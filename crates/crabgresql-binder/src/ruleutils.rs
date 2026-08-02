@@ -23,8 +23,11 @@
 //! syntactically valid SQL but is *not* guaranteed to match PostgreSQL byte for
 //! byte, so extend the match arms rather than relying on it.
 
+use std::sync::Arc;
+
 use crabgresql_parser::{ast, keywords};
-use crabgresql_types::{PgType, interval, text};
+use crabgresql_storage_api::TypeCatalog;
+use crabgresql_types::{FmtCtx, Numeric, PgType, interval, text, timestamptz};
 
 /// `pretty`-printed `pg_get_viewdef`. Returns `None` if `sql` does not re-parse
 /// as a single `SELECT`, in which case the caller reports the view as
@@ -39,7 +42,11 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    let cx = Cx { pretty };
+    let cx = Cx {
+        pretty,
+        calls: None,
+        zone: None,
+    };
 
     let mut out = String::from(" SELECT ");
     let projection: Vec<String> = select
@@ -77,13 +84,128 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
     Some(out)
 }
 
+/// See [`Cx::calls`].
+type CallTypes<'a> = dyn Fn(&ast::Function) -> Option<Vec<PgType>> + 'a;
+
 /// Rendering options that thread through the whole walk.
 #[derive(Clone, Copy)]
-struct Cx {
+struct Cx<'a> {
     /// `pg_get_viewdef`'s `pretty` flag, which is PG's `PRETTYFLAG_PAREN`: with
     /// it, an operator is parenthesised only where precedence actually requires
     /// it; without it, every operator node is wrapped.
     pretty: bool,
+    /// Resolves a function call to the parameter types the binder chose for it,
+    /// so a literal argument can carry the cast PostgreSQL's analysed tree would
+    /// (`nextval('s'::regclass)`, not `nextval('s'::text)`).
+    ///
+    /// `None` reproduces the type-blind rendering: every bare string is `text`.
+    /// A view takes that path, since deparsing one happens far from the binder;
+    /// a column default takes the resolving path, because it is deparsed while
+    /// the DDL that declared it is still being bound.
+    calls: Option<&'a CallTypes<'a>>,
+    /// The reading session's display zone, when there is one — see
+    /// [`stored_expr`]. `None` leaves every constant as written.
+    zone: Option<&'a FmtCtx>,
+}
+
+/// `pg_get_expr` for a stored expression that is not a whole query — today, a
+/// column default. Returns `None` if `sql` does not re-parse as one expression,
+/// leaving the caller to fall back to the text as written.
+///
+/// `catalog` resolves the function calls inside, so a literal argument carries
+/// the type its signature gives it.
+///
+/// The result is the *non-pretty* form, every operator node parenthesised —
+/// `DEFAULT (1 + 2)` stays `(1 + 2)`. That is what `pg_get_expr` returns without
+/// its `pretty` flag, and it is the form `information_schema.columns` echoes
+/// straight out of the catalog; psql asks for the pretty one and
+/// [`stored_expr`] derives it by re-parsing.
+pub fn column_default(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
+    let e = parse_expression(sql)?;
+    let resolve = |f: &ast::Function| call_arg_types(f, catalog);
+    let cx = Cx {
+        pretty: false,
+        calls: Some(&resolve),
+        zone: None,
+    };
+    Some(top_expr(&e, cx))
+}
+
+/// Render a stored `pg_node_tree` deparse for one reader — `pg_get_expr`'s side
+/// of the split. `None` if `sql` is not a single expression (a partition bound,
+/// say), leaving the caller to echo it as stored.
+///
+/// Two things about a default cannot be settled when it is written, because they
+/// belong to whoever reads it:
+///
+/// * **Parenthesisation.** `pg_get_expr` wraps every operator node unless asked
+///   to be `pretty`, so the *same* default is `(1 + 2)` to
+///   `information_schema.columns` and `1 + 2` to psql's `\d`. Re-parsing is what
+///   makes both available from one stored string.
+/// * **The session zone.** A `timestamptz` constant renders in the reader's
+///   zone, so one default reads `'2019-12-31 22:00:00+00'::timestamp with time
+///   zone` under UTC and `'2020-01-01 07:00:00+09'::…` under `Asia/Tokyo`.
+///   Verified against PostgreSQL 18.4, including that `timetz` does *not* move —
+///   it carries its own offset — and neither does a zone-less `timestamp`.
+///
+/// This is idempotent on what the DDL path stores, because every literal there
+/// already carries its cast: a re-render re-reads `'x'::text` as a cast node
+/// rather than as the bare string it would have to guess a type for.
+pub fn stored_expr(sql: &str, pretty: bool, fmt: &FmtCtx) -> Option<String> {
+    let e = parse_expression(sql)?;
+    let cx = Cx {
+        pretty,
+        calls: None,
+        zone: Some(fmt),
+    };
+    Some(top_expr(&e, cx))
+}
+
+/// A `'…'::timestamp with time zone` constant, re-rendered in this session's
+/// zone. `None` for every other cast, which reads the same for everyone.
+fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Option<String> {
+    let fmt = cx.zone?;
+    if PgType::from_name(&type_name(data_type))? != PgType::TimestampTz {
+        return None;
+    }
+    let ast::Expr::Value(v) = inner else {
+        return None;
+    };
+    let ast::Value::SingleQuotedString(text) = &v.value else {
+        return None;
+    };
+    let micros = timestamptz::parse(text, &fmt.zone).ok()?;
+    Some(format!(
+        "'{}'::timestamp with time zone",
+        timestamptz::format(micros, &fmt.zone)
+    ))
+}
+
+/// The parameter types the binder resolves a call's arguments to, or `None` when
+/// the call does not bind at all (a `CREATE FUNCTION` routine, say, which is not
+/// in the built-in table). A default cannot reference columns, so binding it in
+/// an empty scope is enough.
+fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<Vec<PgType>> {
+    let params = crate::param_ctx_none();
+    let scope = crate::Scope::empty(catalog, &params);
+    let bound = crate::bind_expr(&ast::Expr::Function(f.clone()), &scope).ok()?;
+    match bound {
+        crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
+            Some(args.iter().map(|a| a.ty()).collect())
+        }
+        _ => None,
+    }
+}
+
+fn parse_expression(sql: &str) -> Option<ast::Expr> {
+    let query = parse_query(&format!("SELECT {sql}"))?;
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    match select.projection.as_slice() {
+        [ast::SelectItem::UnnamedExpr(e)] => Some(e.clone()),
+        _ => None,
+    }
 }
 
 fn parse_query(sql: &str) -> Option<Box<ast::Query>> {
@@ -277,7 +399,16 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
             expr: inner,
             data_type,
             ..
-        } => format!("{}::{}", expr(inner, cx, u8::MAX), type_name(data_type)),
+        } => zoned_constant(inner, data_type, cx).unwrap_or_else(|| {
+            // A constant carries exactly one type label. Rendering the operand
+            // through `value` would add the `text` it assumes for a bare string
+            // and produce `'x'::text::text`, which also makes re-rendering an
+            // already-deparsed expression non-idempotent.
+            match literal_of(inner) {
+                Some(v) => format!("{}::{}", value_body(v), type_name(data_type)),
+                None => format!("{}::{}", expr(inner, cx, u8::MAX), type_name(data_type)),
+            }
+        }),
         // A bare string literal in an analysed tree is never untyped: it carries
         // the cast the analyser resolved it to. `current_setting('TimeZone')`
         // deparses as `current_setting('TimeZone'::text)`.
@@ -298,12 +429,23 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
 }
 
 fn function(f: &ast::Function, cx: Cx) -> String {
+    // An argument's type comes from the signature the binder resolved, not from
+    // the literal's own syntax — that is the whole difference between
+    // `nextval('s'::regclass)` and `nextval('s'::text)`.
+    let arg_types = cx.calls.and_then(|resolve| resolve(f));
+    let arg_type = |i: usize| arg_types.as_ref().and_then(|types| types.get(i).copied());
     let args = match &f.args {
         ast::FunctionArguments::List(list) => list
             .args
             .iter()
-            .map(|a: &ast::FunctionArg| match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => top_expr(e, cx),
+            .enumerate()
+            .map(|(i, a): (usize, &ast::FunctionArg)| match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    match (arg_type(i), literal_of(e)) {
+                        (Some(ty), Some(v)) => typed_value(v, ty),
+                        _ => top_expr(e, cx),
+                    }
+                }
                 other => other.to_string(),
             })
             .collect::<Vec<_>>()
@@ -314,11 +456,42 @@ fn function(f: &ast::Function, cx: Cx) -> String {
     format!("{}({args})", object_name(&f.name))
 }
 
+/// The literal an expression is, if it is one — the only place a resolved type
+/// changes the rendering, since every other node carries its own syntax.
+fn literal_of(e: &ast::Expr) -> Option<&ast::Value> {
+    match e {
+        ast::Expr::Value(v) => Some(&v.value),
+        _ => None,
+    }
+}
+
+/// A literal rendered at the type its context gives it, rather than at the
+/// `text` a bare string defaults to.
+fn typed_value(v: &ast::Value, ty: PgType) -> String {
+    match v {
+        ast::Value::SingleQuotedString(_) => {
+            let label = ty
+                .format_type(Some(-1))
+                .unwrap_or_else(|| ty.name().to_string());
+            format!("{}::{label}", value_body(v))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A literal with no type label — the part every rendering of it shares.
+fn value_body(v: &ast::Value) -> String {
+    match v {
+        ast::Value::SingleQuotedString(s) => format!("'{}'", s.replace('\'', "''")),
+        other => other.to_string(),
+    }
+}
+
 /// A literal, with the cast PostgreSQL's analyser attached to it. A bare string
 /// is `text`; numbers and booleans need no cast.
 fn value(v: &ast::Value) -> String {
     match v {
-        ast::Value::SingleQuotedString(s) => format!("'{}'::text", s.replace('\'', "''")),
+        ast::Value::SingleQuotedString(_) => format!("{}::text", value_body(v)),
         other => other.to_string(),
     }
 }
@@ -347,14 +520,34 @@ fn interval_literal(iv: &ast::Interval) -> String {
 }
 
 fn type_name(ty: &ast::DataType) -> String {
-    // Prefer our own canonical spelling, which matches `pg_type.typname`
-    // handling elsewhere; fall back to the parser's rendering for a type we do
-    // not model (a `CREATE TYPE` name).
-    match PgType::from_name(&ty.to_string().to_ascii_lowercase()) {
-        Some(t) => t.name().to_string(),
-        None => ty.to_string().to_ascii_lowercase(),
-    }
+    // A cast label is spelled the way `format_type` spells it, modifier and all:
+    // that is what makes `bpchar` print as `bpchar` rather than as the
+    // `character` its error messages use, and `bit` come out quoted. Fall back to
+    // the parser's rendering for a type we do not model (a `CREATE TYPE` name).
+    let Some(t) = PgType::from_name(&ty.to_string().to_ascii_lowercase()) else {
+        return ty.to_string().to_ascii_lowercase();
+    };
+    let typmod = match t {
+        PgType::Numeric => crate::checked_numeric_typmod(ty)
+            .ok()
+            .flatten()
+            .map(|(p, s)| Numeric::pack_typmod(p, s) + VARHDRSZ),
+        PgType::Varchar | PgType::Bpchar => crate::checked_length_typmod(ty)
+            .ok()
+            .flatten()
+            .map(|n| n + VARHDRSZ),
+        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            crate::datetime_precision(ty)
+        }
+        _ => crate::checked_length_typmod(ty).ok().flatten(),
+    };
+    t.format_type(Some(typmod.unwrap_or(-1)))
+        .unwrap_or_else(|| t.name().to_string())
 }
+
+/// The varlena header the character and numeric modifiers reserve, mirroring the
+/// catalog's `atttypmod_of` encoding.
+const VARHDRSZ: i32 = 4;
 
 fn object_name(name: &ast::ObjectName) -> String {
     name.0

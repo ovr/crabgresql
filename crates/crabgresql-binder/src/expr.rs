@@ -8225,29 +8225,35 @@ pub fn bind_column_default(
 ///   which would otherwise re-parse as `int4`); `boolean` prints the `true`/
 ///   `false` keywords; everything else is quoted and labelled.
 ///
-/// Deliberately left alone, each keeping the source text it has always stored:
+/// * **`DEFAULT NULL`** is not recorded at all for a type that needs no length
+///   coercion, and recorded as `NULL::<label>` for one that does — see
+///   [`ColumnDefault::Omit`].
 ///
-/// * **Non-literals.** `DEFAULT (1 + 2)` must not be folded to `3`, and PG's
-///   deparse of an operator expression (`'a'::text || 'b'::text`) is a whole
-///   node-tree printer this does not attempt. An explicit cast is excluded too:
-///   PG keeps the modifier there (`'1001'::bit(4)`), which is the opposite of the
-///   rule above.
-/// * **`DEFAULT NULL`.** PG discards it outright for a type needing no coercion
-///   (`atthasdef` stays false) but keeps it as `NULL::"bit"` for one that does;
-///   crabgresql records a default either way, so rewriting the text would only
-///   dress up a divergence that lives in `atthasdef`.
-/// * **`timestamptz`/`timetz` literals**, whose text depends on the session zone
-///   at *display* time. PG re-renders from the stored node; a value baked here
-///   would freeze the DDL session's zone into the catalog.
+/// Deliberately left alone, keeping the source text it has always stored:
+///
+/// * **Non-literals**, which go to [`crate::ruleutils::column_default`] instead
+///   — it has the precedence rules an operator expression needs. `DEFAULT (1 +
+///   2)` must not be folded to `3`, which is why the split is between *literal*
+///   and everything else rather than between constant and non-constant. An
+///   explicit cast goes there too: PG keeps the modifier on one
+///   (`'1001'::bit(4)`), which is the opposite of the rule above.
+///
+/// A `timestamptz` value is baked here in whatever zone the DDL session had, and
+/// [`crate::ruleutils::rerender_in_zone`] puts it back into the reader's on the
+/// way out.
 pub fn deparse_literal_default(
     expr: &ast::Expr,
     column: &Column,
     catalog: &Arc<dyn TypeCatalog>,
-) -> Result<Option<String>, BindError> {
+) -> Result<ColumnDefault, BindError> {
     // PG's grammar folds a sign into a numeric literal, so `-1` is a constant
     // (see `bind_unary`); `+1` is not, and stays an operator expression.
     let literal = match expr {
-        ast::Expr::Value(v) => !matches!(v.value, ast::Value::Null | ast::Value::Placeholder(_)),
+        ast::Expr::Value(v) => match v.value {
+            ast::Value::Null => return Ok(null_default(column)),
+            ast::Value::Placeholder(_) => false,
+            _ => true,
+        },
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
             expr,
@@ -8257,17 +8263,17 @@ pub fn deparse_literal_default(
         _ => false,
     };
     if !literal {
-        return Ok(None);
+        return Ok(ColumnDefault::Source);
     }
     let params = param_ctx_none();
     let scope = Scope::empty(catalog, &params);
     let bound = match bind_expr(expr, &scope)? {
         // An untyped constant takes the column's type, as PG's unknown-Const
-        // resolution does.
+        // resolution does. A `timestamptz`/`timetz` one needs the session zone
+        // to resolve, which the binder deliberately does not hold, so it stays
+        // unfolded and falls out below as `Source` — the DDL path renders those
+        // two itself.
         Binding::Unknown { lit, span, param } => {
-            if matches!(column.ty, PgType::TimestampTz | PgType::TimeTz) {
-                return Ok(None);
-            }
             resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
         }
         Binding::Typed(e) => e,
@@ -8275,9 +8281,42 @@ pub fn deparse_literal_default(
     let BoundExpr::Const { value, ty } = bound else {
         // A literal that does not fold to a constant — a `reg*` name, say, whose
         // resolution needs the running catalog.
-        return Ok(None);
+        return Ok(ColumnDefault::Source);
     };
-    Ok(deparse_const(&value, ty))
+    Ok(deparse_const(&value, ty).map_or(ColumnDefault::Source, ColumnDefault::Deparsed))
+}
+
+/// What to record for a column default, once deparsed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColumnDefault {
+    /// PostgreSQL's canonical text for it.
+    Deparsed(String),
+    /// Keep the statement's own expression text.
+    Source,
+    /// Record no default at all, leaving `atthasdef` false.
+    Omit,
+}
+
+/// `DEFAULT NULL`: PostgreSQL skips the `pg_attrdef` entry when the transformed
+/// default is a bare null `Const`, and keeps it when a length coercion wrapped
+/// one — so `text DEFAULT NULL` reports no default at all while `bit(4) DEFAULT
+/// NULL` reports `NULL::"bit"`. A coercion is inserted exactly when the column
+/// carries a modifier, which is the test used here; verified against PostgreSQL
+/// 18.4 across `text`/`varchar`/`varchar(4)`/`bit(4)`/`bit varying(5)`/`char(4)`/
+/// `numeric`/`numeric(5,2)`/`int`/`timestamp(3)`/`name`.
+///
+/// Testing the modifier rather than the shape of the bound expression matters
+/// for one type: `name` truncates through a coercion node here but has no
+/// modifier and no length coercion in PG, so it must still be omitted.
+fn null_default(column: &Column) -> ColumnDefault {
+    if column.typmod < 0 {
+        return ColumnDefault::Omit;
+    }
+    let label = column
+        .ty
+        .format_type(Some(-1))
+        .unwrap_or_else(|| column.ty.name().to_string());
+    ColumnDefault::Deparsed(format!("NULL::{label}"))
 }
 
 /// Render one constant the way PG's deparse does — see

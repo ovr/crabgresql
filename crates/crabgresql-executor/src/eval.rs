@@ -567,23 +567,40 @@ fn eval_deparse_fn(
 ) -> Option<Result<Value, ExecError>> {
     match func {
         ScalarFn::FormatType => Some(Ok(eval_format_type(args, ctx))),
-        // `pg_get_expr` echoes the SQL text crabgresql stores in place of a
-        // `pg_node_tree`, deparsed when the row is written rather than when it
-        // is read: a partition's `relpartbound` by `crabgresql_catalog`'s
-        // `deparse_partbound`, a literal column default by the binder's
-        // `deparse_literal_default`. A default that is *not* a literal keeps the
-        // statement's own text and so prints as written — `nextval('s')` where
-        // PostgreSQL prints `nextval('s'::regclass)`, and `(1 + 2)` where
-        // PostgreSQL prints `1 + 2`. A NULL node yields NULL, as in PG.
-        ScalarFn::PgGetExpr => Some(Ok(args[0].clone())),
+        // crabgresql stores a `pg_node_tree` as the SQL text it deparses to,
+        // written when the row is: a partition's `relpartbound` by
+        // `crabgresql_catalog`'s `deparse_partbound`, a column default by the
+        // binder (`deparse_literal_default` and `ruleutils::column_default`).
+        //
+        // Two things about a default belong to the *reader* rather than the
+        // writer — the `pretty` parenthesisation and the session's time zone —
+        // so `pg_get_expr` re-renders for them; see `ruleutils::stored_expr`.
+        // Anything that is not one expression is echoed. A NULL node yields
+        // NULL, as in PG.
+        ScalarFn::PgGetExpr => Some(Ok(eval_pg_get_expr(args, ctx))),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         _ => None,
     }
 }
 
+/// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
+/// (see [`eval_deparse_fn`]). The third argument is PG's `pretty` flag, which
+/// defaults to false — `information_schema` leaves it off and gets the fully
+/// parenthesised form, psql passes it and gets `\d`'s.
+fn eval_pg_get_expr(args: &[Value], ctx: &ExecContext) -> Value {
+    let Value::Text(sql) = &args[0] else {
+        return args[0].clone();
+    };
+    let pretty = matches!(args.get(2), Some(Value::Bool(true)));
+    match crabgresql_binder::ruleutils::stored_expr(sql, pretty, &ctx.fmt) {
+        Some(text) => Value::Text(text),
+        None => args[0].clone(),
+    }
+}
+
 /// `pg_get_viewdef(name[, pretty])`. Three outcomes, all PostgreSQL's: a name no
 /// relation answers to is `42P01`; a relation that is not a view is the empty
-/// string; a view is its `SELECT`, re-rendered by [`crate::ruleutils`].
+/// string; a view is its `SELECT`, re-rendered by [`crabgresql_binder::ruleutils`].
 fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let Value::Text(name) = &args[0] else {
         return Ok(Value::Null);
@@ -620,7 +637,7 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
     // A view whose body the deparser cannot render must *not* also answer with
     // the empty string: that is the "not a view" answer, and returning it here
     // would let a dump silently drop the view body. Say so instead.
-    crate::ruleutils::view_definition(&sql, pretty, &columns)
+    crabgresql_binder::ruleutils::view_definition(&sql, pretty, &columns)
         .map(Value::Text)
         .ok_or_else(|| {
             ExecError::new(
@@ -629,7 +646,6 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
             )
         })
 }
-
 
 /// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
 /// nothing in the catalog claims is `???`. The modifier is decoded in

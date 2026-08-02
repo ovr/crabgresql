@@ -10,7 +10,6 @@ pub mod eval;
 mod generate_series;
 mod md5;
 pub mod reg;
-pub mod ruleutils;
 pub mod scalar_fns;
 mod special_fns;
 pub mod vector;
@@ -117,7 +116,7 @@ pub trait CatalogOps: Send + Sync {
     fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
     /// The SQL text stored for the view `namespace.name` and its column names,
     /// or `None` if there is no such view. Handed back verbatim; re-parsing and
-    /// re-rendering it in PostgreSQL's canonical shape is [`crate::ruleutils`]'s
+    /// re-rendering it in PostgreSQL's canonical shape is [`crabgresql_binder::ruleutils`]'s
     /// job, so an implementation never learns the SQL surface. The columns are
     /// what a `SELECT *` in the body expands to, frozen at `CREATE VIEW` time.
     /// Backs `pg_get_viewdef`.

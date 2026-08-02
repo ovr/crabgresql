@@ -526,7 +526,7 @@ pub enum ScalarFn {
     /// `relpartbound`), so this echoes its first argument.
     PgGetExpr,
     /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
-    /// in PostgreSQL's canonical shape by [`crabgresql_executor::ruleutils`].
+    /// in PostgreSQL's canonical shape by [`crate::ruleutils`].
     PgGetViewdef,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are

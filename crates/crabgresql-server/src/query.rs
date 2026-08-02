@@ -2867,6 +2867,34 @@ fn resolve_create_namespace(
     }
 }
 
+/// The deparsed form of a `timestamptz`/`timetz` column's literal default, or
+/// `None` when the default is not a bare literal or the column is some other
+/// type.
+///
+/// These two are the literals the binder cannot fold: resolving one needs the
+/// session zone, which the binder holds no access to on purpose. Rendering them
+/// here — where the session *is* in hand — matches PostgreSQL, which resolves
+/// the constant when the DDL runs and stores the instant, not the text. What the
+/// reader then sees is the instant put back into *their* zone, which
+/// `pg_get_expr` does on the way out.
+fn zoned_literal_default(expr: &ast::Expr, column: &Column, session: &Session) -> Option<String> {
+    if !matches!(column.ty, PgType::TimestampTz | PgType::TimeTz) {
+        return None;
+    }
+    let ast::Expr::Value(v) = expr else {
+        return None;
+    };
+    let text = v.value.as_pg_string()?;
+    let fmt = session.fmt_ctx();
+    let value =
+        crabgresql_types::cast::cast_value(Value::Text(text.to_string()), column.ty, &fmt).ok()?;
+    let label = column.ty.format_type(Some(-1))?;
+    Some(format!(
+        "'{}'::{label}",
+        value.encode_text_with(&fmt)?.replace('\'', "''")
+    ))
+}
+
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
@@ -3102,13 +3130,31 @@ fn execute_create_table(
                         )));
                     }
                     crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
-                    // A literal is stored in its deparsed form, so `pg_get_expr`
+                    // The default is stored already deparsed, so `pg_get_expr`
                     // (which echoes this text) prints what PostgreSQL's `\d`
-                    // does; anything else keeps its source text.
-                    column.default = Some(
-                        crabgresql_binder::deparse_literal_default(expr, &column, type_catalog)?
-                            .unwrap_or_else(|| expr.to_string()),
-                    );
+                    // does. A literal takes its type from the column, so the
+                    // binder renders it; everything else goes through the same
+                    // deparser a view definition does. A plain NULL for a type
+                    // needing no coercion is not a default at all.
+                    let source = expr.to_string();
+                    column.default = match crabgresql_binder::deparse_literal_default(
+                        expr,
+                        &column,
+                        type_catalog,
+                    )? {
+                        crabgresql_binder::ColumnDefault::Deparsed(text) => Some(text),
+                        crabgresql_binder::ColumnDefault::Omit => None,
+                        crabgresql_binder::ColumnDefault::Source => Some(
+                            zoned_literal_default(expr, &column, session)
+                                .or_else(|| {
+                                    crabgresql_binder::ruleutils::column_default(
+                                        &source,
+                                        type_catalog,
+                                    )
+                                })
+                                .unwrap_or(source),
+                        ),
+                    };
                 }
                 ast::ColumnOption::PrimaryKey(pk) => {
                     reject_primary_key_options(pk)?;
