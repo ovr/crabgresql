@@ -5834,6 +5834,73 @@ async fn copy_in_extended_loads_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every seam where a statement now leaves the reactor and comes back, in one
+/// session: the autocommit commit `finalize_statement` offloads, the explicit
+/// `COMMIT` `commit_transaction` offloads, the single-transaction `COPY` that
+/// finalizes once for many batches, and `DECLARE … CURSOR`, whose body re-enters
+/// statement execution — the recursion that has to stay boxed for the statement
+/// future to have a finite size at all.
+///
+/// `#[tokio::test]` is current-thread on purpose: the offload has to be a real
+/// handoff to the blocking pool, since a runtime with one worker cannot afford to
+/// have it parked, and it must not be `block_in_place`, which panics here.
+#[tokio::test]
+async fn statement_execution_survives_the_commit_offload() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int4, label text)")
+        .await?;
+
+    // Autocommit write: `finalize_statement` commits on the blocking pool, and the
+    // row is visible to the next statement.
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'autocommit')")
+        .await?;
+
+    // Explicit block: nothing commits at the statement boundary, `COMMIT` does.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (2, 'in-block')")
+        .await?;
+    client.simple_query("COMMIT").await?;
+
+    // One COPY, many batches, one commit.
+    let sink = client.copy_in("COPY t (id, label) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"3\tcopy-a\n")).await?;
+    sink.send(Bytes::from_static(b"4\tcopy-b\n")).await?;
+    assert_eq!(sink.finish().await?, 2);
+
+    // A cursor's body runs through the boxed recursive edge, and its rows outlive
+    // the statement that produced them.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("DECLARE c CURSOR FOR SELECT label FROM t ORDER BY id")
+        .await?;
+    let messages = client.simple_query("FETCH 2 FROM c").await?;
+    let fetched = rows(&messages);
+    assert_eq!(fetched.len(), 2);
+    assert_eq!(fetched[0].get("label"), Some("autocommit"));
+    assert_eq!(fetched[1].get("label"), Some("in-block"));
+    client.simple_query("COMMIT").await?;
+
+    // A rolled-back block leaves nothing behind, so the count is exactly the four
+    // rows the committed paths wrote.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (5, 'rolled-back')")
+        .await?;
+    client.simple_query("ROLLBACK").await?;
+
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    let counted = rows(&messages);
+    assert_eq!(counted[0].get("n"), Some("4"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow::Result<()> {
     use bytes::Bytes;

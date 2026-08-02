@@ -697,7 +697,7 @@ fn declared_cursor_query(stmts: &[ast::Declare]) -> Option<&ast::Query> {
     }
 }
 
-pub fn execute_statement(
+pub async fn execute_statement(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -705,8 +705,18 @@ pub fn execute_statement(
     session: &mut Session,
     params: &BoundParams,
 ) -> Result<QueryResult, PgError> {
-    execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false)
+    execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false).await
 }
+
+/// A boxed, `Send` statement future.
+///
+/// The one place a return type has to be erased: `execute_statement_with` calls
+/// `cursor::execute_declare`, which calls `execute_statement_with` back for the
+/// cursor's body, and two mutually recursive `async fn`s have infinitely sized
+/// futures. Erasing this edge also pins the `Send` requirement here, where a
+/// violation is reported, rather than at the `tokio::spawn` that polls it.
+pub(crate) type StatementFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<QueryResult, PgError>> + Send + 'a>>;
 
 /// [`execute_statement`], plus the one knob `DECLARE … CURSOR` needs.
 ///
@@ -714,7 +724,7 @@ pub fn execute_statement(
 /// transaction instead of handing back a live iterator — the treatment a plan
 /// that calls a routine already gets. `DECLARE` needs it because the rows
 /// outlive the statement that produced them.
-pub(crate) fn execute_statement_with(
+pub(crate) async fn execute_statement_with(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -832,7 +842,8 @@ pub(crate) fn execute_statement_with(
                     txnmgr,
                     create,
                     session,
-                );
+                )
+                .await;
             }
             ast::Statement::CreateTable(create) => {
                 return execute_create_table(engine, &type_catalog, create, session);
@@ -949,10 +960,10 @@ pub(crate) fn execute_statement_with(
                 );
             }
             ast::Statement::Do(block) => {
-                return execute_do(engine, global_catalog, txnmgr, block, session);
+                return execute_do(engine, global_catalog, txnmgr, block, session).await;
             }
             ast::Statement::Call(call) => {
-                return execute_call(engine, global_catalog, txnmgr, call, session);
+                return execute_call(engine, global_catalog, txnmgr, call, session).await;
             }
             ast::Statement::Declare { stmts } => {
                 return crate::cursor::execute_declare(
@@ -963,7 +974,8 @@ pub(crate) fn execute_statement_with(
                     stmts,
                     session,
                     params,
-                );
+                )
+                .await;
             }
             ast::Statement::Fetch {
                 name,
@@ -1005,18 +1017,18 @@ pub(crate) fn execute_statement_with(
             }
             ast::Statement::Commit {
                 chain, modifier, ..
-            } => return commit_transaction(txnmgr, session, *chain, modifier),
+            } => return commit_transaction(txnmgr, session, *chain, modifier).await,
             ast::Statement::Rollback { chain, savepoint } => {
                 return rollback_transaction(txnmgr, session, *chain, savepoint);
             }
             ast::Statement::Truncate(truncate) => {
-                return execute_truncate(&catalog, txnmgr, session, truncate);
+                return execute_truncate(&catalog, txnmgr, session, truncate).await;
             }
             ast::Statement::Analyze(analyze) => {
-                return execute_analyze(&catalog, txnmgr, session, analyze);
+                return execute_analyze(&catalog, txnmgr, session, analyze).await;
             }
             ast::Statement::Vacuum(vacuum) => {
-                return execute_vacuum(&catalog, txnmgr, session, vacuum);
+                return execute_vacuum(&catalog, txnmgr, session, vacuum).await;
             }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
@@ -1026,7 +1038,7 @@ pub(crate) fn execute_statement_with(
             // form never reaches here — the connection intercepts it before
             // execution (see `is_copy_from_stdin`).
             ast::Statement::Copy { .. } => {
-                return execute_copy_from_file(engine, global_catalog, txnmgr, session, stmt);
+                return execute_copy_from_file(engine, global_catalog, txnmgr, session, stmt).await;
             }
             other => {
                 return Err(PgError::feature_not_supported(format!(
@@ -1099,7 +1111,7 @@ pub(crate) fn execute_statement_with(
     let (routines, command_counter) =
         statement_runtime(&catalog, &type_catalog, global_catalog, session);
     if is_write {
-        await_write_capacity(engine, session);
+        await_write_capacity(engine, session.xact.is_some()).await;
     }
     // Every statement that reads takes a snapshot, EXPLAIN included: PG pins the
     // transaction snapshot for it, so inside a REPEATABLE READ block a plain
@@ -1132,7 +1144,8 @@ pub(crate) fn execute_statement_with(
                             is_write,
                             false,
                             Some(&command_counter),
-                        );
+                        )
+                        .await;
                         return Err(e.into());
                     }
                 }
@@ -1145,7 +1158,8 @@ pub(crate) fn execute_statement_with(
             is_write,
             true,
             Some(&command_counter),
-        )?;
+        )
+        .await?;
         if opts.summary {
             lines.extend(crabgresql_planner::explain_summary(planning, execution));
         }
@@ -1177,7 +1191,8 @@ pub(crate) fn execute_statement_with(
                 is_write,
                 false,
                 Some(&command_counter),
-            );
+            )
+            .await;
             return Err(e.into());
         }
     };
@@ -1211,7 +1226,8 @@ pub(crate) fn execute_statement_with(
                     is_write,
                     false,
                     Some(&command_counter),
-                );
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -1225,7 +1241,8 @@ pub(crate) fn execute_statement_with(
         is_write,
         true,
         Some(&command_counter),
-    )?;
+    )
+    .await?;
     // Anything a routine body raised is buffered on the session; hand it to the
     // caller alongside the result so it goes out ahead of the rows.
     let notices = session.notices.drain();
@@ -1330,9 +1347,24 @@ fn materialize(exec: Execution) -> Result<Execution, PgError> {
 /// the XID is already allocated and outlives the statement, so there is no
 /// point in the block at which waiting is safe; such a session writes through
 /// and the flush worker catches up afterwards.
-fn await_write_capacity(engine: &Arc<dyn TableEngine>, session: &Session) {
-    if session.xact.is_none() {
-        engine.await_write_capacity();
+///
+/// The wait runs on the blocking pool: it is a condvar wait bounded only by the
+/// engine's own timeout (30s today), and on a current-thread runtime the reactor
+/// worker it would otherwise occupy is the *only* one — the accept loop and every
+/// other session would stall with it.
+///
+/// Takes the block flag rather than the `&Session` it comes from: an `async fn`
+/// stores its arguments in the future it returns, and `&Session` there would
+/// demand `Session: Sync`, which the `Box<dyn ExecNode>` in a suspended portal
+/// (`ExecNode` is `Send`, not `Sync`) cannot give.
+async fn await_write_capacity(engine: &Arc<dyn TableEngine>, in_txn_block: bool) {
+    if !in_txn_block {
+        let engine = Arc::clone(engine);
+        // A panicked or cancelled wait is not worth failing the statement over:
+        // the wait is advisory back-pressure, and skipping it only means this
+        // statement writes into a full buffer — exactly what an in-block
+        // statement does unconditionally.
+        let _ = tokio::task::spawn_blocking(move || engine.await_write_capacity()).await;
     }
 }
 
@@ -1382,41 +1414,37 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
 /// at the statement boundary. Inside a block nothing is finalized here; the XID
 /// lives until `COMMIT`/`ROLLBACK`. The command counter advances so the next
 /// statement in a block sees this one's writes.
-fn finalize_statement(
-    txnmgr: &TransactionManager,
+async fn finalize_statement(
+    txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     txn: &TxnContext,
     is_write: bool,
     ok: bool,
     command_counter: Option<&Arc<AtomicU32>>,
 ) -> Result<(), PgError> {
-    match &mut session.xact {
-        None => {
-            if is_write {
-                if ok {
-                    // The commit fsyncs the WAL on the durable engine; a failure
-                    // there is a system error, surfaced to the client.
-                    // TODO(perf): this blocking fsync runs on the tokio reactor
-                    // worker. Move statement execution onto a blocking pool (or
-                    // guard with block_in_place on multi-thread runtimes) so
-                    // concurrent committers don't stall the accept loop.
-                    txnmgr.commit(txn.xid).map_err(commit_io_error)?;
-                } else {
-                    txnmgr.abort(txn.xid);
-                }
-            }
-        }
-        Some(active) => {
-            // Read the counter back rather than adding one: a routine body may
-            // have advanced it several times, and reusing an id it already
-            // stamped rows with would hide those rows from the next statement.
-            let used = command_counter.map_or(active.cid.0, |c| {
-                c.load(std::sync::atomic::Ordering::Acquire)
-            });
-            active.cid = CommandId(used.max(active.cid.0) + 1);
-        }
+    // Handled first, and returning, so the `&mut session.xact` borrow ends before
+    // the await below rather than being carried into the future: this path does no
+    // I/O and never suspends.
+    if let Some(active) = &mut session.xact {
+        // Read the counter back rather than adding one: a routine body may
+        // have advanced it several times, and reusing an id it already
+        // stamped rows with would hide those rows from the next statement.
+        let used = command_counter.map_or(active.cid.0, |c| {
+            c.load(std::sync::atomic::Ordering::Acquire)
+        });
+        active.cid = CommandId(used.max(active.cid.0) + 1);
+        return Ok(());
     }
-    Ok(())
+    if !is_write {
+        return Ok(());
+    }
+    if !ok {
+        // Stays inline: an abort appends no fsync'd record by design — one that
+        // never reaches disk is indistinguishable from a crash before commit.
+        txnmgr.abort(txn.xid);
+        return Ok(());
+    }
+    commit_off_reactor(txnmgr, txn.xid).await
 }
 
 /// A bound COPY plus the catalogs its rows will be built against — the type
@@ -1500,7 +1528,7 @@ pub fn prepare_copy_from(
 /// Execute a bound COPY as an INSERT of the decoded field rows, under a write
 /// transaction, returning the number of rows loaded (the `COPY n` count). Reuses
 /// the same XID/commit lifecycle and constraint checks as an ordinary INSERT.
-pub fn run_copy_insert(
+pub async fn run_copy_insert(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
@@ -1510,6 +1538,7 @@ pub fn run_copy_insert(
     run_copy_rows(engine, txnmgr, session, prepared, |insert| {
         insert(rows).map(|_| ())
     })
+    .await
 }
 
 /// Load a COPY's rows, however many batches they arrive in, as **one**
@@ -1521,21 +1550,24 @@ pub fn run_copy_insert(
 /// The write context (capacity wait, XID, routine runtime, execution context) is
 /// built once here rather than per batch, and the statement is finalized once:
 /// committed if `produce` and every batch succeeded, aborted otherwise.
-pub fn run_copy_rows(
+pub async fn run_copy_rows(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     prepared: &PreparedCopy,
+    // `Send` because an `async fn` stores its arguments in the generated future,
+    // and that future is polled inside the connection task's `tokio::spawn`.
     produce: impl FnOnce(
         &mut dyn FnMut(Vec<Vec<Option<String>>>) -> Result<u64, PgError>,
-    ) -> Result<(), PgError>,
+    ) -> Result<(), PgError>
+    + Send,
 ) -> Result<u64, PgError> {
     // A COPY is a write (read-only was rejected at prepare time); its context
     // carries a sequence handle so a `serial`/`nextval()` column default advances
     // the sequence and updates this session's currval/lastval, as INSERT does,
     // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
-    await_write_capacity(engine, session);
+    await_write_capacity(engine, session.xact.is_some()).await;
     let txn = build_txn(txnmgr, session, true);
     let (routines, command_counter) = statement_runtime(
         &prepared.engine,
@@ -1576,12 +1608,13 @@ pub fn run_copy_rows(
         }
     });
     if let Err(e) = outcome {
-        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        let _ =
+            finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter)).await;
         return Err(e);
     }
     // A column default can call a routine, whose body advances the counter, so
     // the block's command id has to be read back rather than merely bumped.
-    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter)).await?;
     Ok(loaded)
 }
 
@@ -1596,7 +1629,7 @@ pub fn run_copy_rows(
 /// A `COPY … FROM STDIN` reaching here is a routing bug rather than a user
 /// error, so it reports the wire-level requirement instead of silently loading
 /// nothing.
-fn execute_copy_from_file(
+async fn execute_copy_from_file(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -1617,8 +1650,60 @@ fn execute_copy_from_file(
     let format = prepared.plan.format.clone();
     let rows = run_copy_rows(engine, txnmgr, session, &prepared, |insert| {
         crate::copy::read_file_rows(file, &path, &format, |batch| insert(batch).map(|_| ()))
-    })?;
+    })
+    .await?;
     Ok(command_with(format!("COPY {rows}"), Vec::new()))
+}
+
+/// Commit `xid` on the blocking pool rather than on the reactor worker.
+///
+/// `TransactionManager::commit` fsyncs the WAL and then takes engine locks in its
+/// finalize hook (the relfilenode swap, the unlink of the old file). Run inline,
+/// that holds a reactor worker for the whole fsync, and concurrent committers park
+/// one worker each on the WAL's group-commit condvar.
+///
+/// `spawn_blocking`, not `block_in_place`: the latter panics on a current-thread
+/// runtime, which is what the e2e suite and the pg_regress harness host the server
+/// on. Nor a dedicated commit thread — `Wal::flush` already coalesces concurrent
+/// committers into one fsync, and funnelling them through a single thread would
+/// serialize the pre- and post-fsync work that today runs in parallel.
+async fn commit_off_reactor(txnmgr: &Arc<TransactionManager>, xid: Xid) -> Result<(), PgError> {
+    // The closure owns everything it touches — the manager is already shared and
+    // `Xid` is `Copy` — so nothing borrows the session or the statement, and the
+    // commit is free to outlive the future awaiting it.
+    let txnmgr = Arc::clone(txnmgr);
+    match tokio::task::spawn_blocking(move || txnmgr.commit(xid)).await {
+        Ok(result) => result.map_err(commit_io_error),
+        Err(e) => Err(commit_task_failed(&e, xid)),
+    }
+}
+
+/// A commit task that never reported a fate. The transaction's outcome is
+/// genuinely unknown, so the client is told the statement failed rather than that
+/// a write it cannot see is durable.
+///
+/// Deliberately does not abort: `commit` already aborts itself on a WAL error, and
+/// a panic may have left the commit half-applied, so a second fate transition from
+/// here would race the unfinished one.
+fn commit_task_failed(e: &tokio::task::JoinError, xid: Xid) -> PgError {
+    if e.is_panic() {
+        // A panic inside the commit path leaves the XID in the in-flight set,
+        // pinning the reclamation horizon, and may have poisoned the WAL mutex
+        // every later flush takes. Logged as the system-level fault it is, on top
+        // of being reported to the client.
+        tracing::error!(?xid, "commit task panicked; transaction fate unknown");
+        PgError::new(
+            sqlstate::INTERNAL_ERROR,
+            "could not commit transaction: commit task failed",
+        )
+    } else {
+        // Cancelled: the runtime is shutting down, so the closure may never have
+        // run. 58030, as for any commit that did not reach disk.
+        PgError::new(
+            sqlstate::IO_ERROR,
+            "could not commit transaction: server is shutting down",
+        )
+    }
 }
 
 /// Map a WAL/commit I/O failure to a SQLSTATE 58030 system error.
@@ -1800,8 +1885,8 @@ fn begin_transaction(
 
 /// `COMMIT` / `END`. Ends the block. A COMMIT of a failed block is reported as
 /// ROLLBACK, and a COMMIT with no block open warns — both as in PG.
-fn commit_transaction(
-    txnmgr: &TransactionManager,
+async fn commit_transaction(
+    txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     chain: bool,
     modifier: &Option<ast::TransactionModifier>,
@@ -1833,10 +1918,14 @@ fn commit_transaction(
             "COMMIT"
         }
         TransactionStatus::InTransaction => {
+            // `take()` before the await, not after: dropping a `spawn_blocking`
+            // handle does not cancel the task, so if this future is dropped
+            // mid-commit the pool thread still finishes it. A `session.xact` that
+            // still held the XID would then make `Session::drop` abort a
+            // transaction that is concurrently committing — two conflicting fate
+            // transitions on one CLOG entry.
             if let Some(active) = session.xact.take() {
-                txnmgr
-                    .commit(active.xid.unwrap_or(Xid::INVALID))
-                    .map_err(commit_io_error)?;
+                commit_off_reactor(txnmgr, active.xid.unwrap_or(Xid::INVALID)).await?;
             }
             // The block's cursors end with it, except the holdable ones.
             crate::cursor::close_on_commit(session);
@@ -1896,7 +1985,7 @@ fn abort_active(txnmgr: &TransactionManager, session: &mut Session) {
 
 /// `TRUNCATE [TABLE] name [, ...]` (bare form only). All named tables are
 /// resolved before any is emptied, so a missing table fails the whole statement.
-fn execute_truncate(
+async fn execute_truncate(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
@@ -1965,11 +2054,11 @@ fn execute_truncate(
         // WAL) may have left an earlier table in the list holding its exclusive
         // AccessExclusive hold, and only the abort's finalize hook releases it.
         if let Err(error) = table.truncate(&txn) {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, None).await;
             return Err(error.into());
         }
     }
-    finalize_statement(txnmgr, session, &txn, true, true, None)?;
+    finalize_statement(txnmgr, session, &txn, true, true, None).await?;
     Ok(QueryResult::command("TRUNCATE TABLE"))
 }
 
@@ -1984,7 +2073,7 @@ fn execute_truncate(
 /// A bare `ANALYZE` covers every relation this session can reach, skipping ones
 /// with no rows of their own (partitioned parents) and other sessions' temp
 /// tables, which the engine refuses by reporting them as absent.
-fn execute_analyze(
+async fn execute_analyze(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
@@ -2035,12 +2124,12 @@ fn execute_analyze(
             // resolved above, so it cannot land here.
             Err(StorageError::TableNotFound(_)) if analyze.table_name.is_none() => {}
             Err(error) => {
-                finalize_statement(txnmgr, session, &txn, false, false, None)?;
+                finalize_statement(txnmgr, session, &txn, false, false, None).await?;
                 return Err(error.into());
             }
         }
     }
-    finalize_statement(txnmgr, session, &txn, false, true, None)?;
+    finalize_statement(txnmgr, session, &txn, false, true, None).await?;
     Ok(QueryResult::command("ANALYZE"))
 }
 
@@ -2052,7 +2141,7 @@ fn execute_analyze(
 ///
 /// Unlike `ANALYZE`, this cannot run inside a transaction block: the flush is its
 /// own transaction, which is also why PostgreSQL raises `25001` here.
-fn execute_vacuum(
+async fn execute_vacuum(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
@@ -2141,12 +2230,12 @@ fn execute_vacuum(
                 Ok(()) => {}
                 Err(StorageError::TableNotFound(_)) if vacuum.table_name.is_none() => {}
                 Err(error) => {
-                    finalize_statement(txnmgr, session, &txn, false, false, None)?;
+                    finalize_statement(txnmgr, session, &txn, false, false, None).await?;
                     return Err(error.into());
                 }
             }
         }
-        finalize_statement(txnmgr, session, &txn, false, true, None)?;
+        finalize_statement(txnmgr, session, &txn, false, true, None).await?;
     }
     Ok(QueryResult::command("VACUUM"))
 }
@@ -3872,7 +3961,7 @@ fn execute_create_partition(
 /// rows into it (à la `INSERT ... SELECT`). The completion tag is `SELECT <n>`,
 /// matching PG's CTAS / `SELECT INTO`.
 #[allow(clippy::too_many_arguments)]
-fn execute_create_table_as(
+async fn execute_create_table_as(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
@@ -4076,14 +4165,15 @@ fn execute_create_table_as(
     let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
         Ok(exec) => exec,
         Err(e) => {
-            let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+            let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter))
+                .await;
             let _ = target.drop_table(&namespace, &name);
             return Err(e.into());
         }
     };
     // The source query can call a routine, whose body advances the counter, so
     // the block's command id has to be read back rather than merely bumped.
-    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter)).await?;
     let n = match exec {
         Execution::Inserted(n) => n,
         // The populate plan is a RETURNING-less INSERT, so execution yields an
@@ -4901,7 +4991,7 @@ fn procedure_body_text(create: &ast::CreateProcedure) -> Result<String, PgError>
 ///
 /// Unlike a routine call this has no catalog entry, so the body is compiled
 /// fresh every time; a `DO` block is written to run once.
-fn execute_do(
+async fn execute_do(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -4945,10 +5035,11 @@ fn execute_do(
     );
     let outcome = routines.run_inline_block(&body, &exec_ctx, &txn);
     if let Err(e) = outcome {
-        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        let _ =
+            finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter)).await;
         return Err(e.into());
     }
-    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter)).await?;
     Ok(QueryResult::Command {
         tag: "DO".into(),
         notices: session.notices.drain(),
@@ -4960,7 +5051,7 @@ fn execute_do(
 /// A `CALL` argument is a constant expression — there is no row for a column
 /// reference to come from — so the arguments are bound against an empty scope
 /// and evaluated before the body is entered.
-fn execute_call(
+async fn execute_call(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -4975,17 +5066,23 @@ fn execute_call(
             "CALL with no argument list is not supported yet",
         ));
     };
-    let params = param_ctx_none();
-    let scope = crabgresql_binder::Scope::empty(&type_catalog, &params);
-    let mut args = Vec::with_capacity(list.args.len());
-    for arg in &list.args {
-        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
-            return Err(PgError::feature_not_supported(
-                "named and wildcard CALL arguments are not supported yet",
-            ));
-        };
-        args.push(crabgresql_binder::bind_scalar(expr, &scope)?);
-    }
+    // Bound inside a block of its own so the binder's scope is dropped before the
+    // awaits below. It is `Rc`-based, hence not `Send`, and this future is polled
+    // on the connection task — anything still live at an await has to be `Send`.
+    let args = {
+        let params = param_ctx_none();
+        let scope = crabgresql_binder::Scope::empty(&type_catalog, &params);
+        let mut args = Vec::with_capacity(list.args.len());
+        for arg in &list.args {
+            let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+                return Err(PgError::feature_not_supported(
+                    "named and wildcard CALL arguments are not supported yet",
+                ));
+            };
+            args.push(crabgresql_binder::bind_scalar(expr, &scope)?);
+        }
+        args
+    };
 
     let sig = resolve_procedure(&type_catalog, &name, &args)?;
 
@@ -5018,17 +5115,19 @@ fn execute_call(
                 // The transaction is open by now, so a bad argument has to abort
                 // it rather than leaving the XID in flight.
                 let _ =
-                    finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+                    finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter))
+                        .await;
                 return Err(e.into());
             }
         }
     }
 
     if let Err(e) = routines.call(sig.oid, values, &exec_ctx, &txn) {
-        let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));
+        let _ =
+            finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter)).await;
         return Err(e.into());
     }
-    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter))?;
+    finalize_statement(txnmgr, session, &txn, true, true, Some(&command_counter)).await?;
     Ok(QueryResult::Command {
         tag: "CALL".into(),
         notices: session.notices.drain(),
