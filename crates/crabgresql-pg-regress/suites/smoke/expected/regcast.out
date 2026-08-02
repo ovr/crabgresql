@@ -105,6 +105,70 @@ SELECT 'rc_nosuchtype'::regtype;
 ERROR:  type "rc_nosuchtype" does not exist
 SELECT 'rc_nosuchschema'::regnamespace;
 ERROR:  schema "rc_nosuchschema" does not exist
+-- pg_typeof reports its argument's type as a regtype. It is polymorphic, so it
+-- has no fixed signature; the argument is never evaluated, only its type read.
+SELECT pg_typeof(1) AS int_, pg_typeof(1.5) AS num, pg_typeof(true) AS bool_,
+       pg_typeof('a'::text) AS text_;
+  int_   |   num   |  bool_  | text_ 
+---------+---------+---------+-------
+ integer | numeric | boolean | text
+(1 row)
+
+-- the SQL spelling, as everywhere else in regtype
+SELECT pg_typeof('2020-01-01'::timestamptz) AS tstz, pg_typeof('x'::varchar) AS vc;
+           tstz           |        vc         
+--------------------------+-------------------
+ timestamp with time zone | character varying
+(1 row)
+
+-- a regtype is only an OID, so the type modifier is not reported
+SELECT pg_typeof(1::numeric(10,2)) AS numeric_mod, pg_typeof('x'::varchar(5)) AS varchar_mod;
+ numeric_mod |    varchar_mod    
+-------------+-------------------
+ numeric     | character varying
+(1 row)
+
+-- an array reports the element type's array spelling
+SELECT pg_typeof(ARRAY[1,2]) AS arr;
+    arr    
+-----------
+ integer[]
+(1 row)
+
+-- a literal that never acquired a type really is `unknown`, not text
+SELECT pg_typeof('abc') AS unknown_lit, pg_typeof(NULL) AS null_lit;
+ unknown_lit | null_lit 
+-------------+----------
+ unknown     | unknown
+(1 row)
+
+SELECT 705::regtype AS unknown_by_oid;
+ unknown_by_oid 
+----------------
+ unknown
+(1 row)
+
+-- the result is an ordinary regtype: comparable, castable, and self-describing
+SELECT pg_typeof(1) = 'integer'::regtype AS eq, pg_typeof(1)::text AS as_text,
+       pg_typeof(pg_typeof(1)) AS selfref;
+ eq | as_text | selfref 
+----+---------+---------
+ t  | integer | regtype
+(1 row)
+
+-- a column's declared type, which is the usual reason to call this
+CREATE TABLE pt_t (a integer, b timestamptz, c numeric(8,3));
+INSERT INTO pt_t VALUES (1, '2020-01-01+00', 1.5);
+SELECT pg_typeof(a) AS a, pg_typeof(b) AS b, pg_typeof(c) AS c FROM pt_t;
+    a    |            b             |    c    
+---------+--------------------------+---------
+ integer | timestamp with time zone | numeric
+(1 row)
+
+DROP TABLE pt_t;
+-- pg_typeof takes exactly one argument
+SELECT pg_typeof(1, 2);
+ERROR:  function pg_typeof(integer, integer) does not exist
 -- sequences are relations, so nextval takes either spelling
 CREATE SEQUENCE rc_s;
 SELECT nextval('rc_s') AS bare, nextval('rc_s'::regclass) AS via_regclass;

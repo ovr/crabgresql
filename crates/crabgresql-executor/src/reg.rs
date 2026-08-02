@@ -41,6 +41,10 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         // `regtype` prints a built-in under its SQL spelling, not its catalog
         // one: 23 is `integer`, 1005 is `smallint[]`, 1043 is
         // `character varying`. That is exactly `PgType::name`.
+        // `unknown` is a real `pg_type` row but has no `PgType` of its own, so
+        // it needs naming here — it is what `pg_typeof` reports for a literal
+        // that never acquired a type.
+        RegKind::Type if oid == crabgresql_types::oid::UNKNOWN => Some("unknown".to_string()),
         RegKind::Type => match PgType::from_oid(oid) {
             Some(ty) => Some(ty.name().to_string()),
             None => ops.user_type_name(oid).map(|(_, name)| quote_ident(&name)),
