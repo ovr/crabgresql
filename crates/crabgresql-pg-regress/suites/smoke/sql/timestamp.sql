@@ -126,3 +126,31 @@ SELECT a.attname, a.atttypmod, pg_catalog.format_type(a.atttypid, a.atttypmod)
  WHERE a.attrelid = 'ts_col'::regclass AND a.attnum > 0
  ORDER BY a.attnum;
 DROP TABLE ts_col;
+
+-- date_bin: for every stride that also names a date_trunc unit the two agree,
+-- in both eras and with the origin on either side of the source
+SELECT str, ival,
+       date_trunc(str, ts) = date_bin(ival::interval, ts, timestamp '2001-01-01') AS equal
+  FROM (VALUES ('week','7 d'),('day','1 d'),('hour','1 h'),('minute','1 m'),
+               ('second','1 s'),('millisecond','1 ms'),('microsecond','1 us'))
+         AS intervals (str, ival),
+       (VALUES (timestamp '2020-02-29 15:44:17.71393')) AS t (ts);
+-- arbitrary strides, which date_trunc cannot express
+SELECT date_bin(interval '15 days', timestamp '2020-02-11 15:44:17.71393', timestamp '2001-01-01') AS d15,
+       date_bin(interval '1 hour 30 minutes', timestamp '2020-02-11 15:44:17.71393', timestamp '2001-01-01') AS h1m30,
+       date_bin(interval '250 microseconds', timestamp '2020-02-11 15:44:17.71393', timestamp '2001-01-01') AS us250;
+-- the origin shifts the bin edges off the natural boundary
+SELECT date_bin(interval '5 min', timestamp '2020-02-01 01:01:01', timestamp '2020-02-01 00:02:30') AS shifted;
+-- a source below the origin still lands on the bin's lower edge
+SELECT date_bin(interval '30 minutes', timestamp '2024-02-01 15:00:00', timestamp '2024-02-01 17:00:00') AS below,
+       date_bin(interval '30 minutes', timestamp '2024-02-01 16:59:59', timestamp '2024-02-01 17:00:00') AS just_below;
+-- an infinite source passes through, ahead of every other check
+SELECT date_bin(interval '1 mon', timestamp 'infinity', timestamp '2001-01-01') AS inf;
+-- errors: months have no fixed width (0A000), the rest are 22008
+SELECT date_bin(interval '5 months', timestamp '2020-02-01 01:01:01', timestamp '2001-01-01');
+SELECT date_bin(interval '0 days', timestamp '2020-02-01 01:01:01', timestamp '2001-01-01');
+SELECT date_bin(interval '-2 days', timestamp '2020-02-01 01:01:01', timestamp '2001-01-01');
+SELECT date_bin(interval '1 hour', timestamp '2020-02-01 01:01:01', timestamp 'infinity');
+SELECT date_bin(interval '15 minutes', timestamp '294276-12-30', timestamp '4000-12-20 BC');
+SELECT date_bin(interval '365000 days', timestamp '4400-01-01 BC', timestamp '4000-01-01 BC');
+SELECT 'still alive' AS status;

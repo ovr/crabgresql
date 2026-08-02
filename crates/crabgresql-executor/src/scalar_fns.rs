@@ -549,6 +549,11 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Timestamp)
                 .map_err(ts_err);
         }
+        ScalarFn::DateBin => {
+            return timestamp::bin(iv(&args[0]), ts(&args[1]), ts(&args[2]))
+                .map(Value::Timestamp)
+                .map_err(ts_err);
+        }
         ScalarFn::Isfinite => {
             return Ok(Value::Bool(timestamp::is_finite(ts(&args[0]))));
         }
@@ -582,6 +587,13 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::DateTruncTz => {
             return timestamptz::date_trunc(text(&args[0]), tstz(&args[1]), &fmt.zone)
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        // Binning a `timestamptz` works on the UTC instant, so unlike
+        // `date_trunc` above it never consults the session zone.
+        ScalarFn::DateBinTz => {
+            return timestamp::bin(iv(&args[0]), tstz(&args[1]), tstz(&args[2]))
                 .map(Value::TimestampTz)
                 .map_err(ts_err);
         }

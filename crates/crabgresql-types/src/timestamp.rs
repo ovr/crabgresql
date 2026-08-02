@@ -31,6 +31,8 @@ pub(crate) const DATETIME_FIELD_OVERFLOW: &str = "22008";
 pub(crate) const INVALID_PARAMETER_VALUE: &str = "22023";
 /// `time zone displacement out of range` — a numeric offset beyond ±15:59:59.
 pub(crate) const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
+/// PG raises this (not a 22xxx) for a `date_bin` stride carrying months.
+pub(crate) const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
 /// `-infinity` / `+infinity` sentinels, matching PG's `DT_NOBEGIN`/`DT_NOEND`.
 pub const NEG_INFINITY: i64 = i64::MIN;
@@ -1195,6 +1197,71 @@ pub fn mi_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
     pl_interval(micros, neg)
 }
 
+/// `date_bin(stride, source, origin)` (`timestamp_bin` / `timestamptz_bin`):
+/// snap `source` down to the start of the fixed-width bin of width `stride`
+/// anchored at `origin`.
+///
+/// Both SQL types share this one implementation: each is microseconds since the
+/// PG epoch, and the `timestamptz` form bins the UTC instant, so — unlike
+/// `date_trunc` — no session zone is involved.
+///
+/// The checks below are ordered the way PG orders them, which is observable
+/// whenever two of them would fire for the same call: an infinite `source`
+/// short-circuits even a zero or month-bearing stride, an infinite `origin`
+/// outranks both, and a stride whose microsecond width overflows reports the
+/// overflow rather than its sign.
+pub fn bin(stride: Interval, source: i64, origin: i64) -> Result<i64, TimestampError> {
+    if inf_sign(source).is_some() {
+        return Ok(source);
+    }
+    if inf_sign(origin).is_some() {
+        return Err(TimestampError {
+            sqlstate: DATETIME_FIELD_OVERFLOW,
+            message: "origin out of range".to_string(),
+        });
+    }
+    if !stride.is_finite() {
+        return Err(TimestampError {
+            sqlstate: DATETIME_FIELD_OVERFLOW,
+            message: "timestamps cannot be binned into infinite intervals".to_string(),
+        });
+    }
+    // Months have no fixed microsecond width, so they cannot define a bin.
+    if stride.months != 0 {
+        return Err(TimestampError {
+            sqlstate: FEATURE_NOT_SUPPORTED,
+            message: "timestamps cannot be binned into intervals containing months or years"
+                .to_string(),
+        });
+    }
+    let stride_usec = (stride.days as i64)
+        .checked_mul(USECS_PER_DAY)
+        .and_then(|days| days.checked_add(stride.usec))
+        .ok_or_else(interval_out_of_range)?;
+    if stride_usec <= 0 {
+        return Err(TimestampError {
+            sqlstate: DATETIME_FIELD_OVERFLOW,
+            message: "stride must be greater than zero".to_string(),
+        });
+    }
+    let diff = source
+        .checked_sub(origin)
+        .ok_or_else(interval_out_of_range)?;
+    // Truncate toward zero, then step one bin further back when `source` is
+    // below `origin`, so the result is always the bin's lower edge.
+    let rem = diff % stride_usec;
+    let mut delta = diff - rem;
+    if rem < 0 {
+        delta = delta
+            .checked_sub(stride_usec)
+            .ok_or_else(interval_out_of_range)?;
+    }
+    let result = origin
+        .checked_add(delta)
+        .ok_or_else(timestamp_out_of_range)?;
+    check_range(result)
+}
+
 /// `timestamp - timestamp` (`timestamp_mi`): the microsecond difference, then
 /// `justify_hours` (PG applies it here for historical compatibility).
 pub fn mi(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
@@ -1635,6 +1702,182 @@ mod tests {
         assert_eq!(date_trunc("day", POS_INFINITY)?, POS_INFINITY);
 
         Ok(())
+    }
+
+    fn iv(s: &str) -> Interval {
+        match interval::parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        }
+    }
+
+    /// For every stride that also names a `date_trunc` unit, the two agree —
+    /// in all four combinations of era and origin/source ordering, which is
+    /// what pins the floor-toward-negative-infinity step.
+    #[test]
+    fn date_bin_agrees_with_date_trunc() -> anyhow::Result<()> {
+        let units = [
+            ("week", "7 d"),
+            ("day", "1 d"),
+            ("hour", "1 h"),
+            ("minute", "1 m"),
+            ("second", "1 s"),
+            ("millisecond", "1 ms"),
+            ("microsecond", "1 us"),
+        ];
+        let cases = [
+            ("2020-02-29 15:44:17.71393", "2001-01-01"),
+            ("0055-06-10 15:44:17.71393 BC", "2000-01-01 BC"),
+            ("2020-02-29 15:44:17.71393", "2020-03-02"),
+            ("0055-06-10 15:44:17.71393 BC", "0055-06-17 BC"),
+        ];
+        for (source, origin) in cases {
+            for (unit, stride) in units {
+                assert_eq!(
+                    bin(iv(stride), ts(source), ts(origin))?,
+                    date_trunc(unit, ts(source))?,
+                    "date_bin('{stride}', '{source}', '{origin}') != date_trunc('{unit}', ...)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn date_bin_arbitrary_strides() -> anyhow::Result<()> {
+        let source = ts("2020-02-11 15:44:17.71393");
+        let origin = ts("2001-01-01");
+        let binned = |stride: &str| -> anyhow::Result<String> {
+            Ok(format(bin(iv(stride), source, origin)?))
+        };
+        assert_eq!(binned("15 days")?, "2020-02-06 00:00:00");
+        assert_eq!(binned("2 hours")?, "2020-02-11 14:00:00");
+        assert_eq!(binned("1 hour 30 minutes")?, "2020-02-11 15:00:00");
+        assert_eq!(binned("15 minutes")?, "2020-02-11 15:30:00");
+        assert_eq!(binned("10 seconds")?, "2020-02-11 15:44:10");
+        assert_eq!(binned("100 milliseconds")?, "2020-02-11 15:44:17.7");
+        assert_eq!(binned("250 microseconds")?, "2020-02-11 15:44:17.71375");
+
+        // The origin shifts the bin edges off the natural boundary.
+        assert_eq!(
+            format(bin(
+                iv("5 min"),
+                ts("2020-02-01 01:01:01"),
+                ts("2020-02-01 00:02:30")
+            )?),
+            "2020-02-01 00:57:30"
+        );
+        // A source below the origin still lands on the bin's *lower* edge,
+        // which only holds because the negative remainder steps back a bin.
+        assert_eq!(
+            format(bin(
+                iv("30 minutes"),
+                ts("2024-02-01 15:00:00"),
+                ts("2024-02-01 17:00:00")
+            )?),
+            "2024-02-01 15:00:00"
+        );
+        assert_eq!(
+            format(bin(
+                iv("30 minutes"),
+                ts("2024-02-01 16:59:59"),
+                ts("2024-02-01 17:00:00")
+            )?),
+            "2024-02-01 16:30:00"
+        );
+        // An exact hit on a bin edge stays put.
+        assert_eq!(
+            format(bin(
+                iv("30 minutes"),
+                ts("2024-02-01 17:00:00"),
+                ts("2024-02-01 17:00:00")
+            )?),
+            "2024-02-01 17:00:00"
+        );
+
+        Ok(())
+    }
+
+    /// Every rejection, and — where two would fire at once — the one PG picks.
+    #[test]
+    fn date_bin_rejections_and_their_precedence() {
+        let err = |stride: &str, source: i64, origin: i64| match bin(iv(stride), source, origin) {
+            Err(e) => (e.sqlstate, e.message),
+            Ok(v) => panic!("expected an error, got {}", format(v)),
+        };
+        let (source, origin) = (ts("2020-02-01 01:01:01"), ts("2001-01-01"));
+
+        assert_eq!(
+            err("5 months", source, origin),
+            (
+                "0A000",
+                "timestamps cannot be binned into intervals containing months or years".into(),
+            )
+        );
+        assert_eq!(
+            err("5 years", source, origin),
+            (
+                "0A000",
+                "timestamps cannot be binned into intervals containing months or years".into(),
+            )
+        );
+        assert_eq!(
+            err("0 days", source, origin),
+            ("22008", "stride must be greater than zero".into())
+        );
+        assert_eq!(
+            err("-2 days", source, origin),
+            ("22008", "stride must be greater than zero".into())
+        );
+        assert_eq!(
+            err("infinity", source, origin),
+            (
+                "22008",
+                "timestamps cannot be binned into infinite intervals".into()
+            )
+        );
+        assert_eq!(
+            err("-infinity", source, origin),
+            (
+                "22008",
+                "timestamps cannot be binned into infinite intervals".into()
+            )
+        );
+        // The source-to-origin span overflows i64 microseconds...
+        assert_eq!(
+            err("15 minutes", ts("294276-12-30"), ts("4000-12-20 BC")),
+            ("22008", "interval out of range".into())
+        );
+        // ...as does the stride's own microsecond width.
+        assert_eq!(
+            err("200000000 days", ts("2024-02-01"), ts("2024-01-01")),
+            ("22008", "interval out of range".into())
+        );
+        // Here everything fits in i64 but the bin start falls outside the
+        // supported year range.
+        assert_eq!(
+            err("365000 days", ts("4400-01-01 BC"), ts("4000-01-01 BC")),
+            ("22008", "timestamp out of range".into())
+        );
+
+        // Precedence. An infinite source wins over every other complaint...
+        assert_eq!(bin(iv("0 s"), POS_INFINITY, origin), Ok(POS_INFINITY));
+        assert_eq!(bin(iv("1 mon"), NEG_INFINITY, origin), Ok(NEG_INFINITY));
+        assert_eq!(bin(iv("infinity"), NEG_INFINITY, origin), Ok(NEG_INFINITY));
+        // ...an infinite origin over every complaint about the stride...
+        for stride in ["0 s", "5 months", "infinity", "1 h"] {
+            assert_eq!(
+                err(stride, source, POS_INFINITY),
+                ("22008", "origin out of range".into()),
+                "stride `{stride}` should not outrank the infinite origin"
+            );
+        }
+        // ...and a stride whose width overflows reports that, not its sign.
+        assert_eq!(
+            err("-200000000 days", ts("2024-02-01"), ts("2024-01-01")),
+            ("22008", "interval out of range".into())
+        );
     }
 
     #[test]
