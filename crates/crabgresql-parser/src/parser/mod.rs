@@ -10971,6 +10971,25 @@ impl<'a> Parser<'a> {
         Ok(Statement::Close { cursor })
     }
 
+    /// The optional boolean argument of a `COPY` option such as `FREEZE` or
+    /// `HEADER`. PostgreSQL spells booleans in option lists as `TRUE`/`FALSE` or
+    /// `ON`/`OFF`, and omitting the argument entirely means `TRUE` — so
+    /// `(FREEZE)`, `(FREEZE TRUE)` and `(FREEZE ON)` are the same statement.
+    ///
+    /// A word that is neither is left unconsumed for the caller's option-list
+    /// loop, which then reports the usual `,`-or-`)` syntax error.
+    fn parse_copy_boolean(&mut self) -> bool {
+        !matches!(
+            self.parse_one_of_keywords(&[
+                Keyword::TRUE,
+                Keyword::FALSE,
+                Keyword::ON,
+                Keyword::OFF,
+            ]),
+            Some(Keyword::FALSE) | Some(Keyword::OFF)
+        )
+    }
+
     fn parse_copy_option(&mut self) -> Result<CopyOption, ParserError> {
         let ret = match self.parse_one_of_keywords(&[
             Keyword::FORMAT,
@@ -10986,16 +11005,10 @@ impl<'a> Parser<'a> {
             Keyword::ENCODING,
         ]) {
             Some(Keyword::FORMAT) => CopyOption::Format(self.parse_identifier()?),
-            Some(Keyword::FREEZE) => CopyOption::Freeze(!matches!(
-                self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
-                Some(Keyword::FALSE)
-            )),
+            Some(Keyword::FREEZE) => CopyOption::Freeze(self.parse_copy_boolean()),
             Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_literal_char()?),
             Some(Keyword::NULL) => CopyOption::Null(self.parse_literal_string()?),
-            Some(Keyword::HEADER) => CopyOption::Header(!matches!(
-                self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]),
-                Some(Keyword::FALSE)
-            )),
+            Some(Keyword::HEADER) => CopyOption::Header(self.parse_copy_boolean()),
             Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
             Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
             Some(Keyword::FORCE_QUOTE) => {
@@ -11038,6 +11051,7 @@ impl<'a> Parser<'a> {
             Keyword::ESCAPE,
             Keyword::EXTENSION,
             Keyword::FIXEDWIDTH,
+            Keyword::FREEZE,
             Keyword::GZIP,
             Keyword::HEADER,
             Keyword::IAM_ROLE,
@@ -11126,6 +11140,7 @@ impl<'a> Parser<'a> {
                 let spec = self.parse_literal_string()?;
                 CopyLegacyOption::FixedWidth(spec)
             }
+            Some(Keyword::FREEZE) => CopyLegacyOption::Freeze(self.parse_copy_boolean()),
             Some(Keyword::GZIP) => CopyLegacyOption::Gzip,
             Some(Keyword::HEADER) => CopyLegacyOption::Header,
             Some(Keyword::IAM_ROLE) => CopyLegacyOption::IamRole(self.parse_iam_role_kind()?),
@@ -17780,6 +17795,55 @@ mod tests {
             pg.verified_only_select("SELECT nosuchtype 'x'").projection[..],
             [SelectItem::UnnamedExpr(Expr::TypedString(_))]
         ));
+    }
+
+    /// A COPY option's boolean argument may be spelled `TRUE`/`FALSE` or
+    /// `ON`/`OFF`, or omitted to mean true. `ON` is the spelling PostgreSQL's
+    /// own documentation leads with, and it used to be a syntax error here.
+    #[test]
+    fn parse_copy_option_booleans() {
+        let copy_options = |sql: &str| match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+            Ok(mut stmts) => match stmts.pop() {
+                Some(Statement::Copy {
+                    options,
+                    legacy_options,
+                    ..
+                }) => (options, legacy_options),
+                other => panic!("{sql}: expected COPY, got {other:?}"),
+            },
+            Err(e) => panic!("{sql}: {e}"),
+        };
+
+        for (sql, expected) in [
+            ("COPY t FROM stdin (FREEZE)", true),
+            ("COPY t FROM stdin (FREEZE TRUE)", true),
+            ("COPY t FROM stdin (FREEZE ON)", true),
+            ("COPY t FROM stdin (FREEZE FALSE)", false),
+            ("COPY t FROM stdin (FREEZE OFF)", false),
+        ] {
+            let (options, _) = copy_options(sql);
+            assert_eq!(options, vec![CopyOption::Freeze(expected)], "{sql}");
+        }
+
+        for (sql, expected) in [
+            ("COPY t FROM stdin (HEADER ON)", true),
+            ("COPY t FROM stdin (HEADER OFF)", false),
+        ] {
+            let (options, _) = copy_options(sql);
+            assert_eq!(options, vec![CopyOption::Header(expected)], "{sql}");
+        }
+
+        // The pre-9.0 bare-keyword spelling, which is what the upstream
+        // `copy2` regression script uses.
+        let (options, legacy) = copy_options("COPY t FROM stdin CSV FREEZE");
+        assert!(options.is_empty());
+        assert_eq!(
+            legacy,
+            vec![
+                CopyLegacyOption::Csv(vec![]),
+                CopyLegacyOption::Freeze(true)
+            ]
+        );
     }
 
     #[test]

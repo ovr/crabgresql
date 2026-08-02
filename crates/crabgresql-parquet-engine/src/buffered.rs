@@ -351,7 +351,8 @@ impl TableAm for BufferedParquetTable {
         }
     }
 
-    /// Foreground writes go to the buffer, never straight to a fragment.
+    /// Foreground writes go to the buffer, never straight to a fragment — except
+    /// a frozen one, see [`Self::insert_many`].
     ///
     /// Forwarding here rather than redirecting the binder to the buffer leaf is
     /// what keeps one handle answering for the whole relation: the executor's
@@ -365,7 +366,22 @@ impl TableAm for BufferedParquetTable {
             .ok_or_else(|| StorageError::CorruptData("buffered insert produced no tid".to_string()))
     }
 
+    /// A frozen bulk load goes **straight to a fragment**, bypassing the buffer.
+    ///
+    /// Not an optimization — a correctness requirement. The buffer is one flat
+    /// list of rows in RAM, not partitioned by relfilenode, so a rolled-back
+    /// transaction's rows are hidden only by their own XID's abort record. Frozen
+    /// rows carry no such XID: buffered and then rolled back, they would stay
+    /// visible forever. A fragment has the discard the freeze relies on — abort
+    /// unlinks the `.pending` file, and the staged TRUNCATE directory this
+    /// statement's precondition guarantees is removed wholesale besides.
+    ///
+    /// Writing whole fragments is also what `COPY FREEZE` is for, so the load
+    /// skips the buffer's later flush entirely.
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        if txn.freeze_inserts {
+            return self.chunks.insert_many(tuples, txn);
+        }
         // The relation's shared hold covers the buffer half too, even though the
         // buffer owns no files. Without it a writer would not conflict with a
         // staged TRUNCATE's AccessExclusive hold, and its rows would be logged
@@ -417,6 +433,12 @@ impl TableAm for BufferedParquetTable {
         self.buffer
             .delete_all_live_in(self.chunks.relfilenode(), txn)?;
         Ok(())
+    }
+
+    /// The chunk half decides it: that is where a frozen load writes, and its
+    /// staged directory is what an abort discards.
+    fn truncated_by(&self, xid: Xid) -> bool {
+        self.chunks.truncated_by(xid)
     }
 
     fn vacuum(&self, oldest: Xid, clog: &Clog) {

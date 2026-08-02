@@ -1115,6 +1115,18 @@ pub trait TableAm: Send + Sync {
         Ok(())
     }
 
+    /// Whether transaction `xid` has truncated this table and not yet ended, so
+    /// its rows live in a replacement file that an abort will throw away whole.
+    ///
+    /// This is the precondition for `COPY … FREEZE`: a frozen row is visible to
+    /// everyone the instant it is written and carries no XID whose abort could
+    /// hide it again, so freezing is only safe where a rollback discards the
+    /// storage itself. Engines whose TRUNCATE is not a discardable swap answer
+    /// `false` — the default — and callers then refuse to freeze.
+    fn truncated_by(&self, _xid: Xid) -> bool {
+        false
+    }
+
     /// Reclaim versions dead to every transaction at or before `oldest`. A
     /// version is reclaimable only if its deleter **committed** — `clog` decides
     /// that; a version stamped by an aborted or in-flight deleter is still live.

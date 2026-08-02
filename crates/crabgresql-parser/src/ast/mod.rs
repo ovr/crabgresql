@@ -8204,6 +8204,9 @@ pub enum CopyLegacyOption {
     Extension(String),
     /// FIXEDWIDTH \[ AS \] 'fixedwidth-spec'
     FixedWidth(String),
+    /// `FREEZE [ boolean ]` — PostgreSQL's pre-9.0 bare-keyword spelling, as in
+    /// `COPY t FROM stdin CSV FREEZE`.
+    Freeze(bool),
     /// GZIP
     Gzip,
     /// HEADER
@@ -8306,6 +8309,8 @@ impl fmt::Display for CopyLegacyOption {
                 "FIXEDWIDTH '{}'",
                 value::escape_single_quote_string(spec)
             ),
+            Freeze(true) => write!(f, "FREEZE"),
+            Freeze(false) => write!(f, "FREEZE FALSE"),
             Gzip => write!(f, "GZIP"),
             Header => write!(f, "HEADER"),
             IamRole(role) => write!(f, "IAM_ROLE {role}"),

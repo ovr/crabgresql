@@ -7878,6 +7878,266 @@ async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// COPY ... FREEZE
+// ---------------------------------------------------------------------------
+
+/// Stream `data` into `table` with the given COPY options, returning the row
+/// count or the server's error.
+async fn copy_in_rows(
+    client: &tokio_postgres::Client,
+    statement: &str,
+    data: &'static [u8],
+) -> Result<u64, tokio_postgres::Error> {
+    use futures_util::SinkExt;
+
+    let sink = client.copy_in(statement).await?;
+    futures_util::pin_mut!(sink);
+    sink.send(bytes::Bytes::from_static(data)).await?;
+    sink.finish().await
+}
+
+/// What FREEZE actually changes, expressed as something a client can see: a
+/// REPEATABLE READ snapshot taken *before* the load still sees the rows.
+///
+/// The reader's snapshot predates the loading transaction entirely, so ordinary
+/// rows would be invisible to it no matter how long it waited — that is the
+/// control case below. Frozen rows carry `Xid::FROZEN`, which every snapshot
+/// treats as long-committed, so they show up.
+///
+/// The reader has to run *after* the writer commits rather than concurrently:
+/// TRUNCATE holds AccessExclusive until the transaction ends, so a concurrent
+/// reader would block on the lock rather than demonstrate anything about
+/// visibility.
+#[tokio::test]
+async fn copy_freeze_rows_are_visible_to_an_older_snapshot() -> anyhow::Result<()> {
+    for (options, expected) in [("FREEZE ON", 2), ("FREEZE OFF", 0)] {
+        let port = spawn_server().await;
+        let writer = connect(port).await;
+        let reader = connect(port).await;
+        writer.simple_query("CREATE TABLE vistest (a text)").await?;
+
+        // Pin a snapshot that predates everything the writer is about to do.
+        reader
+            .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await?;
+        assert_eq!(row_count(&reader, "vistest").await, 0);
+
+        writer.simple_query("BEGIN").await?;
+        writer.simple_query("TRUNCATE vistest").await?;
+        let loaded = copy_in_rows(
+            &writer,
+            &format!("COPY vistest FROM STDIN WITH (FORMAT csv, {options})"),
+            b"a2\nb\n",
+        )
+        .await?;
+        assert_eq!(loaded, 2, "{options}");
+        writer.simple_query("COMMIT").await?;
+
+        assert_eq!(
+            row_count(&reader, "vistest").await,
+            expected,
+            "old snapshot with {options}"
+        );
+        reader.simple_query("COMMIT").await?;
+        // A fresh snapshot sees them either way.
+        assert_eq!(row_count(&reader, "vistest").await, 2, "{options}");
+    }
+    Ok(())
+}
+
+/// Rolling back a frozen load must still lose the rows. Nothing about the rows
+/// themselves can hide them — they name no live transaction — so this is really
+/// a test that the staged TRUNCATE file is what gets discarded.
+#[tokio::test]
+async fn copy_freeze_rollback_discards_the_rows() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let writer = connect(port).await;
+    let reader = connect(port).await;
+    writer.simple_query("CREATE TABLE vistest (a text)").await?;
+    writer
+        .simple_query("INSERT INTO vistest VALUES ('old')")
+        .await?;
+
+    writer.simple_query("BEGIN").await?;
+    writer.simple_query("TRUNCATE vistest").await?;
+    assert_eq!(
+        copy_in_rows(
+            &writer,
+            "COPY vistest FROM STDIN WITH (FORMAT csv, FREEZE)",
+            b"x\ny\n",
+        )
+        .await?,
+        2
+    );
+    writer.simple_query("ROLLBACK").await?;
+
+    // Both the TRUNCATE and the frozen rows are gone.
+    let messages = reader.simple_query("SELECT a FROM vistest").await?;
+    let rows = rows(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("a"), Some("old"));
+    Ok(())
+}
+
+/// Without a TRUNCATE in the same transaction there is no discardable storage,
+/// so PostgreSQL refuses rather than write rows a rollback could not take back.
+/// Autocommit is the plain case: the TRUNCATE committed in its own transaction.
+#[tokio::test]
+async fn copy_freeze_requires_a_truncate_in_the_same_transaction() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE vistest (a text)").await?;
+    client.simple_query("TRUNCATE vistest").await?;
+
+    for statement in [
+        "COPY vistest FROM STDIN WITH (FORMAT csv, FREEZE)",
+        // A block that has not truncated is refused just the same.
+        "COPY vistest FROM STDIN CSV FREEZE",
+    ] {
+        let err = copy_in_rows(&client, statement, b"p\ng\n")
+            .await
+            .unwrap_err();
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(
+            db.code(),
+            &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "{statement}"
+        );
+        assert_eq!(
+            db.message(),
+            "cannot perform COPY FREEZE because the table was not created or \
+             truncated in the current subtransaction",
+            "{statement}"
+        );
+    }
+
+    // The refusal loaded nothing and left the session usable.
+    assert_eq!(row_count(&client, "vistest").await, 0);
+    Ok(())
+}
+
+/// This engine's DDL is not transactional, so a table created in the current
+/// transaction is *not* the discardable storage PostgreSQL's rule assumes — a
+/// rollback would leave the relation behind with its frozen rows inside. We
+/// refuse, using PostgreSQL's wording; a documented divergence, pinned here so
+/// it cannot regress into silent data retention.
+#[tokio::test]
+async fn copy_freeze_refuses_a_table_created_in_this_transaction() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("BEGIN").await?;
+    client.simple_query("CREATE TABLE fresh (a text)").await?;
+    let err = copy_in_rows(
+        &client,
+        "COPY fresh FROM STDIN WITH (FORMAT csv, FREEZE)",
+        b"d\ne\n",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
+    );
+    Ok(())
+}
+
+/// `FREEZE OFF` is an ordinary load: no precondition, no frozen rows.
+#[tokio::test]
+async fn copy_freeze_off_is_an_ordinary_load() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let writer = connect(port).await;
+    let reader = connect(port).await;
+    writer.simple_query("CREATE TABLE t (a text)").await?;
+
+    writer.simple_query("BEGIN").await?;
+    assert_eq!(
+        copy_in_rows(
+            &writer,
+            "COPY t FROM STDIN WITH (FORMAT csv, FREEZE OFF)",
+            b"a\nb\n",
+        )
+        .await?,
+        2
+    );
+    // Unfrozen, so still invisible elsewhere until the commit.
+    assert_eq!(row_count(&reader, "t").await, 0);
+    writer.simple_query("COMMIT").await?;
+    assert_eq!(row_count(&reader, "t").await, 2);
+    Ok(())
+}
+
+/// Relations with no storage of their own to discard: a partitioned parent, and
+/// a `buffer` table whose rows live in a RAM list no rollback empties.
+#[tokio::test]
+async fn copy_freeze_rejects_relations_it_cannot_discard() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    // A connection per case on purpose: both errors are raised *before* the
+    // server enters copy mode, and a second `copy_in` on a connection that has
+    // already taken one of those desyncs the driver. That is a pre-existing
+    // protocol defect unrelated to FREEZE — `COPY nosuch FROM STDIN` twice on one
+    // connection reproduces it — so it is not smuggled into this test.
+    for (ddl, statement, message) in [
+        (
+            "CREATE TABLE parted (a int4) PARTITION BY RANGE (a)",
+            "COPY parted FROM STDIN WITH (FREEZE)",
+            "cannot perform COPY FREEZE on a partitioned table",
+        ),
+        (
+            "CREATE TABLE buffered (a int4) USING buffer ORDER BY (a)",
+            "COPY buffered FROM STDIN WITH (FREEZE)",
+            "cannot perform COPY FREEZE on a buffer table",
+        ),
+    ] {
+        let client = connect(port).await;
+        client.simple_query(ddl).await?;
+        let err = copy_in_rows(&client, statement, b"1\n").await.unwrap_err();
+        let db = err.as_db_error().expect("db error");
+        assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED, "{statement}");
+        assert_eq!(db.message(), message, "{statement}");
+    }
+    Ok(())
+}
+
+/// A `parquet` relation routes a frozen load straight to a fragment instead of
+/// its RAM write buffer, because the buffer is not discarded by a rollback.
+/// Both halves are checked: the rows land, and rolling back loses them.
+#[tokio::test]
+async fn copy_freeze_into_parquet_writes_a_discardable_fragment() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let writer = connect(port).await;
+    let reader = connect(port).await;
+    writer
+        .simple_query("CREATE TABLE p (a int4) USING parquet ORDER BY (a)")
+        .await?;
+
+    writer.simple_query("BEGIN").await?;
+    writer.simple_query("TRUNCATE p").await?;
+    assert_eq!(
+        copy_in_rows(&writer, "COPY p FROM STDIN WITH (FREEZE)", b"1\n2\n3\n").await?,
+        3
+    );
+    // Only after COMMIT: the TRUNCATE holds AccessExclusive until then, so a
+    // concurrent reader would block on the lock rather than on visibility.
+    writer.simple_query("COMMIT").await?;
+    assert_eq!(row_count(&reader, "p").await, 3);
+
+    // And a rolled-back frozen load leaves nothing behind.
+    writer.simple_query("BEGIN").await?;
+    writer.simple_query("TRUNCATE p").await?;
+    assert_eq!(
+        copy_in_rows(&writer, "COPY p FROM STDIN WITH (FREEZE)", b"7\n8\n").await?,
+        2
+    );
+    writer.simple_query("ROLLBACK").await?;
+    assert_eq!(row_count(&reader, "p").await, 3);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // COPY ... FROM '<file>' — the server reads the file itself
 // ---------------------------------------------------------------------------
 

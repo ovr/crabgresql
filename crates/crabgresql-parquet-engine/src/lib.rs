@@ -264,8 +264,13 @@ fn required_array<'a, T: 'static>(
 struct Fragment {
     path: PathBuf,
     block: u32,
+    /// The transaction that wrote the fragment. Reconciliation keys off this even
+    /// for a frozen fragment, whose *visibility* is decided by [`Fragment::frozen`].
     xid: Xid,
     cid: CommandId,
+    /// Written by `COPY … FREEZE`: the fragment's rows are visible to every
+    /// snapshot, so [`header`] reports `xmin = Xid::FROZEN` for it.
+    frozen: bool,
     pending: bool,
 }
 
@@ -336,6 +341,20 @@ fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
         .and_then(|value| value.parse::<u32>().ok())
         .map(CommandId)
         .ok_or_else(|| corrupt(format!("invalid Parquet fragment filename \"{name}\"")))?;
+    // An optional trailing `-f` marks a `COPY … FREEZE` fragment. The writing
+    // transaction stays in the name ahead of it because that is what
+    // `reconcile_pending_in` matches on to promote or unlink the file; only the
+    // *visibility* is frozen, and that is what this segment carries. Names
+    // written before the segment existed simply lack it and stay readable.
+    let frozen = match parts.next() {
+        None => false,
+        Some("f") => true,
+        Some(_) => {
+            return Err(corrupt(format!(
+                "invalid Parquet fragment filename \"{name}\""
+            )));
+        }
+    };
     if parts.next().is_some() {
         return Err(corrupt(format!(
             "invalid Parquet fragment filename \"{name}\""
@@ -346,6 +365,7 @@ fn parse_fragment(path: PathBuf) -> Result<Option<Fragment>, StorageError> {
         block,
         xid,
         cid,
+        frozen,
         pending,
     }))
 }
@@ -367,9 +387,35 @@ fn fragments(dir: &Path) -> Result<Vec<Fragment>, StorageError> {
     Ok(out)
 }
 
+/// The filename stem a fragment of `block` written by `txn` takes, shared by the
+/// writer and by the cleanup path that has to name a half-written `.tmp`.
+///
+/// The writer's XID stays in the name even for a frozen fragment, because that is
+/// what [`ParquetTable::reconcile_pending_in`] matches on to promote or unlink the
+/// file; the `-f` segment is what marks its rows frozen for readers. Encoding
+/// `Xid::FROZEN` as the name's XID instead would strand the fragment `.pending`
+/// forever — visible, since frozen rows ignore that suffix, and never unlinked on
+/// abort.
+fn fragment_base(block: u32, txn: &TxnContext) -> String {
+    format!(
+        "{block:08x}-{}-{}{}",
+        txn.xid.0,
+        txn.cid.0,
+        if txn.freeze_inserts { "-f" } else { "" }
+    )
+}
+
 fn header(fragment: &Fragment) -> TupleHeader {
     TupleHeader {
-        xmin: fragment.xid,
+        // A frozen fragment reports `Xid::FROZEN` rather than its writer, which is
+        // what makes `satisfies_mvcc` show its rows to every snapshot without a
+        // commit-log lookup. `fragment.xid` still names the writer for
+        // reconciliation; only what readers see changes here.
+        xmin: if fragment.frozen {
+            Xid::FROZEN
+        } else {
+            fragment.xid
+        },
         xmax: Xid::INVALID,
         cmin: fragment.cid,
         cmax: CommandId::FIRST,
@@ -1266,7 +1312,7 @@ impl ParquetTable {
         sorting: Option<&[SortingColumn]>,
         txn: &TxnContext,
     ) -> Result<(PathBuf, PathBuf), StorageError> {
-        let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
+        let base = fragment_base(block, txn);
         let temp = dir.join(format!("{base}.tmp"));
         let pending = dir.join(format!("{base}.parquet.pending"));
         let file = OpenOptions::new()
@@ -1613,7 +1659,7 @@ impl TableAm for ParquetTable {
             let (temp, pending) = match written {
                 Ok(paths) => paths,
                 Err(error) => {
-                    let base = format!("{block:08x}-{}-{}", txn.xid.0, txn.cid.0);
+                    let base = fragment_base(block, txn);
                     let _ = std::fs::remove_file(dir.join(format!("{base}.tmp")));
                     for (temp, pending) in &staged {
                         let _ = std::fs::remove_file(temp);
@@ -1717,6 +1763,13 @@ impl TableAm for ParquetTable {
                 Err(error)
             }
         }
+    }
+
+    /// A staged directory swap by `xid` means this transaction's fragments land in
+    /// a directory an abort removes wholesale — the discardable storage
+    /// `COPY … FREEZE` needs.
+    fn truncated_by(&self, xid: Xid) -> bool {
+        self.staged_truncate(xid).is_some()
     }
 }
 
@@ -1871,7 +1924,36 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::basic::Compression;
 
-    use super::{ParquetTable, RelfilenodeAllocator, corrupt};
+    use super::{ParquetTable, RelfilenodeAllocator, corrupt, header, parse_fragment};
+
+    /// The frozen marker is an *optional* trailing segment, so fragment files
+    /// written before it existed keep parsing — the on-disk format has to stay
+    /// readable across upgrades. And a frozen fragment reports its writer as the
+    /// owner (reconciliation matches on that) while reporting `Xid::FROZEN` as the
+    /// visibility xmin; getting those two the same way round is what keeps an
+    /// aborted frozen load from stranding a permanently visible `.pending` file.
+    #[test]
+    fn fragment_filenames_carry_owner_and_freeze_separately() -> Result<(), StorageError> {
+        let parse = |name: &str| parse_fragment(PathBuf::from("/t").join(name));
+
+        let plain = parse("0000002a-77-3.parquet")?.expect("a fragment");
+        assert_eq!(
+            (plain.block, plain.xid, plain.cid),
+            (42, Xid(77), CommandId(3))
+        );
+        assert!(!plain.frozen && !plain.pending);
+        assert_eq!(header(&plain).xmin, Xid(77));
+
+        let frozen = parse("0000002a-77-3-f.parquet.pending")?.expect("a fragment");
+        assert_eq!(frozen.xid, Xid(77), "the writer still owns it");
+        assert!(frozen.frozen && frozen.pending);
+        assert_eq!(header(&frozen).xmin, Xid::FROZEN);
+
+        // A trailing segment that is not the marker is corruption, not a freeze.
+        assert!(parse("0000002a-77-3-q.parquet").is_err());
+        assert!(parse("0000002a-77-3-f-f.parquet").is_err());
+        Ok(())
+    }
 
     /// A relfilenode counter for tests. It starts far above the ids the tests
     /// assign by hand, so a directory staged by a TRUNCATE can never collide with
