@@ -15,11 +15,10 @@
 //! Deviations from PG, acceptable while no passing test needs them: only ISO
 //! `Y-M-D` and the verbose `Mon DD, YYYY` input forms are accepted (the
 //! `SET DateStyle` ymd/dmy/mdy matrix, Julian `J…` input, and `.NNN`
-//! day-of-year forms are not), and the current-relative specials
-//! (`now`/`today`/`yesterday`/`tomorrow`) need a transaction clock and are not
-//! supported — matching how `timestamp` parses today.
+//! day-of-year forms are not).
 
 use crate::Numeric;
+use crate::fmt::FmtCtx;
 use crate::interval::Interval;
 use crate::timestamp::{
     self, POSTGRES_EPOCH_JDATE, century, date2j, days_in_month, decade, iso_week_year, j2date,
@@ -107,22 +106,39 @@ pub fn format(d: i32) -> String {
 // --- input (date_in, a practical subset) -----------------------------------
 
 /// `date_in`. Accepts the ISO `Y-M-D` and verbose `Mon DD, YYYY` forms, `BC`,
-/// and the `infinity`/`-infinity`/`epoch` specials; a trailing time and zone
-/// are accepted and ignored (this type has no time-of-day). Unparseable input
-/// is `22007`; a well-formed value out of range is `22008`.
-pub fn parse(input: &str) -> Result<i32, DateError> {
+/// the `infinity`/`-infinity`/`epoch` specials and the current-relative
+/// `now`/`today`/`tomorrow`/`yesterday`; a trailing time and zone are accepted
+/// and ignored (this type has no time-of-day). Unparseable input is `22007`; a
+/// well-formed value out of range is `22008`.
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i32, DateError> {
     // Reuse the shared timestamp scanner, then keep only the date part. A comma
     // is a field separator in the verbose form (`January 8, 1999`), which PG
     // treats as whitespace. Its error messages name `timestamp`, so remap them.
     let cleaned = input.replace(',', " ");
-    let parsed = timestamp::parse_parts(&cleaned).map_err(|e| {
+    let parsed = timestamp::parse_parts(&cleaned, fmt).map_err(|e| {
         if e.sqlstate == DATETIME_FIELD_OVERFLOW {
             field_out_of_range(input)
-        } else {
+        } else if e.sqlstate == INVALID_DATETIME_FORMAT {
             invalid_syntax(input)
+        } else {
+            // A missing transaction clock: keep the internal error rather than
+            // dressing it up as a syntax error the input does not have.
+            DateError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            }
         }
     })?;
     let tm = match parsed {
+        // `'now'` is the transaction timestamp; a date keeps only its day.
+        timestamp::Parsed::Now => {
+            let wall = timestamp::session_wall_clock(fmt).map_err(|e| DateError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })?;
+            return to_date_value(wall.div_euclid(USECS_PER_DAY))
+                .ok_or_else(|| out_of_range_input(input));
+        }
         timestamp::Parsed::Micros(m) => {
             // The specials, remapped from the timestamp scale to date days.
             if m == timestamp::POS_INFINITY {
@@ -466,7 +482,7 @@ mod tests {
     use super::*;
 
     fn d(s: &str) -> i32 {
-        match parse(s) {
+        match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid date test fixture `{s}`: {error:?}"),
         }
@@ -520,5 +536,53 @@ mod tests {
         assert!(make_date(2013, 2, 30).is_err());
 
         Ok(())
+    }
+
+    // --- the relative input specials (pinned against PostgreSQL 18.4) ------
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, 763_860_600_123_456, 763_860_600_123_456).with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve(zone).expect("real zone"),
+        ))
+    }
+
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// A `date` keeps only the day, so `now` and `today` agree — and both
+    /// follow the *session* zone, which at the frozen instant
+    /// (2024-03-15 23:30 UTC) is already the next day in Kolkata.
+    #[test]
+    fn relative_specials_follow_the_session_zone() {
+        assert_eq!(rel("now", "UTC"), "2024-03-15");
+        assert_eq!(rel("today", "UTC"), "2024-03-15");
+        assert_eq!(rel("tomorrow", "UTC"), "2024-03-16");
+        assert_eq!(rel("yesterday", "UTC"), "2024-03-14");
+        assert_eq!(rel("now", "Asia/Kolkata"), "2024-03-16");
+        assert_eq!(rel("today", "Asia/Kolkata"), "2024-03-16");
+        assert_eq!(rel("now", "America/New_York"), "2024-03-15");
+        // A time rides along and is discarded, as for any other date input.
+        assert_eq!(rel("tomorrow 10:00", "UTC"), "2024-03-16");
+    }
+
+    /// `allballs` is a time-of-day special; a `date` has no time of day.
+    #[test]
+    fn a_date_rejects_the_time_only_special() {
+        let e = parse("allballs", &at("UTC")).expect_err("allballs");
+        assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
+        assert_eq!(
+            e.message,
+            "invalid input syntax for type date: \"allballs\""
+        );
+    }
+
+    #[test]
+    fn a_relative_special_without_a_clock_is_an_internal_error() {
+        let e = parse("today", &FmtCtx::utc_default()).expect_err("today");
+        assert_eq!(e.sqlstate, "XX000");
     }
 }

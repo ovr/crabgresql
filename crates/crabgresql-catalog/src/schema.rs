@@ -408,10 +408,9 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
 /// A view over `pg_cursor()` in PostgreSQL; served here as a relation whose rows
 /// the session supplies, which is indistinguishable to a client reading it.
 ///
-/// Divergence: `creation_time` is always NULL. It is a `timestamptz` of when the
-/// cursor was declared, and crabgresql has no wall clock in the executor yet —
-/// no `now()`/`current_timestamp`. The column is kept so `SELECT *` has
-/// PostgreSQL's shape.
+/// `creation_time` is the `DECLARE`'s *statement* timestamp, as in PostgreSQL:
+/// a cursor declared mid-block reports an instant strictly after that block's
+/// `now()`, and two cursors declared in separate messages differ.
 pub fn pg_cursors_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_cursors",
@@ -438,7 +437,7 @@ pub fn pg_cursors_rows(cursors: &[CatalogCursor]) -> Vec<Vec<Value>> {
                 Value::Bool(cursor.is_holdable),
                 Value::Bool(cursor.is_binary),
                 Value::Bool(cursor.is_scrollable),
-                Value::Null,
+                Value::TimestampTz(cursor.creation_time),
             ]
         })
         .collect()

@@ -330,6 +330,7 @@ fn bind_catalogs(
                 // Every materialised cursor can scan backward unless it was
                 // declared NO SCROLL.
                 is_scrollable: cursor.scroll != Some(false),
+                creation_time: cursor.creation_time,
             })
             .collect();
         cursors.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1797,7 +1798,7 @@ fn begin_transaction(
     let iso = mode_iso.unwrap_or(session.default_iso);
     let read_only = mode_read_only.unwrap_or(session.default_read_only);
     session.tx_status = TransactionStatus::InTransaction;
-    session.xact = Some(ActiveTxn::new(iso, read_only));
+    session.xact = Some(ActiveTxn::new(iso, read_only, session.stmt_start));
     Ok(QueryResult::command(tag))
 }
 
@@ -2884,18 +2885,25 @@ fn resolve_create_namespace(
     }
 }
 
-/// The deparsed form of a `timestamptz`/`timetz` column's literal default, or
-/// `None` when the default is not a bare literal or the column is some other
-/// type.
+/// The deparsed form of a date/time column's literal default, or `None` when
+/// the default is not a bare literal or the column is some other type.
 ///
-/// These two are the literals the binder cannot fold: resolving one needs the
-/// session zone, which the binder holds no access to on purpose. Rendering them
-/// here — where the session *is* in hand — matches PostgreSQL, which resolves
-/// the constant when the DDL runs and stores the instant, not the text. What the
-/// reader then sees is the instant put back into *their* zone, which
-/// `pg_get_expr` does on the way out.
+/// These are the literals the binder cannot fold, for the two reasons it holds
+/// no session: a `timestamptz`/`timetz` text needs the display zone, and a
+/// relative one (`'now'`, `'today'`, `'tomorrow'`, `'yesterday'`) needs the
+/// transaction clock. Resolving them here — where the session *is* in hand —
+/// matches PostgreSQL, which evaluates the constant when the DDL runs and
+/// stores the resulting value, not the text. That is what makes `DEFAULT 'now'`
+/// the moment of `CREATE TABLE` rather than a fresh reading per insert, the
+/// distinction PG's manual draws against `DEFAULT now()`.
+///
+/// What a reader then sees is the stored value put back into *their* zone,
+/// which `pg_get_expr` does on the way out.
 fn zoned_literal_default(expr: &ast::Expr, column: &Column, session: &Session) -> Option<String> {
-    if !matches!(column.ty, PgType::TimestampTz | PgType::TimeTz) {
+    if !matches!(
+        column.ty,
+        PgType::TimestampTz | PgType::TimeTz | PgType::Timestamp | PgType::Date | PgType::Time
+    ) {
         return None;
     }
     let ast::Expr::Value(v) = expr else {

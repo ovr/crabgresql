@@ -23,6 +23,7 @@ use crabgresql_storage_api::{SequenceAdvance, TableEngine, Tuple};
 use crabgresql_txn::{
     CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
 };
+use crabgresql_types::fmt::Clock;
 use crabgresql_types::tz::SessionZone;
 use crabgresql_types::{FmtCtx, PgType, Value};
 
@@ -159,6 +160,8 @@ pub struct Cursor {
     /// when they are holdable; a holdable cursor declared under autocommit
     /// belongs to no block and survives later rollbacks.
     pub in_block: bool,
+    /// The `DECLARE`'s statement timestamp, for `pg_cursors.creation_time`.
+    pub creation_time: i64,
 }
 
 impl Cursor {
@@ -314,12 +317,17 @@ pub struct ActiveTxn {
     /// TRANSACTION` may only change the isolation level before the first such
     /// query (PG raises 25001 afterwards).
     pub has_run_query: bool,
+    /// When the block started, backing `now()`/`transaction_timestamp()` and
+    /// the `'now'` input special for every statement in it. Taken from the
+    /// `BEGIN`'s own message stamp rather than read fresh, so the block's clock
+    /// is the moment the client asked for a block.
+    pub xact_start: i64,
 }
 
 impl ActiveTxn {
     /// Open a block with the given isolation level and access mode (seeded from
     /// the session defaults, then overridden by the block's transaction modes).
-    pub fn new(iso: IsolationLevel, read_only: bool) -> Self {
+    pub fn new(iso: IsolationLevel, read_only: bool, xact_start: i64) -> Self {
         ActiveTxn {
             xid: None,
             iso,
@@ -327,6 +335,7 @@ impl ActiveTxn {
             snapshot: None,
             cid: CommandId::FIRST,
             has_run_query: false,
+            xact_start,
         }
     }
 }
@@ -361,6 +370,11 @@ pub struct Session {
     /// rendered in. Behind an `Arc` because it is cloned into the formatting
     /// context of every statement and every plan node.
     pub timezone: Arc<SessionZone>,
+    /// When the protocol message being processed arrived, backing
+    /// `statement_timestamp()`. Stamped once per message — not per statement —
+    /// so every statement of a multi-statement simple query shares it, as in
+    /// PostgreSQL. Outside a block it is also the transaction start.
+    pub stmt_start: i64,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
     /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
@@ -653,6 +667,9 @@ impl Session {
             // PG's boot value is the host zone; ours is UTC, which keeps every
             // expected output in the test suites stable.
             timezone: Arc::new(SessionZone::utc()),
+            // Restamped by every incoming message; seeded here so the value is
+            // never an invented instant even before the first one arrives.
+            stmt_start: crabgresql_types::tz::now_micros(),
             saved_gucs: Vec::new(),
             default_iso: IsolationLevel::ReadCommitted,
             default_read_only: false,
@@ -711,10 +728,29 @@ impl Session {
         }
     }
 
-    /// The formatting context for this session: `extra_float_digits` and the
-    /// display zone, as the value layer wants them.
+    /// The formatting context for this session: `extra_float_digits`, the
+    /// display zone and the clock, as the value layer wants them.
+    ///
+    /// Under autocommit there is no block to take a transaction start from, so
+    /// the statement's own stamp serves as both — which is what makes
+    /// `now() = statement_timestamp()` outside a block, as in PostgreSQL.
     pub fn fmt_ctx(&self) -> FmtCtx {
-        FmtCtx::new(self.extra_float_digits, Arc::clone(&self.timezone))
+        let xact_start = self.xact.as_ref().map_or(self.stmt_start, |x| x.xact_start);
+        FmtCtx::new(
+            self.extra_float_digits,
+            Arc::clone(&self.timezone),
+            Clock {
+                xact_start,
+                stmt_start: self.stmt_start,
+            },
+        )
+    }
+
+    /// Stamp the arrival of a protocol message. Called once per `Query`,
+    /// `Parse`, `Bind` and `Execute` — never per statement inside a
+    /// multi-statement simple query, which PostgreSQL treats as one stamp.
+    pub fn stamp_message(&mut self) {
+        self.stmt_start = crabgresql_types::tz::now_micros();
     }
 
     /// A context for evaluation outside a statement's normal execution path —
@@ -817,6 +853,7 @@ mod cursor_tests {
             scroll,
             statement: String::new(),
             in_block: true,
+            creation_time: 0,
         }
     }
 

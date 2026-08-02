@@ -112,6 +112,10 @@ pub async fn handle_connection(
             // Between an error and the next Sync, every message is dropped.
             Some(_) if skip_until_sync => {}
             Some(FrontendMessage::Query(sql)) => {
+                // One stamp for the whole message, not one per statement: a
+                // multi-statement simple query shares a `statement_timestamp()`
+                // in PostgreSQL.
+                session.stamp_message();
                 run_simple_query(
                     &sql,
                     &engine,
@@ -130,6 +134,7 @@ pub async fn handle_connection(
                 query,
                 param_types,
             }) => {
+                session.stamp_message();
                 let outcome = handle_parse(
                     &engine,
                     &catalog,
@@ -154,6 +159,7 @@ pub async fn handle_connection(
                 params,
                 result_formats,
             }) => {
+                session.stamp_message();
                 let outcome = handle_bind(
                     &mut session,
                     &mut writer,
@@ -182,6 +188,7 @@ pub async fn handle_connection(
                 );
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
+                session.stamp_message();
                 // COPY FROM STDIN needs the socket (to read CopyData frames),
                 // which the pure execute path lacks — drive it here, where the
                 // reader is in scope and errors are ProtocolError. Any other

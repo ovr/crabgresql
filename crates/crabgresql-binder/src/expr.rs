@@ -17,7 +17,6 @@ use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCatalog, UserCast};
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
-use crabgresql_types::tz::SessionZone;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
     FmtCtx, Numeric, PgType, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
@@ -961,18 +960,29 @@ impl BoundExpr {
         }
     }
 
-    /// Whether this expression contains a volatile function call. Today the only
-    /// volatile [`ScalarFn`]s are the sequence functions (`nextval`/`setval` have
-    /// side effects, `currval`/`lastval` read mutable session state) — all marked
-    /// `VOLATILE` by PostgreSQL. Any future volatile scalar function (e.g.
-    /// `random()`) must be added to the match here. Used to refuse duplicating a
-    /// volatile argument when inlining a SQL function body.
+    /// Whether this expression contains a volatile function call. The volatile
+    /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
+    /// side effects, `currval`/`lastval` read mutable session state) and
+    /// `clock_timestamp`, which reads the wall clock afresh at every call — all
+    /// marked `VOLATILE` by PostgreSQL. Any future volatile scalar function
+    /// (e.g. `random()`) must be added to the match here. Used to refuse
+    /// duplicating a volatile argument when inlining a SQL function body, and
+    /// to keep such a call from being pushed down into a scan.
+    ///
+    /// `now()` and `statement_timestamp()` are deliberately *not* here: PG
+    /// marks them `STABLE`, and they are. Calling them volatile would cost a
+    /// real optimization — `WHERE ts > now() - interval '1 day'` could no
+    /// longer be pushed to a leaf — for no change in the answer.
     pub fn contains_volatile_fn(&self) -> bool {
         match self {
             BoundExpr::FuncCall { func, args, .. } => {
                 matches!(
                     func,
-                    ScalarFn::Nextval | ScalarFn::Currval | ScalarFn::Setval | ScalarFn::Lastval
+                    ScalarFn::Nextval
+                        | ScalarFn::Currval
+                        | ScalarFn::Setval
+                        | ScalarFn::Lastval
+                        | ScalarFn::ClockTimestamp
                 ) || args.iter().any(BoundExpr::contains_volatile_fn)
             }
             // A routine's body is opaque here and PostgreSQL defaults a
@@ -3892,7 +3902,10 @@ fn apply_interval_typmod(expr: BoundExpr, typmod: i32) -> BoundExpr {
 /// Round `expr` to a datetime type's fractional-second precision, folding a
 /// constant at bind time. Cast and assignment context round identically, so this
 /// serves both.
-fn apply_datetime_precision(expr: BoundExpr, precision: i32) -> Result<BoundExpr, BindError> {
+pub(crate) fn apply_datetime_precision(
+    expr: BoundExpr,
+    precision: i32,
+) -> Result<BoundExpr, BindError> {
     let rounded = match &expr {
         BoundExpr::Const { value, ty } => match value {
             Value::Time(usec) => Some(Value::Time(time::apply_typmod(*usec, precision))),
@@ -8037,14 +8050,27 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 ///   an instant to a wall clock, in both directions — and for every conversion
 ///   to `timetz`, which attaches the zone's offset when the value carries none.
 ///
-/// **Known divergence.** PostgreSQL folds a `timestamptz` literal during parse
-/// analysis using the parsing session's zone, so the instant is frozen; we defer
-/// it and recompute per execution. That is visible for a prepared statement
-/// re-executed after a `SET TimeZone` (pinned by
-/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and it means
-/// a stored `timestamptz` column DEFAULT resolves in the *inserting* session's
-/// zone rather than the one that defined it. Closing it means giving the binder
-/// the session's `FmtCtx` so this function can fold instead of defer.
+/// The transaction clock is the third such input, and [`resolve_unknown`]
+/// defers on it the same way — but it is detected by probing rather than listed
+/// here, since `'today 10:00'` is as relative as `'today'` and only the scanner
+/// knows that.
+///
+/// **Known divergence.** PostgreSQL folds these literals during parse analysis,
+/// freezing the instant with the parsing session's zone and clock; we defer and
+/// recompute per execution. Visible for a prepared statement re-executed after
+/// a `SET TimeZone` (pinned by
+/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and for
+/// `PREPARE p AS SELECT 'now'::timestamptz`, which PG answers identically on
+/// every `EXECUTE`.
+///
+/// Handing the binder a session `FmtCtx` would *not* close it: the extended
+/// protocol re-binds the statement on every `Execute` (`analyze_statement`
+/// binds for Describe and throws the plan away; `bind_dml_with_params` runs
+/// again from Execute), so a bind-time fold would be re-done with each
+/// execution's own session state and land back where it started. Closing it
+/// needs a plan cache. What the deferral *does* still cost is nothing at DDL
+/// time: a column default resolves through `zoned_literal_default`, where the
+/// session is in hand, so `DEFAULT 'now'` freezes exactly as PG's does.
 fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
     if matches!(
         to,
@@ -8059,13 +8085,13 @@ fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
 /// value — see the call site in [`resolve_unknown`].
 fn validate_zone_dependent_literal(s: &str, ty: PgType) -> Result<(), BindError> {
     match ty {
-        PgType::TimestampTz => timestamptz::parse(s, &SessionZone::utc())
+        PgType::TimestampTz => timestamptz::parse(s, &FmtCtx::utc_default())
             .map(|_| ())
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::TimeTz => timetz::parse(s, &SessionZone::utc())
+        PgType::TimeTz => timetz::parse(s, &FmtCtx::utc_default())
             .map(|_| ())
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::Array(_) => parse_unknown(s, ty).map(|_| ()),
+        PgType::Array(_) => parse_unknown(s, ty, &FmtCtx::utc_default()).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -8178,7 +8204,13 @@ pub(crate) fn resolve_unknown(
         let text = match lit {
             None => Value::Null,
             Some(s) => {
-                validate_zone_dependent_literal(&s, ty).map_err(|e| e.at(span))?;
+                // A relative literal cannot be validated without the clock
+                // either; it is deferred whole, like the value itself.
+                match validate_zone_dependent_literal(&s, ty) {
+                    Ok(()) => {}
+                    Err(e) if needs_session_clock(&e) => {}
+                    Err(e) => return Err(e.at(span)),
+                }
                 Value::Text(s)
             }
         };
@@ -8192,12 +8224,40 @@ pub(crate) fn resolve_unknown(
     }
     let value = match lit {
         None => Value::Null,
-        Some(s) => parse_unknown(&s, ty).map_err(|e| e.at(span))?,
+        Some(s) => match parse_unknown(&s, ty, &FmtCtx::utc_default()) {
+            Ok(value) => value,
+            // The literal reads the transaction clock (`now`, `today`,
+            // `tomorrow`, `yesterday`), which the binder does not hold. Defer
+            // it to a runtime coercion, exactly as the zone-dependent branch
+            // above does — and for the same reason. Any *other* error is a real
+            // diagnostic and keeps its cursor position.
+            Err(e) if needs_session_clock(&e) => {
+                return Ok(BoundExpr::Coerce {
+                    expr: Box::new(BoundExpr::Const {
+                        value: Value::Text(s),
+                        ty: PgType::Text,
+                    }),
+                    ty,
+                });
+            }
+            Err(e) => return Err(e.at(span)),
+        },
     };
     Ok(BoundExpr::Const { value, ty })
 }
 
-pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
+/// Whether an input-function error is "this value needs the transaction clock"
+/// rather than a complaint about the input.
+///
+/// Probing for it, instead of matching the token text, is what keeps the
+/// composite forms working: `'today 10:00'` and `'10:00 today'` are relative
+/// too, and a token table here would have to re-implement the scanner to know
+/// that.
+fn needs_session_clock(e: &BindError) -> bool {
+    e.code == sqlstate::INTERNAL_ERROR
+}
+
+pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, BindError> {
     let invalid = || {
         BindError::new(
             sqlstate::INVALID_TEXT_REPRESENTATION,
@@ -8232,19 +8292,19 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
             ),
         }),
         PgType::Bool => parse_bool(s).map(Value::Bool).ok_or_else(invalid),
-        PgType::Date => date::parse(s)
+        PgType::Date => date::parse(s, fmt)
             .map(Value::Date)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::Time => time::parse(s)
+        PgType::Time => time::parse(s, fmt)
             .map(Value::Time)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // Zone-dependent, so unreachable from `resolve_unknown` for the same
         // reason `TimestampTz` below is; UTC serves `pg_input_is_valid`, which
         // asks only whether the syntax is acceptable.
-        PgType::TimeTz => timetz::parse(s, &SessionZone::utc())
+        PgType::TimeTz => timetz::parse(s, fmt)
             .map(Value::TimeTz)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::Timestamp => timestamp::parse(s)
+        PgType::Timestamp => timestamp::parse(s, fmt)
             .map(Value::Timestamp)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::Interval => interval::parse(s)
@@ -8255,7 +8315,7 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType) -> Result<Value, BindError> {
         // whether the *syntax* is acceptable. Validity is zone-independent
         // except within a few hours of the representable range, so UTC answers
         // it correctly for every input a caller can realistically ask about.
-        PgType::TimestampTz => timestamptz::parse(s, &SessionZone::utc())
+        PgType::TimestampTz => timestamptz::parse(s, fmt)
             .map(Value::TimestampTz)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // bytea input (byteain) is shared with the executor's text→bytea cast.

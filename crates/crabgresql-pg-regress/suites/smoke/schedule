@@ -22,6 +22,7 @@ test: time
 test: timetz
 test: timestamp
 test: timestamptz
+test: now
 test: interval
 test: case
 test: bool_test

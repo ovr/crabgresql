@@ -408,6 +408,8 @@ pub struct CatalogCursor {
     pub is_holdable: bool,
     pub is_binary: bool,
     pub is_scrollable: bool,
+    /// When the cursor was declared, in `timestamptz` micros.
+    pub creation_time: i64,
 }
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so

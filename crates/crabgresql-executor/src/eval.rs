@@ -119,6 +119,12 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_guc_fn(*func, &arg_values, ctx) {
                 return result;
             }
+            // The clock functions answer from the session's stamped instants
+            // (or, for `clock_timestamp`, from real time) rather than from
+            // their arguments — there are none.
+            if let Some(result) = eval_clock_fn(*func, ctx) {
+                return result;
+            }
             // The catalog functions read the session's pg_catalog snapshot, which
             // the pure `eval_scalar` has no handle to.
             match eval_catalog_fn(*func, &arg_values, ctx) {
@@ -418,6 +424,26 @@ fn eval_sequence_fn(
     Some(result)
 }
 
+/// Dispatch the clock functions. Returns `None` for any other function.
+///
+/// They take no arguments and read no row, so a pure `eval_scalar` could hold
+/// two of them — but not `clock_timestamp`, which reads real time. Keeping the
+/// family together here is what makes "which instant does this answer with" a
+/// single readable decision instead of one split across two files.
+fn eval_clock_fn(func: ScalarFn, ctx: &ExecContext) -> Option<Result<Value, ExecError>> {
+    let micros = match func {
+        ScalarFn::TransactionTimestamp => ctx.fmt.xact_start(),
+        ScalarFn::StatementTimestamp => ctx.fmt.stmt_start(),
+        ScalarFn::ClockTimestamp => Ok(crabgresql_types::tz::now_micros()),
+        _ => return None,
+    };
+    Some(
+        micros
+            .map(Value::TimestampTz)
+            .map_err(|e| ExecError::new(e.sqlstate, e.message)),
+    )
+}
+
 /// Dispatch `current_setting`, which reads the session GUC table through the
 /// [`GucOps`] handle. Returns `None` for any other function.
 ///
@@ -568,7 +594,7 @@ pub(crate) fn soft_input_in_ctx(
         })?;
         return Ok(crate::reg::from_text(kind, value, ops).err());
     }
-    Ok(spec.check(value).err().map(ExecError::from))
+    Ok(spec.check(value, &ctx.fmt).err().map(ExecError::from))
 }
 
 /// Dispatch the type-formatting / node-tree deparse functions. Returns `None`

@@ -84,10 +84,20 @@ impl Dialect for PostgreSqlDialect {
     }
 
     fn is_reserved_for_identifier(&self, kw: Keyword) -> bool {
-        if matches!(kw, Keyword::INTERVAL) {
-            false
-        } else {
-            RESERVED_FOR_IDENTIFIER.contains(&kw)
+        match kw {
+            Keyword::INTERVAL => false,
+            // The `CURRENT_TIMESTAMP` family is grammar, not a function name.
+            // Reserving these stops the expression parser from retrying a
+            // rejected `current_timestamp(1+1)` as an ordinary call, which
+            // would swallow the strict-modifier error `parse_time_functions`
+            // raised and blame the parenthesis instead of the `+` PostgreSQL
+            // points at.
+            Keyword::CURRENT_DATE
+            | Keyword::CURRENT_TIME
+            | Keyword::CURRENT_TIMESTAMP
+            | Keyword::LOCALTIME
+            | Keyword::LOCALTIMESTAMP => true,
+            _ => RESERVED_FOR_IDENTIFIER.contains(&kw),
         }
     }
 

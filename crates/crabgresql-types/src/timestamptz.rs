@@ -16,6 +16,7 @@
 //! [`crate::timestamp`].
 
 use crate::Numeric;
+use crate::fmt::FmtCtx;
 use crate::timestamp::{
     self, DATETIME_FIELD_OVERFLOW, INVALID_DATETIME_FORMAT, INVALID_PARAMETER_VALUE,
     INVALID_TIME_ZONE_DISPLACEMENT, NEG_INFINITY, POS_INFINITY, Parsed, TimestampError, decode,
@@ -95,6 +96,13 @@ fn relabel_units(e: TimestampError) -> TimestampError {
     }
 }
 
+fn clock_unavailable(e: crate::fmt::ClockError) -> TimestampError {
+    TimestampError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+    }
+}
+
 /// Map a [`ZoneError`] to PG's SQLSTATE/message.
 fn zone_error(e: ZoneError) -> TimestampError {
     match e {
@@ -125,11 +133,16 @@ fn tmlite(micros: i64) -> TmLite {
 /// clock to UTC; **a missing zone token means the session zone**, not UTC.
 /// `infinity`/`epoch` pass through. Syntax errors are `22007`, out-of-range
 /// results `22008`, an unknown zone `22023`, a bad numeric offset `22009`.
-pub fn parse(input: &str, session: &SessionZone) -> Result<i64, TimestampError> {
-    let parsed = timestamp::parse_parts(input).map_err(|e| relabel_syntax(e, input))?;
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
+    let session = &fmt.zone;
+    let parsed = timestamp::parse_parts(input, fmt).map_err(|e| relabel_syntax(e, input))?;
     let (tm, zone) = match parsed {
         // infinity/-infinity/epoch are zone-independent.
         Parsed::Micros(m) => return Ok(m),
+        // `'now'` is already an instant. Taking it directly rather than
+        // rendering it as a wall clock and reading that back is what keeps it
+        // exact across a DST fold, where the round trip is ambiguous.
+        Parsed::Now => return fmt.xact_start().map_err(clock_unavailable),
         Parsed::Calendar { tm, zone } => (tm, zone),
     };
     validate_fields(&tm, input)?;
@@ -551,8 +564,14 @@ mod tests {
         SessionZone::utc()
     }
 
+    /// An input context in `z` with no clock — every case here spells out its
+    /// own instant, so a relative special would be a test bug.
+    fn in_zone(z: SessionZone) -> FmtCtx {
+        FmtCtx::utc_default().with_zone(std::sync::Arc::new(z))
+    }
+
     fn p(s: &str) -> i64 {
-        match parse(s, &utc()) {
+        match parse(s, &in_zone(utc())) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamptz test fixture `{s}`: {error:?}"),
         }
@@ -619,29 +638,29 @@ mod tests {
             "0097-02-16 20:00:00+00 BC"
         );
         // Lower boundary: 4714-11-24 00:00:00 UTC BC is valid.
-        assert!(parse("4714-11-24 00:00:00+00 BC", &utc()).is_ok());
-        assert!(parse("4714-11-23 16:00:00-08 BC", &utc()).is_ok()); // == the same instant
+        assert!(parse("4714-11-24 00:00:00+00 BC", &in_zone(utc())).is_ok());
+        assert!(parse("4714-11-23 16:00:00-08 BC", &in_zone(utc())).is_ok()); // == the same instant
         // One second earlier is out of range.
-        let e = parse("4714-11-23 23:59:59+00 BC", &utc()).unwrap_err();
+        let e = parse("4714-11-23 23:59:59+00 BC", &in_zone(utc())).unwrap_err();
         assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW);
         // Upper boundary.
-        assert!(parse("294276-12-31 23:59:59+00", &utc()).is_ok());
+        assert!(parse("294276-12-31 23:59:59+00", &in_zone(utc())).is_ok());
         assert_eq!(
-            parse("294277-01-01 00:00:00+00", &utc()).unwrap_err().sqlstate,
+            parse("294277-01-01 00:00:00+00", &in_zone(utc())).unwrap_err().sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
     }
 
     #[test]
     fn errors() {
-        let e = parse("garbage", &utc()).unwrap_err();
+        let e = parse("garbage", &in_zone(utc())).unwrap_err();
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
         assert_eq!(
             e.message,
             "invalid input syntax for type timestamp with time zone: \"garbage\""
         );
         assert_eq!(
-            parse("2001-01-01 00:00 Nowhere/Nozone", &utc())
+            parse("2001-01-01 00:00 Nowhere/Nozone", &in_zone(utc()))
                 .unwrap_err()
                 .sqlstate,
             INVALID_PARAMETER_VALUE
@@ -692,7 +711,7 @@ mod tests {
     fn huge_year_does_not_overflow() {
         // In i32 field range but past the timestamp range: "timestamp out of range".
         for input in ["999999-01-01", "300000-01-01 00:00:00+00"] {
-            let e = parse(input, &utc()).expect_err(input);
+            let e = parse(input, &in_zone(utc())).expect_err(input);
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
             assert_eq!(
                 e.message,
@@ -703,7 +722,7 @@ mod tests {
         // Beyond the i32 field range: "date/time field value out of range"
         // (must not overflow i64 in `encode`). Both signs.
         for input in ["5000000000-01-01", "5000000000-01-01 BC"] {
-            let e = parse(input, &utc()).expect_err(input);
+            let e = parse(input, &in_zone(utc())).expect_err(input);
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "{input}");
             assert_eq!(
                 e.message,
@@ -723,7 +742,7 @@ mod tests {
             "2001-01-01 12:00:00 -600000:00",
             "2001-01-01 12:00:00 +99:00",
         ] {
-            let e = parse(input, &utc()).expect_err(input);
+            let e = parse(input, &in_zone(utc())).expect_err(input);
             assert_eq!(
                 e.sqlstate,
                 crate::timestamp::INVALID_TIME_ZONE_DISPLACEMENT,
@@ -745,7 +764,7 @@ mod tests {
             DATETIME_FIELD_OVERFLOW
         );
         // AT TIME ZONE past the upper boundary (timestamp -> timestamptz).
-        let near_max = timestamp::parse("294276-12-31 23:59:59")?;
+        let near_max = timestamp::parse("294276-12-31 23:59:59", &in_zone(utc()))?;
         assert_eq!(
             timestamp_at_zone("America/New_York", near_max)
                 .unwrap_err()
@@ -761,7 +780,7 @@ mod tests {
     #[test]
     fn glued_date_zone_requires_numeric_offset() {
         assert_eq!(format(p("2001-02-16+00"), &utc()), "2001-02-16 00:00:00+00");
-        let e = parse("2001-02-16+garbage", &utc()).unwrap_err();
+        let e = parse("2001-02-16+garbage", &in_zone(utc())).unwrap_err();
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
     }
 
@@ -775,7 +794,7 @@ mod tests {
 
     /// Parse in `z`, then render in `z`.
     fn round(s: &str, z: &SessionZone) -> String {
-        match parse(s, z) {
+        match parse(s, &in_zone(z.clone())) {
             Ok(v) => format(v, z),
             Err(e) => panic!("invalid timestamptz test fixture `{s}`: {e:?}"),
         }
@@ -791,7 +810,7 @@ mod tests {
         // An explicit zone token still wins; only the rendering follows the
         // session.
         assert_eq!(
-            format(parse("2024-06-01 12:00:00+00", &ny).unwrap(), &ny),
+            round("2024-06-01 12:00:00+00", &ny),
             "2024-06-01 08:00:00-04"
         );
     }
@@ -818,7 +837,7 @@ mod tests {
     fn fields_read_the_local_wall_clock() -> anyhow::Result<()> {
         let ny = zone("America/New_York");
         // 02:00 UTC on Jan 1 is still December 31st in New York.
-        let v = parse("2024-01-01 02:00:00+00", &ny)?;
+        let v = parse("2024-01-01 02:00:00+00", &in_zone(ny.clone()))?;
         assert_eq!(date_part("day", v, &ny)?, Some(31.0));
         assert_eq!(date_part("month", v, &ny)?, Some(12.0));
         assert_eq!(date_part("year", v, &ny)?, Some(2023.0));
@@ -832,7 +851,7 @@ mod tests {
     #[test]
     fn timezone_fields_report_the_session_offset() -> anyhow::Result<()> {
         let ny = zone("America/New_York");
-        let v = parse("2024-01-15 12:00:00-05", &ny)?;
+        let v = parse("2024-01-15 12:00:00-05", &in_zone(ny.clone()))?;
         assert_eq!(date_part("timezone", v, &ny)?, Some(-18000.0));
         assert_eq!(date_part("timezone_hour", v, &ny)?, Some(-5.0));
         assert_eq!(date_part("timezone_minute", v, &ny)?, Some(0.0));
@@ -840,7 +859,7 @@ mod tests {
 
         // A half-hour zone west of UTC: the sign is carried on *both* fields.
         let stj = zone("America/St_Johns");
-        let v = parse("2024-01-15 12:00:00-03:30", &stj)?;
+        let v = parse("2024-01-15 12:00:00-03:30", &in_zone(stj.clone()))?;
         assert_eq!(date_part("timezone_hour", v, &stj)?, Some(-3.0));
         assert_eq!(date_part("timezone_minute", v, &stj)?, Some(-30.0));
 
@@ -855,7 +874,7 @@ mod tests {
     #[test]
     fn date_trunc_lands_on_local_midnight_across_dst() -> anyhow::Result<()> {
         let ny = zone("America/New_York");
-        let v = parse("2024-03-10 15:00:00-04", &ny)?;
+        let v = parse("2024-03-10 15:00:00-04", &in_zone(ny.clone()))?;
         assert_eq!(
             format(date_trunc("day", v, &ny)?, &ny),
             "2024-03-10 00:00:00-05"
@@ -875,7 +894,7 @@ mod tests {
     fn date_trunc_sub_day_units_keep_the_input_offset() -> anyhow::Result<()> {
         let ny = zone("America/New_York");
         // 01:30-04 is the *first* pass through 01:30 on fall-back day.
-        let v = parse("2024-11-03 01:30:00-04", &ny)?;
+        let v = parse("2024-11-03 01:30:00-04", &in_zone(ny.clone()))?;
         assert_eq!(
             format(date_trunc("hour", v, &ny)?, &ny),
             "2024-11-03 01:00:00-04"
@@ -920,14 +939,14 @@ mod tests {
     fn session_zone_conversions_are_not_an_identity() -> anyhow::Result<()> {
         let ny = zone("America/New_York");
         // timestamp -> timestamptz reads the wall clock in the session zone.
-        let wall = timestamp::parse("2024-06-01 12:00:00")
+        let wall = timestamp::parse("2024-06-01 12:00:00", &in_zone(utc()))
             .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             format(timestamp_at_session_zone(wall, &ny)?, &ny),
             "2024-06-01 12:00:00-04"
         );
         // ... and back the other way.
-        let instant = parse("2024-06-01 12:00:00+00", &ny)?;
+        let instant = parse("2024-06-01 12:00:00+00", &in_zone(ny.clone()))?;
         assert_eq!(
             timestamp::format(session_zone_wall_clock(instant, &ny)?),
             "2024-06-01 08:00:00"
@@ -939,5 +958,64 @@ mod tests {
         assert_eq!(timestamp_at_session_zone(POS_INFINITY, &ny)?, POS_INFINITY);
         assert_eq!(session_zone_wall_clock(NEG_INFINITY, &ny)?, NEG_INFINITY);
         Ok(())
+    }
+
+    // --- the relative input specials (pinned against PostgreSQL 18.4) ------
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, 763_860_600_123_456, 763_860_600_123_456)
+            .with_zone(std::sync::Arc::new(zone_of(zone)))
+    }
+
+    fn zone_of(name: &str) -> SessionZone {
+        SessionZone::resolve(name).expect("test fixture names a real zone")
+    }
+
+    /// Parse `input` against the frozen clock in `zone`, then render it there.
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v, &zone_of(zone)),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// The instant `input` parses to, unrendered.
+    fn rel_micros(input: &str, zone: &str) -> i64 {
+        match parse(input, &at(zone)) {
+            Ok(v) => v,
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// `'now'` is the transaction timestamp itself. It is taken as an instant,
+    /// never rendered to a wall clock and read back — so it round-trips to the
+    /// exact microsecond in every zone, including one mid-DST.
+    #[test]
+    fn now_is_the_transaction_instant_exactly() {
+        for zone in [
+            "UTC",
+            "America/New_York",
+            "Asia/Kolkata",
+            "America/Santiago",
+        ] {
+            assert_eq!(
+                rel_micros("now", zone),
+                763_860_600_123_456,
+                "now in {zone}"
+            );
+        }
+    }
+
+    /// `'today'` is local midnight — the *session's* midnight, turned back into
+    /// an instant. At the frozen moment Kolkata is already on the 16th, and its
+    /// midnight is 18.5 hours before UTC's.
+    #[test]
+    fn today_is_local_midnight_as_an_instant() {
+        assert_eq!(rel("today", "UTC"), "2024-03-15 00:00:00+00");
+        assert_eq!(rel("today", "America/New_York"), "2024-03-15 00:00:00-04");
+        assert_eq!(rel("today", "Asia/Kolkata"), "2024-03-16 00:00:00+05:30");
+        // A zone token on a relative date overrides the session's, so this is
+        // midnight EST of the session's today.
+        assert_eq!(rel("today EST", "UTC"), "2024-03-15 05:00:00+00");
     }
 }

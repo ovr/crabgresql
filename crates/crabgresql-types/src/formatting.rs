@@ -1288,6 +1288,12 @@ fn assemble(p: &Parsed) -> Result<(Tm, Option<i32>), FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clockless input context in `z`; every case here spells out its own
+    /// instant.
+    fn in_zone(z: &SessionZone) -> crate::FmtCtx {
+        crate::FmtCtx::utc_default().with_zone(std::sync::Arc::new(z.clone()))
+    }
     use crate::interval::parse as parse_interval;
     use crate::timestamp::parse as parse_ts;
 
@@ -1303,7 +1309,7 @@ mod tests {
     }
 
     fn ts(s: &str, fmt: &str) -> String {
-        let value = match parse_ts(s) {
+        let value = match parse_ts(s, &crate::FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
         };
@@ -1314,7 +1320,7 @@ mod tests {
     }
 
     fn tstz(s: &str, fmt: &str) -> String {
-        let value = match parse_ts(s) {
+        let value = match parse_ts(s, &crate::FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
         };
@@ -1720,7 +1726,7 @@ mod tests {
     fn to_char_renders_the_session_zone() -> anyhow::Result<()> {
         let z = |n: &str| SessionZone::resolve(n).expect("real zone");
         let ny = z("America/New_York");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &in_zone(&ny)).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &ny).map_err(fe)?,
             Some("2024-01-15 12:00:00 EST -05".to_string())
@@ -1728,7 +1734,7 @@ mod tests {
 
         // A sub-hour zone widens `OF`, and the abbreviation comes from tzdb.
         let kolkata = z("Asia/Kolkata");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &kolkata).map_err(|e| anyhow::anyhow!(e.message))?;
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &in_zone(&kolkata)).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &kolkata).map_err(fe)?,
             Some("2024-01-15 12:00:00 IST +05:30".to_string())
@@ -1736,7 +1742,7 @@ mod tests {
 
         // `OF` never widens to seconds, even where `timestamptz_out` does:
         // pre-1883 New York ran at -04:56:02, which PG's `OF` prints as -04:56.
-        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &ny).map_err(|e| anyhow::anyhow!(e.message))?;
+        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &in_zone(&ny)).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(lmt, "OF", &ny).map_err(fe)?,
             Some("-04:56".to_string())
@@ -1747,7 +1753,7 @@ mod tests {
         );
 
         // A plain `timestamp` still has no `TZ` and a `+00` `OF`.
-        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00", &crate::FmtCtx::utc_default())
             .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamp(ts, "HH24:MI TZ OF").map_err(fe)?,
@@ -1762,7 +1768,8 @@ mod tests {
     fn to_char_splits_the_offset_into_tzh_tzm() -> anyhow::Result<()> {
         let z = |n: &str| SessionZone::resolve(n).expect("real zone");
         let at = |zone: &SessionZone, s: &str, fmt: &str| -> anyhow::Result<String> {
-            let v = crate::timestamptz::parse(s, zone).map_err(|e| anyhow::anyhow!(e.message))?;
+            let v = crate::timestamptz::parse(s, &in_zone(zone))
+                .map_err(|e| anyhow::anyhow!(e.message))?;
             Ok(to_char_timestamptz(v, fmt, zone)
                 .map_err(fe)?
                 .unwrap_or_default())
@@ -1787,7 +1794,7 @@ mod tests {
         assert_eq!(at(&ny, "2024-06-01 12:00:00", "FMTZH:TZM")?, "-04:00");
 
         // A plain `timestamp` has no zone and reads as +00:00, as `OF` does.
-        let ts = crate::timestamp::parse("2024-01-15 12:00:00")
+        let ts = crate::timestamp::parse("2024-01-15 12:00:00", &crate::FmtCtx::utc_default())
             .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamp(ts, "TZH:TZM|OF|TZ").map_err(fe)?,

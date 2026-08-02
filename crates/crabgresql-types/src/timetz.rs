@@ -11,8 +11,8 @@
 //! value that displays as `-07` stores `+25200`, chosen so ordering by the UTC
 //! instant is `usec + zone*USECS_PER_SEC` (pinned by the ordering tests).
 //!
-//! A missing zone takes the session zone's standard offset, with the divergence
-//! [`crate::tz::SessionZone::standard_offset`] documents.
+//! A missing zone takes the offset the session zone is at on the transaction's
+//! date — see [`crate::FmtCtx::zone_offset_today`].
 //!
 //! One further deviation from PG, acceptable while no passing test needs it: a
 //! zone-backed abbreviation (`MSK`) needs a date here, because we resolve it
@@ -21,10 +21,11 @@
 //! offset and no date at all.
 
 use crate::Numeric;
+use crate::fmt::FmtCtx;
 use crate::interval::Interval;
 use crate::time;
-use crate::timestamp::fixed_point;
-use crate::tz::{self, SessionZone, TmLite, Zone};
+use crate::timestamp::{self, fixed_point};
+use crate::tz::{self, TmLite, Zone};
 
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
@@ -101,10 +102,34 @@ pub fn format(v: TimeTz) -> String {
 /// `'03:30'::time::timetz` agree — PG resolves both through the session zone
 /// too, and having only one of them do it made the same value compare unequal
 /// to itself.
-pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> {
+///
+/// The two whole-value specials `time` accepts are accepted here too, and they
+/// differ in how they treat the session zone: `now` takes the offset in effect
+/// at the transaction timestamp, while `allballs` is `00:00:00+00` in every
+/// zone — PG's decoder gives it a literal zero offset rather than the session's.
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<TimeTz, TimeTzError> {
+    let session = &fmt.zone;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "now" => {
+            let at = fmt.xact_start().map_err(|e| TimeTzError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })?;
+            let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeTzError {
+                sqlstate: e.sqlstate,
+                message: e.message,
+            })?;
+            return Ok(TimeTz {
+                usec: wall.rem_euclid(USECS_PER_DAY),
+                zone: -session.offset_at(at),
+            });
+        }
+        "allballs" => return Ok(TimeTz { usec: 0, zone: 0 }),
+        _ => {}
     }
     let mut time_str: Option<String> = None;
     let mut ampm: Option<&str> = None;
@@ -170,7 +195,7 @@ pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> 
         Some(ap) => format!("{time_str} {ap}"),
         None => time_str,
     };
-    let usec = time::parse(&time_input).map_err(|e| {
+    let usec = time::parse(&time_input, fmt).map_err(|e| {
         if e.sqlstate == DATETIME_FIELD_OVERFLOW {
             field_out_of_range(input)
         } else {
@@ -179,9 +204,9 @@ pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> 
     })?;
 
     let gmtoff = match &zone_tok {
-        // No zone of its own: the session's standard offset, so this agrees with
-        // what the `time -> timetz` cast produces.
-        None => session.standard_offset(),
+        // No zone of its own: the offset the session zone is at today, so this
+        // agrees with what the `time -> timetz` cast produces.
+        None => fmt.zone_offset_today(),
         Some(tok) => resolve(tok, date, usec, input)?,
     };
     Ok(TimeTz {
@@ -315,7 +340,12 @@ pub fn at_zone(v: TimeTz, off_east: i32) -> TimeTz {
 /// unresolvable name here *is* blamed on the zone — this is the
 /// `AT TIME ZONE`/`timezone()` path, where PG reports `22023 time zone "…" not
 /// recognized`.
-pub fn at_zone_named(v: TimeTz, zone: &str) -> Result<TimeTz, TimeTzError> {
+///
+/// A named zone cannot name an offset without a date, and a `timetz` carries
+/// none — so PG's `timetz_zone` resolves the zone at the current instant. `at`
+/// is that instant, the session's transaction timestamp, which keeps the answer
+/// stable for the whole transaction instead of drifting per row.
+pub fn at_zone_named(v: TimeTz, zone: &str, at: i64) -> Result<TimeTz, TimeTzError> {
     let zone = tz::resolve_zone(zone).map_err(|e| match e {
         tz::ZoneError::NotRecognized(name) => TimeTzError {
             sqlstate: INVALID_PARAMETER_VALUE,
@@ -326,7 +356,7 @@ pub fn at_zone_named(v: TimeTz, zone: &str) -> Result<TimeTz, TimeTzError> {
             message: format!("time zone displacement out of range: \"{name}\""),
         },
     })?;
-    Ok(at_zone(v, tz::offset_now(&zone)))
+    Ok(at_zone(v, tz::offset_for_instant(&zone, at)))
 }
 
 // --- interval arithmetic ---------------------------------------------------
@@ -456,9 +486,16 @@ fn canon(unit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tz::SessionZone;
+
+    /// A clockless input context in `z` — every case in this module spells out
+    /// its own time, so a relative special would be a test bug.
+    fn in_zone(z: &SessionZone) -> FmtCtx {
+        FmtCtx::utc_default().with_zone(std::sync::Arc::new(z.clone()))
+    }
 
     fn v(s: &str) -> TimeTz {
-        match parse(s, &SessionZone::utc()) {
+        match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timetz test fixture `{s}`: {error:?}"),
         }
@@ -471,8 +508,8 @@ mod tests {
         assert_eq!(format(v("12:00:00+05:30")), "12:00:00+05:30");
         assert_eq!(format(v("12:00")), "12:00:00+00"); // no offset: the session's
         assert_eq!(format(v("23:59:60 -07")), "24:00:00-07"); // rounds up
-        assert!(parse("24:00:00.01 -07", &SessionZone::utc()).is_err());
-        assert!(parse("15:36:39 America/New_York", &SessionZone::utc()).is_err());
+        assert!(parse("24:00:00.01 -07", &FmtCtx::utc_default()).is_err());
+        assert!(parse("15:36:39 America/New_York", &FmtCtx::utc_default()).is_err());
     }
 
     /// An input with no offset of its own takes the session zone's, so it
@@ -480,9 +517,12 @@ mod tests {
     #[test]
     fn a_missing_offset_takes_the_session_zone() -> anyhow::Result<()> {
         let ny = SessionZone::resolve("America/New_York")?;
-        assert_eq!(format(parse("12:00", &ny)?), "12:00:00-05");
+        assert_eq!(format(parse("12:00", &in_zone(&ny))?), "12:00:00-05");
         // An explicit offset still wins.
-        assert_eq!(format(parse("12:00+05:30", &ny)?), "12:00:00+05:30");
+        assert_eq!(
+            format(parse("12:00+05:30", &in_zone(&ny))?),
+            "12:00:00+05:30"
+        );
         Ok(())
     }
 
@@ -539,7 +579,7 @@ mod zone_tests {
         ];
         for (abbrev, offset) in cases {
             let input = format!("12:00 {abbrev}");
-            match parse(&input, &SessionZone::utc()) {
+            match parse(&input, &FmtCtx::utc_default()) {
                 Ok(v) => assert_eq!(format(v), format!("12:00:00{offset}"), "abbrev {abbrev}"),
                 Err(e) => panic!("abbrev {abbrev} should parse, got {e:?}"),
             }
@@ -567,7 +607,7 @@ mod zone_tests {
             ("23:59:60 PDT", "24:00:00-07"),
         ];
         for (input, want) in ok {
-            match parse(input, &SessionZone::utc()) {
+            match parse(input, &FmtCtx::utc_default()) {
                 Ok(v) => assert_eq!(format(v), want, "input {input}"),
                 Err(e) => panic!("input {input} should parse, got {e:?}"),
             }
@@ -584,7 +624,7 @@ mod zone_tests {
             "12:00 EST5EDT",
             "12:00 am pm",
         ] {
-            let Err(e) = parse(input, &SessionZone::utc()) else {
+            let Err(e) = parse(input, &FmtCtx::utc_default()) else {
                 panic!("input {input} should fail");
             };
             assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "input {input}");
@@ -607,7 +647,7 @@ mod zone_tests {
             "0000-01-01 12:00-04",
             "0000-06-15 12:00 America/New_York",
         ] {
-            let Err(e) = parse(input, &SessionZone::utc()) else {
+            let Err(e) = parse(input, &FmtCtx::utc_default()) else {
                 panic!("input {input} should fail");
             };
             assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "input {input}");
@@ -620,7 +660,7 @@ mod zone_tests {
             ("12:00 Nowhere/Nozone", "time zone \"nowhere/nozone\" not recognized"),
             ("12:00 UTC+168", "time zone \"utc+168\" not recognized"),
         ] {
-            let Err(e) = parse(input, &SessionZone::utc()) else {
+            let Err(e) = parse(input, &FmtCtx::utc_default()) else {
                 panic!("input {input} should fail");
             };
             assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE, "input {input}");
@@ -628,7 +668,7 @@ mod zone_tests {
         }
 
         // A bare numeric offset past ±15:59:59 is 22009, quoting the whole input.
-        let Err(e) = parse("12:00:00+16:00", &SessionZone::utc()) else {
+        let Err(e) = parse("12:00:00+16:00", &FmtCtx::utc_default()) else {
             panic!("expected a displacement error");
         };
         assert_eq!(e.sqlstate, INVALID_TIME_ZONE_DISPLACEMENT);
@@ -636,5 +676,49 @@ mod zone_tests {
             e.message,
             "time zone displacement out of range: \"12:00:00+16:00\""
         );
+    }
+
+    // --- the whole-value specials (pinned against PostgreSQL 18.4) ---------
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, 763_860_600_123_456, 763_860_600_123_456).with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve(zone).expect("real zone"),
+        ))
+    }
+
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// `now` takes the offset in effect at the transaction timestamp — so it
+    /// carries the session zone. `allballs` does *not*: PG's decoder gives it
+    /// a literal zero offset, and it reads `00:00:00+00` in every zone.
+    #[test]
+    fn now_takes_the_session_offset_and_allballs_does_not() {
+        assert_eq!(rel("now", "UTC"), "23:30:00.123456+00");
+        assert_eq!(rel("now", "America/New_York"), "19:30:00.123456-04");
+        assert_eq!(rel("now", "Asia/Kolkata"), "05:00:00.123456+05:30");
+        for zone in ["UTC", "America/New_York", "Asia/Kolkata"] {
+            assert_eq!(rel("allballs", zone), "00:00:00+00", "allballs in {zone}");
+        }
+    }
+
+    #[test]
+    fn the_date_shaped_specials_are_rejected() {
+        for bad in ["today", "tomorrow", "yesterday", "epoch", "infinity"] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+        }
+    }
+
+    /// A zone-less `timetz` takes the offset the session zone is at *today*,
+    /// which at the frozen instant is New York's DST offset — not the standard
+    /// `-05` a clockless context would fall back to.
+    #[test]
+    fn a_zoneless_literal_takes_todays_offset() {
+        assert_eq!(rel("03:30", "America/New_York"), "03:30:00-04");
     }
 }

@@ -209,6 +209,20 @@ pub enum ScalarFn {
     /// [`crabgresql_executor::GucOps`], so it dispatches in `eval`, not in the
     /// pure `eval_scalar`.
     CurrentSetting,
+
+    // --- the clock. All three read the session's stamped instants rather than
+    // their arguments, so they dispatch in `eval`, not in `eval_scalar`.
+    /// `now()` / `transaction_timestamp() -> timestamptz`: when the current
+    /// transaction started. Stable — the same value for every row and every
+    /// statement of the block. Also what a `'now'` literal resolves to.
+    TransactionTimestamp,
+    /// `statement_timestamp() -> timestamptz`: when the current protocol
+    /// message arrived. Stable within it, so a multi-statement simple query
+    /// sees one value throughout.
+    StatementTimestamp,
+    /// `clock_timestamp() -> timestamptz`: the wall clock, read afresh at every
+    /// call. The only volatile member of the family.
+    ClockTimestamp,
     /// `timezone(text, timestamp) -> timestamptz` (`ts AT TIME ZONE zone`).
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
@@ -2146,6 +2160,28 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[],
             ret: I8,
         }],
+        // The clock. Zero-arity and impure, so the executor's `eval` dispatches
+        // them from the session's stamped instants; nothing folds them here,
+        // since the binder does not fold calls at all.
+        //
+        // The `CURRENT_TIMESTAMP` family is deliberately absent: those are
+        // keywords the grammar rewrites, not `pg_proc` entries, so a quoted
+        // `"current_timestamp"()` must still be an unknown function — as in PG.
+        "now" | "transaction_timestamp" => &[Signature {
+            func: ScalarFn::TransactionTimestamp,
+            args: &[],
+            ret: TSTZ,
+        }],
+        "statement_timestamp" => &[Signature {
+            func: ScalarFn::StatementTimestamp,
+            args: &[],
+            ret: TSTZ,
+        }],
+        "clock_timestamp" => &[Signature {
+            func: ScalarFn::ClockTimestamp,
+            args: &[],
+            ret: TSTZ,
+        }],
         // Catalog lookups. `int -> oid` is implicit, so an OID written as an
         // integer literal resolves too. Dispatched by the executor's `eval`
         // (not `eval_scalar`), which holds the session's catalog snapshot.
@@ -2890,6 +2926,11 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             format!("window function {} requires an OVER clause", win.name()),
         ));
     }
+    // The `CURRENT_TIMESTAMP` family: grammar keywords, not functions, so they
+    // are rewritten here rather than resolved through the overload table.
+    if let Some(binding) = bind_current_datetime(&name, &func.args)? {
+        return Ok(binding);
+    }
     // Aggregates bind to a transient `Aggregate` marker (extracted into an
     // `Aggregate` plan node later), not to a scalar overload.
     if let Some(agg) = lookup_agg(&name) {
@@ -3457,6 +3498,81 @@ fn bind_aggregate(
 /// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
 /// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
 /// `FuncCall` construction site so the check isn't duplicated at each one.
+/// Bind `CURRENT_DATE`, `CURRENT_TIME(p)`, `CURRENT_TIMESTAMP(p)`,
+/// `LOCALTIME(p)` and `LOCALTIMESTAMP(p)`. `None` for any other name.
+///
+/// Every one of them is exactly a cast of `now()` — verified against
+/// PostgreSQL 18.4 in several session zones: `current_date = now()::date`,
+/// `localtimestamp = now()::timestamp`, `current_time = now()::timetz`,
+/// `localtime = now()::time`, `current_time(2) = now()::timetz(2)`. Building
+/// them that way rather than as five more `ScalarFn`s means the zone rules and
+/// the rounding rule live in one place each, and cannot drift apart.
+///
+/// Divergence: PostgreSQL implements these in the grammar, so a *quoted* call
+/// (`"current_timestamp"()`) is an unknown function there. By the time a name
+/// reaches here the quoting is gone, so we accept that spelling too. It is a
+/// spelling no portable SQL uses, and distinguishing it would mean a dedicated
+/// AST node for the keyword forms.
+fn bind_current_datetime(
+    name: &str,
+    args: &ast::FunctionArguments,
+) -> Result<Option<Binding>, BindError> {
+    let target = match name {
+        "current_timestamp" => None,
+        "localtimestamp" => Some(PgType::Timestamp),
+        "current_date" => Some(PgType::Date),
+        "current_time" => Some(PgType::TimeTz),
+        "localtime" => Some(PgType::Time),
+        _ => return Ok(None),
+    };
+    let now = BoundExpr::FuncCall {
+        func: ScalarFn::TransactionTimestamp,
+        ret: PgType::TimestampTz,
+        args: Vec::new(),
+    };
+    let expr = match target {
+        None => now,
+        Some(ty) => crate::expr::coerce_expr(now, ty)?,
+    };
+    // The grammar has already rejected everything but a bare integer literal
+    // here, so a modifier is either absent or well-formed. `CURRENT_DATE` is
+    // rejected there too — repeated because a `date` has no fractional seconds
+    // to round, and `apply_datetime_precision` would hand the executor a
+    // `TimeApplyTypmod` over a `date` that it can only panic on.
+    let expr = match keyword_precision(args)? {
+        None => expr,
+        Some(_) if target == Some(PgType::Date) => {
+            return Err(BindError::syntax("syntax error at or near \"(\""));
+        }
+        Some(p) => crate::expr::apply_datetime_precision(expr, p)?,
+    };
+    Ok(Some(Binding::Typed(expr)))
+}
+
+/// The `(p)` of a keyword datetime form, clamped like a written `timestamp(p)`
+/// type modifier — see [`crate::expr::datetime_precision`] for the missing
+/// `WARNING` that clamping inherits.
+fn keyword_precision(args: &ast::FunctionArguments) -> Result<Option<i32>, BindError> {
+    let ast::FunctionArguments::List(list) = args else {
+        return Ok(None);
+    };
+    let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr))] = list.args.as_slice() else {
+        return Err(BindError::syntax("syntax error at or near \"(\""));
+    };
+    let ast::Expr::Value(v) = expr else {
+        return Err(BindError::syntax("syntax error at or near \"(\""));
+    };
+    let ast::Value::Number(digits, _) = &v.value else {
+        return Err(BindError::syntax("syntax error at or near \"(\""));
+    };
+    let p: i64 = digits
+        .parse()
+        .map_err(|_| BindError::syntax("syntax error at or near \"(\""))?;
+    Ok(Some(
+        (p.min(i32::MAX as i64) as i32).min(crabgresql_types::timestamp::MAX_PRECISION),
+    ))
+}
+
 fn finish_func_call(
     func: ScalarFn,
     ret: PgType,

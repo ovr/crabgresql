@@ -9529,20 +9529,28 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
             "23:30:45.5-04",
         ),
         ("SELECT '2024-06-15 03:30:45.5'::timestamp::time", "03:30:45.5"),
-        // `time -> timetz` attaches the zone's *standard* offset; PG uses the
-        // current date's, which this engine has no clock to ask for.
-        ("SELECT '03:30:45.5'::time::timetz", "03:30:45.5-05"),
-        // Every route to a zone-less `timetz` must agree, or the same value
-        // compares unequal to itself: the literal, the text cast and the
-        // `time` widening all take the session zone, scalars and arrays alike.
-        ("SELECT '03:30:45.5'::timetz", "03:30:45.5-05"),
-        ("SELECT '03:30:45.5'::text::timetz", "03:30:45.5-05"),
-        ("SELECT '03:30:45.5'::timetz = '03:30:45.5'::time::timetz", "t"),
-        ("SELECT '{03:30}'::time[]::timetz[]", "{03:30:00-05}"),
-        ("SELECT ARRAY['03:30'::time]::timetz[]", "{03:30:00-05}"),
     ];
     for (sql, want) in cases {
         assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");
+    }
+
+    // A `timetz` with no zone of its own takes the offset the session zone is
+    // at *today*, as PG's `time_timetz` does — so New York gives `-04` in a
+    // summer transaction and `-05` in a winter one. That makes a literal
+    // expectation a test that fails every March, so these assert the two
+    // properties that hold year-round instead: the offset is the one `now()`
+    // reports, and every route to a zone-less `timetz` agrees on it. (The
+    // second matters on its own: when one route disagreed, the same value
+    // compared unequal to itself.)
+    let relative = [
+        "SELECT date_part('timezone', '03:30'::timetz) = date_part('timezone', now())",
+        "SELECT '03:30:45.5'::timetz = '03:30:45.5'::time::timetz",
+        "SELECT '03:30:45.5'::text::timetz = '03:30:45.5'::timetz",
+        "SELECT ('{03:30}'::time[]::timetz[])[1] = '03:30'::timetz",
+        "SELECT (ARRAY['03:30'::time]::timetz[])[1] = '03:30'::timetz",
+    ];
+    for sql in relative {
+        assert_eq!(scalar(&client, sql).await, "t", "for `{sql}`");
     }
     Ok(())
 }
@@ -9563,11 +9571,15 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
 ///
 /// We defer the literal to a runtime `Coerce`, because the binder holds no
 /// session zone to fold with — so the instant is recomputed per execution and
-/// the second row reads `12:00:00-04`, a *different* instant. Closing this means
-/// threading the session's `FmtCtx` into the binder so `resolve_unknown` can
-/// fold; the same change would freeze column defaults and partition bounds at
-/// DDL time, which is where the divergence actually costs data (see the module
-/// comment on `fold_needs_session`).
+/// the second row reads `12:00:00-04`, a *different* instant. The same applies
+/// to `'now'`, which PG likewise freezes at PREPARE.
+///
+/// Closing it takes a **plan cache**, not a session-aware binder: this server
+/// re-binds the statement on every `Execute`, so folding at bind time would
+/// simply re-fold with the new session state. Where the divergence would
+/// actually cost data — a column default — the DDL path resolves the literal
+/// itself, with the session in hand (`zoned_literal_default`), so
+/// `DEFAULT 'now'` freezes at `CREATE TABLE` as PG's does.
 #[tokio::test]
 async fn prepared_statement_diverges_from_pg_on_a_later_set_timezone() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -10519,5 +10531,354 @@ async fn dropping_an_inheritance_parent_needs_cascade() -> anyhow::Result<()> {
         .await?;
     assert_eq!(rows(&msgs)[0].get(0), Some("0"));
 
+    Ok(())
+}
+
+/// Every row a simple query returned, first column only. Unlike [`scalar`],
+/// this keeps the results of *every* statement in a multi-statement message,
+/// which is exactly what the stamping tests need to compare.
+async fn column(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should succeed: {e}"))
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `now()` is fixed for the whole transaction, `statement_timestamp()` for the
+/// whole message, and `clock_timestamp()` for nothing.
+///
+/// The three are asserted by their ordering rather than by elapsed time: the
+/// engine has no `pg_sleep`, and a test that raced the clock would be flaky in
+/// whichever direction the machine was slow.
+#[tokio::test]
+async fn the_clock_functions_are_stable_at_three_different_scopes() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    client.simple_query("BEGIN").await?;
+    let first = scalar(&client, "SELECT now()").await;
+    // Two intervening round trips, so a per-message or per-statement stamp
+    // would have moved by now.
+    client.simple_query("SELECT 1").await?;
+    client.simple_query("SELECT 1").await?;
+    assert_eq!(scalar(&client, "SELECT now()").await, first);
+    assert_eq!(
+        scalar(&client, "SELECT now() = transaction_timestamp()").await,
+        "t"
+    );
+    // Inside a block the statement is later than the transaction, and the wall
+    // clock is later than both.
+    assert_eq!(scalar(&client, "SELECT now() < statement_timestamp()").await, "t");
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT statement_timestamp() <= clock_timestamp()
+                AND clock_timestamp() <= clock_timestamp()"
+        )
+        .await,
+        "t"
+    );
+    client.simple_query("COMMIT").await?;
+
+    // Under autocommit each statement is its own transaction, so the two
+    // coincide — and successive statements move.
+    assert_eq!(
+        scalar(&client, "SELECT now() = statement_timestamp()").await,
+        "t"
+    );
+    let a = scalar(&client, "SELECT now()").await;
+    let b = scalar(&client, "SELECT now()").await;
+    assert_ne!(a, b, "autocommit statements should not share a transaction");
+    Ok(())
+}
+
+/// A statement timestamp belongs to the *message*, not the statement: PG stamps
+/// it once per protocol message, so every statement of a multi-statement simple
+/// query reports the same one — and, since the batch is one implicit
+/// transaction, the same `now()` too.
+#[tokio::test]
+async fn a_multi_statement_query_shares_one_stamp() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    let stamps = column(
+        &client,
+        "SELECT statement_timestamp(); SELECT statement_timestamp(); SELECT statement_timestamp()",
+    )
+    .await;
+    assert_eq!(stamps.len(), 3);
+    assert!(
+        stamps.windows(2).all(|w| w[0] == w[1]),
+        "one message should be one statement timestamp: {stamps:?}"
+    );
+
+    let nows = column(&client, "SELECT now(); SELECT now()").await;
+    assert_eq!(nows[0], nows[1], "one message is one implicit transaction");
+    Ok(())
+}
+
+/// The extended protocol restamps per `Execute`, so a prepared statement run
+/// twice inside a block sees one `now()` and two statement timestamps.
+#[tokio::test]
+async fn the_extended_protocol_restamps_each_execute() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    // `timestamptz` has no binary output routine yet, so ask for text.
+    let stmt = client
+        .prepare("SELECT now()::text, statement_timestamp()::text")
+        .await?;
+
+    client.simple_query("BEGIN").await?;
+    let first = client.query_one(&stmt, &[]).await?;
+    let second = client.query_one(&stmt, &[]).await?;
+    client.simple_query("COMMIT").await?;
+
+    let (now1, stmt1): (String, String) = (first.get(0), first.get(1));
+    let (now2, stmt2): (String, String) = (second.get(0), second.get(1));
+    assert_eq!(now1, now2, "the block's transaction timestamp is frozen");
+    assert_ne!(stmt1, stmt2, "each Execute is its own statement");
+    Ok(())
+}
+
+/// `'now'` is the *transaction* timestamp, to the microsecond — not the
+/// statement's, and not a fresh reading. Everything relative is measured from
+/// the same instant, so the date specials line up with it.
+#[tokio::test]
+async fn the_relative_literals_read_the_transaction_clock() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    client.simple_query("BEGIN").await?;
+    // An intervening statement, so the statement stamp has moved past the
+    // transaction's and the two can be told apart.
+    client.simple_query("SELECT 1").await?;
+    for (sql, want) in [
+        ("SELECT 'now'::timestamptz = now()", "t"),
+        ("SELECT 'now'::timestamptz <> statement_timestamp()", "t"),
+        ("SELECT 'now'::timestamp = now()::timestamp", "t"),
+        ("SELECT 'now'::date = current_date", "t"),
+        ("SELECT 'now'::time = localtime", "t"),
+        ("SELECT 'now'::timetz = current_time", "t"),
+        // The date tokens are fields, so they combine with a time.
+        ("SELECT 'tomorrow'::date - 'today'::date", "1"),
+        ("SELECT 'today'::date - 'yesterday'::date", "1"),
+        ("SELECT 'today 10:00'::timestamp - 'today'::timestamp", "10:00:00"),
+        ("SELECT '10:00 today'::timestamp = 'today 10:00'::timestamp", "t"),
+        ("SELECT 'today'::timestamp = current_date::timestamp", "t"),
+        // `allballs` is midnight, and at a literal `+00` whatever the session
+        // zone — unlike `now`, which takes the session's offset.
+        ("SELECT 'allballs'::time", "00:00:00"),
+        ("SELECT 'allballs'::timetz", "00:00:00+00"),
+    ] {
+        assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");
+    }
+    client.simple_query("COMMIT").await?;
+    Ok(())
+}
+
+/// The specials each type does *not* accept, and the two shapes `now` refuses.
+#[tokio::test]
+async fn the_relative_literals_reject_what_pg_rejects() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    for (sql, want) in [
+        ("SELECT 'today'::time", "invalid input syntax for type time: \"today\""),
+        ("SELECT 'epoch'::time", "invalid input syntax for type time: \"epoch\""),
+        (
+            "SELECT 'allballs'::date",
+            "invalid input syntax for type date: \"allballs\"",
+        ),
+        (
+            "SELECT 'now 10:00'::timestamp",
+            "invalid input syntax for type timestamp: \"now 10:00\"",
+        ),
+        (
+            "SELECT 'today today'::timestamp",
+            "invalid input syntax for type timestamp: \"today today\"",
+        ),
+        (
+            "SELECT '2020-01-01 today'::timestamp",
+            "invalid input syntax for type timestamp: \"2020-01-01 today\"",
+        ),
+    ] {
+        let e = client
+            .simple_query(sql)
+            .await
+            .expect_err(sql)
+            .as_db_error()
+            .expect("a database error")
+            .message()
+            .to_string();
+        assert_eq!(e, want, "for `{sql}`");
+    }
+    Ok(())
+}
+
+/// The `CURRENT_TIMESTAMP` family is exactly a set of casts of `now()`, and its
+/// `(p)` is a grammar slot: an unsigned integer literal or nothing. Both halves
+/// are pinned against PostgreSQL 18.4.
+#[tokio::test]
+async fn the_keyword_datetime_forms_are_casts_of_now() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    for zone in ["UTC", "America/New_York", "Asia/Kolkata"] {
+        client
+            .simple_query(&format!("SET TIME ZONE '{zone}'"))
+            .await?;
+        for sql in [
+            "SELECT current_timestamp = now()",
+            "SELECT current_date = now()::date",
+            "SELECT localtimestamp = now()::timestamp",
+            "SELECT current_time = now()::timetz",
+            "SELECT localtime = now()::time",
+            "SELECT current_timestamp(2) = now()::timestamptz(2)",
+        ] {
+            assert_eq!(scalar(&client, sql).await, "t", "for `{sql}` in {zone}");
+        }
+    }
+
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    // A modifier above 6 clamps, silently — the divergence
+    // `expr::datetime_precision` documents (PG also warns).
+    assert_eq!(
+        scalar(&client, "SELECT current_timestamp(7) = current_timestamp").await,
+        "t"
+    );
+    // Everything the grammar rejects, reported at the token PG blames.
+    for (sql, want) in [
+        ("SELECT current_date(0)", "syntax error at or near \"(\""),
+        ("SELECT current_timestamp(-1)", "syntax error at or near \"-\""),
+        ("SELECT current_timestamp(1+1)", "syntax error at or near \"+\""),
+        ("SELECT current_time(3::int)", "syntax error at or near \"::\""),
+        // `now` *is* a function, so a wrong-arity call is an overload failure.
+        ("SELECT now(0)", "function now(integer) does not exist"),
+    ] {
+        let e = client
+            .simple_query(sql)
+            .await
+            .expect_err(sql)
+            .as_db_error()
+            .expect("a database error")
+            .message()
+            .to_string();
+        assert_eq!(e, want, "for `{sql}`");
+    }
+    Ok(())
+}
+
+/// PostgreSQL evaluates a *literal* default when the DDL runs and stores the
+/// value, so `DEFAULT 'now'` is the moment of `CREATE TABLE`; `DEFAULT now()`
+/// stays a live call. The manual draws exactly this distinction, and it is the
+/// difference between a column that records when the table was made and one
+/// that records when the row was.
+#[tokio::test]
+async fn relative_column_defaults_freeze_but_function_defaults_do_not() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    client
+        .simple_query(
+            "CREATE TABLE d (
+                 frozen_ts    timestamp   DEFAULT 'now',
+                 frozen_date  date        DEFAULT 'tomorrow',
+                 live         timestamptz DEFAULT now(),
+                 keyword      timestamptz DEFAULT current_timestamp(3),
+                 keyword_date date        DEFAULT current_date)",
+        )
+        .await?;
+
+    // What was stored: a resolved literal for the relative ones, the call
+    // itself for the rest — and the keyword forms print back as keywords.
+    let stored = column(
+        &client,
+        "SELECT pg_get_expr(ad.adbin, ad.adrelid)
+           FROM pg_attrdef ad JOIN pg_attribute a
+             ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+          WHERE ad.adrelid = 'd'::regclass
+          ORDER BY a.attnum",
+    )
+    .await;
+    assert!(
+        stored[0].ends_with("::timestamp without time zone") && !stored[0].contains("now"),
+        "DEFAULT 'now' should have frozen into a literal, got {:?}",
+        stored[0]
+    );
+    assert!(
+        stored[1].ends_with("::date") && !stored[1].contains("tomorrow"),
+        "DEFAULT 'tomorrow' should have frozen into a literal, got {:?}",
+        stored[1]
+    );
+    assert_eq!(stored[2], "now()");
+    assert_eq!(stored[3], "CURRENT_TIMESTAMP(3)");
+    assert_eq!(stored[4], "CURRENT_DATE");
+
+    // And what they do: the frozen one repeats, the live one does not.
+    client.simple_query("INSERT INTO d DEFAULT VALUES").await?;
+    client.simple_query("INSERT INTO d DEFAULT VALUES").await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(DISTINCT frozen_ts) FROM d").await,
+        "1"
+    );
+    assert_eq!(scalar(&client, "SELECT count(DISTINCT live) FROM d").await, "2");
+    assert_eq!(
+        scalar(&client, "SELECT frozen_date = current_date + 1 FROM d LIMIT 1").await,
+        "t"
+    );
+    Ok(())
+}
+
+/// `current_date` and the date specials are read in the session zone, so a
+/// `SET TIME ZONE` across the date line moves them together with `now()::date`.
+#[tokio::test]
+async fn the_session_zone_decides_which_day_today_is() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    // Two zones 18.5 hours apart: at some instant every day they disagree about
+    // the date, and at every instant they agree with their own `now()`.
+    for zone in ["Pacific/Midway", "Pacific/Kiritimati"] {
+        client
+            .simple_query(&format!("SET TIME ZONE '{zone}'"))
+            .await?;
+        for sql in [
+            "SELECT current_date = now()::date",
+            "SELECT 'today'::date = current_date",
+            "SELECT 'today'::timestamptz = current_date::timestamptz",
+        ] {
+            assert_eq!(scalar(&client, sql).await, "t", "for `{sql}` in {zone}");
+        }
+    }
+    Ok(())
+}
+
+/// **Known divergence from PostgreSQL**, the `'now'` half of the one above.
+///
+/// PG resolves `'now'` during parse analysis, so a prepared statement freezes
+/// it and every `EXECUTE` — in whatever later transaction — returns the same
+/// instant. Probed against PG 18.4: two executes 0.3 s apart gave one frozen
+/// `'now'` and two different `now()`s. Here both move, because the plan is
+/// re-bound per Execute. See `fold_needs_session` for why closing this needs a
+/// plan cache rather than a session-aware binder.
+#[tokio::test]
+async fn a_prepared_now_literal_is_not_frozen_as_pg_freezes_it() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    let stmt = client
+        .prepare("SELECT ('now'::timestamptz)::text, now()::text")
+        .await?;
+
+    let first = client.query_one(&stmt, &[]).await?;
+    let second = client.query_one(&stmt, &[]).await?;
+    let (lit1, now1): (String, String) = (first.get(0), first.get(1));
+    let (lit2, now2): (String, String) = (second.get(0), second.get(1));
+
+    // Each execute is its own autocommit transaction, so `now()` moves — as it
+    // does in PG.
+    assert_ne!(now1, now2);
+    // PG would hold `lit1 == lit2` here. We track `now()` instead.
+    assert_eq!(lit1, now1);
+    assert_eq!(lit2, now2);
+    assert_ne!(lit1, lit2);
     Ok(())
 }
