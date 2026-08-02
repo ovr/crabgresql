@@ -68,6 +68,62 @@ SELECT table_name, table_type FROM information_schema.tables
  v_alias    | VIEW
 (2 rows)
 
+-- A view's columns carry the type modifier the query's output does: a plain
+-- reference and an explicit cast keep theirs, anything computed loses it.
+CREATE TABLE tm(a varchar(20), b numeric(8,2), c timestamp(3), d char(5),
+                e interval day to second(2));
+CREATE VIEW v_tm AS
+  SELECT a, b, c, d, e,
+         a || 'x' AS cat,
+         (SELECT a) AS sq,
+         a::varchar(9) AS cst,
+         upper(a) AS up,
+         'abc'::varchar(7) AS lit,
+         CASE WHEN true THEN a ELSE a END AS arms
+    FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'v_tm'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |            spelling            
+---------+--------------------------------
+ a       | character varying(20)
+ b       | numeric(8,2)
+ c       | timestamp(3) without time zone
+ d       | character(5)
+ e       | interval day to second(2)
+ cat     | text
+ sq      | character varying(20)
+ cst     | character varying(9)
+ up      | text
+ lit     | character varying(7)
+ arms    | character varying(20)
+(11 rows)
+
+-- A set operation keeps a modifier only when every arm declares the same one.
+CREATE VIEW v_tm_same AS SELECT a FROM tm UNION ALL SELECT a FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'v_tm_same'::regclass AND attnum > 0;
+ attname |       spelling        
+---------+-----------------------
+ a       | character varying(20)
+(1 row)
+
+-- CREATE TABLE AS carries them across the same way.
+CREATE TABLE tm_copy AS SELECT a, b, c, d, e FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'tm_copy'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |            spelling            
+---------+--------------------------------
+ a       | character varying(20)
+ b       | numeric(8,2)
+ c       | timestamp(3) without time zone
+ d       | character(5)
+ e       | interval day to second(2)
+(5 rows)
+
+DROP VIEW v_tm_same;
+DROP VIEW v_tm;
+DROP TABLE tm_copy;
+DROP TABLE tm;
 -- Clean up (this suite shares one database across tests).
 DROP VIEW v_over;
 DROP VIEW v_alias;

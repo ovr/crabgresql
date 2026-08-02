@@ -807,11 +807,10 @@ impl PgType {
     /// Below the threshold PostgreSQL prints the bare type name rather than a
     /// nonsensical `character varying(-2)`.
     ///
-    /// Two deliberate gaps, neither reachable from a crabgresql catalog row
-    /// (both need a modifier this build never stores): `interval`'s modifier
-    /// packs range bits and is printed bare rather than decoded, and
-    /// PostgreSQL's generic fallback for a type with no `typmodout`
-    /// (`format_type(25, 5)` → `text(5)`) is not reproduced.
+    /// One deliberate gap, not reachable from a crabgresql catalog row (it needs
+    /// a modifier this build never stores): PostgreSQL's generic fallback for a
+    /// type with no `typmodout` (`format_type(25, 5)` → `text(5)`) is not
+    /// reproduced.
     pub fn format_type(self, typmod: Option<i32>) -> Option<String> {
         // VARHDRSZ: character types encode `length + 4` (see the catalog's
         // `atttypmod_of`, which is the encoder this decodes).
@@ -845,6 +844,20 @@ impl PgType {
             PgType::TimeTz if m >= 0 => format!("time({m}) with time zone"),
             PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
             PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
+            // `interval` is the one type whose modifier is two things at once:
+            // the fields it admits, spelled out, then the precision.
+            PgType::Interval if m >= 0 => {
+                let (range, precision) = interval::unpack_typmod(m);
+                let mut s = name.to_string();
+                if let Some(fields) = interval::range_name(range) {
+                    s.push(' ');
+                    s.push_str(fields);
+                }
+                if let Some(p) = precision {
+                    s.push_str(&format!("({p})"));
+                }
+                s
+            }
             // Below its type's threshold a modifier prints nothing at all.
             _ => name.to_string(),
         })

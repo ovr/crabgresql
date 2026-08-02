@@ -2096,6 +2096,7 @@ impl Scope {
                             ty: col.expr.ty(),
                             collation,
                             strength,
+                            typmod: expr_typmod(&col.expr, self),
                         },
                         col.expr.clone(),
                     )
@@ -2107,6 +2108,21 @@ impl Scope {
             expand_rel(rel, &mut out);
         }
         out
+    }
+
+    /// The type modifier of the column at a combined-row `index`, or `-1` when
+    /// it has none (or the index is past every relation).
+    pub fn column_typmod(&self, index: usize) -> i32 {
+        typmod_at(&self.rels, index)
+    }
+
+    /// The same, for a correlated reference `level` query levels up (1 = the
+    /// immediate parent).
+    pub fn outer_column_typmod(&self, level: usize, index: usize) -> i32 {
+        match self.outer.get(level.wrapping_sub(1)) {
+            Some(outer) => typmod_at(&outer.rels, index),
+            None => -1,
+        }
     }
 
     /// The `qualifier.name` label of the column at a combined-row `index`, as PG
@@ -2148,6 +2164,7 @@ fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
                 // the type default (mirroring `expr_collation`'s `ColumnRef`
                 // arm).
                 strength: crate::collation::Strength::Implicit,
+                typmod: col.typmod,
             },
             with_column_collation(
                 BoundExpr::ColumnRef {
@@ -2157,6 +2174,110 @@ fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
                 col.collation,
             ),
         ));
+    }
+}
+
+/// The modifier of the column at a combined-row `index` within `rels`, or `-1`
+/// when the index is past every relation.
+fn typmod_at(rels: &[ScopeRel], index: usize) -> i32 {
+    for rel in rels {
+        if index >= rel.offset && index < rel.offset + rel.columns.len() {
+            return rel.columns[index - rel.offset].typmod;
+        }
+    }
+    -1
+}
+
+/// The type modifier a projected expression carries, mirroring PostgreSQL's
+/// `exprTypmod`: a modifier survives a reference and an explicit coercion, and
+/// nothing else. `CREATE VIEW` stores the result on the view's column, so
+/// `\d v` can print `character varying(20)`.
+///
+/// The bound tree already records every coercion — `x::varchar(9)` is a
+/// `FuncCall` whose second argument is the modifier — so this reads them back
+/// rather than needing a slot on [`BoundExpr`]. The exception is a *folded*
+/// constant, where the wrapper is gone by the time we get here; the projection
+/// sites handle that by consulting the AST first (see
+/// [`crate::declared_typmod`]).
+pub(crate) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
+    match expr {
+        BoundExpr::ColumnRef { index, .. } => scope.column_typmod(*index),
+        BoundExpr::OuterColumnRef { level, index, .. } => scope.outer_column_typmod(*level, *index),
+        // Value-transparent wrappers.
+        BoundExpr::Collate { expr, .. } => expr_typmod(expr, scope),
+        BoundExpr::FuncCall { func, args, .. } => {
+            let arg = |i: usize| match args.get(i) {
+                Some(BoundExpr::Const {
+                    value: Value::Int4(n),
+                    ..
+                }) => Some(*n),
+                _ => None,
+            };
+            match func {
+                ScalarFn::VarcharTypmod
+                | ScalarFn::BpcharTypmod
+                | ScalarFn::BitTypmod
+                | ScalarFn::VarbitTypmod
+                | ScalarFn::TimeApplyTypmod
+                | ScalarFn::IntervalTypmod => arg(1).unwrap_or(-1),
+                // `numeric` is the one modifier that packs two numbers, and it
+                // travels as two separate arguments at run time.
+                ScalarFn::NumApplyTypmod => match (arg(1), arg(2)) {
+                    (Some(p), Some(s)) => Numeric::pack_typmod(p, s),
+                    _ => -1,
+                },
+                _ => -1,
+            }
+        }
+        // `CASE` (which is also how `COALESCE` is lowered) keeps a modifier only
+        // when every arm agrees on it, as PostgreSQL's `select_common_typmod`
+        // does.
+        BoundExpr::Case { whens, else_, .. } => {
+            let arms = whens
+                .iter()
+                .map(|(_, result)| result)
+                .chain(else_.as_deref());
+            common_typmod(arms.map(|arm| expr_typmod(arm, scope)))
+        }
+        // A scalar subquery reports its single output column's modifier.
+        BoundExpr::ScalarSubquery { subplan, .. } => crate::plan::output_columns_of(&subplan.0)
+            .ok()
+            .and_then(|columns| columns.first().map(|c| c.typmod))
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
+/// The type modifier a projected select-list item carries.
+///
+/// A top-level cast is read off the *written* type name rather than the bound
+/// tree, because a cast over a constant folds away at bind time and takes the
+/// modifier with it — PostgreSQL keeps it (`select 'abc'::varchar(9)` in a view
+/// is a `character varying(9)` column), and reading the AST is how we do too.
+/// Everything else comes from [`expr_typmod`].
+pub(crate) fn projection_typmod(expr: &ast::Expr, bound: &BoundExpr, scope: &Scope) -> i32 {
+    if let ast::Expr::Cast { data_type, .. } = expr {
+        // A modifier that failed its range check already errored while binding
+        // the cast itself, so an error here cannot happen; treat it as "none"
+        // rather than duplicating the diagnostic.
+        if let Ok(Some(m)) = declared_typmod(bound.ty(), data_type) {
+            return m;
+        }
+        return -1;
+    }
+    expr_typmod(bound, scope)
+}
+
+/// The modifier a set of alternatives share, or `-1` if they disagree (or there
+/// are none).
+pub(crate) fn common_typmod(mut typmods: impl Iterator<Item = i32>) -> i32 {
+    let Some(first) = typmods.next() else {
+        return -1;
+    };
+    if first >= 0 && typmods.all(|m| m == first) {
+        first
+    } else {
+        -1
     }
 }
 
@@ -3682,6 +3803,92 @@ pub fn datetime_precision(dt: &ast::DataType) -> Option<i32> {
     Some((p as i32).min(crabgresql_types::timestamp::MAX_PRECISION))
 }
 
+/// The packed modifier of an `interval` type name — the admitted fields and the
+/// fractional-second precision in one `i32`, as `pg_attribute.atttypmod` stores
+/// them. `None` for a bare `interval`, which has no modifier at all.
+///
+/// Like the other datetime types, a precision above 6 is clamped (PostgreSQL
+/// also warns; see [`datetime_precision`]). The grammar already rejects a
+/// precision on a range that does not reach `SECOND`, so that combination cannot
+/// arrive here.
+pub fn interval_typmod(dt: &ast::DataType) -> Option<i32> {
+    use ast::{DataType, IntervalFields as F};
+    use crabgresql_types::interval as iv;
+
+    let DataType::Interval { fields, precision } = dt else {
+        return None;
+    };
+    let range = match fields {
+        None => iv::FULL_RANGE,
+        Some(F::Year) => iv::MASK_YEAR,
+        Some(F::Month) => iv::MASK_MONTH,
+        Some(F::Day) => iv::MASK_DAY,
+        Some(F::Hour) => iv::MASK_HOUR,
+        Some(F::Minute) => iv::MASK_MINUTE,
+        Some(F::Second) => iv::MASK_SECOND,
+        Some(F::YearToMonth) => iv::MASK_YEAR | iv::MASK_MONTH,
+        Some(F::DayToHour) => iv::MASK_DAY | iv::MASK_HOUR,
+        Some(F::DayToMinute) => iv::MASK_DAY | iv::MASK_HOUR | iv::MASK_MINUTE,
+        Some(F::DayToSecond) => iv::MASK_DAY | iv::MASK_HOUR | iv::MASK_MINUTE | iv::MASK_SECOND,
+        Some(F::HourToMinute) => iv::MASK_HOUR | iv::MASK_MINUTE,
+        Some(F::HourToSecond) => iv::MASK_HOUR | iv::MASK_MINUTE | iv::MASK_SECOND,
+        Some(F::MinuteToSecond) => iv::MASK_MINUTE | iv::MASK_SECOND,
+    };
+    // `interval` with neither fields nor precision carries no modifier, exactly
+    // as an undecorated column does.
+    if fields.is_none() && precision.is_none() {
+        return None;
+    }
+    let p = precision.map(|p| (p as i32).min(crabgresql_types::timestamp::MAX_PRECISION) as u8);
+    Some(iv::pack_typmod(range, p))
+}
+
+/// The type modifier a written-out type name declares, in the raw encoding
+/// [`crabgresql_storage_api::Column::typmod`] uses. `None` when the name carries
+/// no modifier.
+///
+/// These are the *checked* readers, not the bare ones: an out-of-range modifier
+/// would otherwise be stored on a column and later overflow
+/// `pg_attribute.atttypmod`. `numeric` packs two numbers into the one slot;
+/// `interval` packs its admitted fields alongside the precision; every other
+/// modifier is a bare length or fractional-second precision.
+pub fn declared_typmod(ty: PgType, dt: &ast::DataType) -> Result<Option<i32>, BindError> {
+    Ok(match ty {
+        PgType::Numeric => checked_numeric_typmod(dt)?.map(|(p, s)| Numeric::pack_typmod(p, s)),
+        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            datetime_precision(dt)
+        }
+        PgType::Interval => interval_typmod(dt),
+        _ => checked_length_typmod(dt)?,
+    })
+}
+
+/// Coerce `expr` to an `interval` modifier, folding a constant at bind time.
+/// Cast and assignment context coerce identically, so this serves both.
+fn apply_interval_typmod(expr: BoundExpr, typmod: i32) -> BoundExpr {
+    if let BoundExpr::Const {
+        value: Value::Interval(iv),
+        ty,
+    } = &expr
+    {
+        return BoundExpr::Const {
+            value: Value::Interval(crabgresql_types::interval::apply_typmod(*iv, typmod)),
+            ty: *ty,
+        };
+    }
+    BoundExpr::FuncCall {
+        func: ScalarFn::IntervalTypmod,
+        ret: PgType::Interval,
+        args: vec![
+            expr,
+            BoundExpr::Const {
+                value: Value::Int4(typmod),
+                ty: PgType::Int4,
+            },
+        ],
+    }
+}
+
 /// Round `expr` to a datetime type's fractional-second precision, folding a
 /// constant at bind time. Cast and assignment context round identically, so this
 /// serves both.
@@ -3751,6 +3958,10 @@ pub(crate) fn apply_length_typmod_if_any(
                 None => return Ok(expr),
             }
         }
+        PgType::Interval => match interval_typmod(data_type) {
+            Some(m) => return Ok(apply_interval_typmod(expr, m)),
+            None => return Ok(expr),
+        },
         // `"char"` takes no modifier and PG rejects one rather than ignoring
         // it, so this target still has to run the check even though it never
         // yields a typmod — the DDL path reaches `checked_length_typmod`
@@ -3822,6 +4033,14 @@ pub(crate) fn apply_length_typmod_if_any(
 /// `interval '...'` (with an optional SQL-standard field qualifier). The
 /// literal string is parsed by `interval_in`; a leading field (`INTERVAL '1'
 /// DAY`) sets the default unit for a bare number, and any precision is ignored.
+///
+/// Divergence: in PostgreSQL the qualifier also *steers the parse* of a
+/// punctuated literal — `interval '1 2:03' day to second` is `1 day 02:03:00`
+/// while `interval '1 2:03' hour to second` reads the same text as `mm:ss`. Here
+/// the qualifier only picks the default unit for a bare number, so those two
+/// spellings still agree. That lives inside `interval_in`, not in the type
+/// modifier ([`interval_typmod`]), and is why `interval` is not yet an
+/// upstream must-pass test.
 fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     let (s, span) = match &*node.value {
         ast::Expr::Value(v) => match v.value.as_pg_string() {
@@ -8719,6 +8938,7 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
             PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
                 return apply_datetime_precision(expr, column.typmod);
             }
+            PgType::Interval => return Ok(apply_interval_typmod(expr, column.typmod)),
             _ => {}
         }
     }

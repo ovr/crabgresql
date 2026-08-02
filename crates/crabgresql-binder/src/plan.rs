@@ -1947,11 +1947,27 @@ fn unify_set_columns(
             }
             None => (None, crate::collation::Strength::None),
         };
+        // A modifier survives a set operation only when every contributing arm
+        // declares the same one on the same type, as PG's `select_common_typmod`
+        // requires: `varchar(20) UNION varchar(20)` stays `character
+        // varying(20)`, `varchar(20) UNION char(5)` goes bare.
+        let merged_typmod = crate::expr::common_typmod(
+            arms.iter()
+                .filter(|(plan, _)| !is_null_literal_column(plan, i))
+                .map(|(_, cols)| {
+                    if cols[i].ty == merged_ty {
+                        cols[i].typmod
+                    } else {
+                        -1
+                    }
+                }),
+        );
         columns.push(OutputColumn {
             name: first.name.clone(),
             ty: merged_ty,
             collation,
             strength,
+            typmod: merged_typmod,
         });
     }
     Ok(columns)
@@ -2558,7 +2574,7 @@ fn to_columns(columns: &[OutputColumn]) -> Vec<Column> {
     columns
         .iter()
         .map(|c| {
-            let mut col = Column::new(c.name.clone(), c.ty);
+            let mut col = Column::with_typmod(c.name.clone(), c.ty, c.typmod);
             col.collation = c.collation;
             col
         })
@@ -2849,6 +2865,7 @@ fn bind_from_item(
                             // whether or not its collation equals the type
                             // default.
                             strength: crate::collation::Strength::Implicit,
+                            typmod: c.typmod,
                         })
                         .collect();
                     // A relation whose rows live in several places is read as a
@@ -4101,6 +4118,7 @@ fn bind_values_select(
             ty: bound.ty(),
             collation,
             strength,
+            typmod: crate::expr::projection_typmod(expr, &bound, &scope),
         });
         row.push(bound);
     }
@@ -4272,6 +4290,7 @@ fn bind_target_list(items: &[ast::SelectItem], scope: &Scope) -> Result<Returnin
                     ty: bound.ty(),
                     collation,
                     strength,
+                    typmod: crate::expr::projection_typmod(expr, &bound, scope),
                 });
                 projections.push(bound);
             }

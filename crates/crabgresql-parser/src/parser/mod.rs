@@ -11719,7 +11719,19 @@ impl<'a> Parser<'a> {
                 Keyword::INTERVAL => {
                     if self.dialect.supports_interval_options() {
                         let fields = self.maybe_parse_optional_interval_fields()?;
-                        let precision = self.parse_optional_precision()?;
+                        // A precision may only follow a range that reaches
+                        // SECOND (or no range at all) — `interval year(3)` is a
+                        // syntax error in PostgreSQL, not a `(3)` to ignore.
+                        let precision = match fields {
+                            None
+                            | Some(
+                                IntervalFields::Second
+                                | IntervalFields::DayToSecond
+                                | IntervalFields::HourToSecond
+                                | IntervalFields::MinuteToSecond,
+                            ) => self.parse_optional_precision()?,
+                            Some(_) => None,
+                        };
                         Ok(DataType::Interval { fields, precision })
                     } else {
                         Ok(DataType::Interval {

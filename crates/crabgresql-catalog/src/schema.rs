@@ -866,17 +866,13 @@ pub fn pg_attribute_schema() -> TableSchema {
 
 /// PostgreSQL's `atttypmod` encoding of a column's declared modifier, from the
 /// raw form crabgresql stores in [`Column::typmod`] (a bare length for the
-/// character/bit types, the packed `(precision, scale)` for `numeric`, a bare
-/// precision for the datetime types, `-1` for none). `character`/`character
-/// varying`/`numeric` reserve four bytes for the varlena header (`raw +
-/// VARHDRSZ`); the fixed-width types store their modifier directly. Keeping this
-/// the true PostgreSQL encoding lets `format_type(atttypid, atttypmod)` reproduce
-/// PG's `\d` type strings.
-///
-/// One modifier still does not survive to here, upstream of this function: a
-/// **view**'s columns record their output type without a modifier
-/// (`OutputColumn` carries no typmod), so `\d v` prints `character varying`
-/// where PostgreSQL prints `character varying(20)`.
+/// character/bit types, the packed `(precision, scale)` for `numeric`, the
+/// packed `(fields, precision)` for `interval`, a bare precision for the other
+/// datetime types, `-1` for none). `character`/`character varying`/`numeric`
+/// reserve four bytes for the varlena header (`raw + VARHDRSZ`); the fixed-width
+/// types store their modifier directly. Keeping this the true PostgreSQL
+/// encoding lets `format_type(atttypid, atttypmod)` reproduce PG's `\d` type
+/// strings.
 ///
 /// The addition saturates rather than wrapping: DDL rejects a length beyond
 /// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]) and a
@@ -1390,13 +1386,35 @@ pub fn information_schema_columns_rows(
                         PgType::Float8 => (Value::Int4(53), Value::Int4(2)),
                         _ => (Value::Null, Value::Null),
                     };
-                    let datetime_precision = match column.ty {
-                        PgType::Time
-                        | PgType::TimeTz
-                        | PgType::Timestamp
-                        | PgType::TimestampTz
-                        | PgType::Interval => Value::Int4(6),
-                        _ => Value::Null,
+                    // `datetime_precision` is the declared fractional-second
+                    // precision, defaulting to the 6 every datetime type keeps.
+                    // `interval_type` names the fields the modifier admits,
+                    // uppercased and with the precision appended
+                    // (`DAY TO SECOND(4)`); a full-range `interval(3)` reports
+                    // NULL there and carries its precision only in
+                    // `datetime_precision`.
+                    let (datetime_precision, interval_type) = match column.ty {
+                        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+                            let p = if column.typmod >= 0 { column.typmod } else { 6 };
+                            (Value::Int4(p), Value::Null)
+                        }
+                        PgType::Interval => {
+                            let (range, precision) =
+                                crabgresql_types::interval::unpack_typmod(column.typmod);
+                            let spelling =
+                                crabgresql_types::interval::range_name(range).map(|fields| {
+                                    let mut s = fields.to_ascii_uppercase();
+                                    if let Some(p) = precision {
+                                        s.push_str(&format!("({p})"));
+                                    }
+                                    Value::Text(s)
+                                });
+                            (
+                                Value::Int4(precision.map_or(6, i32::from)),
+                                spelling.unwrap_or(Value::Null),
+                            )
+                        }
+                        _ => (Value::Null, Value::Null),
                     };
                     // PG's view joins pg_collation but excludes
                     // `pg_catalog.default`, so a column left on the database
@@ -1432,8 +1450,10 @@ pub fn information_schema_columns_rows(
                         // numeric_scale
                         Value::Null,
                         datetime_precision,
-                        // interval_type, interval_precision
-                        Value::Null,
+                        interval_type,
+                        // `interval_precision` is always NULL in PostgreSQL too:
+                        // an interval's precision is reported through
+                        // `datetime_precision` instead.
                         Value::Null,
                         // character_set_{catalog,schema,name}
                         Value::Null,

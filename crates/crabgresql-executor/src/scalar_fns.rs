@@ -757,6 +757,12 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 other => unreachable!("expected a datetime arg, got {other:?}"),
             });
         }
+        ScalarFn::IntervalTypmod => {
+            return Ok(match &args[0] {
+                Value::Interval(iv) => Value::Interval(interval::apply_typmod(*iv, i4(&args[1]))),
+                other => unreachable!("expected an interval arg, got {other:?}"),
+            });
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {

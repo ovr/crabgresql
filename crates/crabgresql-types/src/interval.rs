@@ -303,6 +303,135 @@ pub(crate) fn split_time(usec: i64) -> (i64, i64, i64, i64) {
     (hour, min, sec, fsec)
 }
 
+// --- type modifier (interval(p), interval <fields>) ------------------------
+//
+// An interval's modifier carries two things at once: which *fields* the type
+// admits (`interval day to second`) and the fractional-second precision
+// (`interval(3)`). They pack into one `i32` as `(range << 16) | precision`,
+// with `NO_PRECISION` in the low half meaning "not specified". The bit values
+// were read back off a real PostgreSQL 18.4 catalog (`atttypmod` for a column of
+// each of the fourteen spellings), not taken from its source.
+
+/// Range bits, one per field the type admits.
+pub const MASK_MONTH: u16 = 1 << 1;
+pub const MASK_YEAR: u16 = 1 << 2;
+pub const MASK_DAY: u16 = 1 << 3;
+pub const MASK_HOUR: u16 = 1 << 10;
+pub const MASK_MINUTE: u16 = 1 << 11;
+pub const MASK_SECOND: u16 = 1 << 12;
+
+/// The range a bare `interval(p)` gets: every field admitted.
+pub const FULL_RANGE: u16 = 0x7FFF;
+
+/// The low half of a modifier when no precision was written.
+const NO_PRECISION: u16 = 0xFFFF;
+
+/// Pack a range mask and an optional precision into one modifier.
+pub fn pack_typmod(range: u16, precision: Option<u8>) -> i32 {
+    let p = precision.map_or(NO_PRECISION, u16::from);
+    ((range as i32) << 16) | (p as i32)
+}
+
+/// Split a modifier back into its range mask and precision. A negative modifier
+/// (no modifier at all) yields the full range and no precision.
+pub fn unpack_typmod(typmod: i32) -> (u16, Option<u8>) {
+    if typmod < 0 {
+        return (FULL_RANGE, None);
+    }
+    let range = ((typmod >> 16) & 0x7FFF) as u16;
+    let p = (typmod & 0xFFFF) as u16;
+    let precision = if p == NO_PRECISION {
+        None
+    } else {
+        Some(p.min(crate::timestamp::MAX_PRECISION as u16) as u8)
+    };
+    (range, precision)
+}
+
+/// How a range mask spells itself in `format_type`, e.g. `day to second`.
+/// `None` for the full range and for any combination PostgreSQL does not name,
+/// both of which print as a bare `interval`.
+pub fn range_name(range: u16) -> Option<&'static str> {
+    Some(match range {
+        MASK_YEAR => "year",
+        MASK_MONTH => "month",
+        MASK_DAY => "day",
+        MASK_HOUR => "hour",
+        MASK_MINUTE => "minute",
+        MASK_SECOND => "second",
+        r if r == MASK_YEAR | MASK_MONTH => "year to month",
+        r if r == MASK_DAY | MASK_HOUR => "day to hour",
+        r if r == MASK_DAY | MASK_HOUR | MASK_MINUTE => "day to minute",
+        r if r == MASK_DAY | MASK_HOUR | MASK_MINUTE | MASK_SECOND => "day to second",
+        r if r == MASK_HOUR | MASK_MINUTE => "hour to minute",
+        r if r == MASK_HOUR | MASK_MINUTE | MASK_SECOND => "hour to second",
+        r if r == MASK_MINUTE | MASK_SECOND => "minute to second",
+        _ => return None,
+    })
+}
+
+/// Coerce `iv` to what its declared modifier admits.
+///
+/// The *lowest* field in the range decides everything; fields above it are left
+/// alone. `interval year` keeps whole years and drops the rest, `interval hour`
+/// truncates the time toward zero at the hour, and a range reaching `second`
+/// rounds the fractional part to the declared precision (half away from zero,
+/// like [`crate::timestamp::apply_typmod`]). Verified against PostgreSQL 18.4:
+/// `interval '1 year 2 months 3 days 4:05:06.789'` cast to `interval year` is
+/// `1 year`, to `interval hour` is `1 year 2 mons 3 days 04:00:00`, and to
+/// `interval minute to second(0)` is `1 year 2 mons 3 days 04:05:07`.
+///
+/// A negative modifier, an unnamed bit combination, or a non-finite value all
+/// leave the interval unchanged.
+pub fn apply_typmod(iv: Interval, typmod: i32) -> Interval {
+    if typmod < 0 || !iv.is_finite() {
+        return iv;
+    }
+    let (range, precision) = unpack_typmod(typmod);
+    if range == FULL_RANGE {
+        return round_usec(iv, precision);
+    }
+    // Truncate at the lowest admitted field, then round if that field is
+    // `second`. `%` truncating toward zero is what makes a negative interval
+    // truncate toward zero too (`-1 day -2:30` as `interval hour` keeps
+    // `-02:00:00`).
+    let mut out = iv;
+    if range & MASK_SECOND != 0 {
+        return round_usec(out, precision);
+    }
+    if range & MASK_MINUTE != 0 {
+        out.usec -= out.usec % USECS_PER_MINUTE;
+    } else if range & MASK_HOUR != 0 {
+        out.usec -= out.usec % USECS_PER_HOUR;
+    } else if range & MASK_DAY != 0 {
+        out.usec = 0;
+    } else if range & MASK_MONTH != 0 {
+        out.days = 0;
+        out.usec = 0;
+    } else if range & MASK_YEAR != 0 {
+        out.months -= out.months % MONTHS_PER_YEAR as i32;
+        out.days = 0;
+        out.usec = 0;
+    }
+    out
+}
+
+fn round_usec(mut iv: Interval, precision: Option<u8>) -> Interval {
+    let Some(p) = precision else { return iv };
+    let p = p as i32;
+    if !(0..crate::timestamp::MAX_PRECISION).contains(&p) {
+        return iv;
+    }
+    let scale = 10_i64.pow((crate::timestamp::MAX_PRECISION - p) as u32);
+    let half = scale / 2;
+    iv.usec = if iv.usec >= 0 {
+        (iv.usec + half) / scale * scale
+    } else {
+        -((-iv.usec + half) / scale * scale)
+    };
+    iv
+}
+
 // --- comparison ------------------------------------------------------------
 
 /// Total order over intervals: `-infinity < finite < +infinity`, finite values
@@ -1168,6 +1297,152 @@ mod tests {
     }
     fn out(s: &str) -> String {
         format(iv(s))
+    }
+
+    /// Every spelling of the modifier, with the `atttypmod` PostgreSQL 18.4
+    /// stores for a column declared that way.
+    const TYPMOD_CASES: &[(&str, i32, u16, Option<u8>)] = &[
+        ("interval(3)", 2147418115, FULL_RANGE, Some(3)),
+        ("interval year", 327679, MASK_YEAR, None),
+        ("interval month", 196607, MASK_MONTH, None),
+        ("interval day", 589823, MASK_DAY, None),
+        ("interval hour", 67174399, MASK_HOUR, None),
+        ("interval minute", 134283263, MASK_MINUTE, None),
+        ("interval second", 268500991, MASK_SECOND, None),
+        ("interval second(2)", 268435458, MASK_SECOND, Some(2)),
+        (
+            "interval year to month",
+            458751,
+            MASK_YEAR | MASK_MONTH,
+            None,
+        ),
+        ("interval day to hour", 67698687, MASK_DAY | MASK_HOUR, None),
+        (
+            "interval day to minute",
+            201916415,
+            MASK_DAY | MASK_HOUR | MASK_MINUTE,
+            None,
+        ),
+        (
+            "interval day to second",
+            470351871,
+            MASK_DAY | MASK_HOUR | MASK_MINUTE | MASK_SECOND,
+            None,
+        ),
+        (
+            "interval day to second(4)",
+            470286340,
+            MASK_DAY | MASK_HOUR | MASK_MINUTE | MASK_SECOND,
+            Some(4),
+        ),
+        (
+            "interval hour to minute",
+            201392127,
+            MASK_HOUR | MASK_MINUTE,
+            None,
+        ),
+        (
+            "interval hour to second",
+            469827583,
+            MASK_HOUR | MASK_MINUTE | MASK_SECOND,
+            None,
+        ),
+        (
+            "interval hour to second(1)",
+            469762049,
+            MASK_HOUR | MASK_MINUTE | MASK_SECOND,
+            Some(1),
+        ),
+        (
+            "interval minute to second",
+            402718719,
+            MASK_MINUTE | MASK_SECOND,
+            None,
+        ),
+        (
+            "interval minute to second(0)",
+            402653184,
+            MASK_MINUTE | MASK_SECOND,
+            Some(0),
+        ),
+    ];
+
+    #[test]
+    fn typmod_round_trips_postgres_atttypmod() {
+        for &(spelling, typmod, range, precision) in TYPMOD_CASES {
+            assert_eq!(pack_typmod(range, precision), typmod, "packing {spelling}");
+            assert_eq!(
+                unpack_typmod(typmod),
+                (range, precision),
+                "unpacking {spelling}"
+            );
+        }
+        // No modifier at all reads as "everything, unspecified precision", and
+        // applying it is a no-op.
+        assert_eq!(unpack_typmod(-1), (FULL_RANGE, None));
+    }
+
+    #[test]
+    fn typmod_names_its_fields() {
+        for &(spelling, typmod, range, precision) in TYPMOD_CASES {
+            let mut rendered = "interval".to_string();
+            if let Some(fields) = range_name(range) {
+                rendered = format!("{rendered} {fields}");
+            }
+            if let Some(p) = precision {
+                rendered = format!("{rendered}({p})");
+            }
+            assert_eq!(rendered, spelling, "typmod {typmod}");
+        }
+        assert_eq!(range_name(FULL_RANGE), None);
+    }
+
+    /// The lowest admitted field decides what survives; the fields above it are
+    /// untouched. Values from PostgreSQL 18.4.
+    #[test]
+    fn typmod_coerces_the_value() {
+        let src = iv("1 year 2 months 3 days 4:05:06.789");
+        let apply = |range, precision| format(apply_typmod(src, pack_typmod(range, precision)));
+
+        assert_eq!(apply(MASK_YEAR, None), "1 year");
+        assert_eq!(apply(MASK_MONTH, None), "1 year 2 mons");
+        assert_eq!(apply(MASK_YEAR | MASK_MONTH, None), "1 year 2 mons");
+        assert_eq!(apply(MASK_DAY, None), "1 year 2 mons 3 days");
+        assert_eq!(apply(MASK_HOUR, None), "1 year 2 mons 3 days 04:00:00");
+        assert_eq!(apply(MASK_MINUTE, None), "1 year 2 mons 3 days 04:05:00");
+        assert_eq!(
+            apply(MASK_SECOND, None),
+            "1 year 2 mons 3 days 04:05:06.789"
+        );
+        assert_eq!(
+            apply(MASK_MINUTE | MASK_SECOND, Some(0)),
+            "1 year 2 mons 3 days 04:05:07"
+        );
+        assert_eq!(
+            apply(MASK_DAY | MASK_HOUR | MASK_MINUTE | MASK_SECOND, Some(2)),
+            "1 year 2 mons 3 days 04:05:06.79"
+        );
+
+        // Rounding is half away from zero, and truncation is toward zero, so a
+        // negative interval mirrors the positive one rather than drifting down.
+        let round = |s: &str, p| format(apply_typmod(iv(s), pack_typmod(FULL_RANGE, Some(p))));
+        assert_eq!(round("0.005 sec", 2), "00:00:00.01");
+        assert_eq!(round("-0.005 sec", 2), "-00:00:00.01");
+        assert_eq!(round("0.015 sec", 2), "00:00:00.02");
+        assert_eq!(
+            format(apply_typmod(
+                iv("-1 day -2:30:00"),
+                pack_typmod(MASK_HOUR, None)
+            )),
+            "-1 days -02:00:00"
+        );
+
+        // `±infinity` and "no modifier" pass through untouched.
+        assert_eq!(
+            apply_typmod(POS_INFINITY, pack_typmod(MASK_YEAR, None)),
+            POS_INFINITY
+        );
+        assert_eq!(apply_typmod(src, -1), src);
     }
 
     #[test]
