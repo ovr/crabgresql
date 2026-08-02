@@ -10246,6 +10246,68 @@ mod tests {
         assert_eq!(err.message, "could not determine data type of parameter $1");
     }
 
+    /// `pg_typeof` reads its argument's type without evaluating it, so it gives
+    /// a bare `$n` no context to be typed from and has to give up on the spot.
+    #[test]
+    fn pg_typeof_of_an_untyped_param_is_42p18() {
+        let err = param_err("SELECT pg_typeof($1)", vec![]);
+        assert_eq!(err.code, "42P18");
+        assert_eq!(err.message, "could not determine data type of parameter $1");
+        // A declared parameter has a type to report, so it binds.
+        assert!(
+            bind_params("SELECT pg_typeof($1)", vec![Some(PgType::Int4)])
+                .0
+                .is_ok()
+        );
+    }
+
+    /// The argument collapses to its type's OID at bind time — the expression
+    /// itself is never evaluated, and no modifier survives into the `regtype`.
+    #[test]
+    fn pg_typeof_binds_to_the_argument_type_oid() {
+        use crate::ScalarFn;
+        use crabgresql_types::{RegKind, Value, oid};
+        let oid_of = |sql: &str| {
+            let LogicalPlan::Values { rows, .. } = bound(sql) else {
+                panic!("expected a FROM-less SELECT for: {sql}");
+            };
+            let BoundExpr::FuncCall { func, ret, args } = &rows[0][0] else {
+                panic!("expected a FuncCall for: {sql}");
+            };
+            assert_eq!(*func, ScalarFn::RegFromOid(RegKind::Type));
+            assert_eq!(*ret, PgType::Reg(RegKind::Type));
+            let BoundExpr::Const {
+                value: Value::Oid(o),
+                ..
+            } = &args[0]
+            else {
+                panic!("expected a folded OID const for: {sql}");
+            };
+            *o
+        };
+        assert_eq!(oid_of("SELECT pg_typeof(1)"), PgType::Int4.oid());
+        assert_eq!(
+            oid_of("SELECT pg_typeof('2020-01-01'::timestamptz)"),
+            PgType::TimestampTz.oid()
+        );
+        // The typmod is not part of the OID, so it cannot be reported.
+        assert_eq!(
+            oid_of("SELECT pg_typeof(1::numeric(10,2))"),
+            PgType::Numeric.oid()
+        );
+        // An untyped literal is genuinely `unknown`, not text.
+        assert_eq!(oid_of("SELECT pg_typeof('abc')"), oid::UNKNOWN);
+        assert_eq!(oid_of("SELECT pg_typeof(NULL)"), oid::UNKNOWN);
+
+        // Only unary.
+        let err = bind_err("SELECT pg_typeof(1, 2)");
+        assert_eq!(err.code, "42883");
+        assert_eq!(
+            err.message,
+            "function pg_typeof(integer, integer) does not exist"
+        );
+    }
+
     #[test]
     fn conflicting_param_deductions_are_42p18() {
         // `$1 IN (big, name)` clones the still-untyped `$1` for each comparison,

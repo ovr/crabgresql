@@ -13,7 +13,7 @@ use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{RoutineImpl, RoutineKind, RoutineSig, TypeCatalog};
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
-use crabgresql_types::{PgType, RegKind};
+use crabgresql_types::{PgType, RegKind, Value};
 
 use crate::expr::{
     Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
@@ -2926,7 +2926,61 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return Ok(binding);
     }
 
+    // `pg_typeof(any)` accepts every type, so it has no fixed signature either.
+    if name == "pg_typeof" {
+        return bind_pg_typeof(&bindings);
+    }
+
     resolve_call(&name, bindings, scope.catalog())
+}
+
+/// Bind `pg_typeof(any) -> regtype`, which reports its argument's type.
+///
+/// The result depends only on the argument's *static* type, so the argument is
+/// never evaluated: it collapses to the OID, and the existing
+/// [`ScalarFn::RegFromOid`] renders that as a name at run time. Going through
+/// the catalog rather than folding the name in here is what makes a user type
+/// print correctly, and keeps a prepared statement honest if the type is
+/// renamed between bind and execute.
+///
+/// Note the reported type carries no modifier — `pg_typeof(1::numeric(10,2))`
+/// is `numeric`, not `numeric(10,2)` — because a `regtype` is only an OID.
+fn bind_pg_typeof(bindings: &[Binding]) -> Result<Binding, BindError> {
+    let [binding] = bindings else {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "function pg_typeof({}) does not exist",
+                call_type_list(bindings)
+            ),
+        ));
+    };
+    let oid = match binding {
+        Binding::Typed(expr) => expr.ty().oid(),
+        // A `$n` still awaiting context has no type to report, and unlike an
+        // ordinary call site `pg_typeof` gives it none, so PG gives up here
+        // rather than at Describe time.
+        Binding::Unknown {
+            param: Some((index, _)),
+            ..
+        } => {
+            return Err(BindError::new(
+                "42P18",
+                format!("could not determine data type of parameter ${}", index + 1),
+            ));
+        }
+        // A bare literal or `NULL` really is of type `unknown`; PG reports that
+        // rather than resolving it to text the way most call sites would.
+        Binding::Unknown { .. } => crabgresql_types::oid::UNKNOWN,
+    };
+    finish_func_call(
+        ScalarFn::RegFromOid(RegKind::Type),
+        PgType::Reg(RegKind::Type),
+        vec![BoundExpr::Const {
+            value: Value::Oid(oid),
+            ty: PgType::Oid,
+        }],
+    )
 }
 
 /// Bind a call carrying an `OVER` clause to a transient

@@ -116,6 +116,10 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
     /// `jsonpath`: an SQL/JSON path expression. See [`crate::jsonpath`].
     pub const JSONPATH: u32 = 4072;
+    /// `unknown`: the type of a literal that has not yet been resolved. It has
+    /// no [`crate::PgType`] of its own — the binder models it as
+    /// `Binding::Unknown` — but `pg_typeof` and `705::regtype` have to name it.
+    pub const UNKNOWN: u32 = 705;
     /// `regclass`: an OID that renders as a relation name. See [`crate::Reg`].
     pub const REGCLASS: u32 = 2205;
     /// `regtype`: an OID that renders as a type name. See [`crate::Reg`].

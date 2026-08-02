@@ -205,9 +205,10 @@ SELECT date_bin(interval '5 years', timestamptz '2020-02-01 01:01:01+00', timest
 SELECT date_bin(interval '0 days', timestamptz '2020-02-01 01:01:01+00', timestamptz '2001-01-01+00');
 SELECT date_bin(interval '200000000 days', timestamptz '2024-02-01+00', timestamptz '2024-01-01+00');
 -- overload resolution: untyped literals reach the preferred type (timestamptz),
--- and so do two `date` arguments. The trailing +00 is what says timestamptz won
--- — the timestamp overload would render without an offset.
-SELECT date_bin('1 h', '2020-01-05 05:30', '2001-01-01') AS unknown_args,
-       date_bin(interval '1 h', date '2020-01-05', date '2001-01-01') AS date_args,
-       date_bin(interval '1 h', timestamp '2020-01-05 05:30', timestamp '2001-01-01') AS ts_args;
+-- and so do two `date` arguments; only a genuine timestamp pair picks the
+-- timestamp overload
+SELECT pg_typeof(date_bin('1 h', '2020-01-05 05:30', '2001-01-01')) AS unknown_args,
+       pg_typeof(date_bin(interval '1 h', date '2020-01-05', date '2001-01-01')) AS date_args,
+       pg_typeof(date_bin(interval '1 h', timestamp '2020-01-05 05:30', timestamp '2001-01-01'))
+         AS ts_args;
 SELECT 'still alive' AS status;

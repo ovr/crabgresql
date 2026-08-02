@@ -37,6 +37,29 @@ SELECT 'rcs.rc_u'::regclass = 'rc_t'::regclass AS different_relations;
 SELECT 'rc_nosuchtable'::regclass;
 SELECT 'rc_nosuchtype'::regtype;
 SELECT 'rc_nosuchschema'::regnamespace;
+-- pg_typeof reports its argument's type as a regtype. It is polymorphic, so it
+-- has no fixed signature; the argument is never evaluated, only its type read.
+SELECT pg_typeof(1) AS int_, pg_typeof(1.5) AS num, pg_typeof(true) AS bool_,
+       pg_typeof('a'::text) AS text_;
+-- the SQL spelling, as everywhere else in regtype
+SELECT pg_typeof('2020-01-01'::timestamptz) AS tstz, pg_typeof('x'::varchar) AS vc;
+-- a regtype is only an OID, so the type modifier is not reported
+SELECT pg_typeof(1::numeric(10,2)) AS numeric_mod, pg_typeof('x'::varchar(5)) AS varchar_mod;
+-- an array reports the element type's array spelling
+SELECT pg_typeof(ARRAY[1,2]) AS arr;
+-- a literal that never acquired a type really is `unknown`, not text
+SELECT pg_typeof('abc') AS unknown_lit, pg_typeof(NULL) AS null_lit;
+SELECT 705::regtype AS unknown_by_oid;
+-- the result is an ordinary regtype: comparable, castable, and self-describing
+SELECT pg_typeof(1) = 'integer'::regtype AS eq, pg_typeof(1)::text AS as_text,
+       pg_typeof(pg_typeof(1)) AS selfref;
+-- a column's declared type, which is the usual reason to call this
+CREATE TABLE pt_t (a integer, b timestamptz, c numeric(8,3));
+INSERT INTO pt_t VALUES (1, '2020-01-01+00', 1.5);
+SELECT pg_typeof(a) AS a, pg_typeof(b) AS b, pg_typeof(c) AS c FROM pt_t;
+DROP TABLE pt_t;
+-- pg_typeof takes exactly one argument
+SELECT pg_typeof(1, 2);
 -- sequences are relations, so nextval takes either spelling
 CREATE SEQUENCE rc_s;
 SELECT nextval('rc_s') AS bare, nextval('rc_s'::regclass) AS via_regclass;
