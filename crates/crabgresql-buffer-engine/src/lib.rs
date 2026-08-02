@@ -491,6 +491,12 @@ impl BufferTable {
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
+        // Deliberately `txn.xid`, never `txn.insert_xid()`. Rows here live in one
+        // flat in-RAM list that is not partitioned by relfilenode, so the only
+        // thing that hides a rolled-back transaction's rows is its own XID's abort
+        // record — which a frozen row does not have. `COPY … FREEZE` is refused on
+        // a `buffer` relation for exactly this reason, and a buffered Parquet
+        // relation routes a frozen load straight to a fragment instead.
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
 
         // Encode outside every lock: this is the expensive step and nothing it

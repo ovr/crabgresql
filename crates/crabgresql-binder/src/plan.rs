@@ -12,7 +12,8 @@ use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    Column, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog,
+    ViewDefinition,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
@@ -5877,6 +5878,12 @@ pub struct CopyFromPlan {
     /// Default expression per schema column (used for columns not in the list).
     defaults: Vec<BoundExpr>,
     pub format: CopyFormat,
+    /// `FREEZE`: stamp the loaded rows visible-to-everyone rather than
+    /// visible-once-this-transaction-commits. Binding only records the request
+    /// and rejects the relations that can never honor it; the precondition that
+    /// makes freezing safe needs a transaction, so the server checks it (and
+    /// sets [`crabgresql_txn::TxnContext::freeze_inserts`]) once it has one.
+    pub freeze: bool,
     /// Where the row bytes come from: the wire, or a server-side file.
     pub source: CopyFromSource,
     /// Leaf partitions when `table` is a partitioned parent, so each decoded row
@@ -5894,6 +5901,12 @@ impl CopyFromPlan {
     /// The relation's bare name, for the `COPY` command tag / error context.
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    /// The write target, so the server can ask whether it satisfies `FREEZE`'s
+    /// precondition once it holds a transaction.
+    pub fn target(&self) -> &Arc<dyn TableAm> {
+        &self.table
     }
 
     /// Turn decoded field rows (`None` = the NULL marker matched) into a
@@ -6049,6 +6062,24 @@ pub fn bind_copy_from(
     };
 
     let format = resolve_copy_format(options, legacy_options, &schema, &target_indices, &name)?;
+    let freeze = resolve_copy_freeze(options, legacy_options);
+    if freeze {
+        // A partitioned parent has no storage of its own, so there is no
+        // relfilenode for a rollback to discard and nothing to freeze into.
+        if schema.partition_scheme.is_some() {
+            return Err(BindError::feature_not_supported(
+                "cannot perform COPY FREEZE on a partitioned table",
+            ));
+        }
+        // A `buffer` relation keeps its rows in one flat RAM list that no rollback
+        // discards, so a frozen row written there would outlive its transaction.
+        // Stated rather than silently downgraded to an unfrozen load.
+        if schema.access_method == TableAccessMethod::Buffer {
+            return Err(BindError::feature_not_supported(
+                "cannot perform COPY FREEZE on a buffer table",
+            ));
+        }
+    }
 
     Ok(CopyFromPlan {
         table,
@@ -6057,9 +6088,32 @@ pub fn bind_copy_from(
         target_indices,
         defaults,
         format,
+        freeze,
         source: copy_source,
         routing,
     })
+}
+
+/// Whether `FREEZE` is on, across both option spellings. PostgreSQL lets a later
+/// option override an earlier one, and the legacy bare keyword (`COPY … CSV
+/// FREEZE`) means the same thing as `WITH (FREEZE)`, so both lists feed one
+/// answer in the order they were written.
+fn resolve_copy_freeze(
+    options: &[ast::CopyOption],
+    legacy_options: &[ast::CopyLegacyOption],
+) -> bool {
+    let mut freeze = false;
+    for opt in options {
+        if let ast::CopyOption::Freeze(on) = opt {
+            freeze = *on;
+        }
+    }
+    for opt in legacy_options {
+        if let ast::CopyLegacyOption::Freeze(on) = opt {
+            freeze = *on;
+        }
+    }
+    freeze
 }
 
 /// Resolve the modern `WITH (…)` options plus the pre-9.0 legacy option list
@@ -6182,7 +6236,10 @@ fn resolve_copy_format(
             ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
             ast::CopyLegacyOption::Null(s) => fmt.null = s.clone(),
             ast::CopyLegacyOption::Header => fmt.header = true,
-            ast::CopyLegacyOption::Binary | ast::CopyLegacyOption::Csv(_) => {}
+            // Freeze is not a decoding rule; `resolve_copy_freeze` reads it.
+            ast::CopyLegacyOption::Binary
+            | ast::CopyLegacyOption::Csv(_)
+            | ast::CopyLegacyOption::Freeze(_) => {}
             other => {
                 return Err(BindError::feature_not_supported(format!(
                     "COPY option {other} is not supported yet"

@@ -279,6 +279,10 @@ impl TableAm for ManagedTable {
         self.as_am().truncate(txn)
     }
 
+    fn truncated_by(&self, xid: Xid) -> bool {
+        self.as_am().truncated_by(xid)
+    }
+
     fn vacuum(&self, oldest: Xid, clog: &Clog) {
         self.as_am().vacuum(oldest, clog)
     }

@@ -772,9 +772,30 @@ pub struct TxnContext {
     /// transaction's XID for contexts built without a session; the server stamps
     /// the connection's owner over it in `build_txn`.
     pub lock_owner: LockOwner,
+    /// Stamp this transaction's inserts with [`Xid::FROZEN`] instead of its own
+    /// XID, so the rows are visible to every snapshot immediately and cost no
+    /// commit-log lookup ever after. Set only by `COPY … FREEZE`, whose
+    /// precondition — the table was truncated in this same transaction — is what
+    /// makes it safe: a rollback throws the whole relation file away, and with it
+    /// rows that no abort record could otherwise hide.
+    pub freeze_inserts: bool,
 }
 
 impl TxnContext {
+    /// The XID to stamp into a new version's `xmin`.
+    ///
+    /// This is *not* interchangeable with [`TxnContext::xid`]: WAL records,
+    /// commit-log bookkeeping and table locks all continue to name the real
+    /// transaction. Only the tuple header changes, which is precisely what makes
+    /// the row visible without consulting that transaction's fate.
+    pub fn insert_xid(&self) -> Xid {
+        if self.freeze_inserts {
+            Xid::FROZEN
+        } else {
+            self.xid
+        }
+    }
+
     /// The same transaction at a later command.
     ///
     /// Everything that identifies the transaction is carried over — the XID, the
@@ -1246,6 +1267,9 @@ impl TransactionManager {
             // `build_txn`. This default keeps engine-level tests (which build
             // contexts directly) correctly keyed per transaction.
             lock_owner: LockOwner(xid.0),
+            // Off unless a `COPY … FREEZE` turns it on after checking its
+            // precondition; every other statement writes ordinary versions.
+            freeze_inserts: false,
         }
     }
 }
@@ -1257,6 +1281,34 @@ mod tests {
     /// Is `hdr` visible to reader `(xid, cid)` under `snap`?
     fn visible(hdr: &TupleHeader, snap: &Snapshot, clog: &Clog, xid: Xid, cid: u32) -> bool {
         satisfies_mvcc(hdr, snap, clog, xid, CommandId(cid))
+    }
+
+    /// `freeze_inserts` redirects only the tuple header. The transaction's own
+    /// XID is what WAL records, the commit log and table locks keep naming, so a
+    /// freeze must not leak into `TxnContext::xid` — and a version it stamps must
+    /// be visible to a snapshot that counts the writer as still in flight, which
+    /// is the whole point.
+    #[test]
+    fn freeze_inserts_redirects_only_the_tuple_header() {
+        let tm = TransactionManager::new();
+        let xid = tm.allocate_xid();
+        let mut txn = tm.context(xid, CommandId::FIRST);
+        assert_eq!(txn.insert_xid(), xid);
+
+        txn.freeze_inserts = true;
+        assert_eq!(txn.insert_xid(), Xid::FROZEN);
+        assert_eq!(txn.xid, xid, "the transaction still names itself");
+        // The flag survives a command bump, so every batch of one COPY freezes.
+        assert!(txn.with_cid(CommandId(4)).freeze_inserts);
+
+        // A reader whose snapshot has `xid` still in flight sees the frozen
+        // version but not an ordinary one from the same transaction.
+        let snap = tm.snapshot();
+        let clog = Clog::new();
+        let frozen = TupleHeader::inserted(txn.insert_xid(), txn.cid);
+        let ordinary = TupleHeader::inserted(txn.xid, txn.cid);
+        assert!(visible(&frozen, &snap, &clog, Xid::INVALID, 0));
+        assert!(!visible(&ordinary, &snap, &clog, Xid::INVALID, 0));
     }
 
     #[test]

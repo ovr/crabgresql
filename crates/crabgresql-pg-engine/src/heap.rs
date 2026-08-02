@@ -556,20 +556,26 @@ impl HeapTable {
             .collect()
     }
 
+    /// The file `xid` staged with an uncommitted TRUNCATE of this table, or
+    /// `None` if `xid` has not truncated it. `has_pending` is the cheap gate that
+    /// keeps the read/write hot path off the `pending` lock entirely.
+    fn staged_for(&self, xid: Xid) -> Option<RelFileNode> {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        self.pending
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .as_ref()
+            .filter(|p| p.xid == xid)
+            .map(|p| RelFileNode(p.new_rel))
+    }
+
     /// The relfilenode `xid` should read and write: the staged TRUNCATE file if
     /// `xid` is the truncating transaction, else the committed file.
     fn effective_rel(&self, xid: Xid) -> RelFileNode {
-        if self.has_pending.load(Ordering::Acquire)
-            && let Some(p) = self
-                .pending
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"))
-                .as_ref()
-            && p.xid == xid
-        {
-            return RelFileNode(p.new_rel);
-        }
-        RelFileNode(self.live_rel.load(Ordering::Relaxed))
+        self.staged_for(xid)
+            .unwrap_or_else(|| RelFileNode(self.live_rel.load(Ordering::Relaxed)))
     }
 
     /// The index relfilenode `xid` should read and write, mirroring
@@ -842,7 +848,10 @@ impl HeapTable {
     /// it is placed; writing forwards would need a second pass to patch every
     /// link. The last chunk points at itself, which terminates the walk.
     fn write_chain(&self, toast_rel: RelFileNode, bytes: &[u8], txn: &TxnContext) -> Tid {
-        let hdr = TupleHeader::inserted(txn.xid, txn.cid);
+        // Chunks inherit the freeze: a frozen heap tuple is visible to snapshots
+        // that would find its chunks invisible, and the row would then read back
+        // with a dangling out-of-line value.
+        let hdr = TupleHeader::inserted(txn.insert_xid(), txn.cid);
         let mut next: Option<Tid> = None;
         for payload in toast::chunks_last_first(bytes) {
             // A placeholder for the last chunk: `place_item` patches it to the
@@ -1404,7 +1413,10 @@ impl TableAm for HeapTable {
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
-        let hdr = TupleHeader::inserted(txn.xid, txn.cid);
+        // `insert_xid`, not `xid`: a `COPY … FREEZE` stamps the version frozen.
+        // Everything below still names the real transaction — the relfilenode it
+        // writes into, the WAL record, the page lock.
+        let hdr = TupleHeader::inserted(txn.insert_xid(), txn.cid);
         let planned = self.plan_tuple(&tuple, &hdr)?;
         let bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let tid = self.place(rel, txn.xid, &bytes);
@@ -1433,6 +1445,12 @@ impl TableAm for HeapTable {
         //    after.
         //
         // `plan_tuple` is pure, so running it first costs nothing if we then lose.
+        //
+        // Deliberately `txn.xid`, not `txn.insert_xid()`: an update is a delete
+        // plus an insert, and freezing only the insert half would leave an abort
+        // undoing the delete while the new version stayed visible — one row
+        // becoming two. Only `COPY … FREEZE` sets that flag and it never updates,
+        // so this is a guard against a future caller, not a live case.
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
         let planned = self.plan_tuple(&tuple, &hdr)?;
         // Stamp the old version deleted-by-us, atomically under its page lock
@@ -1622,6 +1640,13 @@ impl TableAm for HeapTable {
             }
         }
         Ok(())
+    }
+
+    /// A staged TRUNCATE by `xid` means this transaction's rows are going into a
+    /// fresh relfilenode that `abort_truncate` discards untouched, which is the
+    /// discardable storage `COPY … FREEZE` needs.
+    fn truncated_by(&self, xid: Xid) -> bool {
+        self.staged_for(xid).is_some()
     }
 
     fn vacuum(&self, oldest: Xid, clog: &Clog) {

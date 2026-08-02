@@ -1543,7 +1543,28 @@ pub fn run_copy_rows(
     // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
     await_write_capacity(engine, session);
-    let txn = build_txn(txnmgr, session, true);
+    let mut txn = build_txn(txnmgr, session, true);
+    // FREEZE stamps rows visible to everyone with no XID whose abort could take
+    // them back, so it is only sound where a rollback throws the storage away:
+    // the relation must have been truncated by this very transaction. Checked
+    // here rather than at bind time because only now is there a transaction to
+    // name — and before any row is written, so a refusal loads nothing.
+    //
+    // PostgreSQL also accepts a table *created* in the current subtransaction.
+    // This engine's DDL is not transactional, so a rolled-back CREATE leaves the
+    // relation behind and its frozen rows with it; that half is refused, with
+    // PostgreSQL's wording kept because the wording is the observable part.
+    if prepared.plan.freeze && !prepared.plan.target().truncated_by(txn.xid) {
+        // No command id was consumed and no routine ran, so there is no counter to
+        // read back — unlike the failure paths below, which have executed batches.
+        let _ = finalize_statement(txnmgr, session, &txn, true, false, None);
+        return Err(PgError::new(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "cannot perform COPY FREEZE because the table was not created or \
+             truncated in the current subtransaction",
+        ));
+    }
+    txn.freeze_inserts = prepared.plan.freeze;
     let (routines, command_counter) = statement_runtime(
         &prepared.engine,
         &prepared.catalog,

@@ -73,6 +73,52 @@ SELECT octet_length(a) AS len FROM ch;
    5
 (1 row)
 
+-- COPY ... FREEZE. The rows are stamped visible-to-everyone, which is only safe
+-- where a rollback discards the storage — so the table must have been truncated
+-- in this same transaction. Outside a block it never has been.
+CREATE TABLE vistest (a text);
+COPY vistest FROM stdin CSV FREEZE;
+ERROR:  cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction
+BEGIN;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV FREEZE;
+SELECT * FROM vistest ORDER BY a;
+ a  
+----
+ a2
+ b
+(2 rows)
+
+COMMIT;
+SELECT * FROM vistest ORDER BY a;
+ a  
+----
+ a2
+ b
+(2 rows)
+
+-- A rollback still loses the frozen rows: the truncated file goes with it.
+BEGIN;
+TRUNCATE vistest;
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE ON);
+ROLLBACK;
+SELECT * FROM vistest ORDER BY a;
+ a  
+----
+ a2
+ b
+(2 rows)
+
+-- FREEZE OFF is an ordinary load and needs no truncate.
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE OFF);
+SELECT * FROM vistest ORDER BY a;
+ a  
+----
+ a2
+ b
+ z
+(3 rows)
+
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative
 -- data path, and `:'filename'` interpolates the result as a quoted literal.
