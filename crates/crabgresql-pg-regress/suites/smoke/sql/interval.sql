@@ -132,3 +132,9 @@ DROP TABLE interval_typmod_tbl;
 SELECT interval 'garbage';
 SELECT date_part('bogus', interval '1 day');
 SELECT 'still alive' AS status;
+
+-- an infinite stride cannot define a bin
+SELECT date_bin(interval 'infinity', timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00');
+SELECT date_bin(interval '-infinity', timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00');
+-- a bare `m` in an interval literal is minutes, not months
+SELECT interval '1 m' AS one_minute, interval '1 mon' AS one_month;

@@ -920,7 +920,9 @@ fn unit_from_word(word: &str) -> Option<Unit> {
         "microsecond" | "microseconds" | "us" | "usec" | "usecs" => Unit::Microsecond,
         "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => Unit::Millisecond,
         "second" | "seconds" | "sec" | "secs" | "s" => Unit::Second,
-        "minute" | "minutes" | "min" | "mins" => Unit::Minute,
+        // A bare `m` is minutes, not months — PG's interval unit table resolves
+        // the collision in favour of the smaller unit.
+        "minute" | "minutes" | "min" | "mins" | "m" => Unit::Minute,
         "hour" | "hours" | "hr" | "hrs" | "h" => Unit::Hour,
         "day" | "days" | "d" => Unit::Day,
         "week" | "weeks" | "w" => Unit::Week,

@@ -66,6 +66,8 @@ pub enum ScalarFn {
     Extract,
     /// `date_trunc(text, timestamp) -> timestamp`.
     DateTrunc,
+    /// `date_bin(interval, timestamp, timestamp) -> timestamp`.
+    DateBin,
     /// `isfinite(timestamp) -> bool`.
     Isfinite,
     /// `make_timestamp(int, int, int, int, int, float8) -> timestamp`.
@@ -190,6 +192,8 @@ pub enum ScalarFn {
     ExtractTz,
     /// `date_trunc(text, timestamptz) -> timestamptz`.
     DateTruncTz,
+    /// `date_bin(interval, timestamptz, timestamptz) -> timestamptz`.
+    DateBinTz,
     /// `isfinite(timestamptz) -> bool`.
     IsfiniteTz,
     /// `make_timestamptz(int×5, float8[, text]) -> timestamptz`.
@@ -1777,6 +1781,26 @@ fn lookup(name: &str) -> &'static [Signature] {
                 func: ScalarFn::DateTruncTz,
                 args: &[TEXT, TSTZ],
                 ret: TSTZ,
+            },
+        ],
+        // The `timestamptz` form is listed first deliberately. Both overloads
+        // sit in the datetime category, so an untyped literal reaches the
+        // preferred type (`timestamptz`) through `narrow_by_unknown_category`;
+        // but two `date` arguments are already typed, and the coercible pass
+        // then breaks the exact-count tie by list order. PG resolves that case
+        // to `timestamptz` too, so `timestamptz` has to come first for it to
+        // agree. A genuine `timestamp` pair still matches exactly and never
+        // reaches the tie-break.
+        "date_bin" => &[
+            Signature {
+                func: ScalarFn::DateBinTz,
+                args: &[IV, TSTZ, TSTZ],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::DateBin,
+                args: &[IV, TS, TS],
+                ret: TS,
             },
         ],
         "isfinite" => &[

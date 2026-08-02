@@ -189,3 +189,25 @@ SELECT timestamptz 'infinity'::time IS NULL AS inf_time_is_null,
        timestamp '-infinity'::time IS NULL AS neg_inf_time_is_null;
 SET TimeZone = 'UTC';
 
+
+-- date_bin on a timestamptz bins the UTC instant, so unlike date_trunc it never
+-- consults the session zone; the results below are identical under any TimeZone
+SELECT date_bin(interval '15 days', timestamptz '2020-02-11 15:44:17.71393+00', timestamptz '2001-01-01+00') AS d15,
+       date_bin(interval '2 hours', timestamptz '2020-02-11 15:44:17.71393+00', timestamptz '2001-01-01+00') AS h2,
+       date_bin(interval '250 microseconds', timestamptz '2020-02-11 15:44:17.71393+00', timestamptz '2001-01-01+00') AS us250;
+SET TimeZone = 'Asia/Kolkata';
+SELECT date_bin(interval '2 hours', timestamptz '2020-02-11 15:44:17.71393+00', timestamptz '2001-01-01+00') AT TIME ZONE 'UTC' AS same_instant;
+SET TimeZone = 'UTC';
+SELECT date_bin(interval '5 min', timestamptz '2020-02-01 01:01:01+00', timestamptz '2020-02-01 00:02:30+00') AS shifted;
+SELECT date_bin(interval '30 minutes', timestamptz '2024-02-01 15:00:00+00', timestamptz '2024-02-01 17:00:00+00') AS below;
+SELECT date_bin(interval '1 hour', timestamptz 'infinity', timestamptz '2001-01-01+00') AS inf;
+SELECT date_bin(interval '5 years', timestamptz '2020-02-01 01:01:01+00', timestamptz '2001-01-01+00');
+SELECT date_bin(interval '0 days', timestamptz '2020-02-01 01:01:01+00', timestamptz '2001-01-01+00');
+SELECT date_bin(interval '200000000 days', timestamptz '2024-02-01+00', timestamptz '2024-01-01+00');
+-- overload resolution: untyped literals reach the preferred type (timestamptz),
+-- and so do two `date` arguments. The trailing +00 is what says timestamptz won
+-- — the timestamp overload would render without an offset.
+SELECT date_bin('1 h', '2020-01-05 05:30', '2001-01-01') AS unknown_args,
+       date_bin(interval '1 h', date '2020-01-05', date '2001-01-01') AS date_args,
+       date_bin(interval '1 h', timestamp '2020-01-05 05:30', timestamp '2001-01-01') AS ts_args;
+SELECT 'still alive' AS status;
