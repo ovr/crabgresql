@@ -740,6 +740,23 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Numeric)
                 .map_err(num_err);
         }
+        ScalarFn::TimeApplyTypmod => {
+            let precision = i4(&args[1]);
+            return Ok(match &args[0] {
+                Value::Time(usec) => Value::Time(time::apply_typmod(*usec, precision)),
+                Value::TimeTz(t) => Value::TimeTz(TimeTz {
+                    usec: time::apply_typmod(t.usec, precision),
+                    zone: t.zone,
+                }),
+                Value::Timestamp(usec) => {
+                    Value::Timestamp(timestamp::apply_typmod(*usec, precision))
+                }
+                Value::TimestampTz(usec) => {
+                    Value::TimestampTz(timestamp::apply_typmod(*usec, precision))
+                }
+                other => unreachable!("expected a datetime arg, got {other:?}"),
+            });
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {

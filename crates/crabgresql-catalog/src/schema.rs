@@ -866,31 +866,31 @@ pub fn pg_attribute_schema() -> TableSchema {
 
 /// PostgreSQL's `atttypmod` encoding of a column's declared modifier, from the
 /// raw form crabgresql stores in [`Column::typmod`] (a bare length for the
-/// character/bit types, `-1` for none). `character`/`character varying` reserve
-/// four bytes for the varlena header (`n + VARHDRSZ`); `bit`/`bit varying` store
-/// the length directly. Keeping this the true PostgreSQL encoding lets
-/// `format_type(atttypid, atttypmod)` reproduce PG's `\d` type strings.
+/// character/bit types, the packed `(precision, scale)` for `numeric`, a bare
+/// precision for the datetime types, `-1` for none). `character`/`character
+/// varying`/`numeric` reserve four bytes for the varlena header (`raw +
+/// VARHDRSZ`); the fixed-width types store their modifier directly. Keeping this
+/// the true PostgreSQL encoding lets `format_type(atttypid, atttypmod)` reproduce
+/// PG's `\d` type strings.
 ///
-/// Two modifiers do not survive to here yet, so `\d` shows the bare type name
-/// where PostgreSQL shows a modifier. Both are upstream of this function:
-/// - `numeric(p,s)` and `timestamp(p)`/`time(p)`: [`Column::typmod`] is only
-///   populated from `length_typmod` (the character and bit types), and it is
-///   also what the INSERT path length-coerces against, so persisting these
-///   needs its own change rather than a catalog-side re-encode.
-/// - a **view**'s columns: a view records its output columns without a modifier
-///   (`OutputColumn` carries no typmod), so `\d v` prints `character varying`
-///   where PostgreSQL prints `character varying(20)`.
+/// One modifier still does not survive to here, upstream of this function: a
+/// **view**'s columns record their output type without a modifier
+/// (`OutputColumn` carries no typmod), so `\d v` prints `character varying`
+/// where PostgreSQL prints `character varying(20)`.
 ///
 /// The addition saturates rather than wrapping: DDL rejects a length beyond
-/// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]), so a value
-/// that could overflow is unreachable through a `CREATE TABLE` — but this runs
-/// against whatever a data directory already holds, and building a catalog row
-/// must never panic the session that reads `pg_attribute`.
+/// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]) and a
+/// precision beyond `numeric`'s, so a value that could overflow is unreachable
+/// through a `CREATE TABLE` — but this runs against whatever a data directory
+/// already holds, and building a catalog row must never panic the session that
+/// reads `pg_attribute`.
 fn atttypmod_of(column: &Column) -> i32 {
     const VARHDRSZ: i32 = 4;
     match column.ty {
         _ if column.typmod < 0 => -1,
-        PgType::Varchar | PgType::Bpchar => column.typmod.saturating_add(VARHDRSZ),
+        PgType::Varchar | PgType::Bpchar | PgType::Numeric => {
+            column.typmod.saturating_add(VARHDRSZ)
+        }
         _ => column.typmod,
     }
 }

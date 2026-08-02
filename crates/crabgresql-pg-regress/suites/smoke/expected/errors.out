@@ -15,9 +15,10 @@ SELECT 'still alive' AS status;
  still alive
 (1 row)
 
--- metacommands are not implemented; the runner emits a deterministic stub
-\d crabs
-\d: metacommand not supported by crabgresql regress runner
+-- most metacommands are not implemented; the runner emits a deterministic stub
+-- rather than guessing (`\d <relation>` is the exception — see psql_describe)
+\dt
+\dt: metacommand not supported by crabgresql regress runner
 SELECT 2 AS after_metacommand;
  after_metacommand 
 -------------------

@@ -101,3 +101,28 @@ SELECT make_timestamp(2013, 7, 15, 24, 0, 0) AS end_of_day,
 SELECT timestamp 'garbage';
 SELECT date_part('bogus', timestamp '2001-02-16');
 SELECT 'still alive' AS status;
+-- A fractional-second precision modifier rounds the value, in a cast and in
+-- assignment to a column alike. Rounding is half away from zero on the internal
+-- microsecond count, which for `timestamp` runs from 2000-01-01 — so which way a
+-- tie goes depends on which side of that epoch the value falls.
+SELECT '2020-01-01 00:00:00.5'::timestamp(0) AS half_up,
+       '2020-01-01 00:00:01.5'::timestamp(0) AS one_half,
+       '2020-01-01 00:00:00.4999'::timestamp(0) AS below,
+       '1900-01-01 00:00:00.5'::timestamp(0) AS pre_epoch_half,
+       '1900-01-01 00:00:01.5'::timestamp(0) AS pre_epoch_one_half;
+-- rounding the whole count, not just the fractional field, carries into the
+-- next second
+SELECT '2020-01-01 00:00:00.9999995'::timestamp(6) AS carry,
+       '2020-01-01 00:00:00.123456'::timestamp(3) AS down,
+       '2020-01-01 00:00:00.1235'::timestamp(3) AS up;
+-- (a modifier above the six digits any datetime type holds is clamped, which
+-- crabgresql does silently where PostgreSQL also warns, so it is not pinned here)
+CREATE TABLE ts_col (a timestamp(3), b timestamp);
+INSERT INTO ts_col VALUES ('2020-01-01 00:00:00.1235', '2020-01-01 00:00:00.1235');
+UPDATE ts_col SET a = '2020-01-01 00:00:00.9996';
+SELECT a, b FROM ts_col;
+SELECT a.attname, a.atttypmod, pg_catalog.format_type(a.atttypid, a.atttypmod)
+  FROM pg_catalog.pg_attribute a
+ WHERE a.attrelid = 'ts_col'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+DROP TABLE ts_col;

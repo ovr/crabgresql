@@ -10,9 +10,9 @@
 //! range `[0, 86_400_000_000]` (the upper bound is `24:00:00`, which PG allows).
 //! There are no infinity values.
 //!
-//! Deviations from PG, acceptable while no passing test needs them: a `time`
-//! precision modifier (`time(2)`) is accepted and ignored (full microsecond
-//! resolution is kept); a trailing numeric offset or fixed abbreviation is
+//! Deviations from PG, acceptable while no passing test needs them: a precision
+//! modifier above 6 is clamped silently where PG also warns; a trailing numeric
+//! offset or fixed abbreviation is
 //! accepted and ignored, but a bare IANA zone name without a date is rejected
 //! (as PG does).
 
@@ -51,6 +51,18 @@ fn field_out_of_range(input: &str) -> TimeError {
 
 pub fn cmp(a: i64, b: i64) -> std::cmp::Ordering {
     a.cmp(&b)
+}
+
+/// Round `usec` to `precision` fractional-second digits — the `time(p)` /
+/// `timetz(p)` type modifier, applied in both cast and assignment context.
+///
+/// A time is microseconds since midnight and so never negative, which makes this
+/// a plain half-up round; the shared implementation lives in
+/// [`crate::timestamp::apply_typmod`]. Rounding can reach the `24:00:00` upper
+/// bound (`'23:59:59.5'::time(0)`, verified against PostgreSQL 18.4) but cannot
+/// pass it, since the largest representable value is already exactly that.
+pub fn apply_typmod(usec: i64, precision: i32) -> i64 {
+    timestamp::apply_typmod(usec, precision)
 }
 
 // --- output (time_out) -----------------------------------------------------

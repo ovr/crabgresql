@@ -790,6 +790,66 @@ impl PgType {
         }
     }
 
+    /// PostgreSQL's SQL spelling of this type with `typmod` applied — the body
+    /// of the `format_type(oid, typmod)` function, and the type label a deparsed
+    /// constant carries. `None` for [`PgType::Array`] and [`PgType::User`],
+    /// whose names need a catalog the type layer has no access to.
+    ///
+    /// `typmod` is `None` when no modifier was given at all and `Some(m)` for
+    /// one that was — including `Some(-1)`, the "no modifier" value
+    /// `pg_attribute` stores, which PostgreSQL still distinguishes from `None`
+    /// (`bpchar` and `bit` both report themselves differently for each).
+    ///
+    /// Each type prints its modifier only above its own threshold, matching the
+    /// `typmodout` functions (probed against PostgreSQL 18.4): the character
+    /// types need more than the four-byte varlena header they reserve, `numeric`
+    /// needs at least that header, and the rest need only a non-negative value.
+    /// Below the threshold PostgreSQL prints the bare type name rather than a
+    /// nonsensical `character varying(-2)`.
+    ///
+    /// Two deliberate gaps, neither reachable from a crabgresql catalog row
+    /// (both need a modifier this build never stores): `interval`'s modifier
+    /// packs range bits and is printed bare rather than decoded, and
+    /// PostgreSQL's generic fallback for a type with no `typmodout`
+    /// (`format_type(25, 5)` → `text(5)`) is not reproduced.
+    pub fn format_type(self, typmod: Option<i32>) -> Option<String> {
+        // VARHDRSZ: character types encode `length + 4` (see the catalog's
+        // `atttypmod_of`, which is the encoder this decodes).
+        const VARHDRSZ: i32 = 4;
+        if matches!(self, PgType::Array(_) | PgType::User(_)) {
+            return None;
+        }
+        let name = self.name();
+        let Some(m) = typmod else {
+            return Some(name.to_string());
+        };
+        Some(match self {
+            PgType::Numeric if m >= VARHDRSZ => {
+                let (precision, scale) = Numeric::unpack_typmod(m - VARHDRSZ);
+                format!("numeric({precision},{scale})")
+            }
+            PgType::Varchar if m > VARHDRSZ => format!("character varying({})", m - VARHDRSZ),
+            PgType::Bpchar if m > VARHDRSZ => format!("character({})", m - VARHDRSZ),
+            // `bpchar` and `bit` are the two types that report which spelling
+            // they were asked about. Given a modifier they cannot print,
+            // `bpchar` is `bpchar` (not `character`) and `bit` is quoted, to
+            // keep it distinct from the `bit` keyword that a re-parse would read
+            // as `bit(1)`. An unmodified column of either stores -1, so these
+            // are the arms `\d` and a deparsed default take.
+            PgType::Bpchar => "bpchar".to_string(),
+            PgType::Bit if m >= 0 => format!("bit({m})"),
+            PgType::Bit => "\"bit\"".to_string(),
+            PgType::Varbit if m >= 0 => format!("bit varying({m})"),
+            // The precision goes *before* the "with[out] time zone" suffix.
+            PgType::Time if m >= 0 => format!("time({m}) without time zone"),
+            PgType::TimeTz if m >= 0 => format!("time({m}) with time zone"),
+            PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
+            PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
+            // Below its type's threshold a modifier prints nothing at all.
+            _ => name.to_string(),
+        })
+    }
+
     /// Catalog `typname` (used for cast-derived column headers): `float4`, not
     /// `real`. `'NaN'::float4` yields a column named `float4`.
     pub fn typname(self) -> &'static str {
@@ -1367,6 +1427,33 @@ impl std::error::Error for tz::ZoneError {}
 mod tests {
     use super::*;
     use deepsize::DeepSizeOf;
+
+    /// `bpchar` and `bit` are the two types whose spelling depends on *whether*
+    /// a modifier was given, not just on its value. Probed against PostgreSQL
+    /// 18.4: `format_type(1560, -1)` is `"bit"` but `format_type(1560, NULL)` is
+    /// `bit`, and the quoted form is what a deparsed `bit` constant's type label
+    /// uses (`'1001'::"bit"`).
+    #[test]
+    fn a_modifier_that_was_given_but_cannot_print_changes_the_spelling() {
+        let ft = |ty: PgType, m: Option<i32>| ty.format_type(m);
+        assert_eq!(ft(PgType::Bit, None).as_deref(), Some("bit"));
+        assert_eq!(ft(PgType::Bit, Some(-1)).as_deref(), Some("\"bit\""));
+        assert_eq!(ft(PgType::Bit, Some(4)).as_deref(), Some("bit(4)"));
+        assert_eq!(ft(PgType::Bpchar, None).as_deref(), Some("character"));
+        assert_eq!(ft(PgType::Bpchar, Some(-1)).as_deref(), Some("bpchar"));
+        assert_eq!(ft(PgType::Bpchar, Some(8)).as_deref(), Some("character(4)"));
+        // `bit varying` has one spelling either way.
+        assert_eq!(ft(PgType::Varbit, None).as_deref(), Some("bit varying"));
+        assert_eq!(ft(PgType::Varbit, Some(-1)).as_deref(), Some("bit varying"));
+        assert_eq!(
+            ft(PgType::Varbit, Some(5)).as_deref(),
+            Some("bit varying(5)")
+        );
+        // The two catalog-dependent types decline, leaving their name to the
+        // caller that holds the catalog.
+        assert_eq!(PgType::Array(23).format_type(Some(-1)), None);
+        assert_eq!(PgType::User(90000).format_type(Some(-1)), None);
+    }
 
     #[test]
     fn bool_encodes_as_t_f() {

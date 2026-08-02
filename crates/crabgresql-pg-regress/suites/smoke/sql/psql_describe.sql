@@ -185,3 +185,106 @@ DROP TABLE dfmt_p;
 DROP VIEW dfmt_v;
 DROP TABLE dfmt_d;
 DROP TABLE dfmt_t;
+-- `bit` is the one type besides `bpchar` whose spelling depends on *whether* a
+-- modifier was given: with one it prints `bit(4)`, with the -1 that means "none"
+-- it is quoted, and that quoted form is what a deparsed constant's label uses.
+SELECT pg_catalog.format_type(1560, -1) AS "bit -1",
+       pg_catalog.format_type(1560, NULL) AS "bit none",
+       pg_catalog.format_type(1562, -1) AS "varbit -1";
+-- A literal column default is stored already deparsed, so `\d` prints what
+-- PostgreSQL prints. The type label is the *literal's* own type with no
+-- modifier, so an untyped '1001' takes the column's type while B'0101' stays
+-- `bit` even in a `bit varying` column; int4 and a fractional numeric print
+-- bare, a negative one does not; and the value is re-rendered by the type's
+-- output function ('007' -> 7, and 'x' stays unpadded in a char(4)).
+-- Non-literal defaults are not rewritten and print as written, which is a known
+-- divergence (PostgreSQL deparses the node), so none appears here.
+CREATE TABLE dfmt_def (
+  b1 bit(4) DEFAULT '1001',
+  b2 bit(4) DEFAULT B'0101',
+  b3 bit varying(5) DEFAULT '1001',
+  b4 bit varying(5) DEFAULT B'0101',
+  i1 integer DEFAULT 42,
+  i2 integer DEFAULT -1,
+  i3 bigint DEFAULT 42,
+  n1 numeric(5,2) DEFAULT 1.5,
+  n2 numeric DEFAULT -1.5,
+  t1 text DEFAULT 'it''s',
+  c1 char(4) DEFAULT 'x',
+  bo boolean DEFAULT true,
+  d1 date DEFAULT '2020-01-02',
+  i4 integer DEFAULT '007',
+  nn text NOT NULL,
+  co text COLLATE "de-x-icu"
+);
+\d dfmt_def
+DROP TABLE dfmt_def;
+-- `DEFAULT NULL` is recorded only when the column's type needs a length
+-- coercion to accept it; for everything else PostgreSQL drops the default
+-- outright, leaving `atthasdef` false. `name` is the one type that looks like it
+-- should be in the first group and is not.
+CREATE TABLE dfmt_null (
+  a text DEFAULT NULL, b bit(4) DEFAULT NULL, c varchar(4) DEFAULT NULL,
+  d varchar DEFAULT NULL, e numeric(5,2) DEFAULT NULL, f numeric DEFAULT NULL,
+  g char(4) DEFAULT NULL, h integer DEFAULT NULL, i timestamp(3) DEFAULT NULL,
+  j bit varying(5) DEFAULT NULL, k name DEFAULT NULL
+);
+SELECT a.attname, a.atthasdef,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) AS def
+  FROM pg_catalog.pg_attribute a
+       LEFT JOIN pg_catalog.pg_attrdef d
+              ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'dfmt_null'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+DROP TABLE dfmt_null;
+-- A default that is not a literal is deparsed too, so it comes back canonical
+-- rather than as typed: a function argument carries the type its signature gives
+-- it (`nextval` takes a regclass, `upper` a text), and the stored form is the
+-- fully parenthesised one. psql's `\d` asks for the `pretty` rendering, which
+-- drops the parentheses precedence already implies.
+CREATE SEQUENCE dfmt_seq;
+CREATE TABLE dfmt_expr (
+  a integer DEFAULT (1 + 2),
+  b text DEFAULT 'a' || 'b',
+  c integer DEFAULT nextval('dfmt_seq'),
+  e integer DEFAULT (2 * (3 + 4)),
+  f text DEFAULT upper('x'),
+  h boolean DEFAULT (1 < 2)
+);
+SELECT a.attname,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS plain,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) AS pretty
+  FROM pg_catalog.pg_attribute a
+       JOIN pg_catalog.pg_attrdef d
+         ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'dfmt_expr'::regclass
+ ORDER BY a.attnum;
+-- the deparse is a rendering, not a rewrite: the defaults still evaluate
+INSERT INTO dfmt_expr (a) VALUES (DEFAULT);
+SELECT a, b, c, e, f, h FROM dfmt_expr;
+DROP TABLE dfmt_expr;
+DROP SEQUENCE dfmt_seq;
+-- A `timestamptz` constant is the one default whose text belongs to the reader:
+-- PostgreSQL stores the instant and renders it in the session's zone. A `timetz`
+-- carries its own offset and a zone-less `timestamp` has none, so neither moves.
+CREATE TABLE dfmt_zone (
+  a timestamptz DEFAULT '2020-01-01 00:00:00+02',
+  b timetz DEFAULT '12:00:00+02',
+  c timestamp DEFAULT '2020-01-01 00:00:00'
+);
+SET TIME ZONE 'UTC';
+SELECT a.attname, pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) AS def
+  FROM pg_catalog.pg_attribute a
+       JOIN pg_catalog.pg_attrdef d
+         ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'dfmt_zone'::regclass
+ ORDER BY a.attnum;
+SET TIME ZONE 'Asia/Tokyo';
+SELECT a.attname, pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) AS def
+  FROM pg_catalog.pg_attribute a
+       JOIN pg_catalog.pg_attrdef d
+         ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'dfmt_zone'::regclass
+ ORDER BY a.attnum;
+RESET timezone;
+DROP TABLE dfmt_zone;

@@ -13,9 +13,9 @@
 //! `-infinity`/`infinity` sentinels, so the natural integer order already
 //! sorts them correctly (they compare less/greater than every finite value).
 //!
-//! Deviations from PG, acceptable while no passing test needs them: `timestamp`
-//! precision modifiers (`timestamp(2)`) are ignored (full microsecond
-//! resolution is kept), and the input grammar covers ISO 8601, the traditional
+//! Deviations from PG, acceptable while no passing test needs them: a precision
+//! modifier above 6 is clamped silently where PG also warns, and the input
+//! grammar covers ISO 8601, the traditional
 //! `Mon DD HH:MM:SS YYYY` form, and the `infinity`/`epoch` specials — a trailing
 //! time zone is accepted and ignored (this type has no zone), but the
 //! current-relative specials (`now`/`today`/...) need a transaction clock and
@@ -79,6 +79,37 @@ fn units_not_recognized(unit: &str) -> TimestampError {
 
 pub fn is_finite(micros: i64) -> bool {
     micros != NEG_INFINITY && micros != POS_INFINITY
+}
+
+/// The largest fractional-second precision any datetime type keeps. PostgreSQL
+/// accepts a larger modifier but warns and clamps to this, so the stored value
+/// is the same either way.
+pub const MAX_PRECISION: i32 = 6;
+
+/// Round `micros` to `precision` fractional-second digits — the `timestamp(p)` /
+/// `timestamptz(p)` type modifier, applied in both cast and assignment context.
+///
+/// Rounding is half **away from zero** on the internal value, which is
+/// microseconds from 2000-01-01, so where the tie falls depends on which side of
+/// that epoch the timestamp is (verified against PostgreSQL 18.4:
+/// `'2020-01-01 00:00:00.5'::timestamp(0)` is `00:00:01` but
+/// `'1900-01-01 00:00:00.5'::timestamp(0)` is `00:00:00`). Rounding the whole
+/// microsecond count, rather than the fractional field alone, is also what makes
+/// `'2020-01-01 00:00:00.9999995'::timestamp(6)` carry into the next second.
+///
+/// A precision at or above [`MAX_PRECISION`], or a non-finite value, is returned
+/// unchanged.
+pub fn apply_typmod(micros: i64, precision: i32) -> i64 {
+    if !is_finite(micros) || !(0..MAX_PRECISION).contains(&precision) {
+        return micros;
+    }
+    let scale = 10_i64.pow((MAX_PRECISION - precision) as u32);
+    let half = scale / 2;
+    if micros >= 0 {
+        (micros + half) / scale * scale
+    } else {
+        -((-micros + half) / scale * scale)
+    }
 }
 
 // --- proleptic-Gregorian calendar conversions ------------------------------
@@ -1252,6 +1283,37 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
         }
+    }
+
+    /// The tie-breaking rule, pinned against PostgreSQL 18.4. Rounding is half
+    /// away from zero on the *internal* count, so the same `.5` goes up after
+    /// the 2000-01-01 epoch and down before it — which is only visible because
+    /// the epoch is not the year 0.
+    #[test]
+    fn a_precision_modifier_rounds_half_away_from_the_epoch() {
+        let round = |s: &str, p: i32| format(apply_typmod(ts(s), p));
+        assert_eq!(round("2020-01-01 00:00:00.5", 0), "2020-01-01 00:00:01");
+        assert_eq!(round("2020-01-01 00:00:01.5", 0), "2020-01-01 00:00:02");
+        assert_eq!(round("2020-01-01 00:00:00.4999", 0), "2020-01-01 00:00:00");
+        assert_eq!(round("1900-01-01 00:00:00.5", 0), "1900-01-01 00:00:00");
+        assert_eq!(round("1900-01-01 00:00:01.5", 0), "1900-01-01 00:00:01");
+        // Rounding the whole count, not the fractional field alone, carries.
+        assert_eq!(
+            round("2020-01-01 00:00:00.9999995", 6),
+            "2020-01-01 00:00:01"
+        );
+        assert_eq!(
+            round("2020-01-01 00:00:00.1235", 3),
+            "2020-01-01 00:00:00.124"
+        );
+        // At or above the six digits the type holds, nothing changes; nor for
+        // the infinities.
+        assert_eq!(
+            round("2020-01-01 00:00:00.123456", 6),
+            "2020-01-01 00:00:00.123456"
+        );
+        assert_eq!(apply_typmod(POS_INFINITY, 0), POS_INFINITY);
+        assert_eq!(apply_typmod(NEG_INFINITY, 0), NEG_INFINITY);
     }
 
     fn span(s: &str) -> Interval {

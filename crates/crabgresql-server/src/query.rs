@@ -29,7 +29,7 @@ use crabgresql_storage_api::{
     TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
-use crabgresql_types::{FmtCtx, PgType, Value};
+use crabgresql_types::{FmtCtx, Numeric, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
@@ -2867,6 +2867,34 @@ fn resolve_create_namespace(
     }
 }
 
+/// The deparsed form of a `timestamptz`/`timetz` column's literal default, or
+/// `None` when the default is not a bare literal or the column is some other
+/// type.
+///
+/// These two are the literals the binder cannot fold: resolving one needs the
+/// session zone, which the binder holds no access to on purpose. Rendering them
+/// here — where the session *is* in hand — matches PostgreSQL, which resolves
+/// the constant when the DDL runs and stores the instant, not the text. What the
+/// reader then sees is the instant put back into *their* zone, which
+/// `pg_get_expr` does on the way out.
+fn zoned_literal_default(expr: &ast::Expr, column: &Column, session: &Session) -> Option<String> {
+    if !matches!(column.ty, PgType::TimestampTz | PgType::TimeTz) {
+        return None;
+    }
+    let ast::Expr::Value(v) = expr else {
+        return None;
+    };
+    let text = v.value.as_pg_string()?;
+    let fmt = session.fmt_ctx();
+    let value =
+        crabgresql_types::cast::cast_value(Value::Text(text.to_string()), column.ty, &fmt).ok()?;
+    let label = column.ty.format_type(Some(-1))?;
+    Some(format!(
+        "'{}'::{label}",
+        value.encode_text_with(&fmt)?.replace('\'', "''")
+    ))
+}
+
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
@@ -3013,9 +3041,19 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
-        // Checked, not bare `length_typmod`: an out-of-range length would be
+        // Checked, not the bare readers: an out-of-range modifier would be
         // stored on the column and later overflow `pg_attribute.atttypmod`.
-        let typmod = crabgresql_binder::checked_length_typmod(&col.data_type)?.unwrap_or(-1);
+        // `numeric` packs two numbers into the one `Column::typmod` slot; every
+        // other modifier is a bare length or fractional-second precision.
+        let typmod = match ty {
+            PgType::Numeric => crabgresql_binder::checked_numeric_typmod(&col.data_type)?
+                .map(|(p, s)| Numeric::pack_typmod(p, s)),
+            PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+                crabgresql_binder::datetime_precision(&col.data_type)
+            }
+            _ => crabgresql_binder::checked_length_typmod(&col.data_type)?,
+        }
+        .unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
             // Name the sequence `t_col_seq`, dodging existing relations and any
@@ -3034,7 +3072,10 @@ fn execute_create_table(
             } else {
                 format!("{namespace}.{seq_name}")
             };
-            column.default = Some(format!("nextval('{seq_ref}')"));
+            // Written the way PG's deparse prints it — `nextval` takes a
+            // `regclass`, and the cast is what a re-parse of this text needs to
+            // resolve the name.
+            column.default = Some(format!("nextval('{seq_ref}'::regclass)"));
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
                 namespace: namespace.clone(),
@@ -3089,7 +3130,31 @@ fn execute_create_table(
                         )));
                     }
                     crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
-                    column.default = Some(expr.to_string());
+                    // The default is stored already deparsed, so `pg_get_expr`
+                    // (which echoes this text) prints what PostgreSQL's `\d`
+                    // does. A literal takes its type from the column, so the
+                    // binder renders it; everything else goes through the same
+                    // deparser a view definition does. A plain NULL for a type
+                    // needing no coercion is not a default at all.
+                    let source = expr.to_string();
+                    column.default = match crabgresql_binder::deparse_literal_default(
+                        expr,
+                        &column,
+                        type_catalog,
+                    )? {
+                        crabgresql_binder::ColumnDefault::Deparsed(text) => Some(text),
+                        crabgresql_binder::ColumnDefault::Omit => None,
+                        crabgresql_binder::ColumnDefault::Source => Some(
+                            zoned_literal_default(expr, &column, session)
+                                .or_else(|| {
+                                    crabgresql_binder::ruleutils::column_default(
+                                        &source,
+                                        type_catalog,
+                                    )
+                                })
+                                .unwrap_or(source),
+                        ),
+                    };
                 }
                 ast::ColumnOption::PrimaryKey(pk) => {
                     reject_primary_key_options(pk)?;

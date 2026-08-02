@@ -1372,13 +1372,13 @@ mod tests {
 
     /// `pg_attribute.atttypmod` is emitted in PostgreSQL's encoding, not the raw
     /// modifier crabgresql stores on the column, so `format_type(atttypid,
-    /// atttypmod)` reproduces PG's `\d` type strings. The character types add
-    /// the four-byte varlena header; the bit types do not; a column with no
-    /// modifier is `-1`.
+    /// atttypmod)` reproduces PG's `\d` type strings. The character types and
+    /// `numeric` add the four-byte varlena header; the fixed-width types do not;
+    /// a column with no modifier is `-1`.
     #[test]
     fn pg_attribute_encodes_postgres_atttypmod() -> anyhow::Result<()> {
         use crabgresql_storage_api::{Column, TableSchema};
-        use crabgresql_types::PgType;
+        use crabgresql_types::{Numeric, PgType};
 
         let cat = SystemCatalog::with_relations(vec![TableSchema::new(
             "t",
@@ -1387,6 +1387,9 @@ mod tests {
                 Column::with_typmod("c", PgType::Bpchar, 10),
                 Column::with_typmod("b", PgType::Bit, 5),
                 Column::with_typmod("vb", PgType::Varbit, 7),
+                Column::with_typmod("n", PgType::Numeric, Numeric::pack_typmod(5, 2)),
+                // A negative scale round trips through the signed 11-bit field.
+                Column::with_typmod("nn", PgType::Numeric, Numeric::pack_typmod(4, -2)),
                 Column::new("i", PgType::Int4),
             ],
         )]);
@@ -1411,6 +1414,9 @@ mod tests {
         assert_eq!(cell("c", "atttypmod")?, Value::Int4(14));
         assert_eq!(cell("b", "atttypmod")?, Value::Int4(5));
         assert_eq!(cell("vb", "atttypmod")?, Value::Int4(7));
+        // The values PostgreSQL 18.4 stores for `numeric(5,2)`/`numeric(4,-2)`.
+        assert_eq!(cell("n", "atttypmod")?, Value::Int4(327686));
+        assert_eq!(cell("nn", "atttypmod")?, Value::Int4(264194));
         assert_eq!(cell("i", "atttypmod")?, Value::Int4(-1));
         // Identity and generated columns do not exist, and PG spells "neither"
         // as the empty string rather than NULL — psql projects both directly.

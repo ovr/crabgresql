@@ -296,6 +296,11 @@ pub enum ScalarFn {
     /// `(numeric, int4 precision, int4 scale)`; the length coercion PG inserts
     /// for `x::numeric(p,s)`.
     NumApplyTypmod,
+    /// Apply a fractional-second precision modifier at run time. Args are
+    /// `(time|timetz|timestamp|timestamptz, int4 precision)`; one function
+    /// serves all four because they round the same way and differ only in which
+    /// `Value` carries the microseconds.
+    TimeApplyTypmod,
     /// `abs(float8) -> float8`.
     AbsF8,
     /// `log(float8) -> float8` (base 10).
@@ -521,7 +526,7 @@ pub enum ScalarFn {
     /// `relpartbound`), so this echoes its first argument.
     PgGetExpr,
     /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
-    /// in PostgreSQL's canonical shape by [`crabgresql_executor::ruleutils`].
+    /// in PostgreSQL's canonical shape by [`crate::ruleutils`].
     PgGetViewdef,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
@@ -2073,49 +2078,26 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: I4,
             },
         ],
-        // Sequence functions. PG declares these over `regclass`; the `text`
-        // overload is kept alongside it so a bare `nextval('seq')` still binds
-        // without the unknown literal having to resolve through the catalog.
+        // Sequence functions. PG declares these over `regclass` only, so a bare
+        // `nextval('seq')` types its unknown literal from that — which is what
+        // makes `nextval('S1')` and `nextval(' s1 ')` find `s1`, since the
+        // `regclass` input normalizes an unquoted name the way the parser would.
         // These are side-effecting and are dispatched by the executor's `eval`
         // (not `eval_scalar`).
-        "nextval" => &[
-            Signature {
-                func: ScalarFn::Nextval,
-                args: &[TEXT],
-                ret: I8,
-            },
-            Signature {
-                func: ScalarFn::Nextval,
-                args: &[REGCLASS],
-                ret: I8,
-            },
-        ],
-        "currval" => &[
-            Signature {
-                func: ScalarFn::Currval,
-                args: &[TEXT],
-                ret: I8,
-            },
-            Signature {
-                func: ScalarFn::Currval,
-                args: &[REGCLASS],
-                ret: I8,
-            },
-        ],
+        "nextval" => &[Signature {
+            func: ScalarFn::Nextval,
+            args: &[REGCLASS],
+            ret: I8,
+        }],
+        "currval" => &[Signature {
+            func: ScalarFn::Currval,
+            args: &[REGCLASS],
+            ret: I8,
+        }],
         "setval" => &[
             Signature {
                 func: ScalarFn::Setval,
-                args: &[TEXT, I8],
-                ret: I8,
-            },
-            Signature {
-                func: ScalarFn::Setval,
                 args: &[REGCLASS, I8],
-                ret: I8,
-            },
-            Signature {
-                func: ScalarFn::Setval,
-                args: &[TEXT, I8, BOOL],
                 ret: I8,
             },
             Signature {

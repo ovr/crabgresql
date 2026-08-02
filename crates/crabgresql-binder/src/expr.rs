@@ -3489,7 +3489,7 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
 /// the same reason [`checked_length_typmod`] exists: `numeric(0)` and
 /// `numeric(1001)` are not merely odd, PostgreSQL rejects them outright while
 /// resolving the type name — before any value is looked at.
-pub(crate) fn checked_numeric_typmod(dt: &ast::DataType) -> Result<Option<(i32, i32)>, BindError> {
+pub fn checked_numeric_typmod(dt: &ast::DataType) -> Result<Option<(i32, i32)>, BindError> {
     let Some((precision, scale)) = numeric_typmod(dt) else {
         return Ok(None);
     };
@@ -3521,6 +3521,22 @@ fn apply_numeric_typmod_if_any(
     let Some((precision, scale)) = checked_numeric_typmod(data_type)? else {
         return Ok(expr);
     };
+    apply_numeric_typmod(expr, precision, scale)
+}
+
+/// Round `expr` to a `numeric(precision, scale)`, folding a constant at bind time
+/// and emitting a runtime coercion otherwise.
+///
+/// PostgreSQL applies the same rounding in cast and assignment context — both
+/// round to the scale and both raise `22003` when the integer part no longer
+/// fits — so unlike the character and bit types this needs no
+/// truncate-vs-error flag, and the cast path ([`apply_numeric_typmod_if_any`])
+/// and the column path ([`apply_length_to_column`]) share it.
+pub(crate) fn apply_numeric_typmod(
+    expr: BoundExpr,
+    precision: i32,
+    scale: i32,
+) -> Result<BoundExpr, BindError> {
     if let BoundExpr::Const {
         value: Value::Numeric(n),
         ..
@@ -3650,6 +3666,59 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
     Ok(length_typmod(dt))
 }
 
+/// The fractional-second precision of a `time(p)`/`timestamp(p)` type name,
+/// clamped to what any datetime type can hold.
+///
+/// PostgreSQL warns and clamps rather than rejecting a larger modifier
+/// (`TIMESTAMP(7) precision reduced to maximum allowed, 6`), and since the
+/// clamped value is what it then stores, the only divergence here is the missing
+/// warning. A negative modifier never reaches this: the grammar rejects it.
+pub fn datetime_precision(dt: &ast::DataType) -> Option<i32> {
+    use ast::DataType;
+    let p = match dt {
+        DataType::Time(p, _) | DataType::Timestamp(p, _) => (*p)?,
+        _ => return None,
+    };
+    Some((p as i32).min(crabgresql_types::timestamp::MAX_PRECISION))
+}
+
+/// Round `expr` to a datetime type's fractional-second precision, folding a
+/// constant at bind time. Cast and assignment context round identically, so this
+/// serves both.
+fn apply_datetime_precision(expr: BoundExpr, precision: i32) -> Result<BoundExpr, BindError> {
+    let rounded = match &expr {
+        BoundExpr::Const { value, ty } => match value {
+            Value::Time(usec) => Some(Value::Time(time::apply_typmod(*usec, precision))),
+            Value::TimeTz(t) => Some(Value::TimeTz(crabgresql_types::TimeTz {
+                usec: time::apply_typmod(t.usec, precision),
+                zone: t.zone,
+            })),
+            Value::Timestamp(usec) => {
+                Some(Value::Timestamp(timestamp::apply_typmod(*usec, precision)))
+            }
+            Value::TimestampTz(usec) => Some(Value::TimestampTz(timestamp::apply_typmod(
+                *usec, precision,
+            ))),
+            // NULL, or a constant of some other type that a coercion above will
+            // still convert.
+            _ => None,
+        }
+        .map(|value| BoundExpr::Const { value, ty: *ty }),
+        _ => None,
+    };
+    Ok(rounded.unwrap_or_else(|| BoundExpr::FuncCall {
+        func: ScalarFn::TimeApplyTypmod,
+        ret: expr.ty(),
+        args: vec![
+            expr,
+            BoundExpr::Const {
+                value: Value::Int4(precision),
+                ty: PgType::Int4,
+            },
+        ],
+    }))
+}
+
 /// Apply a `varchar(n)`/`char(n)` length coercion, or a `name` truncation, when
 /// the target is one of those types. Constant inputs fold at bind time.
 pub(crate) fn apply_length_typmod_if_any(
@@ -3676,6 +3745,12 @@ pub(crate) fn apply_length_typmod_if_any(
         },
         // `name` always truncates to 63 characters, independent of any modifier.
         PgType::Name => (ScalarFn::NameInput, None),
+        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            match datetime_precision(data_type) {
+                Some(p) => return apply_datetime_precision(expr, p),
+                None => return Ok(expr),
+            }
+        }
         // `"char"` takes no modifier and PG rejects one rather than ignoring
         // it, so this target still has to run the check even though it never
         // yields a typmod — the DDL path reaches `checked_length_typmod`
@@ -8122,6 +8197,156 @@ pub fn bind_column_default(
     Ok(bound)
 }
 
+/// The text PostgreSQL's `pg_get_expr(adbin, adrelid, true)` prints for a column
+/// default that is a bare *literal*, or `None` when this expression is not one —
+/// in which case the caller keeps the statement's own source text.
+///
+/// PostgreSQL stores the default as a node tree coerced to the column's type and
+/// deparses it on demand, so `b bit(4) DEFAULT '1001'` comes back as
+/// `'1001'::"bit"`, not as written. crabgresql stores SQL text (see
+/// [`Column::default`]), so the canonical form has to be produced here, once, at
+/// DDL time. The rules below were probed against PostgreSQL 18.4:
+///
+/// * The type label is the **literal's own** type, never the column's: psql
+///   passes `pretty`, which hides the implicit coercion to the column type. So
+///   `'1001'` — an untyped constant, typed from context — labels itself with the
+///   column's type (`"bit"` in a `bit(4)` column, `bit varying` in a `bit
+///   varying(5)` one), while `B'0101'` is already `bit` and stays `'0101'::"bit"`
+///   in *both*. Same reason `i bigint DEFAULT 42` prints a bare `42` (the
+///   literal is `int4`) and `n numeric DEFAULT -1` prints `'-1'::integer`.
+/// * The label never carries a modifier, so it is `format_type(oid, -1)` — which
+///   is where `bit`'s quoted spelling comes from ([`PgType::format_type`]).
+/// * The value is the literal put through the type's input function *without*
+///   the modifier: `'007'` on an `integer` prints `7`, and `'x'` on a `char(4)`
+///   prints `'x'::bpchar` — unpadded, because the padding is the modifier's work.
+/// * `int4` prints bare unless negative (`'-1'::integer`, so a re-parse sees a
+///   constant and not a unary minus); `numeric` prints bare only when
+///   non-negative and unambiguously fractional (`1.5`, but `'1000'::numeric`,
+///   which would otherwise re-parse as `int4`); `boolean` prints the `true`/
+///   `false` keywords; everything else is quoted and labelled.
+///
+/// * **`DEFAULT NULL`** is not recorded at all for a type that needs no length
+///   coercion, and recorded as `NULL::<label>` for one that does — see
+///   [`ColumnDefault::Omit`].
+///
+/// Deliberately left alone, keeping the source text it has always stored:
+///
+/// * **Non-literals**, which go to [`crate::ruleutils::column_default`] instead
+///   — it has the precedence rules an operator expression needs. `DEFAULT (1 +
+///   2)` must not be folded to `3`, which is why the split is between *literal*
+///   and everything else rather than between constant and non-constant. An
+///   explicit cast goes there too: PG keeps the modifier on one
+///   (`'1001'::bit(4)`), which is the opposite of the rule above.
+///
+/// A `timestamptz` value is baked here in whatever zone the DDL session had, and
+/// [`crate::ruleutils::rerender_in_zone`] puts it back into the reader's on the
+/// way out.
+pub fn deparse_literal_default(
+    expr: &ast::Expr,
+    column: &Column,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<ColumnDefault, BindError> {
+    // PG's grammar folds a sign into a numeric literal, so `-1` is a constant
+    // (see `bind_unary`); `+1` is not, and stays an operator expression.
+    let literal = match expr {
+        ast::Expr::Value(v) => match v.value {
+            ast::Value::Null => return Ok(null_default(column)),
+            ast::Value::Placeholder(_) => false,
+            _ => true,
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => {
+            matches!(expr.as_ref(), ast::Expr::Value(v) if matches!(v.value, ast::Value::Number(..)))
+        }
+        _ => false,
+    };
+    if !literal {
+        return Ok(ColumnDefault::Source);
+    }
+    let params = param_ctx_none();
+    let scope = Scope::empty(catalog, &params);
+    let bound = match bind_expr(expr, &scope)? {
+        // An untyped constant takes the column's type, as PG's unknown-Const
+        // resolution does. A `timestamptz`/`timetz` one needs the session zone
+        // to resolve, which the binder deliberately does not hold, so it stays
+        // unfolded and falls out below as `Source` — the DDL path renders those
+        // two itself.
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
+        }
+        Binding::Typed(e) => e,
+    };
+    let BoundExpr::Const { value, ty } = bound else {
+        // A literal that does not fold to a constant — a `reg*` name, say, whose
+        // resolution needs the running catalog.
+        return Ok(ColumnDefault::Source);
+    };
+    Ok(deparse_const(&value, ty).map_or(ColumnDefault::Source, ColumnDefault::Deparsed))
+}
+
+/// What to record for a column default, once deparsed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColumnDefault {
+    /// PostgreSQL's canonical text for it.
+    Deparsed(String),
+    /// Keep the statement's own expression text.
+    Source,
+    /// Record no default at all, leaving `atthasdef` false.
+    Omit,
+}
+
+/// `DEFAULT NULL`: PostgreSQL skips the `pg_attrdef` entry when the transformed
+/// default is a bare null `Const`, and keeps it when a length coercion wrapped
+/// one — so `text DEFAULT NULL` reports no default at all while `bit(4) DEFAULT
+/// NULL` reports `NULL::"bit"`. A coercion is inserted exactly when the column
+/// carries a modifier, which is the test used here; verified against PostgreSQL
+/// 18.4 across `text`/`varchar`/`varchar(4)`/`bit(4)`/`bit varying(5)`/`char(4)`/
+/// `numeric`/`numeric(5,2)`/`int`/`timestamp(3)`/`name`.
+///
+/// Testing the modifier rather than the shape of the bound expression matters
+/// for one type: `name` truncates through a coercion node here but has no
+/// modifier and no length coercion in PG, so it must still be omitted.
+fn null_default(column: &Column) -> ColumnDefault {
+    if column.typmod < 0 {
+        return ColumnDefault::Omit;
+    }
+    let label = column
+        .ty
+        .format_type(Some(-1))
+        .unwrap_or_else(|| column.ty.name().to_string());
+    ColumnDefault::Deparsed(format!("NULL::{label}"))
+}
+
+/// Render one constant the way PG's deparse does — see
+/// [`deparse_literal_default`] for where each rule comes from. `None` for a NULL
+/// value, which no caller produces.
+fn deparse_const(value: &Value, ty: PgType) -> Option<String> {
+    // `true`/`false` are SQL keywords, not the `t`/`f` of the wire encoding,
+    // which would not even re-parse as a boolean default.
+    if let Value::Bool(b) = value {
+        return Some(if *b { "true" } else { "false" }.to_string());
+    }
+    let text = value.encode_text_utc()?;
+    let bare = match ty {
+        PgType::Int4 => !text.starts_with('-'),
+        PgType::Numeric => {
+            !text.starts_with('-')
+                && text.contains('.')
+                && text.chars().all(|c| c.is_ascii_digit() || c == '.')
+        }
+        _ => false,
+    };
+    if bare {
+        return Some(text);
+    }
+    let label = ty
+        .format_type(Some(-1))
+        .unwrap_or_else(|| ty.name().to_string());
+    Some(format!("'{}'::{label}", text.replace('\'', "''")))
+}
+
 /// Bind the body of a `CREATE FUNCTION ... LANGUAGE SQL` to a typed expression,
 /// with `$1..$n` seeded to the declared argument types and the result coerced to
 /// the declared return type. An argument declared with a name is also reachable
@@ -8483,6 +8708,20 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
 /// Apply a column's `varchar(n)`/`char(n)`/`name` length coercion in assignment
 /// context (an over-long varchar/char errors unless the excess is blank).
 fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr, BindError> {
+    // `numeric` and the datetime types round rather than truncating, and share
+    // their whole implementation with the cast path.
+    if column.typmod >= 0 {
+        match column.ty {
+            PgType::Numeric => {
+                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                return apply_numeric_typmod(expr, precision, scale);
+            }
+            PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+                return apply_datetime_precision(expr, column.typmod);
+            }
+            _ => {}
+        }
+    }
     let func = match column.ty {
         PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
         PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,
