@@ -329,6 +329,16 @@ impl TableEngine for SessionCatalog {
         self.global.relation_metadata()
     }
 
+    /// Forwarded rather than left to the trait default, which derives the links
+    /// from `relations()` — a schema deep-clone per relation. The binder asks
+    /// this of every base relation of every statement, and it is handed *this*
+    /// overlay, not the engine underneath, so without this arm the engine's
+    /// cheap override is unreachable and the default's cost is what every query
+    /// actually pays.
+    fn inheritance_links(&self) -> Vec<((String, String), (String, String))> {
+        self.global.inheritance_links()
+    }
+
     /// Analyze the same relation `open_table` would resolve: this session's temp
     /// table shadows a permanent one of the same unqualified name, and another
     /// session's temp table is never reachable.
@@ -552,5 +562,70 @@ mod tests {
         fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
             Err(StorageError::TableNotFound(name.to_string()))
         }
+    }
+
+    /// An engine that answers `inheritance_links` but refuses `relations`.
+    ///
+    /// This shape is deliberate. `SessionCatalog` once failed to forward
+    /// `inheritance_links`, so the trait default ran and derived the links from
+    /// `relations()` — a schema deep-clone of the whole catalog on the path that
+    /// the method exists to keep cheap. **No assertion on the returned links
+    /// could have caught it**, because the default computes the same answer; only
+    /// the cost differed. So this double makes the cost fatal instead, and the
+    /// test below fails loudly if the forwarding arm is ever removed again.
+    struct LinksOnlyEngine;
+
+    impl TableEngine for LinksOnlyEngine {
+        fn create_table(&self, _schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+            unreachable!("this test never creates")
+        }
+
+        fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+
+        fn resolve(
+            &self,
+            _namespace: Option<&str>,
+            name: &str,
+        ) -> Result<Arc<dyn TableAm>, StorageError> {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+
+        fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+
+        fn relations(&self) -> Vec<TableSchema> {
+            panic!(
+                "relations() is the expensive path: SessionCatalog must forward \
+                 inheritance_links to the engine instead of falling back to the \
+                 trait default that derives links from full schema clones"
+            );
+        }
+
+        fn inheritance_links(&self) -> Vec<((String, String), (String, String))> {
+            vec![(
+                ("public".to_string(), "child".to_string()),
+                ("public".to_string(), "parent".to_string()),
+            )]
+        }
+    }
+
+    #[test]
+    fn session_catalog_forwards_inheritance_links_rather_than_deriving_them() {
+        let system = Arc::new(crabgresql_catalog::SystemCatalog::new());
+        let catalog = SessionCatalog::new(
+            Arc::new(LinksOnlyEngine),
+            Arc::clone(&system) as Arc<dyn TableEngine>,
+            "pg_temp_1",
+        );
+        assert_eq!(
+            catalog.inheritance_links(),
+            vec![(
+                ("public".to_string(), "child".to_string()),
+                ("public".to_string(), "parent".to_string())
+            )],
+        );
     }
 }

@@ -23,7 +23,7 @@ use crabgresql_executor::{
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionBound,
+    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent, PartitionBound,
     PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
     RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig, SequenceDefinition, StorageError,
     TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
@@ -39,7 +39,7 @@ use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
     RoutineDefinition, RoutineKind, TypeRef, Volatility,
 };
-use crate::routines::RoutineDispatch;
+use crate::routines::{RoutineDispatch, SessionNotices};
 use crate::session::{ActiveTxn, Session};
 
 /// Severity of a non-error message sent before a command's CommandComplete.
@@ -1930,17 +1930,34 @@ fn execute_truncate(
             "TRUNCATE ... ON CLUSTER is not supported yet",
         ));
     }
-    let mut named: Vec<(String, Arc<dyn TableAm>)> = Vec::with_capacity(truncate.table_names.len());
+    // Keyed by `(namespace, name)`, not the bare name: a recursion can reach
+    // children in other schemas, and a bare-name key would let one of them
+    // collide with an unrelated same-named relation and silently drop it from
+    // the statement.
+    let mut named: Vec<((String, String), Arc<dyn TableAm>)> =
+        Vec::with_capacity(truncate.table_names.len());
+    let mut push = |table: Arc<dyn TableAm>| {
+        let schema = table.schema();
+        named.push((
+            (schema.namespace.clone(), schema.name.clone()),
+            table.clone(),
+        ));
+    };
     for target in &truncate.table_names {
-        if target.only || target.has_asterisk {
-            return Err(PgError::feature_not_supported(
-                "TRUNCATE ONLY / descendant selection is not supported yet",
-            ));
-        }
         let name = object_name_to_table_name(&target.name)?;
         let table = engine.open_table(&name)?;
         reject_partitioned_parent(&table, &name)?;
-        named.push((name, table));
+        push(table.clone());
+        // TRUNCATE recurses into the inheritance children unless told `ONLY`
+        // (`t*` is the explicit spelling of the default). Emptying the parent
+        // alone would leave the rows a plain `SELECT * FROM parent` still
+        // returns, which is not what "truncate" can be allowed to mean.
+        if target.only {
+            continue;
+        }
+        for child in crabgresql_binder::inheritance_descendants(engine, table.schema())? {
+            push(child);
+        }
     }
     // Acquire the tables' exclusive locks in a deterministic order (by name), so
     // two concurrent multi-table TRUNCATEs can never deadlock, and drop duplicates
@@ -2922,6 +2939,21 @@ fn execute_create_table(
     } else {
         resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
     };
+    // `IF NOT EXISTS` on a relation that is already there is a no-op, and PG
+    // decides that *before* it analyzes anything else. Checking it here rather
+    // than after the columns are resolved is what makes the no-op total: the
+    // rest of this function raises notices (the inheritance merge, the datetime
+    // clamp) and errors (a type conflict, a missing parent, the sort-key rule)
+    // that all describe a table this statement is not going to touch.
+    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
+        return Ok(QueryResult::Command {
+            tag: "CREATE TABLE".into(),
+            notices: vec![Notice::notice(
+                format!("relation \"{name}\" already exists, skipping"),
+                None,
+            )],
+        });
+    }
     // Temp and UNLOGGED tables are memory tables (RAM-backed, WAL-skipping); a
     // plain table is a durable heap. All of them live in the one shared engine now.
     let persistence = if create.temporary {
@@ -2960,12 +2992,29 @@ fn execute_create_table(
             "CREATE TABLE ... ON COMMIT is not supported yet",
         ));
     }
-    // Table inheritance (`INHERITS (...)`) is a distinct feature from declarative
-    // partitioning and is not implemented; reject rather than silently ignore.
-    if create.inherits.is_some() {
-        return Err(PgError::feature_not_supported(
-            "CREATE TABLE ... INHERITS is not supported yet",
-        ));
+    // Table inheritance is a distinct feature from declarative partitioning, and
+    // the two do not compose here: a partitioned relation anywhere in a hierarchy
+    // would make the read fan-out have to expand a leaf set inside a descendant
+    // set. PG allows the combination; we reject it rather than half-honor it.
+    let inherits = create.inherits.as_deref().unwrap_or(&[]);
+    if !inherits.is_empty() {
+        // Both `PARTITION BY` (this table is a partitioned parent) and
+        // `PARTITION OF` (it is a leaf) are refused. The `PARTITION OF` case
+        // matters most: the parser accepts the two clauses together, and the
+        // dispatch below would hand the statement to `execute_create_partition`,
+        // which builds its schema from the parent alone — silently discarding
+        // the parents this clause named.
+        if create.partition_by.is_some() || create.partition_of.is_some() {
+            return Err(PgError::feature_not_supported(
+                "CREATE TABLE ... INHERITS with declarative partitioning is not supported yet",
+            ));
+        }
+        if access_method.is_engine_managed() {
+            return Err(PgError::feature_not_supported(format!(
+                "table access method \"{}\" does not support inheritance",
+                access_method.as_str(),
+            )));
+        }
     }
     // Redshift's `SORTKEY (...)` parses ungated, and is a second spelling of the
     // layout order `ORDER BY` now owns. Accepting it silently would let a table
@@ -3008,6 +3057,7 @@ fn execute_create_table(
             &namespace,
             &name,
             parent,
+            &session.temp_schema,
             &session.exec_context(),
         );
     }
@@ -3266,6 +3316,27 @@ fn execute_create_table(
         None => None,
     };
 
+    // Fold in the inherited columns now that the table's own are fully resolved
+    // (serial desugaring, NOT NULL, DEFAULT, COLLATE all applied), and before
+    // anything indexes into the layout: the merge is what decides the final
+    // column *positions*, which every PRIMARY KEY and sort key below refers to.
+    // The merge's own notices go straight to the session sink, so they reach the
+    // client ahead of the error when the merge fails; `notices` here carries only
+    // what this function raises on the success path.
+    let mut notices: Vec<Notice> = Vec::new();
+    let (columns, inherit_links) = if inherits.is_empty() {
+        (columns, Vec::new())
+    } else {
+        merge_inherited_columns(
+            engine,
+            inherits,
+            create.temporary,
+            &session.temp_schema,
+            columns,
+            &session.notices,
+        )?
+    };
+
     let schema = TableSchema {
         name: name.clone(),
         namespace: namespace.clone(),
@@ -3274,6 +3345,7 @@ fn execute_create_table(
         access_method,
         partition_scheme,
         partition_of: None,
+        inherits: inherit_links,
         // Resolved below, once the PRIMARY KEY's columns are known.
         sort_key: Vec::new(),
     };
@@ -3327,16 +3399,6 @@ fn execute_create_table(
             }
         }
     }
-    // `IF NOT EXISTS` on a relation that is already there is a no-op, so it must
-    // not trip over the sort-key rule: a database written before sort keys
-    // existed is full of keyless engine-managed relations, and re-running the
-    // DDL that created one is exactly what an idempotent bootstrap script does.
-    // Checked here rather than at the top of the function because that is the
-    // narrow fix — and it lands above the serial-sequence creation below, so the
-    // re-run also stops creating a throwaway `t_id_seq1` only to drop it again.
-    if create.if_not_exists && engine.resolve(Some(&namespace), &name).is_ok() {
-        return Ok(QueryResult::command("CREATE TABLE"));
-    }
     schema.sort_key = build_sort_key(
         create.order_by.as_ref(),
         access_method,
@@ -3363,17 +3425,31 @@ fn execute_create_table(
                 }
             }
         }
-        // PG succeeds with a notice; NoticeResponse itself is still todo. The
-        // serial sequences we just created would be orphaned, so drop them.
+        // The relation appeared between the check above and this create (or the
+        // check could not see it). PG reports the skip; the serial sequences we
+        // just created would be orphaned, so drop them.
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
             drop_created_sequences(target, &serial_defs);
+            // Nothing was created, so the merge that would have happened did
+            // not: reporting it would describe a table this statement did not
+            // touch. The merge notices are already in the session sink, so drop
+            // them there rather than from the local list.
+            notices.clear();
+            let _ = session.notices.drain();
+            notices.push(Notice::notice(
+                format!("relation \"{name}\" already exists, skipping"),
+                None,
+            ));
         }
         Err(e) => {
             drop_created_sequences(target, &serial_defs);
             return Err(e.into());
         }
     }
-    Ok(QueryResult::command("CREATE TABLE"))
+    Ok(QueryResult::Command {
+        tag: "CREATE TABLE".to_string(),
+        notices,
+    })
 }
 
 /// Reject a direct physical DDL operation (TRUNCATE, CREATE INDEX) on a
@@ -3761,6 +3837,297 @@ fn stored_endpoint(datum: &PartitionBoundDatum) -> Endpoint {
     }
 }
 
+/// Resolve the relation a `PARTITION OF` or `INHERITS (...)` clause names,
+/// returning it with its bare name for error text. Both clauses report a
+/// non-table relation of that name as wrong-object-type rather than as missing,
+/// and both use PG's inheritance wording for it.
+///
+/// An **unqualified** name is looked for in `temp_schema` before the global
+/// engine, because that is the order a read resolves in and a temp table shadows
+/// a permanent one of the same name. DDL runs against the raw engine rather than
+/// the session overlay, whose `resolve` would do this for us, so without the
+/// extra probe naming a temp parent reports `relation "t" does not exist` about a
+/// relation that plainly does — worse than the "not supported" both clauses
+/// actually mean to say about it.
+fn resolve_parent_relation(
+    engine: &Arc<dyn TableEngine>,
+    parent_ref: &ast::ObjectName,
+    temp_schema: &str,
+) -> Result<(Arc<dyn TableAm>, String), PgError> {
+    let (qual, name) = split_object_name(parent_ref, "relation")?;
+    let resolved = match qual.as_deref() {
+        None => engine
+            .resolve(Some(temp_schema), &name)
+            .or_else(|_| engine.resolve(None, &name)),
+        Some(_) => engine.resolve(qual.as_deref(), &name),
+    };
+    let table = resolved.map_err(|_| {
+        // A view or sequence of that name exists but is not a table: PG reports
+        // wrong-object-type, not "does not exist".
+        let is_non_table_relation = engine.resolve_view(qual.as_deref(), &name).is_some()
+            || engine
+                .sequence(qual.as_deref().unwrap_or("public"), &name)
+                .is_some();
+        if is_non_table_relation {
+            PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("inherited relation \"{name}\" is not a table or foreign table"),
+            )
+        } else {
+            PgError::new(
+                sqlstate::UNDEFINED_TABLE,
+                format!("relation \"{name}\" does not exist"),
+            )
+        }
+    })?;
+    Ok((table, name))
+}
+
+/// Fold the columns of a table's `INHERITS (...)` parents together with its own
+/// declared columns, returning the merged layout and the parent links to persist.
+///
+/// The `merging ...` notices go to the session sink rather than into the return
+/// value, because PostgreSQL raises them even when the merge then fails —
+/// `NOTICE: merging column "a" ...` followed by `ERROR: column "a" has a type
+/// conflict`. A `Result`'s `Ok` half cannot carry them past that error.
+///
+/// Two passes:
+///
+/// 1. The parents, left to right. A name seen for the first time is appended; a
+///    name a previous parent already contributed is merged into that earlier
+///    *position*, which is why `stud_emp INHERITS (emp, student)` orders its
+///    columns `name, age, location, salary, manager, gpa` rather than
+///    interleaving `student`'s copy of `person`'s columns a second time.
+/// 2. The child's own columns. Again by name, again merging in place — so a
+///    child that redeclares an inherited column refines it rather than
+///    duplicating it, and only genuinely new names extend the layout.
+///
+/// Merging is conservative in both passes: NOT NULL is OR'd (either side may
+/// tighten), a default flows down from whichever side has one, and a conflict in
+/// type or collation is an error rather than a silent pick.
+///
+/// Two parents disagreeing about a DEFAULT is only *provisionally* an error. The
+/// hint PG prints for it — "specify a default explicitly" — describes a
+/// resolution the child is allowed to supply, so the conflict is recorded in
+/// pass 1 and raised after pass 2, once the child has had its chance to settle
+/// it.
+fn merge_inherited_columns(
+    engine: &Arc<dyn TableEngine>,
+    parents: &[ast::ObjectName],
+    child_temporary: bool,
+    temp_schema: &str,
+    own: Vec<Column>,
+    notices: &SessionNotices,
+) -> Result<(Vec<Column>, Vec<InheritParent>), PgError> {
+    let mut merged: Vec<Column> = Vec::new();
+    let mut links: Vec<InheritParent> = Vec::new();
+    // Columns whose parents supplied different defaults, pending the child's
+    // own declaration.
+    let mut default_conflicts: Vec<String> = Vec::new();
+
+    for parent_ref in parents {
+        let (parent, parent_name) = resolve_parent_relation(engine, parent_ref, temp_schema)?;
+        let parent_schema = parent.schema();
+        let link = InheritParent {
+            namespace: parent_schema.namespace.clone(),
+            name: parent_schema.name.clone(),
+        };
+        if links.contains(&link) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_TABLE,
+                format!("relation \"{parent_name}\" would be inherited from more than once"),
+            ));
+        }
+        // A partitioned parent holds no rows and a partition enforces a bound;
+        // an inheritance child of either would need routing rules this slice
+        // does not have, so both are refused at DDL rather than half-honored.
+        if parent_schema.partition_scheme.is_some() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("cannot inherit from partitioned table \"{parent_name}\""),
+            ));
+        }
+        if parent_schema.partition_of.is_some() {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("cannot inherit from partition \"{parent_name}\""),
+            ));
+        }
+        // PG allows a temp child of a temp parent, and a temp child of a
+        // permanent one. We allow neither, and the reason is the fan-out rather
+        // than the DDL: descendants are discovered from the engine-wide link set,
+        // which is not filtered by session, so another session reading a
+        // permanent parent would find a temp child it cannot resolve and fail
+        // the SELECT outright. Refusing at CREATE keeps that from being built.
+        //
+        // Tested before the parent's persistence so a temp/temp hierarchy — the
+        // combination this gap is actually about — gets *this* message. The
+        // other way round, it drew the permanent-child wording below and called
+        // a temporary parent's temporary child a cross-session problem.
+        if child_temporary {
+            return Err(PgError::feature_not_supported(
+                "temporary tables in an inheritance hierarchy are not supported yet",
+            ));
+        }
+        // A permanent child of a temporary parent would outlive its parent.
+        if parent_schema.persistence == RelPersistence::Temporary {
+            return Err(PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("cannot inherit from temporary relation \"{parent_name}\""),
+            ));
+        }
+        // An engine-managed parent is refused for the same reason the guard on
+        // the table being created refuses an engine-managed child: such a
+        // relation reads through its own storage leaves, and mixing those into an
+        // Append beside a heap descendant takes the whole node off the batch path
+        // — silently, for every read of the parent. The child-side guard alone
+        // left this reachable from the other end.
+        if parent_schema.access_method.is_engine_managed() {
+            return Err(PgError::feature_not_supported(format!(
+                "table access method \"{}\" does not support inheritance",
+                parent_schema.access_method.as_str(),
+            )));
+        }
+        links.push(link);
+
+        for col in &parent_schema.columns {
+            let Some(existing) = merged.iter_mut().find(|c| c.name == col.name) else {
+                merged.push(col.clone());
+                continue;
+            };
+            // Raised before the merge is attempted, because PostgreSQL reports
+            // the merge and *then* the conflict that stopped it.
+            notices.push(Notice::notice(
+                format!(
+                    "merging multiple inherited definitions of column \"{}\"",
+                    col.name
+                ),
+                None,
+            ));
+            merge_column_into(existing, col, &col.name, true)?;
+            // Both sides having a default, and disagreeing, is the one clash the
+            // child can still resolve.
+            match (&existing.default, &col.default) {
+                (Some(a), Some(b)) if a != b => {
+                    if !default_conflicts.contains(&col.name) {
+                        default_conflicts.push(col.name.clone());
+                    }
+                }
+                (None, Some(_)) => existing.default = col.default.clone(),
+                _ => {}
+            }
+        }
+    }
+
+    for (own_position, col) in own.into_iter().enumerate() {
+        let Some(position) = merged.iter().position(|c| c.name == col.name) else {
+            merged.push(col);
+            continue;
+        };
+        // PG distinguishes the two cases by whether the column had to move:
+        // declared at the position it already merged into, it is a plain merge;
+        // declared anywhere else, PG says so and explains where it went. Raised
+        // before the merge is attempted, as in pass 1.
+        notices.push(if own_position == position {
+            Notice::notice(
+                format!("merging column \"{}\" with inherited definition", col.name),
+                None,
+            )
+        } else {
+            Notice::notice(
+                format!(
+                    "moving and merging column \"{}\" with inherited definition",
+                    col.name
+                ),
+                Some(
+                    "User-specified column moved to the position of the inherited column."
+                        .to_string(),
+                ),
+            )
+        });
+        merge_column_into(&mut merged[position], &col, &col.name, false)?;
+        // The child's own declaration is the resolution PG's hint asks for, so
+        // it settles any disagreement its parents had.
+        if col.default.is_some() {
+            merged[position].default = col.default.clone();
+            default_conflicts.retain(|name| *name != col.name);
+        }
+    }
+
+    if let Some(name) = default_conflicts.first() {
+        return Err(PgError::new(
+            // 42611 invalid_column_definition.
+            "42611",
+            format!("column \"{name}\" inherits conflicting default values"),
+        )
+        .with_hint("To resolve the conflict, specify a default explicitly."));
+    }
+
+    Ok((merged, links))
+}
+
+/// A column's type as PostgreSQL names it in an error message.
+///
+/// Goes through the same `format_type` spelling `\d` uses, so a type reported in
+/// a DETAIL and the same type in a catalog listing cannot drift apart. The
+/// modifier has to be converted first: `format_type` speaks the
+/// `pg_attribute.atttypmod` dialect (where a character type carries its varlena
+/// header) and `Column::typmod` does not, so a `char(5)` column would otherwise
+/// render as `character(1)`.
+fn column_type_name(column: &Column) -> String {
+    column
+        .ty
+        .format_type(Some(column.atttypmod()))
+        .unwrap_or_else(|| column.ty.name().to_string())
+}
+
+/// Fold `incoming` into the already-merged column `existing`, or report the
+/// conflict that stops it. `inherited` selects PG's two spellings of the same
+/// complaint: a clash between two parents names the column as inherited, a clash
+/// between the child's own declaration and what it inherited does not.
+///
+/// DEFAULTs are the caller's business, not this function's: a disagreement
+/// between two parents is not final until the child has declared its own
+/// columns, so resolving it needs a view of both passes.
+fn merge_column_into(
+    existing: &mut Column,
+    incoming: &Column,
+    name: &str,
+    inherited: bool,
+) -> Result<(), PgError> {
+    let qualifier = if inherited {
+        "inherited column"
+    } else {
+        "column"
+    };
+    if existing.ty != incoming.ty || existing.typmod != incoming.typmod {
+        return Err(PgError::new(
+            sqlstate::DATATYPE_MISMATCH,
+            format!("{qualifier} \"{name}\" has a type conflict"),
+        )
+        .with_detail(format!(
+            "{} versus {}",
+            column_type_name(existing),
+            column_type_name(incoming),
+        )));
+    }
+    if existing.collation != incoming.collation {
+        return Err(PgError::new(
+            // 42P21 collation_mismatch.
+            "42P21",
+            format!("{qualifier} \"{name}\" has a collation conflict"),
+        ));
+    }
+    // NOT NULL is a restriction: either side may impose it, neither may lift it.
+    if !incoming.nullable {
+        existing.nullable = false;
+        if existing.not_null_constraint.is_none() {
+            existing.not_null_constraint = incoming.not_null_constraint.clone();
+        }
+    }
+    Ok(())
+}
+
 /// `CREATE TABLE <child> PARTITION OF <parent> FOR VALUES FROM (...) TO (...)`:
 /// create a leaf partition as an ordinary heap table that inherits the parent's
 /// columns and records its bound. RANGE only; the bound is validated non-empty
@@ -3772,6 +4139,7 @@ fn execute_create_partition(
     namespace: &str,
     name: &str,
     parent_ref: &ast::ObjectName,
+    temp_schema: &str,
     ctx: &ExecContext,
 ) -> Result<QueryResult, PgError> {
     // A partition inherits its shape from the parent: no redeclared columns,
@@ -3786,30 +4154,7 @@ fn execute_create_partition(
             "sub-partitioning is not supported yet",
         ));
     }
-    let (parent_qual, parent_name) = split_object_name(parent_ref, "relation")?;
-    let parent = engine
-        .resolve(parent_qual.as_deref(), &parent_name)
-        .map_err(|_| {
-            // A view or sequence of that name exists but is not a table: PG reports
-            // wrong-object-type, not "does not exist".
-            let is_non_table_relation = engine
-                .resolve_view(parent_qual.as_deref(), &parent_name)
-                .is_some()
-                || engine
-                    .sequence(parent_qual.as_deref().unwrap_or("public"), &parent_name)
-                    .is_some();
-            if is_non_table_relation {
-                PgError::new(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    format!("inherited relation \"{parent_name}\" is not a table or foreign table"),
-                )
-            } else {
-                PgError::new(
-                    sqlstate::UNDEFINED_TABLE,
-                    format!("relation \"{parent_name}\" does not exist"),
-                )
-            }
-        })?;
+    let (parent, parent_name) = resolve_parent_relation(engine, parent_ref, temp_schema)?;
     let parent_schema = parent.schema();
     let Some(scheme) = &parent_schema.partition_scheme else {
         return Err(PgError::new(
@@ -3908,6 +4253,8 @@ fn execute_create_partition(
                 to: vec![to_datum],
             },
         }),
+        // Partitioning and inheritance are mutually exclusive links.
+        inherits: Vec::new(),
         // A leaf partition is always a heap, which declares no layout order.
         sort_key: Vec::new(),
     };
@@ -4052,6 +4399,8 @@ fn execute_create_table_as(
         access_method,
         partition_scheme: None,
         partition_of: None,
+        // CTAS derives its shape from a query; `INHERITS` is rejected above.
+        inherits: Vec::new(),
         sort_key: Vec::new(),
     };
     // As on the plain path: an `IF NOT EXISTS` re-run against an existing
@@ -5526,8 +5875,8 @@ fn execute_drop_table(
         .map(|n| ("public".to_string(), n.clone()))
         .collect();
     all_targets.extend(qualified.iter().cloned());
-    let (dependent_views, mut cascade_notices) =
-        plan_view_cascade(catalog, "table", &all_targets, cascade)?;
+    let (dependents, mut cascade_notices) =
+        plan_drop_cascade(catalog, "table", &all_targets, cascade)?;
     notices.append(&mut cascade_notices);
     for name in &plain {
         catalog.drop_table("public", name)?;
@@ -5535,17 +5884,30 @@ fn execute_drop_table(
     for (ns, name) in &qualified {
         catalog.drop_table(ns, name)?;
     }
-    for (ns, view) in &dependent_views {
-        catalog.drop_view(ns, view)?;
-    }
+    drop_cascaded(catalog, &dependents)?;
     // Auto-drop sequences a dropped table owns (a `serial` column's sequence, via
     // PG's OWNED BY). PG removes these silently, without a cascade notice.
+    //
+    // A table CASCADE pulled in counts as dropped here too: since inheritance
+    // children became dependents, a cascade can remove a table that owns
+    // sequences, and skipping those would leave a `t_id_seq` behind whose table
+    // is gone — so recreating `t` would silently get `t_id_seq1`.
+    let dropped_tables: Vec<(&str, &str)> = plain
+        .iter()
+        .map(|n| ("public", n.as_str()))
+        .chain(qualified.iter().map(|(ns, n)| (ns.as_str(), n.as_str())))
+        .chain(
+            dependents
+                .iter()
+                .filter(|(kind, ..)| *kind == DependentKind::Table)
+                .map(|(_, ns, n)| (ns.as_str(), n.as_str())),
+        )
+        .collect();
     for seq in catalog.sequences() {
         let owned_by_dropped = seq.owned_by.as_deref().is_some_and(|owner| {
-            (seq.namespace == "public" && plain.iter().any(|t| t == owner))
-                || qualified
-                    .iter()
-                    .any(|(ns, t)| *ns == seq.namespace && t == owner)
+            dropped_tables
+                .iter()
+                .any(|(ns, t)| *ns == seq.namespace && *t == owner)
         });
         if owned_by_dropped {
             let _ = catalog.drop_sequence(&seq.namespace, &seq.name);
@@ -5605,15 +5967,12 @@ fn execute_drop_view(
         .iter()
         .map(|n| ("public".to_string(), n.clone()))
         .collect();
-    let (dependent_views, mut cascade_notices) =
-        plan_view_cascade(catalog, "view", &targets, cascade)?;
+    let (dependents, mut cascade_notices) = plan_drop_cascade(catalog, "view", &targets, cascade)?;
     notices.append(&mut cascade_notices);
     for name in &to_drop {
         catalog.drop_view("public", name)?;
     }
-    for (ns, view) in &dependent_views {
-        catalog.drop_view(ns, view)?;
-    }
+    drop_cascaded(catalog, &dependents)?;
     Ok(QueryResult::Command {
         tag: "DROP VIEW".into(),
         notices,
@@ -6235,42 +6594,127 @@ fn execute_drop_schema(
         }
         contents.sort();
 
-        if !contents.is_empty() && !cascade {
-            // RESTRICT (the default): refuse to drop a non-empty schema.
-            let detail = contents
-                .iter()
-                .map(|(kind, obj)| format!("{kind} {name}.{obj} depends on schema {name}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(PgError::new(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                format!("cannot drop schema {name} because other objects depend on it"),
-            )
-            .with_detail(detail)
-            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
-        }
-        if !contents.is_empty() {
-            // CASCADE: mirror PG's `drop cascades to ...` NOTICE, then drop each
-            // contained object in the target namespace.
-            let lines: Vec<String> = contents
-                .iter()
-                .map(|(kind, obj)| format!("drop cascades to {kind} {name}.{obj}"))
-                .collect();
-            let notice = if contents.len() == 1 {
+        // Objects in *other* schemas can depend on this schema's relations — an
+        // inheritance child, or a view over one of its tables *or views*. They
+        // are dependents of the schema just as its own contents are, and CASCADE
+        // has to take them too: leaving a child behind strands its `inherits`
+        // link on a parent that no longer exists, and recreating that name would
+        // silently re-adopt it.
+        //
+        // Seeded from tables *and* views, because `ViewDefinition::depends_on`
+        // records view-over-view edges — a probe over tables alone misses an
+        // outside view whose only path into this schema runs through a view in
+        // it.
+        let graph = dependency_graph(engine);
+        let in_schema: Vec<QualifiedRelation> = contents
+            .iter()
+            .filter(|(kind, _)| *kind == "table" || *kind == "view")
+            .map(|(_, obj)| (name.clone(), obj.clone()))
+            .collect();
+        let external: Vec<Dependent> = drop_dependents(&graph, &in_schema)
+            .into_iter()
+            .filter(|(_, ns, _)| ns != name)
+            .collect();
+
+        if !contents.is_empty() || !external.is_empty() {
+            if !cascade {
+                // RESTRICT. The schema's own contents depend on the *schema*;
+                // an outside dependent depends on the particular relation it
+                // names, and PG says which — so report the real edge rather
+                // than re-attributing it to the schema.
+                //
+                // Interleaved, not grouped: PG lists each of the schema's own
+                // objects followed immediately by whatever depends on *that*
+                // object, so `s.p` is followed by the child of `s.p` rather than
+                // by the schema's next content.
+                let edges = dependency_edges(&graph, &in_schema);
+                let mut detail: Vec<String> = Vec::new();
+                for (kind, obj) in &contents {
+                    detail.push(format!("{kind} {name}.{obj} depends on schema {name}"));
+                    for ((dkind, dns, dn), (_, tn)) in &edges {
+                        if dns != name && tn == obj {
+                            detail.push(format!(
+                                "{} {} depends on {} {}",
+                                dkind.noun(),
+                                dep_display(dns, dn),
+                                kind,
+                                dep_display(name, tn)
+                            ));
+                        }
+                    }
+                }
+                return Err(PgError::new(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!("cannot drop schema {name} because other objects depend on it"),
+                )
+                .with_detail(detail.join("\n"))
+                .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+            }
+            // CASCADE: PG's `drop cascades to ...` NOTICE over the schema's own
+            // contents and every outside dependent, then the drops.
+            // Same interleaving as the RESTRICT DETAIL above: each of the
+            // schema's own objects, then whatever depended on that one.
+            let edges = dependency_edges(&graph, &in_schema);
+            let mut lines: Vec<String> = Vec::new();
+            let mut listed: Vec<&Dependent> = Vec::new();
+            for (kind, obj) in &contents {
+                lines.push(format!("drop cascades to {kind} {name}.{obj}"));
+                for (dep, (_, tn)) in &edges {
+                    if dep.1 != *name && tn == obj && !listed.contains(&dep) {
+                        lines.push(format!(
+                            "drop cascades to {} {}",
+                            dep.0.noun(),
+                            dep_display(&dep.1, &dep.2)
+                        ));
+                        listed.push(dep);
+                    }
+                }
+            }
+            // Anything reached only transitively (a view over a cascaded child)
+            // has no direct edge into the schema, so it follows.
+            for dep in &external {
+                if !listed.contains(&dep) {
+                    lines.push(format!(
+                        "drop cascades to {} {}",
+                        dep.0.noun(),
+                        dep_display(&dep.1, &dep.2)
+                    ));
+                }
+            }
+            notices.push(if lines.len() == 1 {
                 Notice::notice(lines[0].clone(), None)
             } else {
                 Notice::notice(
-                    format!("drop cascades to {} other objects", contents.len()),
+                    format!("drop cascades to {} other objects", lines.len()),
                     Some(lines.join("\n")),
                 )
-            };
-            notices.push(notice);
+            });
+            // Outside dependents first, for the same reason `drop_cascaded`
+            // orders views ahead of tables: never leave the catalog holding an
+            // object that points at one already removed.
+            drop_cascaded(engine, &external)?;
             for (kind, obj) in &contents {
                 let _ = match *kind {
                     "table" => engine.drop_table(name, obj),
                     "view" => engine.drop_view(name, obj),
                     _ => engine.drop_sequence(name, obj),
                 };
+            }
+            // A cascaded outside table owns its serial sequences just as one in
+            // this schema does; `owned_seqs` only covers the latter, so sweep
+            // the former here (as `execute_drop_table` does for its own
+            // cascade). Otherwise `c_id_seq` outlives `c`.
+            for seq in engine.sequences() {
+                let owned_by_cascaded = seq.owned_by.as_deref().is_some_and(|owner| {
+                    external
+                        .iter()
+                        .any(|(kind, ns, t)| {
+                            *kind == DependentKind::Table && *ns == seq.namespace && t == owner
+                        })
+                });
+                if owned_by_cascaded {
+                    let _ = engine.drop_sequence(&seq.namespace, &seq.name);
+                }
             }
         }
         // Drop the serial-owned sequences silently, with their tables (they were
@@ -6286,84 +6730,156 @@ fn execute_drop_schema(
     })
 }
 
-/// Resolve the views that depend on a set of relations being dropped. `targets`
-/// are the `(namespace, name)` relations being removed, all of object class
-/// `target_noun` (`"table"` or `"view"`). Dependencies are matched on the
-/// qualified `"namespace.name"` key, so a view in any schema that reads a dropped
-/// relation is found (cross-schema included). Under RESTRICT (`!cascade`) any
-/// dependent is an error (2BP01, with a DETAIL line per dependency edge). Under
-/// CASCADE it returns the transitive set of dependent views to drop (each as
-/// `(namespace, name)`), in discovery order, plus the `drop cascades to ...`
-/// NOTICE(s) — matching the wording of `DROP TYPE ... CASCADE`.
-/// A relation as `(namespace, name)` — the key `plan_view_cascade` matches drop
-/// targets and dependent views by.
+/// A relation as `(namespace, name)` — how a drop target and a dependency edge
+/// name what they point at. Matched on the qualified [`dep_key`], so a dependent
+/// in any schema is found, cross-schema included.
 type QualifiedRelation = (String, String);
 
-fn plan_view_cascade(
-    catalog: &Arc<dyn TableEngine>,
-    target_noun: &str,
-    targets: &[QualifiedRelation],
-    cascade: bool,
-) -> Result<(Vec<QualifiedRelation>, Vec<Notice>), PgError> {
-    let all_views = catalog.views();
-    let key = |ns: &str, name: &str| format!("{ns}.{name}");
-    // PG omits the `public.` prefix in dependency messages; keep a bare display
-    // for public objects and qualify the rest.
-    let disp = |ns: &str, name: &str| {
-        if ns == "public" {
-            name.to_string()
-        } else {
-            format!("{ns}.{name}")
-        }
-    };
-    let target_keys: Vec<String> = targets.iter().map(|(ns, n)| key(ns, n)).collect();
+/// What a dependent found by [`plan_drop_cascade`] is, so the caller drops it
+/// with the right verb and the messages name it correctly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DependentKind {
+    Table,
+    View,
+}
 
-    if !cascade {
-        // RESTRICT: report every (dependent view, target) edge as a DETAIL line,
-        // in target order then view order, as PG does.
-        let mut detail = Vec::new();
-        let mut first_blocked: Option<String> = None;
-        for (tns, tn) in targets {
-            let tkey = key(tns, tn);
-            for view in &all_views {
-                if target_keys.contains(&key(&view.namespace, &view.name)) {
-                    continue;
-                }
-                if view.depends_on.iter().any(|d| d == &tkey) {
-                    detail.push(format!(
-                        "view {} depends on {target_noun} {}",
-                        disp(&view.namespace, &view.name),
-                        disp(tns, tn)
-                    ));
-                    first_blocked.get_or_insert_with(|| disp(tns, tn));
-                }
-            }
+impl DependentKind {
+    fn noun(self) -> &'static str {
+        match self {
+            DependentKind::Table => "table",
+            DependentKind::View => "view",
         }
-        if let Some(blocked) = first_blocked {
-            return Err(PgError::new(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                format!("cannot drop {target_noun} {blocked} because other objects depend on it"),
-            )
-            .with_detail(detail.join("\n"))
-            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
-        }
-        return Ok((Vec::new(), Vec::new()));
     }
+}
 
-    // CASCADE: breadth-first transitive closure of dependent views. A view is
-    // pulled in when its `depends_on` names anything already being dropped.
-    let mut removed: Vec<String> = target_keys;
-    let mut dependents: Vec<(String, String)> = Vec::new();
-    loop {
-        let mut added = false;
-        for view in &all_views {
-            let vkey = key(&view.namespace, &view.name);
-            if removed.contains(&vkey) {
+/// One dependent object: what it is and where it lives.
+type Dependent = (DependentKind, String, String);
+
+/// Drop the objects a CASCADE pulled in, views first.
+///
+/// The order is for the catalog's sake, not for a dependency check —
+/// `TableEngine::drop_table` performs none. Dropping a view before the relation
+/// it reads means the catalog never holds a view whose stored query names a
+/// relation that is already gone, so a concurrent reader cannot observe one.
+fn drop_cascaded(catalog: &Arc<dyn TableEngine>, dependents: &[Dependent]) -> Result<(), PgError> {
+    for (kind, ns, name) in dependents {
+        if *kind == DependentKind::View {
+            catalog.drop_view(ns, name)?;
+        }
+    }
+    for (kind, ns, name) in dependents {
+        if *kind == DependentKind::Table {
+            catalog.drop_table(ns, name)?;
+        }
+    }
+    Ok(())
+}
+
+/// The qualified `"namespace.name"` key both dependency sources speak.
+fn dep_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}.{name}")
+}
+
+/// How PostgreSQL names an object in a dependency message: bare in `public`,
+/// schema-qualified everywhere else.
+fn dep_display(namespace: &str, name: &str) -> String {
+    if namespace == "public" {
+        name.to_string()
+    } else {
+        format!("{namespace}.{name}")
+    }
+}
+
+/// Every object that can depend on a relation, paired with the keys it depends
+/// on — the graph both the RESTRICT report and the CASCADE closure read.
+///
+/// Two kinds of edge feed it. A **view** depends on every relation its stored
+/// query reads. An **inheritance child** depends on each of its `INHERITS (...)`
+/// parents; PostgreSQL treats that link exactly as it treats a view's, refusing
+/// the drop under RESTRICT and dropping the child under CASCADE. (A *partition*
+/// is different: it is an internal dependency PostgreSQL drops with its parent
+/// and no CASCADE, which `execute_drop_table` handles by expanding the target
+/// set instead.)
+///
+/// A child of two parents contributes one entry per parent rather than one
+/// merged entry. Both readers are indifferent — RESTRICT iterates targets on the
+/// outside, so it reports one line per matching (dependent, target) edge either
+/// way, and the closure dedupes on its own — so folding them would be
+/// bookkeeping that buys nothing.
+fn dependency_graph(catalog: &Arc<dyn TableEngine>) -> Vec<(Dependent, Vec<String>)> {
+    let mut graph: Vec<(Dependent, Vec<String>)> = Vec::new();
+    for view in catalog.views() {
+        graph.push((
+            (
+                DependentKind::View,
+                view.namespace.clone(),
+                view.name.clone(),
+            ),
+            view.depends_on.clone(),
+        ));
+    }
+    // `inheritance_links` rather than `relation_metadata`: a DROP should not
+    // clone (and stat) the whole catalog to read a usually-empty list.
+    //
+    // Sorted, because the engine reads them out of a `HashMap` and so hands them
+    // over in an order that varies between processes. Everything downstream —
+    // the DETAIL lines, the `drop cascades to` list — is user-visible output
+    // that must not depend on that. (PostgreSQL orders by OID, i.e. creation
+    // order; by name is a deliberate divergence, since nothing here has OIDs.)
+    let mut links = catalog.inheritance_links();
+    links.sort();
+    for (child, parent) in links {
+        graph.push((
+            (DependentKind::Table, child.0, child.1),
+            vec![dep_key(&parent.0, &parent.1)],
+        ));
+    }
+    graph
+}
+
+/// The direct `(dependent, target)` edges into `targets`, in target order then
+/// dependent order — PostgreSQL's DETAIL ordering. A target that is itself being
+/// dropped is not reported as depending on another.
+fn dependency_edges(
+    graph: &[(Dependent, Vec<String>)],
+    targets: &[QualifiedRelation],
+) -> Vec<(Dependent, QualifiedRelation)> {
+    let target_keys: Vec<String> = targets.iter().map(|(ns, n)| dep_key(ns, n)).collect();
+    let mut edges = Vec::new();
+    for (tns, tn) in targets {
+        let tkey = dep_key(tns, tn);
+        for (dep, depends_on) in graph {
+            if target_keys.contains(&dep_key(&dep.1, &dep.2)) {
                 continue;
             }
-            if view.depends_on.iter().any(|d| removed.contains(d)) {
-                removed.push(vkey);
-                dependents.push((view.namespace.clone(), view.name.clone()));
+            if depends_on.iter().any(|d| *d == tkey) {
+                edges.push((dep.clone(), (tns.clone(), tn.clone())));
+            }
+        }
+    }
+    edges
+}
+
+/// The transitive set of objects a CASCADE must take with `targets`, in
+/// discovery order. An object joins when anything it depends on is already
+/// going — so a view over an inheritance child that is itself cascading away
+/// comes along too.
+fn drop_dependents(
+    graph: &[(Dependent, Vec<String>)],
+    targets: &[QualifiedRelation],
+) -> Vec<Dependent> {
+    let mut removed: HashSet<String> = targets.iter().map(|(ns, n)| dep_key(ns, n)).collect();
+    let mut dependents: Vec<Dependent> = Vec::new();
+    loop {
+        let mut added = false;
+        for (dep, depends_on) in graph {
+            let dkey = dep_key(&dep.1, &dep.2);
+            if removed.contains(&dkey) {
+                continue;
+            }
+            if depends_on.iter().any(|d| removed.contains(d)) {
+                removed.insert(dkey);
+                dependents.push(dep.clone());
                 added = true;
             }
         }
@@ -6371,25 +6887,67 @@ fn plan_view_cascade(
             break;
         }
     }
+    dependents
+}
 
-    let notices = match dependents.as_slice() {
+/// PostgreSQL's `drop cascades to ...` NOTICE(s) for a set of dependents: one
+/// line on its own, more than one summarized with the lines as DETAIL —
+/// matching the wording of `DROP TYPE ... CASCADE`.
+fn cascade_notices(dependents: &[Dependent]) -> Vec<Notice> {
+    let line = |(kind, ns, name): &Dependent| {
+        format!(
+            "drop cascades to {} {}",
+            kind.noun(),
+            dep_display(ns, name)
+        )
+    };
+    match dependents {
         [] => Vec::new(),
-        [(ns, name)] => vec![Notice::notice(
-            format!("drop cascades to view {}", disp(ns, name)),
-            None,
+        [only] => vec![Notice::notice(line(only), None)],
+        many => vec![Notice::notice(
+            format!("drop cascades to {} other objects", many.len()),
+            Some(many.iter().map(line).collect::<Vec<_>>().join("\n")),
         )],
-        many => {
-            let detail = many
+    }
+}
+
+/// `DROP TABLE`/`DROP VIEW`'s use of the three above: under RESTRICT any
+/// dependent is an error (2BP01, one DETAIL line per edge); under CASCADE the
+/// transitive set to drop plus its notices.
+fn plan_drop_cascade(
+    catalog: &Arc<dyn TableEngine>,
+    target_noun: &str,
+    targets: &[QualifiedRelation],
+    cascade: bool,
+) -> Result<(Vec<Dependent>, Vec<Notice>), PgError> {
+    let graph = dependency_graph(catalog);
+    if !cascade {
+        let edges = dependency_edges(&graph, targets);
+        if let Some(((_, _, _), (tns, tn))) = edges.first() {
+            let blocked = dep_display(tns, tn);
+            let detail = edges
                 .iter()
-                .map(|(ns, name)| format!("drop cascades to view {}", disp(ns, name)))
+                .map(|((kind, dns, dn), (tns, tn))| {
+                    format!(
+                        "{} {} depends on {target_noun} {}",
+                        kind.noun(),
+                        dep_display(dns, dn),
+                        dep_display(tns, tn)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
-            vec![Notice::notice(
-                format!("drop cascades to {} other objects", many.len()),
-                Some(detail),
-            )]
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop {target_noun} {blocked} because other objects depend on it"),
+            )
+            .with_detail(detail)
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
         }
-    };
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let dependents = drop_dependents(&graph, targets);
+    let notices = cascade_notices(&dependents);
     Ok((dependents, notices))
 }
 

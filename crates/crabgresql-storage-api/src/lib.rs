@@ -168,6 +168,35 @@ impl Column {
             collation: None,
         }
     }
+
+    /// PostgreSQL's `atttypmod` encoding of this column's declared modifier,
+    /// from the raw form [`Self::typmod`] stores: a bare length for the
+    /// character/bit types, the packed `(precision, scale)` for `numeric`, the
+    /// packed `(fields, precision)` for `interval`, a bare precision for the
+    /// other datetime types, `-1` for none.
+    ///
+    /// `character`/`character varying`/`numeric` reserve four bytes for the
+    /// varlena header (`raw + VARHDRSZ`); the fixed-width types store their
+    /// modifier directly. Keeping this the true PostgreSQL encoding lets
+    /// `format_type(atttypid, atttypmod)` reproduce PG's `\d` type strings — and
+    /// lets an error message name a type the way PostgreSQL names it.
+    ///
+    /// The addition saturates rather than wrapping: DDL rejects a length beyond
+    /// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]) and a
+    /// precision beyond `numeric`'s, so a value that could overflow is
+    /// unreachable through a `CREATE TABLE` — but this also runs against
+    /// whatever a data directory already holds, and building a catalog row must
+    /// never panic the session that reads `pg_attribute`.
+    pub fn atttypmod(&self) -> i32 {
+        const VARHDRSZ: i32 = 4;
+        match self.ty {
+            _ if self.typmod < 0 => -1,
+            PgType::Varchar | PgType::Bpchar | PgType::Numeric => {
+                self.typmod.saturating_add(VARHDRSZ)
+            }
+            _ => self.typmod,
+        }
+    }
 }
 
 /// Access method recorded for a semantic index. Physical index access arrives
@@ -254,6 +283,20 @@ pub struct PartitionOf {
     /// on the leaf so it can enforce its own bound without resolving the parent.
     pub key_columns: Vec<usize>,
     pub bound: PartitionBound,
+}
+
+/// One entry of a table's `INHERITS (...)` list. The parent is named rather
+/// than OID'd — this layer has no OIDs, and it mirrors how [`PartitionOf`]
+/// points at its own parent.
+///
+/// Inheritance and partitioning differ in every way that matters downstream: an
+/// inheritance parent owns rows of its own (`relkind = 'r'`), a child's columns
+/// are a *superset* of the parent's in an order of the child's choosing, and an
+/// INSERT aimed at the parent stays in the parent instead of being routed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InheritParent {
+    pub namespace: String,
+    pub name: String,
 }
 
 /// A user relation together with its mutable index metadata and size estimates.
@@ -425,6 +468,17 @@ pub struct TableSchema {
     pub partition_scheme: Option<PartitionScheme>,
     /// `Some` on a leaf partition: the parent it attaches to and its bound.
     pub partition_of: Option<PartitionOf>,
+    /// The parents this table inherits from (`CREATE TABLE ... INHERITS (...)`),
+    /// in declaration order — the order that assigns `pg_inherits.inhseqno`.
+    /// Empty for every table that is not an inheritance child, and mutually
+    /// exclusive with [`Self::partition_of`].
+    ///
+    /// Only the link is stored. The parent↔child column correspondence is
+    /// recomputed by column *name* wherever it is needed, which is exact because
+    /// the merge at `CREATE TABLE` gives the child a column of every parent name
+    /// and nothing may afterwards rename or drop it (this server has no
+    /// `ALTER TABLE`).
+    pub inherits: Vec<InheritParent>,
     /// The layout sort key: the order an engine-managed access method stores
     /// rows in, from `ORDER BY (...)` or defaulted to the `PRIMARY KEY`. A heap
     /// relation is always empty — `ORDER BY` on one is rejected at DDL time —
@@ -460,6 +514,7 @@ impl TableSchema {
             access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
+            inherits: Vec::new(),
             sort_key: Vec::new(),
         }
     }
@@ -478,6 +533,7 @@ impl TableSchema {
             access_method: TableAccessMethod::Heap,
             partition_scheme: None,
             partition_of: None,
+            inherits: Vec::new(),
             sort_key: Vec::new(),
         }
     }
@@ -1129,6 +1185,38 @@ pub trait TableEngine: Send + Sync {
     /// engines that keep a relation registry override it.
     fn relations(&self) -> Vec<TableSchema> {
         Vec::new()
+    }
+
+    /// Every `INHERITS (...)` link in the engine as
+    /// `((child_namespace, child_name), (parent_namespace, parent_name))`,
+    /// without cloning full schemas.
+    ///
+    /// The binder asks this of **every** base relation a statement names, to
+    /// learn whether the relation has descendants to fan out to — so it is on
+    /// the path of every query, and the usual answer is "no links at all". That
+    /// is why it exists separately from [`relations`](Self::relations): a schema
+    /// deep-clone per relation per FROM item is a real cost to pay for reading
+    /// one usually-empty vector, and [`relation_metadata`](Self::relation_metadata)
+    /// is worse still — it stats every relation's files.
+    ///
+    /// The default derives from `relations`; an engine with a relation registry
+    /// overrides it to read just the links.
+    fn inheritance_links(&self) -> Vec<((String, String), (String, String))> {
+        self.relations()
+            .into_iter()
+            .flat_map(|schema| {
+                schema
+                    .inherits
+                    .iter()
+                    .map(move |parent| {
+                        (
+                            (schema.namespace.clone(), schema.name.clone()),
+                            (parent.namespace.clone(), parent.name.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Names of relations in `namespace`, without cloning full schemas. The

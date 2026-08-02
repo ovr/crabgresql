@@ -119,28 +119,44 @@ impl RoutineOps for RoutineDispatch {
 ///
 /// Shared behind an `Arc` because the execution context inside a suspended
 /// portal still has to reach it. The connection layer drains it as it writes
-/// rows, so a `RAISE NOTICE` from row 3 lands between row 3 and row 4.
+/// rows, so a `RAISE NOTICE` from row 3 lands between row 3 and row 4 — and
+/// drains it *before* an ErrorResponse too, which is what puts a statement's
+/// notices ahead of the error that ended it, as PostgreSQL does.
+///
+/// That last property is why a DDL path with notices to raise should push them
+/// here rather than returning them: a `Result`'s `Ok` half cannot carry
+/// diagnostics past a failure, and `PgError` has nowhere to put them.
+///
+/// Buffers already-converted [`Notice`]s. Converting on the way *in* rather than
+/// on the way out is what lets [`Self::push`] accept one directly: a `Notice`
+/// routed through [`RuntimeNotice`] would lose its `location`, and some
+/// producers (`CatalogNotice`) do carry a caret.
 #[derive(Default)]
-pub struct SessionNotices(Mutex<Vec<RuntimeNotice>>);
+pub struct SessionNotices(Mutex<Vec<Notice>>);
 
 impl SessionNotices {
     /// Take everything buffered so far, leaving the buffer empty.
     pub fn drain(&self) -> Vec<Notice> {
-        let taken = match self.0.lock() {
+        match self.0.lock() {
             Ok(mut buf) => std::mem::take(&mut *buf),
             // A poisoned buffer means a panic already unwound through a notice
             // emit; dropping the diagnostics is better than propagating it.
             Err(_) => Vec::new(),
-        };
-        taken.into_iter().map(into_notice).collect()
+        }
+    }
+
+    /// Buffer a notice raised outside the executor — a DDL diagnostic that must
+    /// still reach the client if the statement goes on to fail.
+    pub fn push(&self, notice: Notice) {
+        if let Ok(mut buf) = self.0.lock() {
+            buf.push(notice);
+        }
     }
 }
 
 impl NoticeSink for SessionNotices {
     fn emit(&self, notice: RuntimeNotice) {
-        if let Ok(mut buf) = self.0.lock() {
-            buf.push(notice);
-        }
+        self.push(into_notice(notice));
     }
 }
 

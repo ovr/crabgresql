@@ -4,6 +4,7 @@
 //! silently dropping a clause would return wrong results instead of an honest
 //! error.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -66,6 +67,82 @@ pub struct SetOpArm {
     pub coercion: Option<Vec<BoundExpr>>,
 }
 
+/// One relation a statement reaches through the name of another, with the
+/// permutation that puts its tuples into the *named* relation's layout — an arm
+/// of a [`LogicalPlan::Append`], or one relation an inheriting `UPDATE`/`DELETE`
+/// fans out to.
+///
+/// `map` is indexed by the named relation's ordinal and holds this relation's
+/// own ordinal for that column. `None` is the identity map, meaning this
+/// relation already carries exactly the named layout — true of every leaf
+/// partition (a partition is created as a verbatim clone of its parent) and of
+/// every storage leaf of a single relation, so those paths pay nothing.
+///
+/// Only an inheritance descendant needs a map. Its columns are a *superset* of
+/// its parent's, in an order the child chose, and the order need not even keep
+/// the parent's columns contiguous: with `emp(name, age, location, salary,
+/// manager)` and `student(name, age, location, gpa)` both inheriting `person`,
+/// `stud_emp INHERITS (emp, student)` lays out `name, age, location, salary,
+/// manager, gpa, percent` — so read as a `student`, its `gpa` is at ordinal 5,
+/// not 3.
+///
+/// Nothing above ever re-indexes an expression: a bound predicate, SET target or
+/// RETURNING projection stays in the named relation's index space, and it is the
+/// *tuple* that is viewed through `map` on the way in and scattered back through
+/// it on the way out.
+#[derive(Clone)]
+pub struct MappedRelation {
+    pub table: Arc<dyn TableAm>,
+    pub map: Option<Arc<[usize]>>,
+}
+
+impl MappedRelation {
+    /// This relation's tuple read as a tuple of the named relation.
+    ///
+    /// Borrowed for an identity relation, which is what the parent of every
+    /// inheritance fan-out is: it is called once per *scanned* row, before the
+    /// predicate runs, so cloning there would make `DELETE FROM parent WHERE id
+    /// = 1` deep-copy every row of the parent to hand the predicate a tuple it
+    /// was already holding.
+    pub fn view<'a>(&self, tuple: &'a [Value]) -> Cow<'a, [Value]> {
+        match &self.map {
+            None => Cow::Borrowed(tuple),
+            Some(map) => Cow::Owned(map.iter().map(|&i| tuple[i].clone()).collect()),
+        }
+    }
+
+    /// Write a named-relation tuple back over the columns of `tuple` it was read
+    /// from, leaving this relation's own extra columns untouched.
+    pub fn scatter(&self, tuple: &mut [Value], view: &[Value]) {
+        match &self.map {
+            None => tuple.clone_from_slice(view),
+            Some(map) => {
+                for (value, &i) in view.iter().zip(map.iter()) {
+                    tuple[i] = value.clone();
+                }
+            }
+        }
+    }
+
+    /// The full tuple to store, given the row it was read from and the
+    /// named-relation tuple an UPDATE produced from it.
+    ///
+    /// For an identity relation the new view *is* the new tuple, so it moves
+    /// through untouched — no clone of `old`, no copy back over it. That is the
+    /// common case twice over: the parent of every inheritance fan-out is an
+    /// identity relation, and so is every child declared `() INHERITS (p)`.
+    pub fn rebuild(&self, old: &[Value], view: Vec<Value>) -> Vec<Value> {
+        match &self.map {
+            None => view,
+            Some(_) => {
+                let mut tuple = old.to_vec();
+                self.scatter(&mut tuple, &view);
+                tuple
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum LogicalPlan {
     /// FROM-less SELECT (`SELECT 1`) or a standalone `VALUES` list: one or more
@@ -87,15 +164,16 @@ pub enum LogicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
-    /// Union scan over the leaf partitions of a partitioned parent. `tables` are
-    /// the leaf relations (each with the parent's column layout); the node emits
-    /// every leaf's rows, full parent-column width, in leaf order. It carries no
-    /// projection/predicate/sort of its own — a partitioned-parent FROM item is
-    /// bound as a [`Self::Subquery`] wrapping this Append, so the surrounding
-    /// SELECT's WHERE/projection/ORDER BY/DISTINCT apply on top (and joins /
-    /// aggregates reuse the same subplan machinery).
+    /// Union scan over the several relations one FROM item names: the leaf
+    /// partitions of a partitioned parent, or an inheritance parent together with
+    /// its descendants. The node emits every arm's rows in arm order, each
+    /// remapped to the full width of the relation that was named. It carries no
+    /// projection/predicate/sort of its own — such a FROM item is bound as a
+    /// [`Self::Subquery`] wrapping this Append, so the surrounding SELECT's
+    /// WHERE/projection/ORDER BY/DISTINCT apply on top (and joins / aggregates
+    /// reuse the same subplan machinery).
     Append {
-        tables: Vec<Arc<dyn TableAm>>,
+        arms: Vec<MappedRelation>,
         columns: Vec<OutputColumn>,
     },
     /// A `UNION` / `UNION ALL`: concatenate both arms, then optionally
@@ -257,6 +335,15 @@ pub enum LogicalPlan {
         /// leaf, insert into the new) when the key change lands it elsewhere.
         /// `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// Inheritance fan-out: `table`'s descendants, each with the map that
+        /// reads one of its rows as a `table` row. Empty unless `table` has
+        /// inheritance children and the statement did not say `ONLY`.
+        ///
+        /// Deliberately *not* folded into `routing`: routing exists to move a row
+        /// between partitions when its key changes, and inheritance has no such
+        /// notion — every row is updated where it lies, in its own relation, and
+        /// nothing ever moves.
+        inherited: Vec<MappedRelation>,
     },
     Delete {
         table: Arc<dyn TableAm>,
@@ -267,6 +354,9 @@ pub enum LogicalPlan {
         /// a partitioned parent. The executor scans every leaf and deletes matching
         /// rows from whichever leaf holds them. `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// Inheritance fan-out, as on [`Self::Update`]: rows are deleted from
+        /// whichever descendant holds them.
+        inherited: Vec<MappedRelation>,
     },
 }
 
@@ -470,31 +560,222 @@ fn resolve_write_table(
 /// The physical sources a read of `table` must union, or `None` when it is
 /// scanned directly.
 ///
-/// Two independent kinds of split compose here. A **SQL partitioned parent**
-/// holds no rows itself and fans out to its catalog leaf partitions. An access
-/// method with **engine-internal storage leaves** fans out to its own physical
-/// sources ([`TableAm::storage_leaves`]) — invisible to the catalog.
+/// Three independent kinds of split compose here. A **SQL partitioned parent**
+/// holds no rows itself and fans out to its catalog leaf partitions. An
+/// **inheritance parent** holds rows *and* fans out, to itself followed by its
+/// descendants — suppressed by `ONLY`. An access method with **engine-internal
+/// storage leaves** fans out to its own physical sources
+/// ([`TableAm::storage_leaves`]) — invisible to the catalog.
 ///
-/// A SQL leaf may itself split the second way, so the leaves are expanded and
-/// the result flattened: `Append` stays one flat list and the executor keeps one
-/// loop. Nothing produces that nesting today (a partitioned parent's leaves are
-/// heap relations), but writing the flatten costs three lines and removes the
-/// trap for whoever first makes a columnar relation a partition.
-fn scan_leaves(
+/// A relation reached by either of the first two may itself split the third way,
+/// so every arm is expanded and the result flattened: `Append` stays one flat
+/// list and the executor keeps one loop. Nothing produces that nesting today (a
+/// partition and an inheritance child are both heap relations), but writing the
+/// flatten costs three lines and removes the trap for whoever first makes a
+/// columnar relation a partition or a child.
+///
+/// `ONLY` on a *partitioned* parent is a deliberate divergence: PostgreSQL scans
+/// the parent's own (always empty) storage and returns nothing, whereas this
+/// still expands to the leaves. A silently empty result is the worse surprise of
+/// the two, and nothing in the corpus asks for it; revisit if `DETACH PARTITION`
+/// ever lands, which is what makes PG's answer meaningful.
+fn scan_arms(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
-) -> Result<Option<Vec<Arc<dyn TableAm>>>, BindError> {
-    if table.schema().partition_scheme.is_some() {
-        let mut leaves = Vec::new();
-        for leaf in partition_leaves(engine, table.schema())? {
-            match leaf.storage_leaves() {
-                Some(inner) => leaves.extend(inner),
-                None => leaves.push(leaf),
+    only: bool,
+) -> Result<Option<Vec<MappedRelation>>, BindError> {
+    let schema = table.schema();
+    if schema.partition_scheme.is_some() {
+        let mut arms = Vec::new();
+        for leaf in partition_leaves(engine, schema)? {
+            // A leaf is a verbatim clone of the parent's layout, so identity.
+            push_storage_leaves(&mut arms, leaf, None);
+        }
+        return Ok(Some(arms));
+    }
+    if !only {
+        let descendants = inheritance_descendants(engine, schema)?;
+        if !descendants.is_empty() {
+            // The parent owns rows of its own and reads first, in its own layout.
+            let mut arms = Vec::new();
+            push_storage_leaves(&mut arms, table.clone(), None);
+            for child in descendants {
+                let map = inherit_map(schema, child.schema())?;
+                push_storage_leaves(&mut arms, child, map);
+            }
+            return Ok(Some(arms));
+        }
+    }
+    Ok(table
+        .storage_leaves()
+        .map(|leaves| leaves.into_iter().map(|t| arm(t, None)).collect()))
+}
+
+fn arm(table: Arc<dyn TableAm>, map: Option<Arc<[usize]>>) -> MappedRelation {
+    MappedRelation { table, map }
+}
+
+/// The relations an `UPDATE`/`DELETE` naming `table` must touch, or empty when
+/// it is just `table` itself.
+///
+/// Unlike [`scan_arms`] this returns the parent as the *first* entry when it
+/// returns anything at all, because the executor's fan-out treats every entry
+/// alike — there is no "and also the named table" step, since nothing is routed.
+/// Storage leaves are not expanded: a write goes to the relation, and the access
+/// method decides where inside itself it lands.
+fn write_targets(
+    engine: &Arc<dyn TableEngine>,
+    table: &Arc<dyn TableAm>,
+    only: bool,
+) -> Result<Vec<MappedRelation>, BindError> {
+    if only {
+        return Ok(Vec::new());
+    }
+    let schema = table.schema();
+    let descendants = inheritance_descendants(engine, schema)?;
+    if descendants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut targets = vec![arm(table.clone(), None)];
+    for child in descendants {
+        let map = inherit_map(schema, child.schema())?;
+        targets.push(arm(child, map));
+    }
+    Ok(targets)
+}
+
+/// Append `table` to `arms`, expanded into its engine-internal storage leaves if
+/// it has any. Every leaf of one relation shares that relation's layout, so they
+/// all carry the same `map`.
+fn push_storage_leaves(
+    arms: &mut Vec<MappedRelation>,
+    table: Arc<dyn TableAm>,
+    map: Option<Arc<[usize]>>,
+) {
+    match table.storage_leaves() {
+        Some(inner) => arms.extend(inner.into_iter().map(|t| arm(t, map.clone()))),
+        None => arms.push(arm(table, map)),
+    }
+}
+
+/// The permutation reading a `child` row as a `parent` row: for each of the
+/// parent's columns, the ordinal of the child column of that name.
+///
+/// `None` means the identity *over the same width* — the child is a verbatim
+/// clone of the parent (`CREATE TABLE c () INHERITS (p)`, and every leaf
+/// partition), so the executor and the projection pass skip the remap entirely.
+/// A child that only appends columns still gets a map, because narrowing its
+/// wider tuple to the parent's width is the same operation as permuting it.
+///
+/// The lookup is by name, and is total: `merge_inherited_columns` gives a child a
+/// column for every name each of its parents contributes, and this server has no
+/// `ALTER TABLE` to rename or drop one afterwards. A miss is therefore a bug in
+/// that invariant, not a user error — reported as such rather than panicking on
+/// the index.
+fn inherit_map(
+    parent: &TableSchema,
+    child: &TableSchema,
+) -> Result<Option<Arc<[usize]>>, BindError> {
+    let mut map = Vec::with_capacity(parent.columns.len());
+    for col in &parent.columns {
+        let Some(pos) = child.columns.iter().position(|c| c.name == col.name) else {
+            return Err(BindError::new(
+                sqlstate::INTERNAL_ERROR,
+                format!(
+                    "child \"{}\" of \"{}\" has no column \"{}\"",
+                    child.name, parent.name, col.name
+                ),
+            ));
+        };
+        map.push(pos);
+    }
+    let identity =
+        map.len() == child.columns.len() && map.iter().enumerate().all(|(i, &pos)| i == pos);
+    Ok((!identity).then(|| map.into()))
+}
+
+/// Every table that inherits from `parent`, transitively, in breadth-first order
+/// with each level sorted by name. The parent itself is **not** included: unlike
+/// a partitioned parent it owns rows, so the caller puts it first and this
+/// function answers only "what else".
+///
+/// Like [`partition_leaves`], the set is captured at bind time, so a child
+/// created after a statement is planned is not observed until it is re-bound.
+///
+/// The `visited` set is what makes this terminate. A cycle cannot be built
+/// through `CREATE TABLE` — a parent must already exist to be inherited from —
+/// but the links come off a catalog file on disk, and `ALTER TABLE ... INHERIT`
+/// would be able to close one. Without the set that is a hang, not a wrong
+/// answer.
+pub fn inheritance_descendants(
+    engine: &Arc<dyn TableEngine>,
+    parent: &TableSchema,
+) -> Result<Vec<Arc<dyn TableAm>>, BindError> {
+    // `inheritance_links` rather than `relation_metadata`: this runs for every
+    // base relation of every statement, so it must not clone the catalog (let
+    // alone stat every relation's files) to discover the usual answer, which is
+    // that nothing inherits from anything.
+    let links = engine.inheritance_links();
+    if links.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Index child-by-parent once: the walk is O(V+E) rather than one sweep per
+    // level.
+    let mut children: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
+    for (child, parent) in &links {
+        children
+            .entry((parent.0.as_str(), parent.1.as_str()))
+            .or_default()
+            .push((child.0.as_str(), child.1.as_str()));
+    }
+    let mut visited: HashSet<(&str, &str)> =
+        HashSet::from([(parent.namespace.as_str(), parent.name.as_str())]);
+    let mut frontier = vec![(parent.namespace.as_str(), parent.name.as_str())];
+    let mut order: Vec<(String, String)> = Vec::new();
+    while !frontier.is_empty() {
+        let mut next: Vec<(&str, &str)> = Vec::new();
+        for key in frontier {
+            for child in children.get(&key).into_iter().flatten() {
+                if visited.insert(*child) {
+                    next.push(*child);
+                }
             }
         }
-        return Ok(Some(leaves));
+        next.sort_unstable();
+        order.extend(
+            next.iter()
+                .map(|(ns, name)| (ns.to_string(), name.to_string())),
+        );
+        frontier = next;
     }
-    Ok(table.storage_leaves())
+    resolve_all(engine, &order, "child", &parent.name)
+}
+
+/// Resolve a catalog-derived list of `(namespace, name)` relations to storage
+/// handles.
+///
+/// Every name came out of the catalog moments earlier, so a miss is a torn
+/// catalog rather than anything the user did — reported as an internal error
+/// naming `noun` (`"child"`, `"partition"`) and the relation it hangs off.
+/// Shared by the two callers so that framing, and the SQLSTATE, cannot drift
+/// apart between them.
+fn resolve_all(
+    engine: &Arc<dyn TableEngine>,
+    relations: &[(String, String)],
+    noun: &str,
+    parent_name: &str,
+) -> Result<Vec<Arc<dyn TableAm>>, BindError> {
+    relations
+        .iter()
+        .map(|(namespace, name)| {
+            engine.resolve(Some(namespace), name).map_err(|e| {
+                BindError::new(
+                    sqlstate::INTERNAL_ERROR,
+                    format!("{noun} \"{name}\" of \"{parent_name}\" is unreadable: {e}"),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Enumerate the leaf partitions of the partitioned parent `parent` as storage
@@ -518,20 +799,7 @@ fn partition_leaves(
         })
         .collect();
     leaves.sort();
-    leaves
-        .into_iter()
-        .map(|(namespace, name)| {
-            engine.resolve(Some(&namespace), &name).map_err(|e| {
-                BindError::new(
-                    sqlstate::INTERNAL_ERROR,
-                    format!(
-                        "partition \"{name}\" of \"{}\" is unreadable: {e}",
-                        parent.name
-                    ),
-                )
-            })
-        })
-        .collect()
+    resolve_all(engine, &leaves, "partition", &parent.name)
 }
 
 /// Which DML verb is writing, for the non-updatable-view error text.
@@ -567,8 +835,11 @@ fn open_write_relation(
     engine: &Arc<dyn TableEngine>,
     relation: &ast::TableFactor,
     verb: WriteVerb,
-) -> Result<(Arc<dyn TableAm>, String), BindError> {
-    let ast::TableFactor::Table { name, alias, .. } = relation else {
+) -> Result<(Arc<dyn TableAm>, String, bool), BindError> {
+    let ast::TableFactor::Table {
+        name, only, alias, ..
+    } = relation
+    else {
         return Err(BindError::feature_not_supported(format!(
             "target is not supported yet: {relation}"
         )));
@@ -578,7 +849,7 @@ fn open_write_relation(
     // unlike before — the parent is not rejected here.
     let (table, table_name) = resolve_write_table(engine, name, verb)?;
     let qualifier = aliased_qualifier(alias, table_name)?;
-    Ok((table, qualifier))
+    Ok((table, qualifier, *only))
 }
 
 fn bind_where(
@@ -2503,6 +2774,7 @@ fn bind_table_query(
     // qualification are honored exactly as in a FROM clause.
     let relation = ast::TableFactor::Table {
         name: table.name.clone(),
+        only: false,
         alias: None,
         args: None,
         with_hints: Vec::new(),
@@ -2824,6 +3096,7 @@ fn bind_from_item(
         // A bare name may resolve to a CTE (which shadows a real table).
         ast::TableFactor::Table {
             name,
+            only,
             alias,
             args: None,
             ..
@@ -2873,9 +3146,9 @@ fn bind_from_item(
                     // relation columns), so the surrounding SELECT's
                     // projection/WHERE/ORDER BY — and any join or aggregate —
                     // apply through the existing subplan machinery.
-                    let input = match scan_leaves(engine, &table)? {
-                        Some(leaves) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
-                            tables: leaves,
+                    let input = match scan_arms(engine, &table, *only)? {
+                        Some(arms) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
+                            arms,
                             columns: columns.clone(),
                         })),
                         None => JoinInput::Scan(table),
@@ -6002,7 +6275,7 @@ pub fn bind_update_with_params(
         )));
     }
 
-    let (table, qualifier) =
+    let (table, qualifier, only) =
         open_write_relation(engine, &update.table.relation, WriteVerb::Update)?;
     let schema = table.schema().clone();
     let table_name = schema.name.clone();
@@ -6013,6 +6286,8 @@ pub fn bind_update_with_params(
     } else {
         None
     };
+    // An inheritance parent instead updates every descendant in place.
+    let inherited = write_targets(engine, &table, only)?;
     // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
     // so the CTE environment is empty.
     let scope =
@@ -6067,6 +6342,7 @@ pub fn bind_update_with_params(
         assignments,
         returning,
         routing,
+        inherited,
     })
 }
 
@@ -6114,7 +6390,8 @@ pub fn bind_delete_with_params(
         ));
     }
 
-    let (table, qualifier) = open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
+    let (table, qualifier, only) =
+        open_write_relation(engine, &target.relation, WriteVerb::Delete)?;
     let schema = table.schema().clone();
     // A partitioned parent deletes matching rows from whichever leaf holds them;
     // capture the leaves now. `None` for a plain table.
@@ -6123,6 +6400,8 @@ pub fn bind_delete_with_params(
     } else {
         None
     };
+    // An inheritance parent instead deletes from every descendant in place.
+    let inherited = write_targets(engine, &table, only)?;
     // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
     let scope =
         Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
@@ -6137,6 +6416,7 @@ pub fn bind_delete_with_params(
         predicate,
         returning,
         routing,
+        inherited,
     })
 }
 
@@ -10189,8 +10469,59 @@ mod tests {
         );
     }
 
+    /// The permutation that reads a child row as a parent row.
+    ///
+    /// The `stud_emp` case is the one that matters: `student`'s columns are not
+    /// a *prefix* of `stud_emp`'s, because `stud_emp` merges `emp`'s columns in
+    /// first. Anything that assumed inherited columns stay contiguous, or stay
+    /// at the front, would read `salary` where `gpa` belongs.
+    #[test]
+    fn inherit_map_is_by_name_and_none_when_it_is_the_identity() {
+        let cols = |names: &[&str]| -> Vec<Column> {
+            names
+                .iter()
+                .map(|n| Column::new(*n, PgType::Int4))
+                .collect()
+        };
+        let person = TableSchema::new("person", cols(&["name", "age"]));
+        let student = TableSchema::new("student", cols(&["name", "age", "gpa"]));
+        let stud_emp = TableSchema::new(
+            "stud_emp",
+            cols(&["name", "age", "salary", "manager", "gpa", "percent"]),
+        );
+
+        // Only a verbatim clone of the parent is free. `CREATE TABLE clone ()
+        // INHERITS (person)` is exactly that, and pays nothing.
+        let clone = TableSchema::new("clone", cols(&["name", "age"]));
+        assert!(
+            inherit_map(&person, &clone)
+                .expect("map must resolve")
+                .is_none()
+        );
+        // A child that merely *appends* still needs a map, because the map is
+        // also what narrows its wider tuple to the parent's width.
+        let map = inherit_map(&person, &student)
+            .expect("map must resolve")
+            .expect("a wider child needs a map");
+        assert_eq!(map.as_ref(), [0, 1]);
+        // Reading `stud_emp` as a `student` needs a real permutation on top.
+        let map = inherit_map(&student, &stud_emp)
+            .expect("map must resolve")
+            .expect("a non-prefix layout needs a map");
+        assert_eq!(map.as_ref(), [0, 1, 4]);
+
+        // A missing column is an invariant break, not a user error.
+        let stranger = TableSchema::new("stranger", cols(&["name"]));
+        assert_eq!(
+            inherit_map(&person, &stranger)
+                .expect_err("a missing column must be reported")
+                .code,
+            sqlstate::INTERNAL_ERROR
+        );
+    }
+
     /// A relation whose storage is split into engine-internal leaves. Only
-    /// `schema` and `storage_leaves` are exercised — `scan_leaves` inspects
+    /// `schema` and `storage_leaves` are exercised — `scan_arms` inspects
     /// metadata and never touches rows.
     struct SplitTable {
         schema: TableSchema,
@@ -10258,13 +10589,17 @@ mod tests {
         leaves.iter().map(|l| l.schema().name.clone()).collect()
     }
 
+    fn arm_names(arms: &[MappedRelation]) -> Vec<String> {
+        arms.iter().map(|a| a.table.schema().name.clone()).collect()
+    }
+
     #[test]
     fn a_relation_without_storage_leaves_is_scanned_directly() {
         let engine = engine_with_table();
         let table = SplitTable::new("solo", Vec::new());
         assert!(
-            scan_leaves(&engine, &table)
-                .expect("scan_leaves must not fail on a plain relation")
+            scan_arms(&engine, &table, false)
+                .expect("scan_arms must not fail on a plain relation")
                 .is_none(),
             "a monolithic relation must bind to a plain Scan, not a one-armed Append"
         );
@@ -10280,12 +10615,16 @@ mod tests {
                 SplitTable::new("split_buffer", Vec::new()),
             ],
         );
-        let leaves = scan_leaves(&engine, &table)
-            .expect("scan_leaves must not fail")
+        let arms = scan_arms(&engine, &table, false)
+            .expect("scan_arms must not fail")
             .expect("a relation reporting storage leaves must fan out");
         // Order is the access method's, not sorted: a leaf order carries meaning
         // (durable storage before the write buffer, say) that must survive.
-        assert_eq!(leaf_names(&leaves), vec!["split_chunks", "split_buffer"]);
+        assert_eq!(arm_names(&arms), vec!["split_chunks", "split_buffer"]);
+        assert!(
+            arms.iter().all(|a| a.map.is_none()),
+            "one relation's storage leaves all carry its layout, so none remaps"
+        );
     }
 
     #[test]
@@ -10301,7 +10640,7 @@ mod tests {
             ],
         );
         // `partition_leaves` reads the engine's catalog, so exercise the flatten
-        // directly on the expansion `scan_leaves` performs.
+        // directly on the expansion `scan_arms` performs.
         let flattened: Vec<Arc<dyn TableAm>> = match inner.storage_leaves() {
             Some(leaves) => leaves,
             None => vec![Arc::clone(&inner)],

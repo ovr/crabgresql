@@ -762,7 +762,8 @@ const TOAST_COLUMNS: [(&str, PgType); 3] = [
 ];
 
 /// `pg_catalog.pg_inherits` — the parent/child links of declarative partitions
-/// (and, in PG, table inheritance). One row per leaf partition.
+/// and of table inheritance. One row per leaf partition, and one per
+/// `INHERITS (...)` parent of an inheritance child.
 pub fn pg_inherits_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_inherits",
@@ -776,9 +777,15 @@ pub fn pg_inherits_schema() -> TableSchema {
     )
 }
 
-/// One `pg_inherits` row per leaf partition, linking its OID to its parent's.
-/// Both OIDs come from the same positional assignment as `pg_class`, so the
-/// `inhrelid`/`inhparent` → `pg_class.oid` joins line up.
+/// One `pg_inherits` row per parent link: a leaf partition has exactly one, an
+/// inheritance child has one per `INHERITS (...)` entry. Both OIDs come from the
+/// same positional assignment as `pg_class`, so the `inhrelid`/`inhparent` →
+/// `pg_class.oid` joins line up.
+///
+/// `inhseqno` numbers a child's parents from 1 in declaration order. A partition
+/// always gets 1, and only one of the two branches ever fires for a relation:
+/// DDL refuses `INHERITS` together with `PARTITION OF` rather than letting one
+/// clause quietly win.
 pub fn pg_inherits_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
     let parent_oid = |namespace: &str, name: &str| -> Option<u32> {
         relations
@@ -795,6 +802,17 @@ pub fn pg_inherits_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Value>> {
                 Value::Oid(*oid),
                 Value::Oid(parent),
                 Value::Int4(1),
+                Value::Bool(false),
+            ]);
+        }
+        for (i, inherit) in schema.inherits.iter().enumerate() {
+            let Some(parent) = parent_oid(&inherit.namespace, &inherit.name) else {
+                continue;
+            };
+            rows.push(vec![
+                Value::Oid(*oid),
+                Value::Oid(parent),
+                Value::Int4(i as i32 + 1),
                 Value::Bool(false),
             ]);
         }
@@ -864,33 +882,6 @@ pub fn pg_attribute_schema() -> TableSchema {
     )
 }
 
-/// PostgreSQL's `atttypmod` encoding of a column's declared modifier, from the
-/// raw form crabgresql stores in [`Column::typmod`] (a bare length for the
-/// character/bit types, the packed `(precision, scale)` for `numeric`, the
-/// packed `(fields, precision)` for `interval`, a bare precision for the other
-/// datetime types, `-1` for none). `character`/`character varying`/`numeric`
-/// reserve four bytes for the varlena header (`raw + VARHDRSZ`); the fixed-width
-/// types store their modifier directly. Keeping this the true PostgreSQL
-/// encoding lets `format_type(atttypid, atttypmod)` reproduce PG's `\d` type
-/// strings.
-///
-/// The addition saturates rather than wrapping: DDL rejects a length beyond
-/// PostgreSQL's limit ([`crabgresql_types::text::MAX_CHAR_LENGTH`]) and a
-/// precision beyond `numeric`'s, so a value that could overflow is unreachable
-/// through a `CREATE TABLE` — but this runs against whatever a data directory
-/// already holds, and building a catalog row must never panic the session that
-/// reads `pg_attribute`.
-fn atttypmod_of(column: &Column) -> i32 {
-    const VARHDRSZ: i32 = 4;
-    match column.ty {
-        _ if column.typmod < 0 => -1,
-        PgType::Varchar | PgType::Bpchar | PgType::Numeric => {
-            column.typmod.saturating_add(VARHDRSZ)
-        }
-        _ => column.typmod,
-    }
-}
-
 /// `attcollation`: the column's explicit `COLLATE`, else the type's own
 /// collation — and `0` when the type has none, as PostgreSQL records it.
 fn attcollation_of(column: &Column) -> u32 {
@@ -916,7 +907,7 @@ pub fn pg_attribute_rows(
                 Value::Oid(c.ty.oid()),
                 Value::Int2(c.ty.typlen()),
                 Value::Int2((i + 1) as i16),
-                Value::Int4(atttypmod_of(c)),
+                Value::Int4(c.atttypmod()),
                 Value::Bool(!c.nullable),
                 Value::Bool(c.default.is_some()),
                 // attidentity / attgenerated: no identity or generated columns.
@@ -936,7 +927,7 @@ pub fn pg_attribute_rows(
                 Value::Oid(column.ty.oid()),
                 Value::Int2(column.ty.typlen()),
                 Value::Int2((position + 1) as i16),
-                Value::Int4(atttypmod_of(column)),
+                Value::Int4(column.atttypmod()),
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Text(String::new()),

@@ -10017,3 +10017,507 @@ async fn show_describes_its_columns_in_the_extended_protocol() -> anyhow::Result
     Ok(())
 }
 
+/// `CREATE TABLE ... INHERITS (...)`: the merged column layout, the notices PG
+/// raises while merging, and the `pg_inherits`/`pg_class` reflection.
+///
+/// The hierarchy is `test_setup.sql`'s, because its `stud_emp` is the shape that
+/// makes the merge non-trivial: `student`'s layout is *not* a prefix of
+/// `stud_emp`'s, so nothing can get away with assuming inherited columns stay
+/// contiguous.
+#[tokio::test]
+async fn table_inheritance_merges_columns_and_reflects_in_the_catalog() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query("CREATE TABLE person (name text, age int4)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE emp (salary int4, manager name) INHERITS (person)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE student (gpa float8) INHERITS (person)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE stud_emp (percent int4) INHERITS (emp, student)")
+        .await?;
+    // An empty column list is legal and yields a verbatim copy of the parent.
+    client
+        .simple_query("CREATE TABLE clone () INHERITS (person)")
+        .await?;
+
+    let layout = |table: &str| {
+        let sql = format!(
+            "SELECT a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relname = '{table}' AND a.attnum > 0 ORDER BY a.attnum"
+        );
+        let client = &client;
+        async move {
+            let msgs = client.simple_query(&sql).await?;
+            Ok::<_, anyhow::Error>(
+                rows(&msgs)
+                    .iter()
+                    .filter_map(|r| r.get(0).map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    assert_eq!(layout("emp").await?, ["name", "age", "salary", "manager"]);
+    assert_eq!(layout("student").await?, ["name", "age", "gpa"]);
+    assert_eq!(layout("clone").await?, ["name", "age"]);
+    // Parents left to right, each contributing only names not already merged,
+    // then the child's own. `gpa` lands at position 5 rather than 3, which is
+    // exactly what a naive prefix assumption would get wrong.
+    assert_eq!(
+        layout("stud_emp").await?,
+        ["name", "age", "salary", "manager", "gpa", "percent"]
+    );
+
+    // One `pg_inherits` row per parent link, numbered in declaration order.
+    let msgs = client
+        .simple_query(
+            "SELECT p.relname, i.inhseqno FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class p ON p.oid = i.inhparent \
+             WHERE c.relname = 'stud_emp' ORDER BY i.inhseqno",
+        )
+        .await?;
+    let links: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        links,
+        vec![(Some("emp"), Some("1")), (Some("student"), Some("2"))]
+    );
+
+    // Neither end of an inheritance link is a partition: both stay `relkind='r'`.
+    let msgs = client
+        .simple_query(
+            "SELECT relkind, relispartition FROM pg_class \
+             WHERE relname IN ('person', 'stud_emp') ORDER BY relname",
+        )
+        .await?;
+    for row in rows(&msgs) {
+        assert_eq!((row.get(0), row.get(1)), (Some("r"), Some("f")));
+    }
+
+    Ok(())
+}
+
+/// The NOTICEs the merge raises, and the errors that stop it. PG reports a clash
+/// between two parents differently from a clash between the child's own
+/// declaration and what it inherited, so both spellings are pinned.
+#[tokio::test]
+async fn table_inheritance_reports_merges_and_conflicts_like_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client
+        .simple_query("CREATE TABLE person (name text, age int4)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE emp (salary int4) INHERITS (person)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE student (gpa float8) INHERITS (person)")
+        .await?;
+
+    // NOTICEs are read off a raw socket: the pooled client discards them.
+    let mut socket = raw_session(port).await;
+    let notices = |msgs: &[(u8, Vec<u8>)]| {
+        msgs.iter()
+            .filter(|(tag, _)| *tag == b'N')
+            .map(|m| fields(m).message().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Merging two parents that share a common ancestor reports each shared
+    // column once, in the order the merge reaches them.
+    let msgs = simple_query_raw(
+        &mut socket,
+        "CREATE TABLE stud_emp (percent int4) INHERITS (emp, student)",
+    )
+    .await;
+    assert_eq!(
+        notices(&msgs),
+        [
+            "merging multiple inherited definitions of column \"name\"",
+            "merging multiple inherited definitions of column \"age\"",
+        ]
+    );
+    // A child redeclaring an inherited column refines it; different wording.
+    let msgs = simple_query_raw(
+        &mut socket,
+        "CREATE TABLE tightened (name text NOT NULL) INHERITS (person)",
+    )
+    .await;
+    assert_eq!(
+        notices(&msgs),
+        ["merging column \"name\" with inherited definition"]
+    );
+
+    // PG raises the merge NOTICE and *then* the conflict that stopped it. The
+    // notices go to the session sink for exactly that reason: a `Result`'s `Ok`
+    // half cannot carry them past the error, and `PgError` has nowhere to put
+    // them. Asserting the *order* of the wire messages, not just their presence.
+    let msgs = simple_query_raw(
+        &mut socket,
+        "CREATE TABLE conflicted (name int4) INHERITS (person)",
+    )
+    .await;
+    let kinds: Vec<u8> = msgs
+        .iter()
+        .map(|(tag, _)| *tag)
+        .filter(|tag| *tag == b'N' || *tag == b'E')
+        .collect();
+    assert_eq!(kinds, [b'N', b'E'], "the NOTICE must precede the ERROR");
+    assert_eq!(
+        notices(&msgs),
+        ["merging column \"name\" with inherited definition"]
+    );
+    let e = fields(msgs.iter().find(|(tag, _)| *tag == b'E').expect("an ERROR"));
+    assert_eq!(e.message(), "column \"name\" has a type conflict");
+    assert_eq!(e.get(b'D'), Some("text versus integer"));
+
+    // A child that declares an inherited column somewhere other than its
+    // inherited position is told the column moved — PG's other wording.
+    let msgs = simple_query_raw(
+        &mut socket,
+        "CREATE TABLE moved (age int4, extra int4) INHERITS (person)",
+    )
+    .await;
+    let notice = fields(
+        msgs.iter()
+            .find(|(tag, _)| *tag == b'N')
+            .expect("a NOTICE is expected"),
+    );
+    assert_eq!(
+        notice.message(),
+        "moving and merging column \"age\" with inherited definition"
+    );
+    assert_eq!(
+        notice.get(b'D'),
+        Some("User-specified column moved to the position of the inherited column.")
+    );
+
+    // A redeclared column merges into its inherited position rather than
+    // appearing twice.
+    let msgs = client
+        .simple_query(
+            "SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relname = 'tightened' AND a.attname = 'name'",
+        )
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("1"));
+
+    let err = |sql: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .simple_query(sql)
+                .await
+                .expect_err("the statement must fail")
+        }
+    };
+
+    // The child's own declaration versus what it inherited.
+    let e = err("CREATE TABLE bad (age text) INHERITS (person)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
+    assert_eq!(db.message(), "column \"age\" has a type conflict");
+    assert_eq!(db.detail(), Some("integer versus text"));
+
+    // A conflict the merge can only see because the column records its type
+    // *modifier*, not just its type. This is what the inheritance check needs
+    // from `Column::typmod`, and the encoding it goes through is not the one
+    // stored (`bpchar` has no header, `char(5)` does), so both spellings are
+    // pinned.
+    for (parent, child, detail) in [
+        ("numeric(10,4)", "numeric(10,7)", "numeric(10,4) versus numeric(10,7)"),
+        (
+            "timestamp(2)",
+            "timestamp(4)",
+            "timestamp(2) without time zone versus timestamp(4) without time zone",
+        ),
+        ("bpchar", "char(5)", "bpchar versus character(5)"),
+    ] {
+        client
+            .simple_query(&format!("CREATE TABLE tp_{} (v {parent})", detail.len()))
+            .await?;
+        let e = client
+            .simple_query(&format!(
+                "CREATE TABLE tc_{} (v {child}) INHERITS (tp_{})",
+                detail.len(),
+                detail.len()
+            ))
+            .await
+            .expect_err("a differing type modifier is a conflict");
+        let db = e.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
+        assert_eq!(db.detail(), Some(detail), "for {parent} vs {child}");
+    }
+
+    // Two parents disagreeing — a different message, same SQLSTATE.
+    client
+        .simple_query("CREATE TABLE other (age float8)")
+        .await?;
+    let e = err("CREATE TABLE bad2 () INHERITS (person, other)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
+    assert_eq!(db.message(), "inherited column \"age\" has a type conflict");
+    assert_eq!(db.detail(), Some("integer versus double precision"));
+
+    // Conflicting inherited defaults are unresolvable; PG names the fix.
+    client
+        .simple_query("CREATE TABLE d1 (a int4 DEFAULT 1)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE d2 (a int4 DEFAULT 2)")
+        .await?;
+    let e = err("CREATE TABLE bad3 () INHERITS (d1, d2)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::from_code("42611"));
+    assert_eq!(
+        db.message(),
+        "column \"a\" inherits conflicting default values"
+    );
+    assert_eq!(
+        db.hint(),
+        Some("To resolve the conflict, specify a default explicitly.")
+    );
+
+    let e = err("CREATE TABLE bad4 () INHERITS (person, person)").await;
+    assert_eq!(
+        e.as_db_error().expect("database error").message(),
+        "relation \"person\" would be inherited from more than once"
+    );
+
+    // A temporary relation anywhere in a hierarchy is refused, and the message
+    // says so rather than borrowing the permanent-child wording. Naming a temp
+    // parent unqualified must find it: DDL runs against the raw engine, which
+    // resolves `public` only, so before the temp probe this reported that a
+    // relation plainly present "does not exist".
+    client.simple_query("CREATE TEMP TABLE tp (a int4)").await?;
+    for sql in [
+        "CREATE TEMP TABLE tc1 () INHERITS (tp)",
+        "CREATE TEMP TABLE tc2 () INHERITS (person)",
+    ] {
+        let e = err(sql).await;
+        let db = e.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+        assert_eq!(
+            db.message(),
+            "temporary tables in an inheritance hierarchy are not supported yet"
+        );
+    }
+    // A permanent child of a temp parent keeps PG's own wording, verbatim.
+    let e = err("CREATE TABLE pc () INHERITS (tp)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "cannot inherit from temporary relation \"tp\"");
+
+    // An engine-managed relation is refused on *either* side of the link. The
+    // child side was already guarded; a parquet parent was not, and it would
+    // have taken every read of the parent off the batch path.
+    client
+        .simple_query("CREATE TABLE pq (a int4) USING parquet ORDER BY (a)")
+        .await?;
+    let e = err("CREATE TABLE pqc () INHERITS (pq)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        db.message(),
+        "table access method \"parquet\" does not support inheritance"
+    );
+
+    client
+        .simple_query("CREATE VIEW v AS SELECT 1 AS x")
+        .await?;
+    let e = err("CREATE TABLE bad5 () INHERITS (v)").await;
+    let db = e.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(
+        db.message(),
+        "inherited relation \"v\" is not a table or foreign table"
+    );
+
+    let e = err("CREATE TABLE bad6 () INHERITS (nope)").await;
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+
+    Ok(())
+}
+
+/// Reading and writing through an inheritance parent: a scan unions the parent
+/// with its descendants, `ONLY` suppresses that, and UPDATE/DELETE/TRUNCATE fan
+/// out the same way — updating each row where it lies, never moving one.
+#[tokio::test]
+async fn table_inheritance_reads_and_writes_fan_out_to_descendants() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query("CREATE TABLE person (name text, age int4)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE emp (salary int4) INHERITS (person)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE student (gpa float8) INHERITS (person)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE stud_emp (percent int4) INHERITS (emp, student)")
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO person VALUES ('pp', 10); \
+             INSERT INTO emp VALUES ('ee', 20, 100); \
+             INSERT INTO student VALUES ('ss', 30, 3.5); \
+             INSERT INTO stud_emp VALUES ('se', 40, 200, 4.0, 50)",
+        )
+        .await?;
+
+    let names = |sql: &'static str| {
+        let client = &client;
+        async move {
+            let msgs = client.simple_query(sql).await?;
+            Ok::<_, anyhow::Error>(
+                rows(&msgs)
+                    .iter()
+                    .filter_map(|r| r.get(0).map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+
+    // The parent sees itself plus every descendant, transitively.
+    assert_eq!(
+        names("SELECT name FROM person ORDER BY name").await?,
+        ["ee", "pp", "se", "ss"]
+    );
+    // An INSERT aimed at the parent stays in the parent — the difference from a
+    // partitioned parent, which would route the row away.
+    assert_eq!(names("SELECT name FROM ONLY person").await?, ["pp"]);
+    // Reading `stud_emp` as a `student` must find `gpa` at ordinal 5, not 3.
+    let msgs = client
+        .simple_query("SELECT name, gpa FROM student ORDER BY name")
+        .await?;
+    let read: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        read,
+        vec![(Some("se"), Some("4")), (Some("ss"), Some("3.5"))]
+    );
+
+    // EXPLAIN renders one scan per relation, parent first.
+    let plan = client.simple_query("EXPLAIN SELECT * FROM person").await?;
+    let lines: Vec<&str> = rows(&plan).iter().filter_map(|r| r.get(0)).collect();
+    assert_eq!(lines[0], "Append");
+    assert_eq!(lines[1], "  ->  Seq Scan on person");
+    assert_eq!(lines.len(), 5);
+    let plan = client
+        .simple_query("EXPLAIN SELECT * FROM ONLY person")
+        .await?;
+    assert_eq!(rows(&plan)[0].get(0), Some("Seq Scan on person"));
+
+    // UPDATE through the parent touches every descendant in place.
+    client
+        .simple_query("UPDATE person SET age = age + 1")
+        .await?;
+    let msgs = client
+        .simple_query("SELECT age FROM person ORDER BY age")
+        .await?;
+    let ages: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(ages, vec![Some("11"), Some("21"), Some("31"), Some("41")]);
+    // A wider child's own columns are untouched by an update through the parent.
+    let msgs = client
+        .simple_query("SELECT salary, gpa, percent FROM stud_emp")
+        .await?;
+    let extra: Vec<_> = rows(&msgs)[0..1]
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(extra, vec![(Some("200"), Some("4"), Some("50"))]);
+
+    // `ONLY` confines the write to the parent's own rows.
+    client
+        .simple_query("UPDATE ONLY person SET age = 99")
+        .await?;
+    assert_eq!(
+        names("SELECT name FROM person WHERE age = 99").await?,
+        ["pp"]
+    );
+
+    // RETURNING through the parent is in the parent's shape, not a child's.
+    let msgs = client
+        .simple_query("UPDATE person SET name = name || '!' WHERE age > 30 RETURNING name")
+        .await?;
+    let mut returned: Vec<_> = rows(&msgs)
+        .iter()
+        .filter_map(|r| r.get(0).map(str::to_string))
+        .collect();
+    returned.sort();
+    assert_eq!(returned, ["pp!", "se!", "ss!"]);
+
+    // DELETE removes each row from whichever descendant holds it.
+    client
+        .simple_query("DELETE FROM person WHERE age > 30")
+        .await?;
+    assert_eq!(names("SELECT name FROM person").await?, ["ee"]);
+
+    // TRUNCATE recurses; `ONLY` does not.
+    client
+        .simple_query("INSERT INTO person VALUES ('p2', 1)")
+        .await?;
+    client.simple_query("TRUNCATE ONLY person").await?;
+    assert_eq!(names("SELECT name FROM person").await?, ["ee"]);
+    client.simple_query("TRUNCATE person").await?;
+    let msgs = client.simple_query("SELECT count(*) FROM person").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("0"));
+
+    Ok(())
+}
+
+/// An inheritance child is a RESTRICT-blocking dependent of its parent, and a
+/// CASCADE target — unlike a *partition*, which PG drops with its parent
+/// silently and without CASCADE.
+#[tokio::test]
+async fn dropping_an_inheritance_parent_needs_cascade() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE person (name text)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE emp () INHERITS (person)")
+        .await?;
+
+    let err = client
+        .simple_query("DROP TABLE person")
+        .await
+        .expect_err("RESTRICT must refuse a parent with children");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        db.message(),
+        "cannot drop table person because other objects depend on it"
+    );
+    assert_eq!(db.detail(), Some("table emp depends on table person"));
+
+    // Dropping the child alone needs nothing: the link lives only on the child.
+    client.simple_query("DROP TABLE emp").await?;
+    client.simple_query("DROP TABLE person").await?;
+
+    // CASCADE takes the children with it, transitively.
+    client.simple_query("CREATE TABLE a (x int4)").await?;
+    client
+        .simple_query("CREATE TABLE b () INHERITS (a)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE c () INHERITS (b)")
+        .await?;
+    client.simple_query("DROP TABLE a CASCADE").await?;
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relname IN ('a', 'b', 'c')")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("0"));
+
+    Ok(())
+}
