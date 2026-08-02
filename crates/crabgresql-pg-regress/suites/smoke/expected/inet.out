@@ -119,8 +119,14 @@ LINE 1: SELECT inet '+1.2.3.4';
 -- no operator (rather than silently truncating)
 SELECT inet '10.0.0.1' + 3.5;
 ERROR:  operator does not exist: inet + numeric
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT inet '10.0.0.1' + 3.5;
+                               ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- and the "operator does not exist" message keeps the real operand order
 SELECT 'abc'::text << inet '10.0.0.0/8';
 ERROR:  operator does not exist: text << inet
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT 'abc'::text << inet '10.0.0.0/8';
+                           ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.

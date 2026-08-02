@@ -194,6 +194,10 @@ pub enum ScalarFn {
     IsfiniteTz,
     /// `make_timestamptz(int×5, float8[, text]) -> timestamptz`.
     MakeTimestampTz,
+    /// `current_setting(text[, bool]) -> text`. Reads the session GUC table via
+    /// [`crabgresql_executor::GucOps`], so it dispatches in `eval`, not in the
+    /// pure `eval_scalar`.
+    CurrentSetting,
     /// `timezone(text, timestamp) -> timestamptz` (`ts AT TIME ZONE zone`).
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
@@ -246,6 +250,20 @@ pub enum ScalarFn {
     DatePartTimeTz,
     /// `EXTRACT(field FROM timetz) -> numeric`.
     ExtractTimeTz,
+    /// `timezone(text, timetz) -> timetz` (`timetz AT TIME ZONE zone`).
+    TimezoneTimeTz,
+    /// `timezone(interval, timetz) -> timetz` (`timetz AT TIME ZONE INTERVAL …`).
+    TimezoneIntervalTimeTz,
+    /// `timezone(timetz) -> timetz` (`timetz AT LOCAL`): the session zone.
+    TimezoneLocalTimeTz,
+    /// `timezone(timestamp) -> timestamptz` (`timestamp AT LOCAL`).
+    TimezoneLocalToTz,
+    /// `timezone(timestamptz) -> timestamp` (`timestamptz AT LOCAL`).
+    TimezoneLocalToTs,
+    /// `timezone(interval, timestamp) -> timestamptz`.
+    TimezoneIntervalToTz,
+    /// `timezone(interval, timestamptz) -> timestamp`.
+    TimezoneIntervalToTs,
 
     // ---- numeric-typed math (arg and result are `numeric`) ----
     /// `round(numeric [, int4]) -> numeric` (round half away from zero).
@@ -502,6 +520,9 @@ pub enum ScalarFn {
     /// to SQL. crabgresql already stores canonical SQL text (column defaults,
     /// `relpartbound`), so this echoes its first argument.
     PgGetExpr,
+    /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
+    /// in PostgreSQL's canonical shape by [`crabgresql_executor::ruleutils`].
+    PgGetViewdef,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
@@ -1902,7 +1923,24 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TSTZ,
             },
         ],
-        // The function form of `AT TIME ZONE`: `timezone(zone, value)`.
+        // `current_setting(name)` errors on an unknown GUC; the two-argument form
+        // returns NULL instead when `missing_ok` is true.
+        "current_setting" => &[
+            Signature {
+                func: ScalarFn::CurrentSetting,
+                args: &[TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::CurrentSetting,
+                args: &[TEXT, BOOL],
+                ret: TEXT,
+            },
+        ],
+        // The function form of `AT TIME ZONE`: `timezone(zone, value)`, with the
+        // zone as either a name or a fixed `interval` displacement. The one-arg
+        // overloads are the function form of `AT LOCAL` — the zone is the
+        // session's, read at execution time.
         "timezone" => &[
             Signature {
                 func: ScalarFn::TimezoneToTz,
@@ -1913,6 +1951,41 @@ fn lookup(name: &str) -> &'static [Signature] {
                 func: ScalarFn::TimezoneToTs,
                 args: &[TEXT, TSTZ],
                 ret: TS,
+            },
+            Signature {
+                func: ScalarFn::TimezoneTimeTz,
+                args: &[TEXT, TIMETZ],
+                ret: TIMETZ,
+            },
+            Signature {
+                func: ScalarFn::TimezoneIntervalToTz,
+                args: &[IV, TS],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::TimezoneIntervalToTs,
+                args: &[IV, TSTZ],
+                ret: TS,
+            },
+            Signature {
+                func: ScalarFn::TimezoneIntervalTimeTz,
+                args: &[IV, TIMETZ],
+                ret: TIMETZ,
+            },
+            Signature {
+                func: ScalarFn::TimezoneLocalToTz,
+                args: &[TS],
+                ret: TSTZ,
+            },
+            Signature {
+                func: ScalarFn::TimezoneLocalToTs,
+                args: &[TSTZ],
+                ret: TS,
+            },
+            Signature {
+                func: ScalarFn::TimezoneLocalTimeTz,
+                args: &[TIMETZ],
+                ret: TIMETZ,
             },
         ],
         // Two overloads. Text is listed first so a bare `md5('abc')` unknown
@@ -2086,6 +2159,20 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature {
                 func: ScalarFn::PgGetExpr,
                 args: &[TEXT, OID, BOOL],
+                ret: TEXT,
+            },
+        ],
+        // The `pretty` flag is accepted and ignored: PostgreSQL's non-pretty
+        // form differs only in line breaking, and nothing here asks for it.
+        "pg_get_viewdef" => &[
+            Signature {
+                func: ScalarFn::PgGetViewdef,
+                args: &[TEXT],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetViewdef,
+                args: &[TEXT, BOOL],
                 ret: TEXT,
             },
         ],

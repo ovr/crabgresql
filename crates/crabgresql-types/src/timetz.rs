@@ -11,21 +11,24 @@
 //! value that displays as `-07` stores `+25200`, chosen so ordering by the UTC
 //! instant is `usec + zone*USECS_PER_SEC` (pinned by the ordering tests).
 //!
-//! Deviations from PG, acceptable while no passing test needs them: a numeric
-//! offset (`-07`, `+05:30`) is honored, but resolving a named zone or dynamic
-//! abbreviation (which needs a date and the zone database) is not — those
-//! inputs are rejected. A missing zone takes the session zone's standard
-//! offset, with the divergence [`crate::tz::SessionZone::standard_offset`]
-//! documents.
+//! A missing zone takes the session zone's standard offset, with the divergence
+//! [`crate::tz::SessionZone::standard_offset`] documents.
+//!
+//! One further deviation from PG, acceptable while no passing test needs it: a
+//! zone-backed abbreviation (`MSK`) needs a date here, because we resolve it
+//! through its reference zone. PG additionally knows *when that zone used that
+//! abbreviation*, so it can answer `'15:36:39 MSK'` with the zone's standard
+//! offset and no date at all.
 
 use crate::Numeric;
 use crate::interval::Interval;
 use crate::time;
 use crate::timestamp::fixed_point;
-use crate::tz::SessionZone;
+use crate::tz::{self, SessionZone, TmLite, Zone};
 
 const INVALID_DATETIME_FORMAT: &str = "22007";
 const DATETIME_FIELD_OVERFLOW: &str = "22008";
+const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
 const INVALID_PARAMETER_VALUE: &str = "22023";
 
 const USECS_PER_DAY: i64 = 86_400_000_000;
@@ -77,32 +80,22 @@ pub fn cmp(a: TimeTz, b: TimeTz) -> std::cmp::Ordering {
 /// `-07`, `-04:30`).
 pub fn format(v: TimeTz) -> String {
     let mut out = time::format(v.usec);
-    out.push_str(&format_offset(v.zone));
+    // The shared renderer, so `timetz_out` and `timestamptz_out` cannot drift
+    // apart on how wide an offset prints. It counts east; `zone` counts west.
+    out.push_str(&tz::format_offset(-v.zone));
     out
-}
-
-/// Format the stored west-of-UTC `zone` as a signed east-of-UTC display offset.
-fn format_offset(zone_west: i32) -> String {
-    let gmtoff = -zone_west; // seconds east of UTC
-    let sign = if gmtoff < 0 { '-' } else { '+' };
-    let a = gmtoff.unsigned_abs();
-    let (h, m, s) = (a / 3600, (a % 3600) / 60, a % 60);
-    let mut o = format!("{sign}{h:02}");
-    if m != 0 || s != 0 {
-        o.push_str(&format!(":{m:02}"));
-    }
-    if s != 0 {
-        o.push_str(&format!(":{s:02}"));
-    }
-    o
 }
 
 // --- input (timetz_in) -----------------------------------------------------
 
 /// `timetz_in`. Accepts `HH:MM[:SS[.ffffff]]` with an optional `AM`/`PM`, an
-/// optional leading date (ignored), and a numeric UTC offset (`-07`, `+05:30`,
-/// or glued to the time). A named zone or dynamic abbreviation is rejected (no
-/// date here to resolve one against).
+/// optional leading date, and a zone: a numeric UTC offset (`-07`, `+05:30`, or
+/// glued to the time), a fixed abbreviation (`PDT`), or a named IANA zone.
+///
+/// A zone that only means something at an instant — a named zone, or a
+/// zone-backed abbreviation — needs the date to resolve, so it is an error
+/// without one. Every token is accounted for: an unrecognized trailing word is
+/// `22007`, never silently ignored.
 ///
 /// A missing offset takes `session`'s, so `'03:30'::timetz` and
 /// `'03:30'::time::timetz` agree — PG resolves both through the session zone
@@ -115,46 +108,64 @@ pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> 
     }
     let mut time_str: Option<String> = None;
     let mut ampm: Option<&str> = None;
-    let mut gmtoff: Option<i32> = None;
-    let mut have_date = false;
+    let mut zone_tok: Option<String> = None;
+    let mut date: Option<(i64, i64, i64)> = None;
+
+    // Record a zone token, rejecting a second one (`'15:36:39 MSK m2'`).
+    let set_zone = |tok: &str, seen: &mut Option<String>| -> Result<(), TimeTzError> {
+        if seen.is_some() {
+            return Err(invalid_syntax(input));
+        }
+        *seen = Some(tok.to_string());
+        Ok(())
+    };
 
     for tok in trimmed.split_whitespace() {
         let lower = tok.to_ascii_lowercase();
         if lower == "am" || lower == "pm" {
+            // A second meridiem is bad syntax, not last-one-wins — the same rule
+            // the zone and date guards below apply.
+            if ampm.is_some() {
+                return Err(invalid_syntax(input));
+            }
             ampm = Some(if lower == "am" { "am" } else { "pm" });
             continue;
         }
         if tok.starts_with(['+', '-']) {
-            gmtoff = Some(parse_offset(tok).ok_or_else(|| invalid_syntax(input))?);
+            set_zone(tok, &mut zone_tok)?;
             continue;
         }
-        if tok.contains(':') {
-            if time_str.is_some() {
+        if tok.contains(':') && time_str.is_none() {
+            // A glued offset (`13:30:25.5-04`) begins at the first sign.
+            match tok.find(['+', '-']) {
+                Some(pos) => {
+                    set_zone(&tok[pos..], &mut zone_tok)?;
+                    time_str = Some(tok[..pos].to_string());
+                }
+                None => time_str = Some(tok.to_string()),
+            }
+            continue;
+        }
+        if let Some((y, m, d)) = parse_date_token(tok) {
+            if date.is_some() {
                 return Err(invalid_syntax(input));
             }
-            // A glued offset (`13:30:25.5-04`) begins at the first sign.
-            if let Some(pos) = tok.find(['+', '-']) {
-                gmtoff = Some(parse_offset(&tok[pos..]).ok_or_else(|| invalid_syntax(input))?);
-                time_str = Some(tok[..pos].to_string());
-            } else {
-                time_str = Some(tok.to_string());
+            if !valid_date(y, m, d) {
+                return Err(field_out_of_range(input));
             }
+            date = Some((y, m, d));
             continue;
         }
-        if is_date_token(tok) {
-            have_date = true;
-            continue;
-        }
-        // A named zone (`America/New_York`) without a date cannot be resolved.
-        if tok.contains('/') && !have_date {
-            return Err(invalid_syntax(input));
-        }
-        // Any other bare abbreviation is left decorative (defaults to UTC).
+        // Anything left is a zone name or abbreviation; resolved below, once
+        // the time-of-day has had its chance to raise the better error.
+        set_zone(tok, &mut zone_tok)?;
     }
 
     let time_str = time_str.ok_or_else(|| invalid_syntax(input))?;
     // Reuse `time`'s parser for the time-of-day (with any am/pm suffix), then
-    // remap its error to name `time with time zone`.
+    // remap its error to name `time with time zone`. This runs *before* zone
+    // resolution because PG reports the time error first: `'25:00:00 PDT'` is
+    // `22008`, not a zone complaint.
     let time_input = match ampm {
         Some(ap) => format!("{time_str} {ap}"),
         None => time_str,
@@ -166,45 +177,156 @@ pub fn parse(input: &str, session: &SessionZone) -> Result<TimeTz, TimeTzError> 
             invalid_syntax(input)
         }
     })?;
-    let zone = -gmtoff.unwrap_or_else(|| session.standard_offset()); // stored west-of-UTC
-    Ok(TimeTz { usec, zone })
+
+    let gmtoff = match &zone_tok {
+        // No zone of its own: the session's standard offset, so this agrees with
+        // what the `time -> timetz` cast produces.
+        None => session.standard_offset(),
+        Some(tok) => resolve(tok, date, usec, input)?,
+    };
+    Ok(TimeTz {
+        usec,
+        zone: -gmtoff, // stored west-of-UTC
+    })
 }
 
-/// Parse a numeric offset `±HH[:MM[:SS]]` into seconds east of UTC.
-fn parse_offset(s: &str) -> Option<i32> {
-    let sign = match s.as_bytes().first()? {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let mut h = 0i32;
-    let mut m = 0i32;
-    let mut sec = 0i32;
-    for (i, part) in s[1..].split(':').enumerate() {
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let v: i32 = part.parse().ok()?;
-        match i {
-            0 => h = v,
-            1 => m = v,
-            2 => sec = v,
-            _ => return None,
+/// Resolve a zone token to seconds **east** of UTC.
+///
+/// A [`Zone::Fixed`] answer is good on its own. A [`Zone::Named`] one is only
+/// meaningful at an instant, so it needs the literal's date; without one, PG
+/// reports plain bad syntax (not "zone not recognized"), because its decoder
+/// never gets far enough to blame the zone.
+fn resolve(
+    tok: &str,
+    date: Option<(i64, i64, i64)>,
+    usec: i64,
+    input: &str,
+) -> Result<i32, TimeTzError> {
+    let zone = tz::resolve_zone(tok).map_err(|e| zone_error(e, tok, input))?;
+    match zone {
+        Zone::Fixed(secs) => Ok(secs),
+        Zone::Named(_) => {
+            let (year, month, day) = date.ok_or_else(|| invalid_syntax(input))?;
+            // `24:00:00` has no hour 24 in a civil clock; clamp for the purpose
+            // of picking an offset, which no zone transition can distinguish.
+            let tod = usec.min(USECS_PER_DAY - 1);
+            Ok(tz::offset_for_local(
+                &zone,
+                TmLite {
+                    year,
+                    month,
+                    day,
+                    hour: tod / USECS_PER_HOUR,
+                    min: tod % USECS_PER_HOUR / USECS_PER_MINUTE,
+                    sec: tod % USECS_PER_MINUTE / USECS_PER_SEC,
+                },
+            ))
         }
     }
-    // PG limits offsets to ±15:59:59.
-    if h > 15 || m > 59 || sec > 59 {
+}
+
+/// Map a zone-resolution failure onto PG's `timetz_in` errors.
+///
+/// Which error depends on how far PG's decoder got. A bare word is just another
+/// unrecognized field, so the whole input is bad syntax — `'15:36:39 m2'` is
+/// `22007`, not `time zone "m2" not recognized`. But a token *shaped* like a
+/// zone spec reaches the zone lookup, and its failure is blamed on the zone:
+/// `22023`, quoting the lowercased token rather than the input.
+fn zone_error(e: tz::ZoneError, tok: &str, input: &str) -> TimeTzError {
+    match e {
+        tz::ZoneError::NotRecognized(_) if looks_like_zone_spec(tok) => TimeTzError {
+            sqlstate: INVALID_PARAMETER_VALUE,
+            message: format!("time zone \"{}\" not recognized", tok.to_ascii_lowercase()),
+        },
+        tz::ZoneError::NotRecognized(_) => invalid_syntax(input),
+        tz::ZoneError::DisplacementOutOfRange(_) => TimeTzError {
+            sqlstate: INVALID_TIME_ZONE_DISPLACEMENT,
+            message: format!("time zone displacement out of range: \"{input}\""),
+        },
+    }
+}
+
+/// Whether a token is shaped like a zone *spec* rather than a plain word, and so
+/// reaches PG's zone lookup: an IANA-style `Area/Location`, or the POSIX
+/// `<letters><±offset>` form. Verified against PG 18 — `'Nowhere/Nozone'` and
+/// `'UTC+168'` are blamed on the zone, while `'foo'` and `'EST5EDT'` are not.
+fn looks_like_zone_spec(tok: &str) -> bool {
+    tok.contains('/')
+        || matches!(tok.find(['+', '-']), Some(sign) if sign > 0
+            && tok[..sign].bytes().all(|b| b.is_ascii_alphabetic())
+            && tok[sign + 1..].bytes().all(|b| b.is_ascii_digit() || b == b':' || b == b'.'))
+}
+
+/// A `YYYY-MM-DD` token, as year/month/day.
+///
+/// Shape only — three all-digit parts. Whether the fields name a real day is a
+/// separate question, answered by [`valid_date`], because the two failures get
+/// different errors: a token that is not a date at all is a zone token, while
+/// `2003-02-30` *is* a date token and is `22008`.
+fn parse_date_token(tok: &str) -> Option<(i64, i64, i64)> {
+    let parts: Vec<&str> = tok.split('-').collect();
+    if parts.len() != 3 {
         return None;
     }
-    Some(sign * (h * 3600 + m * 60 + sec))
+    let mut it = parts.iter().map(|p| {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse::<i64>().ok()
+    });
+    let y = it.next()??;
+    let m = it.next()??;
+    let d = it.next()??;
+    Some((y, m, d))
 }
 
-fn is_date_token(tok: &str) -> bool {
-    let parts: Vec<&str> = tok.split('-').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+/// Whether `(y, m, d)` names a day that exists, month length and leap years
+/// included.
+///
+/// Not a nicety: the resolved date reaches `jiff` through
+/// [`tz::offset_for_local`], whose civil-datetime constructor treats its input
+/// as already validated and panics otherwise — so without this check
+/// `timetz '2003-02-30 12:00 America/New_York'` takes the backend down. PG
+/// answers `22008`.
+fn valid_date(y: i64, m: i64, d: i64) -> bool {
+    // There is no year 0 in the proleptic Gregorian calendar PG uses; 1 BC is
+    // followed by 1 AD. A large year is fine — PG takes `300000-01-01` here,
+    // because the date only picks a zone offset and is then discarded.
+    y != 0 && (1..=12).contains(&m) && d >= 1 && d <= crate::timestamp::days_in_month(y, m)
+}
+
+// --- zone rotation (timetz_zone / timetz_izone / AT LOCAL) -----------------
+
+/// `timetz AT TIME ZONE <zone>` (`timetz_zone`/`timetz_izone`): the same instant
+/// of day, read in a different zone. `off_east` is seconds east of UTC.
+///
+/// The instant is a time *of day*, so the result wraps modulo a day and loses
+/// any notion of which day it landed on — `00:01-07` at `-10` is `21:01-10`, the
+/// previous day's evening, exactly as PG reports it.
+pub fn at_zone(v: TimeTz, off_east: i32) -> TimeTz {
+    let utc = utc_key(v);
+    TimeTz {
+        usec: (utc + off_east as i64 * USECS_PER_SEC).rem_euclid(USECS_PER_DAY),
+        zone: -off_east,
+    }
+}
+
+/// `timetz AT TIME ZONE '<name>'` (`timetz_zone`). Unlike `timetz_in`, an
+/// unresolvable name here *is* blamed on the zone — this is the
+/// `AT TIME ZONE`/`timezone()` path, where PG reports `22023 time zone "…" not
+/// recognized`.
+pub fn at_zone_named(v: TimeTz, zone: &str) -> Result<TimeTz, TimeTzError> {
+    let zone = tz::resolve_zone(zone).map_err(|e| match e {
+        tz::ZoneError::NotRecognized(name) => TimeTzError {
+            sqlstate: INVALID_PARAMETER_VALUE,
+            message: format!("time zone \"{name}\" not recognized"),
+        },
+        tz::ZoneError::DisplacementOutOfRange(name) => TimeTzError {
+            sqlstate: INVALID_TIME_ZONE_DISPLACEMENT,
+            message: format!("time zone displacement out of range: \"{name}\""),
+        },
+    })?;
+    Ok(at_zone(v, tz::offset_now(&zone)))
 }
 
 // --- interval arithmetic ---------------------------------------------------
@@ -386,5 +508,133 @@ mod tests {
         assert!(date_part("day", x).is_err());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+
+    /// Every entry of `tz::DATETIME_ABBREVS` that names a constant offset, read
+    /// off a live PostgreSQL 18.4 (`select timetz '12:00 <abbrev>'`) before
+    /// being pinned. The table's doc comment says to add abbreviations only as
+    /// differential tests demand, so this is that test — without it nothing
+    /// would catch a mistyped offset.
+    #[test]
+    fn fixed_abbreviations_match_pg() {
+        let cases = [
+            ("AST", "-04"),
+            ("ADT", "-03"),
+            ("EST", "-05"),
+            ("EDT", "-04"),
+            ("CST", "-06"),
+            ("CDT", "-05"),
+            ("MST", "-07"),
+            ("MDT", "-06"),
+            ("PST", "-08"),
+            ("PDT", "-07"),
+            ("AKST", "-09"),
+            ("AKDT", "-08"),
+            ("HST", "-10"),
+        ];
+        for (abbrev, offset) in cases {
+            let input = format!("12:00 {abbrev}");
+            match parse(&input, &SessionZone::utc()) {
+                Ok(v) => assert_eq!(format(v), format!("12:00:00{offset}"), "abbrev {abbrev}"),
+                Err(e) => panic!("abbrev {abbrev} should parse, got {e:?}"),
+            }
+        }
+    }
+
+    /// Every case here was read off a live PostgreSQL 18.4 before being pinned.
+    #[test]
+    fn zone_tokens_resolve_or_fail_like_pg() {
+        let ok = [
+            ("00:01 PDT", "00:01:00-07"),
+            ("07:07 PST", "07:07:00-08"),
+            ("08:08 EDT", "08:08:00-04"),
+            ("11:59:59.99 PM PDT", "23:59:59.99-07"),
+            ("2003-03-07 15:36:39 America/New_York", "15:36:39-05"),
+            ("2003-07-07 15:36:39 America/New_York", "15:36:39-04"),
+            ("2003-03-07 12:00 america/new_york", "12:00:00-05"),
+            // The abbreviation prefix is ignored; the offset is POSIX-signed.
+            ("12:00:00 UTC+10", "12:00:00-10"),
+            ("12:00 UTC-3", "12:00:00+03"),
+            ("12:00 Z", "12:00:00+00"),
+            ("12:00 GMT", "12:00:00+00"),
+            ("12:00-0730", "12:00:00-07:30"),
+            ("24:00:00 PDT", "24:00:00-07"),
+            ("23:59:60 PDT", "24:00:00-07"),
+        ];
+        for (input, want) in ok {
+            match parse(input, &SessionZone::utc()) {
+                Ok(v) => assert_eq!(format(v), want, "input {input}"),
+                Err(e) => panic!("input {input} should parse, got {e:?}"),
+            }
+        }
+
+        // Syntax errors (22007): an unknown word, a zone that needs a date, and
+        // a repeated meridiem. A bare word never gets blamed on the zone.
+        for input in [
+            "15:36:39 America/New_York",
+            "15:36:39 m2",
+            "15:36:39 MSK m2",
+            "2003-07-07 15:36:39 MSK m2",
+            "12:00 foo",
+            "12:00 EST5EDT",
+            "12:00 am pm",
+        ] {
+            let Err(e) = parse(input, &SessionZone::utc()) else {
+                panic!("input {input} should fail");
+            };
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "input {input}");
+        }
+
+        // Field overflow (22008) wins over any zone complaint. The date cases
+        // are regression guards: an impossible day used to reach `jiff`'s
+        // civil-datetime constructor, which panics rather than erroring, so
+        // `'2003-02-30 …'` with a named zone took the whole backend down.
+        for input in [
+            "24:00:00.01 PDT",
+            "23:59:60.01 PDT",
+            "24:01:00 PDT",
+            "25:00:00 PDT",
+            "2003-02-30 12:00 America/New_York",
+            "2003-04-31 12:00 America/New_York",
+            "2003-02-30 12:00-04",
+            "2003-13-01 12:00-04",
+            // No year 0: 1 BC is followed by 1 AD.
+            "0000-01-01 12:00-04",
+            "0000-06-15 12:00 America/New_York",
+        ] {
+            let Err(e) = parse(input, &SessionZone::utc()) else {
+                panic!("input {input} should fail");
+            };
+            assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW, "input {input}");
+        }
+
+        // A token *shaped* like a zone spec reaches PG's zone lookup, so its
+        // failure is 22023 blaming the (lowercased) token, not 22007 blaming the
+        // whole input. Pinned against PG 18.4.
+        for (input, want) in [
+            ("12:00 Nowhere/Nozone", "time zone \"nowhere/nozone\" not recognized"),
+            ("12:00 UTC+168", "time zone \"utc+168\" not recognized"),
+        ] {
+            let Err(e) = parse(input, &SessionZone::utc()) else {
+                panic!("input {input} should fail");
+            };
+            assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE, "input {input}");
+            assert_eq!(e.message, want, "input {input}");
+        }
+
+        // A bare numeric offset past ±15:59:59 is 22009, quoting the whole input.
+        let Err(e) = parse("12:00:00+16:00", &SessionZone::utc()) else {
+            panic!("expected a displacement error");
+        };
+        assert_eq!(e.sqlstate, INVALID_TIME_ZONE_DISPLACEMENT);
+        assert_eq!(
+            e.message,
+            "time zone displacement out of range: \"12:00:00+16:00\""
+        );
     }
 }

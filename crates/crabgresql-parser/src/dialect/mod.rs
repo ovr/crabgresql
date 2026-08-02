@@ -777,6 +777,8 @@ pub trait Dialect: Debug + Any {
                     {
                         Ok(p!(AtTz))
                     }
+                    // `AT LOCAL` is the same operator with the zone left implicit.
+                    (Token::Word(w), _) if w.keyword == Keyword::LOCAL => Ok(p!(AtTz)),
                     _ => Ok(self.prec_unknown()),
                 }
             }

@@ -90,6 +90,13 @@ pub struct BindError {
     /// body (a `LANGUAGE SQL` inline expansion, or a statement in a PL/pgSQL
     /// body bound at call time).
     pub context: Vec<String>,
+    /// Set when this error is the operator resolver's own "operator does not
+    /// exist" — as opposed to one an *operand* raised on its way out through
+    /// the same call. `bind_binary` uses it to decide whether the caret belongs
+    /// under the operator token, which is a question the SQLSTATE cannot answer:
+    /// `42883` is also `function nosuchfn(integer) does not exist` raised while
+    /// binding an operand, where PG points at the function instead.
+    pub blames_operator: bool,
 }
 
 impl std::fmt::Display for BindError {
@@ -109,6 +116,7 @@ impl BindError {
             hint: None,
             location: None,
             context: Vec::new(),
+            blames_operator: false,
         }
     }
 

@@ -4,8 +4,8 @@
 //!
 //! The rules are derived from psql's observable output in the vendored
 //! expected files. Known gaps, acceptable while no passing test needs them:
-//! multi-line cell values (psql's `+` continuation markers), wide-character
-//! display widths, and psql's truncation of long `LINE n:` excerpts.
+//! wide-character display widths, and psql's truncation of long `LINE n:`
+//! excerpts.
 
 use crate::client::{ErrorFields, Field};
 
@@ -14,12 +14,20 @@ use crate::client::{ErrorFields, Field};
 const RIGHT_ALIGNED_OIDS: &[u32] = &[20, 21, 23, 26, 28, 29, 700, 701, 790, 1700, 5069];
 
 pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display: &str) -> String {
+    // A cell containing newlines occupies one output line per line of content,
+    // so a column is as wide as its widest *line* — not its widest value.
     let widths: Vec<usize> = fields
         .iter()
         .enumerate()
         .map(|(i, field)| {
             rows.iter()
-                .map(|row| row[i].as_deref().unwrap_or(null_display).chars().count())
+                .flat_map(|row| {
+                    row[i]
+                        .as_deref()
+                        .unwrap_or(null_display)
+                        .split('\n')
+                        .map(|line| line.chars().count())
+                })
                 .max()
                 .unwrap_or(0)
                 .max(field.name.chars().count())
@@ -44,27 +52,60 @@ pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display
 
     // Data: numeric-ish columns are right-aligned, and the last column drops
     // its trailing padding (so a NULL last cell leaves a lone space).
+    //
+    // A row is as tall as its tallest cell. Every line of a cell but its last
+    // carries a `+` where the trailing separator space would go — psql's marker
+    // for "this value continues" — which is also why a continued line keeps its
+    // padding even in the last column, where a single-line value would not.
     for row in rows {
         // `saturating_sub`: a zero-column result still yields one row per
         // tuple (`SELECT * FROM t` where `t` has no columns), and `0 - 1`
         // would panic.
         let last = fields.len().saturating_sub(1);
-        let cells: Vec<String> = row
+        let cells: Vec<Vec<&str>> = row
             .iter()
-            .enumerate()
-            .map(|(i, value)| {
-                let value = value.as_deref().unwrap_or(null_display);
-                let pad = " ".repeat(widths[i] - value.chars().count());
-                match (RIGHT_ALIGNED_OIDS.contains(&fields[i].type_oid), i == last) {
-                    (true, false) => format!(" {pad}{value} "),
-                    (true, true) => format!(" {pad}{value}"),
-                    (false, false) => format!(" {value}{pad} "),
-                    (false, true) => format!(" {value}"),
-                }
-            })
+            .map(|value| value.as_deref().unwrap_or(null_display).split('\n').collect())
             .collect();
-        out.push_str(&cells.join("|"));
-        out.push('\n');
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for line in 0..height {
+            let rendered: Vec<String> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, lines)| {
+                    // A cell shorter than the row renders as blanks. `filler`
+                    // distinguishes those lines from a cell whose own content is
+                    // empty — the two are padded differently in the last column.
+                    let filler = line >= lines.len();
+                    let value = lines.get(line).copied().unwrap_or("");
+                    let pad = " ".repeat(widths[i] - value.chars().count());
+                    let continues = line + 1 < lines.len();
+                    // A continued line is always left-aligned: the `+` marker
+                    // takes the place the right-hand padding would occupy.
+                    let right = RIGHT_ALIGNED_OIDS.contains(&fields[i].type_oid);
+                    let inner = if right && !continues {
+                        format!("{pad}{value}")
+                    } else {
+                        format!("{value}{pad}")
+                    };
+                    match (continues, i == last) {
+                        (true, _) => format!(" {inner}+"),
+                        // The last column drops its *padding* — but only the
+                        // padding: a `bpchar` keeps the blanks that are part of
+                        // its value. Left-aligned, that means dropping the
+                        // trailing pad. Right-aligned, the pad leads the value
+                        // so it stays — a NULL still renders as a full-width run
+                        // of blanks — except on a filler line, which belongs to
+                        // no value at all and collapses to the lone leading space.
+                        (false, true) if !right => format!(" {value}"),
+                        (false, true) if filler => " ".to_string(),
+                        (false, true) => format!(" {pad}{value}"),
+                        (false, false) => format!(" {inner} "),
+                    }
+                })
+                .collect();
+            out.push_str(&rendered.join("|"));
+            out.push('\n');
+        }
     }
 
     let n = rows.len();
@@ -279,6 +320,30 @@ mod tests {
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[2], " 1 | ");
+    }
+
+    /// A cell containing newlines occupies one output line per line of content,
+    /// each but the last marked with `+`. Pinned against psql 18.4 rendering
+    /// `SELECT pg_get_viewdef('v1'), 42 AS n;` — note the right-aligned `n`
+    /// column's filler lines collapse to a single space, because the last column
+    /// drops trailing whitespace.
+    #[test]
+    fn multi_line_cells_use_psql_continuation_markers() {
+        let out = format_table(
+            &[field("pg_get_viewdef", 25), field("n", 23)],
+            &[vec![
+                text(" SELECT a AS aa,\n    a AS bb\n   FROM t;"),
+                text("42"),
+            ]],
+            "",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "  pg_get_viewdef  | n  ");
+        assert_eq!(lines[1], "------------------+----");
+        assert_eq!(lines[2], "  SELECT a AS aa,+| 42");
+        assert_eq!(lines[3], "     a AS bb     +| ");
+        assert_eq!(lines[4], "    FROM t;       | ");
+        assert_eq!(lines[5], "(1 row)");
     }
 
     #[test]

@@ -1575,6 +1575,36 @@ async fn substring_similar_extracts_from_the_earliest_position() -> anyhow::Resu
     Ok(())
 }
 
+/// A failing binary operator whose error carries no cursor position of its own
+/// must not make binding cost double per nesting level.
+///
+/// `bind_binary` stamps the operator token onto its own 42883 so PG's caret
+/// lands there. An earlier shape decided *whose* error it was by re-binding both
+/// operands on the error path, which re-bound the whole subtree once per
+/// enclosing operator — 24 chained `+` took over 30 seconds to reject, from a
+/// query short enough to paste. A typed marker on the error answers the same
+/// question in constant time.
+#[tokio::test]
+async fn a_deeply_nested_operator_error_binds_in_linear_time() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The `IN` fallback raises an unlocated 42883, so nothing short-circuits on
+    // an already-set position.
+    let query = format!("SELECT (1 IN (1, 'x'::text)){}", " + 1".repeat(24));
+    let started = std::time::Instant::now();
+    let err = client.simple_query(&query).await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    let db = err.as_db_error().ok_or_else(|| anyhow::anyhow!("expected a db error"))?;
+    assert_eq!(db.message(), "operator does not exist: integer = text");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "binding took {elapsed:?}; an exponential re-bind has regressed"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -1624,13 +1654,10 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
         "unexpected message: {}",
         db.message()
     );
-    assert_eq!(
-        db.hint(),
-        Some(
-            "No operator matches the given name and argument types. \
-             You might need to add explicit type casts."
-        )
-    );
+    // An unrecognized symbol names no operator at all, so PG reports that rather
+    // than the type-mismatch DETAIL, and offers no cast HINT.
+    assert_eq!(db.detail(), Some("There is no operator of that name."));
+    assert_eq!(db.hint(), None);
 
     // An operand error surfaces first, as PG analyzes operands before resolving
     // the operator — an undefined column is 42703, not masked as 42883.

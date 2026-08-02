@@ -21,6 +21,10 @@ use crabgresql_txn::{TxnContext, Xid};
 pub struct SessionCatalogOps {
     system: Arc<SystemCatalog>,
     temp_schema: String,
+    /// The same search-path-aware catalog the statement resolves relations
+    /// against, so `pg_get_viewdef` finds a view by exactly the name the query
+    /// would. `None` in tests that exercise only the OID-keyed methods.
+    relations: Option<Arc<dyn TableEngine>>,
 }
 
 impl SessionCatalogOps {
@@ -28,7 +32,14 @@ impl SessionCatalogOps {
         Self {
             system,
             temp_schema: temp_schema.into(),
+            relations: None,
         }
+    }
+
+    /// Attach the relation catalog that backs [`CatalogOps::view_sql`].
+    pub fn with_relations(mut self, relations: Arc<dyn TableEngine>) -> Self {
+        self.relations = Some(relations);
+        self
     }
 }
 
@@ -133,6 +144,13 @@ impl CatalogOps for SessionCatalogOps {
 
     fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
         self.system.user_type_oid(namespace, name)
+    }
+
+    fn view_sql(&self, namespace: Option<&str>, name: &str) -> Option<(String, Vec<String>)> {
+        self.relations
+            .as_ref()?
+            .resolve_view(namespace, name)
+            .map(|v| (v.sql, v.columns.into_iter().map(|c| c.name).collect()))
     }
 }
 

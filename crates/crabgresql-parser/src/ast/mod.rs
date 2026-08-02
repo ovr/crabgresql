@@ -1131,6 +1131,14 @@ pub enum Expr {
         /// Time zone expression to apply.
         time_zone: Box<Expr>,
     },
+    /// `<expr> AT LOCAL` — [`Expr::AtTimeZone`] against the session `TimeZone`.
+    /// Kept as its own node rather than desugared because the session zone is
+    /// not known at parse time, and because PG echoes the syntax back verbatim
+    /// when deparsing a view.
+    AtLocal {
+        /// Timestamp expression to shift.
+        timestamp: Box<Expr>,
+    },
     /// Extract a field from a timestamp e.g. `EXTRACT(MONTH FROM foo)`
     /// Or `EXTRACT(MONTH, foo)`
     ///
@@ -2229,6 +2237,9 @@ impl fmt::Display for Expr {
                 time_zone,
             } => {
                 write!(f, "{timestamp} AT TIME ZONE {time_zone}")
+            }
+            Expr::AtLocal { timestamp } => {
+                write!(f, "{timestamp} AT LOCAL")
             }
             Expr::Interval(interval) => {
                 write!(f, "{interval}")

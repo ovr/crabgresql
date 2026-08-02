@@ -16,11 +16,11 @@
 -- `pg_xact_status` and `\gset`, none of which are modeled -- so upstream `xid`
 -- is not on the promotion list in suites/upstream_must_pass.txt.
 --
--- Known divergence, recorded in the expected output below: the
--- `operator does not exist` / `function ... does not exist` errors carry PG's
--- `HINT: ... explicit type casts.` but not its `LINE n: ... ^` caret. That is a
--- repo-wide convention of `no_operator`/`undefined_function`, not anything
--- specific to these types.
+-- `operator does not exist` now carries PG's full report — the `LINE n: ... ^`
+-- caret under the operator, the DETAIL, and the HINT. `function ... does not
+-- exist` still has no caret: it is raised while binding an operand, which knows
+-- no span of its own, so the caret is omitted rather than pointed at the wrong
+-- token. That remaining gap is repo-wide, not specific to these types.
 --
 -- values in range, in octal, decimal, hex
 select '010'::xid,
@@ -168,16 +168,28 @@ select '1'::xid = 1, '4294967295'::xid = -1, '1'::xid <> 2, '1'::xid = 1::int2;
 
 select 1 = '1'::xid;      -- error: not commutative
 ERROR:  operator does not exist: integer = xid
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select 1 = '1'::xid;
+                 ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid = 1::int8;  -- error: int4 only
 ERROR:  operator does not exist: xid = bigint
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid = 1::int8;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid < 2;      -- error: still no ordering operator
 ERROR:  operator does not exist: xid < integer
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid < 2;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid8 = 1;     -- error: xid8 has no int variant
 ERROR:  operator does not exist: xid8 = integer
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid8 = 1;
+                         ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- the operator's coercion must not leak out as a user-written cast
 select 1::xid;
 ERROR:  cannot cast type integer to xid
@@ -208,16 +220,28 @@ select '4294967297'::xid8::xid;
 -- we don't want relational operators for xid, due to use of modular arithmetic
 select '1'::xid < '2'::xid;
 ERROR:  operator does not exist: xid < xid
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid < '2'::xid;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid <= '2'::xid;
 ERROR:  operator does not exist: xid <= xid
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid <= '2'::xid;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid > '2'::xid;
 ERROR:  operator does not exist: xid > xid
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid > '2'::xid;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select '1'::xid >= '2'::xid;
 ERROR:  operator does not exist: xid >= xid
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: select '1'::xid >= '2'::xid;
+                        ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- we want them for xid8 though
 select '1'::xid8 < '2'::xid8, '2'::xid8 < '2'::xid8, '2'::xid8 < '1'::xid8;
  ?column? | ?column? | ?column? 

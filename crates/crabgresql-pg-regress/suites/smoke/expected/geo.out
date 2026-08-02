@@ -947,8 +947,9 @@ SELECT sql_error_code FROM pg_input_error_info('(1,1),(1,1)', 'line');
 (1 row)
 
 -- PostgreSQL gives `box` no `<>` operator (unlike circle, lseg and point).
--- The expected output drops PG's `LINE n: ... ^` caret here, which this build
--- does not emit for `operator does not exist` (see the note in xid.sql).
 SELECT box '(1,1),(0,0)' <> box '(3,3),(2,2)';
 ERROR:  operator does not exist: box <> box
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT box '(1,1),(0,0)' <> box '(3,3),(2,2)';
+                                 ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.

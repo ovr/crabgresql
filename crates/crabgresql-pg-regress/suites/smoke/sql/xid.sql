@@ -16,11 +16,11 @@
 -- `pg_xact_status` and `\gset`, none of which are modeled -- so upstream `xid`
 -- is not on the promotion list in suites/upstream_must_pass.txt.
 --
--- Known divergence, recorded in the expected output below: the
--- `operator does not exist` / `function ... does not exist` errors carry PG's
--- `HINT: ... explicit type casts.` but not its `LINE n: ... ^` caret. That is a
--- repo-wide convention of `no_operator`/`undefined_function`, not anything
--- specific to these types.
+-- `operator does not exist` now carries PG's full report — the `LINE n: ... ^`
+-- caret under the operator, the DETAIL, and the HINT. `function ... does not
+-- exist` still has no caret: it is raised while binding an operand, which knows
+-- no span of its own, so the caret is omitted rather than pointed at the wrong
+-- token. That remaining gap is repo-wide, not specific to these types.
 --
 
 -- values in range, in octal, decimal, hex

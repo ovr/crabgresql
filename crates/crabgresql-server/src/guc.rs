@@ -258,6 +258,19 @@ pub fn lookup(name: &str) -> Option<&'static GucDef> {
     GUCS.iter().find(|g| g.key == key)
 }
 
+/// Every parameter's current value, keyed by lowercase name — the snapshot
+/// `current_setting()` reads during a statement.
+///
+/// A snapshot rather than a live borrow because the executor holds its handle
+/// for the whole statement, and nothing can change a GUC mid-statement: `SET` is
+/// itself a statement. Rendering goes through the same `show` functions `SHOW`
+/// uses, so the two cannot disagree.
+pub fn snapshot(session: &Session) -> std::collections::HashMap<String, String> {
+    GUCS.iter()
+        .map(|g| (g.key.to_string(), (g.show)(session)))
+        .collect()
+}
+
 /// Every reported parameter's current value — the startup `ParameterStatus`
 /// burst, and the baseline [`changed`] diffs against.
 pub fn report_values(session: &Session) -> Vec<(String, String)> {

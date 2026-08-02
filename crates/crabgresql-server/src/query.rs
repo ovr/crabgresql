@@ -428,7 +428,10 @@ fn bind_catalogs(
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
     let catalog_ops: Arc<dyn CatalogOps> =
-        Arc::new(SessionCatalogOps::new(system, session.temp_schema.clone()));
+        Arc::new(
+            SessionCatalogOps::new(system, session.temp_schema.clone())
+                .with_relations(Arc::clone(&catalog)),
+        );
     (catalog, type_catalog, catalog_ops)
 }
 
@@ -2977,7 +2980,7 @@ fn execute_create_table(
             &namespace,
             &name,
             parent,
-            &session.fmt_ctx(),
+            &session.exec_context(),
         );
     }
     #[derive(Clone)]
@@ -3653,19 +3656,16 @@ fn fold_bound_value(
     expr: &ast::Expr,
     key_col: &Column,
     type_catalog: &Arc<dyn TypeCatalog>,
-    fmt: &FmtCtx,
+    ctx: &ExecContext,
 ) -> Result<Value, PgError> {
     let bound = crabgresql_binder::bind_column_default(expr, key_col, type_catalog)?;
     // The session's context, not a default one: a `timestamptz` bound is a wall
     // clock read in the *defining* session's zone, exactly as the INSERT that
     // routes a row reads its value. Folding under UTC here while routing under
     // the session zone put rows in the wrong partition, and the wrong bound is
-    // persisted.
-    let ctx = ExecContext {
-        fmt: fmt.clone(),
-        ..ExecContext::default()
-    };
-    Ok(crabgresql_executor::eval::eval(&bound, &[], &ctx)?)
+    // persisted. It carries the session's GUCs for the same reason — a bound
+    // may call `current_setting()`.
+    Ok(crabgresql_executor::eval::eval(&bound, &[], ctx)?)
 }
 
 /// Convert one incoming `FOR VALUES` datum into its storage form plus its
@@ -3675,13 +3675,13 @@ fn incoming_endpoint(
     value: &ast::PartitionBoundValue,
     key_col: &Column,
     type_catalog: &Arc<dyn TypeCatalog>,
-    fmt: &FmtCtx,
+    ctx: &ExecContext,
 ) -> Result<(PartitionBoundDatum, Endpoint), PgError> {
     match value {
         ast::PartitionBoundValue::MinValue => Ok((PartitionBoundDatum::MinValue, Endpoint::NegInf)),
         ast::PartitionBoundValue::MaxValue => Ok((PartitionBoundDatum::MaxValue, Endpoint::PosInf)),
         ast::PartitionBoundValue::Expr(expr) => {
-            let value = fold_bound_value(expr, key_col, type_catalog, fmt)?;
+            let value = fold_bound_value(expr, key_col, type_catalog, ctx)?;
             // A NULL bound has no place in the RANGE order (and would panic the
             // downstream `compare_values`); reject it as PG does.
             if value == Value::Null {
@@ -3719,7 +3719,7 @@ fn execute_create_partition(
     namespace: &str,
     name: &str,
     parent_ref: &ast::ObjectName,
-    fmt: &FmtCtx,
+    ctx: &ExecContext,
 ) -> Result<QueryResult, PgError> {
     // A partition inherits its shape from the parent: no redeclared columns,
     // constraints, or sub-partitioning in this slice.
@@ -3798,8 +3798,8 @@ fn execute_create_partition(
             "FROM/TO must specify exactly one value per partition key column",
         ));
     }
-    let (from_datum, lower) = incoming_endpoint(&from_spec[0], key_col, type_catalog, fmt)?;
-    let (to_datum, upper) = incoming_endpoint(&to_spec[0], key_col, type_catalog, fmt)?;
+    let (from_datum, lower) = incoming_endpoint(&from_spec[0], key_col, type_catalog, ctx)?;
+    let (to_datum, upper) = incoming_endpoint(&to_spec[0], key_col, type_catalog, ctx)?;
     // The bound must be non-empty: lower strictly below upper.
     if endpoint_cmp(&lower, &upper, key_col.ty) != std::cmp::Ordering::Less {
         return Err(PgError::new(

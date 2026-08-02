@@ -179,6 +179,78 @@ pub fn format(iv: Interval) -> String {
     out
 }
 
+/// `IntervalStyle = postgres_verbose`: `@ 1 year 2 mons 3 days 4 hours 5 mins
+/// 6.7 secs`, `@ 1 day 2 hours ago` for a negative span, and `@ 0` for zero.
+///
+/// Only the deparser wants this. PostgreSQL's `ruleutils` renders an interval
+/// constant in verbose style regardless of the session's `IntervalStyle`, so a
+/// dumped view definition reads the same for every client — which is why
+/// `pg_get_viewdef` shows `'@ 0'::interval` where `SELECT` would show
+/// `00:00:00`.
+///
+/// Unlike [`format`], every field is signed the same way: verbose style factors
+/// a wholly-negative interval's sign out into the trailing `ago`.
+pub fn format_verbose(iv: Interval) -> String {
+    if iv == POS_INFINITY {
+        return "infinity".to_string();
+    }
+    if iv == NEG_INFINITY {
+        return "-infinity".to_string();
+    }
+    // `ago` is PG's rule for a span whose *first* nonzero field is negative.
+    let ago = iv.months < 0
+        || (iv.months == 0 && iv.days < 0)
+        || (iv.months == 0 && iv.days == 0 && iv.usec < 0);
+    // Widen the month/day counts before negating: `i32::MIN` months is a
+    // reachable interval that is *not* the infinity sentinel
+    // (`'-178956970 years -8 mons'`), so negating in place would overflow and
+    // panic. `usec` saturates instead, which only the sentinel could reach.
+    let (months, days) = (iv.months as i64, iv.days as i64);
+    let (months, days, usec) = if ago {
+        (-months, -days, iv.usec.saturating_neg())
+    } else {
+        (months, days, iv.usec)
+    };
+    let (hour, min, sec, fsec) = split_time(usec);
+    let mut parts: Vec<String> = Vec::new();
+    // Only an exact `1` is singular — `-1` pluralizes, so a mixed-sign interval
+    // reads `@ 1 mon -1 days`. (The seconds field below is the exception: PG
+    // makes it singular on the magnitude, giving `-1 sec`.)
+    let mut push = |value: i64, unit: &str| {
+        if value != 0 {
+            parts.push(format!("{value} {unit}{}", if value != 1 { "s" } else { "" }));
+        }
+    };
+    push(months / 12, "year");
+    push(months % 12, "mon");
+    push(days, "day");
+    push(hour, "hour");
+    push(min, "min");
+    if sec != 0 || fsec != 0 {
+        let mut secs = String::new();
+        append_seconds(&mut secs, sec.abs(), fsec.abs());
+        // `append_seconds` zero-pads for the `HH:MM:SS` form; verbose style does not.
+        let secs = secs.trim_start_matches('0');
+        let secs = if secs.starts_with('.') || secs.is_empty() {
+            format!("0{secs}")
+        } else {
+            secs.to_string()
+        };
+        let sign = if sec < 0 || fsec < 0 { "-" } else { "" };
+        let plural = if sec.abs() == 1 && fsec == 0 { "" } else { "s" };
+        parts.push(format!("{sign}{secs} sec{plural}"));
+    }
+    if parts.is_empty() {
+        return "@ 0".to_string();
+    }
+    let body = parts.join(" ");
+    if ago {
+        format!("@ {body} ago")
+    } else {
+        format!("@ {body}")
+    }
+}
+
 /// Append one leading field (year/mon/day) in PostgreSQL's postgres-IntervalStyle
 /// output: a separating space once a field has been emitted, an explicit `+` when a
 /// prior field was negative but this one is positive, and a plural `s` unless
@@ -1312,6 +1384,41 @@ mod tests {
                 .message
                 .contains("not supported")
         );
+
+        Ok(())
+    }
+
+    /// `IntervalStyle = postgres_verbose`, the style `pg_get_viewdef` renders an
+    /// interval constant in. Every expectation was read off a live PostgreSQL
+    /// 18.4 under `SET IntervalStyle='postgres_verbose'`.
+    #[test]
+    fn verbose_style_matches_pg() -> anyhow::Result<()> {
+        let cases = [
+            ("0", "@ 0"),
+            ("00:00", "@ 0"),
+            ("1 sec", "@ 1 sec"),
+            ("2 secs", "@ 2 secs"),
+            ("1.5 secs", "@ 1.5 secs"),
+            ("-1 sec", "@ 1 sec ago"),
+            ("0.000001 sec", "@ 0.000001 secs"),
+            ("1 year", "@ 1 year"),
+            ("-1 year -2 mons", "@ 1 year 2 mons ago"),
+            // A mixed-sign span keeps its per-field signs, and `-1` pluralizes.
+            ("1 mon -1 day", "@ 1 mon -1 days"),
+            ("1 day -1 hour", "@ 1 day -1 hours"),
+            ("1 day -1 sec", "@ 1 day -1 sec"),
+            ("25:00:00", "@ 25 hours"),
+            ("1 year 2 mons 3 days 04:05:06.7", "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs"),
+            // Not the infinity sentinel: `i32::MIN` months, which must not
+            // overflow while being negated for the `ago` form.
+            ("-178956970 years -8 mons", "@ 178956970 years 8 mons ago"),
+        ];
+        for (input, want) in cases {
+            let iv = parse(input).map_err(|e| anyhow::anyhow!("{input}: {e:?}"))?;
+            assert_eq!(format_verbose(iv), want, "input {input}");
+        }
+        assert_eq!(format_verbose(POS_INFINITY), "infinity");
+        assert_eq!(format_verbose(NEG_INFINITY), "-infinity");
 
         Ok(())
     }

@@ -122,7 +122,7 @@ fn not_found(kind: RegKind, s: &str) -> ExecError {
 /// keeps its spelling (and `""` inside it is a literal quote). `None` for a
 /// malformed name — an unterminated quote, an empty part, or more than two
 /// parts (no `db.schema.table` here, since there is one database).
-fn split_qualified_name(s: &str) -> Option<(Option<String>, String)> {
+pub(crate) fn split_qualified_name(s: &str) -> Option<(Option<String>, String)> {
     let mut parts = Vec::new();
     let mut rest = s;
     loop {

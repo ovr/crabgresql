@@ -2217,6 +2217,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
             timestamp,
             time_zone,
         } => bind_at_time_zone(timestamp, time_zone, scope),
+        ast::Expr::AtLocal { timestamp } => bind_at_local(timestamp, scope),
         ast::Expr::Case {
             operand,
             conditions,
@@ -3844,38 +3845,76 @@ fn bind_at_time_zone(
     zone: &ast::Expr,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
+    // The zone is either a `text` name or an `interval` displacement; PG has
+    // both overloads of every `timezone()` pair.
     let zone_arg = match bind_expr(zone, scope)? {
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
-        Binding::Typed(e) if e.ty() == PgType::Text => e,
+        Binding::Typed(e) if e.ty() == PgType::Text || e.ty() == PgType::Interval => e,
         Binding::Typed(e) => {
+            // PG resolves both operand types before reporting, so name them
+            // both. Binding the value here is safe: this is the error path, and
+            // a failure in the value is the more specific complaint anyway.
+            let value_ty = match bind_expr(value, scope) {
+                Ok(Binding::Typed(v)) => v.ty().name().to_string(),
+                Ok(Binding::Unknown { .. }) => PgType::Timestamp.name().to_string(),
+                Err(inner) => return Err(inner),
+            };
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
                 format!(
-                    "function pg_catalog.timezone({}, ...) does not exist",
+                    "function pg_catalog.timezone({}, {value_ty}) does not exist",
                     e.ty().name()
                 ),
             ));
         }
     };
+    let by_interval = zone_arg.ty() == PgType::Interval;
+    let zone_name = zone_arg.ty().name();
     // An untyped value literal defaults to `timestamp` (→ timestamptz), as PG does.
     let (func, ret, value_arg) = match bind_expr(value, scope)? {
-        Binding::Typed(e) if e.ty() == PgType::Timestamp => {
-            (ScalarFn::TimezoneToTz, PgType::TimestampTz, e)
-        }
-        Binding::Typed(e) if e.ty() == PgType::TimestampTz => {
-            (ScalarFn::TimezoneToTs, PgType::Timestamp, e)
-        }
+        Binding::Typed(e) if e.ty() == PgType::Timestamp => (
+            pick(by_interval, ScalarFn::TimezoneIntervalToTz, ScalarFn::TimezoneToTz),
+            PgType::TimestampTz,
+            e,
+        ),
+        Binding::Typed(e) if e.ty() == PgType::TimestampTz => (
+            pick(by_interval, ScalarFn::TimezoneIntervalToTs, ScalarFn::TimezoneToTs),
+            PgType::Timestamp,
+            e,
+        ),
+        // A bare `time` reaches the timetz overload through the implicit cast PG
+        // uses here, picking up the session zone on the way.
+        Binding::Typed(e) if e.ty() == PgType::Time => (
+            pick(
+                by_interval,
+                ScalarFn::TimezoneIntervalTimeTz,
+                ScalarFn::TimezoneTimeTz,
+            ),
+            PgType::TimeTz,
+            coerce_expr(e, PgType::TimeTz)?,
+        ),
+        // Unlike the timestamp pair, a `timetz` keeps its type: the zone is part
+        // of the value, so rotating it yields another `timetz`.
+        Binding::Typed(e) if e.ty() == PgType::TimeTz => (
+            pick(
+                by_interval,
+                ScalarFn::TimezoneIntervalTimeTz,
+                ScalarFn::TimezoneTimeTz,
+            ),
+            PgType::TimeTz,
+            e,
+        ),
         Binding::Typed(e) => {
             return Err(BindError::new(
                 sqlstate::UNDEFINED_FUNCTION,
                 format!(
-                    "function pg_catalog.timezone(text, {}) does not exist",
+                    "function pg_catalog.timezone({zone_name}, {}) does not exist",
                     e.ty().name()
                 ),
             ));
         }
         Binding::Unknown { lit, span, param } => (
-            ScalarFn::TimezoneToTz,
+            pick(by_interval, ScalarFn::TimezoneIntervalToTz, ScalarFn::TimezoneToTz),
             PgType::TimestampTz,
             resolve_unknown(lit, span, param, PgType::Timestamp)?,
         ),
@@ -3884,6 +3923,53 @@ fn bind_at_time_zone(
         func,
         ret,
         args: vec![zone_arg, value_arg],
+    }))
+}
+
+fn pick(by_interval: bool, interval: ScalarFn, text: ScalarFn) -> ScalarFn {
+    if by_interval { interval } else { text }
+}
+
+/// `<value> AT LOCAL` — [`bind_at_time_zone`] against the session `TimeZone`,
+/// which is only known at execution time, so it lowers to the one-argument
+/// `timezone(value)` form rather than to a zone constant. PG names the result
+/// column `timezone`, exactly as for `AT TIME ZONE`.
+fn bind_at_local(value: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> {
+    let (func, ret, arg) = match bind_expr(value, scope)? {
+        Binding::Typed(e) if e.ty() == PgType::Timestamp => {
+            (ScalarFn::TimezoneLocalToTz, PgType::TimestampTz, e)
+        }
+        Binding::Typed(e) if e.ty() == PgType::TimestampTz => {
+            (ScalarFn::TimezoneLocalToTs, PgType::Timestamp, e)
+        }
+        Binding::Typed(e) if e.ty() == PgType::TimeTz => {
+            (ScalarFn::TimezoneLocalTimeTz, PgType::TimeTz, e)
+        }
+        // As in `bind_at_time_zone`: a `time` casts to `timetz` first.
+        Binding::Typed(e) if e.ty() == PgType::Time => (
+            ScalarFn::TimezoneLocalTimeTz,
+            PgType::TimeTz,
+            coerce_expr(e, PgType::TimeTz)?,
+        ),
+        Binding::Typed(e) => {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "function pg_catalog.timezone({}) does not exist",
+                    e.ty().name()
+                ),
+            ));
+        }
+        Binding::Unknown { lit, span, param } => (
+            ScalarFn::TimezoneLocalToTz,
+            PgType::TimestampTz,
+            resolve_unknown(lit, span, param, PgType::Timestamp)?,
+        ),
+    };
+    Ok(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret,
+        args: vec![arg],
     }))
 }
 
@@ -4434,6 +4520,33 @@ fn in_list_type(items: &[Binding]) -> ListType {
 }
 
 fn bind_binary(
+    left: &ast::Expr,
+    op: &ast::BinaryOperator,
+    right: &ast::Expr,
+    op_span: Span,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    // PG points its caret at the operator token for a 42883. The error is built
+    // at dozens of sites deep inside the type-resolution walk, so rather than
+    // thread the span through all of them, stamp it here on the way out.
+    //
+    // Only the operator resolver's *own* 42883 gets the caret, and only this
+    // frame's. `blames_operator` is what identifies it — the SQLSTATE cannot,
+    // since 42883 is also `function nosuchfn(integer) does not exist` raised
+    // while binding an *operand* (PG points at `nosuchfn`) and the resolver's
+    // `could not identify an equality operator for type json`, which PG leaves
+    // unpositioned. The flag is cleared once stamped, so an error passing
+    // outward through an enclosing operator keeps the innermost position.
+    bind_binary_inner(left, op, right, op_span, scope).map_err(|mut e| {
+        if !e.blames_operator {
+            return e;
+        }
+        e.blames_operator = false;
+        e.at(op_span)
+    })
+}
+
+fn bind_binary_inner(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
     right: &ast::Expr,
@@ -5245,15 +5358,11 @@ fn operand_name(b: &Binding) -> &'static str {
 /// a cast failure from inside `coerce_expr`. Carries PG's HINT, as
 /// `custom_op_undefined` does for the `OPERATOR(...)` spelling.
 fn undefined_binary_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
-    BindError::new(
-        sqlstate::UNDEFINED_FUNCTION,
-        format!(
-            "operator does not exist: {} {op} {}",
-            operand_name(lb),
-            operand_name(rb)
-        ),
-    )
-    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
+    undefined_operator_error(format!(
+        "operator does not exist: {} {op} {}",
+        operand_name(lb),
+        operand_name(rb)
+    ))
 }
 
 /// 42883 for an `OPERATOR(schema.op)` spelling that names no built-in operator
@@ -5281,6 +5390,12 @@ fn custom_op_undefined(
         ast::BinaryOperator::PGCustomBinaryOperator(parts) => parts.join("."),
         _ => op.to_string(),
     };
+    // A different DETAIL from the type-mismatch sites, and no HINT: nothing here
+    // names an operator that exists, so there are no casts to suggest. (PG
+    // splits this further — a symbol that exists in another schema gets "An
+    // operator of that name exists, but it is not in the search_path." — but
+    // that needs an operator catalog we do not have, so both collapse here, as
+    // the SQLSTATE already does.)
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
         format!(
@@ -5289,7 +5404,7 @@ fn custom_op_undefined(
             operand_name(&rb)
         ),
     )
-    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
+    .with_detail(Some("There is no operator of that name.".to_string()))
 }
 
 /// Materialize a network operand: a typed inet/cidr as is (both read through
@@ -7275,20 +7390,35 @@ fn bind_similar_to(
     Ok(Binding::Typed(expr))
 }
 
-/// The HINT PG attaches to every `operator does not exist` (42883). Shared by
-/// all three constructors below so they cannot drift apart.
-const NO_OPERATOR_HINT: &str = "No operator matches the given name and argument types. \
-     You might need to add explicit type casts.";
+/// The DETAIL/HINT pair PG attaches to an `operator does not exist` (42883)
+/// raised because the operator *name* is known but no candidate accepts these
+/// operand types — which is every site below, since an unrecognized symbol never
+/// reaches them. Shared so the constructors cannot drift apart.
+///
+/// PG words this case as a DETAIL plus a short HINT; the older single-HINT
+/// phrasing ("No operator matches the given name and argument types…") belongs
+/// to a form PG no longer emits here.
+const NO_OPERATOR_DETAIL: &str = "No operator of that name accepts the given argument types.";
+const NO_OPERATOR_HINT: &str = "You might need to add explicit type casts.";
+
+/// Build the 42883 with PG's DETAIL/HINT pair. The caret is attached by the
+/// caller — [`bind_binary`] stamps the operator token onto any 42883 leaving it
+/// that has no position of its own, so the many construction sites do not each
+/// have to thread a span.
+fn undefined_operator_error(message: String) -> BindError {
+    let mut e = BindError::new(sqlstate::UNDEFINED_FUNCTION, message)
+        .with_detail(Some(NO_OPERATOR_DETAIL.to_string()))
+        .with_hint(Some(NO_OPERATOR_HINT.to_string()));
+    // Lets `bind_binary` recognise its own error on the way out; see there.
+    e.blames_operator = true;
+    e
+}
 
 fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
-    BindError::new(
-        sqlstate::UNDEFINED_FUNCTION,
-        format!(
-            "operator does not exist: {left} {} {right}",
-            op.sql_symbol()
-        ),
-    )
-    .with_hint(Some(NO_OPERATOR_HINT.to_string()))
+    undefined_operator_error(format!(
+        "operator does not exist: {left} {} {right}",
+        op.sql_symbol()
+    ))
 }
 
 /// PG reports 42725 (with DETAIL/HINT) when more than one candidate operator
@@ -8448,7 +8578,7 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         // EXTRACT(... ) is named "extract" in PG, regardless of the field.
         ast::Expr::Extract { .. } => "extract".into(),
         // `x AT TIME ZONE y` lowers to timezone(); PG names the column "timezone".
-        ast::Expr::AtTimeZone { .. } => "timezone".into(),
+        ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. } => "timezone".into(),
         // An `ARRAY[...]` constructor is named "array" in PG.
         ast::Expr::Array(_) => "array".into(),
         // `a[i]` subscript keeps the base's name, like a bare column through a

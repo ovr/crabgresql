@@ -217,10 +217,16 @@ SELECT '16' + '0/1'::pg_lsn;
 -- operator for a float operand
 SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
 ERROR:  operator does not exist: pg_lsn + double precision
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
+                                   ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
 ERROR:  operator does not exist: pg_lsn - double precision
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
+                                   ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- an operand too wide for the internal accumulator is out of range, not a crash
 SELECT '0/1'::pg_lsn + 170141183460469231731687303715884105727;
 ERROR:  pg_lsn out of range
@@ -229,13 +235,22 @@ ERROR:  pg_lsn out of range
 -- the combinations with no operator at all
 SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
 ERROR:  operator does not exist: pg_lsn * pg_lsn
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
+                             ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
 ERROR:  operator does not exist: pg_lsn / pg_lsn
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
+                             ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 SELECT 16::numeric - '0/1'::pg_lsn;
 ERROR:  operator does not exist: numeric - pg_lsn
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+LINE 1: SELECT 16::numeric - '0/1'::pg_lsn;
+                           ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- pg_lsn(numeric)
 SELECT pg_lsn(23783416::numeric);
    pg_lsn   
