@@ -848,10 +848,15 @@ impl HeapTable {
     /// it is placed; writing forwards would need a second pass to patch every
     /// link. The last chunk points at itself, which terminates the walk.
     fn write_chain(&self, toast_rel: RelFileNode, bytes: &[u8], txn: &TxnContext) -> Tid {
-        // Chunks inherit the freeze: a frozen heap tuple is visible to snapshots
-        // that would find its chunks invisible, and the row would then read back
-        // with a dangling out-of-line value.
-        let hdr = TupleHeader::inserted(txn.insert_xid(), txn.cid);
+        // `txn.xid`, never `txn.insert_xid()`: a chunk header's XIDs are written
+        // and then read by nothing. `decode_chunk` returns only the link and the
+        // payload, and `detoast` deliberately skips a visibility check because the
+        // owning heap tuple has already passed one. So freezing a chunk would
+        // change no reader's answer, and stamping the real writer keeps the header
+        // honest for anyone who ever does look — a future toast-relation sweep,
+        // for one, which is the only thing that could reclaim a chain whose heap
+        // tuple is already gone.
+        let hdr = TupleHeader::inserted(txn.xid, txn.cid);
         let mut next: Option<Tid> = None;
         for payload in toast::chunks_last_first(bytes) {
             // A placeholder for the last chunk: `place_item` patches it to the
@@ -1449,8 +1454,9 @@ impl TableAm for HeapTable {
         // Deliberately `txn.xid`, not `txn.insert_xid()`: an update is a delete
         // plus an insert, and freezing only the insert half would leave an abort
         // undoing the delete while the new version stayed visible — one row
-        // becoming two. Only `COPY … FREEZE` sets that flag and it never updates,
-        // so this is a guard against a future caller, not a live case.
+        // becoming two, durably. Nothing frozen reaches here today, because the
+        // executor derives its frozen context around an INSERT's write alone; this
+        // stays explicit so that arrangement is not silently relied upon.
         let hdr = TupleHeader::inserted(txn.xid, txn.cid);
         let planned = self.plan_tuple(&tuple, &hdr)?;
         // Stamp the old version deleted-by-us, atomically under its page lock
