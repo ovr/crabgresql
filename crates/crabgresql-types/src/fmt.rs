@@ -124,12 +124,6 @@ impl FmtCtx {
         self.clock.map(|c| c.stmt_start).ok_or_else(no_clock)
     }
 
-    /// Whether a session clock is present, for the binder's decision to fold a
-    /// clock-dependent constant now or defer it to execution.
-    pub fn has_clock(&self) -> bool {
-        self.clock.is_some()
-    }
-
     /// The zone's offset (seconds east) "today" — what a value with a
     /// time-of-day but no date takes: the `time -> timetz` cast, `timetz_in`
     /// without a zone token, `timetz AT LOCAL`. PostgreSQL resolves these at
@@ -149,9 +143,21 @@ impl FmtCtx {
     }
 }
 
+/// The message [`FmtCtx::xact_start`] and [`FmtCtx::stmt_start`] raise with, and
+/// the marker the binder recognizes it by.
+///
+/// The binder needs to tell "this literal wants the transaction clock" (defer it
+/// to execution, where a session exists) from "something went genuinely wrong"
+/// (report it, with its cursor position). Both are `XX000`, and by the time the
+/// error surfaces it has been through three type-specific error structs, so the
+/// SQLSTATE alone cannot carry the distinction. Matching this constant is what
+/// keeps an unrelated internal error from being silently swallowed as a
+/// deferral — see `is_clock_unavailable` in the binder.
+pub const CLOCK_UNAVAILABLE: &str = "date/time value evaluated without a transaction clock";
+
 fn no_clock() -> ClockError {
     ClockError {
         sqlstate: INTERNAL_ERROR,
-        message: "date/time value evaluated without a transaction clock".to_string(),
+        message: CLOCK_UNAVAILABLE.to_string(),
     }
 }

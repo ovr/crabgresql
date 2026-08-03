@@ -10882,3 +10882,41 @@ async fn a_prepared_now_literal_is_not_frozen_as_pg_freezes_it() -> anyhow::Resu
     assert_ne!(lit1, lit2);
     Ok(())
 }
+
+/// A relative literal reaches the clock through *every* route to a date/time
+/// type, not just the unknown-literal one.
+///
+/// `'now'::text::timestamp` arrives at `coerce_expr` as an already-typed `text`
+/// constant, which the binder folds at bind time — where there is no session.
+/// The fold has to defer instead, the way `resolve_unknown` does for a bare
+/// literal; before it did, this reported the internal "no transaction clock"
+/// error to the client.
+#[tokio::test]
+async fn a_relative_literal_resolves_through_an_explicit_text_cast() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    for sql in [
+        "SELECT ('now'::text::timestamp) = now()::timestamp",
+        "SELECT ('today'::text::date) = current_date",
+        "SELECT ('now'::varchar::time) = localtime",
+        "SELECT ('now'::text::timestamptz) = now()",
+        // The array element route reaches the same input functions.
+        "SELECT ('{now}'::timestamp[])[1] = now()::timestamp",
+    ] {
+        assert_eq!(scalar(&client, sql).await, "t", "for `{sql}`");
+    }
+
+    // Deferring must not swallow a real diagnostic: an unparseable literal still
+    // reports at bind time, with its own message.
+    let e = client
+        .simple_query("SELECT 'garbage'::text::timestamp")
+        .await
+        .expect_err("garbage should not parse")
+        .as_db_error()
+        .expect("a database error")
+        .message()
+        .to_string();
+    assert_eq!(e, "invalid input syntax for type timestamp: \"garbage\"");
+    Ok(())
+}
