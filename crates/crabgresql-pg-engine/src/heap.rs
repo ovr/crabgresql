@@ -1244,10 +1244,12 @@ impl TableAm for HeapTable {
     /// Probe the physical B-tree `index_name` for versions whose key equals
     /// `key`, returning those visible to `txn`. `None` (caller falls back to a
     /// scan) when the index is absent or has no physical B-tree; `Some(empty)`
-    /// when it is served but nothing matches (including a NULL probe key, which
-    /// never satisfies equality). Visibility is decided by re-fetching each heap
-    /// tuple through [`TableAm::fetch`] — the index entry is never trusted for
-    /// visibility, exactly like a PostgreSQL secondary index.
+    /// when it is served but nothing matches (including a key `btkey` cannot
+    /// encode — a NULL, say — which is also a key `maintain_insert` indexed no
+    /// row under, so the tree and the probe agree). Visibility is decided by
+    /// re-fetching each heap tuple through [`TableAm::fetch`] — the index entry
+    /// is never trusted for visibility, exactly like a PostgreSQL secondary
+    /// index.
     fn index_lookup(
         &self,
         index_name: &str,

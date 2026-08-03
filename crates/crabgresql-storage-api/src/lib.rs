@@ -962,9 +962,17 @@ pub trait TableAm: Send + Sync {
     /// `index_name` — i.e. whether [`TableAm::index_lookup`] would return `Some`
     /// rather than fall back to a scan. The planner consults this so it only
     /// chooses an index scan the executor can actually perform, keeping `EXPLAIN`
-    /// honest. The default is `false` (no physical index): the durable heap
-    /// engine and system catalogs report no index-scan support, so their queries
-    /// plan (and display) as sequential scans.
+    /// honest.
+    ///
+    /// The answer is about the *index*, not about a particular key: an engine
+    /// that says yes here and then declines a probe for one key would make a
+    /// per-key caller (`UNIQUE` enforcement) fall back once per row. Declining
+    /// because the index went away under a concurrent `DROP INDEX` is the
+    /// sanctioned reason, and it is sticky rather than per-key.
+    ///
+    /// The default is `false` — no physical index — which the columnar engines
+    /// and the read-only system catalogs inherit; the durable heap engine
+    /// answers for a B-tree over key types `btkey` can encode.
     fn supports_index_scan(&self, _index_name: &str) -> bool {
         false
     }
@@ -974,9 +982,19 @@ pub trait TableAm: Send + Sync {
     /// visible to `txn`. Returns `None` when the engine has no physical index
     /// able to serve this probe (no such index, or a key type it cannot index) —
     /// the caller then falls back to a full [`TableAm::scan`], so an index scan
-    /// stays correct on every engine. The default is `None`: only the in-memory
-    /// reference engine builds a physical index today; the durable heap engine
-    /// and read-only system catalogs inherit the fallback.
+    /// stays correct on every engine.
+    ///
+    /// `Some` of an empty iterator is a different answer: the probe *was*
+    /// served and nothing matched. A key an engine cannot encode lands here
+    /// rather than in `None`, because such a key is also one no stored row was
+    /// indexed under — the two agree, and equality is what a probe answers. A
+    /// NULL is the everyday case: it matches nothing, so `Some(empty)` is
+    /// right, and only a caller for whom NULLs *do* collide (`UNIQUE NULLS NOT
+    /// DISTINCT`) has to stay off the probe.
+    ///
+    /// The default is `None`, which the columnar engines and the read-only
+    /// system catalogs inherit; the durable heap engine serves this from its
+    /// B-tree.
     fn index_lookup(
         &self,
         _index_name: &str,
