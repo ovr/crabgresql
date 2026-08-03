@@ -2928,7 +2928,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     }
     // The `CURRENT_TIMESTAMP` family: grammar keywords, not functions, so they
     // are rewritten here rather than resolved through the overload table.
-    if let Some(binding) = bind_current_datetime(&name, &func.args)? {
+    if let Some(binding) = bind_current_datetime(&name, &func.name, &func.args)? {
         return Ok(binding);
     }
     // Aggregates bind to a transient `Aggregate` marker (extracted into an
@@ -3491,13 +3491,6 @@ fn bind_aggregate(
     }))
 }
 
-/// Resolve an overload for `name` given already-bound arguments, then build the
-/// `FuncCall` node. Shared by ordinary function calls and the `CEIL`/`FLOOR`
-/// special-syntax expressions.
-/// Build a `FuncCall` binding, rejecting conflicting explicit `COLLATE`
-/// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
-/// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
-/// `FuncCall` construction site so the check isn't duplicated at each one.
 /// Bind `CURRENT_DATE`, `CURRENT_TIME(p)`, `CURRENT_TIMESTAMP(p)`,
 /// `LOCALTIME(p)` and `LOCALTIMESTAMP(p)`. `None` for any other name.
 ///
@@ -3508,15 +3501,29 @@ fn bind_aggregate(
 /// them that way rather than as five more `ScalarFn`s means the zone rules and
 /// the rounding rule live in one place each, and cannot drift apart.
 ///
-/// Divergence: PostgreSQL implements these in the grammar, so a *quoted* call
-/// (`"current_timestamp"()`) is an unknown function there. By the time a name
-/// reaches here the quoting is gone, so we accept that spelling too. It is a
-/// spelling no portable SQL uses, and distinguishing it would mean a dedicated
-/// AST node for the keyword forms.
+/// These are grammar productions, not `pg_proc` entries, so only the bare
+/// unquoted spelling is one — see the guard on `object_name` below.
 fn bind_current_datetime(
     name: &str,
+    object_name: &ast::ObjectName,
     args: &ast::FunctionArguments,
 ) -> Result<Option<Binding>, BindError> {
+    // Only the *keyword* spelling is a keyword. `name` has already been
+    // lowercased and stripped of quoting, so it cannot tell `current_date` from
+    // `"current_date"`; the unnormalized name can. A quoted word carries a
+    // `quote_style` and is never a keyword to the tokenizer, and a qualified
+    // name has more than one part — neither is the grammar production, so both
+    // must fall through to ordinary function resolution.
+    //
+    // Without this, any function whose bare name matched was intercepted:
+    // `CREATE FUNCTION "localtime"(int)` became unreachable, and its argument
+    // was reinterpreted as a fractional-second precision.
+    let [part] = object_name.0.as_slice() else {
+        return Ok(None);
+    };
+    if !part.as_ident().is_some_and(|i| i.quote_style.is_none()) {
+        return Ok(None);
+    }
     let target = match name {
         "current_timestamp" => None,
         "localtimestamp" => Some(PgType::Timestamp),
@@ -3573,6 +3580,10 @@ fn keyword_precision(args: &ast::FunctionArguments) -> Result<Option<i32>, BindE
     ))
 }
 
+/// Build a `FuncCall` binding, rejecting conflicting explicit `COLLATE`
+/// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
+/// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
+/// `FuncCall` construction site so the check isn't duplicated at each one.
 fn finish_func_call(
     func: ScalarFn,
     ret: PgType,
