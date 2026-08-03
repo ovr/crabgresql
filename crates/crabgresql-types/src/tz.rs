@@ -395,10 +395,24 @@ fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
 /// A POSIX displacement, `[+-]?HH[:MM[:SS]]`, in seconds **east** of UTC — the
 /// sign is flipped on the way out, since POSIX counts hours *west*.
 ///
-/// The accepted range is the wide [`MAX_GUC_OFFSET_SECS`] band, not the
-/// in-value [`MAX_TZ_DISPLACEMENT_SECS`] one: PG reads `UTC+167` but rejects
-/// both `UTC+168` and a bare `+16` *inside a value*. A fractional hour is
-/// truncated toward zero (`UTC+5.5` is UTC−5), as PG's POSIX reader does.
+/// The field rules are PG's, pinned by probing 18.4 rather than by counting
+/// digits the way a `timestamptz` literal's offset is counted:
+///
+/// * a field is *digits*, however many — `5:0000000030` is 5:30 and `005:30` is
+///   5:30, so there is no two-digit cap;
+/// * minutes are `0..=59` (`5:60` is unrecognized), but **seconds may be 60**
+///   and carry: `5:30:60` is 5:31:00 and `5:59:60` is 6:00:00;
+/// * the [`MAX_GUC_OFFSET_SECS`] band is checked on the **hour field**, not on
+///   the total, which is why `167:59:60` (a flat 168 h) is accepted while
+///   `+168` and `+200:00` are not. Inside a value the much narrower
+///   [`MAX_TZ_DISPLACEMENT_SECS`] applies instead, so a bare `+16` is legal
+///   here and out of range there.
+///
+/// A fractional part is where PG stops being a displacement reader at all: it
+/// treats the rest as a DST abbreviation and applies default transition rules,
+/// so `'5.5'`, `'5.0'` and `'5.'` mean 5 h, 0 h and 4 h west respectively. We
+/// implement no default DST rules, so any fraction is refused — see
+/// [`resolve_zone_arg`] for the divergence note.
 fn parse_posix_offset(body: &str) -> Option<i32> {
     // Leading whitespace is skipped, as PG's reader does — `' +05:30'` is a
     // legal zone argument. Trailing whitespace is *not*: PG reads it as the
@@ -411,35 +425,38 @@ fn parse_posix_offset(body: &str) -> Option<i32> {
         _ => (1, body),
     };
     let mut parts = digits.split(':');
-    // The hour is unbounded in digits (`UTC+167` is legal), so parse it as i64
-    // and let the range check below reject an over-large one rather than
-    // overflowing. A fractional part is dropped.
-    let hh = parts.next()?;
-    let hh = hh.split_once('.').map_or(hh, |(int, _)| int);
-    if hh.is_empty() || !hh.bytes().all(|b| b.is_ascii_digit()) {
+    // The hour is unbounded in digits (`+167` and `00005` are both legal), so
+    // parse it as i64 and let the band check reject an over-large one rather
+    // than overflowing.
+    let hh = field(parts.next()?)?;
+    // The band is the hour's, not the total's: `167:59:60` is a flat 168 h and
+    // PG takes it, while `+168` is one hour too far.
+    if hh * 3600 > MAX_GUC_OFFSET_SECS as i64 {
         return None;
     }
-    let mut secs: i64 = hh.parse::<i64>().ok()?.checked_mul(3600)?;
+    let mut secs = hh * 3600;
     for (i, part) in parts.enumerate() {
-        // One or two digits, as PG accepts (`UTC+5:3` is five hours three minutes).
-        if part.is_empty() || part.len() > 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let v: i64 = part.parse().ok()?;
-        if v > 59 {
-            return None;
-        }
+        let v = field(part)?;
         match i {
-            0 => secs += v * 60,
-            1 => secs += v,
+            // Minutes cap at 59 …
+            0 if v < 60 => secs += v * 60,
+            // … seconds at 60, which carries into the minute.
+            1 if v <= 60 => secs += v,
             _ => return None,
         }
     }
-    if secs > MAX_GUC_OFFSET_SECS as i64 {
-        return None;
-    }
     // POSIX counts west; our `Zone::Fixed` counts east.
     Some((-sign * secs) as i32)
+}
+
+/// One `:`-separated field of a POSIX displacement: digits only, any number of
+/// them, leading zeros and all. `None` for anything else — including a
+/// fractional part, which PG reads as the start of a DST abbreviation.
+fn field(part: &str) -> Option<i64> {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
 }
 
 /// The UTC offset (seconds east) to apply to a civil wall clock interpreted in
@@ -833,10 +850,20 @@ mod tests {
         assert_eq!(arg("05:30")?, -(5 * 3600 + 30 * 60));
         assert_eq!(arg("5")?, -5 * 3600);
         assert_eq!(arg("+05:30:15")?, -(5 * 3600 + 30 * 60 + 15));
-        // PG accepts `UTC+5:3` as five hours three minutes, and drops a
-        // fractional hour.
+        // A field is digits, however many: no two-digit cap, leading zeros fine.
         assert_eq!(arg("+5:3")?, -(5 * 3600 + 3 * 60));
-        assert_eq!(arg("5.5")?, -5 * 3600);
+        assert_eq!(arg("5:0000000030")?, -(5 * 3600 + 30 * 60));
+        assert_eq!(arg("005:30")?, -(5 * 3600 + 30 * 60));
+        assert_eq!(arg("5:059")?, -(5 * 3600 + 59 * 60));
+        // Minutes cap at 59; seconds may be 60 and carry.
+        assert_eq!(arg("5:30:60")?, -(5 * 3600 + 31 * 60));
+        assert_eq!(arg("5:59:60")?, -6 * 3600);
+        for tok in ["5:60", "5:100", "5:30:100"] {
+            assert!(
+                matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
+                "{tok}"
+            );
+        }
         // The colon-less `±HHMM` spelling is value-only: PG does not read it here.
         assert!(matches!(
             resolve_zone_arg("+0530"),
@@ -847,15 +874,50 @@ mod tests {
         // reports it as unrecognized rather than out of range.
         assert_eq!(arg("+16")?, -16 * 3600);
         assert_eq!(arg("+167")?, -167 * 3600);
-        assert!(matches!(
-            resolve_zone_arg("+168"),
-            Err(ZoneError::NotRecognized(_))
-        ));
-        assert!(matches!(
-            resolve_zone_arg("+05:60"),
-            Err(ZoneError::NotRecognized(_))
-        ));
+        // The band is the hour field's, not the total's, so a flat 168 h spelled
+        // with a carrying seconds field is legal where `+168` is not.
+        assert_eq!(arg("167:59:60")?, -168 * 3600);
+        for tok in ["+168", "+200:00"] {
+            assert!(
+                matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
+                "{tok}"
+            );
+        }
         Ok(())
+    }
+
+    /// **Known divergence from PostgreSQL**, pinned here so it is visible rather
+    /// than silent.
+    ///
+    /// A fraction is where PG stops reading a displacement: it takes the rest as
+    /// a DST abbreviation and applies its default transition rules, so with the
+    /// session in UTC and a June instant, PG 18.4 answers (west of UTC)
+    ///
+    /// ```text
+    /// '5.5' -> 5 h    '-5.5' -> 5 h   (the sign belongs to the std part)
+    /// '5.0' -> 0 h    '5.'   -> 4 h   (std 5, DST unnamed, June is DST)
+    /// '5:30.5' -> 5 h        '5:30:30.9' -> 9 h
+    /// ```
+    ///
+    /// Reproducing that means implementing tzcode's default DST rules, which is
+    /// the line AGENTS.md draws. We refuse the whole family with `22023`
+    /// instead, which is at least a diagnosable answer rather than a wrong one.
+    ///
+    /// The `TimeZone` GUC shares the reader and so shares the refusal: PG takes
+    /// `SET TimeZone = 'UTC+5.5'` (and runs at −05, or −04 while its default DST
+    /// rule is in effect), we do not.
+    #[test]
+    fn a_fractional_displacement_is_refused() {
+        for tok in [
+            "5.5", "-5.5", "+5.5", "5.0", "5.", ".5", "5:30.5", "5:30:30.9", "UTC+5.5",
+        ] {
+            assert!(
+                matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
+                "{tok}"
+            );
+        }
+        assert!(SessionZone::resolve("UTC+5.5").is_err());
+        assert!(resolve_zone("UTC+5.5").is_err());
     }
 
     /// Everything that is *not* a bare displacement means the same as it does
