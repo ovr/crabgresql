@@ -1,0 +1,32 @@
+-- A key too large for an index page is a user error (54000), not a crash. The
+-- row itself is storable -- only the indexed columns are capped -- so the error
+-- names the index and the heap tuple rather than the row.
+--
+-- Divergence from PostgreSQL, which is otherwise byte-identical here: it says
+-- "btree version 4 maximum 2704" where we say "btree maximum 2000". We model
+-- neither index versions nor its page layout, so the cap is our own.
+
+-- On INSERT, from the index maintenance that follows the heap write.
+CREATE TABLE big_key (a text UNIQUE);
+INSERT INTO big_key SELECT string_agg(md5(g::text), '') FROM generate_series(1, 200) g;
+-- Nothing was written, and the relation is still usable.
+SELECT count(*) FROM big_key;
+INSERT INTO big_key VALUES ('small');
+SELECT a FROM big_key;
+
+-- The same key through UPDATE, which indexes the new version.
+UPDATE big_key SET a = (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 200) g);
+SELECT a FROM big_key;
+
+-- And at build time, over a row that is already there.
+CREATE TABLE big_key_build (a text);
+INSERT INTO big_key_build SELECT string_agg(md5(g::text), '') FROM generate_series(1, 200) g;
+CREATE UNIQUE INDEX big_key_build_a ON big_key_build (a);
+-- The failed build published no index: the row is still there and still
+-- insertable alongside a duplicate.
+SELECT count(*) FROM big_key_build;
+
+-- A key just under the cap is ordinary.
+CREATE TABLE fits_key (a text UNIQUE);
+INSERT INTO fits_key SELECT string_agg(md5(g::text), '') FROM generate_series(1, 60) g;
+SELECT length(a) FROM fits_key;
