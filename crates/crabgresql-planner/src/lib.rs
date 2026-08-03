@@ -150,6 +150,9 @@ pub enum PhysicalPlan {
         /// Leaf partitions for tuple routing when `table` is a partitioned parent
         /// (see [`LogicalPlan::Insert`]); `None` for an ordinary table.
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// `COPY … FREEZE` (see [`LogicalPlan::Insert`]): the executor freezes
+        /// this target's write and nothing else.
+        freeze: bool,
     },
     Update {
         table: Arc<dyn TableAm>,
@@ -781,6 +784,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             source,
             returning,
             routing,
+            freeze,
         } => PhysicalPlan::Insert {
             table,
             source: match source {
@@ -792,6 +796,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             },
             returning,
             routing,
+            freeze,
         },
         LogicalPlan::Update {
             table,

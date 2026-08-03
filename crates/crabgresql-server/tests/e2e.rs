@@ -7896,6 +7896,48 @@ async fn copy_in_rows(
     sink.finish().await
 }
 
+/// FREEZE is authorized per relation, so it must reach only that relation's
+/// write. A column `DEFAULT` that calls a routine is the path that proves it: the
+/// routine's own INSERT targets a table nobody truncated, and freezing *those*
+/// rows would leave them visible after a ROLLBACK with no XID whose abort could
+/// hide them — permanently committed rows written by a rolled-back transaction.
+#[tokio::test]
+async fn copy_freeze_does_not_reach_a_routine_s_own_inserts() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let writer = connect(port).await;
+    let reader = connect(port).await;
+    writer.simple_query("CREATE TABLE audit (msg text)").await?;
+    writer
+        .simple_query(
+            "CREATE FUNCTION note() RETURNS text LANGUAGE plpgsql AS $$ \
+             BEGIN INSERT INTO audit VALUES ('row'); RETURN 'x'; END $$",
+        )
+        .await?;
+    writer
+        .simple_query("CREATE TABLE t (a text, b text DEFAULT note())")
+        .await?;
+
+    writer.simple_query("BEGIN").await?;
+    writer.simple_query("TRUNCATE t").await?;
+    assert_eq!(
+        copy_in_rows(
+            &writer,
+            "COPY t (a) FROM STDIN WITH (FORMAT csv, FREEZE)",
+            b"p\nq\n",
+        )
+        .await?,
+        2
+    );
+    writer.simple_query("ROLLBACK").await?;
+
+    // `audit` was never truncated, so nothing discarded its storage: the only
+    // thing that can hide the routine's rows is their own transaction's abort.
+    assert_eq!(row_count(&reader, "audit").await, 0);
+    // And the frozen half is gone too, with the staged file it was written into.
+    assert_eq!(row_count(&reader, "t").await, 0);
+    Ok(())
+}
+
 /// What FREEZE actually changes, expressed as something a client can see: a
 /// REPEATABLE READ snapshot taken *before* the load still sees the rows.
 ///

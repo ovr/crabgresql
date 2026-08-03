@@ -321,6 +321,12 @@ pub enum LogicalPlan {
         /// bound from each leaf's `partition_of`) and writes there instead of to
         /// `table`. `None` for an ordinary table (rows go straight to `table`).
         routing: Option<Vec<Arc<dyn TableAm>>>,
+        /// `COPY … FREEZE`: stamp the rows visible-to-everyone rather than
+        /// visible-once-this-transaction-commits. Carried on the node, not on the
+        /// transaction, so it reaches exactly this target's write and nothing else
+        /// the statement happens to do — see
+        /// [`crabgresql_txn::TxnContext::freeze_inserts`].
+        freeze: bool,
     },
     Update {
         table: Arc<dyn TableAm>,
@@ -5787,6 +5793,8 @@ pub fn bind_insert_with_params(
         source: insert_source,
         returning,
         routing,
+        // Only COPY can freeze; there is no `INSERT … FREEZE` in PostgreSQL.
+        freeze: false,
     })
 }
 
@@ -5972,6 +5980,9 @@ impl CopyFromPlan {
             // A partitioned parent routes each decoded row to a leaf, reusing the
             // executor's INSERT tuple routing; `None` targets an ordinary table.
             routing: self.routing.clone(),
+            // The server has already verified the precondition against this very
+            // target (it needs a transaction, which binding has no access to).
+            freeze: self.freeze,
         })
     }
 }

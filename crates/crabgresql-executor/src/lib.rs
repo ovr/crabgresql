@@ -671,7 +671,8 @@ pub fn execute(
             source,
             returning,
             routing,
-        } => execute_insert(&table, source, returning, routing, ctx, txn),
+            freeze,
+        } => execute_insert(&table, source, returning, routing, freeze, ctx, txn),
         PhysicalPlan::Update {
             table,
             predicate,
@@ -1820,12 +1821,21 @@ fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb)
 /// Statement atomicity: evaluate everything first, mutate only after nothing
 /// can fail, so a failure in a later row leaves no earlier rows behind. The
 /// writes are stamped with `txn`'s XID and become durable/visible only when the
-/// transaction commits.
+/// transaction commits — unless `freeze` is set, which stamps them frozen and so
+/// visible at once (`COPY … FREEZE`; the caller has verified that a rollback
+/// discards this target's storage).
+///
+/// `freeze` is applied to a *derived* context handed to the `insert_many` calls
+/// below, and never to the ambient `txn` or to [`ExecContext::txn`]. That is what
+/// keeps it off a column `DEFAULT` that calls a routine: the routine reads the
+/// context out of `ctx` (see `eval`), writes to relations nobody checked, and
+/// freezing those rows would leave them visible after a rollback.
 fn execute_insert(
     table: &Arc<dyn TableAm>,
     source: PhysicalInsertSource,
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
+    freeze: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -1837,9 +1847,21 @@ fn execute_insert(
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
         // its key and write there.
-        Some(leaves) => insert_routed(table, tuples, returning, &leaves, ctx, txn),
+        Some(leaves) => insert_routed(table, tuples, returning, &leaves, freeze, ctx, txn),
         // Ordinary table: rows go straight to `table`.
-        None => insert_direct(table, tuples, returning, ctx, txn),
+        None => insert_direct(table, tuples, returning, freeze, ctx, txn),
+    }
+}
+
+/// The context a target's rows are written under: `txn` itself, or a frozen
+/// derivation of it. A separate step so the freeze is visible at the write and
+/// reaches nothing else — reads, constraint checks and `RETURNING` keep using the
+/// plain context.
+fn write_context(freeze: bool, txn: &TxnContext) -> TxnContext {
+    if freeze {
+        txn.with_freeze()
+    } else {
+        txn.clone()
     }
 }
 
@@ -1895,6 +1917,7 @@ fn insert_direct(
     table: &Arc<dyn TableAm>,
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
+    freeze: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -1917,7 +1940,7 @@ fn insert_direct(
         Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
         None => None,
     };
-    table.insert_many(tuples, txn)?;
+    table.insert_many(tuples, &write_context(freeze, txn))?;
     finish_insert(returning, output, inserted)
 }
 
@@ -1936,6 +1959,7 @@ fn insert_routed(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     leaves: &[Arc<dyn TableAm>],
+    freeze: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -1981,8 +2005,9 @@ fn insert_routed(
     for (tuple, leaf) in tuples.into_iter().zip(routes) {
         batches[leaf].push(tuple);
     }
+    let write_txn = write_context(freeze, txn);
     for (leaf, tuples) in leaves.iter().zip(batches) {
-        leaf.insert_many(tuples, txn)?;
+        leaf.insert_many(tuples, &write_txn)?;
     }
     finish_insert(returning, output, inserted)
 }

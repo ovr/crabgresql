@@ -1543,12 +1543,18 @@ pub fn run_copy_rows(
     // and the catalog snapshot bound at prepare time for the same reason.
     let read_only = read_only_active(session);
     await_write_capacity(engine, session);
-    let mut txn = build_txn(txnmgr, session, true);
+    let txn = build_txn(txnmgr, session, true);
     // FREEZE stamps rows visible to everyone with no XID whose abort could take
     // them back, so it is only sound where a rollback throws the storage away:
     // the relation must have been truncated by this very transaction. Checked
     // here rather than at bind time because only now is there a transaction to
     // name — and before any row is written, so a refusal loads nothing.
+    //
+    // The check names the very relation the plan writes to, and the freeze itself
+    // rides on the plan node so it reaches only that relation's write — see
+    // `crabgresql_txn::TxnContext::freeze_inserts`. Authorizing one relation and
+    // freezing the whole transaction is how this leaked rows into tables a
+    // rollback does not discard.
     //
     // PostgreSQL also accepts a table *created* in the current subtransaction.
     // This engine's DDL is not transactional, so a rolled-back CREATE leaves the
@@ -1564,7 +1570,6 @@ pub fn run_copy_rows(
              truncated in the current subtransaction",
         ));
     }
-    txn.freeze_inserts = prepared.plan.freeze;
     let (routines, command_counter) = statement_runtime(
         &prepared.engine,
         &prepared.catalog,
@@ -4965,6 +4970,9 @@ fn execute_create_table_as(
         returning: None,
         // CTAS populates a freshly-created ordinary table — never partitioned.
         routing: None,
+        // `CREATE TABLE … AS` has no FREEZE spelling, and this table's DDL is not
+        // transactional, so there would be no storage for a rollback to discard.
+        freeze: false,
     };
 
     // Run the populate INSERT through the standard write tail. The DDL catalog
