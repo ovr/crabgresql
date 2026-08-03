@@ -772,12 +772,17 @@ pub struct TxnContext {
     /// transaction's XID for contexts built without a session; the server stamps
     /// the connection's owner over it in `build_txn`.
     pub lock_owner: LockOwner,
-    /// Stamp this transaction's inserts with [`Xid::FROZEN`] instead of its own
-    /// XID, so the rows are visible to every snapshot immediately and cost no
-    /// commit-log lookup ever after. Set only by `COPY … FREEZE`, whose
-    /// precondition — the table was truncated in this same transaction — is what
-    /// makes it safe: a rollback throws the whole relation file away, and with it
-    /// rows that no abort record could otherwise hide.
+    /// Stamp writes made through this context with [`Xid::FROZEN`] instead of the
+    /// transaction's own XID, so the rows are visible to every snapshot
+    /// immediately and cost no commit-log lookup ever after.
+    ///
+    /// **Scope is the point.** Freezing is sound only for a relation whose
+    /// storage a rollback discards, and that is checked per relation — so this
+    /// flag must never be set on a context that outlives the one write it was
+    /// authorized for. [`TxnContext::with_freeze`] is the only way to set it, and
+    /// the executor derives such a context immediately around the target's
+    /// `insert_many` call, after every expression (including a column `DEFAULT`
+    /// that calls a routine) has already been evaluated under the plain context.
     pub freeze_inserts: bool,
 }
 
@@ -793,6 +798,20 @@ impl TxnContext {
             Xid::FROZEN
         } else {
             self.xid
+        }
+    }
+
+    /// The same transaction with its writes frozen — see
+    /// [`freeze_inserts`](TxnContext::freeze_inserts).
+    ///
+    /// Deliberately a derived context rather than a mutable setter: a caller can
+    /// only widen the freeze by keeping the returned value alive, which makes the
+    /// scope visible at the call site instead of hiding it in a field assignment
+    /// several frames up.
+    pub fn with_freeze(&self) -> TxnContext {
+        TxnContext {
+            freeze_inserts: true,
+            ..self.clone()
         }
     }
 
