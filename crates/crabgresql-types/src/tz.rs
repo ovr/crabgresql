@@ -255,13 +255,17 @@ pub enum ZoneError {
     DisplacementOutOfRange(String),
 }
 
-/// Classify and resolve a zone token from a `timestamptz` literal, an
-/// `AT TIME ZONE` argument, or a `make_timestamptz` zone argument.
+/// Classify and resolve a zone token from a `timestamptz` literal or a
+/// `make_timestamptz` zone argument.
 ///
 /// Numeric offsets (`±HH`, `±HHMM`, `±HH:MM[:SS]`), `Z`/`zulu`, and `UTC`/`GMT`
 /// resolve to [`Zone::Fixed`] via our own parser. Named IANA zones
 /// (`America/New_York`) and the zone-backed abbreviations in [`ABBREVS`]
 /// resolve through `jiff`. Unknown tokens are [`ZoneError::NotRecognized`].
+///
+/// **Not** the resolver for `AT TIME ZONE` or the three-argument `date_trunc` —
+/// see [`resolve_zone_arg`], which reads a bare numeric offset with the opposite
+/// sign.
 pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
     let token = name.trim();
     if token.is_empty() {
@@ -302,6 +306,71 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
         .ok_or_else(|| ZoneError::NotRecognized(name.to_string()))
 }
 
+/// Classify and resolve a zone token that arrives as a *function argument* —
+/// `AT TIME ZONE`, `timezone(zone, …)`, and the three-argument `date_trunc`.
+/// PG funnels all three through one reader (`parse_sane_timezone`), and its
+/// grammar is neither [`resolve_zone`]'s nor [`SessionZone::resolve`]'s.
+///
+/// The difference that matters is the **sign of a bare numeric offset**, and it
+/// is the reverse of the same spelling inside a value. Verified against PG 18
+/// with the session in UTC:
+///
+/// | token       | here                | [`resolve_zone`] (in a value) |
+/// |-------------|---------------------|-------------------------------|
+/// | `+05:30`    | UTC−5:30 (POSIX)    | UTC+5:30 (ISO)                |
+/// | `05:30`     | UTC−5:30            | not recognized                |
+/// | `+0530`     | not recognized      | UTC+5:30                      |
+/// | `+16`       | UTC−16              | out of range                  |
+///
+/// So the colon-less `±HHMM` form is a value-only spelling, the wide
+/// [`MAX_GUC_OFFSET_SECS`] band applies here rather than the in-value
+/// [`MAX_TZ_DISPLACEMENT_SECS`] one, and an unsigned offset is legal. Named
+/// zones, the [`ABBREVS`] table, `Z`/`zulu` and `UTC`/`GMT` mean the same in
+/// both readers.
+pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
+    let token = name.trim();
+    let not_recognized = || ZoneError::NotRecognized(name.to_string());
+    if token.is_empty() {
+        return Err(not_recognized());
+    }
+
+    // The UTC synonyms, handled by our own code so they work across the entire
+    // timestamp range without `jiff`.
+    if matches!(
+        token.to_ascii_lowercase().as_str(),
+        "z" | "zulu" | "utc" | "gmt"
+    ) {
+        return Ok(Zone::Fixed(0));
+    }
+
+    // Same abbreviation table as a datetime value: PG accepts `VET` and `MSK`
+    // here, unlike in the `TimeZone` GUC.
+    if let Some(kind) = lookup_abbrev(token) {
+        return match kind {
+            Abbrev::Fixed(secs) => Ok(Zone::Fixed(*secs)),
+            Abbrev::Zone(zone) => TimeZone::get(zone)
+                .map(Zone::Named)
+                .map_err(|_| not_recognized()),
+        };
+    }
+
+    // A full IANA zone name. Tried before the POSIX form below so that a real
+    // zone whose name ends in a displacement (`Etc/GMT+5`) keeps its own,
+    // opposite-signed meaning.
+    if let Ok(tz) = TimeZone::get(token) {
+        return Ok(Zone::Named(tz));
+    }
+
+    // A POSIX displacement, with or without the ignored alphabetic prefix:
+    // `+05:30`, `05:30`, `UTC+10` and `XYZ5` all land here.
+    let split = token
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .ok_or_else(not_recognized)?;
+    parse_posix_offset(&token[split..])
+        .map(Zone::Fixed)
+        .ok_or_else(not_recognized)
+}
+
 /// PG's `<abbrev><POSIX offset>` zone form. Returns seconds **east** of UTC.
 ///
 /// The leading run of ASCII letters is discarded — PG does not check it against
@@ -309,19 +378,29 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 /// against PG 18). The remainder is a POSIX displacement, which counts hours
 /// *west*, so `UTC+10` is UTC−10 — the opposite of the bare `+10` that
 /// [`parse_fixed`] handles.
-///
-/// The accepted range is the wide [`MAX_GUC_OFFSET_SECS`] band, not the
-/// in-value [`MAX_TZ_DISPLACEMENT_SECS`] one: PG reads `UTC+167` but rejects
-/// both `UTC+168` and a bare `+16`. A fractional hour is truncated toward zero
-/// (`UTC+5.5` is UTC−5), as PG's POSIX reader does.
 fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
     let split = token.find(['+', '-'])?;
     let (prefix, body) = token.split_at(split);
     if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_alphabetic()) {
         return None;
     }
-    let sign: i64 = if body.starts_with('-') { -1 } else { 1 };
-    let mut parts = body[1..].split(':');
+    parse_posix_offset(body)
+}
+
+/// A POSIX displacement, `[+-]?HH[:MM[:SS]]`, in seconds **east** of UTC — the
+/// sign is flipped on the way out, since POSIX counts hours *west*.
+///
+/// The accepted range is the wide [`MAX_GUC_OFFSET_SECS`] band, not the
+/// in-value [`MAX_TZ_DISPLACEMENT_SECS`] one: PG reads `UTC+167` but rejects
+/// both `UTC+168` and a bare `+16` *inside a value*. A fractional hour is
+/// truncated toward zero (`UTC+5.5` is UTC−5), as PG's POSIX reader does.
+fn parse_posix_offset(body: &str) -> Option<i32> {
+    let (sign, digits): (i64, &str) = match body.as_bytes().first()? {
+        b'+' => (1, &body[1..]),
+        b'-' => (-1, &body[1..]),
+        _ => (1, body),
+    };
+    let mut parts = digits.split(':');
     // The hour is unbounded in digits (`UTC+167` is legal), so parse it as i64
     // and let the range check below reject an over-large one rather than
     // overflowing. A fractional part is dropped.
@@ -563,6 +642,11 @@ static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
     // Oct 2014), so it maps to the zone rather than a constant — and therefore
     // needs a date.
     ("MSK", Abbrev::Zone("Europe/Moscow")),
+    // `VET` likewise varies: Venezuela ran at -04:30 from 2007 to 2016 and at
+    // -04 either side of that, and PG's reading of the abbreviation follows the
+    // zone (verified against PG 18.4). Exercised by upstream's `timestamptz`
+    // suite as the "variable-offset abbreviation" case for `date_trunc`.
+    ("VET", Abbrev::Zone("America/Caracas")),
 ];
 
 /// Look up a datetime-literal abbreviation, case-insensitively.
@@ -721,6 +805,80 @@ mod tests {
 
         // The literal token means the opposite direction.
         assert_eq!(offset_for_instant(&resolve_zone("+05:30")?, 0), 5 * 3600 + 30 * 60);
+        Ok(())
+    }
+
+    /// The third sign convention: a zone token passed as a *function argument*
+    /// (`AT TIME ZONE`, the three-argument `date_trunc`) is POSIX like the GUC
+    /// string, not ISO like the same token inside a value. Pinned against PG
+    /// 18.4 with the session in UTC.
+    #[test]
+    fn zone_argument_offsets_are_posix_signed() -> anyhow::Result<()> {
+        let arg = |t: &str| -> anyhow::Result<i32> { Ok(fixed(&resolve_zone_arg(t)?)) };
+        // The headline reversal: west here, east inside a value.
+        assert_eq!(arg("+05:30")?, -(5 * 3600 + 30 * 60));
+        assert_eq!(fixed(&resolve_zone("+05:30")?), 5 * 3600 + 30 * 60);
+        assert_eq!(arg("-05:30")?, 5 * 3600 + 30 * 60);
+        // The sign is optional, unlike in a value.
+        assert_eq!(arg("05:30")?, -(5 * 3600 + 30 * 60));
+        assert_eq!(arg("5")?, -5 * 3600);
+        assert_eq!(arg("+05:30:15")?, -(5 * 3600 + 30 * 60 + 15));
+        // PG accepts `UTC+5:3` as five hours three minutes, and drops a
+        // fractional hour.
+        assert_eq!(arg("+5:3")?, -(5 * 3600 + 3 * 60));
+        assert_eq!(arg("5.5")?, -5 * 3600);
+        // The colon-less `±HHMM` spelling is value-only: PG does not read it here.
+        assert!(matches!(
+            resolve_zone_arg("+0530"),
+            Err(ZoneError::NotRecognized(_))
+        ));
+        // The wide GUC band applies, so `+16` is a legal argument even though it
+        // is out of range inside a value. `+168` is one hour too far, and PG
+        // reports it as unrecognized rather than out of range.
+        assert_eq!(arg("+16")?, -16 * 3600);
+        assert_eq!(arg("+167")?, -167 * 3600);
+        assert!(matches!(
+            resolve_zone_arg("+168"),
+            Err(ZoneError::NotRecognized(_))
+        ));
+        assert!(matches!(
+            resolve_zone_arg("+05:60"),
+            Err(ZoneError::NotRecognized(_))
+        ));
+        Ok(())
+    }
+
+    /// Everything that is *not* a bare displacement means the same as it does
+    /// inside a value — including the abbreviations the `TimeZone` GUC refuses.
+    #[test]
+    fn zone_argument_names_match_the_value_namespace() -> anyhow::Result<()> {
+        for tok in ["utc", "GMT", "Z", "zulu"] {
+            assert_eq!(fixed(&resolve_zone_arg(tok)?), 0, "{tok}");
+        }
+        // A DST-varying abbreviation resolves through its reference zone; PG
+        // takes it here but rejects `SET TimeZone = 'MSK'`.
+        let msk = resolve_zone_arg("MSK")?;
+        assert_eq!(offset_for_local(&msk, tm(2011, 3, 27, 1, 0, 0)), 3 * 3600);
+        assert!(SessionZone::resolve("MSK").is_err());
+        // A full IANA name, and the `<letters><POSIX offset>` form.
+        let ny = resolve_zone_arg("America/New_York")?;
+        assert_eq!(
+            offset_for_local(&ny, tm(2013, 7, 15, 17, 15, 23)),
+            -4 * 3600
+        );
+        assert_eq!(fixed(&resolve_zone_arg("UTC+10")?), -10 * 3600);
+        assert_eq!(fixed(&resolve_zone_arg("XYZ5")?), -5 * 3600);
+        // An IANA name that ends in a displacement keeps its own, opposite sign.
+        assert_eq!(
+            offset_for_instant(&resolve_zone_arg("Etc/GMT+5")?, 0),
+            -5 * 3600
+        );
+        for tok in ["", "   ", "Nowhere/Nozone"] {
+            assert!(
+                matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
+                "{tok:?}"
+            );
+        }
         Ok(())
     }
 

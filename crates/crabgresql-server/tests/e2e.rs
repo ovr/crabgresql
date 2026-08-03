@@ -10066,6 +10066,64 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The three-argument `date_trunc` truncates in the zone it is handed, leaving
+/// the session zone to decide only how the result prints. Pinned against
+/// PG 18.4.
+#[tokio::test]
+async fn date_trunc_takes_an_explicit_zone() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+
+    let cases = [
+        // Local midnight in UTC is the previous evening in New York, where the
+        // two-argument form lands on local midnight instead.
+        (
+            "SELECT date_trunc('day', '2024-03-10 15:00:00-04'::timestamptz, 'UTC')",
+            "2024-03-09 19:00:00-05",
+        ),
+        (
+            "SELECT date_trunc('day', '2024-03-10 15:00:00-04'::timestamptz)",
+            "2024-03-10 00:00:00-05",
+        ),
+        // A bare numeric zone argument is POSIX-signed: `+05:30` is UTC-5:30, so
+        // local midnight there is 05:30 UTC — 00:30 EST.
+        (
+            "SELECT date_trunc('day', '2001-02-16 20:38:40+00'::timestamptz, '+05:30')",
+            "2001-02-16 00:30:00-05",
+        ),
+        // An abbreviation the `TimeZone` GUC would refuse is legal as an argument.
+        (
+            "SELECT date_trunc('day', '2001-02-16 20:38:40+00'::timestamptz, 'VET')",
+            "2001-02-15 23:00:00-05",
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");
+    }
+
+    // The zone is resolved before the unit is looked at, and the connection
+    // survives both errors.
+    for (sql, want) in [
+        (
+            "SELECT date_trunc('bogus', now(), 'Nowhere/Nozone')",
+            "time zone \"Nowhere/Nozone\" not recognized",
+        ),
+        (
+            "SELECT date_trunc('bogus', now(), 'UTC')",
+            "timestamp with time zone units \"bogus\" not recognized",
+        ),
+    ] {
+        let err = client.simple_query(sql).await.expect_err("should fail");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::INVALID_PARAMETER_VALUE, "for `{sql}`");
+        assert_eq!(db.message(), want, "for `{sql}`");
+    }
+    assert_eq!(scalar(&client, "SELECT 1").await, "1");
+    Ok(())
+}
+
 /// **Known divergence from PostgreSQL**, pinned here so it is visible rather
 /// than silent.
 ///

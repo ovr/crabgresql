@@ -588,9 +588,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             );
         }
         ScalarFn::DateTruncTz => {
-            return timestamptz::date_trunc(text(&args[0]), tstz(&args[1]), &fmt.zone)
-                .map(Value::TimestampTz)
-                .map_err(ts_err);
+            // The 3rd argument (a text zone) is optional; without it the
+            // truncation happens in the session zone.
+            return match args.get(2) {
+                Some(zone) => {
+                    timestamptz::date_trunc_in_zone(text(&args[0]), tstz(&args[1]), text(zone))
+                }
+                None => timestamptz::date_trunc(text(&args[0]), tstz(&args[1]), fmt.zone.zone()),
+            }
+            .map(Value::TimestampTz)
+            .map_err(ts_err);
         }
         // Binning a `timestamptz` works on the UTC instant, so unlike
         // `date_trunc` above it never consults the session zone.
