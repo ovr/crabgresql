@@ -15,10 +15,13 @@
 //! date — see [`crate::FmtCtx::zone_offset_today`].
 //!
 //! One further deviation from PG, acceptable while no passing test needs it: a
-//! zone-backed abbreviation (`MSK`) needs a date here, because we resolve it
-//! through its reference zone. PG additionally knows *when that zone used that
-//! abbreviation*, so it can answer `'15:36:39 MSK'` with the zone's standard
-//! offset and no date at all.
+//! zone-backed abbreviation (`MSK`, `VET`) needs a date here, because we resolve
+//! it through its reference zone. PG additionally knows *when that zone used
+//! that abbreviation*, so it can answer `'15:36:39 MSK'` with the zone's
+//! standard offset and no date at all — `15:36:39+03`, where we raise `22007`.
+//! The set of affected tokens is whichever abbreviations `crate::tz` maps to a
+//! reference zone, so adding one for another reader's sake widens this too;
+//! `zone_tokens_resolve_or_fail_like_pg` pins the current list.
 
 use crate::Numeric;
 use crate::fmt::FmtCtx;
@@ -646,9 +649,17 @@ mod zone_tests {
 
         // Syntax errors (22007): an unknown word, a zone that needs a date, and
         // a repeated meridiem. A bare word never gets blamed on the zone.
+        //
+        // `MSK` and `VET` alone are the **known divergence** the module doc
+        // describes, pinned here rather than left silent: PG answers them
+        // `15:36:39+03` and `00:01:00-04` (18.4), while we need a date to read a
+        // zone-backed abbreviation. Every `Abbrev::Zone` entry lands in this
+        // list, so the list grows whenever that table does.
         for input in [
             "15:36:39 America/New_York",
             "15:36:39 m2",
+            "15:36:39 MSK",
+            "00:01:00 VET",
             "15:36:39 MSK m2",
             "2003-07-07 15:36:39 MSK m2",
             "12:00 foo",
