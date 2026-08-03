@@ -10067,8 +10067,9 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
 }
 
 /// The three-argument `date_trunc` truncates in the zone it is handed, leaving
-/// the session zone to decide only how the result prints. Pinned against
-/// PG 18.4.
+/// the session zone to decide only how the result prints. Values pinned against
+/// PG 18.4; the unit-error *wording* is PG 14's, which is the baseline the
+/// suites target — 18.4 phrases it `unit "bogus" not recognized for type …`.
 #[tokio::test]
 async fn date_trunc_takes_an_explicit_zone() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -10111,6 +10112,7 @@ async fn date_trunc_takes_an_explicit_zone() -> anyhow::Result<()> {
             "time zone \"Nowhere/Nozone\" not recognized",
         ),
         (
+            // PG 14 wording; 18.4 says `unit "bogus" not recognized for type …`.
             "SELECT date_trunc('bogus', now(), 'UTC')",
             "timestamp with time zone units \"bogus\" not recognized",
         ),

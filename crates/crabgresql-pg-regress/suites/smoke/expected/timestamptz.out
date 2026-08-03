@@ -634,7 +634,9 @@ SELECT date_trunc('day', NULL::timestamptz, 'UTC') IS NULL AS null_value,
  t          | t
 (1 row)
 
--- the zone is resolved before the unit is looked at
+-- the zone is resolved before the unit is looked at. The unit message below is
+-- PG 14's wording, this suite's baseline; PG 16+ rephrased it as
+-- `unit "bogus" not recognized for type timestamp with time zone`
 SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'Nowhere/Nozone');
 ERROR:  time zone "Nowhere/Nozone" not recognized
 SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'UTC');
