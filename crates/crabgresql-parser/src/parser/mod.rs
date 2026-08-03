@@ -7456,9 +7456,7 @@ impl<'a> Parser<'a> {
     /// identifier paths and are left alone for now.
     fn reject_reserved_column_name(&self) -> Result<(), ParserError> {
         if let Token::Word(w) = &self.peek_token_ref().token {
-            if w.quote_style.is_none()
-                && keywords::RESERVED_FOR_COLUMN_NAME.contains(&w.keyword)
-            {
+            if w.quote_style.is_none() && keywords::RESERVED_FOR_COLUMN_NAME.contains(&w.keyword) {
                 return Err(self.pg_syntax_error(&w.value));
             }
         }

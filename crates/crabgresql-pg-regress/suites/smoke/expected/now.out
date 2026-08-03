@@ -107,7 +107,8 @@ SELECT 'now EST'::timestamptz;
 ERROR:  invalid input syntax for type timestamp with time zone: "now EST"
 LINE 1: SELECT 'now EST'::timestamptz;
                ^
--- ...and two date tokens conflict just as two dates would
+-- ...and a relative token conflicts with any other field that fixes the date,
+-- a month name included
 SELECT 'today today'::timestamp;
 ERROR:  invalid input syntax for type timestamp: "today today"
 LINE 1: SELECT 'today today'::timestamp;
@@ -116,6 +117,46 @@ SELECT '2020-01-01 today'::timestamp;
 ERROR:  invalid input syntax for type timestamp: "2020-01-01 today"
 LINE 1: SELECT '2020-01-01 today'::timestamp;
                ^
+SELECT 'Feb today'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "Feb today"
+LINE 1: SELECT 'Feb today'::timestamp;
+               ^
+SELECT 'today 5'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "today 5"
+LINE 1: SELECT 'today 5'::timestamp;
+               ^
+-- the reserved words that are whole values everywhere are errors in company
+SELECT '2020-01-01 epoch'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "2020-01-01 epoch"
+LINE 1: SELECT '2020-01-01 epoch'::timestamp;
+               ^
+SELECT 'now 10:00'::time;
+ERROR:  invalid input syntax for type time: "now 10:00"
+LINE 1: SELECT 'now 10:00'::time;
+               ^
+SELECT 'today 10:00'::time;
+ERROR:  invalid input syntax for type time: "today 10:00"
+LINE 1: SELECT 'today 10:00'::time;
+               ^
+SELECT '10:00 allballs'::timetz;
+ERROR:  invalid input syntax for type time with time zone: "10:00 allballs"
+LINE 1: SELECT '10:00 allballs'::timetz;
+               ^
+-- a relative literal resolves through every route to the type, not just a bare
+-- one: an explicit text cast and an array element reach the same input function
+SELECT 'now'::text::timestamp = now()::timestamp AS via_text_cast,
+       ('{now}'::timestamp[])[1] = now()::timestamp AS via_array;
+ via_text_cast | via_array 
+---------------+-----------
+ t             | t
+(1 row)
+
+SELECT pg_input_is_valid('{now}', 'timestamp[]') AS array_soft_input;
+ array_soft_input 
+------------------
+ t
+(1 row)
+
 -- allballs is midnight, and always at +00 — unlike 'now', which takes the
 -- session zone's offset
 SELECT 'allballs'::time AS t, 'allballs'::timetz AS ttz;
