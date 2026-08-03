@@ -1458,12 +1458,14 @@ impl TableAm for HeapTable {
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
         // An empty replacement tree per physical index, staged the same way.
         //
-        // Deliberately *outside* the `CheckpointDelay` block below: `BTree::create`
-        // takes a barrier of its own, and nesting the two deadlocks against a
-        // checkpointer that raises `wanted` in between. Creating first is safe for
-        // the same reason `create_if_missing(new)` above is — a crash before the
-        // record is appended leaves files nothing names, which the startup orphan
-        // sweep reclaims.
+        // Deliberately *outside* the `CheckpointDelay` block below, for the same
+        // reason the heap's own allocation and `create_if_missing` are: this is
+        // file I/O and WAL appends proportional to the index count, and the
+        // barrier — which stalls the checkpointer — should cover only the window
+        // it exists for, between the `HEAP_TRUNCATE` record and the state that
+        // decides whether that record must be replayed. Creating first is safe
+        // because a crash before the record is appended leaves files nothing
+        // names, which the startup orphan sweep reclaims.
         let staged_indexes: Vec<(String, RelFileNode, RelFileNode)> = {
             let mut indexes = self
                 .indexes
