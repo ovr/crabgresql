@@ -6891,23 +6891,34 @@ fn int_width(ty: Option<PgType>) -> Option<PgType> {
 ///
 /// This resolver runs last in the chain, after every type-specific one, so it
 /// can never shadow `inet << inet` (containment), `bit << int4`, or the
-/// geometric "strictly left of". It fires only on a typed integer left operand;
-/// an `unknown` literal there still falls through to the generic path, whose
-/// error is the one PG gives.
+/// geometric "strictly left of". A typed non-integer operand is left to the
+/// generic path; an `unknown` literal is resolved against the other side, the
+/// way PG resolves an untyped constant against whichever candidate the typed
+/// side selects.
 ///
-/// PG defines the bitwise trio only at equal widths (`int2 & int2`, …), but its
-/// operator resolution widens an operand implicitly, so `int2 & int4` binds the
-/// int4 form and yields int4. The shifts take an int4 count at every width and
-/// return the left operand's type.
+/// The two families differ in how much an unknown operand can be pinned by, and
+/// every rule below was probed against PostgreSQL 18.4:
+///
+/// * bitwise `& | #` take two operands of one type in every candidate, so an
+///   unknown on either side simply borrows the other's width — `'5' & 1::int8`
+///   is 1, not ambiguous. Two typed sides meet at the wider one, since PG's
+///   resolution widens implicitly (`int2 & int4` binds the int4 form).
+/// * the shifts take an int4 count at *every* width, so a typed count pins
+///   nothing about the left operand. `'1' << 2` is 4 because int4 is the exact
+///   count type, but `'1' << 2::int2` is 42725 `operator is not unique` — all
+///   three candidates accept a widened int2 — and `'1' << 2::int8` is 42883,
+///   because int8 → int4 is an assignment cast and matches no candidate at all.
+///   That last rule bites a typed left operand too: `1 << 2::int8` is 42883.
+///
+/// Two unknowns are 42725 either way (`'a' << 'b'`), which PG decides from the
+/// signatures alone and never from what the literals contain.
 fn resolve_int_bitwise_op(
     op: &ast::BinaryOperator,
     lb: &Binding,
     rb: &Binding,
 ) -> Result<Option<Binding>, BindError> {
     use ast::BinaryOperator as B;
-    let Some(lt) = int_width(binding_typed_ty(lb)) else {
-        return Ok(None);
-    };
+    let (lt, rt) = (binding_typed_ty(lb), binding_typed_ty(rb));
     let no_op = || {
         BindError::new(
             sqlstate::UNDEFINED_FUNCTION,
@@ -6918,25 +6929,41 @@ fn resolve_int_bitwise_op(
             ),
         )
     };
+    let ambiguous = || {
+        ambiguous_operator(
+            &binding_type_label(lb),
+            &op.to_string(),
+            &binding_type_label(rb),
+        )
+    };
 
-    // Shifts: `intN << int4`. PG has no overflow check here, so no result-type
-    // widening either — the left operand's type comes straight back out.
     let shift = match op {
         B::PGBitwiseShiftLeft => Some(ScalarFn::IntShl),
         B::PGBitwiseShiftRight => Some(ScalarFn::IntShr),
         _ => None,
     };
     if let Some(func) = shift {
-        // The count is int4 for every width; a non-integer count has no
-        // operator, rather than being coerced.
-        if binding_typed_ty(rb).is_some_and(|t| int_width(Some(t)).is_none()) {
+        // The width of the value being shifted, which is also the result type —
+        // PG applies no overflow check here, so there is no widening.
+        let width = match (int_width(lt), lt) {
+            (Some(w), _) => w,
+            (None, Some(_)) => return Ok(None),
+            (None, None) => match rt {
+                None => return Err(ambiguous()),
+                Some(PgType::Int4) => PgType::Int4,
+                Some(PgType::Int2) => return Err(ambiguous()),
+                Some(_) => return Err(no_op()),
+            },
+        };
+        // The count is int4, which int2 reaches implicitly and nothing else does.
+        if !matches!(rt, None | Some(PgType::Int2 | PgType::Int4)) {
             return Err(no_op());
         }
         let amount = resolve_operand(rb, PgType::Int4)?;
-        let left = resolve_operand(lb, lt)?;
+        let left = resolve_operand(lb, width)?;
         return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
             func,
-            ret: lt,
+            ret: width,
             args: vec![left, amount],
         })));
     }
@@ -6950,14 +6977,23 @@ fn resolve_int_bitwise_op(
     let Some(func) = bitwise else {
         return Ok(None);
     };
-    // Both sides meet at the wider width; an `unknown` literal takes the left
-    // operand's type, as it would for any other integer operator.
-    let common = match binding_typed_ty(rb) {
-        None => lt,
-        Some(rt) => match int_width(Some(rt)) {
-            Some(rt) => common_numeric(lt, rt).unwrap_or(lt),
-            None => return Err(no_op()),
+    let common = match (lt, rt) {
+        (Some(_), Some(_)) => match (int_width(lt), int_width(rt)) {
+            (Some(l), Some(r)) => common_numeric(l, r).unwrap_or(l),
+            // An integer beside a typed non-integer has no operator at all; a
+            // non-integer on the left is somebody else's business.
+            (Some(_), None) => return Err(no_op()),
+            _ => return Ok(None),
         },
+        (Some(_), None) => match int_width(lt) {
+            Some(l) => l,
+            None => return Ok(None),
+        },
+        (None, Some(_)) => match int_width(rt) {
+            Some(r) => r,
+            None => return Ok(None),
+        },
+        (None, None) => return Err(ambiguous()),
     };
     Ok(Some(Binding::Typed(BoundExpr::FuncCall {
         func,
