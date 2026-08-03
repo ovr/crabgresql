@@ -1037,9 +1037,79 @@ impl HeapTable {
         self.place_item(rel, xid, tuple_bytes, &self.insert_hint, true)
     }
 
+    /// Free the TOAST chains named by tuples in `rel`, a relfilenode that is about
+    /// to be unlinked without any of its rows ever becoming visible.
+    ///
+    /// A TRUNCATE stages a fresh heap file and the transaction may then write wide
+    /// rows into it. If that transaction aborts, the staged file is discarded
+    /// whole — and with it every tuple that named a chain. The chunk store is
+    /// deliberately *not* swapped by a TRUNCATE (see
+    /// [`HeapTable::reclaim_toast_after_truncate`]), so those chunks stay behind
+    /// with nothing pointing at them, and VACUUM reaches a chain only through a
+    /// heap tuple. Without this they are unreachable and unreclaimable for the
+    /// life of the relation, and repeating the rolled-back load grows the store
+    /// without bound.
+    ///
+    /// Reads through the buffer pool rather than the file: `discard_relfile` drops
+    /// the staged file's frames *without* writing them back, so pages may exist
+    /// only in memory. Every failure is logged and skipped — this runs on the
+    /// abort path, including `Session::drop`, where a panic would be fatal.
+    ///
+    /// The usual "free chains only after the owning slots are gone" ordering
+    /// (see [`TableAm::vacuum`]) does not bind here: the tuples naming these chains
+    /// live in a file no snapshot can reach, and a crash before the unlink leaves
+    /// the whole relfilenode to be discarded by recovery, so no reader can ever
+    /// observe a tuple whose chunks have been freed.
+    /// The same sweep over whatever heap file `xid` staged with a TRUNCATE it is
+    /// about to abort. A no-op if `xid` staged nothing.
+    ///
+    /// Call this *before* `abort_truncate`, which clears the staged state — and
+    /// so that the caller never has to know which of the discarded relfilenodes is
+    /// the heap's rather than an index's.
+    pub(crate) fn free_staged_chains(&self, xid: Xid) {
+        if let Some(rel) = self.staged_for(xid) {
+            self.free_orphaned_chains(rel);
+        }
+    }
+
+    pub(crate) fn free_orphaned_chains(&self, rel: RelFileNode) {
+        let Ok(nblocks) = self.engine.bufpool.smgr().nblocks(rel) else {
+            tracing::warn!(
+                table = %self.snap().name,
+                relfilenode = rel.0,
+                "could not size a discarded relfilenode; its out-of-line values stay allocated"
+            );
+            return;
+        };
+        let mut chains: Vec<toast::ToastPointer> = Vec::new();
+        for block in 0..nblocks {
+            let Ok(page) = self.engine.bufpool.pin(rel, block) else {
+                continue;
+            };
+            chains.extend(page.read(|pg| {
+                let mut found: Vec<toast::ToastPointer> = Vec::new();
+                for off in 1..=page::max_offset(pg) {
+                    if let Some(bytes) = page::get_item(pg, off) {
+                        // No visibility test: every tuple in this file is doomed.
+                        // The only question is whether the row owns chunks at all,
+                        // which `has_external` answers without a full decode.
+                        if tuple::decode_header(bytes).has_external
+                            && let Ok(raw) = tuple::decode_raw(bytes)
+                        {
+                            found.extend(raw.external().iter().map(|(_, p)| *p));
+                        }
+                    }
+                }
+                found
+            }));
+        }
+        self.free_chains(&chains);
+    }
+
     /// Free every chunk of each chain, block by block, logging a HEAP_VACUUM per
-    /// page touched. Called only from [`TableAm::vacuum`], once the rows that
-    /// named these chains are gone.
+    /// page touched. Called once the rows that named these chains are gone —
+    /// either because VACUUM reclaimed them, or because the file holding them is
+    /// being discarded (see [`HeapTable::free_orphaned_chains`]).
     ///
     /// The walk reads each chunk's link before freeing it, so it collects the
     /// whole chain first and frees per block afterwards — freeing as it went
@@ -1629,7 +1699,10 @@ impl TableAm for HeapTable {
         match prev {
             Some(prev) => {
                 // The superseded staged heap file was used only by this uncommitted
-                // transaction; reclaim it now.
+                // transaction; reclaim it now — chunks first, for the reason given
+                // in `free_orphaned_chains`: this file holds the only tuples that
+                // name them, and the chunk store survives a TRUNCATE.
+                self.free_orphaned_chains(RelFileNode(prev.new_rel));
                 self.engine.discard_relfile(RelFileNode(prev.new_rel));
                 // Already registered with the engine on the first TRUNCATE.
             }

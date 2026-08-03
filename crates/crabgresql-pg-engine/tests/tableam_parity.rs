@@ -1173,6 +1173,52 @@ fn a_rolled_back_truncate_keeps_the_chunk_store_and_its_values() -> anyhow::Resu
 }
 
 #[test]
+fn a_rolled_back_truncate_reclaims_the_chunks_it_wrote() -> anyhow::Result<()> {
+    // The other half of the rollback story. A TRUNCATE stages a fresh heap file
+    // and discards it on abort, which takes away every tuple that named a chain
+    // written into it — but the chunk store is deliberately not swapped, and
+    // VACUUM reaches a chain only through a heap tuple. So without an explicit
+    // sweep those chunks are unreachable *and* unreclaimable, and repeating this
+    // cycle grows the store without bound.
+    //
+    // Same single-page value as `vacuum_reclaims_the_chunks_of_a_dead_row`, and
+    // for the same reason: chunk writes follow a one-block hint with no free space
+    // map, so this stays a test of reclamation rather than of block selection.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    let big = big_text(7_000);
+
+    insert_committed(&h.tm, &*table, vec![Value::Int4(1), big.clone()]);
+    let after_first = relfile_len(&h, 2);
+
+    let xid = h.tm.allocate_xid();
+    let txn = h.tm.context(xid, CommandId::FIRST);
+    table.truncate(&txn)?;
+    table.insert(vec![Value::Int4(2), big.clone()], &txn)?;
+    let while_staged = relfile_len(&h, 2);
+    assert!(
+        while_staged > after_first,
+        "the doomed row's chunks should have extended the store: \
+         {while_staged} vs {after_first}"
+    );
+    h.tm.abort(xid);
+
+    // The surviving row is untouched, and the doomed row's space is available
+    // again — so the next value reuses it instead of extending the store.
+    insert_committed(&h.tm, &*table, vec![Value::Int4(3), big.clone()]);
+    assert_eq!(
+        relfile_len(&h, 2),
+        while_staged,
+        "the rolled-back load's chunks should have been reclaimed and reused"
+    );
+    let rows = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1, vec![Value::Int4(1), big.clone()]);
+    assert_eq!(rows[1].1, vec![Value::Int4(3), big]);
+    Ok(())
+}
+
+#[test]
 fn vacuum_reclaims_the_chunks_of_a_rolled_back_insert() -> anyhow::Result<()> {
     // A rolled-back wide INSERT leaves a tuple whose *inserter* aborted. Keying
     // VACUUM's victim rule on `xmax` alone would never select it, so its whole
