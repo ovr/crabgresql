@@ -478,7 +478,18 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
 
     // Now that the scan has accepted every field, a relative date token can
     // read the clock.
+    //
+    // It fixes the *whole* date, so it conflicts with any other field that
+    // contributes one. The `have_date` guard in the loop catches a second date
+    // token, and the bare-number pass above rejects a loose number (it refuses
+    // to run once `have_date` is set) — but a month name sets `month` without
+    // touching `have_date`, and nothing caught that. PG sets the full
+    // `DTK_DATE_M` mask for these words and detects the overlap the same way,
+    // which is why `'Feb today'` is an error there and was today's date here.
     if let Some(shift) = relative {
+        if month.is_some() || year.is_some() || day.is_some() {
+            return Err(invalid_syntax(input));
+        }
         let (y, m, d) = session_today(fmt, shift)?;
         year = Some(y);
         month = Some(m);
@@ -2075,10 +2086,25 @@ mod tests {
         assert_eq!(rel("10:00 today", "UTC"), "2024-03-15 10:00:00");
         assert_eq!(rel("yesterday 23:59:59.5", "UTC"), "2024-03-14 23:59:59.5");
         assert_eq!(rel("tomorrow 00:00:01", "UTC"), "2024-03-16 00:00:01");
-        for bad in ["now 10:00", "now EST", "today today", "2020-01-01 today"] {
+        for bad in [
+            "now 10:00",
+            "now EST",
+            "today today",
+            "2020-01-01 today",
+            // A relative token fixes the whole date, so any other field that
+            // contributes one conflicts — including a month name, which sets
+            // `month` without going through the date-token guard.
+            "Feb today",
+            "today Feb",
+            "Mon Feb today",
+            "today 5",
+            "5 today",
+        ] {
             let e = parse(bad, &at("UTC")).expect_err(bad);
             assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
         }
+        // The verbose form itself is untouched.
+        assert_eq!(rel("Feb 10 1997", "UTC"), "1997-02-10 00:00:00");
     }
 
     /// Reaching a relative special with no session behind it is a wiring bug,
