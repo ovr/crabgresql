@@ -1283,9 +1283,21 @@ impl TableAm for HeapTable {
             // index scan quietly return fewer rows than a sequential scan of the
             // same table — the same query answering differently by plan.
             match self.fetch(tid, txn) {
-                Ok(Some(tuple)) => out.push(Ok((tid, tuple))),
-                // Not visible to this snapshot: not an error.
-                Ok(None) => {}
+                // Re-check the key against the row we actually read. The B-tree
+                // is *supposed* to be exact here — that is why the executor's
+                // index scan re-checks nothing — but nothing else enforces it,
+                // and an entry naming a tid the heap has since reused is a wrong
+                // answer rather than a missing row. One encode plus a compare per
+                // returned row turns that whole class of defect into rows quietly
+                // absent, which a probe-versus-scan test catches.
+                Ok(Some(tuple))
+                    if btkey::encode_row(&schema, &cols, &tuple).is_some_and(|k| k == kb) =>
+                {
+                    out.push(Ok((tid, tuple)))
+                }
+                // Either not visible to this snapshot or not actually a match:
+                // neither is an error.
+                Ok(_) => {}
                 Err(error) => out.push(Err(error)),
             }
         }
