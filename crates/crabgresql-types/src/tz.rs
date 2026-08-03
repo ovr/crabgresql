@@ -720,8 +720,12 @@ static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
     ("MSK", Abbrev::Zone("Europe/Moscow")),
     // `VET` likewise varies: Venezuela ran at -04:30 from 2007 to 2016 and at
     // -04 either side of that, and PG's reading of the abbreviation follows the
-    // zone (verified against PG 18.4). Exercised by upstream's `timestamptz`
-    // suite as the "variable-offset abbreviation" case for `date_trunc`.
+    // zone (verified against PG 18.4). Upstream's `timestamptz` suite uses it as
+    // the "variable-offset abbreviation" case for `date_trunc`; that suite is
+    // not in `upstream_must_pass.txt`, so the guard here is our own smoke block.
+    //
+    // Being an `Abbrev::Zone` it also needs a date, which widens the `timetz_in`
+    // divergence documented in `crate::timetz`.
     ("VET", Abbrev::Zone("America/Caracas")),
 ];
 
