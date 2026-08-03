@@ -8432,7 +8432,10 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
         // element type. Carry PG's DETAIL through (`'{a,,c}'::int[]`).
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(invalid)?;
-            crabgresql_types::array::array_in(s, elem, &FmtCtx::utc_default())
+            // `fmt`, not a fresh UTC one: an element is read by the element
+            // type's own input function, so it needs the same session zone and
+            // transaction clock a scalar of that type would get.
+            crabgresql_types::array::array_in(s, elem, fmt)
                 .map(|elems| Value::Array { elem, elems })
                 .map_err(|e| {
                     BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))

@@ -11022,3 +11022,41 @@ async fn every_spelling_of_a_literal_default_freezes_alike() -> anyhow::Result<(
     assert_eq!(scalar(&client, "SELECT count(DISTINCT live) FROM f").await, "2");
     Ok(())
 }
+
+/// An array element is read by the element type's own input function, so it
+/// needs the same session the scalar would get.
+///
+/// `parse_unknown` threaded the session context into every date/time arm except
+/// the array one, which built a fresh clockless UTC context — so
+/// `pg_input_is_valid('{now}','timestamp[]')` answered `f`, and
+/// `pg_input_error_info` handed the client the internal `XX000` wiring message
+/// as though it were an input error.
+#[tokio::test]
+async fn soft_input_reads_array_elements_with_the_session() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    for sql in [
+        "SELECT pg_input_is_valid('{now}','timestamp[]')",
+        "SELECT pg_input_is_valid('{today}','date[]')",
+        "SELECT pg_input_is_valid('{2024-01-01 12:00}','timestamptz[]')",
+    ] {
+        assert_eq!(scalar(&client, sql).await, "t", "for `{sql}`");
+    }
+
+    // A genuinely bad element still reports as a *value* error, not an internal
+    // one — the distinction the soft-input surface exists to make.
+    assert_eq!(
+        scalar(&client, "SELECT pg_input_is_valid('{bogus}','date[]')").await,
+        "f"
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT sql_error_code FROM pg_input_error_info('{bogus}','date[]')"
+        )
+        .await,
+        "22007"
+    );
+    Ok(())
+}
