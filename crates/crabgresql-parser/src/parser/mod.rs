@@ -10971,23 +10971,67 @@ impl<'a> Parser<'a> {
         Ok(Statement::Close { cursor })
     }
 
+    /// The four bare keywords PostgreSQL spells a boolean option value with.
+    /// `None` leaves the token unconsumed, so a caller can treat "no argument" as
+    /// its own case or fall through to a richer form.
+    fn parse_boolean_keyword(&mut self) -> Option<bool> {
+        match self.parse_one_of_keywords(&[
+            Keyword::TRUE,
+            Keyword::FALSE,
+            Keyword::ON,
+            Keyword::OFF,
+        ]) {
+            Some(Keyword::TRUE) | Some(Keyword::ON) => Some(true),
+            Some(Keyword::FALSE) | Some(Keyword::OFF) => Some(false),
+            _ => None,
+        }
+    }
+
     /// The optional boolean argument of a `COPY` option such as `FREEZE` or
-    /// `HEADER`. PostgreSQL spells booleans in option lists as `TRUE`/`FALSE` or
-    /// `ON`/`OFF`, and omitting the argument entirely means `TRUE` — so
-    /// `(FREEZE)`, `(FREEZE TRUE)` and `(FREEZE ON)` are the same statement.
+    /// `HEADER`. Omitting it means `TRUE`, so `(FREEZE)`, `(FREEZE TRUE)` and
+    /// `(FREEZE ON)` are the same statement.
     ///
-    /// A word that is neither is left unconsumed for the caller's option-list
-    /// loop, which then reports the usual `,`-or-`)` syntax error.
-    fn parse_copy_boolean(&mut self) -> bool {
-        !matches!(
-            self.parse_one_of_keywords(&[
-                Keyword::TRUE,
-                Keyword::FALSE,
-                Keyword::ON,
-                Keyword::OFF,
-            ]),
-            Some(Keyword::FALSE) | Some(Keyword::OFF)
-        )
+    /// Accepts what PostgreSQL's `defGetBoolean` does: `true`/`false`/`on`/`off`
+    /// bare or single-quoted, and the integers `1`/`0`. Anything else is
+    /// `42601`, not a bare syntax error, because that is the state PostgreSQL
+    /// reports and clients key on it. `message` is the complete error text: it
+    /// varies per option, since upstream's `HEADER` also accepts `match` and says
+    /// so.
+    fn parse_copy_boolean(&mut self, message: &str) -> Result<bool, ParserError> {
+        if let Some(value) = self.parse_boolean_keyword() {
+            return Ok(value);
+        }
+        // No argument at all: the option list's `,`/`)` follows.
+        let next = self.peek_token();
+        match &next.token {
+            Token::Comma | Token::RParen => return Ok(true),
+            // A quoted spelling (`'on'`) or an integer (`1`). PostgreSQL takes
+            // only 1 and 0 here — `2` is an error, not truthiness.
+            Token::SingleQuotedString(text) => match text.to_ascii_lowercase().as_str() {
+                "true" | "on" => {
+                    self.next_token();
+                    return Ok(true);
+                }
+                "false" | "off" => {
+                    self.next_token();
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            Token::Number(digits, _) => match digits.as_str() {
+                "1" => {
+                    self.next_token();
+                    return Ok(true);
+                }
+                "0" => {
+                    self.next_token();
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        parser_err!(message, next.span.start)
     }
 
     fn parse_copy_option(&mut self) -> Result<CopyOption, ParserError> {
@@ -11005,10 +11049,17 @@ impl<'a> Parser<'a> {
             Keyword::ENCODING,
         ]) {
             Some(Keyword::FORMAT) => CopyOption::Format(self.parse_identifier()?),
-            Some(Keyword::FREEZE) => CopyOption::Freeze(self.parse_copy_boolean()),
+            Some(Keyword::FREEZE) => {
+                CopyOption::Freeze(self.parse_copy_boolean("freeze requires a Boolean value")?)
+            }
             Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_literal_char()?),
             Some(Keyword::NULL) => CopyOption::Null(self.parse_literal_string()?),
-            Some(Keyword::HEADER) => CopyOption::Header(self.parse_copy_boolean()),
+            // PostgreSQL's HEADER also takes `match`, which this parser does not
+            // implement; its message names that option all the same, because the
+            // message is what a client sees for a bad value either way.
+            Some(Keyword::HEADER) => CopyOption::Header(
+                self.parse_copy_boolean("header requires a Boolean value or \"match\"")?,
+            ),
             Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
             Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
             Some(Keyword::FORCE_QUOTE) => {
@@ -11089,16 +11140,7 @@ impl<'a> Parser<'a> {
             Some(Keyword::CLEANPATH) => CopyLegacyOption::CleanPath,
             Some(Keyword::COMPUPDATE) => {
                 let preset = self.parse_keyword(Keyword::PRESET);
-                let enabled = match self.parse_one_of_keywords(&[
-                    Keyword::TRUE,
-                    Keyword::FALSE,
-                    Keyword::ON,
-                    Keyword::OFF,
-                ]) {
-                    Some(Keyword::TRUE) | Some(Keyword::ON) => Some(true),
-                    Some(Keyword::FALSE) | Some(Keyword::OFF) => Some(false),
-                    _ => None,
-                };
+                let enabled = self.parse_boolean_keyword();
                 CopyLegacyOption::CompUpdate { preset, enabled }
             }
             Some(Keyword::CREDENTIALS) => {
@@ -11180,16 +11222,7 @@ impl<'a> Parser<'a> {
                 CopyLegacyOption::Null(self.parse_literal_string()?)
             }
             Some(Keyword::PARALLEL) => {
-                let enabled = match self.parse_one_of_keywords(&[
-                    Keyword::TRUE,
-                    Keyword::FALSE,
-                    Keyword::ON,
-                    Keyword::OFF,
-                ]) {
-                    Some(Keyword::TRUE) | Some(Keyword::ON) => Some(true),
-                    Some(Keyword::FALSE) | Some(Keyword::OFF) => Some(false),
-                    _ => None,
-                };
+                let enabled = self.parse_boolean_keyword();
                 CopyLegacyOption::Parallel(enabled)
             }
             Some(Keyword::PARQUET) => CopyLegacyOption::Parquet,
@@ -11211,16 +11244,7 @@ impl<'a> Parser<'a> {
                 CopyLegacyOption::RowGroupSize(file_size)
             }
             Some(Keyword::STATUPDATE) => {
-                let enabled = match self.parse_one_of_keywords(&[
-                    Keyword::TRUE,
-                    Keyword::FALSE,
-                    Keyword::ON,
-                    Keyword::OFF,
-                ]) {
-                    Some(Keyword::TRUE) | Some(Keyword::ON) => Some(true),
-                    Some(Keyword::FALSE) | Some(Keyword::OFF) => Some(false),
-                    _ => None,
-                };
+                let enabled = self.parse_boolean_keyword();
                 CopyLegacyOption::StatUpdate(enabled)
             }
             Some(Keyword::TIMEFORMAT) => {
@@ -17854,6 +17878,57 @@ mod tests {
                 Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
                 "{sql} should not parse"
             );
+        }
+    }
+
+    /// `defGetBoolean`'s full accepted set, which is wider than the four bare
+    /// keywords: quoted spellings and the integers 1 and 0. A value outside it is
+    /// PostgreSQL's own "requires a Boolean value", not a bare syntax error.
+    #[test]
+    fn parse_copy_option_boolean_literals_match_pg() {
+        let freeze = |sql: &str| match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+            Ok(mut stmts) => match stmts.pop() {
+                Some(Statement::Copy { options, .. }) => options,
+                other => panic!("{sql}: expected COPY, got {other:?}"),
+            },
+            Err(e) => panic!("{sql}: {e}"),
+        };
+
+        for (sql, expected) in [
+            ("COPY t FROM stdin (FREEZE 1)", true),
+            ("COPY t FROM stdin (FREEZE 0)", false),
+            ("COPY t FROM stdin (FREEZE 'true')", true),
+            ("COPY t FROM stdin (FREEZE 'false')", false),
+            ("COPY t FROM stdin (FREEZE 'on')", true),
+            ("COPY t FROM stdin (FREEZE 'OFF')", false),
+        ] {
+            assert_eq!(freeze(sql), vec![CopyOption::Freeze(expected)], "{sql}");
+        }
+
+        // Rejected upstream too: `yes`/`t` are not Boolean spellings here, and an
+        // integer other than 1 or 0 is an error rather than truthiness.
+        for (sql, message) in [
+            (
+                "COPY t FROM stdin (FREEZE yes)",
+                "freeze requires a Boolean value",
+            ),
+            (
+                "COPY t FROM stdin (FREEZE 2)",
+                "freeze requires a Boolean value",
+            ),
+            (
+                "COPY t FROM stdin (FREEZE 't')",
+                "freeze requires a Boolean value",
+            ),
+            (
+                "COPY t FROM stdin (HEADER 2)",
+                "header requires a Boolean value or \"match\"",
+            ),
+        ] {
+            let e = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                .expect_err(sql)
+                .to_string();
+            assert!(e.contains(message), "{sql}: {e}");
         }
     }
 
