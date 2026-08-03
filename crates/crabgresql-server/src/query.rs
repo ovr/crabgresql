@@ -1648,8 +1648,11 @@ fn execute_copy_from_file(
     };
     let file = crate::copy::open_source_file(global_catalog.copy_files(), &path)?;
     let format = prepared.plan.format.clone();
+    let freeze = prepared.plan.freeze;
     let rows = run_copy_rows(engine, txnmgr, session, &prepared, |insert| {
-        crate::copy::read_file_rows(file, &path, &format, |batch| insert(batch).map(|_| ()))
+        crate::copy::read_file_rows(file, &path, &format, freeze, |batch| {
+            insert(batch).map(|_| ())
+        })
     })?;
     Ok(command_with(format!("COPY {rows}"), Vec::new()))
 }
