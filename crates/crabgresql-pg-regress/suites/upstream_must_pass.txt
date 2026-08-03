@@ -8,6 +8,7 @@ circle
 comments
 float4
 float8
+int2
 line
 lseg
 macaddr

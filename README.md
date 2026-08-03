@@ -114,7 +114,7 @@ server, emulating `psql -a -q` output, and diffs against `expected/*.out`:
 ```console
 $ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
 $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
-19 of 245 tests passed (7%).
+20 of 245 tests passed (8%).
 See target/regress/regression.diffs for details.
 ```
 

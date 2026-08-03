@@ -285,6 +285,10 @@ impl Dialect for PostgreSqlDialect {
         true
     }
 
+    fn supports_non_decimal_numeric_literals(&self) -> bool {
+        true
+    }
+
     /// See: <https://www.postgresql.org/docs/current/arrays.html#ARRAYS-DECLARATION>
     fn supports_array_typedef_with_brackets(&self) -> bool {
         true

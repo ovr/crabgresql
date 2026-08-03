@@ -426,6 +426,59 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::NameInput => return Ok(Value::Text(text::name_input(text(&args[0])))),
         ScalarFn::BpcharToText => return Ok(Value::Text(text::bpchar_rtrim(text(&args[0])))),
+        // --- integer bitwise / shift ---
+        // PG's int2 shifts widen to int32, shift there, then truncate back, and
+        // check nothing on the way — which is why `(-1)::int2 << 15` is -32768
+        // rather than an overflow error. int4/int8 shift in their own width.
+        // The count is taken modulo the width, as the underlying machine
+        // instruction does; PG leaves that case to the hardware too.
+        ScalarFn::IntShl | ScalarFn::IntShr => {
+            let n = i4(&args[1]) as u32;
+            let left = matches!(func, ScalarFn::IntShl);
+            return Ok(match &args[0] {
+                Value::Int2(a) => {
+                    let wide = *a as i32;
+                    let r = if left {
+                        wide.wrapping_shl(n)
+                    } else {
+                        wide.wrapping_shr(n)
+                    };
+                    Value::Int2(r as i16)
+                }
+                Value::Int4(a) => Value::Int4(if left {
+                    a.wrapping_shl(n)
+                } else {
+                    a.wrapping_shr(n)
+                }),
+                Value::Int8(a) => Value::Int8(if left {
+                    a.wrapping_shl(n)
+                } else {
+                    a.wrapping_shr(n)
+                }),
+                other => unreachable!("expected an integer, got {other:?}"),
+            });
+        }
+        ScalarFn::IntAnd | ScalarFn::IntOr | ScalarFn::IntXor => {
+            let apply = |a: i64, b: i64| match func {
+                ScalarFn::IntAnd => a & b,
+                ScalarFn::IntOr => a | b,
+                _ => a ^ b,
+            };
+            return Ok(match (&args[0], &args[1]) {
+                (Value::Int2(a), Value::Int2(b)) => Value::Int2(apply(*a as i64, *b as i64) as i16),
+                (Value::Int4(a), Value::Int4(b)) => Value::Int4(apply(*a as i64, *b as i64) as i32),
+                (Value::Int8(a), Value::Int8(b)) => Value::Int8(apply(*a, *b)),
+                (a, b) => unreachable!("expected two integers of one width, got {a:?} / {b:?}"),
+            });
+        }
+        ScalarFn::IntNot => {
+            return Ok(match &args[0] {
+                Value::Int2(a) => Value::Int2(!a),
+                Value::Int4(a) => Value::Int4(!a),
+                Value::Int8(a) => Value::Int8(!a),
+                other => unreachable!("expected an integer, got {other:?}"),
+            });
+        }
         // --- bit / varbit ---
         ScalarFn::BitNot => {
             let (len, data) = bits(&args[0]);

@@ -18,6 +18,7 @@ pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
 pub mod interval;
+pub mod intlit;
 pub mod json;
 pub mod jsonpath;
 pub mod macaddr;

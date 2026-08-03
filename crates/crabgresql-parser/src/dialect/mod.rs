@@ -456,6 +456,14 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect reads `0x1F` / `0o17` / `0b11` as integer
+    /// constants (PostgreSQL 16 and later). When false, `0x…` keeps its older
+    /// reading as an `X'…'` bit-string literal and `0o…`/`0b…` are not
+    /// recognized at all.
+    fn supports_non_decimal_numeric_literals(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialects supports specifying null treatment
     /// as part of a window function's parameter list as opposed
     /// to after the parameter list.

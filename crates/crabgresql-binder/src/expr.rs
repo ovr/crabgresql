@@ -3176,22 +3176,52 @@ fn bind_bit_literal(
 /// Integer literals become int4 when they fit, int8 otherwise. Literals with a
 /// decimal point or exponent bind as `numeric`, as PG does — a numeric constant
 /// keeps its exact value and display scale.
+///
+/// A whole-number literal goes through the same acceptor as the `int4 '…'` input
+/// function, so the hex/octal/binary spellings (`0x1F`, `0o17`, `0b11`) and the
+/// `_` digit separators mean the same thing written bare as they do quoted.
 fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
-    if let Ok(v) = n.parse::<i32>() {
-        return Ok(BoundExpr::Const {
-            value: Value::Int4(v),
-            ty: PgType::Int4,
-        });
+    if let Ok((negative, magnitude)) = crabgresql_types::intlit::scan_int_literal(n) {
+        // A leading `-` never reaches here (the parser builds unary minus), but
+        // the acceptor reports the sign anyway, so honour it rather than assume.
+        let signed = i128::try_from(magnitude)
+            .ok()
+            .map(|m| if negative { m.wrapping_neg() } else { m });
+        if let Some(v) = signed.and_then(|v| i32::try_from(v).ok()) {
+            return Ok(BoundExpr::Const {
+                value: Value::Int4(v),
+                ty: PgType::Int4,
+            });
+        }
+        if let Some(v) = signed.and_then(|v| i64::try_from(v).ok()) {
+            return Ok(BoundExpr::Const {
+                value: Value::Int8(v),
+                ty: PgType::Int8,
+            });
+        }
+        // Past int8, PG keeps the value as `numeric` — `0x8000000000000000` is
+        // 9223372036854775808, not an overflow. Render the magnitude in decimal
+        // so a non-decimal spelling reaches `Numeric::parse` in a form it reads.
+        let decimal = format!("{}{magnitude}", if negative { "-" } else { "" });
+        return numeric_const(&decimal, n);
     }
-    if let Ok(v) = n.parse::<i64>() {
-        return Ok(BoundExpr::Const {
-            value: Value::Int8(v),
-            ty: PgType::Int8,
-        });
-    }
-    // A whole-number literal too large for int8, or one with a decimal point or
-    // exponent, is `numeric` (PG's `numeric` type for any unsuffixed decimal).
-    match Numeric::parse(n) {
+    // Not a whole number: a decimal point or exponent, where the separators (if
+    // any) still have to come out before `Numeric::parse` sees the text.
+    let stripped;
+    let n = if n.contains('_') {
+        stripped = n.replace('_', "");
+        stripped.as_str()
+    } else {
+        n
+    };
+    numeric_const(n, n)
+}
+
+/// Bind a `numeric` constant from `text`, reporting an unreadable one against
+/// `original` — the literal as it was written, which may differ once digit
+/// separators have been stripped or a non-decimal spelling converted.
+fn numeric_const(text: &str, original: &str) -> Result<BoundExpr, BindError> {
+    match Numeric::parse(text) {
         Ok(value) => Ok(BoundExpr::Const {
             value: Value::Numeric(value),
             ty: PgType::Numeric,
@@ -3201,7 +3231,7 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
             "value overflows numeric format",
         )),
         Err(ParseError::Syntax) => Err(BindError::feature_not_supported(format!(
-            "numeric literal \"{n}\" is not supported yet"
+            "numeric literal \"{original}\" is not supported yet"
         ))),
     }
 }
@@ -4517,6 +4547,15 @@ fn bind_unary(
                     args: vec![e],
                 }))
             }
+            // `~intN` — one's complement, same width back.
+            Binding::Typed(e) if matches!(e.ty(), PgType::Int2 | PgType::Int4 | PgType::Int8) => {
+                let ret = e.ty();
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::IntNot,
+                    ret,
+                    args: vec![e],
+                }))
+            }
             // `~macaddr` / `~macaddr8` — one's complement, same type back.
             Binding::Typed(e) if matches!(e.ty(), PgType::Macaddr | PgType::Macaddr8) => {
                 let ret = e.ty();
@@ -5111,6 +5150,14 @@ fn bind_binary_inner(
 
     // Array containment / overlap (`@>` `<@` `&&`) on array operands.
     if let Some(binding) = resolve_array_op(op, &lb, &rb, scope.catalog().as_ref())? {
+        return Ok(binding);
+    }
+
+    // Integer bitwise (`& | #`) and shift (`<< >>`) operators. Deliberately the
+    // last resolver: every spelling it claims is shared with the network, bit
+    // and geometric families above, and this one only fires on an integer left
+    // operand, so putting it here means it can never shadow them.
+    if let Some(binding) = resolve_int_bitwise_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -6808,6 +6855,93 @@ fn resolve_bit_op(
         })));
     }
     Ok(None)
+}
+
+/// `int2`/`int4`/`int8`, or `None` for anything else.
+fn int_width(ty: Option<PgType>) -> Option<PgType> {
+    ty.filter(|t| matches!(t, PgType::Int2 | PgType::Int4 | PgType::Int8))
+}
+
+/// The integer bitwise (`& | #`) and shift (`<< >>`) operators. Like the bit,
+/// inet and geometric families these don't fit the single-`arg_ty` `Binary`
+/// node — a shift's operands have *different* types — so they lower to
+/// `ScalarFn` calls.
+///
+/// This resolver runs last in the chain, after every type-specific one, so it
+/// can never shadow `inet << inet` (containment), `bit << int4`, or the
+/// geometric "strictly left of". It fires only on a typed integer left operand;
+/// an `unknown` literal there still falls through to the generic path, whose
+/// error is the one PG gives.
+///
+/// PG defines the bitwise trio only at equal widths (`int2 & int2`, …), but its
+/// operator resolution widens an operand implicitly, so `int2 & int4` binds the
+/// int4 form and yields int4. The shifts take an int4 count at every width and
+/// return the left operand's type.
+fn resolve_int_bitwise_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let Some(lt) = int_width(binding_typed_ty(lb)) else {
+        return Ok(None);
+    };
+    let no_op = || {
+        BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "operator does not exist: {} {op} {}",
+                binding_type_label(lb),
+                binding_type_label(rb)
+            ),
+        )
+    };
+
+    // Shifts: `intN << int4`. PG has no overflow check here, so no result-type
+    // widening either — the left operand's type comes straight back out.
+    let shift = match op {
+        B::PGBitwiseShiftLeft => Some(ScalarFn::IntShl),
+        B::PGBitwiseShiftRight => Some(ScalarFn::IntShr),
+        _ => None,
+    };
+    if let Some(func) = shift {
+        // The count is int4 for every width; a non-integer count has no
+        // operator, rather than being coerced.
+        if binding_typed_ty(rb).is_some_and(|t| int_width(Some(t)).is_none()) {
+            return Err(no_op());
+        }
+        let amount = resolve_operand(rb, PgType::Int4)?;
+        let left = resolve_operand(lb, lt)?;
+        return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret: lt,
+            args: vec![left, amount],
+        })));
+    }
+
+    let bitwise = match op {
+        B::BitwiseAnd => Some(ScalarFn::IntAnd),
+        B::BitwiseOr => Some(ScalarFn::IntOr),
+        B::PGBitwiseXor => Some(ScalarFn::IntXor),
+        _ => None,
+    };
+    let Some(func) = bitwise else {
+        return Ok(None);
+    };
+    // Both sides meet at the wider width; an `unknown` literal takes the left
+    // operand's type, as it would for any other integer operator.
+    let common = match binding_typed_ty(rb) {
+        None => lt,
+        Some(rt) => match int_width(Some(rt)) {
+            Some(rt) => common_numeric(lt, rt).unwrap_or(lt),
+            None => return Err(no_op()),
+        },
+    };
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret: common,
+        args: vec![resolve_operand(lb, common)?, resolve_operand(rb, common)?],
+    })))
 }
 
 /// The `(array type, element type)` of a binding that is a typed array, or
