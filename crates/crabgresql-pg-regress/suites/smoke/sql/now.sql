@@ -57,9 +57,24 @@ SELECT 'yesterday 23:59:59.5'::timestamp - 'yesterday'::timestamp AS almost_a_da
 SELECT 'now 10:00'::timestamp;
 SELECT 'now EST'::timestamptz;
 
--- ...and two date tokens conflict just as two dates would
+-- ...and a relative token conflicts with any other field that fixes the date,
+-- a month name included
 SELECT 'today today'::timestamp;
 SELECT '2020-01-01 today'::timestamp;
+SELECT 'Feb today'::timestamp;
+SELECT 'today 5'::timestamp;
+
+-- the reserved words that are whole values everywhere are errors in company
+SELECT '2020-01-01 epoch'::timestamp;
+SELECT 'now 10:00'::time;
+SELECT 'today 10:00'::time;
+SELECT '10:00 allballs'::timetz;
+
+-- a relative literal resolves through every route to the type, not just a bare
+-- one: an explicit text cast and an array element reach the same input function
+SELECT 'now'::text::timestamp = now()::timestamp AS via_text_cast,
+       ('{now}'::timestamp[])[1] = now()::timestamp AS via_array;
+SELECT pg_input_is_valid('{now}', 'timestamp[]') AS array_soft_input;
 
 -- allballs is midnight, and always at +00 — unlike 'now', which takes the
 -- session zone's offset

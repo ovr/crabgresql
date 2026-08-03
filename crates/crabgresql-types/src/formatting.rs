@@ -1726,7 +1726,8 @@ mod tests {
     fn to_char_renders_the_session_zone() -> anyhow::Result<()> {
         let z = |n: &str| SessionZone::resolve(n).expect("real zone");
         let ny = z("America/New_York");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &in_zone(&ny)).map_err(|e| anyhow::anyhow!(e.message))?;
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00-05", &in_zone(&ny))
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &ny).map_err(fe)?,
             Some("2024-01-15 12:00:00 EST -05".to_string())
@@ -1734,7 +1735,8 @@ mod tests {
 
         // A sub-hour zone widens `OF`, and the abbreviation comes from tzdb.
         let kolkata = z("Asia/Kolkata");
-        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &in_zone(&kolkata)).map_err(|e| anyhow::anyhow!(e.message))?;
+        let v = crate::timestamptz::parse("2024-01-15 12:00:00+05:30", &in_zone(&kolkata))
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(v, "YYYY-MM-DD HH24:MI:SS TZ OF", &kolkata).map_err(fe)?,
             Some("2024-01-15 12:00:00 IST +05:30".to_string())
@@ -1742,7 +1744,8 @@ mod tests {
 
         // `OF` never widens to seconds, even where `timestamptz_out` does:
         // pre-1883 New York ran at -04:56:02, which PG's `OF` prints as -04:56.
-        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &in_zone(&ny)).map_err(|e| anyhow::anyhow!(e.message))?;
+        let lmt = crate::timestamptz::parse("1875-06-01 12:00:00", &in_zone(&ny))
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(
             to_char_timestamptz(lmt, "OF", &ny).map_err(fe)?,
             Some("-04:56".to_string())

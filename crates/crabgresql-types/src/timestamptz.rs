@@ -646,7 +646,9 @@ mod tests {
         // Upper boundary.
         assert!(parse("294276-12-31 23:59:59+00", &in_zone(utc())).is_ok());
         assert_eq!(
-            parse("294277-01-01 00:00:00+00", &in_zone(utc())).unwrap_err().sqlstate,
+            parse("294277-01-01 00:00:00+00", &in_zone(utc()))
+                .unwrap_err()
+                .sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
     }
@@ -855,7 +857,10 @@ mod tests {
         assert_eq!(date_part("timezone", v, &ny)?, Some(-18000.0));
         assert_eq!(date_part("timezone_hour", v, &ny)?, Some(-5.0));
         assert_eq!(date_part("timezone_minute", v, &ny)?, Some(0.0));
-        assert_eq!(extract("timezone", v, &ny)?, Some(Numeric::from_i128(-18000)));
+        assert_eq!(
+            extract("timezone", v, &ny)?,
+            Some(Numeric::from_i128(-18000))
+        );
 
         // A half-hour zone west of UTC: the sign is carried on *both* fields.
         let stj = zone("America/St_Johns");

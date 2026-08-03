@@ -9528,7 +9528,10 @@ async fn timezone_guc_drives_casts_and_field_functions() -> anyhow::Result<()> {
             "SELECT '2024-06-15 03:30:45.5+00'::timestamptz::timetz",
             "23:30:45.5-04",
         ),
-        ("SELECT '2024-06-15 03:30:45.5'::timestamp::time", "03:30:45.5"),
+        (
+            "SELECT '2024-06-15 03:30:45.5'::timestamp::time",
+            "03:30:45.5",
+        ),
     ];
     for (sql, want) in cases {
         assert_eq!(scalar(&client, sql).await, want, "for `{sql}`");
@@ -10574,7 +10577,10 @@ async fn the_clock_functions_are_stable_at_three_different_scopes() -> anyhow::R
     );
     // Inside a block the statement is later than the transaction, and the wall
     // clock is later than both.
-    assert_eq!(scalar(&client, "SELECT now() < statement_timestamp()").await, "t");
+    assert_eq!(
+        scalar(&client, "SELECT now() < statement_timestamp()").await,
+        "t"
+    );
     assert_eq!(
         scalar(
             &client,
@@ -10668,8 +10674,14 @@ async fn the_relative_literals_read_the_transaction_clock() -> anyhow::Result<()
         // The date tokens are fields, so they combine with a time.
         ("SELECT 'tomorrow'::date - 'today'::date", "1"),
         ("SELECT 'today'::date - 'yesterday'::date", "1"),
-        ("SELECT 'today 10:00'::timestamp - 'today'::timestamp", "10:00:00"),
-        ("SELECT '10:00 today'::timestamp = 'today 10:00'::timestamp", "t"),
+        (
+            "SELECT 'today 10:00'::timestamp - 'today'::timestamp",
+            "10:00:00",
+        ),
+        (
+            "SELECT '10:00 today'::timestamp = 'today 10:00'::timestamp",
+            "t",
+        ),
         ("SELECT 'today'::timestamp = current_date::timestamp", "t"),
         // `allballs` is midnight, and at a literal `+00` whatever the session
         // zone — unlike `now`, which takes the session's offset.
@@ -10687,8 +10699,14 @@ async fn the_relative_literals_read_the_transaction_clock() -> anyhow::Result<()
 async fn the_relative_literals_reject_what_pg_rejects() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     for (sql, want) in [
-        ("SELECT 'today'::time", "invalid input syntax for type time: \"today\""),
-        ("SELECT 'epoch'::time", "invalid input syntax for type time: \"epoch\""),
+        (
+            "SELECT 'today'::time",
+            "invalid input syntax for type time: \"today\"",
+        ),
+        (
+            "SELECT 'epoch'::time",
+            "invalid input syntax for type time: \"epoch\"",
+        ),
         (
             "SELECT 'allballs'::date",
             "invalid input syntax for type date: \"allballs\"",
@@ -10751,9 +10769,18 @@ async fn the_keyword_datetime_forms_are_casts_of_now() -> anyhow::Result<()> {
     // Everything the grammar rejects, reported at the token PG blames.
     for (sql, want) in [
         ("SELECT current_date(0)", "syntax error at or near \"(\""),
-        ("SELECT current_timestamp(-1)", "syntax error at or near \"-\""),
-        ("SELECT current_timestamp(1+1)", "syntax error at or near \"+\""),
-        ("SELECT current_time(3::int)", "syntax error at or near \"::\""),
+        (
+            "SELECT current_timestamp(-1)",
+            "syntax error at or near \"-\"",
+        ),
+        (
+            "SELECT current_timestamp(1+1)",
+            "syntax error at or near \"+\"",
+        ),
+        (
+            "SELECT current_time(3::int)",
+            "syntax error at or near \"::\"",
+        ),
         // `now` *is* a function, so a wrong-arity call is an overload failure.
         ("SELECT now(0)", "function now(integer) does not exist"),
     ] {
@@ -10822,9 +10849,16 @@ async fn relative_column_defaults_freeze_but_function_defaults_do_not() -> anyho
         scalar(&client, "SELECT count(DISTINCT frozen_ts) FROM d").await,
         "1"
     );
-    assert_eq!(scalar(&client, "SELECT count(DISTINCT live) FROM d").await, "2");
     assert_eq!(
-        scalar(&client, "SELECT frozen_date = current_date + 1 FROM d LIMIT 1").await,
+        scalar(&client, "SELECT count(DISTINCT live) FROM d").await,
+        "2"
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT frozen_date = current_date + 1 FROM d LIMIT 1"
+        )
+        .await,
         "t"
     );
     Ok(())
@@ -11019,7 +11053,10 @@ async fn every_spelling_of_a_literal_default_freezes_alike() -> anyhow::Result<(
             "`{col}` should be frozen"
         );
     }
-    assert_eq!(scalar(&client, "SELECT count(DISTINCT live) FROM f").await, "2");
+    assert_eq!(
+        scalar(&client, "SELECT count(DISTINCT live) FROM f").await,
+        "2"
+    );
     Ok(())
 }
 
