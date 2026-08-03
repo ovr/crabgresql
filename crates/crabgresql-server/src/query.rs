@@ -2605,15 +2605,78 @@ fn validate_unique_index_build(
     fmt: &FmtCtx,
 ) -> Result<(), PgError> {
     let schema = table.schema();
-    let mut seen: Vec<crabgresql_storage_api::Tuple> = Vec::new();
     // Only the index's own key columns are ever read below — for the duplicate
-    // check, the error DETAIL and the `seen` comparisons alike.
+    // check and the error DETAIL alike.
     let projection = crabgresql_storage_api::ColumnProjection::of(
         index.keys.iter().map(|key| key.column),
         &schema,
     );
-    for row in table.scan(txn, &projection) {
-        let (_, tuple) = row?;
+    let rows = table
+        .scan(txn, &projection)
+        .map(|row| row.map(|(_, tuple)| tuple));
+    let Some(tuple) = find_duplicate(rows, &schema, index)? else {
+        return Ok(());
+    };
+    let names = index
+        .keys
+        .iter()
+        .map(|key| schema.columns[key.column].name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = index
+        .keys
+        .iter()
+        .map(|key| {
+            tuple[key.column]
+                .encode_text_with(fmt)
+                .unwrap_or_else(|| "null".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(PgError::new(
+        "23505",
+        format!("could not create unique index \"{}\"", index.name),
+    )
+    .with_detail(format!("Key ({names})=({values}) is duplicated.")))
+}
+
+/// One row whose key repeats another's, or `None` when every key is unique.
+///
+/// Split out from [`validate_unique_index_build`] so the strategy is separable
+/// from the error: the caller owns the SQLSTATE, the column names and the
+/// rendered values, and this returns only the row to blame.
+///
+/// Sorted, not hashed — which is what PostgreSQL, InnoDB, SQLite, SQL Server
+/// and Oracle all do. Equality here *is* the index's ordering comparison, so
+/// reusing [`index_rows_cmp`] makes the two agree by construction; a hash would
+/// be a second definition of key equality to keep in lockstep with the first,
+/// and a divergence between them is a duplicate silently let through, not an
+/// error. Sorting is also the shape a bulk-load build wants, so this comparison
+/// becomes free the day the B-tree is filled from a sorted stream instead of
+/// one descent per row.
+///
+/// Which duplicate is named, when several keys repeat, is deliberately left
+/// unpinned. PostgreSQL finds the collision inside its build sort, so its
+/// answer follows neither scan nor sort order — probed on 18.4, a heap of
+/// `1, 100..10000, 1, 50, 50` reports `50` even though the pair of `1`s
+/// completes first. This reports the first duplicate in index order.
+///
+/// Memory is what the linear predecessor already used: one key-projected row
+/// per surviving tuple, plus the sort's own scratch.
+///
+/// Rows arrive under `ColumnProjection::of`, i.e. full width with `Null`
+/// padding outside the key, so every access indexes by `key.column`.
+fn find_duplicate(
+    rows: impl Iterator<Item = Result<crabgresql_storage_api::Tuple, StorageError>>,
+    schema: &TableSchema,
+    index: &IndexMetadata,
+) -> Result<Option<crabgresql_storage_api::Tuple>, StorageError> {
+    let mut keyed: Vec<crabgresql_storage_api::Tuple> = Vec::new();
+    for row in rows {
+        let tuple = row?;
+        // A NULL key is exempt under the default NULLS DISTINCT, so it never
+        // reaches the sort. Under NULLS NOT DISTINCT it does, and the ordering
+        // below groups NULLs together so two of them land adjacent.
         if index.nulls_distinct
             && index
                 .keys
@@ -2622,53 +2685,45 @@ fn validate_unique_index_build(
         {
             continue;
         }
-        if seen
-            .iter()
-            .any(|other| index_rows_equal(&schema, index, &tuple, other))
-        {
-            let names = index
-                .keys
-                .iter()
-                .map(|key| schema.columns[key.column].name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = index
-                .keys
-                .iter()
-                .map(|key| {
-                    tuple[key.column]
-                        .encode_text_with(fmt)
-                        .unwrap_or_else(|| "null".to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(PgError::new(
-                "23505",
-                format!("could not create unique index \"{}\"", index.name),
-            )
-            .with_detail(format!("Key ({names})=({values}) is duplicated.")));
-        }
-        seen.push(tuple);
+        keyed.push(tuple);
     }
-    Ok(())
+    keyed.sort_by(|left, right| index_rows_cmp(schema, index, left, right));
+    Ok(keyed
+        .windows(2)
+        .find(|pair| index_rows_cmp(schema, index, &pair[0], &pair[1]).is_eq())
+        .map(|pair| pair[1].clone()))
 }
 
-fn index_rows_equal(
+/// Order two rows by the index's key columns, for the sole purpose of making
+/// equal keys adjacent.
+///
+/// `descending` and `nulls_first` are ignored: reversing a key column or moving
+/// the NULLs to the other end permutes the result but cannot change which rows
+/// are neighbours, and adjacency is all [`find_duplicate`] reads. Equality is
+/// unchanged from the linear scan this replaced — the same `compare_values`
+/// call, judged with `is_eq`.
+fn index_rows_cmp(
     schema: &TableSchema,
     index: &IndexMetadata,
     left: &[crabgresql_types::Value],
     right: &[crabgresql_types::Value],
-) -> bool {
-    index.keys.iter().all(|key| {
+) -> std::cmp::Ordering {
+    for key in &index.keys {
         let left = &left[key.column];
         let right = &right[key.column];
-        match (left, right) {
-            (crabgresql_types::Value::Null, crabgresql_types::Value::Null) => true,
-            (crabgresql_types::Value::Null, _) | (_, crabgresql_types::Value::Null) => false,
-            _ => crabgresql_executor::compare_values(schema.columns[key.column].ty, left, right)
-                .is_eq(),
+        let ordering = match (left, right) {
+            (crabgresql_types::Value::Null, crabgresql_types::Value::Null) => {
+                std::cmp::Ordering::Equal
+            }
+            (crabgresql_types::Value::Null, _) => std::cmp::Ordering::Less,
+            (_, crabgresql_types::Value::Null) => std::cmp::Ordering::Greater,
+            _ => crabgresql_executor::compare_values(schema.columns[key.column].ty, left, right),
+        };
+        if ordering.is_ne() {
+            return ordering;
         }
-    })
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// `SET`. Parameters are resolved through the [`crate::guc`] table; the
@@ -7634,5 +7689,139 @@ mod tests {
         let err = type_shape_from_options(&catalog, &options).expect_err("must reject");
         assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(err.message, "type \"public.int8\" does not exist");
+    }
+
+    /// Feed [`find_duplicate`] the rows a key-projected scan would hand it.
+    /// The engine-level cases (which relation, which snapshot) are covered by
+    /// the e2e tests; these pin the rule itself, which is pure.
+    fn duplicate_of(
+        columns: Vec<Column>,
+        keys: Vec<usize>,
+        nulls_distinct: bool,
+        rows: Vec<Vec<Value>>,
+    ) -> Option<Vec<Value>> {
+        let schema = TableSchema::new("t", columns);
+        let index = IndexMetadata {
+            name: "t_pkey".into(),
+            method: IndexMethod::BTree,
+            keys: keys.into_iter().map(key).collect(),
+            unique: true,
+            nulls_distinct,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        };
+        find_duplicate(rows.into_iter().map(Ok), &schema, &index).expect("scan")
+    }
+
+    fn int_column() -> Vec<Column> {
+        vec![Column::new("k", PgType::Int4)]
+    }
+
+    #[test]
+    fn distinct_keys_have_no_duplicate() {
+        let rows = vec![
+            vec![Value::Int4(3)],
+            vec![Value::Int4(1)],
+            vec![Value::Int4(2)],
+        ];
+        assert_eq!(duplicate_of(int_column(), vec![0], true, rows), None);
+    }
+
+    #[test]
+    fn a_repeated_key_is_reported_whatever_the_scan_order() {
+        // Sorting is what makes the pair adjacent, so the answer must not
+        // depend on how far apart the two rows were in the scan.
+        for spread in [1, 2, 3] {
+            let mut rows = vec![vec![Value::Int4(7)]];
+            rows.extend((0..spread).map(|i| vec![Value::Int4(100 + i)]));
+            rows.push(vec![Value::Int4(7)]);
+            assert_eq!(
+                duplicate_of(int_column(), vec![0], true, rows),
+                Some(vec![Value::Int4(7)]),
+                "spread {spread}"
+            );
+        }
+    }
+
+    /// Under the default NULLS DISTINCT a NULL key is exempt, so any number of
+    /// them coexist; NULLS NOT DISTINCT makes two of them collide. The value
+    /// renders as the bare token `null` in the caller's DETAIL, which is why
+    /// the row itself has to come back rather than a formatted string.
+    #[test]
+    fn null_keys_collide_only_when_nulls_are_not_distinct() {
+        let rows = vec![vec![Value::Null], vec![Value::Null], vec![Value::Int4(5)]];
+        assert_eq!(
+            duplicate_of(int_column(), vec![0], true, rows.clone()),
+            None
+        );
+        assert_eq!(
+            duplicate_of(int_column(), vec![0], false, rows),
+            Some(vec![Value::Null])
+        );
+    }
+
+    /// A multi-column key is duplicated only when *every* column matches, and a
+    /// NULL in any one of them exempts the row under NULLS DISTINCT.
+    #[test]
+    fn a_composite_key_needs_every_column_to_match() {
+        let columns = || {
+            vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Text),
+            ]
+        };
+        let partial = vec![
+            vec![Value::Int4(1), Value::Text("x".into())],
+            vec![Value::Int4(1), Value::Text("y".into())],
+            vec![Value::Int4(2), Value::Text("x".into())],
+        ];
+        assert_eq!(duplicate_of(columns(), vec![0, 1], true, partial), None);
+        let full = vec![
+            vec![Value::Int4(1), Value::Text("x".into())],
+            vec![Value::Int4(2), Value::Text("y".into())],
+            vec![Value::Int4(1), Value::Text("x".into())],
+        ];
+        assert_eq!(
+            duplicate_of(columns(), vec![0, 1], true, full),
+            Some(vec![Value::Int4(1), Value::Text("x".into())])
+        );
+        let one_null = vec![
+            vec![Value::Int4(1), Value::Null],
+            vec![Value::Int4(1), Value::Null],
+        ];
+        assert_eq!(duplicate_of(columns(), vec![0, 1], true, one_null), None);
+    }
+
+    /// Equality is the type's, not the representation's: `numeric` ignores
+    /// trailing zeroes and `bpchar` ignores trailing blanks, so both pairs are
+    /// duplicates even though the two rows differ byte for byte. This is the
+    /// property a hash-bucketed dedup would have had to reproduce separately.
+    #[test]
+    fn equality_follows_the_type_not_the_bytes() {
+        let numeric = vec![
+            vec![Value::Numeric(crabgresql_types::Numeric::parse("1.0").expect("numeric"))],
+            vec![Value::Numeric(crabgresql_types::Numeric::parse("1.00").expect("numeric"))],
+        ];
+        assert!(
+            duplicate_of(
+                vec![Column::new("k", PgType::Numeric)],
+                vec![0],
+                true,
+                numeric
+            )
+            .is_some()
+        );
+        let padded = vec![
+            vec![Value::Text("ab".into())],
+            vec![Value::Text("ab  ".into())],
+        ];
+        assert!(
+            duplicate_of(
+                vec![Column::new("k", PgType::Bpchar)],
+                vec![0],
+                true,
+                padded
+            )
+            .is_some()
+        );
     }
 }
