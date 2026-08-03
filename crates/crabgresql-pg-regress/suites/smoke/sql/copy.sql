@@ -83,6 +83,23 @@ COPY vistest FROM stdin WITH (FORMAT csv, FREEZE OFF);
 z
 \.
 SELECT * FROM vistest ORDER BY a;
+-- A boolean option takes 1/0 and the quoted spellings too, and anything else is
+-- rejected by name rather than as a bare syntax error.
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 0);
+w
+\.
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 'off');
+v
+\.
+SELECT * FROM vistest ORDER BY a;
+-- The rejections below name a file rather than stdin only so this script stays
+-- readable: the statement never gets far enough to open it, and psql would not
+-- enter copy mode for a statement the server refused anyway.
+COPY vistest FROM '/dev/null' WITH (FREEZE yes);
+-- A repeated option is refused with the caret on the second occurrence.
+COPY vistest FROM '/dev/null' (format csv, FORMAT CSV);
+COPY vistest FROM '/dev/null' (freeze off, freeze on);
+COPY vistest FROM '/dev/null' (delimiter ',', delimiter ',');
 
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative

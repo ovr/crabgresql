@@ -10934,7 +10934,27 @@ impl<'a> Parser<'a> {
         let _ = self.parse_keyword(Keyword::WITH); // [ WITH ]
         let mut options = vec![];
         if self.consume_token(&Token::LParen) {
-            options = self.parse_comma_separated(Parser::parse_copy_option)?;
+            // Hand-rolled rather than `parse_comma_separated` so each option's
+            // start position is in hand: PostgreSQL rejects a repeated option with
+            // `conflicting or redundant options` and points its caret at the second
+            // occurrence, and the position is only knowable here.
+            loop {
+                let at = self.peek_token().span.start;
+                let option = self.parse_copy_option()?;
+                if options
+                    .iter()
+                    .any(|seen| std::mem::discriminant(seen) == std::mem::discriminant(&option))
+                {
+                    return Err(Self::pg_syntax_diagnostic(
+                        "conflicting or redundant options",
+                        at,
+                    ));
+                }
+                options.push(option);
+                if !self.consume_token(&Token::Comma) {
+                    break;
+                }
+            }
             self.expect_token(&Token::RParen)?;
         }
         let mut legacy_options = vec![];
@@ -10971,6 +10991,19 @@ impl<'a> Parser<'a> {
         Ok(Statement::Close { cursor })
     }
 
+    /// PostgreSQL's `42601` with its own wording and a cursor position, which is
+    /// what puts the `LINE n: … ^` caret under the offending token. A plain
+    /// `parser_err!` would instead fold the position into the message text and
+    /// report it as a generic syntax error.
+    fn pg_syntax_diagnostic(message: impl Into<String>, at: Location) -> ParserError {
+        ParserError::PgDiagnostic(PgDiagnostic {
+            sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
+            message: message.into(),
+            hint: None,
+            location: at,
+        })
+    }
+
     /// The four bare keywords PostgreSQL spells a boolean option value with.
     /// `None` leaves the token unconsumed, so a caller can treat "no argument" as
     /// its own case or fall through to a richer form.
@@ -10997,6 +11030,10 @@ impl<'a> Parser<'a> {
     /// reports and clients key on it. `message` is the complete error text: it
     /// varies per option, since upstream's `HEADER` also accepts `match` and says
     /// so.
+    ///
+    /// Reported without a cursor position, and so without a `LINE n: … ^` caret:
+    /// PostgreSQL raises this while *processing* the option list rather than while
+    /// parsing it, and its output carries no position either.
     fn parse_copy_boolean(&mut self, message: &str) -> Result<bool, ParserError> {
         if let Some(value) = self.parse_boolean_keyword() {
             return Ok(value);
@@ -11031,7 +11068,7 @@ impl<'a> Parser<'a> {
             },
             _ => {}
         }
-        parser_err!(message, next.span.start)
+        Err(Self::pg_syntax_diagnostic(message, Location::empty()))
     }
 
     fn parse_copy_option(&mut self) -> Result<CopyOption, ParserError> {
@@ -17879,6 +17916,45 @@ mod tests {
                 "{sql} should not parse"
             );
         }
+    }
+
+    /// PostgreSQL rejects a repeated COPY option with `conflicting or redundant
+    /// options` and points the caret at the second occurrence. The columns below
+    /// are the ones upstream's `copy2` expected output marks.
+    #[test]
+    fn parse_copy_rejects_a_repeated_option() {
+        for (sql, column) in [
+            ("COPY x from stdin (format CSV, FORMAT CSV)", 32),
+            ("COPY x from stdin (freeze off, freeze on)", 32),
+            ("COPY x from stdin (delimiter ',', delimiter ',')", 35),
+            ("COPY x from stdin (null ' ', null ' ')", 30),
+            ("COPY x from stdin (header off, header on)", 32),
+            ("COPY x from stdin (quote ':', quote ':')", 31),
+            ("COPY x from stdin (escape ':', escape ':')", 32),
+            ("COPY x from stdin (force_quote (a), force_quote (b))", 37),
+            (
+                "COPY x from stdin (force_not_null (a), force_not_null (b))",
+                40,
+            ),
+            ("COPY x from stdin (force_null (a), force_null (b))", 36),
+            ("COPY x from stdin (encoding 'utf8', encoding 'utf8')", 37),
+        ] {
+            match Parser::parse_sql(&PostgreSqlDialect {}, sql).expect_err(sql) {
+                ParserError::PgDiagnostic(d) => {
+                    assert_eq!(d.message, "conflicting or redundant options", "{sql}");
+                    assert_eq!(d.sqlstate, "42601", "{sql}");
+                    assert_eq!((d.location.line, d.location.column), (1, column), "{sql}");
+                }
+                other => panic!("{sql}: expected a PG diagnostic, got {other:?}"),
+            }
+        }
+
+        // Distinct options in one list are of course fine.
+        assert!(Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "COPY x from stdin (format csv, freeze on, header off)"
+        )
+        .is_ok());
     }
 
     /// `defGetBoolean`'s full accepted set, which is wider than the four bare

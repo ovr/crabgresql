@@ -6105,10 +6105,12 @@ pub fn bind_copy_from(
     })
 }
 
-/// Whether `FREEZE` is on, across both option spellings. PostgreSQL lets a later
-/// option override an earlier one, and the legacy bare keyword (`COPY … CSV
-/// FREEZE`) means the same thing as `WITH (FREEZE)`, so both lists feed one
-/// answer in the order they were written.
+/// Whether `FREEZE` is on, across both option spellings. The legacy bare keyword
+/// (`COPY … CSV FREEZE`) means the same thing as `WITH (FREEZE)`.
+///
+/// A repeated option never reaches here: the parser rejects it with PostgreSQL's
+/// `conflicting or redundant options`, so at most one occurrence per list exists
+/// and there is no precedence rule to get wrong.
 fn resolve_copy_freeze(
     options: &[ast::CopyOption],
     legacy_options: &[ast::CopyLegacyOption],
