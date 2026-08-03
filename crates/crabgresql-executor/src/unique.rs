@@ -12,7 +12,9 @@
 //!   relation is then never read as a whole, which is what takes a batched
 //!   `COPY` off one full scan per batch;
 //! * a scan, for everything else (a metadata-only index, a `NULLS NOT DISTINCT`
-//!   index, or an engine with no physical index at all).
+//!   index, or an engine with no physical index at all) — and for an index whose
+//!   probe the engine declines mid-statement, which demotes it to this source
+//!   rather than answering one key with a scan.
 //!
 //! Either way the rows the statement itself contributes live in the buckets
 //! here: they are not written until every row has been checked, so no engine can
@@ -44,9 +46,7 @@ pub(crate) struct UniqueKeySet<'a> {
     /// One entry per unique index, in the order the caller's `indexes` slice
     /// lists them, so the index reported for a collision is the one the linear
     /// predecessor would have reported.
-    indexes: Vec<KeySet>,
-    /// The relation to probe, for the indexes held as [`Source::Probe`].
-    probe: Option<(&'a Arc<dyn TableAm>, &'a TxnContext)>,
+    indexes: Vec<KeySet<'a>>,
     /// The rows recorded with a tid. This is what the row-vector predecessor
     /// answered with `position()` — whether the simulation still holds a given
     /// row — and it is not derivable from the key buckets, which a row with a
@@ -55,7 +55,7 @@ pub(crate) struct UniqueKeySet<'a> {
 }
 
 /// One unique index's keys.
-struct KeySet {
+struct KeySet<'a> {
     /// Position of this index in the caller's `indexes` slice.
     slot: usize,
     name: String,
@@ -64,19 +64,32 @@ struct KeySet {
     columns: Vec<usize>,
     types: Vec<PgType>,
     nulls_distinct: bool,
-    source: Source,
+    source: Source<'a>,
     /// Keys of the rows this set answers for itself: the statement's own rows
     /// always, plus the relation's rows under [`Source::Scan`].
     buckets: HashMap<u64, Vec<Entry>>,
 }
 
-/// Where the *pre-existing* rows' keys for one index come from.
-#[derive(PartialEq, Eq)]
-enum Source {
+/// Where the *pre-existing* rows' keys for one index come from. The relation to
+/// ask lives in the `Probe` variant rather than beside it, so an index cannot be
+/// marked probeable without one.
+enum Source<'a> {
     /// Asked of the engine one key at a time.
-    Probe,
+    Probe(ProbeSource<'a>),
     /// Read into `buckets` up front.
     Scan,
+}
+
+/// What a probe needs, captured for the statement.
+struct ProbeSource<'a> {
+    table: &'a Arc<dyn TableAm>,
+    txn: &'a TxnContext,
+    /// The same snapshot `columns` and `types` were resolved against — a probe
+    /// that projects with these ordinals must not read them in a shape DDL has
+    /// republished since. Held as an `Arc` rather than a borrow because
+    /// `insert_routed` keeps its per-leaf shapes in a vector it also inserts
+    /// into while the sets are alive.
+    schema: Arc<TableSchema>,
 }
 
 struct Entry {
@@ -93,7 +106,7 @@ impl<'a> UniqueKeySet<'a> {
     pub(crate) fn for_insert(
         table: &'a Arc<dyn TableAm>,
         txn: &'a TxnContext,
-        schema: &TableSchema,
+        schema: &Arc<TableSchema>,
         indexes: &[IndexMetadata],
     ) -> Result<Self, StorageError> {
         let mut set = UniqueKeySet {
@@ -104,12 +117,15 @@ impl<'a> UniqueKeySet<'a> {
                 // equality probe (which is `btkey`-encoded) has no NULL to
                 // encode and answers "no such key".
                 if index.nulls_distinct && table.supports_index_scan(&index.name) {
-                    Source::Probe
+                    Source::Probe(ProbeSource {
+                        table,
+                        txn,
+                        schema: Arc::clone(schema),
+                    })
                 } else {
                     Source::Scan
                 }
             }),
-            probe: Some((table, txn)),
             tids: HashSet::new(),
         };
         set.seed(table, txn, schema)?;
@@ -123,7 +139,6 @@ impl<'a> UniqueKeySet<'a> {
     pub(crate) fn simulation(schema: &TableSchema, indexes: &[IndexMetadata]) -> Self {
         UniqueKeySet {
             indexes: key_sets(schema, indexes, |_| Source::Scan),
-            probe: None,
             tids: HashSet::new(),
         }
     }
@@ -134,7 +149,6 @@ impl<'a> UniqueKeySet<'a> {
     pub(crate) fn none() -> Self {
         UniqueKeySet {
             indexes: Vec::new(),
-            probe: None,
             tids: HashSet::new(),
         }
     }
@@ -153,7 +167,7 @@ impl<'a> UniqueKeySet<'a> {
         let scanned: Vec<usize> = self
             .indexes
             .iter()
-            .filter(|set| set.source == Source::Scan)
+            .filter(|set| matches!(set.source, Source::Scan))
             .flat_map(|set| set.columns.iter().copied())
             .collect();
         if scanned.is_empty() {
@@ -163,11 +177,34 @@ impl<'a> UniqueKeySet<'a> {
         for row in table.scan(txn, &projection) {
             let (_, tuple) = row?;
             for set in &mut self.indexes {
-                if set.source == Source::Scan {
+                if matches!(set.source, Source::Scan) {
                     set.record(&tuple, None);
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Read the relation for one index that was being probed, and stop probing
+    /// it. Called when the engine declines a probe it advertised.
+    ///
+    /// The scan is the one [`UniqueKeySet::seed`] would have run at construction
+    /// and sees exactly the same rows: the transaction's snapshot is fixed (only
+    /// its command id advances), and the statement's own rows are not written
+    /// until every one of them has been checked — so they are still only in the
+    /// buckets, and cannot be counted twice.
+    fn reseed(&mut self, i: usize) -> Result<(), StorageError> {
+        let Source::Probe(probe) = &self.indexes[i].source else {
+            return Ok(());
+        };
+        let (table, txn) = (probe.table, probe.txn);
+        let projection =
+            ColumnProjection::of(self.indexes[i].columns.iter().copied(), &probe.schema);
+        for row in table.scan(txn, &projection) {
+            let (_, tuple) = row?;
+            self.indexes[i].record(&tuple, None);
+        }
+        self.indexes[i].source = Source::Scan;
         Ok(())
     }
 
@@ -206,33 +243,34 @@ impl<'a> UniqueKeySet<'a> {
 
     /// The position in the caller's `indexes` slice of the first unique index
     /// `tuple` collides on, or `None` when it collides on none.
-    pub(crate) fn conflict(&self, tuple: &Tuple) -> Result<Option<usize>, StorageError> {
-        for set in &self.indexes {
-            let Some(key) = set.key_of(tuple) else {
+    pub(crate) fn conflict(&mut self, tuple: &Tuple) -> Result<Option<usize>, StorageError> {
+        for i in 0..self.indexes.len() {
+            let Some(key) = self.indexes[i].key_of(tuple) else {
                 continue;
             };
-            if set.holds(&key) || (set.source == Source::Probe && self.probed(set, &key)?) {
-                return Ok(Some(set.slot));
+            // A `Scan` index answers from its buckets alone: `probed` is a no-op
+            // for it, so the two questions compose without a source test here.
+            if self.indexes[i].holds(&key) || self.probed(i, &key)? {
+                return Ok(Some(self.indexes[i].slot));
             }
         }
         Ok(None)
     }
 
-    /// Whether the engine holds a visible row keyed `key` under `set`'s index.
+    /// Whether the engine holds a visible row keyed `key` under index `i`, for an
+    /// index still being probed. Always false for one read from its buckets.
     ///
     /// The probe's rows are re-checked with [`agg::keys_equal`] rather than
     /// trusted: the tree orders by `btkey`'s encoding, and only a comparison in
     /// `compare_values` terms can decide the equality this check is about.
-    fn probed(&self, set: &KeySet, key: &[Value]) -> Result<bool, StorageError> {
-        let Some((table, txn)) = self.probe else {
+    fn probed(&mut self, i: usize, key: &[Value]) -> Result<bool, StorageError> {
+        let Source::Probe(probe) = &self.indexes[i].source else {
             return Ok(false);
         };
-        // An engine may decline a probe it advertised (`supports_index_scan` is
-        // a promise about the index, not about this key). Declining must not
-        // skip the check, so it falls back to the scan the probe replaced —
-        // slow, and unreachable on today's engines, but never silent.
-        match table.index_lookup(&set.name, key, txn) {
+        let (table, txn) = (probe.table, probe.txn);
+        match table.index_lookup(&self.indexes[i].name, key, txn) {
             Some(rows) => {
+                let set = &self.indexes[i];
                 for row in rows {
                     let (_, tuple) = row?;
                     if let Some(found) = set.key_of(&tuple)
@@ -243,18 +281,14 @@ impl<'a> UniqueKeySet<'a> {
                 }
                 Ok(false)
             }
+            // The engine declined a probe it advertised — a `DROP INDEX` that
+            // landed since, say. Answering this one key with a scan would answer
+            // every later key with one too, since the decline is decided by state
+            // that outlives the row; so read the relation once, as construction
+            // would have, and let the buckets answer from here on.
             None => {
-                let schema = table.schema();
-                let projection = ColumnProjection::of(set.columns.iter().copied(), &schema);
-                for row in table.scan(txn, &projection) {
-                    let (_, tuple) = row?;
-                    if let Some(found) = set.key_of(&tuple)
-                        && agg::keys_equal(&set.types, &found, key)
-                    {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
+                self.reseed(i)?;
+                Ok(self.indexes[i].holds(key))
             }
         }
     }
@@ -262,11 +296,11 @@ impl<'a> UniqueKeySet<'a> {
 
 /// One [`KeySet`] per unique index of `indexes`, each reading from the source
 /// `source` picks for it.
-fn key_sets(
+fn key_sets<'a>(
     schema: &TableSchema,
     indexes: &[IndexMetadata],
-    source: impl Fn(&IndexMetadata) -> Source,
-) -> Vec<KeySet> {
+    source: impl Fn(&IndexMetadata) -> Source<'a>,
+) -> Vec<KeySet<'a>> {
     indexes
         .iter()
         .enumerate()
@@ -287,7 +321,7 @@ fn key_sets(
         .collect()
 }
 
-impl KeySet {
+impl KeySet<'_> {
     /// `tuple`'s key for this index, or `None` when the row cannot take part in
     /// this index's uniqueness at all: under `NULLS DISTINCT` (PostgreSQL's
     /// default) a key containing NULL conflicts with nothing, so such a row is

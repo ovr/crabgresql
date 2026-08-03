@@ -1900,7 +1900,7 @@ fn insert_direct(
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
     for tuple in &tuples {
-        validate_constraints(&schema, &indexes, tuple, &visible, ctx)?;
+        validate_constraints(&schema, &indexes, tuple, &mut visible, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -1964,9 +1964,13 @@ fn insert_routed(
                 validate_constraints(leaf_schema, leaf_indexes, tuple, seen, ctx)?;
                 seen.record(tuple, None);
             }
-            None => {
-                validate_constraints(leaf_schema, leaf_indexes, tuple, &UniqueKeySet::none(), ctx)?
-            }
+            None => validate_constraints(
+                leaf_schema,
+                leaf_indexes,
+                tuple,
+                &mut UniqueKeySet::none(),
+                ctx,
+            )?,
         }
         routes.push(leaf);
     }
@@ -2165,14 +2169,20 @@ fn update_inherited(
                     continue;
                 }
                 if let Err(error) =
-                    validate_constraints(&shapes[i].0, &shapes[i].1, &new, &simulated[i], ctx)
+                    validate_constraints(&shapes[i].0, &shapes[i].1, &new, &mut simulated[i], ctx)
                 {
                     simulated[i].record(old, Some(*tid));
                     return Err(error);
                 }
                 simulated[i].record(&new, Some(*tid));
             } else {
-                validate_constraints(&shapes[i].0, &shapes[i].1, &new, &UniqueKeySet::none(), ctx)?;
+                validate_constraints(
+                    &shapes[i].0,
+                    &shapes[i].1,
+                    &new,
+                    &mut UniqueKeySet::none(),
+                    ctx,
+                )?;
             }
             if let Some(view) = returned {
                 new_rows.push(view);
@@ -2261,13 +2271,13 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) = validate_constraints(&schema, &indexes, &new, &simulated, ctx) {
+            if let Err(error) = validate_constraints(&schema, &indexes, &new, &mut simulated, ctx) {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
             simulated.record(&new, Some(tid));
         } else {
-            validate_constraints(&schema, &indexes, &new, &UniqueKeySet::none(), ctx)?;
+            validate_constraints(&schema, &indexes, &new, &mut UniqueKeySet::none(), ctx)?;
         }
         pending.push((tid, new));
     }
@@ -2406,7 +2416,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &leaf_shapes[dst].1,
                         &new,
-                        &simulated[dst],
+                        &mut simulated[dst],
                         ctx,
                     ) {
                         simulated[dst].record(old, Some(tid));
@@ -2418,7 +2428,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &leaf_shapes[dst].1,
                         &new,
-                        &simulated[dst],
+                        &mut simulated[dst],
                         ctx,
                     )?;
                     // Recorded without its tid: in the destination the row is an
@@ -2431,7 +2441,7 @@ fn update_routed(
                     &leaf_shapes[dst].0,
                     &leaf_shapes[dst].1,
                     &new,
-                    &UniqueKeySet::none(),
+                    &mut UniqueKeySet::none(),
                     ctx,
                 )?;
             }
@@ -2490,7 +2500,7 @@ fn validate_constraints(
     schema: &TableSchema,
     indexes: &[IndexMetadata],
     tuple: &Tuple,
-    existing: &UniqueKeySet,
+    existing: &mut UniqueKeySet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
     for (column, value) in schema.columns.iter().zip(tuple) {
@@ -4864,8 +4874,88 @@ mod tests {
         let schema = table.schema();
         let indexes = table.indexes();
         let txn = rtxn();
-        let set = test_ok(UniqueKeySet::for_insert(table, &txn, &schema, &indexes));
+        let mut set = test_ok(UniqueKeySet::for_insert(table, &txn, &schema, &indexes));
         test_ok(set.conflict(&vec![key])).is_some()
+    }
+
+    /// A table that advertises an index scan and then declines every probe,
+    /// counting the scans it serves. That is the state a `DROP INDEX` landing
+    /// mid-statement leaves behind: the set sampled `supports_index_scan` once,
+    /// and `index_lookup` answers `None` from there on.
+    struct DeclinedProbe {
+        inner: Arc<dyn TableAm>,
+        scans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TableAm for DeclinedProbe {
+        fn schema(&self) -> Arc<TableSchema> {
+            self.inner.schema()
+        }
+        fn indexes(&self) -> Vec<IndexMetadata> {
+            self.inner.indexes()
+        }
+        fn supports_index_scan(&self, _index_name: &str) -> bool {
+            true
+        }
+        fn index_lookup(
+            &self,
+            _index_name: &str,
+            _key: &[Value],
+            _txn: &TxnContext,
+        ) -> Option<crabgresql_storage_api::IndexProbe> {
+            None
+        }
+        fn scan(
+            &self,
+            txn: &TxnContext,
+            projection: &ColumnProjection,
+        ) -> crabgresql_storage_api::TupleStream {
+            self.scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.scan(txn, projection)
+        }
+        fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
+            self.inner.fetch(tid, txn)
+        }
+        fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
+            self.inner.insert(tuple, txn)
+        }
+        fn update(
+            &self,
+            tid: Tid,
+            tuple: Tuple,
+            txn: &TxnContext,
+        ) -> Result<crabgresql_storage_api::UpdateResult, StorageError> {
+            self.inner.update(tid, tuple, txn)
+        }
+        fn delete(
+            &self,
+            tid: Tid,
+            txn: &TxnContext,
+        ) -> Result<crabgresql_storage_api::DeleteResult, StorageError> {
+            self.inner.delete(tid, txn)
+        }
+    }
+
+    #[test]
+    fn unique_key_set_reseeds_once_when_the_engine_declines_a_probe() {
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let table: Arc<dyn TableAm> = Arc::new(DeclinedProbe {
+            inner: unique_table(PgType::Int4, true, vec![Value::Int4(1), Value::Int4(2)]),
+            scans: Arc::clone(&scans),
+        });
+        let schema = table.schema();
+        let indexes = table.indexes();
+        let txn = rtxn();
+        let mut set = test_ok(UniqueKeySet::for_insert(&table, &txn, &schema, &indexes));
+        // Nothing was read to build the set: every index looked probeable.
+        assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // The declined probe still catches the duplicate...
+        assert!(test_ok(set.conflict(&vec![Value::Int4(2)])).is_some());
+        assert!(test_ok(set.conflict(&vec![Value::Int4(9)])).is_none());
+        // ...and every later row is answered from the buckets, so the relation
+        // is read once for the statement rather than once per row.
+        assert_eq!(scans.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
