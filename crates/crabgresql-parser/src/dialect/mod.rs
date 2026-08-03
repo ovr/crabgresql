@@ -1661,6 +1661,20 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if the dialect writes a typed literal as `<type name>
+    /// '<string>'` for *any* type name, not just the ones the parser has a
+    /// dedicated [`DataType`](crate::ast::DataType) variant for — e.g.
+    /// `pg_lsn '0/16AE7F7'`, `money '1'`, or a `CREATE TYPE` name.
+    ///
+    /// Only bare type names that are not keywords are accepted, so `NOT 'a'
+    /// LIKE 'b'` keeps parsing as a unary negation. Dialects that let a string
+    /// literal stand in for an alias (`SELECT a 'alias'`) must leave this off.
+    ///
+    /// [PostgreSQL](https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-CONSTANTS-GENERIC)
+    fn supports_bare_custom_typed_strings(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports `USING <format>` in `CREATE TABLE`.
     ///
     /// Example:
