@@ -1404,16 +1404,18 @@ impl<'a> Tokenizer<'a> {
                         );
                     }
 
-                    // Some dialects support underscore as number separator
-                    // There can only be one at a time and it must be followed by another digit
-                    let is_number_separator = |ch: char, next_char: Option<char>| {
+                    // Some dialects support underscore as number separator.
+                    // There can only be one at a time and it must be followed by
+                    // another digit *of the run's own base* — `radix` is what
+                    // makes `1_e5` and `0b1_2` junk rather than 100000 and 3.
+                    let is_number_separator = |ch: char, next_char: Option<char>, radix: u32| {
                         self.dialect.supports_numeric_literal_underscores()
                             && ch == '_'
-                            && next_char.is_some_and(|next_ch| next_ch.is_ascii_hexdigit())
+                            && next_char.is_some_and(|next_ch| next_ch.is_digit(radix))
                     };
 
                     let mut s = peeking_next_take_while(chars, |ch, next_ch| {
-                        ch.is_ascii_digit() || is_number_separator(ch, next_ch)
+                        ch.is_ascii_digit() || is_number_separator(ch, next_ch, 10)
                     });
 
                     // PostgreSQL 16 and later spell integer constants in hex,
@@ -1435,7 +1437,7 @@ impl<'a> Tokenizer<'a> {
                             _ => (2, "binary"),
                         };
                         let digits = peeking_next_take_while(chars, |ch, next_ch| {
-                            ch.is_digit(radix) || is_number_separator(ch, next_ch)
+                            ch.is_digit(radix) || is_number_separator(ch, next_ch, radix)
                         });
                         s.push(prefix);
                         s.push_str(&digits);
@@ -1471,7 +1473,7 @@ impl<'a> Tokenizer<'a> {
                     if s == "0" && chars.peek() == Some(&'x') {
                         chars.next();
                         let s2 = peeking_next_take_while(chars, |ch, next_ch| {
-                            ch.is_ascii_hexdigit() || is_number_separator(ch, next_ch)
+                            ch.is_ascii_hexdigit() || is_number_separator(ch, next_ch, 16)
                         });
                         return Ok(Some(Token::HexStringLiteral(s2)));
                     }
@@ -1499,7 +1501,7 @@ impl<'a> Tokenizer<'a> {
                     let mut fraction_started = false;
                     s += &peeking_next_take_while(chars, |ch, next_ch| {
                         let ok = ch.is_ascii_digit()
-                            || (fraction_started && is_number_separator(ch, next_ch));
+                            || (fraction_started && is_number_separator(ch, next_ch, 10));
                         fraction_started |= ok;
                         ok
                     });
@@ -1535,7 +1537,8 @@ impl<'a> Tokenizer<'a> {
                                 let mut exponent_started = false;
                                 exponent_part += &peeking_next_take_while(chars, |ch, next_ch| {
                                     let ok = ch.is_ascii_digit()
-                                        || (exponent_started && is_number_separator(ch, next_ch));
+                                        || (exponent_started
+                                            && is_number_separator(ch, next_ch, 10));
                                     exponent_started |= ok;
                                     ok
                                 });
@@ -3132,6 +3135,25 @@ mod tests {
             (
                 "SELECT 1_000.5e_1",
                 "trailing junk after numeric literal at or near \"1_000.5e_1\"",
+            ),
+            // A separator sits between two digits *of the run's own base*, so
+            // `e` does not close one even though it is a hex digit…
+            (
+                "SELECT 1_e5",
+                "trailing junk after numeric literal at or near \"1_e5\"",
+            ),
+            (
+                "SELECT 2_e+3",
+                "trailing junk after numeric literal at or near \"2_e\"",
+            ),
+            (
+                "SELECT 1.5_e3",
+                "trailing junk after numeric literal at or near \"1.5_e3\"",
+            ),
+            // …and `2` does not close one inside a binary run.
+            (
+                "SELECT 0b1_2",
+                "trailing junk after numeric literal at or near \"0b1_2\"",
             ),
         ] {
             let err = Tokenizer::new(&dialect, sql)
