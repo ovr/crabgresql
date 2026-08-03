@@ -25,12 +25,13 @@ use crabgresql_binder::{
     LogicalPlan, MappedRelation, Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
-    HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource, PhysicalJoinExpr,
-    PhysicalJoinInput, PhysicalPlan,
+    DmlIndexProbe, HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
+    PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, map_assigned_columns,
+    update_needs_unique_snapshot,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
-    Tuple,
+    ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
+    TableSchema, Tid, Tuple,
 };
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{FmtCtx, PgType, Value};
@@ -672,6 +673,7 @@ pub fn execute(
             returning,
             routing,
             inherited,
+            index,
         } => execute_update(
             &table,
             &predicate,
@@ -679,6 +681,7 @@ pub fn execute(
             returning,
             routing,
             inherited,
+            &index,
             ctx,
             txn,
         ),
@@ -688,7 +691,10 @@ pub fn execute(
             returning,
             routing,
             inherited,
-        } => execute_delete(&table, &predicate, returning, routing, inherited, ctx, txn),
+            index,
+        } => execute_delete(
+            &table, &predicate, returning, routing, inherited, &index, ctx, txn,
+        ),
     }
 }
 
@@ -832,21 +838,39 @@ fn resolve_subqueries(
             predicate,
             assignments,
             returning,
+            index,
             ..
         } => {
             resolve_opt(predicate, ctx, txn)?;
             for (_, value) in assignments.iter_mut() {
                 resolve_expr(value, ctx, txn)?;
             }
+            resolve_probe_keys(index, ctx, txn)?;
             resolve_returning(returning, ctx, txn)?;
         }
         PhysicalPlan::Delete {
             predicate,
             returning,
+            index,
             ..
         } => {
             resolve_opt(predicate, ctx, txn)?;
+            resolve_probe_keys(index, ctx, txn)?;
             resolve_returning(returning, ctx, txn)?;
+        }
+    }
+    Ok(())
+}
+
+/// A DML probe's key values are expressions of their own, folded like any other.
+fn resolve_probe_keys(
+    index: &mut [Option<DmlIndexProbe>],
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<(), ExecError> {
+    for probe in index.iter_mut().flatten() {
+        for (_, value) in probe.key.iter_mut() {
+            resolve_expr(value, ctx, txn)?;
         }
     }
     Ok(())
@@ -2002,6 +2026,7 @@ fn route_tuple(
 /// UPDATE dispatch: an ordinary table updates in place ([`update_direct`]); a
 /// partitioned parent re-routes each NEW row through its leaves, moving a row to
 /// a different leaf when the key change relocates it ([`update_routed`]).
+#[allow(clippy::too_many_arguments)]
 fn execute_update(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
@@ -2009,15 +2034,39 @@ fn execute_update(
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
     inherited: Vec<MappedRelation>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
-        Some(leaves) => update_routed(table, &leaves, predicate, assignments, returning, ctx, txn),
-        None if !inherited.is_empty() => {
-            update_inherited(&inherited, predicate, assignments, returning, ctx, txn)
-        }
-        None => update_direct(table, predicate, assignments, returning, ctx, txn),
+        Some(leaves) => update_routed(
+            table,
+            &leaves,
+            predicate,
+            assignments,
+            returning,
+            index,
+            ctx,
+            txn,
+        ),
+        None if !inherited.is_empty() => update_inherited(
+            &inherited,
+            predicate,
+            assignments,
+            returning,
+            index,
+            ctx,
+            txn,
+        ),
+        None => update_direct(
+            table,
+            predicate,
+            assignments,
+            returning,
+            probe_at(index, 0),
+            ctx,
+            txn,
+        ),
     }
 }
 
@@ -2041,20 +2090,19 @@ fn update_inherited(
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Scan every target once up front, so the match set is fixed before any
+    // Read every target once up front, so the match set is fixed before any
     // write (Halloween-safe) and RETURNING can fault with nothing written.
     let scans: Vec<Vec<(Tid, Tuple)>> = targets
         .iter()
-        // Unprojected: the row is rebuilt full width and RETURNING may name any
-        // column of the named relation.
-        .map(|target| {
-            target
-                .table
-                .scan(txn, &ColumnProjection::All)
+        .enumerate()
+        .map(|(i, target)| {
+            dml_rows(&target.table, probe_at(index, i), ctx, txn)?
                 .collect::<Result<Vec<_>, _>>()
+                .map_err(ExecError::from)
         })
         .collect::<Result<_, _>>()?;
     // Each target's shape, once per target rather than per matched row. Eager
@@ -2064,9 +2112,18 @@ fn update_inherited(
         .iter()
         .map(|target| (target.table.schema(), target.table.indexes()))
         .collect();
-    let has_unique: Vec<bool> = shapes
+    // Only a statement that writes a unique key can create a conflict, and the
+    // planner withholds a probe from exactly those targets, so a probed target
+    // never needs the whole-relation snapshot below. The assignment columns are
+    // the named relation's, so each target translates them into its own first.
+    let has_unique: Vec<bool> = targets
         .iter()
-        .map(|(_, indexes)| indexes.iter().any(|index| index.unique))
+        .zip(&shapes)
+        .map(|(target, (_, indexes))| {
+            let assigned = map_assigned_columns(assignments, &target.map);
+            // Inheritance updates strictly in place — nothing moves.
+            update_needs_unique_snapshot(indexes, &assigned, false)
+        })
         .collect();
     // Per-target simulation of its live rows after this statement, for UNIQUE
     // checks only. Each target's uniqueness is its own — inheritance does not
@@ -2168,19 +2225,22 @@ fn update_direct(
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
+    probe: Option<&DmlIndexProbe>,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Unprojected: UPDATE rebuilds each row full width by ordinal, carrying the
-    // untouched columns through verbatim, and RETURNING may name any of them.
-    let original: Vec<(Tid, Tuple)> = table
-        .scan(txn, &ColumnProjection::All)
-        .collect::<Result<_, _>>()?;
+    let original: Vec<(Tid, Tuple)> =
+        dml_rows(table, probe, ctx, txn)?.collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
-    // rows' new values; it is only needed when a unique index exists.
+    // rows' new values. It is only needed when the statement actually writes a
+    // unique key — otherwise every row keeps the key it had and no conflict can
+    // appear. That is also why a probe is safe here: the planner withholds one
+    // whenever this is true, because `original` would then hold only the matching
+    // rows and the check would miss conflicts with the rest of the table.
     let schema = table.schema();
     let indexes = table.indexes();
-    let has_unique = indexes.iter().any(|index| index.unique);
+    let assigned: Vec<usize> = assignments.iter().map(|(column, _)| *column).collect();
+    let has_unique = update_needs_unique_snapshot(&indexes, &assigned, false);
     let mut simulated = if has_unique {
         original.clone()
     } else {
@@ -2256,12 +2316,14 @@ fn update_direct(
 /// index (the common case has none, so no simulation is built). All routing and
 /// validation runs before any write, and the whole matched set is taken from the
 /// snapshot first, so the statement stays all-or-nothing and Halloween-safe.
+#[allow(clippy::too_many_arguments)]
 fn update_routed(
     parent: &Arc<dyn TableAm>,
     leaves: &[Arc<dyn TableAm>],
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2273,21 +2335,27 @@ fn update_routed(
         .iter()
         .map(|leaf| (leaf.schema(), leaf.indexes()))
         .collect();
+    // Every unique index counts here, written key or not: a row moved in from
+    // another leaf arrives as an insert and can collide on a key this statement
+    // never touched. The planner withholds a probe from such a leaf, so the
+    // simulation below always has the leaf's whole row set to check against.
+    // A leaf's columns are the parent's one-for-one, so no translation is needed.
+    let assigned: Vec<usize> = assignments.iter().map(|(column, _)| *column).collect();
     let leaf_has_unique: Vec<bool> = leaf_shapes
         .iter()
-        .map(|(_, indexes)| indexes.iter().any(|index| index.unique))
+        .map(|(_, indexes)| update_needs_unique_snapshot(indexes, &assigned, true))
         .collect();
-    // Scan every leaf once (the parent owns no rows). The collected snapshot
+    // Read every leaf once (the parent owns no rows). The collected snapshot
     // drives the match loop and — for leaves with a unique index — seeds the
-    // post-statement simulation, so a leaf is never scanned twice and the match
-    // set is fixed before any write (Halloween-safe).
+    // post-statement simulation, so a leaf is never read twice and the match set
+    // is fixed before any write (Halloween-safe).
     let scans: Vec<Vec<(Tid, Tuple)>> = leaves
         .iter()
-        // Unprojected: rows are rebuilt full width, and cross-leaf row movement
-        // re-routes the whole tuple.
-        .map(|leaf| {
-            leaf.scan(txn, &ColumnProjection::All)
+        .enumerate()
+        .map(|(i, leaf)| {
+            dml_rows(leaf, probe_at(index, i), ctx, txn)?
                 .collect::<Result<Vec<_>, _>>()
+                .map_err(ExecError::from)
         })
         .collect::<Result<_, _>>()?;
     // Per-leaf simulation of the leaf's live rows after this statement, used only
@@ -2627,21 +2695,23 @@ fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
 /// DELETE dispatch: an ordinary table deletes from its own storage
 /// ([`delete_direct`]); a partitioned parent scans every leaf and deletes matching
 /// rows from whichever leaf holds them ([`delete_routed`]).
+#[allow(clippy::too_many_arguments)]
 fn execute_delete(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
     inherited: Vec<MappedRelation>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
-        Some(leaves) => delete_routed(&leaves, predicate, returning, ctx, txn),
+        Some(leaves) => delete_routed(&leaves, predicate, returning, index, ctx, txn),
         None if !inherited.is_empty() => {
-            delete_inherited(&inherited, predicate, returning, ctx, txn)
+            delete_inherited(&inherited, predicate, returning, index, ctx, txn)
         }
-        None => delete_direct(table, predicate, returning, ctx, txn),
+        None => delete_direct(table, predicate, returning, probe_at(index, 0), ctx, txn),
     }
 }
 
@@ -2654,6 +2724,7 @@ fn delete_inherited(
     targets: &[MappedRelation],
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2662,8 +2733,7 @@ fn delete_inherited(
     // scan (target) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     for (i, target) in targets.iter().enumerate() {
-        // Unprojected: RETURNING may name any column of the named relation.
-        for row in target.table.scan(txn, &ColumnProjection::All) {
+        for row in dml_rows(&target.table, probe_at(index, i), ctx, txn)? {
             let (tid, tuple) = row?;
             let view = target.view(&tuple);
             if predicate_holds(predicate, &view, ctx)? {
@@ -2700,14 +2770,14 @@ fn delete_direct(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
+    probe: Option<&DmlIndexProbe>,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
-    // Unprojected: RETURNING may name any column of the deleted row.
-    for row in table.scan(txn, &ColumnProjection::All) {
+    for row in dml_rows(table, probe, ctx, txn)? {
         let (tid, tuple) = row?;
         if predicate_holds(predicate, &tuple, ctx)? {
             pending.push(tid);
@@ -2736,6 +2806,7 @@ fn delete_routed(
     leaves: &[Arc<dyn TableAm>],
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
+    index: &[Option<DmlIndexProbe>],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2743,8 +2814,7 @@ fn delete_routed(
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
-        // Unprojected, as above: RETURNING sees the whole OLD row.
-        for row in leaf.scan(txn, &ColumnProjection::All) {
+        for row in dml_rows(leaf, probe_at(index, i), ctx, txn)? {
             let (tid, tuple) = row?;
             if predicate_holds(predicate, &tuple, ctx)? {
                 pending[i].push(tid);
@@ -4062,44 +4132,93 @@ impl IndexScan {
         txn: &TxnContext,
         projection: &ColumnProjection,
     ) -> Result<Self, ExecError> {
-        // The key value expressions are row-constant (the planner guarantees
-        // it), so they evaluate once against an empty row.
-        let key_values: Vec<Value> = key
-            .iter()
-            .map(|(_, expr)| eval(expr, &[], ctx))
-            .collect::<Result<_, _>>()?;
-        let iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send> =
-            match table.index_lookup(index_name, &key_values, txn) {
-                // Exact path: the engine already returned only key-matching,
-                // MVCC-visible rows.
-                Some(rows) => Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
-                // Fallback path: a full scan, so re-check the key per row.
-                None => {
-                    let cols: Vec<(usize, PgType)> = key
-                        .iter()
-                        .map(|(column, _)| (*column, table.schema().columns[*column].ty))
-                        .collect();
-                    // The planner folds every key column into `projection`
-                    // precisely so this re-check can read them.
-                    Box::new(table.scan(txn, projection).filter_map(move |row| {
-                        match row {
-                            Ok((_, tuple)) => cols
-                                .iter()
-                                .zip(&key_values)
-                                .all(|(&(column, ty), want)| {
-                                    let cell = &tuple[column];
-                                    !matches!(cell, Value::Null)
-                                        && !matches!(want, Value::Null)
-                                        && compare_values(ty, cell, want) == Ordering::Equal
-                                })
-                                .then_some(Ok(tuple)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    }))
-                }
-            };
-        Ok(Self { iter })
+        let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+        Ok(Self {
+            iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
+        })
     }
+}
+
+/// The rows an equality index probe yields, each with its `Tid`.
+///
+/// Two paths, both producing exactly the key-matching, MVCC-visible rows:
+/// the engine's own `index_lookup`, or — when it declines with `None` — a full
+/// scan re-checking the key per row. The `Tid` is kept because DML needs it to
+/// write the row back; [`IndexScan`] drops it.
+fn index_probe_rows(
+    table: &Arc<dyn TableAm>,
+    index_name: &str,
+    key: &[(usize, BoundExpr)],
+    ctx: &ExecContext,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Result<IndexProbe, ExecError> {
+    // The key value expressions are row-constant (the planner guarantees it), so
+    // they evaluate once against an empty row.
+    let key_values: Vec<Value> = key
+        .iter()
+        .map(|(_, expr)| eval(expr, &[], ctx))
+        .collect::<Result<_, _>>()?;
+    Ok(match table.index_lookup(index_name, &key_values, txn) {
+        // Exact path: the engine already returned only key-matching, MVCC-visible
+        // rows.
+        Some(rows) => rows,
+        // Fallback path: a full scan, so re-check the key per row.
+        None => {
+            let cols: Vec<(usize, PgType)> = key
+                .iter()
+                .map(|(column, _)| (*column, table.schema().columns[*column].ty))
+                .collect();
+            // The planner folds every key column into `projection` precisely so
+            // this re-check can read them.
+            Box::new(table.scan(txn, projection).filter_map(move |row| {
+                match row {
+                    Ok((tid, tuple)) => cols
+                        .iter()
+                        .zip(&key_values)
+                        .all(|(&(column, ty), want)| {
+                            let cell = &tuple[column];
+                            !matches!(cell, Value::Null)
+                                && !matches!(want, Value::Null)
+                                && compare_values(ty, cell, want) == Ordering::Equal
+                        })
+                        .then_some(Ok((tid, tuple))),
+                    Err(error) => Some(Err(error)),
+                }
+            }))
+        }
+    })
+}
+
+/// The rows one `UPDATE`/`DELETE` target contributes: an index probe when the
+/// planner chose one for it, else the whole relation.
+///
+/// Always full width — `UPDATE` rebuilds each row by ordinal and `RETURNING` may
+/// name any column — which also means the probe's fallback path can always read
+/// its key columns back.
+fn dml_rows(
+    table: &Arc<dyn TableAm>,
+    probe: Option<&DmlIndexProbe>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<IndexProbe, ExecError> {
+    match probe {
+        Some(probe) => index_probe_rows(
+            table,
+            &probe.index_name,
+            &probe.key,
+            ctx,
+            txn,
+            &ColumnProjection::All,
+        ),
+        None => Ok(Box::new(table.scan(txn, &ColumnProjection::All))),
+    }
+}
+
+/// The probe chosen for target `i`, tolerating the empty "all targets scan"
+/// vector the planner emits when no target had a usable index.
+fn probe_at(index: &[Option<DmlIndexProbe>], i: usize) -> Option<&DmlIndexProbe> {
+    index.get(i).and_then(Option::as_ref)
 }
 
 impl ExecNode for IndexScan {
@@ -4789,6 +4908,126 @@ mod tests {
         assert!(collect(&mut node).is_empty());
     }
 
+    /// `WHERE id = 2`, in the parent's column space.
+    fn id_eq_2() -> Option<BoundExpr> {
+        Some(binary(
+            BinOp::Eq,
+            PgType::Int4,
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4,
+            },
+            int4(2),
+        ))
+    }
+
+    fn probe_on_id(index_name: &str, id: i32) -> Vec<Option<DmlIndexProbe>> {
+        vec![Some(DmlIndexProbe {
+            index_name: index_name.into(),
+            key: vec![(0, int4(id))],
+        })]
+    }
+
+    fn remaining(table: &Arc<dyn TableAm>) -> Vec<Tuple> {
+        table
+            .scan(&rtxn(), &ColumnProjection::All)
+            .map(|row| test_ok(row).1)
+            .collect()
+    }
+
+    /// A probed DML statement must agree with the scanned one row for row — the
+    /// probe narrows the source, the predicate still decides.
+    #[test]
+    fn probed_delete_matches_the_scanned_delete() {
+        for index in [probe_on_id("t_id_key", 2), Vec::new()] {
+            let table = indexed_table();
+            let Execution::Deleted(n) = test_ok(execute_delete(
+                &table,
+                &id_eq_2(),
+                None,
+                None,
+                Vec::new(),
+                &index,
+                &ExecContext::default(),
+                &wtxn(),
+            )) else {
+                panic!("expected Deleted");
+            };
+            assert_eq!(n, 1);
+            assert_eq!(
+                remaining(&table),
+                vec![
+                    vec![Value::Int4(1), Value::Text("one".into())],
+                    vec![Value::Int4(3), Value::Null],
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn probed_update_matches_the_scanned_update() {
+        // `label` is not the unique key, so the planner would allow a probe here.
+        let assignments = vec![(
+            1usize,
+            BoundExpr::Const {
+                value: Value::Text("hit".into()),
+                ty: PgType::Text,
+            },
+        )];
+        for index in [probe_on_id("t_id_key", 2), Vec::new()] {
+            let table = indexed_table();
+            let Execution::Updated(n) = test_ok(execute_update(
+                &table,
+                &id_eq_2(),
+                &assignments,
+                None,
+                None,
+                Vec::new(),
+                &index,
+                &ExecContext::default(),
+                &wtxn(),
+            )) else {
+                panic!("expected Updated");
+            };
+            assert_eq!(n, 1);
+            // By id, not scan order: an updated row lands at the end of the heap.
+            let mut rows = remaining(&table);
+            rows.sort_by_key(|row| match row[0] {
+                Value::Int4(id) => id,
+                _ => unreachable!("id is int4"),
+            });
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int4(1), Value::Text("one".into())],
+                    vec![Value::Int4(2), Value::Text("hit".into())],
+                    vec![Value::Int4(3), Value::Null],
+                ]
+            );
+        }
+    }
+
+    /// A probe naming an index the engine cannot serve falls back to a scan, so
+    /// the statement still affects exactly the predicate's rows.
+    #[test]
+    fn a_probe_the_engine_declines_falls_back_to_a_scan() {
+        let table = test_table();
+        let Execution::Deleted(n) = test_ok(execute_delete(
+            &table,
+            &id_eq_2(),
+            None,
+            None,
+            Vec::new(),
+            &probe_on_id("missing_index", 2),
+            &ExecContext::default(),
+            &wtxn(),
+        )) else {
+            panic!("expected Deleted");
+        };
+        assert_eq!(n, 1);
+        assert_eq!(remaining(&table).len(), 2);
+    }
+
     #[test]
     fn filter_drops_false_and_null_rows() {
         let table = test_table();
@@ -5078,6 +5317,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            &[],
             &ExecContext::default(),
             &wtxn(),
         )?
@@ -5125,6 +5365,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            &[],
             &ExecContext::default(),
             &wtxn(),
         ) else {
@@ -5156,6 +5397,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            &[],
             &ExecContext::default(),
             &wtxn(),
         )?

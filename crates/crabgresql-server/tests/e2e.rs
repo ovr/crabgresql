@@ -4235,6 +4235,64 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+
+    // The modify node now reports the child scan it reads through.
+    let lines = explain_lines(&client, "EXPLAIN UPDATE t SET label = 'x' WHERE id = 2").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Update on t",
+            "  ->  Index Scan using t_pkey on t",
+            "        Index Cond: (id = 2)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    // Writing the PK itself needs every row for the UNIQUE check, so it scans.
+    let lines = explain_lines(&client, "EXPLAIN UPDATE t SET id = 9 WHERE id = 2").await?;
+    assert_eq!(lines, vec!["Update on t"], "plan was {lines:?}");
+
+    let lines = explain_lines(&client, "EXPLAIN DELETE FROM t WHERE id = 2").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Delete on t",
+            "  ->  Index Scan using t_pkey on t",
+            "        Index Cond: (id = 2)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    // ...and the probed statements touch exactly the rows the predicate names.
+    let result = client
+        .simple_query("UPDATE t SET label = 'hit' WHERE id = 2 RETURNING id, label")
+        .await?;
+    let returned = rows(&result);
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].get(1), Some("hit"));
+
+    client.simple_query("DELETE FROM t WHERE id = 1").await?;
+    let result = client
+        .simple_query("SELECT id, label FROM t ORDER BY id")
+        .await?;
+    let left = rows(&result);
+    assert_eq!(left.len(), 2);
+    assert_eq!(left[0].get(0), Some("2"));
+    assert_eq!(left[0].get(1), Some("hit"));
+    assert_eq!(left[1].get(0), Some("3"));
+
+    Ok(())
+}
+
 /// The `QUERY PLAN` lines of an EXPLAIN, as the client sees them.
 async fn explain_lines(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<Vec<String>> {
     let plan = client.simple_query(sql).await?;
