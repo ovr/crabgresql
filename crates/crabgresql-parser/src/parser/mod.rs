@@ -7438,6 +7438,33 @@ impl<'a> Parser<'a> {
         Ok(Some(value))
     }
 
+    /// Refuse a fully reserved keyword where a column name is expected.
+    ///
+    /// `parse_identifier` accepts any word — its doc says so — so without this
+    /// `CREATE TABLE k (select int)` parsed, and so did `current_date`. The
+    /// latter is the one that hurt: the expression grammar rewrites that word
+    /// into a value, so the column existed but no unqualified reference could
+    /// ever reach it, and a read silently answered with today's date instead.
+    ///
+    /// A *quoted* reserved word is a perfectly good column name, here as in
+    /// PostgreSQL, which is why this looks at the keyword rather than the text.
+    ///
+    /// Deliberately scoped to a column *definition* — so `ALTER TABLE … ADD
+    /// COLUMN` and `RETURNS TABLE (…)` inherit it, both funnelling through
+    /// `parse_column_def`. The `CREATE VIEW` column list and the parenthesized
+    /// column lists (INSERT targets, index keys, FK references) have their own
+    /// identifier paths and are left alone for now.
+    fn reject_reserved_column_name(&self) -> Result<(), ParserError> {
+        if let Token::Word(w) = &self.peek_token_ref().token {
+            if w.quote_style.is_none()
+                && keywords::RESERVED_FOR_COLUMN_NAME.contains(&w.keyword)
+            {
+                return Err(self.pg_syntax_error(&w.value));
+            }
+        }
+        Ok(())
+    }
+
     /// PostgreSQL's `syntax error at or near "…"`, pointing at the token the
     /// cursor is on.
     fn pg_syntax_error(&self, token: &str) -> ParserError {
@@ -8561,6 +8588,7 @@ impl<'a> Parser<'a> {
         &mut self,
         optional_data_type: bool,
     ) -> Result<ColumnDef, ParserError> {
+        self.reject_reserved_column_name()?;
         let col_name = self.parse_identifier()?;
         let data_type = if optional_data_type {
             self.maybe_parse(|parser| parser.parse_data_type())?
@@ -18850,5 +18878,39 @@ mod tests {
         ] {
             dialects.verified_stmt(sql);
         }
+    }
+
+    /// A fully reserved keyword is not a column name unless quoted.
+    ///
+    /// `parse_identifier` accepts any word, so a column definition took one
+    /// happily. For `current_date` that was worse than permissive: the
+    /// expression grammar rewrites the word into a value, so the column existed
+    /// but no unqualified reference could reach it and a read silently answered
+    /// with today's date.
+    #[test]
+    fn a_reserved_keyword_is_not_a_bare_column_name() {
+        let pg = PostgreSqlDialect {};
+        for sql in [
+            "CREATE TABLE k (current_date int)",
+            "CREATE TABLE k (localtime int)",
+            "CREATE TABLE k (select int)",
+            "CREATE TABLE k (from int)",
+            "CREATE TABLE k (binary int)",
+            // The same guard covers every column *definition* site.
+            "ALTER TABLE k ADD COLUMN current_time int",
+        ] {
+            let e = Parser::parse_sql(&pg, sql).expect_err(sql).to_string();
+            assert!(
+                e.contains("syntax error at or near"),
+                "`{sql}` should be a PG-shaped syntax error, got {e}"
+            );
+        }
+
+        // Quoted, it is an ordinary name — as in PostgreSQL.
+        Parser::parse_sql(&pg, "CREATE TABLE k (\"select\" int)").expect("quoted is fine");
+        // And the `col_name_keyword` category is untouched: these are the type
+        // names, which PG accepts as column names and this suite is full of.
+        Parser::parse_sql(&pg, "CREATE TABLE k (name text, value int, time timestamp)")
+            .expect("col_name keywords are still names");
     }
 }
