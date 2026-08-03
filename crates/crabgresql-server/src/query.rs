@@ -2614,7 +2614,7 @@ fn validate_unique_index_build(
     let rows = table
         .scan(txn, &projection)
         .map(|row| row.map(|(_, tuple)| tuple));
-    let Some(tuple) = find_duplicate(rows, &schema, index)? else {
+    let Some(key) = find_duplicate(rows, &schema, index)? else {
         return Ok(());
     };
     let names = index
@@ -2623,11 +2623,12 @@ fn validate_unique_index_build(
         .map(|key| schema.columns[key.column].name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let values = index
-        .keys
+    // `key` holds one value per index key, in `index.keys` order, so the names
+    // and the values are rendered from the same walk.
+    let values = key
         .iter()
-        .map(|key| {
-            tuple[key.column]
+        .map(|value| {
+            value
                 .encode_text_with(fmt)
                 .unwrap_or_else(|| "null".to_string())
         })
@@ -2640,43 +2641,95 @@ fn validate_unique_index_build(
     .with_detail(format!("Key ({names})=({values}) is duplicated.")))
 }
 
-/// One row whose key repeats another's, or `None` when every key is unique.
+/// How many keys accumulate before the run is sorted and checked on its own.
+///
+/// The runs are what give the check back its fail-fast: without them the whole
+/// relation has to be read before any duplicate can be reported. They are not
+/// free real estate either — a sorted run is only a *cheap* run for the final
+/// sort while it stays long relative to the input (Rust's `sort_by` extends
+/// shorter ones rather than merging them as they are), which puts the break-even
+/// for a fixed 8192 at around 67M rows. Below that the two sorts together cost
+/// what the single sort cost: `n·log(n) = n·log(run) + n·log(n/run)`.
+const EARLY_RUN: usize = 8192;
+
+/// The key of one row that repeats another's, or `None` when every key is
+/// unique. The values are in `index.keys` order, which is the order the caller
+/// names the columns in.
 ///
 /// Split out from [`validate_unique_index_build`] so the strategy is separable
 /// from the error: the caller owns the SQLSTATE, the column names and the
-/// rendered values, and this returns only the row to blame.
+/// rendered values.
 ///
 /// Sorted, not hashed — which is what PostgreSQL, InnoDB, SQLite, SQL Server
-/// and Oracle all do. Equality here *is* the index's ordering comparison, so
-/// reusing [`index_rows_cmp`] makes the two agree by construction; a hash would
-/// be a second definition of key equality to keep in lockstep with the first,
-/// and a divergence between them is a duplicate silently let through, not an
-/// error. Sorting is also the shape a bulk-load build wants, so this comparison
-/// becomes free the day the B-tree is filled from a sorted stream instead of
-/// one descent per row.
+/// and Oracle all do. Equality here *is* an ordering comparison, so [`key_cmp`]
+/// makes the two agree by construction; a hash would be a second definition of
+/// key equality to keep in lockstep with the first, and a divergence between
+/// them is a duplicate silently let through, not an error. A bulk-load build
+/// wants the same shape — but not this buffer: the stream here has dropped the
+/// heap `Tid`, which is both a leaf item's payload and its tiebreak, and it
+/// orders by `compare_values` rather than by the `btkey` bytes the tree is laid
+/// out in (which cannot encode `numeric` or `bpchar` at all). Such a build would
+/// re-sort on `(key bytes, tid)`; what it inherits from here is the argument,
+/// not the code.
 ///
-/// Which duplicate is named, when several keys repeat, is deliberately left
-/// unpinned. PostgreSQL finds the collision inside its build sort, so its
-/// answer follows neither scan nor sort order — probed on 18.4, a heap of
-/// `1, 100..10000, 1, 50, 50` reports `50` even though the pair of `1`s
-/// completes first. This reports the first duplicate in index order.
+/// Which duplicate is named is deliberately left unpinned, and two things move
+/// it: the runs (a pair inside one run is reported before the whole relation is
+/// even read) and, past that, ascending key order with NULLs first — *not* the
+/// index's own order, which [`key_cmp`] does not reproduce. For a key whose
+/// equal values are not identical (`numeric` `1.0` and `1.00`, `bpchar` `'ab'`
+/// and `'ab  '`) that also decides which of the two representations is rendered.
+/// PostgreSQL pins none of this either: it finds the collision inside its build
+/// sort, so its answer follows neither scan nor sort order — probed on 18.4, a
+/// heap of `1, 100..10000, 1, 50, 50` reports `50` even though the pair of `1`s
+/// completes first.
 ///
-/// Memory is what the linear predecessor already used: one key-projected row
-/// per surviving tuple, plus the sort's own scratch.
-///
-/// Rows arrive under `ColumnProjection::of`, i.e. full width with `Null`
-/// padding outside the key, so every access indexes by `key.column`.
+/// Memory is one key per surviving row — strictly less than the linear
+/// predecessor, which retained the full-width tuple. The fail-fast is narrower
+/// than it sounds, though, and worth stating plainly: a duplicate short-circuits
+/// the scan only when its two rows land in the same run. A pair further apart
+/// than that still reads the relation to the end, so this bounds the common case
+/// (a table dense with duplicates) rather than every case.
 fn find_duplicate(
     rows: impl Iterator<Item = Result<crabgresql_storage_api::Tuple, StorageError>>,
     schema: &TableSchema,
     index: &IndexMetadata,
-) -> Result<Option<crabgresql_storage_api::Tuple>, StorageError> {
-    let mut keyed: Vec<crabgresql_storage_api::Tuple> = Vec::new();
+) -> Result<Option<Vec<crabgresql_types::Value>>, StorageError> {
+    find_duplicate_in_runs(rows, schema, index, EARLY_RUN)
+}
+
+/// [`find_duplicate`] with the run length exposed, so a test can reach the
+/// short-circuit without materializing [`EARLY_RUN`] rows.
+fn find_duplicate_in_runs(
+    rows: impl Iterator<Item = Result<crabgresql_storage_api::Tuple, StorageError>>,
+    schema: &TableSchema,
+    index: &IndexMetadata,
+    run: usize,
+) -> Result<Option<Vec<crabgresql_types::Value>>, StorageError> {
+    let tys: Vec<PgType> = index
+        .keys
+        .iter()
+        .map(|key| schema.columns[key.column].ty)
+        .collect();
+    // Moving the value out of the row costs no allocation, but it leaves a hole,
+    // so it is only sound while each column is read once. A repeated key column
+    // is legal — PostgreSQL accepts `UNIQUE (a, a)` and renders it
+    // `Key (a, a)=(5, 5)` — and would read that hole. Decided once, not per row.
+    let distinct_columns = index
+        .keys
+        .iter()
+        .map(|key| key.column)
+        .collect::<HashSet<_>>()
+        .len()
+        == index.keys.len();
+    let mut keyed: Vec<Vec<crabgresql_types::Value>> = Vec::new();
+    let mut sorted = 0;
+    let mut runs = 0;
     for row in rows {
-        let tuple = row?;
+        let mut tuple = row?;
         // A NULL key is exempt under the default NULLS DISTINCT, so it never
         // reaches the sort. Under NULLS NOT DISTINCT it does, and the ordering
-        // below groups NULLs together so two of them land adjacent.
+        // below groups NULLs together so two of them land adjacent. The count
+        // that drives the runs is therefore of surviving rows, not scanned ones.
         if index.nulls_distinct
             && index
                 .keys
@@ -2685,39 +2738,78 @@ fn find_duplicate(
         {
             continue;
         }
-        keyed.push(tuple);
+        // Rows arrive under `ColumnProjection::of`, i.e. full width with `Null`
+        // padding outside the key — which is why this indexes by `key.column`
+        // and everything downstream can stop caring about the table's shape.
+        keyed.push(
+            index
+                .keys
+                .iter()
+                .map(|key| {
+                    if distinct_columns {
+                        std::mem::replace(&mut tuple[key.column], crabgresql_types::Value::Null)
+                    } else {
+                        tuple[key.column].clone()
+                    }
+                })
+                .collect(),
+        );
+        if keyed.len() - sorted >= run {
+            if let Some(duplicate) = sort_and_scan(&mut keyed[sorted..], &tys) {
+                return Ok(Some(duplicate));
+            }
+            sorted = keyed.len();
+            runs += 1;
+        }
     }
-    keyed.sort_by(|left, right| index_rows_cmp(schema, index, left, right));
-    Ok(keyed
-        .windows(2)
-        .find(|pair| index_rows_cmp(schema, index, &pair[0], &pair[1]).is_eq())
-        .map(|pair| pair[1].clone()))
+    // Exactly one run and nothing pushed after it: the vector is already sorted
+    // and already scanned. The test has to be on the run *count* — `sorted ==
+    // keyed.len()` alone would also hold for two runs, and skipping there would
+    // skip the merge that finds a pair split across them.
+    if runs == 1 && sorted == keyed.len() {
+        return Ok(None);
+    }
+    Ok(sort_and_scan(&mut keyed, &tys))
 }
 
-/// Order two rows by the index's key columns, for the sole purpose of making
-/// equal keys adjacent.
+/// Sort `keys` and return the second member of the first equal-adjacent pair.
+fn sort_and_scan(
+    keys: &mut [Vec<crabgresql_types::Value>],
+    tys: &[PgType],
+) -> Option<Vec<crabgresql_types::Value>> {
+    keys.sort_by(|left, right| key_cmp(tys, left, right));
+    keys.windows(2)
+        .find(|pair| key_cmp(tys, &pair[0], &pair[1]).is_eq())
+        .map(|pair| pair[1].clone())
+}
+
+/// Order two index keys, for the sole purpose of making equal ones adjacent.
 ///
-/// `descending` and `nulls_first` are ignored: reversing a key column or moving
-/// the NULLs to the other end permutes the result but cannot change which rows
-/// are neighbours, and adjacency is all [`find_duplicate`] reads. Equality is
-/// unchanged from the linear scan this replaced — the same `compare_values`
-/// call, judged with `is_eq`.
-fn index_rows_cmp(
-    schema: &TableSchema,
-    index: &IndexMetadata,
+/// `descending` and `nulls_first` are ignored — hence `tys` rather than the
+/// keys themselves: reversing a column or moving the NULLs to the other end
+/// permutes the result but cannot change which keys are neighbours, and
+/// adjacency is all [`find_duplicate`] reads. Equality is unchanged from the
+/// linear scan this replaced — the same `compare_values` call, judged with
+/// `is_eq`.
+fn key_cmp(
+    tys: &[PgType],
     left: &[crabgresql_types::Value],
     right: &[crabgresql_types::Value],
 ) -> std::cmp::Ordering {
-    for key in &index.keys {
-        let left = &left[key.column];
-        let right = &right[key.column];
-        let ordering = match (left, right) {
+    // Indexed rather than zipped: `zip` stops at the shortest, so a `tys` short
+    // by one would silently call two different keys equal — a spurious 23505
+    // refusing a legitimate index, which is the very failure the sorted-not-
+    // hashed argument above exists to rule out.
+    debug_assert_eq!(tys.len(), left.len());
+    debug_assert_eq!(tys.len(), right.len());
+    for (i, ty) in tys.iter().enumerate() {
+        let ordering = match (&left[i], &right[i]) {
             (crabgresql_types::Value::Null, crabgresql_types::Value::Null) => {
                 std::cmp::Ordering::Equal
             }
             (crabgresql_types::Value::Null, _) => std::cmp::Ordering::Less,
             (_, crabgresql_types::Value::Null) => std::cmp::Ordering::Greater,
-            _ => crabgresql_executor::compare_values(schema.columns[key.column].ty, left, right),
+            (left, right) => crabgresql_executor::compare_values(*ty, left, right),
         };
         if ordering.is_ne() {
             return ordering;
@@ -7716,6 +7808,86 @@ mod tests {
         vec![Column::new("k", PgType::Int4)]
     }
 
+    /// [`duplicate_of`] with the run length forced small enough to reach the
+    /// short-circuit, plus how many rows were actually pulled from the scan.
+    fn duplicate_in_runs(
+        run: usize,
+        keys: Vec<usize>,
+        rows: Vec<Vec<Value>>,
+    ) -> (Option<Vec<Value>>, usize) {
+        let schema = TableSchema::new("t", int_column());
+        let index = IndexMetadata {
+            name: "t_pkey".into(),
+            method: IndexMethod::BTree,
+            keys: keys.into_iter().map(key).collect(),
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        };
+        let mut pulled = 0;
+        let found = find_duplicate_in_runs(
+            rows.into_iter().map(|row| {
+                pulled += 1;
+                Ok(row)
+            }),
+            &schema,
+            &index,
+            run,
+        )
+        .expect("scan");
+        (found, pulled)
+    }
+
+    fn ints(values: &[i32]) -> Vec<Vec<Value>> {
+        values.iter().map(|&v| vec![Value::Int4(v)]).collect()
+    }
+
+    /// The point of sorting in runs: a duplicate inside one of them is reported
+    /// without reading the rest of the relation. A table that is merely large
+    /// used to have to be read to the end before it could be refused.
+    #[test]
+    fn a_duplicate_inside_a_run_stops_the_scan() {
+        let rows = ints(&[7, 3, 7, 1, 5, 9, 2, 8, 6, 4]);
+        let (found, pulled) = duplicate_in_runs(4, vec![0], rows);
+        assert_eq!(found, Some(vec![Value::Int4(7)]));
+        assert_eq!(
+            pulled, 4,
+            "the scan should stop at the end of the first run"
+        );
+    }
+
+    /// The runs only bound the common case. A pair further apart than one run
+    /// survives to the final sort, which is what keeps the check exhaustive.
+    #[test]
+    fn a_pair_split_across_runs_is_still_found() {
+        let rows = ints(&[7, 3, 1, 5, 9, 2, 8, 7]);
+        let (found, pulled) = duplicate_in_runs(4, vec![0], rows);
+        assert_eq!(found, Some(vec![Value::Int4(7)]));
+        assert_eq!(
+            pulled, 8,
+            "a split pair can only be found after a full scan"
+        );
+    }
+
+    /// Exactly one full run and nothing after it: already sorted, already
+    /// scanned, and the tail must not report a duplicate that is not there.
+    #[test]
+    fn a_single_full_run_of_distinct_keys_is_clean() {
+        assert_eq!(duplicate_in_runs(4, vec![0], ints(&[4, 2, 3, 1])).0, None);
+    }
+
+    /// A key column may legally repeat — PostgreSQL accepts `UNIQUE (a, a)` and
+    /// renders it `Key (a, a)=(5, 5)`. The key has to carry the value twice, so
+    /// the row cannot be read destructively here.
+    #[test]
+    fn a_repeated_key_column_carries_its_value_twice() {
+        let rows = vec![vec![Value::Int4(5)], vec![Value::Int4(5)]];
+        assert_eq!(
+            duplicate_of(int_column(), vec![0, 0], true, rows),
+            Some(vec![Value::Int4(5), Value::Int4(5)])
+        );
+    }
+
     #[test]
     fn distinct_keys_have_no_duplicate() {
         let rows = vec![
@@ -7797,10 +7969,9 @@ mod tests {
     /// property a hash-bucketed dedup would have had to reproduce separately.
     #[test]
     fn equality_follows_the_type_not_the_bytes() {
-        let numeric = vec![
-            vec![Value::Numeric(crabgresql_types::Numeric::parse("1.0").expect("numeric"))],
-            vec![Value::Numeric(crabgresql_types::Numeric::parse("1.00").expect("numeric"))],
-        ];
+        let numeric_value =
+            |text: &str| Value::Numeric(crabgresql_types::Numeric::parse(text).expect("numeric"));
+        let numeric = vec![vec![numeric_value("1.0")], vec![numeric_value("1.00")]];
         assert!(
             duplicate_of(
                 vec![Column::new("k", PgType::Numeric)],
