@@ -1388,6 +1388,10 @@ impl<'a> Tokenizer<'a> {
                 }
                 // numbers and period
                 '0'..='9' | '.' => {
+                    // Snapshotted before anything is consumed: PostgreSQL's
+                    // caret for a malformed numeric literal sits on the
+                    // literal's first character, not on the offending one.
+                    let literal_start = chars.location();
                     // special case where if ._ is encountered after a word then that word
                     // is a table and the _ is the start of the col name.
                     // if the prev token is not a word, then this is not a valid sql
@@ -1449,10 +1453,12 @@ impl<'a> Tokenizer<'a> {
                             s += &peeking_take_while(chars, |ch| {
                                 self.dialect.is_identifier_part(ch)
                             });
-                            return self.tokenizer_error(
-                                chars.location(),
+                            return Err(TokenizerError::pg(
+                                DEFAULT_TOKENIZER_SQLSTATE,
                                 format!("invalid {base_name} integer at or near \"{s}\""),
-                            );
+                                None,
+                                literal_start,
+                            ));
                         }
                         if chars
                             .peek()
@@ -1461,10 +1467,12 @@ impl<'a> Tokenizer<'a> {
                             s += &peeking_take_while(chars, |ch| {
                                 self.dialect.is_identifier_part(ch)
                             });
-                            return self.tokenizer_error(
-                                chars.location(),
+                            return Err(TokenizerError::pg(
+                                DEFAULT_TOKENIZER_SQLSTATE,
                                 format!("trailing junk after numeric literal at or near \"{s}\""),
-                            );
+                                None,
+                                literal_start,
+                            ));
                         }
                         return Ok(Some(Token::Number(s, false)));
                     }
@@ -1582,10 +1590,12 @@ impl<'a> Tokenizer<'a> {
                             .is_some_and(|&c| self.dialect.is_identifier_part(c))
                     {
                         s += &peeking_take_while(chars, |ch| self.dialect.is_identifier_part(ch));
-                        return self.tokenizer_error(
-                            chars.location(),
+                        return Err(TokenizerError::pg(
+                            DEFAULT_TOKENIZER_SQLSTATE,
                             format!("trailing junk after numeric literal at or near \"{s}\""),
-                        );
+                            None,
+                            literal_start,
+                        ));
                     }
 
                     let long = if chars.peek() == Some(&'L') {
