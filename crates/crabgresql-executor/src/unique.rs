@@ -270,6 +270,16 @@ impl<'a> UniqueKeySet<'a> {
     /// Whether the engine holds a visible row keyed `key` under index `i`, for an
     /// index still being probed. Always false for one read from its buckets.
     ///
+    /// [`TableAm::index_lookup`] answers in three ways, and only two of them are
+    /// branches here. `Some` of matching rows and `Some` of none are both the
+    /// engine having served the probe — including for a key it cannot encode,
+    /// which is a key no stored row was indexed under either, so "served, no
+    /// match" is the truthful answer. That equivalence is what the probe rests
+    /// on, and it holds because a stored `Value`'s variant matches its column's
+    /// declared type: nothing reaches storage without the binder's coercion, and
+    /// no DDL re-types a column in place. `None` is the engine declining, which
+    /// is the third case, below.
+    ///
     /// The probe's rows are re-checked with [`agg::keys_equal`] rather than
     /// trusted: the tree orders by `btkey`'s encoding, and only a comparison in
     /// `compare_values` terms can decide the equality this check is about.
