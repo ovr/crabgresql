@@ -2334,7 +2334,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         ast::Expr::Cast {
             expr, data_type, ..
         } => bind_cast(expr, data_type, scope),
-        ast::Expr::TypedString(ts) => bind_typed_string(ts),
+        ast::Expr::TypedString(ts) => bind_typed_string(ts, scope),
         ast::Expr::Function(func) => bind_function(func, scope),
         ast::Expr::Ceil { expr, field } => {
             crate::functions::bind_ceil_floor("ceil", expr, field, scope)
@@ -3572,8 +3572,10 @@ fn coerce_user_cast(
     }
 }
 
-fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
-    let target = map_data_type(&ts.data_type)?;
+fn bind_typed_string(ts: &ast::TypedString, scope: &Scope) -> Result<Binding, BindError> {
+    // Same resolution a cast target goes through, so `CREATE TYPE` names work in
+    // the `t 'literal'` spelling exactly as they do in `'literal'::t`.
+    let target = resolve_data_type(scope.catalog(), &ts.data_type)?;
     let (lit, span) = match ts.value.value.as_pg_string() {
         Some(s) => (Some(s.to_string()), ts.value.span),
         None => {
@@ -3583,7 +3585,7 @@ fn bind_typed_string(ts: &ast::TypedString) -> Result<Binding, BindError> {
             )));
         }
     };
-    let expr = resolve_unknown(lit, span, None, target)?;
+    let expr = resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, None, target)?;
     let expr = apply_numeric_typmod_if_any(expr, target, &ts.data_type)?;
     Ok(Binding::Typed(apply_length_typmod_if_any(
         expr,

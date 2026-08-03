@@ -5,12 +5,9 @@
 --
 -- Ported from vendor/postgres/regress/sql/pg_lsn.sql. Every `pg_lsn`-specific
 -- result there is reproduced exactly; upstream `pg_lsn` is nonetheless not on
--- the promotion list in suites/upstream_must_pass.txt, because two things
--- unrelated to this type still block it:
---   1. `pg_lsn '0/16AE7F7'` -- the parser rejects the `type 'literal'` spelling
---      for any bareword type name (only `xml` is excepted).
---   2. `EXPLAIN (COSTS OFF)`, whose plan text this planner does not reproduce.
--- Both are dropped below.
+-- the promotion list in suites/upstream_must_pass.txt, because one thing
+-- unrelated to this type still blocks it: `EXPLAIN (COSTS OFF)`, whose plan
+-- text this planner does not reproduce. It is dropped below.
 --
 -- NOTE ON OUTPUT FORMAT: the low half is zero-padded to eight hex digits
 -- (`0/00000000`), which is what the vendored 19devel corpus expects and what
@@ -45,11 +42,21 @@ DROP TABLE PG_LSN_TBL;
 -- input is case-insensitive; output is uppercase with the low half padded
 SELECT 'abcd/ef'::pg_lsn, 'ABCD/EF'::pg_lsn;
 
+-- the `<type name> '<literal>'` spelling: the column is named after the type,
+-- and the qualified and quoted forms name the same type
+SELECT pg_lsn '0/16AE7F7';
+SELECT pg_catalog.pg_lsn '0/1', "pg_lsn" '0/2';
+SELECT pg_lsn 'zzz';
+-- a bare type name is still just a column reference when no literal follows it
+CREATE TABLE lsn_name_tbl (pg_lsn int);
+SELECT pg_lsn FROM lsn_name_tbl;
+DROP TABLE lsn_name_tbl;
+
 -- Operators
 SELECT '0/16AE7F8' = '0/16AE7F8'::pg_lsn;
 SELECT '0/16AE7F8'::pg_lsn != '0/16AE7F7';
 SELECT '0/16AE7F7' < '0/16AE7F8'::pg_lsn;
-SELECT '0/16AE7F8' > '0/16AE7F7'::pg_lsn;
+SELECT '0/16AE7F8' > pg_lsn '0/16AE7F7';
 SELECT '0/16AE7F7'::pg_lsn - '0/16AE7F8'::pg_lsn;
 SELECT '0/16AE7F8'::pg_lsn - '0/16AE7F7'::pg_lsn;
 SELECT '0/16AE7F7'::pg_lsn + 16::numeric;

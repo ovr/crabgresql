@@ -1476,6 +1476,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True for the string-literal tokens PostgreSQL's grammar spells `Sconst`,
+    /// the only thing a generic `<type name> '<literal>'` constant may carry.
+    fn is_string_constant_token(token: &Token) -> bool {
+        matches!(
+            token,
+            Token::SingleQuotedString(_)
+                | Token::EscapedStringLiteral(_)
+                | Token::UnicodeStringLiteral(_)
+                | Token::NationalStringLiteral(_)
+                | Token::DollarQuotedString(_)
+        )
+    }
+
     /// Parse an expression prefix.
     pub fn parse_prefix(&mut self) -> Result<Expr, ParserError> {
         // allow the dialect to override prefix parsing
@@ -1500,23 +1513,37 @@ impl<'a> Parser<'a> {
         // name is not followed by a string literal, but in fact in PostgreSQL it is a valid
         // expression that should parse as the column name "date".
         let loc = self.peek_token_ref().span.start;
+        // PostgreSQL allows almost any identifier to be used as custom data type name,
+        // and we support that in `parse_data_type()`. But unlike Postgres we don't
+        // have a list of globally reserved keywords (since they vary across dialects),
+        // so given `NOT 'a' LIKE 'b'`, we'd accept `NOT` as a possible custom data type
+        // name, resulting in `NOT 'a'` being recognized as a `TypedString` instead of
+        // an unary negation `NOT ('a' LIKE 'b')`.
+        //
+        // What is ambiguous is a *keyword* standing where a type name could stand, so
+        // on dialects that write generic typed literals we accept a custom type name
+        // whose first word is no keyword at all: `pg_lsn '0/16AE7F7'`, a quoted
+        // `"pg_lsn" '...'` (quoting always yields `NoKeyword`), and a qualified
+        // `pg_catalog.pg_lsn '...'` all pass, while `NOT`, `ALL`, `CASE` and friends
+        // stay out.
+        let type_name_is_bare_keyword = matches!(
+            &self.peek_token_ref().token,
+            Token::Word(w) if w.keyword != Keyword::NoKeyword
+        );
+        let custom_typed_string_ok =
+            self.dialect.supports_bare_custom_typed_strings() && !type_name_is_bare_keyword;
         let opt_expr = self.maybe_parse(|parser| {
             match parser.parse_data_type()? {
                 DataType::Interval { .. } => parser.parse_interval(),
-                // PostgreSQL allows almost any identifier to be used as custom data type name,
-                // and we support that in `parse_data_type()`. But unlike Postgres we don't
-                // have a list of globally reserved keywords (since they vary across dialects),
-                // so given `NOT 'a' LIKE 'b'`, we'd accept `NOT` as a possible custom data type
-                // name, resulting in `NOT 'a'` being recognized as a `TypedString` instead of
-                // an unary negation `NOT ('a' LIKE 'b')`. To solve this, we don't accept the
-                // `type 'string'` syntax for the custom data types at all ...
-                //
-                // ... with the exception of `xml '...'` on dialects that support XML
-                // expressions, which is a valid PostgreSQL typed string literal.
+                // The other custom type name accepted here is `xml '...'` on dialects
+                // that support XML expressions, which is a valid PostgreSQL typed
+                // string literal even though `XML` is a keyword.
                 DataType::Custom(ref name, ref modifiers)
                     if modifiers.is_empty()
-                        && Self::is_simple_unquoted_object_name(name, "xml")
-                        && parser.dialect.supports_xml_expressions() =>
+                        && ((custom_typed_string_ok
+                            && Self::is_string_constant_token(&parser.peek_token_ref().token))
+                            || (Self::is_simple_unquoted_object_name(name, "xml")
+                                && parser.dialect.supports_xml_expressions())) =>
                 {
                     Ok(Expr::TypedString(TypedString {
                         data_type: DataType::Custom(name.clone(), modifiers.clone()),
@@ -17686,6 +17713,52 @@ mod tests {
             "SELECT SUBSTR('a' SIMILAR 'b' ESCAPE '#')"
         )
         .is_err());
+    }
+
+    /// PostgreSQL writes a constant of any type as `<type name> '<literal>'`,
+    /// including types this parser has no dedicated `DataType` for (`pg_lsn`,
+    /// `money`, a `CREATE TYPE` name). The guard that admits them keys on the
+    /// name not being a keyword, so pin both halves: the custom names parse,
+    /// and a keyword in that position still means what it always did.
+    #[test]
+    fn parse_custom_typed_string_literals() {
+        let pg = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        for sql in [
+            "SELECT pg_lsn '0/16AE7F7'",
+            "SELECT money '$1.00'",
+            "SELECT jsonpath '$.a'",
+            "SELECT pg_catalog.pg_lsn '0/16AE7F7'",
+        ] {
+            let expr = &pg.verified_only_select(sql).projection;
+            assert!(
+                matches!(expr[..], [SelectItem::UnnamedExpr(Expr::TypedString(_))]),
+                "{sql} did not parse as a typed string: {expr:?}"
+            );
+        }
+        // Quoting a word always yields `Keyword::NoKeyword`, so the quoted
+        // spelling rides the same path.
+        assert!(matches!(
+            pg.verified_only_select("SELECT \"pg_lsn\" '0/16AE7F7'").projection[..],
+            [SelectItem::UnnamedExpr(Expr::TypedString(_))]
+        ));
+
+        // A keyword before a literal keeps its own meaning: `NOT` is a unary
+        // negation, not a type name.
+        assert!(matches!(
+            pg.verified_only_select("SELECT NOT 'a' LIKE 'b'").projection[..],
+            [SelectItem::UnnamedExpr(Expr::UnaryOp { .. })]
+        ));
+        // Without a following string constant the word is just an identifier.
+        assert!(matches!(
+            pg.verified_only_select("SELECT pg_lsn FROM t").projection[..],
+            [SelectItem::UnnamedExpr(Expr::Identifier(_))]
+        ));
+        // And a string literal is never an alias in PostgreSQL, so a name that
+        // denotes no type is a bind-time error, not a parse-time one.
+        assert!(matches!(
+            pg.verified_only_select("SELECT nosuchtype 'x'").projection[..],
+            [SelectItem::UnnamedExpr(Expr::TypedString(_))]
+        ));
     }
 
     #[test]
