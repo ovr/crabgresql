@@ -815,7 +815,19 @@ fn narrowest_column(schema: &TableSchema) -> usize {
 /// Table access: scans and modifications on one table, all judged against the
 /// caller's [`TxnContext`].
 pub trait TableAm: Send + Sync {
-    fn schema(&self) -> &TableSchema;
+    /// The relation's shape, as an immutable snapshot.
+    ///
+    /// A snapshot rather than a borrow because DDL changes a relation's shape
+    /// while other sessions hold a handle on it, and PostgreSQL's own model is
+    /// the same: a backend reads a relcache entry, and DDL makes the *next*
+    /// open see a new one rather than mutating the live one underneath. An
+    /// engine publishes a new schema by swapping the `Arc`; readers that
+    /// already took one keep the consistent version they started with.
+    ///
+    /// Cheap enough to call freely — a refcount bump — but callers on a
+    /// per-row path should hoist it out of the loop, since an engine whose
+    /// schema can change takes a lock to hand one out.
+    fn schema(&self) -> Arc<TableSchema>;
 
     fn capabilities(&self) -> TableCapabilities {
         TableCapabilities::MUTABLE
@@ -868,7 +880,7 @@ pub trait TableAm: Send + Sync {
     /// The default is [`RelStats::unknown`]: an engine that cannot report a
     /// physical size reports nothing rather than a fabricated number.
     fn statistics(&self) -> RelStats {
-        RelStats::unknown(self.schema())
+        RelStats::unknown(&self.schema())
     }
 
     /// The size of this relation's out-of-line ("TOAST") storage, or `None` for

@@ -1583,7 +1583,7 @@ fn scan_source(
 ) -> Source {
     match vector::BatchScan::open(table, txn, projection) {
         Some(scan) => {
-            let layout = vector::layout_of(table.schema());
+            let layout = vector::layout_of(&table.schema());
             let positions = scan_positions(projection, layout.len());
             Source::Batches {
                 node: Box::new(scan),
@@ -1608,7 +1608,7 @@ fn append_source(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Source {
     // relation's layout, so any of them describes the batch. `Append` over zero
     // arms is not a shape the planner emits.
     let first = arms.first();
-    let layout = first.map(|arm| vector::layout_of(arm.relation.table.schema()));
+    let layout = first.map(|arm| vector::layout_of(&arm.relation.table.schema()));
     match (vector::BatchAppend::open(arms, txn), layout) {
         (Some(append), Some(layout)) => {
             let positions = scan_positions(
@@ -1849,7 +1849,9 @@ fn insert_direct(
 ) -> Result<Execution, ExecError> {
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
     // unique index never needs the scan (NOT NULL checks only the new row).
-    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let schema = table.schema();
+    let indexes = table.indexes();
+    let has_unique = indexes.iter().any(|index| index.unique);
     let mut visible: Vec<Tuple> = if has_unique {
         table
             // Unprojected: the UNIQUE check compares whichever columns each
@@ -1861,7 +1863,7 @@ fn insert_direct(
         Vec::new()
     };
     for tuple in &tuples {
-        validate_constraints(table, tuple, visible.iter(), ctx)?;
+        validate_constraints(&schema, &indexes, tuple, visible.iter(), ctx)?;
         if has_unique {
             visible.push(tuple.clone());
         }
@@ -1901,10 +1903,16 @@ fn insert_routed(
     // first time a row routes to a leaf that has a unique index (leaves without
     // one, the common case, never get scanned). `None` = not yet scanned.
     let mut visible: Vec<Option<Vec<Tuple>>> = vec![None; leaves.len()];
+    // Each leaf's shape, fetched once on first use rather than per routed row.
+    let shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = leaves
+        .iter()
+        .map(|leaf| (leaf.schema(), leaf.indexes()))
+        .collect();
     let mut routes: Vec<usize> = Vec::with_capacity(tuples.len());
     for tuple in &tuples {
-        let leaf = route_tuple(parent_schema, leaves, tuple, ctx)?;
-        let has_unique = leaves[leaf].indexes().iter().any(|index| index.unique);
+        let leaf = route_tuple(&parent_schema, leaves, tuple, ctx)?;
+        let (leaf_schema, leaf_indexes) = &shapes[leaf];
+        let has_unique = leaf_indexes.iter().any(|index| index.unique);
         if has_unique && visible[leaf].is_none() {
             visible[leaf] = Some(
                 leaves[leaf]
@@ -1915,8 +1923,10 @@ fn insert_routed(
             );
         }
         match visible[leaf].as_deref() {
-            Some(seen) => validate_constraints(&leaves[leaf], tuple, seen.iter(), ctx)?,
-            None => validate_constraints(&leaves[leaf], tuple, std::iter::empty(), ctx)?,
+            Some(seen) => validate_constraints(leaf_schema, leaf_indexes, tuple, seen.iter(), ctx)?,
+            None => {
+                validate_constraints(leaf_schema, leaf_indexes, tuple, std::iter::empty(), ctx)?
+            }
         }
         if let Some(seen) = visible[leaf].as_mut() {
             seen.push(tuple.clone());
@@ -1965,7 +1975,7 @@ fn route_tuple(
     // The RANGE-admits rule lives in `leaf_admits` (shared with the leaf-bound
     // check), so a routed row lands in exactly the leaf a direct INSERT would.
     for (idx, leaf) in leaves.iter().enumerate() {
-        if leaf_admits(leaf.schema(), tuple) {
+        if leaf_admits(&leaf.schema(), tuple) {
             return Ok(idx);
         }
     }
@@ -2046,9 +2056,14 @@ fn update_inherited(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<_, _>>()?;
-    let has_unique: Vec<bool> = targets
+    // Each target's shape, fetched once rather than per row it matches.
+    let shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = targets
         .iter()
-        .map(|target| target.table.indexes().iter().any(|index| index.unique))
+        .map(|target| (target.table.schema(), target.table.indexes()))
+        .collect();
+    let has_unique: Vec<bool> = shapes
+        .iter()
+        .map(|(_, indexes)| indexes.iter().any(|index| index.unique))
         .collect();
     // Per-target simulation of its live rows after this statement, for UNIQUE
     // checks only. Each target's uniqueness is its own — inheritance does not
@@ -2095,7 +2110,8 @@ fn update_inherited(
                 };
                 let removed = simulated[i].remove(pos);
                 if let Err(error) = validate_constraints(
-                    &target.table,
+                    &shapes[i].0,
+                    &shapes[i].1,
                     &new,
                     simulated[i].iter().map(|(_, t)| t),
                     ctx,
@@ -2105,7 +2121,7 @@ fn update_inherited(
                 }
                 simulated[i].insert(pos, (*tid, new.clone()));
             } else {
-                validate_constraints(&target.table, &new, std::iter::empty(), ctx)?;
+                validate_constraints(&shapes[i].0, &shapes[i].1, &new, std::iter::empty(), ctx)?;
             }
             if let Some(view) = returned {
                 new_rows.push(view);
@@ -2159,7 +2175,9 @@ fn update_direct(
         .collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
     // rows' new values; it is only needed when a unique index exists.
-    let has_unique = table.indexes().iter().any(|index| index.unique);
+    let schema = table.schema();
+    let indexes = table.indexes();
+    let has_unique = indexes.iter().any(|index| index.unique);
     let mut simulated = if has_unique {
         original.clone()
     } else {
@@ -2183,15 +2201,19 @@ fn update_direct(
                 continue;
             };
             let (_, removed) = simulated.remove(pos);
-            if let Err(error) =
-                validate_constraints(table, &new, simulated.iter().map(|(_, t)| t), ctx)
-            {
+            if let Err(error) = validate_constraints(
+                &schema,
+                &indexes,
+                &new,
+                simulated.iter().map(|(_, t)| t),
+                ctx,
+            ) {
                 simulated.insert(pos, (tid, removed));
                 return Err(error);
             }
             simulated.insert(pos, (tid, new.clone()));
         } else {
-            validate_constraints(table, &new, std::iter::empty(), ctx)?;
+            validate_constraints(&schema, &indexes, &new, std::iter::empty(), ctx)?;
         }
         pending.push((tid, new));
     }
@@ -2241,9 +2263,14 @@ fn update_routed(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let parent_schema = parent.schema();
-    let leaf_has_unique: Vec<bool> = leaves
+    // Each leaf's shape, fetched once rather than per row routed to it.
+    let leaf_shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = leaves
         .iter()
-        .map(|leaf| leaf.indexes().iter().any(|index| index.unique))
+        .map(|leaf| (leaf.schema(), leaf.indexes()))
+        .collect();
+    let leaf_has_unique: Vec<bool> = leaf_shapes
+        .iter()
+        .map(|(_, indexes)| indexes.iter().any(|index| index.unique))
         .collect();
     // Scan every leaf once (the parent owns no rows). The collected snapshot
     // drives the match loop and — for leaves with a unique index — seeds the
@@ -2292,7 +2319,7 @@ fn update_routed(
             for (index, expr) in assignments {
                 new[*index] = eval(expr, old, ctx)?;
             }
-            let dst = route_tuple(parent_schema, leaves, &new, ctx)?;
+            let dst = route_tuple(&parent_schema, leaves, &new, ctx)?;
 
             // Validate against the destination leaf. When it has a unique index,
             // check the NEW row against that leaf's simulated rows (excluding the
@@ -2310,7 +2337,8 @@ fn update_routed(
                     };
                     let removed = simulated[dst].remove(pos);
                     if let Err(error) = validate_constraints(
-                        &leaves[dst],
+                        &leaf_shapes[dst].0,
+                        &leaf_shapes[dst].1,
                         &new,
                         simulated[dst].iter().map(|(_, t)| t),
                         ctx,
@@ -2321,7 +2349,8 @@ fn update_routed(
                     simulated[dst].insert(pos, (tid, new.clone()));
                 } else {
                     validate_constraints(
-                        &leaves[dst],
+                        &leaf_shapes[dst].0,
+                        &leaf_shapes[dst].1,
                         &new,
                         simulated[dst].iter().map(|(_, t)| t),
                         ctx,
@@ -2329,7 +2358,13 @@ fn update_routed(
                     simulated[dst].push((tid, new.clone()));
                 }
             } else {
-                validate_constraints(&leaves[dst], &new, std::iter::empty(), ctx)?;
+                validate_constraints(
+                    &leaf_shapes[dst].0,
+                    &leaf_shapes[dst].1,
+                    &new,
+                    std::iter::empty(),
+                    ctx,
+                )?;
             }
             // A moved-out row leaves its source leaf's simulation so a later row
             // routed back to that leaf does not see the stale OLD value.
@@ -2384,13 +2419,16 @@ fn update_routed(
     }
 }
 
+/// Takes the relation's shape rather than the relation, so a caller validating
+/// a batch fetches it once instead of per row — `schema()` and `indexes()` both
+/// cost a lock and a clone on an engine whose DDL can republish them.
 fn validate_constraints<'a>(
-    table: &Arc<dyn TableAm>,
+    schema: &TableSchema,
+    indexes: &[IndexMetadata],
     tuple: &Tuple,
     existing: impl Iterator<Item = &'a Tuple>,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
-    let schema = table.schema();
     for (column, value) in schema.columns.iter().zip(tuple) {
         if !column.nullable && matches!(value, Value::Null) {
             return Err(ExecError::new(
@@ -2413,7 +2451,7 @@ fn validate_constraints<'a>(
     check_partition_bound(schema, tuple, ctx)?;
 
     let existing: Vec<&Tuple> = existing.collect();
-    for index in table.indexes().iter().filter(|index| index.unique) {
+    for index in indexes.iter().filter(|index| index.unique) {
         if unique_key_skipped(index, tuple) {
             continue;
         }

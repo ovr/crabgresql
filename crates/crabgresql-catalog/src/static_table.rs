@@ -18,14 +18,14 @@ use crabgresql_txn::Xid;
 
 /// One materialized `pg_catalog` relation: its schema plus a fixed set of rows.
 pub struct StaticTable {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     rows: Arc<Vec<Tuple>>,
 }
 
 impl StaticTable {
     pub fn new(schema: TableSchema, rows: Vec<Tuple>) -> Self {
         Self {
-            schema,
+            schema: Arc::new(schema),
             rows: Arc::new(rows),
         }
     }
@@ -44,8 +44,8 @@ impl StaticTable {
 }
 
 impl TableAm for StaticTable {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
+    fn schema(&self) -> Arc<TableSchema> {
+        Arc::clone(&self.schema)
     }
 
     /// Exact, not estimated: the rows are already materialized, so counting them

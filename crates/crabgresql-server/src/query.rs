@@ -1955,7 +1955,7 @@ fn execute_truncate(
         if target.only {
             continue;
         }
-        for child in crabgresql_binder::inheritance_descendants(engine, table.schema())? {
+        for child in crabgresql_binder::inheritance_descendants(engine, &table.schema())? {
             push(child);
         }
     }
@@ -2239,7 +2239,7 @@ fn execute_create_index(
     }
     let table = engine.open_table(&table_name)?;
     reject_partitioned_parent(&table, &table_name)?;
-    let keys = simple_index_keys(table.schema(), &create.columns)?;
+    let keys = simple_index_keys(&table.schema(), &create.columns)?;
     // PG names an unnamed index after the table and every key column, e.g.
     // `t_a_b_idx`, then bumps the label on collision (`t_a_b_idx1`).
     let index_name = explicit_name.unwrap_or_else(|| {
@@ -2280,7 +2280,7 @@ fn validate_unique_index_build(
     // check, the error DETAIL and the `seen` comparisons alike.
     let projection = crabgresql_storage_api::ColumnProjection::of(
         index.keys.iter().map(|key| key.column),
-        schema,
+        &schema,
     );
     for row in table.scan(txn, &projection) {
         let (_, tuple) = row?;
@@ -2294,7 +2294,7 @@ fn validate_unique_index_build(
         }
         if seen
             .iter()
-            .any(|other| index_rows_equal(schema, index, &tuple, other))
+            .any(|other| index_rows_equal(&schema, index, &tuple, other))
         {
             let names = index
                 .keys

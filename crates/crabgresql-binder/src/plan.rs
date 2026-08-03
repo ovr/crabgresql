@@ -587,20 +587,20 @@ fn scan_arms(
     let schema = table.schema();
     if schema.partition_scheme.is_some() {
         let mut arms = Vec::new();
-        for leaf in partition_leaves(engine, schema)? {
+        for leaf in partition_leaves(engine, &schema)? {
             // A leaf is a verbatim clone of the parent's layout, so identity.
             push_storage_leaves(&mut arms, leaf, None);
         }
         return Ok(Some(arms));
     }
     if !only {
-        let descendants = inheritance_descendants(engine, schema)?;
+        let descendants = inheritance_descendants(engine, &schema)?;
         if !descendants.is_empty() {
             // The parent owns rows of its own and reads first, in its own layout.
             let mut arms = Vec::new();
             push_storage_leaves(&mut arms, table.clone(), None);
             for child in descendants {
-                let map = inherit_map(schema, child.schema())?;
+                let map = inherit_map(&schema, &child.schema())?;
                 push_storage_leaves(&mut arms, child, map);
             }
             return Ok(Some(arms));
@@ -632,13 +632,13 @@ fn write_targets(
         return Ok(Vec::new());
     }
     let schema = table.schema();
-    let descendants = inheritance_descendants(engine, schema)?;
+    let descendants = inheritance_descendants(engine, &schema)?;
     if descendants.is_empty() {
         return Ok(Vec::new());
     }
     let mut targets = vec![arm(table.clone(), None)];
     for child in descendants {
-        let map = inherit_map(schema, child.schema())?;
+        let map = inherit_map(&schema, &child.schema())?;
         targets.push(arm(child, map));
     }
     Ok(targets)
@@ -5868,7 +5868,8 @@ pub enum CopyFromSource {
 pub struct CopyFromPlan {
     table: Arc<dyn TableAm>,
     table_name: String,
-    schema: TableSchema,
+    /// The shape COPY was planned against, pinned for the statement's life.
+    schema: Arc<TableSchema>,
     /// One schema-column index per data column, in wire order.
     target_indices: Vec<usize>,
     /// Default expression per schema column (used for columns not in the list).
@@ -10609,22 +10610,25 @@ mod tests {
     /// `schema` and `storage_leaves` are exercised — `scan_arms` inspects
     /// metadata and never touches rows.
     struct SplitTable {
-        schema: TableSchema,
+        schema: Arc<TableSchema>,
         leaves: Vec<Arc<dyn TableAm>>,
     }
 
     impl SplitTable {
         fn new(name: &str, leaves: Vec<Arc<dyn TableAm>>) -> Arc<dyn TableAm> {
             Arc::new(Self {
-                schema: TableSchema::new(name, vec![Column::new("id", PgType::Int4)]),
+                schema: Arc::new(TableSchema::new(
+                    name,
+                    vec![Column::new("id", PgType::Int4)],
+                )),
                 leaves,
             })
         }
     }
 
     impl TableAm for SplitTable {
-        fn schema(&self) -> &TableSchema {
-            &self.schema
+        fn schema(&self) -> Arc<TableSchema> {
+            Arc::clone(&self.schema)
         }
         fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
             (!self.leaves.is_empty()).then(|| self.leaves.clone())

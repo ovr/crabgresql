@@ -184,7 +184,7 @@ impl ManagedTable {
 }
 
 impl TableAm for ManagedTable {
-    fn schema(&self) -> &TableSchema {
+    fn schema(&self) -> Arc<TableSchema> {
         self.as_am().schema()
     }
 
@@ -1837,7 +1837,7 @@ impl TableEngine for PgEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
-            .map(|t| t.schema().clone())
+            .map(|t| (*t.schema()).clone())
             .collect()
     }
 
@@ -1884,7 +1884,7 @@ impl TableEngine for PgEngine {
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
             .map(|t| RelationMetadata {
-                schema: t.schema().clone(),
+                schema: (*t.schema()).clone(),
                 indexes: t.indexes(),
                 stats: t.statistics(),
                 toast: t.toast_statistics(),

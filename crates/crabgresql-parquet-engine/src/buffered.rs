@@ -36,7 +36,7 @@ use crate::{ParquetSwap, ParquetTable};
 /// The chunk store and its write buffer under one relation identity.
 pub struct BufferedParquetTable {
     /// The user-visible relation schema; its `access_method` is `Parquet`.
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     /// Leaf 0: the durable, immutable fragment store.
     chunks: Arc<ParquetTable>,
     /// Leaf 1: the WAL-logged RAM buffer.
@@ -258,8 +258,8 @@ impl BufferedParquetTable {
 }
 
 impl TableAm for BufferedParquetTable {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
+    fn schema(&self) -> Arc<TableSchema> {
+        Arc::clone(&self.schema)
     }
 
     /// Identical to the chunk store's: append-only plus TRUNCATE. The buffer leaf

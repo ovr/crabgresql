@@ -490,7 +490,7 @@ fn open_reader(
 /// scan: `fetch` addresses rows by their ordinal *within a scan*, and DML needs
 /// that identity.
 struct ParquetBatchScan {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     /// The relation's `scan_schema`, built once. Every batch is stamped with it,
     /// and deriving it per batch would rebuild a `Field` and a metadata map per
     /// column — on a hundred-column relation that dwarfs the widening.
@@ -549,7 +549,7 @@ impl Iterator for ParquetBatchScan {
 }
 
 struct ParquetScan {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     rel: u32,
     /// The columns to read off disk. Prunes work only: a mask never changes how
     /// many rows a fragment yields or the order they arrive in, which is what
@@ -651,7 +651,7 @@ struct PendingTruncate {
 }
 
 pub struct ParquetTable {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     /// The data directory. The table's fragments live in `root/parquet/<rel>`,
     /// which TRUNCATE swaps — so the path is derived, never cached.
     root: PathBuf,
@@ -712,7 +712,7 @@ impl ParquetTable {
         std::fs::create_dir_all(&dir)
             .map_err(|error| io_error("create Parquet table directory", error))?;
         Ok(Self {
-            schema,
+            schema: Arc::new(schema),
             root: root.to_path_buf(),
             live_rel: AtomicU32::new(rel),
             pending: RwLock::new(None),
@@ -1192,7 +1192,7 @@ impl ParquetTable {
         let rel = self.effective_rel(txn.xid);
         Ok(ParquetBatchScan {
             stamp: crabgresql_storage_api::arrow::scan_schema(&self.schema),
-            schema: self.schema.clone(),
+            schema: Arc::clone(&self.schema),
             rel,
             projection: projection.clone(),
             fragments: self.visible_fragments(rel, txn)?,
@@ -1214,7 +1214,7 @@ impl ParquetTable {
         projection: &ColumnProjection,
     ) -> ParquetScan {
         ParquetScan {
-            schema: self.schema.clone(),
+            schema: Arc::clone(&self.schema),
             rel,
             projection: projection.clone(),
             fragments,
@@ -1425,8 +1425,8 @@ fn decode_truncate(xid: Xid, payload: &[u8]) -> Result<RecoveredParquetTruncate,
 }
 
 impl TableAm for ParquetTable {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
+    fn schema(&self) -> Arc<TableSchema> {
+        Arc::clone(&self.schema)
     }
 
     fn capabilities(&self) -> TableCapabilities {
@@ -3104,7 +3104,7 @@ mod tests {
 
         let reader = tm.context(Xid::INVALID, CommandId::FIRST);
         let projected: Vec<Tuple> = table
-            .scan(&reader, &ColumnProjection::of([0, 2], table.schema()))
+            .scan(&reader, &ColumnProjection::of([0, 2], &table.schema()))
             .map(|result| result.map(|(_, tuple)| tuple))
             .collect::<Result<_, _>>()?;
 
@@ -3139,7 +3139,7 @@ mod tests {
         let reader = tm.context(Xid::INVALID, CommandId::FIRST);
         for column in [1usize, 3] {
             let rows: Vec<Tuple> = table
-                .scan(&reader, &ColumnProjection::of([column], table.schema()))
+                .scan(&reader, &ColumnProjection::of([column], &table.schema()))
                 .map(|result| result.map(|(_, tuple)| tuple))
                 .collect::<Result<_, _>>()?;
             let mut want = vec![Value::Null; row.len()];
@@ -3332,7 +3332,7 @@ mod tests {
         let reader = tm.context(Xid::INVALID, CommandId::FIRST);
         // Project around the `Interval` struct column, the case a naive
         // positional decode gets wrong.
-        let projection = ColumnProjection::of([2], table.schema());
+        let projection = ColumnProjection::of([2], &table.schema());
         let batched = batch_scan_rows(&table, &reader, &projection)?;
         let scanned: Vec<Tuple> = table
             .scan(&reader, &projection)
@@ -3378,9 +3378,9 @@ mod tests {
         };
         let full = tids(&ColumnProjection::All)?;
         assert_eq!(full.len(), 6);
-        assert_eq!(tids(&ColumnProjection::of([2], table.schema()))?, full);
+        assert_eq!(tids(&ColumnProjection::of([2], &table.schema()))?, full);
         // The empty set is the `count(*)` shape, normalized to one column.
-        assert_eq!(tids(&ColumnProjection::of([], table.schema()))?, full);
+        assert_eq!(tids(&ColumnProjection::of([], &table.schema()))?, full);
 
         // `fetch` still resolves each tid to the whole row.
         for tid in full {
