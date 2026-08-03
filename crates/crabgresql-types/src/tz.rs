@@ -327,8 +327,13 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 /// [`MAX_TZ_DISPLACEMENT_SECS`] one, and an unsigned offset is legal. Named
 /// zones, the [`ABBREVS`] table, `Z`/`zulu` and `UTC`/`GMT` mean the same in
 /// both readers.
+///
+/// The token is **not trimmed**, unlike [`resolve_zone`]'s: PG matches a zone
+/// argument as given, so `'UTC '` and `' UTC'` are both `22023`. Only the
+/// numeric form tolerates leading whitespace (`' +05:30'` is UTC−5:30), which
+/// [`parse_posix_offset`] handles.
 pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
-    let token = name.trim();
+    let token = name;
     let not_recognized = || ZoneError::NotRecognized(name.to_string());
     if token.is_empty() {
         return Err(not_recognized());
@@ -395,6 +400,11 @@ fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
 /// both `UTC+168` and a bare `+16` *inside a value*. A fractional hour is
 /// truncated toward zero (`UTC+5.5` is UTC−5), as PG's POSIX reader does.
 fn parse_posix_offset(body: &str) -> Option<i32> {
+    // Leading whitespace is skipped, as PG's reader does — `' +05:30'` is a
+    // legal zone argument. Trailing whitespace is *not*: PG reads it as the
+    // start of a DST abbreviation, which we do not implement (see
+    // [`resolve_zone_arg`]), so we refuse it rather than guess.
+    let body = body.trim_start();
     let (sign, digits): (i64, &str) = match body.as_bytes().first()? {
         b'+' => (1, &body[1..]),
         b'-' => (-1, &body[1..]),
@@ -879,6 +889,39 @@ mod tests {
                 "{tok:?}"
             );
         }
+        Ok(())
+    }
+
+    /// A zone *argument* is matched as given: PG does not trim it, so a padded
+    /// name is `22023` rather than the zone it names. Only the numeric form
+    /// tolerates leading whitespace. Pinned against PG 18.4, where
+    /// `AT TIME ZONE 'UTC '` errors while `AT TIME ZONE ' +05:30'` is UTC−5:30.
+    #[test]
+    fn a_padded_zone_argument_is_not_the_zone() -> anyhow::Result<()> {
+        for tok in [
+            "UTC ",
+            " UTC",
+            "  utc  ",
+            "America/New_York ",
+            " America/New_York",
+            "MSK ",
+        ] {
+            assert!(
+                matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
+                "{tok:?}"
+            );
+        }
+        // Leading whitespace on a displacement is skipped; trailing is not —
+        // PG reads it as the start of a DST abbreviation, a form we refuse.
+        assert_eq!(fixed(&resolve_zone_arg(" +05:30")?), -(5 * 3600 + 30 * 60));
+        assert_eq!(fixed(&resolve_zone_arg("\t5")?), -5 * 3600);
+        assert!(matches!(
+            resolve_zone_arg("+05:30 "),
+            Err(ZoneError::NotRecognized(_))
+        ));
+        // The value reader keeps its own trim: a datetime literal's lexer has
+        // already split the token out, so padding never reaches it in practice.
+        assert_eq!(fixed(&resolve_zone("  UTC  ")?), 0);
         Ok(())
     }
 

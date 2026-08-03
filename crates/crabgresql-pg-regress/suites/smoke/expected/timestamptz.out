@@ -686,6 +686,18 @@ SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+0530';
 ERROR:  time zone "+0530" not recognized
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+168';
 ERROR:  time zone "+168" not recognized
+-- a zone argument is matched as given: a padded *name* is not that zone, while
+-- a displacement may carry leading whitespace
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' +05:30' AS padded_offset;
+     padded_offset      
+------------------------
+ 2001-06-16 17:30:00+00
+(1 row)
+
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'UTC ';
+ERROR:  time zone "UTC " not recognized
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' America/New_York';
+ERROR:  time zone " America/New_York" not recognized
 SELECT 'still alive' AS status;
    status    
 -------------

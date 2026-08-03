@@ -263,4 +263,9 @@ SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+16' AS wide_band,
        timestamp '2001-06-16 12:00:00' AT TIME ZONE 'UTC+10' AS abbrev_prefix;
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+0530';
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+168';
+-- a zone argument is matched as given: a padded *name* is not that zone, while
+-- a displacement may carry leading whitespace
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' +05:30' AS padded_offset;
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'UTC ';
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' America/New_York';
 SELECT 'still alive' AS status;
