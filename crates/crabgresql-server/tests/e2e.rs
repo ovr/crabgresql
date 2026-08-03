@@ -10920,3 +10920,44 @@ async fn a_relative_literal_resolves_through_an_explicit_text_cast() -> anyhow::
     assert_eq!(e, "invalid input syntax for type timestamp: \"garbage\"");
     Ok(())
 }
+
+/// The `CURRENT_TIMESTAMP` family is a grammar production, so only the bare
+/// unquoted spelling is one.
+///
+/// The binder sees a lowercased, unquoted name and cannot tell `current_date`
+/// from `"current_date"` — so it has to consult the unnormalized name. Before
+/// it did, every function whose bare name matched was intercepted: a user's
+/// `"localtime"(int)` was unreachable and its argument was reinterpreted as a
+/// fractional-second precision.
+#[tokio::test]
+async fn only_the_keyword_spelling_binds_to_the_clock() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "CREATE FUNCTION \"localtime\"(int) RETURNS int LANGUAGE SQL AS 'SELECT $1 + 1'",
+        )
+        .await?;
+    assert_eq!(scalar(&client, "SELECT \"localtime\"(1)").await, "2");
+
+    // A quoted zero-arg call names no function, exactly as in PostgreSQL.
+    let e = client
+        .simple_query("SELECT \"current_timestamp\"()")
+        .await
+        .expect_err("quoted spelling is not the keyword")
+        .as_db_error()
+        .expect("a database error")
+        .message()
+        .to_string();
+    assert_eq!(e, "function current_timestamp() does not exist");
+
+    // ...and the keyword spelling is untouched.
+    for sql in [
+        "SELECT current_date = now()::date",
+        "SELECT current_timestamp(2) = now()::timestamptz(2)",
+        "SELECT localtime = now()::time",
+    ] {
+        assert_eq!(scalar(&client, sql).await, "t", "for `{sql}`");
+    }
+    Ok(())
+}
