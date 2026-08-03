@@ -400,3 +400,52 @@ SELECT interval '1 m' AS one_minute, interval '1 mon' AS one_month;
  00:01:00   | 1 mon
 (1 row)
 
+-- an SQL field qualifier masks the literal: fields coarser than its *trailing*
+-- field are kept, finer ones dropped, truncating toward zero
+SELECT interval '1 year 2 mons 3 days 4:05:06' year AS yr,
+       interval '1 year 2 mons 3 days 4:05:06' month AS mo,
+       interval '1 year 2 mons 3 days 4:05:06' day AS dy;
+   yr   |      mo       |          dy          
+--------+---------------+----------------------
+ 1 year | 1 year 2 mons | 1 year 2 mons 3 days
+(1 row)
+
+SELECT interval '1 year 2 mons 3 days 4:05:06' hour AS hr,
+       interval '1 year 2 mons 3 days 4:05:06' minute AS mi;
+              hr               |              mi               
+-------------------------------+-------------------------------
+ 1 year 2 mons 3 days 04:00:00 | 1 year 2 mons 3 days 04:05:00
+(1 row)
+
+SELECT interval '1 2:03:04' day to hour AS day_to_hour,
+       interval '-1.75 hours' hour AS neg_truncates_toward_zero,
+       interval '-13 mons' year AS neg_year;
+  day_to_hour   | neg_truncates_toward_zero | neg_year 
+----------------+---------------------------+----------
+ 1 day 02:00:00 | -01:00:00                 | -1 years
+(1 row)
+
+-- a lone number takes the range's *fine* end; a `D HH:MM:SS` form takes its
+-- coarse end, because that is where the SQL form puts the leading integer
+SELECT interval '1' year to month AS lone_ytm, interval '5' day to hour AS lone_dth,
+       interval '90' minute to second AS lone_mts,
+       interval '3 4:05:06' day to second AS with_time;
+ lone_ytm | lone_dth | lone_mts |    with_time    
+----------+----------+----------+-----------------
+ 1 mon    | 05:00:00 | 00:01:30 | 3 days 04:05:06
+(1 row)
+
+-- a bare `m` is minutes, so a MONTH qualifier masks it away entirely
+SELECT interval '1 m' AS bare_m, interval '1 m' month AS masked_m;
+  bare_m  | masked_m 
+----------+----------
+ 00:01:00 | 00:00:00
+(1 row)
+
+-- an infinite interval masks to itself
+SELECT interval 'infinity' month AS inf;
+   inf    
+----------
+ infinity
+(1 row)
+

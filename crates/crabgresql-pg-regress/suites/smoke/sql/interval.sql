@@ -138,3 +138,22 @@ SELECT date_bin(interval 'infinity', timestamp '2001-02-16 20:38:40', timestamp 
 SELECT date_bin(interval '-infinity', timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00');
 -- a bare `m` in an interval literal is minutes, not months
 SELECT interval '1 m' AS one_minute, interval '1 mon' AS one_month;
+-- an SQL field qualifier masks the literal: fields coarser than its *trailing*
+-- field are kept, finer ones dropped, truncating toward zero
+SELECT interval '1 year 2 mons 3 days 4:05:06' year AS yr,
+       interval '1 year 2 mons 3 days 4:05:06' month AS mo,
+       interval '1 year 2 mons 3 days 4:05:06' day AS dy;
+SELECT interval '1 year 2 mons 3 days 4:05:06' hour AS hr,
+       interval '1 year 2 mons 3 days 4:05:06' minute AS mi;
+SELECT interval '1 2:03:04' day to hour AS day_to_hour,
+       interval '-1.75 hours' hour AS neg_truncates_toward_zero,
+       interval '-13 mons' year AS neg_year;
+-- a lone number takes the range's *fine* end; a `D HH:MM:SS` form takes its
+-- coarse end, because that is where the SQL form puts the leading integer
+SELECT interval '1' year to month AS lone_ytm, interval '5' day to hour AS lone_dth,
+       interval '90' minute to second AS lone_mts,
+       interval '3 4:05:06' day to second AS with_time;
+-- a bare `m` is minutes, so a MONTH qualifier masks it away entirely
+SELECT interval '1 m' AS bare_m, interval '1 m' month AS masked_m;
+-- an infinite interval masks to itself
+SELECT interval 'infinity' month AS inf;

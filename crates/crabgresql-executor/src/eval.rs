@@ -469,10 +469,14 @@ fn eval_catalog_fn(
             | ScalarFn::PgTableIsVisible
             | ScalarFn::RegIn(_)
             | ScalarFn::RegFromOid(_)
+            | ScalarFn::PgTypeof(_)
     ) {
         return None;
     }
-    if matches!(args[0], Value::Null) {
+    // Every function here but `pg_typeof` is STRICT, and this path runs ahead of
+    // `eval_scalar`'s NULL short-circuit, so the check is hand-rolled.
+    // `pg_typeof(NULL)` reports the argument's declared type, not NULL.
+    if !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args[0], Value::Null) {
         return Some(Ok(Value::Null));
     }
     let Some(ops) = ctx.catalog.as_deref() else {
@@ -481,6 +485,17 @@ fn eval_catalog_fn(
             "catalog function evaluated without a catalog context",
         )));
     };
+    // `pg_typeof` names the type the binder recorded on the call. It returns
+    // before `oid_of` below, which accepts only `Value::Oid` — the argument here
+    // is the user's own expression, of any type, already evaluated for its errors
+    // and side effects and of no further use.
+    if let ScalarFn::PgTypeof(type_oid) = func {
+        return Some(Ok(Value::Reg(crate::reg::from_oid(
+            crabgresql_types::RegKind::Type,
+            type_oid,
+            ops,
+        ))));
+    }
     // The binder declares the OID-taking arguments as `oid` and inserts the
     // coercion, so the value has already arrived as one — including the
     // reinterpret-not-clamp of a negative (PG prints `pg_get_userbyid(-1)` as
@@ -678,12 +693,18 @@ fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogO
         return "-".to_string();
     }
     let Some(ty) = PgType::from_oid(oid) else {
-        // Not a built-in: a `CREATE TYPE` type resolves through the catalog, the
-        // same lookup `regtype` renders through, so the two agree on a name.
-        // Anything else is `???`, as in PG.
-        return catalog
-            .and_then(|ops| ops.user_type_name(oid))
-            .map_or_else(|| "???".to_string(), |(_, name)| quote_ident(&name));
+        // Not a built-in: a pseudo-type names itself from the shared table, and a
+        // `CREATE TYPE` type resolves through the catalog. Both are the lookups
+        // `regtype` renders through, so the two agree on a name. Anything else is
+        // `???`, as in PG.
+        return crabgresql_types::pseudo_type_name(oid)
+            .map(str::to_string)
+            .or_else(|| {
+                catalog
+                    .and_then(|ops| ops.user_type_name(oid))
+                    .map(|(_, name)| quote_ident(&name))
+            })
+            .unwrap_or_else(|| "???".to_string());
     };
     // An array formats its element type (carrying the modifier) with `[]`; a
     // user-defined type needs the catalog. Both are the cases `format_type`

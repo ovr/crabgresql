@@ -60,6 +60,45 @@ SELECT pg_typeof(a) AS a, pg_typeof(b) AS b, pg_typeof(c) AS c FROM pt_t;
 DROP TABLE pt_t;
 -- pg_typeof takes exactly one argument
 SELECT pg_typeof(1, 2);
+-- pseudo-types (pg_type.typtype = 'p') have a catalog row but no runtime
+-- representation, so they are named from a shared table rather than resolved as
+-- a type. `any` prints quoted, and oid 2287's typname `_record` prints as an array.
+SELECT 705::regtype AS unknown_, 2249::regtype AS record_, 2276::regtype AS any_,
+       2283::regtype AS anyelement_, 2287::regtype AS record_array;
+-- the input direction resolves the same names, and folds case like any other
+SELECT 'unknown'::regtype AS u, 'record'::regtype AS r, '"any"'::regtype AS a,
+       'ANYELEMENT'::regtype AS folded, 'pg_catalog.void'::regtype AS qualified;
+SELECT 'unknown'::regtype = 705::regtype AS roundtrip;
+-- format_type and regtype must agree on the name
+SELECT format_type(705, NULL) AS ft_unknown, format_type(2249, NULL) AS ft_record;
+-- pg_typeof reports an untyped literal as `unknown`, which is why the above
+-- matters; the two spellings compare equal
+SELECT pg_typeof('abc') AS lit, pg_typeof('abc') = 'unknown'::regtype AS eq;
+-- pg_typeof keeps its argument: the argument is still evaluated, and every pass
+-- that walks a call's arguments still sees it.
+CREATE TABLE pt_ev (a int, b int);
+INSERT INTO pt_ev VALUES (1, 10), (2, 20), (3, 30);
+-- an aggregate inside pg_typeof still groups, so this is one row and not three
+SELECT pg_typeof(count(*)) AS agg FROM pt_ev;
+-- ... and a bare column beside a grouped one is still rejected
+SELECT pg_typeof(a) FROM pt_ev GROUP BY b;
+-- the argument's own errors still surface
+SELECT pg_typeof(1/0);
+-- ... and its side effects still happen
+CREATE SEQUENCE pt_s;
+SELECT pg_typeof(nextval('pt_s')) AS nx;
+SELECT currval('pt_s') AS advanced;
+-- a stored DEFAULT round-trips: the argument keeps the type it was written with,
+-- so a bare literal is still `unknown` when the default is re-bound per row
+CREATE TABLE pt_def (b text DEFAULT pg_typeof('abc'), c text DEFAULT pg_typeof(1),
+                     d text DEFAULT pg_typeof('x'::text));
+SELECT column_name, column_default FROM information_schema.columns
+ WHERE table_name = 'pt_def' ORDER BY ordinal_position;
+INSERT INTO pt_def DEFAULT VALUES;
+SELECT * FROM pt_def;
+DROP TABLE pt_def;
+DROP SEQUENCE pt_s;
+DROP TABLE pt_ev;
 -- sequences are relations, so nextval takes either spelling
 CREATE SEQUENCE rc_s;
 SELECT nextval('rc_s') AS bare, nextval('rc_s'::regclass) AS via_regclass;

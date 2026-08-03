@@ -1247,15 +1247,13 @@ pub fn bin(stride: Interval, source: i64, origin: i64) -> Result<i64, TimestampE
     let diff = source
         .checked_sub(origin)
         .ok_or_else(interval_out_of_range)?;
-    // Truncate toward zero, then step one bin further back when `source` is
-    // below `origin`, so the result is always the bin's lower edge.
-    let rem = diff % stride_usec;
-    let mut delta = diff - rem;
-    if rem < 0 {
-        delta = delta
-            .checked_sub(stride_usec)
-            .ok_or_else(interval_out_of_range)?;
-    }
+    // Floor rather than truncate, so a `source` below `origin` still lands on
+    // the bin's lower edge. `stride_usec` is positive by the check above, so the
+    // division itself cannot overflow.
+    let delta = diff
+        .div_euclid(stride_usec)
+        .checked_mul(stride_usec)
+        .ok_or_else(interval_out_of_range)?;
     let result = origin
         .checked_add(delta)
         .ok_or_else(timestamp_out_of_range)?;
@@ -1704,13 +1702,6 @@ mod tests {
         Ok(())
     }
 
-    fn iv(s: &str) -> Interval {
-        match interval::parse(s) {
-            Ok(value) => value,
-            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
-        }
-    }
-
     /// For every stride that also names a `date_trunc` unit, the two agree —
     /// in all four combinations of era and origin/source ordering, which is
     /// what pins the floor-toward-negative-infinity step.
@@ -1734,7 +1725,7 @@ mod tests {
         for (source, origin) in cases {
             for (unit, stride) in units {
                 assert_eq!(
-                    bin(iv(stride), ts(source), ts(origin))?,
+                    bin(span(stride), ts(source), ts(origin))?,
                     date_trunc(unit, ts(source))?,
                     "date_bin('{stride}', '{source}', '{origin}') != date_trunc('{unit}', ...)"
                 );
@@ -1749,7 +1740,7 @@ mod tests {
         let source = ts("2020-02-11 15:44:17.71393");
         let origin = ts("2001-01-01");
         let binned = |stride: &str| -> anyhow::Result<String> {
-            Ok(format(bin(iv(stride), source, origin)?))
+            Ok(format(bin(span(stride), source, origin)?))
         };
         assert_eq!(binned("15 days")?, "2020-02-06 00:00:00");
         assert_eq!(binned("2 hours")?, "2020-02-11 14:00:00");
@@ -1762,7 +1753,7 @@ mod tests {
         // The origin shifts the bin edges off the natural boundary.
         assert_eq!(
             format(bin(
-                iv("5 min"),
+                span("5 min"),
                 ts("2020-02-01 01:01:01"),
                 ts("2020-02-01 00:02:30")
             )?),
@@ -1772,7 +1763,7 @@ mod tests {
         // which only holds because the negative remainder steps back a bin.
         assert_eq!(
             format(bin(
-                iv("30 minutes"),
+                span("30 minutes"),
                 ts("2024-02-01 15:00:00"),
                 ts("2024-02-01 17:00:00")
             )?),
@@ -1780,7 +1771,7 @@ mod tests {
         );
         assert_eq!(
             format(bin(
-                iv("30 minutes"),
+                span("30 minutes"),
                 ts("2024-02-01 16:59:59"),
                 ts("2024-02-01 17:00:00")
             )?),
@@ -1789,7 +1780,7 @@ mod tests {
         // An exact hit on a bin edge stays put.
         assert_eq!(
             format(bin(
-                iv("30 minutes"),
+                span("30 minutes"),
                 ts("2024-02-01 17:00:00"),
                 ts("2024-02-01 17:00:00")
             )?),
@@ -1802,7 +1793,7 @@ mod tests {
     /// Every rejection, and — where two would fire at once — the one PG picks.
     #[test]
     fn date_bin_rejections_and_their_precedence() {
-        let err = |stride: &str, source: i64, origin: i64| match bin(iv(stride), source, origin) {
+        let err = |stride: &str, source: i64, origin: i64| match bin(span(stride), source, origin) {
             Err(e) => (e.sqlstate, e.message),
             Ok(v) => panic!("expected an error, got {}", format(v)),
         };
@@ -1862,9 +1853,12 @@ mod tests {
         );
 
         // Precedence. An infinite source wins over every other complaint...
-        assert_eq!(bin(iv("0 s"), POS_INFINITY, origin), Ok(POS_INFINITY));
-        assert_eq!(bin(iv("1 mon"), NEG_INFINITY, origin), Ok(NEG_INFINITY));
-        assert_eq!(bin(iv("infinity"), NEG_INFINITY, origin), Ok(NEG_INFINITY));
+        assert_eq!(bin(span("0 s"), POS_INFINITY, origin), Ok(POS_INFINITY));
+        assert_eq!(bin(span("1 mon"), NEG_INFINITY, origin), Ok(NEG_INFINITY));
+        assert_eq!(
+            bin(span("infinity"), NEG_INFINITY, origin),
+            Ok(NEG_INFINITY)
+        );
         // ...an infinite origin over every complaint about the stride...
         for stride in ["0 s", "5 months", "infinity", "1 h"] {
             assert_eq!(

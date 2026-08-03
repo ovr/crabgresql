@@ -185,6 +185,76 @@ pub mod oid {
     pub const OIDVECTOR_ARRAY: u32 = 1013;
 }
 
+/// PostgreSQL's pseudo-types (`pg_type.typtype = 'p'`): real catalog rows that
+/// have no runtime representation, so deliberately no [`PgType`] — a pseudo-type
+/// cannot be a column, a value, or a parameter. `CREATE TABLE t (a unknown)` is
+/// `column "a" has pseudo-type unknown` in PG, and giving these a `PgType` would
+/// make them declarable.
+///
+/// They still have to *name* themselves wherever an OID renders as a type name,
+/// which is three independent places: `regtype`'s output, `regtype`'s input, and
+/// `format_type`. `pg_typeof` made this load-bearing — an untyped literal reports
+/// `unknown` — and `format_type` and `regtype` are required to agree.
+///
+/// The list is generated from the vendored `pg_type.dat` and pinned by a drift
+/// test in `crabgresql-catalog`.
+///
+/// The entries are `(oid, typname, rendered name)`. The rendered name differs
+/// twice: `any` prints quoted, the way `"char"` does, and `_record` prints as
+/// `record[]`.
+const PSEUDO_TYPES: &[(u32, &str, &str)] = &[
+    (32, "pg_ddl_command", "pg_ddl_command"),
+    (269, "table_am_handler", "table_am_handler"),
+    (325, "index_am_handler", "index_am_handler"),
+    (oid::UNKNOWN, "unknown", "unknown"),
+    (2249, "record", "record"),
+    (2275, "cstring", "cstring"),
+    (2276, "any", "\"any\""),
+    (2277, "anyarray", "anyarray"),
+    (2278, "void", "void"),
+    (2279, "trigger", "trigger"),
+    (2280, "language_handler", "language_handler"),
+    (2281, "internal", "internal"),
+    (2283, "anyelement", "anyelement"),
+    (2287, "_record", "record[]"),
+    (2776, "anynonarray", "anynonarray"),
+    (3115, "fdw_handler", "fdw_handler"),
+    (3310, "tsm_handler", "tsm_handler"),
+    (3500, "anyenum", "anyenum"),
+    (3831, "anyrange", "anyrange"),
+    (3838, "event_trigger", "event_trigger"),
+    (4537, "anymultirange", "anymultirange"),
+    (4538, "anycompatiblemultirange", "anycompatiblemultirange"),
+    (5077, "anycompatible", "anycompatible"),
+    (5078, "anycompatiblearray", "anycompatiblearray"),
+    (5079, "anycompatiblenonarray", "anycompatiblenonarray"),
+    (5080, "anycompatiblerange", "anycompatiblerange"),
+];
+
+/// The name a pseudo-type OID renders as, for `regtype` output and
+/// `format_type`. `None` for every other OID. See [`PSEUDO_TYPES`].
+pub fn pseudo_type_name(oid: u32) -> Option<&'static str> {
+    PSEUDO_TYPES
+        .iter()
+        .find(|(o, _, _)| *o == oid)
+        .map(|(_, _, rendered)| *rendered)
+}
+
+/// The OID a pseudo-type name denotes, for `regtype` input. The name is the
+/// catalog `typname`, already unquoted and case-folded by the caller.
+///
+/// Divergence: PG rejects a bare `'any'::regtype` with a *syntax* error, because
+/// `any` is a reserved word in its type-name grammar, and resolves only the
+/// quoted `'"any"'::regtype`. Both spellings resolve here — reproducing the
+/// rejection would mean carrying "was it quoted" through name splitting for the
+/// one pseudo-type that is a keyword.
+pub fn pseudo_type_oid(name: &str) -> Option<u32> {
+    PSEUDO_TYPES
+        .iter()
+        .find(|(_, typname, _)| *typname == name)
+        .map(|(oid, _, _)| *oid)
+}
+
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgType {
     Bool,

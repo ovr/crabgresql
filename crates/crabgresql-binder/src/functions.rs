@@ -13,7 +13,7 @@ use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{RoutineImpl, RoutineKind, RoutineSig, TypeCatalog};
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
-use crabgresql_types::{PgType, RegKind, Value};
+use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
     Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
@@ -194,6 +194,13 @@ pub enum ScalarFn {
     DateTruncTz,
     /// `date_bin(interval, timestamptz, timestamptz) -> timestamptz`.
     DateBinTz,
+    /// `pg_typeof(any) -> regtype`, carrying the OID of the argument's static
+    /// type. The argument stays in `args` and is still evaluated for its errors
+    /// and side effects; only its *value* is unused. Not STRICT —
+    /// `pg_typeof(NULL)` is `unknown`, not NULL — and it needs the catalog to
+    /// name a user type, so `eval` dispatches it and the pure evaluator rejects
+    /// it.
+    PgTypeof(u32),
     /// `isfinite(timestamptz) -> bool`.
     IsfiniteTz,
     /// `make_timestamptz(int×5, float8[, text]) -> timestamptz`.
@@ -2927,8 +2934,11 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     }
 
     // `pg_typeof(any)` accepts every type, so it has no fixed signature either.
-    if name == "pg_typeof" {
-        return bind_pg_typeof(&bindings);
+    // Only the unary form is ours; any other arity falls through, so a
+    // user-defined overload of this name stays reachable.
+    if name == "pg_typeof" && bindings.len() == 1 {
+        let binding = bindings.into_iter().next().expect("exactly one argument");
+        return bind_pg_typeof(binding, scope);
     }
 
     resolve_call(&name, bindings, scope.catalog())
@@ -2936,27 +2946,24 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
 
 /// Bind `pg_typeof(any) -> regtype`, which reports its argument's type.
 ///
-/// The result depends only on the argument's *static* type, so the argument is
-/// never evaluated: it collapses to the OID, and the existing
-/// [`ScalarFn::RegFromOid`] renders that as a name at run time. Going through
-/// the catalog rather than folding the name in here is what makes a user type
-/// print correctly, and keeps a prepared statement honest if the type is
-/// renamed between bind and execute.
+/// The reported OID comes from the argument's *static* type and rides on
+/// [`ScalarFn::PgTypeof`]; the argument itself stays in `args`. That matters more
+/// than it looks: `pg_typeof` is an ordinary function in PG, so the argument is
+/// still evaluated (`pg_typeof(1/0)` raises, `pg_typeof(nextval('s'))` advances
+/// the sequence), and every pass that walks `FuncCall.args` — aggregate
+/// extraction, GROUP BY validation, volatility, deparse — has to keep seeing it.
+/// Collapsing the call to a bare OID constant, as an earlier version did, made
+/// all of those quietly wrong.
+///
+/// The name is resolved at run time against the catalog rather than folded in
+/// here, so a user type prints correctly and a prepared statement stays honest if
+/// the type is renamed between bind and execute.
 ///
 /// Note the reported type carries no modifier — `pg_typeof(1::numeric(10,2))`
 /// is `numeric`, not `numeric(10,2)` — because a `regtype` is only an OID.
-fn bind_pg_typeof(bindings: &[Binding]) -> Result<Binding, BindError> {
-    let [binding] = bindings else {
-        return Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "function pg_typeof({}) does not exist",
-                call_type_list(bindings)
-            ),
-        ));
-    };
-    let oid = match binding {
-        Binding::Typed(expr) => expr.ty().oid(),
+fn bind_pg_typeof(binding: Binding, scope: &Scope) -> Result<Binding, BindError> {
+    let (oid, arg) = match binding {
+        Binding::Typed(expr) => (expr.ty().oid(), expr),
         // A `$n` still awaiting context has no type to report, and unlike an
         // ordinary call site `pg_typeof` gives it none, so PG gives up here
         // rather than at Describe time.
@@ -2970,16 +2977,26 @@ fn bind_pg_typeof(bindings: &[Binding]) -> Result<Binding, BindError> {
             ));
         }
         // A bare literal or `NULL` really is of type `unknown`; PG reports that
-        // rather than resolving it to text the way most call sites would.
-        Binding::Unknown { .. } => crabgresql_types::oid::UNKNOWN,
+        // rather than resolving it to text the way most call sites would. The
+        // literal is still resolved — to text, arbitrarily — only so `args` holds
+        // a real expression to evaluate and to deparse; its type never escapes,
+        // because `ruleutils::call_arg_types` declines to relabel a `pg_typeof`
+        // argument.
+        Binding::Unknown { lit, span, param } => (
+            crabgresql_types::oid::UNKNOWN,
+            crate::expr::resolve_unknown_ctx(
+                scope.catalog().as_ref(),
+                lit,
+                span,
+                param,
+                PgType::Text,
+            )?,
+        ),
     };
     finish_func_call(
-        ScalarFn::RegFromOid(RegKind::Type),
+        ScalarFn::PgTypeof(oid),
         PgType::Reg(RegKind::Type),
-        vec![BoundExpr::Const {
-            value: Value::Oid(oid),
-            ty: PgType::Oid,
-        }],
+        vec![arg],
     )
 }
 

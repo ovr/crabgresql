@@ -1154,6 +1154,51 @@ mod tests {
         }
     }
 
+    /// The pseudo-type table in `crabgresql-types` is hand-written (it cannot
+    /// depend on this crate's codegen), so pin it against the vendored
+    /// `pg_type.dat`: every `typtype = 'p'` row must be named, with no extras and
+    /// no drift in either direction. Without this the table silently rots the next
+    /// time the catalog is re-vendored.
+    #[test]
+    fn pseudo_types_agree_with_the_vendored_catalog() {
+        let mut vendored: Vec<(u32, &str)> = PG_TYPE_ROWS
+            .iter()
+            .filter(|row| row.typtype == "p")
+            .map(|row| (row.oid, row.typname))
+            .collect();
+        vendored.sort();
+        assert!(!vendored.is_empty(), "no pseudo-types in the vendored rows");
+
+        for (oid, typname) in &vendored {
+            assert!(
+                crabgresql_types::pseudo_type_name(*oid).is_some(),
+                "pseudo-type {typname} (oid {oid}) is not named"
+            );
+            assert_eq!(
+                crabgresql_types::pseudo_type_oid(typname),
+                Some(*oid),
+                "{typname} does not resolve back to its oid"
+            );
+            // A pseudo-type must NOT be a PgType: that is what keeps it
+            // undeclarable, since a column type is resolved through `from_name`.
+            assert_eq!(
+                crabgresql_types::PgType::from_name(typname),
+                None,
+                "{typname} must not be declarable as a column type"
+            );
+        }
+
+        // No extras: every named oid is a vendored pseudo-type.
+        for (oid, _) in (0..=u32::from(u16::MAX))
+            .filter_map(|oid| crabgresql_types::pseudo_type_name(oid).map(|name| (oid, name)))
+        {
+            assert!(
+                vendored.iter().any(|(o, _)| *o == oid),
+                "oid {oid} is named as a pseudo-type but is not one in pg_type.dat"
+            );
+        }
+    }
+
     #[test]
     fn pg_cast_resolves_type_names_to_oids() -> anyhow::Result<()> {
         let schema = schema::pg_cast_schema();

@@ -84,8 +84,9 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
     Some(out)
 }
 
-/// See [`Cx::calls`].
-type CallTypes<'a> = dyn Fn(&ast::Function) -> Option<Vec<PgType>> + 'a;
+/// See [`Cx::calls`]. The outer `None` means "do not resolve at all"; a `None` at
+/// one position means that argument takes no cast (see [`call_arg_types`]).
+type CallTypes<'a> = dyn Fn(&ast::Function) -> Option<Vec<Option<PgType>>> + 'a;
 
 /// Rendering options that thread through the whole walk.
 #[derive(Clone, Copy)]
@@ -185,13 +186,28 @@ fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Optio
 /// the call does not bind at all (a `CREATE FUNCTION` routine, say, which is not
 /// in the built-in table). A default cannot reference columns, so binding it in
 /// an empty scope is enough.
-fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<Vec<PgType>> {
+///
+/// A `None` at one position means that argument must be rendered *without* a
+/// cast. Only `pg_typeof` needs it: it coerces nothing, so its argument keeps the
+/// type it was written with — and for a bare literal that type is `unknown`, which
+/// has no spelling a re-bind would resolve back to. PG prints
+/// `pg_typeof('abc')`, and labelling the literal `text` here would silently change
+/// what a re-bound default reports.
+fn call_arg_types(
+    f: &ast::Function,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Option<Vec<Option<PgType>>> {
     let params = crate::param_ctx_none();
     let scope = crate::Scope::empty(catalog, &params);
     let bound = crate::bind_expr(&ast::Expr::Function(f.clone()), &scope).ok()?;
     match bound {
+        crate::Binding::Typed(crate::BoundExpr::FuncCall {
+            func: crate::ScalarFn::PgTypeof(_),
+            args,
+            ..
+        }) => Some(args.iter().map(|_| None).collect()),
         crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
-            Some(args.iter().map(|a| a.ty()).collect())
+            Some(args.iter().map(|a| Some(a.ty())).collect())
         }
         _ => None,
     }
@@ -433,6 +449,8 @@ fn function(f: &ast::Function, cx: Cx) -> String {
     // the literal's own syntax — that is the whole difference between
     // `nextval('s'::regclass)` and `nextval('s'::text)`.
     let arg_types = cx.calls.and_then(|resolve| resolve(f));
+    // `Some(Some(ty))` resolved to a type, `Some(None)` resolved to no cast, and
+    // `None` means the position was not resolved at all.
     let arg_type = |i: usize| arg_types.as_ref().and_then(|types| types.get(i).copied());
     let args = match &f.args {
         ast::FunctionArguments::List(list) => list
@@ -442,7 +460,8 @@ fn function(f: &ast::Function, cx: Cx) -> String {
             .map(|(i, a): (usize, &ast::FunctionArg)| match a {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
                     match (arg_type(i), literal_of(e)) {
-                        (Some(ty), Some(v)) => typed_value(v, ty),
+                        (Some(Some(ty)), Some(v)) => typed_value(v, ty),
+                        (Some(None), Some(v)) => value_body(v),
                         _ => top_expr(e, cx),
                     }
                 }

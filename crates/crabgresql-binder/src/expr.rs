@@ -4030,17 +4030,24 @@ pub(crate) fn apply_length_typmod_if_any(
     })
 }
 
-/// `interval '...'` (with an optional SQL-standard field qualifier). The
-/// literal string is parsed by `interval_in`; a leading field (`INTERVAL '1'
-/// DAY`) sets the default unit for a bare number, and any precision is ignored.
+/// `interval '...'` (with an optional SQL-standard field qualifier). The literal
+/// string is parsed by `interval_in`, then the qualifier is applied as the type
+/// modifier it is — the same [`interval_typmod`] encoding a column or a cast
+/// carries, so all three masks agree.
+///
+/// The qualifier's two ends do different jobs:
+///
+/// * the **leading** field is the default unit for a bare number;
+/// * the whole **range** becomes the modifier, and
+///   [`crabgresql_types::interval::apply_typmod`] drops everything below its
+///   lowest field, so `INTERVAL '1 day 2 hours' DAY` is one day.
 ///
 /// Divergence: in PostgreSQL the qualifier also *steers the parse* of a
 /// punctuated literal — `interval '1 2:03' day to second` is `1 day 02:03:00`
 /// while `interval '1 2:03' hour to second` reads the same text as `mm:ss`. Here
-/// the qualifier only picks the default unit for a bare number, so those two
-/// spellings still agree. That lives inside `interval_in`, not in the type
-/// modifier ([`interval_typmod`]), and is why `interval` is not yet an
-/// upstream must-pass test.
+/// the qualifier only picks the default unit and then masks the result, so those
+/// two spellings still agree. That lives inside `interval_in`, not in the type
+/// modifier, and is why `interval` is not yet an upstream must-pass test.
 fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     let (s, span) = match &*node.value {
         ast::Expr::Value(v) => match v.value.as_pg_string() {
@@ -4054,17 +4061,89 @@ fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
         },
         other => return Err(unsupported_expr(other)),
     };
-    let default = node
-        .leading_field
-        .as_ref()
-        .map(datetime_field_to_unit)
-        .unwrap_or(interval::Unit::Second);
-    let iv = interval::parse_with_default(&s, default)
-        .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    // Which end of a range supplies the default unit depends on the literal's
+    // shape, as the SQL forms do. A number standing alone is the range's *fine*
+    // end (`INTERVAL '1' YEAR TO MONTH` is one month, `INTERVAL '5' DAY TO HOUR`
+    // five hours); once there is a unit word or a time part the form is
+    // `D HH:MM:SS`, and the leading integer is the *coarse* end
+    // (`INTERVAL '3 4:05:06' DAY TO SECOND` is three days, not three seconds).
+    let leading = node.leading_field.as_ref();
+    let default = if is_bare_number(&s) {
+        node.last_field.as_ref().or(leading)
+    } else {
+        leading
+    };
+    let iv = interval::parse_with_default(
+        &s,
+        default.map_or(interval::Unit::Second, datetime_field_to_unit),
+    )
+    .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    // The qualifier masks the result, through the same modifier a column or a
+    // cast would carry. No qualifier at all leaves the literal's own units to
+    // speak for themselves.
+    let iv = match interval_literal_typmod(node) {
+        Some(typmod) => interval::apply_typmod(iv, typmod),
+        None => iv,
+    };
     Ok(Binding::Typed(BoundExpr::Const {
         value: Value::Interval(iv),
         ty: PgType::Interval,
     }))
+}
+
+/// The type modifier an `INTERVAL '...' <qualifier>` literal's qualifier
+/// declares, in the same encoding [`interval_typmod`] builds for a column or a
+/// cast. `None` when the literal carries no qualifier at all.
+///
+/// The range runs from the leading field down to the trailing one, so a bare
+/// `MONTH` admits only months while `DAY TO SECOND` admits four fields. It has to
+/// be a combination [`crabgresql_types::interval::range_name`] names, or
+/// `apply_typmod` treats it as no modifier and masks nothing.
+fn interval_literal_typmod(node: &ast::Interval) -> Option<i32> {
+    use crabgresql_types::interval as iv;
+
+    // The ladder of fields a qualifier can name, coarse to fine. `WEEK` is not
+    // an SQL qualifier, so it has no bit and falls out below.
+    const LADDER: [(interval::Unit, u16); 6] = [
+        (interval::Unit::Year, iv::MASK_YEAR),
+        (interval::Unit::Month, iv::MASK_MONTH),
+        (interval::Unit::Day, iv::MASK_DAY),
+        (interval::Unit::Hour, iv::MASK_HOUR),
+        (interval::Unit::Minute, iv::MASK_MINUTE),
+        (interval::Unit::Second, iv::MASK_SECOND),
+    ];
+    let rung = |field: &ast::DateTimeField| {
+        let unit = datetime_field_to_unit(field);
+        LADDER.iter().position(|(u, _)| *u == unit)
+    };
+
+    let leading = node.leading_field.as_ref()?;
+    let first = rung(leading)?;
+    // A bare qualifier admits only its own field; `X TO Y` admits the span.
+    let last = match node.last_field.as_ref() {
+        Some(field) => rung(field)?,
+        None => first,
+    };
+    if last < first {
+        return None;
+    }
+    let range = LADDER[first..=last]
+        .iter()
+        .fold(0, |acc, (_, bit)| acc | bit);
+    iv::range_name(range)?;
+    let precision = node
+        .fractional_seconds_precision
+        .map(|p| (p as i32).min(crabgresql_types::timestamp::MAX_PRECISION) as u8);
+    Some(iv::pack_typmod(range, precision))
+}
+
+/// Whether an interval literal is nothing but a number — no unit word, no time
+/// part — which is what decides which end of a range qualifier types it. Garbage
+/// still falls through to `interval_in`, whose error is the one to report.
+fn is_bare_number(s: &str) -> bool {
+    let body = s.trim();
+    let body = body.strip_prefix(['+', '-']).unwrap_or(body);
+    !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 /// Map a SQL-standard interval leading field to the default unit for a bare
