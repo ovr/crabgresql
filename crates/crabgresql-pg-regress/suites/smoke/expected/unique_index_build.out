@@ -28,6 +28,10 @@ INSERT INTO uixc VALUES (1, 'x'), (2, 'y'), (1, 'x');
 CREATE UNIQUE INDEX uixc_a_b_key ON uixc(a, b);
 ERROR:  could not create unique index "uixc_a_b_key"
 DETAIL:  Key (a, b)=(1, x) is duplicated.
+-- A key column may repeat, and then the value is named once per position.
+CREATE UNIQUE INDEX uixc_a_a_key ON uixc(a, a);
+ERROR:  could not create unique index "uixc_a_a_key"
+DETAIL:  Key (a, a)=(1, 1) is duplicated.
 -- NULL keys are exempt by default and collide only under NULLS NOT DISTINCT.
 CREATE TABLE uixn (i integer);
 INSERT INTO uixn VALUES (NULL), (NULL), (5);
