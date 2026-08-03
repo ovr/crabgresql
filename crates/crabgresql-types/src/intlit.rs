@@ -41,7 +41,7 @@ pub enum ScanError {
 /// could carry. Callers apply their own range check against that pair — see
 /// [`crate::cast::text_to_int`].
 pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
-    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let t = s.trim_matches(is_pg_space);
     let bytes = t.as_bytes();
     let mut i = 0;
 
@@ -123,6 +123,16 @@ pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
     Ok((negative, acc))
 }
 
+/// The whitespace PostgreSQL's integer input functions skip, which is C's
+/// `isspace`. Rust has no predicate for exactly this set: `is_ascii_whitespace`
+/// omits vertical tab, and `char::is_whitespace` is Unicode White_Space, which
+/// wrongly accepts NBSP and U+3000 (`' 1'::int4` with a NBSP is `22P02` in PG).
+/// The same six characters separate `oidvector` elements — see the separator
+/// test in [`crate::vector`].
+fn is_pg_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
 /// The value of `c` as a digit in `radix`, or `None` if it is not one.
 fn digit_val(c: u8, radix: u32) -> Option<u32> {
     let v = match c {
@@ -151,6 +161,22 @@ mod tests {
         assert_eq!(ok("-1234"), -1234);
         assert_eq!(ok("  1234 "), 1234);
         assert_eq!(ok("\t-32768\n"), -32768);
+    }
+
+    /// The surrounding whitespace is C's `isspace`, not Rust's idea of either
+    /// ASCII or Unicode space — vertical tab counts, NBSP does not.
+    #[test]
+    fn pg_whitespace_is_trimmed_and_nothing_more() {
+        for sep in [" ", "\t", "\n", "\x0b", "\x0c", "\r"] {
+            assert_eq!(ok(&format!("{sep}42{sep}")), 42, "sep {sep:?}");
+        }
+        for sep in ["\u{a0}", "\u{3000}"] {
+            assert_eq!(
+                scan_int_literal(&format!("{sep}42")),
+                Err(ScanError::Syntax),
+                "sep {sep:?}"
+            );
+        }
     }
 
     #[test]
