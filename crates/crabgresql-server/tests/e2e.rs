@@ -11060,3 +11060,68 @@ async fn soft_input_reads_array_elements_with_the_session() -> anyhow::Result<()
     );
     Ok(())
 }
+
+/// Every `DataRow`'s first column, as text, in arrival order.
+fn data_row_values(msgs: &[(u8, Vec<u8>)]) -> Vec<String> {
+    msgs.iter()
+        .filter(|(t, _)| *t == b'D')
+        .map(|(_, body)| {
+            // int16 column count, then int32 length + bytes per column.
+            let len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+            String::from_utf8_lossy(&body[6..6 + len]).into_owned()
+        })
+        .collect()
+}
+
+/// An extended-query batch is one implicit transaction block, so every message
+/// up to `Sync` shares a transaction timestamp.
+///
+/// PostgreSQL starts the block at the first Parse/Bind/Execute and ends it at
+/// `Sync`; we re-stamped per message, so a pipelining client that stamped a
+/// parent row and its children in one round trip saw two different instants.
+/// Reachable only over a raw socket: tokio-postgres Syncs once per call.
+///
+/// This is the *clock* half of an implicit block. The batch is still not atomic
+/// — each autocommit statement commits at its own boundary — which is separate
+/// work.
+#[tokio::test]
+async fn an_extended_query_batch_shares_one_transaction_timestamp() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    // Two Parse/Bind/Execute triples, one Sync. `::text` because `timestamptz`
+    // has no binary output routine yet. Statement names are per batch: a second
+    // `Parse` over a live named statement is an error.
+    let batch = |round: u8| {
+        let mut out = Vec::new();
+        for n in 0..2u8 {
+            let (stmt, portal) = (format!("s{round}{n}"), format!("p{round}{n}"));
+            let mut parse = format!("{stmt}\0").into_bytes();
+            parse.extend_from_slice(b"SELECT now()::text\0\x00\x00");
+            out.extend(frontend_message(b'P', &parse));
+            let mut bind = format!("{portal}\0{stmt}\0").into_bytes();
+            bind.extend_from_slice(b"\x00\x00\x00\x00\x00\x00");
+            out.extend(frontend_message(b'B', &bind));
+            let mut exec = format!("{portal}\0").into_bytes();
+            exec.extend_from_slice(b"\x00\x00\x00\x00");
+            out.extend(frontend_message(b'E', &exec));
+        }
+        out.extend(frontend_message(b'S', b""));
+        out
+    };
+
+    socket.write_all(&batch(1)).await?;
+    let values = data_row_values(&read_until_ready(&mut socket).await);
+    assert_eq!(values.len(), 2, "expected one row per Execute: {values:?}");
+    assert_eq!(
+        values[0], values[1],
+        "one batch is one implicit transaction: {values:?}"
+    );
+
+    // The next batch is a new transaction, so it moves.
+    socket.write_all(&batch(2)).await?;
+    let next = data_row_values(&read_until_ready(&mut socket).await);
+    assert_eq!(next.len(), 2);
+    assert_ne!(next[0], values[0], "a new batch starts a new transaction");
+    Ok(())
+}

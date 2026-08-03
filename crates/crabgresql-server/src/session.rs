@@ -373,8 +373,19 @@ pub struct Session {
     /// When the protocol message being processed arrived, backing
     /// `statement_timestamp()`. Stamped once per message — not per statement —
     /// so every statement of a multi-statement simple query shares it, as in
-    /// PostgreSQL. Outside a block it is also the transaction start.
+    /// PostgreSQL.
     pub stmt_start: i64,
+    /// When the current *implicit* transaction block started: the extended-query
+    /// batch running from the first Parse/Bind/Execute to the next `Sync`.
+    /// `None` outside one. PostgreSQL holds a single transaction timestamp
+    /// across such a batch, so a pipelining client that stamps a parent row and
+    /// its children in one round trip sees one instant.
+    ///
+    /// **Clock only.** This does not make the batch atomic: each autocommit
+    /// statement is still committed at its own boundary (see
+    /// `finalize_statement`), where PostgreSQL would roll the whole batch back
+    /// on an error. Giving the batch one XID is a separate piece of work.
+    implicit_xact_start: Option<i64>,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
     /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
@@ -670,6 +681,7 @@ impl Session {
             // Restamped by every incoming message; seeded here so the value is
             // never an invented instant even before the first one arrives.
             stmt_start: crabgresql_types::tz::now_micros(),
+            implicit_xact_start: None,
             saved_gucs: Vec::new(),
             default_iso: IsolationLevel::ReadCommitted,
             default_read_only: false,
@@ -731,11 +743,13 @@ impl Session {
     /// The formatting context for this session: `extra_float_digits`, the
     /// display zone and the clock, as the value layer wants them.
     ///
-    /// Under autocommit there is no block to take a transaction start from, so
-    /// the statement's own stamp serves as both — which is what makes
-    /// `now() = statement_timestamp()` outside a block, as in PostgreSQL.
+    /// The transaction start comes from the innermost thing that is one: an
+    /// explicit block, else the implicit block an extended-query batch forms,
+    /// else this statement. That last case is a single simple query, where the
+    /// two coincide — which is what makes `now() = statement_timestamp()`
+    /// outside a block, as in PostgreSQL.
     pub fn fmt_ctx(&self) -> FmtCtx {
-        let xact_start = self.xact.as_ref().map_or(self.stmt_start, |x| x.xact_start);
+        let xact_start = self.xact_start();
         FmtCtx::new(
             self.extra_float_digits,
             Arc::clone(&self.timezone),
@@ -746,11 +760,34 @@ impl Session {
         )
     }
 
+    /// When the current transaction started, for `now()` and the `'now'` input
+    /// special. See [`Session::fmt_ctx`] for the three-way fallback.
+    pub fn xact_start(&self) -> i64 {
+        self.xact
+            .as_ref()
+            .map(|x| x.xact_start)
+            .or(self.implicit_xact_start)
+            .unwrap_or(self.stmt_start)
+    }
+
     /// Stamp the arrival of a protocol message. Called once per `Query`,
     /// `Parse`, `Bind` and `Execute` — never per statement inside a
     /// multi-statement simple query, which PostgreSQL treats as one stamp.
-    pub fn stamp_message(&mut self) {
+    ///
+    /// An extended-query message also opens the implicit block if one is not
+    /// already open, so every message up to the next `Sync` shares a
+    /// transaction timestamp. PG starts it at the *first* of Parse/Bind/Execute,
+    /// not at the first Execute, which is what `get_or_insert` reproduces.
+    pub fn stamp_message(&mut self, extended: bool) {
         self.stmt_start = crabgresql_types::tz::now_micros();
+        if extended && self.xact.is_none() {
+            self.implicit_xact_start.get_or_insert(self.stmt_start);
+        }
+    }
+
+    /// End the implicit block: a `Sync`, or a simple query, which is its own.
+    pub fn end_implicit_block(&mut self) {
+        self.implicit_xact_start = None;
     }
 
     /// A context for evaluation outside a statement's normal execution path —
