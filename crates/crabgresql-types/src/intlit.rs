@@ -34,13 +34,29 @@ pub enum ScanError {
     Range,
 }
 
-/// Scan an integer literal, returning `(negative, magnitude)`.
-///
-/// The magnitude is unsigned so the most negative value of each width still
-/// round-trips: `int2 '-0x8000'` is 32768 with `negative` set, which no `i16`
-/// could carry. Callers apply their own range check against that pair — see
-/// [`crate::cast::text_to_int`].
-pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
+/// A literal that has passed the grammar: its sign, its base, and the digit run
+/// as written (separators still in it). Borrowing the run rather than collecting
+/// it keeps the common path allocation-free — `text_to_int` sits under COPY.
+struct Literal<'a> {
+    negative: bool,
+    radix: u32,
+    body: &'a str,
+}
+
+impl Literal<'_> {
+    /// The digit values, left to right. `scan` has already proved every byte is
+    /// either a separator or a digit of `radix`, so nothing here can fail.
+    fn digits(&self) -> impl Iterator<Item = u32> + '_ {
+        self.body
+            .bytes()
+            .filter_map(move |c| digit_val(c, self.radix))
+    }
+}
+
+/// The grammar, in one place: everything below folds the same digit run
+/// differently. Only ever reports [`ScanError::Syntax`] — a magnitude that does
+/// not fit is the *fold's* business, not the grammar's.
+fn scan(s: &str) -> Result<Literal<'_>, ScanError> {
     let t = s.trim_matches(is_pg_space);
     let bytes = t.as_bytes();
     let mut i = 0;
@@ -69,13 +85,12 @@ pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
     if radix != 10 {
         i += 2;
     }
+    let body = &t[i..];
 
     // `prev_is_digit` starts true for a prefixed literal so `0b_10_0101` passes:
     // PG treats the prefix itself as the left-hand digit of the separator rule.
     let mut prev_is_digit = radix != 10;
     let mut digits = 0usize;
-    let mut acc: u128 = 0;
-    let mut overflow = false;
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -93,22 +108,9 @@ pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
             i += 1;
             continue;
         }
-        let Some(d) = digit_val(c, radix) else {
+        if digit_val(c, radix).is_none() {
             return Err(ScanError::Syntax);
-        };
-        // Keep scanning past the overflow so a trailing bad character is still
-        // reported as a syntax error, as PG does: `0x` + junk is `22P02` however
-        // long the run is.
-        acc = match acc
-            .checked_mul(radix as u128)
-            .and_then(|v| v.checked_add(d as u128))
-        {
-            Some(v) => v,
-            None => {
-                overflow = true;
-                0
-            }
-        };
+        }
         prev_is_digit = true;
         digits += 1;
         i += 1;
@@ -117,10 +119,71 @@ pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
     if digits == 0 {
         return Err(ScanError::Syntax);
     }
-    if overflow {
-        return Err(ScanError::Range);
+    Ok(Literal {
+        negative,
+        radix,
+        body,
+    })
+}
+
+/// Scan an integer literal, returning `(negative, magnitude)`.
+///
+/// The magnitude is unsigned so the most negative value of each width still
+/// round-trips: `int2 '-0x8000'` is 32768 with `negative` set, which no `i16`
+/// could carry. Callers apply their own range check against that pair — see
+/// [`crate::cast::text_to_int`].
+///
+/// A magnitude past `u128` is [`ScanError::Range`]. That is the honest answer
+/// for the integer types (it is out of range for all three widths anyway); a
+/// caller that can hold more — a `numeric` constant — wants
+/// [`scan_int_literal_decimal`] instead.
+pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
+    let lit = scan(s)?;
+    let radix = lit.radix as u128;
+    let mut acc: u128 = 0;
+    for d in lit.digits() {
+        acc = acc
+            .checked_mul(radix)
+            .and_then(|v| v.checked_add(d as u128))
+            .ok_or(ScanError::Range)?;
     }
-    Ok((negative, acc))
+    Ok((lit.negative, acc))
+}
+
+/// Scan an integer literal into its decimal digits, with no ceiling on the
+/// magnitude. PostgreSQL widens an integer constant past `bigint` into
+/// `numeric`, and keeps doing so without limit, so `0x` followed by forty hex
+/// digits is a number and not an error.
+///
+/// Never returns [`ScanError::Range`]; the only failure is a malformed literal.
+pub fn scan_int_literal_decimal(s: &str) -> Result<(bool, String), ScanError> {
+    let lit = scan(s)?;
+    // Base 10 is already the answer — take the digits as written. This is not
+    // just an optimization: the long multiplication below is quadratic, and a
+    // `numeric` may carry thousands of digits.
+    if lit.radix == 10 {
+        let text: String = lit.digits().map(|d| char::from(b'0' + d as u8)).collect();
+        return Ok((lit.negative, text));
+    }
+    // Long multiplication into little-endian decimal digits: `out = out * radix + d`.
+    let mut out: Vec<u8> = vec![0];
+    for d in lit.digits() {
+        let mut carry = d;
+        for slot in out.iter_mut() {
+            let v = u32::from(*slot) * lit.radix + carry;
+            *slot = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            out.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while out.len() > 1 && out.last() == Some(&0) {
+        out.pop();
+    }
+    let text: String = out.iter().rev().map(|d| char::from(b'0' + d)).collect();
+    Ok((lit.negative, text))
 }
 
 /// The whitespace PostgreSQL's integer input functions skip, which is C's
@@ -228,5 +291,34 @@ mod tests {
             scan_int_literal(&format!("{wide}z")),
             Err(ScanError::Syntax)
         );
+    }
+
+    /// The decimal fold has no ceiling, so the magnitudes that are `Range` above
+    /// still convert — that is what lets a wide non-decimal constant widen into
+    /// `numeric` instead of failing to bind.
+    #[test]
+    fn decimal_fold_has_no_ceiling() -> anyhow::Result<()> {
+        let dec = |s: &str| -> anyhow::Result<String> {
+            let (neg, text) = scan_int_literal_decimal(s)?;
+            Ok(if neg { format!("-{text}") } else { text })
+        };
+        assert_eq!(dec("0b100101")?, "37");
+        assert_eq!(dec("0o273")?, "187");
+        assert_eq!(dec("0x42F")?, "1071");
+        assert_eq!(dec("0x0")?, "0");
+        assert_eq!(dec("0b_10_0101")?, "37");
+        assert_eq!(dec("-0x8000")?, "-32768");
+        assert_eq!(dec("0x8000000000000000")?, "9223372036854775808");
+        // Past u128, where `scan_int_literal` gives up.
+        assert_eq!(
+            dec(&format!("0x{}", "F".repeat(33)))?,
+            "5444517870735015415413993718908291383295"
+        );
+        // Base 10 takes the digits as written, separators and all.
+        assert_eq!(dec("1_000")?, "1000");
+        assert_eq!(dec("007")?, "007");
+        assert_eq!(scan_int_literal_decimal("0x"), Err(ScanError::Syntax));
+
+        Ok(())
     }
 }

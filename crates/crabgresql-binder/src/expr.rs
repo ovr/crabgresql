@@ -3181,40 +3181,62 @@ fn bind_bit_literal(
 /// function, so the hex/octal/binary spellings (`0x1F`, `0o17`, `0b11`) and the
 /// `_` digit separators mean the same thing written bare as they do quoted.
 fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
-    if let Ok((negative, magnitude)) = crabgresql_types::intlit::scan_int_literal(n) {
-        // A leading `-` never reaches here (the parser builds unary minus), but
-        // the acceptor reports the sign anyway, so honour it rather than assume.
-        let signed = i128::try_from(magnitude)
+    use crabgresql_types::intlit::{ScanError, scan_int_literal, scan_int_literal_decimal};
+    // A leading `-` never reaches here (the parser builds unary minus), but the
+    // acceptor reports the sign anyway, so honour it rather than assume.
+    let signed = |negative: bool, m: u128| -> Option<i128> {
+        i128::try_from(m)
             .ok()
-            .map(|m| if negative { m.wrapping_neg() } else { m });
-        if let Some(v) = signed.and_then(|v| i32::try_from(v).ok()) {
-            return Ok(BoundExpr::Const {
-                value: Value::Int4(v),
-                ty: PgType::Int4,
-            });
-        }
-        if let Some(v) = signed.and_then(|v| i64::try_from(v).ok()) {
-            return Ok(BoundExpr::Const {
-                value: Value::Int8(v),
-                ty: PgType::Int8,
-            });
-        }
-        // Past int8, PG keeps the value as `numeric` — `0x8000000000000000` is
-        // 9223372036854775808, not an overflow. Render the magnitude in decimal
-        // so a non-decimal spelling reaches `Numeric::parse` in a form it reads.
-        let decimal = format!("{}{magnitude}", if negative { "-" } else { "" });
-        return numeric_const(&decimal, n);
-    }
-    // Not a whole number: a decimal point or exponent, where the separators (if
-    // any) still have to come out before `Numeric::parse` sees the text.
-    let stripped;
-    let n = if n.contains('_') {
-        stripped = n.replace('_', "");
-        stripped.as_str()
-    } else {
-        n
+            .map(|m| if negative { -m } else { m })
     };
-    numeric_const(n, n)
+    match scan_int_literal(n) {
+        Ok((negative, magnitude)) => {
+            if let Some(v) = signed(negative, magnitude).and_then(|v| i32::try_from(v).ok()) {
+                return Ok(BoundExpr::Const {
+                    value: Value::Int4(v),
+                    ty: PgType::Int4,
+                });
+            }
+            if let Some(v) = signed(negative, magnitude).and_then(|v| i64::try_from(v).ok()) {
+                return Ok(BoundExpr::Const {
+                    value: Value::Int8(v),
+                    ty: PgType::Int8,
+                });
+            }
+            // Past int8, PG keeps the value as `numeric` — `0x8000000000000000`
+            // is 9223372036854775808, not an overflow. Render the magnitude in
+            // decimal so a non-decimal spelling reaches `Numeric::parse` in a
+            // form it reads.
+            let decimal = format!("{}{magnitude}", if negative { "-" } else { "" });
+            numeric_const(&decimal, n)
+        }
+        // Well-formed but past `u128`. PostgreSQL keeps widening into `numeric`
+        // with no ceiling, so re-fold the same digit run without one; only the
+        // non-decimal spellings actually need the conversion, but going through
+        // one function keeps the two paths from disagreeing.
+        Err(ScanError::Range) => match scan_int_literal_decimal(n) {
+            Ok((negative, digits)) => {
+                let decimal = format!("{}{digits}", if negative { "-" } else { "" });
+                numeric_const(&decimal, n)
+            }
+            // Unreachable in practice — the two folds share one grammar, so a
+            // literal that got as far as `Range` cannot be malformed here. Fall
+            // back to the ordinary error rather than assert.
+            Err(_) => numeric_const(n, n),
+        },
+        // Not a whole number: a decimal point or exponent, where the separators
+        // (if any) still have to come out before `Numeric::parse` sees the text.
+        Err(ScanError::Syntax) => {
+            let stripped;
+            let text = if n.contains('_') {
+                stripped = n.replace('_', "");
+                stripped.as_str()
+            } else {
+                n
+            };
+            numeric_const(text, n)
+        }
+    }
 }
 
 /// Bind a `numeric` constant from `text`, reporting an unreadable one against
