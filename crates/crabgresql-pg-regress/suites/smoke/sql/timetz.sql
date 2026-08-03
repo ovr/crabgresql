@@ -68,6 +68,14 @@ SELECT timetz '00:01-07' AT TIME ZONE 'UTC' AS at_named,
        timetz '00:01-07' AT TIME ZONE INTERVAL '-10:00' AS at_interval,
        timetz '00:01-07' AT LOCAL AS at_local,
        timezone(timetz '00:01-07') AS func_form;
+-- the zone *argument* is POSIX-signed, exactly as for timestamp/timestamptz:
+-- '+05:30' is UTC-5:30, the sign is optional, and the colon-less '+0530'
+-- spelling is value-only. A magnitude a value would reject is fine here.
+SELECT timetz '12:00:00+00' AT TIME ZONE '+05:30' AS posix_west,
+       timetz '12:00:00+00' AT TIME ZONE '05:30' AS unsigned_is_west,
+       timetz '12:00:00+00' AT TIME ZONE '-05:30' AS minus_is_east,
+       timetz '12:00:00+00' AT TIME ZONE '+16' AS wide_band;
+SELECT timetz '12:00:00+00' AT TIME ZONE '+0530';
 -- a fixed session zone, not a named one: `timetz` carries no date, so a named
 -- zone would be read at *today's* DST state and this test would drift
 SET TimeZone TO '-05:30';

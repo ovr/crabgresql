@@ -348,8 +348,13 @@ pub fn at_zone(v: TimeTz, off_east: i32) -> TimeTz {
 /// none — so PG's `timetz_zone` resolves the zone at the current instant. `at`
 /// is that instant, the session's transaction timestamp, which keeps the answer
 /// stable for the whole transaction instead of drifting per row.
+///
+/// The zone token is read by [`tz::resolve_zone_arg`], the same reader the
+/// `timestamp`/`timestamptz` forms use — PG runs all three through one
+/// argument-zone grammar, so `'+05:30'` is UTC−5:30 here too, not the eastern
+/// offset the identical token names *inside* a value.
 pub fn at_zone_named(v: TimeTz, zone: &str, at: i64) -> Result<TimeTz, TimeTzError> {
-    let zone = tz::resolve_zone(zone).map_err(|e| match e {
+    let zone = tz::resolve_zone_arg(zone).map_err(|e| match e {
         tz::ZoneError::NotRecognized(name) => TimeTzError {
             sqlstate: INVALID_PARAMETER_VALUE,
             message: format!("time zone \"{name}\" not recognized"),
@@ -527,6 +532,29 @@ mod tests {
             "12:00:00+05:30"
         );
         Ok(())
+    }
+
+    /// `timetz AT TIME ZONE` reads its zone with the *argument* grammar, the
+    /// same one the `timestamp`/`timestamptz` forms use — a bare numeric offset
+    /// is POSIX-signed (west), the sign is optional, and the colon-less `±HHMM`
+    /// spelling is value-only. Pinned against PG 18.4 with the session in UTC,
+    /// where `timetz '12:00:00+00' AT TIME ZONE '+05:30'` is `06:30:00-05:30`.
+    #[test]
+    fn at_zone_named_uses_the_argument_grammar() {
+        // The instant only matters for a DST-varying zone; these are all fixed.
+        let at = 0;
+        let at_zone_of = |tok: &str| at_zone_named(v("12:00:00+00"), tok, at).map(format);
+
+        assert_eq!(at_zone_of("+05:30").expect("west"), "06:30:00-05:30");
+        assert_eq!(at_zone_of("05:30").expect("unsigned is west"), "06:30:00-05:30");
+        assert_eq!(at_zone_of("-05:30").expect("minus is east"), "17:30:00+05:30");
+        // Value-only spelling, and a magnitude a value would reject.
+        assert!(at_zone_of("+0530").is_err());
+        assert_eq!(at_zone_of("+16").expect("wide band"), "20:00:00-16");
+        // Names keep working, and an unknown one is still 22023 on the zone.
+        assert_eq!(at_zone_of("UTC").expect("named"), "12:00:00+00");
+        let e = at_zone_of("Nowhere/Nozone").expect_err("unknown zone");
+        assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE);
     }
 
     #[test]
