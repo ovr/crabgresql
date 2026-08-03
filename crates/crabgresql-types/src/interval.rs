@@ -969,7 +969,13 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
         }
         // A `:`-bearing token is an `HH:MM[:SS[.f]]` time.
         if tok.contains(':') {
-            flush_pending(&mut pending, default, &mut acc, input)?;
+            // A unit-less number sitting immediately before a time is *days*,
+            // whatever `default` says: this is the SQL `D HH:MM:SS` form, so
+            // `interval '3 4:05:06'` is three days and six seconds past four,
+            // never three seconds. Probed against PostgreSQL 18.4.
+            if let Some(n) = pending.take() {
+                apply(n, Unit::Day, &mut acc);
+            }
             acc.add_usec(parse_time_token(tok, input)? as i128);
             continue;
         }
@@ -1573,6 +1579,41 @@ mod tests {
             date_part("bogus", iv("1 day")).unwrap_err().sqlstate,
             "22023"
         );
+
+        Ok(())
+    }
+
+    /// The SQL `D HH:MM:SS` form: a unit-less number immediately before a time is
+    /// days regardless of the default unit, so the default cannot turn it into
+    /// seconds. Pinned against PostgreSQL 18.4.
+    #[test]
+    fn a_number_before_a_time_is_days() -> anyhow::Result<()> {
+        // The default unit is what a *lone* number takes...
+        assert_eq!(format(parse("3")?), "00:00:03");
+        // ...but never the leading number of a `D HH:MM:SS`.
+        assert_eq!(format(parse("3 4:05:06")?), "3 days 04:05:06");
+        assert_eq!(format(parse("3 4:05")?), "3 days 04:05:00");
+        assert_eq!(format(parse("3 4:05:06.75")?), "3 days 04:05:06.75");
+        // Holds for every default a field qualifier could supply.
+        for unit in [
+            Unit::Second,
+            Unit::Minute,
+            Unit::Hour,
+            Unit::Month,
+            Unit::Year,
+        ] {
+            assert_eq!(
+                format(parse_with_default("3 4:05:06", unit)?),
+                "3 days 04:05:06",
+                "default {unit:?} must not retype the leading number"
+            );
+        }
+        // Signs are independent, and an explicit unit word still wins.
+        assert_eq!(format(parse("-3 4:05:06")?), "-3 days +04:05:06");
+        assert_eq!(format(parse("3 -4:05:06")?), "3 days -04:05:06");
+        assert_eq!(format(parse("3 days 4:05:06")?), "3 days 04:05:06");
+        // A bare time keeps its own fields.
+        assert_eq!(format(parse("4:05:06")?), "04:05:06");
 
         Ok(())
     }

@@ -449,3 +449,18 @@ SELECT interval 'infinity' month AS inf;
  infinity
 (1 row)
 
+-- the SQL `D HH:MM:SS` form: a unit-less number before a time is days, whatever
+-- default unit a field qualifier would otherwise supply
+SELECT interval '3 4:05:06' AS unqualified, interval '3 4:05:06' day AS q_day,
+       interval '3 4:05:06' hour AS q_hour, interval '3 4:05:06' month AS q_month;
+   unqualified   | q_day  |     q_hour      | q_month  
+-----------------+--------+-----------------+----------
+ 3 days 04:05:06 | 3 days | 3 days 04:00:00 | 00:00:00
+(1 row)
+
+SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
+     neg_days      |     neg_time     
+-------------------+------------------
+ -3 days +04:05:06 | 3 days -04:05:06
+(1 row)
+
