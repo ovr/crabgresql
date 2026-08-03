@@ -238,7 +238,9 @@ SELECT date_trunc('day', timestamptz '2026-09-06 12:00:00+00', 'America/Santiago
 SELECT date_trunc('week', timestamptz 'infinity', 'GMT') AS inf_zone_trunc;
 SELECT date_trunc('day', NULL::timestamptz, 'UTC') IS NULL AS null_value,
        date_trunc('day', timestamptz '2001-02-16 20:38:40+00', NULL) IS NULL AS null_zone;
--- the zone is resolved before the unit is looked at
+-- the zone is resolved before the unit is looked at. The unit message below is
+-- PG 14's wording, this suite's baseline; PG 16+ rephrased it as
+-- `unit "bogus" not recognized for type timestamp with time zone`
 SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'Nowhere/Nozone');
 SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'UTC');
 -- a timestamp argument reaches this overload through the implicit cast. (There
