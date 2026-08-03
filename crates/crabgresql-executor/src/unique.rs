@@ -283,12 +283,15 @@ impl<'a> UniqueKeySet<'a> {
     /// The probe's rows are re-checked with [`agg::keys_equal`] rather than
     /// trusted: the tree orders by `btkey`'s encoding, and only a comparison in
     /// `compare_values` terms can decide the equality this check is about.
-    fn probed(&mut self, i: usize, key: &[Value]) -> Result<bool, StorageError> {
+    fn probed(&mut self, i: usize, key: &[&Value]) -> Result<bool, StorageError> {
         let Source::Probe(probe) = &self.indexes[i].source else {
             return Ok(false);
         };
         let (table, txn) = (probe.table, probe.txn);
-        match table.index_lookup(&self.indexes[i].name, key, txn) {
+        // The one place the key is copied on a read path: `index_lookup` is a
+        // trait-object method, so it cannot be generic over a borrowed key.
+        let owned: Vec<Value> = key.iter().map(|v| (*v).clone()).collect();
+        match table.index_lookup(&self.indexes[i].name, &owned, txn) {
             Some(rows) => {
                 let set = &self.indexes[i];
                 for row in rows {
@@ -344,8 +347,11 @@ impl KeySet<'_> {
     /// this index's uniqueness at all: under `NULLS DISTINCT` (PostgreSQL's
     /// default) a key containing NULL conflicts with nothing, so such a row is
     /// neither stored nor looked up.
-    fn key_of(&self, tuple: &Tuple) -> Option<Vec<Value>> {
-        let key: Vec<Value> = self.columns.iter().map(|c| tuple[*c].clone()).collect();
+    /// Borrowed out of `tuple`, not copied: only [`KeySet::record`] keeps a key,
+    /// and a `text`/`jsonb` key is expensive to clone for a comparison that
+    /// throws it away.
+    fn key_of<'t>(&self, tuple: &'t Tuple) -> Option<Vec<&'t Value>> {
+        let key: Vec<&Value> = self.columns.iter().map(|c| &tuple[*c]).collect();
         let skipped = self.nulls_distinct && key.iter().any(|v| matches!(v, Value::Null));
         (!skipped).then_some(key)
     }
@@ -354,14 +360,16 @@ impl KeySet<'_> {
         let Some(key) = self.key_of(tuple) else {
             return;
         };
+        let hash = agg::hash_key(&self.types, &key);
+        let key = key.into_iter().cloned().collect();
         self.buckets
-            .entry(agg::hash_key(&self.types, &key))
+            .entry(hash)
             .or_default()
             .push(Entry { tid, key });
     }
 
     /// Whether this set's own buckets already hold `key`.
-    fn holds(&self, key: &[Value]) -> bool {
+    fn holds(&self, key: &[&Value]) -> bool {
         self.buckets
             .get(&agg::hash_key(&self.types, key))
             .is_some_and(|bucket| {
