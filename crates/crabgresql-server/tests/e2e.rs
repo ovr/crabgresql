@@ -10961,3 +10961,64 @@ async fn only_the_keyword_spelling_binds_to_the_clock() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Freezing a literal default follows the *bound* shape, not the written
+/// syntax, so every spelling of the same constant behaves alike.
+///
+/// `DEFAULT 'now'::timestamp` — the spelling PostgreSQL's own manual uses to
+/// contrast with `DEFAULT now()` — used to escape the DDL-time resolution
+/// because it is a `Cast` node rather than a bare `Value`, and re-read the clock
+/// on every insert. An array element escaped for the same reason.
+#[tokio::test]
+async fn every_spelling_of_a_literal_default_freezes_alike() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+    client
+        .simple_query(
+            "CREATE TABLE f (
+                 bare    timestamp     DEFAULT 'now',
+                 cast_ts timestamp     DEFAULT 'now'::timestamp,
+                 cast_tz timestamptz   DEFAULT 'now'::timestamptz,
+                 cast_d  date          DEFAULT 'today'::date,
+                 arr     timestamptz[] DEFAULT '{now}',
+                 live    timestamptz   DEFAULT now())",
+        )
+        .await?;
+
+    let stored = column(
+        &client,
+        "SELECT pg_get_expr(ad.adbin, ad.adrelid)
+           FROM pg_attrdef ad JOIN pg_attribute a
+             ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+          WHERE ad.adrelid = 'f'::regclass
+          ORDER BY a.attnum",
+    )
+    .await;
+    for (i, want_suffix) in [
+        (0, "::timestamp without time zone"),
+        (1, "::timestamp without time zone"),
+        (2, "::timestamp with time zone"),
+        (3, "::date"),
+        (4, "::timestamp with time zone[]"),
+    ] {
+        assert!(
+            stored[i].ends_with(want_suffix) && !stored[i].contains("now"),
+            "column {i} should have frozen into a literal, got {:?}",
+            stored[i]
+        );
+    }
+    assert_eq!(stored[5], "now()");
+
+    // Two inserts a moment apart: everything frozen repeats, `now()` does not.
+    client.simple_query("INSERT INTO f DEFAULT VALUES").await?;
+    client.simple_query("INSERT INTO f DEFAULT VALUES").await?;
+    for col in ["bare", "cast_ts", "cast_tz", "cast_d", "arr"] {
+        assert_eq!(
+            scalar(&client, &format!("SELECT count(DISTINCT {col}) FROM f")).await,
+            "1",
+            "`{col}` should be frozen"
+        );
+    }
+    assert_eq!(scalar(&client, "SELECT count(DISTINCT live) FROM f").await, "2");
+    Ok(())
+}
