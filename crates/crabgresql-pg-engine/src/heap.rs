@@ -455,6 +455,7 @@ impl HeapTable {
                 // is an ordinary user command.
                 let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
                 if let Some(key) = btkey::encode_row(&schema, &cols, &tuple) {
+                    Self::index_row_fits(&key, tid, &meta.name, &schema.name)?;
                     btree.insert(&key, tid);
                 }
             }
@@ -481,10 +482,37 @@ impl HeapTable {
         Ok(())
     }
 
+    /// Whether `key` fits an index page, as the error PostgreSQL raises when it
+    /// does not: `54000`, naming the index and the heap tuple the key came from.
+    /// Asked before [`crate::nbtree::BTree::insert`], whose own size check is a
+    /// panic — a tree knows neither of those names, and an oversized key is an
+    /// ordinary user mistake rather than a broken invariant.
+    fn index_row_fits(
+        key: &[u8],
+        tid: Tid,
+        index: &str,
+        relation: &str,
+    ) -> Result<(), StorageError> {
+        let (size, max) = crate::nbtree::item_size(key);
+        if size <= max {
+            return Ok(());
+        }
+        Err(StorageError::IndexRowTooBig {
+            size,
+            max,
+            index: index.to_string(),
+            relation: relation.to_string(),
+            tid,
+        })
+    }
+
     /// Add a `key -> tid` entry to every physical index for a newly placed
     /// version. A row whose key column is NULL or an un-indexable value is simply
     /// not indexed (its key never satisfies equality), matching the memory engine.
-    fn maintain_insert(&self, tuple: &Tuple, tid: Tid, xid: Xid) {
+    ///
+    /// Fails the statement for a key too large to page — the row itself may be
+    /// far bigger and still storable, since only the indexed columns are capped.
+    fn maintain_insert(&self, tuple: &Tuple, tid: Tid, xid: Xid) -> Result<(), StorageError> {
         let indexes = self
             .indexes
             .read()
@@ -492,7 +520,7 @@ impl HeapTable {
         // An unindexed table has nothing to maintain, so its rows never touch
         // the schema lock at all — that is the bulk-load shape.
         if indexes.is_empty() {
-            return;
+            return Ok(());
         }
         // One snapshot for the whole row: every index is judged and encoded
         // against the same `columns`, and the row costs one schema-lock
@@ -504,9 +532,11 @@ impl HeapTable {
             }
             let cols = btkey::key_columns(&entry.meta.keys);
             if let Some(key) = btkey::encode_row(&schema, &cols, tuple) {
+                Self::index_row_fits(&key, tid, &entry.meta.name, &schema.name)?;
                 self.btree(entry, xid).insert(&key, tid);
             }
         }
+        Ok(())
     }
 
     pub fn relfilenode(&self) -> RelFileNode {
@@ -1378,7 +1408,7 @@ impl TableAm for HeapTable {
         let planned = self.plan_tuple(&tuple, &hdr)?;
         let bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let tid = self.place(rel, txn.xid, &bytes);
-        self.maintain_insert(&tuple, tid, txn.xid);
+        self.maintain_insert(&tuple, tid, txn.xid)?;
         Ok(tid)
     }
 
@@ -1423,7 +1453,7 @@ impl TableAm for HeapTable {
         // memory engine's append-only maintenance.
         let new_bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let new_tid = self.place(rel, txn.xid, &new_bytes);
-        self.maintain_insert(&tuple, new_tid, txn.xid);
+        self.maintain_insert(&tuple, new_tid, txn.xid)?;
         Ok(UpdateResult::Updated)
     }
 

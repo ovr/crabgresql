@@ -659,6 +659,47 @@ pub enum StorageError {
     /// PostgreSQL caps a varlena at 1 GB and reports `54000` for it too.
     #[error("value is too large: size {size}, maximum size {max}")]
     ValueTooBig { size: usize, max: usize },
+    /// A key too large for an index page. A row can be far bigger than this and
+    /// still be storable — only the *indexed* columns are capped — so the error
+    /// names the index and the heap tuple rather than the row, as PostgreSQL's
+    /// does. `54000` again.
+    ///
+    /// PostgreSQL says "btree version 4 maximum 2704"; we model neither index
+    /// versions nor its page layout, so `max` is our own cap and the phrase is
+    /// dropped. The DETAIL and HINT are its wording verbatim.
+    #[error("index row size {size} exceeds btree maximum {max} for index \"{index}\"")]
+    IndexRowTooBig {
+        size: usize,
+        max: usize,
+        index: String,
+        relation: String,
+        tid: Tid,
+    },
+}
+
+impl StorageError {
+    /// PostgreSQL's DETAIL for this error, or `None` where it raises none.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            StorageError::IndexRowTooBig { relation, tid, .. } => Some(format!(
+                "Index row references tuple ({},{}) in relation \"{relation}\".",
+                tid.block, tid.offset
+            )),
+            _ => None,
+        }
+    }
+
+    /// PostgreSQL's HINT for this error, or `None` where it raises none.
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            StorageError::IndexRowTooBig { .. } => Some(
+                "Values larger than 1/3 of a buffer page cannot be indexed.\nConsider a function \
+                 index of an MD5 hash of the value, or use full text indexing."
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of `TableAm::update`.

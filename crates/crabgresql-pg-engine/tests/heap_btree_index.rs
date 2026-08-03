@@ -5,8 +5,8 @@
 //! is never reachable by a stale key), crash recovery, and file lifecycle.
 
 use crabgresql_storage_api::{
-    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, TableAm,
-    TableEngine, TableSchema, Tid,
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError,
+    TableAm, TableEngine, TableSchema, Tid,
 };
 use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -816,7 +816,7 @@ fn metadata_only_index_allocates_no_file_and_no_relfilenode() -> anyhow::Result<
 }
 
 #[test]
-fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Result<()> {
+fn oversized_key_fails_create_index_without_freezing_the_table() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (engine, tm) = open(dir.path())?;
     let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
@@ -828,14 +828,19 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     )?;
     tm.commit(x)?;
 
-    // CREATE INDEX panics building the tree (index row size exceeds btree maximum).
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        engine.create_index("public", "t", idx_on_text())
-    }));
-    assert!(result.is_err(), "oversized-key CREATE INDEX should fail");
+    // The build reports the key, naming the index and the row it came from.
+    match engine.create_index("public", "t", idx_on_text()) {
+        Err(StorageError::IndexRowTooBig {
+            size, max, index, ..
+        }) => {
+            assert!(size > max, "{size} should exceed {max}");
+            assert_eq!(index, "t_s_idx");
+        }
+        other => panic!("expected IndexRowTooBig, got {other:?}"),
+    }
 
-    // The table's exclusive lock was released by the RAII guard during unwind, so
-    // the table is still usable (this would hang/deadlock if the lock leaked).
+    // The table's exclusive lock was released by the RAII guard, so the table is
+    // still usable (this would hang/deadlock if the lock leaked).
     let x = tm.allocate_xid();
     table.insert(
         vec![Value::Text("small".into())],
@@ -845,6 +850,40 @@ fn oversized_key_create_index_panics_without_freezing_the_table() -> anyhow::Res
     assert_eq!(table.scan(&read(&tm), &ColumnProjection::All).count(), 2);
     // The failed index was never published.
     assert!(!table.supports_index_scan("t_s_idx"));
+    Ok(())
+}
+
+#[test]
+fn oversized_key_fails_the_insert_that_carries_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(TableSchema::new("t", vec![Column::new("s", PgType::Text)]))?;
+    engine.create_index("public", "t", idx_on_text())?;
+
+    let x = tm.allocate_xid();
+    let txn = tm.context(x, CommandId::FIRST);
+    match table.insert(vec![Value::Text("z".repeat(4000))], &txn) {
+        Err(error @ StorageError::IndexRowTooBig { .. }) => {
+            // PostgreSQL's DETAIL and HINT, which the row-too-big siblings have
+            // no equivalent of.
+            assert!(
+                error
+                    .detail()
+                    .is_some_and(|d| d.contains("in relation \"t\"")),
+                "{error:?}"
+            );
+            assert!(error.hint().is_some_and(|h| h.contains("1/3 of a buffer")));
+        }
+        other => panic!("expected IndexRowTooBig, got {other:?}"),
+    }
+    // A key that fits still goes in on the same table.
+    table.insert(vec![Value::Text("small".into())], &txn)?;
+    tm.commit(x)?;
+    let found = table
+        .index_lookup("t_s_idx", &[Value::Text("small".into())], &read(&tm))
+        .expect("the index serves probes")
+        .count();
+    assert_eq!(found, 1, "the fitting key is indexed");
     Ok(())
 }
 

@@ -42,6 +42,15 @@ const LP_OVERHEAD: usize = 4;
 /// `choose_split`.
 const BT_MAX_ITEM: usize = 2000;
 
+/// The size a `key -> tid` entry would occupy, and the largest one this tree
+/// accepts. A caller checks the pair *before* [`BTree::insert`] because the
+/// error PostgreSQL raises names the index, the heap tuple and the relation —
+/// none of which a tree knows. Cheap: the item's size is its key plus the tid,
+/// so nothing is encoded to ask.
+pub fn item_size(key: &[u8]) -> (usize, usize) {
+    (8 + key.len(), BT_MAX_ITEM)
+}
+
 /// A durable B-tree rooted in one index relfilenode. Cheap to construct per
 /// operation; all persistent state lives in the buffer pool / WAL keyed by `rel`.
 /// The `latch` is shared across every handle for the same index (it lives on the
@@ -294,8 +303,12 @@ impl BTree {
     // -- Insert ------------------------------------------------------------
 
     /// Insert `key -> tid`. Duplicates are allowed (the `(key, tid)` order is
-    /// total). Panics if the encoded item exceeds the page item limit, matching
-    /// PostgreSQL's "index row size exceeds btree maximum".
+    /// total).
+    ///
+    /// Panics if the encoded item exceeds the page item limit. That is a
+    /// backstop, not the error path: an oversized key is an ordinary user
+    /// mistake, so callers ask [`item_size`] first and raise `54000` with the
+    /// index and heap tuple named. Reaching this assert means one did not.
     pub fn insert(&self, key: &[u8], tid: Tid) {
         let _w = self
             .latch
