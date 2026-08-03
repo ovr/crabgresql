@@ -20,6 +20,8 @@ CREATE UNIQUE INDEX uix_a_b_key ON uix(a, b);
 CREATE TABLE uixc (a integer, b text);
 INSERT INTO uixc VALUES (1, 'x'), (2, 'y'), (1, 'x');
 CREATE UNIQUE INDEX uixc_a_b_key ON uixc(a, b);
+-- A key column may repeat, and then the value is named once per position.
+CREATE UNIQUE INDEX uixc_a_a_key ON uixc(a, a);
 -- NULL keys are exempt by default and collide only under NULLS NOT DISTINCT.
 CREATE TABLE uixn (i integer);
 INSERT INTO uixn VALUES (NULL), (NULL), (5);
