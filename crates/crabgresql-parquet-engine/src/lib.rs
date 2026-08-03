@@ -1571,6 +1571,21 @@ impl TableAm for ParquetTable {
         if tuples.is_empty() {
             return Ok(Vec::new());
         }
+        // A frozen fragment is visible the instant it is fsynced: `header` reports
+        // `Xid::FROZEN` for it and `visible_fragments` never looks at the `.pending`
+        // suffix. What keeps that from being a dirty read is that the fragment
+        // lands in a staged TRUNCATE directory no other session lists — which is
+        // the same precondition the server checked before authorizing the freeze.
+        // Asserting it here too, where it is actually relied upon, so a caller that
+        // widens the freeze fails loudly instead of publishing uncommitted rows
+        // into the live directory.
+        if txn.freeze_inserts && self.staged_truncate(txn.xid).is_none() {
+            return Err(StorageError::UnsupportedOperation(format!(
+                "cannot write frozen rows into \"{}\": \
+                 this transaction has not truncated it",
+                self.schema.name
+            )));
+        }
         // Shared hold for the whole write: a concurrent TRUNCATE must not swap the
         // directory out from under fragments that are already being written into it.
         let _guard = self.lock.acquire_shared(txn.lock_owner);
@@ -2353,6 +2368,42 @@ mod tests {
             })
             .count();
         assert_eq!(pending, 0);
+        Ok(())
+    }
+
+    /// A frozen fragment is visible as soon as it is fsynced — `header` reports
+    /// `Xid::FROZEN` and `visible_fragments` ignores the `.pending` suffix — so the
+    /// only thing standing between it and a dirty read is that it lands in a
+    /// staged TRUNCATE directory nobody else lists. This asserts the invariant
+    /// where it is relied upon, rather than trusting the server two crates away to
+    /// have checked it.
+    #[test]
+    fn a_frozen_write_requires_this_transaction_to_have_truncated() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let table = open_table(
+            dir.path(),
+            1,
+            schema("frozen", &[PgType::Int4]),
+            Arc::clone(&wal),
+        )?;
+
+        let xid = tm.allocate_xid();
+        let txn = tm.context(xid, CommandId::FIRST).with_freeze();
+        let error = table
+            .insert(vec![Value::Int4(1)], &txn)
+            .expect_err("a frozen write with no staged truncate must be refused");
+        assert!(
+            error.to_string().contains("has not truncated it"),
+            "{error}"
+        );
+        // Nothing reached the directory, so no reader could have seen anything.
+        assert!(parquet_files(dir.path(), 1)?.is_empty());
+
+        // With the truncate staged by this same transaction it goes through.
+        table.truncate(&txn)?;
+        table.insert(vec![Value::Int4(1)], &txn)?;
         Ok(())
     }
 
@@ -3432,7 +3483,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[test]
     fn a_projected_scan_yields_the_same_tids_as_a_full_one() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
