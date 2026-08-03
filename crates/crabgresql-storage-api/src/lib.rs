@@ -127,7 +127,10 @@ pub struct Column {
     /// The declared type modifier (e.g. a `varchar(n)`/`char(n)` length), or
     /// `-1` when the type has none. Applied to values on INSERT/UPDATE.
     pub typmod: i32,
-    /// Whether SQL NULL is accepted. A PRIMARY KEY also sets this to false.
+    /// Whether SQL NULL is accepted. A PRIMARY KEY also sets this to false —
+    /// at `CREATE TABLE`, or later through `ALTER TABLE ... ADD PRIMARY KEY`,
+    /// which republishes the whole schema rather than mutating this in place
+    /// (see [`TableAm::schema`]).
     pub nullable: bool,
     /// The name of an explicit NOT NULL constraint. PRIMARY KEY-implied
     /// non-nullability has no separate entry here.
@@ -476,8 +479,8 @@ pub struct TableSchema {
     /// Only the link is stored. The parent↔child column correspondence is
     /// recomputed by column *name* wherever it is needed, which is exact because
     /// the merge at `CREATE TABLE` gives the child a column of every parent name
-    /// and nothing may afterwards rename or drop it (this server has no
-    /// `ALTER TABLE`).
+    /// and nothing may afterwards rename or drop it (the `ALTER TABLE` forms
+    /// this server implements add constraints, never columns).
     pub inherits: Vec<InheritParent>,
     /// The layout sort key: the order an engine-managed access method stores
     /// rows in, from `ORDER BY (...)` or defaulted to the `PRIMARY KEY`. A heap
@@ -1153,6 +1156,25 @@ pub trait TableEngine: Send + Sync {
         index: IndexMetadata,
     ) -> Result<(), StorageError> {
         Err(StorageError::RelationAlreadyExists(index.name))
+    }
+
+    /// Mark `columns` (positions into the relation's column list) NOT NULL,
+    /// durably — what `ALTER TABLE ... ADD PRIMARY KEY` does to its key columns.
+    /// The caller has already scanned the table and found no NULL there.
+    ///
+    /// The whole key goes in one call so the engine can make it durable as one
+    /// write: a crash leaves the key entirely NOT NULL or untouched, never half.
+    ///
+    /// The default rejects, deliberately: an engine that cannot record this must
+    /// fail the statement loudly rather than let a PRIMARY KEY land on columns
+    /// that still accept NULL.
+    fn set_column_not_null(
+        &self,
+        _namespace: &str,
+        table: &str,
+        _columns: &[usize],
+    ) -> Result<(), StorageError> {
+        Err(StorageError::TableNotFound(table.to_string()))
     }
 
     /// Remove the index named `index_name` from `table` in `namespace`. The

@@ -1751,6 +1751,52 @@ impl TableEngine for PgEngine {
         Ok(())
     }
 
+    /// Persist the catalog FIRST, then publish the new schema in memory.
+    /// Ordering matters the same way it does for `create_index` above, and for
+    /// the same reason — make durable first whatever is dangerous by its
+    /// absence. Here the danger is the *other* order: a session that sees the
+    /// column as NOT NULL while the catalog still says nullable would reject
+    /// rows that come back on the next startup, and the PRIMARY KEY the caller
+    /// is about to create would be resting on columns a restart makes nullable
+    /// again.
+    ///
+    /// The exclusive DDL hold spans both, so the durable and the published
+    /// shape never disagree for longer than the statement that changes them.
+    fn set_column_not_null(
+        &self,
+        namespace: &str,
+        table: &str,
+        columns: &[usize],
+    ) -> Result<(), StorageError> {
+        let target = {
+            let tables = self
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            tables
+                .get(&(namespace.to_string(), table.to_string()))
+                .cloned()
+                .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?
+        };
+        // Only the heap records this. A Parquet/Buffer relation derives its
+        // Arrow field nullability from these very bits (`arrow::arrow_schema`),
+        // and that is the schema its *new* fragments are written with — flipping
+        // it mid-life would leave one relation's fragments disagreeing about
+        // whether a field is required. Reads do not care (`scan_schema` forces
+        // every field nullable), but the footer is a claim an outside Parquet
+        // reader will act on, so it deserves its own change rather than riding
+        // along with this one.
+        let ManagedTable::Heap(heap) = target.as_ref() else {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        };
+        let _guard = heap.begin_index_ddl();
+        self.catalog
+            .set_column_not_null(namespace, table, columns)
+            .expect("relation catalog write failed");
+        heap.set_columns_not_null(columns);
+        Ok(())
+    }
+
     fn drop_index(
         &self,
         namespace: &str,

@@ -288,6 +288,27 @@ impl HeapTable {
             });
     }
 
+    /// Publish a schema with `columns` marked NOT NULL, after the durable
+    /// catalog has already recorded it.
+    ///
+    /// Builds a whole new [`TableSchema`] and swaps it in rather than editing
+    /// the live one: a session that already took a snapshot keeps reading the
+    /// version it started with, and the next one sees the new shape entire.
+    /// That is what makes the swap indivisible across a multi-column key — no
+    /// reader can observe half of it — and it is the same move a future
+    /// `ADD COLUMN` will make, which editing a field in place could not be.
+    pub fn set_columns_not_null(&self, columns: &[usize]) {
+        let mut guard = self
+            .schema
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let mut next = (**guard).clone();
+        for &c in columns {
+            next.columns[c].nullable = false;
+        }
+        *guard = Arc::new(next);
+    }
+
     pub fn remove_index(&self, index_name: &str) {
         self.indexes
             .write()

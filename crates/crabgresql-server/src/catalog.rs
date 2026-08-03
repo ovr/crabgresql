@@ -306,6 +306,26 @@ impl TableEngine for SessionCatalog {
         }
     }
 
+    /// Routed exactly like `create_index` — the two are the halves of one
+    /// `ALTER TABLE ... ADD PRIMARY KEY`, so they must land on the same
+    /// relation. Without this arm the default would forward `"public"` straight
+    /// through and mark a same-named *permanent* table's columns NOT NULL.
+    fn set_column_not_null(
+        &self,
+        namespace: &str,
+        table: &str,
+        columns: &[usize],
+    ) -> Result<(), StorageError> {
+        if namespace == "public" && self.temp_has(table) {
+            self.global
+                .set_column_not_null(&self.temp_schema, table, columns)
+        } else if self.is_foreign_temp(namespace) {
+            Err(StorageError::IndexTableNotFound(table.to_string()))
+        } else {
+            self.global.set_column_not_null(namespace, table, columns)
+        }
+    }
+
     fn index_name_exists(&self, namespace: &str, table: &str, index_name: &str) -> bool {
         if namespace == "public" && self.temp_has(table) {
             self.global
