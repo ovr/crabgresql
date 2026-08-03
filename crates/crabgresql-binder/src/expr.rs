@@ -3239,6 +3239,20 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
     }
 }
 
+/// The value of a whole-number literal token, or `None` when the text is not one
+/// (a fraction, an exponent, or a magnitude past `i128`).
+///
+/// The parser keeps a numeric literal as written, so every site that re-reads
+/// that text has to decode it — and they must all agree, or `0x2` means one
+/// thing in an expression and another as an `ORDER BY` ordinal. This is the one
+/// decoder for those sites; the expression path uses [`parse_number`], which is
+/// built on the same acceptor.
+pub fn literal_int(n: &str) -> Option<i128> {
+    let (negative, magnitude) = crabgresql_types::intlit::scan_int_literal(n).ok()?;
+    let v = i128::try_from(magnitude).ok()?;
+    Some(if negative { -v } else { v })
+}
+
 /// Bind a `numeric` constant from `text`, reporting an unreadable one against
 /// `original` — the literal as it was written, which may differ once digit
 /// separators have been stripped or a non-decimal spelling converted.
@@ -3655,8 +3669,9 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
             if builtin_custom_type(obj) != Some(PgType::Numeric) {
                 return None;
             }
-            let precision = mods.first()?.parse().ok()?;
-            let scale = mods.get(1).map_or(Some(0), |s| s.parse().ok())?;
+            let modifier = |s: &String| literal_int(s).and_then(|v| i32::try_from(v).ok());
+            let precision = modifier(mods.first()?)?;
+            let scale = mods.get(1).map_or(Some(0), modifier)?;
             return Some((precision, scale));
         }
         _ => return None,
@@ -3771,7 +3786,7 @@ pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
         // `char`, which the grammar defaults to `char(1)`), so no `unwrap_or`.
         DataType::Custom(obj, mods) => match builtin_custom_type(obj) {
             Some(PgType::Bpchar | PgType::Varchar | PgType::Bit | PgType::Varbit) => {
-                mods.first()?.parse().ok()
+                literal_int(mods.first()?).and_then(|v| i32::try_from(v).ok())
             }
             _ => None,
         },
@@ -3812,7 +3827,10 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
         // is raw token text; the bound and the `typname` in the error follow
         // the type the name resolves to.
         DataType::Custom(obj, mods) => {
-            let declared = mods.first().and_then(|m| m.parse::<u64>().ok());
+            let declared = mods
+                .first()
+                .and_then(|m| literal_int(m))
+                .and_then(|v| u64::try_from(v).ok());
             match builtin_custom_type(obj) {
                 Some(PgType::Bpchar) => (declared, "char", MAX_CHAR_LENGTH),
                 Some(PgType::Varchar) => (declared, "varchar", MAX_CHAR_LENGTH),

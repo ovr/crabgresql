@@ -2484,7 +2484,9 @@ fn bind_count_expr(
 fn const_i64(expr: &ast::Expr) -> Option<Option<i64>> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
-            ast::Value::Number(n, _) => n.parse().ok().map(Some),
+            ast::Value::Number(n, _) => crate::expr::literal_int(n)
+                .and_then(|v| i64::try_from(v).ok())
+                .map(Some),
             ast::Value::Null => Some(None),
             _ => None,
         },
@@ -4170,7 +4172,7 @@ fn order_by_target(
     // an expression, not ordinal 2, so only a plain `Value::Number` qualifies.
     if let ast::Expr::Value(v) = expr
         && let ast::Value::Number(n, _) = &v.value
-        && let Ok(ordinal) = n.parse::<usize>()
+        && let Some(ordinal) = crate::expr::literal_int(n).and_then(|v| usize::try_from(v).ok())
     {
         if ordinal < 1 || ordinal > columns.len() {
             return Err(BindError::new(
@@ -5171,7 +5173,7 @@ fn group_by_ordinal(expr: &ast::Expr) -> Option<usize> {
     if let ast::Expr::Value(v) = expr
         && let ast::Value::Number(n, _) = &v.value
     {
-        return n.parse::<usize>().ok();
+        return crate::expr::literal_int(n).and_then(|v| usize::try_from(v).ok());
     }
     None
 }

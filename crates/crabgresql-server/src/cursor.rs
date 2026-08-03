@@ -279,10 +279,14 @@ fn movement_of(direction: &ast::FetchDirection) -> Result<CursorMove, PgError> {
 ///
 /// The parser accepts only PostgreSQL's `SignedIconst` here, so the literal is
 /// an `int` and this cannot fail in practice; the error path exists so a parser
-/// change cannot silently truncate a count instead.
+/// change cannot silently truncate a count instead. The literal is decoded
+/// through the shared acceptor because `FETCH 0x2` is a valid count in PG —
+/// the parser's own range check reads it the same way.
 fn count(limit: &ast::ValueWithSpan) -> Result<i64, PgError> {
     match &limit.value {
-        ast::Value::Number(digits, _) => digits.parse::<i32>().map(i64::from).ok(),
+        ast::Value::Number(digits, _) => crabgresql_binder::literal_int(digits)
+            .and_then(|v| i32::try_from(v).ok())
+            .map(i64::from),
         _ => None,
     }
     .ok_or_else(|| PgError::syntax(format!("syntax error at or near \"{}\"", limit.value)))

@@ -3588,9 +3588,9 @@ fn keyword_precision(args: &ast::FunctionArguments) -> Result<Option<i32>, BindE
     let ast::Value::Number(digits, _) = &v.value else {
         return Err(BindError::syntax("syntax error at or near \"(\""));
     };
-    let p: i64 = digits
-        .parse()
-        .map_err(|_| BindError::syntax("syntax error at or near \"(\""))?;
+    let p: i64 = crate::expr::literal_int(digits)
+        .and_then(|v| i64::try_from(v).ok())
+        .ok_or_else(|| BindError::syntax("syntax error at or near \"(\""))?;
     Ok(Some(
         (p.min(i32::MAX as i64) as i32).min(crabgresql_types::timestamp::MAX_PRECISION),
     ))

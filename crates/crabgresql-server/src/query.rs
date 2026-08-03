@@ -6100,7 +6100,12 @@ fn drop_created_sequences(engine: &Arc<dyn TableEngine>, defs: &[SequenceDefinit
 fn parse_i64_expr(expr: &ast::Expr) -> Option<i64> {
     match expr {
         ast::Expr::Value(v) => match &v.value {
-            ast::Value::Number(n, _) => n.parse().ok(),
+            // The literal keeps its written spelling, so `INCREMENT 0x2` needs
+            // the same acceptor an expression would use; a quoted option value
+            // is an ordinary string and stays on `str::parse`.
+            ast::Value::Number(n, _) => {
+                crabgresql_binder::literal_int(n).and_then(|v| i64::try_from(v).ok())
+            }
             other => other.as_pg_string()?.trim().parse().ok(),
         },
         ast::Expr::UnaryOp {

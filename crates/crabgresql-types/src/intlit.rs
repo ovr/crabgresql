@@ -268,6 +268,36 @@ mod tests {
         assert_eq!(ok("0b_10_0101"), 37);
     }
 
+    /// `crabgresql-parser` carries a copy of this grammar (`numlit.rs`) because
+    /// that crate is a fork of sqlparser-rs and depends on nothing else in the
+    /// workspace. This is the table both must agree on; the parser asserts the
+    /// same one. Change this file first, then mirror it there.
+    #[test]
+    fn mirrors_the_parser_crate_grammar() {
+        let accepted = [
+            ("5", 5),
+            ("-42", -42),
+            ("+7", 7),
+            ("0x5", 5),
+            ("0X42f", 1071),
+            ("0o17", 15),
+            ("0b11", 3),
+            ("1_000", 1000),
+            ("0xE_FF", 3839),
+            ("0b_10_0101", 37),
+            ("-0x8000", -32768),
+        ];
+        for (text, want) in accepted {
+            assert_eq!(ok(text), want, "for {text:?}");
+        }
+        for bad in [
+            "", "  ", "1.5", "1e5", "abc", "0x", "0o", "0b", "_100", "100_", "10__000", "0b12",
+            "12abc", "1 2",
+        ] {
+            assert_eq!(scan_int_literal(bad), Err(ScanError::Syntax), "for {bad:?}");
+        }
+    }
+
     #[test]
     fn syntax_errors() {
         for bad in [
