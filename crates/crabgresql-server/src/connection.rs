@@ -106,6 +106,8 @@ pub async fn handle_connection(
             // is what ends the skip.
             Some(FrontendMessage::Sync) => {
                 skip_until_sync = false;
+                // `Sync` ends the implicit transaction block the batch formed.
+                session.end_implicit_block();
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -114,8 +116,10 @@ pub async fn handle_connection(
             Some(FrontendMessage::Query(sql)) => {
                 // One stamp for the whole message, not one per statement: a
                 // multi-statement simple query shares a `statement_timestamp()`
-                // in PostgreSQL.
-                session.stamp_message();
+                // in PostgreSQL. It is also its own implicit transaction, so it
+                // neither joins nor continues an extended-query batch's.
+                session.end_implicit_block();
+                session.stamp_message(false);
                 run_simple_query(
                     &sql,
                     &engine,
@@ -134,7 +138,7 @@ pub async fn handle_connection(
                 query,
                 param_types,
             }) => {
-                session.stamp_message();
+                session.stamp_message(true);
                 let outcome = handle_parse(
                     &engine,
                     &catalog,
@@ -159,7 +163,7 @@ pub async fn handle_connection(
                 params,
                 result_formats,
             }) => {
-                session.stamp_message();
+                session.stamp_message(true);
                 let outcome = handle_bind(
                     &mut session,
                     &mut writer,
@@ -188,7 +192,7 @@ pub async fn handle_connection(
                 );
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
-                session.stamp_message();
+                session.stamp_message(true);
                 // COPY FROM STDIN needs the socket (to read CopyData frames),
                 // which the pure execute path lacks — drive it here, where the
                 // reader is in scope and errors are ProtocolError. Any other

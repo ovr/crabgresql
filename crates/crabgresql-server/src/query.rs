@@ -1798,7 +1798,10 @@ fn begin_transaction(
     let iso = mode_iso.unwrap_or(session.default_iso);
     let read_only = mode_read_only.unwrap_or(session.default_read_only);
     session.tx_status = TransactionStatus::InTransaction;
-    session.xact = Some(ActiveTxn::new(iso, read_only, session.stmt_start));
+    // A `BEGIN` inside an extended-query batch adopts the implicit block's
+    // start rather than opening a new one, as in PostgreSQL; outside one,
+    // `xact_start()` is this message's own stamp.
+    session.xact = Some(ActiveTxn::new(iso, read_only, session.xact_start()));
     Ok(QueryResult::command(tag))
 }
 
