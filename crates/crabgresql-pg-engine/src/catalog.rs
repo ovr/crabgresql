@@ -429,15 +429,27 @@ impl RelCatalog {
         RelFileNode(rel)
     }
 
-    /// Point `table` at `new`'s file and persist the catalog. Returns the
-    /// previous relfilenode, or `None` if the table is absent. Idempotent: if the
-    /// table already points at `new` (a re-applied recovery swap) it returns
-    /// `Some(new)` without rewriting the file.
+    /// Point `table` at `new`'s file, each index named in `index_swaps` at its
+    /// own new file, and persist the catalog. Returns the previous relfilenode,
+    /// or `None` if the table is absent. Idempotent: if the table and every named
+    /// index already point at the new files (a re-applied recovery swap) it
+    /// returns `Some(new)` without rewriting the catalog.
+    ///
+    /// Heap and indexes land in ONE `persist`, so the swap is all-or-nothing on
+    /// disk: a catalog naming the new heap beside the old indexes would describe
+    /// a table whose probes return rows from tids the new file has reused.
+    ///
+    /// An index name absent from `rel.indexes` — dropped after the TRUNCATE — is
+    /// skipped rather than an error; its file is reclaimed by the startup orphan
+    /// sweep. An index created *after* the TRUNCATE is absent from `index_swaps`
+    /// and keeps its relfilenode, which is right: it was built from the
+    /// post-truncate heap.
     pub fn swap_relfilenode(
         &self,
         namespace: &str,
         table: &str,
         new: RelFileNode,
+        index_swaps: &[(String, RelFileNode)],
     ) -> std::io::Result<Option<RelFileNode>> {
         let mut state = self
             .state
@@ -451,10 +463,23 @@ impl RelCatalog {
             return Ok(None);
         };
         let old = rel.rel;
-        if old == new.0 {
+        // Nothing to change only if the indexes agree too: a heap that already
+        // matches must not short-circuit an index rewrite that still lags.
+        let indexes_current = index_swaps.iter().all(|(name, irel)| {
+            rel.indexes
+                .iter()
+                .find(|i| i.meta.name == *name)
+                .is_none_or(|i| i.rel == irel.0)
+        });
+        if old == new.0 && indexes_current {
             return Ok(Some(new));
         }
         rel.rel = new.0;
+        for (name, irel) in index_swaps {
+            if let Some(index) = rel.indexes.iter_mut().find(|i| i.meta.name == *name) {
+                index.rel = irel.0;
+            }
+        }
         // Statistics describe the file being swapped out, so they do not carry
         // over to the empty one. Clearing them here (rather than measuring zero)
         // returns the relation to never-analyzed, which is what PostgreSQL
@@ -466,9 +491,12 @@ impl RelCatalog {
         // in-memory relfilenode (so a later DROP unlinks the right rel) but skip the
         // disk write. Permanent/Unlogged persist the swapped relfilenode.
         let persists = rel.persistence.persists_catalog();
-        // Keep `next` above the swapped-in id even if it was allocated on a
+        // Keep `next` above every swapped-in id even if it was allocated on a
         // previous boot and the counter was rebuilt from an older catalog file.
         state.next = state.next.max(new.0 + 1);
+        for (_, irel) in index_swaps {
+            state.next = state.next.max(irel.0 + 1);
+        }
         if persists {
             self.persist(&state)?;
         }
@@ -551,6 +579,28 @@ impl RelCatalog {
             .iter()
             .find(|r| r.namespace == namespace && r.name == table)
             .map(|r| RelFileNode(r.rel))
+    }
+
+    /// `table`'s physical indexes as `(name, relfilenode)`, in catalog order.
+    /// Metadata-only indexes (relfilenode 0) are excluded: they have no file, so
+    /// a TRUNCATE has nothing to swap for them.
+    pub fn index_relfilenodes(&self, namespace: &str, table: &str) -> Vec<(String, RelFileNode)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .rels
+            .iter()
+            .find(|r| r.namespace == namespace && r.name == table)
+            .map(|r| {
+                r.indexes
+                    .iter()
+                    .filter(|i| i.rel != 0)
+                    .map(|i| (i.meta.name.clone(), RelFileNode(i.rel)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Every live relfilenode in the catalog — each table's heap file, each
@@ -2629,7 +2679,7 @@ mod tests {
         assert!(catalog.set_stats("public", "other", 3, 9.0)?);
 
         let swapped = catalog.alloc_relfilenode();
-        catalog.swap_relfilenode("public", "t", swapped)?;
+        catalog.swap_relfilenode("public", "t", swapped, &[])?;
         assert_eq!(catalog.stats_in("public", "t"), None);
         // Only the truncated relation is affected.
         assert_eq!(catalog.stats_in("public", "other"), Some((3, 9.0)));

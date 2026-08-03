@@ -96,6 +96,19 @@ impl RmgrRedo for HeapRedo {
                 let table = String::from_utf8(r.bytes().to_vec())
                     .map_err(|e| WalError::Redo(format!("truncate record: bad table name: {e}")))?;
                 self.engine.bufpool.smgr().create_if_missing(new)?;
+                // The index swaps ride in this record; materialize their new
+                // files for the same reason as the heap's above.
+                let nindexes = r.u32();
+                let mut indexes = Vec::with_capacity(nindexes as usize);
+                for _ in 0..nindexes {
+                    let name = String::from_utf8(r.bytes().to_vec()).map_err(|e| {
+                        WalError::Redo(format!("truncate record: bad index name: {e}"))
+                    })?;
+                    let iold = r.rel();
+                    let inew = r.rel();
+                    self.engine.bufpool.smgr().create_if_missing(inew)?;
+                    indexes.push((name, iold, inew));
+                }
                 self.engine
                     .recovered_truncates
                     .lock()
@@ -106,6 +119,7 @@ impl RmgrRedo for HeapRedo {
                         table,
                         old,
                         new,
+                        indexes,
                         parquet: false,
                     });
             }

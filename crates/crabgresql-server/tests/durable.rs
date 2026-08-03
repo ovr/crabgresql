@@ -601,6 +601,53 @@ async fn truncate_committed_across_a_restart_stays_empty() {
     }
 }
 
+/// An indexed table's TRUNCATE survives a restart on both halves: the catalog
+/// must come back naming the post-truncate B-tree, or the reopened index would
+/// answer a truncated-away key with a row the new heap file has since placed at
+/// the tid the stale entry names.
+#[tokio::test]
+async fn truncate_of_an_indexed_table_is_durable_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE TABLE t (id int)")
+            .await
+            .unwrap();
+        client
+            .simple_query("CREATE INDEX t_idx ON t (id)")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+            .await
+            .unwrap();
+        client.simple_query("TRUNCATE t").await.unwrap();
+        client
+            .simple_query("INSERT INTO t VALUES (7)")
+            .await
+            .unwrap();
+        shutdown(client, handle).await;
+    }
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        let msgs = client
+            .simple_query("SELECT id FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        assert!(rows(&msgs).is_empty(), "a truncated-away key came back");
+        let msgs = client
+            .simple_query("SELECT id FROM t WHERE id = 7")
+            .await
+            .unwrap();
+        let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, vec![Some("7")]);
+        shutdown(client, handle).await;
+    }
+}
+
 /// TRUNCATE on a Parquet table end-to-end across restarts: the committed swap
 /// stays committed, a rolled-back one leaves the rows in place, and exactly one
 /// fragment directory survives each restart (the superseded and staged ones are

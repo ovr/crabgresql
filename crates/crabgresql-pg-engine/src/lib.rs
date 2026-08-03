@@ -84,6 +84,10 @@ pub(crate) struct RecoveredTruncate {
     pub table: String,
     pub old: RelFileNode,
     pub new: RelFileNode,
+    /// The relation's physical indexes as `(name, old, new)`, swapped by the same
+    /// verdict as the heap file. Always empty for a Parquet relation, whose
+    /// indexes are metadata-only.
+    pub indexes: Vec<(String, RelFileNode, RelFileNode)>,
     /// Whether the swapped relation is a Parquet fragment directory rather than a
     /// heap file — the physical reclaim differs (`gc_orphan_parquet_dirs` sweeps
     /// directories; `discard_relfile` only knows about `base/<n>`).
@@ -964,6 +968,7 @@ impl PgEngine {
                 table: rt.name,
                 old: RelFileNode(rt.old),
                 new: RelFileNode(rt.new),
+                indexes: Vec::new(),
                 parquet: true,
             }
         }));
@@ -976,6 +981,10 @@ impl PgEngine {
         for rt in recovered {
             self.catalog.observe_relfilenode(rt.old);
             self.catalog.observe_relfilenode(rt.new);
+            for (_, iold, inew) in &rt.indexes {
+                self.catalog.observe_relfilenode(*iold);
+                self.catalog.observe_relfilenode(*inew);
+            }
             let key = (rt.namespace.clone(), rt.table.clone());
             if !by_table.contains_key(&key) {
                 order.push(key.clone());
@@ -993,6 +1002,12 @@ impl PgEngine {
             let (namespace, table) = &key;
             let chain = &by_table[&key];
             let mut live = self.catalog.current_relfilenode(namespace, table);
+            // The indexes' live relfilenodes, threaded through the chain beside
+            // the heap's. Seeded from the catalog so an index the chain never
+            // mentions (created after the last TRUNCATE, or dropped) keeps what
+            // it has.
+            let mut live_indexes: Vec<(String, RelFileNode)> =
+                self.catalog.index_relfilenodes(namespace, table);
             for rt in chain {
                 // A swap only applies to the relation it was recorded against. The
                 // WAL is replayed from the beginning on every boot and DDL is not
@@ -1014,19 +1029,32 @@ impl PgEngine {
                         self.inner.discard_relfile(rt.old);
                     }
                     live = Some(rt.new);
+                    // The indexes swapped with it — one record, one verdict.
+                    for (name, iold, inew) in &rt.indexes {
+                        self.inner.discard_relfile(*iold);
+                        match live_indexes.iter_mut().find(|(n, _)| n == name) {
+                            Some(slot) => slot.1 = *inew,
+                            None => live_indexes.push((name.clone(), *inew)),
+                        }
+                    }
                 } else if !rt.parquet {
-                    // Swap never committed: the staged new file is an orphan.
+                    // Swap never committed: the staged new files are orphans.
                     self.inner.discard_relfile(rt.new);
+                    for (_, _, inew) in &rt.indexes {
+                        self.inner.discard_relfile(*inew);
+                    }
                 }
             }
             if let Some(live) = live {
                 // Persist the catalog only if it lagged the WAL, and repoint the
                 // in-memory table handle at the final live relation.
-                if self.catalog.current_relfilenode(namespace, table) != Some(live) {
+                if self.catalog.current_relfilenode(namespace, table) != Some(live)
+                    || self.catalog.index_relfilenodes(namespace, table) != live_indexes
+                {
                     // Recovery only reconciles permanent, WAL-logged tables; memory
                     // tables never reach the WAL.
                     self.catalog
-                        .swap_relfilenode(namespace, table, live)
+                        .swap_relfilenode(namespace, table, live, &live_indexes)
                         .unwrap_or_else(|e| panic!("relation catalog write failed: {e}"));
                 }
                 let handle = self
@@ -1046,7 +1074,11 @@ impl PgEngine {
                 // from the catalog), so the relation would silently lose its
                 // statistics at every restart.
                 let stale = match handle.as_ref() {
-                    ManagedTable::Heap(t) => t.relfilenode() != live,
+                    // A handle whose heap already matches but whose indexes lag
+                    // is still stale: probing it would read the pre-truncate tree.
+                    ManagedTable::Heap(t) => {
+                        t.relfilenode() != live || t.index_relfilenodes() != live_indexes
+                    }
                     ManagedTable::Parquet(t) => t.relfilenode() != live.0,
                     // A buffer table owns no physical relation to swap: TRUNCATE
                     // is MVCC tombstones, so there is nothing to repoint.
@@ -1057,7 +1089,7 @@ impl PgEngine {
                 }
                 match handle.as_ref() {
                     ManagedTable::Buffer(_) => unreachable!("a buffer table is never stale"),
-                    ManagedTable::Heap(t) => t.rebind(live),
+                    ManagedTable::Heap(t) => t.rebind(live, &live_indexes),
                     ManagedTable::Parquet(t) => {
                         if let Err(error) = t.rebind(live.0) {
                             // One relation we cannot repoint must not stop the
@@ -1209,16 +1241,18 @@ impl TxnFinalize for PgEngine {
                 // strand the lock and wedge the table for the process lifetime).
                 // The lock is held across the persist so a concurrent TRUNCATE that
                 // commits can't have its catalog write clobbered by a stale one.
-                if let Some((old, owner)) = t.commit_truncate(xid) {
+                if let Some(swap) = t.commit_truncate(xid) {
                     // The commit is already durable in the WAL, so a catalog persist
                     // failure is not fatal — recovery re-applies the swap from the
                     // WAL at the next boot; log and continue rather than panic. (A
                     // memory/temp table writes no WAL and its catalog row is not
                     // persisted, so the swap only updates in-memory state.)
-                    if let Err(e) =
-                        self.catalog
-                            .swap_relfilenode(&namespace, &name, t.relfilenode())
-                    {
+                    if let Err(e) = self.catalog.swap_relfilenode(
+                        &namespace,
+                        &name,
+                        t.relfilenode(),
+                        &swap.new_indexes,
+                    ) {
                         tracing::error!(
                             table = %name,
                             error = %e,
@@ -1232,12 +1266,17 @@ impl TxnFinalize for PgEngine {
                         // Only now is the swap durable.
                         t.truncate_reconciled();
                     }
-                    self.inner.discard_relfile(old);
+                    self.inner.discard_relfile(swap.old_heap);
+                    // The superseded index trees die with the heap file they
+                    // pointed into.
+                    for old in swap.old_indexes {
+                        self.inner.discard_relfile(old);
+                    }
                     // The chunk store keeps its relfilenode, so nothing has to be
                     // recorded or unlinked for it — only emptied, and only when
                     // that is safe.
                     t.reclaim_toast_after_truncate();
-                    t.release_truncate_lock(owner);
+                    t.release_truncate_lock(swap.owner);
                 }
             }
         }
@@ -1255,8 +1294,14 @@ impl TxnFinalize for PgEngine {
                 // way or the table would be wedged for the process lifetime.
                 Ok(Some(swap)) => {
                     if let Err(error) =
-                        self.catalog
-                            .swap_relfilenode(namespace, name, RelFileNode(swap.new_rel))
+                        // A Parquet relation's indexes are metadata-only, so there
+                        // is nothing to swap alongside its fragment directory.
+                        self.catalog.swap_relfilenode(
+                            namespace,
+                            name,
+                            RelFileNode(swap.new_rel),
+                            &[],
+                        )
                     {
                         tracing::error!(
                             table = %name,
@@ -1297,9 +1342,11 @@ impl TxnFinalize for PgEngine {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
                 .and_then(|table| table.as_heap())
-                && let Some((new, owner)) = t.abort_truncate(xid)
+                && let Some((staged, owner)) = t.abort_truncate(xid)
             {
-                self.inner.discard_relfile(new);
+                for rel in staged {
+                    self.inner.discard_relfile(rel);
+                }
                 t.release_truncate_lock(owner);
             }
         }
@@ -1656,9 +1703,10 @@ impl TableEngine for PgEngine {
             let Some(rel) = rel else {
                 return Err(StorageError::TableNotFound(name.to_string()));
             };
-            // Also reclaim any file staged by an in-flight TRUNCATE on this table
-            // (its new relfilenode lives on the handle, not the catalog), so
-            // dropping the table doesn't leak it. Concurrent DROP vs another
+            // Also reclaim any files staged by an in-flight TRUNCATE on this table
+            // — the heap's and every index's (their new relfilenodes live on the
+            // handle, not the catalog) — so dropping the table doesn't leak
+            // them. Concurrent DROP vs another
             // session's uncommitted TRUNCATE is not otherwise synchronized — full
             // serialization needs transactional DDL, which is deferred; the losing
             // side's staged file is caught here or by `gc_orphan_relfiles`.
@@ -1666,7 +1714,8 @@ impl TableEngine for PgEngine {
             let staged = dropped
                 .as_deref()
                 .and_then(ManagedTable::as_heap)
-                .and_then(HeapTable::staged_relfilenode);
+                .map(HeapTable::staged_relfilenodes)
+                .unwrap_or_default();
             // The chunk store goes with the table. `remove_in` has already
             // dropped the catalog row that named it, so the startup sweep would
             // reclaim it eventually — unlinking here just makes it immediate.
@@ -1693,7 +1742,7 @@ impl TableEngine for PgEngine {
                     .expect("relation file unlink failed");
             }
         }
-        if let Some(staged) = staged {
+        for staged in staged {
             self.inner.discard_relfile(staged);
         }
         if let Some(toast) = toast {
@@ -1833,11 +1882,15 @@ impl TableEngine for PgEngine {
                     .catalog
                     .remove_index_in(namespace, table, index_name)
                     .expect("relation catalog write failed");
-                heap.remove_index(index_name);
-                if let Some(rel) = rel
-                    && rel.0 != 0
-                {
-                    self.inner.discard_relfile(rel);
+                // A file staged for this index by an in-flight TRUNCATE goes with
+                // it. Unreachable while that TRUNCATE holds the table (this path
+                // took the same lock as `DDL`), but reclaiming it keeps the
+                // invariant explicit.
+                let staged = heap.remove_index(index_name).and_then(|(_, staged)| staged);
+                for rel in rel.into_iter().chain(staged) {
+                    if rel.0 != 0 {
+                        self.inner.discard_relfile(rel);
+                    }
                 }
             }
             ManagedTable::Buffer(buffer) => {
@@ -2176,7 +2229,9 @@ mod tests {
             "the swap is still only in memory: replay must stay unbounded"
         );
 
-        engine.catalog.swap_relfilenode("public", "t", swapped_to)?;
+        engine
+            .catalog
+            .swap_relfilenode("public", "t", swapped_to, &[])?;
         {
             let tables = engine
                 .tables

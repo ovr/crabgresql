@@ -831,6 +831,40 @@ fn drop_table_reclaims_a_pending_truncate_file() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn drop_table_reclaims_a_pending_truncates_index_files_too() -> anyhow::Result<()> {
+    // A TRUNCATE stages a fresh file per physical index alongside the heap's;
+    // none of them is in the catalog until commit, so DROP TABLE must unlink
+    // every one.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    insert_committed(&h.tm, &*table, vec![Value::Int4(1), Value::Null]);
+    h.engine.create_index("public", "t", pk_on_id())?;
+    let before: Vec<_> = std::fs::read_dir(h._dir.path().join("base"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+
+    let tx = h.tm.allocate_xid();
+    table.truncate(&h.tm.context(tx, CommandId::FIRST))?;
+    let staged: Vec<_> = std::fs::read_dir(h._dir.path().join("base"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| !before.contains(p))
+        .collect();
+    assert_eq!(
+        staged.len(),
+        2,
+        "one staged file for the heap and one for the index: {staged:?}"
+    );
+
+    h.engine.drop_table("public", "t")?;
+    for path in staged {
+        assert!(!path.exists(), "drop_table leaked the staged file {path:?}");
+    }
+    Ok(())
+}
+
 /// A row of `plain`-storage columns only: nothing is a candidate for out-of-line
 /// storage, so this is the shape that must still be rejected once TOAST exists.
 fn untoastable_schema(name: &str, ncols: usize) -> TableSchema {
