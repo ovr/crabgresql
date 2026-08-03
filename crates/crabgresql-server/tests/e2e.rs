@@ -9567,7 +9567,9 @@ async fn date_trunc_takes_an_explicit_zone() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
 
     let client = connect(spawn_server().await).await;
-    client.simple_query("SET TIME ZONE 'America/New_York'").await?;
+    client
+        .simple_query("SET TIME ZONE 'America/New_York'")
+        .await?;
 
     let cases = [
         // Local midnight in UTC is the previous evening in New York, where the

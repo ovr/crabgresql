@@ -549,8 +549,14 @@ mod tests {
         let at_zone_of = |tok: &str| at_zone_named(v("12:00:00+00"), tok, at).map(format);
 
         assert_eq!(at_zone_of("+05:30").expect("west"), "06:30:00-05:30");
-        assert_eq!(at_zone_of("05:30").expect("unsigned is west"), "06:30:00-05:30");
-        assert_eq!(at_zone_of("-05:30").expect("minus is east"), "17:30:00+05:30");
+        assert_eq!(
+            at_zone_of("05:30").expect("unsigned is west"),
+            "06:30:00-05:30"
+        );
+        assert_eq!(
+            at_zone_of("-05:30").expect("minus is east"),
+            "17:30:00+05:30"
+        );
         // Value-only spelling, and a magnitude a value would reject.
         assert!(at_zone_of("+0530").is_err());
         assert_eq!(at_zone_of("+16").expect("wide band"), "20:00:00-16");

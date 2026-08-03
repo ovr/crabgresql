@@ -997,7 +997,15 @@ mod tests {
     #[test]
     fn a_fractional_displacement_is_refused() {
         for tok in [
-            "5.5", "-5.5", "+5.5", "5.0", "5.", ".5", "5:30.5", "5:30:30.9", "UTC+5.5",
+            "5.5",
+            "-5.5",
+            "+5.5",
+            "5.0",
+            "5.",
+            ".5",
+            "5:30.5",
+            "5:30:30.9",
+            "UTC+5.5",
         ] {
             assert!(
                 matches!(resolve_zone_arg(tok), Err(ZoneError::NotRecognized(_))),
@@ -1025,7 +1033,10 @@ mod tests {
         // so a zone we print round-trips back through this reader.
         let seven = SessionZone::from_offset_east(7 * 3600)?;
         assert_eq!(seven.name(), "<+07>-07");
-        assert_eq!(offset_for_instant(&resolve_zone_arg(seven.name())?, june), 7 * 3600);
+        assert_eq!(
+            offset_for_instant(&resolve_zone_arg(seven.name())?, june),
+            7 * 3600
+        );
 
         // The simple prefixed forms stay `Fixed`, so they keep working outside
         // the range `jiff` covers.
@@ -1199,5 +1210,3 @@ mod tests {
         Ok(())
     }
 }
-
-
