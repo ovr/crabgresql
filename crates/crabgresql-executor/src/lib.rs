@@ -12,6 +12,7 @@ mod md5;
 pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
+mod unique;
 pub mod vector;
 
 use std::borrow::Cow;
@@ -41,6 +42,7 @@ pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
 };
 use generate_series::Series;
+use unique::UniqueKeySet;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
 /// which the otherwise-pure expression evaluator cannot express: they mutate
@@ -1893,25 +1895,15 @@ fn insert_direct(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
-    // unique index never needs the scan (NOT NULL checks only the new row).
+    // unique index reads nothing at all (NOT NULL checks only the new row).
     let schema = table.schema();
     let indexes = table.indexes();
-    let has_unique = indexes.iter().any(|index| index.unique);
-    let mut visible: Vec<Tuple> = if has_unique {
-        table
-            // Unprojected: the UNIQUE check compares whichever columns each
-            // index covers, which is not known here.
-            .scan(txn, &ColumnProjection::All)
-            .map(|row| row.map(|(_, tuple)| tuple))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        Vec::new()
-    };
+    let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
     for tuple in &tuples {
-        validate_constraints(&schema, &indexes, tuple, visible.iter(), ctx)?;
-        if has_unique {
-            visible.push(tuple.clone());
-        }
+        validate_constraints(&schema, &indexes, tuple, &visible, ctx)?;
+        // The rows of this statement are not written until every one of them has
+        // been checked, so the set is what carries a duplicate within one INSERT.
+        visible.record(tuple, None);
     }
     let inserted = tuples.len() as u64;
     // RETURNING sees the fully-formed row (defaults filled in), in schema order.
@@ -1944,10 +1936,10 @@ fn insert_routed(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let parent_schema = parent.schema();
-    // Per-leaf snapshot of the rows a UNIQUE check must see, built lazily the
-    // first time a row routes to a leaf that has a unique index (leaves without
-    // one, the common case, never get scanned). `None` = not yet scanned.
-    let mut visible: Vec<Option<Vec<Tuple>>> = vec![None; leaves.len()];
+    // Per-leaf key set a UNIQUE check consults, built lazily the first time a
+    // row routes to a leaf that has a unique index (leaves without one, the
+    // common case, never get scanned). `None` = not yet seeded.
+    let mut visible: Vec<Option<UniqueKeySet>> = (0..leaves.len()).map(|_| None).collect();
     // Each leaf's shape, fetched on first use like `visible` above — a wide
     // partitioned table has many more leaves than a statement touches, and
     // materializing all of them would make a single-row INSERT cost
@@ -1960,22 +1952,21 @@ fn insert_routed(
             &*shapes[leaf].get_or_insert_with(|| (leaves[leaf].schema(), leaves[leaf].indexes()));
         let has_unique = leaf_indexes.iter().any(|index| index.unique);
         if has_unique && visible[leaf].is_none() {
-            visible[leaf] = Some(
-                leaves[leaf]
-                    // Unprojected, as above: the UNIQUE check needs index columns.
-                    .scan(txn, &ColumnProjection::All)
-                    .map(|row| row.map(|(_, tuple)| tuple))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            visible[leaf] = Some(UniqueKeySet::for_insert(
+                &leaves[leaf],
+                txn,
+                leaf_schema,
+                leaf_indexes,
+            )?);
         }
-        match visible[leaf].as_deref() {
-            Some(seen) => validate_constraints(leaf_schema, leaf_indexes, tuple, seen.iter(), ctx)?,
-            None => {
-                validate_constraints(leaf_schema, leaf_indexes, tuple, std::iter::empty(), ctx)?
+        match visible[leaf].as_mut() {
+            Some(seen) => {
+                validate_constraints(leaf_schema, leaf_indexes, tuple, seen, ctx)?;
+                seen.record(tuple, None);
             }
-        }
-        if let Some(seen) = visible[leaf].as_mut() {
-            seen.push(tuple.clone());
+            None => {
+                validate_constraints(leaf_schema, leaf_indexes, tuple, &UniqueKeySet::none(), ctx)?
+            }
         }
         routes.push(leaf);
     }
@@ -2130,14 +2121,20 @@ fn update_inherited(
     // Per-target simulation of its live rows after this statement, for UNIQUE
     // checks only. Each target's uniqueness is its own — inheritance does not
     // make a parent's unique index span its children, in PG or here.
-    let mut simulated: Vec<Vec<(Tid, Tuple)>> = scans
+    let mut simulated: Vec<UniqueKeySet> = scans
         .iter()
         .zip(&has_unique)
-        .map(
-            |(rows, unique)| {
-                if *unique { rows.clone() } else { Vec::new() }
-            },
-        )
+        .zip(&shapes)
+        .map(|((rows, unique), (schema, indexes))| {
+            if !*unique {
+                return UniqueKeySet::none();
+            }
+            let mut set = UniqueKeySet::simulation(schema, indexes);
+            for (tid, tuple) in rows {
+                set.record(tuple, Some(*tid));
+            }
+            set
+        })
         .collect();
 
     let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
@@ -2164,26 +2161,18 @@ fn update_inherited(
             if has_unique[i] {
                 // Mirror `update_direct`: a tid absent from the simulation is a
                 // row that vanished under us — skip it rather than update it.
-                let Some(pos) = simulated[i]
-                    .iter()
-                    .position(|(candidate, _)| candidate == tid)
-                else {
+                if !simulated[i].forget(old, *tid) {
                     continue;
-                };
-                let removed = simulated[i].remove(pos);
-                if let Err(error) = validate_constraints(
-                    &shapes[i].0,
-                    &shapes[i].1,
-                    &new,
-                    simulated[i].iter().map(|(_, t)| t),
-                    ctx,
-                ) {
-                    simulated[i].insert(pos, removed);
+                }
+                if let Err(error) =
+                    validate_constraints(&shapes[i].0, &shapes[i].1, &new, &simulated[i], ctx)
+                {
+                    simulated[i].record(old, Some(*tid));
                     return Err(error);
                 }
-                simulated[i].insert(pos, (*tid, new.clone()));
+                simulated[i].record(&new, Some(*tid));
             } else {
-                validate_constraints(&shapes[i].0, &shapes[i].1, &new, std::iter::empty(), ctx)?;
+                validate_constraints(&shapes[i].0, &shapes[i].1, &new, &UniqueKeySet::none(), ctx)?;
             }
             if let Some(view) = returned {
                 new_rows.push(view);
@@ -2245,9 +2234,13 @@ fn update_direct(
     let assigned: Vec<usize> = assignments.iter().map(|(column, _)| *column).collect();
     let has_unique = update_needs_unique_snapshot(&indexes, &assigned, false);
     let mut simulated = if has_unique {
-        original.clone()
+        let mut set = UniqueKeySet::simulation(&schema, &indexes);
+        for (tid, tuple) in &original {
+            set.record(tuple, Some(*tid));
+        }
+        set
     } else {
-        Vec::new()
+        UniqueKeySet::none()
     };
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
     for (tid, old) in original {
@@ -2260,26 +2253,21 @@ fn update_direct(
             new[*index] = eval(expr, &old, ctx)?;
         }
         if has_unique {
-            let Some(pos) = simulated
-                .iter()
-                .position(|(candidate, _)| *candidate == tid)
-            else {
+            // The row's own OLD key must not conflict with its NEW one, so it
+            // leaves the simulation for the check. A tid the simulation does not
+            // hold is a row that vanished under us — skip it rather than update
+            // it. On a violation the OLD key goes back, leaving the simulation
+            // as it was.
+            if !simulated.forget(&old, tid) {
                 continue;
-            };
-            let (_, removed) = simulated.remove(pos);
-            if let Err(error) = validate_constraints(
-                &schema,
-                &indexes,
-                &new,
-                simulated.iter().map(|(_, t)| t),
-                ctx,
-            ) {
-                simulated.insert(pos, (tid, removed));
+            }
+            if let Err(error) = validate_constraints(&schema, &indexes, &new, &simulated, ctx) {
+                simulated.record(&old, Some(tid));
                 return Err(error);
             }
-            simulated.insert(pos, (tid, new.clone()));
+            simulated.record(&new, Some(tid));
         } else {
-            validate_constraints(&schema, &indexes, &new, std::iter::empty(), ctx)?;
+            validate_constraints(&schema, &indexes, &new, &UniqueKeySet::none(), ctx)?;
         }
         pending.push((tid, new));
     }
@@ -2367,15 +2355,18 @@ fn update_routed(
     // Per-leaf simulation of the leaf's live rows after this statement, used only
     // for UNIQUE checks; seeded from `scans` for leaves that carry a unique index,
     // left empty (and unused) for the common unique-free leaf.
-    let mut simulated: Vec<Vec<(Tid, Tuple)>> = scans
+    let mut simulated: Vec<UniqueKeySet> = scans
         .iter()
         .enumerate()
         .map(|(i, rows)| {
-            if leaf_has_unique[i] {
-                rows.clone()
-            } else {
-                Vec::new()
+            if !leaf_has_unique[i] {
+                return UniqueKeySet::none();
             }
+            let mut set = UniqueKeySet::simulation(&leaf_shapes[i].0, &leaf_shapes[i].1);
+            for (tid, tuple) in rows {
+                set.record(tuple, Some(*tid));
+            }
+            set
         })
         .collect();
 
@@ -2408,52 +2399,46 @@ fn update_routed(
                 if src == dst {
                     // Mirror `update_direct`: a tid absent from the simulation is a
                     // row that vanished under us — skip it rather than update it.
-                    let Some(pos) = simulated[dst]
-                        .iter()
-                        .position(|(candidate, _)| *candidate == tid)
-                    else {
+                    if !simulated[dst].forget(old, tid) {
                         continue;
-                    };
-                    let removed = simulated[dst].remove(pos);
+                    }
                     if let Err(error) = validate_constraints(
                         &leaf_shapes[dst].0,
                         &leaf_shapes[dst].1,
                         &new,
-                        simulated[dst].iter().map(|(_, t)| t),
+                        &simulated[dst],
                         ctx,
                     ) {
-                        simulated[dst].insert(pos, removed);
+                        simulated[dst].record(old, Some(tid));
                         return Err(error);
                     }
-                    simulated[dst].insert(pos, (tid, new.clone()));
+                    simulated[dst].record(&new, Some(tid));
                 } else {
                     validate_constraints(
                         &leaf_shapes[dst].0,
                         &leaf_shapes[dst].1,
                         &new,
-                        simulated[dst].iter().map(|(_, t)| t),
+                        &simulated[dst],
                         ctx,
                     )?;
-                    simulated[dst].push((tid, new.clone()));
+                    // Recorded without its tid: in the destination the row is an
+                    // insert, and its tid belongs to the source leaf's space —
+                    // retracting it here would have to name a row of *this* leaf.
+                    simulated[dst].record(&new, None);
                 }
             } else {
                 validate_constraints(
                     &leaf_shapes[dst].0,
                     &leaf_shapes[dst].1,
                     &new,
-                    std::iter::empty(),
+                    &UniqueKeySet::none(),
                     ctx,
                 )?;
             }
             // A moved-out row leaves its source leaf's simulation so a later row
             // routed back to that leaf does not see the stale OLD value.
             if src != dst && leaf_has_unique[src] {
-                if let Some(pos) = simulated[src]
-                    .iter()
-                    .position(|(candidate, _)| *candidate == tid)
-                {
-                    simulated[src].remove(pos);
-                }
+                simulated[src].forget(old, tid);
             }
 
             // `new_rows` is only read (for RETURNING) below; skip cloning into it
@@ -2501,11 +2486,11 @@ fn update_routed(
 /// Takes the relation's shape rather than the relation, so a caller validating
 /// a batch fetches it once instead of per row — `schema()` and `indexes()` both
 /// cost a lock and a clone on an engine whose DDL can republish them.
-fn validate_constraints<'a>(
+fn validate_constraints(
     schema: &TableSchema,
     indexes: &[IndexMetadata],
     tuple: &Tuple,
-    existing: impl Iterator<Item = &'a Tuple>,
+    existing: &UniqueKeySet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
     for (column, value) in schema.columns.iter().zip(tuple) {
@@ -2529,38 +2514,30 @@ fn validate_constraints<'a>(
     // before a unique-key violation (checked below).
     check_partition_bound(schema, tuple, ctx)?;
 
-    let existing: Vec<&Tuple> = existing.collect();
-    for index in indexes.iter().filter(|index| index.unique) {
-        if unique_key_skipped(index, tuple) {
-            continue;
-        }
-        if existing
-            .iter()
-            .any(|other| unique_keys_equal(schema, index, tuple, other))
-        {
-            let names = index
-                .keys
-                .iter()
-                .map(|key| schema.columns[key.column].name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = index
-                .keys
-                .iter()
-                .map(|key| display_value(&tuple[key.column], ctx))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ExecError::new(
-                "23505",
-                format!(
-                    "duplicate key value violates unique constraint \"{}\"",
-                    index.name
-                ),
-            )
-            .with_detail(Some(format!("Key ({names})=({values}) already exists."))));
-        }
-    }
-    Ok(())
+    let Some(slot) = existing.conflict(tuple)? else {
+        return Ok(());
+    };
+    let index = &indexes[slot];
+    let names = index
+        .keys
+        .iter()
+        .map(|key| schema.columns[key.column].name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = index
+        .keys
+        .iter()
+        .map(|key| display_value(&tuple[key.column], ctx))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ExecError::new(
+        "23505",
+        format!(
+            "duplicate key value violates unique constraint \"{}\"",
+            index.name
+        ),
+    )
+    .with_detail(Some(format!("Key ({names})=({values}) already exists."))))
 }
 
 /// Enforce a leaf partition's RANGE bound against a fully-formed row. A key
@@ -2631,38 +2608,6 @@ fn leaf_admits(leaf: &TableSchema, tuple: &Tuple) -> bool {
     !matches!(key, Value::Null)
         && lower_admits(&part.bound.from[0], ty, key)
         && upper_admits(&part.bound.to[0], ty, key)
-}
-
-fn unique_key_skipped(index: &IndexMetadata, tuple: &Tuple) -> bool {
-    index.nulls_distinct
-        && index
-            .keys
-            .iter()
-            .any(|key| matches!(tuple[key.column], Value::Null))
-}
-
-fn unique_keys_equal(
-    schema: &crabgresql_storage_api::TableSchema,
-    index: &IndexMetadata,
-    left: &Tuple,
-    right: &Tuple,
-) -> bool {
-    let tys = index
-        .keys
-        .iter()
-        .map(|key| schema.columns[key.column].ty)
-        .collect::<Vec<_>>();
-    let left = index
-        .keys
-        .iter()
-        .map(|key| left[key.column].clone())
-        .collect::<Vec<_>>();
-    let right = index
-        .keys
-        .iter()
-        .map(|key| right[key.column].clone())
-        .collect::<Vec<_>>();
-    agg::keys_equal(&tys, &left, &right)
 }
 
 fn display_value(value: &Value, ctx: &ExecContext) -> String {
@@ -4210,11 +4155,12 @@ fn index_probe_rows(
 /// A probe's rows are deduplicated by `Tid`. A tid names exactly one row version,
 /// so a repeat is always a defect in the source, and DML is where it does visible
 /// damage: `update_direct` would write the row twice and report the inflated
-/// count. One such source exists today — `TRUNCATE` swaps the heap's relfilenode
-/// without resetting the index, so a stale `key -> tid` entry can be handed back
-/// alongside the row that reused the slot. This filter is a barrier, not the fix:
-/// the read path (`IndexScan`) is still affected, and the engine-side repair is
-/// tracked separately.
+/// count. No source is known today: the one that was — `TRUNCATE` swapping the
+/// heap's relfilenode without resetting the index, so a stale `key -> tid` entry
+/// came back alongside the row that reused the slot — was repaired in the engine
+/// by swapping the indexes in lockstep. The filter stays as a barrier: it is
+/// cheap, and it is DML that would turn such a defect into wrong data rather
+/// than a wrong read.
 fn dml_rows(
     table: &Arc<dyn TableAm>,
     probe: Option<&DmlIndexProbe>,
@@ -4877,6 +4823,126 @@ mod tests {
         test_ok(table.insert(vec![Value::Int4(2), Value::Text("two".into())], &txn));
         test_ok(table.insert(vec![Value::Int4(3), Value::Null], &txn));
         table
+    }
+
+    /// A one-column unique index on `key_type`, with `nulls_distinct` as given,
+    /// over a table holding `rows`. `numeric` is deliberately not indexable by
+    /// `btkey`, so it is how a caller asks for a metadata-only index — one the
+    /// engine declines to probe.
+    fn unique_table(key_type: PgType, nulls_distinct: bool, rows: Vec<Value>) -> Arc<dyn TableAm> {
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let table = test_ok(engine.create_table(TableSchema::in_namespace(
+            "t",
+            "public",
+            vec![Column::new("k", key_type)],
+        )));
+        test_ok(engine.create_index(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_k_key".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: true,
+                nulls_distinct,
+                constraint: Some(IndexConstraint::Unique),
+            },
+        ));
+        let txn = wtxn();
+        for row in rows {
+            test_ok(table.insert(vec![row], &txn));
+        }
+        table
+    }
+
+    /// Whether `key` collides with what `table`'s unique index already holds.
+    fn collides(table: &Arc<dyn TableAm>, key: Value) -> bool {
+        let schema = table.schema();
+        let indexes = table.indexes();
+        let txn = rtxn();
+        let set = test_ok(UniqueKeySet::for_insert(table, &txn, &schema, &indexes));
+        test_ok(set.conflict(&vec![key])).is_some()
+    }
+
+    #[test]
+    fn unique_key_set_probes_the_physical_index() {
+        let table = unique_table(PgType::Int4, true, vec![Value::Int4(1), Value::Int4(2)]);
+        assert!(collides(&table, Value::Int4(2)));
+        assert!(!collides(&table, Value::Int4(9)));
+    }
+
+    #[test]
+    fn unique_key_set_scans_an_index_the_engine_will_not_probe() {
+        // `numeric` has no `btkey` encoding, so the index is metadata-only and
+        // the set falls back to reading the relation. Equality is still
+        // `compare_values`, under which `1.0` and `1.00` are the same key.
+        let numeric = |s: &str| Value::Numeric(test_ok(crabgresql_types::Numeric::parse(s)));
+        let table = unique_table(PgType::Numeric, true, vec![numeric("1.0")]);
+        assert!(collides(&table, numeric("1.00")));
+        assert!(!collides(&table, numeric("2")));
+    }
+
+    #[test]
+    fn unique_key_set_never_probes_a_nulls_not_distinct_index() {
+        // Two NULLs collide here, which an equality probe cannot answer: it has
+        // no NULL to encode and would report the key as absent.
+        let table = unique_table(PgType::Int4, false, vec![Value::Null]);
+        assert!(collides(&table, Value::Null));
+        // The default (`NULLS DISTINCT`) is the opposite: NULL collides with
+        // nothing, itself included.
+        let table = unique_table(PgType::Int4, true, vec![Value::Null]);
+        assert!(!collides(&table, Value::Null));
+    }
+
+    #[test]
+    fn unique_key_set_holds_the_statement_own_rows() {
+        // A statement's rows are not written until every one is checked, so no
+        // engine can answer for them — the set is what catches a duplicate
+        // within one INSERT.
+        let table = unique_table(PgType::Int4, true, vec![Value::Int4(1)]);
+        let schema = table.schema();
+        let indexes = table.indexes();
+        let txn = rtxn();
+        let mut set = test_ok(UniqueKeySet::for_insert(&table, &txn, &schema, &indexes));
+        let row = vec![Value::Int4(7)];
+        assert!(test_ok(set.conflict(&row)).is_none());
+        set.record(&row, None);
+        assert!(test_ok(set.conflict(&row)).is_some());
+    }
+
+    #[test]
+    fn unique_key_set_forgets_a_superseded_row() {
+        // What an UPDATE does to its own row: retract the OLD key so the NEW one
+        // does not collide with it, and report whether the row was there at all.
+        let schema = TableSchema::in_namespace("t", "public", vec![Column::new("k", PgType::Int4)]);
+        let indexes = vec![IndexMetadata {
+            name: "t_k_key".into(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::Unique),
+        }];
+        let mut set = UniqueKeySet::simulation(&schema, &indexes);
+        let tid = Tid {
+            block: 0,
+            offset: 1,
+        };
+        let row = vec![Value::Int4(1)];
+        set.record(&row, Some(tid));
+        assert!(test_ok(set.conflict(&row)).is_some());
+        assert!(set.forget(&row, tid));
+        assert!(test_ok(set.conflict(&row)).is_none());
+        // Gone once: a second retraction says the simulation no longer holds it.
+        assert!(!set.forget(&row, tid));
     }
 
     #[test]
