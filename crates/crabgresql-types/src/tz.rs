@@ -113,11 +113,11 @@ impl SessionZone {
         }
 
         // The UTC synonyms, reported in PG's canonical upper case.
-        if token.eq_ignore_ascii_case("utc") || token.eq_ignore_ascii_case("gmt") {
+        if is_utc_name(token) {
             let name = token.to_ascii_uppercase();
             return Ok(SessionZone::new(name.clone(), Some(name), Zone::Fixed(0)));
         }
-        if token.eq_ignore_ascii_case("z") || token.eq_ignore_ascii_case("zulu") {
+        if is_zulu(token) {
             return Err(not_recognized());
         }
 
@@ -278,22 +278,10 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
         return res.map(Zone::Fixed);
     }
 
-    // Curated abbreviations, seeded from PG's `tznames/Default` for the entries
-    // the tests exercise. Some are fixed offsets; the DST-varying ones map to a
-    // reference IANA zone (e.g. MSK -> Europe/Moscow) so their offset tracks
-    // that zone's history, matching PG.
-    if let Some(kind) = lookup_abbrev(token) {
-        return match kind {
-            Abbrev::Fixed(secs) => Ok(Zone::Fixed(*secs)),
-            Abbrev::Zone(zone) => TimeZone::get(zone)
-                .map(Zone::Named)
-                .map_err(|_| ZoneError::NotRecognized(name.to_string())),
-        };
-    }
-
-    // A full IANA zone name.
-    if let Ok(tz) = TimeZone::get(token) {
-        return Ok(Zone::Named(tz));
+    // The abbreviation table and the IANA names, which mean the same here as in
+    // a zone argument.
+    if let Some(zone) = resolve_named(token) {
+        return zone.ok_or_else(|| ZoneError::NotRecognized(name.to_string()));
     }
 
     // Last resort: PG's abbreviation-prefix form, `<alpha><POSIX offset>` —
@@ -349,38 +337,23 @@ pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
 
     // The UTC synonyms, handled by our own code so they work across the entire
     // timestamp range without `jiff`.
-    if matches!(
-        token.to_ascii_lowercase().as_str(),
-        "z" | "zulu" | "utc" | "gmt"
-    ) {
+    if is_utc_name(token) || is_zulu(token) {
         return Ok(Zone::Fixed(0));
     }
 
-    // Same abbreviation table as a datetime value: PG accepts `VET` and `MSK`
-    // here, unlike in the `TimeZone` GUC.
-    if let Some(kind) = lookup_abbrev(token) {
-        return match kind {
-            Abbrev::Fixed(secs) => Ok(Zone::Fixed(*secs)),
-            Abbrev::Zone(zone) => TimeZone::get(zone)
-                .map(Zone::Named)
-                .map_err(|_| not_recognized()),
-        };
-    }
-
-    // A full IANA zone name. Tried before the POSIX form below so that a real
-    // zone whose name ends in a displacement (`Etc/GMT+5`) keeps its own,
+    // The abbreviation table (PG takes `VET` and `MSK` here, unlike in the GUC)
+    // and the IANA names. Tried before the POSIX forms below so that a real zone
+    // whose name ends in a displacement (`Etc/GMT+5`) keeps its own,
     // opposite-signed meaning.
-    if let Ok(tz) = TimeZone::get(token) {
-        return Ok(Zone::Named(tz));
+    if let Some(zone) = resolve_named(token) {
+        return zone.ok_or_else(not_recognized);
     }
 
     // A POSIX displacement, with or without the ignored alphabetic prefix:
     // `+05:30`, `05:30`, `UTC+10` and `XYZ5` all land here. Taken before the
     // full POSIX spec below so these stay [`Zone::Fixed`], which is exact across
     // the entire timestamp range instead of `jiff`'s narrower one.
-    if let Some(split) = token.find(|c: char| !c.is_ascii_alphabetic())
-        && let Some(secs) = parse_posix_offset(&token[split..])
-    {
+    if let Some(secs) = parse_posix_offset(strip_alpha_prefix(token)) {
         return Ok(Zone::Fixed(secs));
     }
 
@@ -407,6 +380,9 @@ pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
 /// against PG 18). The remainder is a POSIX displacement, which counts hours
 /// *west*, so `UTC+10` is UTC−10 — the opposite of the bare `+10` that
 /// [`parse_fixed`] handles.
+/// A *value*'s spelling of this form requires both the prefix and the sign, so
+/// it is the stricter of the two entry points; a zone argument takes
+/// [`strip_alpha_prefix`] instead, where both are optional.
 fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
     let split = token.find(['+', '-'])?;
     let (prefix, body) = token.split_at(split);
@@ -414,6 +390,15 @@ fn parse_abbrev_prefix_offset(token: &str) -> Option<i32> {
         return None;
     }
     parse_posix_offset(body)
+}
+
+/// Drop the leading run of ASCII letters, if any, leaving what should be a
+/// displacement. `UTC+10` -> `+10`, `XYZ5` -> `5`, `+05:30` -> itself.
+fn strip_alpha_prefix(token: &str) -> &str {
+    let end = token
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(token.len());
+    &token[end..]
 }
 
 /// A POSIX displacement, `[+-]?HH[:MM[:SS]]`, in seconds **east** of UTC — the
@@ -599,8 +584,7 @@ fn instant(micros: i64) -> Timestamp {
 /// if the token is not a fixed-offset form (so the caller falls through to the
 /// abbreviation table / named-zone lookup).
 fn parse_fixed(token: &str) -> Option<Result<i32, ZoneError>> {
-    let lower = token.to_ascii_lowercase();
-    if matches!(lower.as_str(), "z" | "zulu" | "utc" | "gmt") {
+    if is_utc_name(token) || is_zulu(token) {
         return Some(Ok(0));
     }
     let sign = match token.as_bytes().first()? {
@@ -702,11 +686,37 @@ static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
 
 /// Look up a datetime-literal abbreviation, case-insensitively.
 pub(crate) fn lookup_abbrev(token: &str) -> Option<&'static Abbrev> {
-    let upper = token.to_ascii_uppercase();
     DATETIME_ABBREVS
         .iter()
-        .find(|(a, _)| *a == upper)
+        .find(|(a, _)| a.eq_ignore_ascii_case(token))
         .map(|(_, k)| k)
+}
+
+/// The zone *names* the value and argument readers share: the [`ABBREVS`] table
+/// first, then a full IANA name.
+///
+/// `None` means "not a name, try a displacement"; `Some(None)` means the token
+/// named something the tz database could not produce, which is the caller's
+/// `22023`. The `TimeZone` GUC deliberately does **not** call this — its
+/// namespace excludes the abbreviations, see [`SessionZone::resolve`].
+fn resolve_named(token: &str) -> Option<Option<Zone>> {
+    if let Some(kind) = lookup_abbrev(token) {
+        return Some(match kind {
+            Abbrev::Fixed(secs) => Some(Zone::Fixed(*secs)),
+            Abbrev::Zone(zone) => TimeZone::get(zone).ok().map(Zone::Named),
+        });
+    }
+    TimeZone::get(token).ok().map(|tz| Some(Zone::Named(tz)))
+}
+
+/// `UTC`/`GMT`, the two spellings every reader accepts.
+fn is_utc_name(token: &str) -> bool {
+    token.eq_ignore_ascii_case("utc") || token.eq_ignore_ascii_case("gmt")
+}
+
+/// `Z`/`zulu`: legal in a value and as a zone argument, refused by the GUC.
+fn is_zulu(token: &str) -> bool {
+    token.eq_ignore_ascii_case("z") || token.eq_ignore_ascii_case("zulu")
 }
 
 #[cfg(test)]
@@ -971,6 +981,33 @@ mod tests {
         // A DST abbreviation with no rule is where we stop and PG does not.
         assert!(resolve_zone_arg("FOO5BAR").is_err());
         Ok(())
+    }
+
+    /// **Known divergences from PostgreSQL**, pinned so they are visible rather
+    /// than silent. The `TimeZone` GUC reads its numeric forms with
+    /// [`parse_fixed`] — the *value* grammar with the sign flipped — where PG
+    /// gives the GUC its own reader. Measured on PG 18.4:
+    ///
+    /// ```text
+    /// SET TimeZone = 'XYZ5'    -> accepted, SHOW says XYZ5, session at -05
+    /// SET TimeZone = '+167'    -> accepted, SHOW says <+167>-167, session at +167
+    /// SET TimeZone = '+5'      -> accepted, SHOW says <+05>-05, session at +05
+    /// ```
+    ///
+    /// The last is the sharp one: with a colon the GUC string counts *west*
+    /// (`'+05:30'` is UTC−5:30, which we match), without one it counts *east*.
+    /// Fixing that means giving the GUC the same POSIX reader the argument path
+    /// now has, plus PG's `<+NN>-NN` renaming — a separate change.
+    #[test]
+    fn the_guc_numeric_grammar_still_diverges() {
+        assert!(SessionZone::resolve("XYZ5").is_err());
+        assert!(SessionZone::resolve("+167").is_err());
+        // We read a colon-less GUC value west; PG reads it east.
+        let five = SessionZone::resolve("+5").expect("accepted, wrong direction");
+        assert_eq!(five.offset_at(0), -5 * 3600);
+        // The colon form does agree.
+        let half = SessionZone::resolve("+05:30").expect("colon form");
+        assert_eq!(half.offset_at(0), -(5 * 3600 + 30 * 60));
     }
 
     /// Everything that is *not* a bare displacement means the same as it does
