@@ -14,6 +14,8 @@
 //! fall-back) uses the offset *after* the transition. `jiff` hands us both
 //! bracketing offsets, so this is a direct match.
 
+use std::cell::RefCell;
+
 use jiff::Timestamp;
 use jiff::civil::DateTime;
 use jiff::tz::{AmbiguousOffset, TimeZone};
@@ -329,6 +331,38 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 /// numeric form tolerates leading whitespace (`' +05:30'` is UTC−5:30), which
 /// [`parse_posix_offset`] handles.
 pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
+    // The UTC synonyms are four bytes to compare and answer without touching
+    // anything, so they go ahead of the memo rather than through it.
+    if is_utc_name(name) || is_zulu(name) {
+        return Ok(Zone::Fixed(0));
+    }
+
+    // `eval_scalar` runs per row, and a zone argument is a constant in every
+    // real query, so the same token is resolved over and over. Remembering the
+    // last answer collapses that to one resolution per query without a
+    // bind-time rewrite. Sound because resolution is pure: it reads only the
+    // token and the bundled tz database, neither of which changes at runtime.
+    // Only successes are cached — a failure aborts the statement, so it happens
+    // once by construction.
+    if let Some(zone) = LAST_ZONE_ARG.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(tok, _)| tok == name)
+            .map(|(_, zone)| zone.clone())
+    }) {
+        return Ok(zone);
+    }
+    let zone = resolve_zone_arg_uncached(name)?;
+    LAST_ZONE_ARG.with(|slot| *slot.borrow_mut() = Some((name.to_string(), zone.clone())));
+    Ok(zone)
+}
+
+thread_local! {
+    /// The last token [`resolve_zone_arg`] resolved, and what it resolved to.
+    static LAST_ZONE_ARG: RefCell<Option<(String, Zone)>> = const { RefCell::new(None) };
+}
+
+fn resolve_zone_arg_uncached(name: &str) -> Result<Zone, ZoneError> {
     let token = name;
     let not_recognized = || ZoneError::NotRecognized(name.to_string());
     if token.is_empty() {
@@ -345,7 +379,14 @@ pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
     // and the IANA names. Tried before the POSIX forms below so that a real zone
     // whose name ends in a displacement (`Etc/GMT+5`) keeps its own,
     // opposite-signed meaning.
-    if let Some(zone) = resolve_named(token) {
+    //
+    // Only a token that *starts* with a letter can be either — every IANA name
+    // and every abbreviation does — and the guard is worth its line: asking the
+    // tz database about `+05:30` and being told no costs about as much as
+    // resolving a real zone.
+    if starts_alphabetic(token)
+        && let Some(zone) = resolve_named(token)
+    {
         return zone.ok_or_else(not_recognized);
     }
 
@@ -717,6 +758,15 @@ fn is_utc_name(token: &str) -> bool {
 /// `Z`/`zulu`: legal in a value and as a zone argument, refused by the GUC.
 fn is_zulu(token: &str) -> bool {
     token.eq_ignore_ascii_case("z") || token.eq_ignore_ascii_case("zulu")
+}
+
+/// Whether a token could name a zone at all: every IANA name and every
+/// abbreviation starts with a letter, and nothing else does.
+fn starts_alphabetic(token: &str) -> bool {
+    token
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic())
 }
 
 #[cfg(test)]
@@ -1145,4 +1195,5 @@ mod tests {
         Ok(())
     }
 }
+
 
