@@ -167,6 +167,20 @@ SELECT timetz '00:01-07' AT TIME ZONE 'UTC' AS at_named,
  07:01:00+00 | 21:01:00-10 | 07:01:00+00 | 07:01:00+00
 (1 row)
 
+-- the zone *argument* is POSIX-signed, exactly as for timestamp/timestamptz:
+-- '+05:30' is UTC-5:30, the sign is optional, and the colon-less '+0530'
+-- spelling is value-only. A magnitude a value would reject is fine here.
+SELECT timetz '12:00:00+00' AT TIME ZONE '+05:30' AS posix_west,
+       timetz '12:00:00+00' AT TIME ZONE '05:30' AS unsigned_is_west,
+       timetz '12:00:00+00' AT TIME ZONE '-05:30' AS minus_is_east,
+       timetz '12:00:00+00' AT TIME ZONE '+16' AS wide_band;
+   posix_west   | unsigned_is_west | minus_is_east  |  wide_band  
+----------------+------------------+----------------+-------------
+ 06:30:00-05:30 | 06:30:00-05:30   | 17:30:00+05:30 | 20:00:00-16
+(1 row)
+
+SELECT timetz '12:00:00+00' AT TIME ZONE '+0530';
+ERROR:  time zone "+0530" not recognized
 -- a fixed session zone, not a named one: `timetz` carries no date, so a named
 -- zone would be read at *today's* DST state and this test would drift
 SET TimeZone TO '-05:30';
