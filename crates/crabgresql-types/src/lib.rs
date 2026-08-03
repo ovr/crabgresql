@@ -554,7 +554,13 @@ impl PgType {
     /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `point`, `lseg`,
     /// and user types) all hash into one shared bucket, so a hash join keyed on
     /// them would collapse to a full scan; the join planner keeps such equalities
-    /// as nested-loop predicates instead. Must stay in sync with `hash_key`.
+    /// as nested-loop predicates instead.
+    ///
+    /// Must stay in sync with `hash_key` — and that function's own doc explains
+    /// why the sync is load-bearing for correctness rather than for speed: the
+    /// same buckets enforce `UNIQUE`. Moving a type into this list means
+    /// teaching `hash_key` to distinguish it, and doing that in a way that
+    /// disagrees with `keys_equal` admits duplicate keys silently.
     pub fn hashes_distinctly(self) -> bool {
         matches!(
             self,

@@ -299,6 +299,16 @@ pub fn feed(
 /// different scale share it). Types whose equality is not a raw-field comparison
 /// (`timetz`, `interval`, `inet`, `cidr`) contribute nothing and land in a shared
 /// bucket that `keys_equal` then disambiguates.
+///
+/// The consistency in the first paragraph is a **correctness** requirement, not
+/// a performance one, because `crate::unique` enforces `UNIQUE` through these
+/// buckets. Splitting one arm so that two `keys_equal`-equal values hash apart
+/// puts them in different buckets, and a duplicate key is then admitted with no
+/// error at all — the failure the build-time check avoids by sorting instead
+/// (see `find_duplicate` in the server crate, which argues a hash would be a
+/// second definition of key equality). It is not one here only because the
+/// buckets never decide: they narrow the candidates, and `keys_equal` answers.
+/// Widening this function is safe; making it finer than `keys_equal` is not.
 pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
     let mut h = DefaultHasher::new();
     for (ty, v) in tys.iter().zip(values) {
