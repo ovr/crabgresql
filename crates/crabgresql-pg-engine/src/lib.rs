@@ -2252,6 +2252,103 @@ mod tests {
         Ok(())
     }
 
+    /// A committed TRUNCATE leaves the index's B-tree *itself* empty.
+    ///
+    /// This reads the tree directly instead of going through
+    /// `TableAm::index_lookup`, and that is the whole point of the test — do not
+    /// "simplify" it back to a probe. `index_lookup` re-checks each fetched row's
+    /// key, so it reports an empty result for a tree still full of entries naming
+    /// tids the new heap file has recycled. Every behavioral test written through
+    /// a probe therefore passes with the index swap removed entirely; measured,
+    /// only the two file-count assertions notice. The tree's contents are the
+    /// invariant the rest of the engine depends on — `HeapTable::btree` hands the
+    /// raw tree to insert/update/delete maintenance and to `vacuum`, and neither
+    /// re-checks anything — so the tree is what this test pins.
+    #[test]
+    fn a_committed_truncate_leaves_the_index_tree_empty() -> anyhow::Result<()> {
+        use crabgresql_storage_api::{IndexKey, IndexMetadata, IndexMethod};
+
+        let dir = tempfile::tempdir()?;
+        let (engine, tm, _wal) = wired(dir.path())?;
+        let table = engine.create_table(one_column("t"))?;
+        engine.create_index(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_id_idx".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )?;
+        for id in 1..=3 {
+            let xid = tm.allocate_xid();
+            table.insert(vec![Value::Int4(id)], &tm.context(xid, CommandId::FIRST))?;
+            tm.commit(xid)?;
+        }
+
+        let key = |id: i32| {
+            crate::btkey::encode_values(&table.schema(), &[0], &[Value::Int4(id)])
+                .expect("an int4 key encodes")
+        };
+        // Positive control: without it, an assertion that the tree is empty would
+        // also pass if the build had simply never indexed anything.
+        assert!(
+            !tree_of(&engine, "t", "t_id_idx")?
+                .search_equal(&key(1))
+                .is_empty(),
+            "the pre-truncate tree must hold the seeded keys"
+        );
+
+        let xid = tm.allocate_xid();
+        table.truncate(&tm.context(xid, CommandId::FIRST))?;
+        tm.commit(xid)?;
+
+        let tree = tree_of(&engine, "t", "t_id_idx")?;
+        for id in 1..=3 {
+            assert!(
+                tree.search_equal(&key(id)).is_empty(),
+                "key {id} is still in the tree: the index was not swapped"
+            );
+        }
+        Ok(())
+    }
+
+    /// Open the live B-tree of `table`'s index `index_name` for direct inspection.
+    /// A fresh latch is fine: nothing else touches the tree in these tests.
+    fn tree_of(
+        engine: &Arc<PgEngine>,
+        table: &str,
+        index_name: &str,
+    ) -> anyhow::Result<crate::nbtree::BTree> {
+        let tables = engine
+            .tables
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let heap = tables
+            .get(&("public".to_string(), table.to_string()))
+            .and_then(|t| t.as_heap())
+            .ok_or_else(|| anyhow::anyhow!("{table} is not a heap table"))?;
+        let rel = heap
+            .index_relfilenodes()
+            .into_iter()
+            .find(|(name, _)| name == index_name)
+            .map(|(_, rel)| rel)
+            .ok_or_else(|| anyhow::anyhow!("{index_name} has no physical tree"))?;
+        Ok(crate::nbtree::BTree::open(
+            Arc::clone(&engine.inner),
+            rel,
+            Arc::new(std::sync::RwLock::new(())),
+            false,
+        ))
+    }
+
     /// An `UNLOGGED` TRUNCATE writes no record, so there is nothing for replay to
     /// reach and pinning the redo point for it would clamp the whole cluster to a
     /// whole-stream replay for free.
