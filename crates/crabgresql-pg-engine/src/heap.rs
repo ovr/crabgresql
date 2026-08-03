@@ -56,14 +56,14 @@ const PLACEHOLDER_TID: Tid = Tid {
 /// An uncommitted relfilenode-swap TRUNCATE staged by one transaction. Because a
 /// TRUNCATE holds the table exclusively until it commits, at most one can exist
 /// on a table at a time — hence a single `Option`, not a map.
+/// The empty replacement B-tree each physical index stages alongside it lives on
+/// [`IndexEntry::staged`], not here: one fact, one owner. Indexes are swapped in
+/// lockstep with the heap because the new file reuses the tids the old index
+/// entries name, so an index carried across the swap would answer probes with
+/// rows whose key does not match.
 struct PendingTruncate {
     xid: Xid,
     new_rel: u32,
-    /// The empty replacement B-tree staged for each physical index, by index
-    /// name. Indexes are swapped in lockstep with the heap: the new file reuses
-    /// the tids the old index entries name, so an index carried across the swap
-    /// would answer probes with rows whose key does not match.
-    new_indexes: Vec<(String, RelFileNode)>,
     /// The lock owner that holds the table's exclusive lock — needed to release
     /// it from the commit/abort hook, which only receives the XID.
     owner: LockOwner,
@@ -585,9 +585,11 @@ impl HeapTable {
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
         let mut old_indexes = Vec::new();
+        let mut new_indexes = Vec::new();
         for entry in indexes.iter_mut() {
             if let Some(staged) = entry.staged.take() {
                 old_indexes.push(std::mem::replace(&mut entry.rel, staged));
+                new_indexes.push((entry.meta.name.clone(), staged));
             }
         }
         self.has_pending.store(false, Ordering::Release);
@@ -608,7 +610,7 @@ impl HeapTable {
         Some(TruncateCommit {
             old_heap: RelFileNode(old),
             old_indexes,
-            new_indexes: p.new_indexes,
+            new_indexes,
             owner: p.owner,
         })
     }
@@ -682,16 +684,23 @@ impl HeapTable {
     /// index's. `drop_table` reads this so it can reclaim staged files the
     /// catalog doesn't know about.
     pub(crate) fn staged_relfilenodes(&self) -> Vec<RelFileNode> {
-        self.pending
+        // Two sequential acquisitions, never held together, so the usual
+        // `indexes` before `pending` order cannot be violated here.
+        let mut out: Vec<RelFileNode> = self
+            .indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .as_ref()
-            .map(|p| {
-                std::iter::once(RelFileNode(p.new_rel))
-                    .chain(p.new_indexes.iter().map(|(_, irel)| *irel))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| e.staged)
+            .collect();
+        out.extend(
+            self.pending
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .as_ref()
+                .map(|p| RelFileNode(p.new_rel)),
+        );
+        out
     }
 
     /// Release the exclusive lock a TRUNCATE held (keyed by its lock owner).
@@ -1466,6 +1475,11 @@ impl TableAm for HeapTable {
         // decides whether that record must be replayed. Creating first is safe
         // because a crash before the record is appended leaves files nothing
         // names, which the startup orphan sweep reclaims.
+        // `superseded` collects what a *second* TRUNCATE in the same transaction
+        // displaces — `replace` hands back the tree the previous one staged, so
+        // the double-TRUNCATE reclaim reads out of the same field that owns the
+        // staged file rather than a parallel list that could disagree with it.
+        let mut superseded = Vec::new();
         let staged_indexes: Vec<(String, RelFileNode, RelFileNode)> = {
             let mut indexes = self
                 .indexes
@@ -1489,7 +1503,7 @@ impl TableAm for HeapTable {
                 )
                 .create();
                 staged.push((entry.meta.name.clone(), entry.rel, irel));
-                entry.staged = Some(irel);
+                superseded.extend(entry.staged.replace(irel));
             }
             staged
         };
@@ -1545,24 +1559,22 @@ impl TableAm for HeapTable {
                 .replace(PendingTruncate {
                     xid: txn.xid,
                     new_rel: new.0,
-                    new_indexes: staged_indexes
-                        .iter()
-                        .map(|(name, _, irel)| (name.clone(), *irel))
-                        .collect(),
                     owner: txn.lock_owner,
                 });
             self.has_pending.store(true, Ordering::Release);
             prev
         };
         self.insert_hint.store(0, Ordering::Relaxed);
+        // The trees a previous TRUNCATE in this same transaction staged, displaced
+        // by the ones just created. Empty on the first TRUNCATE.
+        for irel in superseded {
+            self.engine.discard_relfile(irel);
+        }
         match prev {
             Some(prev) => {
-                // The superseded staged files were used only by this uncommitted
-                // transaction; reclaim them now — the heap's and every index's.
+                // The superseded staged heap file was used only by this uncommitted
+                // transaction; reclaim it now.
                 self.engine.discard_relfile(RelFileNode(prev.new_rel));
-                for (_, irel) in prev.new_indexes {
-                    self.engine.discard_relfile(irel);
-                }
                 // Already registered with the engine on the first TRUNCATE.
             }
             None => {
