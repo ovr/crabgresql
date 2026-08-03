@@ -158,10 +158,13 @@ pub enum PhysicalPlan {
         returning: Option<Returning>,
         /// Leaf partitions for tuple routing when `table` is a partitioned parent
         /// (see [`LogicalPlan::Update`]); `None` for an ordinary table.
-        routing: Option<Vec<Arc<dyn TableAm>>>,
+        routing: Option<Vec<DmlTarget>>,
         /// `table` and its inheritance descendants, each with its column map
         /// (see [`LogicalPlan::Update`]); empty for a table with no children.
-        inherited: Vec<MappedRelation>,
+        inherited: Vec<DmlTarget>,
+        /// The row source for `table` itself, used when it is neither partitioned
+        /// nor inherited (the other two arms carry their own).
+        probe: Option<DmlIndexProbe>,
     },
     Delete {
         table: Arc<dyn TableAm>,
@@ -169,11 +172,51 @@ pub enum PhysicalPlan {
         returning: Option<Returning>,
         /// Leaf partitions for tuple routing when `table` is a partitioned parent
         /// (see [`LogicalPlan::Delete`]); `None` for an ordinary table.
-        routing: Option<Vec<Arc<dyn TableAm>>>,
+        routing: Option<Vec<DmlTarget>>,
         /// `table` and its inheritance descendants, each with its column map
         /// (see [`LogicalPlan::Delete`]); empty for a table with no children.
-        inherited: Vec<MappedRelation>,
+        inherited: Vec<DmlTarget>,
+        /// The row source for `table` itself, used when it is neither partitioned
+        /// nor inherited (the other two arms carry their own).
+        probe: Option<DmlIndexProbe>,
     },
+}
+
+/// One relation an `UPDATE`/`DELETE` reads rows from, with the row source chosen
+/// for it.
+///
+/// The probe travels *with* its relation rather than in a vector alongside one,
+/// so the two cannot fall out of step — the same reason [`PhysicalAppendArm`]
+/// embeds its [`MappedRelation`] instead of running parallel to it. A positional
+/// pairing would survive partition pruning skipping a leaf, and read leaf B
+/// through leaf A's index.
+pub struct DmlTarget {
+    pub relation: MappedRelation,
+    /// `None` scans the whole relation.
+    pub probe: Option<DmlIndexProbe>,
+}
+
+/// An equality index probe standing in for one DML target's sequential scan.
+///
+/// Unlike [`PhysicalPlan::IndexScan`], a probe here does *not* consume the
+/// conjuncts it matched: the plan's `predicate` stays the whole `WHERE` and is
+/// re-checked per row. The probe only narrows the row source, so a target that
+/// cannot serve one falls back to a scan without any predicate rewriting — which
+/// is what lets each inheritance descendant and each leaf partition decide
+/// independently, in its own column space.
+pub struct DmlIndexProbe {
+    pub index_name: String,
+    /// One `(key column, equality value)` pair per index key column, in key
+    /// order. Columns are ordinals in the *target's* own schema, already
+    /// translated through [`MappedRelation::map`] where one applies.
+    pub key: Vec<(usize, BoundExpr)>,
+    /// The conjuncts the key did *not* cover, for `EXPLAIN` only.
+    ///
+    /// The executor re-checks the whole `WHERE`, so this never drives execution;
+    /// it exists so a plan can show the same `Index Cond` / `Filter` split PG
+    /// shows. Re-checking a conjunct the index already satisfied is not
+    /// observable, which is what lets display and execution differ here.
+    pub residual: Option<BoundExpr>,
 }
 
 /// One arm of a [`PhysicalPlan::Append`]: a [`MappedRelation`] plus the columns
@@ -757,27 +800,52 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             returning,
             routing,
             inherited,
-        } => PhysicalPlan::Update {
-            table,
-            predicate,
-            assignments,
-            returning,
-            routing,
-            inherited,
-        },
+        } => {
+            // A target whose UNIQUE check needs the whole-relation snapshot has
+            // to be scanned: see `update_needs_unique_snapshot`. Row movement is
+            // possible only through a partitioned parent.
+            let row_movement = routing.is_some();
+            let keep = |target: &Arc<dyn TableAm>, map: &Option<Arc<[usize]>>| {
+                let indexes = target.indexes();
+                match map_assigned_columns(&assignments, map) {
+                    Some(assigned) => {
+                        !update_needs_unique_snapshot(&indexes, &assigned, row_movement)
+                    }
+                    // Untranslatable assignment: assume the worst and scan.
+                    None => false,
+                }
+            };
+            let (routing, inherited, probe) =
+                dml_targets(&table, routing, inherited, &predicate, Some(&keep));
+            PhysicalPlan::Update {
+                table,
+                predicate,
+                assignments,
+                returning,
+                routing,
+                inherited,
+                probe,
+            }
+        }
         LogicalPlan::Delete {
             table,
             predicate,
             returning,
             routing,
             inherited,
-        } => PhysicalPlan::Delete {
-            table,
-            predicate,
-            returning,
-            routing,
-            inherited,
-        },
+        } => {
+            // A DELETE removes rows outright, so no target needs a snapshot.
+            let (routing, inherited, probe) =
+                dml_targets(&table, routing, inherited, &predicate, None);
+            PhysicalPlan::Delete {
+                table,
+                predicate,
+                returning,
+                routing,
+                inherited,
+                probe,
+            }
+        }
     }
 }
 
@@ -816,14 +884,48 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
     flatten_and(predicate, &mut conjuncts);
     let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
 
-    // Prefer a PRIMARY KEY, then a UNIQUE index, then any other index.
+    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs) else {
+        return AccessPath::Scan {
+            predicate: rebuild_and(conjuncts),
+        };
+    };
+    let residual = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed[*i])
+        .map(|(_, conjunct)| conjunct)
+        .collect();
+    AccessPath::Index {
+        index_name: probe.index_name,
+        key: probe.key,
+        residual: rebuild_and(residual),
+    }
+}
+
+/// Pick the index to probe for a set of already-classified conjuncts, returning
+/// the probe and a per-conjunct flag saying which conjuncts the key consumed.
+///
+/// Preference is structural rather than by cost: a PRIMARY KEY, then a UNIQUE
+/// index, then any other. Shared by the read path ([`choose_access`], which turns
+/// the unconsumed conjuncts into a residual filter the scan applies) and the DML
+/// path ([`dml_targets`], which keeps the whole predicate and uses the residual
+/// for `EXPLAIN` alone).
+///
+/// `indexes` is passed in rather than fetched because `TableAm::indexes` deep
+/// clones the metadata under a lock, and every caller already needs the list for
+/// something else.
+fn pick_index(
+    table: &Arc<dyn TableAm>,
+    indexes: &[IndexMetadata],
+    eqs: &[Option<(usize, BoundExpr)>],
+) -> Option<(DmlIndexProbe, Vec<bool>)> {
     for pref in [
         Some(IndexConstraint::PrimaryKey),
         Some(IndexConstraint::Unique),
         None,
     ] {
         for index in indexes.iter().filter(|i| i.constraint == pref) {
-            let Some(chosen) = cover_index(index, &eqs) else {
+            let Some(chosen) = cover_index(index, eqs) else {
                 continue;
             };
             // Only route to an index scan the engine can physically serve;
@@ -833,7 +935,7 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
                 continue;
             }
             let mut key = Vec::with_capacity(chosen.len());
-            let mut consumed = vec![false; conjuncts.len()];
+            let mut consumed = vec![false; eqs.len()];
             for (column, conjunct) in chosen {
                 // `cover_index` only ever returns conjuncts classified as an
                 // equality key, so `eqs[conjunct]` is always `Some`.
@@ -842,23 +944,159 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
                     consumed[conjunct] = true;
                 }
             }
-            let residual = conjuncts
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !consumed[*i])
-                .map(|(_, conjunct)| conjunct)
-                .collect();
-            return AccessPath::Index {
-                index_name: index.name.clone(),
-                key,
-                residual: rebuild_and(residual),
-            };
+            return Some((
+                DmlIndexProbe {
+                    index_name: index.name.clone(),
+                    key,
+                    residual: None,
+                },
+                consumed,
+            ));
         }
     }
+    None
+}
 
-    AccessPath::Scan {
-        predicate: rebuild_and(conjuncts),
+/// Whether one DML target may keep the probe an index offers it, given the
+/// target and its [`MappedRelation::map`]. `UPDATE` uses this to veto a probe for
+/// a relation it must read in full; see [`update_needs_unique_snapshot`].
+type KeepProbe<'a> = &'a dyn Fn(&Arc<dyn TableAm>, &Option<Arc<[usize]>>) -> bool;
+
+/// Attach a row source to every relation an `UPDATE`/`DELETE` writes through,
+/// returning the arms in the shape [`PhysicalPlan::Update`]/[`Delete`] carries
+/// them: leaf partitions, inheritance descendants, or the plain table's own probe.
+///
+/// Exactly one arm is ever populated, mirroring the executor's dispatch —
+/// routing wins over inheritance, and a plain table is its own single target.
+/// Leaf partitions carry no map: a leaf is a verbatim clone of the parent's
+/// layout.
+///
+/// Each target is decided independently against its own indexes, so a mixed plan
+/// — one descendant probed, another scanned — is normal. `keep` lets `UPDATE`
+/// veto a probe for a target it must read in full; `DELETE` passes `None`.
+///
+/// [`Delete`]: PhysicalPlan::Delete
+fn dml_targets(
+    table: &Arc<dyn TableAm>,
+    routing: Option<Vec<Arc<dyn TableAm>>>,
+    inherited: Vec<MappedRelation>,
+    predicate: &Option<BoundExpr>,
+    keep: Option<KeepProbe<'_>>,
+) -> (
+    Option<Vec<DmlTarget>>,
+    Vec<DmlTarget>,
+    Option<DmlIndexProbe>,
+) {
+    let eqs = predicate.as_ref().map(|predicate| {
+        let mut conjuncts = Vec::new();
+        flatten_and(predicate.clone(), &mut conjuncts);
+        let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
+        (conjuncts, eqs)
+    });
+    let probe_for = |target: &Arc<dyn TableAm>, map: &Option<Arc<[usize]>>| {
+        let (conjuncts, eqs) = eqs.as_ref()?;
+        if keep.is_some_and(|keep| !keep(target, map)) {
+            return None;
+        }
+        // The predicate stays in the named relation's column space — that is the
+        // invariant the executor's `view` rests on — so only the key columns are
+        // translated into the target's own. A conjunct whose column the map does
+        // not cover simply stops being an index candidate.
+        let translated: Vec<Option<(usize, BoundExpr)>> = match map {
+            None => eqs.clone(),
+            Some(map) => eqs
+                .iter()
+                .map(|eq| {
+                    let (column, value) = eq.as_ref()?;
+                    Some((*map.get(*column)?, value.clone()))
+                })
+                .collect(),
+        };
+        let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated)?;
+        probe.residual = rebuild_and(
+            conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !consumed[*i])
+                .map(|(_, conjunct)| conjunct.clone())
+                .collect(),
+        );
+        Some(probe)
+    };
+
+    if let Some(leaves) = routing {
+        let arms = leaves
+            .into_iter()
+            .map(|leaf| DmlTarget {
+                probe: probe_for(&leaf, &None),
+                relation: MappedRelation {
+                    table: leaf,
+                    map: None,
+                },
+            })
+            .collect();
+        return (Some(arms), Vec::new(), None);
     }
+    if !inherited.is_empty() {
+        let arms = inherited
+            .into_iter()
+            .map(|relation| DmlTarget {
+                probe: probe_for(&relation.table, &relation.map),
+                relation,
+            })
+            .collect();
+        return (None, arms, None);
+    }
+    (None, Vec::new(), probe_for(table, &None))
+}
+
+/// Whether an `UPDATE` must snapshot all of a relation's rows to check `UNIQUE`.
+///
+/// It must whenever the statement can introduce a conflict. Writing a unique key
+/// is the obvious way. The other is row movement: an `UPDATE` through a
+/// partitioned parent can relocate a row into a leaf where its key — untouched
+/// though it is — already exists, so for a routed target every unique index
+/// counts, not just the written ones.
+///
+/// This governs the index probe too, and in the same direction: a probe returns
+/// only the matching rows, which is too little to build that snapshot from, so
+/// the planner withholds one from exactly the targets that answer `true` here.
+///
+/// `assigned` holds the written columns as ordinals in the schema `indexes`
+/// belongs to, so a caller writing through an inheritance parent must translate
+/// them first (see [`map_assigned_columns`]).
+pub fn update_needs_unique_snapshot(
+    indexes: &[IndexMetadata],
+    assigned: &[usize],
+    row_movement: bool,
+) -> bool {
+    indexes.iter().any(|index| {
+        index.unique
+            && (row_movement || index.keys.iter().any(|key| assigned.contains(&key.column)))
+    })
+}
+
+/// Translate assignment target columns from the named relation's ordinals into
+/// one target's own, through that target's [`MappedRelation::map`], or `None` if
+/// the map does not cover them all.
+///
+/// A gap cannot happen today — every parent column exists in a descendant by
+/// name — but the answer must stay safe if one ever does, and no fallback ordinal
+/// is safe: passing the parent's through unchanged would test the *wrong* column
+/// against the target's unique keys, which can flip
+/// [`update_needs_unique_snapshot`] to `false` and admit a duplicate key. Callers
+/// treat `None` as "snapshot required".
+pub fn map_assigned_columns(
+    assignments: &[(usize, BoundExpr)],
+    map: &Option<Arc<[usize]>>,
+) -> Option<Vec<usize>> {
+    assignments
+        .iter()
+        .map(|(column, _)| match map {
+            None => Some(*column),
+            Some(map) => map.get(*column).copied(),
+        })
+        .collect()
 }
 
 /// Match each of `index`'s key columns to a distinct equality conjunct, or
@@ -1001,27 +1239,13 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             key,
             predicate,
             ..
-        } => {
-            let schema = table.schema();
-            let names = schema_names(&schema);
-            let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
-            let cond = key
-                .iter()
-                .map(|(column, value)| {
-                    format!(
-                        "{} = {}",
-                        schema.columns[*column].name,
-                        explain_expr(value, &names)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(") AND (");
-            lines.push(format!("  Index Cond: ({cond})"));
-            if let Some(predicate) = predicate {
-                lines.push(format!("  Filter: ({})", explain_expr(predicate, &names)));
-            }
-            lines
-        }
+        } => index_scan_lines(
+            table,
+            index_name,
+            key,
+            predicate.as_ref(),
+            &schema_names(&table.schema()),
+        ),
         PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
         PhysicalPlan::Append { arms, .. } => {
             // PG's Append: one child scan per arm, in scan order. A WHERE
@@ -1136,9 +1360,146 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::Update { table, .. } => vec![format!("Update on {}", table.schema().name)],
-        PhysicalPlan::Delete { table, .. } => vec![format!("Delete on {}", table.schema().name)],
+        PhysicalPlan::Update {
+            table,
+            predicate,
+            routing,
+            inherited,
+            probe,
+            ..
+        } => {
+            let mut lines = vec![format!("Update on {}", table.schema().name)];
+            lines.extend(dml_child_lines(
+                table,
+                routing,
+                inherited,
+                probe,
+                predicate.as_ref(),
+            ));
+            lines
+        }
+        PhysicalPlan::Delete {
+            table,
+            predicate,
+            routing,
+            inherited,
+            probe,
+            ..
+        } => {
+            let mut lines = vec![format!("Delete on {}", table.schema().name)];
+            lines.extend(dml_child_lines(
+                table,
+                routing,
+                inherited,
+                probe,
+                predicate.as_ref(),
+            ));
+            lines
+        }
     }
+}
+
+/// The `Index Scan` node for a read, and — indented — for one probed DML target.
+///
+/// `predicate` is the residual filter: the conjuncts the index key did not cover.
+///
+/// The two halves are spelled in different column spaces, which is why `names` is
+/// a parameter. `Index Cond` names key columns, which are ordinals in `table`'s
+/// own schema; the residual belongs to whichever relation the predicate was
+/// written against, and for an inheritance descendant that is the parent.
+fn index_scan_lines(
+    table: &Arc<dyn TableAm>,
+    index_name: &str,
+    key: &[(usize, BoundExpr)],
+    predicate: Option<&BoundExpr>,
+    names: &[Option<String>],
+) -> Vec<String> {
+    let schema = table.schema();
+
+    let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
+    let cond = key
+        .iter()
+        .map(|(column, value)| {
+            format!(
+                "{} = {}",
+                schema.columns[*column].name,
+                explain_expr(value, names)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(") AND (");
+    lines.push(format!("  Index Cond: ({cond})"));
+    if let Some(predicate) = predicate {
+        lines.push(format!("  Filter: ({})", explain_expr(predicate, names)));
+    }
+    lines
+}
+
+/// The `Seq Scan` node for a read, and — indented — for one scanned DML target.
+///
+/// `names` is supplied rather than read off `table` because a DML child renders a
+/// predicate written in the *named relation's* column space; an inheritance
+/// descendant's own schema would spell those ordinals as different columns.
+fn seq_scan_lines(
+    table: &Arc<dyn TableAm>,
+    names: &[Option<String>],
+    predicate: Option<&BoundExpr>,
+) -> Vec<String> {
+    let mut lines = vec![format!("Seq Scan on {}", table.schema().name)];
+    if let Some(predicate) = predicate {
+        lines.push(format!("  Filter: ({})", explain_expr(predicate, names)));
+    }
+    lines
+}
+
+/// The child scan nodes under an `Update on`/`Delete on`, one per target.
+///
+/// Every target is rendered, probed or not, because the set of relations a
+/// statement reads is exactly what the plan is being asked. Showing only the
+/// probed ones made an inheritance plan name the indexed descendant and stay
+/// silent about the parent whose rows it also modifies.
+///
+/// A probed target splits its predicate the way PG does — the covered conjuncts
+/// as `Index Cond`, the rest as `Filter` — even though the executor re-checks the
+/// whole `WHERE`; see [`DmlIndexProbe::residual`].
+fn dml_child_lines(
+    table: &Arc<dyn TableAm>,
+    routing: &Option<Vec<DmlTarget>>,
+    inherited: &[DmlTarget],
+    probe: &Option<DmlIndexProbe>,
+    predicate: Option<&BoundExpr>,
+) -> Vec<String> {
+    // The predicate is in the named relation's column space, whichever target
+    // ends up reading the rows.
+    let names = schema_names(&table.schema());
+    let mut lines = Vec::new();
+    let mut push = |target: &Arc<dyn TableAm>, probe: &Option<DmlIndexProbe>| {
+        let child = match probe {
+            Some(probe) => index_scan_lines(
+                target,
+                &probe.index_name,
+                &probe.key,
+                probe.residual.as_ref(),
+                &names,
+            ),
+            None => seq_scan_lines(target, &names, predicate),
+        };
+        push_child(&mut lines, child);
+    };
+    match (routing, inherited.is_empty()) {
+        (Some(leaves), _) => {
+            for leaf in leaves {
+                push(&leaf.relation.table, &leaf.probe);
+            }
+        }
+        (None, false) => {
+            for target in inherited {
+                push(&target.relation.table, &target.probe);
+            }
+        }
+        (None, true) => push(table, probe),
+    }
+    lines
 }
 
 /// The trailing summary `EXPLAIN` prints below the plan when `SUMMARY` is on
@@ -2418,6 +2779,124 @@ mod tests {
     fn equality_without_index_stays_seq_scan() {
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", None);
         assert!(matches!(plan, PhysicalPlan::Select { .. }));
+    }
+
+    /// The probe a single-table DML plan chose for its own relation.
+    fn direct_probe(plan: &PhysicalPlan) -> &Option<DmlIndexProbe> {
+        match plan {
+            PhysicalPlan::Update { probe, .. } | PhysicalPlan::Delete { probe, .. } => probe,
+            _ => panic!("expected a DML plan"),
+        }
+    }
+
+    #[test]
+    fn dml_on_pk_equality_probes_the_index() {
+        for sql in [
+            "UPDATE t SET name = 'x' WHERE id = 1",
+            "DELETE FROM t WHERE id = 1",
+        ] {
+            let plan = plan_sql_indexed(sql, Some(pk_on_id()));
+            let Some(probe) = direct_probe(&plan) else {
+                panic!("expected a probe for {sql}");
+            };
+            assert_eq!(probe.index_name, "t_pkey");
+            assert_eq!(
+                probe.key,
+                vec![(
+                    0,
+                    BoundExpr::Const {
+                        value: Value::Int4(1),
+                        ty: PgType::Int4
+                    }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn a_dml_probe_leaves_the_whole_predicate_in_place() {
+        // Unlike a read, the probe consumes no conjunct: the modify node still
+        // re-checks `id = 1` along with `name = 'y'`. The residual it carries is
+        // for EXPLAIN only.
+        let plan = plan_sql_indexed(
+            "UPDATE t SET big = 1 WHERE id = 1 AND name = 'y'",
+            Some(pk_on_id()),
+        );
+        let Some(probe) = direct_probe(&plan) else {
+            panic!("expected a probe");
+        };
+        let Some(BoundExpr::Binary {
+            op: BinOp::Eq,
+            arg_ty: PgType::Text,
+            ..
+        }) = &probe.residual
+        else {
+            panic!("expected the uncovered text equality as the residual");
+        };
+        let PhysicalPlan::Update { predicate, .. } = &plan else {
+            panic!("expected Update");
+        };
+        let Some(BoundExpr::Binary { op: BinOp::And, .. }) = predicate else {
+            panic!("expected the full AND predicate to survive");
+        };
+    }
+
+    #[test]
+    fn update_writing_the_unique_key_stays_seq_scan() {
+        // Writing `id` means the UNIQUE check needs every row, which a probe
+        // cannot supply — see `update_needs_unique_snapshot`.
+        let plan = plan_sql_indexed("UPDATE t SET id = 2 WHERE id = 1", Some(pk_on_id()));
+        assert!(direct_probe(&plan).is_none(), "expected no probe");
+    }
+
+    #[test]
+    fn dml_without_a_usable_index_stays_seq_scan() {
+        for (sql, index) in [
+            ("UPDATE t SET big = 1 WHERE id = 1", None),
+            ("DELETE FROM t WHERE name = 'x'", Some(pk_on_id())),
+            ("DELETE FROM t WHERE id > 1", Some(pk_on_id())),
+            ("DELETE FROM t", Some(pk_on_id())),
+        ] {
+            let plan = plan_sql_indexed(sql, index);
+            assert!(
+                direct_probe(&plan).is_none(),
+                "{sql} must not probe an index"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_renders_a_child_per_dml_target() {
+        // Probed: the covered conjunct as Index Cond, the rest as Filter — the
+        // split PG prints.
+        let lines = explain(&plan_sql_indexed(
+            "DELETE FROM t WHERE id = 1 AND name = 'y'",
+            Some(pk_on_id()),
+        ));
+        assert_eq!(
+            lines,
+            vec![
+                "Delete on t",
+                "  ->  Index Scan using t_pkey on t",
+                "        Index Cond: (id = 1)",
+                "        Filter: (name = y)",
+            ]
+        );
+
+        // Unprobed: the child is still rendered, carrying the whole predicate.
+        let lines = explain(&plan_sql_indexed("DELETE FROM t WHERE id = 1", None));
+        assert_eq!(
+            lines,
+            vec![
+                "Delete on t",
+                "  ->  Seq Scan on t",
+                "        Filter: (id = 1)"
+            ]
+        );
+
+        // An unfiltered DML still names the relation it reads.
+        let lines = explain(&plan_sql("DELETE FROM t"));
+        assert_eq!(lines, vec!["Delete on t", "  ->  Seq Scan on t"]);
     }
 
     #[test]

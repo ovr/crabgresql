@@ -4235,6 +4235,128 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await?;
+
+    // The modify node now reports the child scan it reads through.
+    let lines = explain_lines(&client, "EXPLAIN UPDATE t SET label = 'x' WHERE id = 2").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Update on t",
+            "  ->  Index Scan using t_pkey on t",
+            "        Index Cond: (id = 2)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    // Writing the PK itself needs every row for the UNIQUE check, so it scans —
+    // and the child says so, as PG's does.
+    let lines = explain_lines(&client, "EXPLAIN UPDATE t SET id = 9 WHERE id = 2").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Update on t",
+            "  ->  Seq Scan on t",
+            "        Filter: (id = 2)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    let lines = explain_lines(&client, "EXPLAIN DELETE FROM t WHERE id = 2").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Delete on t",
+            "  ->  Index Scan using t_pkey on t",
+            "        Index Cond: (id = 2)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    // A conjunct the key does not cover stays visible as the child's Filter.
+    let lines = explain_lines(
+        &client,
+        "EXPLAIN DELETE FROM t WHERE id = 2 AND label = 'x'",
+    )
+    .await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Delete on t",
+            "  ->  Index Scan using t_pkey on t",
+            "        Index Cond: (id = 2)",
+            "        Filter: (label = x)",
+        ],
+        "plan was {lines:?}"
+    );
+
+    // ...and the probed statements touch exactly the rows the predicate names.
+    let result = client
+        .simple_query("UPDATE t SET label = 'hit' WHERE id = 2 RETURNING id, label")
+        .await?;
+    let returned = rows(&result);
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].get(1), Some("hit"));
+
+    client.simple_query("DELETE FROM t WHERE id = 1").await?;
+    let result = client
+        .simple_query("SELECT id, label FROM t ORDER BY id")
+        .await?;
+    let left = rows(&result);
+    assert_eq!(left.len(), 2);
+    assert_eq!(left[0].get(0), Some("2"));
+    assert_eq!(left[0].get(1), Some("hit"));
+    assert_eq!(left[1].get(0), Some("3"));
+
+    Ok(())
+}
+
+/// A probe must never hand the same row to DML twice.
+///
+/// `TRUNCATE` swaps the heap's relfilenode without resetting the index, so a
+/// stale `key -> tid` entry survives and the next insert reuses the very slot it
+/// names. The probe then reports that tid twice — once for the stale entry, once
+/// for the new one — and an unguarded UPDATE would write the row twice and report
+/// `UPDATE 2` for a one-row table. The engine-side repair is tracked separately;
+/// this pins the executor's guard.
+#[tokio::test]
+async fn a_probe_never_reports_the_same_row_twice() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, v text)")
+        .await?;
+    client.simple_query("INSERT INTO t VALUES (1, 'a')").await?;
+    client.simple_query("TRUNCATE t").await?;
+    client.simple_query("INSERT INTO t VALUES (1, 'b')").await?;
+
+    let result = client
+        .simple_query("UPDATE t SET v = 'c' WHERE id = 1 RETURNING id, v")
+        .await?;
+    assert_eq!(rows(&result).len(), 1, "UPDATE ... RETURNING duplicated a row");
+    assert!(
+        result.iter().any(|m| matches!(
+            m,
+            tokio_postgres::SimpleQueryMessage::CommandComplete(1)
+        )),
+        "expected the tag to count one row, got {result:?}"
+    );
+
+    let result = client.simple_query("SELECT id, v FROM t").await?;
+    let left = rows(&result);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].get(1), Some("c"));
+
+    Ok(())
+}
+
 /// The `QUERY PLAN` lines of an EXPLAIN, as the client sees them.
 async fn explain_lines(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<Vec<String>> {
     let plan = client.simple_query(sql).await?;
@@ -4418,7 +4540,11 @@ async fn explain_analyze_honors_the_read_only_transaction_check() -> anyhow::Res
     // executes, so there is nothing to reject. ANALYZE does execute, so it is.
     assert_eq!(
         explain_lines(&client, "EXPLAIN DELETE FROM t WHERE id = 1").await?,
-        vec!["Delete on t".to_string()]
+        vec![
+            "Delete on t".to_string(),
+            "  ->  Seq Scan on t".to_string(),
+            "        Filter: (id = 1)".to_string(),
+        ]
     );
     assert_eq!(
         sqlstate(&client, "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1").await?,
