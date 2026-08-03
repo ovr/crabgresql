@@ -8145,8 +8145,15 @@ async fn copy_freeze_rejects_relations_it_cannot_discard() -> anyhow::Result<()>
 }
 
 /// A `parquet` relation routes a frozen load straight to a fragment instead of
-/// its RAM write buffer, because the buffer is not discarded by a rollback.
-/// Both halves are checked: the rows land, and rolling back loses them.
+/// its RAM write buffer, because the buffer is one flat list that no rollback
+/// discards — a frozen row left there would outlive its transaction forever.
+///
+/// The assertions have to distinguish the two paths, which "rows land, rollback
+/// loses them" does not: buffered rows are stamped with the real XID and hidden
+/// by its abort record, so an ordinary buffered load passes that pair too. What
+/// only a fragment can do is answer an *older* snapshot, since a frozen fragment
+/// reports `Xid::FROZEN` while a buffered row reports its writer. Deleting the
+/// bypass makes the first assertion below fail.
 #[tokio::test]
 async fn copy_freeze_into_parquet_writes_a_discardable_fragment() -> anyhow::Result<()> {
     let port = spawn_server().await;
@@ -8156,18 +8163,34 @@ async fn copy_freeze_into_parquet_writes_a_discardable_fragment() -> anyhow::Res
         .simple_query("CREATE TABLE p (a int4) USING parquet ORDER BY (a)")
         .await?;
 
+    // Pin a snapshot that predates the load, as the heap test does.
+    reader
+        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    assert_eq!(row_count(&reader, "p").await, 0);
+
     writer.simple_query("BEGIN").await?;
     writer.simple_query("TRUNCATE p").await?;
     assert_eq!(
         copy_in_rows(&writer, "COPY p FROM STDIN WITH (FREEZE)", b"1\n2\n3\n").await?,
         3
     );
-    // Only after COMMIT: the TRUNCATE holds AccessExclusive until then, so a
-    // concurrent reader would block on the lock rather than on visibility.
+    // The loading transaction sees its own rows before committing: a frozen
+    // fragment is on disk and visible, not parked in an accumulator.
+    assert_eq!(row_count(&writer, "p").await, 3);
+    // The reader is only consulted after COMMIT: TRUNCATE holds AccessExclusive
+    // until then, so a concurrent read would block on the lock rather than show
+    // anything about visibility.
     writer.simple_query("COMMIT").await?;
-    assert_eq!(row_count(&reader, "p").await, 3);
+    assert_eq!(
+        row_count(&reader, "p").await,
+        3,
+        "a frozen fragment must be visible to a snapshot that predates it"
+    );
+    reader.simple_query("COMMIT").await?;
 
-    // And a rolled-back frozen load leaves nothing behind.
+    // And a rolled-back frozen load leaves nothing behind — the `.pending`
+    // fragment is unlinked, keyed on the writer XID the filename preserves.
     writer.simple_query("BEGIN").await?;
     writer.simple_query("TRUNCATE p").await?;
     assert_eq!(
