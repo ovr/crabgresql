@@ -41,13 +41,16 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         // `regtype` prints a built-in under its SQL spelling, not its catalog
         // one: 23 is `integer`, 1005 is `smallint[]`, 1043 is
         // `character varying`. That is exactly `PgType::name`.
-        // `unknown` is a real `pg_type` row but has no `PgType` of its own, so
-        // it needs naming here — it is what `pg_typeof` reports for a literal
-        // that never acquired a type.
-        RegKind::Type if oid == crabgresql_types::oid::UNKNOWN => Some("unknown".to_string()),
         RegKind::Type => match PgType::from_oid(oid) {
             Some(ty) => Some(ty.name().to_string()),
-            None => ops.user_type_name(oid).map(|(_, name)| quote_ident(&name)),
+            // A pseudo-type has a catalog row but no `PgType`, so it names itself
+            // from the shared table — `pg_typeof` reports `unknown` for an untyped
+            // literal, and `record`/`void`/`anyelement` turn up in introspection.
+            // Ahead of the user-type lookup: these OIDs are all below the
+            // user-OID floor, so the order is belt-and-braces.
+            None => crabgresql_types::pseudo_type_name(oid)
+                .map(str::to_string)
+                .or_else(|| ops.user_type_name(oid).map(|(_, name)| quote_ident(&name))),
         },
         RegKind::Namespace => ops.namespace_name(oid).map(|n| quote_ident(&n)),
     }
@@ -71,6 +74,7 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
         RegKind::Type => builtin_type_oid_from_syntax(trimmed)
             .or_else(|| builtin_type_oid(namespace.as_deref(), &name))
+            .or_else(|| pseudo_type_oid(namespace.as_deref(), &name))
             .or_else(|| ops.user_type_oid(namespace.as_deref(), &name)),
         // A schema name is never itself qualified.
         RegKind::Namespace => match namespace {
@@ -105,6 +109,15 @@ fn builtin_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
         return None;
     }
     PgType::from_name(name).map(|t| t.oid())
+}
+
+/// The OID of a pseudo-type name (`'record'::regtype`). Pseudo-types live in
+/// `pg_catalog` alongside the built-ins, so the same qualifier gate applies.
+fn pseudo_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
+    if matches!(namespace, Some(ns) if ns != "pg_catalog") {
+        return None;
+    }
+    crabgresql_types::pseudo_type_oid(name)
 }
 
 /// PG's "does not exist" error for a name that resolved to nothing, quoting the

@@ -155,7 +155,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         // Likewise the catalog functions, which `eval` dispatches through the
         // session's CatalogOps handle.
-        ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible => {
+        // `pg_typeof` is here too: it needs the catalog to name a user type, and
+        // it is not STRICT, so the NULL short-circuit above would be wrong for it.
+        ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible | ScalarFn::PgTypeof(_) => {
             return Err(ExecError::new(
                 sqlstate::INTERNAL_ERROR,
                 "catalog function reached the pure scalar evaluator",

@@ -10261,30 +10261,31 @@ mod tests {
         );
     }
 
-    /// The argument collapses to its type's OID at bind time — the expression
-    /// itself is never evaluated, and no modifier survives into the `regtype`.
+    /// The reported OID rides on the `ScalarFn`, and the argument *stays* in
+    /// `args`. Keeping it is what makes the argument still get evaluated and still
+    /// be seen by every pass that walks a call's arguments — aggregate extraction,
+    /// GROUP BY validation, volatility, deparse. An earlier version collapsed the
+    /// whole call to a bare OID constant and broke all four.
     #[test]
-    fn pg_typeof_binds_to_the_argument_type_oid() {
+    fn pg_typeof_reports_the_type_and_keeps_the_argument() {
         use crate::ScalarFn;
-        use crabgresql_types::{RegKind, Value, oid};
-        let oid_of = |sql: &str| {
+        use crabgresql_types::{RegKind, oid};
+        let call_of = |sql: &str| {
             let LogicalPlan::Values { rows, .. } = bound(sql) else {
                 panic!("expected a FROM-less SELECT for: {sql}");
             };
             let BoundExpr::FuncCall { func, ret, args } = &rows[0][0] else {
                 panic!("expected a FuncCall for: {sql}");
             };
-            assert_eq!(*func, ScalarFn::RegFromOid(RegKind::Type));
             assert_eq!(*ret, PgType::Reg(RegKind::Type));
-            let BoundExpr::Const {
-                value: Value::Oid(o),
-                ..
-            } = &args[0]
-            else {
-                panic!("expected a folded OID const for: {sql}");
+            let ScalarFn::PgTypeof(reported) = *func else {
+                panic!("expected ScalarFn::PgTypeof for: {sql}");
             };
-            *o
+            assert_eq!(args.len(), 1, "the argument must survive: {sql}");
+            (reported, args[0].clone())
         };
+        let oid_of = |sql: &str| call_of(sql).0;
+
         assert_eq!(oid_of("SELECT pg_typeof(1)"), PgType::Int4.oid());
         assert_eq!(
             oid_of("SELECT pg_typeof('2020-01-01'::timestamptz)"),
@@ -10299,7 +10300,29 @@ mod tests {
         assert_eq!(oid_of("SELECT pg_typeof('abc')"), oid::UNKNOWN);
         assert_eq!(oid_of("SELECT pg_typeof(NULL)"), oid::UNKNOWN);
 
-        // Only unary.
+        // The kept argument is the user's own expression, not a folded OID.
+        let (reported, arg) = call_of("SELECT pg_typeof(1 + 1)");
+        assert_eq!(reported, PgType::Int4.oid());
+        assert!(
+            matches!(arg, BoundExpr::Binary { .. }),
+            "the `1 + 1` expression should still be there, got {arg:?}"
+        );
+
+        // An aggregate inside the argument is still visible to the extraction
+        // pass, so the query groups instead of scanning. `agg_of` panics if the
+        // plan is not an Aggregate, which is exactly the regression to catch.
+        let (_, aggregates, _, _) = agg_of("SELECT pg_typeof(count(*)) FROM t");
+        assert_eq!(aggregates.len(), 1);
+        // ... and a bare column beside a grouped one is still the GROUP BY error.
+        let err = bind_err("SELECT pg_typeof(id) FROM t GROUP BY name");
+        assert_eq!(err.code, "42803");
+    }
+
+    /// Any arity but one falls through to ordinary resolution, so a user-defined
+    /// overload of this name stays reachable. With no such routine the
+    /// fall-through still reports PG's `42883`.
+    #[test]
+    fn pg_typeof_is_only_unary() {
         let err = bind_err("SELECT pg_typeof(1, 2)");
         assert_eq!(err.code, "42883");
         assert_eq!(
