@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelStats, StorageError, TableAm,
-    TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelPersistence, RelStats,
+    StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -81,7 +81,11 @@ enum Planned {
 }
 
 pub struct HeapTable {
-    schema: TableSchema,
+    /// The relation's shape. Behind a lock because `ALTER TABLE` republishes it
+    /// while other sessions hold this table — see `TableAm::schema`. Only
+    /// `columns` ever differs between versions; name, namespace and persistence
+    /// are fixed at creation.
+    schema: RwLock<Arc<TableSchema>>,
     engine: Arc<EngineInner>,
     /// The committed relfilenode — what every transaction sees, except the one
     /// with a pending TRUNCATE (which sees `pending.new_rel`).
@@ -133,12 +137,18 @@ pub struct HeapTable {
     /// publish sequence, which is short and runs at most once per table.
     toast_create: std::sync::Mutex<()>,
     indexes: RwLock<Vec<IndexEntry>>,
-    /// Whether this relation's mutations skip the WAL (`Unlogged`/`Temporary`).
-    /// Cached from `schema.persistence` at construction. Note this is the WAL axis
-    /// only — RAM-vs-file backing is the storage manager's concern (`is_ram_backed`,
-    /// registered at create time), so an `Unlogged` table is `wal_skipped` but
-    /// on-disk.
-    wal_skipped: bool,
+    /// This relation's storage class, cached from `schema.persistence` at
+    /// construction.
+    ///
+    /// Not a second source of truth: only `columns` ever differs between schema
+    /// versions (see `schema`), so persistence is fixed for the relation's life.
+    /// Caching it keeps the WAL and backing-store predicates off the schema lock
+    /// on the per-row write path, where they are asked once per index per row.
+    ///
+    /// The axes are distinct and neither implies the other: `is_wal_skipped()`
+    /// is `Unlogged | Temporary`, while `is_unlogged()` is `Unlogged` alone — an
+    /// `Unlogged` table skips the WAL but is still on disk.
+    persistence: RelPersistence,
     /// What `ANALYZE` last measured, or `None` for a never-analyzed relation.
     /// Loaded from the durable catalog at open and rewritten by `ANALYZE`;
     /// non-transactional, matching PostgreSQL (see `RelCatalog::set_stats`).
@@ -180,9 +190,9 @@ impl HeapTable {
                 latch: Arc::new(RwLock::new(())),
             })
             .collect();
-        let wal_skipped = schema.persistence.is_wal_skipped();
+        let persistence = schema.persistence;
         HeapTable {
-            schema,
+            schema: RwLock::new(Arc::new(schema)),
             engine,
             live_rel: AtomicU32::new(rel.0),
             pending: RwLock::new(None),
@@ -194,7 +204,7 @@ impl HeapTable {
             toast_hint: AtomicU32::new(0),
             toast_create: std::sync::Mutex::new(()),
             indexes: RwLock::new(indexes),
-            wal_skipped,
+            persistence,
             analyzed: RwLock::new(None),
         }
     }
@@ -255,11 +265,34 @@ impl HeapTable {
     /// dirty page evicts straight to its backing store (RAM for `Temporary`, a
     /// file for `Unlogged`).
     fn log(&self, info: u8, xid: Xid, payload: &[u8]) -> Lsn {
-        if self.wal_skipped {
+        if self.persistence.is_wal_skipped() {
             Lsn(0)
         } else {
             self.engine.wal.append(RmgrId::HEAP, info, xid, payload).end
         }
+    }
+
+    /// This table's current shape.
+    ///
+    /// Call it **once per operation** and pass `&schema` down. Never inside a
+    /// per-row or per-index loop, and never twice in one expression: two calls
+    /// can return two different versions, so a pair like "is this index
+    /// physical?" and "encode this row for it" could disagree about `columns`
+    /// and silently leave a row out of a live index.
+    ///
+    /// One snapshot is stable for a whole operation by construction, not by
+    /// luck: every caller holds a `TableLock` hold, and the only mutator
+    /// (`set_columns_not_null`) takes that lock exclusively.
+    ///
+    /// Fields that cannot change are cached on the struct (`persistence`) and
+    /// must not be read through here.
+    fn snap(&self) -> Arc<TableSchema> {
+        Arc::clone(
+            &self
+                .schema
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned")),
+        )
     }
 
     pub fn add_index(&self, index: IndexMetadata, rel: RelFileNode) {
@@ -271,6 +304,27 @@ impl HeapTable {
                 rel,
                 latch: Arc::new(RwLock::new(())),
             });
+    }
+
+    /// Publish a schema with `columns` marked NOT NULL, after the durable
+    /// catalog has already recorded it.
+    ///
+    /// Builds a whole new [`TableSchema`] and swaps it in rather than editing
+    /// the live one: a session that already took a snapshot keeps reading the
+    /// version it started with, and the next one sees the new shape entire.
+    /// That is what makes the swap indivisible across a multi-column key — no
+    /// reader can observe half of it — and it is the same move a future
+    /// `ADD COLUMN` will make, which editing a field in place could not be.
+    pub fn set_columns_not_null(&self, columns: &[usize]) {
+        let mut guard = self
+            .schema
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let mut next = (**guard).clone();
+        for &c in columns {
+            next.columns[c].nullable = false;
+        }
+        *guard = Arc::new(next);
     }
 
     pub fn remove_index(&self, index_name: &str) {
@@ -295,7 +349,7 @@ impl HeapTable {
             Arc::clone(&self.engine),
             entry.rel,
             Arc::clone(&entry.latch),
-            self.schema.persistence.is_unlogged(),
+            self.persistence.is_unlogged(),
         )
     }
 
@@ -310,7 +364,7 @@ impl HeapTable {
     /// B-tree on this table (all key types order-preserving-encodable). When
     /// false, the index is registered metadata-only (relfilenode 0).
     pub fn can_index(&self, index: &IndexMetadata) -> bool {
-        btkey::keys_indexable(&self.schema, &index.keys)
+        btkey::keys_indexable(&self.snap(), &index.keys)
     }
 
     /// `Err` when a row's out-of-line value cannot be read: CREATE INDEX is an
@@ -327,12 +381,15 @@ impl HeapTable {
         // Exclude sessions AND vacuum (which runs as INTERNAL) during the build,
         // via an RAII guard so a panic mid-build cannot leak the exclusive hold.
         let _guard = self.lock.acquire_exclusive_guard(LockOwner::DDL);
+        // Pinned by the hold above: the only republisher takes the same
+        // exclusive lock, so one snapshot covers the whole build.
+        let schema = self.snap();
         let latch = Arc::new(RwLock::new(()));
         let btree = BTree::open(
             Arc::clone(&self.engine),
             rel,
             Arc::clone(&latch),
-            self.schema.persistence.is_unlogged(),
+            self.persistence.is_unlogged(),
         );
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
         btree.create();
@@ -358,7 +415,7 @@ impl HeapTable {
                 // statement; it must not take the process down, since CREATE INDEX
                 // is an ordinary user command.
                 let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
-                if let Some(key) = btkey::encode_row(&self.schema, &cols, &tuple) {
+                if let Some(key) = btkey::encode_row(&schema, &cols, &tuple) {
                     btree.insert(&key, tid);
                 }
             }
@@ -366,7 +423,7 @@ impl HeapTable {
         // Make the build durable now, so the index survives a crash even with no
         // subsequent commit — CREATE INDEX is a durable DDL, as in PostgreSQL. An
         // Unlogged index writes no WAL (it is rebuilt on crash), so nothing to flush.
-        if !self.schema.persistence.is_unlogged() {
+        if !self.persistence.is_unlogged() {
             let lsn = self.engine.wal.current_lsn();
             Self::io(self.engine.wal.flush(lsn).map_err(std::io::Error::other));
         }
@@ -388,12 +445,21 @@ impl HeapTable {
             .indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        // An unindexed table has nothing to maintain, so its rows never touch
+        // the schema lock at all — that is the bulk-load shape.
+        if indexes.is_empty() {
+            return;
+        }
+        // One snapshot for the whole row: every index is judged and encoded
+        // against the same `columns`, and the row costs one schema-lock
+        // acquisition rather than two per index.
+        let schema = self.snap();
         for entry in indexes.iter() {
-            if !entry.is_physical(&self.schema) {
+            if !entry.is_physical(&schema) {
                 continue;
             }
             let cols = btkey::key_columns(&entry.meta.keys);
-            if let Some(key) = btkey::encode_row(&self.schema, &cols, tuple) {
+            if let Some(key) = btkey::encode_row(&schema, &cols, tuple) {
                 self.btree(entry).insert(&key, tid);
             }
         }
@@ -481,7 +547,7 @@ impl HeapTable {
             // Advisory: failing to reclaim leaves unreferenced chunks, never
             // unreadable ones, so it must not fail the commit.
             tracing::warn!(
-                table = %self.schema.name,
+                table = %self.snap().name,
                 %error,
                 "TRUNCATE: could not empty the chunk store; its space is retained"
             );
@@ -590,14 +656,16 @@ impl HeapTable {
         }
         let rel = self.engine.catalog.alloc_relfilenode();
         // A temporary table's chunks must live wherever its rows do.
-        if self.schema.persistence.is_ram_backed() {
+        if self.persistence.is_ram_backed() {
             self.engine.bufpool.smgr().register_memory(rel);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
-        if self.schema.persistence.persists_catalog() {
+        if self.persistence.persists_catalog() {
+            // One snapshot: namespace and name must name the same version.
+            let schema = self.snap();
             self.engine
                 .catalog
-                .set_toast_rel(&self.schema.namespace, &self.schema.name, rel)
+                .set_toast_rel(&schema.namespace, &schema.name, rel)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         self.toast_rel.store(rel.0, Ordering::Release);
@@ -637,6 +705,10 @@ impl HeapTable {
         if bytes.len() <= toast::TOAST_TUPLE_TARGET {
             return Ok(Planned::Inline(bytes));
         }
+        // Only the toasting path reads the shape (`typlen` per column), so the
+        // common narrow row — every row of an untoasted bulk load — never takes
+        // the schema lock.
+        let schema = self.snap();
 
         // Re-derive each attribute's encoded width rather than measuring the
         // whole tuple: the planner needs to know what moving one out would save.
@@ -661,12 +733,7 @@ impl HeapTable {
             widths.push(buf.len());
             // Only a variable-length type can be wide enough to be worth moving;
             // `typlen == -1` is exactly PostgreSQL's varlena predicate.
-            toastable.push(
-                self.schema
-                    .columns
-                    .get(i)
-                    .is_some_and(|c| c.ty.typlen() == -1),
-            );
+            toastable.push(schema.columns.get(i).is_some_and(|c| c.ty.typlen() == -1));
             encoded.push(buf);
         }
         let base = bytes.len() - widths.iter().sum::<usize>();
@@ -975,8 +1042,8 @@ fn detoast(engine: &EngineInner, p: &toast::ToastPointer) -> Result<Vec<u8>, Sto
 }
 
 impl TableAm for HeapTable {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
+    fn schema(&self) -> Arc<TableSchema> {
+        self.snap()
     }
 
     fn indexes(&self) -> Vec<IndexMetadata> {
@@ -1011,9 +1078,10 @@ impl TableAm for HeapTable {
                 columns: Vec::new(),
             };
         }
+        let schema = self.snap();
         match self.nblocks() {
-            Ok(nblocks) => RelStats::from_pages(nblocks, &self.schema),
-            Err(_) => RelStats::unknown(&self.schema),
+            Ok(nblocks) => RelStats::from_pages(nblocks, &schema),
+            Err(_) => RelStats::unknown(&schema),
         }
     }
 
@@ -1032,11 +1100,12 @@ impl TableAm for HeapTable {
     }
 
     fn supports_index_scan(&self, index_name: &str) -> bool {
+        let schema = self.snap();
         self.indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .iter()
-            .any(|e| e.meta.name == index_name && e.is_physical(&self.schema))
+            .any(|e| e.meta.name == index_name && e.is_physical(&schema))
     }
 
     /// Probe the physical B-tree `index_name` for versions whose key equals
@@ -1052,13 +1121,16 @@ impl TableAm for HeapTable {
         key: &[Value],
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
+        // Bound before the index guard: the filter and the key encoding below
+        // must agree on `columns`.
+        let schema = self.snap();
         let (rel, latch, cols) = {
             let indexes = self
                 .indexes
                 .read()
                 .unwrap_or_else(|_| panic!("rwlock poisoned"));
             let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
-            if !entry.is_physical(&self.schema) {
+            if !entry.is_physical(&schema) {
                 return None;
             }
             (
@@ -1067,7 +1139,7 @@ impl TableAm for HeapTable {
                 btkey::key_columns(&entry.meta.keys),
             )
         };
-        let Some(kb) = btkey::encode_values(&self.schema, &cols, key) else {
+        let Some(kb) = btkey::encode_values(&schema, &cols, key) else {
             // A NULL (or otherwise un-encodable) probe key: served, no match.
             return Some(Box::new(std::iter::empty()));
         };
@@ -1075,7 +1147,7 @@ impl TableAm for HeapTable {
             Arc::clone(&self.engine),
             rel,
             latch,
-            self.schema.persistence.is_unlogged(),
+            self.persistence.is_unlogged(),
         )
         .search_equal(&kb);
         let mut out = Vec::new();
@@ -1214,11 +1286,14 @@ impl TableAm for HeapTable {
         // until we commit, so no one reads the old file we are about to unlink or
         // writes rows that the swap would drop. Held until txn end.
         self.lock.acquire_exclusive(txn.lock_owner);
+        // One snapshot for the statement: the WAL record and the finalize-hook
+        // registration below must name the same version of this relation.
+        let schema = self.snap();
         let old = self.effective_rel(txn.xid);
         // A fresh, never-reused relfilenode for the empty post-truncate file. A
         // RAM-backed (`Temporary`) table's replacement must also be RAM-backed.
         let new = self.engine.catalog.alloc_relfilenode();
-        if self.schema.persistence.is_ram_backed() {
+        if self.persistence.is_ram_backed() {
             self.engine.bufpool.smgr().register_memory(new);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
@@ -1246,13 +1321,14 @@ impl TableAm for HeapTable {
             // such record (an Unlogged table's data is reset on crash instead) and
             // so needs neither the barrier nor the pin — the same `wal_skipped`
             // gate `nbtree` uses.
-            let _delay = (!self.wal_skipped).then(|| self.engine.wal.delay_checkpoint());
-            if !self.wal_skipped {
+            let _delay =
+                (!self.persistence.is_wal_skipped()).then(|| self.engine.wal.delay_checkpoint());
+            if !self.persistence.is_wal_skipped() {
                 let lsn = self.engine.wal.append(
                     RmgrId::HEAP,
                     rec::HEAP_TRUNCATE,
                     txn.xid,
-                    &rec::truncate(&self.schema.namespace, &self.schema.name, old, new),
+                    &rec::truncate(&schema.namespace, &schema.name, old, new),
                 );
                 Self::io(
                     self.engine
@@ -1295,7 +1371,7 @@ impl TableAm for HeapTable {
                     .unwrap_or_else(|_| panic!("mutex poisoned"))
                     .entry(txn.xid)
                     .or_default()
-                    .push((self.schema.namespace.clone(), self.schema.name.clone()));
+                    .push((schema.namespace.clone(), schema.name.clone()));
             }
         }
         Ok(())
@@ -1304,6 +1380,10 @@ impl TableAm for HeapTable {
     fn vacuum(&self, oldest: Xid, clog: &Clog) {
         // Vacuum reclaims committed-dead versions from the committed file.
         let _guard = self.lock.acquire_shared(LockOwner::INTERNAL);
+        // One snapshot for the whole pass: the index set is filtered and every
+        // victim's key encoded against the same `columns`, and the
+        // victims x indexes loop below takes no schema lock at all.
+        let schema = self.snap();
         let rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
         // Snapshot the physical indexes so each reclaimed version's index entry
         // can be removed too — otherwise a stale `key -> tid` would point at a
@@ -1313,7 +1393,7 @@ impl TableAm for HeapTable {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .iter()
-            .filter(|e| e.is_physical(&self.schema))
+            .filter(|e| e.is_physical(&schema))
             .map(|e| {
                 (
                     e.rel,
@@ -1376,7 +1456,7 @@ impl TableAm for HeapTable {
                             // slot for a later pass.
                             Err(error) => {
                                 tracing::warn!(
-                                    table = %self.schema.name,
+                                    table = %schema.name,
                                     %error,
                                     "VACUUM: could not read a dead row; \
                                      leaving its index entries for a later pass"
@@ -1394,12 +1474,12 @@ impl TableAm for HeapTable {
             // old key. Deleting entries first closes that window.
             for (tid, tuple) in &victims {
                 for (irel, latch, cols) in &phys {
-                    if let Some(key) = btkey::encode_row(&self.schema, cols, tuple) {
+                    if let Some(key) = btkey::encode_row(&schema, cols, tuple) {
                         BTree::open(
                             Arc::clone(&self.engine),
                             *irel,
                             Arc::clone(latch),
-                            self.schema.persistence.is_unlogged(),
+                            self.persistence.is_unlogged(),
                         )
                         .delete(&key, *tid);
                     }

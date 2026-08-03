@@ -776,6 +776,70 @@ async fn schema_and_qualified_table_survive_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A primary key added by `ALTER TABLE` survives a restart — both halves of it.
+///
+/// The index half rides the relation catalog like any other. The NOT NULL half
+/// is the one worth pinning: it is a bit inside the persisted column record, and
+/// nothing about the in-memory flip that the same statement performs would show
+/// up here. If the catalog write were ever dropped, the reflection below would
+/// still look right on the *original* process and only this test would notice.
+#[tokio::test]
+async fn alter_table_primary_key_survives_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client.simple_query("CREATE TABLE r (a int, b int)").await?;
+        client.simple_query("INSERT INTO r VALUES (1, 1)").await?;
+        client
+            .simple_query("ALTER TABLE r ADD PRIMARY KEY (a)")
+            .await?;
+        shutdown(client, handle).await;
+    }
+
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let msgs = client
+        .simple_query(
+            "SELECT attname, attnotnull FROM pg_attribute \
+             WHERE attrelid = 'r'::regclass AND attnum > 0 ORDER BY attnum",
+        )
+        .await?;
+    let notnull: Vec<(Option<&str>, Option<&str>)> =
+        rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        notnull,
+        vec![(Some("a"), Some("t")), (Some("b"), Some("f"))]
+    );
+    let msgs = client
+        .simple_query("SELECT conname, contype FROM pg_constraint WHERE conrelid = 'r'::regclass")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("r_pkey"));
+    assert_eq!(rows(&msgs)[0].get(1), Some("p"));
+
+    // Reflection is a claim; these are the enforcement it is claiming.
+    let e = client
+        .simple_query("INSERT INTO r VALUES (NULL, 2)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().map(|e| e.code().code().to_string()),
+        Some("23502".to_string())
+    );
+    let e = client
+        .simple_query("INSERT INTO r VALUES (1, 3)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().map(|e| e.code().code().to_string()),
+        Some("23505".to_string())
+    );
+    shutdown(client, handle).await;
+
+    Ok(())
+}
+
 /// A view — a catalog-only object with no heap — survives a full restart: the
 /// relation catalog persists its definition, so `SELECT` through it still works.
 #[tokio::test]

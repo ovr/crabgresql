@@ -5792,6 +5792,514 @@ async fn drop_index_temp_and_shadowing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ALTER TABLE ... ADD PRIMARY KEY` on a populated table: it creates `t_pkey`,
+/// reflects everywhere PostgreSQL reflects a primary key, and — the part that
+/// needs the schema to actually change — makes the key columns NOT NULL.
+#[tokio::test]
+async fn alter_table_add_primary_key() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (a int, b int); INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await?;
+    client
+        .batch_execute("ALTER TABLE t ADD PRIMARY KEY (a)")
+        .await?;
+
+    let msgs = client
+        .simple_query(
+            "SELECT conname, contype FROM pg_constraint \
+             WHERE conrelid = 't'::regclass ORDER BY 1",
+        )
+        .await?;
+    let constraints: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(constraints, [(Some("t_pkey"), Some("p"))]);
+
+    let msgs = client
+        .simple_query(
+            "SELECT x.indisprimary FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \
+             WHERE i.relname = 't_pkey'",
+        )
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("t"));
+
+    // The key column is NOT NULL now; the other one is untouched. Both spellings
+    // of the question, since they read the schema through different row builders.
+    let msgs = client
+        .simple_query(
+            "SELECT attname, attnotnull FROM pg_attribute \
+             WHERE attrelid = 't'::regclass AND attnum > 0 ORDER BY attnum",
+        )
+        .await?;
+    let notnull: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(notnull, [(Some("a"), Some("t")), (Some("b"), Some("f"))]);
+    let msgs = client
+        .simple_query(
+            "SELECT column_name, is_nullable FROM information_schema.columns \
+             WHERE table_name = 't' ORDER BY ordinal_position",
+        )
+        .await?;
+    let nullable: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        nullable,
+        [(Some("a"), Some("NO")), (Some("b"), Some("YES"))]
+    );
+
+    // And it is enforced, which is what the reflection above is claiming.
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (NULL, 30)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        e.message(),
+        "null value in column \"a\" of relation \"t\" violates not-null constraint"
+    );
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (1, 40)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+    Ok(())
+}
+
+/// The rows already in the table have to satisfy the constraint being added, and
+/// a failure must leave the relation exactly as it was.
+#[tokio::test]
+async fn alter_table_add_constraint_validates_existing_rows() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let index_count = async |name: &str| -> anyhow::Result<Option<String>> {
+        let msgs = client
+            .simple_query(&format!(
+                "SELECT count(*) FROM pg_class WHERE relname = '{name}'"
+            ))
+            .await?;
+        Ok(rows(&msgs)[0].get(0).map(str::to_string))
+    };
+
+    client
+        .batch_execute("CREATE TABLE n (a int, b int); INSERT INTO n VALUES (1, 1), (NULL, 2)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE n ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        e.message(),
+        "column \"a\" of relation \"n\" contains null values"
+    );
+    // Nothing was applied: no index, and the column still takes NULL.
+    assert_eq!(index_count("n_pkey").await?.as_deref(), Some("0"));
+    client
+        .batch_execute("INSERT INTO n VALUES (NULL, 3)")
+        .await?;
+
+    // PostgreSQL builds the index before it verifies not-null, so a table with
+    // both a duplicate and a NULL reports the duplicate — the reverse of the
+    // order the same two constraints are reported in on INSERT.
+    client
+        .batch_execute("CREATE TABLE d (a int); INSERT INTO d VALUES (1), (1), (NULL)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE d ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::UNIQUE_VIOLATION);
+    assert_eq!(e.message(), "could not create unique index \"d_pkey\"");
+    assert_eq!(e.detail(), Some("Key (a)=(1) is duplicated."));
+
+    // Within an offending row PostgreSQL names the lowest-numbered column, not
+    // the first in key order — `PRIMARY KEY (b, a)` over `(1, NULL)` says "b".
+    client
+        .batch_execute("CREATE TABLE o (a int, b int); INSERT INTO o VALUES (1, NULL)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE o ADD PRIMARY KEY (b, a)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.message(),
+        "column \"b\" of relation \"o\" contains null values"
+    );
+    Ok(())
+}
+
+/// Constraint index naming, and the errors that come out of resolving a name or
+/// a second primary key.
+#[tokio::test]
+async fn alter_table_add_constraint_names_and_conflicts() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let index_names = async |like: &str| -> anyhow::Result<Vec<String>> {
+        let msgs = client
+            .simple_query(&format!(
+                "SELECT relname FROM pg_class WHERE relkind = 'i' \
+                 AND relname LIKE '{like}' ORDER BY 1"
+            ))
+            .await?;
+        Ok(rows(&msgs)
+            .iter()
+            .map(|r| r.get(0).unwrap_or_default().to_string())
+            .collect())
+    };
+
+    client
+        .batch_execute("CREATE TABLE u (a int, b int, c int)")
+        .await?;
+    // PRIMARY KEY collapses to `t_pkey`; UNIQUE is named after every key column.
+    client
+        .batch_execute("ALTER TABLE u ADD PRIMARY KEY (c)")
+        .await?;
+    client.batch_execute("ALTER TABLE u ADD UNIQUE (a)").await?;
+    client
+        .batch_execute("ALTER TABLE u ADD UNIQUE (a, b)")
+        .await?;
+    assert_eq!(index_names("u%").await?, ["u_a_b_key", "u_a_key", "u_pkey"]);
+
+    // A repeat is allowed — PostgreSQL only requires the *name* to be fresh.
+    client.batch_execute("ALTER TABLE u ADD UNIQUE (a)").await?;
+    assert_eq!(index_names("u\\_a\\_key%").await?, ["u_a_key", "u_a_key1"]);
+
+    // Two constraints in ONE statement collide with each other, and neither is
+    // visible to the engine yet when the second name is picked.
+    client.batch_execute("CREATE TABLE v (b int)").await?;
+    client
+        .batch_execute("ALTER TABLE v ADD UNIQUE (b), ADD UNIQUE (b)")
+        .await?;
+    assert_eq!(index_names("v%").await?, ["v_b_key", "v_b_key1"]);
+
+    // An explicit name that is taken is a *relation* collision (42P07), not the
+    // 42710 that CREATE TABLE's constraint-name check raises.
+    client
+        .batch_execute("ALTER TABLE u ADD CONSTRAINT c1 UNIQUE (b)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE u ADD CONSTRAINT c1 UNIQUE (c)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::DUPLICATE_TABLE);
+    assert_eq!(e.message(), "relation \"c1\" already exists");
+
+    // A second primary key, whether against the stored one or within a statement.
+    let e = client
+        .batch_execute("ALTER TABLE u ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::INVALID_TABLE_DEFINITION);
+    assert_eq!(
+        e.message(),
+        "multiple primary keys for table \"u\" are not allowed"
+    );
+    client
+        .batch_execute("CREATE TABLE w (a int, b int)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE w ADD PRIMARY KEY (a), ADD PRIMARY KEY (b)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::INVALID_TABLE_DEFINITION
+    );
+    assert_eq!(index_names("w%").await?, Vec::<String>::new());
+    Ok(())
+}
+
+/// A multi-action `ALTER TABLE` is all-or-nothing: validating every action
+/// before applying any is what keeps the first one from landing when the second
+/// is the one that fails.
+#[tokio::test]
+async fn alter_table_multi_action_is_atomic() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE m (a int, b int); INSERT INTO m VALUES (1, 1), (2, 1)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE m ADD UNIQUE (a), ADD UNIQUE (b)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::UNIQUE_VIOLATION
+    );
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_class WHERE relkind = 'i' AND relname LIKE 'm\\_%'")
+        .await?;
+    assert_eq!(
+        rows(&msgs)[0].get(0),
+        Some("0"),
+        "the first action must not survive the second action's failure"
+    );
+    Ok(())
+}
+
+/// Name resolution and the forms that are refused.
+#[tokio::test]
+async fn alter_table_rejected_forms() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let code = async |sql: &str| -> anyhow::Result<SqlState> {
+        let e = client.batch_execute(sql).await.unwrap_err();
+        Ok(e.as_db_error()
+            .context("missing error details")?
+            .code()
+            .clone())
+    };
+
+    client
+        .batch_execute("CREATE TABLE t (a int, b int); CREATE VIEW v AS SELECT * FROM t")
+        .await?;
+
+    assert_eq!(
+        code("ALTER TABLE nosuch ADD PRIMARY KEY (a)").await?,
+        SqlState::UNDEFINED_TABLE
+    );
+    // IF EXISTS turns that into a notice and a successful command.
+    client
+        .batch_execute("ALTER TABLE IF EXISTS nosuch ADD PRIMARY KEY (a)")
+        .await?;
+
+    // 25006 is raised before name resolution, so it wins over 42P01.
+    client.batch_execute("BEGIN TRANSACTION READ ONLY").await?;
+    assert_eq!(
+        code("ALTER TABLE nosuch ADD PRIMARY KEY (a)").await?,
+        SqlState::READ_ONLY_SQL_TRANSACTION
+    );
+    client.batch_execute("ROLLBACK").await?;
+
+    assert_eq!(
+        code("ALTER TABLE v ADD PRIMARY KEY (a)").await?,
+        SqlState::WRONG_OBJECT_TYPE
+    );
+    assert_eq!(
+        code("ALTER TABLE t ADD PRIMARY KEY (zz)").await?,
+        SqlState::UNDEFINED_COLUMN
+    );
+    assert_eq!(
+        code("ALTER TABLE t ADD PRIMARY KEY (a, a)").await?,
+        SqlState::DUPLICATE_COLUMN
+    );
+    for sql in [
+        "ALTER TABLE t ADD COLUMN z int",
+        "ALTER TABLE t DROP CONSTRAINT nope",
+        "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+        "ALTER TABLE t RENAME TO t2",
+        "ALTER TABLE t ADD CHECK (a > 0)",
+        "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES t (a)",
+        "ALTER TABLE t ADD PRIMARY KEY (a) NOT VALID",
+        "ALTER TABLE t ADD UNIQUE (b) DEFERRABLE",
+        "ALTER TABLE public.t ADD UNIQUE (b)",
+    ] {
+        assert_eq!(
+            code(sql).await?,
+            SqlState::FEATURE_NOT_SUPPORTED,
+            "expected {sql} to be rejected as unsupported"
+        );
+    }
+    Ok(())
+}
+
+/// A PRIMARY KEY makes its key columns NOT NULL, and PostgreSQL pushes that down
+/// the inheritance tree. We have no fan-out for it, so a parent is refused —
+/// while UNIQUE, which PostgreSQL never inherits, is allowed on one.
+#[tokio::test]
+async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE par (a int, b int); CREATE TABLE chi (c int) INHERITS (par)")
+        .await?;
+
+    let e = client
+        .batch_execute("ALTER TABLE par ADD PRIMARY KEY (b)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // UNIQUE on the parent lands on the parent alone, as in PostgreSQL.
+    client
+        .batch_execute("ALTER TABLE par ADD UNIQUE (a)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT relname FROM pg_class WHERE relkind = 'i' \
+             AND (relname LIKE 'par%' OR relname LIKE 'chi%') ORDER BY 1",
+        )
+        .await?;
+    let names: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(names, [Some("par_a_key")]);
+
+    // A leaf child has nothing below it to recurse into, so it takes a key.
+    client
+        .batch_execute("ALTER TABLE chi ADD PRIMARY KEY (c)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT attname, attnotnull FROM pg_attribute \
+             WHERE attrelid = 'chi'::regclass AND attnum > 0 ORDER BY attnum",
+        )
+        .await?;
+    let notnull: Vec<_> = rows(&msgs).iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        notnull,
+        [
+            (Some("a"), Some("f")),
+            (Some("b"), Some("f")),
+            (Some("c"), Some("t"))
+        ]
+    );
+
+    // Descent is transitive: a grandchild keeps the grandparent refused, even
+    // though no link names the two directly.
+    client
+        .batch_execute("CREATE TABLE g1 (a int); CREATE TABLE g2 () INHERITS (g1)")
+        .await?;
+    client
+        .batch_execute("CREATE TABLE g3 () INHERITS (g2)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE g1 ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // …and it is namespace-exact. A temp table shadowing a parent has no
+    // children of its own, so the refusal must not follow the *name*: matching
+    // bare names would let `public.par` veto a key on `pg_temp_N.par`.
+    // PostgreSQL 18.4 accepts this and creates `pg_temp_N.par_pkey`.
+    client
+        .batch_execute("CREATE TEMP TABLE par (a int, b int)")
+        .await?;
+    client
+        .batch_execute("ALTER TABLE par ADD PRIMARY KEY (a)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'par_pkey'",
+        )
+        .await?;
+    let schemas: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(schemas.len(), 1);
+    assert!(
+        schemas[0].unwrap_or_default().starts_with("pg_temp_"),
+        "the key must land on the temp table, got {schemas:?}"
+    );
+    Ok(())
+}
+
+/// Only the heap can record a column as NOT NULL, so ADD PRIMARY KEY on another
+/// access method is refused — as *unsupported*, and before anything is written.
+///
+/// Both halves are the regression. The refusal used to come from the engine in
+/// the apply pass as a `TableNotFound`, so the client was told `relation "p"
+/// does not exist` about a relation it had just queried; and because the engine
+/// call is skipped when there is nothing to flip, the same statement succeeded
+/// on the same table whenever the key column was already NOT NULL.
+#[tokio::test]
+async fn alter_table_add_primary_key_rejects_non_heap() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE p (a int, b int) USING parquet ORDER BY (b); \
+             INSERT INTO p VALUES (1, 2)",
+        )
+        .await?;
+
+    let e = client
+        .batch_execute("ALTER TABLE p ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        e.message(),
+        "PRIMARY KEY on a table using access method \"parquet\" is not supported yet"
+    );
+
+    // Already NOT NULL: nothing to flip, so the old gate let this through.
+    client
+        .batch_execute("CREATE TABLE q (a int NOT NULL, b int) USING parquet ORDER BY (b)")
+        .await?;
+    assert_eq!(
+        client
+            .batch_execute("ALTER TABLE q ADD PRIMARY KEY (a)")
+            .await
+            .unwrap_err()
+            .as_db_error()
+            .context("missing error details")?
+            .code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // UNIQUE changes no column, so it stays available — as `CREATE UNIQUE INDEX`
+    // already is on these methods.
+    client.batch_execute("ALTER TABLE p ADD UNIQUE (a)").await?;
+    let msgs = client
+        .simple_query("SELECT conname FROM pg_constraint WHERE conrelid = 'p'::regclass")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("p_a_key"));
+    Ok(())
+}
+
+/// Both halves of ADD PRIMARY KEY — the index and the NOT NULL flip — have to
+/// reach the session's temp table, not a same-named permanent one.
+#[tokio::test]
+async fn alter_table_add_primary_key_temp_shadowing() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE sh (a int, b int); CREATE TEMP TABLE sh (a int, b int)")
+        .await?;
+    client
+        .batch_execute("ALTER TABLE sh ADD PRIMARY KEY (a)")
+        .await?;
+
+    let msgs = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'sh_pkey'",
+        )
+        .await?;
+    let schemas: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(schemas.len(), 1);
+    assert!(
+        schemas[0].unwrap_or_default().starts_with("pg_temp_"),
+        "the index must land in the temp schema, got {schemas:?}"
+    );
+
+    // The permanent table must be untouched — including its nullability, which
+    // travels through a different engine call than the index does.
+    let msgs = client
+        .simple_query(
+            "SELECT a.attnotnull FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'sh' AND n.nspname = 'public' AND a.attnum > 0 ORDER BY a.attnum",
+        )
+        .await?;
+    let notnull: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(notnull, [Some("f"), Some("f")]);
+    Ok(())
+}
+
 /// nextval() / setval() are rejected in a read-only transaction (25006), even
 /// though a bare SELECT is not a DML write.
 #[tokio::test]

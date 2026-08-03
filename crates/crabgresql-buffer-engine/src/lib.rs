@@ -146,7 +146,7 @@ pub struct RestoredBuffer {
 
 /// A WAL-logged, RAM-resident MVCC row store.
 pub struct BufferTable {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     /// The relation identity this table's WAL records carry — the relfilenode
     /// the catalog currently names.
     ///
@@ -186,7 +186,7 @@ pub struct BufferTable {
 impl BufferTable {
     pub fn open(rel: u32, schema: TableSchema, indexes: Vec<IndexMetadata>, wal: Arc<Wal>) -> Self {
         BufferTable {
-            schema,
+            schema: Arc::new(schema),
             rel: AtomicU32::new(rel),
             rows: RwLock::new(Vec::new()),
             next_row_id: AtomicU64::new(0),
@@ -824,8 +824,8 @@ fn decode_row(cursor: &mut Cursor<'_>, n_cols: usize) -> Result<Tuple, WalError>
 }
 
 impl TableAm for BufferTable {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
+    fn schema(&self) -> Arc<TableSchema> {
+        Arc::clone(&self.schema)
     }
 
     fn indexes(&self) -> Vec<IndexMetadata> {

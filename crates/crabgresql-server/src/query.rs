@@ -1022,6 +1022,9 @@ pub(crate) fn execute_statement_with(
             ast::Statement::Vacuum(vacuum) => {
                 return execute_vacuum(&catalog, txnmgr, session, vacuum);
             }
+            ast::Statement::AlterTable(alter) => {
+                return execute_alter_table(&catalog, txnmgr, session, alter);
+            }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
             }
@@ -1724,6 +1727,7 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         ast::Statement::CreateIndex(_) => "CREATE INDEX",
         ast::Statement::CreateType { .. } => "CREATE TYPE",
+        ast::Statement::AlterTable(_) => "ALTER TABLE",
         ast::Statement::AlterType(_) => "ALTER TYPE",
         ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
         ast::Statement::CreateCast { .. } => "CREATE CAST",
@@ -1959,7 +1963,7 @@ fn execute_truncate(
         if target.only {
             continue;
         }
-        for child in crabgresql_binder::inheritance_descendants(engine, table.schema())? {
+        for child in crabgresql_binder::inheritance_descendants(engine, &table.schema())? {
             push(child);
         }
     }
@@ -2243,7 +2247,7 @@ fn execute_create_index(
     }
     let table = engine.open_table(&table_name)?;
     reject_partitioned_parent(&table, &table_name)?;
-    let keys = simple_index_keys(table.schema(), &create.columns)?;
+    let keys = simple_index_keys(&table.schema(), &create.columns)?;
     // PG names an unnamed index after the table and every key column, e.g.
     // `t_a_b_idx`, then bumps the label on collision (`t_a_b_idx1`).
     let index_name = explicit_name.unwrap_or_else(|| {
@@ -2254,7 +2258,7 @@ fn execute_create_index(
             base.push_str(&schema.columns[key.column].name);
         }
         base.push_str("_idx");
-        fresh_index_name(engine, &table_name, &base)
+        fresh_index_name(engine, &table_name, &HashSet::new(), &base)
     });
     let index = IndexMetadata {
         name: index_name.clone(),
@@ -2272,6 +2276,328 @@ fn execute_create_index(
     Ok(QueryResult::command("CREATE INDEX"))
 }
 
+/// One `ADD CONSTRAINT` resolved against the table but not yet applied: the
+/// index to create, and — for a PRIMARY KEY — the key columns that are still
+/// nullable and therefore have to be marked NOT NULL.
+struct PendingConstraint {
+    index: IndexMetadata,
+    not_null: Vec<usize>,
+}
+
+/// `ALTER TABLE ... ADD [CONSTRAINT n] {PRIMARY KEY|UNIQUE} (cols)`. Every other
+/// `ALTER TABLE` action is rejected as unsupported.
+///
+/// Runs in passes — classify, resolve, plan, validate, apply — because PostgreSQL
+/// applies a multi-action `ALTER TABLE` atomically. Our DDL is not transactional
+/// (see the module's other `execute_*` handlers), so the nearest we get is to
+/// raise every user-visible error before the first write and compensate for what
+/// lands after it.
+///
+/// Two gaps that shape are **not** enough to close, both shared with
+/// `CREATE INDEX` and neither introduced here:
+///
+/// * **`ROLLBACK` does not undo it.** The constraint is applied to the durable
+///   catalog immediately. Worse, pass 4 validates under the session's own
+///   snapshot, so `BEGIN; DELETE FROM t; ALTER TABLE t ADD PRIMARY KEY (a);
+///   ROLLBACK;` validates against rows the rollback then brings back — leaving a
+///   NULL, or a duplicate, under a key that forbids it.
+/// * **No lock spans validation and application.** The exclusive hold lives
+///   inside each engine call, so another session can commit a violating row in
+///   between and neither session is told. PostgreSQL holds ACCESS EXCLUSIVE for
+///   the whole statement.
+///
+/// Closing either needs machinery this tree does not have: a server-visible
+/// table-lock API (`TableLock` is private to the access method, and neither
+/// `TableAm` nor `TableEngine` exposes locking), and a transactional-DDL hook
+/// general enough to stage a schema change — `TxnFinalize` today serves one
+/// bespoke TRUNCATE registry.
+fn execute_alter_table(
+    engine: &Arc<dyn TableEngine>,
+    txnmgr: &TransactionManager,
+    session: &mut Session,
+    alter: &ast::AlterTable,
+) -> Result<QueryResult, PgError> {
+    if alter.table_type.is_some() || alter.location.is_some() || alter.on_cluster.is_some() {
+        return Err(PgError::feature_not_supported(
+            "this ALTER TABLE form is not supported yet",
+        ));
+    }
+
+    // Pass 1: classify the actions. Nothing here touches the catalog, so an
+    // unsupported action in the list rejects the whole statement before the
+    // supported ones ahead of it have done anything.
+    let mut requested = Vec::new();
+    for op in &alter.operations {
+        let ast::AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } = op
+        else {
+            return Err(PgError::feature_not_supported(format!(
+                "ALTER TABLE operation is not supported yet: {op}"
+            )));
+        };
+        let (name, columns, kind, nulls_distinct, characteristics) = match constraint {
+            ast::TableConstraint::PrimaryKey(pk) => {
+                if *not_valid {
+                    // PostgreSQL rejects this in its grammar; we reach it here
+                    // because the vendored parser accepts the suffix uniformly.
+                    return Err(PgError::new(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PRIMARY KEY constraints cannot be marked NOT VALID",
+                    ));
+                }
+                reject_primary_key_options(pk)?;
+                (
+                    pk.name.as_ref().map(normalize_ident),
+                    pk.columns.clone(),
+                    IndexConstraint::PrimaryKey,
+                    true,
+                    pk.characteristics,
+                )
+            }
+            ast::TableConstraint::Unique(unique) => {
+                if *not_valid {
+                    return Err(PgError::new(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "UNIQUE constraints cannot be marked NOT VALID",
+                    ));
+                }
+                reject_unique_options(unique)?;
+                (
+                    unique.name.as_ref().map(normalize_ident),
+                    unique.columns.clone(),
+                    IndexConstraint::Unique,
+                    !matches!(unique.nulls_distinct, ast::NullsDistinctOption::NotDistinct),
+                    unique.characteristics,
+                )
+            }
+            ast::TableConstraint::PrimaryKeyUsingIndex(_)
+            | ast::TableConstraint::UniqueUsingIndex(_) => {
+                return Err(PgError::feature_not_supported(
+                    "ALTER TABLE ... USING INDEX is not supported yet",
+                ));
+            }
+            other => {
+                return Err(PgError::feature_not_supported(format!(
+                    "table constraint is not supported yet: {other}"
+                )));
+            }
+        };
+        reject_deferred_characteristics(characteristics)?;
+        requested.push((name, columns, kind, nulls_distinct));
+    }
+
+    // Pass 2: resolve the relation.
+    let table_name = object_name_to_table_name(&alter.name)?;
+    if engine.resolve_view(None, &table_name).is_some() {
+        return Err(PgError::new(
+            sqlstate::WRONG_OBJECT_TYPE,
+            format!("ALTER action ADD CONSTRAINT cannot be performed on relation \"{table_name}\""),
+        )
+        .with_detail("This operation is not supported for views."));
+    }
+    let table = match engine.open_table(&table_name) {
+        Ok(table) => table,
+        Err(StorageError::TableNotFound(_)) if alter.if_exists => {
+            let mut result = QueryResult::command("ALTER TABLE");
+            if let QueryResult::Command { notices, .. } = &mut result {
+                notices.push(Notice::notice(
+                    format!("relation \"{table_name}\" does not exist, skipping"),
+                    None,
+                ));
+            }
+            return Ok(result);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    reject_partitioned_parent(&table, &table_name)?;
+
+    let schema = table.schema();
+    let wants_primary_key = requested
+        .iter()
+        .any(|(_, _, kind, _)| *kind == IndexConstraint::PrimaryKey);
+
+    // Only the heap can record a column as NOT NULL, so a PRIMARY KEY on any
+    // other method is refused here rather than discovered from the engine in the
+    // apply pass — which would report it after an earlier action had landed.
+    // Named from the relation's own method, as the TRUNCATE guard above is, so
+    // the message stays true when a third method appears. UNIQUE is unaffected:
+    // it changes no column, and `CREATE UNIQUE INDEX` already works there.
+    if wants_primary_key && schema.access_method != TableAccessMethod::Heap {
+        let method = schema.access_method.as_str();
+        return Err(PgError::feature_not_supported(format!(
+            "PRIMARY KEY on a table using access method \"{method}\" is not supported yet"
+        )));
+    }
+
+    // A PRIMARY KEY marks its key columns NOT NULL, and PostgreSQL pushes that
+    // down the inheritance tree — flipping every descendant's matching column
+    // and scanning its rows for NULLs. We have no fan-out for that, so a parent
+    // is refused rather than given a key its children do not honor. A child with
+    // no children of its own is fine: there is nothing below it to reach.
+    //
+    // Asked through the shared helper because descent must be namespace-exact
+    // and transitive: matching a bare relation name would let an unrelated
+    // `public.par` with children veto a key on a temp or schema-qualified `par`
+    // that has none.
+    //
+    // This is also what keeps `alter.only` a no-op. `ONLY` means "do not recurse",
+    // which can only differ from the default where recursion would happen at all
+    // — and the sole recursing action is the one refused right here. UNIQUE never
+    // recurses in PostgreSQL either, so `ONLY` cannot change its meaning.
+    if wants_primary_key && !crabgresql_binder::inheritance_descendants(engine, &schema)?.is_empty()
+    {
+        return Err(PgError::feature_not_supported(format!(
+            "ADD PRIMARY KEY on \"{table_name}\", which has inheritance children, is not supported yet"
+        )));
+    }
+
+    // Pass 3: turn each action into the index it creates, raising every name,
+    // column and cardinality error. `claimed` holds the names this statement has
+    // taken but not yet created — invisible to the engine until the apply pass.
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut pending: Vec<PendingConstraint> = Vec::new();
+    let existing_primary_key = table
+        .indexes()
+        .iter()
+        .any(|index| index.constraint == Some(IndexConstraint::PrimaryKey));
+    let mut added_primary_key = false;
+    for (explicit_name, columns, kind, nulls_distinct) in requested {
+        let keys = simple_index_keys(&schema, &columns)?;
+        if kind == IndexConstraint::PrimaryKey {
+            if existing_primary_key || added_primary_key {
+                return Err(PgError::new(
+                    "42P16",
+                    format!("multiple primary keys for table \"{table_name}\" are not allowed"),
+                ));
+            }
+            added_primary_key = true;
+        }
+        let index_name = match explicit_name {
+            // PostgreSQL reports a taken constraint name as a *relation*
+            // collision here (42P07), not the 42710 that CREATE TABLE's
+            // constraint-name check raises — the index has to enter the relation
+            // namespace, and that is what fails first.
+            Some(name) => {
+                if claimed.contains(&name)
+                    || engine.index_name_exists("public", &table_name, &name)
+                    || engine.resolve(Some("public"), &name).is_ok()
+                {
+                    return Err(PgError::new(
+                        sqlstate::DUPLICATE_TABLE,
+                        format!("relation \"{name}\" already exists"),
+                    ));
+                }
+                name
+            }
+            None => {
+                let base = constraint_index_base(&table_name, &schema, kind, &keys);
+                fresh_index_name(engine, &table_name, &claimed, &base)
+            }
+        };
+        claimed.insert(index_name.clone());
+        // Only columns that are still nullable need the catalog rewrite; one
+        // already NOT NULL is left alone, which is what makes re-running the
+        // same ALTER TABLE after a crash idempotent.
+        let not_null = match kind {
+            IndexConstraint::PrimaryKey => keys
+                .iter()
+                .map(|key| key.column)
+                .filter(|&c| schema.columns[c].nullable)
+                .collect(),
+            IndexConstraint::Unique => Vec::new(),
+        };
+        pending.push(PendingConstraint {
+            index: IndexMetadata {
+                name: index_name,
+                method: IndexMethod::BTree,
+                keys,
+                unique: true,
+                nulls_distinct,
+                constraint: Some(kind),
+            },
+            not_null,
+        });
+    }
+
+    // Pass 4: check the rows already in the table. Uniqueness first: PostgreSQL
+    // builds the index before it verifies not-null, so a table holding both a
+    // duplicate and a NULL reports the duplicate — the opposite of the order the
+    // same two constraints are reported in on INSERT.
+    let txn = build_txn(txnmgr, session, false);
+    for p in &pending {
+        validate_unique_index_build(&table, &p.index, &txn, &session.fmt_ctx())?;
+        if p.index.constraint == Some(IndexConstraint::PrimaryKey) {
+            validate_primary_key_not_null(&table, &p.index, &txn)?;
+        }
+    }
+
+    // Pass 5: apply. NOT NULL is made durable before the index for the reason
+    // spelled out on `PgEngine::set_column_not_null`: a key resting on columns
+    // that still accept NULL is the dangerous half to lose.
+    let mut created: Vec<String> = Vec::new();
+    for p in pending {
+        let applied = (|| {
+            if !p.not_null.is_empty() {
+                engine.set_column_not_null("public", &table_name, &p.not_null)?;
+            }
+            engine.create_index("public", &table_name, p.index.clone())
+        })();
+        if let Err(e) = applied {
+            // Passes 1-4 raise everything a statement can be wrong about, so what
+            // reaches here is an engine or IO failure. Undo the indexes that did
+            // land; the NOT NULL flips are deliberately left in place, being the
+            // conservative direction (they reject strictly more rows, and
+            // re-running the statement re-converges).
+            //
+            // The drop goes through the same handle the create did, so it lands
+            // on the same relation — an overlay routing `public` to this
+            // session's temp schema must undo the index it put there, not look
+            // for it under `public`.
+            for name in created.iter().rev() {
+                let _ = engine.drop_index("public", &table_name, name);
+            }
+            return Err(e.into());
+        }
+        created.push(p.index.name);
+    }
+    Ok(QueryResult::command("ALTER TABLE"))
+}
+
+/// Reject `ADD PRIMARY KEY` on a table whose key columns already hold a NULL:
+/// the key would make them NOT NULL, and existing rows have to satisfy that.
+///
+/// PostgreSQL names the first offending *row* in physical order and, within it,
+/// the lowest-numbered column rather than the first in key order — so `PRIMARY
+/// KEY (b, a)` over a row `(1, NULL)` complains about `b`. Sorting the key
+/// columns before the per-row test is what reproduces that.
+fn validate_primary_key_not_null(
+    table: &Arc<dyn TableAm>,
+    index: &IndexMetadata,
+    txn: &TxnContext,
+) -> Result<(), PgError> {
+    let schema = table.schema();
+    let mut columns: Vec<usize> = index.keys.iter().map(|key| key.column).collect();
+    columns.sort_unstable();
+    let projection = crabgresql_storage_api::ColumnProjection::of(columns.iter().copied(), &schema);
+    for row in table.scan(txn, &projection) {
+        let (_, tuple) = row?;
+        for &c in &columns {
+            if matches!(tuple[c], crabgresql_types::Value::Null) {
+                return Err(PgError::new(
+                    "23502",
+                    format!(
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        schema.columns[c].name, schema.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_unique_index_build(
     table: &Arc<dyn TableAm>,
     index: &IndexMetadata,
@@ -2284,7 +2610,7 @@ fn validate_unique_index_build(
     // check, the error DETAIL and the `seen` comparisons alike.
     let projection = crabgresql_storage_api::ColumnProjection::of(
         index.keys.iter().map(|key| key.column),
-        schema,
+        &schema,
     );
     for row in table.scan(txn, &projection) {
         let (_, tuple) = row?;
@@ -2298,7 +2624,7 @@ fn validate_unique_index_build(
         }
         if seen
             .iter()
-            .any(|other| index_rows_equal(schema, index, &tuple, other))
+            .any(|other| index_rows_equal(&schema, index, &tuple, other))
         {
             let names = index
                 .keys
@@ -3382,20 +3708,7 @@ fn execute_create_table(
     for p in pending {
         reject_deferred_characteristics(p.characteristics)?;
         let keys = simple_index_keys(&schema, &p.columns)?;
-        // PG names a UNIQUE constraint after every key column, e.g.
-        // `t_a_b_key`; only PRIMARY KEY collapses to `t_pkey`.
-        let base = match p.constraint {
-            IndexConstraint::PrimaryKey => format!("{name}_pkey"),
-            IndexConstraint::Unique => {
-                let mut base = name.clone();
-                for key in &keys {
-                    base.push('_');
-                    base.push_str(&schema.columns[key.column].name);
-                }
-                base.push_str("_key");
-                base
-            }
-        };
+        let base = constraint_index_base(&name, &schema, p.constraint, &keys);
         let index_name = p
             .explicit_name
             .unwrap_or_else(|| fresh_relation_name(target, &namespace, &constraint_names, &base));
@@ -4670,13 +4983,49 @@ fn fresh_relation_name(
     unreachable!()
 }
 
+/// The name PostgreSQL gives the index behind an unnamed PRIMARY KEY / UNIQUE
+/// constraint: `t_pkey` for the primary key (which collapses to the table name,
+/// there being at most one), `t_a_b_key` for a unique constraint, named after
+/// every key column. Shared by `CREATE TABLE` and `ALTER TABLE ... ADD` so the
+/// two spellings of one constraint produce one name.
+fn constraint_index_base(
+    table: &str,
+    schema: &TableSchema,
+    constraint: IndexConstraint,
+    keys: &[IndexKey],
+) -> String {
+    match constraint {
+        IndexConstraint::PrimaryKey => format!("{table}_pkey"),
+        IndexConstraint::Unique => {
+            let mut base = table.to_string();
+            for key in keys {
+                base.push('_');
+                base.push_str(&schema.columns[key.column].name);
+            }
+            base.push_str("_key");
+            base
+        }
+    }
+}
+
 /// Pick a free name for an index PG would auto-name. Unlike `fresh_relation_name`
 /// this goes through `index_name_exists`, which resolves the table's *effective*
 /// namespace — so an index on a temp table dodges the other indexes in that
 /// session's `pg_temp_N` schema rather than the ones in `public`.
-fn fresh_index_name(engine: &Arc<dyn TableEngine>, table: &str, base: &str) -> String {
+///
+/// `local` holds the names an in-flight statement has already claimed but not
+/// yet created. One `ALTER TABLE` may add several constraints, and until they
+/// reach the engine none of them is visible to `index_name_exists` — without
+/// this, `ADD UNIQUE (a), ADD UNIQUE (a)` would generate `t_a_key` twice.
+fn fresh_index_name(
+    engine: &Arc<dyn TableEngine>,
+    table: &str,
+    local: &HashSet<String>,
+    base: &str,
+) -> String {
     let taken = |candidate: &str| {
-        engine.index_name_exists("public", table, candidate)
+        local.contains(candidate)
+            || engine.index_name_exists("public", table, candidate)
             || engine.resolve(Some("public"), candidate).is_ok()
     };
     if !taken(base) {

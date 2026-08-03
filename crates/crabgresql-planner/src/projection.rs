@@ -75,7 +75,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             ..
         } => {
             let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
-            *projection = resolve(demand, table.schema());
+            *projection = resolve(demand, &table.schema());
         }
         PhysicalPlan::IndexScan {
             table,
@@ -98,7 +98,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             // Key *values* are row-constant, but folding them in costs nothing
             // and keeps the set correct if that ever loosens.
             let demand = add_exprs(demand, key.iter().map(|(_, value)| value));
-            *projection = resolve(demand, table.schema());
+            *projection = resolve(demand, &table.schema());
         }
         PhysicalPlan::Subquery {
             source,
@@ -182,7 +182,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
                 });
             match input {
                 PhysicalAggInput::Scan { table, projection } => {
-                    *projection = resolve(demand, table.schema());
+                    *projection = resolve(demand, &table.schema());
                 }
                 PhysicalAggInput::Join(source) => prune_join(source, demand),
                 PhysicalAggInput::SingleRow => {}
@@ -290,7 +290,7 @@ fn prune_append(arms: &mut [PhysicalAppendArm], demand: Demand, columns: usize) 
         let schema = arm.relation.table.schema();
         arm.projection = match &arm.relation.map {
             None if !identity_layouts_agree => ColumnProjection::All,
-            None => ColumnProjection::of(demand.iter().copied(), schema),
+            None => ColumnProjection::of(demand.iter().copied(), &schema),
             // A demand ordinal the map does not cover is forwarded out of range
             // rather than dropped, so `of`'s own fail-safe turns it into `All`.
             // Dropping it would instead narrow the scan past what the query
@@ -300,7 +300,7 @@ fn prune_append(arms: &mut [PhysicalAppendArm], demand: Demand, columns: usize) 
                 demand
                     .iter()
                     .map(|i| map.get(*i).copied().unwrap_or(usize::MAX)),
-                schema,
+                &schema,
             ),
         };
     }
@@ -329,7 +329,7 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
             };
             match input {
                 PhysicalJoinInput::Scan { table, projection } => {
-                    *projection = resolve(demand, table.schema());
+                    *projection = resolve(demand, &table.schema());
                 }
                 PhysicalJoinInput::Subplan(source) => push(source, demand),
                 PhysicalJoinInput::TableFunction { .. } => {}

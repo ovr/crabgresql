@@ -984,7 +984,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             table, predicate, ..
         } => {
             let schema = table.schema();
-            let names = schema_names(schema);
+            let names = schema_names(&schema);
             let mut lines = vec![format!(
                 "Seq Scan on {}{}",
                 schema.name,
@@ -1003,7 +1003,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             ..
         } => {
             let schema = table.schema();
-            let names = schema_names(schema);
+            let names = schema_names(&schema);
             let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
             let cond = key
                 .iter()
@@ -1191,7 +1191,7 @@ fn push_root_property(lines: &mut Vec<String>, property: String) {
 /// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
 /// constant key or a residual comparison, not a faithful SQL deparser. Column
 /// references render by name against `schema`.
-fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
+fn explain_expr(expr: &BoundExpr, names: &[Option<String>]) -> String {
     match expr {
         // Divergence: rendered in UTC at the default `extra_float_digits`,
         // because `EXPLAIN` output is built without a session context, so a
@@ -1207,8 +1207,7 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
             .unwrap_or_else(|| "NULL".to_string()),
         BoundExpr::ColumnRef { index, .. } => names
             .get(*index)
-            .copied()
-            .flatten()
+            .and_then(Option::as_deref)
             .map_or_else(|| format!("${index}"), str::to_string),
         BoundExpr::Param { index, .. } => format!("${}", index + 1),
         BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => {
@@ -1243,7 +1242,7 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<&str>]) -> String {
 /// Render `expr` where a larger expression uses it as an operand. PG's
 /// ruleutils parenthesizes anything that is not a bare column, constant, or
 /// parameter, so `x IS NULL` under an `IS TRUE` prints as `(x IS NULL) IS TRUE`.
-fn explain_operand(expr: &BoundExpr, names: &[Option<&str>]) -> String {
+fn explain_operand(expr: &BoundExpr, names: &[Option<String>]) -> String {
     // A cast is invisible in this output, so its operand decides.
     let bare = match expr {
         BoundExpr::Coerce { expr, .. } | BoundExpr::Reinterpret { expr, .. } => expr,
@@ -1259,11 +1258,11 @@ fn explain_operand(expr: &BoundExpr, names: &[Option<&str>]) -> String {
 }
 
 /// The column names of a single table's row, for [`explain_expr`].
-fn schema_names(schema: &TableSchema) -> Vec<Option<&str>> {
+fn schema_names(schema: &TableSchema) -> Vec<Option<String>> {
     schema
         .columns
         .iter()
-        .map(|c| Some(c.name.as_str()))
+        .map(|c| Some(c.name.clone()))
         .collect()
 }
 
@@ -1284,7 +1283,7 @@ fn window_number(plan: &PhysicalPlan) -> usize {
 /// Render an `OVER (…)` clause the way PG's `Window:` property does, omitting a
 /// clause that is absent. The frame is never printed: only the default frame is
 /// supported, and PG omits that one too.
-fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<&str>]) -> String {
+fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<String>]) -> String {
     let mut parts = Vec::new();
     if !spec.partition_by.is_empty() {
         parts.push(format!(
@@ -1328,13 +1327,13 @@ fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<&str>]) -> String
 /// The column names of `plan`'s output row, for rendering an expression that
 /// indexes into it. Empty when the shape has no names to offer, which
 /// [`explain_expr`] renders as `$index`.
-fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
+fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<String>> {
     match plan {
         PhysicalPlan::Append { columns, .. } => {
-            columns.iter().map(|c| Some(c.name.as_str())).collect()
+            columns.iter().map(|c| Some(c.name.clone())).collect()
         }
         PhysicalPlan::Select { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
-            schema_names(table.schema())
+            schema_names(&table.schema())
         }
         // A window step reproduces its input row and appends slots, so the
         // names below it still apply — and every spec in a chain reads that
@@ -1348,17 +1347,17 @@ fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<&str>> {
 /// The column names of a join subtree's row, in layout order. A subplan or
 /// table-function leaf contributes `None` per column — its output columns have
 /// no schema name to show, so an expression over them renders as `$index`.
-fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<&str>> {
+fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
     match join {
         PhysicalJoinExpr::Input { input, width, .. } => match input {
-            PhysicalJoinInput::Scan { table, .. } => schema_names(table.schema()),
+            PhysicalJoinInput::Scan { table, .. } => schema_names(&table.schema()),
             // An `Append` here is one relation read from several physical
             // sources, not a genuine subquery: its columns are the relation's, so
             // an expression over them must still render by name. Without this a
             // join or filter touching such a relation prints `$0`.
             PhysicalJoinInput::Subplan(plan) => match plan.as_ref() {
                 PhysicalPlan::Append { columns, .. } if columns.len() == *width => {
-                    columns.iter().map(|c| Some(c.name.as_str())).collect()
+                    columns.iter().map(|c| Some(c.name.clone())).collect()
                 }
                 _ => vec![None; *width],
             },
@@ -1486,13 +1485,13 @@ mod tests {
     }
 
     struct MetaTable {
-        schema: TableSchema,
+        schema: Arc<TableSchema>,
         indexes: Mutex<Vec<IndexMetadata>>,
     }
 
     impl TableAm for MetaTable {
-        fn schema(&self) -> &TableSchema {
-            &self.schema
+        fn schema(&self) -> Arc<TableSchema> {
+            Arc::clone(&self.schema)
         }
         fn indexes(&self) -> Vec<IndexMetadata> {
             self.indexes.lock().expect("mutex").clone()
@@ -1525,7 +1524,7 @@ mod tests {
     impl TableEngine for MetaEngine {
         fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
             let table = Arc::new(MetaTable {
-                schema: schema.clone(),
+                schema: Arc::new(schema.clone()),
                 indexes: Mutex::new(Vec::new()),
             });
             self.tables

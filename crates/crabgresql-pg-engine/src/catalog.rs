@@ -607,6 +607,51 @@ impl RelCatalog {
         self.persist(&state)
     }
 
+    /// Mark `columns` (positions into the relation's column list) NOT NULL and
+    /// persist — the durable half of `ALTER TABLE ... ADD PRIMARY KEY`.
+    ///
+    /// No format change: `PersistCol.nullable` has been in the [`META_MAGIC`]
+    /// block since column metadata was first written, so a catalog this rewrites
+    /// still loads on an older reader and vice versa.
+    ///
+    /// The whole key arrives in one call, so it becomes one whole-file
+    /// [`Self::persist`]: a crash leaves the key entirely NOT NULL or entirely
+    /// untouched. Half a key marked NOT NULL is unrepresentable.
+    ///
+    /// An out-of-range position is a caller bug (the server resolved these from
+    /// the very schema it is altering), so it is an error rather than a skip.
+    pub fn set_column_not_null(
+        &self,
+        namespace: &str,
+        table: &str,
+        columns: &[usize],
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(r) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("relation \"{namespace}.{table}\" does not exist"),
+            ));
+        };
+        if let Some(&out) = columns.iter().find(|&&c| c >= r.cols.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("column {out} is out of range for relation \"{namespace}.{table}\""),
+            ));
+        }
+        for &c in columns {
+            r.cols[c].nullable = false;
+        }
+        self.persist(&state)
+    }
+
     /// Each `Unlogged` relation's `(heap relfilenode, physical index relfilenodes,
     /// chunk store)`. The startup crash-reset
     /// (`PgEngine::reset_unlogged_relations`) empties these files, since their
@@ -1826,6 +1871,48 @@ mod tests {
         assert!(schema.columns[0].nullable);
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
+
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... ADD PRIMARY KEY` marks its key columns NOT NULL through
+    /// this, and the flip has to outlive the process — it rides the existing
+    /// column record, so there is no new tail to reload, only a changed byte.
+    #[test]
+    fn set_column_not_null_persists_and_is_addressed_by_position() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Int4),
+                Column::new("c", PgType::Int4),
+            ],
+        ))?;
+        catalog.set_column_not_null("public", "t", &[0, 2])?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let (_, _, _, schema, _) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
+        let nullable: Vec<bool> = schema.columns.iter().map(|c| c.nullable).collect();
+        assert_eq!(nullable, [false, true, false]);
+
+        // A relation that is not there, and a column past the end, are both
+        // caller bugs rather than no-ops — the server resolved these positions
+        // from the very schema it is altering.
+        assert!(loaded.set_column_not_null("public", "nope", &[0]).is_err());
+        assert!(loaded.set_column_not_null("public", "t", &[3]).is_err());
+        // …and the failed call left the relation alone.
+        let (_, _, _, schema, _) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
+        let nullable: Vec<bool> = schema.columns.iter().map(|c| c.nullable).collect();
+        assert_eq!(nullable, [false, true, false]);
 
         Ok(())
     }
