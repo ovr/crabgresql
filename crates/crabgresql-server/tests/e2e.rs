@@ -4151,6 +4151,62 @@ async fn truncate_empties_tables() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// TRUNCATE swaps the table's indexes along with its heap file. Only at this
+/// level does the executor's Index Scan run, and on the physical path it
+/// re-checks nothing — so a carried-over index would answer `WHERE id = 1` with
+/// a row the post-truncate INSERT placed at the tid the stale entry names.
+#[tokio::test]
+async fn truncate_resets_the_index_so_stale_keys_find_nothing() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id integer)").await?;
+    client.simple_query("CREATE INDEX t_idx ON t (id)").await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+    client.simple_query("TRUNCATE t").await?;
+    client.simple_query("INSERT INTO t VALUES (7)").await?;
+
+    // Guard the guard: if the planner stopped choosing the index this test would
+    // silently pass on a sequential scan, which re-checks the key itself.
+    let plan = rows(
+        &client
+            .simple_query("EXPLAIN SELECT * FROM t WHERE id = 1")
+            .await?,
+    )
+    .iter()
+    .filter_map(|r| r.get(0).map(str::to_string))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("Index Scan"),
+        "expected an index scan:\n{plan}"
+    );
+
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM t WHERE id = 1").await?).len(),
+        0,
+        "a truncated-away key must find nothing"
+    );
+    let msgs = client.simple_query("SELECT * FROM t WHERE id = 7").await?;
+    let after = rows(&msgs);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].get(0), Some("7"));
+
+    // And a rolled-back TRUNCATE leaves the index serving the original rows.
+    client
+        .simple_query("BEGIN; TRUNCATE t; INSERT INTO t VALUES (42); ROLLBACK")
+        .await?;
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM t WHERE id = 7").await?).len(),
+        1
+    );
+    assert_eq!(
+        rows(&client.simple_query("SELECT * FROM t WHERE id = 42").await?).len(),
+        0
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn truncate_resolves_every_table_before_emptying() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

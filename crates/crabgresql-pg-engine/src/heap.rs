@@ -56,12 +56,28 @@ const PLACEHOLDER_TID: Tid = Tid {
 /// An uncommitted relfilenode-swap TRUNCATE staged by one transaction. Because a
 /// TRUNCATE holds the table exclusively until it commits, at most one can exist
 /// on a table at a time — hence a single `Option`, not a map.
+/// The empty replacement B-tree each physical index stages alongside it lives on
+/// [`IndexEntry::staged`], not here: one fact, one owner. Indexes are swapped in
+/// lockstep with the heap because the new file reuses the tids the old index
+/// entries name, so an index carried across the swap would answer probes with
+/// rows whose key does not match.
 struct PendingTruncate {
     xid: Xid,
     new_rel: u32,
     /// The lock owner that holds the table's exclusive lock — needed to release
     /// it from the commit/abort hook, which only receives the XID.
     owner: LockOwner,
+}
+
+/// What a committed TRUNCATE hands its caller: the files to unlink and the new
+/// ones the durable catalog must name, plus the lock owner to release.
+pub(crate) struct TruncateCommit {
+    pub old_heap: RelFileNode,
+    /// The superseded index files, to unlink.
+    pub old_indexes: Vec<RelFileNode>,
+    /// The new index relfilenodes, by index name, for the catalog write.
+    pub new_indexes: Vec<(String, RelFileNode)>,
+    pub owner: LockOwner,
 }
 
 /// What [`HeapTable::plan_tuple`] decided, before anything is written.
@@ -162,11 +178,20 @@ pub struct HeapTable {
 struct IndexEntry {
     meta: IndexMetadata,
     rel: RelFileNode,
+    /// The empty replacement tree staged by an uncommitted TRUNCATE, which only
+    /// the truncating transaction reads and writes (see
+    /// [`HeapTable::effective_index_rel`]). Set and cleared together with the
+    /// table's `pending`.
+    staged: Option<RelFileNode>,
     latch: Arc<RwLock<()>>,
 }
 
 impl IndexEntry {
     /// Whether this index has a physical B-tree the engine can scan.
+    ///
+    /// Judged on the committed `rel`, never on `staged`: a staged index is still
+    /// an index, and the two are always both zero or both non-zero anyway
+    /// (`truncate` stages a file exactly for the entries this returns true for).
     fn is_physical(&self, schema: &TableSchema) -> bool {
         self.rel.0 != 0 && btkey::keys_indexable(schema, &self.meta.keys)
     }
@@ -187,6 +212,7 @@ impl HeapTable {
             .map(|(meta, rel)| IndexEntry {
                 meta,
                 rel,
+                staged: None,
                 latch: Arc::new(RwLock::new(())),
             })
             .collect();
@@ -302,6 +328,7 @@ impl HeapTable {
             .push(IndexEntry {
                 meta: index,
                 rel,
+                staged: None,
                 latch: Arc::new(RwLock::new(())),
             });
     }
@@ -327,11 +354,21 @@ impl HeapTable {
         *guard = Arc::new(next);
     }
 
-    pub fn remove_index(&self, index_name: &str) {
-        self.indexes
+    /// Unpublish an index, returning its committed relfilenode and any file a
+    /// staged TRUNCATE allocated for it, so the caller can unlink both.
+    ///
+    /// The staged half is unreachable in practice — DROP INDEX takes the table
+    /// exclusively as [`LockOwner::DDL`], which cannot be granted while a
+    /// TRUNCATE holds it under the session's owner — but returning it keeps the
+    /// invariant explicit instead of implicit.
+    pub fn remove_index(&self, index_name: &str) -> Option<(RelFileNode, Option<RelFileNode>)> {
+        let mut indexes = self
+            .indexes
             .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .retain(|i| i.meta.name != index_name);
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let pos = indexes.iter().position(|i| i.meta.name == index_name)?;
+        let entry = indexes.remove(pos);
+        Some((entry.rel, entry.staged))
     }
 
     /// Take the table's exclusive lock for an index DDL operation (DROP INDEX),
@@ -343,11 +380,13 @@ impl HeapTable {
         self.lock.acquire_exclusive_guard(LockOwner::DDL)
     }
 
-    /// Open the [`BTree`] for an index entry (shares the entry's latch).
-    fn btree(&self, entry: &IndexEntry) -> BTree {
+    /// Open the [`BTree`] `xid` should read and write for an index entry (shares
+    /// the entry's latch): the staged tree if `xid` is the truncating
+    /// transaction, else the committed one.
+    fn btree(&self, entry: &IndexEntry, xid: Xid) -> BTree {
         BTree::open(
             Arc::clone(&self.engine),
-            entry.rel,
+            self.effective_index_rel(entry, xid),
             Arc::clone(&entry.latch),
             self.persistence.is_unlogged(),
         )
@@ -432,7 +471,12 @@ impl HeapTable {
         self.indexes
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .push(IndexEntry { meta, rel, latch });
+            .push(IndexEntry {
+                meta,
+                rel,
+                staged: None,
+                latch,
+            });
         // `_guard` releases the exclusive hold here (or on an unwinding panic).
         Ok(())
     }
@@ -440,7 +484,7 @@ impl HeapTable {
     /// Add a `key -> tid` entry to every physical index for a newly placed
     /// version. A row whose key column is NULL or an un-indexable value is simply
     /// not indexed (its key never satisfies equality), matching the memory engine.
-    fn maintain_insert(&self, tuple: &Tuple, tid: Tid) {
+    fn maintain_insert(&self, tuple: &Tuple, tid: Tid, xid: Xid) {
         let indexes = self
             .indexes
             .read()
@@ -460,13 +504,26 @@ impl HeapTable {
             }
             let cols = btkey::key_columns(&entry.meta.keys);
             if let Some(key) = btkey::encode_row(&schema, &cols, tuple) {
-                self.btree(entry).insert(&key, tid);
+                self.btree(entry, xid).insert(&key, tid);
             }
         }
     }
 
     pub fn relfilenode(&self) -> RelFileNode {
         RelFileNode(self.live_rel.load(Ordering::Relaxed))
+    }
+
+    /// This table's physical indexes as `(name, committed relfilenode)`, in
+    /// publication order — the shape `RelCatalog::index_relfilenodes` returns, so
+    /// recovery can compare a handle against the catalog directly.
+    pub(crate) fn index_relfilenodes(&self) -> Vec<(String, RelFileNode)> {
+        self.indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .filter(|e| e.rel.0 != 0)
+            .map(|e| (e.meta.name.clone(), e.rel))
+            .collect()
     }
 
     /// The relfilenode `xid` should read and write: the staged TRUNCATE file if
@@ -485,6 +542,27 @@ impl HeapTable {
         RelFileNode(self.live_rel.load(Ordering::Relaxed))
     }
 
+    /// The index relfilenode `xid` should read and write, mirroring
+    /// [`HeapTable::effective_rel`] for the heap file.
+    ///
+    /// Load-bearing: without it the truncating transaction's own inserts would
+    /// maintain the *committed* tree, keyed to the staged heap's tids, and a
+    /// rollback could not undo them.
+    fn effective_index_rel(&self, entry: &IndexEntry, xid: Xid) -> RelFileNode {
+        if self.has_pending.load(Ordering::Acquire)
+            && let Some(staged) = entry.staged
+            && let Some(p) = self
+                .pending
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .as_ref()
+            && p.xid == xid
+        {
+            return staged;
+        }
+        entry.rel
+    }
+
     /// Commit a staged TRUNCATE: the new file becomes the committed one. Returns
     /// the old heap relfilenode to unlink and the lock owner to release, or
     /// `None` if nothing was pending for `xid`.
@@ -492,13 +570,28 @@ impl HeapTable {
     /// The chunk store keeps its relfilenode across a TRUNCATE — see
     /// [`HeapTable::reclaim_toast_after_truncate`] for why the space is reclaimed
     /// by emptying that file rather than by swapping it.
-    pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
+    pub(crate) fn commit_truncate(&self, xid: Xid) -> Option<TruncateCommit> {
+        // `indexes` before `pending`, the order every reader takes them in
+        // (`index_lookup` -> `effective_index_rel`). Holding both makes the heap
+        // and index swap indivisible to a concurrent probe.
+        let mut indexes = self
+            .indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let mut pending = self
             .pending
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
         let old = self.live_rel.swap(p.new_rel, Ordering::Relaxed);
+        let mut old_indexes = Vec::new();
+        let mut new_indexes = Vec::new();
+        for entry in indexes.iter_mut() {
+            if let Some(staged) = entry.staged.take() {
+                old_indexes.push(std::mem::replace(&mut entry.rel, staged));
+                new_indexes.push((entry.meta.name.clone(), staged));
+            }
+        }
         self.has_pending.store(false, Ordering::Release);
         // `truncate_unreconciled` is deliberately NOT cleared here. The swap is
         // only in memory at this point; it becomes durable when the caller's
@@ -514,7 +607,12 @@ impl HeapTable {
             .analyzed
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned")) = None;
-        Some((RelFileNode(old), p.owner))
+        Some(TruncateCommit {
+            old_heap: RelFileNode(old),
+            old_indexes,
+            new_indexes,
+            owner: p.owner,
+        })
     }
 
     /// Empty the chunk store after a committed TRUNCATE, if it is safe to.
@@ -556,30 +654,53 @@ impl HeapTable {
         self.toast_hint.store(0, Ordering::Relaxed);
     }
 
-    /// Discard a staged TRUNCATE on abort: the new file is dropped, the committed
-    /// one stays. Returns the staged heap relfilenode to unlink and the lock owner
-    /// to release, or `None`. The chunk store is untouched by a TRUNCATE until it
-    /// commits, so there is nothing to undo there.
-    pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<(RelFileNode, LockOwner)> {
+    /// Discard a staged TRUNCATE on abort: the new files are dropped, the
+    /// committed ones stay. Returns the staged relfilenodes to unlink — the
+    /// heap's first, then each index's — and the lock owner to release, or
+    /// `None`. The chunk store is untouched by a TRUNCATE until it commits, so
+    /// there is nothing to undo there.
+    pub(crate) fn abort_truncate(&self, xid: Xid) -> Option<(Vec<RelFileNode>, LockOwner)> {
+        // `indexes` before `pending` — see `commit_truncate`.
+        let mut indexes = self
+            .indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let mut pending = self
             .pending
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let p = pending.take_if(|p| p.xid == xid)?;
+        let mut discard = vec![RelFileNode(p.new_rel)];
+        for entry in indexes.iter_mut() {
+            discard.extend(entry.staged.take());
+        }
         self.has_pending.store(false, Ordering::Release);
         // The swap never happened, so no replay is needed to reconcile it.
         self.truncate_reconciled();
-        Some((RelFileNode(p.new_rel), p.owner))
+        Some((discard, p.owner))
     }
 
-    /// The relfilenode staged by an uncommitted TRUNCATE, if any. `drop_table`
-    /// reads this so it can reclaim a staged file the catalog doesn't know about.
-    pub(crate) fn staged_relfilenode(&self) -> Option<RelFileNode> {
-        self.pending
+    /// The relfilenodes staged by an uncommitted TRUNCATE — the heap's and every
+    /// index's. `drop_table` reads this so it can reclaim staged files the
+    /// catalog doesn't know about.
+    pub(crate) fn staged_relfilenodes(&self) -> Vec<RelFileNode> {
+        // Two sequential acquisitions, never held together, so the usual
+        // `indexes` before `pending` order cannot be violated here.
+        let mut out: Vec<RelFileNode> = self
+            .indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
-            .as_ref()
-            .map(|p| RelFileNode(p.new_rel))
+            .iter()
+            .filter_map(|e| e.staged)
+            .collect();
+        out.extend(
+            self.pending
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"))
+                .as_ref()
+                .map(|p| RelFileNode(p.new_rel)),
+        );
+        out
     }
 
     /// Release the exclusive lock a TRUNCATE held (keyed by its lock owner).
@@ -587,9 +708,21 @@ impl HeapTable {
         self.lock.release_exclusive(owner);
     }
 
-    /// Point the table at `new` after recovery applied a committed TRUNCATE swap
-    /// (the on-disk catalog lagged the WAL). Clears any stale pending state.
-    pub(crate) fn rebind(&self, new: RelFileNode) {
+    /// Point the table at `new`, and each named index at its post-swap file,
+    /// after recovery applied a committed TRUNCATE swap (the on-disk catalog
+    /// lagged the WAL). Clears any stale pending state.
+    pub(crate) fn rebind(&self, new: RelFileNode, index_rels: &[(String, RelFileNode)]) {
+        // `indexes` before `pending` — see `commit_truncate`.
+        let mut indexes = self
+            .indexes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        for entry in indexes.iter_mut() {
+            entry.staged = None;
+            if let Some((_, irel)) = index_rels.iter().find(|(n, _)| *n == entry.meta.name) {
+                entry.rel = *irel;
+            }
+        }
         *self
             .pending
             .write()
@@ -1121,6 +1254,19 @@ impl TableAm for HeapTable {
         key: &[Value],
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
+        // Hold the table's shared lock across the tree descent, exactly as `scan`
+        // and `fetch` do. Without it a committing TRUNCATE — whose
+        // `acquire_exclusive` waits only on *foreign shared* holds, so nothing
+        // would make it wait for this probe — unlinks the index file mid-descent;
+        // `smgr` then reopens it with `create(true)`, and the descent panics on a
+        // zeroed meta page.
+        //
+        // Safe for the truncating transaction's own probe: `acquire_shared` grants
+        // immediately when the exclusive holder is this same owner, and the per-tid
+        // holds `fetch` takes underneath are refcounted per owner. The guard need
+        // only live to the end of this function — the result is materialized into a
+        // `Vec`, so the returned iterator reads no page.
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         // Bound before the index guard: the filter and the key encoding below
         // must agree on `columns`.
         let schema = self.snap();
@@ -1134,7 +1280,9 @@ impl TableAm for HeapTable {
                 return None;
             }
             (
-                entry.rel,
+                // The staged tree when `txn` is the truncating transaction, so a
+                // probe agrees with a scan of the file it reads.
+                self.effective_index_rel(entry, txn.xid),
                 Arc::clone(&entry.latch),
                 btkey::key_columns(&entry.meta.keys),
             )
@@ -1157,9 +1305,21 @@ impl TableAm for HeapTable {
             // index scan quietly return fewer rows than a sequential scan of the
             // same table — the same query answering differently by plan.
             match self.fetch(tid, txn) {
-                Ok(Some(tuple)) => out.push(Ok((tid, tuple))),
-                // Not visible to this snapshot: not an error.
-                Ok(None) => {}
+                // Re-check the key against the row we actually read. The B-tree
+                // is *supposed* to be exact here — that is why the executor's
+                // index scan re-checks nothing — but nothing else enforces it,
+                // and an entry naming a tid the heap has since reused is a wrong
+                // answer rather than a missing row. One encode plus a compare per
+                // returned row turns that whole class of defect into rows quietly
+                // absent, which a probe-versus-scan test catches.
+                Ok(Some(tuple))
+                    if btkey::encode_row(&schema, &cols, &tuple).is_some_and(|k| k == kb) =>
+                {
+                    out.push(Ok((tid, tuple)))
+                }
+                // Either not visible to this snapshot or not actually a match:
+                // neither is an error.
+                Ok(_) => {}
                 Err(error) => out.push(Err(error)),
             }
         }
@@ -1216,7 +1376,7 @@ impl TableAm for HeapTable {
         let planned = self.plan_tuple(&tuple, &hdr)?;
         let bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let tid = self.place(rel, txn.xid, &bytes);
-        self.maintain_insert(&tuple, tid);
+        self.maintain_insert(&tuple, tid, txn.xid);
         Ok(tid)
     }
 
@@ -1261,7 +1421,7 @@ impl TableAm for HeapTable {
         // memory engine's append-only maintenance.
         let new_bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let new_tid = self.place(rel, txn.xid, &new_bytes);
-        self.maintain_insert(&tuple, new_tid);
+        self.maintain_insert(&tuple, new_tid, txn.xid);
         Ok(UpdateResult::Updated)
     }
 
@@ -1281,6 +1441,14 @@ impl TableAm for HeapTable {
     /// the [`crabgresql_txn::TxnFinalize`] hook (`PgEngine::on_commit`/`on_abort`).
     /// The old file stays intact until commit, so a rollback or crash-before-commit
     /// restores every row.
+    ///
+    /// Every physical index is swapped the same way, in the same record and by
+    /// the same commit verdict. Carrying an index across the swap would corrupt
+    /// it rather than merely age it: the new heap file starts at block 0 with the
+    /// insert hint reset, so rows inserted after the TRUNCATE occupy exactly the
+    /// tids the old index entries name, and a probe would return live, visible
+    /// rows whose key does not match — which the executor's index scan does not
+    /// re-check.
     fn truncate(&self, txn: &TxnContext) -> Result<(), StorageError> {
         // AccessExclusiveLock: block concurrent readers/writers of this table
         // until we commit, so no one reads the old file we are about to unlink or
@@ -1297,6 +1465,48 @@ impl TableAm for HeapTable {
             self.engine.bufpool.smgr().register_memory(new);
         }
         Self::io(self.engine.bufpool.smgr().create_if_missing(new));
+        // An empty replacement tree per physical index, staged the same way.
+        //
+        // Deliberately *outside* the `CheckpointDelay` block below, for the same
+        // reason the heap's own allocation and `create_if_missing` are: this is
+        // file I/O and WAL appends proportional to the index count, and the
+        // barrier — which stalls the checkpointer — should cover only the window
+        // it exists for, between the `HEAP_TRUNCATE` record and the state that
+        // decides whether that record must be replayed. Creating first is safe
+        // because a crash before the record is appended leaves files nothing
+        // names, which the startup orphan sweep reclaims.
+        // `superseded` collects what a *second* TRUNCATE in the same transaction
+        // displaces — `replace` hands back the tree the previous one staged, so
+        // the double-TRUNCATE reclaim reads out of the same field that owns the
+        // staged file rather than a parallel list that could disagree with it.
+        let mut superseded = Vec::new();
+        let staged_indexes: Vec<(String, RelFileNode, RelFileNode)> = {
+            let mut indexes = self
+                .indexes
+                .write()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let mut staged = Vec::new();
+            for entry in indexes.iter_mut() {
+                if !entry.is_physical(&schema) {
+                    continue;
+                }
+                let irel = self.engine.catalog.alloc_relfilenode();
+                if self.persistence.is_ram_backed() {
+                    self.engine.bufpool.smgr().register_memory(irel);
+                }
+                Self::io(self.engine.bufpool.smgr().create_if_missing(irel));
+                BTree::open(
+                    Arc::clone(&self.engine),
+                    irel,
+                    Arc::clone(&entry.latch),
+                    self.persistence.is_unlogged(),
+                )
+                .create();
+                staged.push((entry.meta.name.clone(), entry.rel, irel));
+                superseded.extend(entry.staged.replace(irel));
+            }
+            staged
+        };
         // Everything from the append to the last piece of state a checkpoint reads
         // runs under one barrier: this is a writer that logs a record and only
         // afterwards publishes what decides whether the record must be replayed,
@@ -1328,7 +1538,7 @@ impl TableAm for HeapTable {
                     RmgrId::HEAP,
                     rec::HEAP_TRUNCATE,
                     txn.xid,
-                    &rec::truncate(&schema.namespace, &schema.name, old, new),
+                    &rec::truncate(&schema.namespace, &schema.name, old, new, &staged_indexes),
                 );
                 Self::io(
                     self.engine
@@ -1355,9 +1565,14 @@ impl TableAm for HeapTable {
             prev
         };
         self.insert_hint.store(0, Ordering::Relaxed);
+        // The trees a previous TRUNCATE in this same transaction staged, displaced
+        // by the ones just created. Empty on the first TRUNCATE.
+        for irel in superseded {
+            self.engine.discard_relfile(irel);
+        }
         match prev {
             Some(prev) => {
-                // The superseded staged file was used only by this uncommitted
+                // The superseded staged heap file was used only by this uncommitted
                 // transaction; reclaim it now.
                 self.engine.discard_relfile(RelFileNode(prev.new_rel));
                 // Already registered with the engine on the first TRUNCATE.

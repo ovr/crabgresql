@@ -467,6 +467,169 @@ fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() -> 
     Ok(())
 }
 
+// --- TRUNCATE across a crash, with a physical index ---
+//
+// The index relfilenodes swap in the same WAL record and by the same verdict as
+// the heap file. Recovery must apply or discard both together: a committed heap
+// swap left beside the pre-truncate tree would answer probes with rows the new
+// file has since placed at the tids the old entries name.
+
+/// A non-unique B-tree index on `id` for the recovery tests.
+fn idx_on_id() -> crabgresql_storage_api::IndexMetadata {
+    crabgresql_storage_api::IndexMetadata {
+        name: "t_id_idx".into(),
+        method: crabgresql_storage_api::IndexMethod::BTree,
+        keys: vec![crabgresql_storage_api::IndexKey {
+            column: 0,
+            descending: false,
+            nulls_first: false,
+        }],
+        unique: false,
+        nulls_distinct: true,
+        constraint: None,
+    }
+}
+
+/// Seed 1,2,3 and index them.
+fn seed_three_indexed(engine: &PgEngine, tm: &TransactionManager) -> Arc<dyn TableAm> {
+    let table = seed_three(engine, tm);
+    engine
+        .create_index("public", "t", idx_on_id())
+        .expect("create index");
+    table
+}
+
+/// The visible `id`s an index probe for `key` returns, sorted.
+fn probe_ids(tm: &TransactionManager, table: &dyn TableAm, key: i32) -> Vec<i32> {
+    let mut v: Vec<i32> = table
+        .index_lookup("t_id_idx", &[Value::Int4(key)], &read(tm))
+        .expect("index serves the probe")
+        .map(|row| match row.expect("index probe failed").1[0] {
+            Value::Int4(x) => x,
+            _ => unreachable!(),
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn indexed_truncate_committed_then_crash_recovers_an_empty_index() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = seed_three_indexed(&engine, &tm);
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        tm.commit(tx).unwrap();
+    }
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    for k in [1, 2, 3] {
+        assert!(probe_ids(&tm, &*table, k).is_empty(), "key {k} survived");
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_truncate_uncommitted_then_crash_restores_index_entries() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = seed_three_indexed(&engine, &tm);
+        let tx = tm.allocate_xid();
+        table.truncate(&tm.context(tx, CommandId::FIRST))?;
+        // Never commits: crash with the swap pending.
+    }
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    for k in [1, 2, 3] {
+        assert_eq!(probe_ids(&tm, &*table, k), vec![k]);
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_truncate_then_insert_then_commit_crash_probes_only_new_rows() -> anyhow::Result<()> {
+    // The sharpest case: the post-truncate rows occupy the tids the pre-truncate
+    // index entries name, so recovery applying only the heap swap would surface
+    // them under the old keys.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = seed_three_indexed(&engine, &tm);
+        let tx = tm.allocate_xid();
+        let ctx = tm.context(tx, CommandId::FIRST);
+        table.truncate(&ctx)?;
+        insert(&*table, &ctx, 10, "x");
+        insert(&*table, &ctx, 11, "y");
+        tm.commit(tx).unwrap();
+    }
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
+    for k in [1, 2, 3] {
+        assert!(probe_ids(&tm, &*table, k).is_empty(), "key {k} survived");
+    }
+    for k in [10, 11] {
+        assert_eq!(probe_ids(&tm, &*table, k), vec![k]);
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_committed_then_uncommitted_truncate_crash_keeps_the_committed_index()
+-> anyhow::Result<()> {
+    // Per-record verdicts over the index chain, mirroring
+    // `committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows`.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = seed_three_indexed(&engine, &tm);
+        let a = tm.allocate_xid();
+        let ca = tm.context(a, CommandId::FIRST);
+        table.truncate(&ca)?;
+        insert(&*table, &ca, 10, "x");
+        tm.commit(a).unwrap();
+        let b = tm.allocate_xid();
+        table.truncate(&tm.context(b, CommandId::FIRST))?;
+    }
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    assert_eq!(visible_ids(&tm, &*table), vec![10]);
+    assert_eq!(probe_ids(&tm, &*table, 10), vec![10]);
+    assert!(probe_ids(&tm, &*table, 1).is_empty());
+    Ok(())
+}
+
+/// A committed TRUNCATE whose catalog write never happened: recovery must repair
+/// the index relfilenodes from the WAL too, not just the heap's. Without the
+/// index half the reopened catalog would name the new heap beside the old tree.
+#[test]
+fn an_indexed_committed_truncate_with_a_stale_catalog_is_repaired_at_recovery() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (engine, tm) = common::open_without_finalize(dir.path()).unwrap();
+        let table = seed_three_indexed(&engine, &tm);
+        let tx = tm.allocate_xid();
+        let ctx = tm.context(tx, CommandId::FIRST);
+        table.truncate(&ctx)?;
+        insert(&*table, &ctx, 10, "x");
+        // Commits in the WAL, but the finalize hook never runs, so the catalog
+        // still names the pre-truncate files.
+        tm.commit(tx).unwrap();
+    }
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    assert_eq!(visible_ids(&tm, &*table), vec![10]);
+    assert_eq!(probe_ids(&tm, &*table, 10), vec![10]);
+    for k in [1, 2, 3] {
+        assert!(probe_ids(&tm, &*table, k).is_empty(), "key {k} survived");
+    }
+    Ok(())
+}
+
 #[test]
 fn size_derived_statistics_survive_a_crash() -> anyhow::Result<()> {
     // Statistics are not WAL-logged, but the size-derived estimate is read back

@@ -280,6 +280,67 @@ fn unlogged_survives_clean_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An Unlogged table is NOT ram-backed, so its indexes are real on-disk B-trees
+/// — the TRUNCATE index swap applies to it exactly as to a Permanent table, and
+/// the catalog carries the swap across a clean restart.
+#[test]
+fn unlogged_indexed_truncate_survives_a_clean_restart() -> anyhow::Result<()> {
+    let h = setup();
+    let u = h
+        .engine
+        .create_table(schema("u", RelPersistence::Unlogged))?;
+    insert_committed(&h.tm, &*u, vec![Value::Int4(1), Value::Null]);
+    h.engine.create_index("public", "u", idx("u_idx"))?;
+    assert!(
+        u.supports_index_scan("u_idx"),
+        "unlogged indexes are physical"
+    );
+
+    let tx = h.tm.allocate_xid();
+    u.truncate(&h.tm.context(tx, CommandId::FIRST))?;
+    h.tm.commit(tx)?;
+    insert_committed(&h.tm, &*u, vec![Value::Int4(7), Value::Null]);
+    drop(u);
+
+    let h = reopen(h, true);
+    let u = h.engine.open_table("u")?;
+    assert_eq!(ids(&h.tm, &*u), vec![7]);
+    let probe = |key: i32| {
+        u.index_lookup("u_idx", &[Value::Int4(key)], &read(&h.tm))
+            .expect("index serves the probe")
+            .count()
+    };
+    assert_eq!(probe(1), 0, "a truncated-away key came back");
+    assert_eq!(probe(7), 1);
+    Ok(())
+}
+
+/// A Temporary table's index stays metadata-only across a TRUNCATE: there is no
+/// physical tree to swap, and probes keep falling back to a re-checking scan.
+#[test]
+fn temporary_index_stays_metadata_only_across_a_truncate() -> anyhow::Result<()> {
+    let h = setup();
+    let t = h
+        .engine
+        .create_table(schema("t", RelPersistence::Temporary))?;
+    insert_committed(&h.tm, &*t, vec![Value::Int4(1), Value::Null]);
+    h.engine.create_index("public", "t", idx("t_idx"))?;
+
+    let tx = h.tm.allocate_xid();
+    t.truncate(&h.tm.context(tx, CommandId::FIRST))?;
+    h.tm.commit(tx)?;
+    insert_committed(&h.tm, &*t, vec![Value::Int4(7), Value::Null]);
+
+    assert!(!t.supports_index_scan("t_idx"));
+    assert!(
+        t.index_lookup("t_idx", &[Value::Int4(1)], &read(&h.tm))
+            .is_none()
+    );
+    assert_eq!(ids(&h.tm, &*t), vec![7]);
+    assert_eq!(base_file_count(&h), 0, "still nothing on disk");
+    Ok(())
+}
+
 #[test]
 fn unlogged_truncated_after_crash() -> anyhow::Result<()> {
     let h = setup();

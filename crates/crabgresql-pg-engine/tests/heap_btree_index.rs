@@ -40,6 +40,20 @@ fn idx_on_id() -> IndexMetadata {
     }
 }
 
+/// A second non-unique index, on column 1 (`name`), for the multi-index cases.
+fn idx_on_name() -> IndexMetadata {
+    IndexMetadata {
+        name: "t_name_idx".into(),
+        keys: vec![IndexKey {
+            column: 1,
+            descending: false,
+            nulls_first: false,
+        }],
+        constraint: None,
+        ..idx_on_id()
+    }
+}
+
 fn read(tm: &TransactionManager) -> TxnContext {
     tm.context(Xid::INVALID, CommandId::FIRST)
 }
@@ -319,6 +333,194 @@ fn vacuum_removes_the_index_entry_so_a_reused_slot_is_not_found() -> anyhow::Res
         "stale key is gone"
     );
     assert_eq!(probe_ids(&*table, &read(&tm), 2), vec![2]);
+    Ok(())
+}
+
+/// A TRUNCATE swaps in a fresh, empty heap file and resets the insert hint, so
+/// the rows inserted after it reuse the very tids the pre-truncate index entries
+/// name. The index must therefore be swapped in lockstep with the heap — a probe
+/// on an old key that surfaced a post-truncate row would be a wrong answer, not
+/// a stale-but-invisible one, because the row is genuinely live and visible.
+#[test]
+fn truncate_then_insert_does_not_return_stale_index_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    for id in 1..=5 {
+        insert_committed(&tm, &*table, id, "before");
+    }
+
+    let xt = tm.allocate_xid();
+    table.truncate(&tm.context(xt, CommandId::FIRST))?;
+    tm.commit(xt)?;
+
+    insert_committed(&tm, &*table, 99, "after");
+
+    for k in 1..=5 {
+        assert!(
+            probe_ids(&*table, &read(&tm), k).is_empty(),
+            "key {k} was truncated away, but the probe still finds it"
+        );
+    }
+    assert_eq!(probe_ids(&*table, &read(&tm), 99), vec![99]);
+    Ok(())
+}
+
+/// The invariant the executor's `IndexScan` relies on: on the physical path it
+/// performs no key re-check, so a probe must agree with a filtered scan exactly.
+#[test]
+fn truncate_then_insert_probe_agrees_with_scan() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    for id in 1..=5 {
+        insert_committed(&tm, &*table, id, "before");
+    }
+    let xt = tm.allocate_xid();
+    table.truncate(&tm.context(xt, CommandId::FIRST))?;
+    tm.commit(xt)?;
+    for id in [3, 7] {
+        insert_committed(&tm, &*table, id, "after");
+    }
+
+    for k in [1, 2, 3, 4, 5, 7, 99] {
+        assert_eq!(
+            probe_ids(&*table, &read(&tm), k),
+            scan_ids(&*table, &read(&tm), k),
+            "probe and scan disagree on key {k}"
+        );
+    }
+    Ok(())
+}
+
+/// `TRUNCATE t; INSERT ...` inside ONE transaction: the truncating transaction
+/// must probe its own new rows and none of the old ones. This is the case an
+/// in-place index reset at commit time could not serve, since the rows exist
+/// before the commit hook runs.
+#[test]
+fn truncate_and_insert_in_one_txn_then_commit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    for id in 1..=3 {
+        insert_committed(&tm, &*table, id, "before");
+    }
+
+    let x = tm.allocate_xid();
+    let txn = tm.context(x, CommandId::FIRST);
+    table.truncate(&txn)?;
+    table.insert(vec![Value::Int4(42), Value::Text("after".into())], &txn)?;
+    // Inside the transaction: the staged index serves the new row only. Read at
+    // the NEXT command id — a statement does not see its own writes.
+    let later = tm.context(x, CommandId(1));
+    assert!(probe_ids(&*table, &later, 1).is_empty());
+    assert_eq!(probe_ids(&*table, &later, 42), vec![42]);
+    tm.commit(x)?;
+
+    assert!(probe_ids(&*table, &read(&tm), 1).is_empty());
+    assert_eq!(probe_ids(&*table, &read(&tm), 42), vec![42]);
+    Ok(())
+}
+
+/// A rolled-back TRUNCATE leaves the committed index exactly as it was, and the
+/// rows the aborted transaction inserted are not reachable through it.
+#[test]
+fn rolled_back_truncate_leaves_the_index_intact() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    for id in 1..=3 {
+        insert_committed(&tm, &*table, id, "before");
+    }
+
+    let x = tm.allocate_xid();
+    let txn = tm.context(x, CommandId::FIRST);
+    table.truncate(&txn)?;
+    table.insert(vec![Value::Int4(42), Value::Text("gone".into())], &txn)?;
+    tm.abort(x);
+
+    for k in 1..=3 {
+        assert_eq!(probe_ids(&*table, &read(&tm), k), vec![k]);
+    }
+    assert!(probe_ids(&*table, &read(&tm), 42).is_empty());
+    Ok(())
+}
+
+/// The swap replaces every index file and leaks none: the pre-truncate trees are
+/// unlinked, the post-truncate ones exist, and the file count is unchanged.
+#[test]
+fn truncate_swaps_every_index_relfilenode_and_leaks_none() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    engine.create_index("public", "t", idx_on_name())?;
+    insert_committed(&tm, &*table, 1, "a");
+    let before = base_files(dir.path());
+
+    let xt = tm.allocate_xid();
+    table.truncate(&tm.context(xt, CommandId::FIRST))?;
+    tm.commit(xt)?;
+
+    let after = base_files(dir.path());
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "one file per relation before and after: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.iter().all(|f| !before.contains(f)),
+        "every file is a fresh relfilenode: {before:?} -> {after:?}"
+    );
+    Ok(())
+}
+
+/// Two TRUNCATEs in one transaction: the first transaction's superseded staged
+/// files — the heap's AND each index's — are reclaimed, not leaked.
+#[test]
+fn double_truncate_in_one_txn_leaks_no_index_file() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    engine.create_index("public", "t", idx_on_id())?;
+    insert_committed(&tm, &*table, 1, "a");
+    let before = base_files(dir.path()).len();
+
+    let x = tm.allocate_xid();
+    let txn = tm.context(x, CommandId::FIRST);
+    table.truncate(&txn)?;
+    table.truncate(&txn)?;
+    tm.commit(x)?;
+
+    assert_eq!(base_files(dir.path()).len(), before);
+    assert!(probe_ids(&*table, &read(&tm), 1).is_empty());
+    Ok(())
+}
+
+/// An index created after a TRUNCATE keeps its own relfilenode and indexes only
+/// the post-truncate rows — the swap must not repoint it.
+#[test]
+fn truncate_then_create_index_indexes_only_the_new_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema("t"))?;
+    for id in 1..=3 {
+        insert_committed(&tm, &*table, id, "before");
+    }
+    let xt = tm.allocate_xid();
+    table.truncate(&tm.context(xt, CommandId::FIRST))?;
+    tm.commit(xt)?;
+    insert_committed(&tm, &*table, 7, "after");
+
+    engine.create_index("public", "t", idx_on_id())?;
+    assert_eq!(probe_ids(&*table, &read(&tm), 7), vec![7]);
+    for k in [1, 2, 3] {
+        assert!(probe_ids(&*table, &read(&tm), k).is_empty());
+    }
     Ok(())
 }
 
