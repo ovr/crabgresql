@@ -1900,7 +1900,7 @@ fn insert_direct(
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
     for tuple in &tuples {
-        validate_constraints(&schema, &indexes, tuple, &mut visible, ctx)?;
+        validate_constraints(&schema, tuple, &mut visible, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -1961,16 +1961,10 @@ fn insert_routed(
         }
         match visible[leaf].as_mut() {
             Some(seen) => {
-                validate_constraints(leaf_schema, leaf_indexes, tuple, seen, ctx)?;
+                validate_constraints(leaf_schema, tuple, seen, ctx)?;
                 seen.record(tuple, None);
             }
-            None => validate_constraints(
-                leaf_schema,
-                leaf_indexes,
-                tuple,
-                &mut UniqueKeySet::none(),
-                ctx,
-            )?,
+            None => validate_constraints(leaf_schema, tuple, &mut UniqueKeySet::none(), ctx)?,
         }
         routes.push(leaf);
     }
@@ -2168,21 +2162,14 @@ fn update_inherited(
                 if !simulated[i].forget(old, *tid) {
                     continue;
                 }
-                if let Err(error) =
-                    validate_constraints(&shapes[i].0, &shapes[i].1, &new, &mut simulated[i], ctx)
+                if let Err(error) = validate_constraints(&shapes[i].0, &new, &mut simulated[i], ctx)
                 {
                     simulated[i].record(old, Some(*tid));
                     return Err(error);
                 }
                 simulated[i].record(&new, Some(*tid));
             } else {
-                validate_constraints(
-                    &shapes[i].0,
-                    &shapes[i].1,
-                    &new,
-                    &mut UniqueKeySet::none(),
-                    ctx,
-                )?;
+                validate_constraints(&shapes[i].0, &new, &mut UniqueKeySet::none(), ctx)?;
             }
             if let Some(view) = returned {
                 new_rows.push(view);
@@ -2271,13 +2258,13 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) = validate_constraints(&schema, &indexes, &new, &mut simulated, ctx) {
+            if let Err(error) = validate_constraints(&schema, &new, &mut simulated, ctx) {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
             simulated.record(&new, Some(tid));
         } else {
-            validate_constraints(&schema, &indexes, &new, &mut UniqueKeySet::none(), ctx)?;
+            validate_constraints(&schema, &new, &mut UniqueKeySet::none(), ctx)?;
         }
         pending.push((tid, new));
     }
@@ -2412,38 +2399,22 @@ fn update_routed(
                     if !simulated[dst].forget(old, tid) {
                         continue;
                     }
-                    if let Err(error) = validate_constraints(
-                        &leaf_shapes[dst].0,
-                        &leaf_shapes[dst].1,
-                        &new,
-                        &mut simulated[dst],
-                        ctx,
-                    ) {
+                    if let Err(error) =
+                        validate_constraints(&leaf_shapes[dst].0, &new, &mut simulated[dst], ctx)
+                    {
                         simulated[dst].record(old, Some(tid));
                         return Err(error);
                     }
                     simulated[dst].record(&new, Some(tid));
                 } else {
-                    validate_constraints(
-                        &leaf_shapes[dst].0,
-                        &leaf_shapes[dst].1,
-                        &new,
-                        &mut simulated[dst],
-                        ctx,
-                    )?;
+                    validate_constraints(&leaf_shapes[dst].0, &new, &mut simulated[dst], ctx)?;
                     // Recorded without its tid: in the destination the row is an
                     // insert, and its tid belongs to the source leaf's space —
                     // retracting it here would have to name a row of *this* leaf.
                     simulated[dst].record(&new, None);
                 }
             } else {
-                validate_constraints(
-                    &leaf_shapes[dst].0,
-                    &leaf_shapes[dst].1,
-                    &new,
-                    &mut UniqueKeySet::none(),
-                    ctx,
-                )?;
+                validate_constraints(&leaf_shapes[dst].0, &new, &mut UniqueKeySet::none(), ctx)?;
             }
             // A moved-out row leaves its source leaf's simulation so a later row
             // routed back to that leaf does not see the stale OLD value.
@@ -2494,11 +2465,11 @@ fn update_routed(
 }
 
 /// Takes the relation's shape rather than the relation, so a caller validating
-/// a batch fetches it once instead of per row — `schema()` and `indexes()` both
-/// cost a lock and a clone on an engine whose DDL can republish them.
+/// a batch fetches it once instead of per row — `schema()` costs a lock and a
+/// clone on an engine whose DDL can republish it. The unique indexes arrive
+/// inside `existing`, which was built from them.
 fn validate_constraints(
     schema: &TableSchema,
-    indexes: &[IndexMetadata],
     tuple: &Tuple,
     existing: &mut UniqueKeySet,
     ctx: &ExecContext,
@@ -2524,27 +2495,28 @@ fn validate_constraints(
     // before a unique-key violation (checked below).
     check_partition_bound(schema, tuple, ctx)?;
 
-    let Some(slot) = existing.conflict(tuple)? else {
+    let Some(conflict) = existing.conflict(tuple)? else {
         return Ok(());
     };
-    let index = &indexes[slot];
-    let names = index
-        .keys
+    // Named by the set that found it, not by re-indexing a slice passed
+    // alongside: the two are the same list today, and nothing would say so.
+    let names = conflict
+        .columns
         .iter()
-        .map(|key| schema.columns[key.column].name.as_str())
+        .map(|column| schema.columns[*column].name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let values = index
-        .keys
+    let values = conflict
+        .columns
         .iter()
-        .map(|key| display_value(&tuple[key.column], ctx))
+        .map(|column| display_value(&tuple[*column], ctx))
         .collect::<Vec<_>>()
         .join(", ");
     Err(ExecError::new(
         "23505",
         format!(
             "duplicate key value violates unique constraint \"{}\"",
-            index.name
+            conflict.name
         ),
     )
     .with_detail(Some(format!("Key ({names})=({values}) already exists."))))
