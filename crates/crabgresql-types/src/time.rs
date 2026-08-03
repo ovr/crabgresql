@@ -102,16 +102,17 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimeError> {
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
     }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "now" => {
-            let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            })?;
-            return Ok(wall.rem_euclid(USECS_PER_DAY));
-        }
-        "allballs" => return Ok(0),
-        _ => {}
+    // Compared without allocating: this runs for every `time` value parsed,
+    // and the specials are vanishingly rare.
+    if trimmed.eq_ignore_ascii_case("now") {
+        let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        })?;
+        return Ok(wall.rem_euclid(USECS_PER_DAY));
+    }
+    if trimmed.eq_ignore_ascii_case("allballs") {
+        return Ok(0);
     }
     let mut time_tok: Option<&str> = None;
     let mut ampm: Option<&str> = None;
@@ -140,6 +141,13 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimeError> {
         if is_date_token(tok) {
             have_date = true;
             continue;
+        }
+        // A reserved word is only ever a whole value, so in company it is a
+        // format error — never a decorative zone, which the catch-all below
+        // would otherwise make it. Without this `'now 10:00'` silently answered
+        // `10:00:00`, disagreeing with `timestamp`, which rejects it.
+        if timestamp::is_reserved_word(&lower) {
+            return Err(invalid_syntax(input));
         }
         // A numeric offset (`-07`, `+05:30`) or a fixed abbreviation is
         // accepted and ignored; a bare IANA zone name (`America/New_York`)
@@ -495,5 +503,30 @@ mod tests {
                 .sqlstate,
             "XX000"
         );
+    }
+
+    /// A reserved word is a whole value or nothing. In company it used to fall
+    /// into the scanner's decorative-zone catch-all and be dropped, so
+    /// `'now 10:00'` silently answered `10:00:00` — while `timestamp`, which
+    /// shares the concept, rejected the very same input.
+    #[test]
+    fn a_reserved_word_in_company_is_a_syntax_error() {
+        for bad in [
+            "now 10:00",
+            "10:00 now",
+            "today 10:00",
+            "allballs 10:00",
+            "10:00 epoch",
+            "10:00 infinity",
+        ] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type time: \"{bad}\"")
+            );
+        }
+        // A real zone abbreviation is still decorative, as before.
+        assert_eq!(rel("13:30:25 PST", "UTC"), "13:30:25");
     }
 }

@@ -444,6 +444,13 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
             nums.push((n, field.len()));
             continue;
         }
+        // A reserved word that got this far is one the whole-value match above
+        // and `relative_day` both declined — `epoch`, `infinity`, or a second
+        // `now`. In company it is a format error, not the zone abbreviation the
+        // catch-all below would take it for.
+        if is_reserved_word(&fl) {
+            return Err(invalid_syntax(input));
+        }
         // Anything else is a bare time-zone token (an abbreviation like `PST` or
         // an IANA name like `America/New_York`): the zone for `timestamptz`,
         // decorative for `timestamp`.
@@ -501,6 +508,30 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
         },
         zone,
     })
+}
+
+/// Whether `word` (already lowercased) is one of the reserved date/time input
+/// words, whatever type accepts it.
+///
+/// PostgreSQL's decoder gives each of these a RESERV token, and a RESERV token
+/// in company is a format error — `'now 10:00'` and `'Feb today'` are rejected
+/// even though every part is individually meaningful. Types that do not accept
+/// a given word still need to *recognize* it, or their scanner's catch-all
+/// (`time`'s "decorative zone abbreviation") swallows it and silently answers
+/// with the rest of the input.
+pub(crate) fn is_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "now"
+            | "today"
+            | "tomorrow"
+            | "yesterday"
+            | "allballs"
+            | "epoch"
+            | "infinity"
+            | "+infinity"
+            | "-infinity"
+    )
 }
 
 /// The day offset a relative date token names, or `None` if the token is not
@@ -2058,5 +2089,20 @@ mod tests {
             let e = parse(input, &FmtCtx::utc_default()).expect_err(input);
             assert_eq!(e.sqlstate, "XX000", "{input}");
         }
+    }
+
+    /// `epoch`, `infinity` and a second `now` are whole values too, so they are
+    /// errors in company rather than the decorative zone abbreviation the
+    /// scanner's catch-all would take them for.
+    #[test]
+    fn a_non_relative_reserved_word_in_company_is_a_syntax_error() {
+        for bad in ["2020-01-01 epoch", "2020-01-01 infinity", "epoch 10:00"] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+        }
+        // The relative date tokens *are* fields, and still combine.
+        assert_eq!(rel("today 10:00", "UTC"), "2024-03-15 10:00:00");
+        // ...and a real zone token is still accepted and ignored.
+        assert_eq!(rel("2020-01-01 10:00 PST", "UTC"), "2020-01-01 10:00:00");
     }
 }
