@@ -108,28 +108,26 @@ pub fn format(v: TimeTz) -> String {
 /// at the transaction timestamp, while `allballs` is `00:00:00+00` in every
 /// zone — PG's decoder gives it a literal zero offset rather than the session's.
 pub fn parse(input: &str, fmt: &FmtCtx) -> Result<TimeTz, TimeTzError> {
-    let session = &fmt.zone;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
     }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "now" => {
-            let at = fmt.xact_start().map_err(|e| TimeTzError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            })?;
-            let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeTzError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-            })?;
-            return Ok(TimeTz {
-                usec: wall.rem_euclid(USECS_PER_DAY),
-                zone: -session.offset_at(at),
-            });
-        }
-        "allballs" => return Ok(TimeTz { usec: 0, zone: 0 }),
-        _ => {}
+    // Compared without allocating: this runs for every `timetz` value parsed.
+    if trimmed.eq_ignore_ascii_case("now") {
+        let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeTzError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        })?;
+        return Ok(TimeTz {
+            usec: wall.rem_euclid(USECS_PER_DAY),
+            // The same accessor the zone-less case below uses, so the two agree
+            // on what "the session's offset today" means — including what it
+            // falls back to without a clock.
+            zone: -fmt.zone_offset_today(),
+        });
+    }
+    if trimmed.eq_ignore_ascii_case("allballs") {
+        return Ok(TimeTz { usec: 0, zone: 0 });
     }
     let mut time_str: Option<String> = None;
     let mut ampm: Option<&str> = None;
@@ -180,6 +178,11 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<TimeTz, TimeTzError> {
             }
             date = Some((y, m, d));
             continue;
+        }
+        // A reserved word is only ever a whole value; in company it is a format
+        // error, not the zone name the catch-all below would take it for.
+        if timestamp::is_reserved_word(&lower) {
+            return Err(invalid_syntax(input));
         }
         // Anything left is a zone name or abbreviation; resolved below, once
         // the time-of-day has had its chance to raise the better error.
@@ -720,5 +723,16 @@ mod zone_tests {
     #[test]
     fn a_zoneless_literal_takes_todays_offset() {
         assert_eq!(rel("03:30", "America/New_York"), "03:30:00-04");
+    }
+
+    /// See the sibling case in `time`: a reserved word in company is a format
+    /// error, not a zone name.
+    #[test]
+    fn a_reserved_word_in_company_is_a_syntax_error() {
+        for bad in ["now 10:00", "10:00 now", "10:00 today", "10:00 allballs"] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+        }
+        assert_eq!(rel("13:30:25 -04", "UTC"), "13:30:25-04");
     }
 }
