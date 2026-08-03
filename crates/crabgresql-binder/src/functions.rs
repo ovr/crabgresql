@@ -190,7 +190,9 @@ pub enum ScalarFn {
     DatePartTz,
     /// `EXTRACT(field FROM timestamptz) -> numeric`; the field is a text arg.
     ExtractTz,
-    /// `date_trunc(text, timestamptz) -> timestamptz`.
+    /// `date_trunc(text, timestamptz[, text]) -> timestamptz`. The optional
+    /// third argument names the zone to truncate in; without it the session zone
+    /// is used.
     DateTruncTz,
     /// `date_bin(interval, timestamptz, timestamptz) -> timestamptz`.
     DateBinTz,
@@ -1801,6 +1803,14 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature {
                 func: ScalarFn::DateTruncTz,
                 args: &[TEXT, TSTZ],
+                ret: TSTZ,
+            },
+            // Truncation in an explicit zone. Only `timestamptz` has this form
+            // in PG; a `timestamp` argument reaches it through the implicit
+            // `timestamp -> timestamptz` cast, and there is no `interval` one.
+            Signature {
+                func: ScalarFn::DateTruncTz,
+                args: &[TEXT, TSTZ, TEXT],
                 ret: TSTZ,
             },
         ],

@@ -220,10 +220,10 @@ pub fn format(micros: i64, session: &SessionZone) -> String {
     }
 }
 
-/// The local wall clock this instant shows in `session`, as a stored
-/// `timestamp` value. Saturating for the same reason [`format`] is.
-fn to_wall_clock(micros: i64, session: &SessionZone) -> i64 {
-    micros.saturating_add(session.offset_at(micros) as i64 * USECS_PER_SEC)
+/// The local wall clock this instant shows in `zone`, as a stored `timestamp`
+/// value. Saturating for the same reason [`format`] is.
+fn to_wall_clock(micros: i64, zone: &tz::Zone) -> i64 {
+    micros.saturating_add(tz::offset_for_instant(zone, micros) as i64 * USECS_PER_SEC)
 }
 
 // --- field functions -------------------------------------------------------
@@ -306,12 +306,16 @@ fn local_for_field(unit: &str, micros: i64, session: &SessionZone) -> i64 {
     if is_epoch_unit(unit) || !is_finite(micros) {
         micros
     } else {
-        to_wall_clock(micros, session)
+        to_wall_clock(micros, session.zone())
     }
 }
 
-/// `date_trunc(text, timestamptz) -> timestamptz`: truncate the **local** wall
-/// clock, then convert back.
+/// `date_trunc(text, timestamptz[, text]) -> timestamptz`: truncate the
+/// **local** wall clock, then convert back.
+///
+/// `zone` is the session zone for the two-argument form and the resolved third
+/// argument for the three-argument one — the arithmetic is identical either way,
+/// which is why this takes a bare [`tz::Zone`] rather than a [`SessionZone`].
 ///
 /// Which offset converts back depends on the unit, matching PG's `redotz` flag:
 ///
@@ -325,22 +329,18 @@ fn local_for_field(unit: &str, micros: i64, session: &SessionZone) -> i64 {
 ///   `date_trunc('hour', '2024-11-03 01:30:00-04')` must stay at `-04`, and
 ///   re-resolving picks the after-transition `-05`, moving the result an hour
 ///   *later* than the value it truncated.
-pub fn date_trunc(
-    unit: &str,
-    micros: i64,
-    session: &SessionZone,
-) -> Result<i64, TimestampError> {
+pub fn date_trunc(unit: &str, micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
     // The unit is validated even on the infinities, where there is no wall clock
     // to truncate — `timestamp::date_trunc` checks it before its own finiteness
     // short-circuit, and the two types must agree.
-    let offset = session.offset_at(micros);
-    let truncated = timestamp::date_trunc(unit, to_wall_clock(micros, session))
-        .map_err(relabel_units)?;
+    let offset = tz::offset_for_instant(zone, micros);
+    let truncated =
+        timestamp::date_trunc(unit, to_wall_clock(micros, zone)).map_err(relabel_units)?;
     if !is_finite(micros) {
         return Ok(micros);
     }
     let offset = if redo_zone(unit) {
-        session.offset_for_wall(tmlite(truncated))
+        tz::offset_for_local(zone, tmlite(truncated))
     } else {
         offset
     };
@@ -349,6 +349,16 @@ pub fn date_trunc(
         return Err(out_of_range_bare());
     }
     Ok(utc)
+}
+
+/// `date_trunc(text, timestamptz, text)`: the same truncation, in the zone the
+/// third argument names rather than the session's.
+///
+/// The zone is resolved *before* the unit is checked, so
+/// `date_trunc('bogus', …, 'Bad/Zone')` reports the zone, as PG does.
+pub fn date_trunc_in_zone(unit: &str, micros: i64, zone: &str) -> Result<i64, TimestampError> {
+    let zone = tz::resolve_zone_arg(zone).map_err(zone_error)?;
+    date_trunc(unit, micros, &zone)
 }
 
 /// Whether truncating to `unit` re-resolves the zone offset from the truncated
@@ -468,8 +478,12 @@ fn trim_zeros(s: &str) -> &str {
 /// `timestamptz AT TIME ZONE zone` (= `timezone(zone, timestamptz)`): the wall
 /// clock the instant shows in `zone`, as a zone-less `timestamp`. `±infinity`
 /// passes through.
+///
+/// The zone token is read by [`tz::resolve_zone_arg`], not [`tz::resolve_zone`]:
+/// a bare numeric offset in an *argument* is POSIX-signed, so `'+05:30'` here is
+/// UTC−5:30 — the reverse of the same spelling inside a value.
 pub fn at_zone_to_timestamp(zone: &str, micros: i64) -> Result<i64, TimestampError> {
-    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
+    let zone = tz::resolve_zone_arg(zone).map_err(zone_error)?;
     instant_to_wall(micros, &zone)
 }
 
@@ -504,9 +518,10 @@ fn instant_to_wall(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> 
 
 /// `timestamp AT TIME ZONE zone` (= `timezone(zone, timestamp)`): interpret the
 /// zone-less wall clock as being in `zone`, yielding the UTC `timestamptz`
-/// instant. `±infinity` passes through.
+/// instant. `±infinity` passes through. Same POSIX-signed zone grammar as
+/// [`at_zone_to_timestamp`].
 pub fn timestamp_at_zone(zone: &str, micros: i64) -> Result<i64, TimestampError> {
-    let zone = tz::resolve_zone(zone).map_err(zone_error)?;
+    let zone = tz::resolve_zone_arg(zone).map_err(zone_error)?;
     wall_to_instant(micros, &zone)
 }
 
@@ -881,11 +896,11 @@ mod tests {
         let ny = zone("America/New_York");
         let v = parse("2024-03-10 15:00:00-04", &in_zone(ny.clone()))?;
         assert_eq!(
-            format(date_trunc("day", v, &ny)?, &ny),
+            format(date_trunc("day", v, ny.zone())?, &ny),
             "2024-03-10 00:00:00-05"
         );
         assert_eq!(
-            format(date_trunc("month", v, &ny)?, &ny),
+            format(date_trunc("month", v, ny.zone())?, &ny),
             "2024-03-01 00:00:00-05"
         );
         Ok(())
@@ -901,17 +916,17 @@ mod tests {
         // 01:30-04 is the *first* pass through 01:30 on fall-back day.
         let v = parse("2024-11-03 01:30:00-04", &in_zone(ny.clone()))?;
         assert_eq!(
-            format(date_trunc("hour", v, &ny)?, &ny),
+            format(date_trunc("hour", v, ny.zone())?, &ny),
             "2024-11-03 01:00:00-04"
         );
         assert_eq!(
-            format(date_trunc("minute", v, &ny)?, &ny),
+            format(date_trunc("minute", v, ny.zone())?, &ny),
             "2024-11-03 01:30:00-04"
         );
         // `day` and coarser still re-resolve, which is what lands them on local
         // midnight.
         assert_eq!(
-            format(date_trunc("day", v, &ny)?, &ny),
+            format(date_trunc("day", v, ny.zone())?, &ny),
             "2024-11-03 00:00:00-04"
         );
         Ok(())
@@ -922,12 +937,88 @@ mod tests {
     #[test]
     fn date_trunc_validates_the_unit_on_infinity() {
         let ny = zone("America/New_York");
-        let e = date_trunc("bogus", POS_INFINITY, &ny).expect_err("unknown unit");
+        let e = date_trunc("bogus", POS_INFINITY, ny.zone()).expect_err("unknown unit");
         assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE);
         assert_eq!(
-            date_trunc("day", POS_INFINITY, &ny).expect("infinity truncates"),
+            date_trunc("day", POS_INFINITY, ny.zone()).expect("infinity truncates"),
             POS_INFINITY
         );
+    }
+
+    /// The three-argument form truncates in the zone it is given, not the
+    /// session's. Pinned against PG 18.4 with the session in `America/New_York`.
+    #[test]
+    fn date_trunc_in_zone_ignores_the_session_zone() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        let at = |s: &str| -> anyhow::Result<i64> { Ok(parse(s, &in_zone(ny.clone()))?) };
+
+        // Local midnight in UTC is 19:00 the previous day in New York.
+        assert_eq!(
+            format(
+                date_trunc_in_zone("day", at("2024-03-10 15:00:00-04")?, "UTC")?,
+                &ny
+            ),
+            "2024-03-09 19:00:00-05"
+        );
+        // A sub-day unit still keeps the input's offset in the named zone.
+        assert_eq!(
+            format(
+                date_trunc_in_zone("hour", at("2024-11-03 01:30:00-04")?, "UTC")?,
+                &ny
+            ),
+            "2024-11-03 01:00:00-04"
+        );
+        assert_eq!(
+            format(
+                date_trunc_in_zone("day", at("2024-11-03 01:30:00-04")?, "Australia/Sydney")?,
+                &ny
+            ),
+            "2024-11-02 09:00:00-04"
+        );
+        // Santiago springs forward *at* midnight on 2026-09-06, so the truncated
+        // wall clock does not exist; PG's gap rule keeps the pre-transition
+        // offset.
+        assert_eq!(
+            format(
+                date_trunc_in_zone("day", at("2026-09-06 12:00:00+00")?, "America/Santiago")?,
+                &ny
+            ),
+            "2026-09-06 00:00:00-04"
+        );
+        // An abbreviation the `TimeZone` GUC would refuse is legal here.
+        assert_eq!(
+            format(
+                date_trunc_in_zone("week", at("2004-02-29 15:44:17.71393+00")?, "VET")?,
+                &ny
+            ),
+            "2004-02-22 23:00:00-05"
+        );
+        Ok(())
+    }
+
+    /// The zone is resolved before the unit is looked at, and `±infinity` still
+    /// passes through with the unit validated.
+    #[test]
+    fn date_trunc_in_zone_reports_the_zone_first() -> anyhow::Result<()> {
+        let ny = zone("America/New_York");
+        let v = parse("2024-03-10 15:00:00-04", &in_zone(ny.clone()))?;
+
+        let e = date_trunc_in_zone("bogus", v, "Nowhere/Nozone").expect_err("unknown zone");
+        assert_eq!(e.sqlstate, INVALID_PARAMETER_VALUE);
+        assert_eq!(e.message, "time zone \"Nowhere/Nozone\" not recognized");
+        // With a good zone the unit error surfaces instead.
+        let e = date_trunc_in_zone("bogus", v, "UTC").expect_err("unknown unit");
+        assert_eq!(
+            e.message,
+            "timestamp with time zone units \"bogus\" not recognized"
+        );
+
+        assert_eq!(
+            date_trunc_in_zone("day", POS_INFINITY, "GMT")?,
+            POS_INFINITY
+        );
+        assert!(date_trunc_in_zone("bogus", POS_INFINITY, "GMT").is_err());
+        Ok(())
     }
 
     #[test]

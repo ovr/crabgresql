@@ -212,3 +212,55 @@ SELECT pg_typeof(date_bin('1 h', '2020-01-05 05:30', '2001-01-01')) AS unknown_a
        pg_typeof(date_bin(interval '1 h', timestamp '2020-01-05 05:30', timestamp '2001-01-01'))
          AS ts_args;
 SELECT 'still alive' AS status;
+
+
+--
+-- date_trunc(text, timestamptz, text): truncation in an explicit zone, which
+-- overrides the session's. Only timestamptz has this form.
+--
+SET TimeZone = 'America/New_York';
+-- local midnight in UTC is the previous evening here
+SELECT date_trunc('day', timestamptz '2024-03-10 15:00:00-04', 'UTC') AS day_in_utc;
+SELECT date_trunc('day', timestamptz '2001-02-16 20:38:40+00', 'Australia/Sydney') AS sydney;
+-- a fixed-offset abbreviation, and a variable-offset one (VET ran at -04:30
+-- from 2007 to 2016 and at -04 either side of it)
+SELECT date_trunc('day', timestamptz '2001-02-16 20:38:40+00', 'GMT') AS gmt,
+       date_trunc('day', timestamptz '2001-02-16 20:38:40+00', 'VET') AS vet_2001,
+       date_trunc('day', timestamptz '2010-06-16 20:38:40+00', 'VET') AS vet_2010;
+-- the sub-day units keep the input's offset in the named zone too; `day` and
+-- coarser re-resolve it, which is what lands them on real local midnight
+SELECT date_trunc('hour', timestamptz '2024-11-03 01:30:00-04', 'UTC') AS fold_hour_in_utc,
+       date_trunc('day', timestamptz '2024-11-03 01:30:00-04', 'Australia/Sydney') AS fold_day_in_sydney;
+-- Santiago springs forward *at* midnight on 2026-09-06, so the truncated wall
+-- clock does not exist; the pre-transition offset wins
+SELECT date_trunc('day', timestamptz '2026-09-06 12:00:00+00', 'America/Santiago') AS gap_midnight;
+-- the infinities pass through, and NULL anywhere gives NULL
+SELECT date_trunc('week', timestamptz 'infinity', 'GMT') AS inf_zone_trunc;
+SELECT date_trunc('day', NULL::timestamptz, 'UTC') IS NULL AS null_value,
+       date_trunc('day', timestamptz '2001-02-16 20:38:40+00', NULL) IS NULL AS null_zone;
+-- the zone is resolved before the unit is looked at
+SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'Nowhere/Nozone');
+SELECT date_trunc('bogus', timestamptz '2001-02-16 20:38:40+00', 'UTC');
+-- a timestamp argument reaches this overload through the implicit cast. (There
+-- is no interval form; the `42883` it raises is omitted here because our
+-- "function does not exist" error still lacks PG's LINE/caret and HINT.)
+SELECT date_trunc('day', timestamp '2001-02-16 20:38:40', 'UTC') AS ts_arg;
+SET TimeZone = 'UTC';
+SELECT 'still alive' AS status;
+
+
+--
+-- AT TIME ZONE reads a bare numeric offset the POSIX way (hours *west*), which
+-- is the reverse of the same spelling inside a value. The colon-less ±HHMM form
+-- is value-only, and the accepted magnitude runs far wider than the ±15:59:59 a
+-- value allows.
+--
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+05:30' AS posix_west,
+       timestamptz '2001-06-16 12:00:00+05:30' AS iso_east_in_value;
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '05:30' AS unsigned_is_west,
+       timestamp '2001-06-16 12:00:00' AT TIME ZONE '-05:30' AS minus_is_east;
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+16' AS wide_band,
+       timestamp '2001-06-16 12:00:00' AT TIME ZONE 'UTC+10' AS abbrev_prefix;
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+0530';
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+168';
+SELECT 'still alive' AS status;
