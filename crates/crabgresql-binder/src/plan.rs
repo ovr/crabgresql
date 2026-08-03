@@ -6119,10 +6119,9 @@ fn resolve_copy_freeze(
             freeze = *on;
         }
     }
-    for opt in legacy_options {
-        if let ast::CopyLegacyOption::Freeze(on) = opt {
-            freeze = *on;
-        }
+    // The legacy spelling carries no argument, so its presence means "on".
+    if legacy_options.contains(&ast::CopyLegacyOption::Freeze) {
+        freeze = true;
     }
     freeze
 }
@@ -6250,7 +6249,7 @@ fn resolve_copy_format(
             // Freeze is not a decoding rule; `resolve_copy_freeze` reads it.
             ast::CopyLegacyOption::Binary
             | ast::CopyLegacyOption::Csv(_)
-            | ast::CopyLegacyOption::Freeze(_) => {}
+            | ast::CopyLegacyOption::Freeze => {}
             other => {
                 return Err(BindError::feature_not_supported(format!(
                     "COPY option {other} is not supported yet"

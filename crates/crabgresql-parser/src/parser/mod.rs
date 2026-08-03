@@ -11140,7 +11140,10 @@ impl<'a> Parser<'a> {
                 let spec = self.parse_literal_string()?;
                 CopyLegacyOption::FixedWidth(spec)
             }
-            Some(Keyword::FREEZE) => CopyLegacyOption::Freeze(self.parse_copy_boolean()),
+            // No boolean argument: PostgreSQL's pre-9.0 `copy_opt_item` takes the
+            // bare keyword, and `COPY t FROM stdin CSV FREEZE FALSE` is a syntax
+            // error there. Booleans belong to the modern `WITH (…)` list.
+            Some(Keyword::FREEZE) => CopyLegacyOption::Freeze,
             Some(Keyword::GZIP) => CopyLegacyOption::Gzip,
             Some(Keyword::HEADER) => CopyLegacyOption::Header,
             Some(Keyword::IAM_ROLE) => CopyLegacyOption::IamRole(self.parse_iam_role_kind()?),
@@ -17834,16 +17837,24 @@ mod tests {
         }
 
         // The pre-9.0 bare-keyword spelling, which is what the upstream
-        // `copy2` regression script uses.
+        // `copy2` regression script uses. It takes no argument, so a boolean
+        // after it is a syntax error, exactly as in PostgreSQL.
         let (options, legacy) = copy_options("COPY t FROM stdin CSV FREEZE");
         assert!(options.is_empty());
         assert_eq!(
             legacy,
-            vec![
-                CopyLegacyOption::Csv(vec![]),
-                CopyLegacyOption::Freeze(true)
-            ]
+            vec![CopyLegacyOption::Csv(vec![]), CopyLegacyOption::Freeze]
         );
+        for sql in [
+            "COPY t FROM stdin CSV FREEZE FALSE",
+            "COPY t FROM stdin CSV FREEZE OFF",
+            "COPY t FROM stdin CSV FREEZE TRUE",
+        ] {
+            assert!(
+                Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
+                "{sql} should not parse"
+            );
+        }
     }
 
     #[test]
