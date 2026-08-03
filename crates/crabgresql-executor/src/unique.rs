@@ -44,8 +44,7 @@ use crate::agg;
 /// wrong answer.
 pub(crate) struct UniqueKeySet<'a> {
     /// One entry per unique index, in the order the caller's `indexes` slice
-    /// lists them, so the index reported for a collision is the one the linear
-    /// predecessor would have reported.
+    /// listed them.
     indexes: Vec<KeySet<'a>>,
     /// The rows recorded with a tid. This is what the row-vector predecessor
     /// answered with `position()` — whether the simulation still holds a given
@@ -56,8 +55,6 @@ pub(crate) struct UniqueKeySet<'a> {
 
 /// One unique index's keys.
 struct KeySet<'a> {
-    /// Position of this index in the caller's `indexes` slice.
-    slot: usize,
     name: String,
     /// Key columns as schema ordinals, and their types, resolved once here
     /// rather than per comparison.
@@ -97,6 +94,15 @@ struct Entry {
     /// later retract. A row inserted by the statement has none.
     tid: Option<Tid>,
     key: Vec<Value>,
+}
+
+/// What naming a unique violation takes: the constraint and its key columns, as
+/// schema ordinals. Owned, and built only when a violation is being raised —
+/// the alternative was handing back a position into a slice the caller had to
+/// still be holding, which nothing enforced.
+pub(crate) struct Conflict {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<usize>,
 }
 
 impl<'a> UniqueKeySet<'a> {
@@ -241,9 +247,10 @@ impl<'a> UniqueKeySet<'a> {
         self.tids.remove(&tid)
     }
 
-    /// The position in the caller's `indexes` slice of the first unique index
-    /// `tuple` collides on, or `None` when it collides on none.
-    pub(crate) fn conflict(&mut self, tuple: &Tuple) -> Result<Option<usize>, StorageError> {
+    /// The first unique index `tuple` collides on, or `None` when it collides on
+    /// none. Indexes are considered in the order the caller's `indexes` slice
+    /// listed them, which is the one the linear predecessor reported in.
+    pub(crate) fn conflict(&mut self, tuple: &Tuple) -> Result<Option<Conflict>, StorageError> {
         for i in 0..self.indexes.len() {
             let Some(key) = self.indexes[i].key_of(tuple) else {
                 continue;
@@ -251,7 +258,10 @@ impl<'a> UniqueKeySet<'a> {
             // A `Scan` index answers from its buckets alone: `probed` is a no-op
             // for it, so the two questions compose without a source test here.
             if self.indexes[i].holds(&key) || self.probed(i, &key)? {
-                return Ok(Some(self.indexes[i].slot));
+                return Ok(Some(Conflict {
+                    name: self.indexes[i].name.clone(),
+                    columns: self.indexes[i].columns.clone(),
+                }));
             }
         }
         Ok(None)
@@ -303,10 +313,8 @@ fn key_sets<'a>(
 ) -> Vec<KeySet<'a>> {
     indexes
         .iter()
-        .enumerate()
-        .filter(|(_, index)| index.unique)
-        .map(|(slot, index)| KeySet {
-            slot,
+        .filter(|index| index.unique)
+        .map(|index| KeySet {
             name: index.name.clone(),
             columns: index.keys.iter().map(|key| key.column).collect(),
             types: index
