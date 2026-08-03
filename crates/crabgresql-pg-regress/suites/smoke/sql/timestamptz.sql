@@ -268,4 +268,10 @@ SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE '+168';
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' +05:30' AS padded_offset;
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'UTC ';
 SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE ' America/New_York';
+-- a token that is neither a name nor a plain displacement is a POSIX TZ spec,
+-- so one carrying its own transition rule observes DST, and the quoted form
+-- resolves -- the latter is how `SET TIME ZONE 7` names itself
+SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2' AS spec_june,
+       timestamp '2001-01-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2' AS spec_jan,
+       timestamp '2001-06-16 12:00:00' AT TIME ZONE '<+07>-07' AS quoted_spec;
 SELECT 'still alive' AS status;

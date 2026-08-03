@@ -328,6 +328,14 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 /// zones, the [`ABBREVS`] table, `Z`/`zulu` and `UTC`/`GMT` mean the same in
 /// both readers.
 ///
+/// What PG is really doing with a token that is none of the above is handing it
+/// to a POSIX TZ reader, so a full specification works — `EST5EDT,M3.2.0/2,`
+/// `M11.1.0/2` observes DST, and the quoted `<+07>-07` resolves. `jiff` owns
+/// that grammar for us. It draws one line PG does not: a spec that names a DST
+/// abbreviation *without* a transition rule (`FOO5BAR`, `'5.'`, `'+05:30 '`) is
+/// refused here, where PG applies default US rules. See
+/// [`parse_posix_offset`] for the fraction family and the divergence test.
+///
 /// The token is **not trimmed**, unlike [`resolve_zone`]'s: PG matches a zone
 /// argument as given, so `'UTC '` and `' UTC'` are both `22023`. Only the
 /// numeric form tolerates leading whitespace (`' +05:30'` is UTC−5:30), which
@@ -367,13 +375,29 @@ pub fn resolve_zone_arg(name: &str) -> Result<Zone, ZoneError> {
     }
 
     // A POSIX displacement, with or without the ignored alphabetic prefix:
-    // `+05:30`, `05:30`, `UTC+10` and `XYZ5` all land here.
-    let split = token
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .ok_or_else(not_recognized)?;
-    parse_posix_offset(&token[split..])
-        .map(Zone::Fixed)
-        .ok_or_else(not_recognized)
+    // `+05:30`, `05:30`, `UTC+10` and `XYZ5` all land here. Taken before the
+    // full POSIX spec below so these stay [`Zone::Fixed`], which is exact across
+    // the entire timestamp range instead of `jiff`'s narrower one.
+    if let Some(split) = token.find(|c: char| !c.is_ascii_alphabetic())
+        && let Some(secs) = parse_posix_offset(&token[split..])
+    {
+        return Ok(Zone::Fixed(secs));
+    }
+
+    // A full POSIX TZ specification, which is what PG hands the token to once
+    // the simpler forms miss. `jiff` owns this grammar, so a spec carrying its
+    // own transition rule works: `EST5EDT,M3.2.0/2,M11.1.0/2` observes DST, and
+    // the quoted form `<+07>-07` resolves — the latter matters because it is
+    // exactly what [`SessionZone::from_offset_east`] names a `SET TIME ZONE 7`
+    // session, so `AT TIME ZONE current_setting('TimeZone')` round-trips.
+    //
+    // `jiff` refuses a spec that names a DST abbreviation without a rule
+    // (`FOO5BAR`, and everything the fraction case turns into); PG applies
+    // default US rules there, which we do not implement — see
+    // [`parse_posix_offset`].
+    TimeZone::posix(token)
+        .map(Zone::Named)
+        .map_err(|_| not_recognized())
 }
 
 /// PG's `<abbrev><POSIX offset>` zone form. Returns seconds **east** of UTC.
@@ -920,6 +944,35 @@ mod tests {
         assert!(resolve_zone("UTC+5.5").is_err());
     }
 
+    /// A token that is neither a name nor a plain displacement is a POSIX TZ
+    /// specification. Pinned against PG 18.4 at a June instant, session in UTC.
+    #[test]
+    fn a_full_posix_spec_resolves_with_its_own_rules() -> anyhow::Result<()> {
+        // 2001-06-16 12:00:00 UTC, in our epoch.
+        let june = (992_692_800i64 - 946_684_800) * 1_000_000;
+
+        // A spec carrying its own transition rule observes DST: EST5EDT is -05
+        // in winter and -04 in June.
+        let est = resolve_zone_arg("EST5EDT,M3.2.0/2,M11.1.0/2")?;
+        assert_eq!(offset_for_instant(&est, june), -4 * 3600);
+        assert_eq!(offset_for_instant(&est, 0), -5 * 3600);
+
+        // The quoted form, which is exactly how `SET TIME ZONE 7` names itself —
+        // so a zone we print round-trips back through this reader.
+        let seven = SessionZone::from_offset_east(7 * 3600)?;
+        assert_eq!(seven.name(), "<+07>-07");
+        assert_eq!(offset_for_instant(&resolve_zone_arg(seven.name())?, june), 7 * 3600);
+
+        // The simple prefixed forms stay `Fixed`, so they keep working outside
+        // the range `jiff` covers.
+        assert_eq!(fixed(&resolve_zone_arg("XYZ5")?), -5 * 3600);
+        assert_eq!(fixed(&resolve_zone_arg("UTC+10")?), -10 * 3600);
+
+        // A DST abbreviation with no rule is where we stop and PG does not.
+        assert!(resolve_zone_arg("FOO5BAR").is_err());
+        Ok(())
+    }
+
     /// Everything that is *not* a bare displacement means the same as it does
     /// inside a value — including the abbreviations the `TimeZone` GUC refuses.
     #[test]
@@ -1055,3 +1108,4 @@ mod tests {
         Ok(())
     }
 }
+
