@@ -2885,38 +2885,51 @@ fn resolve_create_namespace(
     }
 }
 
-/// The deparsed form of a date/time column's literal default, or `None` when
-/// the default is not a bare literal or the column is some other type.
+/// The deparsed form of a column default the binder left for execution, or
+/// `None` when it is not one.
 ///
-/// These are the literals the binder cannot fold, for the two reasons it holds
-/// no session: a `timestamptz`/`timetz` text needs the display zone, and a
-/// relative one (`'now'`, `'today'`, `'tomorrow'`, `'yesterday'`) needs the
-/// transaction clock. Resolving them here — where the session *is* in hand —
-/// matches PostgreSQL, which evaluates the constant when the DDL runs and
-/// stores the resulting value, not the text. That is what makes `DEFAULT 'now'`
-/// the moment of `CREATE TABLE` rather than a fresh reading per insert, the
-/// distinction PG's manual draws against `DEFAULT now()`.
+/// A literal the binder cannot fold comes back as exactly one shape: a
+/// `Coerce` over a text `Const`. It is deferred for one of two reasons, both of
+/// them "the binder holds no session" — a `timestamptz`/`timetz` text needs the
+/// display zone, and a relative one (`'now'`, `'today'`, `'tomorrow'`,
+/// `'yesterday'`) needs the transaction clock. Here the session *is* in hand,
+/// so the constant resolves, which is what PostgreSQL does: it evaluates a
+/// literal default when the DDL runs and stores the resulting value, not the
+/// text. That is the distinction PG's manual draws between `DEFAULT 'now'` and
+/// `DEFAULT now()`.
+///
+/// Recognising the *bound* shape rather than the written syntax is what makes
+/// `DEFAULT 'now'` and `DEFAULT 'now'::timestamp` — the spelling the manual
+/// actually uses — behave alike, and it covers an array element (`timestamptz[]
+/// DEFAULT '{now}'`) without naming a single type. Matching the AST instead
+/// froze only the unqualified spelling and left the rest re-reading the clock
+/// on every insert.
 ///
 /// What a reader then sees is the stored value put back into *their* zone,
 /// which `pg_get_expr` does on the way out.
-fn zoned_literal_default(expr: &ast::Expr, column: &Column, session: &Session) -> Option<String> {
-    if !matches!(
-        column.ty,
-        PgType::TimestampTz | PgType::TimeTz | PgType::Timestamp | PgType::Date | PgType::Time
-    ) {
-        return None;
-    }
-    let ast::Expr::Value(v) = expr else {
+fn session_literal_default(
+    bound: &crabgresql_binder::BoundExpr,
+    column: &Column,
+    session: &Session,
+) -> Option<String> {
+    let crabgresql_binder::BoundExpr::Coerce { expr, ty } = bound else {
         return None;
     };
-    let text = v.value.as_pg_string()?;
+    let crabgresql_binder::BoundExpr::Const {
+        value: Value::Text(text),
+        ..
+    } = expr.as_ref()
+    else {
+        return None;
+    };
     let fmt = session.fmt_ctx();
-    let value =
-        crabgresql_types::cast::cast_value(Value::Text(text.to_string()), column.ty, &fmt).ok()?;
-    let label = column.ty.format_type(Some(-1))?;
+    let value = crabgresql_types::cast::cast_value(Value::Text(text.clone()), *ty, &fmt).ok()?;
+    // Labelled by the same helper the folded path uses, so the two renderings
+    // cannot drift; the *value* is what differs, since this one needs a session.
     Some(format!(
-        "'{}'::{label}",
-        value.encode_text_with(&fmt)?.replace('\'', "''")
+        "'{}'::{}",
+        value.encode_text_with(&fmt)?.replace('\'', "''"),
+        crabgresql_binder::const_type_label(column.ty)
     ))
 }
 
@@ -3175,7 +3188,8 @@ fn execute_create_table(
                             "multiple default values specified for column \"{column_name}\" of table \"{name}\""
                         )));
                     }
-                    crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
+                    let bound =
+                        crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
                     // The default is stored already deparsed, so `pg_get_expr`
                     // (which echoes this text) prints what PostgreSQL's `\d`
                     // does. A literal takes its type from the column, so the
@@ -3191,7 +3205,7 @@ fn execute_create_table(
                         crabgresql_binder::ColumnDefault::Deparsed(text) => Some(text),
                         crabgresql_binder::ColumnDefault::Omit => None,
                         crabgresql_binder::ColumnDefault::Source => Some(
-                            zoned_literal_default(expr, &column, session)
+                            session_literal_default(&bound, &column, session)
                                 .or_else(|| {
                                     crabgresql_binder::ruleutils::column_default(
                                         &source,

@@ -8733,10 +8733,23 @@ fn deparse_const(value: &Value, ty: PgType) -> Option<String> {
     if bare {
         return Some(text);
     }
-    let label = ty
-        .format_type(Some(-1))
-        .unwrap_or_else(|| ty.name().to_string());
-    Some(format!("'{}'::{label}", text.replace('\'', "''")))
+    Some(format!(
+        "'{}'::{}",
+        text.replace('\'', "''"),
+        const_type_label(ty)
+    ))
+}
+
+/// The `::type` suffix a deparsed constant carries.
+///
+/// `format_type` declines an array or a user type, which have no modifier to
+/// render; the bare type name is the right answer for both. Shared with the DDL
+/// path's `session_literal_default`, which resolves the value itself but must
+/// label it identically — the two used to disagree, and an array default came
+/// out as `::text`.
+pub fn const_type_label(ty: PgType) -> String {
+    ty.format_type(Some(-1))
+        .unwrap_or_else(|| ty.name().to_string())
 }
 
 /// Bind the body of a `CREATE FUNCTION ... LANGUAGE SQL` to a typed expression,
