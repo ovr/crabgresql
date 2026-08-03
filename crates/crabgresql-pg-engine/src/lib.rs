@@ -1787,12 +1787,21 @@ impl TableEngine for PgEngine {
         // reader will act on, so it deserves its own change rather than riding
         // along with this one.
         let ManagedTable::Heap(heap) = target.as_ref() else {
-            return Err(StorageError::TableNotFound(table.to_string()));
+            let method = target.schema().access_method.as_str();
+            return Err(StorageError::UnsupportedOperation(format!(
+                "table access method \"{method}\" does not support a NOT NULL column constraint"
+            )));
         };
         let _guard = heap.begin_index_ddl();
+        // Propagated, not `expect`ed: this call reports a missing relation or an
+        // out-of-range column position as well as an IO failure, and none of the
+        // three should take the process — and every other session on it — down.
+        // Returning also means the in-memory publish below is reached only once
+        // the catalog has accepted the positions, so its unchecked indexing is
+        // guarded by the bounds check that just ran.
         self.catalog
             .set_column_not_null(namespace, table, columns)
-            .expect("relation catalog write failed");
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         heap.set_columns_not_null(columns);
         Ok(())
     }

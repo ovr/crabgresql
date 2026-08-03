@@ -1903,15 +1903,16 @@ fn insert_routed(
     // first time a row routes to a leaf that has a unique index (leaves without
     // one, the common case, never get scanned). `None` = not yet scanned.
     let mut visible: Vec<Option<Vec<Tuple>>> = vec![None; leaves.len()];
-    // Each leaf's shape, fetched once on first use rather than per routed row.
-    let shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = leaves
-        .iter()
-        .map(|leaf| (leaf.schema(), leaf.indexes()))
-        .collect();
+    // Each leaf's shape, fetched on first use like `visible` above — a wide
+    // partitioned table has many more leaves than a statement touches, and
+    // materializing all of them would make a single-row INSERT cost
+    // O(partitions) reads of a lock-guarded schema and index list.
+    let mut shapes: Vec<Option<(Arc<TableSchema>, Vec<IndexMetadata>)>> = vec![None; leaves.len()];
     let mut routes: Vec<usize> = Vec::with_capacity(tuples.len());
     for tuple in &tuples {
         let leaf = route_tuple(&parent_schema, leaves, tuple, ctx)?;
-        let (leaf_schema, leaf_indexes) = &shapes[leaf];
+        let (leaf_schema, leaf_indexes) =
+            &*shapes[leaf].get_or_insert_with(|| (leaves[leaf].schema(), leaves[leaf].indexes()));
         let has_unique = leaf_indexes.iter().any(|index| index.unique);
         if has_unique && visible[leaf].is_none() {
             visible[leaf] = Some(
@@ -2056,7 +2057,9 @@ fn update_inherited(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<_, _>>()?;
-    // Each target's shape, fetched once rather than per row it matches.
+    // Each target's shape, once per target rather than per matched row. Eager
+    // like the `has_unique` vector it feeds: an inheritance UPDATE scans every
+    // target anyway, so there is no leaf here that the statement does not touch.
     let shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = targets
         .iter()
         .map(|target| (target.table.schema(), target.table.indexes()))
@@ -2263,7 +2266,9 @@ fn update_routed(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let parent_schema = parent.schema();
-    // Each leaf's shape, fetched once rather than per row routed to it.
+    // Each leaf's shape, once per leaf rather than per routed row. Eager like
+    // the `leaf_has_unique` vector it feeds: a routed UPDATE scans every leaf to
+    // find its matches, so every leaf is touched regardless.
     let leaf_shapes: Vec<(Arc<TableSchema>, Vec<IndexMetadata>)> = leaves
         .iter()
         .map(|leaf| (leaf.schema(), leaf.indexes()))
@@ -5830,7 +5835,10 @@ mod tests {
     /// The single generate_series column, rendered as PG-formatted text.
     fn series_text(rows: &[Tuple]) -> Vec<String> {
         rows.iter()
-            .map(|r| r[0].encode_text_with(&FmtCtx::utc_default()).unwrap_or_default())
+            .map(|r| {
+                r[0].encode_text_with(&FmtCtx::utc_default())
+                    .unwrap_or_default()
+            })
             .collect()
     }
 

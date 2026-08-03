@@ -2285,10 +2285,28 @@ struct PendingConstraint {
 ///
 /// Runs in passes — classify, resolve, plan, validate, apply — because PostgreSQL
 /// applies a multi-action `ALTER TABLE` atomically. Our DDL is not transactional
-/// (see the module's other `execute_*` handlers), so the only way to make
-/// `ADD ..., ADD ...` observably all-or-nothing is to raise every user-visible
-/// error before the first write. What survives that is IO failure, which the
-/// apply pass compensates for as far as it can.
+/// (see the module's other `execute_*` handlers), so the nearest we get is to
+/// raise every user-visible error before the first write and compensate for what
+/// lands after it.
+///
+/// Two gaps that shape are **not** enough to close, both shared with
+/// `CREATE INDEX` and neither introduced here:
+///
+/// * **`ROLLBACK` does not undo it.** The constraint is applied to the durable
+///   catalog immediately. Worse, pass 4 validates under the session's own
+///   snapshot, so `BEGIN; DELETE FROM t; ALTER TABLE t ADD PRIMARY KEY (a);
+///   ROLLBACK;` validates against rows the rollback then brings back — leaving a
+///   NULL, or a duplicate, under a key that forbids it.
+/// * **No lock spans validation and application.** The exclusive hold lives
+///   inside each engine call, so another session can commit a violating row in
+///   between and neither session is told. PostgreSQL holds ACCESS EXCLUSIVE for
+///   the whole statement.
+///
+/// Closing either needs machinery this tree does not have: a server-visible
+/// table-lock API (`TableLock` is private to the access method, and neither
+/// `TableAm` nor `TableEngine` exposes locking), and a transactional-DDL hook
+/// general enough to stage a schema change — `TxnFinalize` today serves one
+/// bespoke TRUNCATE registry.
 fn execute_alter_table(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &TransactionManager,
@@ -2391,24 +2409,40 @@ fn execute_alter_table(
     };
     reject_partitioned_parent(&table, &table_name)?;
 
+    let schema = table.schema();
+    let wants_primary_key = requested
+        .iter()
+        .any(|(_, _, kind, _)| *kind == IndexConstraint::PrimaryKey);
+
+    // Only the heap can record a column as NOT NULL, so a PRIMARY KEY on any
+    // other method is refused here rather than discovered from the engine in the
+    // apply pass — which would report it after an earlier action had landed.
+    // Named from the relation's own method, as the TRUNCATE guard above is, so
+    // the message stays true when a third method appears. UNIQUE is unaffected:
+    // it changes no column, and `CREATE UNIQUE INDEX` already works there.
+    if wants_primary_key && schema.access_method != TableAccessMethod::Heap {
+        let method = schema.access_method.as_str();
+        return Err(PgError::feature_not_supported(format!(
+            "PRIMARY KEY on a table using access method \"{method}\" is not supported yet"
+        )));
+    }
+
     // A PRIMARY KEY marks its key columns NOT NULL, and PostgreSQL pushes that
     // down the inheritance tree — flipping every descendant's matching column
     // and scanning its rows for NULLs. We have no fan-out for that, so a parent
     // is refused rather than given a key its children do not honor. A child with
     // no children of its own is fine: there is nothing below it to reach.
     //
+    // Asked through the shared helper because descent must be namespace-exact
+    // and transitive: matching a bare relation name would let an unrelated
+    // `public.par` with children veto a key on a temp or schema-qualified `par`
+    // that has none.
+    //
     // This is also what keeps `alter.only` a no-op. `ONLY` means "do not recurse",
     // which can only differ from the default where recursion would happen at all
     // — and the sole recursing action is the one refused right here. UNIQUE never
     // recurses in PostgreSQL either, so `ONLY` cannot change its meaning.
-    let wants_primary_key = requested
-        .iter()
-        .any(|(_, _, kind, _)| *kind == IndexConstraint::PrimaryKey);
-    if wants_primary_key
-        && engine
-            .inheritance_links()
-            .iter()
-            .any(|(_, parent)| parent.1 == table_name)
+    if wants_primary_key && !crabgresql_binder::inheritance_descendants(engine, &schema)?.is_empty()
     {
         return Err(PgError::feature_not_supported(format!(
             "ADD PRIMARY KEY on \"{table_name}\", which has inheritance children, is not supported yet"
@@ -2418,7 +2452,6 @@ fn execute_alter_table(
     // Pass 3: turn each action into the index it creates, raising every name,
     // column and cardinality error. `claimed` holds the names this statement has
     // taken but not yet created — invisible to the engine until the apply pass.
-    let schema = table.schema();
     let mut claimed: HashSet<String> = HashSet::new();
     let mut pending: Vec<PendingConstraint> = Vec::new();
     let existing_primary_key = table
@@ -2508,11 +2541,16 @@ fn execute_alter_table(
             engine.create_index("public", &table_name, p.index.clone())
         })();
         if let Err(e) = applied {
-            // Only IO failure reaches here — pass 3 and 4 raised everything a
-            // statement can be wrong about. Undo what did land so the statement
-            // stays all-or-nothing; the NOT NULL flips are deliberately left in
-            // place, being the conservative direction (they reject strictly more
-            // rows, and re-running the statement re-converges).
+            // Passes 1-4 raise everything a statement can be wrong about, so what
+            // reaches here is an engine or IO failure. Undo the indexes that did
+            // land; the NOT NULL flips are deliberately left in place, being the
+            // conservative direction (they reject strictly more rows, and
+            // re-running the statement re-converges).
+            //
+            // The drop goes through the same handle the create did, so it lands
+            // on the same relation — an overlay routing `public` to this
+            // session's temp schema must undo the index it put there, not look
+            // for it under `public`.
             for name in created.iter().rev() {
                 let _ = engine.drop_index("public", &table_name, name);
             }
@@ -2538,8 +2576,7 @@ fn validate_primary_key_not_null(
     let schema = table.schema();
     let mut columns: Vec<usize> = index.keys.iter().map(|key| key.column).collect();
     columns.sort_unstable();
-    let projection =
-        crabgresql_storage_api::ColumnProjection::of(columns.iter().copied(), &schema);
+    let projection = crabgresql_storage_api::ColumnProjection::of(columns.iter().copied(), &schema);
     for row in table.scan(txn, &projection) {
         let (_, tuple) = row?;
         for &c in &columns {

@@ -1167,14 +1167,19 @@ pub trait TableEngine: Send + Sync {
     ///
     /// The default rejects, deliberately: an engine that cannot record this must
     /// fail the statement loudly rather than let a PRIMARY KEY land on columns
-    /// that still accept NULL.
+    /// that still accept NULL. It reports the refusal as *unsupported* rather
+    /// than as a missing relation — the relation is right there, this engine
+    /// just cannot alter it, and a fabricated `TableNotFound` would surface as
+    /// `relation does not exist` for something the caller just opened.
     fn set_column_not_null(
         &self,
         _namespace: &str,
-        table: &str,
+        _table: &str,
         _columns: &[usize],
     ) -> Result<(), StorageError> {
-        Err(StorageError::TableNotFound(table.to_string()))
+        Err(StorageError::UnsupportedOperation(
+            "this engine does not support a NOT NULL column constraint".to_string(),
+        ))
     }
 
     /// Remove the index named `index_name` from `table` in `namespace`. The

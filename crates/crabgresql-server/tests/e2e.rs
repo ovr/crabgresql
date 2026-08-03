@@ -6162,6 +6162,101 @@ async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
             (Some("c"), Some("t"))
         ]
     );
+
+    // Descent is transitive: a grandchild keeps the grandparent refused, even
+    // though no link names the two directly.
+    client
+        .batch_execute("CREATE TABLE g1 (a int); CREATE TABLE g2 () INHERITS (g1)")
+        .await?;
+    client
+        .batch_execute("CREATE TABLE g3 () INHERITS (g2)")
+        .await?;
+    let e = client
+        .batch_execute("ALTER TABLE g1 ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // …and it is namespace-exact. A temp table shadowing a parent has no
+    // children of its own, so the refusal must not follow the *name*: matching
+    // bare names would let `public.par` veto a key on `pg_temp_N.par`.
+    // PostgreSQL 18.4 accepts this and creates `pg_temp_N.par_pkey`.
+    client
+        .batch_execute("CREATE TEMP TABLE par (a int, b int)")
+        .await?;
+    client
+        .batch_execute("ALTER TABLE par ADD PRIMARY KEY (a)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'par_pkey'",
+        )
+        .await?;
+    let schemas: Vec<_> = rows(&msgs).iter().map(|r| r.get(0)).collect();
+    assert_eq!(schemas.len(), 1);
+    assert!(
+        schemas[0].unwrap_or_default().starts_with("pg_temp_"),
+        "the key must land on the temp table, got {schemas:?}"
+    );
+    Ok(())
+}
+
+/// Only the heap can record a column as NOT NULL, so ADD PRIMARY KEY on another
+/// access method is refused — as *unsupported*, and before anything is written.
+///
+/// Both halves are the regression. The refusal used to come from the engine in
+/// the apply pass as a `TableNotFound`, so the client was told `relation "p"
+/// does not exist` about a relation it had just queried; and because the engine
+/// call is skipped when there is nothing to flip, the same statement succeeded
+/// on the same table whenever the key column was already NOT NULL.
+#[tokio::test]
+async fn alter_table_add_primary_key_rejects_non_heap() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE p (a int, b int) USING parquet ORDER BY (b); \
+             INSERT INTO p VALUES (1, 2)",
+        )
+        .await?;
+
+    let e = client
+        .batch_execute("ALTER TABLE p ADD PRIMARY KEY (a)")
+        .await
+        .unwrap_err();
+    let e = e.as_db_error().context("missing error details")?;
+    assert_eq!(e.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        e.message(),
+        "PRIMARY KEY on a table using access method \"parquet\" is not supported yet"
+    );
+
+    // Already NOT NULL: nothing to flip, so the old gate let this through.
+    client
+        .batch_execute("CREATE TABLE q (a int NOT NULL, b int) USING parquet ORDER BY (b)")
+        .await?;
+    assert_eq!(
+        client
+            .batch_execute("ALTER TABLE q ADD PRIMARY KEY (a)")
+            .await
+            .unwrap_err()
+            .as_db_error()
+            .context("missing error details")?
+            .code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // UNIQUE changes no column, so it stays available — as `CREATE UNIQUE INDEX`
+    // already is on these methods.
+    client.batch_execute("ALTER TABLE p ADD UNIQUE (a)").await?;
+    let msgs = client
+        .simple_query("SELECT conname FROM pg_constraint WHERE conrelid = 'p'::regclass")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("p_a_key"));
     Ok(())
 }
 

@@ -326,6 +326,32 @@ impl TableEngine for SessionCatalog {
         }
     }
 
+    /// The inverse of `create_index`, routed identically, for a caller that
+    /// names the *table* an index belongs to — the compensating drop when a
+    /// multi-action `ALTER TABLE` fails partway.
+    ///
+    /// Without this arm the trait default runs and returns `TableNotFound`
+    /// unconditionally, so such a rollback silently drops nothing.
+    ///
+    /// `DROP INDEX` deliberately does not come through here: there the user
+    /// names the *index* and the owning table has to be found first, so it
+    /// resolves against the concrete store to avoid a temp table's name
+    /// shadowing the permanent relation that actually owns the index.
+    fn drop_index(
+        &self,
+        namespace: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<(), StorageError> {
+        if namespace == "public" && self.temp_has(table) {
+            self.global.drop_index(&self.temp_schema, table, index_name)
+        } else if self.is_foreign_temp(namespace) {
+            Err(StorageError::IndexTableNotFound(table.to_string()))
+        } else {
+            self.global.drop_index(namespace, table, index_name)
+        }
+    }
+
     fn index_name_exists(&self, namespace: &str, table: &str, index_name: &str) -> bool {
         if namespace == "public" && self.temp_has(table) {
             self.global
@@ -582,6 +608,117 @@ mod tests {
         fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
             Err(StorageError::TableNotFound(name.to_string()))
         }
+    }
+
+    /// Records the namespace each index DDL call was routed to.
+    #[derive(Default)]
+    struct RoutingEngine {
+        relations: Vec<(&'static str, &'static str)>,
+        dropped: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl TableEngine for RoutingEngine {
+        fn create_table(&self, _schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+            unreachable!("routing test never creates")
+        }
+
+        fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+            self.resolve(Some("public"), name)
+        }
+
+        fn resolve(
+            &self,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> Result<Arc<dyn TableAm>, StorageError> {
+            let namespace = namespace.unwrap_or("public");
+            match self
+                .relations
+                .iter()
+                .find(|(ns, n)| *ns == namespace && *n == name)
+            {
+                Some((ns, n)) => Ok(crabgresql_catalog::StaticTable::arc(
+                    table(ns, n).schema,
+                    Vec::new(),
+                )),
+                None => Err(StorageError::TableNotFound(name.to_string())),
+            }
+        }
+
+        fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
+            Err(StorageError::TableNotFound(name.to_string()))
+        }
+
+        fn drop_index(
+            &self,
+            namespace: &str,
+            table: &str,
+            _index_name: &str,
+        ) -> Result<(), StorageError> {
+            self.dropped
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .push((namespace.to_string(), table.to_string()));
+            Ok(())
+        }
+    }
+
+    /// `drop_index` must route exactly as `create_index` does: they are the make
+    /// and unmake of one index, so a statement that creates through the overlay
+    /// and compensates through it must reach the same relation.
+    ///
+    /// The regression this pins is silent, not loud. `SessionCatalog` did not
+    /// override `drop_index`, so the trait default ran and returned
+    /// `TableNotFound` unconditionally — and the one caller discards the error,
+    /// which made every compensating drop a no-op that still looked like a
+    /// rollback. Asserting the *namespace reached* is the only thing that
+    /// catches it, since a returned `Ok` alone would not.
+    #[test]
+    fn drop_index_routes_like_create_index() -> anyhow::Result<()> {
+        let temp_schema = "pg_temp_1";
+        // `shadowed` exists in both namespaces; `only_public` in neither temp.
+        let engine = Arc::new(RoutingEngine {
+            relations: vec![
+                ("public", "shadowed"),
+                ("pg_temp_1", "shadowed"),
+                ("public", "only_public"),
+            ],
+            dropped: std::sync::Mutex::new(Vec::new()),
+        });
+        let system = Arc::new(
+            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn("db", "owner", Vec::new),
+        );
+        let catalog = SessionCatalog::new(
+            Arc::clone(&engine) as Arc<dyn TableEngine>,
+            system as Arc<dyn TableEngine>,
+            temp_schema,
+        );
+
+        // A temp table shadows the permanent one: the drop follows the create.
+        catalog.drop_index("public", "shadowed", "shadowed_a_key")?;
+        // Nothing shadows this one, so it stays in public.
+        catalog.drop_index("public", "only_public", "only_public_a_key")?;
+        // Another session's temp table is unreachable, and must not fall through
+        // to a same-named permanent relation.
+        assert!(
+            catalog
+                .drop_index("pg_temp_9", "shadowed", "shadowed_a_key")
+                .is_err()
+        );
+
+        let dropped = engine
+            .dropped
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .clone();
+        assert_eq!(
+            dropped,
+            vec![
+                ("pg_temp_1".to_string(), "shadowed".to_string()),
+                ("public".to_string(), "only_public".to_string()),
+            ]
+        );
+        Ok(())
     }
 
     /// An engine that answers `inheritance_links` but refuses `relations`.
