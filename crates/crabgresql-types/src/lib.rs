@@ -243,6 +243,11 @@ pub fn pseudo_type_name(oid: u32) -> Option<&'static str> {
 /// The OID a pseudo-type name denotes, for `regtype` input. The name is the
 /// catalog `typname`, already unquoted and case-folded by the caller.
 ///
+/// Both the `typname` and the *rendered* spelling resolve, so every name
+/// [`pseudo_type_name`] can print is one this accepts — `2287::regtype` prints
+/// `record[]`, and `'record[]'::regtype` and `'_record'::regtype` both come back
+/// to 2287, as in PG.
+///
 /// Divergence: PG rejects a bare `'any'::regtype` with a *syntax* error, because
 /// `any` is a reserved word in its type-name grammar, and resolves only the
 /// quoted `'"any"'::regtype`. Both spellings resolve here — reproducing the
@@ -251,7 +256,9 @@ pub fn pseudo_type_name(oid: u32) -> Option<&'static str> {
 pub fn pseudo_type_oid(name: &str) -> Option<u32> {
     PSEUDO_TYPES
         .iter()
-        .find(|(_, typname, _)| *typname == name)
+        .find(|(_, typname, rendered)| {
+            *typname == name || *rendered == name || rendered.trim_matches('"') == name
+        })
         .map(|(oid, _, _)| *oid)
 }
 

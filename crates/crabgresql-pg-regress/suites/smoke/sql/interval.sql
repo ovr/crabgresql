@@ -157,3 +157,8 @@ SELECT interval '1' year to month AS lone_ytm, interval '5' day to hour AS lone_
 SELECT interval '1 m' AS bare_m, interval '1 m' month AS masked_m;
 -- an infinite interval masks to itself
 SELECT interval 'infinity' month AS inf;
+-- the SQL `D HH:MM:SS` form: a unit-less number before a time is days, whatever
+-- default unit a field qualifier would otherwise supply
+SELECT interval '3 4:05:06' AS unqualified, interval '3 4:05:06' day AS q_day,
+       interval '3 4:05:06' hour AS q_hour, interval '3 4:05:06' month AS q_month;
+SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;

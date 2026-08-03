@@ -84,9 +84,8 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
     Some(out)
 }
 
-/// See [`Cx::calls`]. The outer `None` means "do not resolve at all"; a `None` at
-/// one position means that argument takes no cast (see [`call_arg_types`]).
-type CallTypes<'a> = dyn Fn(&ast::Function) -> Option<Vec<Option<PgType>>> + 'a;
+/// See [`Cx::calls`].
+type CallTypes<'a> = dyn Fn(&ast::Function) -> Option<Vec<PgType>> + 'a;
 
 /// Rendering options that thread through the whole walk.
 #[derive(Clone, Copy)]
@@ -186,28 +185,13 @@ fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Optio
 /// the call does not bind at all (a `CREATE FUNCTION` routine, say, which is not
 /// in the built-in table). A default cannot reference columns, so binding it in
 /// an empty scope is enough.
-///
-/// A `None` at one position means that argument must be rendered *without* a
-/// cast. Only `pg_typeof` needs it: it coerces nothing, so its argument keeps the
-/// type it was written with — and for a bare literal that type is `unknown`, which
-/// has no spelling a re-bind would resolve back to. PG prints
-/// `pg_typeof('abc')`, and labelling the literal `text` here would silently change
-/// what a re-bound default reports.
-fn call_arg_types(
-    f: &ast::Function,
-    catalog: &Arc<dyn TypeCatalog>,
-) -> Option<Vec<Option<PgType>>> {
+fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<Vec<PgType>> {
     let params = crate::param_ctx_none();
     let scope = crate::Scope::empty(catalog, &params);
     let bound = crate::bind_expr(&ast::Expr::Function(f.clone()), &scope).ok()?;
     match bound {
-        crate::Binding::Typed(crate::BoundExpr::FuncCall {
-            func: crate::ScalarFn::PgTypeof(_),
-            args,
-            ..
-        }) => Some(args.iter().map(|_| None).collect()),
         crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
-            Some(args.iter().map(|a| Some(a.ty())).collect())
+            Some(args.iter().map(|a| a.ty()).collect())
         }
         _ => None,
     }
@@ -449,9 +433,14 @@ fn function(f: &ast::Function, cx: Cx) -> String {
     // the literal's own syntax — that is the whole difference between
     // `nextval('s'::regclass)` and `nextval('s'::text)`.
     let arg_types = cx.calls.and_then(|resolve| resolve(f));
-    // `Some(Some(ty))` resolved to a type, `Some(None)` resolved to no cast, and
-    // `None` means the position was not resolved at all.
     let arg_type = |i: usize| arg_types.as_ref().and_then(|types| types.get(i).copied());
+    // `pg_typeof` coerces nothing: its argument keeps the type it was written
+    // with, and that type *is* the result. So a literal argument takes no cast —
+    // labelling a bare one `text` would change what the re-parsed expression
+    // reports, and `unknown` has no spelling to label it with. PG prints
+    // `pg_typeof('abc')`. Keyed on the name because this has to hold on the
+    // type-blind path too (`pg_get_expr`, `pg_get_viewdef`), which has no binder.
+    let bare_args = is_named(f, "pg_typeof");
     let args = match &f.args {
         ast::FunctionArguments::List(list) => list
             .args
@@ -460,8 +449,8 @@ fn function(f: &ast::Function, cx: Cx) -> String {
             .map(|(i, a): (usize, &ast::FunctionArg)| match a {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
                     match (arg_type(i), literal_of(e)) {
-                        (Some(Some(ty)), Some(v)) => typed_value(v, ty),
-                        (Some(None), Some(v)) => value_body(v),
+                        (_, Some(v)) if bare_args => value_body(v),
+                        (Some(ty), Some(v)) => typed_value(v, ty),
                         _ => top_expr(e, cx),
                     }
                 }
@@ -568,6 +557,16 @@ fn type_name(ty: &ast::DataType) -> String {
 /// The varlena header the character and numeric modifiers reserve, mirroring the
 /// catalog's `atttypmod_of` encoding.
 const VARHDRSZ: i32 = 4;
+
+/// Whether a call names `want`, ignoring any `pg_catalog.` qualifier — the
+/// deparser's own check, so it works without a binder.
+fn is_named(f: &ast::Function, want: &str) -> bool {
+    f.name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .is_some_and(|id| id.quote_style.is_none() && id.value.eq_ignore_ascii_case(want))
+}
 
 fn object_name(name: &ast::ObjectName) -> String {
     name.0

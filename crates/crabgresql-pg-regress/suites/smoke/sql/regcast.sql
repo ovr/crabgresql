@@ -107,3 +107,7 @@ DROP SEQUENCE rc_s;
 DROP TABLE rc_t;
 DROP TABLE rcs.rc_u;
 DROP SCHEMA rcs;
+-- the array pseudo-type resolves under both spellings, so what regtype prints is
+-- always something regtype can read back
+SELECT '_record'::regtype AS typname_spelling, 'record[]'::regtype AS rendered_spelling;
+SELECT 2287::regtype::text::regtype AS roundtrip;
