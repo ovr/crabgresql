@@ -3176,22 +3176,88 @@ fn bind_bit_literal(
 /// Integer literals become int4 when they fit, int8 otherwise. Literals with a
 /// decimal point or exponent bind as `numeric`, as PG does — a numeric constant
 /// keeps its exact value and display scale.
+///
+/// A whole-number literal goes through the same acceptor as the `int4 '…'` input
+/// function, so the hex/octal/binary spellings (`0x1F`, `0o17`, `0b11`) and the
+/// `_` digit separators mean the same thing written bare as they do quoted.
 fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
-    if let Ok(v) = n.parse::<i32>() {
-        return Ok(BoundExpr::Const {
-            value: Value::Int4(v),
-            ty: PgType::Int4,
-        });
+    use crabgresql_types::intlit::{ScanError, scan_int_literal, scan_int_literal_decimal};
+    // A leading `-` never reaches here (the parser builds unary minus), but the
+    // acceptor reports the sign anyway, so honour it rather than assume.
+    let signed = |negative: bool, m: u128| -> Option<i128> {
+        i128::try_from(m)
+            .ok()
+            .map(|m| if negative { -m } else { m })
+    };
+    match scan_int_literal(n) {
+        Ok((negative, magnitude)) => {
+            if let Some(v) = signed(negative, magnitude).and_then(|v| i32::try_from(v).ok()) {
+                return Ok(BoundExpr::Const {
+                    value: Value::Int4(v),
+                    ty: PgType::Int4,
+                });
+            }
+            if let Some(v) = signed(negative, magnitude).and_then(|v| i64::try_from(v).ok()) {
+                return Ok(BoundExpr::Const {
+                    value: Value::Int8(v),
+                    ty: PgType::Int8,
+                });
+            }
+            // Past int8, PG keeps the value as `numeric` — `0x8000000000000000`
+            // is 9223372036854775808, not an overflow. Render the magnitude in
+            // decimal so a non-decimal spelling reaches `Numeric::parse` in a
+            // form it reads.
+            let decimal = format!("{}{magnitude}", if negative { "-" } else { "" });
+            numeric_const(&decimal, n)
+        }
+        // Well-formed but past `u128`. PostgreSQL keeps widening into `numeric`
+        // with no ceiling, so re-fold the same digit run without one; only the
+        // non-decimal spellings actually need the conversion, but going through
+        // one function keeps the two paths from disagreeing.
+        Err(ScanError::Range) => match scan_int_literal_decimal(n) {
+            Ok((negative, digits)) => {
+                let decimal = format!("{}{digits}", if negative { "-" } else { "" });
+                numeric_const(&decimal, n)
+            }
+            // Unreachable in practice — the two folds share one grammar, so a
+            // literal that got as far as `Range` cannot be malformed here. Fall
+            // back to the ordinary error rather than assert.
+            Err(_) => numeric_const(n, n),
+        },
+        // Not a whole number: a decimal point or exponent, where the separators
+        // (if any) still have to come out before `Numeric::parse` sees the text.
+        Err(ScanError::Syntax) => {
+            let stripped;
+            let text = if n.contains('_') {
+                stripped = n.replace('_', "");
+                stripped.as_str()
+            } else {
+                n
+            };
+            numeric_const(text, n)
+        }
     }
-    if let Ok(v) = n.parse::<i64>() {
-        return Ok(BoundExpr::Const {
-            value: Value::Int8(v),
-            ty: PgType::Int8,
-        });
-    }
-    // A whole-number literal too large for int8, or one with a decimal point or
-    // exponent, is `numeric` (PG's `numeric` type for any unsuffixed decimal).
-    match Numeric::parse(n) {
+}
+
+/// The value of a whole-number literal token, or `None` when the text is not one
+/// (a fraction, an exponent, or a magnitude past `i128`).
+///
+/// The parser keeps a numeric literal as written, so every site that re-reads
+/// that text has to decode it — and they must all agree, or `0x2` means one
+/// thing in an expression and another as an `ORDER BY` ordinal. This is the one
+/// decoder for those sites; the expression path uses [`parse_number`], which is
+/// built on the same acceptor.
+pub fn literal_int(n: &str) -> Option<i128> {
+    let (negative, magnitude) = crabgresql_types::intlit::scan_int_literal(n).ok()?;
+    let v = i128::try_from(magnitude).ok()?;
+    Some(if negative { -v } else { v })
+}
+
+/// Bind a `numeric` constant from `text`, reporting an unreadable one against
+/// `original` — the literal as it was written, which may differ once digit
+/// separators have been stripped or a non-decimal spelling converted.
+fn numeric_const(text: &str, original: &str) -> Result<BoundExpr, BindError> {
+    match Numeric::parse(text) {
         Ok(value) => Ok(BoundExpr::Const {
             value: Value::Numeric(value),
             ty: PgType::Numeric,
@@ -3201,7 +3267,7 @@ fn parse_number(n: &str) -> Result<BoundExpr, BindError> {
             "value overflows numeric format",
         )),
         Err(ParseError::Syntax) => Err(BindError::feature_not_supported(format!(
-            "numeric literal \"{n}\" is not supported yet"
+            "numeric literal \"{original}\" is not supported yet"
         ))),
     }
 }
@@ -3605,8 +3671,9 @@ pub(crate) fn numeric_typmod(dt: &ast::DataType) -> Option<(i32, i32)> {
             if builtin_custom_type(obj) != Some(PgType::Numeric) {
                 return None;
             }
-            let precision = mods.first()?.parse().ok()?;
-            let scale = mods.get(1).map_or(Some(0), |s| s.parse().ok())?;
+            let modifier = |s: &String| literal_int(s).and_then(|v| i32::try_from(v).ok());
+            let precision = modifier(mods.first()?)?;
+            let scale = mods.get(1).map_or(Some(0), modifier)?;
             return Some((precision, scale));
         }
         _ => return None,
@@ -3721,7 +3788,7 @@ pub fn length_typmod(dt: &ast::DataType) -> Option<i32> {
         // `char`, which the grammar defaults to `char(1)`), so no `unwrap_or`.
         DataType::Custom(obj, mods) => match builtin_custom_type(obj) {
             Some(PgType::Bpchar | PgType::Varchar | PgType::Bit | PgType::Varbit) => {
-                mods.first()?.parse().ok()
+                literal_int(mods.first()?).and_then(|v| i32::try_from(v).ok())
             }
             _ => None,
         },
@@ -3762,7 +3829,10 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
         // is raw token text; the bound and the `typname` in the error follow
         // the type the name resolves to.
         DataType::Custom(obj, mods) => {
-            let declared = mods.first().and_then(|m| m.parse::<u64>().ok());
+            let declared = mods
+                .first()
+                .and_then(|m| literal_int(m))
+                .and_then(|v| u64::try_from(v).ok());
             match builtin_custom_type(obj) {
                 Some(PgType::Bpchar) => (declared, "char", MAX_CHAR_LENGTH),
                 Some(PgType::Varchar) => (declared, "varchar", MAX_CHAR_LENGTH),
@@ -4519,6 +4589,15 @@ fn bind_unary(
                     args: vec![e],
                 }))
             }
+            // `~intN` — one's complement, same width back.
+            Binding::Typed(e) if matches!(e.ty(), PgType::Int2 | PgType::Int4 | PgType::Int8) => {
+                let ret = e.ty();
+                Ok(Binding::Typed(BoundExpr::FuncCall {
+                    func: ScalarFn::IntNot,
+                    ret,
+                    args: vec![e],
+                }))
+            }
             // `~macaddr` / `~macaddr8` — one's complement, same type back.
             Binding::Typed(e) if matches!(e.ty(), PgType::Macaddr | PgType::Macaddr8) => {
                 let ret = e.ty();
@@ -5113,6 +5192,14 @@ fn bind_binary_inner(
 
     // Array containment / overlap (`@>` `<@` `&&`) on array operands.
     if let Some(binding) = resolve_array_op(op, &lb, &rb, scope.catalog().as_ref())? {
+        return Ok(binding);
+    }
+
+    // Integer bitwise (`& | #`) and shift (`<< >>`) operators. Deliberately the
+    // last resolver: every spelling it claims is shared with the network, bit
+    // and geometric families above, and this one only fires on an integer left
+    // operand, so putting it here means it can never shadow them.
+    if let Some(binding) = resolve_int_bitwise_op(op, &lb, &rb)? {
         return Ok(binding);
     }
 
@@ -6810,6 +6897,129 @@ fn resolve_bit_op(
         })));
     }
     Ok(None)
+}
+
+/// `int2`/`int4`/`int8`, or `None` for anything else.
+fn int_width(ty: Option<PgType>) -> Option<PgType> {
+    ty.filter(|t| matches!(t, PgType::Int2 | PgType::Int4 | PgType::Int8))
+}
+
+/// The integer bitwise (`& | #`) and shift (`<< >>`) operators. Like the bit,
+/// inet and geometric families these don't fit the single-`arg_ty` `Binary`
+/// node — a shift's operands have *different* types — so they lower to
+/// `ScalarFn` calls.
+///
+/// This resolver runs last in the chain, after every type-specific one, so it
+/// can never shadow `inet << inet` (containment), `bit << int4`, or the
+/// geometric "strictly left of". A typed non-integer operand is left to the
+/// generic path; an `unknown` literal is resolved against the other side, the
+/// way PG resolves an untyped constant against whichever candidate the typed
+/// side selects.
+///
+/// The two families differ in how much an unknown operand can be pinned by, and
+/// every rule below was probed against PostgreSQL 18.4:
+///
+/// * bitwise `& | #` take two operands of one type in every candidate, so an
+///   unknown on either side simply borrows the other's width — `'5' & 1::int8`
+///   is 1, not ambiguous. Two typed sides meet at the wider one, since PG's
+///   resolution widens implicitly (`int2 & int4` binds the int4 form).
+/// * the shifts take an int4 count at *every* width, so a typed count pins
+///   nothing about the left operand. `'1' << 2` is 4 because int4 is the exact
+///   count type, but `'1' << 2::int2` is 42725 `operator is not unique` — all
+///   three candidates accept a widened int2 — and `'1' << 2::int8` is 42883,
+///   because int8 → int4 is an assignment cast and matches no candidate at all.
+///   That last rule bites a typed left operand too: `1 << 2::int8` is 42883.
+///
+/// Two unknowns are 42725 either way (`'a' << 'b'`), which PG decides from the
+/// signatures alone and never from what the literals contain.
+fn resolve_int_bitwise_op(
+    op: &ast::BinaryOperator,
+    lb: &Binding,
+    rb: &Binding,
+) -> Result<Option<Binding>, BindError> {
+    use ast::BinaryOperator as B;
+    let (lt, rt) = (binding_typed_ty(lb), binding_typed_ty(rb));
+    // Through `undefined_operator_error` rather than a bare `BindError`, so the
+    // 42883 carries PG's HINT and `bind_binary` can hang the caret under the
+    // operator, as every other "operator does not exist" here does.
+    let no_op = || {
+        undefined_operator_error(format!(
+            "operator does not exist: {} {op} {}",
+            binding_type_label(lb),
+            binding_type_label(rb)
+        ))
+    };
+    let ambiguous = || {
+        ambiguous_operator(
+            &binding_type_label(lb),
+            &op.to_string(),
+            &binding_type_label(rb),
+        )
+    };
+
+    let shift = match op {
+        B::PGBitwiseShiftLeft => Some(ScalarFn::IntShl),
+        B::PGBitwiseShiftRight => Some(ScalarFn::IntShr),
+        _ => None,
+    };
+    if let Some(func) = shift {
+        // The width of the value being shifted, which is also the result type —
+        // PG applies no overflow check here, so there is no widening.
+        let width = match (int_width(lt), lt) {
+            (Some(w), _) => w,
+            (None, Some(_)) => return Ok(None),
+            (None, None) => match rt {
+                None => return Err(ambiguous()),
+                Some(PgType::Int4) => PgType::Int4,
+                Some(PgType::Int2) => return Err(ambiguous()),
+                Some(_) => return Err(no_op()),
+            },
+        };
+        // The count is int4, which int2 reaches implicitly and nothing else does.
+        if !matches!(rt, None | Some(PgType::Int2 | PgType::Int4)) {
+            return Err(no_op());
+        }
+        let amount = resolve_operand(rb, PgType::Int4)?;
+        let left = resolve_operand(lb, width)?;
+        return Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+            func,
+            ret: width,
+            args: vec![left, amount],
+        })));
+    }
+
+    let bitwise = match op {
+        B::BitwiseAnd => Some(ScalarFn::IntAnd),
+        B::BitwiseOr => Some(ScalarFn::IntOr),
+        B::PGBitwiseXor => Some(ScalarFn::IntXor),
+        _ => None,
+    };
+    let Some(func) = bitwise else {
+        return Ok(None);
+    };
+    let common = match (lt, rt) {
+        (Some(_), Some(_)) => match (int_width(lt), int_width(rt)) {
+            (Some(l), Some(r)) => common_numeric(l, r).unwrap_or(l),
+            // An integer beside a typed non-integer has no operator at all; a
+            // non-integer on the left is somebody else's business.
+            (Some(_), None) => return Err(no_op()),
+            _ => return Ok(None),
+        },
+        (Some(_), None) => match int_width(lt) {
+            Some(l) => l,
+            None => return Ok(None),
+        },
+        (None, Some(_)) => match int_width(rt) {
+            Some(r) => r,
+            None => return Ok(None),
+        },
+        (None, None) => return Err(ambiguous()),
+    };
+    Ok(Some(Binding::Typed(BoundExpr::FuncCall {
+        func,
+        ret: common,
+        args: vec![resolve_operand(lb, common)?, resolve_operand(rb, common)?],
+    })))
 }
 
 /// The `(array type, element type)` of a binding that is a typed array, or

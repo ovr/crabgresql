@@ -363,7 +363,12 @@ fn set_extra_float_digits(session: &mut Session, value: GucValue) -> Result<(), 
         GucValue::Default => 1,
         GucValue::OffsetSecondsEast(_) => return Err(requires_integer()),
         GucValue::Str(s) => {
-            let v: i32 = s.trim().parse().map_err(|_| requires_integer())?;
+            // `SET extra_float_digits = 0x2` is as valid as `= 2` in PG: the
+            // value arrives as the literal's written text, so decode it with
+            // the acceptor rather than assuming decimal.
+            let v: i32 = crabgresql_binder::literal_int(&s)
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(requires_integer)?;
             if !(-15..=3).contains(&v) {
                 return Err(PgError::new(
                     sqlstate::INVALID_PARAMETER_VALUE,

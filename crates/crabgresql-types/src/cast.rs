@@ -956,25 +956,44 @@ fn numeric_parse_error(e: ParseError, s: &str) -> CastError {
     }
 }
 
-/// `int2in`/`int4in`/`int8in`: trim, base-10, optional sign. A well-formed
-/// number that does not fit is `22003` (printing the literal); anything else is
-/// `22P02`. The error's type name comes from `ty`, so int2/int4/int8 print
-/// smallint/integer/bigint. Shared with the binder's `parse_unknown`, which
-/// resolves unknown literals through the same acceptor (adding the cursor
-/// position on the `CastError` it returns).
+/// `int2in`/`int4in`/`int8in`: trim, optional sign, then a decimal, hex (`0x`),
+/// octal (`0o`) or binary (`0b`) digit run that may carry `_` separators — the
+/// grammar lives in [`crate::intlit`]. A well-formed number that does not fit is
+/// `22003` (printing the literal); anything else is `22P02`. The error's type
+/// name comes from `ty`, so int2/int4/int8 print smallint/integer/bigint, and
+/// the quoted spelling is the caller's `s`, prefix and sign included. Shared
+/// with the binder's `parse_unknown`, which resolves unknown literals through
+/// the same acceptor (adding the cursor position on the `CastError` it returns).
 pub fn text_to_int(s: &str, ty: PgType) -> Result<Value, CastError> {
-    use std::num::IntErrorKind;
-    let map = |e: std::num::ParseIntError| match e.kind() {
-        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => value_out_of_range(ty, s),
-        _ => invalid_input(ty, s),
-    };
-    let t = s.trim();
-    match ty {
-        PgType::Int2 => t.parse::<i16>().map(Value::Int2).map_err(map),
-        PgType::Int4 => t.parse::<i32>().map(Value::Int4).map_err(map),
-        PgType::Int8 => t.parse::<i64>().map(Value::Int8).map_err(map),
+    let (negative, magnitude) = crate::intlit::scan_int_literal(s).map_err(|e| match e {
+        crate::intlit::ScanError::Range => value_out_of_range(ty, s),
+        crate::intlit::ScanError::Syntax => invalid_input(ty, s),
+    })?;
+    // Range-check against the magnitude rather than a signed value, so the most
+    // negative number of each width converts: `-0x8000` is 32768 negated, which
+    // no `i16` could hold on the way in.
+    let limit: u128 = match (ty, negative) {
+        (PgType::Int2, false) => i16::MAX as u128,
+        (PgType::Int2, true) => i16::MAX as u128 + 1,
+        (PgType::Int4, false) => i32::MAX as u128,
+        (PgType::Int4, true) => i32::MAX as u128 + 1,
+        (PgType::Int8, false) => i64::MAX as u128,
+        (PgType::Int8, true) => i64::MAX as u128 + 1,
         _ => unreachable!("text_to_int called with {ty:?}"),
+    };
+    if magnitude > limit {
+        return Err(value_out_of_range(ty, s));
     }
+    let signed = if negative {
+        (magnitude as i128).wrapping_neg()
+    } else {
+        magnitude as i128
+    };
+    Ok(match ty {
+        PgType::Int2 => Value::Int2(signed as i16),
+        PgType::Int4 => Value::Int4(signed as i32),
+        _ => Value::Int8(signed as i64),
+    })
 }
 
 /// `oidin`: parse an object identifier from text.
@@ -1224,6 +1243,72 @@ mod tests {
             e.message,
             "value \"99999\" is out of range for type smallint"
         );
+
+        Ok(())
+    }
+
+    /// The non-decimal and `_`-separated spellings, at each type's boundary.
+    /// The negative limit is one past the positive one, so `-0x8000` converts
+    /// while `-0x8001` does not.
+    #[test]
+    fn text_to_int_non_decimal_and_underscores() -> anyhow::Result<()> {
+        assert_eq!(
+            cast(Value::Text("0b100101".into()), PgType::Int2)?,
+            Value::Int2(37)
+        );
+        assert_eq!(
+            cast(Value::Text("0o273".into()), PgType::Int2)?,
+            Value::Int2(187)
+        );
+        assert_eq!(
+            cast(Value::Text("0x42F".into()), PgType::Int2)?,
+            Value::Int2(1071)
+        );
+        assert_eq!(
+            cast(Value::Text("0b_10_0101".into()), PgType::Int2)?,
+            Value::Int2(37)
+        );
+        assert_eq!(
+            cast(Value::Text("1_000".into()), PgType::Int2)?,
+            Value::Int2(1000)
+        );
+        assert_eq!(
+            cast(Value::Text("0x7FFF".into()), PgType::Int2)?,
+            Value::Int2(32767)
+        );
+        assert_eq!(
+            cast(Value::Text("-0x8000".into()), PgType::Int2)?,
+            Value::Int2(-32768)
+        );
+        assert_eq!(
+            cast(Value::Text("-0x80000000".into()), PgType::Int4)?,
+            Value::Int4(i32::MIN)
+        );
+        assert_eq!(
+            cast(Value::Text("-0x8000000000000000".into()), PgType::Int8)?,
+            Value::Int8(i64::MIN)
+        );
+
+        let e = cast(Value::Text("0x8000".into()), PgType::Int2).unwrap_err();
+        assert_eq!(e.sqlstate, "22003");
+        assert_eq!(
+            e.message,
+            "value \"0x8000\" is out of range for type smallint"
+        );
+        let e = cast(Value::Text("-0x8001".into()), PgType::Int2).unwrap_err();
+        assert_eq!(
+            e.message,
+            "value \"-0x8001\" is out of range for type smallint"
+        );
+        // An empty digit run, and the three rejected underscore placements.
+        for bad in ["0b", "0o", "0x", "_100", "100_", "10__000"] {
+            let e = cast(Value::Text(bad.into()), PgType::Int2).unwrap_err();
+            assert_eq!(e.sqlstate, "22P02", "for {bad:?}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type smallint: \"{bad}\"")
+            );
+        }
 
         Ok(())
     }

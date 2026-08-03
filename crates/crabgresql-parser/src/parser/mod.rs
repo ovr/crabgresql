@@ -7450,7 +7450,9 @@ impl<'a> Parser<'a> {
         let Value::Number(digits, _) = &mut value.value else {
             return self.expected_ref("literal number", self.peek_token_ref());
         };
-        if digits.parse::<i32>().is_err() {
+        // `SignedIconst` is an int, and the literal keeps its written spelling,
+        // so `FETCH 0x2` has to decode the same way an expression would.
+        if !crate::numlit::literal_int(digits).is_some_and(|v| i32::try_from(v).is_ok()) {
             let literal = digits.clone();
             return Err(ParserError::PgDiagnostic(PgDiagnostic {
                 sqlstate: crate::tokenizer::DEFAULT_TOKENIZER_SQLSTATE,
@@ -11537,11 +11539,24 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse an unsigned literal integer/long
+    /// Parse an unsigned literal integer/long.
+    ///
+    /// The widest funnel for an integer constant that has to be read while
+    /// parsing — type modifiers (`varchar(0x5)`), precisions (`timestamp(0x2)`),
+    /// `MODULUS`/`REMAINDER`, `IGNOREHEADER`. It decodes through
+    /// [`crate::numlit`] rather than `str::parse` so those spell an integer the
+    /// same way an expression does.
     pub fn parse_literal_uint(&mut self) -> Result<u64, ParserError> {
         let next_token = self.next_token();
         match next_token.token {
-            Token::Number(s, _) => Self::parse::<u64>(s, next_token.span.start),
+            Token::Number(s, _) => crate::numlit::literal_int(&s)
+                .and_then(|v| u64::try_from(v).ok())
+                .ok_or_else(|| {
+                    ParserError::ParserError(format!(
+                        "Could not parse '{s}' as u64{}",
+                        next_token.span.start
+                    ))
+                }),
             _ => self.expected("literal int", next_token),
         }
     }
@@ -12773,7 +12788,13 @@ impl<'a> Parser<'a> {
                 let s = s.clone();
                 let span_start = current_token.span.start;
                 self.advance_token();
-                let value = Self::parse::<i64>(s, span_start)?;
+                let value = crate::numlit::literal_int(&s)
+                    .and_then(|v| i64::try_from(v).ok())
+                    .ok_or_else(|| {
+                        ParserError::ParserError(format!(
+                            "Could not parse '{s}' as i64{span_start}"
+                        ))
+                    })?;
                 Ok(if is_negative { -value } else { value })
             }
             _ => self.expected_ref("number", current_token),

@@ -464,6 +464,22 @@ pub enum ScalarFn {
     CashLarger,
     /// `cashsmaller(money, money) -> money`.
     CashSmaller,
+    // --- integer bitwise / shift (int2 / int4 / int8) ---
+    // Each takes and returns the *left* operand's integer type, so one variant
+    // covers all three widths; the executor dispatches on the `Value`.
+    /// `intN << int4` — the count is int4 for every width, and PG applies no
+    /// overflow check: `(-1)::int2 << 15` is -32768.
+    IntShl,
+    /// `intN >> int4` — arithmetic (sign-propagating) shift right.
+    IntShr,
+    /// `intN & intN` (bitwise AND), both operands the same width.
+    IntAnd,
+    /// `intN | intN` (bitwise OR), both operands the same width.
+    IntOr,
+    /// `intN # intN` (bitwise XOR), both operands the same width.
+    IntXor,
+    /// `~intN` (one's complement).
+    IntNot,
     // --- bit / varbit ---
     /// `~bit` (bitwise NOT).
     BitNot,
@@ -3582,9 +3598,9 @@ fn keyword_precision(args: &ast::FunctionArguments) -> Result<Option<i32>, BindE
     let ast::Value::Number(digits, _) = &v.value else {
         return Err(BindError::syntax("syntax error at or near \"(\""));
     };
-    let p: i64 = digits
-        .parse()
-        .map_err(|_| BindError::syntax("syntax error at or near \"(\""))?;
+    let p: i64 = crate::expr::literal_int(digits)
+        .and_then(|v| i64::try_from(v).ok())
+        .ok_or_else(|| BindError::syntax("syntax error at or near \"(\""))?;
     Ok(Some(
         (p.min(i32::MAX as i64) as i32).min(crabgresql_types::timestamp::MAX_PRECISION),
     ))

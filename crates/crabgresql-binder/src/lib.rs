@@ -20,8 +20,8 @@ pub use expr::{
     bind_expr, bind_scalar, bind_sql_function_body, bool_test_clause, builtin_type_from_syntax,
     checked_length_typmod, checked_numeric_typmod, coerce_to_column, const_type_label,
     datetime_precision, declared_typmod, deparse_literal_default, inline_params, interval_typmod,
-    length_typmod, map_data_type, param_ctx_capped, param_ctx_extended, param_ctx_none,
-    param_types, require_all_resolved, resolve_data_type,
+    length_typmod, literal_int, map_data_type, param_ctx_capped, param_ctx_extended,
+    param_ctx_none, param_types, require_all_resolved, resolve_data_type,
 };
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,

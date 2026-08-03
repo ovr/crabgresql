@@ -18,6 +18,7 @@ pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
 pub mod interval;
+pub mod intlit;
 pub mod json;
 pub mod jsonpath;
 pub mod macaddr;
@@ -1552,6 +1553,17 @@ impl std::fmt::Display for numeric::ParseError {
 }
 
 impl std::error::Error for numeric::ParseError {}
+
+impl std::fmt::Display for intlit::ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            intlit::ScanError::Syntax => "invalid integer syntax",
+            intlit::ScanError::Range => "integer value out of range",
+        })
+    }
+}
+
+impl std::error::Error for intlit::ScanError {}
 
 impl std::fmt::Display for tz::ZoneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1388,6 +1388,10 @@ impl<'a> Tokenizer<'a> {
                 }
                 // numbers and period
                 '0'..='9' | '.' => {
+                    // Snapshotted before anything is consumed: PostgreSQL's
+                    // caret for a malformed numeric literal sits on the
+                    // literal's first character, not on the offending one.
+                    let literal_start = chars.location();
                     // special case where if ._ is encountered after a word then that word
                     // is a table and the _ is the start of the col name.
                     // if the prev token is not a word, then this is not a valid sql
@@ -1404,23 +1408,80 @@ impl<'a> Tokenizer<'a> {
                         );
                     }
 
-                    // Some dialects support underscore as number separator
-                    // There can only be one at a time and it must be followed by another digit
-                    let is_number_separator = |ch: char, next_char: Option<char>| {
+                    // Some dialects support underscore as number separator.
+                    // There can only be one at a time and it must be followed by
+                    // another digit *of the run's own base* — `radix` is what
+                    // makes `1_e5` and `0b1_2` junk rather than 100000 and 3.
+                    let is_number_separator = |ch: char, next_char: Option<char>, radix: u32| {
                         self.dialect.supports_numeric_literal_underscores()
                             && ch == '_'
-                            && next_char.is_some_and(|next_ch| next_ch.is_ascii_hexdigit())
+                            && next_char.is_some_and(|next_ch| next_ch.is_digit(radix))
                     };
 
                     let mut s = peeking_next_take_while(chars, |ch, next_ch| {
-                        ch.is_ascii_digit() || is_number_separator(ch, next_ch)
+                        ch.is_ascii_digit() || is_number_separator(ch, next_ch, 10)
                     });
+
+                    // PostgreSQL 16 and later spell integer constants in hex,
+                    // octal and binary as `0x1F` / `0o17` / `0b11`. These are
+                    // *numbers*, not the `X'…'` bit string the `0x` case below
+                    // yields for other dialects, so the prefix stays in the
+                    // token text and the binder converts it through the same
+                    // acceptor as the `int4 '0x1F'` input function.
+                    if s == "0"
+                        && self.dialect.supports_non_decimal_numeric_literals()
+                        && chars
+                            .peek()
+                            .is_some_and(|c| matches!(c, 'x' | 'X' | 'o' | 'O' | 'b' | 'B'))
+                    {
+                        let prefix = chars.next().expect("peeked above");
+                        let (radix, base_name) = match prefix.to_ascii_lowercase() {
+                            'x' => (16, "hexadecimal"),
+                            'o' => (8, "octal"),
+                            _ => (2, "binary"),
+                        };
+                        let digits = peeking_next_take_while(chars, |ch, next_ch| {
+                            ch.is_digit(radix) || is_number_separator(ch, next_ch, radix)
+                        });
+                        s.push(prefix);
+                        s.push_str(&digits);
+                        // PG rejects both an empty digit run and a digit run cut
+                        // short by an identifier character, rather than handing
+                        // back two tokens. Consuming the tail first makes the
+                        // message name the whole offending literal, as PG's does.
+                        if digits.chars().all(|c| c == '_') {
+                            s += &peeking_take_while(chars, |ch| {
+                                self.dialect.is_identifier_part(ch)
+                            });
+                            return Err(TokenizerError::pg(
+                                DEFAULT_TOKENIZER_SQLSTATE,
+                                format!("invalid {base_name} integer at or near \"{s}\""),
+                                None,
+                                literal_start,
+                            ));
+                        }
+                        if chars
+                            .peek()
+                            .is_some_and(|&c| self.dialect.is_identifier_part(c))
+                        {
+                            s += &peeking_take_while(chars, |ch| {
+                                self.dialect.is_identifier_part(ch)
+                            });
+                            return Err(TokenizerError::pg(
+                                DEFAULT_TOKENIZER_SQLSTATE,
+                                format!("trailing junk after numeric literal at or near \"{s}\""),
+                                None,
+                                literal_start,
+                            ));
+                        }
+                        return Ok(Some(Token::Number(s, false)));
+                    }
 
                     // match binary literal that starts with 0x
                     if s == "0" && chars.peek() == Some(&'x') {
                         chars.next();
                         let s2 = peeking_next_take_while(chars, |ch, next_ch| {
-                            ch.is_ascii_hexdigit() || is_number_separator(ch, next_ch)
+                            ch.is_ascii_hexdigit() || is_number_separator(ch, next_ch, 16)
                         });
                         return Ok(Some(Token::HexStringLiteral(s2)));
                     }
@@ -1442,9 +1503,15 @@ impl<'a> Tokenizer<'a> {
                         }
                     }
 
-                    // Consume fractional digits.
+                    // Consume fractional digits. A separator has to sit
+                    // *between* digits, so it may not lead the fraction: PG
+                    // reads `1_000._5` as junk, not as 1000.5.
+                    let mut fraction_started = false;
                     s += &peeking_next_take_while(chars, |ch, next_ch| {
-                        ch.is_ascii_digit() || is_number_separator(ch, next_ch)
+                        let ok = ch.is_ascii_digit()
+                            || (fraction_started && is_number_separator(ch, next_ch, 10));
+                        fraction_started |= ok;
+                        ok
                     });
 
                     // No fraction -> Token::Period
@@ -1475,8 +1542,14 @@ impl<'a> Tokenizer<'a> {
                                 for _ in 0..exponent_part.len() {
                                     chars.next();
                                 }
-                                exponent_part +=
-                                    &peeking_take_while(chars, |ch| ch.is_ascii_digit());
+                                let mut exponent_started = false;
+                                exponent_part += &peeking_next_take_while(chars, |ch, next_ch| {
+                                    let ok = ch.is_ascii_digit()
+                                        || (exponent_started
+                                            && is_number_separator(ch, next_ch, 10));
+                                    exponent_started |= ok;
+                                    ok
+                                });
                                 s += exponent_part.as_str();
                             }
                             // Not an exponent, discard the work done
@@ -1503,6 +1576,26 @@ impl<'a> Tokenizer<'a> {
                             // the value we have is part of an identifier.
                             return Ok(Some(Token::make_word_owned(s, None)));
                         }
+                    }
+
+                    // A number that runs straight into an identifier character
+                    // is one bad literal, not a number beside a word — PG reads
+                    // `123abc`, `1x` and `100_` all that way. Gated on the same
+                    // flag as the radix prefixes because a dialect without them
+                    // (or with `supports_numeric_prefix`, handled above) still
+                    // wants the older two-token reading.
+                    if self.dialect.supports_non_decimal_numeric_literals()
+                        && chars
+                            .peek()
+                            .is_some_and(|&c| self.dialect.is_identifier_part(c))
+                    {
+                        s += &peeking_take_while(chars, |ch| self.dialect.is_identifier_part(ch));
+                        return Err(TokenizerError::pg(
+                            DEFAULT_TOKENIZER_SQLSTATE,
+                            format!("trailing junk after numeric literal at or near \"{s}\""),
+                            None,
+                            literal_start,
+                        ));
                     }
 
                     let long = if chars.peek() == Some(&'L') {
@@ -2972,27 +3065,113 @@ mod tests {
         ];
         compare(expected, tokens);
 
+        // PostgreSQL takes a well-placed separator as part of the number, and a
+        // leading one as an identifier (`_10_000` is a column reference, which
+        // is why the error for it is "column does not exist", not a syntax
+        // error). The malformed placements are errors — see
+        // `tokenize_pg_trailing_junk`.
         all_dialects_where(|dialect| dialect.supports_numeric_literal_underscores()).tokenizes_to(
-            "SELECT 10_000, _10_000, 10_00_, 10___0",
+            "SELECT 10_000, _10_000",
             vec![
                 Token::make_keyword("SELECT"),
                 Token::Whitespace(Whitespace::Space),
                 Token::Number("10_000".to_string(), false),
                 Token::Comma,
                 Token::Whitespace(Whitespace::Space),
-                Token::make_word("_10_000", None), // leading underscore tokenizes as a word (parsed as column identifier)
-                Token::Comma,
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("10_00".to_string(), false),
-                Token::make_word("_", None), // trailing underscores tokenizes as a word (syntax error in some dialects)
-                Token::Comma,
-                Token::Whitespace(Whitespace::Space),
-                Token::Number("10".to_string(), false),
-                Token::make_word("___0", None), // multiple underscores tokenizes as a word (syntax error in some dialects)
+                Token::make_word("_10_000", None),
             ],
         );
 
         Ok(())
+    }
+
+    /// PostgreSQL 16 and later read `0x1F` / `0o17` / `0b11` as integers, not as
+    /// the `X'…'` bit string other dialects take `0x…` for.
+    #[test]
+    fn tokenize_pg_non_decimal_literals() {
+        let dialect = PostgreSqlDialect {};
+        for (sql, want) in [
+            ("SELECT 0x42F", "0x42F"),
+            ("SELECT 0X42f", "0X42f"),
+            ("SELECT 0o273", "0o273"),
+            ("SELECT 0b100101", "0b100101"),
+            // A separator may lead the digits of a prefixed literal, because the
+            // prefix stands in for the digit on its left.
+            ("SELECT 0b_10_0101", "0b_10_0101"),
+            ("SELECT 0xE_FF", "0xE_FF"),
+        ] {
+            let tokens = Tokenizer::new(&dialect, sql).tokenize().expect(sql);
+            assert_eq!(
+                tokens.last(),
+                Some(&Token::Number(want.to_string(), false)),
+                "for {sql}"
+            );
+        }
+    }
+
+    /// The literals PostgreSQL rejects outright, where a laxer tokenizer would
+    /// hand back a number beside a word.
+    #[test]
+    fn tokenize_pg_trailing_junk() {
+        let dialect = PostgreSqlDialect {};
+        for (sql, want) in [
+            ("SELECT 0x", "invalid hexadecimal integer at or near \"0x\""),
+            ("SELECT 0o", "invalid octal integer at or near \"0o\""),
+            ("SELECT 0b", "invalid binary integer at or near \"0b\""),
+            (
+                "SELECT 0x0y",
+                "trailing junk after numeric literal at or near \"0x0y\"",
+            ),
+            (
+                "SELECT 123abc",
+                "trailing junk after numeric literal at or near \"123abc\"",
+            ),
+            (
+                "SELECT 1x",
+                "trailing junk after numeric literal at or near \"1x\"",
+            ),
+            (
+                "SELECT 100_",
+                "trailing junk after numeric literal at or near \"100_\"",
+            ),
+            (
+                "SELECT 100__000",
+                "trailing junk after numeric literal at or near \"100__000\"",
+            ),
+            (
+                "SELECT 1_000._5",
+                "trailing junk after numeric literal at or near \"1_000._5\"",
+            ),
+            (
+                "SELECT 1_000.5e_1",
+                "trailing junk after numeric literal at or near \"1_000.5e_1\"",
+            ),
+            // A separator sits between two digits *of the run's own base*, so
+            // `e` does not close one even though it is a hex digit…
+            (
+                "SELECT 1_e5",
+                "trailing junk after numeric literal at or near \"1_e5\"",
+            ),
+            (
+                "SELECT 2_e+3",
+                "trailing junk after numeric literal at or near \"2_e\"",
+            ),
+            (
+                "SELECT 1.5_e3",
+                "trailing junk after numeric literal at or near \"1.5_e3\"",
+            ),
+            // …and `2` does not close one inside a binary run.
+            (
+                "SELECT 0b1_2",
+                "trailing junk after numeric literal at or near \"0b1_2\"",
+            ),
+        ] {
+            let err = Tokenizer::new(&dialect, sql)
+                .tokenize()
+                .expect_err(sql)
+                .to_string();
+            assert!(err.contains(want), "for {sql}: got {err}");
+        }
     }
 
     #[test]
