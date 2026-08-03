@@ -4131,8 +4131,14 @@ fn interval_literal_typmod(node: &ast::Interval) -> Option<i32> {
         .iter()
         .fold(0, |acc, (_, bit)| acc | bit);
     iv::range_name(range)?;
+    // A precision only means anything on a range reaching SECOND, and the parser
+    // files it in one of two places: `X TO SECOND(n)` fills
+    // `fractional_seconds_precision`, while a bare `SECOND(n)` — where SECOND is
+    // itself the leading field — goes through the grammar's
+    // `SECOND(<leading> [, <fractional>])` form and lands in `leading_precision`.
     let precision = node
         .fractional_seconds_precision
+        .or(node.leading_precision)
         .map(|p| (p as i32).min(crabgresql_types::timestamp::MAX_PRECISION) as u8);
     Some(iv::pack_typmod(range, precision))
 }
