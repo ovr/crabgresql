@@ -7,6 +7,7 @@
 //! Every aggregate but `count` ignores NULL inputs and yields NULL over an empty
 //! (or all-NULL) group.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -309,9 +310,10 @@ pub fn feed(
 /// second definition of key equality). It is not one here only because the
 /// buckets never decide: they narrow the candidates, and `keys_equal` answers.
 /// Widening this function is safe; making it finer than `keys_equal` is not.
-pub fn hash_key(tys: &[PgType], values: &[Value]) -> u64 {
+pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
     let mut h = DefaultHasher::new();
     for (ty, v) in tys.iter().zip(values) {
+        let v = v.borrow();
         if matches!(v, Value::Null) {
             0u8.hash(&mut h);
             continue;
@@ -490,12 +492,15 @@ fn text_of(v: &Value) -> &str {
 /// (`NULL == NULL`), and non-null values compare with the type's total order —
 /// the same equality PG's `GROUP BY` uses (so `0.0` and `-0.0`, and two `NaN`s,
 /// each group together).
-pub fn keys_equal(tys: &[PgType], a: &[Value], b: &[Value]) -> bool {
-    a.iter().zip(b).zip(tys).all(|((x, y), ty)| match (x, y) {
-        (Value::Null, Value::Null) => true,
-        (Value::Null, _) | (_, Value::Null) => false,
-        _ => compare_values(*ty, x, y) == Ordering::Equal,
-    })
+pub fn keys_equal<A: Borrow<Value>, B: Borrow<Value>>(tys: &[PgType], a: &[A], b: &[B]) -> bool {
+    a.iter()
+        .zip(b)
+        .zip(tys)
+        .all(|((x, y), ty)| match (x.borrow(), y.borrow()) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            (x, y) => compare_values(*ty, x, y) == Ordering::Equal,
+        })
 }
 
 fn as_i64(v: &Value) -> i64 {
