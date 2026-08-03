@@ -1410,8 +1410,17 @@ impl TxnFinalize for PgEngine {
             if let Some(t) = handles
                 .get(&(namespace.clone(), name.clone()))
                 .and_then(|table| table.as_heap())
-                && let Some((staged, owner)) = t.abort_truncate(xid)
             {
+                // Before the files go: the rows in the staged heap are the only
+                // thing naming the chunks this transaction wrote, and a TRUNCATE
+                // does not swap the chunk store, so unlinking that file alone
+                // would strand them beyond VACUUM's reach. Runs ahead of
+                // `abort_truncate`, which clears the staged state, and still under
+                // the exclusive hold released below.
+                t.free_staged_chains(xid);
+                let Some((staged, owner)) = t.abort_truncate(xid) else {
+                    continue;
+                };
                 for rel in staged {
                     self.inner.discard_relfile(rel);
                 }
