@@ -1245,6 +1245,19 @@ impl TableAm for HeapTable {
         key: &[Value],
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
+        // Hold the table's shared lock across the tree descent, exactly as `scan`
+        // and `fetch` do. Without it a committing TRUNCATE — whose
+        // `acquire_exclusive` waits only on *foreign shared* holds, so nothing
+        // would make it wait for this probe — unlinks the index file mid-descent;
+        // `smgr` then reopens it with `create(true)`, and the descent panics on a
+        // zeroed meta page.
+        //
+        // Safe for the truncating transaction's own probe: `acquire_shared` grants
+        // immediately when the exclusive holder is this same owner, and the per-tid
+        // holds `fetch` takes underneath are refcounted per owner. The guard need
+        // only live to the end of this function — the result is materialized into a
+        // `Vec`, so the returned iterator reads no page.
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
         // Bound before the index guard: the filter and the key encoding below
         // must agree on `columns`.
         let schema = self.snap();
