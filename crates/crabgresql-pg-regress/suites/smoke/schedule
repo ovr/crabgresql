@@ -48,6 +48,7 @@ test: cidr
 test: pg_catalog
 test: information_schema
 test: constraints
+test: unique_index_build
 test: returning
 test: insert_select
 test: create_table_as
