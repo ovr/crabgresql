@@ -6937,15 +6937,15 @@ fn resolve_int_bitwise_op(
 ) -> Result<Option<Binding>, BindError> {
     use ast::BinaryOperator as B;
     let (lt, rt) = (binding_typed_ty(lb), binding_typed_ty(rb));
+    // Through `undefined_operator_error` rather than a bare `BindError`, so the
+    // 42883 carries PG's HINT and `bind_binary` can hang the caret under the
+    // operator, as every other "operator does not exist" here does.
     let no_op = || {
-        BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "operator does not exist: {} {op} {}",
-                binding_type_label(lb),
-                binding_type_label(rb)
-            ),
-        )
+        undefined_operator_error(format!(
+            "operator does not exist: {} {op} {}",
+            binding_type_label(lb),
+            binding_type_label(rb)
+        ))
     };
     let ambiguous = || {
         ambiguous_operator(
