@@ -464,3 +464,14 @@ SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
  -3 days +04:05:06 | 3 days -04:05:06
 (1 row)
 
+-- a precision on a literal's qualifier is the same modifier a column carries, so
+-- it rounds the same way; the parser files a bare SECOND(n) separately from a
+-- range's TO SECOND(n), and both reach it
+SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
+       interval '4:05:06.789' minute to second(1) AS range_second_p,
+       interval '1.6 seconds' second(0) AS rounds_away_from_zero;
+ bare_second_p | range_second_p | rounds_away_from_zero 
+---------------+----------------+-----------------------
+ 00:00:01.23   | 04:05:06.8     | 00:00:02
+(1 row)
+

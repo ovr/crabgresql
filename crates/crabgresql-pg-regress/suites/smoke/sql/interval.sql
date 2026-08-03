@@ -162,3 +162,9 @@ SELECT interval 'infinity' month AS inf;
 SELECT interval '3 4:05:06' AS unqualified, interval '3 4:05:06' day AS q_day,
        interval '3 4:05:06' hour AS q_hour, interval '3 4:05:06' month AS q_month;
 SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
+-- a precision on a literal's qualifier is the same modifier a column carries, so
+-- it rounds the same way; the parser files a bare SECOND(n) separately from a
+-- range's TO SECOND(n), and both reach it
+SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
+       interval '4:05:06.789' minute to second(1) AS range_second_p,
+       interval '1.6 seconds' second(0) AS rounds_away_from_zero;
