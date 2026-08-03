@@ -19,8 +19,8 @@ use crabgresql_storage_api::{Column, EnumInfo, TableEngine, TableSchema, TypeCat
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::numeric::ParseError;
 use crabgresql_types::{
-    FmtCtx, Numeric, PgType, RegKind, Value, cast, date, float, interval, money, parse_bool, time,
-    timestamp, timestamptz, timetz,
+    FmtCtx, Numeric, PgType, RegKind, Value, cast, date, float, fmt, interval, money, parse_bool,
+    time, timestamp, timestamptz, timetz,
 };
 
 use crate::BindError;
@@ -8021,12 +8021,28 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
         });
     }
     match expr {
-        BoundExpr::Const { value, .. } if !fold_needs_session(value.pg_type(), ty) => {
-            // Safe to fold: `FmtCtx::utc` cannot change the outcome, because
-            // `fold_needs_session` has already excluded every pair it could.
-            let value = cast::cast_value(value, ty, &FmtCtx::utc_default())
-                .map_err(|e| BindError::new(e.sqlstate, e.message))?;
-            Ok(BoundExpr::Const { value, ty })
+        BoundExpr::Const {
+            value,
+            ty: value_ty,
+        } if !fold_needs_session(value.pg_type(), ty) => {
+            // Safe to fold *unless the value reads the clock*: `fold_needs_session`
+            // rules out every pair `FmtCtx::utc` could change by GUC, but it is a
+            // question about types, and whether a literal is relative is a question
+            // about its text — only the input function knows. So try the fold and
+            // defer if it turns out to want a session, exactly as `resolve_unknown`
+            // does one layer up. Without this, `'now'::text::timestamp` reports the
+            // internal "no transaction clock" error to the client.
+            match cast::cast_value(value.clone(), ty, &FmtCtx::utc_default()) {
+                Ok(value) => Ok(BoundExpr::Const { value, ty }),
+                Err(e) if cast_needs_clock(&e) => Ok(BoundExpr::Coerce {
+                    expr: Box::new(BoundExpr::Const {
+                        value,
+                        ty: value_ty,
+                    }),
+                    ty,
+                }),
+                Err(e) => Err(BindError::new(e.sqlstate, e.message)),
+            }
         }
         expr => Ok(BoundExpr::Coerce {
             expr: Box::new(expr),
@@ -8208,7 +8224,7 @@ pub(crate) fn resolve_unknown(
                 // either; it is deferred whole, like the value itself.
                 match validate_zone_dependent_literal(&s, ty) {
                     Ok(()) => {}
-                    Err(e) if needs_session_clock(&e) => {}
+                    Err(e) if is_clock_unavailable(&e) => {}
                     Err(e) => return Err(e.at(span)),
                 }
                 Value::Text(s)
@@ -8231,7 +8247,7 @@ pub(crate) fn resolve_unknown(
             // it to a runtime coercion, exactly as the zone-dependent branch
             // above does — and for the same reason. Any *other* error is a real
             // diagnostic and keeps its cursor position.
-            Err(e) if needs_session_clock(&e) => {
+            Err(e) if is_clock_unavailable(&e) => {
                 return Ok(BoundExpr::Coerce {
                     expr: Box::new(BoundExpr::Const {
                         value: Value::Text(s),
@@ -8253,8 +8269,20 @@ pub(crate) fn resolve_unknown(
 /// composite forms working: `'today 10:00'` and `'10:00 today'` are relative
 /// too, and a token table here would have to re-implement the scanner to know
 /// that.
-fn needs_session_clock(e: &BindError) -> bool {
-    e.code == sqlstate::INTERNAL_ERROR
+///
+/// The SQLSTATE alone would be too coarse a signal. `XX000` means "something
+/// unexpected", and `parse_unknown` fans out to every type's input function —
+/// several of which raise it for genuine internal faults. Keying on it alone
+/// would silently turn any of those into a deferral, losing the diagnostic's
+/// cursor position and moving it from bind time to per-row execution. Matching
+/// the shared [`fmt::CLOCK_UNAVAILABLE`] marker keeps the two apart.
+fn is_clock_unavailable(e: &BindError) -> bool {
+    e.code == sqlstate::INTERNAL_ERROR && e.message == fmt::CLOCK_UNAVAILABLE
+}
+
+/// [`is_clock_unavailable`] for the cast layer's own error type.
+fn cast_needs_clock(e: &crabgresql_types::cast::CastError) -> bool {
+    e.sqlstate == sqlstate::INTERNAL_ERROR && e.message == fmt::CLOCK_UNAVAILABLE
 }
 
 pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, BindError> {
