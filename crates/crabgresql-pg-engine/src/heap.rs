@@ -1037,14 +1037,6 @@ impl HeapTable {
         self.place_item(rel, xid, tuple_bytes, &self.insert_hint, true)
     }
 
-    /// Sweep whatever heap file `xid` staged with a TRUNCATE it is about to
-    /// abort. A no-op if `xid` staged nothing.
-    ///
-    /// Call this *before* `abort_truncate`, which clears the staged state. It
-    /// exists so the caller never has to know which of the relfilenodes that
-    /// abort is about to discard is the heap's rather than an index's — the
-    /// distinction matters, because reading a B-tree page as heap tuples would
-    /// synthesize garbage chain pointers.
     /// Whether this relation's writes bypass the WAL (`UNLOGGED`/`TEMP`), for the
     /// engine-level sweeps that log a record per page they touch.
     pub(crate) fn wal_skipped(&self) -> bool {
@@ -1061,10 +1053,36 @@ impl HeapTable {
         self.toast_hint.store(0, Ordering::Relaxed);
     }
 
+    /// [`EngineInner::discard_heap_relfile`] for one of *this* relation's heap
+    /// files, skipping the chain sweep when there is provably nothing to sweep.
+    ///
+    /// A relation with no chunk store has never toasted a value, so no tuple in
+    /// any of its files can own a chain and the scan can only ever find nothing.
+    /// Worth a branch: without it every rolled-back `TRUNCATE` reads the whole
+    /// staged file back through the buffer pool, on a path that includes
+    /// `Session::drop` — so a client disconnecting mid-load would wait out a full
+    /// table scan, and the pages it faulted in would evict every other relation's.
+    pub(crate) fn discard_heap_file(&self, rel: RelFileNode) {
+        if self.toast_relfilenode().is_some() {
+            self.engine.discard_heap_relfile(rel, self.wal_skipped());
+        } else {
+            self.engine.discard_relfile(rel);
+        }
+    }
+
+    /// Sweep whatever heap file `xid` staged with a TRUNCATE it is about to
+    /// abort, then discard it. A no-op if `xid` staged nothing.
+    ///
+    /// Call this *before* `abort_truncate`, which clears the staged state. It
+    /// exists so the caller never has to know which of the relfilenodes that
+    /// abort is about to discard is the heap's rather than an index's — the
+    /// distinction matters, because reading a B-tree page as heap tuples would
+    /// synthesize garbage chain pointers.
     pub(crate) fn free_staged_chains(&self, xid: Xid) {
-        if let Some(rel) = self.staged_for(xid) {
-            self.engine
-                .free_orphaned_chains(rel, self.persistence.is_wal_skipped());
+        if let Some(rel) = self.staged_for(xid)
+            && self.toast_relfilenode().is_some()
+        {
+            self.engine.free_orphaned_chains(rel, self.wal_skipped());
         }
     }
 
@@ -1592,11 +1610,7 @@ impl TableAm for HeapTable {
                 // transaction; reclaim it now — chunks first, for the reason given
                 // in `free_orphaned_chains`: this file holds the only tuples that
                 // name them, and the chunk store survives a TRUNCATE.
-                self.engine.free_orphaned_chains(
-                    RelFileNode(prev.new_rel),
-                    self.persistence.is_wal_skipped(),
-                );
-                self.engine.discard_relfile(RelFileNode(prev.new_rel));
+                self.discard_heap_file(RelFileNode(prev.new_rel));
                 // Already registered with the engine on the first TRUNCATE.
             }
             None => {
