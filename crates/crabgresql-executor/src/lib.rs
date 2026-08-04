@@ -1857,12 +1857,15 @@ fn execute_insert(
 /// derivation of it. A separate step so the freeze is visible at the write and
 /// reaches nothing else — reads, constraint checks and `RETURNING` keep using the
 /// plain context.
-fn write_context(freeze: bool, txn: &TxnContext) -> TxnContext {
-    if freeze {
-        txn.with_freeze()
-    } else {
-        txn.clone()
-    }
+///
+/// Returns an `Option` the caller unwraps against `txn` rather than an owned
+/// context, so the overwhelmingly common unfrozen path borrows instead of
+/// cloning: a `TxnContext` carries a `Snapshot` whose in-progress list is a
+/// `Vec<Xid>` as long as the number of transactions in flight, plus two `Arc`s.
+/// Every ordinary INSERT would otherwise pay an allocation and two contended
+/// refcount bumps for a feature it is not using.
+fn write_context(freeze: bool, txn: &TxnContext) -> Option<TxnContext> {
+    freeze.then(|| txn.with_freeze())
 }
 
 /// Evaluate an INSERT's source into fully-formed, schema-order tuples. No
@@ -1940,7 +1943,8 @@ fn insert_direct(
         Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
         None => None,
     };
-    table.insert_many(tuples, &write_context(freeze, txn))?;
+    let frozen = write_context(freeze, txn);
+    table.insert_many(tuples, frozen.as_ref().unwrap_or(txn))?;
     finish_insert(returning, output, inserted)
 }
 
@@ -2005,9 +2009,10 @@ fn insert_routed(
     for (tuple, leaf) in tuples.into_iter().zip(routes) {
         batches[leaf].push(tuple);
     }
-    let write_txn = write_context(freeze, txn);
+    let frozen = write_context(freeze, txn);
+    let write_txn = frozen.as_ref().unwrap_or(txn);
     for (leaf, tuples) in leaves.iter().zip(batches) {
-        leaf.insert_many(tuples, &write_txn)?;
+        leaf.insert_many(tuples, write_txn)?;
     }
     finish_insert(returning, output, inserted)
 }
