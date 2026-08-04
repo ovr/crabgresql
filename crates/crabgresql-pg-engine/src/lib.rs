@@ -340,6 +340,17 @@ impl EngineInner {
         let mut chains: Vec<toast::ToastPointer> = Vec::new();
         for block in 0..nblocks {
             let Ok(page) = self.bufpool.pin(rel, block) else {
+                // Not silently: this block's chains are about to become
+                // unreachable *and* unreclaimable — the file naming them is
+                // unlinked moments later, and VACUUM only reaches a chain through
+                // a heap tuple. `pin` fails when every frame is pinned, which this
+                // very scan makes more likely, so the leak has a plausible trigger
+                // and needs to leave a trace.
+                tracing::warn!(
+                    relfilenode = rel.0,
+                    block,
+                    "could not read a discarded block; its out-of-line values stay allocated"
+                );
                 continue;
             };
             chains.extend(page.read(|pg| {
