@@ -1394,6 +1394,21 @@ impl TableAm for HeapTable {
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
+        // A frozen tuple is visible to every snapshot the moment it is placed and
+        // names no transaction whose abort could take it back — not on rollback,
+        // not in recovery, since the WAL record carries the already-frozen header.
+        // The only thing that makes it retractable is landing in storage a
+        // rollback discards, which is what `truncated_by` answers. The server
+        // checks it too; asserting it here as well is what turns "the caller was
+        // careful" into an invariant of the heap, and mirrors the same refusal in
+        // `ParquetTable::insert_many`.
+        if txn.freeze_inserts && !self.truncated_by(txn.xid) {
+            return Err(StorageError::UnsupportedOperation(format!(
+                "cannot write frozen rows into \"{}\": \
+                 this transaction has not truncated it",
+                self.snap().name
+            )));
+        }
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         // `insert_xid`, not `xid`: a `COPY … FREEZE` stamps the version frozen.
