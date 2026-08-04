@@ -8100,6 +8100,20 @@ pub enum OnCommit {
     Drop,
 }
 
+/// What `COPY … HEADER` does with the first data line.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CopyHeaderMode {
+    /// No header line; the first line is data.
+    Off,
+    /// There is a header line; discard it unread.
+    On,
+    /// There is a header line, and its field names must match the columns the
+    /// COPY names, in order. `COPY TO` rejects this.
+    Match,
+}
+
 /// An option in `COPY` statement.
 ///
 /// <https://www.postgresql.org/docs/14/sql-copy.html>
@@ -8115,8 +8129,8 @@ pub enum CopyOption {
     Delimiter(char),
     /// NULL 'null_string'
     Null(String),
-    /// HEADER \[ boolean \]
-    Header(bool),
+    /// HEADER \[ boolean | MATCH \]
+    Header(CopyHeaderMode),
     /// QUOTE 'quote_character'
     Quote(char),
     /// ESCAPE 'escape_character'
@@ -8140,8 +8154,9 @@ impl fmt::Display for CopyOption {
             Freeze(false) => write!(f, "FREEZE FALSE"),
             Delimiter(char) => write!(f, "DELIMITER '{char}'"),
             Null(string) => write!(f, "NULL '{}'", value::escape_single_quote_string(string)),
-            Header(true) => write!(f, "HEADER"),
-            Header(false) => write!(f, "HEADER FALSE"),
+            Header(CopyHeaderMode::On) => write!(f, "HEADER"),
+            Header(CopyHeaderMode::Off) => write!(f, "HEADER FALSE"),
+            Header(CopyHeaderMode::Match) => write!(f, "HEADER MATCH"),
             Quote(char) => write!(f, "QUOTE '{char}'"),
             Escape(char) => write!(f, "ESCAPE '{char}'"),
             ForceQuote(columns) => write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns)),

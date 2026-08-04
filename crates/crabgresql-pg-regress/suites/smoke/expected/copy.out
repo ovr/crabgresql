@@ -73,6 +73,28 @@ SELECT octet_length(a) AS len FROM ch;
    5
 (1 row)
 
+-- HEADER match: the first line is a header AND its names are checked against
+-- the columns the statement names, in that order.
+CREATE TABLE hm (a integer, b text);
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+SELECT a, b FROM hm ORDER BY a;
+ a |  b  
+---+-----
+ 1 | one
+(1 row)
+
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+ERROR:  column name mismatch in header line field 1: got "b", expected "a"
+COPY hm (b, a) FROM stdin WITH (FORMAT csv, HEADER match);
+SELECT a, b FROM hm ORDER BY a;
+ a |  b  
+---+-----
+ 1 | one
+ 2 | two
+(2 rows)
+
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+ERROR:  wrong number of fields in header line: got 1, expected 2
 -- COPY ... FREEZE. The rows are stamped visible-to-everyone, which is only safe
 -- where a rollback discards the storage — so the table must have been truncated
 -- in this same transaction. Outside a block it never has been.

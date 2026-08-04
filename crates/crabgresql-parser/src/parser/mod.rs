@@ -11168,9 +11168,15 @@ impl<'a> Parser<'a> {
             // PostgreSQL's HEADER also takes `match`, which this parser does not
             // implement; its message names that option all the same, because the
             // message is what a client sees for a bad value either way.
-            Some(Keyword::HEADER) => CopyOption::Header(
-                self.parse_copy_boolean("header requires a Boolean value or \"match\"")?,
-            ),
+            // `MATCH` is a third value, not a Boolean, so it is taken before the
+            // Boolean parse — which is also why this option's error names it.
+            Some(Keyword::HEADER) => CopyOption::Header(if self.parse_keyword(Keyword::MATCH) {
+                CopyHeaderMode::Match
+            } else if self.parse_copy_boolean("header requires a Boolean value or \"match\"")? {
+                CopyHeaderMode::On
+            } else {
+                CopyHeaderMode::Off
+            }),
             Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
             Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
             Some(Keyword::FORCE_QUOTE) => {
@@ -17981,8 +17987,12 @@ mod tests {
         }
 
         for (sql, expected) in [
-            ("COPY t FROM stdin (HEADER ON)", true),
-            ("COPY t FROM stdin (HEADER OFF)", false),
+            ("COPY t FROM stdin (HEADER ON)", CopyHeaderMode::On),
+            ("COPY t FROM stdin (HEADER OFF)", CopyHeaderMode::Off),
+            // A third value rather than a Boolean, which is why the option's
+            // error names it alongside them.
+            ("COPY t FROM stdin (HEADER MATCH)", CopyHeaderMode::Match),
+            ("COPY t FROM stdin (HEADER match)", CopyHeaderMode::Match),
         ] {
             let (options, _) = copy_options(sql);
             assert_eq!(options, vec![CopyOption::Header(expected)], "{sql}");
