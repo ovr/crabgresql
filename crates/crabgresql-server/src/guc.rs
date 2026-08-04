@@ -151,7 +151,11 @@ pub static GUCS: &[GucDef] = &[
         kind: GucKind::Settable {
             set: set_timezone,
             capture: |s| SavedValue::TimeZone(std::sync::Arc::clone(&s.timezone)),
-            restore: |s, v| { if let SavedValue::TimeZone(z) = v { s.timezone = z; } },
+            restore: |s, v| {
+                if let SavedValue::TimeZone(z) = v {
+                    s.timezone = z;
+                }
+            },
         },
     },
     GucDef {
@@ -163,7 +167,11 @@ pub static GUCS: &[GucDef] = &[
         kind: GucKind::Settable {
             set: set_extra_float_digits,
             capture: |s| SavedValue::ExtraFloatDigits(s.extra_float_digits),
-            restore: |s, v| { if let SavedValue::ExtraFloatDigits(n) = v { s.extra_float_digits = n; } },
+            restore: |s, v| {
+                if let SavedValue::ExtraFloatDigits(n) = v {
+                    s.extra_float_digits = n;
+                }
+            },
         },
     },
     GucDef {
@@ -175,7 +183,11 @@ pub static GUCS: &[GucDef] = &[
         kind: GucKind::Settable {
             set: set_default_isolation,
             capture: |s| SavedValue::DefaultIsolation(s.default_iso),
-            restore: |s, v| { if let SavedValue::DefaultIsolation(l) = v { s.default_iso = l; } },
+            restore: |s, v| {
+                if let SavedValue::DefaultIsolation(l) = v {
+                    s.default_iso = l;
+                }
+            },
         },
     },
     GucDef {
@@ -187,7 +199,11 @@ pub static GUCS: &[GucDef] = &[
         kind: GucKind::Settable {
             set: set_default_read_only,
             capture: |s| SavedValue::DefaultReadOnly(s.default_read_only),
-            restore: |s, v| { if let SavedValue::DefaultReadOnly(b) = v { s.default_read_only = b; } },
+            restore: |s, v| {
+                if let SavedValue::DefaultReadOnly(b) = v {
+                    s.default_read_only = b;
+                }
+            },
         },
     },
     // --- reported constants -------------------------------------------------
@@ -418,4 +434,3 @@ fn requires_boolean(param: &str) -> PgError {
         format!("parameter \"{param}\" requires a Boolean value"),
     )
 }
-

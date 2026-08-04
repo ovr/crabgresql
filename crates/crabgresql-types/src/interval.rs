@@ -218,7 +218,10 @@ pub fn format_verbose(iv: Interval) -> String {
     // makes it singular on the magnitude, giving `-1 sec`.)
     let mut push = |value: i64, unit: &str| {
         if value != 0 {
-            parts.push(format!("{value} {unit}{}", if value != 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{value} {unit}{}",
+                if value != 1 { "s" } else { "" }
+            ));
         }
     };
     push(months / 12, "year");
@@ -1726,7 +1729,10 @@ mod tests {
             ("1 day -1 hour", "@ 1 day -1 hours"),
             ("1 day -1 sec", "@ 1 day -1 sec"),
             ("25:00:00", "@ 25 hours"),
-            ("1 year 2 mons 3 days 04:05:06.7", "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs"),
+            (
+                "1 year 2 mons 3 days 04:05:06.7",
+                "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs",
+            ),
             // Not the infinity sentinel: `i32::MIN` months, which must not
             // overflow while being negated for the `ago` form.
             ("-178956970 years -8 mons", "@ 178956970 years 8 mons ago"),

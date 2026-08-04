@@ -705,7 +705,10 @@ mod zone_tests {
         // failure is 22023 blaming the (lowercased) token, not 22007 blaming the
         // whole input. Pinned against PG 18.4.
         for (input, want) in [
-            ("12:00 Nowhere/Nozone", "time zone \"nowhere/nozone\" not recognized"),
+            (
+                "12:00 Nowhere/Nozone",
+                "time zone \"nowhere/nozone\" not recognized",
+            ),
             ("12:00 UTC+168", "time zone \"utc+168\" not recognized"),
         ] {
             let Err(e) = parse(input, &FmtCtx::utc_default()) else {

@@ -20,8 +20,8 @@ use crabgresql_types::json::Jsonb;
 use crabgresql_types::jsonpath;
 use crabgresql_types::{
     FmtCtx, Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting,
-    formatting_num,
-    geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz, timetz,
+    formatting_num, geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz,
+    timetz,
 };
 
 use crate::ExecError;
@@ -80,7 +80,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             let Some(sep) = args.first().and_then(|a| a.encode_text_with(fmt)) else {
                 return Ok(Value::Null);
             };
-            let parts: Vec<String> = args[1..].iter().filter_map(|a| a.encode_text_with(fmt)).collect();
+            let parts: Vec<String> = args[1..]
+                .iter()
+                .filter_map(|a| a.encode_text_with(fmt))
+                .collect();
             return Ok(Value::Text(parts.join(&sep)));
         }
         ScalarFn::Format => {
@@ -626,7 +629,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::DatePartTz => {
             return Ok(
-                match timestamptz::date_part(text(&args[0]), tstz(&args[1]), &fmt.zone).map_err(ts_err)? {
+                match timestamptz::date_part(text(&args[0]), tstz(&args[1]), &fmt.zone)
+                    .map_err(ts_err)?
+                {
                     Some(v) => Value::Float8(v),
                     None => Value::Null,
                 },
@@ -634,7 +639,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::ExtractTz => {
             return Ok(
-                match timestamptz::extract(text(&args[0]), tstz(&args[1]), &fmt.zone).map_err(ts_err)? {
+                match timestamptz::extract(text(&args[0]), tstz(&args[1]), &fmt.zone)
+                    .map_err(ts_err)?
+                {
                     Some(n) => Value::Numeric(n),
                     None => Value::Null,
                 },
@@ -2616,12 +2623,22 @@ mod tests {
             (true, true, true),
         ] {
             let args = [Value::Bool(left), Value::Bool(right)];
-            assert_eq!(eval_scalar(ScalarFn::BoolEq, &args, &FmtCtx::utc_default())?, Value::Bool(equal));
-            assert_eq!(eval_scalar(ScalarFn::BoolNe, &args, &FmtCtx::utc_default())?, Value::Bool(!equal));
+            assert_eq!(
+                eval_scalar(ScalarFn::BoolEq, &args, &FmtCtx::utc_default())?,
+                Value::Bool(equal)
+            );
+            assert_eq!(
+                eval_scalar(ScalarFn::BoolNe, &args, &FmtCtx::utc_default())?,
+                Value::Bool(!equal)
+            );
         }
         for func in [ScalarFn::BoolEq, ScalarFn::BoolNe] {
             assert_eq!(
-                eval_scalar(func, &[Value::Bool(true), Value::Null], &FmtCtx::utc_default())?,
+                eval_scalar(
+                    func,
+                    &[Value::Bool(true), Value::Null],
+                    &FmtCtx::utc_default()
+                )?,
                 Value::Null
             );
         }
@@ -2665,9 +2682,13 @@ mod tests {
     fn atanh_and_sign_preserve_nan() {
         assert!(call(ScalarFn::Atanh, f64::NAN).is_nan());
         assert_eq!(
-            eval_scalar(ScalarFn::Atanh, &[Value::Float8(2.0)], &FmtCtx::utc_default())
-                .unwrap_err()
-                .code,
+            eval_scalar(
+                ScalarFn::Atanh,
+                &[Value::Float8(2.0)],
+                &FmtCtx::utc_default()
+            )
+            .unwrap_err()
+            .code,
             "22003"
         );
         assert!(call(ScalarFn::Sign, f64::NAN).is_nan());

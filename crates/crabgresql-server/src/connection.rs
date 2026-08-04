@@ -16,8 +16,8 @@ use crabgresql_types::{FmtCtx, PgType, Value, wire};
 use tokio::net::TcpStream;
 
 use crate::error::PgError;
-use crate::guc;
 use crate::global_catalog::GlobalCatalog;
+use crate::guc;
 use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
     fetch_columns, prepare_copy_from, run_copy_insert,
@@ -591,7 +591,10 @@ fn statement_may_change_gucs(stmt: &crabgresql_parser::ast::Statement) -> bool {
     use crabgresql_parser::ast::Statement;
     matches!(
         stmt,
-        Statement::Set(_) | Statement::Reset(_) | Statement::Commit { .. } | Statement::Rollback { .. }
+        Statement::Set(_)
+            | Statement::Reset(_)
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
     )
 }
 

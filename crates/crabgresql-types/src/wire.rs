@@ -368,9 +368,18 @@ mod tests {
 
     #[test]
     fn text_param_matches_literal_input() -> anyhow::Result<()> {
-        assert_eq!(decode_text(PgType::Int4, " 42 ", &FmtCtx::utc_default())?, Value::Int4(42));
-        assert_eq!(decode_text(PgType::Bool, "t", &FmtCtx::utc_default())?, Value::Bool(true));
-        assert_eq!(decode_text(PgType::Text, "hi", &FmtCtx::utc_default())?, Value::Text("hi".into()));
+        assert_eq!(
+            decode_text(PgType::Int4, " 42 ", &FmtCtx::utc_default())?,
+            Value::Int4(42)
+        );
+        assert_eq!(
+            decode_text(PgType::Bool, "t", &FmtCtx::utc_default())?,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            decode_text(PgType::Text, "hi", &FmtCtx::utc_default())?,
+            Value::Text("hi".into())
+        );
 
         Ok(())
     }

@@ -495,10 +495,7 @@ pub fn at_offset_to_timestamp(off_east: i32, micros: i64) -> Result<i64, Timesta
 
 /// The `timestamptz → timestamp` cast: the wall clock the instant shows in the
 /// **session** zone. Same operation as `AT TIME ZONE <session zone>`.
-pub fn session_zone_wall_clock(
-    micros: i64,
-    session: &SessionZone,
-) -> Result<i64, TimestampError> {
+pub fn session_zone_wall_clock(micros: i64, session: &SessionZone) -> Result<i64, TimestampError> {
     instant_to_wall(micros, session.zone())
 }
 
@@ -608,7 +605,10 @@ mod tests {
             "1997-02-11 01:32:01+00"
         );
         // No zone token -> already UTC.
-        assert_eq!(format(p("2001-02-16 20:38:40"), &utc()), "2001-02-16 20:38:40+00");
+        assert_eq!(
+            format(p("2001-02-16 20:38:40"), &utc()),
+            "2001-02-16 20:38:40+00"
+        );
         assert_eq!(
             format(p("2001-02-16 20:38:40+00"), &utc()),
             "2001-02-16 20:38:40+00"
@@ -632,7 +632,10 @@ mod tests {
             format(p("1997-02-10 17:32:01 UTC"), &utc()),
             "1997-02-10 17:32:01+00"
         );
-        assert_eq!(format(p("2001-09-22T18:19:20Z"), &utc()), "2001-09-22 18:19:20+00");
+        assert_eq!(
+            format(p("2001-09-22T18:19:20Z"), &utc()),
+            "2001-09-22 18:19:20+00"
+        );
     }
 
     #[test]
@@ -701,7 +704,10 @@ mod tests {
     fn make_and_fields() -> anyhow::Result<()> {
         // 6-arg is UTC.
         assert_eq!(
-            format(make_timestamptz(2013, 7, 15, 8, 15, 23.5, None, &utc())?, &utc()),
+            format(
+                make_timestamptz(2013, 7, 15, 8, 15, 23.5, None, &utc())?,
+                &utc()
+            ),
             "2013-07-15 08:15:23.5+00"
         );
         // 7-arg with a summer EDT zone (-04:00) shifts +4h to UTC.

@@ -1153,7 +1153,11 @@ mod tests {
             "22003"
         );
         assert_eq!(
-            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, &FmtCtx::utc(1))?,
+            cast_value(
+                Value::Float8(-9223372036854775808.5),
+                PgType::Int8,
+                &FmtCtx::utc(1)
+            )?,
             Value::Int8(i64::MIN)
         );
 
@@ -1178,19 +1182,38 @@ mod tests {
 
     #[test]
     fn numeric_nan_to_float() -> anyhow::Result<()> {
-        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, &FmtCtx::utc_default())?;
+        let n = cast_value(
+            Value::Text("nan".into()),
+            PgType::Numeric,
+            &FmtCtx::utc_default(),
+        )?;
         let f = cast_value(n, PgType::Float4, &FmtCtx::utc(1))?;
-        assert_eq!(f.encode_text_with(&FmtCtx::utc_default()).as_deref(), Some("NaN"));
+        assert_eq!(
+            f.encode_text_with(&FmtCtx::utc_default()).as_deref(),
+            Some("NaN")
+        );
 
         Ok(())
     }
 
     #[test]
     fn numeric_rejects_garbage() {
-        let e = cast_value(Value::Text("abc".into()), PgType::Numeric, &FmtCtx::utc_default()).unwrap_err();
+        let e = cast_value(
+            Value::Text("abc".into()),
+            PgType::Numeric,
+            &FmtCtx::utc_default(),
+        )
+        .unwrap_err();
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type numeric: \"abc\"");
-        assert!(cast_value(Value::Text("1.5".into()), PgType::Numeric, &FmtCtx::utc_default()).is_ok());
+        assert!(
+            cast_value(
+                Value::Text("1.5".into()),
+                PgType::Numeric,
+                &FmtCtx::utc_default()
+            )
+            .is_ok()
+        );
     }
 
     fn cast(v: Value, to: PgType) -> Result<Value, CastError> {

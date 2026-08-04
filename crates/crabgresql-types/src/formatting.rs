@@ -1631,7 +1631,11 @@ mod tests {
             "value for \"YYYY\" in source string is out of range"
         );
         // In range for an int, but still more than a second of fraction.
-        let e = expect_err(from_char_timestamptz("2024 9999999", "YYYY US", &SessionZone::utc()));
+        let e = expect_err(from_char_timestamptz(
+            "2024 9999999",
+            "YYYY US",
+            &SessionZone::utc(),
+        ));
         assert_eq!(e.sqlstate, "22008");
         assert_eq!(
             e.message,
@@ -1791,7 +1795,10 @@ mod tests {
         // Seconds are dropped, exactly as `OF` drops them: pre-1883 New York
         // ran at -04:56:02.
         let ny = z("America/New_York");
-        assert_eq!(at(&ny, "1875-06-01 12:00:00", "TZH:TZM OF")?, "-04:56 -04:56");
+        assert_eq!(
+            at(&ny, "1875-06-01 12:00:00", "TZH:TZM OF")?,
+            "-04:56 -04:56"
+        );
 
         // `FM` does not reach either code — both keep their fixed width.
         assert_eq!(at(&ny, "2024-06-01 12:00:00", "FMTZH:TZM")?, "-04:00");
@@ -1811,10 +1818,12 @@ mod tests {
     #[test]
     fn from_char_defaults_to_the_session_zone() -> anyhow::Result<()> {
         let ny = SessionZone::resolve("America/New_York").expect("real zone");
-        let v = from_char_timestamptz("2024-06-01 12:00:00", "YYYY-MM-DD HH24:MI:SS", &ny).map_err(fe)?;
+        let v = from_char_timestamptz("2024-06-01 12:00:00", "YYYY-MM-DD HH24:MI:SS", &ny)
+            .map_err(fe)?;
         assert_eq!(crate::timestamptz::format(v, &ny), "2024-06-01 12:00:00-04");
         let explicit =
-            from_char_timestamptz("2024-06-01 12:00:00 +00", "YYYY-MM-DD HH24:MI:SS OF", &ny).map_err(fe)?;
+            from_char_timestamptz("2024-06-01 12:00:00 +00", "YYYY-MM-DD HH24:MI:SS OF", &ny)
+                .map_err(fe)?;
         assert_eq!(
             crate::timestamptz::format(explicit, &ny),
             "2024-06-01 08:00:00-04"
@@ -1831,8 +1840,20 @@ mod tests {
         let at = |input: &str, fmt: &str| from_char_timestamptz(input, fmt, &utc);
 
         // Agreeing repetitions are fine, in either code order.
-        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS OF TZH").is_ok());
-        assert!(at("2024-03-05 10:00:00 -05 -05", "YYYY-MM-DD HH24:MI:SS TZH OF").is_ok());
+        assert!(
+            at(
+                "2024-03-05 10:00:00 -05 -05",
+                "YYYY-MM-DD HH24:MI:SS OF TZH"
+            )
+            .is_ok()
+        );
+        assert!(
+            at(
+                "2024-03-05 10:00:00 -05 -05",
+                "YYYY-MM-DD HH24:MI:SS TZH OF"
+            )
+            .is_ok()
+        );
 
         // Contradictions name the code that noticed, i.e. the second one.
         for (fmt, code) in [

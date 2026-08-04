@@ -150,11 +150,7 @@ impl SessionZone {
         // a value, so this is the one spelling that means the same in both
         // namespaces.
         let east = parse_abbrev_prefix_offset(token).ok_or_else(not_recognized)?;
-        Ok(SessionZone::new(
-            token.to_string(),
-            None,
-            Zone::Fixed(east),
-        ))
+        Ok(SessionZone::new(token.to_string(), None, Zone::Fixed(east)))
     }
 
     /// A fixed zone `secs` east of UTC, named with the POSIX spec PG reports for
@@ -211,7 +207,10 @@ impl SessionZone {
         }
         match &self.zone {
             Zone::Fixed(_) => String::new(),
-            Zone::Named(tz) => tz.to_offset_info(instant(micros)).abbreviation().to_string(),
+            Zone::Named(tz) => tz
+                .to_offset_info(instant(micros))
+                .abbreviation()
+                .to_string(),
         }
     }
 }
@@ -919,7 +918,10 @@ mod tests {
         assert_eq!(session.abbrev_at(0), "");
 
         // The literal token means the opposite direction.
-        assert_eq!(offset_for_instant(&resolve_zone("+05:30")?, 0), 5 * 3600 + 30 * 60);
+        assert_eq!(
+            offset_for_instant(&resolve_zone("+05:30")?, 0),
+            5 * 3600 + 30 * 60
+        );
         Ok(())
     }
 

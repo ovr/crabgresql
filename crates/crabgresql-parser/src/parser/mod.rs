@@ -17935,14 +17935,16 @@ mod tests {
         // Quoting a word always yields `Keyword::NoKeyword`, so the quoted
         // spelling rides the same path.
         assert!(matches!(
-            pg.verified_only_select("SELECT \"pg_lsn\" '0/16AE7F7'").projection[..],
+            pg.verified_only_select("SELECT \"pg_lsn\" '0/16AE7F7'")
+                .projection[..],
             [SelectItem::UnnamedExpr(Expr::TypedString(_))]
         ));
 
         // A keyword before a literal keeps its own meaning: `NOT` is a unary
         // negation, not a type name.
         assert!(matches!(
-            pg.verified_only_select("SELECT NOT 'a' LIKE 'b'").projection[..],
+            pg.verified_only_select("SELECT NOT 'a' LIKE 'b'")
+                .projection[..],
             [SelectItem::UnnamedExpr(Expr::UnaryOp { .. })]
         ));
         // Without a following string constant the word is just an identifier.

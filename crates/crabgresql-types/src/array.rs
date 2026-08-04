@@ -336,18 +336,29 @@ mod tests {
     fn round_trips_int_array() {
         let elems = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default()).unwrap();
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
-        assert_eq!(format(PgType::Int4, &elems, &FmtCtx::utc_default()), "{1,2,3}");
+        assert_eq!(
+            format(PgType::Int4, &elems, &FmtCtx::utc_default()),
+            "{1,2,3}"
+        );
     }
 
     #[test]
     fn empty_array() {
-        assert_eq!(array_in("{}", PgType::Int4, &FmtCtx::utc_default()).unwrap(), vec![]);
+        assert_eq!(
+            array_in("{}", PgType::Int4, &FmtCtx::utc_default()).unwrap(),
+            vec![]
+        );
         assert_eq!(format(PgType::Int4, &[], &FmtCtx::utc_default()), "{}");
     }
 
     #[test]
     fn null_and_quoting() {
-        let elems = array_in(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text, &FmtCtx::utc_default()).unwrap();
+        let elems = array_in(
+            r#"{a,"b,c",NULL,"NULL",""}"#,
+            PgType::Text,
+            &FmtCtx::utc_default(),
+        )
+        .unwrap();
         assert_eq!(
             elems,
             vec![
@@ -389,7 +400,12 @@ mod tests {
     #[test]
     fn malformed_detail_matches_pg() {
         // DETAIL strings verified against PostgreSQL's array_in.
-        let d = |s: &str| array_in(s, PgType::Text, &FmtCtx::utc_default()).unwrap_err().detail.unwrap();
+        let d = |s: &str| {
+            array_in(s, PgType::Text, &FmtCtx::utc_default())
+                .unwrap_err()
+                .detail
+                .unwrap()
+        };
         assert_eq!(d("1,2,3"), DETAIL_START);
         assert_eq!(d("abc"), DETAIL_START);
         assert_eq!(d("{1,2"), DETAIL_EOF);
@@ -436,7 +452,11 @@ mod tests {
         // PG's array_out only treats ASCII whitespace as needing quotes; a
         // non-breaking space (U+00A0) is left bare.
         assert_eq!(
-            format(PgType::Text, &[Value::Text("a\u{00A0}b".into())], &FmtCtx::utc_default()),
+            format(
+                PgType::Text,
+                &[Value::Text("a\u{00A0}b".into())],
+                &FmtCtx::utc_default()
+            ),
             "{a\u{00A0}b}"
         );
     }
@@ -445,7 +465,11 @@ mod tests {
     fn box_arrays_use_a_semicolon_delimiter() -> Result<(), ArrayError> {
         // `box` is the one built-in with `typdelim = ';'`, because its own
         // output text contains commas.
-        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box, &FmtCtx::utc_default())?;
+        let elems = array_in(
+            "{(1,1),(0,0);(3,3),(2,2)}",
+            PgType::Box,
+            &FmtCtx::utc_default(),
+        )?;
         assert_eq!(
             elems,
             vec![
@@ -455,7 +479,10 @@ mod tests {
         );
         // Round-trips unquoted: a comma is no longer the delimiter, so the
         // element text does not need quoting.
-        assert_eq!(format(PgType::Box, &elems, &FmtCtx::utc_default()), "{(1,1),(0,0);(3,3),(2,2)}");
+        assert_eq!(
+            format(PgType::Box, &elems, &FmtCtx::utc_default()),
+            "{(1,1),(0,0);(3,3),(2,2)}"
+        );
         Ok(())
     }
 

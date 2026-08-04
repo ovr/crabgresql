@@ -33,12 +33,12 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps};
 use crate::error::PgError;
-use crate::guc;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
     RoutineDefinition, RoutineKind, TypeRef, Volatility,
 };
+use crate::guc;
 use crate::routines::{RoutineDispatch, SessionNotices};
 use crate::session::{ActiveTxn, Session};
 
@@ -428,11 +428,10 @@ fn bind_catalogs(
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
-    let catalog_ops: Arc<dyn CatalogOps> =
-        Arc::new(
-            SessionCatalogOps::new(system, session.temp_schema.clone())
-                .with_relations(Arc::clone(&catalog)),
-        );
+    let catalog_ops: Arc<dyn CatalogOps> = Arc::new(
+        SessionCatalogOps::new(system, session.temp_schema.clone())
+            .with_relations(Arc::clone(&catalog)),
+    );
     (catalog, type_catalog, catalog_ops)
 }
 
@@ -2904,11 +2903,7 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
         }
         ast::Set::SetTimeZone { local, value } => {
             let scope = local.then_some(ast::ContextModifier::Local);
-            (
-                "timezone".to_string(),
-                timezone_value(value)?,
-                scope,
-            )
+            ("timezone".to_string(), timezone_value(value)?, scope)
         }
         // SET ROLE / SET NAMES / SESSION AUTHORIZATION: accepted and ignored.
         _ => return Ok(QueryResult::command("SET")),
@@ -3031,8 +3026,7 @@ fn numeric_hours_east(expr: &ast::Expr) -> Option<Result<i32, PgError>> {
                         if iv.months != 0 || iv.days != 0 {
                             return Err(invalid_timezone_value(text));
                         }
-                        i32::try_from(iv.usec / 1_000_000)
-                            .map_err(|_| invalid_timezone_value(text))
+                        i32::try_from(iv.usec / 1_000_000).map_err(|_| invalid_timezone_value(text))
                     }),
             )
         }
@@ -3043,9 +3037,7 @@ fn numeric_hours_east(expr: &ast::Expr) -> Option<Result<i32, PgError>> {
 /// Parse an hour count into seconds east. Fractional hours are allowed
 /// (`SET TIME ZONE 167.5` is `+167:30` in PG).
 fn hours_to_secs(digits: &str, sign: i32) -> Result<i32, PgError> {
-    let hours: f64 = digits
-        .parse()
-        .map_err(|_| invalid_timezone_value(digits))?;
+    let hours: f64 = digits.parse().map_err(|_| invalid_timezone_value(digits))?;
     let secs = (hours * 3600.0).round();
     if !secs.is_finite() || secs.abs() > i32::MAX as f64 {
         return Err(invalid_timezone_value(digits));
@@ -7272,11 +7264,9 @@ fn execute_drop_schema(
             // cascade). Otherwise `c_id_seq` outlives `c`.
             for seq in engine.sequences() {
                 let owned_by_cascaded = seq.owned_by.as_deref().is_some_and(|owner| {
-                    external
-                        .iter()
-                        .any(|(kind, ns, t)| {
-                            *kind == DependentKind::Table && *ns == seq.namespace && t == owner
-                        })
+                    external.iter().any(|(kind, ns, t)| {
+                        *kind == DependentKind::Table && *ns == seq.namespace && t == owner
+                    })
                 });
                 if owned_by_cascaded {
                     let _ = engine.drop_sequence(&seq.namespace, &seq.name);
@@ -7461,11 +7451,7 @@ fn drop_dependents(
 /// matching the wording of `DROP TYPE ... CASCADE`.
 fn cascade_notices(dependents: &[Dependent]) -> Vec<Notice> {
     let line = |(kind, ns, name): &Dependent| {
-        format!(
-            "drop cascades to {} {}",
-            kind.noun(),
-            dep_display(ns, name)
-        )
+        format!("drop cascades to {} {}", kind.noun(), dep_display(ns, name))
     };
     match dependents {
         [] => Vec::new(),
