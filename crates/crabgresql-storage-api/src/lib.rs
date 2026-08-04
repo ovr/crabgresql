@@ -449,6 +449,36 @@ impl TableAccessMethod {
     pub fn honors_sort_key(self) -> bool {
         matches!(self, TableAccessMethod::Parquet)
     }
+
+    /// Whether a write batch becomes one immutable on-disk unit, so the size of
+    /// the batch a bulk load hands over decides the size of the units it leaves
+    /// behind. [`TableAccessMethod::bulk_load_batch_rows`] is what that is for.
+    ///
+    /// A row store answers `false`: it places rows one at a time and coalesces
+    /// nothing, so a bigger batch buys it only a bigger memory floor.
+    pub fn writes_whole_batches(self) -> bool {
+        matches!(self, TableAccessMethod::Parquet)
+    }
+
+    /// How many rows a bulk load should decode before handing them over.
+    ///
+    /// For a row store this is only a memory bound, and a small one is right.
+    /// For a method that turns each batch into one immutable unit it also decides
+    /// how many of those units the load leaves behind: at 1024 rows a large file
+    /// lands as thousands of tiny fragments — each with its own footer, file
+    /// fsync, directory fsync and WAL flush — that no later flush compacts and
+    /// every subsequent scan pays for. `u16::MAX` is the largest unit those
+    /// methods build, their row offsets being 16-bit, so filling one exactly
+    /// turns that cost per 1024 rows into the same cost per 65535.
+    ///
+    /// Advisory: a writer that cannot use a whole batch splits it itself.
+    pub fn bulk_load_batch_rows(self) -> usize {
+        if self.writes_whole_batches() {
+            u16::MAX as usize
+        } else {
+            1024
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
