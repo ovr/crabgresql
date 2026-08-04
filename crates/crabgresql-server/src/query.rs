@@ -1648,9 +1648,17 @@ fn execute_copy_from_file(
     };
     let file = crate::copy::open_source_file(global_catalog.copy_files(), &path)?;
     let format = prepared.plan.format.clone();
-    let freeze = prepared.plan.freeze;
+    // The write target decides how much to decode at once: for a row store the
+    // batch is only a memory bound, but a method that turns each batch into one
+    // immutable unit also has the units' size decided here.
+    let batch_rows = prepared
+        .plan
+        .target()
+        .schema()
+        .access_method
+        .bulk_load_batch_rows();
     let rows = run_copy_rows(engine, txnmgr, session, &prepared, |insert| {
-        crate::copy::read_file_rows(file, &path, &format, freeze, |batch| {
+        crate::copy::read_file_rows(file, &path, &format, batch_rows, |batch| {
             insert(batch).map(|_| ())
         })
     })?;

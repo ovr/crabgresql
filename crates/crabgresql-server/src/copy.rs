@@ -38,23 +38,11 @@ pub type Field = Option<String>;
 /// smaller than this, so the carried-over partial record stays short.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Rows decoded before they are handed to the inserter. Bounds how much of a
-/// file is materialized at once.
+/// Rows decoded before they are handed to the inserter, when the caller states
+/// no preference. Bounds how much of a file is materialized at once; a write
+/// target whose batches become whole on-disk units asks for more (see
+/// `TableAccessMethod::bulk_load_batch_rows`).
 const BATCH_ROWS: usize = 1024;
-
-/// The batch size a `FREEZE` load uses instead.
-///
-/// A frozen load is the one case where the batch size is not just a memory knob:
-/// a columnar target writes each batch as one immutable unit, so at 1024 rows a
-/// large file lands as thousands of tiny fragments — each with its own footer,
-/// file fsync, directory fsync and WAL flush — that no later flush ever compacts,
-/// and every subsequent scan pays for. `u16::MAX` is the largest unit those
-/// targets build (their row offsets are 16-bit), so filling one exactly turns
-/// that cost per 1024 rows into the same cost per 65535.
-///
-/// Ordinary loads keep [`BATCH_ROWS`]: their rows are coalesced downstream, so a
-/// bigger batch would buy nothing and only raise the memory floor.
-const FROZEN_BATCH_ROWS: usize = u16::MAX as usize;
 
 /// The most bytes one COPY record may span, matching `MaxAllocSize` — the
 /// ceiling PostgreSQL's own line buffer hits (see [`record_too_long`]).
@@ -556,10 +544,9 @@ fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
 }
 
 /// Stream an already-opened COPY source file, handing the decoded rows to `sink`
-/// in batches of at most [`BATCH_ROWS`] — or [`FROZEN_BATCH_ROWS`] when `freeze`
-/// is set, see that constant — so a large file is never held in memory in full.
-/// `sink` runs inside the COPY's transaction, so an error it returns aborts the
-/// whole load.
+/// in batches of at most `batch_rows` so a large file is never held in memory in
+/// full. `sink` runs inside the COPY's transaction, so an error it returns aborts
+/// the whole load.
 ///
 /// The file arrives open because resolving and authorizing the path
 /// ([`crate::copy_access::CopyFileAccess`]) happens before the statement takes a
@@ -569,14 +556,9 @@ pub fn read_file_rows(
     mut file: File,
     path: &str,
     format: &CopyFormat,
-    freeze: bool,
+    batch_rows: usize,
     mut sink: impl FnMut(Vec<Vec<Field>>) -> Result<(), PgError>,
 ) -> Result<(), PgError> {
-    let batch_rows = if freeze {
-        FROZEN_BATCH_ROWS
-    } else {
-        BATCH_ROWS
-    };
     let mut decoder = CopyDecoder::new(format);
     let mut chunk = vec![0u8; READ_CHUNK];
     let mut pending: Vec<Vec<Field>> = Vec::new();
@@ -706,6 +688,7 @@ fn strerror(e: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabgresql_storage_api::TableAccessMethod;
 
     fn text_format() -> CopyFormat {
         CopyFormat::text()
@@ -715,41 +698,45 @@ mod tests {
         CopyFormat::csv()
     }
 
-    /// A frozen load hands rows over in whole-unit batches, because its target
-    /// writes each batch as one immutable fragment; an ordinary load keeps the
-    /// small batch, which only bounds memory. Both must produce the same rows.
+    /// The batch size is the caller's to choose, and it is what decides how many
+    /// on-disk units a load leaves behind for a target that writes whole batches.
+    /// Whatever it is, the rows must come out the same.
     #[test]
-    fn a_frozen_file_load_batches_by_the_whole_unit() -> Result<(), PgError> {
+    fn a_file_load_batches_at_the_size_the_target_asks_for() -> Result<(), PgError> {
         let rows = BATCH_ROWS * 2 + 7;
         let mut data = Vec::new();
         for row in 0..rows {
             data.extend_from_slice(format!("{row}\tv\n").as_bytes());
         }
 
-        let batches = |freeze: bool| -> Result<Vec<usize>, PgError> {
+        let batches = |batch_rows: usize| -> Result<Vec<usize>, PgError> {
             let dir = tempfile::tempdir().map_err(|e| bad_copy(e.to_string()))?;
             let path = dir.path().join("rows.data");
             std::fs::write(&path, &data).map_err(|e| bad_copy(e.to_string()))?;
             let file = File::open(&path).map_err(|e| bad_copy(e.to_string()))?;
             let mut sizes = Vec::new();
-            read_file_rows(file, "rows.data", &text_format(), freeze, |batch| {
+            read_file_rows(file, "rows.data", &text_format(), batch_rows, |batch| {
                 sizes.push(batch.len());
                 Ok(())
             })?;
             Ok(sizes)
         };
 
-        // Unfrozen: capped at BATCH_ROWS, so three batches for this many rows.
-        let plain = batches(false)?;
+        // A row store's bound: three batches for this many rows.
+        let heap = TableAccessMethod::Heap.bulk_load_batch_rows();
+        assert_eq!(heap, BATCH_ROWS);
+        let plain = batches(heap)?;
         assert_eq!(plain, vec![BATCH_ROWS, BATCH_ROWS, 7]);
 
-        // Frozen: FROZEN_BATCH_ROWS is far above the row count, so one batch —
-        // one fragment instead of three.
-        let frozen = batches(true)?;
-        assert_eq!(frozen, vec![rows]);
+        // A whole-batch writer asks for far more than this file holds, so it gets
+        // one batch — one fragment instead of three.
+        let columnar = TableAccessMethod::Parquet.bulk_load_batch_rows();
+        assert!(columnar > rows);
+        let whole = batches(columnar)?;
+        assert_eq!(whole, vec![rows]);
 
         // And the batching is the only difference.
-        assert_eq!(plain.iter().sum::<usize>(), frozen.iter().sum::<usize>());
+        assert_eq!(plain.iter().sum::<usize>(), whole.iter().sum::<usize>());
         Ok(())
     }
 
