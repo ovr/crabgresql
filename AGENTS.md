@@ -60,6 +60,17 @@ for the entire codebase:
   file contributes only the tests that actually pass, and is never rounded up to
   a whole file or dropped to zero. Report the honest per-test total.
 
+## Comments
+
+- **Do not restate the code.** A comment that says what the next line already
+  says — `// increment the counter`, `# the build job`, a doc comment that
+  echoes the function name — costs a reader time and goes stale silently. This
+  applies to configuration and CI files as much as to Rust.
+- Comment the things the code cannot say: why a branch or a constant exists,
+  which observable PG behavior it reproduces, what breaks if it is changed, or
+  which non-obvious alternative was rejected and why.
+- If nothing of that kind is true of a line, leave it uncommented.
+
 ## Rust error handling
 
 - Never use `unwrap()`.
