@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR makes the running job's answer stale, so drop it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain named by rust-toolchain.toml, with rustfmt and
+      # clippy, instead of whatever the runner image happens to ship.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      # `--all-targets` is the point: the workspace denies `unwrap_used` and
+      # `disallowed_methods`, and a plain `cargo clippy` never lints tests,
+      # examples or benches — exactly where those denials get violated.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: build + test (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` makes Cargo.lock part of the contract: a change that forgot
+      # to update it fails loudly instead of silently re-resolving.
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+      - name: cargo test
+        run: cargo test --workspace --locked
