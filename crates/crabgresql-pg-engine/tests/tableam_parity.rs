@@ -1173,6 +1173,35 @@ fn a_rolled_back_truncate_keeps_the_chunk_store_and_its_values() -> anyhow::Resu
 }
 
 #[test]
+fn a_frozen_write_requires_this_transaction_to_have_truncated() -> anyhow::Result<()> {
+    // A frozen tuple is visible at once and names no transaction whose abort
+    // could retract it, so it is only sound in storage a rollback discards. The
+    // server checks that before authorizing the freeze; the heap checks it again
+    // where the header is actually stamped, so widening the freeze fails loudly
+    // instead of writing unretractable rows into a live relfilenode.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    let xid = h.tm.allocate_xid();
+    let txn = h.tm.context(xid, CommandId::FIRST).with_freeze();
+
+    let error = table
+        .insert(vec![Value::Int4(1), Value::Null], &txn)
+        .expect_err("a frozen write with no staged truncate must be refused");
+    assert!(
+        error.to_string().contains("has not truncated it"),
+        "{error}"
+    );
+    assert_eq!(scan_rows(&*table, &read(&h.tm)).len(), 0);
+
+    // With this transaction's own TRUNCATE staged, the same write goes through.
+    table.truncate(&txn)?;
+    table.insert(vec![Value::Int4(1), Value::Null], &txn)?;
+    h.tm.commit(xid)?;
+    assert_eq!(ids(&h.tm, &*table), vec![Value::Int4(1)]);
+    Ok(())
+}
+
+#[test]
 fn a_rolled_back_truncate_reclaims_the_chunks_it_wrote() -> anyhow::Result<()> {
     // The other half of the rollback story. A TRUNCATE stages a fresh heap file
     // and discards it on abort, which takes away every tuple that named a chain
