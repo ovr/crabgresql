@@ -67,6 +67,18 @@ const MAX_GLOBAL_BUFFER_BYTES: usize = GB.saturating_mul(16);
 /// kilobytes of it — a `Vec<Value>` pays `size_of::<Value>()` per column
 /// whatever that column holds.
 const MIN_BUFFER_BYTES: usize = MB;
+/// A page pool has to hold every page pinned at once, or the clock sweep finds
+/// no victim and the pin fails. How many that is depends on the workload — a
+/// btree split holds four at once, and an index build holds a heap page across
+/// the whole insert — and nothing caps the number of sessions, so no floor here
+/// can make exhaustion impossible; the pool reports it instead. What this floor
+/// does is keep the smallest configurable pool no smaller than the 8 MB this
+/// engine shipped with before the size was configurable at all.
+const MIN_SHARED_BUFFERS: usize = 8 * MB;
+/// Unlike the write buffers above, these bytes are reserved for the process
+/// lifetime rather than transiently occupied, so the ceiling is about the
+/// machine rather than about a flush. Still a backstop against a typo.
+const MAX_SHARED_BUFFERS: usize = GB.saturating_mul(16);
 /// Anything shorter is a background thread that spends its life waking up.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -106,6 +118,20 @@ pub const BUFFER_TICK: TimeVar = TimeVar {
     max: Duration::from_secs(60 * 60),
     help: "how often the background flush worker looks for eligible buffers",
 };
+/// RAM the buffer pool holds relation pages in, rounded down to whole 8 KiB
+/// frames.
+///
+/// PostgreSQL's default, and for the same reason: a pool far below the working
+/// set turns every page read into a file read, and each of those is serialized
+/// against every other one. The old value here was 8 MiB, against which
+/// `pgbench -s 10` puts a 178 MiB working set — so essentially nothing hit.
+pub const SHARED_BUFFERS: SizeVar = SizeVar {
+    name: "CRABGRESQL_SHARED_BUFFERS",
+    default: 128 * MB,
+    min: MIN_SHARED_BUFFERS,
+    max: MAX_SHARED_BUFFERS,
+    help: "RAM the buffer pool holds relation pages in, rounded down to whole 8 KiB frames",
+};
 
 // Bounds that are transposed, or a default outside them, would be a startup
 // panic waiting for the first operator to set that variable: `Ord::clamp`
@@ -115,6 +141,7 @@ const _: () = assert!(BUFFER_TABLE_SOFT_BYTES.is_sane());
 const _: () = assert!(BUFFER_GLOBAL_HARD_BYTES.is_sane());
 const _: () = assert!(BUFFER_MAX_AGE.is_sane());
 const _: () = assert!(BUFFER_TICK.is_sane());
+const _: () = assert!(SHARED_BUFFERS.is_sane());
 
 /// A knob whose value is a quantity: its name, its default, and the range it
 /// is allowed to take.
@@ -350,6 +377,79 @@ mod tests {
         assert_eq!(BUFFER_TICK.default.render(), "1s");
         assert_eq!(BUFFER_TICK.min.render(), "10ms");
         assert_eq!(BUFFER_TICK.max.render(), "1h");
+
+        assert_eq!(SHARED_BUFFERS.default.render(), "128MB");
+        assert_eq!(SHARED_BUFFERS.min.render(), "8MB");
+        assert_eq!(SHARED_BUFFERS.max.render(), "16GB");
+    }
+
+    /// The same table, read rather than transcribed.
+    ///
+    /// The test above pins the constants to spellings a human typed here, which
+    /// catches a knob changing under the documentation but not the documentation
+    /// drifting from the knob: raising a minimum and forgetting the README
+    /// leaves it green. This one opens the file, so the row has to agree about
+    /// the default, the range, and the description a knob gives of itself.
+    #[test]
+    fn the_readme_table_agrees_with_the_knobs_it_describes() {
+        let readme = include_str!("../../../README.md");
+        let mut rows = vec![
+            (
+                SHARED_BUFFERS.name,
+                SHARED_BUFFERS.help,
+                Row::from(SHARED_BUFFERS),
+            ),
+            (
+                BUFFER_TABLE_SOFT_BYTES.name,
+                BUFFER_TABLE_SOFT_BYTES.help,
+                Row::from(BUFFER_TABLE_SOFT_BYTES),
+            ),
+            (
+                BUFFER_GLOBAL_HARD_BYTES.name,
+                BUFFER_GLOBAL_HARD_BYTES.help,
+                Row::from(BUFFER_GLOBAL_HARD_BYTES),
+            ),
+        ];
+        rows.push((
+            BUFFER_MAX_AGE.name,
+            BUFFER_MAX_AGE.help,
+            Row::from(BUFFER_MAX_AGE),
+        ));
+        rows.push((BUFFER_TICK.name, BUFFER_TICK.help, Row::from(BUFFER_TICK)));
+
+        for (name, help, row) in rows {
+            let line = readme
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{name}` |")))
+                .unwrap_or_else(|| panic!("{name} has no row in the README Configuration table"));
+            for (what, expected) in [
+                ("default", format!("`{}`", row.default)),
+                ("range", format!("`{}`–`{}`", row.min, row.max)),
+                ("description", help.to_string()),
+            ] {
+                assert!(
+                    line.contains(&expected),
+                    "the README row for {name} disagrees about its {what}\n  row:      {line}\n  expected: {expected}"
+                );
+            }
+        }
+    }
+
+    /// One knob's three spellings, so both quantity kinds go through one check.
+    struct Row {
+        default: String,
+        min: String,
+        max: String,
+    }
+
+    impl<T: Quantity> From<RangedVar<T>> for Row {
+        fn from(var: RangedVar<T>) -> Row {
+            Row {
+                default: var.default.render(),
+                min: var.min.render(),
+                max: var.max.render(),
+            }
+        }
     }
 
     #[test]

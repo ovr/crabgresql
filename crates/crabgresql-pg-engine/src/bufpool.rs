@@ -27,8 +27,65 @@ pub struct BufferTag {
     pub block: u32,
 }
 
+/// How many 8 KiB frames a pool commits.
+///
+/// A value object with a separate `from_env`, in the shape `BufferFlushPolicy`
+/// already established in this crate, and for the same reason: the frame count
+/// is a property of the engine being opened, not of the process environment.
+/// Without the seam, every engine a test builds would commit the production
+/// default, and the only way to ask for less would be to mutate the environment
+/// — which is `unsafe` under the 2024 edition precisely because it races every
+/// other thread reading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferPoolPolicy {
+    pub frames: usize,
+}
+
+impl Default for BufferPoolPolicy {
+    fn default() -> Self {
+        BufferPoolPolicy {
+            frames: crabgresql_config::SHARED_BUFFERS.default / BLCKSZ,
+        }
+    }
+}
+
+impl BufferPoolPolicy {
+    /// The pool size [`crabgresql_config::SHARED_BUFFERS`] asks for, rounded
+    /// down to whole frames. A value that cannot be used as written is corrected
+    /// and the correction logged, as with every other knob.
+    pub fn from_env() -> Self {
+        let complain = |message: String| tracing::warn!("{message}");
+        BufferPoolPolicy {
+            frames: crabgresql_config::SHARED_BUFFERS.get(complain) / BLCKSZ,
+        }
+    }
+
+    /// The smallest pool this engine has ever shipped with, for tests and tools
+    /// that open an engine to exercise it rather than to serve with it. A test
+    /// binary opens many engines, and at the production default each would
+    /// commit its full `shared_buffers` up front.
+    pub fn minimal() -> Self {
+        BufferPoolPolicy {
+            frames: crabgresql_config::SHARED_BUFFERS.min / BLCKSZ,
+        }
+    }
+}
+
+// The pool divides by its frame count on every miss, so a floor below one whole
+// frame would be a division by zero. The bound belongs to the config crate,
+// which has no notion of a page size; the reconciliation belongs here.
+const _: () = assert!(crabgresql_config::SHARED_BUFFERS.min >= BLCKSZ);
+
 struct Frame {
     tag: Option<BufferTag>,
+    /// The frame's 8 KiB page, committed when the pool is built.
+    ///
+    /// Up front, the way PostgreSQL commits `shared_buffers`, so a pool sized
+    /// past what the machine has fails at startup where an operator can see it
+    /// rather than hours later mid-query. Allocating on first use instead would
+    /// also put the allocation inside `pin`'s critical section, which is the one
+    /// stretch of code the whole pool serializes on, to zero bytes that
+    /// `smgr::read` overwrites in full a line later.
     data: Box<Page>,
     dirty: bool,
     pins: u32,
@@ -282,6 +339,8 @@ impl BufferPool {
             .iter()
             .filter_map(|frame| {
                 let fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+                // A frame that never held a page has nothing to be dirty about,
+                // and asking it for one would panic.
                 let lsn = page::get_lsn(&fr.data);
                 (fr.dirty && fr.tag.is_some() && lsn != 0).then_some(lsn)
             })
@@ -301,16 +360,35 @@ impl BufferPool {
         // file. Defence in depth — `unlink`/`truncate` clear it too.
         self.smgr.forget_pending_fsync(rel);
         let mut map = self.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-        for frame in &self.frames {
-            let mut fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-            if fr.tag.map(|t| t.rel == rel).unwrap_or(false) {
-                if let Some(tag) = fr.tag.take() {
-                    map.remove(&tag);
-                }
+        // Driven off the mapping rather than by sweeping every frame: a frame
+        // carries a tag exactly while the mapping names it (`pin` sets both under
+        // this lock, and the removal below clears both), so the mapping already
+        // lists every frame this could touch. Sweeping instead would lock all
+        // `shared_buffers` worth of frames to find the few that match, which at a
+        // realistic pool size is thousands of acquisitions for a handful of hits.
+        //
+        // The mapping decides *which* frames to visit, but the frame decides what
+        // it holds. Checking the tag before clearing it is what keeps a mapping
+        // that has somehow drifted from costing another relation its dirty page:
+        // the entry goes either way, since an entry naming a frame that does not
+        // hold it is wrong by definition, but only a frame that agrees is
+        // emptied. `retain` rather than a collected `Vec` so the removal cannot
+        // be forgotten by a later edit, and so a TRUNCATE of a pool-sized
+        // relation does not allocate its way through the mapping lock.
+        map.retain(|tag, &mut idx| {
+            if tag.rel != rel {
+                return true;
+            }
+            let mut fr = self.frames[idx]
+                .lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"));
+            if fr.tag == Some(*tag) {
+                fr.tag = None;
                 fr.dirty = false;
                 fr.ref_bit = false;
             }
-        }
+            false
+        });
     }
 }
 
@@ -715,7 +793,8 @@ mod bufpool_contention_bench {
     /// three working sets below are defined as ratios against it, so following
     /// the shipping default would silently redefine what `thrash` means the next
     /// time somebody tunes the server and make every recorded number
-    /// incomparable.
+    /// incomparable. 1024 frames is what this engine shipped before that knob
+    /// existed, which is what the recorded baseline was taken against.
     const POOL_FRAMES: usize = 1024;
     /// Prime, so it is coprime with every span below and each thread's walk is
     /// one cycle over the whole working set rather than a few frames.

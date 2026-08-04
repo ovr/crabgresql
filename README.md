@@ -77,6 +77,7 @@ not parse falls back to its default rather than failing startup.
 | `CRABGRESQL_BUFFER_GLOBAL_HARD_BYTES` | `256MB` | `1MB`–`16GB` | buffered bytes across all relations that make every buffer eligible |
 | `CRABGRESQL_BUFFER_MAX_AGE` | `1m` | `10ms`–`24h` | how long a write buffer may hold rows before being flushed anyway |
 | `CRABGRESQL_BUFFER_TICK` | `1s` | `10ms`–`1h` | how often the background flush worker looks for eligible buffers |
+| `CRABGRESQL_SHARED_BUFFERS` | `128MB` | `8MB`–`16GB` | RAM the buffer pool holds relation pages in, rounded down to whole 8 KiB frames |
 
 Sizes take a bare byte count or a binary unit — `kB`, `MB`, `GB`, `TB`, with
 the trailing `B` optional, so `33554432`, `32MB` and `32m` all say the same

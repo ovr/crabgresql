@@ -32,7 +32,12 @@ fn setup() -> H {
         Err(error) => panic!("failed to open test WAL: {error}"),
     });
     let mut reg = RmgrRegistry::new();
-    let engine = match PgEngine::new(dir.path(), Arc::clone(&wal), &mut reg) {
+    let engine = match PgEngine::new_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        &mut reg,
+        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
+    ) {
         Ok(engine) => Arc::new(engine),
         Err(error) => panic!("failed to open test engine: {error}"),
     };

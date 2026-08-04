@@ -70,6 +70,7 @@ use crate::nbtree::BTree;
 use crate::redo::HeapRedo;
 use crate::smgr::StorageManager;
 
+pub use crate::bufpool::{BufferPoolPolicy, PoolStats};
 pub use crate::flush::{BufferFlushPolicy, BufferedRelation};
 pub use crate::smgr::RelFileNode;
 
@@ -93,10 +94,6 @@ pub(crate) struct RecoveredTruncate {
     /// directories; `discard_relfile` only knows about `base/<n>`).
     pub parquet: bool,
 }
-
-/// Number of buffer-pool frames (8 MB). Must comfortably exceed the number of
-/// pages pinned concurrently; see `bufpool` docs.
-const DEFAULT_FRAMES: usize = 1024;
 
 /// Shared engine state that both the table AM and the redo handler reach into.
 pub(crate) struct EngineInner {
@@ -373,8 +370,21 @@ impl PgEngine {
         wal: Arc<Wal>,
         registry: &mut RmgrRegistry,
     ) -> std::io::Result<PgEngine> {
+        Self::new_with_pool(data_dir, wal, registry, BufferPoolPolicy::from_env())
+    }
+
+    /// [`PgEngine::new`] with the buffer pool sized explicitly rather than from
+    /// the environment. For tests and tools that open an engine to exercise it:
+    /// the pool commits its frames up front, so a binary that opens a dozen
+    /// engines at the production default commits a dozen times `shared_buffers`.
+    pub fn new_with_pool(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+        registry: &mut RmgrRegistry,
+        pool: BufferPoolPolicy,
+    ) -> std::io::Result<PgEngine> {
         let smgr = Arc::new(StorageManager::open(data_dir)?);
-        let bufpool = BufferPool::new(DEFAULT_FRAMES, smgr, Arc::clone(&wal));
+        let bufpool = BufferPool::new(pool.frames, smgr, Arc::clone(&wal));
         let catalog = Arc::new(RelCatalog::load(data_dir)?);
         let inner = Arc::new(EngineInner {
             bufpool,
@@ -514,7 +524,7 @@ impl PgEngine {
         data_dir: &Path,
         wal: Arc<Wal>,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
-        Self::open_recovered_at(data_dir, wal, None)
+        Self::open_recovered_at(data_dir, wal, None, BufferPoolPolicy::from_env())
     }
 
     /// [`PgEngine::open_recovered`], but resuming at an explicit `redo` instead of
@@ -530,13 +540,38 @@ impl PgEngine {
         wal: Arc<Wal>,
         redo: Lsn,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
-        Self::open_recovered_at(data_dir, wal, Some(redo))
+        Self::open_recovered_at(data_dir, wal, Some(redo), BufferPoolPolicy::from_env())
+    }
+
+    /// [`PgEngine::open_recovered`] with the buffer pool sized explicitly. See
+    /// [`PgEngine::new_with_pool`] for why a test wants this.
+    pub fn open_recovered_with_pool(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+        pool: BufferPoolPolicy,
+    ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        Self::open_recovered_at(data_dir, wal, None, pool)
+    }
+
+    /// [`PgEngine::open_recovered_from`] with the buffer pool sized explicitly.
+    ///
+    /// Distinct from [`PgEngine::open_recovered_with_pool`] in the same way the
+    /// two it mirrors are: this one is told where to start replaying, that one
+    /// reads the redo point from the control file.
+    pub fn open_recovered_from_with_pool(
+        data_dir: &Path,
+        wal: Arc<Wal>,
+        redo: Lsn,
+        pool: BufferPoolPolicy,
+    ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
+        Self::open_recovered_at(data_dir, wal, Some(redo), pool)
     }
 
     fn open_recovered_at(
         data_dir: &Path,
         wal: Arc<Wal>,
         redo: Option<Lsn>,
+        pool: BufferPoolPolicy,
     ) -> std::io::Result<(Arc<PgEngine>, Arc<Clog>, Xid)> {
         // Read the pre-recovery control file: `clean_shutdown == false` (or absent)
         // means the last run crashed, so unlogged relations must be reset. Read it
@@ -550,7 +585,12 @@ impl PgEngine {
         // it came from a control file that is readable.
         let redo = redo.unwrap_or_else(|| control.map_or(Lsn::INVALID, |c| c.redo_lsn));
         let mut registry = RmgrRegistry::new();
-        let engine = Arc::new(PgEngine::new(data_dir, Arc::clone(&wal), &mut registry)?);
+        let engine = Arc::new(PgEngine::new_with_pool(
+            data_dir,
+            Arc::clone(&wal),
+            &mut registry,
+            pool,
+        )?);
         // Load the durable commit log, then replay over it: the WAL is the
         // authority, so a status it carries simply overwrites what was on disk.
         // What the CLOG adds is the fates of transactions whose commit records
@@ -2131,6 +2171,7 @@ impl TableEngine for PgEngine {
 mod tests {
     use std::sync::Arc;
 
+    use crate::BufferPoolPolicy;
     use crabgresql_storage_api::{Column, TableEngine, TableSchema};
     use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize, Xid};
     use crabgresql_types::{PgType, Value};
@@ -2154,7 +2195,11 @@ mod tests {
     fn a_checkpoint_publishes_a_redo_point_naming_its_own_record() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            BufferPoolPolicy::minimal(),
+        )?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -2194,7 +2239,8 @@ mod tests {
         dir: &std::path::Path,
     ) -> anyhow::Result<(Arc<PgEngine>, TransactionManager, Arc<Wal>)> {
         let wal = Arc::new(Wal::open(dir)?);
-        let (engine, clog, next_xid) = PgEngine::open_recovered(dir, Arc::clone(&wal))?;
+        let (engine, clog, next_xid) =
+            PgEngine::open_recovered_with_pool(dir, Arc::clone(&wal), BufferPoolPolicy::minimal())?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -2217,7 +2263,11 @@ mod tests {
         // never runs the swap, so this test drives the hook's steps by hand and can
         // look between them.
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            BufferPoolPolicy::minimal(),
+        )?;
         let tm = TransactionManager::new_recovered(
             Arc::clone(&wal) as Arc<dyn CommitSink>,
             clog,
@@ -2445,7 +2495,11 @@ mod tests {
     fn a_checkpoint_records_the_live_xid_floor() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            BufferPoolPolicy::minimal(),
+        )?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -2481,7 +2535,7 @@ mod test_support {
     use crabgresql_wal::Wal;
     use tempfile::TempDir;
 
-    use crate::PgEngine;
+    use crate::{BufferPoolPolicy, PgEngine};
 
     /// A fully-wired durable [`PgEngine`] over a throwaway temp directory, plus its
     /// WAL-backed [`TransactionManager`]. The directory is deleted when this is
@@ -2519,9 +2573,13 @@ mod test_support {
     pub fn ephemeral_engine() -> Arc<PgEngine> {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
-        let (engine, _clog, _next_xid) =
-            PgEngine::open_recovered_from(dir.path(), wal, crabgresql_wal::Lsn::INVALID)
-                .expect("open engine");
+        let (engine, _clog, _next_xid) = PgEngine::open_recovered_from_with_pool(
+            dir.path(),
+            wal,
+            crabgresql_wal::Lsn::INVALID,
+            BufferPoolPolicy::minimal(),
+        )
+        .expect("open engine");
         // Keep the data directory alive for the process lifetime; the OS reclaims
         // it when the (short-lived) test process exits.
         std::mem::forget(dir);
@@ -2533,10 +2591,11 @@ mod test_support {
     pub fn ephemeral() -> Ephemeral {
         let dir = TempDir::new().expect("create temp data dir");
         let wal = Arc::new(Wal::open(dir.path()).expect("open wal"));
-        let (engine, clog, next_xid) = PgEngine::open_recovered_from(
+        let (engine, clog, next_xid) = PgEngine::open_recovered_from_with_pool(
             dir.path(),
             Arc::clone(&wal),
             crabgresql_wal::Lsn::INVALID,
+            BufferPoolPolicy::minimal(),
         )
         .expect("open engine");
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;

@@ -722,7 +722,11 @@ mod tests {
     fn no_page_stays_dirty_at_or_below_a_sampled_redo_point() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, clog, next_xid) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            crate::BufferPoolPolicy::minimal(),
+        )?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);

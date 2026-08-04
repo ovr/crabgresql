@@ -359,8 +359,12 @@ mod tests {
         dir: &std::path::Path,
     ) -> anyhow::Result<(Arc<PgEngine>, Arc<TransactionManager>, Arc<dyn TableAm>)> {
         let wal = Arc::new(Wal::open(dir)?);
-        let (engine, clog, next_xid) =
-            PgEngine::open_recovered_from(dir, Arc::clone(&wal), crabgresql_wal::Lsn::INVALID)?;
+        let (engine, clog, next_xid) = PgEngine::open_recovered_from_with_pool(
+            dir,
+            Arc::clone(&wal),
+            crabgresql_wal::Lsn::INVALID,
+            crate::BufferPoolPolicy::minimal(),
+        )?;
         let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
         let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
         tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
@@ -646,7 +650,11 @@ mod tests {
     fn the_worker_exits_when_the_engine_is_dropped() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
-        let (engine, _clog, _next) = PgEngine::open_recovered(dir.path(), Arc::clone(&wal))?;
+        let (engine, _clog, _next) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            crate::BufferPoolPolicy::minimal(),
+        )?;
         let weak = Arc::downgrade(&engine);
         let worker = FlushWorker::spawn(
             weak.clone(),

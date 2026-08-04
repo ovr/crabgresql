@@ -150,7 +150,12 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
 
     let mut reg = RmgrRegistry::new();
     let wal = Arc::new(Wal::open(dir.path())?);
-    let engine2 = PgEngine::new(dir.path(), Arc::clone(&wal), &mut reg)?;
+    let engine2 = PgEngine::new_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        &mut reg,
+        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
+    )?;
     let clog = Arc::new(Clog::new());
     let res = recover(dir.path(), &reg, &clog, crabgresql_wal::Lsn::INVALID)?;
     let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
