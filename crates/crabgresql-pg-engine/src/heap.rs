@@ -1037,144 +1037,34 @@ impl HeapTable {
         self.place_item(rel, xid, tuple_bytes, &self.insert_hint, true)
     }
 
-    /// Free the TOAST chains named by tuples in `rel`, a relfilenode that is about
-    /// to be unlinked without any of its rows ever becoming visible.
+    /// Sweep whatever heap file `xid` staged with a TRUNCATE it is about to
+    /// abort. A no-op if `xid` staged nothing.
     ///
-    /// A TRUNCATE stages a fresh heap file and the transaction may then write wide
-    /// rows into it. If that transaction aborts, the staged file is discarded
-    /// whole — and with it every tuple that named a chain. The chunk store is
-    /// deliberately *not* swapped by a TRUNCATE (see
-    /// [`HeapTable::reclaim_toast_after_truncate`]), so those chunks stay behind
-    /// with nothing pointing at them, and VACUUM reaches a chain only through a
-    /// heap tuple. Without this they are unreachable and unreclaimable for the
-    /// life of the relation, and repeating the rolled-back load grows the store
-    /// without bound.
+    /// Call this *before* `abort_truncate`, which clears the staged state. It
+    /// exists so the caller never has to know which of the relfilenodes that
+    /// abort is about to discard is the heap's rather than an index's — the
+    /// distinction matters, because reading a B-tree page as heap tuples would
+    /// synthesize garbage chain pointers.
+    /// Whether this relation's writes bypass the WAL (`UNLOGGED`/`TEMP`), for the
+    /// engine-level sweeps that log a record per page they touch.
+    pub(crate) fn wal_skipped(&self) -> bool {
+        self.persistence.is_wal_skipped()
+    }
+
+    /// Point the chunk-store insert hint back at the start of the file.
     ///
-    /// Reads through the buffer pool rather than the file: `discard_relfile` drops
-    /// the staged file's frames *without* writing them back, so pages may exist
-    /// only in memory. Every failure is logged and skipped — this runs on the
-    /// abort path, including `Session::drop`, where a panic would be fatal.
-    ///
-    /// The usual "free chains only after the owning slots are gone" ordering
-    /// (see [`TableAm::vacuum`]) does not bind here: the tuples naming these chains
-    /// live in a file no snapshot can reach, and a crash before the unlink leaves
-    /// the whole relfilenode to be discarded by recovery, so no reader can ever
-    /// observe a tuple whose chunks have been freed.
-    /// The same sweep over whatever heap file `xid` staged with a TRUNCATE it is
-    /// about to abort. A no-op if `xid` staged nothing.
-    ///
-    /// Call this *before* `abort_truncate`, which clears the staged state — and
-    /// so that the caller never has to know which of the discarded relfilenodes is
-    /// the heap's rather than an index's.
+    /// Freeing a chain only recovers space the *next* write can find: chunk
+    /// writes follow a one-block hint and there is no free space map, so space
+    /// freed behind the hint is invisible. `reclaim_toast_after_truncate` resets
+    /// it for the same reason when it empties the store outright.
+    pub(crate) fn reset_toast_hint(&self) {
+        self.toast_hint.store(0, Ordering::Relaxed);
+    }
+
     pub(crate) fn free_staged_chains(&self, xid: Xid) {
         if let Some(rel) = self.staged_for(xid) {
-            self.free_orphaned_chains(rel);
-        }
-    }
-
-    pub(crate) fn free_orphaned_chains(&self, rel: RelFileNode) {
-        let Ok(nblocks) = self.engine.bufpool.smgr().nblocks(rel) else {
-            tracing::warn!(
-                table = %self.snap().name,
-                relfilenode = rel.0,
-                "could not size a discarded relfilenode; its out-of-line values stay allocated"
-            );
-            return;
-        };
-        let mut chains: Vec<toast::ToastPointer> = Vec::new();
-        for block in 0..nblocks {
-            let Ok(page) = self.engine.bufpool.pin(rel, block) else {
-                continue;
-            };
-            chains.extend(page.read(|pg| {
-                let mut found: Vec<toast::ToastPointer> = Vec::new();
-                for off in 1..=page::max_offset(pg) {
-                    if let Some(bytes) = page::get_item(pg, off) {
-                        // No visibility test: every tuple in this file is doomed.
-                        // The only question is whether the row owns chunks at all,
-                        // which `has_external` answers without a full decode.
-                        if tuple::decode_header(bytes).has_external
-                            && let Ok(raw) = tuple::decode_raw(bytes)
-                        {
-                            found.extend(raw.external().iter().map(|(_, p)| *p));
-                        }
-                    }
-                }
-                found
-            }));
-        }
-        self.free_chains(&chains);
-    }
-
-    /// Free every chunk of each chain, block by block, logging a HEAP_VACUUM per
-    /// page touched. Called once the rows that named these chains are gone —
-    /// either because VACUUM reclaimed them, or because the file holding them is
-    /// being discarded (see [`HeapTable::free_orphaned_chains`]).
-    ///
-    /// The walk reads each chunk's link before freeing it, so it collects the
-    /// whole chain first and frees per block afterwards — freeing as it went
-    /// would destroy the link it still needs.
-    fn free_chains(&self, chains: &[toast::ToastPointer]) {
-        if chains.is_empty() {
-            return;
-        }
-        let mut per_block: std::collections::HashMap<(u32, u32), Vec<u16>> =
-            std::collections::HashMap::new();
-        let smgr = self.engine.bufpool.smgr();
-        for p in chains {
-            // Same bounds check as `detoast`, and for the same reason: pinning an
-            // out-of-range block extends the relation to reach it.
-            let Ok(nblocks) = smgr.nblocks(p.rel) else {
-                continue;
-            };
-            let mut at = p.first;
-            let mut seen = 0usize;
-            loop {
-                if at.block >= nblocks {
-                    break;
-                }
-                let Ok(page) = self.engine.bufpool.pin(p.rel, at.block) else {
-                    break;
-                };
-                let Some(next) = page.read(|pg| {
-                    page::get_item(pg, at.offset)
-                        .and_then(|bytes| tuple::decode_chunk(bytes).map(|(next, _)| next))
-                }) else {
-                    break;
-                };
-                per_block
-                    .entry((p.rel.0, at.block))
-                    .or_default()
-                    .push(at.offset);
-                seen += 1;
-                // Self-link terminates the chain. The count is a backstop against
-                // a corrupt link cycling forever: no value has more chunks than
-                // its own byte count.
-                if next == at || seen > p.rawsize as usize {
-                    break;
-                }
-                at = next;
-            }
-        }
-        for ((rel, block), mut offs) in per_block {
-            offs.sort_unstable();
-            offs.dedup();
-            let rel = RelFileNode(rel);
-            let Ok(page) = self.engine.bufpool.pin(rel, block) else {
-                continue;
-            };
-            page.modify(|pg| {
-                for &off in &offs {
-                    page::set_flags(pg, off, page::LP_UNUSED);
-                }
-                page::compact(pg);
-                let lsn = self.log(
-                    rec::HEAP_VACUUM,
-                    Xid::INVALID,
-                    &rec::vacuum(rel, block, &offs),
-                );
-                page::set_lsn(pg, lsn.0);
-            });
+            self.engine
+                .free_orphaned_chains(rel, self.persistence.is_wal_skipped());
         }
     }
 
@@ -1702,7 +1592,10 @@ impl TableAm for HeapTable {
                 // transaction; reclaim it now — chunks first, for the reason given
                 // in `free_orphaned_chains`: this file holds the only tuples that
                 // name them, and the chunk store survives a TRUNCATE.
-                self.free_orphaned_chains(RelFileNode(prev.new_rel));
+                self.engine.free_orphaned_chains(
+                    RelFileNode(prev.new_rel),
+                    self.persistence.is_wal_skipped(),
+                );
                 self.engine.discard_relfile(RelFileNode(prev.new_rel));
                 // Already registered with the engine on the first TRUNCATE.
             }
@@ -1856,7 +1749,8 @@ impl TableAm for HeapTable {
             // chunks. This way a crash in the gap leaks chunks nothing references,
             // which the next full vacuum cannot even see — a leak, never
             // corruption.
-            self.free_chains(&dead_chains);
+            self.engine
+                .free_chains(&dead_chains, self.persistence.is_wal_skipped());
         }
     }
 }
