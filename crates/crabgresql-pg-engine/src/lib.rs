@@ -1495,8 +1495,7 @@ impl TxnFinalize for PgEngine {
                     // when the *new* heap is empty, which `TRUNCATE t; COPY t;`
                     // never is: without this, reloading in a loop grows the store
                     // by a whole dataset per reload.
-                    self.inner
-                        .discard_heap_relfile(swap.old_heap, t.wal_skipped());
+                    t.discard_heap_file(swap.old_heap);
                     t.reset_toast_hint();
                     // The superseded index trees die with the heap file they
                     // pointed into.
