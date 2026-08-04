@@ -151,6 +151,26 @@ COPY vistest FROM '/dev/null' (delimiter ',', delimiter ',');
 ERROR:  conflicting or redundant options
 LINE 1: COPY vistest FROM '/dev/null' (delimiter ',', delimiter ',')...
                                                       ^
+-- The rule is about options, not about parentheses: it covers the pre-9.0 list
+-- and the sub-options of its CSV item too.
+COPY vistest FROM '/dev/null' CSV FREEZE FREEZE;
+ERROR:  conflicting or redundant options
+LINE 1: COPY vistest FROM '/dev/null' CSV FREEZE FREEZE;
+                                                 ^
+COPY vistest FROM '/dev/null' CSV HEADER HEADER;
+ERROR:  conflicting or redundant options
+LINE 1: COPY vistest FROM '/dev/null' CSV HEADER HEADER;
+                                                 ^
+COPY vistest FROM '/dev/null' DELIMITER ',' DELIMITER ',';
+ERROR:  conflicting or redundant options
+LINE 1: COPY vistest FROM '/dev/null' DELIMITER ',' DELIMITER ',';
+                                                    ^
+-- And the two spellings are alternatives, so carrying both is a syntax error
+-- rather than a redundant option.
+COPY vistest FROM '/dev/null' (FREEZE OFF) CSV FREEZE;
+ERROR:  syntax error at or near "CSV"
+LINE 1: COPY vistest FROM '/dev/null' (FREEZE OFF) CSV FREEZE;
+                                                   ^
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative
 -- data path, and `:'filename'` interpolates the result as a quoted literal.
