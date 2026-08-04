@@ -21,7 +21,7 @@ use std::path::Path;
 use crabgresql_txn::{Clog, Xid};
 
 use crate::control::read_control;
-use crate::page::{XLOG_BLCKSZ, first_usable, is_record_position, page_start};
+use crate::page::{XLOG_BLCKSZ, is_record_position, page_start};
 use crate::reader::{StopReason, WalReader};
 use crate::record::{Lsn, WalError};
 use crate::rmgr::{RedoContext, RmgrId, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
@@ -59,8 +59,10 @@ fn first_valid_record_after(dir: &Path, from: Lsn) -> Result<Option<Lsn>, WalErr
     let mut page = page_start(from.0) + XLOG_BLCKSZ;
     let mut buf = Vec::new();
     while page < ceiling {
-        let candidate = Lsn(first_usable(page));
-        let mut reader = WalReader::open(dir, candidate)?;
+        // The page header names where its first record starts, which is past any
+        // tail owed to a record that began earlier.
+        let mut reader = WalReader::open_at_page(dir, Lsn(page))?;
+        let candidate = reader.position();
         if let Some((rec, _)) = reader.next_into(&mut buf)?
             && rec.rec_lsn == candidate
         {

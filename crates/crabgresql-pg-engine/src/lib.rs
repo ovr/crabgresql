@@ -900,6 +900,18 @@ impl PgEngine {
             },
         )
         .map_err(std::io::Error::other)?;
+        // Reclaim the segments below the redo point — **after** `write_control`,
+        // never before: a crash between the two would otherwise leave a control
+        // file naming a segment that is gone, and recovery refuses to start on
+        // that. Doing it last also means a failure here costs disk, not
+        // correctness, so it is logged rather than propagated.
+        //
+        // A clamped redo point recycles nothing, which `Wal::recycle` enforces:
+        // the published redo then names the head of the stream and every segment
+        // is still needed.
+        if let Err(error) = self.inner.wal.recycle(redo) {
+            tracing::warn!(%error, "could not reclaim spent write-ahead log segments");
+        }
         Ok(())
     }
 

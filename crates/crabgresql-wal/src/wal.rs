@@ -89,20 +89,23 @@ impl Inner {
 }
 
 /// Where a scan for the end of the log must begin: the redo point `pg_control`
-/// names, floored at the first usable byte of the lowest segment present.
+/// names, or [`Lsn::INVALID`] to let the reader resolve the head of the
+/// surviving log for itself.
 ///
-/// The floor matters because recycling removes the log's prefix, so byte zero is
-/// not generally reachable; the redo point matters because scanning from the
-/// lowest segment on every open would read the whole log.
+/// The redo point is what keeps an open from reading the whole log. It is
+/// discarded when it names a segment recycling has already reclaimed — which the
+/// checkpointer will not produce, but a stale or hand-written control file can —
+/// because the reader's own resolution is the safe answer there, and it is not a
+/// position this function can compute: the head of the lowest surviving segment
+/// may be owed to a record that started in a segment now gone.
 fn scan_origin(dir: &Path) -> Result<Lsn, WalError> {
     let redo = read_control(dir)?
         .map(|control| control.redo_lsn)
         .filter(|lsn| lsn.is_valid());
-    let lowest = segment_bounds(dir)?.map(|(lo, _)| Lsn(crate::page::first_usable(segment_start(lo))));
+    let lowest = segment_bounds(dir)?.map(|(lo, _)| segment_start(lo));
     Ok(match (redo, lowest) {
-        (Some(redo), Some(lowest)) if redo >= lowest => redo,
-        (_, Some(lowest)) => lowest,
-        (_, None) => Lsn::START,
+        (Some(redo), Some(lowest)) if redo.0 >= lowest => redo,
+        _ => Lsn::INVALID,
     })
 }
 
@@ -1470,6 +1473,62 @@ mod tests {
             records.last().map(|(x, p)| (*x, p.len())),
             Some((Xid(7), 40_000))
         );
+
+        Ok(())
+    }
+
+    // --- Segment recycling ---
+
+    /// Fill past `through` segments and flush.
+    fn fill_segments(wal: &Wal, through: u64) -> Result<(), WalError> {
+        while wal.current_lsn().0 < through * WAL_SEG_SIZE {
+            wal.append(RmgrId::HEAP, 0, Xid(3), &[0x77; 7_000]);
+        }
+        wal.flush(wal.current_lsn())
+    }
+
+    /// The end-to-end shape of recycling: spent segments are renamed forward
+    /// rather than rewritten, the log above the redo point still reads, and
+    /// nothing from a segment's previous life comes back.
+    #[test]
+    fn recycling_reclaims_the_prefix_without_resurrecting_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        fill_segments(&wal, 3)?;
+        let redo = wal.current_lsn();
+        let above = wal.append(RmgrId::HEAP, 0, Xid(4), b"above the redo point");
+        wal.flush(above.end)?;
+
+        wal.recycle(redo)?;
+        let (lowest, highest) = crate::segment::segment_bounds(dir.path())?
+            .ok_or_else(|| anyhow::anyhow!("every segment was reclaimed"))?;
+        assert_eq!(lowest, segno_of(redo.0), "the redo point's segment must stay");
+        assert!(highest > segno_of(redo.0), "nothing was recycled forward");
+
+        // The recycled segments are the *same files*, not fresh ones: that is the
+        // whole point, and it is also what makes their stale contents a hazard.
+        let recycled = crate::segment::segment_path(dir.path(), highest);
+        assert_eq!(std::fs::metadata(&recycled)?.len(), WAL_SEG_SIZE);
+
+        // Replay from the redo point still finds the record above it, and the
+        // walk stops rather than running on into a recycled segment.
+        let reopened = Wal::open(dir.path())?;
+        assert_eq!(reopened.current_lsn(), above.end);
+
+        Ok(())
+    }
+
+    /// A checkpoint that cannot bound replay publishes an invalid redo point,
+    /// meaning "resume from the head of the stream". Every segment is then still
+    /// needed, and reclaiming any of them would make the cluster unstartable.
+    #[test]
+    fn a_clamped_redo_point_reclaims_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        fill_segments(&wal, 3)?;
+        let before = crate::segment::segment_bounds(dir.path())?;
+        wal.recycle(Lsn::INVALID)?;
+        assert_eq!(crate::segment::segment_bounds(dir.path())?, before);
 
         Ok(())
     }

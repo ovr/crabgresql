@@ -106,23 +106,59 @@ impl WalReader {
     /// on disk — not byte zero, since recycling removes the log's prefix — or
     /// [`Lsn::START`] when there are no segments at all.
     pub fn open(dir: &Path, from: Lsn) -> Result<WalReader, WalError> {
-        let next = if from.is_valid() {
-            from.0
-        } else {
-            match segment_bounds(dir)? {
-                Some((lo, _)) => first_usable(segment_start(lo)),
-                None => Lsn::START.0,
+        if from.is_valid() {
+            return Ok(WalReader::at(dir, from.0));
+        }
+        match segment_bounds(dir)? {
+            Some((lo, _)) => WalReader::open_at_page(dir, Lsn(segment_start(lo))),
+            None => Ok(WalReader::at(dir, Lsn::START.0)),
+        }
+    }
+
+    /// Position at the first record **on** the page starting at `page`.
+    ///
+    /// Not always that page's first usable byte. Recycling removes the log's
+    /// prefix, and the segment it removes can be the one a record started in,
+    /// leaving that record's tail at the head of the survivor. The page header
+    /// says how much of it is owed, and skipping exactly that is what makes a
+    /// whole-stream replay after a recycle land on a record boundary instead of
+    /// in the middle of one.
+    pub fn open_at_page(dir: &Path, page: Lsn) -> Result<WalReader, WalError> {
+        debug_assert_eq!(page_offset(page.0), 0);
+        let mut reader = WalReader::at(dir, page.0 + XLP_PAGE_HEADER_SIZE);
+        let mut at = page.0;
+        loop {
+            if !reader.load_page(at)? {
+                // No page there at all. Leave the cursor on it: the walk will
+                // report the same verdict, with the same reason.
+                reader.stop = None;
+                reader.next = first_usable(at);
+                return Ok(reader);
             }
-        };
+            let owed = match reader.loaded {
+                Some((_, header)) => u64::from(header.rem_len),
+                None => 0,
+            };
+            let room = XLOG_BLCKSZ - XLP_PAGE_HEADER_SIZE;
+            if owed < room {
+                reader.next = first_usable(at) + owed;
+                return Ok(reader);
+            }
+            // The straddling record runs past this page too.
+            at += XLOG_BLCKSZ;
+        }
+    }
+
+    fn at(dir: &Path, next: u64) -> WalReader {
         let mut page = AlignedBuf::with_pages(1);
         page.extend_from_slice(&vec![0u8; XLOG_BLCKSZ as usize]);
-        Ok(WalReader {
+        WalReader {
             segs: Segments::new(dir),
             next,
             page,
             loaded: None,
             stop: None,
-        })
+        }
     }
 
     /// Where the walk stands: the start of the record that has not been returned.
@@ -785,6 +821,38 @@ mod tests {
         let (_, end) = b.record(Xid(3), b"only");
         b.finish(dir.path())?;
         assert_eq!(end_of_wal(dir.path(), Lsn::INVALID)?, end);
+
+        Ok(())
+    }
+
+    /// Recycling can reclaim the segment a record *started* in, leaving its tail
+    /// at the head of the survivor. A whole-stream replay must skip that tail and
+    /// resume at the next record boundary — starting at the segment's first
+    /// usable byte instead would land mid-record and report an empty log.
+    #[test]
+    fn a_whole_stream_replay_after_a_recycle_skips_an_orphaned_tail() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Start on the last page of segment 1 and straddle into segment 2.
+        let last_page = 2 * WAL_SEG_SIZE - XLOG_BLCKSZ;
+        let mut b = Builder::at(Lsn(first_usable(last_page)));
+        let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
+        b.record(Xid(1), &vec![0xAA; filler]);
+        b.record(Xid(2), &[0xBB; 100]); // straddles the boundary
+        b.record(Xid(3), b"first whole record in segment 2");
+        b.finish(dir.path())?;
+
+        // The head of segment 2 is owed to the straddling record.
+        let head = PageHeader::decode(b.page_mut(Lsn(segment_start(2))))
+            .ok_or_else(|| anyhow::anyhow!("segment 2's first page header did not decode"))?;
+        assert!(head.is_contrecord() && head.rem_len > 0);
+
+        std::fs::remove_file(segment_path(dir.path(), 1))?;
+        let (records, _) = read_all(dir.path(), Lsn::INVALID)?;
+        assert_eq!(
+            records,
+            vec![(Xid(3), b"first whole record in segment 2".to_vec())],
+            "the orphaned tail was not skipped"
+        );
 
         Ok(())
     }
