@@ -123,15 +123,19 @@ SELECT * FROM vistest ORDER BY a;
 -- rejected by name rather than as a bare syntax error.
 COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 0);
 COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 'off');
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE "off");
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE -0);
 SELECT * FROM vistest ORDER BY a;
  a  
 ----
  a2
  b
+ t
+ u
  v
  w
  z
-(5 rows)
+(7 rows)
 
 -- The rejections below name a file rather than stdin only so this script stays
 -- readable: the statement never gets far enough to open it, and psql would not
