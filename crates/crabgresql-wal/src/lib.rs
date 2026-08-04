@@ -23,6 +23,7 @@
 //! guarantees that `append` hands back a monotonic end-LSN and that
 //! `flush`/`flushed_lsn` are honest about what is on stable storage.
 
+mod aligned;
 mod ckpt;
 mod control;
 mod fsutil;
@@ -35,7 +36,10 @@ mod wal;
 pub use ckpt::{CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint};
 pub use control::{ControlFile, control_path, read_control, write_control};
 pub use fsutil::sync_dir;
-pub use page::{PageHeader, XLOG_BLCKSZ, XLP_FIRST_IS_CONTRECORD, XLP_PAGE_HEADER_SIZE, XLP_USABLE};
+pub use page::{
+    PageHeader, XLOG_BLCKSZ, XLP_FIRST_IS_CONTRECORD, XLP_PAGE_HEADER_SIZE, XLP_USABLE, advance,
+    advance_lsn, first_usable, is_record_position, page_offset, page_start,
+};
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
 pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
