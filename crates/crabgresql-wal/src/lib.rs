@@ -28,6 +28,7 @@ mod ckpt;
 mod control;
 mod fsutil;
 mod page;
+mod reader;
 mod record;
 mod recovery;
 mod rmgr;
@@ -41,6 +42,7 @@ pub use page::{
     PageHeader, XLOG_BLCKSZ, XLP_FIRST_IS_CONTRECORD, XLP_PAGE_HEADER_SIZE, XLP_USABLE, advance,
     advance_lsn, first_usable, is_record_position, page_offset, page_start,
 };
+pub use reader::{StopReason, WalReader, end_of_wal};
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
 pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};

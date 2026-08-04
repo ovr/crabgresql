@@ -42,7 +42,7 @@ pub const XLP_USABLE: u64 = XLOG_BLCKSZ - XLP_PAGE_HEADER_SIZE;
 pub const XLP_MAGIC: u16 = 0xC6A1;
 
 /// The first byte of this page continues a record that began earlier;
-/// [`PageHeader::rem_len`] says how many of its bytes land here.
+/// [`PageHeader::rem_len`] says how much of that record is still owed.
 pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 
 /// The header at the top of every WAL page.
@@ -66,8 +66,14 @@ pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageHeader {
     pub info: u16,
-    /// Bytes at the head of this page belonging to a record that started on an
-    /// earlier page. `0` unless [`XLP_FIRST_IS_CONTRECORD`] is set.
+    /// Bytes of a record started on an earlier page that are **still owed** as of
+    /// this page's first byte — the whole remainder, not just the part landing
+    /// here, so a record spanning several pages leaves a strictly decreasing
+    /// chain. `0` unless [`XLP_FIRST_IS_CONTRECORD`] is set.
+    ///
+    /// The reader compares it against exactly what it is still expecting, which
+    /// is what turns "this page happens to be valid" into "this page continues
+    /// *this* record".
     pub rem_len: u32,
     /// The LSN of this page's own first byte.
     pub pageaddr: u64,
