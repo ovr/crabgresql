@@ -505,25 +505,26 @@ mod tests {
         // promptly, and clearing it must wake the waiter.
         engine.buffer_pressure().set(true);
         let waiter = Arc::clone(&engine);
-        let released = std::thread::spawn(move || {
-            let started = Instant::now();
-            waiter.await_write_capacity();
-            started.elapsed()
-        });
+        // Time the wait from this thread. The spawned thread cannot: its clock
+        // starts whenever the OS gets around to running it, which may be after
+        // the sleep below has already begun, so its own elapsed can come in
+        // just under the sleep even though it waited the whole time.
+        let started = Instant::now();
+        let released = std::thread::spawn(move || waiter.await_write_capacity());
 
         // Long enough to distinguish "waited" from "returned immediately", short
         // enough not to slow the suite.
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!released.is_finished(), "the writer must still be waiting");
+        assert!(
+            !released.is_finished(),
+            "the writer returned while the flag was still set, so it never waited"
+        );
         engine.buffer_pressure().set(false);
 
-        let waited = released
+        released
             .join()
             .unwrap_or_else(|_| panic!("waiter panicked"));
-        assert!(
-            waited >= Duration::from_millis(200),
-            "the writer returned after {waited:?}, so it never waited"
-        );
+        let waited = started.elapsed();
         assert!(
             waited < WRITE_CAPACITY_TIMEOUT,
             "the writer rode out the timeout instead of being woken"
