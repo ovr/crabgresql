@@ -58,6 +58,10 @@ pub struct StorageManager {
     /// Makes the next per-relation fsync fail, so the retry path is testable.
     #[cfg(test)]
     fail_next_file_sync: AtomicBool,
+    /// Makes the next block write fail, so the buffer pool's mid-eviction error
+    /// path is testable. That path is otherwise reachable only from a full disk.
+    #[cfg(test)]
+    pub(crate) fail_next_write: AtomicBool,
 }
 
 impl StorageManager {
@@ -76,6 +80,8 @@ impl StorageManager {
             dir_sync_hook: Mutex::new(None),
             #[cfg(test)]
             fail_next_file_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_write: AtomicBool::new(false),
         })
     }
 
@@ -325,6 +331,10 @@ impl StorageManager {
     /// Write one block, stamping its checksum. The caller's buffer is not
     /// modified (the checksum is stamped on a copy).
     pub fn write(&self, rel: RelFileNode, block: u32, buf: &Page) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected write failure"));
+        }
         // Grow the page vector to cover the block, then store it verbatim (no
         // checksum: RAM is never verified on read).
         if self

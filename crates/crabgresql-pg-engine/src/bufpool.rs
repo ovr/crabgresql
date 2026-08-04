@@ -85,7 +85,25 @@ impl BufferPool {
             return Ok(PinnedPage { pool: self, idx });
         }
         // Miss: find an unpinned victim via clock sweep.
+        //
+        // Bounded, because the alternative is not a slow pin but a hung engine:
+        // this loop runs with `map` held, so a sweep that never finds a victim
+        // blocks every other pin in the process, including the ones holding the
+        // pins it is waiting for. Two revolutions suffice when a victim exists —
+        // the first clears every `ref_bit`, so the second can only be blocked by
+        // pins — and a third leaves no doubt. Past that every frame is pinned,
+        // which is resource exhaustion and belongs to the caller as an error,
+        // the way PostgreSQL raises "no unpinned buffers available".
+        let mut swept = 0usize;
+        let sweep_limit = self.frames.len().saturating_mul(3);
         let idx = loop {
+            swept += 1;
+            if swept > sweep_limit {
+                return Err(std::io::Error::other(format!(
+                    "no unpinned buffer available: all {} buffer pool frames are pinned",
+                    self.frames.len()
+                )));
+            }
             let i = self.hand.fetch_add(1, Ordering::Relaxed) % self.frames.len();
             let mut fr = self.frames[i]
                 .lock()
@@ -98,17 +116,36 @@ impl BufferPool {
                 continue;
             }
             // Evict whatever this frame held.
-            if let Some(old) = fr.tag.take() {
+            //
+            // The tag is surrendered only once the write-back has succeeded, and
+            // the mapping is updated in the same breath. Taking it first would be
+            // enough for the happy path, but the two `?` below can return while
+            // the frame is mid-eviction — a full disk, an EIO, or a `wal.flush`
+            // for a cached page whose `pd_lsn` predates a recovery `reset_to`.
+            // That would leave the mapping naming a frame with no tag: the next
+            // sweep reuses the frame without removing the stale key (the removal
+            // lives inside this arm), the mapping ends up with two keys for one
+            // frame, and a later pin of the old tag is served another relation's
+            // page as a hit. So an error here has to leave the frame exactly as
+            // it found it.
+            if let Some(old) = fr.tag {
                 if fr.dirty {
                     let lsn = page::get_lsn(&fr.data);
                     self.wal
                         .flush(Lsn(lsn))
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     self.smgr.write(old.rel, old.block, &fr.data)?;
-                    fr.dirty = false;
                 }
+                fr.tag = None;
                 map.remove(&old);
             }
+            // Unconditionally, not just when something was evicted: a frame can
+            // reach here untagged *and* dirty, because `forget_relation` clears
+            // the tag of a frame a live `PinnedPage` may still `modify`. Leaving
+            // the flag set would carry it onto the page loaded next, so a page
+            // read clean from disk would be written straight back at every
+            // checkpoint and `dirty` would stop meaning "differs from disk".
+            fr.dirty = false;
             // Load the requested block. A block past end-of-file (a fresh insert
             // target, or a block a redo record recreates) extends the relation so
             // `nblocks` always reflects every pinned block — scans and recovery
@@ -242,9 +279,23 @@ impl<'a> PinnedPage<'a> {
 
 impl Drop for PinnedPage<'_> {
     fn drop(&mut self) {
+        // Poison-tolerant, unlike every other lock site here, because this one
+        // runs during unwinding. `read`/`modify` hold the frame guard across the
+        // caller's closure, so a panic in that closure poisons this very mutex;
+        // panicking again here would be a panic inside a destructor during
+        // cleanup, which Rust turns into an `abort()` — not even catchable by an
+        // enclosing `catch_unwind`. Releasing a pin must never be what escalates
+        // somebody else's failed statement into a dead server.
+        //
+        // Only the pin count is touched under that tolerance, and it is exactly
+        // the field a panic cannot have corrupted. The *page* may well be torn —
+        // `modify` stamps `dirty` after the closure returns, so a panic halfway
+        // through leaves half-written bytes carrying the old flag — which is why
+        // every other site here still treats a poisoned frame as fatal rather
+        // than reading it. This releases the pin and lets that judgement stand.
         let mut fr = self.pool.frames[self.idx]
             .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // saturating: a concurrent forget_relation must never drive this to
         // underflow even though it no longer resets pins.
         fr.pins = fr.pins.saturating_sub(1);
@@ -367,6 +418,121 @@ mod tests {
         // not the stale contents.
         let fresh = bp.pin(rel, 0)?;
         fresh.read(|page| assert!(page::get_item(page, 1).is_none()));
+
+        Ok(())
+    }
+
+    /// Run `f` with a watchdog; `None` means it never finished. Local copy of
+    /// the one in `smgr`'s tests — a test module cannot import another's.
+    fn within<T: Send + 'static>(max_ms: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_millis(max_ms))
+            .ok()
+    }
+
+    /// An eviction that fails partway must leave the frame exactly as it found
+    /// it. The dangerous shape is the opposite: a frame stripped of its tag
+    /// while the mapping still names it, because nothing removes that key
+    /// afterwards — the removal lives inside the very branch the error skipped
+    /// next time round — so the mapping ends up with two keys for one frame and
+    /// serves one relation's page under the other's tag.
+    #[test]
+    fn a_failed_eviction_leaves_the_mapping_and_the_tag_agreeing() -> anyhow::Result<()> {
+        let (_d, bp) = pool(1)?;
+        let victim = BufferTag {
+            rel: RelFileNode(1),
+            block: 0,
+        };
+        // Fill the single frame with a dirty page, then let go of it.
+        {
+            let page = bp.pin(victim.rel, victim.block)?;
+            page.modify(|p| page::add_item(p, b"keep"))
+                .ok_or_else(|| anyhow::anyhow!("row did not fit"))?;
+        }
+        // The next pin must evict it; make the write-back fail mid-eviction.
+        bp.smgr.fail_next_write.store(true, Ordering::SeqCst);
+        assert!(
+            bp.pin(RelFileNode(2), 0).is_err(),
+            "the injected write failure must surface"
+        );
+
+        let map = bp.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
+        let fr = bp.frames[0]
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        assert_eq!(
+            fr.tag,
+            Some(victim),
+            "a failed eviction must not surrender the tag"
+        );
+        assert_eq!(
+            map.get(&victim),
+            Some(&0),
+            "and must leave the mapping naming the frame it still describes"
+        );
+        assert!(fr.dirty, "the page it could not write is still unwritten");
+        assert_eq!(map.len(), 1, "no key was leaked for a frame it never took");
+
+        Ok(())
+    }
+
+    /// A pool whose every frame is pinned has no victim to find. The sweep used
+    /// to spin on that forever while holding the mapping lock, which blocks
+    /// every other pin in the process — including the ones holding the pins it
+    /// is waiting for. It has to be an error the caller can see instead.
+    #[test]
+    fn a_fully_pinned_pool_reports_exhaustion_instead_of_spinning() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let smgr = Arc::new(StorageManager::open(dir.path())?);
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let bp = Arc::new(BufferPool::new(4, smgr, wal));
+
+        let held: Vec<_> = (0..4)
+            .map(|b| bp.pin(RelFileNode(1), b))
+            .collect::<std::io::Result<_>>()?;
+
+        let probe = {
+            let bp = Arc::clone(&bp);
+            within(5_000, move || bp.pin(RelFileNode(1), 99).is_err())
+        };
+        drop(held);
+        assert_eq!(
+            probe,
+            Some(true),
+            "pinning against a fully pinned pool must return an error, not hang"
+        );
+
+        Ok(())
+    }
+
+    /// `read`/`modify` hold the frame guard across the caller's closure, so a
+    /// panic in that closure poisons this frame's mutex. Releasing the pin must
+    /// not then panic on the poison: that would be a panic inside a destructor
+    /// during unwinding, which aborts the process outright — not catchable by
+    /// any enclosing `catch_unwind`, not loggable, and fatal to every other
+    /// session. If this regresses, the whole test binary dies with SIGABRT
+    /// rather than failing this one case, so a plain FAILED here is already the
+    /// good outcome.
+    ///
+    /// What deliberately is *not* asserted: that the frame stays usable. A
+    /// panic inside `modify` can leave the page half-written, so every other
+    /// site treats a poisoned frame as fatal; this only keeps the failure
+    /// unwinding to the one statement instead of taking the process with it.
+    #[test]
+    fn a_panic_under_the_frame_guard_does_not_abort_the_process() -> anyhow::Result<()> {
+        let (_d, bp) = pool(2)?;
+        let page = bp.pin(RelFileNode(1), 0)?;
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            page.read(|_| panic!("a statement failed while holding the page"));
+        }));
+        assert!(panicked.is_err(), "the closure's panic must propagate");
+        // Dropping the pin is the step that used to abort. Reaching the next
+        // line at all is the assertion.
+        drop(page);
 
         Ok(())
     }
