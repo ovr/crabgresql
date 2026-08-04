@@ -8231,7 +8231,12 @@ mod tests {
         let cols = output_columns_of(&insert)?;
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "big", "name", "flag", "next"]);
-        assert_eq!(cols.last().unwrap().ty, PgType::Int4);
+        assert_eq!(
+            cols.last()
+                .expect("RETURNING produced at least one column")
+                .ty,
+            PgType::Int4
+        );
 
         // UPDATE and DELETE report their RETURNING columns too (used by Describe).
         let update = bound("UPDATE t SET id = 1 RETURNING id, name");

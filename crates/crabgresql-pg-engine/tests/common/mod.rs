@@ -113,20 +113,19 @@ pub fn relfile_path(dir: &Path, rel: RelFileNode) -> PathBuf {
 
 /// Flip one byte at `offset` in the file at `path` (read-modify-write) to
 /// simulate a torn/corrupt write.
-pub fn flip_byte(path: &Path, offset: u64) {
+pub fn flip_byte(path: &Path, offset: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(path)
-        .unwrap();
-    f.seek(SeekFrom::Start(offset)).unwrap();
+        .open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
     let mut b = [0u8; 1];
-    f.read_exact(&mut b).unwrap();
+    f.read_exact(&mut b)?;
     b[0] ^= 0xFF;
-    f.seek(SeekFrom::Start(offset)).unwrap();
-    f.write_all(&b).unwrap();
-    f.sync_all().unwrap();
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(&b)?;
+    f.sync_all()
 }
 
 /// Overwrite `[from, to)` of the file at `path` with `byte`.
@@ -136,8 +135,7 @@ pub fn flip_byte(path: &Path, offset: u64) {
 /// below, the first `decode` fails, the log reads as empty, and everything below
 /// the redo point vanishes — so such a test cannot pass by accident.
 ///
-/// Returns `Result` and is propagated with `?` per AGENTS.md; `flip_byte` above
-/// predates that rule, so do not copy its `unwrap` style.
+/// Returns `Result` and is propagated with `?` per AGENTS.md.
 pub fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -150,7 +148,7 @@ pub fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()
 /// Corrupt a data page by flipping a byte well inside its written region (past
 /// the page header, before the checksum field), deterministically breaking its
 /// CRC so `StorageManager::read` must reject it.
-pub fn corrupt_page_byte(dir: &Path, rel: RelFileNode, block: u32) {
+pub fn corrupt_page_byte(dir: &Path, rel: RelFileNode, block: u32) -> std::io::Result<()> {
     const BLCKSZ: u64 = 8192;
-    flip_byte(&relfile_path(dir, rel), block as u64 * BLCKSZ + 100);
+    flip_byte(&relfile_path(dir, rel), block as u64 * BLCKSZ + 100)
 }

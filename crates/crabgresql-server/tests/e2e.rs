@@ -4875,7 +4875,10 @@ async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
             "SELECT table_schema FROM information_schema.tables WHERE table_name = 'secret'",
         )
         .await?;
-    let a_temp_schema = rows(&ns)[0].get("table_schema").unwrap().to_string();
+    let a_temp_schema = rows(&ns)[0]
+        .get("table_schema")
+        .expect("table_schema is present")
+        .to_string();
     assert!(a_temp_schema.starts_with("pg_temp_"));
 
     // A second session must not read, write, or drop A's temp table by qualifier.
@@ -5625,7 +5628,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        e.as_db_error().unwrap().code(),
+        e.as_db_error().expect("a database error").code(),
         &SqlState::NUMERIC_VALUE_OUT_OF_RANGE
     );
 
@@ -5650,7 +5653,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        e.as_db_error().unwrap().code(),
+        e.as_db_error().expect("a database error").code(),
         &SqlState::INVALID_PARAMETER_VALUE
     );
 
@@ -5661,7 +5664,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        e.as_db_error().unwrap().code(),
+        e.as_db_error().expect("a database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
     );
 
@@ -5673,14 +5676,20 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .query_one("SELECT currval('gone')", &[])
         .await
         .unwrap_err();
-    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::UNDEFINED_TABLE);
+    assert_eq!(
+        e.as_db_error().expect("a database error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
 
     // An index cannot take a sequence's name (shared relation namespace).
     let e = client
         .batch_execute("CREATE INDEX a ON tab (id)")
         .await
         .unwrap_err();
-    assert_eq!(e.as_db_error().unwrap().code(), &SqlState::DUPLICATE_TABLE);
+    assert_eq!(
+        e.as_db_error().expect("a database error").code(),
+        &SqlState::DUPLICATE_TABLE
+    );
 
     // DROP SEQUENCE of a serial-owned sequence is blocked under RESTRICT (2BP01).
     client.batch_execute("CREATE TABLE ser (id serial)").await?;
@@ -5689,7 +5698,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        e.as_db_error().unwrap().code(),
+        e.as_db_error().expect("a database error").code(),
         &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
     );
     // CASCADE drops it.
@@ -6500,7 +6509,7 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert_eq!(
-        e.as_db_error().unwrap().code(),
+        e.as_db_error().expect("a database error").code(),
         &SqlState::READ_ONLY_SQL_TRANSACTION
     );
     client.batch_execute("ROLLBACK").await?;

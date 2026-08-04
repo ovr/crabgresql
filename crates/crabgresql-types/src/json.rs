@@ -1186,7 +1186,7 @@ mod tests {
     fn deep_nesting_errors_instead_of_overflowing() {
         // Just past the limit returns a controlled 54001 error, not a crash.
         let deep = "[".repeat(MAX_DEPTH + 5) + &"]".repeat(MAX_DEPTH + 5);
-        let err = jsonb_in(&deep).unwrap_err();
+        let err = jsonb_in(&deep).expect_err("nesting past MAX_DEPTH must be rejected");
         assert_eq!(err.sqlstate, PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(err.message, "stack depth limit exceeded");
         // A document nested right up to the limit still parses.
@@ -1195,8 +1195,8 @@ mod tests {
     }
 
     #[test]
-    fn jsonb_rejects_nul_escape_but_json_keeps_it() {
-        let err = jsonb_in("\"\\u0000\"").unwrap_err();
+    fn jsonb_rejects_nul_escape_but_json_keeps_it() -> Result<()> {
+        let err = jsonb_in("\"\\u0000\"").expect_err("jsonb rejects a \\u0000 escape");
         assert_eq!(err.sqlstate, UNTRANSLATABLE_CHARACTER);
         assert_eq!(err.message, "unsupported Unicode escape sequence");
         assert_eq!(
@@ -1204,12 +1204,14 @@ mod tests {
             Some("\\u0000 cannot be converted to text.")
         );
         // `json` preserves the raw text verbatim.
-        assert_eq!(json_in("\"\\u0000\"").unwrap(), "\"\\u0000\"");
+        let raw = json_in("\"\\u0000\"").map_err(|e| anyhow!("json_in failed: {}", e.message))?;
+        assert_eq!(raw, "\"\\u0000\"");
+        Ok(())
     }
 
     #[test]
     fn numeric_overflow_is_out_of_range() {
-        let err = jsonb_in("1e1000000").unwrap_err();
+        let err = jsonb_in("1e1000000").expect_err("1e1000000 overflows numeric");
         assert_eq!(err.sqlstate, NUMERIC_VALUE_OUT_OF_RANGE);
         assert_eq!(err.message, "value overflows numeric format");
     }
@@ -1217,19 +1219,20 @@ mod tests {
     #[test]
     fn object_error_detail_matches_pg_position() {
         // After a comma only a key is valid (no "or }").
-        let err = jsonb_in("{\"a\":1,}").unwrap_err();
+        let err = jsonb_in("{\"a\":1,}").expect_err("a trailing comma is invalid JSON");
         assert_eq!(
             err.detail.as_deref(),
             Some("Expected string, but found \"}\".")
         );
         // At the first key, "}" is offered as an alternative.
-        let err = jsonb_in("{,}").unwrap_err();
+        let err = jsonb_in("{,}").expect_err("a bare comma is invalid JSON");
         assert_eq!(
             err.detail.as_deref(),
             Some("Expected string or \"}\", but found \",\".")
         );
         // Two high surrogates in a row is a distinct message.
-        let err = jsonb_in("\"\\ud800\\ud800\"").unwrap_err();
+        let err =
+            jsonb_in("\"\\ud800\\ud800\"").expect_err("two high surrogates in a row are invalid");
         assert_eq!(
             err.detail.as_deref(),
             Some("Unicode high surrogate must not follow a high surrogate.")
@@ -1339,7 +1342,7 @@ mod tests {
         // JSON null is SQL NULL.
         assert_eq!(t("null")?, None);
         // A NUL cannot become a `text` datum, even though `json_in` accepts it.
-        let err = json_as_text("\"\\u0000\"").unwrap_err();
+        let err = json_as_text("\"\\u0000\"").expect_err("a NUL cannot become a text datum");
         assert_eq!(err.sqlstate, UNTRANSLATABLE_CHARACTER);
         assert_eq!(
             err.detail.as_deref(),

@@ -63,6 +63,7 @@ for the entire codebase:
 ## Rust error handling
 
 - Never use `unwrap()`.
-- `unwrap_err()` is allowed only in tests that assert an operation fails.
+- To assert that an operation fails, use `expect_err("…")` — `clippy::unwrap_used`
+  denies `unwrap_err()` too, and CI lints test targets.
 - In tests, return `Result<(), _>` and propagate errors with `?` instead of
   calling `unwrap()` for successful fallible operations.

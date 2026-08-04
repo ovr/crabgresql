@@ -832,14 +832,16 @@ mod tests {
 
     #[test]
     fn text_invalid_utf8_byte_errors() {
-        let err = decode(&text_format(), b"\\351\n").unwrap_err();
+        let err =
+            decode(&text_format(), b"\\351\n").expect_err("an invalid UTF-8 byte must be rejected");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         assert!(err.message.contains("0xe9"), "{}", err.message);
     }
 
     #[test]
     fn text_nul_byte_errors() {
-        let err = decode(&text_format(), b"a\\000b\n").unwrap_err();
+        let err =
+            decode(&text_format(), b"a\\000b\n").expect_err("an embedded NUL must be rejected");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         assert!(err.message.contains("0x00"), "{}", err.message);
     }
@@ -929,7 +931,8 @@ mod tests {
 
     #[test]
     fn csv_unterminated_quote_errors() {
-        let err = decode(&csv_format(), b"\"oops\n").unwrap_err();
+        let err =
+            decode(&csv_format(), b"\"oops\n").expect_err("an unterminated quote must be rejected");
         assert_eq!(err.code, sqlstate::BAD_COPY_FILE_FORMAT);
     }
 

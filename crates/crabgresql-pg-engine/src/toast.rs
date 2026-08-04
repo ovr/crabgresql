@@ -366,7 +366,8 @@ mod tests {
         // out-of-line storage helps and the row must be refused.
         let widths = vec![17usize; 500];
         let toastable = vec![false; 500];
-        let error = plan_at(&widths, &toastable, 36).unwrap_err();
+        let error =
+            plan_at(&widths, &toastable, 36).expect_err("a row of untoastable columns is rejected");
         match error {
             StorageError::RowTooBig { size, max } => {
                 assert_eq!(size, 36 + 500 * 17);

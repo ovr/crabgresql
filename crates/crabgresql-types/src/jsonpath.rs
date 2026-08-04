@@ -2710,7 +2710,7 @@ mod tests {
 
     /// The error text/message returned by evaluating `path` against `target`.
     fn qerr(target: &str, path: &str) -> JsonError {
-        query(&parse(path).expect("parse"), &jb(target), None, false).unwrap_err()
+        query(&parse(path).expect("parse"), &jb(target), None, false).expect_err("query failed")
     }
 
     #[test]
@@ -2763,21 +2763,18 @@ mod tests {
         );
     }
 
+    /// `match_predicate` for a path/target pair, lifted into `anyhow`.
+    fn mp(path: &str, target: &str) -> Result<Option<bool>> {
+        match_predicate(&parse(path)?, &jb(target), None, false)
+            .map_err(|e| anyhow!("match_predicate failed: {}", e.message))
+    }
+
     #[test]
     fn predicates_and_matching() -> Result<()> {
-        assert_eq!(
-            match_predicate(&parse("$.a == 1")?, &jb("{\"a\":1}"), None, false).unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            match_predicate(&parse("$.a == 2")?, &jb("{\"a\":1}"), None, false).unwrap(),
-            Some(false)
-        );
+        assert_eq!(mp("$.a == 1", "{\"a\":1}")?, Some(true));
+        assert_eq!(mp("$.a == 2", "{\"a\":1}")?, Some(false));
         // Type-mismatch comparison → Unknown → SQL NULL.
-        assert_eq!(
-            match_predicate(&parse("$.a > 1")?, &jb("{\"a\":\"x\"}"), None, false).unwrap(),
-            None
-        );
+        assert_eq!(mp("$.a > 1", "{\"a\":\"x\"}")?, None);
         // Predicate query yields one boolean item.
         assert_eq!(q("{\"a\":1}", "$.a > 0")?, vec!["true"]);
         assert_eq!(q("{\"a\":\"x\"}", "$.a > 1")?, vec!["null"]);
@@ -2797,18 +2794,17 @@ mod tests {
         // lax member on scalar → empty.
         assert!(q("1", "$.a")?.is_empty());
         // strict member-not-found → error.
-        let e = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, false).unwrap_err();
+        let e = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, false)
+            .expect_err("strict member-not-found must error");
         assert_eq!(e.message, "JSON object does not contain key \"b\"");
         // silent suppresses it.
-        assert!(
-            query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true)
-                .unwrap()
-                .is_empty()
-        );
+        let silent = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true)
+            .map_err(|e| anyhow!("silent query failed: {}", e.message))?;
+        assert!(silent.is_empty());
         // out-of-range subscript: strict errors, lax skips.
         assert_eq!(
             query(&parse("strict $[5]")?, &jb("[1,2]"), None, false)
-                .unwrap_err()
+                .expect_err("a strict out-of-bounds subscript must error")
                 .message,
             "jsonpath array subscript is out of bounds"
         );
@@ -2821,7 +2817,8 @@ mod tests {
         let vars = jb("{\"min\":3}");
         assert_eq!(q_vars("{\"x\":5}", "$.x ? (@ >= $min)", &vars)?, vec!["5"]);
         // Missing variable is a hard error even under silent.
-        let e = query(&parse("$.x ? (@ >= $min)")?, &jb("{\"x\":5}"), None, true).unwrap_err();
+        let e = query(&parse("$.x ? (@ >= $min)")?, &jb("{\"x\":5}"), None, true)
+            .expect_err("a missing variable is a hard error");
         assert_eq!(e.sqlstate, UNDEFINED_OBJECT);
         assert_eq!(e.message, "could not find jsonpath variable \"min\"");
         Ok(())
@@ -2837,13 +2834,20 @@ mod tests {
     #[test]
     fn parse_errors() {
         assert_eq!(
-            jsonpath_in("$.").unwrap_err().message,
+            jsonpath_in("$.")
+                .expect_err("a bare `$.` is a syntax error")
+                .message,
             "syntax error at end of jsonpath input"
         );
-        assert_eq!(jsonpath_in("foo").unwrap_err().sqlstate, SYNTAX_ERROR);
+        assert_eq!(
+            jsonpath_in("foo")
+                .expect_err("a bare `foo` is a syntax error")
+                .sqlstate,
+            SYNTAX_ERROR
+        );
         assert!(
             jsonpath_in("5.double()")
-                .unwrap_err()
+                .expect_err("`5.double()` is a syntax error")
                 .message
                 .contains("trailing junk after numeric literal")
         );
