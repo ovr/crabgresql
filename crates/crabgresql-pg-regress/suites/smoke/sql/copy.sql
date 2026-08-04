@@ -100,6 +100,14 @@ COPY vistest FROM '/dev/null' WITH (FREEZE yes);
 COPY vistest FROM '/dev/null' (format csv, FORMAT CSV);
 COPY vistest FROM '/dev/null' (freeze off, freeze on);
 COPY vistest FROM '/dev/null' (delimiter ',', delimiter ',');
+-- The rule is about options, not about parentheses: it covers the pre-9.0 list
+-- and the sub-options of its CSV item too.
+COPY vistest FROM '/dev/null' CSV FREEZE FREEZE;
+COPY vistest FROM '/dev/null' CSV HEADER HEADER;
+COPY vistest FROM '/dev/null' DELIMITER ',' DELIMITER ',';
+-- And the two spellings are alternatives, so carrying both is a syntax error
+-- rather than a redundant option.
+COPY vistest FROM '/dev/null' (FREEZE OFF) CSV FREEZE;
 
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative

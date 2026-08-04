@@ -6105,27 +6105,23 @@ pub fn bind_copy_from(
     })
 }
 
-/// Whether `FREEZE` is on, across both option spellings. The legacy bare keyword
-/// (`COPY … CSV FREEZE`) means the same thing as `WITH (FREEZE)`.
+/// Whether `FREEZE` is on. The pre-9.0 bare keyword (`COPY … CSV FREEZE`) means
+/// the same thing as `WITH (FREEZE)`, and carries no argument.
 ///
-/// A repeated option never reaches here: the parser rejects it with PostgreSQL's
-/// `conflicting or redundant options`, so at most one occurrence per list exists
-/// and there is no precedence rule to get wrong.
+/// Exactly one of the two lists can be non-empty and neither can repeat an
+/// option: the parser rejects a repeat with PostgreSQL's `conflicting or
+/// redundant options`, and the mixed form with a syntax error, because upstream's
+/// grammar makes the spellings alternatives. So there is no precedence rule here
+/// to get wrong — which is the whole reason this reads as a search rather than as
+/// a fold with a mutable accumulator.
 fn resolve_copy_freeze(
     options: &[ast::CopyOption],
     legacy_options: &[ast::CopyLegacyOption],
 ) -> bool {
-    let mut freeze = false;
-    for opt in options {
-        if let ast::CopyOption::Freeze(on) = opt {
-            freeze = *on;
-        }
-    }
-    // The legacy spelling carries no argument, so its presence means "on".
-    if legacy_options.contains(&ast::CopyLegacyOption::Freeze) {
-        freeze = true;
-    }
-    freeze
+    options
+        .iter()
+        .any(|opt| matches!(opt, ast::CopyOption::Freeze(true)))
+        || legacy_options.contains(&ast::CopyLegacyOption::Freeze)
 }
 
 /// Resolve the modern `WITH (…)` options plus the pre-9.0 legacy option list

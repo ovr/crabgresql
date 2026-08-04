@@ -4893,6 +4893,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Parser::maybe_parse`] for a list whose items may themselves raise a
+    /// PostgreSQL diagnostic.
+    ///
+    /// `maybe_parse` reads *every* failure as "no item here", which is exactly
+    /// right for deciding where an optional list ends — a token that is not an
+    /// item at all reports `Expected: …` through `parser_err!`. But it is exactly
+    /// wrong for a deliberate refusal such as `conflicting or redundant options`:
+    /// that would be swallowed, the position rewound, and the statement would go
+    /// on to fail somewhere else with an unrelated message. A `PgDiagnostic` is
+    /// never a "this is not an item" signal, so it propagates.
+    fn maybe_parse_diagnosed<T, F>(&mut self, f: F) -> Result<Option<T>, ParserError>
+    where
+        F: FnMut(&mut Parser) -> Result<T, ParserError>,
+    {
+        match self.try_parse(f) {
+            Ok(t) => Ok(Some(t)),
+            Err(e @ (ParserError::RecursionLimitExceeded | ParserError::PgDiagnostic(_))) => Err(e),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Run a parser method `f`, reverting back to the current position if unsuccessful.
     pub fn try_parse<T, F>(&mut self, mut f: F) -> Result<T, ParserError>
     where
@@ -10957,8 +10978,46 @@ impl<'a> Parser<'a> {
             }
             self.expect_token(&Token::RParen)?;
         }
-        let mut legacy_options = vec![];
-        while let Some(opt) = self.maybe_parse(|parser| parser.parse_copy_legacy_option())? {
+        // The pre-9.0 bare-keyword list. PostgreSQL's grammar makes it an
+        // *alternative* to the parenthesized one (`copy_options: copy_opt_list |
+        // '(' copy_generic_opt_list ')'`), so a statement carrying both is a plain
+        // syntax error there, raised before any option is interpreted — not the
+        // "conflicting or redundant" message, which only exists once both
+        // spellings have become entries of one list.
+        //
+        // An empty `options` reliably means no parenthesized form was present: an
+        // empty `()` would have failed in `parse_copy_option` above.
+        let mut legacy_options: Vec<CopyLegacyOption> = vec![];
+        loop {
+            // Captured before the option is consumed, so the caret lands on the
+            // keyword the way PostgreSQL's does. Also the token to name if this is
+            // the mixed form.
+            let token = self.peek_token();
+            let Some(opt) =
+                self.maybe_parse_diagnosed(|parser| parser.parse_copy_legacy_option())?
+            else {
+                break;
+            };
+            if !options.is_empty() {
+                return Err(Self::pg_syntax_diagnostic(
+                    format!("syntax error at or near \"{}\"", token.token),
+                    token.span.start,
+                ));
+            }
+            // The same duplicate rule as the parenthesized list, and deliberately
+            // in *this* loop rather than inside `parse_copy_legacy_option`:
+            // `maybe_parse` turns every error but `RecursionLimitExceeded` into
+            // `Ok(None)` and rewinds, so a refusal raised in there would silently
+            // read as "the list ended here" instead of reaching the client.
+            if legacy_options
+                .iter()
+                .any(|seen| std::mem::discriminant(seen) == std::mem::discriminant(&opt))
+            {
+                return Err(Self::pg_syntax_diagnostic(
+                    "conflicting or redundant options",
+                    token.span.start,
+                ));
+            }
             legacy_options.push(opt);
         }
         let values =
@@ -11184,10 +11243,27 @@ impl<'a> Parser<'a> {
                 CopyLegacyOption::Credentials(self.parse_literal_string()?)
             }
             Some(Keyword::CSV) => CopyLegacyOption::Csv({
-                let mut opts = vec![];
-                while let Some(opt) =
-                    self.maybe_parse(|parser| parser.parse_copy_legacy_csv_option())?
-                {
+                let mut opts: Vec<CopyLegacyCsvOption> = vec![];
+                loop {
+                    let at = self.peek_token().span.start;
+                    let Some(opt) =
+                        self.maybe_parse_diagnosed(|parser| parser.parse_copy_legacy_csv_option())?
+                    else {
+                        break;
+                    };
+                    // `CSV HEADER HEADER` is as redundant as `(header on, header
+                    // on)` and PostgreSQL says so with the caret on the second
+                    // one. `maybe_parse_diagnosed`, not `maybe_parse`, is what
+                    // lets this refusal out of the sub-list.
+                    if opts
+                        .iter()
+                        .any(|seen| std::mem::discriminant(seen) == std::mem::discriminant(&opt))
+                    {
+                        return Err(Self::pg_syntax_diagnostic(
+                            "conflicting or redundant options",
+                            at,
+                        ));
+                    }
                     opts.push(opt);
                 }
                 opts
@@ -17955,6 +18031,68 @@ mod tests {
             "COPY x from stdin (format csv, freeze on, header off)"
         )
         .is_ok());
+    }
+
+    /// The rule is not the parenthesized list's: PostgreSQL raises it while
+    /// processing options, so it covers the pre-9.0 bare-keyword list and the
+    /// sub-options of its `CSV` item too. The columns below are the ones a live
+    /// PostgreSQL 18 puts its caret at.
+    #[test]
+    fn parse_copy_rejects_a_repeated_legacy_option() {
+        for (sql, column) in [
+            ("COPY t FROM '/dev/null' CSV FREEZE FREEZE", 36),
+            ("COPY t FROM '/dev/null' CSV HEADER HEADER", 36),
+            ("COPY t FROM '/dev/null' CSV QUOTE ':' QUOTE ':'", 39),
+            ("COPY t FROM '/dev/null' DELIMITER ',' DELIMITER ','", 39),
+        ] {
+            match Parser::parse_sql(&PostgreSqlDialect {}, sql).expect_err(sql) {
+                ParserError::PgDiagnostic(d) => {
+                    assert_eq!(d.message, "conflicting or redundant options", "{sql}");
+                    assert_eq!(d.sqlstate, "42601", "{sql}");
+                    assert_eq!((d.location.line, d.location.column), (1, column), "{sql}");
+                }
+                other => panic!("{sql}: expected a PG diagnostic, got {other:?}"),
+            }
+        }
+
+        // Distinct legacy options, and distinct CSV sub-options, still parse.
+        for sql in [
+            "COPY t FROM '/dev/null' CSV FREEZE",
+            "COPY t FROM '/dev/null' CSV HEADER DELIMITER ','",
+            "COPY t FROM '/dev/null' CSV HEADER QUOTE ':' ESCAPE ':'",
+        ] {
+            assert!(
+                Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok(),
+                "{sql} should parse"
+            );
+        }
+    }
+
+    /// PostgreSQL's grammar makes the two option spellings alternatives
+    /// (`copy_options: copy_opt_list | '(' copy_generic_opt_list ')'`), so a
+    /// statement carrying both is a syntax error at the first legacy keyword -
+    /// not `conflicting or redundant options`, which only exists once both have
+    /// become entries of one list. Accepting the mixed form let a legacy `FREEZE`
+    /// silently override an explicit `(FREEZE OFF)`.
+    #[test]
+    fn parse_copy_rejects_mixing_the_two_option_spellings() {
+        for sql in [
+            "COPY t FROM '/dev/null' (FREEZE OFF) CSV FREEZE",
+            "COPY t FROM '/dev/null' WITH (FREEZE) CSV FREEZE",
+            "COPY t FROM '/dev/null' (FORMAT csv) HEADER",
+        ] {
+            match Parser::parse_sql(&PostgreSqlDialect {}, sql).expect_err(sql) {
+                ParserError::PgDiagnostic(d) => {
+                    assert!(
+                        d.message.starts_with("syntax error at or near "),
+                        "{sql}: {}",
+                        d.message
+                    );
+                    assert_eq!(d.sqlstate, "42601", "{sql}");
+                }
+                other => panic!("{sql}: expected a PG diagnostic, got {other:?}"),
+            }
+        }
     }
 
     /// `defGetBoolean`'s full accepted set, which is wider than the four bare
