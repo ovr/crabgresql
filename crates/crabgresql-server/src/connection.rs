@@ -228,7 +228,8 @@ pub async fn handle_connection(
                         &mut writer,
                         &portal,
                         max_rows,
-                    );
+                    )
+                    .await;
                     report(
                         &mut writer,
                         &mut session,
@@ -354,8 +355,15 @@ async fn run_simple_query(
             }
             continue;
         }
-        let outcome =
-            execute_statement(engine, catalog, txnmgr, stmt, session, &BoundParams::none());
+        let outcome = Box::pin(execute_statement(
+            engine,
+            catalog,
+            txnmgr,
+            stmt,
+            session,
+            &BoundParams::none(),
+        ))
+        .await;
         // Diagnostics a routine raised belong to this statement whether it
         // succeeded or failed. Handlers fold them into their own result, but
         // draining again here is what makes stranding them impossible: a path
@@ -488,7 +496,7 @@ async fn copy_in_stream(
         Ok(rows) => rows,
         Err(e) => return Ok(CopyOutcome::Failed(e)),
     };
-    match run_copy_insert(engine, txnmgr, session, &prepared, rows) {
+    match run_copy_insert(engine, txnmgr, session, &prepared, rows).await {
         Ok(n) => Ok(CopyOutcome::Loaded(n)),
         Err(e) => Ok(CopyOutcome::Failed(e)),
     }
@@ -894,7 +902,7 @@ fn handle_describe(
 /// Execute (`E`): run a portal, streaming its rows in the requested formats. A
 /// row limit (`max_rows > 0`) suspends the portal after that many rows; a later
 /// Execute resumes it. Does not send RowDescription — that is Describe's job.
-fn handle_execute(
+async fn handle_execute(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -959,7 +967,17 @@ fn handle_execute(
         extended: true,
     };
     let reported = statement_may_change_gucs(&stmt).then(|| guc::report_values(session));
-    let outcome = execute_statement(engine, global_catalog, txnmgr, &stmt, session, &params);
+    // Boxed for the same reason as the simple-query path: it keeps this future's
+    // size independent of the statement future it awaits.
+    let outcome = Box::pin(execute_statement(
+        engine,
+        global_catalog,
+        txnmgr,
+        &stmt,
+        session,
+        &params,
+    ))
+    .await;
     // Drained on both arms — see the simple-query path for why this cannot be
     // left to the statement handlers alone.
     let stranded = session.notices.drain();

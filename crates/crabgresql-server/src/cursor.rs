@@ -21,7 +21,7 @@ use crabgresql_txn::TransactionManager;
 
 use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
-use crate::query::{BoundParams, QueryResult, RowTag, execute_statement_with};
+use crate::query::{BoundParams, QueryResult, RowTag, StatementFuture, execute_statement_with};
 use crate::session::{Cursor, CursorMove, Session};
 
 /// `DECLARE name [BINARY] [[NO] SCROLL] CURSOR [WITH HOLD] FOR <query>`.
@@ -29,7 +29,32 @@ use crate::session::{Cursor, CursorMove, Session};
 /// The query runs to completion here, inside this statement's own transaction —
 /// see [`Cursor`] for why. `stmt` is the whole statement, kept only so its
 /// rendered form can be stored for `pg_cursors`.
-pub(crate) fn execute_declare(
+///
+/// Returns a boxed future rather than being an `async fn`: this calls
+/// [`execute_statement_with`] for the cursor's body and is itself called from it,
+/// and two mutually recursive `async fn`s have infinitely sized futures. Boxing
+/// here breaks the cycle at its one edge.
+pub(crate) fn execute_declare<'a>(
+    engine: &'a Arc<dyn TableEngine>,
+    global_catalog: &'a Arc<GlobalCatalog>,
+    txnmgr: &'a Arc<TransactionManager>,
+    stmt: &'a ast::Statement,
+    stmts: &'a [ast::Declare],
+    session: &'a mut Session,
+    params: &'a BoundParams,
+) -> StatementFuture<'a> {
+    Box::pin(declare_cursor(
+        engine,
+        global_catalog,
+        txnmgr,
+        stmt,
+        stmts,
+        session,
+        params,
+    ))
+}
+
+async fn declare_cursor(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -96,7 +121,8 @@ pub(crate) fn execute_declare(
         session,
         params,
         true,
-    )?;
+    )
+    .await?;
     let (columns, mut node, notices) = match result {
         QueryResult::Rows {
             columns,

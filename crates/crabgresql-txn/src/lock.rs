@@ -29,8 +29,10 @@
 //! (faithful to `AccessShare` waiting for `AccessExclusive`) rather than erroring.
 //! Surfacing `55P03 lock_not_available` with a bounded timeout would require
 //! widening the `TableAm` trait to return `Result`; that is a deliberate
-//! follow-up (see the plan and `query.rs`'s `TODO(perf)` about moving statement
-//! execution off the reactor).
+//! follow-up. The wait itself still blocks a reactor worker: statement execution
+//! is `async` and its commit runs on the blocking pool, but the lock is taken
+//! deep inside a synchronous `TableAm` call, so there is no await point to hang a
+//! timeout off yet.
 //!
 //! Performance note (review finding #9): the shared acquire takes this per-table
 //! `Mutex` on every DML operation, but it is required for cross-session
