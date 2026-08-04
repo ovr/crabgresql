@@ -52,6 +52,28 @@ ab
 \.
 SELECT octet_length(a) AS len FROM ch;
 
+-- HEADER match: the first line is a header AND its names are checked against
+-- the columns the statement names, in that order.
+CREATE TABLE hm (a integer, b text);
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+a,b
+1,one
+\.
+SELECT a, b FROM hm ORDER BY a;
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+b,a
+2,two
+\.
+COPY hm (b, a) FROM stdin WITH (FORMAT csv, HEADER match);
+b,a
+two,2
+\.
+SELECT a, b FROM hm ORDER BY a;
+COPY hm FROM stdin WITH (FORMAT csv, HEADER match);
+a
+3
+\.
+
 -- COPY ... FREEZE. The rows are stamped visible-to-everyone, which is only safe
 -- where a rollback discards the storage — so the table must have been truncated
 -- in this same transaction. Outside a block it never has been.

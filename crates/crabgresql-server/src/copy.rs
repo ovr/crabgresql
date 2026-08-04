@@ -24,7 +24,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use crabgresql_binder::CopyFormat;
+use crabgresql_binder::{CopyFormat, CopyHeader};
 use crabgresql_pg_wire::sqlstate;
 
 use crate::copy_access::CopyFileAccess;
@@ -47,6 +47,33 @@ const BATCH_ROWS: usize = 1024;
 /// The most bytes one COPY record may span, matching `MaxAllocSize` — the
 /// ceiling PostgreSQL's own line buffer hits (see [`record_too_long`]).
 const MAX_RECORD_BYTES: usize = 1024 * 1024 * 1024 - 1;
+
+/// `HEADER match`: the first line's field names must be the columns the COPY
+/// named, in that order.
+///
+/// The comparison is against the *statement's* column list rather than the
+/// table's own order, so `COPY t (b, a) … HEADER match` wants `b,a`. A NULL
+/// field cannot name a column, so it compares as the empty string and fails the
+/// way any other wrong name does.
+fn check_header_names(header: &[Field], expected: &[String]) -> Result<(), PgError> {
+    if header.len() != expected.len() {
+        return Err(bad_copy(format!(
+            "wrong number of fields in header line: got {}, expected {}",
+            header.len(),
+            expected.len()
+        )));
+    }
+    for (index, (got, want)) in header.iter().zip(expected).enumerate() {
+        let got = got.as_deref().unwrap_or_default();
+        if got != want {
+            return Err(bad_copy(format!(
+                "column name mismatch in header line field {}: got \"{got}\", expected \"{want}\"",
+                index + 1
+            )));
+        }
+    }
+    Ok(())
+}
 
 fn bad_copy(message: impl Into<String>) -> PgError {
     PgError::new(sqlstate::BAD_COPY_FILE_FORMAT, message)
@@ -146,7 +173,7 @@ impl CopyDecoder {
             format: format.clone(),
             line: Vec::new(),
             csv: CsvState::default(),
-            skip_header: format.header,
+            skip_header: format.header.present(),
             end_of_data: false,
             record_bytes: 0,
             max_record_bytes: MAX_RECORD_BYTES,
@@ -245,9 +272,19 @@ impl CopyDecoder {
             self.line.clear();
             return Ok(());
         }
-        // Skipped before decoding, so a text HEADER line is never UTF-8 checked.
+        // Skipped before decoding, so a plain text HEADER line is never UTF-8
+        // checked. `MATCH` has to read the names, so it decodes first — the same
+        // asymmetry PostgreSQL has.
         if self.skip_header {
             self.skip_header = false;
+            if let CopyHeader::Match(expected) = &self.format.header {
+                let header = decode_text_line(
+                    &self.line,
+                    self.format.delimiter,
+                    self.format.null.as_bytes(),
+                )?;
+                check_header_names(&header, expected)?;
+            }
             self.line.clear();
             return Ok(());
         }
@@ -381,6 +418,9 @@ impl CopyDecoder {
         // the asymmetry with the text format is PG's.
         if self.skip_header {
             self.skip_header = false;
+            if let CopyHeader::Match(expected) = &self.format.header {
+                check_header_names(&row, expected)?;
+            }
             return Ok(());
         }
         rows.push(row);
@@ -823,7 +863,7 @@ mod tests {
     #[test]
     fn text_header_skips_first_line() -> Result<(), PgError> {
         let mut fmt = text_format();
-        fmt.header = true;
+        fmt.header = CopyHeader::On;
         let rows = decode(&fmt, b"a\tb\n1\tx\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("x".into())]]);
         Ok(())
@@ -896,7 +936,7 @@ mod tests {
     #[test]
     fn csv_header_skips_first_row() -> Result<(), PgError> {
         let mut fmt = csv_format();
-        fmt.header = true;
+        fmt.header = CopyHeader::On;
         let rows = decode(&fmt, b"a,b\n1,x\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("x".into())]]);
         Ok(())
@@ -958,7 +998,7 @@ mod tests {
         // Every slab size, so a boundary inside the header line is covered too.
         for chunk in 1..=16 {
             let mut fmt = text_format();
-            fmt.header = true;
+            fmt.header = CopyHeader::On;
             assert_eq!(
                 decode_in_chunks(&fmt, b"h1\th2\n1\ta\n2\tb\n", chunk)?,
                 vec![
@@ -968,7 +1008,7 @@ mod tests {
                 "text, chunk {chunk}"
             );
             let mut fmt = csv_format();
-            fmt.header = true;
+            fmt.header = CopyHeader::On;
             assert_eq!(
                 decode_in_chunks(&fmt, b"a,b\n1,x\n2,y\n", chunk)?,
                 vec![
@@ -1170,11 +1210,11 @@ mod tests {
         // checked; the text format skips the line before decoding. Pinned so the
         // asymmetry is a decision rather than an accident.
         let mut fmt = text_format();
-        fmt.header = true;
+        fmt.header = CopyHeader::On;
         assert!(decode(&fmt, b"\\351\n1\ta\n").is_ok());
 
         let mut fmt = csv_format();
-        fmt.header = true;
+        fmt.header = CopyHeader::On;
         let err = decode(&fmt, b"\xff\n1,a\n").expect_err("csv validates the header");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         Ok(())

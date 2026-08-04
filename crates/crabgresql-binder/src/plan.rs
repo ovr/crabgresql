@@ -5798,6 +5798,26 @@ pub fn bind_insert_with_params(
     })
 }
 
+/// What `COPY … HEADER` does with the first data line, resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyHeader {
+    /// No header line; the first line is data.
+    Off,
+    /// Discard the first line unread.
+    On,
+    /// Discard it, but first check its field names against the columns the COPY
+    /// names — carried here already resolved, in statement order, because the
+    /// decoder has the header line and nothing else.
+    Match(Vec<String>),
+}
+
+impl CopyHeader {
+    /// Whether a first line is to be consumed as a header at all.
+    pub fn present(&self) -> bool {
+        !matches!(self, CopyHeader::Off)
+    }
+}
+
 /// The COPY text/CSV format, resolved from the statement's `WITH (…)` (and
 /// legacy) options. Consumed by the server's row decoder, which splits the raw
 /// stdin bytes into fields per these rules before [`CopyFromPlan::build_insert`]
@@ -5814,8 +5834,8 @@ pub struct CopyFormat {
     pub delimiter: u8,
     /// The unquoted token that means SQL NULL (`\N` for text, empty for CSV).
     pub null: String,
-    /// Skip the first data line (`HEADER`).
-    pub header: bool,
+    /// What to do with the first data line (`HEADER`).
+    pub header: CopyHeader,
     /// CSV quote byte (default `"`); unused in text format.
     pub quote: u8,
     /// CSV escape byte (default = the quote byte); unused in text.
@@ -5833,7 +5853,7 @@ impl CopyFormat {
             csv: false,
             delimiter: b'\t',
             null: "\\N".to_string(),
-            header: false,
+            header: CopyHeader::Off,
             quote: b'"',
             escape: b'"',
             force_not_null: Vec::new(),
@@ -5846,7 +5866,7 @@ impl CopyFormat {
             csv: true,
             delimiter: b',',
             null: String::new(),
-            header: false,
+            header: CopyHeader::Off,
             quote: b'"',
             escape: b'"',
             force_not_null: Vec::new(),
@@ -6216,7 +6236,21 @@ fn resolve_copy_format(
             ast::CopyOption::Format(_) | ast::CopyOption::Freeze(_) => {}
             ast::CopyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
             ast::CopyOption::Null(s) => fmt.null = s.clone(),
-            ast::CopyOption::Header(b) => fmt.header = *b,
+            // `MATCH` needs the columns the statement named, in its order — the
+            // decoder sees only the header line, and PostgreSQL compares against
+            // the COPY column list rather than the table's own order.
+            ast::CopyOption::Header(mode) => {
+                fmt.header = match mode {
+                    ast::CopyHeaderMode::Off => CopyHeader::Off,
+                    ast::CopyHeaderMode::On => CopyHeader::On,
+                    ast::CopyHeaderMode::Match => CopyHeader::Match(
+                        target_indices
+                            .iter()
+                            .map(|&i| schema.columns[i].name.clone())
+                            .collect(),
+                    ),
+                }
+            }
             ast::CopyOption::Quote(c) => {
                 require_csv("QUOTE")?;
                 fmt.quote = single_byte(*c, "quote")?;
@@ -6243,7 +6277,7 @@ fn resolve_copy_format(
         match opt {
             ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
             ast::CopyLegacyOption::Null(s) => fmt.null = s.clone(),
-            ast::CopyLegacyOption::Header => fmt.header = true,
+            ast::CopyLegacyOption::Header => fmt.header = CopyHeader::On,
             // Freeze is not a decoding rule; `resolve_copy_freeze` reads it.
             ast::CopyLegacyOption::Binary
             | ast::CopyLegacyOption::Csv(_)
@@ -6257,7 +6291,7 @@ fn resolve_copy_format(
         if let ast::CopyLegacyOption::Csv(sub) = opt {
             for s in sub {
                 match s {
-                    ast::CopyLegacyCsvOption::Header => fmt.header = true,
+                    ast::CopyLegacyCsvOption::Header => fmt.header = CopyHeader::On,
                     ast::CopyLegacyCsvOption::Quote(c) => fmt.quote = single_byte(*c, "quote")?,
                     ast::CopyLegacyCsvOption::Escape(c) => fmt.escape = single_byte(*c, "escape")?,
                     ast::CopyLegacyCsvOption::ForceNotNull(cols) => {
