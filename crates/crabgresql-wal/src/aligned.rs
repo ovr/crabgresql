@@ -12,11 +12,6 @@
 //!   whole reason the log no longer needs its file's length to know where it
 //!   ends.
 
-// Lands ahead of its consumer: the writer that stages into this is rewritten a
-// few commits later, and splitting the `unsafe` out to be reviewed and tested on
-// its own is worth carrying the attribute until then.
-#![allow(dead_code)]
-
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
 
@@ -77,10 +72,6 @@ impl AlignedBuf {
 
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -151,7 +142,10 @@ impl AlignedBuf {
     ///
     /// If `n` is not a page multiple or is past the fill mark.
     pub fn drain_front(&mut self, n: usize) {
-        assert_eq!(n % XLOG_BLCKSZ as usize, 0, "drain_front must be page-granular");
+        assert!(
+            n.is_multiple_of(XLOG_BLCKSZ as usize),
+            "drain_front must be page-granular"
+        );
         assert!(n <= self.len, "drain_front past the fill mark");
         let remaining = self.len - n;
         // SAFETY: source and destination are both inside `[0, len)`.
@@ -188,10 +182,11 @@ impl AlignedBuf {
     }
 
     /// Whether the data pointer meets the direct-I/O alignment requirement. Only
-    /// interesting to the tests that assert it, but that assertion is the reason
-    /// the type exists.
+    /// the tests ask, but that assertion is the reason the type exists — an
+    /// unaligned buffer has no symptom short of turning direct I/O on.
+    #[cfg(test)]
     pub fn is_aligned(&self) -> bool {
-        self.ptr.as_ptr() as usize % ALIGN == 0
+        (self.ptr.as_ptr() as usize).is_multiple_of(ALIGN)
     }
 }
 
@@ -275,7 +270,7 @@ mod tests {
         let mut buf = AlignedBuf::with_pages(1);
         buf.extend_from_slice(&[5u8; PAGE]);
         buf.drain_front(PAGE);
-        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
         assert_eq!(buf.whole_pages().len(), 0);
     }
 
@@ -300,7 +295,7 @@ mod tests {
         let mut buf = AlignedBuf::with_pages(1);
         buf.extend_from_slice(&[0xABu8; 300]);
         buf.clear();
-        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
         buf.extend_from_slice(&[1u8; 4]);
         assert_zero_padded(&buf);
         assert!(buf.whole_pages()[4..].iter().all(|&b| b == 0));

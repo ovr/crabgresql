@@ -57,8 +57,20 @@ pub enum WalError {
     UnknownRmgr(u8),
     #[error("wal redo failed: {0}")]
     Redo(String),
-    #[error("cannot flush the wal to {target}: only {appended} bytes have been appended")]
-    FlushPastEnd { target: Lsn, appended: u64 },
+    #[error("cannot flush the wal to {target}: nothing above {appended} has been appended")]
+    FlushPastEnd { target: Lsn, appended: Lsn },
+    /// A data directory from before the WAL became paged and segmented.
+    ///
+    /// Refused loudly rather than read, because the failure mode of reading it is
+    /// silent: the old format's first four bytes are a record length, which is
+    /// not a page magic, so the log would parse as *empty* — and an empty log is
+    /// discarded without a word.
+    #[error(
+        "this data directory predates the paged write-ahead log ({detail}); \
+         the page and segment layout changed and there is no in-place upgrade — \
+         re-initialize the cluster"
+    )]
+    IncompatibleWalFormat { detail: String },
 }
 
 /// One decoded WAL record, borrowing its payload from the replay buffer.

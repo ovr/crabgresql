@@ -27,9 +27,6 @@
 //!    can sit above a break; skipping ahead to it would replay a previous cycle's
 //!    records. The first failure is the end, full stop.
 
-// The reader lands a commit ahead of the writer that produces what it reads.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use crate::aligned::AlignedBuf;
@@ -309,7 +306,6 @@ pub(crate) mod testkit {
 
     use super::*;
     use crate::page::XLP_FIRST_IS_CONTRECORD;
-    use crate::segment::WAL_SEG_SIZE;
     use crabgresql_txn::Xid;
 
     /// A whole-page image of the log, held in memory and spilled to segment files
@@ -331,7 +327,7 @@ pub(crate) mod testkit {
                 bytes: Vec::new(),
                 at: base,
             };
-            builder.open_page(0, XLP_FIRST_IS_CONTRECORD & 0);
+            builder.open_page(0, 0);
             builder
         }
 
@@ -412,15 +408,14 @@ pub(crate) mod testkit {
             }
             Ok(())
         }
-
-        /// Bytes of a whole segment, for tests that rename one.
-        pub fn segment_span(&self) -> u64 {
-            WAL_SEG_SIZE
-        }
     }
 
+    /// Every record the reader hands back, plus the exhausted reader so a test
+    /// can ask *why* the walk ended.
+    pub type ReadAll = (Vec<(Xid, Vec<u8>)>, WalReader);
+
     /// Decode everything the reader will hand back from `from`.
-    pub fn read_all(dir: &Path, from: Lsn) -> Result<(Vec<(Xid, Vec<u8>)>, WalReader), WalError> {
+    pub fn read_all(dir: &Path, from: Lsn) -> Result<ReadAll, WalError> {
         let mut reader = WalReader::open(dir, from)?;
         let mut out = Vec::new();
         let mut buf = Vec::new();
@@ -483,7 +478,7 @@ mod tests {
         // Land the next record 40 bytes short of the page edge.
         let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
         b.record(Xid(1), &vec![0xAA; filler]);
-        let (start, end) = b.record(Xid(2), &vec![0xBB; 200]);
+        let (start, end) = b.record(Xid(2), &[0xBB; 200]);
         b.finish(dir.path())?;
 
         assert_eq!(
@@ -557,7 +552,7 @@ mod tests {
         let mut b = Builder::at(Lsn(first_usable(last_page)));
         let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
         b.record(Xid(1), &vec![0xAA; filler]);
-        let (_, end) = b.record(Xid(2), &vec![0xBB; 100]);
+        let (_, end) = b.record(Xid(2), &[0xBB; 100]);
         b.finish(dir.path())?;
 
         assert!(segment_path(dir.path(), 1).exists());
@@ -656,7 +651,7 @@ mod tests {
         let mut b = Builder::at(Lsn::START);
         let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
         b.record(Xid(1), &vec![0xAA; filler]);
-        let (start, _) = b.record(Xid(2), &vec![0xBB; 200]);
+        let (start, _) = b.record(Xid(2), &[0xBB; 200]);
         let page = Lsn(page_start(Lsn::START.0) + XLOG_BLCKSZ);
         // Clear the flag and re-checksum, so the page is otherwise impeccable.
         let mut header = PageHeader::decode(b.page_mut(page))
@@ -681,7 +676,7 @@ mod tests {
         let mut b = Builder::at(Lsn::START);
         let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
         b.record(Xid(1), &vec![0xAA; filler]);
-        let (start, _) = b.record(Xid(2), &vec![0xBB; 200]);
+        let (start, _) = b.record(Xid(2), &[0xBB; 200]);
         let page = Lsn(page_start(Lsn::START.0) + XLOG_BLCKSZ);
         let mut header = PageHeader::decode(b.page_mut(page))
             .ok_or_else(|| anyhow::anyhow!("header did not decode"))?;

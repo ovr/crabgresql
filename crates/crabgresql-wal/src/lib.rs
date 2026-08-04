@@ -47,7 +47,7 @@ pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
 pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
 pub use segment::{
-    WAL_SEG_SIZE, parse_segment_name, seg_offset, segment_bounds, segment_name, segment_path,
+    WAL_SEG_SIZE, parse_segment_name, scribble, seg_offset, segment_bounds, segment_name, segment_path,
     segment_start, segno_of, wal_dir,
 };
-pub use wal::{CheckpointDelay, Wal, wal_path};
+pub use wal::{CheckpointDelay, Wal};

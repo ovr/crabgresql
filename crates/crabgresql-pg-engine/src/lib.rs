@@ -558,19 +558,20 @@ impl PgEngine {
         let clog = Arc::new(Clog::open(data_dir)?);
         engine.clog.get_or_init(|| Arc::clone(&clog));
         let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
-        // Clamp the WAL to the last valid record before any new append, discarding
-        // a torn tail left by a crash.
-        if let Ok(meta) = std::fs::metadata(crabgresql_wal::wal_path(data_dir))
-            && meta.len() > res.end_of_wal.0
-        {
-            // Dropping a torn tail is routine; dropping a large one is the visible
-            // symptom of a redo point or a decode that went wrong, and it used to
-            // happen in complete silence.
+        // Reposition the WAL at the last valid record before any new append,
+        // discarding a torn tail left by a crash.
+        //
+        // The two ends should be identical: `Wal::open` scanned the same bytes
+        // with the same reader replay just walked. A disagreement is a bug, not a
+        // metric — which is why this warns rather than reporting a routine
+        // "discarded N bytes", as it did when a file's length was the authority.
+        let scanned = wal.current_lsn();
+        if scanned != res.end_of_wal {
             tracing::warn!(
-                discarded = meta.len() - res.end_of_wal.0,
+                scanned = %scanned,
                 end_of_wal = %res.end_of_wal,
                 replayed_from = %res.replayed_from,
-                "discarding the tail of the write-ahead log"
+                "the opening scan and the replay disagree about the end of the write-ahead log"
             );
         }
         wal.reset_to(res.end_of_wal)
@@ -2148,13 +2149,15 @@ mod tests {
             control.redo_lsn.is_valid(),
             "a heap-only cluster has nothing to clamp for, so replay must be bounded"
         );
-        let bytes = std::fs::read(crabgresql_wal::wal_path(dir.path()))?;
-        assert!(
-            control.redo_lsn.0 < bytes.len() as u64,
-            "the redo point must be backed by bytes on disk"
-        );
-        let (rec, _) = crabgresql_wal::WalRecord::decode(&bytes[control.redo_lsn.0 as usize..])
+        // "Backed by bytes on disk" is now a property of the pages, not of a file
+        // length: a preallocated segment is full-length from the moment it exists.
+        // The reader is what can tell the difference, so ask it.
+        let mut reader = crabgresql_wal::WalReader::open(dir.path(), control.redo_lsn)?;
+        let mut buf = Vec::new();
+        let (rec, _) = reader
+            .next_into(&mut buf)?
             .ok_or_else(|| anyhow::anyhow!("no record decodes at the published redo point"))?;
+        assert_eq!(rec.rec_lsn, control.redo_lsn);
         assert_eq!(rec.rmgr, crabgresql_wal::RmgrId::CHECKPOINT.0);
         assert_eq!(rec.info, crabgresql_wal::CHECKPOINT_ONLINE);
         assert_eq!(rec.xid, Xid::INVALID, "a checkpoint owns no transaction");

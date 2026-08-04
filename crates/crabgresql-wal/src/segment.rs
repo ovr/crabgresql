@@ -25,17 +25,13 @@
 //! The invariant that argument rests on is that a rename never *lowers* a segment
 //! number. [`Segments::recycle_below`] asserts it.
 
-// Lands ahead of its consumer, like `aligned`: the writer and the reader are
-// converted in later commits.
-#![allow(dead_code)]
-
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::aligned::AlignedBuf;
 use crate::page::XLOG_BLCKSZ;
-use crate::record::WalError;
+use crate::record::{Lsn, WalError};
 
 /// Bytes per segment file. PostgreSQL's default, and 2048 pages.
 pub const WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
@@ -55,7 +51,7 @@ const PREALLOC_CHUNK: u64 = 1024 * 1024;
 /// across a boundary, and the reader walks forward.
 const OPEN_CACHE: usize = 4;
 
-const _: () = assert!(WAL_SEG_SIZE % XLOG_BLCKSZ == 0);
+const _: () = assert!(WAL_SEG_SIZE.is_multiple_of(XLOG_BLCKSZ));
 
 pub fn wal_dir(dir: &Path) -> PathBuf {
     dir.join(WAL_SUBDIR)
@@ -116,6 +112,28 @@ pub fn segment_bounds(dir: &Path) -> Result<Option<(u64, u64)>, WalError> {
         });
     }
     Ok(bounds)
+}
+
+/// Overwrite the stream range `[from, to)` with `byte`, crossing segment files.
+///
+/// Scaffolding for the tests that simulate a torn write or an unread prefix.
+/// They assert about *stream* positions — "the bytes below the redo point were
+/// never read" — and which file a given byte lives in is this module's business,
+/// not theirs.
+pub fn scribble(dir: &Path, from: Lsn, to: Lsn, byte: u8) -> Result<(), WalError> {
+    let mut segs = Segments::new(dir);
+    let mut at = from.0;
+    while at < to.0 {
+        let take = (WAL_SEG_SIZE - seg_offset(at)).min(to.0 - at) as usize;
+        let Some(file) = segs.open_existing(segno_of(at))? else {
+            at += take as u64;
+            continue;
+        };
+        file.write_all_at(&vec![byte; take], seg_offset(at))?;
+        file.sync_data()?;
+        at += take as u64;
+    }
+    Ok(())
 }
 
 /// A record of every positioned write, kept only under `cfg(test)`.
@@ -258,10 +276,9 @@ impl Segments {
     /// Write whole pages at a page-aligned offset within `segno`, and make them
     /// durable.
     pub fn write_at(&mut self, segno: u64, offset: u64, bytes: &[u8]) -> Result<(), WalError> {
-        debug_assert_eq!(offset % XLOG_BLCKSZ, 0, "unaligned WAL write offset");
-        debug_assert_eq!(
-            bytes.len() as u64 % XLOG_BLCKSZ,
-            0,
+        debug_assert!(offset.is_multiple_of(XLOG_BLCKSZ), "unaligned WAL write offset");
+        debug_assert!(
+            (bytes.len() as u64).is_multiple_of(XLOG_BLCKSZ),
             "WAL write is not a whole number of pages"
         );
         debug_assert!(offset + bytes.len() as u64 <= WAL_SEG_SIZE);
@@ -270,7 +287,7 @@ impl Segments {
             segno,
             offset,
             len: bytes.len(),
-            buf_aligned: bytes.as_ptr() as usize % crate::aligned::ALIGN == 0,
+            buf_aligned: (bytes.as_ptr() as usize).is_multiple_of(crate::aligned::ALIGN),
         });
         let file = self.open_for_write(segno)?;
         file.write_all_at(bytes, offset)?;
