@@ -147,14 +147,21 @@ fn many_rows_force_splits_and_every_key_is_findable() -> anyhow::Result<()> {
     }
     tm.commit(x)?;
 
-    // Every key resolves to exactly its row, across the whole range and at the
-    // edges; a key past the end is empty.
-    for k in (0..N).step_by(97) {
-        assert_eq!(probe_ids(&*table, &read(&tm), k), vec![k], "probe {k}");
+    // Every key resolves to exactly its row, and a key past the end is empty.
+    //
+    // Exhaustively, not sampled. The descent decides at each page whether the
+    // key still belongs to it or has migrated to its right sibling, and getting
+    // that wrong misroutes only the keys nearest a page boundary — which a
+    // stride is free to step over. The failure mode is a probe that returns
+    // nothing rather than one that errors, so a sampled sweep can report a
+    // healthy index while some keys are unreachable. The sweep covers both ends
+    // of the range on its own, so the edges need no separate assertion; only a
+    // key outside it does.
+    let txn = read(&tm);
+    for k in 0..N {
+        assert_eq!(probe_ids(&*table, &txn, k), vec![k], "probe {k}");
     }
-    assert_eq!(probe_ids(&*table, &read(&tm), 0), vec![0]);
-    assert_eq!(probe_ids(&*table, &read(&tm), N - 1), vec![N - 1]);
-    assert!(probe_ids(&*table, &read(&tm), N).is_empty());
+    assert!(probe_ids(&*table, &txn, N).is_empty());
     Ok(())
 }
 

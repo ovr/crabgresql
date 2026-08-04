@@ -96,6 +96,27 @@ fn cmp_route(a: (&[u8], u64), b: (&[u8], u64)) -> Ordering {
     a.0.cmp(b.0).then(a.1.cmp(&b.1))
 }
 
+/// What the page a descent is standing on says to do next.
+///
+/// The three answers are decided together, under one pin, because they are one
+/// question about one page: the high key says whether this page still owns the
+/// search tuple, and only if it does are its downlinks meaningful.
+enum Step {
+    /// The search tuple is `>=` this page's high key, so the target migrated
+    /// right (e.g. across an incomplete split) and this page does not own it.
+    ///
+    /// Not reached by any test in this crate, and not reachable under the coarse
+    /// latch at all: a writer holds it exclusively, so no reader ever observes a
+    /// split in progress. It is here for the states the module header describes
+    /// — a crash between a split and its parent downlink, and the latch-coupling
+    /// milestone — which means it is verified by reading, not by running.
+    Right(u32),
+    /// Follow this downlink.
+    Down(u32),
+    /// This page is the leaf that owns the range.
+    Leaf,
+}
+
 impl BTree {
     pub fn open(
         engine: Arc<EngineInner>,
@@ -186,29 +207,6 @@ impl BTree {
 
     // -- Descent -----------------------------------------------------------
 
-    /// Follow right-links from `blk` while the search tuple `s` is `>=` the page's
-    /// high key (so the target migrated right, e.g. across an incomplete split).
-    /// Returns the block that owns `s`'s key range.
-    fn move_right(&self, mut blk: u32, s: (&[u8], u64)) -> u32 {
-        loop {
-            let page = io(self.engine.bufpool.pin(self.rel, blk));
-            let next = page.read(|pg| {
-                let Some(hk) = btpage::high_key(pg) else {
-                    return None; // rightmost page: unbounded, never step past it
-                };
-                if cmp_route(s, route(btpage::is_leaf(pg), hk)) != Ordering::Less {
-                    Some(btpage::get_opaque(pg).next)
-                } else {
-                    None
-                }
-            });
-            match next {
-                Some(n) => blk = n,
-                None => return blk,
-            }
-        }
-    }
-
     /// The child block on an internal page `pg` for search tuple `s`: the last
     /// downlink whose routing tuple is `<= s` (the leftmost is minus-infinity, so
     /// there is always a match).
@@ -234,21 +232,35 @@ impl BTree {
         let (root, _level) = self.read_meta();
         let mut blk = root;
         loop {
-            blk = self.move_right(blk, s);
             let page = io(self.engine.bufpool.pin(self.rel, blk));
-            let child = page.read(|pg| {
+            let step = page.read(|pg| {
+                // The high key is asked first and answered before anything else
+                // on this page is consulted. A page whose range no longer covers
+                // `s` has downlinks that route some *other* range, and picking
+                // one of those lands the descent in a subtree that cannot
+                // contain the key — a search that quietly returns too few rows
+                // rather than an error. Right-stepping is the whole reason this
+                // check exists; letting it run second would defeat it.
+                if let Some(hk) = btpage::high_key(pg)
+                    && cmp_route(s, route(btpage::is_leaf(pg), hk)) != Ordering::Less
+                {
+                    // A rightmost page has no high key at all, so this can never
+                    // step past the end of the level.
+                    return Step::Right(btpage::get_opaque(pg).next);
+                }
                 if btpage::is_leaf(pg) {
-                    None
+                    Step::Leaf
                 } else {
-                    Some(BTree::internal_pick(pg, s))
+                    Step::Down(BTree::internal_pick(pg, s))
                 }
             });
-            match child {
-                None => return blk,
-                Some(c) => {
+            match step {
+                Step::Right(next) => blk = next,
+                Step::Down(child) => {
                     stack.push(blk);
-                    blk = c;
+                    blk = child;
                 }
+                Step::Leaf => return blk,
             }
         }
     }
