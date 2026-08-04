@@ -11097,37 +11097,52 @@ impl<'a> Parser<'a> {
         if let Some(value) = self.parse_boolean_keyword() {
             return Ok(value);
         }
-        // No argument at all: the option list's `,`/`)` follows.
-        let next = self.peek_token();
-        match &next.token {
-            Token::Comma | Token::RParen => return Ok(true),
-            // A quoted spelling (`'on'`) or an integer (`1`). PostgreSQL takes
-            // only 1 and 0 here — `2` is an error, not truthiness.
-            Token::SingleQuotedString(text) => match text.to_ascii_lowercase().as_str() {
-                "true" | "on" => {
-                    self.next_token();
-                    return Ok(true);
-                }
-                "false" | "off" => {
-                    self.next_token();
-                    return Ok(false);
-                }
-                _ => {}
-            },
-            Token::Number(digits, _) => match digits.as_str() {
-                "1" => {
-                    self.next_token();
-                    return Ok(true);
-                }
-                "0" => {
-                    self.next_token();
-                    return Ok(false);
-                }
-                _ => {}
-            },
-            _ => {}
+        // No argument at all: the option list's `,`/`)` follows, and must be left
+        // for the caller's loop to read.
+        if matches!(
+            self.peek_token_ref().token,
+            Token::Comma | Token::RParen | Token::EOF
+        ) {
+            return Ok(true);
         }
-        Err(Self::pg_syntax_diagnostic(message, Location::empty()))
+        // An integer's sign is its own token, and PostgreSQL compares the *value*:
+        // `+1` and `01` are as valid as `1`, `-0` as `0`.
+        let sign: i64 = match self.peek_token_ref().token {
+            Token::Plus => 1,
+            Token::Minus => -1,
+            _ => 1,
+        };
+        if matches!(self.peek_token_ref().token, Token::Plus | Token::Minus) {
+            self.next_token();
+        }
+        let next = self.next_token();
+        let value = match &next.token {
+            // Quoted, in either style. Upstream's grammar hands `defGetBoolean` a
+            // string for both, which is why `(HEADER "on")` is a value there
+            // rather than an identifier — but a *bare* word is not: `yes` reaches
+            // this point only because it is not one of the four keywords, and has
+            // to stay an error.
+            Token::SingleQuotedString(text) => Self::copy_boolean_word(text),
+            Token::Word(word) if word.quote_style.is_some() => Self::copy_boolean_word(&word.value),
+            // `2` is an error rather than truthiness, and `1.0` is not an integer.
+            Token::Number(digits, _) => match digits.parse::<i64>().map(|n| n * sign) {
+                Ok(1) => Some(true),
+                Ok(0) => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        value.ok_or_else(|| Self::pg_syntax_diagnostic(message, Location::empty()))
+    }
+
+    /// The four words PostgreSQL spells a boolean with, case-insensitively, from
+    /// a value that arrived quoted.
+    fn copy_boolean_word(text: &str) -> Option<bool> {
+        match text.to_ascii_lowercase().as_str() {
+            "true" | "on" => Some(true),
+            "false" | "off" => Some(false),
+            _ => None,
+        }
     }
 
     fn parse_copy_option(&mut self) -> Result<CopyOption, ParserError> {
@@ -18115,6 +18130,15 @@ mod tests {
             ("COPY t FROM stdin (FREEZE 'false')", false),
             ("COPY t FROM stdin (FREEZE 'on')", true),
             ("COPY t FROM stdin (FREEZE 'OFF')", false),
+            // Double-quoted too: upstream's grammar hands `defGetBoolean` a
+            // string either way, so this is a value and not an identifier.
+            ("COPY t FROM stdin (FREEZE \"on\")", true),
+            ("COPY t FROM stdin (FREEZE \"OFF\")", false),
+            // Integers by value, not by spelling.
+            ("COPY t FROM stdin (FREEZE 01)", true),
+            ("COPY t FROM stdin (FREEZE 000)", false),
+            ("COPY t FROM stdin (FREEZE +1)", true),
+            ("COPY t FROM stdin (FREEZE -0)", false),
         ] {
             assert_eq!(freeze(sql), vec![CopyOption::Freeze(expected)], "{sql}");
         }
@@ -18132,6 +18156,16 @@ mod tests {
             ),
             (
                 "COPY t FROM stdin (FREEZE 't')",
+                "freeze requires a Boolean value",
+            ),
+            // An integer other than 1 or 0 is an error, not truthiness — the
+            // sign is part of the value.
+            (
+                "COPY t FROM stdin (FREEZE -1)",
+                "freeze requires a Boolean value",
+            ),
+            (
+                "COPY t FROM stdin (FREEZE 1.0)",
                 "freeze requires a Boolean value",
             ),
             (

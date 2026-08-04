@@ -89,6 +89,12 @@ COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 0);
 w
 \.
 COPY vistest FROM stdin WITH (FORMAT csv, FREEZE 'off');
+u
+\.
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE "off");
+t
+\.
+COPY vistest FROM stdin WITH (FORMAT csv, FREEZE -0);
 v
 \.
 SELECT * FROM vistest ORDER BY a;
