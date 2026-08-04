@@ -12,7 +12,7 @@
 //! finer-grained scheme is a later optimization.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crabgresql_wal::{Lsn, Wal};
@@ -41,6 +41,47 @@ pub struct BufferPool {
     hand: AtomicUsize,
     smgr: Arc<StorageManager>,
     wal: Arc<Wal>,
+    /// How each served pin was answered.
+    ///
+    /// A throughput number on its own cannot tell "the pool got faster" from "the
+    /// working set started fitting", and those call for opposite fixes. Reported
+    /// next to every measurement so the difference stays visible.
+    ///
+    /// Three counters rather than two because creating a page is not a cache
+    /// miss: a pin past end-of-file extends the relation, which is what every
+    /// insert into a full page and every recovered block does. Folding those in
+    /// would report a bulk `COPY` at a hit rate near zero and send the reader off
+    /// to enlarge a pool that was never the problem. They are counted once the
+    /// outcome is known, so a pin that fails partway counts as none of the three
+    /// and the sum stays "pins actually served".
+    ///
+    /// Relaxed: they are a ratio over millions of pins, and ordering them against
+    /// the pin they describe would cost more than the counter is worth.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    extends: AtomicU64,
+}
+
+/// How a pool answered the pins it served. See [`BufferPool::hit_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Served from a resident frame.
+    pub hits: u64,
+    /// The block existed and had to be read in.
+    pub misses: u64,
+    /// The block was past end-of-file and the relation was extended for it.
+    pub extends: u64,
+}
+
+impl PoolStats {
+    /// Share of pins that found their page resident, over the pins that could
+    /// have — a page this pin created was never a candidate for residency, so
+    /// counting it would understate the pool at no one's benefit. `None` when
+    /// nothing has been read or hit yet, since 0/0 is not a rate.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let looked_up = self.hits + self.misses;
+        (looked_up > 0).then(|| self.hits as f64 / looked_up as f64)
+    }
 }
 
 impl BufferPool {
@@ -62,6 +103,23 @@ impl BufferPool {
             hand: AtomicUsize::new(0),
             smgr,
             wal,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            extends: AtomicU64::new(0),
+        }
+    }
+
+    /// How the pins served since this pool was opened were answered.
+    ///
+    /// Deliberately readable outside tests: the whole argument for keeping these
+    /// counters is that a hit rate has to sit next to a throughput number for
+    /// either to mean anything, and a hit rate only a unit test can reach does
+    /// not do that for the workloads anyone actually runs.
+    pub fn hit_stats(&self) -> PoolStats {
+        PoolStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            extends: self.extends.load(Ordering::Relaxed),
         }
     }
 
@@ -76,6 +134,7 @@ impl BufferPool {
         let tag = BufferTag { rel, block };
         let mut map = self.map.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
         if let Some(&idx) = map.get(&tag) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             let mut fr = self.frames[idx]
                 .lock()
                 .unwrap_or_else(|_| panic!("mutex poisoned"));
@@ -150,8 +209,10 @@ impl BufferPool {
             // target, or a block a redo record recreates) extends the relation so
             // `nblocks` always reflects every pinned block — scans and recovery
             // then see it without waiting for a checkpoint.
+            let mut created = false;
             while self.smgr.nblocks(rel)? <= block {
                 self.smgr.extend(rel)?;
+                created = true;
             }
             self.smgr.read(rel, block, &mut fr.data)?;
             if !page::is_initialized(&fr.data) {
@@ -162,6 +223,14 @@ impl BufferPool {
             fr.pins = 1;
             fr.ref_bit = true;
             map.insert(tag, i);
+            // Counted here rather than on the way in, so the outcome is known:
+            // a page this pin brought into existence was never absent from the
+            // pool, and a pin that failed above counts as nothing at all.
+            if created {
+                self.extends.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
             break i;
         };
         Ok(PinnedPage { pool: self, idx })
@@ -535,5 +604,270 @@ mod tests {
         drop(page);
 
         Ok(())
+    }
+}
+
+/// Throughput of [`BufferPool::pin`] at 1, 2, 4, 8 and 16 threads, across three
+/// working-set sizes.
+///
+/// Every page every query touches arrives through `pin`, and `pin` takes one
+/// process-wide `map` lock to do it — so how it behaves under concurrency is a
+/// design constraint, not a detail. This measures the pool in isolation: no
+/// parse, no plan, no executor.
+///
+/// The three working sets exist because a single column cannot distinguish the
+/// two failure modes, and they call for opposite fixes:
+///
+/// * `resident` — half the pool. Every pin is a hit, so this is the cost of the
+///   `map` lock and the three frame-lock acquisitions per pin, and nothing else.
+/// * `tight` — an eighth over the pool. Just past the boundary, so the clock
+///   sweep runs continuously; *at* the pool it would not run at all, because a
+///   working set that fits is an absorbing state and every pin would hit.
+/// * `thrash` — 18x the pool. Almost every pin is a miss, and a miss holds `map`
+///   across `nblocks`, `extend` and `read`. The ratio is the one `pgbench -s 10`
+///   put on the 1024 frames this engine shipped before `shared_buffers` became a
+///   knob: 178 MiB of heap and index against 8 MiB, which is 22:1 — rounded down
+///   here because the point is the order of magnitude, not the decimal.
+///
+/// A pool sized past the working set makes `thrash` disappear and flatters every
+/// number in the other two columns. That is why the hit rate is printed next to
+/// every measurement: a change that only moved the working set is supposed to be
+/// visible as such, not bankable as a speedup.
+///
+/// The relation is written immediately before the run, so its blocks are in the
+/// OS page cache and a miss measures the pool's serialization rather than the
+/// SSD. That is deliberate — the lock structure is what is under test — but it
+/// does mean these numbers are an upper bound on a cold-cache server.
+///
+/// `#[ignore]`d because it is a *measurement*, not an assertion. It asserts
+/// nothing about timing — a timing assertion is the classic CI flake — so it
+/// never runs in CI, and its numbers are machine-dependent. Run it explicitly:
+///
+/// ```text
+/// cargo test --release -p crabgresql-pg-engine --lib bufpool_contention_bench \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+///
+/// `--release` is mandatory (a debug build measures lock bookkeeping and
+/// unoptimised atomics, not the design) and `--test-threads=1` stops the harness
+/// from running two thread counts concurrently and poisoning both.
+///
+/// # Baseline
+///
+/// Recorded on a 10-core machine against a 1024-frame pool, Kops/s aggregate
+/// with the hit rate beside it. Absolute numbers are machine-dependent; the
+/// *shape* is the point:
+///
+/// ```text
+///  threads  resident (512 blk)    tight (1152 blk)  thrash (18432 blk)
+///        1      18638.1 100.0%          317.6 0.2%          280.1 0.0%
+///        2      10431.3 100.0%         501.3 53.1%          247.5 0.0%
+///        4       5002.8 100.0%         569.0 68.2%          182.7 0.0%
+///        8       5825.6 100.0%         496.6 73.3%          163.2 0.0%
+///       16       5373.1 100.0%         980.2 91.2%          149.3 0.6%
+/// ```
+///
+/// Two things to notice, because they decide what is worth fixing first.
+///
+/// The `resident` column *falls* from one thread to four — aggregate throughput
+/// gets worse as threads are added, which is a lock convoy rather than a mere
+/// failure to scale. Whatever else is true, `map` is a real bottleneck.
+///
+/// But `thrash` at one thread is already 66x slower than `resident` at one
+/// thread, while the whole span of the contention collapse is 3.7x. So on this
+/// pool a pin that misses costs more than every lock on the hit path put
+/// together, by more than an order of magnitude — which is why sizing the pool
+/// comes before partitioning the lock, not after.
+///
+/// `tight` is the one column whose hit rate moves along the row, and that is
+/// the finding rather than a defect in it: a lone cyclic scanner over a working
+/// set an eighth larger than the pool hits essentially never (0.2%), because a
+/// clock sweep evicts precisely the block the walk is about to want next.
+/// Spread enough scanners around the same orbit and the pool stays warm
+/// (91.2%), since between them they hold most of it resident. Read that column
+/// as the cost of a scan slightly too big to cache, not as a contention curve —
+/// `thrash`, whose hit rate stays flat at zero, is the contention curve.
+///
+/// # This bench does not have the server's shape
+///
+/// `pgbench -S -s 10` against the server on the same machine, same day:
+///
+/// ```text
+///  clients     1       2       4       8      16
+///      tps  15316   22646   33567   29655   26319
+/// ```
+///
+/// The server peaks at four clients; this bench peaks at one. Both are honest.
+/// A `pin` here is the whole iteration, so the convoy shows up as soon as a
+/// second thread exists, whereas a pgbench transaction spends most of its time
+/// in parse, plan and execute, which spaces the pins out and delays the
+/// collapse. This bench is the more sensitive instrument and the one to iterate
+/// against; it is not the one that decides whether the user-visible curve got
+/// fixed. Check both.
+#[cfg(test)]
+mod bufpool_contention_bench {
+    use super::*;
+    use std::hint::black_box;
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    /// Deliberately fixed, and deliberately not tied to `SHARED_BUFFERS`: the
+    /// three working sets below are defined as ratios against it, so following
+    /// the shipping default would silently redefine what `thrash` means the next
+    /// time somebody tunes the server and make every recorded number
+    /// incomparable.
+    const POOL_FRAMES: usize = 1024;
+    /// Prime, so it is coprime with every span below and each thread's walk is
+    /// one cycle over the whole working set rather than a few frames.
+    const STRIDE: u64 = 7_919;
+
+    struct Workload {
+        name: &'static str,
+        blocks: u32,
+        /// Chosen per workload rather than shared: a resident pin is ~100 ns and
+        /// needs millions of iterations to time reliably, while a thrashing pin
+        /// is a serialized syscall and would run for minutes at that count.
+        /// Throughput is normalised, so the columns stay comparable.
+        iters: u64,
+    }
+
+    const WORKLOADS: [Workload; 3] = [
+        Workload {
+            name: "resident",
+            blocks: POOL_FRAMES as u32 / 2,
+            iters: 2_000_000,
+        },
+        // Above the pool, not equal to it. At exactly `POOL_FRAMES` the working
+        // set fits and the state is absorbing: every timed pin hits, the sweep
+        // never runs, and the column is a second copy of `resident` wearing a
+        // different name. An eighth over is enough to keep eviction going
+        // continuously while the working set is still nearly resident, which is
+        // the boundary this column is supposed to describe.
+        Workload {
+            name: "tight",
+            blocks: POOL_FRAMES as u32 + POOL_FRAMES as u32 / 8,
+            iters: 200_000,
+        },
+        Workload {
+            name: "thrash",
+            blocks: POOL_FRAMES as u32 * 18,
+            iters: 20_000,
+        },
+    ];
+
+    const REL: RelFileNode = RelFileNode(1);
+
+    fn work(pool: &BufferPool, blocks: u32, iters: u64, seed: u64) -> u64 {
+        let span = u64::from(blocks);
+        let mut idx = seed % span;
+        let mut acc = 0u64;
+        for _ in 0..iters {
+            idx = (idx + STRIDE) % span;
+            let page = pool
+                .pin(REL, idx as u32)
+                .unwrap_or_else(|e| panic!("bench pin failed: {e}"));
+            // Touch the bytes under the frame lock: a pin nobody reads would let
+            // the optimiser skip the part of the sequence that costs the most.
+            acc += page.read(|pg| u64::from(pg[0]));
+        }
+        acc
+    }
+
+    /// Elapsed time and the pins served inside it, for `threads` workers.
+    fn run(threads: usize, workload: &Workload) -> (Duration, PoolStats) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let smgr = Arc::new(StorageManager::open(dir.path()).expect("smgr"));
+        // Materialise every block before the pool exists, so the run starts with
+        // a cold pool over a warm file and no worker pays an `extend`.
+        for _ in 0..workload.blocks {
+            smgr.extend(REL).expect("extend");
+        }
+        let wal = Arc::new(Wal::open(dir.path()).expect("wal"));
+        let pool = Arc::new(BufferPool::new(POOL_FRAMES, smgr, wal));
+
+        let barrier = Arc::new(Barrier::new(threads + 1));
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            let (blocks, iters) = (workload.blocks, workload.iters);
+            // Spread the threads evenly around the orbit instead of nudging each
+            // one a fixed step along it. Every thread walks the same cycle, so a
+            // small offset makes the trailing threads read what the leader just
+            // faulted in: the effective working set then shrinks as threads are
+            // added, and a row meant to isolate contention picks up a rising hit
+            // rate instead. Even spacing keeps the formation as wide as the orbit
+            // allows.
+            let seed = t as u64 * u64::from(blocks) / threads as u64;
+            handles.push(std::thread::spawn(move || {
+                // Warm up before the barrier, so filling the pool and
+                // first-touch effects sit outside the timed window. Caught,
+                // because a worker that dies here never reaches the barrier and
+                // `Barrier` has no poisoning — the run would hang with no
+                // diagnostic instead of failing.
+                let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    black_box(work(&pool, blocks, iters / 10, seed));
+                }));
+                barrier.wait();
+                warmed.expect("bench worker panicked during warmup");
+                let acc = work(&pool, blocks, iters, seed);
+                // Without this the optimiser is free to delete the whole loop.
+                black_box(acc);
+            }));
+        }
+        // Sampled before the barrier is released, not after. Every worker has
+        // finished its warmup and is parked here, and none can start timed work
+        // until this thread arrives — so this is the one instant at which the
+        // warmup is complete and the measurement has not begun. Reading it after
+        // the release would subtract whatever the workers managed in the gap,
+        // which is timed work, from the hit rate but not from the throughput.
+        let warm = pool.hit_stats();
+        barrier.wait();
+        let started = Instant::now();
+        for handle in handles {
+            assert!(handle.join().is_ok(), "a bench worker panicked");
+        }
+        let elapsed = started.elapsed();
+        let end = pool.hit_stats();
+        let served = PoolStats {
+            hits: end.hits - warm.hits,
+            misses: end.misses - warm.misses,
+            extends: end.extends - warm.extends,
+        };
+        (elapsed, served)
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion: prints throughput, asserts nothing about timing"]
+    fn bufpool_contention() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        eprintln!(
+            "bufpool contention: {POOL_FRAMES}-frame pool ({} KiB), available_parallelism={cores}",
+            POOL_FRAMES * BLCKSZ / 1024
+        );
+        eprintln!("each cell: Kops/s (aggregate), hit rate");
+        // One width for the header and the data, so the columns cannot drift
+        // apart the way two hand-matched format strings did.
+        const COL: usize = 18;
+        eprint!("{:>8}", "threads");
+        for w in &WORKLOADS {
+            eprint!("  {:>COL$}", format!("{} ({} blk)", w.name, w.blocks));
+        }
+        eprintln!();
+        for threads in [1usize, 2, 4, 8, 16] {
+            eprint!("{threads:>8}");
+            for workload in &WORKLOADS {
+                let (elapsed, served) = run(threads, workload);
+                let kops = (workload.iters * threads as u64) as f64 / elapsed.as_secs_f64() / 1e3;
+                let rate = match served.hit_rate() {
+                    Some(rate) => format!("{:.1}%", rate * 100.0),
+                    None => "--".to_string(),
+                };
+                eprint!("  {:>COL$}", format!("{kops:.1} {rate}"));
+            }
+            eprintln!();
+        }
     }
 }
