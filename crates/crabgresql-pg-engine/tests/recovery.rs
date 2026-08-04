@@ -1465,6 +1465,58 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Recovery discards an uncommitted TRUNCATE's staged file, and now sweeps the
+/// TOAST chains its tuples named on the way — the same reclamation the ROLLBACK
+/// path does, since a crash is the other way that file is thrown away.
+///
+/// What this pins is the hazard that sweep introduces: it must free the doomed
+/// generation's chains and *only* those. The pre-truncate row's wide value lives
+/// in the same chunk store (a TRUNCATE never swaps it), so freeing one chunk too
+/// many would silently truncate or corrupt a committed value.
+#[test]
+fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let big = big_text(7_000);
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = engine.create_table(schema()).unwrap();
+        let tx = tm.allocate_xid();
+        table.insert(
+            vec![Value::Int4(1), big.clone()],
+            &tm.context(tx, CommandId::FIRST),
+        )?;
+        tm.commit(tx)?;
+    }
+    {
+        let (engine, tm) = open(dir.path()).unwrap();
+        let table = engine.open_table("t").unwrap();
+        let tx = tm.allocate_xid();
+        let ctx = tm.context(tx, CommandId::FIRST);
+        table.truncate(&ctx)?;
+        // A wide row into the staged file, then a crash with the swap pending.
+        table.insert(vec![Value::Int4(2), big.clone()], &ctx)?;
+    }
+
+    let (engine, tm) = open(dir.path()).unwrap();
+    let table = engine.open_table("t").unwrap();
+    assert_eq!(visible_ids(&tm, &*table), vec![1]);
+    assert_eq!(
+        big_of(&tm, &*table, 1),
+        big,
+        "the committed value must survive"
+    );
+    // And the store still works for new wide values afterwards.
+    let tx = tm.allocate_xid();
+    table.insert(
+        vec![Value::Int4(3), big.clone()],
+        &tm.context(tx, CommandId::FIRST),
+    )?;
+    tm.commit(tx)?;
+    assert_eq!(big_of(&tm, &*table, 3), big);
+    assert_eq!(big_of(&tm, &*table, 1), big);
+    Ok(())
+}
+
 /// A text value of `n` bytes with position-dependent content, so a chain
 /// reassembled out of order or short would not compare equal.
 fn big_text(n: usize) -> Value {

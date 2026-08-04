@@ -296,6 +296,153 @@ impl EngineInner {
         self.bufpool.forget_relation(rel);
         let _ = self.bufpool.smgr().unlink(rel);
     }
+
+    /// [`EngineInner::discard_relfile`] for a file that holds **heap tuples**:
+    /// free the TOAST chains those tuples name before the file goes.
+    ///
+    /// A TRUNCATE stages a fresh heap file and the transaction may write wide
+    /// rows into it; whichever generation loses — the staged one on abort, the
+    /// old one on commit — is unlinked whole, taking away every tuple that named
+    /// a chain. The chunk store is deliberately *not* swapped by a TRUNCATE (see
+    /// [`HeapTable::reclaim_toast_after_truncate`]) and VACUUM reaches a chain
+    /// only through a heap tuple, so without this those chunks are unreachable
+    /// *and* unreclaimable, and a reload loop grows the store without bound.
+    ///
+    /// Separate from `discard_relfile` rather than folded into it because the
+    /// caller must vouch that this file holds heap tuples: an index or chunk file
+    /// decoded as heap tuples would synthesize garbage chain pointers and free
+    /// arbitrary items in whatever relation they happened to name.
+    fn discard_heap_relfile(&self, rel: RelFileNode, wal_skipped: bool) {
+        self.free_orphaned_chains(rel, wal_skipped);
+        self.discard_relfile(rel);
+    }
+
+    /// Collect the TOAST chains named by tuples in `rel` and free them.
+    ///
+    /// Reads through the buffer pool rather than the file: `discard_relfile`
+    /// drops a relation's frames *without* writing them back, so pages may exist
+    /// only in memory. Every failure is logged and skipped — this runs on the
+    /// abort path, including `Session::drop`, where a panic would be fatal.
+    ///
+    /// The usual "free chains only after the owning slots are gone" ordering (see
+    /// `TableAm::vacuum`) does not bind here: the tuples naming these chains live
+    /// in a file no snapshot can reach, and a crash before the unlink leaves the
+    /// whole relfilenode to be discarded by recovery, so no reader can ever
+    /// observe a tuple whose chunks have been freed.
+    pub(crate) fn free_orphaned_chains(&self, rel: RelFileNode, wal_skipped: bool) {
+        let Ok(nblocks) = self.bufpool.smgr().nblocks(rel) else {
+            tracing::warn!(
+                relfilenode = rel.0,
+                "could not size a discarded relfilenode; its out-of-line values stay allocated"
+            );
+            return;
+        };
+        let mut chains: Vec<toast::ToastPointer> = Vec::new();
+        for block in 0..nblocks {
+            let Ok(page) = self.bufpool.pin(rel, block) else {
+                continue;
+            };
+            chains.extend(page.read(|pg| {
+                let mut found: Vec<toast::ToastPointer> = Vec::new();
+                for off in 1..=page::max_offset(pg) {
+                    if let Some(bytes) = page::get_item(pg, off) {
+                        // No visibility test: every tuple in this file is doomed.
+                        // The only question is whether the row owns chunks at all,
+                        // which `has_external` answers without a full decode.
+                        if tuple::decode_header(bytes).has_external
+                            && let Ok(raw) = tuple::decode_raw(bytes)
+                        {
+                            found.extend(raw.external().iter().map(|(_, p)| *p));
+                        }
+                    }
+                }
+                found
+            }));
+        }
+        self.free_chains(&chains, wal_skipped);
+    }
+
+    /// Free every chunk of each chain, block by block, logging a HEAP_VACUUM per
+    /// page touched. Called once the rows that named these chains are gone —
+    /// either because VACUUM reclaimed them, or because the file holding them is
+    /// being discarded (see [`EngineInner::discard_heap_relfile`]).
+    ///
+    /// The walk reads each chunk's link before freeing it, so it collects the
+    /// whole chain first and frees per block afterwards — freeing as it went
+    /// would destroy the link it still needs.
+    ///
+    /// A chain is self-describing: [`toast::ToastPointer`] carries the chunk
+    /// store's own relfilenode, so this needs no table handle. That is what lets
+    /// it sit on the engine and serve every discard path.
+    pub(crate) fn free_chains(&self, chains: &[toast::ToastPointer], wal_skipped: bool) {
+        if chains.is_empty() {
+            return;
+        }
+        let mut per_block: HashMap<(u32, u32), Vec<u16>> = HashMap::new();
+        let smgr = self.bufpool.smgr();
+        for p in chains {
+            // Same bounds check as `detoast`, and for the same reason: pinning an
+            // out-of-range block extends the relation to reach it.
+            let Ok(nblocks) = smgr.nblocks(p.rel) else {
+                continue;
+            };
+            let mut at = p.first;
+            let mut seen = 0usize;
+            loop {
+                if at.block >= nblocks {
+                    break;
+                }
+                let Ok(page) = self.bufpool.pin(p.rel, at.block) else {
+                    break;
+                };
+                let Some(next) = page.read(|pg| {
+                    page::get_item(pg, at.offset)
+                        .and_then(|bytes| tuple::decode_chunk(bytes).map(|(next, _)| next))
+                }) else {
+                    break;
+                };
+                per_block
+                    .entry((p.rel.0, at.block))
+                    .or_default()
+                    .push(at.offset);
+                seen += 1;
+                // Self-link terminates the chain. The count is a backstop against
+                // a corrupt link cycling forever: no value has more chunks than
+                // its own byte count.
+                if next == at || seen > p.rawsize as usize {
+                    break;
+                }
+                at = next;
+            }
+        }
+        for ((rel, block), mut offs) in per_block {
+            offs.sort_unstable();
+            offs.dedup();
+            let rel = RelFileNode(rel);
+            let Ok(page) = self.bufpool.pin(rel, block) else {
+                continue;
+            };
+            page.modify(|pg| {
+                for &off in &offs {
+                    page::set_flags(pg, off, page::LP_UNUSED);
+                }
+                page::compact(pg);
+                let lsn = if wal_skipped {
+                    crabgresql_wal::Lsn(0)
+                } else {
+                    self.wal
+                        .append(
+                            RmgrId::HEAP,
+                            rec::HEAP_VACUUM,
+                            Xid::INVALID,
+                            &rec::vacuum(rel, block, &offs),
+                        )
+                        .end
+                };
+                page::set_lsn(pg, lsn.0);
+            });
+        }
+    }
 }
 
 /// The durable heap engine: a [`TableEngine`] over a data directory.
@@ -1093,8 +1240,11 @@ impl PgEngine {
                 // every directory the catalog no longer names.
                 if clog.is_committed(rt.xid) {
                     // Swap took effect: the old relation is dead, the new one live.
+                    // Recovery only reconciles permanent, WAL-logged relations —
+                    // an UNLOGGED or TEMP table writes no TRUNCATE record for
+                    // replay to find — so the sweep may log freely here.
                     if !rt.parquet {
-                        self.inner.discard_relfile(rt.old);
+                        self.inner.discard_heap_relfile(rt.old, false);
                     }
                     live = Some(rt.new);
                     // The indexes swapped with it — one record, one verdict.
@@ -1106,8 +1256,12 @@ impl PgEngine {
                         }
                     }
                 } else if !rt.parquet {
-                    // Swap never committed: the staged new files are orphans.
-                    self.inner.discard_relfile(rt.new);
+                    // Swap never committed: the staged new files are orphans. This
+                    // is the abort case reached through a crash rather than a
+                    // ROLLBACK, so it needs the same chain sweep `on_abort` does —
+                    // otherwise `TRUNCATE t; COPY t <wide rows>; <crash>` strands
+                    // the load's chunks for the life of the relation.
+                    self.inner.discard_heap_relfile(rt.new, false);
                     for (_, _, inew) in &rt.indexes {
                         self.inner.discard_relfile(*inew);
                     }
@@ -1334,7 +1488,16 @@ impl TxnFinalize for PgEngine {
                         // Only now is the swap durable.
                         t.truncate_reconciled();
                     }
-                    self.inner.discard_relfile(swap.old_heap);
+                    // The old generation's rows are the only thing naming the
+                    // chunks they wrote, and the store is not swapped with the
+                    // heap — so unlinking this file alone would strand them.
+                    // `reclaim_toast_after_truncate` below only empties the store
+                    // when the *new* heap is empty, which `TRUNCATE t; COPY t;`
+                    // never is: without this, reloading in a loop grows the store
+                    // by a whole dataset per reload.
+                    self.inner
+                        .discard_heap_relfile(swap.old_heap, t.wal_skipped());
+                    t.reset_toast_hint();
                     // The superseded index trees die with the heap file they
                     // pointed into.
                     for old in swap.old_indexes {
