@@ -40,7 +40,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Both architectures on Linux, since the storage layer is full of
+        # endianness- and alignment-sensitive on-disk encoding; macos-latest is
+        # arm64 already, so x86_64 macOS is the gap this deliberately leaves.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
