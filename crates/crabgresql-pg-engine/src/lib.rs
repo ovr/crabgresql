@@ -739,7 +739,31 @@ impl PgEngine {
     }
 
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
+        self.log_pool_stats();
         self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
+    }
+
+    /// Report how the buffer pool is answering pins, at every checkpoint.
+    ///
+    /// The counters are cumulative and there is no metrics surface to publish
+    /// them on yet, so the log is what makes them observable at all — and
+    /// without that, a shipped server pays for them and can never read them.
+    /// Which is the point: a throughput figure with no hit rate beside it cannot
+    /// distinguish a pool that got faster from a working set that started
+    /// fitting, and those want opposite responses.
+    fn log_pool_stats(&self) {
+        let stats = self.inner.bufpool.hit_stats();
+        match stats.hit_rate() {
+            Some(rate) => tracing::debug!(
+                hits = stats.hits,
+                misses = stats.misses,
+                extends = stats.extends,
+                "buffer pool hit rate {:.1}%",
+                rate * 100.0
+            ),
+            // Nothing has been looked up yet — only pages this engine created.
+            None => tracing::debug!(extends = stats.extends, "buffer pool has served no lookups"),
+        }
     }
 
     /// Why this checkpoint may not bound crash recovery, or `None` if it may.
