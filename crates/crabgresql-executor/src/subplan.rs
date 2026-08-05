@@ -110,6 +110,17 @@ pub(crate) struct MemoKey {
 /// has, so the worst case is bounded memory and the existing per-row work.
 const MEMO_CAPACITY: usize = 1 << 16;
 
+/// How many *distinct subplans* one statement may cache anything for.
+///
+/// A statement has finitely many subplans, so ordinarily this never binds. It
+/// binds when something mints `SubplanId`s per row — re-binding a statement in a
+/// loop is the way to do that — and there each entry is dead on arrival, since
+/// the id is never seen again. Unlike the memo, an `exists` entry holds a
+/// materialized hash of a whole inner relation, so leaving that unbounded is the
+/// expensive mistake. Past the cap both caches decline and the per-row path
+/// takes over.
+const SUBPLAN_CAPACITY: usize = 1 << 10;
+
 /// The hashed inner side of one correlated `EXISTS`.
 pub(crate) struct HashedExists {
     /// The outer row slot feeding each key, in key order.
@@ -153,8 +164,14 @@ pub(crate) fn hashed_exists(
     let (Some(cache), Some(id)) = (ctx.subplans.as_ref(), subplan.id()) else {
         return Ok(None);
     };
-    if let Some(hit) = cache.exists.lock().expect("subplan cache mutex").get(&id) {
-        return Ok(hit.clone());
+    {
+        let exists = cache.exists.lock().expect("subplan cache mutex");
+        if let Some(hit) = exists.get(&id) {
+            return Ok(hit.clone());
+        }
+        if exists.len() >= SUBPLAN_CAPACITY {
+            return Ok(None);
+        }
     }
 
     // Deliberately built with the lock released: the build runs a plan, which
@@ -186,12 +203,11 @@ pub(crate) fn hashed_exists(
 /// long bucket.
 pub(crate) fn memo_key(subplan: &Subplan, row: &[Value], ctx: &ExecContext) -> Option<MemoKey> {
     let (cache, id) = (ctx.subplans.as_ref()?, subplan.id()?);
-    let tys = match cache
-        .memo_slots
-        .lock()
-        .expect("subplan cache mutex")
-        .entry(id)
-    {
+    let mut memo_slots = cache.memo_slots.lock().expect("subplan cache mutex");
+    if memo_slots.len() >= SUBPLAN_CAPACITY && !memo_slots.contains_key(&id) {
+        return None;
+    }
+    let tys = match memo_slots.entry(id) {
         std::collections::hash_map::Entry::Occupied(hit) => hit.get().clone(),
         std::collections::hash_map::Entry::Vacant(slot) => {
             // A volatile body must run as many times as it would have; a plan
