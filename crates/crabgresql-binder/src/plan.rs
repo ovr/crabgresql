@@ -1354,58 +1354,143 @@ fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundEx
 
 /// Whether an expression tree holds an [`BoundExpr::OuterColumnRef`] that
 /// escapes the plan this walk started at, given the correlation `depth` this
-/// expression sits at. Descends into nested expression-subquery subplans, which
-/// is the one boundary that pushes a level — see [`plan_has_outer_refs`].
+/// expression sits at.
 fn expr_has_outer_ref(expr: &BoundExpr, depth: usize) -> bool {
-    match expr {
+    let mut found = false;
+    for_each_subexpr(expr, depth, &mut |expr, depth| {
         // Mirrors `subst_outer_expr`: `level == depth` names the immediate
         // parent row and `level > depth` a still-outer one — both are filled
         // from above, so both escape. `level < depth` names an intervening
         // inner query and stays entirely within this plan.
-        BoundExpr::OuterColumnRef { level, .. } => *level >= depth,
-        BoundExpr::Const { .. } | BoundExpr::ColumnRef { .. } | BoundExpr::Param { .. } => false,
+        if let BoundExpr::OuterColumnRef { level, .. } = expr
+            && *level >= depth
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Call `f(node, depth)` for every node of `expr`, with the correlation depth
+/// that node sits at.
+///
+/// Descends into nested expression-subquery subplans, which is the one boundary
+/// that pushes a level — see [`plan_has_outer_refs`]. Callers decide what to do
+/// with `depth` themselves, since "escapes this plan" and "names *this* row" are
+/// different questions asked of the same walk.
+fn for_each_subexpr(expr: &BoundExpr, depth: usize, f: &mut dyn FnMut(&BoundExpr, usize)) {
+    f(expr, depth);
+    match expr {
+        BoundExpr::OuterColumnRef { .. }
+        | BoundExpr::Const { .. }
+        | BoundExpr::ColumnRef { .. }
+        | BoundExpr::Param { .. } => {}
         BoundExpr::Unary { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => expr_has_outer_ref(expr, depth),
+        | BoundExpr::Reinterpret { expr, .. } => for_each_subexpr(expr, depth, f),
         BoundExpr::Binary { left, right, .. } => {
-            expr_has_outer_ref(left, depth) || expr_has_outer_ref(right, depth)
+            for_each_subexpr(left, depth, f);
+            for_each_subexpr(right, depth, f);
         }
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
-        | BoundExpr::Srf { args, .. } => args.iter().any(|e| expr_has_outer_ref(e, depth)),
-        BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(|e| expr_has_outer_ref(e, depth)),
+        | BoundExpr::Srf { args, .. }
+        | BoundExpr::Aggregate { args, .. } => {
+            args.iter().for_each(|e| for_each_subexpr(e, depth, f));
+        }
+        BoundExpr::ArrayCtor { elems, .. } => {
+            elems.iter().for_each(|e| for_each_subexpr(e, depth, f));
+        }
         BoundExpr::Subscript { base, index, .. } => {
-            expr_has_outer_ref(base, depth) || expr_has_outer_ref(index, depth)
+            for_each_subexpr(base, depth, f);
+            for_each_subexpr(index, depth, f);
         }
         BoundExpr::Case { whens, else_, .. } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_has_outer_ref(c, depth) || expr_has_outer_ref(r, depth))
-                || else_
-                    .as_deref()
-                    .is_some_and(|e| expr_has_outer_ref(e, depth))
+            for (condition, result) in whens {
+                for_each_subexpr(condition, depth, f);
+                for_each_subexpr(result, depth, f);
+            }
+            if let Some(e) = else_ {
+                for_each_subexpr(e, depth, f);
+            }
         }
-        BoundExpr::Aggregate { args, .. } => args.iter().any(|e| expr_has_outer_ref(e, depth)),
-        BoundExpr::WindowFunc { kind, spec, .. } => kind
-            .args()
-            .iter()
-            .chain(spec.exprs())
-            .any(|e| expr_has_outer_ref(e, depth)),
+        BoundExpr::WindowFunc { kind, spec, .. } => {
+            kind.args()
+                .iter()
+                .chain(spec.exprs())
+                .for_each(|e| for_each_subexpr(e, depth, f));
+        }
         // A nested expression-subquery is one query level deeper — the same
         // `depth + 1` `subst_outer_expr` applies.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            plan_has_outer_refs_at(&subplan.plan, depth + 1)
+            plan_for_each_subexpr(&subplan.plan, depth + 1, f);
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            plan_has_outer_refs_at(&subplan.plan, depth + 1) || expr_has_outer_ref(cmp, depth)
+            plan_for_each_subexpr(&subplan.plan, depth + 1, f);
+            for_each_subexpr(cmp, depth, f);
         }
         BoundExpr::QuantifiedArray { array, cmp, .. } => {
-            expr_has_outer_ref(array, depth) || expr_has_outer_ref(cmp, depth)
+            for_each_subexpr(array, depth, f);
+            for_each_subexpr(cmp, depth, f);
         }
     }
+}
+
+/// [`for_each_subexpr`] over every expression of a plan reached at `depth`.
+fn plan_for_each_subexpr(plan: &LogicalPlan, depth: usize, f: &mut dyn FnMut(&BoundExpr, usize)) {
+    for_each_plan_expr(plan, depth, &mut |expr, depth| {
+        for_each_subexpr(expr, depth, f);
+    });
+}
+
+/// The slots of the *immediately enclosing* row that `plan` reads, with the type
+/// each is read as, deduplicated and in slot order — everything
+/// [`substitute_outer`] would fill in from that row.
+///
+/// `None` when the plan reads a row further out than the enclosing one, which
+/// [`substitute_outer`] leaves for a boundary above: the value then is not a
+/// function of the enclosing row alone, so nothing may be keyed on it.
+///
+/// The executor uses this to memoize a correlated subplan: two outer rows
+/// agreeing on these slots must produce the same answer, since the plan run for
+/// them is the same plan.
+pub fn plan_outer_ref_slots(plan: &LogicalPlan) -> Option<Vec<(usize, PgType)>> {
+    let mut slots = std::collections::BTreeMap::new();
+    let mut escapes_further = false;
+    plan_for_each_subexpr(plan, 1, &mut |expr, depth| {
+        if let BoundExpr::OuterColumnRef { level, index, ty } = expr {
+            if *level == depth {
+                slots.insert(*index, *ty);
+            } else if *level > depth {
+                escapes_further = true;
+            }
+        }
+    });
+    (!escapes_further).then(|| slots.into_iter().collect())
+}
+
+/// Whether `plan` calls a volatile function (or a routine, which PostgreSQL
+/// defaults to volatile) anywhere.
+///
+/// Running such a plan once and reusing the answer would change how many times
+/// it fires, which is observable — a sequence advances by a different amount, a
+/// routine's writes happen a different number of times.
+/// Unlike [`BoundExpr::contains_volatile_fn`], which stops at a subquery marker
+/// because a subquery's body is a plan of its own, this descends into those
+/// bodies: they all run under the plan being asked about.
+pub fn plan_contains_volatile_fn(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    plan_for_each_subexpr(plan, 1, &mut |expr, _| {
+        // Asked of every node rather than only the root: `contains_volatile_fn`
+        // does not cross a subquery marker, and the walk does.
+        if expr.contains_volatile_fn() {
+            found = true;
+        }
+    });
+    found
 }
 
 pub fn bind_query(
