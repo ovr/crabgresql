@@ -41,6 +41,11 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
+    // Stamp the process start before anything slow (recovery can take minutes),
+    // so `pg_postmaster_start_time()` reports when the server was launched
+    // rather than when it first finished booting.
+    crabgresql_types::tz::postmaster_start_micros();
+
     let cli = Cli::parse();
 
     tracing::info!(

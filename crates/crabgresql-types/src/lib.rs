@@ -37,6 +37,7 @@ pub mod tsvector;
 pub mod tz;
 pub mod uuid;
 pub mod vector;
+pub mod version;
 pub mod wire;
 pub mod xid;
 

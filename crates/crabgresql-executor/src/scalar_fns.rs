@@ -147,6 +147,11 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         // --- geometric (point / lseg) ---
         ScalarFn::Geo(g) => return eval_geo(g, args),
+        // The server's build identity: a compile-time constant, so unlike the
+        // rest of the version/session surface it needs no handle at all.
+        ScalarFn::Version => {
+            return Ok(Value::Text(crabgresql_types::version::version_string()));
+        }
         // Sequence functions are side-effecting and are dispatched by `eval`
         // (which has the session's SequenceOps handle) before it ever reaches
         // this pure evaluator; seeing one here is an internal wiring error.

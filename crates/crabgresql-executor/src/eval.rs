@@ -433,6 +433,10 @@ fn eval_clock_fn(func: ScalarFn, ctx: &ExecContext) -> Option<Result<Value, Exec
         ScalarFn::TransactionTimestamp => ctx.fmt.xact_start(),
         ScalarFn::StatementTimestamp => ctx.fmt.stmt_start(),
         ScalarFn::ClockTimestamp => Ok(crabgresql_types::tz::now_micros()),
+        // Not one of the session's instants: the process's, stamped once at
+        // startup. It lands here because it answers with a bare instant and no
+        // arguments, exactly as the three above do.
+        ScalarFn::PgPostmasterStartTime => Ok(crabgresql_types::tz::postmaster_start_micros()),
         _ => return None,
     };
     Some(

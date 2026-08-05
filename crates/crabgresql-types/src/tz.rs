@@ -583,6 +583,19 @@ pub fn now_micros() -> i64 {
     Timestamp::now().as_microsecond() - PG_EPOCH_UNIX_MICROS
 }
 
+/// When this server process started, as our microseconds since the 2000 epoch —
+/// what `pg_postmaster_start_time()` answers.
+///
+/// Stamped once per process and never again: PG's value is fixed for the life
+/// of the postmaster, and every session must see the same instant. The server
+/// calls this during startup so the stamp is the process's real start; a caller
+/// that reaches it first (a test, an embedded engine) stamps it then instead,
+/// which is still "when this process began doing work".
+pub fn postmaster_start_micros() -> i64 {
+    static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *START.get_or_init(now_micros)
+}
+
 /// Build a `jiff` civil datetime, clamping a year beyond `jiff`'s `±9999` range
 /// to its maximum. Our low end (-4712) is already in range; only the synthetic
 /// upper-boundary rows (`294276-…`) clamp, and they then take the zone's
