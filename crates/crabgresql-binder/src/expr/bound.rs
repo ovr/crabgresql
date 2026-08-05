@@ -1279,6 +1279,44 @@ mod collect_column_refs_tests {
     }
 
     #[test]
+    fn only_the_deep_volatility_test_sees_inside_a_subquery_body() {
+        // `EXISTS (SELECT nextval('s'))`. The shallow predicate stops at the
+        // marker because a subquery body is a plan of its own; the deep one has
+        // to cross it, or a caller reasoning about the *marker* — how many rows
+        // reach it, how many times it is built — draws the wrong conclusion.
+        let nextval = BoundExpr::FuncCall {
+            func: ScalarFn::Nextval,
+            ret: PgType::Int8,
+            args: vec![BoundExpr::Const {
+                value: Value::Text("s".into()),
+                ty: PgType::Text,
+            }],
+        };
+        let marker = BoundExpr::Exists {
+            subplan: Subplan::new(crate::logical_plan::LogicalPlan::Values(
+                crate::logical_plan::ValuesPlan {
+                    columns: Vec::new(),
+                    rows: vec![vec![nextval.clone()]],
+                    predicate: None,
+                    sort: Vec::new(),
+                    distinct: None,
+                },
+            )),
+            negated: false,
+        };
+        assert!(nextval.is_volatile_call());
+        assert!(
+            !marker.is_volatile_call(),
+            "the marker itself is not a call"
+        );
+        assert!(
+            !marker.contains_volatile_fn(),
+            "shallow stops at the marker"
+        );
+        assert!(crate::plan::expr_contains_volatile_fn(&marker));
+    }
+
+    #[test]
     fn nested_expressions_report_every_column_they_read() {
         // CASE WHEN c3 THEN f(c1, c0) ELSE c0 + 1 END
         let expr = BoundExpr::Case {
