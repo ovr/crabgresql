@@ -3408,6 +3408,13 @@ pub struct NestedLoopJoin {
     current_left: Option<Tuple>,
     current_left_matched: bool,
     right_index: usize,
+    /// A full-width joined row reused across candidate pairs, so testing one
+    /// costs no allocation. Only the slots in `touched` are meaningful; the rest
+    /// hold whatever an earlier pair left there, which nothing reads.
+    probe: Vec<Value>,
+    /// The slots of the joined row the filter reads, ascending. `None` means
+    /// "could not be determined — copy the whole row".
+    touched: Option<Vec<usize>>,
 }
 
 impl NestedLoopJoin {
@@ -3431,6 +3438,16 @@ impl NestedLoopJoin {
             right_rows.push(row);
         }
         let right_matched = vec![false; right_rows.len()];
+        // Which slots of the joined row the join filter reads. `None` — an
+        // expression whose dependencies cannot be pinned down — means "all of
+        // them", the same fail-safe the projection pass uses.
+        let mut refs = std::collections::BTreeSet::new();
+        let touched = match &predicate {
+            None => Some(Vec::new()),
+            Some(predicate) => predicate
+                .collect_column_refs(&mut refs)
+                .then(|| refs.into_iter().collect::<Vec<_>>()),
+        };
         Ok(Self {
             left,
             right_rows,
@@ -3444,6 +3461,8 @@ impl NestedLoopJoin {
             current_left: None,
             current_left_matched: false,
             right_index: 0,
+            probe: vec![Value::Null; left_width + right_width],
+            touched,
         })
     }
 
@@ -3486,19 +3505,59 @@ impl ExecNode for NestedLoopJoin {
                     while self.right_index < self.right_rows.len() {
                         let right_index = self.right_index;
                         self.right_index += 1;
-                        let Some(left) = self.current_left.as_ref() else {
+                        if self.current_left.is_none() {
                             continue;
-                        };
-                        let row = self.combined_row(left, &self.right_rows[right_index]);
+                        }
+                        // Test the pair against the reused probe buffer rather
+                        // than a freshly built row: for a wide relation the row
+                        // is an allocation plus a deep clone of every column
+                        // (`Value::Text` is an owned `String`), paid for every
+                        // candidate pair and thrown away on a mismatch. Only the
+                        // columns the filter reads are copied in.
+                        //
+                        // Field-by-field borrows, so the fill can hold `&mut
+                        // probe` while reading the two source rows.
+                        let Self {
+                            probe,
+                            touched,
+                            current_left,
+                            right_rows,
+                            left_width,
+                            ..
+                        } = self;
+                        let left = current_left.as_deref().unwrap_or(&[]);
+                        let right = &right_rows[right_index];
+                        match touched {
+                            Some(touched) => {
+                                for slot in touched {
+                                    let source = if *slot < *left_width {
+                                        left.get(*slot)
+                                    } else {
+                                        right.get(*slot - *left_width)
+                                    };
+                                    probe[*slot] = source.cloned().unwrap_or(Value::Null);
+                                }
+                            }
+                            None => {
+                                probe.truncate(0);
+                                probe.extend_from_slice(left);
+                                probe.extend_from_slice(right);
+                            }
+                        }
                         // A cross join carries no predicate, and `predicate_holds`
                         // already answers `true` for `None`, so there is no
                         // kind-specific short circuit here: an unconditional check
                         // means a predicate that reaches this node is always applied.
-                        let matched = predicate_holds(&self.predicate, &row, &self.ctx)?;
+                        let matched = predicate_holds(&self.predicate, &self.probe, &self.ctx)?;
                         if matched {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
-                            return Ok(Some(row));
+                            let Some(left) = self.current_left.as_ref() else {
+                                continue;
+                            };
+                            return Ok(Some(
+                                self.combined_row(left, &self.right_rows[right_index]),
+                            ));
                         }
                     }
 
