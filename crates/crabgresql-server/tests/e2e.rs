@@ -8154,7 +8154,7 @@ async fn copy_freeze_requires_a_truncate_in_the_same_transaction() -> anyhow::Re
     ] {
         let err = copy_in_rows(&client, statement, b"p\ng\n")
             .await
-            .unwrap_err();
+            .expect_err("FREEZE into a block another transaction can see is refused");
         let db = err.as_db_error().expect("db error");
         assert_eq!(
             db.code(),
@@ -8192,7 +8192,7 @@ async fn copy_freeze_refuses_a_table_created_in_this_transaction() -> anyhow::Re
         b"d\ne\n",
     )
     .await
-    .unwrap_err();
+    .expect_err("FREEZE into a table this transaction did not create is refused");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -8251,7 +8251,9 @@ async fn copy_freeze_rejects_relations_it_cannot_discard() -> anyhow::Result<()>
     ] {
         let client = connect(port).await;
         client.simple_query(ddl).await?;
-        let err = copy_in_rows(&client, statement, b"1\n").await.unwrap_err();
+        let err = copy_in_rows(&client, statement, b"1\n")
+            .await
+            .expect_err("an access method that cannot freeze must refuse the option");
         let db = err.as_db_error().expect("db error");
         assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED, "{statement}");
         assert_eq!(db.message(), message, "{statement}");

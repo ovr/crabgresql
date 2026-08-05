@@ -1477,11 +1477,11 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
 /// many would silently truncate or corrupt a committed value.
 #[test]
 fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let big = big_text(7_000);
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.create_table(schema()).unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
         let tx = tm.allocate_xid();
         table.insert(
             vec![Value::Int4(1), big.clone()],
@@ -1490,8 +1490,8 @@ fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::R
         tm.commit(tx)?;
     }
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.open_table("t").unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.open_table("t")?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
@@ -1499,8 +1499,8 @@ fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::R
         table.insert(vec![Value::Int4(2), big.clone()], &ctx)?;
     }
 
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1]);
     assert_eq!(
         big_of(&tm, &*table, 1),
