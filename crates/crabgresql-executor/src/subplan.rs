@@ -304,11 +304,14 @@ fn analyze(plan: &LogicalPlan) -> Option<Spec> {
         return None;
     }
     // Running the residual once for the whole statement instead of once per
-    // outer row is only invisible if it has no side effects to count.
+    // outer row is only invisible if it has no side effects to count. The deep
+    // test, not `BoundExpr::contains_volatile_fn`: a residual conjunct may hold
+    // a subquery of its own, and that body runs under this build too — the same
+    // question `memo_key` asks with `plan_contains_volatile_fn`.
     if inner_keys
         .iter()
         .chain(&residual)
-        .any(|e| e.contains_volatile_fn())
+        .any(crabgresql_binder::expr_contains_volatile_fn)
     {
         return None;
     }
