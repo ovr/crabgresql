@@ -68,7 +68,8 @@ jobs:
             --no-setup \
             --outdir target/regress/smoke \
             --suite-name smoke \
-            --summary target/regress/smoke.md
+            --summary target/regress/smoke.md \
+            --summary-full target/regress/smoke-full.md
 
       - name: upstream must-pass suite
         id: upstream
@@ -78,22 +79,30 @@ jobs:
             --tests-from crates/crabgresql-pg-regress/suites/upstream_must_pass.txt \
             --outdir target/regress/upstream \
             --suite-name upstream_must_pass \
-            --summary target/regress/upstream.md
+            --summary target/regress/upstream.md \
+            --summary-full target/regress/upstream-full.md
 
+      # The job summary page has room for every test; the pull request comment
+      # gets the same report with only the slowest ones ("" vs "-full").
       - name: build report
         if: always()
         run: |
-          {
-            echo '<!-- crabgresql-regress-report -->'
+          render() {
             echo "## Regress (linux) — ${GITHUB_SHA::7}"
             echo
-            cat target/regress/smoke.md 2>/dev/null || echo '### ⚠️ smoke — did not produce a summary'
+            cat "target/regress/smoke$1.md" 2>/dev/null \
+              || echo '### ⚠️ smoke — did not produce a summary'
             echo
-            cat target/regress/upstream.md 2>/dev/null || echo '### ⚠️ upstream_must_pass — did not produce a summary'
+            cat "target/regress/upstream$1.md" 2>/dev/null \
+              || echo '### ⚠️ upstream_must_pass — did not produce a summary'
             echo
-            echo "[Run details](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          }
+          {
+            echo '<!-- crabgresql-regress-report -->'
+            render ""
+            echo "[Full list and run details](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
           } > target/regress/report.md
-          cat target/regress/report.md >> "$GITHUB_STEP_SUMMARY"
+          render "-full" >> "$GITHUB_STEP_SUMMARY"
 
       # Fork pull requests get a read-only token, so commenting would fail.
       - name: comment on the pull request

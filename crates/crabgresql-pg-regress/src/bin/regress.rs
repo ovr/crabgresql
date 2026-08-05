@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use crabgresql_pg_regress::report::{format_duration, markdown_summary};
+use crabgresql_pg_regress::report::{Detail, format_duration, markdown_summary};
 use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
 
@@ -52,9 +52,13 @@ struct Args {
     #[arg(long)]
     no_setup: bool,
 
-    /// Also write a markdown summary of the run here (for CI)
+    /// Also write a markdown summary here, listing only the slowest tests
     #[arg(long, value_name = "PATH")]
     summary: Option<PathBuf>,
+
+    /// Also write a markdown summary here, listing every test
+    #[arg(long, value_name = "PATH")]
+    summary_full: Option<PathBuf>,
 
     /// Suite name used in the --summary heading
     #[arg(long, value_name = "NAME", default_value = "regress")]
@@ -158,8 +162,13 @@ async fn main() -> ExitCode {
         format_duration(report.duration),
     );
 
-    if let Some(path) = &args.summary {
-        let markdown = markdown_summary(&args.suite_name, &report);
+    let summaries = [
+        (&args.summary, Detail::Slowest),
+        (&args.summary_full, Detail::All),
+    ];
+    for (path, detail) in summaries {
+        let Some(path) = path else { continue };
+        let markdown = markdown_summary(&args.suite_name, &report, detail);
         if let Err(e) = std::fs::write(path, markdown) {
             eprintln!("regress: cannot write summary {}: {e}", path.display());
             return ExitCode::from(2);

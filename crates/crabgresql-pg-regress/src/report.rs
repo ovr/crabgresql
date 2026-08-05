@@ -7,8 +7,16 @@ use std::time::Duration;
 
 use crate::runner::SuiteReport;
 
-/// How many of the slowest tests the summary lists.
+/// How many of the slowest tests [`Detail::Slowest`] lists.
 const SLOWEST: usize = 5;
+
+/// How much of the per-test table a summary carries. A pull request comment
+/// wants the few slowest; a job summary page has room for everything.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    Slowest,
+    All,
+}
 
 /// `4.21s`, the one duration spelling used by both the summary and the
 /// per-test stdout lines.
@@ -17,8 +25,8 @@ pub fn format_duration(duration: Duration) -> String {
 }
 
 /// A GitHub-flavored markdown section for one suite: the headline counts, the
-/// failures if any, and the slowest tests.
-pub fn markdown_summary(suite: &str, report: &SuiteReport) -> String {
+/// failures if any, and a per-test table sized by `detail`.
+pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> String {
     let (passed, total) = (report.passed(), report.total());
     // `total` can be zero only if a caller ran an empty test list; the binary
     // rejects that earlier, but the percentage must not divide by zero here.
@@ -35,18 +43,27 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport) -> String {
         let _ = write!(out, "\nFailed: {}\n", names.join(", "));
     }
 
-    let slowest = report.slowest(SLOWEST);
-    if !slowest.is_empty() {
+    // Slowest first either way: on the full table that is the ordering worth
+    // scanning, and it keeps the two shapes comparable.
+    let rows = match detail {
+        Detail::Slowest => report.slowest(SLOWEST),
+        Detail::All => report.slowest(report.total()),
+    };
+    if !rows.is_empty() {
+        let heading = match detail {
+            Detail::Slowest => format!("Slowest {}", rows.len()),
+            Detail::All => format!("All {} tests, slowest first", rows.len()),
+        };
         let _ = write!(
             out,
-            "\nSlowest {}:\n\n| test | time |\n| --- | --- |\n",
-            slowest.len()
+            "\n{heading}:\n\n| test | result | time |\n| --- | --- | --- |\n"
         );
-        for outcome in slowest {
+        for outcome in rows {
             let _ = writeln!(
                 out,
-                "| `{}` | {} |",
+                "| `{}` | {} | {} |",
                 outcome.name,
+                if outcome.passed { "ok" } else { "**FAILED**" },
                 format_duration(outcome.duration)
             );
         }
@@ -73,17 +90,17 @@ mod tests {
             outcomes: vec![outcome("fast", true, 100), outcome("slow", true, 2500)],
             duration: Duration::from_millis(2600),
         };
-        let md = markdown_summary("smoke", &report);
+        let md = markdown_summary("smoke", &report, Detail::Slowest);
         assert_eq!(
             md,
             "### ✅ smoke — 2/2 passed (100%) in 2.60s\n\
              \n\
              Slowest 2:\n\
              \n\
-             | test | time |\n\
-             | --- | --- |\n\
-             | `slow` | 2.50s |\n\
-             | `fast` | 0.10s |\n"
+             | test | result | time |\n\
+             | --- | --- | --- |\n\
+             | `slow` | ok | 2.50s |\n\
+             | `fast` | ok | 0.10s |\n"
         );
     }
 
@@ -93,8 +110,33 @@ mod tests {
             outcomes: vec![outcome("ok", true, 10), outcome("bad", false, 20)],
             duration: Duration::from_millis(30),
         };
-        let md = markdown_summary("upstream", &report);
+        let md = markdown_summary("upstream", &report, Detail::Slowest);
         assert!(md.starts_with("### ❌ upstream — 1/2 passed (50%) in 0.03s\n"));
         assert!(md.contains("\nFailed: `bad`\n"));
+        assert!(md.contains("| `bad` | **FAILED** | 0.02s |\n"));
+    }
+
+    /// `Detail::All` keeps every test, where `Detail::Slowest` caps the table.
+    #[test]
+    fn full_detail_lists_every_test() {
+        let outcomes = (0..SLOWEST + 3)
+            .map(|i| outcome(&format!("t{i}"), true, i as u64))
+            .collect();
+        let report = SuiteReport {
+            outcomes,
+            duration: Duration::from_millis(100),
+        };
+
+        let all = markdown_summary("smoke", &report, Detail::All);
+        assert!(all.contains(&format!("All {} tests, slowest first:", SLOWEST + 3)));
+        for i in 0..SLOWEST + 3 {
+            assert!(
+                all.contains(&format!("| `t{i}` |")),
+                "t{i} missing from {all}"
+            );
+        }
+
+        let capped = markdown_summary("smoke", &report, Detail::Slowest);
+        assert_eq!(capped.matches("| `t").count(), SLOWEST);
     }
 }
