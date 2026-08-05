@@ -221,9 +221,26 @@ pub fn format(micros: i64, session: &SessionZone) -> String {
 }
 
 /// The local wall clock this instant shows in `zone`, as a stored `timestamp`
-/// value. Saturating for the same reason [`format`] is.
+/// value, with **no range check**.
+///
+/// PG only rejects a rotation on the surfaces that hand the wall clock back as
+/// a value — `AT TIME ZONE`, the `timestamptz -> timestamp` cast — which is
+/// what [`instant_to_wall`] is for. Field extraction and calendar arithmetic
+/// rotate for an intermediate, and PG lets that intermediate leave the band:
+/// under `Asia/Tokyo`, `timestamptz '294276-12-31 20:00:00+00' - interval
+/// '1 day'` is `294276-12-31 05:00:00+09` even though its wall clock is in year
+/// 294277.
+///
+/// `+` rather than `saturating_add`, and a sentinel short-circuit: saturation
+/// turns `infinity` into a finite value under a negative offset, and
+/// [`timestamp::age`] matches on the exact sentinels to reproduce PG's infinity
+/// matrix. Overflow is impossible for a stored instant — `end_micros()` leaves
+/// about eight days of `i64` headroom, far more than any zone offset.
 fn to_wall_clock(micros: i64, zone: &tz::Zone) -> i64 {
-    micros.saturating_add(tz::offset_for_instant(zone, micros) as i64 * USECS_PER_SEC)
+    if !is_finite(micros) {
+        return micros;
+    }
+    micros + tz::offset_for_instant(zone, micros) as i64 * USECS_PER_SEC
 }
 
 // --- field functions -------------------------------------------------------
@@ -443,16 +460,23 @@ pub fn mi_interval(
 }
 
 /// One calendar round trip: rotate the instant into `zone`, add whole months
-/// and/or days there (reusing [`timestamp::pl_interval`] for the day-of-month
-/// clamping and the year-range guard), and rotate the result back.
+/// and/or days there (reusing [`timestamp::pl_interval_wide`] for the
+/// day-of-month clamping), and rotate the result back.
+///
+/// Neither the rotation out nor the calendar shift may band the intermediate
+/// wall clock — for a `timestamptz` the range applies to the resulting
+/// *instant*, which is what the closing [`wall_to_instant`] enforces. Under
+/// `Asia/Tokyo` the wall clock of `294276-12-31 20:00:00+00` is in year 294277,
+/// and PG still answers `- interval '1 day'`, `'1 month'` and `'1 year'` from
+/// it, rejecting `+ interval '1 day'` only because the instant leaves the range.
 fn shift_wall_clock(
     micros: i64,
     months: i32,
     days: i32,
     zone: &tz::Zone,
 ) -> Result<i64, TimestampError> {
-    let wall = instant_to_wall(micros, zone)?;
-    let shifted = timestamp::pl_interval(
+    let wall = to_wall_clock(micros, zone);
+    let shifted = timestamp::pl_interval_wide(
         wall,
         crate::interval::Interval {
             months,
@@ -472,16 +496,21 @@ fn shift_wall_clock(
 /// (`timestamptz - timestamptz`, which measures the instants, reports
 /// `1 day 23:00:00`.)
 ///
-/// [`instant_to_wall`], not `to_wall_clock`: the former passes the infinity
-/// sentinels through untouched, so [`timestamp::age`] sees them and reproduces
-/// PG's infinity matrix — including `age(infinity, infinity)` raising
+/// [`to_wall_clock`], not [`instant_to_wall`]: `age` reads the wall clocks, it
+/// does not return them, so a rotation that leaves the timestamp range is not
+/// an error here. Under `Asia/Tokyo`, PG answers
+/// `age(timestamptz '294276-12-31 20:00:00+00', timestamptz '2000-01-01+00')`
+/// with `292276 years 11 mons 30 days 20:00:00` while the same instant's
+/// `AT TIME ZONE` raises. The rotation also passes the infinity sentinels
+/// through untouched, so [`timestamp::age`] sees them and reproduces PG's
+/// infinity matrix — including `age(infinity, infinity)` raising
 /// `interval out of range`.
 pub fn age(
     dt1: i64,
     dt2: i64,
     zone: &tz::Zone,
 ) -> Result<crate::interval::Interval, TimestampError> {
-    timestamp::age(instant_to_wall(dt1, zone)?, instant_to_wall(dt2, zone)?)
+    timestamp::age(to_wall_clock(dt1, zone), to_wall_clock(dt2, zone))
 }
 
 /// The anchor of the one-argument `age()`: midnight of the transaction's local
@@ -493,7 +522,10 @@ pub fn age(
 /// than as a `date_trunc('day', …)` that would be a second, independently
 /// maintained flooring rule.
 pub fn today_midnight_local(xact_start: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
-    let wall = instant_to_wall(xact_start, zone)?;
+    // Unchecked like `age`'s rotation, for consistency rather than for any
+    // reachable case: a transaction clock is never within a zone offset of a
+    // band edge.
+    let wall = to_wall_clock(xact_start, zone);
     crate::date::to_timestamp_micros(crate::date::from_timestamp_micros(wall)).map_err(|e| {
         TimestampError {
             sqlstate: e.sqlstate,
@@ -630,15 +662,15 @@ pub fn session_zone_wall_clock(micros: i64, session: &SessionZone) -> Result<i64
     instant_to_wall(micros, session.zone())
 }
 
-/// Shared core: rotate a UTC instant into `zone`'s wall clock. `±infinity`
-/// passes through; a result outside the timestamp range is `22008`, as in PG.
+/// [`to_wall_clock`] for the surfaces that hand the wall clock back as a
+/// `timestamp` value: `AT TIME ZONE` and the `timestamptz -> timestamp` cast.
+/// Those are exactly the ones PG rejects when the rotation leaves the range —
+/// `SET TimeZone='Asia/Tokyo'; SELECT timestamptz '294276-12-31 20:00:00+00'
+/// AT TIME ZONE 'Asia/Tokyo'` is `timestamp out of range` — while the same
+/// instant answers `age` and `- interval '1 day'` perfectly well.
 fn instant_to_wall(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
-    if !is_finite(micros) {
-        return Ok(micros);
-    }
-    let off_secs = tz::offset_for_instant(zone, micros);
-    let wall = micros + off_secs as i64 * USECS_PER_SEC;
-    if !in_range(wall) {
+    let wall = to_wall_clock(micros, zone);
+    if is_finite(micros) && !in_range(wall) {
         return Err(out_of_range_bare());
     }
     Ok(wall)
@@ -702,12 +734,20 @@ pub fn timestamp_at_session_zone(
 }
 
 /// Shared core: read a wall clock as being in `zone`, yielding the UTC instant.
+///
+/// This is the one check `timestamptz` arithmetic is actually driven by — the
+/// intermediate wall clock may leave the range, the resulting instant may not.
+/// `checked_sub` because `micros` is no longer guaranteed to be a banded
+/// `timestamp`: [`shift_wall_clock`] hands over whatever the calendar shift
+/// produced, which can sit within a zone offset of `i64::MAX`.
 fn wall_to_instant(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
     if !is_finite(micros) {
         return Ok(micros);
     }
     let off_secs = tz::offset_for_local(zone, tmlite(micros));
-    let utc = micros - off_secs as i64 * USECS_PER_SEC;
+    let utc = micros
+        .checked_sub(off_secs as i64 * USECS_PER_SEC)
+        .ok_or_else(out_of_range_bare)?;
     if !in_range(utc) {
         return Err(out_of_range_bare());
     }
@@ -1291,6 +1331,137 @@ mod tests {
         match mi_interval(p(ts), iv(span), z.zone()) {
             Ok(v) => format(v, &z),
             Err(e) => panic!("{ts:?} - {span:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// Which surfaces reject a rotation that leaves the timestamp range, and
+    /// which do not. The rule is that the range applies to a wall clock only
+    /// when the wall clock is the *answer*: `AT TIME ZONE` and the
+    /// `timestamptz -> timestamp` cast hand one back, so they raise, while
+    /// `age` and `± interval` merely pass through one, so they answer — and
+    /// what bounds them instead is the resulting instant. Every expectation
+    /// read off PostgreSQL 18.4.
+    #[test]
+    fn range_edges_are_decided_by_the_instant() {
+        // Tokyo is +09, so this instant's wall clock is 294277-01-01 05:00 —
+        // one year past the top of the band.
+        let tokyo = zone_of("Asia/Tokyo");
+        let z = tokyo.zone();
+        let x = p("294276-12-31 20:00:00+00");
+
+        assert_eq!(
+            failure(at_zone_to_timestamp("Asia/Tokyo", x)),
+            "timestamp out of range"
+        );
+        assert_eq!(
+            failure(session_zone_wall_clock(x, &tokyo)),
+            "timestamp out of range"
+        );
+        assert_eq!(
+            span(age(x, p("2000-01-01 00:00:00+00"), z)),
+            "292276 years 11 mons 30 days 20:00:00"
+        );
+        assert_eq!(
+            minus("Asia/Tokyo", "294276-12-31 20:00:00+00", "1 day"),
+            "294276-12-31 05:00:00+09"
+        );
+        assert_eq!(
+            minus("Asia/Tokyo", "294276-12-31 20:00:00+00", "1 month"),
+            "294276-12-01 05:00:00+09"
+        );
+        assert_eq!(
+            minus("Asia/Tokyo", "294276-12-31 20:00:00+00", "1 year"),
+            "294276-01-01 05:00:00+09"
+        );
+        assert_eq!(
+            minus("Asia/Tokyo", "294276-12-31 20:00:00+00", "5 hours"),
+            "294277-01-01 00:00:00+09"
+        );
+        assert_eq!(
+            plus("Asia/Tokyo", "294276-12-31 20:00:00+00", "1 microsecond"),
+            "294277-01-01 05:00:00.000001+09"
+        );
+        // The instant leaves the range: rejected by `wall_to_instant`.
+        assert_eq!(
+            failure(pl_interval(x, iv("1 day"), z)),
+            "timestamp out of range"
+        );
+        // A month at the top edge cannot even be encoded: rejected by
+        // `encode_checked`, which is what replaces the year band here.
+        assert_eq!(
+            failure(pl_interval(x, iv("1 month"), z)),
+            "timestamp out of range"
+        );
+
+        // Honolulu is −10:31:26 (LMT), so the low edge mirrors it — and these
+        // two are the cases that only pass once the year band is gone rather
+        // than widened: the shifted wall clock is in astronomical year −4713.
+        let hnl = zone_of("Pacific/Honolulu");
+        let z = hnl.zone();
+        let y = p("4714-11-24 05:00:00+00 BC");
+
+        assert_eq!(
+            failure(at_zone_to_timestamp("Pacific/Honolulu", y)),
+            "timestamp out of range"
+        );
+        assert_eq!(
+            span(age(y, p("2000-01-01 00:00:00+00"), z)),
+            "-6712 years -1 mons -7 days -19:31:26"
+        );
+        assert_eq!(
+            plus("Pacific/Honolulu", "4714-11-24 05:00:00+00 BC", "1 day"),
+            "4714-11-24 18:28:34-10:31:26 BC"
+        );
+        assert_eq!(
+            plus("Pacific/Honolulu", "4714-11-24 05:00:00+00 BC", "1 month"),
+            "4714-12-23 18:28:34-10:31:26 BC"
+        );
+        assert_eq!(
+            plus(
+                "Pacific/Honolulu",
+                "4714-11-24 05:00:00+00 BC",
+                "1 microsecond"
+            ),
+            "4714-11-23 18:28:34.000001-10:31:26 BC"
+        );
+        assert_eq!(
+            failure(mi_interval(y, iv("1 day"), z)),
+            "timestamp out of range"
+        );
+    }
+
+    /// Dropping the year band means the calendar shift can be handed a year in
+    /// the millions. It must come back as an error, not as a panic — `encode`
+    /// multiplies raw, and `tz::offset_for_local` gets asked about a date no
+    /// transition table covers. Run under a debug build, where the overflow
+    /// checks are live.
+    #[test]
+    fn an_absurd_shift_errors_rather_than_panicking() {
+        let ny = zone_of("America/New_York");
+        let z = ny.zone();
+        let x = p("2024-01-01 00:00:00+00");
+        for span in [
+            crate::interval::Interval {
+                months: i32::MAX,
+                days: 0,
+                usec: 0,
+            },
+            crate::interval::Interval {
+                months: i32::MIN,
+                days: 0,
+                usec: 0,
+            },
+            crate::interval::Interval {
+                months: 0,
+                days: i32::MAX,
+                usec: 0,
+            },
+        ] {
+            assert_eq!(
+                failure(pl_interval(x, span, z)),
+                "timestamp out of range",
+                "{span:?}"
+            );
         }
     }
 

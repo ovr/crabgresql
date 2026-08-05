@@ -216,6 +216,11 @@ pub(crate) fn decode(micros: i64) -> Tm {
 }
 
 /// Reassemble calendar fields into a microsecond timestamp.
+///
+/// Unchecked: every caller has already bounded the year, which is what keeps
+/// `date2j * USECS_PER_DAY` inside `i64`. A caller that has *not* — the
+/// zone-aware calendar shift, whose input wall clock may sit outside the band —
+/// wants [`encode_checked`].
 pub(crate) fn encode(tm: Tm) -> i64 {
     let date = date2j(tm.year, tm.month, tm.day) - POSTGRES_EPOCH_JDATE;
     date * USECS_PER_DAY
@@ -223,6 +228,23 @@ pub(crate) fn encode(tm: Tm) -> i64 {
         + tm.min * USECS_PER_MINUTE
         + tm.sec * USECS_PER_SEC
         + tm.usec
+}
+
+/// [`encode`] with the overflow protection an unbanded caller needs.
+///
+/// The band is normally what makes `encode` safe; the timestamptz calendar
+/// shift drops it (the range applies to the resulting instant, not to the
+/// intermediate wall clock) and needs this instead. The headroom is thin —
+/// the top of the timestamp range is only about eight days below `i64::MAX` —
+/// so a month added at the top edge really does overflow. `None` is the
+/// caller's `timestamp out of range`.
+pub(crate) fn encode_checked(tm: Tm) -> Option<i64> {
+    let date = date2j(tm.year, tm.month, tm.day).checked_sub(POSTGRES_EPOCH_JDATE)?;
+    date.checked_mul(USECS_PER_DAY)?
+        .checked_add(tm.hour.checked_mul(USECS_PER_HOUR)?)?
+        .checked_add(tm.min.checked_mul(USECS_PER_MINUTE)?)?
+        .checked_add(tm.sec.checked_mul(USECS_PER_SEC)?)?
+        .checked_add(tm.usec)
 }
 
 // --- output (timestamp_out, ISO datestyle) ---------------------------------
@@ -1270,6 +1292,33 @@ fn check_range(micros: i64) -> Result<i64, TimestampError> {
 /// `timestamp + interval` (`timestamp_pl_interval`): add whole months
 /// calendar-wise (clamping the day of month), then days, then the sub-day time.
 pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
+    let result = pl_interval_banded(micros, span, true)?;
+    // An infinity short-circuited out of the shift and is not a calendar value,
+    // so it must not be range-checked — `check_range` decodes a year.
+    if !is_finite(result) {
+        return Ok(result);
+    }
+    check_range(result)
+}
+
+/// The same calendar shift with **no** year band and **no** final range check,
+/// for the wall-clock half of `timestamptz + interval`.
+///
+/// A `timestamptz`'s range applies to the resulting *instant*, not to the
+/// intermediate wall clock the arithmetic passes through, so banding here would
+/// reject values PG answers: under `Asia/Tokyo` the wall clock of
+/// `timestamptz '294276-12-31 20:00:00+00'` is in year 294277, and PG still
+/// computes `- interval '1 day'`, `'1 month'` and `'1 year'` from it. The
+/// caller's `wall_to_instant` is what enforces the range, and `encode_checked`
+/// is what replaces the band as the overflow guard.
+pub(crate) fn pl_interval_wide(micros: i64, span: Interval) -> Result<i64, TimestampError> {
+    pl_interval_banded(micros, span, false)
+}
+
+/// Shared body of the two. `band` is whether the intermediate calendar date
+/// must lie in PG's year range — true for the zone-less `timestamp` surface,
+/// false for the zone-aware one.
+fn pl_interval_banded(micros: i64, span: Interval, band: bool) -> Result<i64, TimestampError> {
     // An infinite timestamp swallows a finite interval; an infinite interval
     // pushes a finite timestamp to that infinity. Opposite infinities conflict.
     match (inf_sign(micros), span.infinity_sign()) {
@@ -1288,18 +1337,17 @@ pub fn pl_interval(micros: i64, span: Interval) -> Result<i64, TimestampError> {
             tm.day = dim;
         }
     }
-    // Reject an out-of-range year *before* `encode`, whose `date2j * USECS_PER_DAY`
-    // would otherwise overflow i64 and panic. `span.days` is scaled with
-    // `checked_mul` for the same reason.
-    if !(-4712..=294_276).contains(&tm.year) {
+    // The banded surface rejects an out-of-range year here, before `encode`.
+    // The unbanded one relies on `encode_checked` instead — the year is allowed
+    // to leave the range, the arithmetic is not allowed to leave `i64`.
+    if band && !(-4712..=294_276).contains(&tm.year) {
         return Err(timestamp_out_of_range());
     }
-    let result = (span.days as i64)
+    (span.days as i64)
         .checked_mul(USECS_PER_DAY)
-        .and_then(|day_usec| encode(tm).checked_add(day_usec))
+        .and_then(|day_usec| encode_checked(tm)?.checked_add(day_usec))
         .and_then(|r| r.checked_add(span.usec))
-        .ok_or_else(timestamp_out_of_range)?;
-    check_range(result)
+        .ok_or_else(timestamp_out_of_range)
 }
 
 /// `timestamp - interval` (`timestamp_mi_interval`): the negation of the add.
@@ -1529,6 +1577,21 @@ mod tests {
             fmt_iv(age(ts("2010-01-01"), ts("2009-03-15"))?),
             "9 mons 17 days"
         );
+        // The zone-less surface bands the calendar date, and must keep doing
+        // so: PG rejects both of these. `pl_interval_wide`, which the
+        // timestamptz path uses, accepts the same shifts because there the
+        // range belongs to the resulting instant instead.
+        let top = ts("294276-12-31 05:00:00");
+        assert!(pl_interval(top, span("1 day")).is_err());
+        assert!(pl_interval(ts("294276-12-01 05:00:00"), span("1 month")).is_err());
+        assert_eq!(
+            pl_interval_wide(top, span("1 day"))?,
+            encode(tm(294_277, 1, 1, 5, 0, 0, 0))
+        );
+        // Even unbanded, the encode must not overflow: a month past the top
+        // edge is beyond `i64`, and that is an error rather than a panic.
+        assert!(pl_interval_wide(top, span("1 month")).is_err());
+
         // Infinite operands (PG18 semantics).
         assert_eq!(pl_interval(POS_INFINITY, span("1 day"))?, POS_INFINITY);
         assert_eq!(

@@ -351,3 +351,38 @@ SELECT age(timestamptz 'infinity', timestamptz '-infinity') AS opposite,
 SELECT age(timestamptz 'infinity', timestamptz 'infinity');
 SELECT age(timestamp '-infinity', timestamp '-infinity');
 SELECT 'still alive' AS status;
+
+
+--
+-- Range edges. The timestamp range bounds a wall clock only when the wall clock
+-- is the answer: `AT TIME ZONE` and the `timestamptz -> timestamp` cast hand one
+-- back and so reject, while `age` and `± interval` only pass through one and so
+-- answer. What bounds those is the resulting *instant*.
+--
+SET TimeZone = 'Asia/Tokyo';
+-- +09 puts this instant's wall clock in year 294277, one past the top
+SELECT timestamptz '294276-12-31 20:00:00+00' AT TIME ZONE 'Asia/Tokyo';
+SELECT timestamptz '294276-12-31 20:00:00+00'::timestamp;
+SELECT age(timestamptz '294276-12-31 20:00:00+00', timestamptz '2000-01-01+00') AS age_answers;
+SELECT timestamptz '294276-12-31 20:00:00+00' - interval '1 day' AS minus_day,
+       timestamptz '294276-12-31 20:00:00+00' - interval '1 month' AS minus_month,
+       timestamptz '294276-12-31 20:00:00+00' - interval '5 hours' AS minus_hours;
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 microsecond' AS plus_us;
+-- the instant leaves the range
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 day';
+-- a month at the top edge cannot be encoded at all
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 month';
+-- an absurd shift is an error, not a panic
+SELECT timestamptz '2024-01-01+00' + interval '2147483647 months';
+-- the same rule mirrored at the low edge
+SET TimeZone = 'Pacific/Honolulu';
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' AT TIME ZONE 'Pacific/Honolulu';
+SELECT age(timestamptz '4714-11-24 05:00:00+00 BC', timestamptz '2000-01-01+00') AS age_answers;
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' + interval '1 day' AS plus_day,
+       timestamptz '4714-11-24 05:00:00+00 BC' + interval '1 month' AS plus_month;
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' - interval '1 day';
+-- the zone-less type keeps its own band, which is what the range applies to there
+SET TimeZone = 'UTC';
+SELECT timestamp '294276-12-31 05:00:00' + interval '1 day';
+SELECT timestamp '294276-12-01 05:00:00' + interval '1 month';
+SELECT 'still alive' AS status;
