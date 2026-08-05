@@ -1322,7 +1322,7 @@ pub(crate) fn eval_correlated_subquery(
     if let BoundExpr::Exists { negated, .. } = marker
         && let Some(hashed) = subplan::hashed_exists(subplan, ctx, txn)?
     {
-        return Ok(Value::Bool(hashed.probe(row) != *negated));
+        return Ok(Value::Bool(hashed.probe(row, ctx)? != *negated));
     }
     // Otherwise the subplan really is re-run — but only for an outer row that
     // does not agree with an earlier one on every slot the subplan reads. A
@@ -7515,6 +7515,45 @@ mod tests {
             i.insert(vec![k, Value::Int4(*v)], &txn)?;
         }
         Ok(engine as Arc<dyn TableEngine>)
+    }
+
+    #[test]
+    fn a_cross_type_correlation_still_hashes() -> anyhow::Result<()> {
+        // `unify_types` wraps the *narrower* operand, so an int4 outer column
+        // against an int8 inner one arrives as `Coerce{OuterColumnRef}` and used
+        // to fall off the hashed path entirely. Both orientations must answer
+        // the same, and the same as the per-row path.
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let narrow = engine.create_table(TableSchema::in_namespace(
+            "narrow",
+            "public",
+            vec![Column::new("k", PgType::Int4)],
+        ))?;
+        let wide = engine.create_table(TableSchema::in_namespace(
+            "wide",
+            "public",
+            vec![Column::new("k", PgType::Int8)],
+        ))?;
+        let txn = wtxn();
+        for k in [1_i32, 2, 3] {
+            narrow.insert(vec![Value::Int4(k)], &txn)?;
+        }
+        for k in [2_i64, 3, 9] {
+            wide.insert(vec![Value::Int8(k)], &txn)?;
+        }
+        let engine: Arc<dyn TableEngine> = engine;
+        for sql in [
+            "SELECT k FROM narrow o WHERE EXISTS (SELECT 1 FROM wide i WHERE i.k = o.k) ORDER BY k",
+            "SELECT k FROM narrow o WHERE EXISTS (SELECT 1 FROM wide i WHERE o.k = i.k) ORDER BY k",
+        ] {
+            let (_c, rows) = run_rows_on(&engine, sql);
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int4(2)], vec![Value::Int4(3)]],
+                "{sql}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
