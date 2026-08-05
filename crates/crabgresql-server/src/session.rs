@@ -1006,6 +1006,9 @@ impl Session {
             read_only,
             call_depth: 0,
             command_counter: Some(command_counter),
+            // `execute` creates one per statement; a session-wide cache would
+            // outlive the snapshot it was built against.
+            subplans: None,
         }
     }
 }

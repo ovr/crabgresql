@@ -32,8 +32,12 @@ pub struct Subplan {
     pub plan: Box<crate::logical_plan::LogicalPlan>,
     /// See [`SubplanId`]. Deliberately copied by `Clone` rather than freshened:
     /// every clone of a template *is* that template, differing only in the outer
-    /// values substituted into it.
-    pub id: SubplanId,
+    /// values substituted into it — and those are the cache key's other half.
+    ///
+    /// `None` once [`mark_rebound`](Self::mark_rebound) has fired: this copy is
+    /// then no longer the template the id names, and nothing may be cached
+    /// against it.
+    id: Option<SubplanId>,
 }
 
 impl Subplan {
@@ -46,8 +50,28 @@ impl Subplan {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Subplan {
             plan: Box::new(plan),
-            id: SubplanId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            id: Some(SubplanId(
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )),
         }
+    }
+
+    /// This subplan's cache identity, or `None` once it has been rebound.
+    pub fn id(&self) -> Option<SubplanId> {
+        self.id
+    }
+
+    /// Record that an *enclosing* [`substitute_outer`](crate::substitute_outer)
+    /// baked one of its rows' values into this copy.
+    ///
+    /// The plan then differs from row to row while the id does not, so caching
+    /// against the id would serve one outer row's answer to another. Such a
+    /// subplan is a grandchild correlated to both its parent and a grandparent —
+    /// rare enough that dropping it back to the uncached per-row path costs
+    /// nothing worth engineering around, and much easier to be sure of than
+    /// fingerprinting the substituted constants.
+    pub fn mark_rebound(&mut self) {
+        self.id = None;
     }
 }
 
