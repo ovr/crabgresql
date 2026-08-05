@@ -842,6 +842,56 @@ impl BoundExpr {
         }
     }
 
+    /// Whether this expression tree contains a subquery marker anywhere — a
+    /// scalar subquery, an `EXISTS`, or a quantified `op ANY/ALL (SELECT …)`.
+    ///
+    /// Evaluating one runs a whole plan. A *correlated* one runs that plan again
+    /// for every row the expression is applied to, so a conjunct containing one
+    /// is by far the most expensive thing a filter can hold — orders of magnitude
+    /// past any ordinary comparison. Used by the planner to evaluate such a
+    /// conjunct last.
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. }
+            | BoundExpr::QuantifiedSubquery { .. } => true,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_subquery(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_subquery)
+                    || spec.exprs().any(BoundExpr::contains_subquery)
+            }
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_subquery() || index.contains_subquery()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(c, r)| c.contains_subquery() || r.contains_subquery())
+                    || else_.as_ref().is_some_and(|e| e.contains_subquery())
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_subquery() || cmp.contains_subquery()
+            }
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. } => false,
+        }
+    }
+
     /// How many times a given `$n` ([`BoundExpr::Param`] with this 0-based
     /// `index`) occurs in this expression tree. Used to decide whether inlining a
     /// SQL function body would duplicate the evaluation of its `index`-th argument.
