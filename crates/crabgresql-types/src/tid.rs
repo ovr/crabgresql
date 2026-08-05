@@ -106,12 +106,12 @@ pub fn format(block: u32, offset: u16) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn err(input: &str) {
-        let e = parse(input).unwrap_err();
+        let e = parse(input)
+            .expect_err("not a parenthesized (block,offset) pair within tid's field ranges");
         assert_eq!(e.sqlstate, "22P02", "input {input:?}");
         assert_eq!(
             e.message,

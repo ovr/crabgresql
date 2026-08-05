@@ -289,8 +289,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
-    cast::cast_value(value, ty, &ctx.fmt)
-        .map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
 }
 
 /// Assignment-context sibling of [`coerce_value`], for PL/pgSQL's `:=`,
@@ -302,8 +301,7 @@ pub fn coerce_value_assign(
     ty: PgType,
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    cast::cast_value_assign(value, ty, &ctx.fmt)
-        .map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value_assign(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
 }
 
 /// Dispatch the non-strict array constructor functions (`array_cat`,

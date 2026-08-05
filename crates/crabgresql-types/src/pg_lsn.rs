@@ -144,7 +144,6 @@ pub fn from_numeric(n: &Numeric) -> Result<u64, PgLsnError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -182,7 +181,8 @@ mod tests {
             "0/000000001", //
             "+1/0",        // `from_str_radix` would take this; PG does not
         ] {
-            let e = parse(bad).unwrap_err();
+            let e = parse(bad)
+                .expect_err("pg_lsn input is exactly <hi>/<lo>, 1-8 hex digits in each half");
             assert_eq!(e.sqlstate, "22P02", "input {bad:?}");
             assert_eq!(
                 e.message,
@@ -227,10 +227,12 @@ mod tests {
     fn reports_pgs_message_for_each_failure_mode() -> anyhow::Result<()> {
         // Past either end of the u64.
         for e in [
-            add_numeric(u64::MAX - 1, &num("2")).unwrap_err(),
-            sub_numeric(1, &num("2")).unwrap_err(),
-            from_numeric(&num("-1")).unwrap_err(),
-            from_numeric(&num("18446744073709551616")).unwrap_err(),
+            add_numeric(u64::MAX - 1, &num("2"))
+                .expect_err("adding 2 to the second-to-last lsn passes the end of the range"),
+            sub_numeric(1, &num("2")).expect_err("subtracting 2 from lsn 0/1 falls below 0/0"),
+            from_numeric(&num("-1")).expect_err("a negative numeric names no lsn"),
+            from_numeric(&num("18446744073709551616"))
+                .expect_err("2^64 is one past the largest lsn"),
         ] {
             assert_eq!(e.sqlstate, "22023");
             assert_eq!(e.message, "pg_lsn out of range");
@@ -249,7 +251,7 @@ mod tests {
                 "cannot convert infinity to pg_lsn",
             ),
         ] {
-            let e = e.unwrap_err();
+            let e = e.expect_err("NaN and infinity operands have no lsn result");
             assert_eq!(e.sqlstate, "0A000", "{message}");
             assert_eq!(e.message, message);
         }
@@ -272,10 +274,15 @@ mod tests {
         let tiny = num("-170141183460469231731687303715884105728"); // i128::MIN
 
         for e in [
-            add_numeric(1, &huge).unwrap_err(),
-            add_numeric(u64::MAX, &huge).unwrap_err(),
-            sub_numeric(2, &tiny).unwrap_err(),
-            sub_numeric(u64::MAX, &tiny).unwrap_err(),
+            add_numeric(1, &huge)
+                .expect_err("adding i128::MAX to lsn 0/1 overflows the intermediate"),
+            add_numeric(u64::MAX, &huge)
+                .expect_err("adding i128::MAX to the largest lsn overflows the intermediate"),
+            sub_numeric(2, &tiny)
+                .expect_err("subtracting i128::MIN from lsn 0/2 overflows the intermediate"),
+            sub_numeric(u64::MAX, &tiny).expect_err(
+                "subtracting i128::MIN from the largest lsn overflows the intermediate",
+            ),
         ] {
             assert_eq!(e.sqlstate, "22023");
             assert_eq!(e.message, "pg_lsn out of range");

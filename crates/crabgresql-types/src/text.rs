@@ -2079,7 +2079,6 @@ pub fn name_input(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2101,7 +2100,12 @@ mod tests {
         assert_eq!(substr("abcdef", 2, Some(3))?, "bcd");
         assert_eq!(substr("café", 2, None)?, "afé");
         assert_eq!(substr("abcdef", 0, Some(2))?, "a");
-        assert_eq!(substr("abc", 2, Some(-1)).unwrap_err().sqlstate, "22011");
+        assert_eq!(
+            substr("abc", 2, Some(-1))
+                .expect_err("a negative substring length")
+                .sqlstate,
+            "22011"
+        );
 
         Ok(())
     }
@@ -2113,7 +2117,12 @@ mod tests {
         assert_eq!(strpos("abc", "z"), 0);
         assert_eq!(overlay("Txxxxas", "hom", 2, Some(4))?, "Thomas");
         // A start of 0 (or below) is a negative-substring error, as in PG.
-        assert_eq!(overlay("abc", "X", 0, None).unwrap_err().sqlstate, "22011");
+        assert_eq!(
+            overlay("abc", "X", 0, None)
+                .expect_err("an overlay start of 0 asks for a negative substring")
+                .sqlstate,
+            "22011"
+        );
 
         Ok(())
     }
@@ -2126,7 +2135,9 @@ mod tests {
         assert_eq!(pad("abc", -1, " ", true)?, "");
         // A length past MaxAllocSize is rejected instead of allocating.
         assert_eq!(
-            pad("a", 2_000_000_000, "x", true).unwrap_err().sqlstate,
+            pad("a", 2_000_000_000, "x", true)
+                .expect_err("a pad length past MaxAllocSize")
+                .sqlstate,
             "54000"
         );
         assert_eq!(trim("xxabcxx", "x", TrimSide::Both), "abc");
@@ -2140,7 +2151,12 @@ mod tests {
         assert_eq!(replace("abcabc", "", "X"), "abcabc");
         assert_eq!(repeat("x", -2)?, "");
         assert_eq!(repeat("x", 3)?, "xxx");
-        assert_eq!(repeat("ab", 2_000_000_000).unwrap_err().sqlstate, "54000");
+        assert_eq!(
+            repeat("ab", 2_000_000_000)
+                .expect_err("a repeat count that would build a string past MaxAllocSize")
+                .sqlstate,
+            "54000"
+        );
         assert_eq!(reverse("café"), "éfac");
 
         Ok(())
@@ -2152,7 +2168,12 @@ mod tests {
         assert_eq!(right("abc", -1), "bc");
         assert_eq!(split_part("a,b,c", ",", -1)?, "c");
         assert_eq!(split_part("abc", "", 1)?, "abc");
-        assert_eq!(split_part("a", ",", 0).unwrap_err().sqlstate, "22023");
+        assert_eq!(
+            split_part("a", ",", 0)
+                .expect_err("a split_part field number of 0")
+                .sqlstate,
+            "22023"
+        );
 
         Ok(())
     }
@@ -2160,12 +2181,27 @@ mod tests {
     #[test]
     fn chr_and_ascii() {
         assert_eq!(ascii(""), 0);
-        assert_eq!(chr(0).unwrap_err().sqlstate, "54000");
-        assert_eq!(chr(-1).unwrap_err().sqlstate, "22023");
-        assert_eq!(chr(1114112).unwrap_err().sqlstate, "54000");
+        assert_eq!(
+            chr(0)
+                .expect_err("chr(0), which has no representable character")
+                .sqlstate,
+            "54000"
+        );
+        assert_eq!(
+            chr(-1).expect_err("a negative chr argument").sqlstate,
+            "22023"
+        );
+        assert_eq!(
+            chr(1114112)
+                .expect_err("a chr argument past the last code point")
+                .sqlstate,
+            "54000"
+        );
         // A surrogate code point is "not valid", distinct from "too large".
         assert_eq!(
-            chr(55296).unwrap_err().message,
+            chr(55296)
+                .expect_err("chr of a surrogate code point")
+                .message,
             "requested character not valid for encoding: 55296"
         );
         assert_eq!(to_hex_i32(-1), "ffffffff");
@@ -2194,7 +2230,7 @@ mod tests {
         assert!(regex_match("ABC", "abc", true)?);
         assert!(!regex_match("ABC", "abc", false)?);
         // A malformed pattern raises `invalid regular expression` (2201B).
-        let e = regex_match("abc", "a(", false).unwrap_err();
+        let e = regex_match("abc", "a(", false).expect_err("the unclosed group in \"a(\"");
         assert_eq!(e.sqlstate, "2201B");
         assert!(e.message.starts_with("invalid regular expression:"));
 
@@ -2228,11 +2264,13 @@ mod tests {
         assert_eq!(regexp_replace("a.c", "a.c", "X", "q")?, "X");
         assert_eq!(regexp_replace("abc", "a.c", "X", "q")?, "abc");
         // An unknown flag is 22023; `b` (BRE) is an unimplemented feature.
-        let e = regexp_replace("abc", "b", "X", "z").unwrap_err();
+        let e = regexp_replace("abc", "b", "X", "z").expect_err("the unknown regex flag \"z\"");
         assert_eq!(e.sqlstate, "22023");
         assert_eq!(e.message, "invalid regular expression option: \"z\"");
         assert_eq!(
-            regexp_replace("abc", "b", "X", "b").unwrap_err().sqlstate,
+            regexp_replace("abc", "b", "X", "b")
+                .expect_err("the BRE flag \"b\", a grammar this engine does not implement")
+                .sqlstate,
             "0A000"
         );
 
@@ -2448,7 +2486,8 @@ mod tests {
         assert_eq!(regexp_replace("abc", "a b c", "X", "xt")?, "abc");
         // `q` cannot combine with expanded or newline modes, but `s`/`i` are fine.
         for flags in ["qx", "qn", "qm", "qp", "qw"] {
-            let e = regexp_like("a b", "a b", flags).unwrap_err();
+            let e = regexp_like("a b", "a b", flags)
+                .expect_err("the literal flag combined with an expanded or newline mode");
             assert_eq!(e.sqlstate, "2201B", "for {flags:?}");
             assert_eq!(
                 e.message,
@@ -2461,7 +2500,9 @@ mod tests {
         // rather than quietly returning the wrong rows.
         for flags in ["b", "e"] {
             assert_eq!(
-                regexp_like("abc", "b", flags).unwrap_err().sqlstate,
+                regexp_like("abc", "b", flags)
+                    .expect_err("a regex grammar flag this engine does not speak")
+                    .sqlstate,
                 "0A000",
                 "for {flags:?}"
             );
@@ -2475,12 +2516,15 @@ mod tests {
     #[test]
     fn unsupported_constructs_are_reported_as_such() {
         for pattern in [r"(a)\1", "a(?=b)", "a(?<=b)"] {
-            let e = regex_match("aa", pattern, false).unwrap_err();
+            let e = regex_match("aa", pattern, false)
+                .expect_err("a backreference or lookaround construct the engine cannot execute");
             assert_eq!(e.sqlstate, "0A000", "for {pattern:?}");
         }
         // A genuinely malformed pattern still reports a syntax error.
         assert_eq!(
-            regex_match("aa", "a(", false).unwrap_err().sqlstate,
+            regex_match("aa", "a(", false)
+                .expect_err("\"a(\" is malformed, not merely unsupported")
+                .sqlstate,
             "2201B"
         );
     }
@@ -2533,7 +2577,9 @@ mod tests {
         let f = |s: &str| LikeRegexFlags::parse(s).expect("valid flags");
 
         assert_eq!(
-            like_regex_compile("a(", f("")).unwrap_err().sqlstate,
+            like_regex_compile("a(", f(""))
+                .expect_err("the unclosed group in the like_regex pattern \"a(\"")
+                .sqlstate,
             "2201B"
         );
         // Under `q` the pattern is escaped, so it always compiles.
@@ -2546,9 +2592,9 @@ mod tests {
         // These functions match at most once, so `g` is rejected — and PG
         // rejects it before it even compiles the pattern.
         for e in [
-            regexp_like("abc", "a(", "g").unwrap_err(),
-            regexp_count("abc", "a(", 1, "g").unwrap_err(),
-            regexp_substr("abc", "a(", 1, 1, "g", 0).unwrap_err(),
+            regexp_like("abc", "a(", "g").expect_err("the \"g\" flag on regexp_like"),
+            regexp_count("abc", "a(", 1, "g").expect_err("the \"g\" flag on regexp_count"),
+            regexp_substr("abc", "a(", 1, 1, "g", 0).expect_err("the \"g\" flag on regexp_substr"),
         ] {
             assert_eq!(e.sqlstate, "22023");
             assert!(
@@ -2557,15 +2603,21 @@ mod tests {
             );
         }
         assert_eq!(
-            regexp_count("abc", "b", 0, "").unwrap_err().message,
+            regexp_count("abc", "b", 0, "")
+                .expect_err("a regexp_count \"start\" of 0")
+                .message,
             "invalid value for parameter \"start\": 0"
         );
         assert_eq!(
-            regexp_substr("abc", "b", 1, 0, "", 0).unwrap_err().message,
+            regexp_substr("abc", "b", 1, 0, "", 0)
+                .expect_err("a regexp_substr \"n\" of 0")
+                .message,
             "invalid value for parameter \"n\": 0"
         );
         assert_eq!(
-            regexp_substr("abc", "b", 1, 1, "", -1).unwrap_err().message,
+            regexp_substr("abc", "b", 1, 1, "", -1)
+                .expect_err("a negative regexp_substr \"subexpr\"")
+                .message,
             "invalid value for parameter \"subexpr\": -1"
         );
     }
@@ -2614,7 +2666,7 @@ mod tests {
         // An unbalanced bracket is rejected, as in PG.
         assert_eq!(
             similar_to_match("a", "a[", Some('\\'))
-                .unwrap_err()
+                .expect_err("the unbalanced bracket in \"a[\"")
                 .sqlstate,
             "2201B"
         );
@@ -2685,7 +2737,7 @@ mod tests {
         // A third separator is an error rather than a silent extra group.
         assert_eq!(
             substring_similar("XYZ", "X#\"Y#\"Z#\"", esc)
-                .unwrap_err()
+                .expect_err("a third capture separator in the pattern")
                 .sqlstate,
             "2200C"
         );
@@ -2762,20 +2814,22 @@ mod tests {
         // the suffix `(?:{3})` is rejected like PG's `quantifier operand invalid`.
         assert_eq!(
             substring_similar("aaa", "#\"a#\"{3}", esc)
-                .unwrap_err()
+                .expect_err("a bound with no operand after the closing separator")
                 .sqlstate,
             "2201B"
         );
         assert_eq!(
             similar_to_match("aaa", "#\"a#\"{3}", esc)
-                .unwrap_err()
+                .expect_err("the operandless {3} in a SIMILAR TO pattern")
                 .sqlstate,
             "2201B"
         );
         // Digits after `{` commit PG to reading a bound, so leaving it unclosed
         // is an error rather than a literal brace.
         assert_eq!(
-            similar_to_match("a{1", "a{1", esc).unwrap_err().sqlstate,
+            similar_to_match("a{1", "a{1", esc)
+                .expect_err("the unclosed bound in \"a{1\"")
+                .sqlstate,
             "2201B"
         );
 
@@ -2830,15 +2884,21 @@ mod tests {
         // An undefined letter escape is an error, as in PG, and a backreference
         // is reported as the unsupported construct it is.
         assert_eq!(
-            similar_to_match("x", "#q", esc).unwrap_err().sqlstate,
+            similar_to_match("x", "#q", esc)
+                .expect_err("the undefined letter escape \"#q\"")
+                .sqlstate,
             "2201B"
         );
         assert_eq!(
-            similar_to_match("x", "#u41", esc).unwrap_err().sqlstate,
+            similar_to_match("x", "#u41", esc)
+                .expect_err("the too-short unicode escape \"#u41\"")
+                .sqlstate,
             "2201B"
         );
         assert_eq!(
-            similar_to_match("aa", "(a)#1", esc).unwrap_err().sqlstate,
+            similar_to_match("aa", "(a)#1", esc)
+                .expect_err("the backreference \"#1\"")
+                .sqlstate,
             "0A000"
         );
 
@@ -2852,7 +2912,9 @@ mod tests {
         assert!(similar_to_match("a]b", "[a#]b]%", esc)?);
         // Zero-width constraints are not members, and PG rejects them there.
         assert_eq!(
-            similar_to_match("a", "[#y]", esc).unwrap_err().sqlstate,
+            similar_to_match("a", "[#y]", esc)
+                .expect_err("the word-boundary constraint inside the class \"[#y]\"")
+                .sqlstate,
             "2201B"
         );
 
@@ -2868,15 +2930,21 @@ mod tests {
         assert_eq!(decode("001000", "hex")?, vec![0x00, 0x10, 0x00]);
         // Malformed base64 (missing padding / lone trailing symbol) is rejected.
         assert_eq!(
-            decode("abc", "base64").unwrap_err().message,
+            decode("abc", "base64")
+                .expect_err("the unpadded base64 input \"abc\"")
+                .message,
             "invalid base64 end sequence"
         );
         assert_eq!(
-            decode("a@b", "base64").unwrap_err().message,
+            decode("a@b", "base64")
+                .expect_err("the \"@\" symbol in base64 input")
+                .message,
             "invalid symbol \"@\" found while decoding base64 sequence"
         );
         assert_eq!(
-            decode("xy", "hex").unwrap_err().message,
+            decode("xy", "hex")
+                .expect_err("the non-hex digits in \"xy\"")
+                .message,
             "invalid hexadecimal digit: \"x\""
         );
 
@@ -2903,11 +2971,15 @@ mod tests {
         assert_eq!(format("%*s", &[Some("3".into()), Some("x".into())])?, "  x");
         assert_eq!(format("%%", &[])?, "%");
         assert_eq!(
-            format("%", &[]).unwrap_err().message,
+            format("%", &[])
+                .expect_err("a trailing \"%\" with no type specifier")
+                .message,
             "unterminated format() type specifier"
         );
         assert_eq!(
-            format("%0$s", &[Some("x".into())]).unwrap_err().message,
+            format("%0$s", &[Some("x".into())])
+                .expect_err("argument position 0 in a format specifier")
+                .message,
             "format specifies argument 0, but arguments are numbered from 1"
         );
 
@@ -2920,7 +2992,9 @@ mod tests {
         assert_eq!(varchar_input("abcdef", 3, true)?, "abc");
         assert_eq!(varchar_input("ab   ", 2, false)?, "ab");
         assert_eq!(
-            varchar_input("abcdef", 3, false).unwrap_err().sqlstate,
+            varchar_input("abcdef", 3, false)
+                .expect_err("a value too long for varchar(3) without an explicit cast")
+                .sqlstate,
             "22001"
         );
         assert_eq!(bpchar_rtrim("ab   "), "ab");

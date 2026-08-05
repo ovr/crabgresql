@@ -351,7 +351,6 @@ pub fn f8_cbrt(a: f64) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -360,7 +359,8 @@ mod tests {
         for bad in [
             "", "   ", "xyz", "5.0.0", "5 . 0", "5.   0", "- 3.0", "N A N", "NaN x", "1 5",
         ] {
-            let e = float8in(bad).unwrap_err();
+            let e =
+                float8in(bad).expect_err("only a whole, unbroken numeric literal spells a float8");
             assert_eq!(e.sqlstate, "22P02", "for {bad:?}");
         }
     }
@@ -378,10 +378,30 @@ mod tests {
 
     #[test]
     fn parse_range_errors() {
-        assert_eq!(float4in("10e70").unwrap_err().sqlstate, "22003");
-        assert_eq!(float4in("10e-70").unwrap_err().sqlstate, "22003");
-        assert_eq!(float8in("10e400").unwrap_err().sqlstate, "22003");
-        assert_eq!(float8in("10e-400").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            float4in("10e70")
+                .expect_err("10e70 overflows a real")
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            float4in("10e-70")
+                .expect_err("10e-70 underflows a real to zero")
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            float8in("10e400")
+                .expect_err("10e400 overflows a double precision")
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            float8in("10e-400")
+                .expect_err("10e-400 underflows a double precision to zero")
+                .sqlstate,
+            "22003"
+        );
         // float8 tolerates what float4 cannot.
         assert!(float8in("10e-70").is_ok());
         assert!(float8in("1.2345678901234e-200").is_ok());
@@ -394,7 +414,12 @@ mod tests {
         assert_eq!(float8in("0e5")?, 0.0);
         assert_eq!(float8in("0e-400")?, 0.0);
         assert_eq!(float8in("0.0e12")?, 0.0);
-        assert_eq!(float8in("10e-400").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            float8in("10e-400")
+                .expect_err("a nonzero mantissa that rounds to zero is still an underflow")
+                .sqlstate,
+            "22003"
+        );
 
         Ok(())
     }
@@ -424,7 +449,12 @@ mod tests {
 
     #[test]
     fn div_by_zero_and_nan() -> anyhow::Result<()> {
-        assert_eq!(f8_div(1.0, 0.0).unwrap_err().sqlstate, "22012");
+        assert_eq!(
+            f8_div(1.0, 0.0)
+                .expect_err("a finite numerator over a zero divisor has no value")
+                .sqlstate,
+            "22012"
+        );
         assert!(f8_div(f64::NAN, 0.0)?.is_nan());
         assert_eq!(f8_div(42.0, f64::INFINITY)?, 0.0);
 
@@ -436,12 +466,24 @@ mod tests {
         assert_eq!(f8_pow(f64::NAN, 0.0)?, 1.0);
         assert_eq!(f8_pow(1.0, f64::NAN)?, 1.0);
         assert!(f8_pow(f64::NAN, f64::NAN)?.is_nan());
-        assert_eq!(f8_pow(0.0, -1.0).unwrap_err().sqlstate, "2201F");
-        assert_eq!(f8_pow(-1.0, 0.5).unwrap_err().sqlstate, "2201F");
+        assert_eq!(
+            f8_pow(0.0, -1.0)
+                .expect_err("zero raised to a negative power is undefined")
+                .sqlstate,
+            "2201F"
+        );
+        assert_eq!(
+            f8_pow(-1.0, 0.5)
+                .expect_err("a negative base at a fractional exponent is complex")
+                .sqlstate,
+            "2201F"
+        );
         assert!(f8_pow(f64::NEG_INFINITY, -3.0)?.is_sign_negative());
         assert_eq!(f8_pow(f64::NEG_INFINITY, -3.0)?, 0.0);
         assert_eq!(
-            f8_pow(1004.3, 1e200).unwrap_err().message,
+            f8_pow(1004.3, 1e200)
+                .expect_err("1004.3 to the 1e200 leaves the double precision range")
+                .message,
             "value out of range: overflow"
         );
 

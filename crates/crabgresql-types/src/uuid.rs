@@ -95,7 +95,6 @@ pub fn format(b: &[u8; 16]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -133,7 +132,8 @@ mod tests {
             "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", // unmatched brace
             "a0-eebc999c0b4ef8bb6d6bb9bd380a11",     // hyphen after even byte index
         ] {
-            let e = parse(bad).unwrap_err();
+            let e =
+                parse(bad).expect_err("not 32 hex digits with only the punctuation uuid_in allows");
             assert_eq!(e.sqlstate, "22P02", "{bad}");
             assert_eq!(
                 e.message,

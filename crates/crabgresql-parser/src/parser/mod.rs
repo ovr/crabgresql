@@ -17884,7 +17884,6 @@ impl Word {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::test_utils::{all_dialects, TestedDialects};
 
@@ -17935,14 +17934,16 @@ mod tests {
         // Quoting a word always yields `Keyword::NoKeyword`, so the quoted
         // spelling rides the same path.
         assert!(matches!(
-            pg.verified_only_select("SELECT \"pg_lsn\" '0/16AE7F7'").projection[..],
+            pg.verified_only_select("SELECT \"pg_lsn\" '0/16AE7F7'")
+                .projection[..],
             [SelectItem::UnnamedExpr(Expr::TypedString(_))]
         ));
 
         // A keyword before a literal keeps its own meaning: `NOT` is a unary
         // negation, not a type name.
         assert!(matches!(
-            pg.verified_only_select("SELECT NOT 'a' LIKE 'b'").projection[..],
+            pg.verified_only_select("SELECT NOT 'a' LIKE 'b'")
+                .projection[..],
             [SelectItem::UnnamedExpr(Expr::UnaryOp { .. })]
         ));
         // Without a following string constant the word is just an identifier.
@@ -18934,7 +18935,9 @@ mod tests {
         macro_rules! test_parse_multipart_identifier_error {
             ($input:expr, $expected_err:expr $(,)?) => {{
                 all_dialects().run_parser_method(&*$input, |parser| {
-                    let actual_err = parser.parse_multipart_identifier().unwrap_err();
+                    let actual_err = parser
+                        .parse_multipart_identifier()
+                        .expect_err("a malformed multipart identifier must be rejected");
                     assert_eq!(actual_err.to_string(), $expected_err);
                 });
             }};
@@ -19091,7 +19094,8 @@ mod tests {
     /// redundant options" rather than a bare syntax error.
     #[test]
     fn parse_do_rejects_a_repeated_language_clause() {
-        let e = parse_pg("DO LANGUAGE plpgsql $$ BEGIN END $$ LANGUAGE sql").unwrap_err();
+        let e = parse_pg("DO LANGUAGE plpgsql $$ BEGIN END $$ LANGUAGE sql")
+            .expect_err("a second LANGUAGE clause on DO must be rejected");
         assert!(
             e.to_string().contains("conflicting or redundant options"),
             "{e}"
@@ -19173,7 +19177,8 @@ mod tests {
     /// the grammar rather than deferring it to definition time.
     #[test]
     fn parse_create_procedure_rejects_returns() {
-        let e = parse_pg("CREATE PROCEDURE p() RETURNS INT LANGUAGE plpgsql AS $$ $$").unwrap_err();
+        let e = parse_pg("CREATE PROCEDURE p() RETURNS INT LANGUAGE plpgsql AS $$ $$")
+            .expect_err("RETURNS on a procedure must be rejected");
         assert!(
             e.to_string().contains("Expected: a procedure attribute"),
             "{e}"
@@ -19184,7 +19189,8 @@ mod tests {
     /// because the PROCEDURE branch sat below it.
     #[test]
     fn create_or_replace_bail_still_names_the_supported_objects() {
-        let e = parse_pg("CREATE OR REPLACE SEQUENCE s").unwrap_err();
+        let e = parse_pg("CREATE OR REPLACE SEQUENCE s")
+            .expect_err("OR REPLACE on an object that does not support it must be rejected");
         assert!(e.to_string().contains("or FUNCTION or PROCEDURE"), "{e}");
     }
 

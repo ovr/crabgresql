@@ -1631,7 +1631,6 @@ impl std::hash::Hash for Numeric {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1747,8 +1746,20 @@ mod tests {
 
     #[test]
     fn division_by_zero_errors() {
-        assert_eq!(n("1").div(&n("0")).unwrap_err().sqlstate, "22012");
-        assert_eq!(n("1").modulo(&n("0")).unwrap_err().sqlstate, "22012");
+        assert_eq!(
+            n("1")
+                .div(&n("0"))
+                .expect_err("dividing a finite numeric by zero is rejected")
+                .sqlstate,
+            "22012"
+        );
+        assert_eq!(
+            n("1")
+                .modulo(&n("0"))
+                .expect_err("taking a finite numeric modulo zero is rejected")
+                .sqlstate,
+            "22012"
+        );
     }
 
     #[test]
@@ -1756,8 +1767,20 @@ mod tests {
         // inf/inf = NaN; nan/0 = NaN; inf/0 and inf%0 = division by zero.
         assert_eq!(n("Infinity").div(&n("Infinity"))?.to_display(), "NaN");
         assert_eq!(n("NaN").div(&n("0"))?.to_display(), "NaN");
-        assert_eq!(n("Infinity").div(&n("0")).unwrap_err().sqlstate, "22012");
-        assert_eq!(n("Infinity").modulo(&n("0")).unwrap_err().sqlstate, "22012");
+        assert_eq!(
+            n("Infinity")
+                .div(&n("0"))
+                .expect_err("dividing infinity by zero is division by zero, not NaN")
+                .sqlstate,
+            "22012"
+        );
+        assert_eq!(
+            n("Infinity")
+                .modulo(&n("0"))
+                .expect_err("infinity modulo zero is division by zero, not NaN")
+                .sqlstate,
+            "22012"
+        );
         assert_eq!(n("Infinity").div(&n("2"))?.to_display(), "Infinity");
         assert_eq!(n("-Infinity").div(&n("2"))?.to_display(), "-Infinity");
         assert_eq!(n("2").div(&n("Infinity"))?.to_display(), "0");
@@ -1843,21 +1866,27 @@ mod tests {
     #[test]
     fn typmod_overflow_and_ok() -> anyhow::Result<()> {
         assert_eq!(n("0.99994").apply_typmod(4, 4)?.to_display(), "0.9999");
-        let e = n("0.99995").apply_typmod(4, 4).unwrap_err();
+        let e = n("0.99995")
+            .apply_typmod(4, 4)
+            .expect_err("0.99995 rounds up to 1.0000, which numeric(4,4) cannot hold");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(
             e.detail
                 .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
             "A field with precision 4, scale 4 must round to an absolute value less than 1."
         );
-        let e = n("12345.6").apply_typmod(5, 2).unwrap_err();
+        let e = n("12345.6")
+            .apply_typmod(5, 2)
+            .expect_err("12345.6 needs five integer digits, more than numeric(5,2) allows");
         assert_eq!(
             e.detail
                 .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
             "A field with precision 5, scale 2 must round to an absolute value less than 10^3."
         );
         assert_eq!(n("1.005").apply_typmod(5, 2)?.to_display(), "1.01");
-        let e = Numeric::pos_inf().apply_typmod(4, 4).unwrap_err();
+        let e = Numeric::pos_inf()
+            .apply_typmod(4, 4)
+            .expect_err("infinity cannot be held by a numeric with a declared precision");
         assert_eq!(
             e.detail
                 .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
@@ -1897,8 +1926,20 @@ mod tests {
         assert_eq!(n("100").ln()?.to_display(), "4.6051701859880914");
         assert_eq!(n("1e50").ln()?.to_display(), "115.12925464970228");
         assert_eq!(n("1e100").ln()?.to_display(), "230.25850929940457");
-        assert_eq!(n("0").ln().unwrap_err().sqlstate, "2201E");
-        assert_eq!(n("-1").ln().unwrap_err().sqlstate, "2201E");
+        assert_eq!(
+            n("0")
+                .ln()
+                .expect_err("the logarithm of zero is undefined")
+                .sqlstate,
+            "2201E"
+        );
+        assert_eq!(
+            n("-1")
+                .ln()
+                .expect_err("the logarithm of a negative number is undefined")
+                .sqlstate,
+            "2201E"
+        );
 
         Ok(())
     }
@@ -1949,8 +1990,20 @@ mod tests {
         );
         assert_eq!(n("-2").power(&n("3"))?.to_display(), "-8.0000000000000000");
         // Special-case errors.
-        assert_eq!(n("0").power(&n("-1")).unwrap_err().sqlstate, "2201F");
-        assert_eq!(n("-2").power(&n("0.5")).unwrap_err().sqlstate, "2201F");
+        assert_eq!(
+            n("0")
+                .power(&n("-1"))
+                .expect_err("zero raised to a negative exponent is undefined")
+                .sqlstate,
+            "2201F"
+        );
+        assert_eq!(
+            n("-2")
+                .power(&n("0.5"))
+                .expect_err("a negative base with a fractional exponent has no real result")
+                .sqlstate,
+            "2201F"
+        );
         assert_eq!(n("0").power(&n("0"))?.to_display(), "1");
 
         Ok(())
@@ -1965,12 +2018,15 @@ mod tests {
         assert_eq!(
             n("117743296169.0")
                 .power(&n("1000000000"))
-                .unwrap_err()
+                .expect_err("117743296169.0^1000000000 overflows the numeric exponent range")
                 .sqlstate,
             "22003"
         );
         assert_eq!(
-            n("10.0").power(&n("2147483647")).unwrap_err().sqlstate,
+            n("10.0")
+                .power(&n("2147483647"))
+                .expect_err("10.0^2147483647 overflows the numeric exponent range")
+                .sqlstate,
             "22003"
         );
         // Underflows past the result scale, which PG caps at 1000 digits.
@@ -1999,7 +2055,13 @@ mod tests {
         assert_eq!(n("2000000").sqrt()?.to_display(), "1414.2135623730950");
         assert_eq!(n("2.0").sqrt()?.to_display(), "1.414213562373095");
         assert_eq!(n("0").sqrt()?.to_display(), "0.000000000000000");
-        assert_eq!(n("-1").sqrt().unwrap_err().sqlstate, "2201F");
+        assert_eq!(
+            n("-1")
+                .sqrt()
+                .expect_err("the square root of a negative number has no real result")
+                .sqlstate,
+            "2201F"
+        );
 
         Ok(())
     }

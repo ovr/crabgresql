@@ -505,27 +505,37 @@ mod tests {
         // promptly, and clearing it must wake the waiter.
         engine.buffer_pressure().set(true);
         let waiter = Arc::clone(&engine);
+        let (running, started_waiting) = std::sync::mpsc::channel();
         let released = std::thread::spawn(move || {
-            let started = Instant::now();
+            // Signalled from inside the thread, immediately before blocking, so
+            // that "still unfinished" below cannot instead mean "never
+            // scheduled". Nothing clears the flag until after the sleep, so the
+            // few instructions between this and the wait cannot lose a wakeup.
+            running
+                .send(())
+                .expect("the main thread is waiting on this");
             waiter.await_write_capacity();
-            started.elapsed()
         });
+        started_waiting.recv_timeout(Duration::from_secs(5))?;
 
+        // Both ends of every interval below come from this one clock: an elapsed
+        // time measured across two threads' clocks can come in under the sleep
+        // it in fact outlasted.
+        let started = Instant::now();
         // Long enough to distinguish "waited" from "returned immediately", short
         // enough not to slow the suite.
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!released.is_finished(), "the writer must still be waiting");
+        assert!(
+            !released.is_finished(),
+            "the writer returned while the flag was still set, so it never waited"
+        );
         engine.buffer_pressure().set(false);
 
-        let waited = released
+        released
             .join()
-            .unwrap_or_else(|_| panic!("waiter panicked"));
+            .map_err(|_| anyhow::anyhow!("waiter panicked"))?;
         assert!(
-            waited >= Duration::from_millis(200),
-            "the writer returned after {waited:?}, so it never waited"
-        );
-        assert!(
-            waited < WRITE_CAPACITY_TIMEOUT,
+            started.elapsed() < WRITE_CAPACITY_TIMEOUT,
             "the writer rode out the timeout instead of being woken"
         );
         Ok(())

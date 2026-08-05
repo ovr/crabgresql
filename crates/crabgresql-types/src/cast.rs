@@ -1107,7 +1107,6 @@ pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1124,11 +1123,36 @@ mod tests {
         assert_eq!(byteain("\\xDE AD")?, vec![0xde, 0xad]);
         assert_eq!(byteain("\\x")?, b"");
         // Malformed input is 22P02.
-        assert_eq!(byteain("\\xabc").unwrap_err().sqlstate, "22P02"); // odd nibbles
-        assert_eq!(byteain("\\xzz").unwrap_err().sqlstate, "22P02"); // non-hex
-        assert_eq!(byteain("\\x a b").unwrap_err().sqlstate, "22P02"); // mid-byte space
-        assert_eq!(byteain("\\9").unwrap_err().sqlstate, "22P02"); // bad escape
-        assert_eq!(byteain("\\").unwrap_err().sqlstate, "22P02"); // dangling backslash
+        assert_eq!(
+            byteain("\\xabc")
+                .expect_err("hex bytea with an odd number of nibbles has no whole last byte")
+                .sqlstate,
+            "22P02"
+        ); // odd nibbles
+        assert_eq!(
+            byteain("\\xzz")
+                .expect_err("'z' is not a hex digit")
+                .sqlstate,
+            "22P02"
+        ); // non-hex
+        assert_eq!(
+            byteain("\\x a b")
+                .expect_err("whitespace inside a hex pair splits a byte")
+                .sqlstate,
+            "22P02"
+        ); // mid-byte space
+        assert_eq!(
+            byteain("\\9")
+                .expect_err("\\9 is neither \\\\ nor a three-digit octal escape")
+                .sqlstate,
+            "22P02"
+        ); // bad escape
+        assert_eq!(
+            byteain("\\")
+                .expect_err("a trailing backslash has no escape body")
+                .sqlstate,
+            "22P02"
+        ); // dangling backslash
 
         Ok(())
     }
@@ -1141,19 +1165,23 @@ mod tests {
         );
         assert_eq!(
             cast_value(Value::Float4(32767.6), PgType::Int2, &FmtCtx::utc(1))
-                .unwrap_err()
+                .expect_err("32767.6 rounds to 32768, past smallint's top")
                 .message,
             "smallint out of range"
         );
         // f32 of 2147483647 rounds up to 2^31, out of int4 range.
         assert_eq!(
             cast_value(Value::Float4(2147483647.0), PgType::Int4, &FmtCtx::utc(1))
-                .unwrap_err()
+                .expect_err("the float4 nearest 2147483647 is 2^31, one past integer's top")
                 .sqlstate,
             "22003"
         );
         assert_eq!(
-            cast_value(Value::Float8(-9223372036854775808.5), PgType::Int8, &FmtCtx::utc(1))?,
+            cast_value(
+                Value::Float8(-9223372036854775808.5),
+                PgType::Int8,
+                &FmtCtx::utc(1)
+            )?,
             Value::Int8(i64::MIN)
         );
 
@@ -1164,13 +1192,13 @@ mod tests {
     fn float8_to_float4_range() {
         assert_eq!(
             cast_value(Value::Float8(1e70), PgType::Float4, &FmtCtx::utc(1))
-                .unwrap_err()
+                .expect_err("1e70 is larger than any finite float4")
                 .message,
             "value out of range: overflow"
         );
         assert_eq!(
             cast_value(Value::Float8(1e-70), PgType::Float4, &FmtCtx::utc(1))
-                .unwrap_err()
+                .expect_err("1e-70 collapses to zero in float4")
                 .message,
             "value out of range: underflow"
         );
@@ -1178,19 +1206,38 @@ mod tests {
 
     #[test]
     fn numeric_nan_to_float() -> anyhow::Result<()> {
-        let n = cast_value(Value::Text("nan".into()), PgType::Numeric, &FmtCtx::utc_default())?;
+        let n = cast_value(
+            Value::Text("nan".into()),
+            PgType::Numeric,
+            &FmtCtx::utc_default(),
+        )?;
         let f = cast_value(n, PgType::Float4, &FmtCtx::utc(1))?;
-        assert_eq!(f.encode_text_with(&FmtCtx::utc_default()).as_deref(), Some("NaN"));
+        assert_eq!(
+            f.encode_text_with(&FmtCtx::utc_default()).as_deref(),
+            Some("NaN")
+        );
 
         Ok(())
     }
 
     #[test]
     fn numeric_rejects_garbage() {
-        let e = cast_value(Value::Text("abc".into()), PgType::Numeric, &FmtCtx::utc_default()).unwrap_err();
+        let e = cast_value(
+            Value::Text("abc".into()),
+            PgType::Numeric,
+            &FmtCtx::utc_default(),
+        )
+        .expect_err("\"abc\" has no digits for numeric's input function");
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type numeric: \"abc\"");
-        assert!(cast_value(Value::Text("1.5".into()), PgType::Numeric, &FmtCtx::utc_default()).is_ok());
+        assert!(
+            cast_value(
+                Value::Text("1.5".into()),
+                PgType::Numeric,
+                &FmtCtx::utc_default()
+            )
+            .is_ok()
+        );
     }
 
     fn cast(v: Value, to: PgType) -> Result<Value, CastError> {
@@ -1227,18 +1274,21 @@ mod tests {
             Value::Int8(-9)
         );
         // Malformed (including a decimal) is 22P02, echoing the original text.
-        let e = cast(Value::Text("1.5".into()), PgType::Int4).unwrap_err();
+        let e = cast(Value::Text("1.5".into()), PgType::Int4)
+            .expect_err("int4in takes no decimal point");
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type integer: \"1.5\"");
         // A well-formed but too-large number is 22003 and prints the literal,
         // with the target type's name.
-        let e = cast(Value::Text("99999999999".into()), PgType::Int4).unwrap_err();
+        let e = cast(Value::Text("99999999999".into()), PgType::Int4)
+            .expect_err("99999999999 exceeds integer's range");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(
             e.message,
             "value \"99999999999\" is out of range for type integer"
         );
-        let e = cast(Value::Text("99999".into()), PgType::Int2).unwrap_err();
+        let e = cast(Value::Text("99999".into()), PgType::Int2)
+            .expect_err("99999 exceeds smallint's range");
         assert_eq!(
             e.message,
             "value \"99999\" is out of range for type smallint"
@@ -1289,20 +1339,23 @@ mod tests {
             Value::Int8(i64::MIN)
         );
 
-        let e = cast(Value::Text("0x8000".into()), PgType::Int2).unwrap_err();
+        let e = cast(Value::Text("0x8000".into()), PgType::Int2)
+            .expect_err("0x8000 is one past smallint's positive limit");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(
             e.message,
             "value \"0x8000\" is out of range for type smallint"
         );
-        let e = cast(Value::Text("-0x8001".into()), PgType::Int2).unwrap_err();
+        let e = cast(Value::Text("-0x8001".into()), PgType::Int2)
+            .expect_err("-0x8001 is one past smallint's negative limit");
         assert_eq!(
             e.message,
             "value \"-0x8001\" is out of range for type smallint"
         );
         // An empty digit run, and the three rejected underscore placements.
         for bad in ["0b", "0o", "0x", "_100", "100_", "10__000"] {
-            let e = cast(Value::Text(bad.into()), PgType::Int2).unwrap_err();
+            let e = cast(Value::Text(bad.into()), PgType::Int2)
+                .expect_err("an empty digit run or a misplaced underscore is not an int literal");
             assert_eq!(e.sqlstate, "22P02", "for {bad:?}");
             assert_eq!(
                 e.message,
@@ -1327,7 +1380,8 @@ mod tests {
             cast(Value::Text("on".into()), PgType::Bool)?,
             Value::Bool(true)
         );
-        let e = cast(Value::Text("x".into()), PgType::Bool).unwrap_err();
+        let e = cast(Value::Text("x".into()), PgType::Bool)
+            .expect_err("\"x\" is not one of boolin's accepted spellings");
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid input syntax for type boolean: \"x\"");
 
@@ -1342,7 +1396,8 @@ mod tests {
         assert_eq!(cast(Value::Int4(-1), PgType::Bool)?, Value::Bool(true));
 
         for value in [Value::Int2(1), Value::Int8(1)] {
-            let error = cast(value, PgType::Bool).unwrap_err();
+            let error = cast(value, PgType::Bool)
+                .expect_err("only int4 has a cast to boolean, not int2 or int8");
             assert_eq!(error.sqlstate, "42846");
         }
 
@@ -1362,7 +1417,8 @@ mod tests {
             Value::Bool(true)
         );
         for n in [2, -1] {
-            let e = cast_value_assign(Value::Int4(n), PgType::Bool, &FmtCtx::utc(1)).unwrap_err();
+            let e = cast_value_assign(Value::Int4(n), PgType::Bool, &FmtCtx::utc(1))
+                .expect_err("assigning an int4 other than 0 or 1 to bool goes through boolin");
             assert_eq!(e.sqlstate, "22P02");
             assert_eq!(
                 e.message,
@@ -1465,17 +1521,22 @@ mod tests {
 
     #[test]
     fn numeric_to_int_range_and_special() {
-        let e = cast(numeric("99999999999"), PgType::Int4).unwrap_err();
+        let e = cast(numeric("99999999999"), PgType::Int4)
+            .expect_err("the numeric 99999999999 exceeds integer's range");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
         assert_eq!(
-            cast(numeric("1e30"), PgType::Int8).unwrap_err().message,
+            cast(numeric("1e30"), PgType::Int8)
+                .expect_err("the numeric 1e30 exceeds bigint's range")
+                .message,
             "bigint out of range"
         );
-        let e = cast(Value::Numeric(Numeric::nan()), PgType::Int4).unwrap_err();
+        let e = cast(Value::Numeric(Numeric::nan()), PgType::Int4)
+            .expect_err("NaN has no integer image");
         assert_eq!(e.sqlstate, "0A000");
         assert_eq!(e.message, "cannot convert NaN to integer");
-        let e = cast(numeric("infinity"), PgType::Int2).unwrap_err();
+        let e =
+            cast(numeric("infinity"), PgType::Int2).expect_err("infinity has no smallint image");
         assert_eq!(e.sqlstate, "0A000");
         assert_eq!(e.message, "cannot convert infinity to smallint");
     }
@@ -1493,7 +1554,8 @@ mod tests {
             "1e-2000000000",
             "1e-99999999999999999999",
         ] {
-            let e = cast(Value::Text(lit.into()), PgType::Numeric).unwrap_err();
+            let e = cast(Value::Text(lit.into()), PgType::Numeric)
+                .expect_err("an exponent beyond numeric's storable range is rejected at input");
             assert_eq!(e.sqlstate, "22003", "{lit}");
             assert_eq!(e.message, "value overflows numeric format", "{lit}");
         }
@@ -1521,7 +1583,8 @@ mod tests {
         // int8 keeps the same reinterpret semantics.
         assert_eq!(cast(bits(&"1".repeat(64)), PgType::Int8)?, Value::Int8(-1));
         // Wider than the target → out of range.
-        let e = cast(bits(&"1".repeat(40)), PgType::Int4).unwrap_err();
+        let e = cast(bits(&"1".repeat(40)), PgType::Int4)
+            .expect_err("a 40-bit string is wider than integer");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
 
@@ -1531,7 +1594,8 @@ mod tests {
     #[test]
     fn bit_to_smallint_is_rejected() {
         // PG has bittoint4/bittoint8 but no bit→smallint cast.
-        let e = cast(bits("101"), PgType::Int2).unwrap_err();
+        let e =
+            cast(bits("101"), PgType::Int2).expect_err("there is no bit -> smallint cast at all");
         assert_eq!(e.sqlstate, "42846");
         assert_eq!(e.message, "cannot cast type bit to smallint");
     }
@@ -1570,7 +1634,8 @@ mod tests {
 
     #[test]
     fn unsupported_pair_still_cannot_coerce() {
-        let e = cast(Value::Bool(true), PgType::Int4).unwrap_err();
+        let e = cast(Value::Bool(true), PgType::Int4)
+            .expect_err("boolean -> integer is not a cast this engine offers");
         assert_eq!(e.sqlstate, "42846");
         assert_eq!(e.message, "cannot cast type boolean to integer");
     }
@@ -1586,7 +1651,8 @@ mod tests {
             Value::Oid(u32::MAX)
         );
         // Past the 32-bit range errors (22003) instead of silently truncating.
-        let e = cast(Value::Int8(u32::MAX as i64 + 1), PgType::Oid).unwrap_err();
+        let e = cast(Value::Int8(u32::MAX as i64 + 1), PgType::Oid)
+            .expect_err("an int8 past 32 bits has no oid image");
         assert_eq!(e.sqlstate, "22003");
 
         Ok(())
@@ -1599,9 +1665,19 @@ mod tests {
         // oidin accepts a leading minus and wraps (PG: '-1'::oid = 4294967295).
         assert_eq!(text_to_oid("-1")?, Value::Oid(u32::MAX));
         // Magnitude past 32 bits is out of range, not a truncated success.
-        assert_eq!(text_to_oid("4294967296").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            text_to_oid("4294967296")
+                .expect_err("4294967296 is one past oid's unsigned 32-bit top")
+                .sqlstate,
+            "22003"
+        );
         // Non-numeric is 22P02.
-        assert_eq!(text_to_oid("abc").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            text_to_oid("abc")
+                .expect_err("\"abc\" has no digit run for oidin")
+                .sqlstate,
+            "22P02"
+        );
 
         // `oidin` is `strtoul(base 0)`, so hex and octal convert — and each of
         // these must agree with the same text as an `oidvector` element, which
@@ -1612,12 +1688,24 @@ mod tests {
         assert_eq!(text_to_oid("-2147483648")?, Value::Oid(2147483648));
         assert_eq!(text_to_oid("18446744073709551615")?, Value::Oid(u32::MAX));
         // The gap between the two accepted bands is out of range...
-        assert_eq!(text_to_oid("-2147483649").unwrap_err().sqlstate, "22003");
-        assert_eq!(text_to_oid("-4294967295").unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            text_to_oid("-2147483649")
+                .expect_err("-2147483649 falls in the gap between oidin's two accepted bands")
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            text_to_oid("-4294967295")
+                .expect_err("-4294967295 is below the negatives that wrap into oid")
+                .sqlstate,
+            "22003"
+        );
         // ...while a trailing character is a syntax error, not a partial parse.
         for bad in ["1abc", "08x", "1,2", "", "-", "0b11"] {
             assert_eq!(
-                text_to_oid(bad).unwrap_err().sqlstate,
+                text_to_oid(bad)
+                    .expect_err("a trailing character or an empty digit run stops oidin's scan")
+                    .sqlstate,
                 "22P02",
                 "input {bad:?}"
             );
@@ -1645,8 +1733,10 @@ mod tests {
             assert_eq!(via_vector, vec![direct.clone()], "input {text:?}");
         }
         for bad in ["-2147483649", "4294967296", "abc", "-"] {
-            let direct = text_to_oid(bad).unwrap_err();
-            let via_vector = crate::vector::vector_in(bad, crate::VectorKind::Oid).unwrap_err();
+            let direct =
+                text_to_oid(bad).expect_err("text -> oid rejects this out-of-band or garbage text");
+            let via_vector = crate::vector::vector_in(bad, crate::VectorKind::Oid)
+                .expect_err("the same text as a single oidvector element must be rejected too");
             assert_eq!(direct.sqlstate, via_vector.sqlstate, "input {bad:?}");
         }
 

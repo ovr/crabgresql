@@ -201,41 +201,41 @@ fn writes_survive_across_multiple_restarts() -> anyhow::Result<()> {
 // --- Transactional TRUNCATE across crash (relfilenode-swap) ---
 
 /// Seed rows 1,2,3 in their own committed transaction on a fresh table.
-fn seed_three(engine: &PgEngine, tm: &TransactionManager) -> Arc<dyn TableAm> {
-    let table = engine.create_table(schema()).unwrap();
+fn seed_three(engine: &PgEngine, tm: &TransactionManager) -> anyhow::Result<Arc<dyn TableAm>> {
+    let table = engine.create_table(schema())?;
     let x = tm.allocate_xid();
     let ctx = tm.context(x, CommandId::FIRST);
     insert(&*table, &ctx, 1, "a");
     insert(&*table, &ctx, 2, "b");
     insert(&*table, &ctx, 3, "c");
-    tm.commit(x).unwrap();
-    table
+    tm.commit(x)?;
+    Ok(table)
 }
 
 #[test]
 fn truncate_committed_then_crash_recovers_empty() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm)?;
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
         assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
         // Crash: drop without checkpoint.
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
     Ok(())
 }
 
 #[test]
 fn truncate_uncommitted_then_crash_restores_rows() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm)?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
@@ -255,77 +255,77 @@ fn truncate_uncommitted_then_crash_restores_rows() -> anyhow::Result<()> {
         // Never commits: crash (drop) with the swap still pending.
     }
     // Recovery keeps the original file because the swap's XID never committed.
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
     Ok(())
 }
 
 #[test]
 fn truncate_rolled_back_restores_rows_in_place_and_after_restart() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = seed_three(&engine, &tm);
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    let table = seed_three(&engine, &tm)?;
     let tx = tm.allocate_xid();
     table.truncate(&tm.context(tx, CommandId::FIRST))?;
     tm.abort(tx);
     // Explicit abort restores the rows immediately (the old file was untouched).
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
     drop((engine, tm));
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
     Ok(())
 }
 
 #[test]
 fn truncate_then_insert_then_commit_crash_keeps_only_new_rows() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm)?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
         // Post-truncate inserts land in the new file (read-your-own-truncate).
         insert(&*table, &ctx, 10, "x");
         insert(&*table, &ctx, 11, "y");
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
         assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
     Ok(())
 }
 
 #[test]
 fn truncate_crash_then_truncate_again_commit_is_consistent() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm)?;
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
         // Crash before commit.
     }
     {
         // Rows are back; truncate again and commit this time.
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.open_table("t").unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.open_table("t")?;
         assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
         assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
     }
     // Final restart: empty, and the recovered engine still accepts writes.
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), Vec::<i32>::new());
     let x = tm.allocate_xid();
     insert(&*table, &tm.context(x, CommandId::FIRST), 42, "z");
-    tm.commit(x).unwrap();
+    tm.commit(x)?;
     assert_eq!(visible_ids(&tm, &*table), vec![42]);
     Ok(())
 }
@@ -347,13 +347,13 @@ fn a_corrupt_data_page_is_rejected_by_any_replay_that_reads_it() -> anyhow::Resu
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         // Flush the rows to disk so the page carries a checksum we can break.
         engine.checkpoint(Xid::FIRST_NORMAL)?;
     }
     // The first (and only) user table is relfilenode 1.
-    corrupt_page_byte(dir.path(), RelFileNode(1), 0);
+    corrupt_page_byte(dir.path(), RelFileNode(1), 0)?;
 
     // A replay that does reach the records touching the page pins it and fails at
     // startup, exactly as it always has.
@@ -380,41 +380,42 @@ fn a_corrupt_data_page_is_rejected_by_any_replay_that_reads_it() -> anyhow::Resu
 }
 
 #[test]
-fn checkpoint_then_more_writes_then_crash_recovers_all() {
-    let dir = tempfile::tempdir().unwrap();
+fn checkpoint_then_more_writes_then_crash_recovers_all() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.create_table(schema()).unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
         let x = tm.allocate_xid();
         let ctx = tm.context(x, CommandId::FIRST);
         insert(&*table, &ctx, 1, "a");
         insert(&*table, &ctx, 2, "b");
-        tm.commit(x).unwrap();
+        tm.commit(x)?;
         // Make rows 1,2 durable on their pages.
-        engine.checkpoint(Xid::FIRST_NORMAL).unwrap();
+        engine.checkpoint(Xid::FIRST_NORMAL)?;
         // Post-checkpoint committed writes live only in the WAL until replay.
         let y = tm.allocate_xid();
         let ctx = tm.context(y, CommandId::FIRST);
         insert(&*table, &ctx, 3, "c");
         insert(&*table, &ctx, 4, "d");
-        tm.commit(y).unwrap();
+        tm.commit(y)?;
         // Crash.
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3, 4]);
+    Ok(())
 }
 
 #[test]
 fn interleaved_committed_and_in_flight_txns_recover_committed_only() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.create_table(schema()).unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
         // Seed a committed base row.
         let base = tm.allocate_xid();
         let base_tid = insert(&*table, &tm.context(base, CommandId::FIRST), 1, "base");
-        tm.commit(base).unwrap();
+        tm.commit(base)?;
         // Two overlapping transactions: allocate both up front, interleave.
         let xa = tm.allocate_xid();
         let xb = tm.allocate_xid();
@@ -430,14 +431,14 @@ fn interleaved_committed_and_in_flight_txns_recover_committed_only() -> anyhow::
         )?;
         // Commit xa; leave xb in flight, then commit an unrelated row to force
         // xb's records durable, so recovery must reason about them explicitly.
-        tm.commit(xa).unwrap();
+        tm.commit(xa)?;
         let xf = tm.allocate_xid();
         insert(&*table, &tm.context(xf, CommandId::FIRST), 99, "f");
-        tm.commit(xf).unwrap();
+        tm.commit(xf)?;
         // Crash with xb still uncommitted.
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     // xa's insert (2) and update (1->10) survive; xb's insert (3) vanishes; 99 too.
     assert_eq!(visible_ids(&tm, &*table), vec![2, 10, 99]);
     Ok(())
@@ -448,17 +449,17 @@ fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() -> 
     // Regression: a committed TRUNCATE followed by an uncommitted one must NOT be
     // judged by the last record's fate. The committed truncate's file is live and
     // must survive; only the uncommitted truncate is discarded.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three(&engine, &tm)?;
         // Txn A: truncate away the seed rows and insert 10, 11, then COMMIT.
         let a = tm.allocate_xid();
         let ca = tm.context(a, CommandId::FIRST);
         table.truncate(&ca)?;
         insert(&*table, &ca, 10, "x");
         insert(&*table, &ca, 11, "y");
-        tm.commit(a).unwrap();
+        tm.commit(a)?;
         assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
         // Txn B: truncate again but never commit; crash with the swap pending.
         let b = tm.allocate_xid();
@@ -466,8 +467,8 @@ fn committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows() -> 
     }
     // Recovery must keep A's committed rows (10, 11), not delete A's live file
     // because B's later truncate was uncommitted.
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
     Ok(())
 }
@@ -496,12 +497,13 @@ fn idx_on_id() -> crabgresql_storage_api::IndexMetadata {
 }
 
 /// Seed 1,2,3 and index them.
-fn seed_three_indexed(engine: &PgEngine, tm: &TransactionManager) -> Arc<dyn TableAm> {
-    let table = seed_three(engine, tm);
-    engine
-        .create_index("public", "t", idx_on_id())
-        .expect("create index");
-    table
+fn seed_three_indexed(
+    engine: &PgEngine,
+    tm: &TransactionManager,
+) -> anyhow::Result<Arc<dyn TableAm>> {
+    let table = seed_three(engine, tm)?;
+    engine.create_index("public", "t", idx_on_id())?;
+    Ok(table)
 }
 
 /// The visible `id`s an index probe for `key` returns, sorted.
@@ -520,16 +522,16 @@ fn probe_ids(tm: &TransactionManager, table: &dyn TableAm, key: i32) -> Vec<i32>
 
 #[test]
 fn indexed_truncate_committed_then_crash_recovers_an_empty_index() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three_indexed(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three_indexed(&engine, &tm)?;
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     for k in [1, 2, 3] {
         assert!(probe_ids(&tm, &*table, k).is_empty(), "key {k} survived");
     }
@@ -538,16 +540,16 @@ fn indexed_truncate_committed_then_crash_recovers_an_empty_index() -> anyhow::Re
 
 #[test]
 fn indexed_truncate_uncommitted_then_crash_restores_index_entries() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three_indexed(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three_indexed(&engine, &tm)?;
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
         // Never commits: crash with the swap pending.
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     for k in [1, 2, 3] {
         assert_eq!(probe_ids(&tm, &*table, k), vec![k]);
     }
@@ -559,19 +561,19 @@ fn indexed_truncate_then_insert_then_commit_crash_probes_only_new_rows() -> anyh
     // The sharpest case: the post-truncate rows occupy the tids the pre-truncate
     // index entries name, so recovery applying only the heap swap would surface
     // them under the old keys.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three_indexed(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three_indexed(&engine, &tm)?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
         insert(&*table, &ctx, 10, "x");
         insert(&*table, &ctx, 11, "y");
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![10, 11]);
     for k in [1, 2, 3] {
         assert!(probe_ids(&tm, &*table, k).is_empty(), "key {k} survived");
@@ -587,20 +589,20 @@ fn indexed_committed_then_uncommitted_truncate_crash_keeps_the_committed_index()
 -> anyhow::Result<()> {
     // Per-record verdicts over the index chain, mirroring
     // `committed_truncate_then_uncommitted_truncate_crash_keeps_committed_rows`.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = seed_three_indexed(&engine, &tm);
+        let (engine, tm) = open(dir.path())?;
+        let table = seed_three_indexed(&engine, &tm)?;
         let a = tm.allocate_xid();
         let ca = tm.context(a, CommandId::FIRST);
         table.truncate(&ca)?;
         insert(&*table, &ca, 10, "x");
-        tm.commit(a).unwrap();
+        tm.commit(a)?;
         let b = tm.allocate_xid();
         table.truncate(&tm.context(b, CommandId::FIRST))?;
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![10]);
     assert_eq!(probe_ids(&tm, &*table, 10), vec![10]);
     assert!(probe_ids(&tm, &*table, 1).is_empty());
@@ -613,20 +615,20 @@ fn indexed_committed_then_uncommitted_truncate_crash_keeps_the_committed_index()
 #[test]
 fn an_indexed_committed_truncate_with_a_stale_catalog_is_repaired_at_recovery() -> anyhow::Result<()>
 {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
-        let (engine, tm) = common::open_without_finalize(dir.path()).unwrap();
-        let table = seed_three_indexed(&engine, &tm);
+        let (engine, tm) = common::open_without_finalize(dir.path())?;
+        let table = seed_three_indexed(&engine, &tm)?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
         insert(&*table, &ctx, 10, "x");
         // Commits in the WAL, but the finalize hook never runs, so the catalog
         // still names the pre-truncate files.
-        tm.commit(tx).unwrap();
+        tm.commit(tx)?;
     }
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![10]);
     assert_eq!(probe_ids(&tm, &*table, 10), vec![10]);
     for k in [1, 2, 3] {
@@ -1099,7 +1101,7 @@ fn a_replayed_heap_truncate_does_not_repoint_a_recreated_relation() -> anyhow::R
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let tx = tm.allocate_xid();
         table.truncate(&tm.context(tx, CommandId::FIRST))?;
         tm.commit(tx)?;
@@ -1298,7 +1300,7 @@ fn production_startup_resumes_from_the_recorded_redo_point() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         // A clean shutdown checkpoints, which is where the redo point comes from.
         TableEngine::shutdown(engine.as_ref());
@@ -1338,7 +1340,7 @@ fn a_crash_after_a_bounded_recovery_still_recovers_everything() -> anyhow::Resul
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
@@ -1379,7 +1381,7 @@ fn a_checkpoint_does_not_bound_replay_over_an_unresolved_truncate() -> anyhow::R
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
@@ -1418,11 +1420,11 @@ fn an_unreadable_control_file_falls_back_to_a_whole_stream_replay() -> anyhow::R
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
-    common::flip_byte(&crabgresql_wal::control_path(dir.path()), 8);
+    common::flip_byte(&crabgresql_wal::control_path(dir.path()), 8)?;
     assert_eq!(crabgresql_wal::read_control(dir.path())?, None);
 
     let (engine, tm) = open(dir.path())?;
@@ -1440,7 +1442,7 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     {
         let (engine, tm) = open(dir.path())?;
-        let table = seed_three(&engine, &tm);
+        let table = seed_three(&engine, &tm)?;
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
@@ -1475,11 +1477,11 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
 /// many would silently truncate or corrupt a committed value.
 #[test]
 fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let big = big_text(7_000);
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.create_table(schema()).unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
         let tx = tm.allocate_xid();
         table.insert(
             vec![Value::Int4(1), big.clone()],
@@ -1488,8 +1490,8 @@ fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::R
         tm.commit(tx)?;
     }
     {
-        let (engine, tm) = open(dir.path()).unwrap();
-        let table = engine.open_table("t").unwrap();
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.open_table("t")?;
         let tx = tm.allocate_xid();
         let ctx = tm.context(tx, CommandId::FIRST);
         table.truncate(&ctx)?;
@@ -1497,8 +1499,8 @@ fn truncate_uncommitted_then_crash_keeps_the_surviving_wide_value() -> anyhow::R
         table.insert(vec![Value::Int4(2), big.clone()], &ctx)?;
     }
 
-    let (engine, tm) = open(dir.path()).unwrap();
-    let table = engine.open_table("t").unwrap();
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1]);
     assert_eq!(
         big_of(&tm, &*table, 1),
@@ -1647,7 +1649,7 @@ fn a_corrupt_chunk_page_is_rejected_rather_than_silently_short() -> anyhow::Resu
         engine.checkpoint(Xid::FIRST_NORMAL)?;
     }
     // The heap is relfilenode 1, so the chunk store is 2.
-    corrupt_page_byte(dir.path(), RelFileNode(2), 0);
+    corrupt_page_byte(dir.path(), RelFileNode(2), 0)?;
 
     // A whole-stream replay reaches the chunk records, pins the page and fails at
     // startup.
@@ -1692,7 +1694,7 @@ fn table_with_a_corrupt_chunk_page(
         engine.checkpoint(Xid::FIRST_NORMAL)?;
     }
     // The heap is relfilenode 1, so the chunk store is 2.
-    corrupt_page_byte(dir, RelFileNode(2), 0);
+    corrupt_page_byte(dir, RelFileNode(2), 0)?;
     Ok(try_open(dir)?)
 }
 
@@ -1790,7 +1792,7 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
     }
     // The heap is 1 and the index is 2, so the chunk store — created before the
     // index — is 2 and the index is 3. Corrupt the chunk store.
-    corrupt_page_byte(dir.path(), RelFileNode(2), 0);
+    corrupt_page_byte(dir.path(), RelFileNode(2), 0)?;
     let (engine, tm) = try_open(dir.path())?;
     let table = engine.open_table("t")?;
 

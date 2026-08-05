@@ -182,7 +182,6 @@ pub fn xid8_in(input: &str) -> Result<u64, XidError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -209,8 +208,14 @@ mod tests {
     fn rejects_malformed() {
         for bad in ["", "asdf", "1abc", "08", "0b11", "0o17", "0x", "-", "+"] {
             for (name, e) in [
-                ("xid", xid_in(bad).unwrap_err()),
-                ("xid8", xid8_in(bad).unwrap_err()),
+                (
+                    "xid",
+                    xid_in(bad).expect_err("xid needs the whole trimmed input to convert"),
+                ),
+                (
+                    "xid8",
+                    xid8_in(bad).expect_err("xid8 needs the whole trimmed input to convert"),
+                ),
             ] {
                 assert_eq!(e.sqlstate, "22P02", "input {bad:?} as {name}");
                 assert_eq!(
@@ -242,7 +247,7 @@ mod tests {
             "18446744073709551616",
             "99999999999999999999999",
         ] {
-            let e = xid_in(bad).unwrap_err();
+            let e = xid_in(bad).expect_err("the value lands in the gap between xid's two bands");
             assert_eq!(e.sqlstate, "22003", "input {bad:?}");
             assert_eq!(
                 e.message,
@@ -266,7 +271,7 @@ mod tests {
         assert_eq!(xid8_in("4294967296")?, 4294967296);
 
         for bad in ["18446744073709551616", "0xffffffffffffffffffff"] {
-            let e = xid8_in(bad).unwrap_err();
+            let e = xid8_in(bad).expect_err("the magnitude is wider than the u64 xid8 spans");
             assert_eq!(e.sqlstate, "22003", "input {bad:?}");
             assert_eq!(
                 e.message,

@@ -218,7 +218,10 @@ pub fn format_verbose(iv: Interval) -> String {
     // makes it singular on the magnitude, giving `-1 sec`.)
     let mut push = |value: i64, unit: &str| {
         if value != 0 {
-            parts.push(format!("{value} {unit}{}", if value != 1 { "s" } else { "" }));
+            parts.push(format!(
+                "{value} {unit}{}",
+                if value != 1 { "s" } else { "" }
+            ));
         }
     };
     push(months / 12, "year");
@@ -1293,7 +1296,6 @@ fn parse_iso8601(s: &str, input: &str, acc: &mut Acc) -> Result<(), IntervalErro
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1576,7 +1578,9 @@ mod tests {
         assert_eq!(date_part("epoch", NEG_INFINITY)?, Some(f64::NEG_INFINITY));
         assert_eq!(date_part("month", POS_INFINITY)?, None);
         assert_eq!(
-            date_part("bogus", iv("1 day")).unwrap_err().sqlstate,
+            date_part("bogus", iv("1 day"))
+                .expect_err("`bogus` names no interval field")
+                .sqlstate,
             "22023"
         );
 
@@ -1640,9 +1644,19 @@ mod tests {
 
     #[test]
     fn errors() {
-        assert_eq!(parse("garbage").unwrap_err().sqlstate, "22007");
+        assert_eq!(
+            parse("garbage")
+                .expect_err("`garbage` carries neither a number nor a unit word")
+                .sqlstate,
+            "22007"
+        );
         // A field beyond i32 is PG's "interval field value out of range" (22015).
-        assert_eq!(parse("2147483648 mons").unwrap_err().sqlstate, "22015");
+        assert_eq!(
+            parse("2147483648 mons")
+                .expect_err("2147483648 months is one past the i32 the field holds")
+                .sqlstate,
+            "22015"
+        );
         assert_eq!(format(iv("2147483647 mons")), "178956970 years 7 mons");
     }
 
@@ -1651,15 +1665,32 @@ mod tests {
         // Regression: these all used to overflow i64/i32 and panic (or wrap);
         // each must now return a clean error, matching PG.
         // A huge hours field in the colon form (was: i64 overflow panic).
-        assert_eq!(parse("3000000000:00:00").unwrap_err().sqlstate, "22015");
+        assert_eq!(
+            parse("3000000000:00:00")
+                .expect_err("three billion hours is more microseconds than an i64 holds")
+                .sqlstate,
+            "22015"
+        );
         // A bare integer beyond i64 (was: reported as 22007 syntax error).
         assert_eq!(
-            parse("99999999999999999999 days").unwrap_err().sqlstate,
+            parse("99999999999999999999 days")
+                .expect_err("a twenty-digit day count is a field overflow, not bad syntax")
+                .sqlstate,
             "22015"
         );
         // A field beyond i32 (was: silently narrowed).
-        assert_eq!(parse("3000000000 days").unwrap_err().sqlstate, "22015");
-        assert_eq!(parse("3000000000 mons").unwrap_err().sqlstate, "22015");
+        assert_eq!(
+            parse("3000000000 days")
+                .expect_err("three billion days does not fit the i32 day field")
+                .sqlstate,
+            "22015"
+        );
+        assert_eq!(
+            parse("3000000000 mons")
+                .expect_err("three billion months does not fit the i32 month field")
+                .sqlstate,
+            "22015"
+        );
         // justify carrying past i32 (was: wrapping_add → silent wrong value).
         let big = Interval {
             months: 0,
@@ -1680,9 +1711,24 @@ mod tests {
         // Minutes 0-59, seconds 0-60 (60 carries); out of range is 22015.
         assert_eq!(out("00:00:60"), "00:01:00");
         assert_eq!(out("100:00:00"), "100:00:00");
-        assert_eq!(parse("00:00:61").unwrap_err().sqlstate, "22015");
-        assert_eq!(parse("01:60:00").unwrap_err().sqlstate, "22015");
-        assert_eq!(parse("1 day 00:75:00").unwrap_err().sqlstate, "22015");
+        assert_eq!(
+            parse("00:00:61")
+                .expect_err("61 is past the 60 the seconds field admits")
+                .sqlstate,
+            "22015"
+        );
+        assert_eq!(
+            parse("01:60:00")
+                .expect_err("60 is past the 59 the minutes field admits")
+                .sqlstate,
+            "22015"
+        );
+        assert_eq!(
+            parse("1 day 00:75:00")
+                .expect_err("a 75-minute field is rejected even behind a day count")
+                .sqlstate,
+            "22015"
+        );
     }
 
     #[test]
@@ -1698,7 +1744,7 @@ mod tests {
         // A known-but-unsupported unit says "not supported", not "not recognized".
         assert!(
             date_part("dow", iv("1 day"))
-                .unwrap_err()
+                .expect_err("`dow` is a datetime field with no meaning for an interval")
                 .message
                 .contains("not supported")
         );
@@ -1726,7 +1772,10 @@ mod tests {
             ("1 day -1 hour", "@ 1 day -1 hours"),
             ("1 day -1 sec", "@ 1 day -1 sec"),
             ("25:00:00", "@ 25 hours"),
-            ("1 year 2 mons 3 days 04:05:06.7", "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs"),
+            (
+                "1 year 2 mons 3 days 04:05:06.7",
+                "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs",
+            ),
             // Not the infinity sentinel: `i32::MIN` months, which must not
             // overflow while being negated for the `ago` form.
             ("-178956970 years -8 mons", "@ 178956970 years 8 mons ago"),

@@ -208,7 +208,6 @@ impl Value {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -368,18 +367,30 @@ mod tests {
 
     #[test]
     fn text_param_matches_literal_input() -> anyhow::Result<()> {
-        assert_eq!(decode_text(PgType::Int4, " 42 ", &FmtCtx::utc_default())?, Value::Int4(42));
-        assert_eq!(decode_text(PgType::Bool, "t", &FmtCtx::utc_default())?, Value::Bool(true));
-        assert_eq!(decode_text(PgType::Text, "hi", &FmtCtx::utc_default())?, Value::Text("hi".into()));
+        assert_eq!(
+            decode_text(PgType::Int4, " 42 ", &FmtCtx::utc_default())?,
+            Value::Int4(42)
+        );
+        assert_eq!(
+            decode_text(PgType::Bool, "t", &FmtCtx::utc_default())?,
+            Value::Bool(true)
+        );
+        assert_eq!(
+            decode_text(PgType::Text, "hi", &FmtCtx::utc_default())?,
+            Value::Text("hi".into())
+        );
 
         Ok(())
     }
 
     #[test]
     fn unsupported_binary_is_feature_error() {
-        let err = Value::Date(0).encode_binary().unwrap_err();
+        let err = Value::Date(0)
+            .encode_binary()
+            .expect_err("date has no binary send yet");
         assert_eq!(err.sqlstate, FEATURE_NOT_SUPPORTED);
-        let err = decode_binary(PgType::Date, &[0, 0, 0, 0]).unwrap_err();
+        let err =
+            decode_binary(PgType::Date, &[0, 0, 0, 0]).expect_err("date has no binary recv yet");
         assert_eq!(err.sqlstate, FEATURE_NOT_SUPPORTED);
     }
 }

@@ -365,7 +365,6 @@ impl TryFrom<Statement> for CreateDatabaseBuilder {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::ast::helpers::stmt_create_database::CreateDatabaseBuilder;
     use crate::ast::{Ident, ObjectName, Statement};
@@ -392,7 +391,8 @@ mod tests {
         };
 
         assert_eq!(
-            CreateDatabaseBuilder::try_from(stmt).unwrap_err(),
+            CreateDatabaseBuilder::try_from(stmt)
+                .expect_err("a statement that is not CREATE DATABASE must be rejected"),
             ParserError::ParserError(
                 "Expected create database statement, but received: COMMIT".to_owned()
             )

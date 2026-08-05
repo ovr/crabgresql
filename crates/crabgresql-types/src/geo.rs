@@ -1983,7 +1983,6 @@ pub fn dist_poly_circle(p: &PolygonVal, c: &[f64; 3]) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2000,12 +1999,33 @@ mod tests {
 
     #[test]
     fn point_bad_input() {
-        assert_eq!(parse_point("asdfasdf").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse_point("(10.0 10.0)").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse_point("(10.0, 10.0) x").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse_point("(10.0,10.0").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            parse_point("asdfasdf")
+                .expect_err("a bare word carries no coordinates")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse_point("(10.0 10.0)")
+                .expect_err("coordinates separated by a space instead of a comma are rejected")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse_point("(10.0, 10.0) x")
+                .expect_err("trailing junk after the closing paren is rejected")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse_point("(10.0,10.0")
+                .expect_err("an unclosed paren is rejected")
+                .sqlstate,
+            "22P02"
+        );
         // Out of range keeps float8in's "double precision" message + 22003.
-        let e = parse_point("(10.0, 1e+500)").unwrap_err();
+        let e = parse_point("(10.0, 1e+500)")
+            .expect_err("a coordinate past the float8 range is rejected");
         assert_eq!(e.sqlstate, "22003");
         assert!(e.message.contains("double precision"), "{}", e.message);
     }
@@ -2038,7 +2058,13 @@ mod tests {
             "[(1,2),(3,4)",
             "(1,2)",
         ] {
-            assert_eq!(parse_lseg(bad).unwrap_err().sqlstate, "22P02", "{bad}");
+            assert_eq!(
+                parse_lseg(bad)
+                    .expect_err("a malformed or short coordinate list is not an lseg")
+                    .sqlstate,
+                "22P02",
+                "{bad}"
+            );
         }
     }
 
@@ -2053,13 +2079,15 @@ mod tests {
         // Underflow: 1e-300 * 1e-300 underflows to 0 from nonzero inputs.
         assert_eq!(
             point_mul(&[1e-300, -1e-300], &[1e-300, -1e-300])
-                .unwrap_err()
+                .expect_err("a product that underflows to zero from nonzero points is rejected")
                 .sqlstate,
             "22003"
         );
         assert_eq!(point_div(&[5.1, 34.5], &[5.1, 34.5])?, [1.0, 0.0]);
         assert_eq!(
-            point_div(&[1.0, 1.0], &[0.0, 0.0]).unwrap_err().sqlstate,
+            point_div(&[1.0, 1.0], &[0.0, 0.0])
+                .expect_err("dividing a point by the origin is rejected")
+                .sqlstate,
             "22012"
         );
 
@@ -2170,16 +2198,33 @@ mod tests {
         ] {
             assert_eq!(parse_lseg(lenient)?, [1.0, 2.0, 3.0, 4.0], "{lenient}");
             assert_eq!(
-                parse_path(lenient).unwrap_err().sqlstate,
+                parse_path(lenient)
+                    .expect_err("path rejects the trailing separator that lseg accepts")
+                    .sqlstate,
                 "22P02",
                 "path must reject {lenient}"
             );
         }
         // Both reject a separator outside the closing delimiter, and lseg still
         // rejects a list that runs out of points.
-        assert_eq!(parse_lseg("[(1,2),(3,4)],").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse_path("[(1,2),(3,4)],").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse_lseg("[(1,2),]").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            parse_lseg("[(1,2),(3,4)],")
+                .expect_err("lseg rejects a comma outside the closing bracket")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse_path("[(1,2),(3,4)],")
+                .expect_err("path rejects a comma outside the closing bracket")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse_lseg("[(1,2),]")
+                .expect_err("lseg rejects a list that runs out of points")
+                .sqlstate,
+            "22P02"
+        );
 
         Ok(())
     }
@@ -2230,7 +2275,8 @@ mod tests {
             "[(1,2),(3)]",
             "[(1,2,6),(3,4,6)]",
         ] {
-            let e = parse_path(bad).unwrap_err();
+            let e = parse_path(bad)
+                .expect_err("an empty, unbalanced or wrong-arity point list is not a path");
             assert_eq!(e.sqlstate, "22P02", "{bad}");
             assert_eq!(
                 e.message,
@@ -2299,7 +2345,12 @@ mod tests {
             format_path(&path_div_pt(&p, &[2.0, 0.0])?, 0),
             "[(0.5,1),(1.5,2)]"
         );
-        assert_eq!(path_div_pt(&p, &[0.0, 0.0]).unwrap_err().sqlstate, "22012");
+        assert_eq!(
+            path_div_pt(&p, &[0.0, 0.0])
+                .expect_err("dividing a path by the origin is rejected")
+                .sqlstate,
+            "22012"
+        );
 
         Ok(())
     }

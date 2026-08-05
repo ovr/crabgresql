@@ -104,7 +104,13 @@ fn aligned_table(
         let last = fields.len().saturating_sub(1);
         let cells: Vec<Vec<&str>> = row
             .iter()
-            .map(|value| value.as_deref().unwrap_or(null_display).split('\n').collect())
+            .map(|value| {
+                value
+                    .as_deref()
+                    .unwrap_or(null_display)
+                    .split('\n')
+                    .collect()
+            })
             .collect();
         let height = cells.iter().map(Vec::len).max().unwrap_or(1);
         for line in 0..height {

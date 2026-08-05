@@ -522,7 +522,6 @@ fn abbrev_ipv6(addr: &[u8; 16], bits: u8) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -545,7 +544,12 @@ mod tests {
         assert_eq!(inet_out(&inet("192.168.1.5/24")), "192.168.1.5/24");
         assert_eq!(inet_out(&inet("10/8")), "10.0.0.0/8");
         // A bare inet (no mask) requires all four octets.
-        assert_eq!(inet_in("192.168").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            inet_in("192.168")
+                .expect_err("a maskless inet needs all four octets, and `192.168` has two")
+                .sqlstate,
+            "22P02"
+        );
     }
 
     #[test]
@@ -558,20 +562,46 @@ mod tests {
     fn cidr_canonicalizes_and_rejects_host_bits() {
         assert_eq!(cidr_out(&cidr("192.168.1")), "192.168.1.0/24");
         assert_eq!(cidr_out(&cidr("10/8")), "10.0.0.0/8");
-        let e = cidr_in("192.168.1.1/24").unwrap_err();
+        let e = cidr_in("192.168.1.1/24")
+            .expect_err("a cidr may not carry host bits, and .1 sits right of the /24");
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(e.message, "invalid cidr value: \"192.168.1.1/24\"");
     }
 
     #[test]
     fn rejects_malformed() {
-        assert_eq!(inet_in("999.1.1.1").unwrap_err().sqlstate, "22P02");
-        assert_eq!(inet_in("1.2.3.4/33").unwrap_err().sqlstate, "22P02");
-        assert_eq!(inet_in("garbage").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            inet_in("999.1.1.1")
+                .expect_err("999 is past the 255 an octet holds")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            inet_in("1.2.3.4/33")
+                .expect_err("an IPv4 masklen stops at 32, so /33 is out of range")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            inet_in("garbage")
+                .expect_err("`garbage` is neither dotted quad nor IPv6")
+                .sqlstate,
+            "22P02"
+        );
         // A leading '+' is rejected in both octets and the mask (Rust's parse
         // would otherwise accept it, unlike PG).
-        assert_eq!(inet_in("+1.2.3.4").unwrap_err().sqlstate, "22P02");
-        assert_eq!(inet_in("1.2.3.4/+8").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            inet_in("+1.2.3.4")
+                .expect_err("a signed leading octet is not an address")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            inet_in("1.2.3.4/+8")
+                .expect_err("a signed masklen is not a bare digit run")
+                .sqlstate,
+            "22P02"
+        );
     }
 
     #[test]
@@ -614,7 +644,12 @@ mod tests {
         assert_eq!(diff(&a, &b)?, i64::MIN);
         // One past that overflows.
         let c = inet("::8000:0:0:1");
-        assert_eq!(diff(&a, &c).unwrap_err().sqlstate, "22003");
+        assert_eq!(
+            diff(&a, &c)
+                .expect_err("a negative distance of 2^63 + 1 is one past i64::MIN")
+                .sqlstate,
+            "22003"
+        );
 
         Ok(())
     }
@@ -655,7 +690,7 @@ mod tests {
         assert_eq!(diff(&inet("10.0.0.10"), &inet("10.0.0.1"))?, 9);
         assert_eq!(
             add_offset(&inet("255.255.255.255"), 1)
-                .unwrap_err()
+                .expect_err("stepping one past the last IPv4 address leaves the family")
                 .sqlstate,
             "22003"
         );

@@ -328,26 +328,37 @@ fn read_element(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_int_array() {
-        let elems = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default()).unwrap();
+    fn round_trips_int_array() -> Result<(), ArrayError> {
+        let elems = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default())?;
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
-        assert_eq!(format(PgType::Int4, &elems, &FmtCtx::utc_default()), "{1,2,3}");
+        assert_eq!(
+            format(PgType::Int4, &elems, &FmtCtx::utc_default()),
+            "{1,2,3}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn empty_array() {
-        assert_eq!(array_in("{}", PgType::Int4, &FmtCtx::utc_default()).unwrap(), vec![]);
+    fn empty_array() -> Result<(), ArrayError> {
+        assert_eq!(
+            array_in("{}", PgType::Int4, &FmtCtx::utc_default())?,
+            vec![]
+        );
         assert_eq!(format(PgType::Int4, &[], &FmtCtx::utc_default()), "{}");
+        Ok(())
     }
 
     #[test]
-    fn null_and_quoting() {
-        let elems = array_in(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text, &FmtCtx::utc_default()).unwrap();
+    fn null_and_quoting() -> Result<(), ArrayError> {
+        let elems = array_in(
+            r#"{a,"b,c",NULL,"NULL",""}"#,
+            PgType::Text,
+            &FmtCtx::utc_default(),
+        )?;
         assert_eq!(
             elems,
             vec![
@@ -363,21 +374,24 @@ mod tests {
             format(PgType::Text, &elems, &FmtCtx::utc_default()),
             r#"{a,"b,c",NULL,"NULL",""}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn whitespace_between_elements_is_trimmed() {
-        let elems = array_in("{ 1 , 2 , 3 }", PgType::Int4, &FmtCtx::utc_default()).unwrap();
+    fn whitespace_between_elements_is_trimmed() -> Result<(), ArrayError> {
+        let elems = array_in("{ 1 , 2 , 3 }", PgType::Int4, &FmtCtx::utc_default())?;
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
+        Ok(())
     }
 
     #[test]
-    fn backslash_escape_in_quotes() {
-        let elems = array_in(r#"{"a\"b","c\\d"}"#, PgType::Text, &FmtCtx::utc_default()).unwrap();
+    fn backslash_escape_in_quotes() -> Result<(), ArrayError> {
+        let elems = array_in(r#"{"a\"b","c\\d"}"#, PgType::Text, &FmtCtx::utc_default())?;
         assert_eq!(
             elems,
             vec![Value::Text("a\"b".into()), Value::Text("c\\d".into())]
         );
+        Ok(())
     }
 
     #[test]
@@ -389,7 +403,12 @@ mod tests {
     #[test]
     fn malformed_detail_matches_pg() {
         // DETAIL strings verified against PostgreSQL's array_in.
-        let d = |s: &str| array_in(s, PgType::Text, &FmtCtx::utc_default()).unwrap_err().detail.unwrap();
+        let d = |s: &str| {
+            array_in(s, PgType::Text, &FmtCtx::utc_default())
+                .expect_err("malformed array literal must be rejected")
+                .detail
+                .expect("a malformed-literal error carries a DETAIL line")
+        };
         assert_eq!(d("1,2,3"), DETAIL_START);
         assert_eq!(d("abc"), DETAIL_START);
         assert_eq!(d("{1,2"), DETAIL_EOF);
@@ -401,34 +420,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_unquoted_element_is_malformed() {
+    fn empty_unquoted_element_is_malformed() -> Result<(), ArrayError> {
         // A missing element between/around commas is malformed, but a quoted
         // empty string is a legitimate element.
         assert!(array_in("{a,,c}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert!(array_in("{1,}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert!(array_in("{,1}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert_eq!(
-            array_in(r#"{a,"",c}"#, PgType::Text, &FmtCtx::utc_default()).unwrap(),
+            array_in(r#"{a,"",c}"#, PgType::Text, &FmtCtx::utc_default())?,
             vec![
                 Value::Text("a".into()),
                 Value::Text(String::new()),
                 Value::Text("c".into())
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn escaped_trailing_whitespace_is_kept() {
+    fn escaped_trailing_whitespace_is_kept() -> Result<(), ArrayError> {
         // A backslash-escaped trailing space is significant and must survive the
         // unquoted trailing-whitespace trim; an unescaped one is dropped.
         assert_eq!(
-            array_in("{a\\ }", PgType::Text, &FmtCtx::utc_default()).unwrap(),
+            array_in("{a\\ }", PgType::Text, &FmtCtx::utc_default())?,
             vec![Value::Text("a ".into())]
         );
         assert_eq!(
-            array_in("{a }", PgType::Text, &FmtCtx::utc_default()).unwrap(),
+            array_in("{a }", PgType::Text, &FmtCtx::utc_default())?,
             vec![Value::Text("a".into())]
         );
+        Ok(())
     }
 
     #[test]
@@ -436,7 +457,11 @@ mod tests {
         // PG's array_out only treats ASCII whitespace as needing quotes; a
         // non-breaking space (U+00A0) is left bare.
         assert_eq!(
-            format(PgType::Text, &[Value::Text("a\u{00A0}b".into())], &FmtCtx::utc_default()),
+            format(
+                PgType::Text,
+                &[Value::Text("a\u{00A0}b".into())],
+                &FmtCtx::utc_default()
+            ),
             "{a\u{00A0}b}"
         );
     }
@@ -445,7 +470,11 @@ mod tests {
     fn box_arrays_use_a_semicolon_delimiter() -> Result<(), ArrayError> {
         // `box` is the one built-in with `typdelim = ';'`, because its own
         // output text contains commas.
-        let elems = array_in("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box, &FmtCtx::utc_default())?;
+        let elems = array_in(
+            "{(1,1),(0,0);(3,3),(2,2)}",
+            PgType::Box,
+            &FmtCtx::utc_default(),
+        )?;
         assert_eq!(
             elems,
             vec![
@@ -455,7 +484,10 @@ mod tests {
         );
         // Round-trips unquoted: a comma is no longer the delimiter, so the
         // element text does not need quoting.
-        assert_eq!(format(PgType::Box, &elems, &FmtCtx::utc_default()), "{(1,1),(0,0);(3,3),(2,2)}");
+        assert_eq!(
+            format(PgType::Box, &elems, &FmtCtx::utc_default()),
+            "{(1,1),(0,0);(3,3),(2,2)}"
+        );
         Ok(())
     }
 

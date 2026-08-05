@@ -60,9 +60,21 @@ for the entire codebase:
   file contributes only the tests that actually pass, and is never rounded up to
   a whole file or dropped to zero. Report the honest per-test total.
 
+## Comments
+
+- **Do not restate the code.** A comment that says what the next line already
+  says — `// increment the counter`, `# the build job`, a doc comment that
+  echoes the function name — costs a reader time and goes stale silently. This
+  applies to configuration and CI files as much as to Rust.
+- Comment the things the code cannot say: why a branch or a constant exists,
+  which observable PG behavior it reproduces, what breaks if it is changed, or
+  which non-obvious alternative was rejected and why.
+- If nothing of that kind is true of a line, leave it uncommented.
+
 ## Rust error handling
 
 - Never use `unwrap()`.
-- `unwrap_err()` is allowed only in tests that assert an operation fails.
+- To assert that an operation fails, use `expect_err("…")` — `clippy::unwrap_used`
+  denies `unwrap_err()` too, and CI lints test targets.
 - In tests, return `Result<(), _>` and propagate errors with `?` instead of
   calling `unwrap()` for successful fallible operations.

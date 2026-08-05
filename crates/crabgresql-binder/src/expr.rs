@@ -4337,12 +4337,20 @@ fn bind_at_time_zone(
     // An untyped value literal defaults to `timestamp` (→ timestamptz), as PG does.
     let (func, ret, value_arg) = match bind_expr(value, scope)? {
         Binding::Typed(e) if e.ty() == PgType::Timestamp => (
-            pick(by_interval, ScalarFn::TimezoneIntervalToTz, ScalarFn::TimezoneToTz),
+            pick(
+                by_interval,
+                ScalarFn::TimezoneIntervalToTz,
+                ScalarFn::TimezoneToTz,
+            ),
             PgType::TimestampTz,
             e,
         ),
         Binding::Typed(e) if e.ty() == PgType::TimestampTz => (
-            pick(by_interval, ScalarFn::TimezoneIntervalToTs, ScalarFn::TimezoneToTs),
+            pick(
+                by_interval,
+                ScalarFn::TimezoneIntervalToTs,
+                ScalarFn::TimezoneToTs,
+            ),
             PgType::Timestamp,
             e,
         ),
@@ -4378,7 +4386,11 @@ fn bind_at_time_zone(
             ));
         }
         Binding::Unknown { lit, span, param } => (
-            pick(by_interval, ScalarFn::TimezoneIntervalToTz, ScalarFn::TimezoneToTz),
+            pick(
+                by_interval,
+                ScalarFn::TimezoneIntervalToTz,
+                ScalarFn::TimezoneToTz,
+            ),
             PgType::TimestampTz,
             resolve_unknown(lit, span, param, PgType::Timestamp)?,
         ),

@@ -521,33 +521,26 @@ async fn writes_after_a_restart_survive_the_next_restart() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn truncate_rolled_back_across_a_restart_keeps_rows() {
+async fn truncate_rolled_back_across_a_restart_keeps_rows() -> anyhow::Result<()> {
     // Transactional TRUNCATE end-to-end: a rolled-back (and an abandoned) TRUNCATE
     // must not survive; the rows come back and persist across a restart.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client
-            .simple_query("CREATE TABLE t (id int)")
-            .await
-            .unwrap();
+        client.simple_query("CREATE TABLE t (id int)").await?;
         client
             .simple_query("INSERT INTO t VALUES (1), (2), (3)")
-            .await
-            .unwrap();
+            .await?;
         // Explicit block that truncates then rolls back.
-        client.simple_query("BEGIN").await.unwrap();
-        client.simple_query("TRUNCATE t").await.unwrap();
+        client.simple_query("BEGIN").await?;
+        client.simple_query("TRUNCATE t").await?;
         // Inside the block the truncater sees its own empty table.
-        let msgs = client.simple_query("SELECT id FROM t").await.unwrap();
+        let msgs = client.simple_query("SELECT id FROM t").await?;
         assert_eq!(rows(&msgs).len(), 0);
-        client.simple_query("ROLLBACK").await.unwrap();
+        client.simple_query("ROLLBACK").await?;
         // After rollback the rows are back.
-        let msgs = client
-            .simple_query("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await?;
         assert_eq!(rows(&msgs).len(), 3);
         shutdown(client, handle).await;
     }
@@ -555,50 +548,37 @@ async fn truncate_rolled_back_across_a_restart_keeps_rows() {
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        let msgs = client
-            .simple_query("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await?;
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("1"), Some("2"), Some("3")]);
         shutdown(client, handle).await;
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn truncate_committed_across_a_restart_stays_empty() {
-    let dir = tempfile::tempdir().unwrap();
+async fn truncate_committed_across_a_restart_stays_empty() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client
-            .simple_query("CREATE TABLE t (id int)")
-            .await
-            .unwrap();
-        client
-            .simple_query("INSERT INTO t VALUES (1), (2)")
-            .await
-            .unwrap();
-        client.simple_query("BEGIN").await.unwrap();
-        client.simple_query("TRUNCATE t").await.unwrap();
-        client.simple_query("COMMIT").await.unwrap();
-        client
-            .simple_query("INSERT INTO t VALUES (9)")
-            .await
-            .unwrap();
+        client.simple_query("CREATE TABLE t (id int)").await?;
+        client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+        client.simple_query("BEGIN").await?;
+        client.simple_query("TRUNCATE t").await?;
+        client.simple_query("COMMIT").await?;
+        client.simple_query("INSERT INTO t VALUES (9)").await?;
         shutdown(client, handle).await;
     }
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        let msgs = client
-            .simple_query("SELECT id FROM t ORDER BY id")
-            .await
-            .unwrap();
+        let msgs = client.simple_query("SELECT id FROM t ORDER BY id").await?;
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("9")]);
         shutdown(client, handle).await;
     }
+    Ok(())
 }
 
 /// An indexed table's TRUNCATE survives a restart on both halves: the catalog
@@ -606,46 +586,31 @@ async fn truncate_committed_across_a_restart_stays_empty() {
 /// answer a truncated-away key with a row the new heap file has since placed at
 /// the tid the stale entry names.
 #[tokio::test]
-async fn truncate_of_an_indexed_table_is_durable_across_a_restart() {
-    let dir = tempfile::tempdir().unwrap();
+async fn truncate_of_an_indexed_table_is_durable_across_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client
-            .simple_query("CREATE TABLE t (id int)")
-            .await
-            .unwrap();
-        client
-            .simple_query("CREATE INDEX t_idx ON t (id)")
-            .await
-            .unwrap();
+        client.simple_query("CREATE TABLE t (id int)").await?;
+        client.simple_query("CREATE INDEX t_idx ON t (id)").await?;
         client
             .simple_query("INSERT INTO t VALUES (1), (2), (3)")
-            .await
-            .unwrap();
-        client.simple_query("TRUNCATE t").await.unwrap();
-        client
-            .simple_query("INSERT INTO t VALUES (7)")
-            .await
-            .unwrap();
+            .await?;
+        client.simple_query("TRUNCATE t").await?;
+        client.simple_query("INSERT INTO t VALUES (7)").await?;
         shutdown(client, handle).await;
     }
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        let msgs = client
-            .simple_query("SELECT id FROM t WHERE id = 1")
-            .await
-            .unwrap();
+        let msgs = client.simple_query("SELECT id FROM t WHERE id = 1").await?;
         assert!(rows(&msgs).is_empty(), "a truncated-away key came back");
-        let msgs = client
-            .simple_query("SELECT id FROM t WHERE id = 7")
-            .await
-            .unwrap();
+        let msgs = client.simple_query("SELECT id FROM t WHERE id = 7").await?;
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("7")]);
         shutdown(client, handle).await;
     }
+    Ok(())
 }
 
 /// TRUNCATE on a Parquet table end-to-end across restarts: the committed swap
@@ -725,27 +690,24 @@ async fn parquet_truncate_is_durable_across_a_restart() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn dropped_table_stays_dropped_across_a_restart() {
-    let dir = tempfile::tempdir().unwrap();
+async fn dropped_table_stays_dropped_across_a_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
-        client
-            .simple_query("CREATE TABLE t (id int)")
-            .await
-            .unwrap();
-        client
-            .simple_query("INSERT INTO t VALUES (1), (2)")
-            .await
-            .unwrap();
-        client.simple_query("DROP TABLE t").await.unwrap();
+        client.simple_query("CREATE TABLE t (id int)").await?;
+        client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+        client.simple_query("DROP TABLE t").await?;
         shutdown(client, handle).await;
     }
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
         // The table is gone (42P01 undefined_table)...
-        let err = client.simple_query("SELECT id FROM t").await.unwrap_err();
+        let err = client
+            .simple_query("SELECT id FROM t")
+            .await
+            .expect_err("the dropped table must not resolve");
         let db = err.as_db_error().expect("expected a database error");
         assert_eq!(db.code(), &tokio_postgres::error::SqlState::UNDEFINED_TABLE);
         assert!(
@@ -754,19 +716,14 @@ async fn dropped_table_stays_dropped_across_a_restart() {
             db.message()
         );
         // ...and a new table gets a fresh relfilenode with no data-file collision.
-        client
-            .simple_query("CREATE TABLE t2 (id int)")
-            .await
-            .unwrap();
-        client
-            .simple_query("INSERT INTO t2 VALUES (7)")
-            .await
-            .unwrap();
-        let msgs = client.simple_query("SELECT id FROM t2").await.unwrap();
+        client.simple_query("CREATE TABLE t2 (id int)").await?;
+        client.simple_query("INSERT INTO t2 VALUES (7)").await?;
+        let msgs = client.simple_query("SELECT id FROM t2").await?;
         let got: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get(0)).collect();
         assert_eq!(got, vec![Some("7")]);
         shutdown(client, handle).await;
     }
+    Ok(())
 }
 
 /// A user schema and its schema-qualified table survive a full restart: the
@@ -869,7 +826,7 @@ async fn alter_table_primary_key_survives_restart() -> anyhow::Result<()> {
     let e = client
         .simple_query("INSERT INTO r VALUES (NULL, 2)")
         .await
-        .unwrap_err();
+        .expect_err("a NULL in a NOT NULL column must be rejected");
     assert_eq!(
         e.as_db_error().map(|e| e.code().code().to_string()),
         Some("23502".to_string())
@@ -877,7 +834,7 @@ async fn alter_table_primary_key_survives_restart() -> anyhow::Result<()> {
     let e = client
         .simple_query("INSERT INTO r VALUES (1, 3)")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate primary key must be rejected");
     assert_eq!(
         e.as_db_error().map(|e| e.code().code().to_string()),
         Some("23505".to_string())
@@ -1033,7 +990,7 @@ async fn partition_metadata_survives_restart() -> anyhow::Result<()> {
         let err = client
             .simple_query("INSERT INTO m_2024 VALUES (2, '2023-03-01')")
             .await
-            .unwrap_err();
+            .expect_err("an out-of-range partition key must be rejected");
         assert_eq!(
             err.as_db_error().expect("database error").code(),
             &tokio_postgres::error::SqlState::CHECK_VIOLATION

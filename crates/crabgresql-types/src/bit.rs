@@ -389,7 +389,6 @@ pub fn to_u64(len: u32, data: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -415,19 +414,27 @@ mod tests {
     #[test]
     fn parse_rejects_bad_digits() {
         assert_eq!(
-            from_binary(" 0").unwrap_err().message,
+            from_binary(" 0")
+                .expect_err("a leading space is not a binary digit")
+                .message,
             "\" \" is not a valid binary digit"
         );
         assert_eq!(
-            from_hex("Z").unwrap_err().message,
+            from_hex("Z")
+                .expect_err("'Z' is past the end of the hexadecimal alphabet")
+                .message,
             "\"Z\" is not a valid hexadecimal digit"
         );
         assert_eq!(
-            input("01010Z01").unwrap_err().message,
+            input("01010Z01")
+                .expect_err("an unprefixed literal containing 'Z' is not binary")
+                .message,
             "\"Z\" is not a valid binary digit"
         );
         assert_eq!(
-            input("x01010Z01").unwrap_err().message,
+            input("x01010Z01")
+                .expect_err("an x-prefixed literal containing 'Z' is not hexadecimal")
+                .message,
             "\"Z\" is not a valid hexadecimal digit"
         );
     }
@@ -437,13 +444,17 @@ mod tests {
         let (l, d) = from_binary("10")?;
         // fixed, assignment, wrong length
         assert_eq!(
-            coerce(l, &d, 11, false, false).unwrap_err().message,
+            coerce(l, &d, 11, false, false)
+                .expect_err("a 2-bit string does not fit fixed-width bit(11)")
+                .message,
             "bit string length 2 does not match type bit(11)"
         );
         // varying, assignment, too long
         let (l2, d2) = from_binary("101011111010")?;
         assert_eq!(
-            coerce(l2, &d2, 11, true, false).unwrap_err().message,
+            coerce(l2, &d2, 11, true, false)
+                .expect_err("a 12-bit string is wider than bit varying(11) allows on assignment")
+                .message,
             "bit string too long for type bit varying(11)"
         );
         // explicit fixed truncation
@@ -500,7 +511,9 @@ mod tests {
             "00000100"
         );
         assert_eq!(
-            and(la, &da, 3, &from_binary("101")?.1).unwrap_err().message,
+            and(la, &da, 3, &from_binary("101")?.1)
+                .expect_err("ANDing an 8-bit string with a 3-bit one is rejected")
+                .message,
             "cannot AND bit strings of different sizes"
         );
 
@@ -526,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             substring(l, &d, -10, Some(-2147483646))
-                .unwrap_err()
+                .expect_err("a negative substring length is rejected")
                 .message,
             "negative substring length not allowed"
         );
@@ -558,15 +571,24 @@ mod tests {
         let (l2, d2) = set_bit(l, &d, 15, 1)?;
         assert_eq!(s(l2, &d2), "0101011000100101");
         assert_eq!(
-            set_bit(l, &d, 16, 1).unwrap_err().message,
+            set_bit(l, &d, 16, 1)
+                .expect_err("bit index 16 is one past the end of a 16-bit string")
+                .message,
             "bit index 16 out of valid range (0..15)"
         );
         // A newvalue other than 0 or 1 is rejected (PG's bitsetbit).
         assert_eq!(
-            set_bit(l, &d, 3, 5).unwrap_err().message,
+            set_bit(l, &d, 3, 5)
+                .expect_err("a new bit value of 5 is neither 0 nor 1")
+                .message,
             "new bit must be 0 or 1"
         );
-        assert_eq!(set_bit(l, &d, 3, 5).unwrap_err().sqlstate, "22023");
+        assert_eq!(
+            set_bit(l, &d, 3, 5)
+                .expect_err("a new bit value of 5 carries the out-of-range sqlstate")
+                .sqlstate,
+            "22023"
+        );
 
         Ok(())
     }
@@ -596,15 +618,19 @@ mod tests {
         let (l, d) = from_binary("10101")?;
         let (rl, rd) = from_binary("1")?;
         // `sp + sl` must not overflow i32 (would panic in debug); PG raises 22003.
-        let e = overlay(l, &d, rl, &rd, 2, Some(i32::MAX)).unwrap_err();
+        let e = overlay(l, &d, rl, &rd, 2, Some(i32::MAX))
+            .expect_err("a start of 2 plus a length of i32::MAX exceeds i32");
         assert_eq!(e.sqlstate, "22003");
         assert_eq!(e.message, "integer out of range");
         // A non-positive start is a substring error, not an i32 underflow panic.
         assert_eq!(
-            overlay(l, &d, rl, &rd, 0, None).unwrap_err().message,
+            overlay(l, &d, rl, &rd, 0, None)
+                .expect_err("an overlay start of 0 is not a positive position")
+                .message,
             "negative substring length not allowed"
         );
-        overlay(l, &d, rl, &rd, i32::MIN, None).unwrap_err();
+        overlay(l, &d, rl, &rd, i32::MIN, None)
+            .expect_err("an overlay start of i32::MIN is rejected rather than underflowing");
 
         Ok(())
     }
