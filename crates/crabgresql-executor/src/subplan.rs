@@ -34,8 +34,11 @@
 //!
 //! * a shape other than a single-relation `Query` with no `ORDER BY`/`DISTINCT`;
 //! * a correlated conjunct that is not `inner = outer-column` — the outer side
-//!   must be a bare [`BoundExpr::OuterColumnRef`] at level 1, so the probe value
-//!   is simply a slot of the outer row and needs no evaluation;
+//!   must be a [`BoundExpr::OuterColumnRef`] at level 1, bare or under the
+//!   `Coerce` the binder wraps the narrower operand in, so the probe value is a
+//!   slot of the outer row and one optional cast rather than an evaluation. A
+//!   `bpchar` outer reference is widened by a `FuncCall(BpcharToText)` instead
+//!   and stays uncovered;
 //! * a key type that does not hash distinctly (interval, inet, …), for the same
 //!   reason the hash join refuses one;
 //! * a residual or key expression calling a volatile function or a routine —
@@ -61,7 +64,7 @@ use crabgresql_binder::{
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
-use crate::{ExecContext, ExecError, agg, run_subplan};
+use crate::{ExecContext, ExecError, agg, eval, run_subplan};
 
 /// The outer row slots a memoizable subplan reads, with the type each is read
 /// as — the shape [`crabgresql_binder::plan_outer_ref_slots`] returns.
@@ -121,10 +124,14 @@ const MEMO_CAPACITY: usize = 1 << 16;
 /// takes over.
 const SUBPLAN_CAPACITY: usize = 1 << 10;
 
+/// Where one probe value comes from: an outer row slot, plus the type the
+/// binder's coercion put around the reference, if it put one there.
+type OuterKey = (usize, Option<PgType>);
+
 /// The hashed inner side of one correlated `EXISTS`.
 pub(crate) struct HashedExists {
     /// The outer row slot feeding each key, in key order.
-    outer_slots: Vec<usize>,
+    outer_keys: Vec<OuterKey>,
     key_tys: Vec<PgType>,
     /// Hash of the key tuple → the key tuples themselves, so a bucket hit that
     /// is only a hash collision is rejected on the values.
@@ -137,20 +144,31 @@ impl HashedExists {
     /// A NULL in the outer key can never satisfy `=`, so it matches nothing —
     /// the same rule that keeps NULL keys out of the table at build time, and the
     /// same one the hash join follows.
-    pub(crate) fn probe(&self, row: &[Value]) -> bool {
-        let mut keys = Vec::with_capacity(self.outer_slots.len());
-        for slot in &self.outer_slots {
-            match row.get(*slot) {
-                Some(Value::Null) | None => return false,
-                Some(value) => keys.push(value),
+    ///
+    /// A coercion failure here is the one the per-row path would have raised
+    /// from inside the subplan's filter: same value, same cast.
+    pub(crate) fn probe(&self, row: &[Value], ctx: &ExecContext) -> Result<bool, ExecError> {
+        let mut keys = Vec::with_capacity(self.outer_keys.len());
+        for (slot, coerce) in &self.outer_keys {
+            let value = match row.get(*slot) {
+                Some(Value::Null) | None => return Ok(false),
+                Some(value) => value,
+            };
+            let value = match coerce {
+                Some(ty) => eval::coerce_value(value.clone(), *ty, ctx)?,
+                None => value.clone(),
+            };
+            if matches!(value, Value::Null) {
+                return Ok(false);
             }
+            keys.push(value);
         }
         let Some(bucket) = self.buckets.get(&agg::hash_key(&self.key_tys, &keys)) else {
-            return false;
+            return Ok(false);
         };
-        bucket
+        Ok(bucket
             .iter()
-            .any(|candidate| agg::keys_equal(&self.key_tys, &keys, candidate))
+            .any(|candidate| agg::keys_equal(&self.key_tys, &keys, candidate)))
     }
 }
 
@@ -276,7 +294,7 @@ fn key_tys(slots: &[(usize, PgType)]) -> Vec<PgType> {
 /// slot each of its output columns is to be probed against.
 struct Spec {
     plan: LogicalPlan,
-    outer_slots: Vec<usize>,
+    outer_keys: Vec<OuterKey>,
     key_tys: Vec<PgType>,
 }
 
@@ -300,14 +318,14 @@ fn analyze(plan: &LogicalPlan) -> Option<Spec> {
     flatten_and(predicate, &mut conjuncts);
 
     let mut inner_keys = Vec::new();
-    let mut outer_slots = Vec::new();
+    let mut outer_keys = Vec::new();
     let mut key_tys = Vec::new();
     let mut residual = Vec::new();
     for conjunct in conjuncts {
         match as_correlation_key(conjunct) {
-            Some((inner, slot, ty)) => {
+            Some((inner, key, ty)) => {
                 inner_keys.push(inner.clone());
-                outer_slots.push(slot);
+                outer_keys.push(key);
                 key_tys.push(ty);
             }
             // A conjunct still naming the outer row that is not a usable key
@@ -346,14 +364,14 @@ fn analyze(plan: &LogicalPlan) -> Option<Spec> {
             sort: Vec::new(),
             distinct: None,
         }),
-        outer_slots,
+        outer_keys,
         key_tys,
     })
 }
 
-/// If `conjunct` is `inner-expression = outer-column`, its inner side, the outer
-/// row slot to probe with, and the comparison type.
-fn as_correlation_key(conjunct: &BoundExpr) -> Option<(&BoundExpr, usize, PgType)> {
+/// If `conjunct` is `inner-expression = outer-column`, its inner side, where in
+/// the outer row to read the probe value from, and the comparison type.
+fn as_correlation_key(conjunct: &BoundExpr) -> Option<(&BoundExpr, OuterKey, PgType)> {
     let BoundExpr::Binary {
         op: BinOp::Eq,
         arg_ty,
@@ -371,22 +389,10 @@ fn as_correlation_key(conjunct: &BoundExpr) -> Option<(&BoundExpr, usize, PgType
     if !arg_ty.hashes_distinctly() {
         return None;
     }
-    // Level 1 is the immediately enclosing query — the row being probed. A bare
-    // reference, not an expression over one, so the probe reads a slot instead
-    // of evaluating anything.
-    let (inner, outer) = match (left.as_ref(), right.as_ref()) {
-        (
-            inner,
-            BoundExpr::OuterColumnRef {
-                level: 1, index, ..
-            },
-        ) => (inner, *index),
-        (
-            BoundExpr::OuterColumnRef {
-                level: 1, index, ..
-            },
-            inner,
-        ) => (inner, *index),
+    let (inner, outer) = match (outer_key(left), outer_key(right)) {
+        (Some(outer), None) => (right.as_ref(), outer),
+        (None, Some(outer)) => (left.as_ref(), outer),
+        // Both sides outer, or neither: not a correlation key either way.
         _ => return None,
     };
     // The inner side must be evaluable against the inner row alone.
@@ -394,6 +400,33 @@ fn as_correlation_key(conjunct: &BoundExpr) -> Option<(&BoundExpr, usize, PgType
         return None;
     }
     Some((inner, outer, *arg_ty))
+}
+
+/// Where to read one operand's value from the outer row, if that operand *is*
+/// the outer row — a reference to it, or one the binder coerced.
+///
+/// Level 1 is the immediately enclosing query, the row being probed. Only a
+/// reference, not an expression over one, so the probe reads a slot rather than
+/// evaluating anything.
+///
+/// The coercion has to be allowed for, because `unify_types` wraps whichever
+/// operand is the *narrower* one: `b.big_key = a.small_key` puts a `Coerce`
+/// around the outer reference, and refusing it would drop half of all cross-type
+/// correlations back onto the quadratic path. A `bpchar` outer reference is
+/// widened by a `FuncCall(BpcharToText)` instead and stays uncovered.
+fn outer_key(expr: &BoundExpr) -> Option<OuterKey> {
+    match expr {
+        BoundExpr::OuterColumnRef {
+            level: 1, index, ..
+        } => Some((*index, None)),
+        BoundExpr::Coerce { expr, ty } => match expr.as_ref() {
+            BoundExpr::OuterColumnRef {
+                level: 1, index, ..
+            } => Some((*index, Some(*ty))),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether an expression names the enclosing row (or one further out) anywhere.
@@ -419,7 +452,7 @@ fn conjunct_is_correlated(expr: &BoundExpr) -> bool {
 fn build(spec: Spec, ctx: &ExecContext, txn: &TxnContext) -> Result<HashedExists, ExecError> {
     let Spec {
         plan,
-        outer_slots,
+        outer_keys,
         key_tys,
     } = spec;
     let mut buckets: FxHashMap<u64, Vec<Vec<Value>>> = FxHashMap::default();
@@ -439,7 +472,7 @@ fn build(spec: Spec, ctx: &ExecContext, txn: &TxnContext) -> Result<HashedExists
         bucket.push(row);
     }
     Ok(HashedExists {
-        outer_slots,
+        outer_keys,
         key_tys,
         buckets,
     })
