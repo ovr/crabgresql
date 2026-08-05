@@ -11174,20 +11174,29 @@ async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
         .await?;
     assert_eq!(scalar(&client, "SHOW IntervalStyle").await, "sql_standard");
 
-    let err = client
-        .simple_query("SET IntervalStyle TO bogus")
-        .await
-        .expect_err("an unknown IntervalStyle must be rejected");
-    let db = err.as_db_error().expect("database error");
-    assert_eq!(db.code().code(), "22023");
-    assert_eq!(
-        db.message(),
-        "invalid value for parameter \"IntervalStyle\": \"bogus\""
-    );
-    assert_eq!(
-        db.hint(),
-        Some("Available values: postgres, postgres_verbose, sql_standard, iso_8601.")
-    );
+    // Case-insensitively and nothing more: padding is part of the value, so a
+    // padded name is rejected like any other unrecognized one.
+    for value in ["bogus", "' postgres '"] {
+        let err = client
+            .simple_query(&format!("SET IntervalStyle TO {value}"))
+            .await
+            .expect_err("an unrecognized IntervalStyle must be rejected");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "22023", "{value}");
+        assert_eq!(
+            db.message(),
+            format!(
+                "invalid value for parameter \"IntervalStyle\": \"{}\"",
+                value.trim_matches('\'')
+            ),
+            "{value}"
+        );
+        assert_eq!(
+            db.hint(),
+            Some("Available values: postgres, postgres_verbose, sql_standard, iso_8601."),
+            "{value}"
+        );
+    }
     Ok(())
 }
 

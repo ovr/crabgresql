@@ -848,12 +848,15 @@ SELECT pg_typeof(age(date '2001-01-01', date '2000-01-01')) AS resolved,
  interval | 1 year     | 1 year
 (1 row)
 
--- the one-argument forms anchor at today, so pin them by comparison
+-- The one-argument forms anchor at today, so pin them by comparison. The step
+-- has to be a day: `- interval '1 mon'` clamps the day of month, so on the 31st
+-- of a month whose predecessor is shorter the answer is `1 mon 3 days`, and the
+-- assertion would be false seven days a year.
 SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
        age(current_date::timestamptz) = interval '0' AS today_tz_is_zero,
-       age(current_date::timestamptz - interval '1 mon') = interval '1 mon' AS one_month_ago;
- today_is_zero | today_tz_is_zero | one_month_ago 
----------------+------------------+---------------
+       age(current_date::timestamptz - interval '1 day') = interval '1 day' AS one_day_ago;
+ today_is_zero | today_tz_is_zero | one_day_ago 
+---------------+------------------+-------------
  t             | t                | t
 (1 row)
 

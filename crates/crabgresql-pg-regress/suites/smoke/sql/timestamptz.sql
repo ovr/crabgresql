@@ -336,10 +336,13 @@ SELECT age(timestamptz '2001-04-10 00:00:00+00', timestamptz '1957-06-13 00:00:0
 SELECT pg_typeof(age(date '2001-01-01', date '2000-01-01')) AS resolved,
        age(date '2001-01-01', date '2000-01-01') AS from_dates,
        age(timestamptz '2001-01-01+00', timestamp '2000-01-01') AS mixed;
--- the one-argument forms anchor at today, so pin them by comparison
+-- The one-argument forms anchor at today, so pin them by comparison. The step
+-- has to be a day: `- interval '1 mon'` clamps the day of month, so on the 31st
+-- of a month whose predecessor is shorter the answer is `1 mon 3 days`, and the
+-- assertion would be false seven days a year.
 SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
        age(current_date::timestamptz) = interval '0' AS today_tz_is_zero,
-       age(current_date::timestamptz - interval '1 mon') = interval '1 mon' AS one_month_ago;
+       age(current_date::timestamptz - interval '1 day') = interval '1 day' AS one_day_ago;
 -- the infinity matrix is the same for both types
 SELECT age(timestamptz 'infinity') AS inf, age(timestamptz '-infinity') AS neg_inf;
 SELECT age(timestamp 'infinity') AS inf, age(timestamp '-infinity') AS neg_inf;

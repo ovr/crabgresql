@@ -89,6 +89,9 @@ SELECT timetz '12:00' AS lit,
        timetz '12:00' = timetz '12:00' AT LOCAL AS at_local_is_identity,
        ('12:00'::time)::timetz = timetz '12:00' AT LOCAL AS cast_agrees;
 RESET TimeZone;
--- an interval zone must be a fixed displacement (22023)
+-- an interval zone must be a fixed displacement (22023), and an infinite one is
+-- rejected for being infinite rather than for the months its sentinel carries
 SELECT timetz '00:01-07' AT TIME ZONE INTERVAL '1 month';
+SELECT timetz '00:01-07' AT TIME ZONE INTERVAL 'infinity';
+SELECT timetz '00:01-07' AT TIME ZONE INTERVAL '-infinity';
 SELECT 'still alive' AS status;

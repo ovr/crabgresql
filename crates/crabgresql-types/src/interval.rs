@@ -164,9 +164,11 @@ pub enum IntervalStyle {
 pub const INTERVAL_STYLE_VALUES: &str = "postgres, postgres_verbose, sql_standard, iso_8601";
 
 impl IntervalStyle {
-    /// Parse a `SET IntervalStyle` value. Names are case-insensitive in PG.
+    /// Parse a `SET IntervalStyle` value. Names are case-insensitive in PG, and
+    /// nothing more: `SET IntervalStyle TO ' postgres '` is
+    /// `invalid value for parameter` there, so the padding is not trimmed away.
     pub fn from_name(name: &str) -> Option<IntervalStyle> {
-        match name.trim().to_ascii_lowercase().as_str() {
+        match name.to_ascii_lowercase().as_str() {
             "postgres" => Some(IntervalStyle::Postgres),
             "postgres_verbose" => Some(IntervalStyle::PostgresVerbose),
             "sql_standard" => Some(IntervalStyle::SqlStandard),
@@ -596,10 +598,14 @@ pub fn apply_typmod(iv: Interval, typmod: i32) -> Result<Interval, IntervalError
 
 /// Round `iv.usec` to `precision` fractional-second digits, half away from zero.
 ///
-/// The rounding runs on the magnitude so the two signs mirror each other, and
-/// both steps are checked: `i64::MIN` has no positive counterpart, and adding
-/// the half-unit can carry past `i64::MAX`. Either way the value has no rounded
-/// form that fits, which is the "interval out of range" PG raises.
+/// Away-from-zero is reached by moving the value a half-unit *outwards* and then
+/// truncating toward zero, which `/` already does. Doing it that way rather than
+/// rounding the magnitude is what gives PG's boundary on both sides: a negative
+/// `usec` within a half-unit of `i64::MIN` has a rounded form, and reaching it
+/// through `-((-usec) + half)` would overflow one step before the value itself
+/// does. PostgreSQL 18.4: `interval '-9223372036854770808 microseconds'
+/// second(2)` is `-2562047788:00:54.77`, and one microsecond lower is
+/// `interval out of range`.
 fn round_usec(mut iv: Interval, precision: Option<u8>) -> Result<Interval, IntervalError> {
     let Some(p) = precision else { return Ok(iv) };
     let p = p as i32;
@@ -608,11 +614,13 @@ fn round_usec(mut iv: Interval, precision: Option<u8>) -> Result<Interval, Inter
     }
     let scale = 10_i64.pow((crate::timestamp::MAX_PRECISION - p) as u32);
     let half = scale / 2;
-    let magnitude = iv.usec.checked_abs().ok_or_else(out_of_range)?;
-    let rounded = magnitude.checked_add(half).ok_or_else(out_of_range)? / scale * scale;
-    // `rounded <= magnitude` after the truncating divide, so negating it back
-    // cannot overflow.
-    iv.usec = if iv.usec < 0 { -rounded } else { rounded };
+    let shifted = if iv.usec < 0 {
+        iv.usec.checked_sub(half)
+    } else {
+        iv.usec.checked_add(half)
+    }
+    .ok_or_else(out_of_range)?;
+    iv.usec = shifted / scale * scale;
     Ok(iv)
 }
 
@@ -1144,11 +1152,17 @@ fn interval_fields(s: &str) -> Vec<&str> {
 }
 
 /// `Some(1)`/`Some(-1)` if this field spells an infinity, else `None`.
+///
+/// Compared rather than lower-cased: this runs on *every* field of *every*
+/// interval literal, and folding a `String` per field to match three fixed
+/// spellings was measurably the largest single cost in `interval_in`.
 fn infinity_sign(field: &str) -> Option<i32> {
-    match field.to_ascii_lowercase().as_str() {
-        "infinity" | "+infinity" => Some(1),
-        "-infinity" => Some(-1),
-        _ => None,
+    if field.eq_ignore_ascii_case("infinity") || field.eq_ignore_ascii_case("+infinity") {
+        Some(1)
+    } else if field.eq_ignore_ascii_case("-infinity") {
+        Some(-1)
+    } else {
+        None
     }
 }
 
@@ -1697,8 +1711,8 @@ mod tests {
     }
 
     /// A `usec` at either `i64` extreme is a perfectly good interval, but it has
-    /// no room for the half-unit rounding adds, so declaring a precision on it
-    /// is an error rather than a saturated value. PostgreSQL 18.4:
+    /// no room for the half-unit rounding moves it by, so declaring a precision
+    /// on it is an error rather than a saturated value. PostgreSQL 18.4:
     /// `SELECT interval '2562047788:00:54.775807' second(2)` is
     /// `ERROR: interval out of range`.
     #[test]
@@ -1721,21 +1735,49 @@ mod tests {
             assert_eq!(coerce(src, pack_typmod(FULL_RANGE, None)), src);
         }
 
-        // The boundary is exact, and it is the half-increment that sets it:
-        // `i64::MAX - 5000` still has room at `second(2)`, one microsecond more
-        // does not, and `i64::MIN + 1` fails on the magnitude step instead.
-        // Read off PostgreSQL 18.4.
+        // The boundary is the half-unit, and it sits symmetrically: a value
+        // within half a step of either extreme has nowhere to round to. Read
+        // off PostgreSQL 18.4 on both sides — the negative half is what a
+        // magnitude-based rounding gets wrong, because negating `i64::MIN + half`
+        // overflows while moving it outwards does not.
         let second_2 = pack_typmod(FULL_RANGE, Some(2));
+        let second_0 = pack_typmod(FULL_RANGE, Some(0));
         assert_eq!(
             coerce(at(i64::MAX - 5000), second_2).usec,
             9_223_372_036_854_770_000
         );
-        for usec in [i64::MAX - 4999, i64::MIN + 1] {
+        assert_eq!(
+            coerce(at(i64::MIN + 5000), second_2).usec,
+            -9_223_372_036_854_770_000
+        );
+        assert_eq!(
+            coerce(at(i64::MIN + 500_000), second_0).usec,
+            -9_223_372_036_854_000_000
+        );
+        for (usec, typmod) in [
+            (i64::MAX - 4999, second_2),
+            (i64::MIN + 4999, second_2),
+            (i64::MIN + 499_999, second_0),
+        ] {
             assert_eq!(
-                apply_typmod(at(usec), second_2),
+                apply_typmod(at(usec), typmod),
                 Err(out_of_range()),
                 "{usec}"
             );
+        }
+
+        // Away from the extremes the two branches must stay bit-identical to
+        // rounding the magnitude — moving outwards then truncating toward zero
+        // is the same operation, and only the overflow point differs.
+        for (usec, want) in [
+            (15_000, 20_000),
+            (-15_000, -20_000),
+            (5_000, 10_000),
+            (-5_000, -10_000),
+            (4_999, 0),
+            (-4_999, 0),
+        ] {
+            assert_eq!(coerce(at(usec), second_2).usec, want, "{usec}");
         }
     }
 
@@ -2259,11 +2301,15 @@ mod tests {
         ] {
             assert_eq!(IntervalStyle::from_name(style.name()), Some(style));
         }
-        // PG matches the name case-insensitively and trims it.
+        // PG matches the name case-insensitively, and does nothing else to it:
+        // padding is part of the value, so `SET IntervalStyle TO ' postgres '`
+        // is rejected. Read off PostgreSQL 18.4.
         assert_eq!(
-            IntervalStyle::from_name(" SQL_Standard "),
+            IntervalStyle::from_name("SQL_Standard"),
             Some(IntervalStyle::SqlStandard)
         );
+        assert_eq!(IntervalStyle::from_name(" postgres "), None);
+        assert_eq!(IntervalStyle::from_name("postgres "), None);
         assert_eq!(IntervalStyle::from_name("bogus"), None);
         assert_eq!(IntervalStyle::default(), IntervalStyle::Postgres);
     }

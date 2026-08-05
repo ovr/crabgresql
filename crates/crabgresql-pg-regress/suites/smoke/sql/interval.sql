@@ -122,6 +122,14 @@ SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval hour AS h,
 SELECT (interval '0.005 sec')::interval second(2) AS pos,
        (interval '-0.005 sec')::interval second(2) AS neg,
        (interval '-1 day -2:30:00')::interval hour AS neg_trunc;
+-- rounding moves the value a half-unit outwards, so a span within half a unit
+-- of either `i64` microsecond limit has nowhere to go: 22008, symmetrically
+SELECT interval '9223372036854770807 microseconds' second(2) AS hi_ok,
+       interval '-9223372036854770808 microseconds' second(2) AS lo_ok,
+       interval '-9223372036854275808 microseconds' second(0) AS lo_ok_s0;
+SELECT interval '9223372036854770808 microseconds' second(2);
+SELECT interval '-9223372036854770809 microseconds' second(2);
+SELECT interval '2562047788:00:54.775807' second(2);
 -- assignment into a column applies the same modifier
 INSERT INTO interval_typmod_tbl(c, f, i)
   VALUES (interval '14 months 3 days', interval '1 day 2:30:45.6789', interval '1 day 2:30:45.6789');
@@ -200,9 +208,11 @@ SET IntervalStyle TO sql_standard;
 SELECT id, span FROM iv_styles ORDER BY id;
 SET IntervalStyle TO iso_8601;
 SELECT id, span FROM iv_styles ORDER BY id;
--- the name is case-insensitive; an unknown one is 22023 with a HINT
+-- the name is case-insensitive, and nothing more: padding is part of the value.
+-- An unrecognized one is 22023 with a HINT listing the four.
 SET IntervalStyle TO 'POSTGRES';
 SHOW IntervalStyle;
+SET IntervalStyle TO ' postgres ';
 SET IntervalStyle TO bogus;
 -- back to the default, so nothing downstream inherits a style
 RESET IntervalStyle;

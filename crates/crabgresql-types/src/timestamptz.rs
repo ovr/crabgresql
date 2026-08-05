@@ -663,10 +663,23 @@ pub fn timestamp_at_offset(off_east: i32, micros: i64) -> Result<i64, TimestampE
 /// carrying months or days — those are not a fixed displacement — quoting the
 /// interval as it renders it, which means under the session's `IntervalStyle`:
 /// the same value is reported as `"1 mon"` or `"P1M"` depending on the GUC.
+///
+/// An infinite interval is its own rejection, with its own message, and it has
+/// to be tested first: the sentinel carries `months = i32::MAX`, so the
+/// months/days branch would otherwise claim it and report the wrong reason.
 pub fn interval_zone_offset(
     iv: crate::interval::Interval,
     style: crate::interval::IntervalStyle,
 ) -> Result<i32, TimestampError> {
+    if iv.infinity_sign().is_some() {
+        return Err(TimestampError {
+            sqlstate: INVALID_PARAMETER_VALUE,
+            message: format!(
+                "interval time zone \"{}\" must be finite",
+                crate::interval::format_with(iv, style)
+            ),
+        });
+    }
     if iv.months != 0 || iv.days != 0 {
         return Err(TimestampError {
             sqlstate: INVALID_PARAMETER_VALUE,
@@ -1377,6 +1390,43 @@ mod tests {
             Ok(v) => panic!("expected an error, got {v:?}"),
             Err(e) => e.message,
         }
+    }
+
+    /// An interval in a zone position is rejected for two different reasons,
+    /// and the infinite one has to win: the sentinel carries `months = i32::MAX`
+    /// and would otherwise be reported as a months-bearing span. PG names the
+    /// value the same way under every style here, unlike the months/days
+    /// message. Read off PostgreSQL 18.4.
+    #[test]
+    fn an_infinite_zone_interval_is_rejected_as_infinite() {
+        use crate::interval::IntervalStyle;
+        for style in [
+            IntervalStyle::Postgres,
+            IntervalStyle::PostgresVerbose,
+            IntervalStyle::SqlStandard,
+            IntervalStyle::Iso8601,
+        ] {
+            assert_eq!(
+                failure(interval_zone_offset(crate::interval::POS_INFINITY, style)),
+                "interval time zone \"infinity\" must be finite",
+                "{style:?}"
+            );
+            assert_eq!(
+                failure(interval_zone_offset(crate::interval::NEG_INFINITY, style)),
+                "interval time zone \"-infinity\" must be finite",
+                "{style:?}"
+            );
+        }
+        // A finite months-bearing span still reports the other reason, and that
+        // one *does* follow the style.
+        assert_eq!(
+            failure(interval_zone_offset(iv("1 mon"), IntervalStyle::Postgres)),
+            "interval time zone \"1 mon\" must not include months or days"
+        );
+        assert_eq!(
+            failure(interval_zone_offset(iv("1 mon"), IntervalStyle::Iso8601)),
+            "interval time zone \"P1M\" must not include months or days"
+        );
     }
 
     /// The infinity matrix, settled before any zone rotation: `to_wall_clock`'s
