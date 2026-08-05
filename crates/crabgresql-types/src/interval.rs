@@ -1329,6 +1329,129 @@ fn scan_token(b: &[u8], start: usize) -> (usize, FieldKind) {
     (i, FieldKind::Plain)
 }
 
+/// One decoded field, before its unit is known.
+enum Piece {
+    /// An `HH:MM[:SS[.f]]` token, as signed microseconds.
+    Time(i64),
+    /// A SQL-standard `Y-M` token, as signed months.
+    YearMonth(i128),
+    /// A number, with the unit fused to it if it carried one (`'5days'`) or
+    /// attached from the word after it (`'5 days'`).
+    Value { n: (i128, f64), unit: Option<Unit> },
+}
+
+/// Decode every field into a [`Piece`], then attach each unit word to the
+/// number before it.
+///
+/// A word with no number can still be legal: PG lets one trail a time or a
+/// year-month token and discards it, so `'1:30 days'` is an hour and a half and
+/// `'1:30 days 5 days'` is five days past one — the discarded word claims no
+/// field. Exactly one may be absorbed, and a number in between cancels the
+/// opportunity, which is what rejects `'1:30 days days'` and `'5 days days'`.
+fn decode_fields(fields: &[Field<'_>], input: &str) -> Result<Vec<Piece>, IntervalError> {
+    let mut out: Vec<Piece> = Vec::with_capacity(fields.len());
+    let mut absorb = false;
+    for field in fields {
+        let tok: &str = &field.text;
+        match field.kind {
+            FieldKind::Time => {
+                out.push(Piece::Time(parse_time_token(tok, input)?));
+                absorb = true;
+            }
+            // The only legal `Date` field is the SQL-standard `Y-M` year-month.
+            // Everything else the scanner marked — `'1/5'`, `'1-2-3'`,
+            // `'1.days'`, `'day/2'` — reaches here to be rejected.
+            FieldKind::Date => {
+                out.push(Piece::YearMonth(
+                    try_year_month(tok).ok_or_else(|| invalid_syntax(input))?,
+                ));
+                absorb = true;
+            }
+            FieldKind::Plain => {
+                let tl = tok.to_ascii_lowercase();
+                let (num, word) = split_num_unit(&tl);
+                match (num.is_empty(), word.is_empty()) {
+                    // `1year`, `-1.5days`: number and unit fused in one token.
+                    (false, false) => {
+                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
+                        out.push(Piece::Value {
+                            n: parse_number(num, input)?,
+                            unit: Some(unit),
+                        });
+                        absorb = false;
+                    }
+                    (false, true) => {
+                        out.push(Piece::Value {
+                            n: parse_number(num, input)?,
+                            unit: None,
+                        });
+                        absorb = false;
+                    }
+                    (true, false) => {
+                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
+                        match out.last_mut() {
+                            Some(Piece::Value {
+                                unit: slot @ None, ..
+                            }) => *slot = Some(unit),
+                            _ if absorb => absorb = false,
+                            _ => return Err(invalid_syntax(input)),
+                        }
+                    }
+                    (true, true) => return Err(invalid_syntax(input)),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Assign a unit to every number that still lacks one, and fold the whole list
+/// into `acc`.
+///
+/// A number with no unit of its own is *days* when the next field is a time or
+/// an hour count — the SQL `D HH:MM:SS` form, which is why `interval '3 4:05:06'`
+/// is three days and six seconds past four rather than three seconds — and
+/// otherwise takes `default`, but only as the very last field. Anywhere else it
+/// is a syntax error, which is what makes `'1 5 days'` and `'1,5 days'` errors
+/// in PG rather than a silent extra second. Read off PostgreSQL 18.4.
+fn combine(
+    pieces: &[Piece],
+    default: Unit,
+    acc: &mut Acc,
+    input: &str,
+) -> Result<(), IntervalError> {
+    for (i, piece) in pieces.iter().enumerate() {
+        match piece {
+            Piece::Time(usec) => {
+                acc.claim(TIME_BITS, input)?;
+                acc.add_usec(*usec as i128);
+            }
+            Piece::YearMonth(months) => {
+                acc.claim(YEAR_MONTH_BITS, input)?;
+                acc.add_months(*months);
+            }
+            Piece::Value { n, unit: Some(u) } => {
+                acc.claim(unit_bit(*u), input)?;
+                apply(*n, *u, acc);
+            }
+            Piece::Value { n, unit: None } => {
+                let unit = match pieces.get(i + 1) {
+                    Some(Piece::Time(_)) => Unit::Day,
+                    Some(Piece::Value {
+                        unit: Some(Unit::Hour),
+                        ..
+                    }) => Unit::Day,
+                    None => default,
+                    _ => return Err(invalid_syntax(input)),
+                };
+                acc.claim(unit_bit(unit), input)?;
+                apply(*n, unit, acc);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `Some(1)`/`Some(-1)` if this field spells an infinity, else `None`.
 ///
 /// Compared rather than lower-cased: this runs on *every* field of *every*
@@ -1395,57 +1518,7 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
         return Err(invalid_syntax(input));
     }
 
-    let mut pending: Option<(i128, f64)> = None;
-    for field in fields {
-        let tok: &str = &field.text;
-        match field.kind {
-            FieldKind::Time => {
-                // A unit-less number sitting immediately before a time is
-                // *days*, whatever `default` says: this is the SQL
-                // `D HH:MM:SS` form, so `interval '3 4:05:06'` is three days
-                // and six seconds past four, never three seconds. Probed
-                // against PostgreSQL 18.4.
-                if let Some(n) = pending.take() {
-                    apply(n, Unit::Day, &mut acc);
-                }
-                acc.add_usec(parse_time_token(tok, input)? as i128);
-            }
-            // The only legal `Date` field is the SQL-standard `Y-M` year-month.
-            // Everything else the scanner marked — `'1/5'`, `'1-2-3'`,
-            // `'1.days'`, `'day/2'` — reaches here to be rejected.
-            FieldKind::Date => {
-                let months = try_year_month(tok).ok_or_else(|| invalid_syntax(input))?;
-                flush_pending(&mut pending, default, &mut acc, input)?;
-                acc.add_months(months);
-            }
-            FieldKind::Plain => {
-                let tl = tok.to_ascii_lowercase();
-                let (num, word) = split_num_unit(&tl);
-                match (num.is_empty(), word.is_empty()) {
-                    // `1year`, `-1.5days`: number and unit fused in one token.
-                    (false, false) => {
-                        flush_pending(&mut pending, default, &mut acc, input)?;
-                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
-                        apply(parse_number(num, input)?, unit, &mut acc);
-                    }
-                    // A bare number: pair it with a following unit word, else
-                    // `default`.
-                    (false, true) => {
-                        flush_pending(&mut pending, default, &mut acc, input)?;
-                        pending = Some(parse_number(num, input)?);
-                    }
-                    // A bare unit word: applies to the pending number.
-                    (true, false) => {
-                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
-                        let n = pending.take().ok_or_else(|| invalid_syntax(input))?;
-                        apply(n, unit, &mut acc);
-                    }
-                    (true, true) => return Err(invalid_syntax(input)),
-                }
-            }
-        }
-    }
-    flush_pending(&mut pending, default, &mut acc, input)?;
+    combine(&decode_fields(fields, input)?, default, &mut acc, input)?;
 
     if ago {
         acc.negate();
@@ -1460,9 +1533,42 @@ struct Acc {
     months: i128,
     days: i128,
     usec: i128,
+    /// Which units the literal has already named, one bit per [`Unit`].
+    mask: u16,
 }
 
+/// The bit [`Acc::claim`] tracks for a unit.
+///
+/// Twelve of them, not the six of the typmod range encoding: `interval_in`
+/// distinguishes units the modifier collapses, so `'1 second 5 milliseconds'`,
+/// `'1 year 1 decade'` and `'1 month 1 week'` are all legal.
+const fn unit_bit(u: Unit) -> u16 {
+    1 << (u as u16)
+}
+
+/// An `HH:MM[:SS]` token fills every sub-day field at once, which is why PG
+/// rejects `'1:30 2 seconds'` and `'1:30 5 ms'` while accepting `'1:30 2 days'`.
+const TIME_BITS: u16 = unit_bit(Unit::Microsecond)
+    | unit_bit(Unit::Millisecond)
+    | unit_bit(Unit::Second)
+    | unit_bit(Unit::Minute)
+    | unit_bit(Unit::Hour);
+
+/// The SQL-standard `Y-M` token claims the month field only: `'1-2 3 years'` is
+/// four years and two months, while `'1-2 3 months'` is a duplicate.
+const YEAR_MONTH_BITS: u16 = unit_bit(Unit::Month);
+
 impl Acc {
+    /// Claim the fields a token fills. Naming one twice is PG's `22007` —
+    /// `'1 day 1 day'`, `'2 hours 3 hours'`, `'1:00 2:00'`.
+    fn claim(&mut self, bits: u16, input: &str) -> Result<(), IntervalError> {
+        if self.mask & bits != 0 {
+            return Err(invalid_syntax(input));
+        }
+        self.mask |= bits;
+        Ok(())
+    }
+
     fn add_months(&mut self, m: i128) {
         self.months += m;
     }
@@ -1487,18 +1593,6 @@ impl Acc {
             usec: i64::try_from(self.usec).map_err(|_| field_value_out_of_range(input))?,
         })
     }
-}
-
-fn flush_pending(
-    pending: &mut Option<(i128, f64)>,
-    default: Unit,
-    acc: &mut Acc,
-    _input: &str,
-) -> Result<(), IntervalError> {
-    if let Some(n) = pending.take() {
-        apply(n, default, acc);
-    }
-    Ok(())
 }
 
 /// Apply a `(whole, frac)` number in `unit` to the accumulator, cascading any
@@ -2615,6 +2709,125 @@ mod tests {
             // point being that slicing it must not panic.
             "5 day\u{e9}",
         ] {
+            rejects(input);
+        }
+    }
+
+    /// A literal may name each field only once, and a `HH:MM:SS` token names
+    /// every sub-day field at once while a `Y-M` token names only the month.
+    /// Read off PostgreSQL 18.4.
+    #[test]
+    fn a_field_may_be_named_only_once() {
+        for input in [
+            "1 day 1 day",
+            "2 hours 3 hours",
+            "1 year 1 year",
+            "1:00 2:00",
+            "1 day 2:00 3:00",
+            // the time token owns hours through microseconds
+            "1:30 2 hours",
+            "1:30 2 minutes",
+            "1:30 2 seconds",
+            "1:30 5 ms",
+            "1:30 2 us",
+            // the year-month token owns months
+            "1-2 3 months",
+        ] {
+            rejects(input);
+        }
+        for (input, want) in [
+            // Units the typmod encoding collapses are still distinct on input.
+            ("1 second 5 milliseconds", "00:00:01.005"),
+            ("1 year 1 decade", "11 years"),
+            ("1 month 1 week", "1 mon 7 days"),
+            ("1 week 1 day", "8 days"),
+            // A time token leaves the day and month fields free, and a
+            // year-month token leaves the sub-day ones free.
+            ("1:30 2 days", "2 days 01:30:00"),
+            ("1-2 3 years", "4 years 2 mons"),
+            ("1:30 1-2", "1 year 2 mons 01:30:00"),
+            ("1-2 1:30", "1 year 2 mons 01:30:00"),
+            // A fractional cascade is invisible to the mask, so the finer unit
+            // it spills into may still be named.
+            ("1.5 days 2 hours", "1 day 14:00:00"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+    }
+
+    /// A number with no unit of its own is days when the next field is a time
+    /// or an hour count, and otherwise takes the default unit — but only as the
+    /// very last field. Anywhere else it is a syntax error, which is what makes
+    /// `'1 5 days'` and `'1,5 days'` errors rather than a silent extra second.
+    #[test]
+    fn a_bare_number_is_days_before_an_hour_and_default_only_last() {
+        for (input, want) in [
+            ("2 3 hours", "2 days 03:00:00"),
+            ("2 3 h", "2 days 03:00:00"),
+            ("2 3 hrs", "2 days 03:00:00"),
+            ("2 3:00", "2 days 03:00:00"),
+            ("1 mon 3 2:00", "1 mon 3 days 02:00:00"),
+            ("1 mon 2 3 hours", "1 mon 2 days 03:00:00"),
+            ("1+2 hours", "1 day 02:00:00"),
+            ("1 day 2 hours 3", "1 day 02:00:03"),
+            ("5 days 1", "5 days 00:00:01"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+        for input in [
+            // a bare number before anything but a time or an hour count
+            "2 3 minutes",
+            "2 3 seconds",
+            "2 3 days",
+            "2 3 months",
+            "2 1-2",
+            "1 2 3 hours",
+            "2 3 4:05",
+            "1 5 days",
+            "1 5",
+            "1,5 days",
+            "..",
+            "5 days ..",
+            "1 day . 2 hours",
+            "3.5:00",
+            // the promoted or defaulted unit is already taken
+            "1 day 3 4:05:06",
+            "1 day 3 2:00",
+            "1 day 2:00 3",
+            "3 4:05:06 7",
+            "3 2:00 4",
+        ] {
+            rejects(input);
+        }
+        // The leading-field form defaults the trailing bare number, and the
+        // duplicate rule applies to it too.
+        assert_eq!(
+            format(parse_with_default("1", Unit::Day).expect("one day")),
+            "1 day"
+        );
+        for input in ["5 days 1", "1 5"] {
+            assert!(
+                parse_with_default(input, Unit::Day).is_err(),
+                "input {input}"
+            );
+        }
+    }
+
+    /// One unit word may trail a time or year-month token, and is discarded
+    /// rather than applied — it claims no field, so a later use of that unit is
+    /// still legal. Only one, and a number in between cancels the opportunity.
+    #[test]
+    fn a_stray_unit_word_is_absorbed_once_after_a_time() {
+        for (input, want) in [
+            ("1:30 days", "01:30:00"),
+            ("1:30 months", "01:30:00"),
+            ("1-2 hours", "1 year 2 mons"),
+            ("1:days", "01:00:00"),
+            ("1:30 days 5 days", "5 days 01:30:00"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+        for input in ["1:30 days days", "5 days days", "days 5", "5 hours days"] {
             rejects(input);
         }
     }

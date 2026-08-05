@@ -199,6 +199,29 @@ SELECT interval '1.days';
 SELECT interval '2 hours -';
 SELECT interval '--2 hours';
 SELECT interval '-.5';
+
+-- A literal may name each field only once — a `HH:MM:SS` token names every
+-- sub-day field at once, a `Y-M` token only the month — and a number with no
+-- unit of its own is days when the next field is a time or an hour count,
+-- otherwise the default unit and only as the last field.
+SELECT interval '2 3 hours' AS promoted, interval '1 mon 3 2:00' AS with_month,
+       interval '1 day 2 hours 3' AS trailing, interval '5 days 1' AS trailing2;
+SELECT interval '1 second 5 milliseconds' AS distinct_subsecond,
+       interval '1 month 1 week' AS month_week, interval '1-2 3 years' AS ym_then_years,
+       interval '1.5 days 2 hours' AS cascade_is_free;
+SELECT interval '1,5 days';
+SELECT interval '1 5 days';
+SELECT interval '2 3 minutes';
+SELECT interval '1 day 1 day';
+SELECT interval '1:00 2:00';
+SELECT interval '1:30 2 seconds';
+SELECT interval '1 day 3 4:05:06';
+-- one stray unit word may trail a time or year-month token and is discarded,
+-- claiming no field
+SELECT interval '1:30 days' AS absorbed, interval '1-2 hours' AS absorbed_ym,
+       interval '1:30 days 5 days' AS absorbed_then_used;
+SELECT interval '1:30 days days';
+SELECT interval '5 days days';
 -- `ago` may appear once, and only as the last field
 SELECT interval '1 day ago ago';
 SELECT interval '2 minutes ago 5 days';

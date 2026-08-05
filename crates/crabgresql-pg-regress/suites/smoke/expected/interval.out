@@ -563,6 +563,70 @@ SELECT interval '-.5';
 ERROR:  invalid input syntax for type interval: "-.5"
 LINE 1: SELECT interval '-.5';
                         ^
+-- A literal may name each field only once — a `HH:MM:SS` token names every
+-- sub-day field at once, a `Y-M` token only the month — and a number with no
+-- unit of its own is days when the next field is a time or an hour count,
+-- otherwise the default unit and only as the last field.
+SELECT interval '2 3 hours' AS promoted, interval '1 mon 3 2:00' AS with_month,
+       interval '1 day 2 hours 3' AS trailing, interval '5 days 1' AS trailing2;
+    promoted     |      with_month       |    trailing    |    trailing2    
+-----------------+-----------------------+----------------+-----------------
+ 2 days 03:00:00 | 1 mon 3 days 02:00:00 | 1 day 02:00:03 | 5 days 00:00:01
+(1 row)
+
+SELECT interval '1 second 5 milliseconds' AS distinct_subsecond,
+       interval '1 month 1 week' AS month_week, interval '1-2 3 years' AS ym_then_years,
+       interval '1.5 days 2 hours' AS cascade_is_free;
+ distinct_subsecond |  month_week  | ym_then_years  | cascade_is_free 
+--------------------+--------------+----------------+-----------------
+ 00:00:01.005       | 1 mon 7 days | 4 years 2 mons | 1 day 14:00:00
+(1 row)
+
+SELECT interval '1,5 days';
+ERROR:  invalid input syntax for type interval: "1,5 days"
+LINE 1: SELECT interval '1,5 days';
+                        ^
+SELECT interval '1 5 days';
+ERROR:  invalid input syntax for type interval: "1 5 days"
+LINE 1: SELECT interval '1 5 days';
+                        ^
+SELECT interval '2 3 minutes';
+ERROR:  invalid input syntax for type interval: "2 3 minutes"
+LINE 1: SELECT interval '2 3 minutes';
+                        ^
+SELECT interval '1 day 1 day';
+ERROR:  invalid input syntax for type interval: "1 day 1 day"
+LINE 1: SELECT interval '1 day 1 day';
+                        ^
+SELECT interval '1:00 2:00';
+ERROR:  invalid input syntax for type interval: "1:00 2:00"
+LINE 1: SELECT interval '1:00 2:00';
+                        ^
+SELECT interval '1:30 2 seconds';
+ERROR:  invalid input syntax for type interval: "1:30 2 seconds"
+LINE 1: SELECT interval '1:30 2 seconds';
+                        ^
+SELECT interval '1 day 3 4:05:06';
+ERROR:  invalid input syntax for type interval: "1 day 3 4:05:06"
+LINE 1: SELECT interval '1 day 3 4:05:06';
+                        ^
+-- one stray unit word may trail a time or year-month token and is discarded,
+-- claiming no field
+SELECT interval '1:30 days' AS absorbed, interval '1-2 hours' AS absorbed_ym,
+       interval '1:30 days 5 days' AS absorbed_then_used;
+ absorbed |  absorbed_ym  | absorbed_then_used 
+----------+---------------+--------------------
+ 01:30:00 | 1 year 2 mons | 5 days 01:30:00
+(1 row)
+
+SELECT interval '1:30 days days';
+ERROR:  invalid input syntax for type interval: "1:30 days days"
+LINE 1: SELECT interval '1:30 days days';
+                        ^
+SELECT interval '5 days days';
+ERROR:  invalid input syntax for type interval: "5 days days"
+LINE 1: SELECT interval '5 days days';
+                        ^
 -- `ago` may appear once, and only as the last field
 SELECT interval '1 day ago ago';
 ERROR:  invalid input syntax for type interval: "1 day ago ago"
