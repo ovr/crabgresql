@@ -211,6 +211,9 @@ pub enum ScalarFn {
     /// [`crabgresql_executor::GucOps`], so it dispatches in `eval`, not in the
     /// pure `eval_scalar`.
     CurrentSetting,
+    /// `version() -> text`. A build-time constant, so the pure `eval_scalar`
+    /// answers it — no session state is involved.
+    Version,
 
     // --- the clock. All three read the session's stamped instants rather than
     // their arguments, so they dispatch in `eval`, not in `eval_scalar`.
@@ -225,6 +228,10 @@ pub enum ScalarFn {
     /// `clock_timestamp() -> timestamptz`: the wall clock, read afresh at every
     /// call. The only volatile member of the family.
     ClockTimestamp,
+    /// `pg_postmaster_start_time() -> timestamptz`: when this server process
+    /// started. Fixed for the life of the process, so every session and every
+    /// row sees the same instant.
+    PgPostmasterStartTime,
     /// `timezone(text, timestamp) -> timestamptz` (`ts AT TIME ZONE zone`).
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
@@ -2213,6 +2220,20 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::ClockTimestamp,
             args: &[],
             ret: TSTZ,
+        }],
+        // Not a clock reading but an instant like one: fixed for the life of the
+        // process, so `eval` answers it alongside the family above.
+        "pg_postmaster_start_time" => &[Signature {
+            func: ScalarFn::PgPostmasterStartTime,
+            args: &[],
+            ret: TSTZ,
+        }],
+        // The server's build identity. Zero-arity and constant, so unlike the
+        // rest of this neighborhood it needs nothing from the session.
+        "version" => &[Signature {
+            func: ScalarFn::Version,
+            args: &[],
+            ret: TEXT,
         }],
         // Catalog lookups. `int -> oid` is implicit, so an OID written as an
         // integer literal resolves too. Dispatched by the executor's `eval`

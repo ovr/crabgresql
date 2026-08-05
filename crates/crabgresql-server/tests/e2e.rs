@@ -12165,6 +12165,83 @@ async fn the_clock_functions_are_stable_at_three_different_scopes() -> anyhow::R
     Ok(())
 }
 
+/// `pg_postmaster_start_time()` is fixed for the life of the process — a
+/// stronger scope than any of the three clock functions above — and it precedes
+/// everything a session can observe.
+#[tokio::test]
+async fn the_postmaster_start_time_is_fixed_and_precedes_the_session() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("SET TIME ZONE 'UTC'").await?;
+
+    let first = scalar(&client, "SELECT pg_postmaster_start_time()").await;
+    // Unlike `now()`, a second autocommit statement — a new transaction — must
+    // still report the same instant.
+    assert_eq!(
+        scalar(&client, "SELECT pg_postmaster_start_time()").await,
+        first
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT pg_postmaster_start_time() <= clock_timestamp()"
+        )
+        .await,
+        "t"
+    );
+    // It is a timestamptz, so it renders in the session zone like one.
+    client.simple_query("SET TIME ZONE 'Asia/Tokyo'").await?;
+    assert_ne!(
+        scalar(&client, "SELECT pg_postmaster_start_time()").await,
+        first,
+        "a timestamptz must re-render in the new session zone"
+    );
+    Ok(())
+}
+
+/// `version()` and the two version GUCs are one fact with three spellings, and
+/// clients cross-check them: a driver reads `server_version` from the startup
+/// packet, psql branches on `server_version_num`, and `version()` is what a user
+/// pastes into a bug report. They must agree.
+#[tokio::test]
+async fn the_version_surfaces_agree() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    let version = scalar(&client, "SELECT version()").await;
+    let server_version = scalar(&client, "SHOW server_version").await;
+    assert!(
+        version.starts_with(&format!("PostgreSQL {server_version} on ")),
+        "version() must carry server_version ({server_version}) verbatim: got {version}"
+    );
+    assert!(version.ends_with("-bit"), "got {version}");
+
+    // `server_version_num` encodes the same version as an integer.
+    assert_eq!(scalar(&client, "SHOW server_version_num").await, "190000");
+    assert_eq!(
+        scalar(&client, "SELECT current_setting('server_version_num')").await,
+        "190000"
+    );
+    assert!(
+        server_version.starts_with("19.0"),
+        "server_version_num 190000 must match {server_version}"
+    );
+
+    // Both are read-only, as in PG.
+    let err = client
+        .simple_query("SET server_version_num = '1'")
+        .await
+        .expect_err("server_version_num is read-only");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(
+        db.code(),
+        &tokio_postgres::error::SqlState::CANT_CHANGE_RUNTIME_PARAM
+    );
+    assert_eq!(
+        db.message(),
+        "parameter \"server_version_num\" cannot be changed"
+    );
+    Ok(())
+}
+
 /// A statement timestamp belongs to the *message*, not the statement: PG stamps
 /// it once per protocol message, so every statement of a multi-statement simple
 /// query reports the same one — and, since the batch is one implicit

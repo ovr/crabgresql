@@ -215,7 +215,17 @@ pub static GUCS: &[GucDef] = &[
         name: "server_version",
         description: "Shows the server version.",
         report: true,
-        show: |_| "19.0 (CrabgreSQL 0.1.0)".to_string(),
+        show: |_| crabgresql_types::version::SERVER_VERSION.to_string(),
+        kind: GucKind::ReadOnly,
+    },
+    // psql and most drivers branch on this rather than parsing `server_version`,
+    // so the two must agree; `version` owns the pair.
+    GucDef {
+        key: "server_version_num",
+        name: "server_version_num",
+        description: "Shows the server version as an integer.",
+        report: false,
+        show: |_| crabgresql_types::version::SERVER_VERSION_NUM.to_string(),
         kind: GucKind::ReadOnly,
     },
     GucDef {
