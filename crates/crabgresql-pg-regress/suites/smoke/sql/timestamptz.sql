@@ -343,6 +343,23 @@ SELECT pg_typeof(age(date '2001-01-01', date '2000-01-01')) AS resolved,
 SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
        age(current_date::timestamptz) = interval '0' AS today_tz_is_zero,
        age(current_date::timestamptz - interval '1 day') = interval '1 day' AS one_day_ago;
+-- PG's one-argument `age` spans two type categories — the two datetime forms
+-- and `age(xid)` — so an untyped argument has no best candidate: 42725, not a
+-- quiet pick. Nothing but an xid can reach the xid overload, so every typed
+-- call resolves as it did before it existed.
+SELECT age('2001-01-01');
+SELECT age(NULL);
+SELECT pg_typeof(age(date '2001-01-01')) AS from_date,
+       pg_typeof(age(timestamp '2001-01-01')) AS from_ts,
+       pg_typeof(age(timestamptz '2001-01-01+00')) AS from_tstz;
+-- xids below the first normal one are permanent, and report as infinitely old
+SELECT age('0'::xid) AS zero, age('1'::xid) AS one, age('2'::xid) AS two;
+SELECT age(NULL::xid) IS NULL AS strict;
+-- the counter itself is not reproducible, so pin the differences: a 32-bit
+-- wrapping subtract puts an xid past the counter just above the lowest one
+SELECT age('3'::xid) - age('4'::xid) AS adjacent,
+       age('100'::xid) - age('1100'::xid) AS thousand,
+       age('4294967295'::xid) - age('3'::xid) AS wrapped;
 -- the infinity matrix is the same for both types
 SELECT age(timestamptz 'infinity') AS inf, age(timestamptz '-infinity') AS neg_inf;
 SELECT age(timestamp 'infinity') AS inf, age(timestamp '-infinity') AS neg_inf;

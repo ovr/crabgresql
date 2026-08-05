@@ -860,6 +860,47 @@ SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
  t             | t                | t
 (1 row)
 
+-- PG's one-argument `age` spans two type categories — the two datetime forms
+-- and `age(xid)` — so an untyped argument has no best candidate: 42725, not a
+-- quiet pick. Nothing but an xid can reach the xid overload, so every typed
+-- call resolves as it did before it existed.
+SELECT age('2001-01-01');
+ERROR:  function age(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT age(NULL);
+ERROR:  function age(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT pg_typeof(age(date '2001-01-01')) AS from_date,
+       pg_typeof(age(timestamp '2001-01-01')) AS from_ts,
+       pg_typeof(age(timestamptz '2001-01-01+00')) AS from_tstz;
+ from_date | from_ts  | from_tstz 
+-----------+----------+-----------
+ interval  | interval | interval
+(1 row)
+
+-- xids below the first normal one are permanent, and report as infinitely old
+SELECT age('0'::xid) AS zero, age('1'::xid) AS one, age('2'::xid) AS two;
+    zero    |    one     |    two     
+------------+------------+------------
+ 2147483647 | 2147483647 | 2147483647
+(1 row)
+
+SELECT age(NULL::xid) IS NULL AS strict;
+ strict 
+--------
+ t
+(1 row)
+
+-- the counter itself is not reproducible, so pin the differences: a 32-bit
+-- wrapping subtract puts an xid past the counter just above the lowest one
+SELECT age('3'::xid) - age('4'::xid) AS adjacent,
+       age('100'::xid) - age('1100'::xid) AS thousand,
+       age('4294967295'::xid) - age('3'::xid) AS wrapped;
+ adjacent | thousand | wrapped 
+----------+----------+---------
+        1 |     1000 |       4
+(1 row)
+
 -- the infinity matrix is the same for both types
 SELECT age(timestamptz 'infinity') AS inf, age(timestamptz '-infinity') AS neg_inf;
     inf    | neg_inf  

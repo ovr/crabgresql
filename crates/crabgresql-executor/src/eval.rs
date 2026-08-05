@@ -125,6 +125,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_clock_fn(*func, ctx) {
                 return result;
             }
+            // `age(xid)` reads the live transaction counter, which lives on the
+            // transaction context rather than in `FmtCtx`.
+            if let Some(result) = eval_txn_fn(*func, &arg_values, ctx) {
+                return result;
+            }
             // The catalog functions read the session's pg_catalog snapshot, which
             // the pure `eval_scalar` has no handle to.
             match eval_catalog_fn(*func, &arg_values, ctx) {
@@ -359,6 +364,48 @@ fn eval_array_ctor_fn(
         _ => unreachable!(),
     };
     Some(Ok(result))
+}
+
+/// Dispatch the transaction-state functions. Returns `None` for any other
+/// function (the caller falls back to the pure `eval_scalar`).
+///
+/// `age(xid)` is how many transactions have started since `xid`. It answers
+/// from the *live* counter, not from the statement's snapshot: inside one
+/// repeatable-read transaction PG's answer grows as other sessions allocate
+/// XIDs, while the snapshot stands still. `Clog::next_xid_floor` is that
+/// counter — it is bumped at allocation — and unlike `TxnContext::xid` it is
+/// meaningful in a read-only transaction, which never allocates an XID at all.
+fn eval_txn_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    if func != ScalarFn::AgeXid {
+        return None;
+    }
+    let xid = match &args[0] {
+        Value::Null => return Some(Ok(Value::Null)),
+        Value::Xid(x) => *x,
+        other => unreachable!("expected an xid arg, got {other:?}"),
+    };
+    // XIDs below the first normal one are permanent, and PG reports them as
+    // infinitely old rather than as a difference: `age('0'::xid)`,
+    // `age('1'::xid)` and `age('2'::xid)` are all `2147483647`.
+    if u64::from(xid) < crabgresql_txn::Xid::FIRST_NORMAL.0 {
+        return Some(Ok(Value::Int4(i32::MAX)));
+    }
+    let Some(txn) = ctx.txn.as_ref() else {
+        return Some(Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "age(xid) evaluated without a transaction context",
+        )));
+    };
+    // Our XIDs are 64-bit and never wrap; the SQL `xid` type is 32-bit and PG's
+    // answer is a 32-bit wrapping difference reinterpreted as a signed integer.
+    // That is what makes `age('4294967295'::xid)` one *more* than the counter,
+    // and an xid ahead of it negative.
+    let next = txn.clog.next_xid_floor().0 as u32;
+    Some(Ok(Value::Int4(next.wrapping_sub(xid) as i32)))
 }
 
 /// Dispatch the side-effecting sequence functions. Returns `None` for any other

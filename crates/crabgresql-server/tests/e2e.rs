@@ -11200,6 +11200,87 @@ async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// PostgreSQL's one-argument `age` spans two type categories — the two datetime
+/// forms and `age(xid)` — so an untyped argument has no best candidate and the
+/// call is ambiguous rather than quietly resolving to a datetime overload.
+#[tokio::test]
+async fn one_argument_age_is_ambiguous_for_an_untyped_argument() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    for sql in ["SELECT age('2001-01-01')", "SELECT age(NULL)"] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("an untyped one-argument age must be ambiguous");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "42725", "{sql}");
+        assert_eq!(db.message(), "function age(unknown) is not unique", "{sql}");
+        assert_eq!(
+            db.hint(),
+            Some(
+                "Could not choose a best candidate function. You might need to add explicit type casts."
+            ),
+            "{sql}"
+        );
+    }
+
+    // The load-bearing half: the ambiguity must fire *only* for the untyped
+    // case. Nothing can reach the xid overload but an xid, so every typed call
+    // resolves exactly as it did before it existed.
+    for (sql, want) in [
+        ("SELECT pg_typeof(age(DATE '2001-01-01'))", "interval"),
+        ("SELECT pg_typeof(age(TIMESTAMP '2001-01-01'))", "interval"),
+        (
+            "SELECT pg_typeof(age(TIMESTAMPTZ '2001-01-01+00'))",
+            "interval",
+        ),
+        ("SELECT age(DATE '2001-01-01', DATE '2000-01-01')", "1 year"),
+        (
+            "SELECT age(TIMESTAMP '2001-01-01', TIMESTAMP '2000-01-01')",
+            "1 year",
+        ),
+    ] {
+        assert_eq!(scalar(&client, sql).await, want, "{sql}");
+    }
+
+    // `age(xid)` itself: how many transactions have started since that one.
+    // Pinned relatively, because the absolute counter is not reproducible.
+    assert_eq!(
+        scalar(&client, "SELECT age('3'::xid) - age('4'::xid)").await,
+        "1"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT age('100'::xid) - age('1100'::xid)").await,
+        "1000"
+    );
+    // A 32-bit wrapping difference, so an xid past the counter reads as one
+    // more than the lowest normal one rather than as a huge number.
+    assert_eq!(
+        scalar(&client, "SELECT age('4294967295'::xid) - age('3'::xid)").await,
+        "4"
+    );
+    // XIDs below the first normal one are permanent, and report as infinitely
+    // old rather than as a difference.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT age('0'::xid), age('1'::xid), age('2'::xid)"
+        )
+        .await,
+        "2147483647"
+    );
+    assert_eq!(scalar(&client, "SELECT age(NULL::xid) IS NULL").await, "t");
+    // Read-only transactions never allocate an XID, so the answer cannot come
+    // from `TxnContext::xid`.
+    client.simple_query("BEGIN READ ONLY").await?;
+    assert_eq!(
+        scalar(&client, "SELECT age('3'::xid) - age('4'::xid)").await,
+        "1"
+    );
+    client.simple_query("COMMIT").await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn show_all_lists_the_known_parameters() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

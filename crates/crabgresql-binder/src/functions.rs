@@ -174,6 +174,10 @@ pub enum ScalarFn {
     AgeToday,
     /// `age(timestamptz) -> interval` = `age(current_date::timestamptz, $1)`.
     AgeTodayTz,
+    /// `age(xid) -> int4`: how many transactions have started since `xid`.
+    /// Reads the live transaction counter, so it is dispatched from `eval.rs`
+    /// rather than from the pure `eval_scalar`.
+    AgeXid,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
     /// `to_char(timestamp, text) -> text`.
@@ -1472,6 +1476,7 @@ const TSQUERY: PgType = PgType::Tsquery;
 const TEXTARR: PgType = PgType::Array(crabgresql_types::oid::TEXT);
 const OID: PgType = PgType::Oid;
 const TID: PgType = PgType::Tid;
+const XID: PgType = PgType::Xid;
 const XID8: PgType = PgType::Xid8;
 const PGLSN: PgType = PgType::PgLsn;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
@@ -1951,6 +1956,19 @@ fn lookup(name: &str) -> &'static [Signature] {
                 func: ScalarFn::AgeToday,
                 args: &[TS],
                 ret: IV,
+            },
+            // PG's one-argument `age` spans two type categories — datetime for
+            // the two above, user-defined for this one — and that is what makes
+            // `age('2001-01-01')`, `age(NULL)` and `age($1)` report
+            // `function age(unknown) is not unique` instead of quietly picking a
+            // datetime overload. Listed last because nothing but an `xid` can
+            // reach it: `coerce_for_arg` finds no implicit cast into `xid` for
+            // any type, so it is dropped before any tie-break rather than by
+            // its position.
+            Signature {
+                func: ScalarFn::AgeXid,
+                args: &[XID],
+                ret: I4,
             },
         ],
         // PG has no `to_char(date)` and no `to_char(time)` overload: a `date`
