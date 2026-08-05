@@ -17,8 +17,9 @@ use crabgresql_storage_api::{
 use crabgresql_types::{PgType, Value, VectorKind};
 
 use crate::{
-    CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogToast,
-    CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind, TOAST_NAMESPACE,
+    CatalogConstraint, CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine,
+    CatalogSequence, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind,
+    TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -570,9 +571,10 @@ fn analyzed_size(stats: &RelStats) -> (Value, Value) {
 /// `relam = 0`). The synthetic OIDs are stable within one catalog snapshot so a
 /// join to `pg_attribute.attrelid` lines up.
 ///
-/// Columns crabgresql does not track are their PostgreSQL constants: no CHECK
-/// constraints (`relchecks = 0`), rules only on views (`relhasrules`), no
-/// triggers or row security, no `OF type` / tablespace / TOAST relation. A
+/// Columns crabgresql does not track are their PostgreSQL constants: rules only
+/// on views (`relhasrules`), no triggers or row security, no `OF type` /
+/// tablespace / TOAST relation. `relchecks` counts the relation's CHECK
+/// constraints, which is what makes psql print a `Check constraints:` footer. A
 /// heap-backed relation defaults its replica identity to the primary key
 /// (`relreplident = 'd'`); views, sequences, and indexes have none (`'n'`).
 ///
@@ -654,8 +656,9 @@ pub fn pg_class_rows(
                 Value::Text(schema.persistence.as_char().to_string()),
                 Value::Text(relkind.to_string()),
                 Value::Int2(schema.columns.len() as i16),
-                // relchecks: no CHECK constraints modeled.
-                Value::Int2(0),
+                // relchecks: the CHECK constraints on this relation, inherited
+                // ones included — PostgreSQL counts a child's copies too.
+                Value::Int2(schema.checks.len() as i16),
                 // relhasrules: only a view carries the `_RETURN` rule.
                 Value::Bool(matches!(kind, RelKind::View)),
                 // relhastriggers / relrowsecurity / relforcerowsecurity.
@@ -1002,92 +1005,86 @@ pub fn pg_constraint_schema() -> TableSchema {
             col("contype", CHARLIKE),
             col("condeferrable", PgType::Bool),
             col("condeferred", PgType::Bool),
+            // Present in PostgreSQL 18; `NOT ENFORCED` is refused at DDL, so
+            // everything here is enforced.
+            col("conenforced", PgType::Bool),
             col("convalidated", PgType::Bool),
             col("conrelid", PgType::Oid),
+            col("contypid", PgType::Oid),
             col("conindid", PgType::Oid),
+            col("conparentid", PgType::Oid),
+            col("confrelid", PgType::Oid),
+            col("conislocal", PgType::Bool),
+            col("coninhcount", PgType::Int2),
+            col("connoinherit", PgType::Bool),
             // int2[] is represented as PG array text until catalog arrays land.
             col("conkey", PgType::Text),
+            // pg_node_tree in PostgreSQL, modelled as the stored SQL text the
+            // same way `pg_class.relpartbound` is. `pg_get_expr` re-renders it
+            // for the reader.
+            col("conbin", PgType::Text),
         ],
     )
 }
 
+/// Render the constraints [`crate::SystemCatalog::constraint_oids`] already
+/// numbered. Pure: it assigns nothing, so the OID a row reports is the same one
+/// `pg_get_constraintdef` resolves against.
 pub fn pg_constraint_rows(
-    relations: &[(u32, TableSchema)],
-    indexes: &[CatalogIndex],
+    constraints: &[CatalogConstraint],
     namespace_oids: &HashMap<String, u32>,
 ) -> Vec<Vec<Value>> {
     let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
-    let mut next_oid = 31000_u32;
-    let mut rows = Vec::new();
-    for (table_oid, schema) in relations {
-        for (position, column) in schema.columns.iter().enumerate() {
-            if let Some(name) = &column.not_null_constraint {
-                rows.push(constraint_row(
-                    next_oid,
-                    name,
-                    nsp_oid(&schema.namespace),
-                    "n",
-                    *table_oid,
-                    0,
-                    &[position],
-                ));
-                next_oid += 1;
-            }
-        }
-    }
-    for index in indexes {
-        if let Some(constraint) = index.metadata.constraint {
-            rows.push(constraint_row(
-                next_oid,
-                &index.metadata.name,
-                nsp_oid(&index.table_schema.namespace),
-                match constraint {
-                    IndexConstraint::PrimaryKey => "p",
-                    IndexConstraint::Unique => "u",
+    constraints
+        .iter()
+        .map(|c| {
+            vec![
+                Value::Oid(c.oid),
+                Value::Text(c.name.clone()),
+                Value::Oid(nsp_oid(&c.namespace)),
+                Value::Text(c.contype.to_string()),
+                // condeferrable / condeferred: DEFERRABLE is refused at DDL.
+                Value::Bool(false),
+                Value::Bool(false),
+                // conenforced.
+                Value::Bool(true),
+                Value::Bool(c.validated),
+                Value::Oid(c.table_oid),
+                // contypid: domain constraints are not modelled.
+                Value::Oid(0),
+                Value::Oid(c.index_oid),
+                // conparentid: a partition's copied constraint would point at
+                // its parent's; partitioned tables carry no checks here.
+                Value::Oid(0),
+                // confrelid: foreign keys are not supported.
+                Value::Oid(0),
+                Value::Bool(c.islocal),
+                Value::Int2(c.inhcount),
+                // connoinherit: `NO INHERIT` has no parser support, so nothing
+                // that exists here can be marked with it.
+                Value::Bool(false),
+                // NULL, not an empty array, when the constraint reads no column
+                // — PostgreSQL stores NULL for a predicate like `CHECK (1 > 0)`,
+                // so a client testing `conkey IS NULL` agrees. Probed against
+                // 18.4.
+                match c.columns.is_empty() {
+                    true => Value::Null,
+                    false => Value::Text(format!(
+                        "{{{}}}",
+                        c.columns
+                            .iter()
+                            .map(|column| (*column + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )),
                 },
-                index.table_oid,
-                index.oid,
-                &index
-                    .metadata
-                    .keys
-                    .iter()
-                    .map(|key| key.column)
-                    .collect::<Vec<_>>(),
-            ));
-            next_oid += 1;
-        }
-    }
-    rows
-}
-
-fn constraint_row(
-    oid: u32,
-    name: &str,
-    connamespace: u32,
-    kind: &str,
-    table_oid: u32,
-    index_oid: u32,
-    columns: &[usize],
-) -> Vec<Value> {
-    vec![
-        Value::Oid(oid),
-        Value::Text(name.to_string()),
-        Value::Oid(connamespace),
-        Value::Text(kind.to_string()),
-        Value::Bool(false),
-        Value::Bool(false),
-        Value::Bool(true),
-        Value::Oid(table_oid),
-        Value::Oid(index_oid),
-        Value::Text(format!(
-            "{{{}}}",
-            columns
-                .iter()
-                .map(|column| (column + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        )),
-    ]
+                match &c.expr {
+                    Some(expr) => Value::Text(expr.clone()),
+                    None => Value::Null,
+                },
+            ]
+        })
+        .collect()
 }
 
 pub fn pg_index_schema() -> TableSchema {

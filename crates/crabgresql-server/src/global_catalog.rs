@@ -314,6 +314,16 @@ impl FuncEntry {
         let args: Vec<String> = self.args.iter().map(TypeRef::display_name).collect();
         format!("{} {}({})", self.kind.noun(), self.name, args.join(", "))
     }
+
+    /// The same object, spelled the way a *dependency* error spells it —
+    /// `format_procedure`'s form, whose argument list has **no space** after the
+    /// comma: `function h(integer,text)`, against [`Self::describe`]'s
+    /// `function h(integer, text)`. Probed against PostgreSQL 18.4; the two
+    /// spellings really do differ, so they stay two methods.
+    fn object_description(&self) -> String {
+        let args: Vec<String> = self.args.iter().map(TypeRef::display_name).collect();
+        format!("{} {}({})", self.kind.noun(), self.name, args.join(","))
+    }
 }
 
 /// A registered routine as seen from outside the catalog — the shape `pg_proc`
@@ -1029,30 +1039,33 @@ impl GlobalCatalog {
     /// this catalog depends on a function — functions are only ever dependents of
     /// user types — so `CASCADE`/`RESTRICT` have no dependents to walk and are
     /// accepted without producing cascade notices.
-    pub fn drop_functions(
+    /// Resolve each `DROP FUNCTION`/`DROP PROCEDURE` target to the OID it names,
+    /// without removing anything. `None` marks an absent target `if_exists`
+    /// allows skipping.
+    ///
+    /// Separate from [`Self::drop_resolved_routines`] so the caller can look for
+    /// dependents in between — and that scan **re-enters this catalog** through
+    /// `TypeCatalog` to bind stored expressions, which a write lock held across
+    /// it would deadlock (`RwLock` is not reentrant). Hence a read lock here and
+    /// the write lock only in the second half.
+    pub fn resolve_drop_routines(
         &self,
         specs: &[FuncDropSpec],
         kind: RoutineKind,
-        _cascade: bool,
         if_exists: bool,
-    ) -> Result<Vec<CatalogNotice>, PgError> {
-        let mut cat = self
+    ) -> Result<Vec<ResolvedRoutine>, PgError> {
+        let cat = self
             .inner
-            .write()
+            .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        // Phase 1: resolve each target to the OID to remove. `None` marks an
-        // absent target that `if_exists` allows skipping (its NOTICE is emitted
-        // in phase 2). Any hard error here aborts before removing anything.
-        let mut resolved: Vec<Option<u32>> = Vec::with_capacity(specs.len());
+        let mut resolved: Vec<ResolvedRoutine> = Vec::with_capacity(specs.len());
         for spec in specs {
-            resolved.push(cat.resolve_drop_func(spec, kind, if_exists)?);
-        }
-        // Two targets that resolve to the same function (identical signatures, or
-        // a bare name and its signature) name one object twice — PG rejects that
-        // with 42710, rendering the function's real signature.
-        for i in 0..resolved.len() {
-            if let Some(oid) = resolved[i]
-                && resolved[..i].contains(&Some(oid))
+            let oid = cat.resolve_drop_func(spec, kind, if_exists)?;
+            // Two targets that resolve to the same function (identical
+            // signatures, or a bare name and its signature) name one object
+            // twice — PG rejects that with 42710, rendering the real signature.
+            if let Some(oid) = oid
+                && resolved.iter().any(|r| r.oid == Some(oid))
             {
                 let desc = cat
                     .func(oid)
@@ -1063,11 +1076,30 @@ impl GlobalCatalog {
                     format!("{desc} specified more than once"),
                 ));
             }
+            resolved.push(ResolvedRoutine {
+                oid,
+                description: oid
+                    .and_then(|oid| cat.func(oid).map(FuncEntry::object_description))
+                    .unwrap_or_else(|| spec.describe()),
+            });
         }
-        // Phase 2: remove the resolved functions and collect skip NOTICEs.
+        Ok(resolved)
+    }
+
+    /// Remove what [`Self::resolve_drop_routines`] resolved, collecting the
+    /// skip NOTICEs for absent targets.
+    pub fn drop_resolved_routines(
+        &self,
+        specs: &[FuncDropSpec],
+        resolved: &[ResolvedRoutine],
+    ) -> Vec<CatalogNotice> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
         let mut notices = Vec::new();
-        for (spec, oid) in specs.iter().zip(resolved) {
-            match oid {
+        for (spec, r) in specs.iter().zip(resolved) {
+            match r.oid {
                 Some(oid) => cat.remove_func(oid),
                 None => notices.push(CatalogNotice::new(format!(
                     "{} does not exist, skipping",
@@ -1075,8 +1107,17 @@ impl GlobalCatalog {
                 ))),
             }
         }
-        Ok(notices)
+        notices
     }
+}
+
+/// One `DROP FUNCTION` target, resolved but not yet removed.
+pub struct ResolvedRoutine {
+    /// `None` for a target that does not exist and `IF EXISTS` allowed.
+    pub oid: Option<u32>,
+    /// How PostgreSQL names this object in a dependency error — see
+    /// [`FuncEntry::object_description`].
+    pub description: String,
 }
 
 /// Query-time view: lets the binder resolve a user type name in a cast target

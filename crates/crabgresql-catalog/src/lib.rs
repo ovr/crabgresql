@@ -30,8 +30,8 @@ mod static_table;
 use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{
-    Column, IndexMetadata, RelPersistence, RelStats, RelationMetadata, StorageError, TableAm,
-    TableEngine, TableSchema,
+    Column, IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationMetadata,
+    StorageError, TableAm, TableEngine, TableSchema,
 };
 use crabgresql_types::{PgType, Value};
 
@@ -53,6 +53,41 @@ struct CatalogIndex {
     table_oid: u32,
     table_schema: TableSchema,
     metadata: IndexMetadata,
+}
+
+/// One row of `pg_constraint`, resolved to an OID before anything renders it.
+///
+/// The rows used to be built and numbered in the same pass, from a counter local
+/// to the renderer. That was enough while `pg_constraint` was only ever read as a
+/// table, but `pg_get_constraintdef(oid)` looks a constraint up *by* its OID, so
+/// the numbering has to exist independently of the rendering — and in the same
+/// monotone band as every other relation-shaped object, or a constraint OID
+/// could collide with a relation's.
+#[derive(Clone)]
+pub struct CatalogConstraint {
+    pub oid: u32,
+    pub name: String,
+    /// `pg_constraint.contype`: `n` not-null, `p` primary key, `u` unique,
+    /// `c` check.
+    pub contype: &'static str,
+    /// The namespace of the table it constrains — resolved to `connamespace` by
+    /// whoever renders the row.
+    pub namespace: String,
+    pub table_oid: u32,
+    /// The backing index for `p`/`u`, `0` for a constraint with no index.
+    pub index_oid: u32,
+    /// Constrained column positions, zero-based; rendered as `conkey`'s
+    /// one-based array.
+    pub columns: Vec<usize>,
+    /// `pg_constraint.conbin` for a check constraint: the predicate as stored
+    /// SQL. `None` for every other `contype`, which has no expression.
+    pub expr: Option<String>,
+    /// `convalidated` / `conislocal` / `coninhcount`. The non-check contypes
+    /// have no way to be unvalidated or inherited here, so they report
+    /// `(true, true, 0)`.
+    pub validated: bool,
+    pub islocal: bool,
+    pub inhcount: i16,
 }
 
 /// A table's out-of-line ("TOAST") relation, as `pg_class` publishes it.
@@ -430,6 +465,7 @@ pub struct SystemCatalog {
     stats: OnceLock<Vec<RelStats>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     toast_oids: OnceLock<Vec<CatalogToast>>,
+    constraint_oids: OnceLock<Vec<CatalogConstraint>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
@@ -483,6 +519,7 @@ impl SystemCatalog {
             stats: OnceLock::new(),
             index_oids: OnceLock::new(),
             toast_oids: OnceLock::new(),
+            constraint_oids: OnceLock::new(),
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
@@ -702,6 +739,128 @@ impl SystemCatalog {
         })
     }
 
+    /// The constraints of this snapshot, assigned OIDs from a **fourth block**
+    /// beginning after the TOAST block — extending the invariant
+    /// [`SystemCatalog::toast_oids`] documents by one more segment, for the same
+    /// reason: appending keeps every OID that already existed where it was.
+    ///
+    /// Order within the block is not-null constraints first (by relation, then
+    /// column position), then the index-backed ones in index-OID order. It only
+    /// has to be *deterministic* — `pg_constraint` rows carry no inherent order,
+    /// and callers that want one sort by `conname`.
+    fn constraint_oids(&self) -> &[CatalogConstraint] {
+        self.constraint_oids.get_or_init(|| {
+            let indexes = self.index_oids();
+            let first = FIRST_REL_OID
+                + self.relation_oids().len() as u32
+                + indexes.len() as u32
+                + self.toast_oids().len() as u32;
+            let mut out = Vec::new();
+            for (table_oid, schema) in self.relation_oids() {
+                for (position, column) in schema.columns.iter().enumerate() {
+                    // A PRIMARY KEY implies non-nullability without a catalog
+                    // entry of its own, so only an explicitly named one is a row.
+                    let Some(name) = &column.not_null_constraint else {
+                        continue;
+                    };
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: name.clone(),
+                        contype: "n",
+                        namespace: schema.namespace.clone(),
+                        table_oid: *table_oid,
+                        index_oid: 0,
+                        columns: vec![position],
+                        expr: None,
+                        validated: true,
+                        islocal: true,
+                        inhcount: 0,
+                    });
+                }
+                for check in &schema.checks {
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: check.name.clone(),
+                        contype: "c",
+                        namespace: schema.namespace.clone(),
+                        table_oid: *table_oid,
+                        // A check is not index-backed.
+                        index_oid: 0,
+                        columns: check.columns.clone(),
+                        expr: Some(check.expr.clone()),
+                        validated: check.validated,
+                        islocal: check.islocal,
+                        inhcount: check.inhcount,
+                    });
+                }
+            }
+            for index in indexes {
+                let Some(constraint) = index.metadata.constraint else {
+                    continue;
+                };
+                out.push(CatalogConstraint {
+                    oid: first + out.len() as u32,
+                    // An index-backed constraint and its index share a name.
+                    name: index.metadata.name.clone(),
+                    contype: match constraint {
+                        IndexConstraint::PrimaryKey => "p",
+                        IndexConstraint::Unique => "u",
+                    },
+                    namespace: index.table_schema.namespace.clone(),
+                    table_oid: index.table_oid,
+                    index_oid: index.oid,
+                    columns: index.metadata.keys.iter().map(|key| key.column).collect(),
+                    expr: None,
+                    validated: true,
+                    islocal: true,
+                    inhcount: 0,
+                });
+            }
+            out
+        })
+    }
+
+    /// The constraint `oid` identifies, resolved against the same numbering
+    /// [`SystemCatalog::constraint_oids`] hands out — so `pg_get_constraintdef`
+    /// and the `pg_constraint` rows agree by construction.
+    ///
+    /// Column *names* rather than positions, because the caller renders DDL and
+    /// has no schema in hand. An unknown OID is `None`, which PostgreSQL reports
+    /// as a NULL result rather than an error.
+    ///
+    /// Both lookups index rather than scan: each block is one dense run, so the
+    /// offset from its base *is* the position. `pg_get_constraintdef` runs once
+    /// per output row, and a linear scan here made
+    /// `SELECT pg_get_constraintdef(oid) FROM pg_constraint` quadratic — over a
+    /// list whose elements are whole `TableSchema`s. The stored OID is still
+    /// compared afterwards, so a future non-positional assignment degrades to
+    /// not-found rather than to the wrong constraint (as in [`Self::relation_ref`]).
+    pub fn constraint_def(&self, oid: u32) -> Option<(String, Vec<String>, Option<String>)> {
+        let constraints = self.constraint_oids();
+        let base = constraints.first()?.oid;
+        let constraint = constraints.get(oid.checked_sub(base)? as usize)?;
+        if constraint.oid != oid {
+            return None;
+        }
+        let relations = self.relation_oids();
+        let (stored, schema) =
+            relations.get(constraint.table_oid.checked_sub(FIRST_REL_OID)? as usize)?;
+        if *stored != constraint.table_oid {
+            return None;
+        }
+        let columns = constraint
+            .columns
+            .iter()
+            .filter_map(|position| schema.columns.get(*position))
+            .map(|column| column.name.clone())
+            .collect();
+        Some((
+            constraint.contype.to_string(),
+            columns,
+            constraint.expr.clone(),
+        ))
+    }
+
     /// The name of the role `oid` identifies, or `None` if no role has that OID.
     /// Every catalog row reports [`schema::BOOTSTRAP_ROLE_OID`] as its owner
     /// (crabgresql has no role catalog), so exactly one OID resolves — to this
@@ -853,11 +1012,7 @@ impl SystemCatalog {
             )),
             "pg_constraint" => Some((
                 schema::pg_constraint_schema(),
-                schema::pg_constraint_rows(
-                    self.relation_oids(),
-                    self.index_oids(),
-                    &self.namespace_oids(),
-                ),
+                schema::pg_constraint_rows(self.constraint_oids(), &self.namespace_oids()),
             )),
             "pg_index" => Some((
                 schema::pg_index_schema(),

@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent, PartitionBound,
-    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
-    SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema, ViewDefinition,
+    CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
+    PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
+    RelPersistence, SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema,
+    ViewDefinition,
 };
 use crabgresql_types::PgType;
 
@@ -108,6 +109,13 @@ const TOAST_MAGIC: &[u8; 4] = b"TOA1";
 /// relation with no parents, which is what every relation written before this
 /// tail had.
 const INHERIT_MAGIC: &[u8; 4] = b"INH1";
+/// Marks the CHECK-constraint section, appended after the [`INHERIT_MAGIC`]
+/// block — a fourteenth backward-compatible tail carrying each relation's
+/// `CHECK` predicates as canonical SQL. A reader that predates CHECK support
+/// stops above and decodes every relation with no constraints, which is exactly
+/// what every relation written before this tail had: the DDL that declares one
+/// was rejected outright.
+const CHECK_MAGIC: &[u8; 4] = b"CHK1";
 
 struct PersistCol {
     name: String,
@@ -153,6 +161,10 @@ struct PersistRel {
     /// The relation's layout sort key, persisted in the [`SORT_MAGIC`] tail.
     /// Empty for a heap relation and for one written before that tail existed.
     sort_key: Vec<IndexKey>,
+    /// The relation's `CHECK` constraints, persisted in the [`CHECK_MAGIC`]
+    /// tail. Empty for a relation with none and for one written before that
+    /// tail existed.
+    checks: Vec<CheckConstraint>,
     /// What `ANALYZE` last measured, persisted in the [`STAT_MAGIC`] tail.
     /// `None` means never analyzed.
     stats: Option<PersistStats>,
@@ -282,6 +294,7 @@ impl RelCatalog {
                         partition_of: r.partition_of.clone(),
                         inherits: r.inherits.clone(),
                         sort_key: r.sort_key.clone(),
+                        checks: r.checks.clone(),
                     },
                     r.indexes
                         .iter()
@@ -335,6 +348,7 @@ impl RelCatalog {
             partition_of: schema.partition_of.clone(),
             inherits: schema.inherits.clone(),
             sort_key: schema.sort_key.clone(),
+            checks: schema.checks.clone(),
             // No chunk store until a row needs one.
             toast_rel: 0,
             // A brand-new relation has never been analyzed.
@@ -699,6 +713,55 @@ impl RelCatalog {
         for &c in columns {
             r.cols[c].nullable = false;
         }
+        self.persist(&state)
+    }
+
+    /// Append a `CHECK` constraint to a relation, durably.
+    ///
+    /// One whole-file [`Self::persist`], like [`Self::set_column_not_null`]: the
+    /// constraint is either wholly present after a crash or wholly absent, and a
+    /// half-written predicate — which would be re-bound at the next DML and fail
+    /// the statement — is unrepresentable.
+    ///
+    /// A name already on the relation is a caller bug: the server dedupes
+    /// against the live schema before it gets here, and silently merging two
+    /// constraints under one name would hide whichever predicate lost.
+    pub fn add_check_constraint(
+        &self,
+        namespace: &str,
+        table: &str,
+        check: CheckConstraint,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let Some(r) = state
+            .rels
+            .iter_mut()
+            .find(|r| r.namespace == namespace && r.name == table)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("relation \"{namespace}.{table}\" does not exist"),
+            ));
+        };
+        if r.checks.iter().any(|c| c.name == check.name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "constraint \"{}\" already exists on relation \"{namespace}.{table}\"",
+                    check.name
+                ),
+            ));
+        }
+        if let Some(&out) = check.columns.iter().find(|&&c| c >= r.cols.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("column {out} is out of range for relation \"{namespace}.{table}\""),
+            ));
+        }
+        r.checks.push(check);
         self.persist(&state)
     }
 
@@ -1325,6 +1388,26 @@ fn encode(state: &State) -> Vec<u8> {
             put_str(&mut out, &parent.name);
         }
     }
+    // CHECK constraints: a fourteenth backward-compatible tail, a
+    // length-prefixed run per relation. Absent in a pre-CHECK file, where every
+    // relation decodes with none — which is what those relations have, since the
+    // DDL that declares one used to be rejected.
+    out.extend_from_slice(CHECK_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.checks.len() as u32).to_le_bytes());
+        for check in &r.checks {
+            put_str(&mut out, &check.name);
+            put_str(&mut out, &check.expr);
+            out.extend_from_slice(&(check.columns.len() as u32).to_le_bytes());
+            for column in &check.columns {
+                out.extend_from_slice(&(*column as u32).to_le_bytes());
+            }
+            out.push(check.validated as u8);
+            out.push(check.islocal as u8);
+            out.extend_from_slice(&check.inhcount.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -1372,6 +1455,14 @@ impl<'a> Dec<'a> {
     fn i32(&mut self) -> i32 {
         let v = i32::from_le_bytes(self.array());
         self.p += 4;
+        v
+    }
+    /// A `smallint`-width catalog field — today only `coninhcount`, which is
+    /// `int2` in PostgreSQL and stored at its true width so a deep inheritance
+    /// hierarchy cannot silently wrap a narrower one.
+    fn i16(&mut self) -> i16 {
+        let v = i16::from_le_bytes(self.array());
+        self.p += 2;
         v
     }
     fn i64(&mut self) -> i64 {
@@ -1497,6 +1588,8 @@ fn decode(bytes: &[u8]) -> State {
             inherits: Vec::new(),
             // Default to no declared order; overridden below from the SRT1 tail.
             sort_key: Vec::new(),
+            // Default to no constraints; overridden below from the CHK1 tail.
+            checks: Vec::new(),
             // Default to never analyzed; overridden below from the STA1 tail.
             stats: None,
             // Default to no chunk store; overridden below from the TOA1 tail.
@@ -1805,6 +1898,35 @@ fn decode(bytes: &[u8]) -> State {
                 .collect();
         }
     }
+    // CHECK tail: absent means no relation carries a check constraint, which is
+    // both the legacy state and the state of every table declared without one.
+    if d.remaining().starts_with(CHECK_MAGIC) {
+        d.p += CHECK_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let nchecks = d.u32();
+            r.checks = (0..nchecks)
+                .map(|_| {
+                    // Read in the order `encode` wrote, not field order.
+                    let name = d.s();
+                    let expr = d.s();
+                    let ncols = d.u32();
+                    let columns = (0..ncols).map(|_| d.u32() as usize).collect();
+                    let validated = d.byte() != 0;
+                    let islocal = d.byte() != 0;
+                    let inhcount = d.i16();
+                    CheckConstraint {
+                        name,
+                        expr,
+                        columns,
+                        validated,
+                        islocal,
+                        inhcount,
+                    }
+                })
+                .collect();
+        }
+    }
     State {
         next,
         rels,
@@ -2078,6 +2200,79 @@ mod tests {
             assert!(
                 schema.sort_key.is_empty(),
                 "a catalog written before the tail existed must decode with no order ({name})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn check_constraints_round_trip_and_a_legacy_catalog_decodes_with_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        let mut schema = TableSchema::new(
+            "orders",
+            vec![
+                Column::new("id", PgType::Int4),
+                Column::new("qty", PgType::Int4),
+            ],
+        );
+        // Two constraints whose every field differs, so a codec that dropped one
+        // or transposed a pair still fails: `validated`/`islocal` are adjacent
+        // bytes and would be invisible to a fixture where they agree, and
+        // `inhcount` is the only multi-byte field after them.
+        schema.checks = vec![
+            CheckConstraint {
+                name: "orders_qty_check".to_string(),
+                expr: "(qty > 0)".to_string(),
+                columns: vec![1],
+                validated: true,
+                islocal: false,
+                inhcount: 2,
+            },
+            CheckConstraint {
+                name: "orders_check".to_string(),
+                expr: "((id + qty) < 100)".to_string(),
+                columns: vec![0, 1],
+                validated: false,
+                islocal: true,
+                inhcount: 0,
+            },
+        ];
+        catalog.create(&schema)?;
+        catalog.create(&TableSchema::new(
+            "plain",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let checks = |name: &str| {
+            loaded
+                .schemas()
+                .into_iter()
+                .find(|(rel_name, _, _, _, _)| rel_name == name)
+                .map(|(_, _, _, schema, _)| schema.checks)
+        };
+        assert_eq!(checks("orders"), Some(schema.checks.clone()));
+        // An unconstrained relation must not borrow its neighbour's list when
+        // the tail zips by position.
+        assert_eq!(checks("plain"), Some(Vec::new()));
+        drop(loaded);
+
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(CHECK_MAGIC.len())
+            .position(|window| window == CHECK_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("check constraint marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let schemas = legacy.schemas();
+        assert!(!schemas.is_empty(), "legacy catalog is empty");
+        for (name, _, _, schema, _) in schemas {
+            assert!(
+                schema.checks.is_empty(),
+                "a catalog written before the tail existed must decode with no checks ({name})"
             );
         }
         Ok(())

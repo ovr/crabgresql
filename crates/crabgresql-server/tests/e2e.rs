@@ -6387,9 +6387,11 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
         "ALTER TABLE t DROP CONSTRAINT nope",
         "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
         "ALTER TABLE t RENAME TO t2",
-        "ALTER TABLE t ADD CHECK (a > 0)",
         "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES t (a)",
         "ALTER TABLE t ADD PRIMARY KEY (a) NOT VALID",
+        // A CHECK *is* supported now; only these two spellings of it are not.
+        "ALTER TABLE t ADD CHECK (a > 0) NOT VALID",
+        "ALTER TABLE t ADD CHECK (a > 0) NOT ENFORCED",
         "ALTER TABLE t ADD UNIQUE (b) DEFERRABLE",
         "ALTER TABLE public.t ADD UNIQUE (b)",
     ] {
@@ -6399,6 +6401,250 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
             "expected {sql} to be rejected as unsupported"
         );
     }
+    Ok(())
+}
+
+/// The pre-flight scan of `ALTER TABLE ... ADD CHECK` runs under the same
+/// fully-wired runtime a statement gets, so a predicate calling a routine, a
+/// sequence or a catalog function validates instead of failing internally. It
+/// used to run under a bare formatting context, which made the DDL succeed on an
+/// empty table and fail with XX000 on a populated one.
+#[tokio::test]
+async fn alter_table_add_check_evaluates_a_routine_over_existing_rows() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION positive(int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0';
+             CREATE TABLE t (x int);
+             INSERT INTO t VALUES (5)",
+        )
+        .await?;
+    // The row satisfies it, so the constraint lands.
+    client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT c1 CHECK (positive(x))")
+        .await?;
+    // And enforces from then on — the same predicate, the same runtime.
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (-1)")
+        .await
+        .expect_err("-1 fails positive()");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::CHECK_VIOLATION
+    );
+    // A row that violates it is reported as a constraint violation, not as an
+    // internal error from an unwired context.
+    client.batch_execute("CREATE TABLE u (x int)").await?;
+    client.batch_execute("INSERT INTO u VALUES (-3)").await?;
+    let e = client
+        .batch_execute("ALTER TABLE u ADD CONSTRAINT c2 CHECK (positive(x))")
+        .await
+        .expect_err("the existing row fails");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "check constraint \"c2\" of relation \"u\" is violated by some row"
+    );
+    Ok(())
+}
+
+/// `DROP FUNCTION` refuses to strand a stored expression that calls it, the way
+/// PostgreSQL's `pg_depend` does — for a CHECK predicate and a column DEFAULT
+/// alike. Without this the drop succeeded and left the relation unwritable.
+#[tokio::test]
+async fn drop_function_reports_stored_expression_dependents() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION g(int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0';
+             CREATE TABLE gt (x int, CHECK (g(x)));
+             CREATE FUNCTION h() RETURNS int LANGUAGE sql AS 'SELECT 7';
+             CREATE TABLE dt (y int DEFAULT h())",
+        )
+        .await?;
+
+    let e = client
+        .batch_execute("DROP FUNCTION g(int)")
+        .await
+        .expect_err("a CHECK depends on it");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        db.message(),
+        "cannot drop function g(integer) because other objects depend on it"
+    );
+    assert_eq!(
+        db.detail(),
+        Some("constraint gt_x_check on table gt depends on function g(integer)")
+    );
+    assert_eq!(
+        db.hint(),
+        Some("Use DROP ... CASCADE to drop the dependent objects too.")
+    );
+
+    let e = client
+        .batch_execute("DROP FUNCTION h()")
+        .await
+        .expect_err("a DEFAULT depends on it");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.detail(),
+        Some("default value for column y of table dt depends on function h()")
+    );
+
+    // The refusal is total: the function is still callable and the relation is
+    // still writable.
+    client.batch_execute("INSERT INTO gt VALUES (1)").await?;
+
+    // A different overload is a different object.
+    client
+        .batch_execute(
+            "CREATE FUNCTION g(text) RETURNS bool LANGUAGE sql AS 'SELECT true';
+             DROP FUNCTION g(text)",
+        )
+        .await?;
+
+    // CASCADE would have to drop the constraint, and nothing here can — so it is
+    // refused rather than reported as done.
+    let e = client
+        .batch_execute("DROP FUNCTION g(int) CASCADE")
+        .await
+        .expect_err("CASCADE cannot drop the dependent constraint");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // Once the dependent is gone, so is the objection.
+    client
+        .batch_execute("DROP TABLE gt; DROP FUNCTION g(int)")
+        .await?;
+    Ok(())
+}
+
+/// A dependency is *direct*, as in PostgreSQL: a routine reached only through an
+/// inlined SQL body is not one, so dropping it succeeds — while the routine the
+/// expression names itself stays protected, even after that inner drop has made
+/// the body unbindable.
+#[tokio::test]
+async fn drop_function_dependency_is_direct_only() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION base() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE FUNCTION wrap() RETURNS int LANGUAGE sql AS 'SELECT base()';
+             CREATE TABLE wt (x int DEFAULT wrap())",
+        )
+        .await?;
+    // Reached only through `wrap`'s inlined body — not a dependency.
+    client.batch_execute("DROP FUNCTION base()").await?;
+    // Named by the default itself — still a dependency, even though the body no
+    // longer binds.
+    let e = client
+        .batch_execute("DROP FUNCTION wrap()")
+        .await
+        .expect_err("the default names wrap() directly");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+    Ok(())
+}
+
+/// A subquery in a CHECK predicate is refused with PostgreSQL's own wording and
+/// SQLSTATE — `0A000`, not the `42P17` the constraint-violation family might
+/// suggest. Lives here rather than in the smoke suite because PostgreSQL puts
+/// the error cursor on the subquery's opening paren and this parser's span for a
+/// parenthesised subquery starts at `SELECT`, so the `LINE n: … ^` line cannot
+/// match byte-for-byte.
+#[tokio::test]
+async fn check_constraint_rejects_a_subquery() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let e = client
+        .batch_execute("CREATE TABLE t (a int CHECK ((SELECT true)))")
+        .await
+        .expect_err("a subquery in a CHECK is refused");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(db.message(), "cannot use subquery in check constraint");
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD CONSTRAINT ... CHECK`: the existing rows are scanned
+/// before it lands, and the constraint enforces from then on.
+#[tokio::test]
+async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (5)")
+        .await?;
+
+    // A row already in the table fails the predicate: rejected, and — unlike a
+    // DML-time violation — with no DETAIL naming the row.
+    let e = client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a > 3)")
+        .await
+        .expect_err("row a = 1 violates a > 3");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "check constraint \"vc\" of relation \"t\" is violated by some row"
+    );
+    assert_eq!(db.detail(), None);
+    // The refusal is total: nothing was recorded.
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_constraint WHERE contype = 'c'")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("0"));
+
+    // A predicate every row satisfies lands, and enforces from then on.
+    client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a > 0)")
+        .await?;
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (-1)")
+        .await
+        .expect_err("-1 violates the constraint just added");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::CHECK_VIOLATION
+    );
+
+    // The name is taken now. A collision in the *constraint* namespace is 42710;
+    // 42P07 is what a collision in the *relation* namespace raises (a plain
+    // index, a table), which a CHECK never enters.
+    let e = client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a < 9)")
+        .await
+        .expect_err("the name is taken");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::DUPLICATE_OBJECT);
+    assert_eq!(
+        db.message(),
+        "constraint \"vc\" for relation \"t\" already exists"
+    );
+
+    // An unnamed one is named from the predicate, not from where it was written:
+    // one referenced column gives `{table}_{column}_check`.
+    client
+        .batch_execute("ALTER TABLE t ADD CHECK (a < 1000)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE contype = 'c' ORDER BY conname",
+        )
+        .await?;
+    let found = rows(&msgs);
+    assert_eq!(found[0].get(0), Some("t_a_check"));
+    assert_eq!(found[0].get(1), Some("CHECK ((a < 1000))"));
+    assert_eq!(found[1].get(0), Some("vc"));
     Ok(())
 }
 

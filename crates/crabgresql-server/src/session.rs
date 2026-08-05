@@ -19,7 +19,7 @@ use crate::query::RowTag;
 use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
-use crabgresql_storage_api::{SequenceAdvance, TableEngine, Tuple};
+use crabgresql_storage_api::{SequenceAdvance, TableEngine, Tuple, TypeCatalog};
 use crabgresql_txn::{
     CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
 };
@@ -810,11 +810,17 @@ impl Session {
     /// `nextval()` can run and update this session's `currval`/`lastval`) and to
     /// read `catalog` (so `pg_get_userbyid` / `pg_table_is_visible` resolve
     /// against this statement's catalog snapshot).
+    ///
+    /// `type_catalog` is the same snapshot the statement bound against, handed
+    /// on so the executor can bind a relation's stored CHECK constraints — the
+    /// one binding it cannot hoist into the planner, because a partition leaf's
+    /// or an inheritance child's schema is only reached mid-statement.
     #[allow(clippy::too_many_arguments)]
     pub fn exec_context_for_statement(
         &self,
         engine: &Arc<dyn TableEngine>,
         catalog: &Arc<dyn CatalogOps>,
+        type_catalog: &Arc<dyn TypeCatalog>,
         routines: Arc<dyn RoutineOps>,
         command_counter: Arc<AtomicU32>,
         read_only: bool,
@@ -828,6 +834,7 @@ impl Session {
             ))),
             catalog: Some(Arc::clone(catalog)),
             gucs: Some(Arc::new(GucSnapshot(crate::guc::snapshot(self)))),
+            types: Some(Arc::clone(type_catalog)),
             txn: None,
             routines: Some(routines),
             notices: Some(Arc::clone(&self.notices) as Arc<dyn NoticeSink>),
