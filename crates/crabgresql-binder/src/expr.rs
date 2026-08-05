@@ -3947,18 +3947,23 @@ pub fn declared_typmod(ty: PgType, dt: &ast::DataType) -> Result<Option<i32>, Bi
 
 /// Coerce `expr` to an `interval` modifier, folding a constant at bind time.
 /// Cast and assignment context coerce identically, so this serves both.
-fn apply_interval_typmod(expr: BoundExpr, typmod: i32) -> BoundExpr {
+///
+/// Folding can fail the way the runtime call would: rounding a `usec` at the
+/// `i64` extreme to a declared precision is "interval out of range".
+fn apply_interval_typmod(expr: BoundExpr, typmod: i32) -> Result<BoundExpr, BindError> {
     if let BoundExpr::Const {
         value: Value::Interval(iv),
         ty,
     } = &expr
     {
-        return BoundExpr::Const {
-            value: Value::Interval(crabgresql_types::interval::apply_typmod(*iv, typmod)),
+        let iv = crabgresql_types::interval::apply_typmod(*iv, typmod)
+            .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        return Ok(BoundExpr::Const {
+            value: Value::Interval(iv),
             ty: *ty,
-        };
+        });
     }
-    BoundExpr::FuncCall {
+    Ok(BoundExpr::FuncCall {
         func: ScalarFn::IntervalTypmod,
         ret: PgType::Interval,
         args: vec![
@@ -3968,7 +3973,7 @@ fn apply_interval_typmod(expr: BoundExpr, typmod: i32) -> BoundExpr {
                 ty: PgType::Int4,
             },
         ],
-    }
+    })
 }
 
 /// Round `expr` to a datetime type's fractional-second precision, folding a
@@ -4044,7 +4049,7 @@ pub(crate) fn apply_length_typmod_if_any(
             }
         }
         PgType::Interval => match interval_typmod(data_type) {
-            Some(m) => return Ok(apply_interval_typmod(expr, m)),
+            Some(m) => return apply_interval_typmod(expr, m),
             None => return Ok(expr),
         },
         // `"char"` takes no modifier and PG rejects one rather than ignoring
@@ -4167,7 +4172,8 @@ fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     // cast would carry. No qualifier at all leaves the literal's own units to
     // speak for themselves.
     let iv = match interval_literal_typmod(node) {
-        Some(typmod) => interval::apply_typmod(iv, typmod),
+        Some(typmod) => interval::apply_typmod(iv, typmod)
+            .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?,
         None => iv,
     };
     Ok(Binding::Typed(BoundExpr::Const {
@@ -9351,7 +9357,7 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
             PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
                 return apply_datetime_precision(expr, column.typmod);
             }
-            PgType::Interval => return Ok(apply_interval_typmod(expr, column.typmod)),
+            PgType::Interval => return apply_interval_typmod(expr, column.typmod),
             _ => {}
         }
     }

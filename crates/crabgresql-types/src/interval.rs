@@ -386,9 +386,15 @@ pub fn range_name(range: u16) -> Option<&'static str> {
 ///
 /// A negative modifier, an unnamed bit combination, or a non-finite value all
 /// leave the interval unchanged.
-pub fn apply_typmod(iv: Interval, typmod: i32) -> Interval {
+///
+/// Rounding is the one step that can fail: a `usec` near the `i64` extreme has
+/// no room for the half-unit the rounding adds, and PG reports that as `interval
+/// out of range` rather than saturating (`interval '2562047788:00:54.775807'
+/// second(2)` is an error, while the same literal without a precision is a
+/// perfectly good value).
+pub fn apply_typmod(iv: Interval, typmod: i32) -> Result<Interval, IntervalError> {
     if typmod < 0 || !iv.is_finite() {
-        return iv;
+        return Ok(iv);
     }
     let (range, precision) = unpack_typmod(typmod);
     if range == FULL_RANGE {
@@ -416,23 +422,29 @@ pub fn apply_typmod(iv: Interval, typmod: i32) -> Interval {
         out.days = 0;
         out.usec = 0;
     }
-    out
+    Ok(out)
 }
 
-fn round_usec(mut iv: Interval, precision: Option<u8>) -> Interval {
-    let Some(p) = precision else { return iv };
+/// Round `iv.usec` to `precision` fractional-second digits, half away from zero.
+///
+/// The rounding runs on the magnitude so the two signs mirror each other, and
+/// both steps are checked: `i64::MIN` has no positive counterpart, and adding
+/// the half-unit can carry past `i64::MAX`. Either way the value has no rounded
+/// form that fits, which is the "interval out of range" PG raises.
+fn round_usec(mut iv: Interval, precision: Option<u8>) -> Result<Interval, IntervalError> {
+    let Some(p) = precision else { return Ok(iv) };
     let p = p as i32;
     if !(0..crate::timestamp::MAX_PRECISION).contains(&p) {
-        return iv;
+        return Ok(iv);
     }
     let scale = 10_i64.pow((crate::timestamp::MAX_PRECISION - p) as u32);
     let half = scale / 2;
-    iv.usec = if iv.usec >= 0 {
-        (iv.usec + half) / scale * scale
-    } else {
-        -((-iv.usec + half) / scale * scale)
-    };
-    iv
+    let magnitude = iv.usec.checked_abs().ok_or_else(out_of_range)?;
+    let rounded = magnitude.checked_add(half).ok_or_else(out_of_range)? / scale * scale;
+    // `rounded <= magnitude` after the truncating divide, so negating it back
+    // cannot overflow.
+    iv.usec = if iv.usec < 0 { -rounded } else { rounded };
+    Ok(iv)
 }
 
 // --- comparison ------------------------------------------------------------
@@ -1308,6 +1320,14 @@ mod tests {
     fn out(s: &str) -> String {
         format(iv(s))
     }
+    /// `apply_typmod` for the cases that are expected to fit; the overflow ones
+    /// are checked against the error directly.
+    fn coerce(value: Interval, typmod: i32) -> Interval {
+        match apply_typmod(value, typmod) {
+            Ok(value) => value,
+            Err(error) => panic!("typmod {typmod} rejected {value:?}: {error:?}"),
+        }
+    }
 
     /// Every spelling of the modifier, with the `atttypmod` PostgreSQL 18.4
     /// stores for a column declared that way.
@@ -1412,7 +1432,7 @@ mod tests {
     #[test]
     fn typmod_coerces_the_value() {
         let src = iv("1 year 2 months 3 days 4:05:06.789");
-        let apply = |range, precision| format(apply_typmod(src, pack_typmod(range, precision)));
+        let apply = |range, precision| format(coerce(src, pack_typmod(range, precision)));
 
         assert_eq!(apply(MASK_YEAR, None), "1 year");
         assert_eq!(apply(MASK_MONTH, None), "1 year 2 mons");
@@ -1435,24 +1455,54 @@ mod tests {
 
         // Rounding is half away from zero, and truncation is toward zero, so a
         // negative interval mirrors the positive one rather than drifting down.
-        let round = |s: &str, p| format(apply_typmod(iv(s), pack_typmod(FULL_RANGE, Some(p))));
+        let round = |s: &str, p| format(coerce(iv(s), pack_typmod(FULL_RANGE, Some(p))));
         assert_eq!(round("0.005 sec", 2), "00:00:00.01");
         assert_eq!(round("-0.005 sec", 2), "-00:00:00.01");
         assert_eq!(round("0.015 sec", 2), "00:00:00.02");
         assert_eq!(
-            format(apply_typmod(
-                iv("-1 day -2:30:00"),
-                pack_typmod(MASK_HOUR, None)
-            )),
+            format(coerce(iv("-1 day -2:30:00"), pack_typmod(MASK_HOUR, None))),
             "-1 days -02:00:00"
         );
 
         // `±infinity` and "no modifier" pass through untouched.
         assert_eq!(
-            apply_typmod(POS_INFINITY, pack_typmod(MASK_YEAR, None)),
+            coerce(POS_INFINITY, pack_typmod(MASK_YEAR, None)),
             POS_INFINITY
         );
-        assert_eq!(apply_typmod(src, -1), src);
+        assert_eq!(coerce(src, -1), src);
+    }
+
+    /// A `usec` at either `i64` extreme is a perfectly good interval, but it has
+    /// no room for the half-unit rounding adds, so declaring a precision on it
+    /// is an error rather than a saturated value. PostgreSQL 18.4:
+    /// `SELECT interval '2562047788:00:54.775807' second(2)` is
+    /// `ERROR: interval out of range`.
+    #[test]
+    fn rounding_overflow_is_out_of_range() {
+        let extremes = [
+            Interval {
+                months: 0,
+                days: 0,
+                usec: i64::MAX,
+            },
+            Interval {
+                months: 0,
+                days: 0,
+                usec: i64::MIN,
+            },
+        ];
+        for src in extremes {
+            assert_eq!(
+                apply_typmod(src, pack_typmod(MASK_SECOND, Some(2))),
+                Err(out_of_range()),
+                "{src:?}"
+            );
+
+            // Full precision, and no precision at all, keep rounding out of the
+            // way entirely — the value stands.
+            assert_eq!(coerce(src, pack_typmod(MASK_SECOND, Some(6))), src);
+            assert_eq!(coerce(src, pack_typmod(FULL_RANGE, None)), src);
+        }
     }
 
     #[test]
