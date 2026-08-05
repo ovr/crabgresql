@@ -747,10 +747,10 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         // A `$n` may appear inside the subquery body, and (for IN) inside the
         // needle carried by the comparison template.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            substitute_params(&mut subplan.0, params);
+            substitute_params(&mut subplan.plan, params);
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            substitute_params(&mut subplan.0, params);
+            substitute_params(&mut subplan.plan, params);
             subst_expr(cmp, params);
         }
         // `x op ANY/ALL(array)` carries no subplan; a `$n` may appear in either
@@ -1091,10 +1091,10 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         }
         // A nested expression-subquery is one query level deeper.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            subst_outer_plan(&mut subplan.0, outer, depth + 1);
+            subst_outer_plan(&mut subplan.plan, outer, depth + 1);
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            subst_outer_plan(&mut subplan.0, outer, depth + 1);
+            subst_outer_plan(&mut subplan.plan, outer, depth + 1);
             subst_outer_expr(cmp, outer, depth);
         }
         // The array operand and the needle live at this query level.
@@ -1382,10 +1382,10 @@ fn expr_has_outer_ref(expr: &BoundExpr, depth: usize) -> bool {
         // A nested expression-subquery is one query level deeper — the same
         // `depth + 1` `subst_outer_expr` applies.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            plan_has_outer_refs_at(&subplan.0, depth + 1)
+            plan_has_outer_refs_at(&subplan.plan, depth + 1)
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            plan_has_outer_refs_at(&subplan.0, depth + 1) || expr_has_outer_ref(cmp, depth)
+            plan_has_outer_refs_at(&subplan.plan, depth + 1) || expr_has_outer_ref(cmp, depth)
         }
         BoundExpr::QuantifiedArray { array, cmp, .. } => {
             expr_has_outer_ref(array, depth) || expr_has_outer_ref(cmp, depth)
@@ -5338,7 +5338,7 @@ fn rewrite_over_aggregate(
             Ok(c)
         }
         BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
-            if plan_has_outer_refs(&subplan.0) {
+            if plan_has_outer_refs(&subplan.plan) {
                 return Err(correlated_over_aggregate_error());
             }
             Ok(BoundExpr::QuantifiedSubquery {
@@ -5378,7 +5378,7 @@ fn rewrite_over_aggregate(
 /// [`rewrite_over_aggregate`]. Non-correlated markers are left alone.
 fn reject_correlated_over_aggregate(marker: &BoundExpr) -> Result<(), BindError> {
     let subplan = match marker {
-        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => &subplan.0,
+        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => &subplan.plan,
         _ => return Ok(()),
     };
     if plan_has_outer_refs(subplan) {

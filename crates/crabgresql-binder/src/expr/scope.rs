@@ -1005,7 +1005,7 @@ pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
             common_typmod(arms.map(|arm| expr_typmod(arm, scope)))
         }
         // A scalar subquery reports its single output column's modifier.
-        BoundExpr::ScalarSubquery { subplan, .. } => crate::plan::output_columns_of(&subplan.0)
+        BoundExpr::ScalarSubquery { subplan, .. } => crate::plan::output_columns_of(&subplan.plan)
             .ok()
             .and_then(|columns| columns.first().map(|c| c.typmod))
             .unwrap_or(-1),

@@ -19,7 +19,7 @@ pub use collation::{
 };
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ColumnDefault,
-    ParamCtx, ParamState, Scope, Subplan, UnaryOp, WindowKind, WindowSortKey,
+    ParamCtx, ParamState, Scope, Subplan, SubplanId, UnaryOp, WindowKind, WindowSortKey,
     bind_check_constraint, bind_column_default, bind_expr, bind_scalar, bind_sql_function_body,
     bool_test_clause, builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod,
     coerce_to_column, coerce_to_param, const_type_label, datetime_precision, declared_typmod,

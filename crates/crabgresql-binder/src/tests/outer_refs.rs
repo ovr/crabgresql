@@ -79,7 +79,7 @@ fn first_subplan(sql: &str) -> anyhow::Result<LogicalPlan> {
     fn find(exprs: &[BoundExpr]) -> Option<LogicalPlan> {
         exprs.iter().find_map(|e| match e {
             BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-                Some((*subplan.0).clone())
+                Some((*subplan.plan).clone())
             }
             _ => None,
         })

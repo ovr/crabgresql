@@ -1145,7 +1145,7 @@ fn is_foldable_subquery(expr: &BoundExpr) -> bool {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => {
-            !crabgresql_binder::plan_has_outer_refs(&subplan.0)
+            !crabgresql_binder::plan_has_outer_refs(&subplan.plan)
         }
         _ => false,
     }
@@ -1159,7 +1159,7 @@ fn fold_subquery(
 ) -> Result<BoundExpr, ExecError> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, ty } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            let rows = run_subplan(*subplan.plan, ctx, txn)?;
             Ok(BoundExpr::Const {
                 value: scalar_subquery_value(rows, ty, ctx)?,
                 ty,
@@ -1170,7 +1170,7 @@ fn fold_subquery(
             // one rather than draining the whole subplan; the binder already
             // stripped the target list to a constant so no per-row projection
             // (or its errors) is evaluated. NOT EXISTS inverts the test.
-            let exists = subplan_has_rows(*subplan.0, ctx, txn)?;
+            let exists = subplan_has_rows(*subplan.plan, ctx, txn)?;
             Ok(BoundExpr::Const {
                 value: Value::Bool(exists != negated),
                 ty: PgType::Bool,
@@ -1180,7 +1180,7 @@ fn fold_subquery(
         // array so the per-row work reuses the single `QuantifiedArray`
         // evaluation path (which evaluates the needle exactly once per row).
         BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            let rows = run_subplan(*subplan.plan, ctx, txn)?;
             let elem = hole_ty(&cmp).unwrap_or(PgType::Text);
             Ok(BoundExpr::QuantifiedArray {
                 array: Box::new(BoundExpr::Const {
@@ -1257,7 +1257,7 @@ pub(crate) fn eval_correlated_subquery(
             ));
         }
     };
-    let mut logical = (*subplan.0).clone();
+    let mut logical = (*subplan.plan).clone();
     crabgresql_binder::substitute_outer(&mut logical, row);
     match marker {
         BoundExpr::ScalarSubquery { ty, .. } => {

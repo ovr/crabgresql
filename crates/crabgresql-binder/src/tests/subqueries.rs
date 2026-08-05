@@ -104,7 +104,7 @@ fn correlated_qualified_reference_binds_to_outer_column() -> anyhow::Result<()> 
     let LogicalPlan::Query(QueryPlan {
         predicate: Some(inner),
         ..
-    }) = &*subplan.0
+    }) = &*subplan.plan
     else {
         bail!("expected inner Query with a predicate");
     };
@@ -141,7 +141,7 @@ fn correlated_unqualified_reference_binds_to_outer_column() -> anyhow::Result<()
     let LogicalPlan::Values(ValuesPlan {
         predicate: Some(inner),
         ..
-    }) = &*subplan.0
+    }) = &*subplan.plan
     else {
         bail!("expected inner Values with a predicate");
     };
@@ -191,7 +191,7 @@ fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
         bail!("expected Exists");
     };
     // Borrowed out of the row, so the consuming extractor does not apply.
-    let LogicalPlan::Query(QueryPlan { projections, .. }) = subplan.0.as_ref() else {
+    let LogicalPlan::Query(QueryPlan { projections, .. }) = subplan.plan.as_ref() else {
         bail!("expected Query subplan");
     };
     assert!(matches!(projections.as_slice(), [BoundExpr::Const { .. }]));
