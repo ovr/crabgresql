@@ -34,12 +34,7 @@ fn pinned_srcdir(suite_dir: &PathBuf) -> BTreeMap<String, String> {
 async fn assert_suite_passes(config: &SuiteConfig) -> anyhow::Result<()> {
     let report = run_suite(config).await?;
     if !report.all_passed() {
-        let failed: Vec<&str> = report
-            .outcomes
-            .iter()
-            .filter(|(_, ok)| !ok)
-            .map(|(name, _)| name.as_str())
-            .collect();
+        let failed: Vec<&str> = report.failed().map(|o| o.name.as_str()).collect();
         let diffs =
             std::fs::read_to_string(config.outdir.join("regression.diffs")).unwrap_or_default();
         anyhow::bail!("regression tests failed: {failed:?}\n{diffs}");
