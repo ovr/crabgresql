@@ -1431,7 +1431,41 @@ fn plan_for_each_subexpr(plan: &LogicalPlan, depth: usize, f: &mut dyn FnMut(&Bo
     });
 }
 
-/// [`plan_contains_volatile_fn`] for an expression rather than a plan.
+/// Whether `expr` holds a subquery marker whose subplan is *correlated* — one
+/// the executor cannot fold to a constant before the scan starts.
+///
+/// The distinction is what separates a marker that costs a subplan execution per
+/// row from one that costs a `Const` clone: `resolve_subqueries` folds every
+/// marker this returns `false` for, once, before any row is read, using this
+/// very predicate ([`plan_has_outer_refs`]).
+///
+/// Only the expression's own markers are asked. A marker nested inside another
+/// marker's subplan does not matter: if the enclosing one folds, the whole
+/// subtree folds with it, and if it does not, the enclosing one already answers
+/// `true`.
+pub fn expr_contains_correlated_subquery(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    for_each_subexpr(expr, 1, &mut |expr, depth| {
+        // `depth > 1` is a node inside some marker's subplan; the walk pushes a
+        // level at exactly that boundary.
+        if depth != 1 {
+            return;
+        }
+        let subplan = match expr {
+            BoundExpr::ScalarSubquery { subplan, .. }
+            | BoundExpr::Exists { subplan, .. }
+            | BoundExpr::QuantifiedSubquery { subplan, .. } => subplan,
+            _ => return,
+        };
+        if plan_has_outer_refs(&subplan.0) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether an expression calls a volatile function anywhere, crossing into the
+/// body of a subquery marker.
 ///
 /// Unlike [`BoundExpr::contains_volatile_fn`] this descends into the body of a
 /// subquery marker. That matters wherever the decision being made is about the
