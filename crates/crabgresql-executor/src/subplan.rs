@@ -410,7 +410,12 @@ fn conjunct_is_correlated(expr: &BoundExpr) -> bool {
     }))
 }
 
-/// Run the stripped subplan once and hash its key tuples.
+/// Run the stripped subplan once and hash its *distinct* key tuples.
+///
+/// Only membership is ever asked of this table, so a key repeated by a thousand
+/// inner rows is one entry's worth of information stored a thousand times — and
+/// the table lives in the statement's cache until the statement ends. The
+/// folded-`IN` path deduplicates for the same reason (`dedup_candidates`).
 fn build(spec: Spec, ctx: &ExecContext, txn: &TxnContext) -> Result<HashedExists, ExecError> {
     let Spec {
         plan,
@@ -423,10 +428,15 @@ fn build(spec: Spec, ctx: &ExecContext, txn: &TxnContext) -> Result<HashedExists
         if row.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
-        buckets
-            .entry(agg::hash_key(&key_tys, &row))
-            .or_default()
-            .push(row);
+        let bucket = buckets.entry(agg::hash_key(&key_tys, &row)).or_default();
+        // A bucket hit can be a hash collision, so confirm on the values.
+        if bucket
+            .iter()
+            .any(|seen| agg::keys_equal(&key_tys, seen, &row))
+        {
+            continue;
+        }
+        bucket.push(row);
     }
     Ok(HashedExists {
         outer_slots,
