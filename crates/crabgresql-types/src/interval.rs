@@ -13,6 +13,7 @@
 //! sentinels PG uses (all three fields at their `i32`/`i64` extreme), so the
 //! natural field order already places `-infinity < finite < +infinity`.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::Numeric;
@@ -1132,23 +1133,200 @@ pub fn parse(input: &str) -> Result<Interval, IntervalError> {
     parse_with_default(input, Unit::Second)
 }
 
+/// What a scanned field is, which its text alone cannot always say.
+///
+/// `'1.days'` is an error, `'1. days'` is a day, `'.days'` is zero days: the
+/// three differ only in where a `.` sits relative to the digits, so the
+/// classification has to come out of the scanner rather than be re-derived by
+/// the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldKind {
+    /// A digit run followed by `:` — an `HH:MM[:SS[.f]]` time.
+    Time,
+    /// A run reclassified by an embedded `- / .`. Only the SQL-standard `Y-M`
+    /// spelling of this is legal; everything else here is a syntax error.
+    Date,
+    /// Everything else; `split_num_unit` decides what it means.
+    Plain,
+}
+
+/// One field of an interval literal.
+struct Field<'a> {
+    /// Borrowed except for a sign that reached across whitespace to its token —
+    /// `'- 2 hours'` is `-2 hours`, and that `-2` exists in no slice of the
+    /// input.
+    text: Cow<'a, str>,
+    kind: FieldKind,
+}
+
+/// Whether a byte separates fields when it appears *between* them.
+///
+/// PostgreSQL's splitter is positional, not a character class. Twenty-seven
+/// ASCII punctuation characters are pure separators wherever they appear, and
+/// `/` and `:` join them here at a field start — but `+ - .` never separate,
+/// and `/ :` glue into a token once one has begun. That is why `'1 day, 2
+/// hours'` and `'/2 hours'` parse while `'1 day/2 hours'` and `'2 hours/'` are
+/// syntax errors. Probed against PostgreSQL 18.4.
+fn is_field_gap(c: u8) -> bool {
+    is_interval_space(c)
+        || c == b'/'
+        || c == b':'
+        || (c.is_ascii_punctuation() && !matches!(c, b'+' | b'-' | b'.'))
+}
+
+/// C's `isspace`, which has `\v` where Rust's `is_ascii_whitespace` does not —
+/// `interval '5\x0bdays'` parses in PG. A non-breaking space is *not* space.
+fn is_interval_space(c: u8) -> bool {
+    c.is_ascii_whitespace() || c == 0x0B
+}
+
+/// A byte that can be part of a word or number. Bytes above ASCII count, so a
+/// multi-byte character is never split across a slice boundary; such a field
+/// simply fails to classify later.
+fn is_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c >= 0x80
+}
+
 /// Split an interval literal into its fields.
 ///
-/// PostgreSQL's field splitter treats every ASCII punctuation character
-/// **except `+ - . :`** as a separator, exactly like whitespace — the four
-/// exceptions being the ones that carry meaning inside a field (a sign, a
-/// decimal point, a `HH:MM:SS` time, a `Y-M` year-month). Nothing is a keyword
-/// here, so the `@` of the `postgres_verbose` form is not a prefix to strip: it
-/// is simply invisible, anywhere, any number of times. That one rule is why
-/// `'@ 14 seconds ago'` parses at all, why `'@'` alone is a syntax error rather
-/// than a zero interval, and why `'1 day, 2 hours'` and `'1 day(2 hours'` mean
-/// what `'1 day 2 hours'` means. Probed against PostgreSQL 18.4.
-fn interval_fields(s: &str) -> Vec<&str> {
-    s.split(|c: char| {
-        c.is_whitespace() || (c.is_ascii_punctuation() && !matches!(c, '+' | '-' | '.' | ':'))
-    })
-    .filter(|f| !f.is_empty())
-    .collect()
+/// Nothing here is a keyword: the `@` of the `postgres_verbose` form is one of
+/// the twenty-seven pure separators, which is why `'@ 14 seconds ago'` parses
+/// at all and why `'@'` alone is a syntax error rather than a zero interval. A
+/// sign at a field start reaches across whitespace to fuse with the token after
+/// it (`'- infinity'` is `-infinity`), and a sign with nothing to fuse to is
+/// `Err`. Probed against PostgreSQL 18.4.
+fn interval_fields(s: &str) -> Result<Vec<Field<'_>>, ()> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if is_field_gap(b[i]) {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'+' || b[i] == b'-' {
+            let sign = i;
+            i += 1;
+            let mut j = i;
+            while j < b.len() && is_interval_space(b[j]) {
+                j += 1;
+            }
+            // A sign at the very end has nothing to fuse to — `'2 hours -'`.
+            if j >= b.len() {
+                return Err(());
+            }
+            if j == i {
+                // Glued to its token: one slice, scanned from the sign.
+                let (end, kind) = scan_token(b, i);
+                out.push(Field {
+                    text: Cow::Borrowed(&s[sign..end]),
+                    kind,
+                });
+                i = end;
+                continue;
+            }
+            // Reached across whitespace. Only a real token can be fused to; a
+            // second sign or a separator is `22007`.
+            if b[j] == b'+' || b[j] == b'-' || is_field_gap(b[j]) {
+                return Err(());
+            }
+            let (end, kind) = scan_token(b, j);
+            out.push(Field {
+                text: Cow::Owned(format!("{}{}", b[sign] as char, &s[j..end])),
+                kind,
+            });
+            i = end;
+            continue;
+        }
+        let (end, kind) = scan_token(b, i);
+        out.push(Field {
+            text: Cow::Borrowed(&s[i..end]),
+            kind,
+        });
+        i = end;
+    }
+    Ok(out)
+}
+
+/// Scan one token starting at `start` (past any sign), returning where it ends
+/// and what it is.
+fn scan_token(b: &[u8], start: usize) -> (usize, FieldKind) {
+    let mut i = start;
+    // A `.` with no digits before it opens a number — `'.5'`, and a lone `'.'`
+    // worth zero. It is *not* the `Date`-forming `.` that follows digits.
+    if b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        return (i, FieldKind::Plain);
+    }
+    if b[i].is_ascii_digit() {
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        match b.get(i) {
+            Some(b':') => {
+                while i < b.len() && matches!(b[i], b'0'..=b'9' | b':' | b'.') {
+                    i += 1;
+                }
+                return (i, FieldKind::Time);
+            }
+            Some(&d @ (b'-' | b'/' | b'.')) => {
+                i += 1;
+                if b.get(i).is_some_and(u8::is_ascii_digit) {
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    // A second copy of the same separator makes it a three-part
+                    // date, which no interval field may be.
+                    if b.get(i) == Some(&d) {
+                        i += 1;
+                        while i < b.len() && (b[i].is_ascii_digit() || b[i] == d) {
+                            i += 1;
+                        }
+                        return (i, FieldKind::Date);
+                    }
+                    // `1-2` is the year-month spelling; `1.5` is a decimal, and
+                    // only the `-` form survives classification later.
+                    return (
+                        i,
+                        if d == b'.' {
+                            FieldKind::Plain
+                        } else {
+                            FieldKind::Date
+                        },
+                    );
+                }
+                // A separator with no digit after it — `'1.'`, `'1-'`, `'1/'`.
+                // Only a trailing `.` is a number; the others drag whatever
+                // follows into a date.
+                if d == b'.' && (i >= b.len() || is_field_gap(b[i])) {
+                    return (i, FieldKind::Plain);
+                }
+                while i < b.len() && (is_word_byte(b[i]) || b[i] == d) {
+                    i += 1;
+                }
+                return (i, FieldKind::Date);
+            }
+            // `+` ends a digit run, unlike `-`: `'1+2 hours'` is two fields.
+            Some(&c) if !is_word_byte(c) => return (i, FieldKind::Plain),
+            _ => {}
+        }
+    }
+    // A word run, possibly after digits (`'1day'`).
+    while i < b.len() && is_word_byte(b[i]) {
+        i += 1;
+    }
+    // `+ - . /` glued to the right of a word poison it into a date; `:` does
+    // not, which is what makes `'2 hours:'` and `'1 day:2 hours'` legal.
+    if matches!(b.get(i), Some(b'+' | b'-' | b'.' | b'/')) {
+        while i < b.len() && (is_word_byte(b[i]) || matches!(b[i], b'+' | b'-' | b'.' | b'/')) {
+            i += 1;
+        }
+        return (i, FieldKind::Date);
+    }
+    (i, FieldKind::Plain)
 }
 
 /// `Some(1)`/`Some(-1)` if this field spells an infinity, else `None`.
@@ -1190,18 +1368,18 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
         return acc.finish(input);
     }
 
-    let fields = interval_fields(trimmed);
-    // Nothing but delimiters — `'@'`, `'@@@'`.
+    let fields = interval_fields(trimmed).map_err(|()| invalid_syntax(input))?;
+    // Nothing but separators — `'@'`, `'@@@'`.
     let Some((last, rest)) = fields.split_last() else {
         return Err(invalid_syntax(input));
     };
 
-    // `infinity` is decided on the *fields*, not the string, so the delimiters
+    // `infinity` is decided on the *fields*, not the string, so the separators
     // around it are as invisible here as anywhere else (`'@ infinity'` and
     // `'infinity @'` are both accepted) while anything alongside it is a
     // syntax error: `'infinity ago'`, `'infinity years'`, `'+infinity
     // -infinity'`. Probed against PostgreSQL 18.4.
-    if let Some(sign) = fields.iter().find_map(|f| infinity_sign(f)) {
+    if let Some(sign) = fields.iter().find_map(|f| infinity_sign(&f.text)) {
         if fields.len() != 1 {
             return Err(invalid_syntax(input));
         }
@@ -1211,53 +1389,60 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
     // `ago` negates the whole span, and may appear exactly once, as the final
     // field, and never alone: `'2 days ago'` is fine, `'1 day ago ago'`,
     // `'2 minutes ago 5 days'`, `'ago 5 days'` and a bare `'ago'` are 22007.
-    let ago = last.eq_ignore_ascii_case("ago");
+    let ago = last.text.eq_ignore_ascii_case("ago");
     let fields = if ago { rest } else { &fields[..] };
-    if fields.is_empty() || fields.iter().any(|f| f.eq_ignore_ascii_case("ago")) {
+    if fields.is_empty() || fields.iter().any(|f| f.text.eq_ignore_ascii_case("ago")) {
         return Err(invalid_syntax(input));
     }
 
     let mut pending: Option<(i128, f64)> = None;
-    for &tok in fields {
-        let tl = tok.to_ascii_lowercase();
-        // A `:`-bearing token is an `HH:MM[:SS[.f]]` time.
-        if tok.contains(':') {
-            // A unit-less number sitting immediately before a time is *days*,
-            // whatever `default` says: this is the SQL `D HH:MM:SS` form, so
-            // `interval '3 4:05:06'` is three days and six seconds past four,
-            // never three seconds. Probed against PostgreSQL 18.4.
-            if let Some(n) = pending.take() {
-                apply(n, Unit::Day, &mut acc);
+    for field in fields {
+        let tok: &str = &field.text;
+        match field.kind {
+            FieldKind::Time => {
+                // A unit-less number sitting immediately before a time is
+                // *days*, whatever `default` says: this is the SQL
+                // `D HH:MM:SS` form, so `interval '3 4:05:06'` is three days
+                // and six seconds past four, never three seconds. Probed
+                // against PostgreSQL 18.4.
+                if let Some(n) = pending.take() {
+                    apply(n, Unit::Day, &mut acc);
+                }
+                acc.add_usec(parse_time_token(tok, input)? as i128);
             }
-            acc.add_usec(parse_time_token(tok, input)? as i128);
-            continue;
-        }
-        // The SQL-standard `Y-M` year-month token.
-        if let Some(months) = try_year_month(tok) {
-            flush_pending(&mut pending, default, &mut acc, input)?;
-            acc.add_months(months);
-            continue;
-        }
-        let (num, word) = split_num_unit(&tl);
-        match (num.is_empty(), word.is_empty()) {
-            // `1year`, `-1.5days`: number and unit fused in one token.
-            (false, false) => {
+            // The only legal `Date` field is the SQL-standard `Y-M` year-month.
+            // Everything else the scanner marked — `'1/5'`, `'1-2-3'`,
+            // `'1.days'`, `'day/2'` — reaches here to be rejected.
+            FieldKind::Date => {
+                let months = try_year_month(tok).ok_or_else(|| invalid_syntax(input))?;
                 flush_pending(&mut pending, default, &mut acc, input)?;
-                let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
-                apply(parse_number(num, input)?, unit, &mut acc);
+                acc.add_months(months);
             }
-            // A bare number: pair it with a following unit word, else `default`.
-            (false, true) => {
-                flush_pending(&mut pending, default, &mut acc, input)?;
-                pending = Some(parse_number(num, input)?);
+            FieldKind::Plain => {
+                let tl = tok.to_ascii_lowercase();
+                let (num, word) = split_num_unit(&tl);
+                match (num.is_empty(), word.is_empty()) {
+                    // `1year`, `-1.5days`: number and unit fused in one token.
+                    (false, false) => {
+                        flush_pending(&mut pending, default, &mut acc, input)?;
+                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
+                        apply(parse_number(num, input)?, unit, &mut acc);
+                    }
+                    // A bare number: pair it with a following unit word, else
+                    // `default`.
+                    (false, true) => {
+                        flush_pending(&mut pending, default, &mut acc, input)?;
+                        pending = Some(parse_number(num, input)?);
+                    }
+                    // A bare unit word: applies to the pending number.
+                    (true, false) => {
+                        let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
+                        let n = pending.take().ok_or_else(|| invalid_syntax(input))?;
+                        apply(n, unit, &mut acc);
+                    }
+                    (true, true) => return Err(invalid_syntax(input)),
+                }
             }
-            // A bare unit word: applies to the pending number.
-            (true, false) => {
-                let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
-                let n = pending.take().ok_or_else(|| invalid_syntax(input))?;
-                apply(n, unit, &mut acc);
-            }
-            (true, true) => return Err(invalid_syntax(input)),
         }
     }
     flush_pending(&mut pending, default, &mut acc, input)?;
@@ -1395,8 +1580,14 @@ fn split_num_unit(tok: &str) -> (&str, &str) {
 /// not a syntax error, and still narrows to the stored width in `Acc::finish`.
 fn parse_number(s: &str, input: &str) -> Result<(i128, f64), IntervalError> {
     let neg = s.starts_with('-');
+    let signed = s.starts_with(['+', '-']);
     let body = s.trim_start_matches(['+', '-']);
     if body.is_empty() {
+        return Err(invalid_syntax(input));
+    }
+    // A sign must be followed by an integer digit: `'.5'` and `'-0.5'` are
+    // numbers, `'-.5'` and `'+.5'` are `22007`. Read off PostgreSQL 18.4.
+    if signed && !body.starts_with(|c: char| c.is_ascii_digit()) {
         return Err(invalid_syntax(input));
     }
     let (int_str, frac_str) = body.split_once('.').unwrap_or((body, ""));
@@ -1435,18 +1626,18 @@ fn parse_time_token(tok: &str, input: &str) -> Result<i64, IntervalError> {
     let neg = tok.starts_with('-');
     let body = tok.trim_start_matches(['+', '-']);
     let mut parts = body.split(':');
-    let hour: i64 = parts
-        .next()
-        .ok_or_else(syntax)?
-        .parse()
-        .map_err(|_| syntax())?;
-    let min: i64 = parts
-        .next()
-        .ok_or_else(syntax)?
-        .parse()
-        .map_err(|_| syntax())?;
+    // An empty component is zero, so `'1:'` and `'1::'` are one hour — that is
+    // what makes the scanner's `HH:` token, and `'1:days'`, work.
+    let component = |part: Option<&str>| -> Result<i64, IntervalError> {
+        match part.ok_or_else(syntax)? {
+            "" => Ok(0),
+            digits => digits.parse().map_err(|_| syntax()),
+        }
+    };
+    let hour = component(parts.next())?;
+    let min = component(parts.next().or(Some("")))?;
     let (sec, fsec) = match parts.next() {
-        None => (0, 0),
+        None | Some("") => (0, 0),
         Some(secpart) => {
             let (whole, frac) = secpart.split_once('.').unwrap_or((secpart, ""));
             (
@@ -1477,14 +1668,16 @@ fn try_year_month(tok: &str) -> Option<i128> {
     let neg = tok.starts_with('-');
     let body = tok.trim_start_matches(['+', '-']);
     let (y, m) = body.split_once('-')?;
-    if y.is_empty() || m.is_empty() || m.contains('-') {
+    if y.is_empty() || m.contains('-') {
         return None;
     }
     if !y.bytes().all(|b| b.is_ascii_digit()) || !m.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let years: i128 = y.parse().ok()?;
-    let months: i128 = m.parse().ok()?;
+    // An omitted month count is zero, so `'1-'` is a year — which is what makes
+    // `interval '1- 5 days'` five days past a year in PG.
+    let months: i128 = if m.is_empty() { 0 } else { m.parse().ok()? };
     let total = years * 12 + months;
     Some(if neg { -total } else { total })
 }
@@ -2354,9 +2547,74 @@ mod tests {
         for input in ["@", "@@@", "@ 30 eons ago", "@ P1Y2M"] {
             rejects(input);
         }
-        // `- . :` keep their meaning, so a token they join stays one field and
-        // fails as the malformed unit word it is.
-        for input in ["1 day-2 hours", "1 day+2 hours", "1 day.5"] {
+        // `+ - . /` glued to the right of a token poison it into a date, which
+        // no interval field may be.
+        for input in ["1 day-2 hours", "1 day+2 hours", "1 day.5", "1 day/2 hours"] {
+            rejects(input);
+        }
+    }
+
+    /// `+ - . / :` are positional rather than separators, and the position is
+    /// what decides: `/` and `:` are skipped between fields but glue into a
+    /// token once one has begun, `+` ends a digit run where `-` continues it,
+    /// and a sign at a field start reaches across whitespace to fuse with the
+    /// token after it. Read off PostgreSQL 18.4.
+    #[test]
+    fn the_five_special_characters_are_positional() {
+        for (input, want) in [
+            // A sign fuses across whitespace with whatever follows.
+            ("- 2 hours", "-02:00:00"),
+            ("+ 2 hours", "02:00:00"),
+            ("1 day - 2 hours", "1 day -02:00:00"),
+            ("1 day + 2 hours", "1 day 02:00:00"),
+            ("- infinity", "-infinity"),
+            ("+ infinity", "infinity"),
+            // `/` and `:` separate between fields...
+            ("/2 hours", "02:00:00"),
+            (":2 hours", "02:00:00"),
+            ("1 day / 2 hours", "1 day 02:00:00"),
+            // ...and `:` does not glue to a word, so these stay two fields.
+            ("2 hours:", "02:00:00"),
+            ("1 day:2 hours", "1 day 02:00:00"),
+            // An omitted time component is zero.
+            ("1:", "01:00:00"),
+            ("1::", "01:00:00"),
+            // A trailing `.` ends a number; `1-` is a bare year.
+            ("1.", "00:00:01"),
+            ("1. days", "1 day"),
+            (".", "00:00:00"),
+            (".5", "00:00:00.5"),
+            (".days", "00:00:00"),
+            ("1- 5 days", "1 year 5 days"),
+            ("1-.5 days", "1 year 12:00:00"),
+            // `\v` is whitespace to PG even though it is not to Rust.
+            ("5\u{0b}days", "5 days"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+        for input in [
+            // `/` glued to the right of a token is not a separator.
+            "1 day/2 hours",
+            "2 hours/",
+            "1/5 days",
+            "1.days",
+            "1-days",
+            "day/2",
+            // A three-part date is not an interval field.
+            "1-5-5 days",
+            "1/5/5 days",
+            // A sign with nothing to fuse to.
+            "2 hours -",
+            "--2 hours",
+            "-, 2 hours",
+            "- @ 2 hours",
+            // A sign must be followed by a digit.
+            "-.5",
+            "+.5",
+            // A non-ASCII byte is its own field and fails to classify — the
+            // point being that slicing it must not panic.
+            "5 day\u{e9}",
+        ] {
             rejects(input);
         }
     }

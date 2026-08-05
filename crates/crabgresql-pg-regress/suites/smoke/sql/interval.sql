@@ -177,14 +177,28 @@ SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
        interval '4:05:06.789' minute to second(1) AS range_second_p,
        interval '1.6 seconds' second(0) AS rounds_away_from_zero;
 
--- `@` is a delimiter, not a keyword: every ASCII punctuation character except
--- `+ - . :` separates fields exactly as whitespace does, which is what makes the
--- verbose `@ ... ago` input form parse. A literal with nothing but delimiters
--- has no fields at all, and that is an error rather than a zero interval.
+-- `@` is a separator, not a keyword: twenty-seven ASCII punctuation characters
+-- separate fields exactly as whitespace does, which is what makes the verbose
+-- `@ ... ago` input form parse. A literal with nothing but separators has no
+-- fields at all, and that is an error rather than a zero interval.
 SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
        interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
 SELECT interval '@';
 SELECT interval '@ 30 eons ago';
+-- The other five — `+ - . / :` — are positional. `/` and `:` are skipped
+-- between fields but glue into a token once one has begun, and a sign at a
+-- field start reaches across whitespace to fuse with the token after it.
+SELECT interval '- 2 hours' AS lone_sign, interval '1 day + 2 hours' AS plus,
+       interval '1 day - 2 hours' AS minus, interval '- infinity' AS signed_inf;
+SELECT interval '/2 hours' AS leading_slash, interval '1 day:2 hours' AS colon_word,
+       interval '2 hours:' AS trailing_colon, interval '1:' AS empty_minute;
+SELECT interval '1- 5 days' AS bare_year, interval '1. days' AS trailing_point;
+SELECT interval '1 day/2 hours';
+SELECT interval '1/5 days';
+SELECT interval '1.days';
+SELECT interval '2 hours -';
+SELECT interval '--2 hours';
+SELECT interval '-.5';
 -- `ago` may appear once, and only as the last field
 SELECT interval '1 day ago ago';
 SELECT interval '2 minutes ago 5 days';

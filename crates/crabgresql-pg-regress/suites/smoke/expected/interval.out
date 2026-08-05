@@ -497,10 +497,10 @@ SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
  00:00:01.23   | 04:05:06.8     | 00:00:02
 (1 row)
 
--- `@` is a delimiter, not a keyword: every ASCII punctuation character except
--- `+ - . :` separates fields exactly as whitespace does, which is what makes the
--- verbose `@ ... ago` input form parse. A literal with nothing but delimiters
--- has no fields at all, and that is an error rather than a zero interval.
+-- `@` is a separator, not a keyword: twenty-seven ASCII punctuation characters
+-- separate fields exactly as whitespace does, which is what makes the verbose
+-- `@ ... ago` input form parse. A literal with nothing but separators has no
+-- fields at all, and that is an error rather than a zero interval.
 SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
        interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
  verbose_ago | fused |     comma      | trailing_at 
@@ -515,6 +515,53 @@ LINE 1: SELECT interval '@';
 SELECT interval '@ 30 eons ago';
 ERROR:  invalid input syntax for type interval: "@ 30 eons ago"
 LINE 1: SELECT interval '@ 30 eons ago';
+                        ^
+-- The other five — `+ - . / :` — are positional. `/` and `:` are skipped
+-- between fields but glue into a token once one has begun, and a sign at a
+-- field start reaches across whitespace to fuse with the token after it.
+SELECT interval '- 2 hours' AS lone_sign, interval '1 day + 2 hours' AS plus,
+       interval '1 day - 2 hours' AS minus, interval '- infinity' AS signed_inf;
+ lone_sign |      plus      |      minus      | signed_inf 
+-----------+----------------+-----------------+------------
+ -02:00:00 | 1 day 02:00:00 | 1 day -02:00:00 | -infinity
+(1 row)
+
+SELECT interval '/2 hours' AS leading_slash, interval '1 day:2 hours' AS colon_word,
+       interval '2 hours:' AS trailing_colon, interval '1:' AS empty_minute;
+ leading_slash |   colon_word   | trailing_colon | empty_minute 
+---------------+----------------+----------------+--------------
+ 02:00:00      | 1 day 02:00:00 | 02:00:00       | 01:00:00
+(1 row)
+
+SELECT interval '1- 5 days' AS bare_year, interval '1. days' AS trailing_point;
+   bare_year   | trailing_point 
+---------------+----------------
+ 1 year 5 days | 1 day
+(1 row)
+
+SELECT interval '1 day/2 hours';
+ERROR:  invalid input syntax for type interval: "1 day/2 hours"
+LINE 1: SELECT interval '1 day/2 hours';
+                        ^
+SELECT interval '1/5 days';
+ERROR:  invalid input syntax for type interval: "1/5 days"
+LINE 1: SELECT interval '1/5 days';
+                        ^
+SELECT interval '1.days';
+ERROR:  invalid input syntax for type interval: "1.days"
+LINE 1: SELECT interval '1.days';
+                        ^
+SELECT interval '2 hours -';
+ERROR:  invalid input syntax for type interval: "2 hours -"
+LINE 1: SELECT interval '2 hours -';
+                        ^
+SELECT interval '--2 hours';
+ERROR:  invalid input syntax for type interval: "--2 hours"
+LINE 1: SELECT interval '--2 hours';
+                        ^
+SELECT interval '-.5';
+ERROR:  invalid input syntax for type interval: "-.5"
+LINE 1: SELECT interval '-.5';
                         ^
 -- `ago` may appear once, and only as the last field
 SELECT interval '1 day ago ago';
