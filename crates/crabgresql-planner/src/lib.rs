@@ -6,6 +6,7 @@
 
 mod projection;
 mod pushdown;
+mod qualorder;
 pub mod vectorize;
 
 use std::sync::Arc;
@@ -601,6 +602,9 @@ fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
 
 pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
     let mut physical = lower(logical);
+    // After the sinking passes, so each conjunct is ordered against the ones it
+    // shares a node with rather than the ones it was written next to.
+    qualorder::reorder_quals(&mut physical);
     // Last, so every predicate has already been sunk to the leaf that will
     // evaluate it and each scan's demand is analyzed where it actually applies.
     projection::push_column_projections(&mut physical);
