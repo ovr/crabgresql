@@ -50,7 +50,10 @@ pub enum QueryEnd {
 /// Whether a backslash command sends the query buffer instead of leaving it
 /// pending. psql calls these the `\g` family.
 fn is_query_terminator(name: &str) -> bool {
-    matches!(name, "g" | "gset" | "gexec" | "gdesc" | "crosstabview")
+    matches!(
+        name,
+        "g" | "gx" | "gset" | "gexec" | "gdesc" | "crosstabview"
+    )
 }
 
 /// Split the text after a `\` into the command name and the index just past it.

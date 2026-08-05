@@ -212,9 +212,9 @@ async fn run_test(
 ) -> io::Result<String> {
     let mut client = Client::connect(port).await?;
     let mut out = String::new();
-    // psql starts with an empty NULL marker. `\pset null` updates this for the
-    // lifetime of the current script/connection only.
-    let mut null_display = String::new();
+    // psql's output settings, scoped to this script: `\pset`, `\x`, `\a`
+    // and `\t` all change them.
+    let mut printing = format::Printing::default();
     // `\set` variables, likewise scoped to this script.
     let mut vars = Variables::new();
     // A `COPY … FROM STDIN` statement is held here until its `CopyData` payload
@@ -269,6 +269,23 @@ async fn run_test(
                 if matches!(name.as_str(), "q" | "quit") {
                     break;
                 }
+                // `\c` and `\c -` reconnect to the same database as the same
+                // user, which is the corpus's way of dropping session state
+                // (temp tables, GUCs). psql prints nothing: not one
+                // "You are now connected" line appears in the vendored
+                // expected files. Any other argument names a different target
+                // and only `psql.sql` does that, so it still stubs.
+                if name == "c" && matches!(args.trim(), "" | "-") {
+                    match Client::connect(port).await {
+                        Ok(fresh) => client = fresh,
+                        Err(_) => {
+                            out.push_str("connection to server was lost\n");
+                            break;
+                        }
+                    }
+                    buffer.clear();
+                    continue;
+                }
                 let described = match describe_pattern(&name, &args) {
                     Some(pattern) => {
                         match describe::describe(&mut client, pattern, statement_timeout).await {
@@ -290,7 +307,7 @@ async fn run_test(
                         &args,
                         environment,
                         &mut vars,
-                        &mut null_display,
+                        &mut printing,
                         &mut out,
                     ),
                 }
@@ -306,7 +323,7 @@ async fn run_test(
                 // just sending it; neither is implemented, so they stub and
                 // drop the buffer.
                 if let QueryEnd::Backslash { name, .. } = &end
-                    && !matches!(name.as_str(), "g" | "gset" | "gexec")
+                    && !matches!(name.as_str(), "g" | "gx" | "gset" | "gexec")
                 {
                     out.push_str(&format::metacommand_stub(name));
                     continue;
@@ -357,7 +374,7 @@ async fn run_test(
                         // A failed generating query prints its error and
                         // generates nothing.
                         if events.iter().any(|e| matches!(e, QueryEvent::Error(_))) {
-                            render_events(&mut out, &events, &text, &null_display);
+                            render_events(&mut out, &events, &text, &printing);
                             continue;
                         }
                         let mut lost = None;
@@ -371,7 +388,7 @@ async fn run_test(
                             .await
                             {
                                 Ok(Ok(events)) => {
-                                    render_events(&mut out, &events, &generated, &null_display)
+                                    render_events(&mut out, &events, &generated, &printing)
                                 }
                                 Ok(Err(_)) => {
                                     lost = Some("connection to server was lost\n");
@@ -390,7 +407,16 @@ async fn run_test(
                             break;
                         }
                     }
-                    _ => render_events(&mut out, &events, &text, &null_display),
+                    // `\gx` is `\g` with expanded output for this query only:
+                    // the setting is not persisted (`psql.out:31`).
+                    QueryEnd::Backslash { name, .. } if name == "gx" => {
+                        let once = format::Printing {
+                            expanded: true,
+                            ..printing.clone()
+                        };
+                        render_events(&mut out, &events, &text, &once);
+                    }
+                    _ => render_events(&mut out, &events, &text, &printing),
                 }
             }
             ScriptItem::CopyData(data) => {
@@ -400,7 +426,7 @@ async fn run_test(
                 match tokio::time::timeout(statement_timeout, client.copy_in(&statement, &data))
                     .await
                 {
-                    Ok(Ok(events)) => render_events(&mut out, &events, &statement, &null_display),
+                    Ok(Ok(events)) => render_events(&mut out, &events, &statement, &printing),
                     Ok(Err(_)) => {
                         out.push_str("connection to server was lost\n");
                         break;
@@ -418,7 +444,12 @@ async fn run_test(
 
 /// Print a statement's responses: result tables, errors and notices. Command
 /// tags are suppressed, as under `psql -q`.
-fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_display: &str) {
+fn render_events(
+    out: &mut String,
+    events: &[QueryEvent],
+    query: &str,
+    printing: &format::Printing,
+) {
     let mut fields: Option<Vec<Field>> = None;
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     for event in events {
@@ -430,7 +461,7 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_disp
             QueryEvent::Row(row) => rows.push(row.clone()),
             QueryEvent::CommandComplete(_tag) => {
                 if let Some(fields) = fields.take() {
-                    out.push_str(&format::format_table(&fields, &rows, null_display));
+                    out.push_str(&format::format_table(printing, &fields, &rows));
                     rows.clear();
                 }
             }
@@ -588,7 +619,7 @@ fn capture_gset(
 ) {
     // An error means there is no result to bind; psql prints it and stops.
     if events.iter().any(|e| matches!(e, QueryEvent::Error(_))) {
-        render_events(out, events, query, "");
+        render_events(out, events, query, &format::Printing::default());
         return;
     }
     let Some((names, rows)) = last_result(events) else {
@@ -656,7 +687,7 @@ fn run_metacommand(
     arguments: &str,
     environment: &BTreeMap<String, String>,
     vars: &mut Variables,
-    null_display: &mut String,
+    printing: &mut format::Printing,
     out: &mut String,
 ) {
     // Arguments expand against the variables as they stand *before* this
@@ -674,15 +705,74 @@ fn run_metacommand(
             Some(value) => vars.set(variable, value.clone()),
             None => vars.unset(variable),
         },
-        ("pset", ["null", value, ..]) => *null_display = (*value).to_string(),
-        // `\pset null` with no value queries the setting, which is silent
-        // under `-q`.
-        ("pset", ["null"]) => {}
         // `\\` is a bare separator between commands: it does nothing and
         // prints nothing.
         ("\\", _) => {}
+        // The output-format commands all print nothing: not one status line
+        // ("Tuples only is on.", "Output format is …") appears in the whole
+        // vendored corpus. An option or value that is not implemented keeps
+        // the stub rather than silently rendering the wrong shape.
+        ("pset", [option, values @ ..]) => {
+            if !set_print_option(option, values.first().copied(), printing) {
+                out.push_str(&format::metacommand_stub(name));
+            }
+        }
+        // `\pset` with no argument lists every setting; `\x`, `\a` and `\t`
+        // with none toggle.
+        ("x", []) => printing.expanded = !printing.expanded,
+        ("x", [value, ..]) => match parse_bool(value) {
+            Some(on) => printing.expanded = on,
+            None => out.push_str(&format::metacommand_stub(name)),
+        },
+        ("a", _) => printing.aligned = !printing.aligned,
+        ("t", []) => printing.tuples_only = !printing.tuples_only,
+        ("t", [value, ..]) => match parse_bool(value) {
+            Some(on) => printing.tuples_only = on,
+            None => out.push_str(&format::metacommand_stub(name)),
+        },
+        // `\echo` joins its arguments with single spaces. An *unquoted* leading
+        // `-n` is the suppress-newline flag; `'-n'` is a literal argument
+        // (`psql.out:4547`). Leaving the line open is what makes the next
+        // echoed input line run on, as psql does (`psql.out:4546`).
+        ("echo" | "qecho" | "warn", _) => {
+            let suppress = args.first() == Some(&"-n") && !parsed.quoted[0];
+            let args = if suppress { &args[1..] } else { &args[..] };
+            out.push_str(&args.join(" "));
+            if !suppress {
+                out.push('\n');
+            }
+        }
         _ => out.push_str(&format::metacommand_stub(name)),
     }
+}
+
+/// Apply one `\pset` option, or report that the runner does not implement it.
+/// A value-less `\pset <option>` queries the setting, which `-q` silences and
+/// which notably does *not* reset it (`psql.out:480`).
+fn set_print_option(option: &str, value: Option<&str>, printing: &mut format::Printing) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    match option {
+        "null" => printing.null_display = value.to_string(),
+        "expanded" => match parse_bool(value) {
+            Some(on) => printing.expanded = on,
+            None => return false,
+        },
+        "tuples_only" => match parse_bool(value) {
+            Some(on) => printing.tuples_only = on,
+            None => return false,
+        },
+        "format" => match value {
+            "aligned" | "a" => printing.aligned = true,
+            "unaligned" | "u" => printing.aligned = false,
+            // wrapped, csv, html, latex, troff-ms: not implemented, and
+            // rendering them as `aligned` would be a silent lie.
+            _ => return false,
+        },
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(test)]
@@ -694,7 +784,7 @@ mod tests {
     fn run_all(commands: &[&str]) -> (String, String, Variables) {
         let environment = BTreeMap::from([("PG_ABS_SRCDIR".to_string(), "/src".to_string())]);
         let mut vars = Variables::new();
-        let mut null_display = String::new();
+        let mut printing = format::Printing::default();
         let mut out = String::new();
         for command in commands {
             let chars: Vec<char> = command.chars().collect();
@@ -705,11 +795,11 @@ mod tests {
                 &arguments,
                 &environment,
                 &mut vars,
-                &mut null_display,
+                &mut printing,
                 &mut out,
             );
         }
-        (out, null_display, vars)
+        (out, printing.null_display, vars)
     }
 
     #[track_caller]
@@ -745,7 +835,10 @@ mod tests {
 
     #[test]
     fn unimplemented_metacommands_still_stub() {
-        let (out, _, _) = run_all(&["pset format aligned", "d crabs", "psetnull x"]);
+        // `\pset format html` is a *supported command* with a value the runner
+        // cannot render, so it stubs rather than silently printing an aligned
+        // table and claiming it is HTML.
+        let (out, _, _) = run_all(&["pset format html", "d crabs", "psetnull x"]);
         assert_eq!(
             out,
             "\\pset: metacommand not supported by crabgresql regress runner\n\

@@ -286,6 +286,10 @@ pub struct MetaArgs {
     /// unquoted runs concatenate into a single argument, so `x/ 'y' :a` with
     /// `a = hi` is three arguments (`x/`, `y`, `hi`), while `x/'y'` is one.
     pub args: Vec<String>,
+    /// Whether each argument was written with quotes anywhere in it. psql
+    /// compares some flags against the *raw* option text, so `\echo '-n'`
+    /// prints a literal `-n` while `\echo -n` suppresses the newline.
+    pub quoted: Vec<bool>,
     /// The rest of the line starting at an unquoted `\`, which psql reads as
     /// the next backslash command. Empty when the line ended normally.
     pub rest: String,
@@ -298,9 +302,10 @@ pub struct MetaArgs {
 /// in `regproc.sql` hangs a comment off a `\set`).
 pub fn split_args(input: &str, vars: &Variables) -> MetaArgs {
     let chars: Vec<char> = input.chars().collect();
-    let (args, end) = scan_args(&chars, 0, vars);
+    let (args, quoted, end) = scan_args(&chars, 0, vars);
     MetaArgs {
         args,
+        quoted,
         rest: chars[end..].iter().collect(),
     }
 }
@@ -311,17 +316,19 @@ pub fn split_args(input: &str, vars: &Variables) -> MetaArgs {
 /// covers before SQL scanning resumes, and it is exact by construction —
 /// [`scan_args`] advances by a reference's *length*, never by its value.
 pub fn arguments_extent(chars: &[char], start: usize) -> usize {
-    scan_args(chars, start, &Variables::new()).1
+    scan_args(chars, start, &Variables::new()).2
 }
 
 /// The shared scanner behind [`split_args`] and [`arguments_extent`]: returns the
-/// arguments and the index just past them.
-fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, usize) {
+/// arguments, whether each was quoted, and the index just past them.
+fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, Vec<bool>, usize) {
     let mut args = Vec::new();
+    let mut quoted = Vec::new();
     let mut current = String::new();
     // Distinguishes "no argument yet" from "an argument that is the empty
     // string", which `\set x ''` needs.
     let mut started = false;
+    let mut current_quoted = false;
     let mut i = start;
     while i < chars.len() {
         let c = chars[i];
@@ -331,6 +338,7 @@ fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, us
         if c.is_whitespace() {
             if started {
                 args.push(std::mem::take(&mut current));
+                quoted.push(std::mem::take(&mut current_quoted));
                 started = false;
             }
             i += 1;
@@ -338,6 +346,7 @@ fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, us
         }
         started = true;
         if c == '\'' {
+            current_quoted = true;
             i += 1;
             while i < chars.len() {
                 match chars[i] {
@@ -386,8 +395,9 @@ fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, us
     }
     if started {
         args.push(current);
+        quoted.push(current_quoted);
     }
-    (args, i)
+    (args, quoted, i)
 }
 
 #[cfg(test)]

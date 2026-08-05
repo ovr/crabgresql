@@ -13,10 +13,203 @@ use crate::client::{ErrorFields, Field};
 /// xid, cid, float4, float8, money, numeric, xid8.
 const RIGHT_ALIGNED_OIDS: &[u32] = &[20, 21, 23, 26, 28, 29, 700, 701, 790, 1700, 5069];
 
-pub fn format_table(fields: &[Field], rows: &[Vec<Option<String>>], null_display: &str) -> String {
-    let mut out = aligned_table(None, fields, rows, null_display);
-    let n = rows.len();
-    out.push_str(&format!("({n} row{})\n\n", if n == 1 { "" } else { "s" }));
+/// psql's `printQueryOpt`, as far as the corpus exercises it: what `\pset`,
+/// `\x`, `\a` and `\t` change about a result table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Printing {
+    /// `\pset null`. psql starts with the empty string.
+    pub null_display: String,
+    /// `\x` / `\pset expanded`: one `-[ RECORD n ]` block per row.
+    pub expanded: bool,
+    /// `\a` / `\pset format`: false is psql's `unaligned`, which pads nothing
+    /// and ignores `border` entirely.
+    pub aligned: bool,
+    /// `\t` / `\pset tuples_only`: drop the header block and the `(N rows)`
+    /// footer.
+    pub tuples_only: bool,
+}
+
+impl Default for Printing {
+    fn default() -> Self {
+        Self {
+            null_display: String::new(),
+            expanded: false,
+            aligned: true,
+            tuples_only: false,
+        }
+    }
+}
+
+/// psql's `unaligned` field separator. `\pset fieldsep` is only ever exercised
+/// as an error case in the corpus, so the default is the only value needed.
+const FIELD_SEP: &str = "|";
+
+pub fn format_table(options: &Printing, fields: &[Field], rows: &[Vec<Option<String>>]) -> String {
+    if options.expanded {
+        return expanded_table(options, fields, rows);
+    }
+    let mut out = if options.aligned {
+        aligned_table(None, fields, rows, options)
+    } else {
+        unaligned_table(fields, rows, options)
+    };
+    if !options.tuples_only {
+        let n = rows.len();
+        out.push_str(&format!("({n} row{})\n", if n == 1 { "" } else { "s" }));
+    }
+    // The aligned printer always closes with a blank line, even with the header
+    // and footer suppressed (`partition_prune.out:4517`); the unaligned one
+    // never does (`explain.out:262`).
+    if options.aligned {
+        out.push('\n');
+    }
+    out
+}
+
+/// psql's `unaligned` mode: values joined by the field separator with no
+/// padding at all, and no `border` influence whatsoever.
+fn unaligned_table(fields: &[Field], rows: &[Vec<Option<String>>], options: &Printing) -> String {
+    let mut out = String::new();
+    if !options.tuples_only {
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        out.push_str(&names.join(FIELD_SEP));
+        out.push('\n');
+    }
+    for row in rows {
+        let cells: Vec<&str> = row
+            .iter()
+            .map(|v| v.as_deref().unwrap_or(&options.null_display))
+            .collect();
+        out.push_str(&cells.join(FIELD_SEP));
+        out.push('\n');
+    }
+    out
+}
+
+/// psql's expanded (`\x`) mode: one block per row, `name | value`, with the
+/// column names down the left. The `(N rows)` footer is suppressed — except for
+/// an empty result, which prints `(0 rows)` and nothing else
+/// (`stats_import.out:1501`).
+fn expanded_table(options: &Printing, fields: &[Field], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = String::new();
+    if rows.is_empty() {
+        if !options.tuples_only {
+            out.push_str("(0 rows)\n");
+        }
+        out.push('\n');
+        return out;
+    }
+
+    // A name or a value can itself span lines, and both columns are sized by
+    // the widest single line.
+    let names: Vec<Vec<&str>> = fields
+        .iter()
+        .map(|f| f.name.split('\n').collect())
+        .collect();
+    let name_width = names
+        .iter()
+        .flatten()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let value_width = rows
+        .iter()
+        .flatten()
+        .flat_map(|value| {
+            value
+                .as_deref()
+                .unwrap_or(&options.null_display)
+                .split('\n')
+                .map(|line| line.chars().count())
+        })
+        .max()
+        .unwrap_or(0);
+
+    if !options.aligned {
+        return expanded_unaligned(options, fields, rows);
+    }
+
+    // The rule that runs through psql's expanded output: the two columns plus
+    // the continuation flag, the `|` and the space after it.
+    let divider = format!(
+        "{}+{}",
+        "-".repeat(name_width + 1),
+        "-".repeat(value_width + 1)
+    );
+    for (n, row) in rows.iter().enumerate() {
+        if options.tuples_only {
+            // Without the record labels psql separates records with a bare
+            // divider, and prints none before the first (`psql.out:2937`).
+            if n > 0 {
+                out.push_str(&divider);
+                out.push('\n');
+            }
+        } else {
+            // `-[ RECORD n ]` is laid over the divider; a label wider than the
+            // divider is simply all there is (`psql.out:39`).
+            let label = format!("-[ RECORD {} ]", n + 1);
+            out.push_str(&if label.len() >= divider.len() {
+                label
+            } else {
+                format!("{label}{}", &divider[label.len()..])
+            });
+            out.push('\n');
+        }
+        let values: Vec<Vec<&str>> = row
+            .iter()
+            .map(|value| {
+                value
+                    .as_deref()
+                    .unwrap_or(&options.null_display)
+                    .split('\n')
+                    .collect()
+            })
+            .collect();
+        for (name, value) in names.iter().zip(&values) {
+            for line in 0..name.len().max(value.len()) {
+                let segment = name.get(line).copied().unwrap_or("");
+                let pad = " ".repeat(name_width - segment.chars().count());
+                let continues = if line + 1 < name.len() { '+' } else { ' ' };
+                out.push_str(&format!("{segment}{pad}{continues}|"));
+                // A line with no value segment stops right after the `|`, with
+                // no trailing space (`psql.out:829`).
+                if let Some(text) = value.get(line) {
+                    out.push(' ');
+                    if line + 1 < value.len() {
+                        let pad = " ".repeat(value_width - text.chars().count());
+                        out.push_str(&format!("{text}{pad}+"));
+                    } else {
+                        out.push_str(text);
+                    }
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Expanded output with `\a`: `name|value` lines, records separated by a blank
+/// line (`psql.out:2974`).
+fn expanded_unaligned(
+    options: &Printing,
+    fields: &[Field],
+    rows: &[Vec<Option<String>>],
+) -> String {
+    let mut out = String::new();
+    for (n, row) in rows.iter().enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        for (field, value) in fields.iter().zip(row) {
+            let value = value.as_deref().unwrap_or(&options.null_display);
+            out.push_str(&format!("{}{FIELD_SEP}{value}\n", field.name));
+        }
+    }
+    if !options.tuples_only {
+        out.push('\n');
+    }
     out
 }
 
@@ -31,7 +224,7 @@ pub fn format_describe(title: &str, headers: &[&str], rows: &[Vec<Option<String>
             type_oid: 25,
         })
         .collect();
-    let mut out = aligned_table(Some(title), &fields, rows, "");
+    let mut out = aligned_table(Some(title), &fields, rows, &Printing::default());
     out.push('\n');
     out
 }
@@ -40,8 +233,9 @@ fn aligned_table(
     title: Option<&str>,
     fields: &[Field],
     rows: &[Vec<Option<String>>],
-    null_display: &str,
+    options: &Printing,
 ) -> String {
+    let null_display = options.null_display.as_str();
     // A cell containing newlines occupies one output line per line of content,
     // so a column is as wide as its widest *line* — not its widest value.
     let widths: Vec<usize> = fields
@@ -77,18 +271,22 @@ fn aligned_table(
     }
 
     // Header: names centered (extra space to the right), every cell padded —
-    // hence the trailing whitespace psql expected files are known for.
-    let header: Vec<String> = fields
-        .iter()
-        .zip(&widths)
-        .map(|(f, &w)| format!(" {} ", center(&f.name, w)))
-        .collect();
-    out.push_str(&header.join("|"));
-    out.push('\n');
+    // hence the trailing whitespace psql expected files are known for. `\t`
+    // drops the whole block, rows keep their alignment
+    // (`partition_prune.out:4517`).
+    if !options.tuples_only {
+        let header: Vec<String> = fields
+            .iter()
+            .zip(&widths)
+            .map(|(f, &w)| format!(" {} ", center(&f.name, w)))
+            .collect();
+        out.push_str(&header.join("|"));
+        out.push('\n');
 
-    let separator: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
-    out.push_str(&separator.join("+"));
-    out.push('\n');
+        let separator: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
+        out.push_str(&separator.join("+"));
+        out.push('\n');
+    }
 
     // Data: numeric-ish columns are right-aligned, and the last column drops
     // its trailing padding (so a NULL last cell leaves a lone space).
@@ -300,6 +498,107 @@ mod tests {
         }
     }
 
+    /// `\x`: one `-[ RECORD n ]` block per row, no `(N rows)` footer.
+    /// Reproduces `timestamptz.out:3295`, whose separator is
+    /// `name_width + value_width + 3` wide.
+    #[test]
+    fn expanded_lays_the_record_label_over_the_divider() {
+        let out = format_table(
+            &Printing {
+                expanded: true,
+                ..Printing::default()
+            },
+            &[field("ttz_at_local", 25), field("t_func", 25)],
+            &[vec![
+                text("Fri Jul 07 23:38:00 1978"),
+                text("Fri Jul 07 19:38:00 1978 UTC"),
+            ]],
+        );
+        assert_eq!(
+            out,
+            "-[ RECORD 1 ]+-----------------------------\n\
+             ttz_at_local | Fri Jul 07 23:38:00 1978\n\
+             t_func       | Fri Jul 07 19:38:00 1978 UTC\n\n"
+        );
+    }
+
+    /// A label wider than the divider is all that prints (`psql.out:39`), and a
+    /// NULL or empty value still leaves the space after the `|`
+    /// (`enum.out:50`).
+    #[test]
+    fn expanded_short_divider_and_empty_values() {
+        let out = format_table(
+            &Printing {
+                expanded: true,
+                ..Printing::default()
+            },
+            &[field("one", 23), field("two", 23)],
+            &[vec![text("1"), None]],
+        );
+        assert_eq!(out, "-[ RECORD 1 ]\none | 1\ntwo | \n\n");
+    }
+
+    /// An empty result prints the footer and nothing else
+    /// (`stats_import.out:1501`).
+    #[test]
+    fn expanded_empty_result_prints_only_the_footer() {
+        let out = format_table(
+            &Printing {
+                expanded: true,
+                ..Printing::default()
+            },
+            &[field("a", 23)],
+            &[],
+        );
+        assert_eq!(out, "(0 rows)\n\n");
+    }
+
+    /// `\a`: no padding, header and footer still print, and — unlike aligned —
+    /// no trailing blank line (`explain.out:262`).
+    #[test]
+    fn unaligned_pads_nothing_and_ends_without_a_blank_line() {
+        let out = format_table(
+            &Printing {
+                aligned: false,
+                ..Printing::default()
+            },
+            &[field("backend_type", 25), field("object", 25)],
+            &[vec![text("walwriter"), text("wal")]],
+        );
+        assert_eq!(out, "backend_type|object\nwalwriter|wal\n(1 row)\n");
+    }
+
+    /// `\t` drops the header block and the footer but keeps both the row
+    /// alignment and the trailing blank line (`partition_prune.out:4517`).
+    #[test]
+    fn tuples_only_keeps_alignment_and_the_trailing_blank_line() {
+        let out = format_table(
+            &Printing {
+                tuples_only: true,
+                ..Printing::default()
+            },
+            &[field("tableoid", 25), field("a", 23)],
+            &[vec![text("hp_prefix_test_p5"), text("1")]],
+        );
+        assert_eq!(out, " hp_prefix_test_p5 | 1\n\n");
+    }
+
+    /// `\a\t` over an empty result prints nothing at all
+    /// (`opr_sanity.out:900`).
+    #[test]
+    fn unaligned_tuples_only_empty_result_prints_nothing() {
+        let out = format_table(
+            &Printing {
+                aligned: false,
+                tuples_only: true,
+                ..Printing::default()
+            },
+            &[field("oid", 25)],
+            &[],
+        );
+        assert_eq!(out, "");
+    }
+
     fn text(s: &str) -> Option<String> {
         Some(s.into())
     }
@@ -349,31 +648,43 @@ mod tests {
 
     #[test]
     fn int_column_right_aligns_and_header_pads() {
-        let out = format_table(&[field("one", 23)], &[vec![text("1")]], "");
+        let out = format_table(
+            &Printing::default(),
+            &[field("one", 23)],
+            &[vec![text("1")]],
+        );
         assert_eq!(out, " one \n-----\n   1\n(1 row)\n\n");
     }
 
     #[test]
     fn bool_column_left_aligns() {
-        let out = format_table(&[field("true", 16)], &[vec![text("t")]], "");
+        let out = format_table(
+            &Printing::default(),
+            &[field("true", 16)],
+            &[vec![text("t")]],
+        );
         assert_eq!(out, " true \n------\n t\n(1 row)\n\n");
     }
 
     #[test]
     fn default_column_name_width() {
-        let out = format_table(&[field("?column?", 23)], &[vec![text("1")]], "");
+        let out = format_table(
+            &Printing::default(),
+            &[field("?column?", 23)],
+            &[vec![text("1")]],
+        );
         assert_eq!(out, " ?column? \n----------\n        1\n(1 row)\n\n");
     }
 
     #[test]
     fn header_centering_puts_extra_space_right() {
         let out = format_table(
+            &Printing::default(),
             &[field("d", 25), field("istrue", 16)],
             &[
                 vec![text("true "), text("t")],
                 vec![text("false"), text("f")],
             ],
-            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "   d   | istrue ");
@@ -386,9 +697,9 @@ mod tests {
     #[test]
     fn null_renders_empty_and_last_column_keeps_lone_space() {
         let out = format_table(
+            &Printing::default(),
             &[field("a", 23), field("b", 25)],
             &[vec![text("1"), None]],
-            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[2], " 1 | ");
@@ -402,12 +713,12 @@ mod tests {
     #[test]
     fn multi_line_cells_use_psql_continuation_markers() {
         let out = format_table(
+            &Printing::default(),
             &[field("pg_get_viewdef", 25), field("n", 23)],
             &[vec![
                 text(" SELECT a AS aa,\n    a AS bb\n   FROM t;"),
                 text("42"),
             ]],
-            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "  pg_get_viewdef  | n  ");
@@ -421,9 +732,9 @@ mod tests {
     #[test]
     fn right_aligned_middle_column_keeps_trailing_space() {
         let out = format_table(
+            &Printing::default(),
             &[field("id", 23), field("name", 25)],
             &[vec![text("1"), text("ferris")]],
-            "",
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], " id |  name  ");
@@ -433,7 +744,7 @@ mod tests {
 
     #[test]
     fn zero_rows_footer() {
-        let out = format_table(&[field("a", 23)], &[], "");
+        let out = format_table(&Printing::default(), &[field("a", 23)], &[]);
         assert_eq!(out, " a \n---\n(0 rows)\n\n");
     }
 
@@ -443,13 +754,20 @@ mod tests {
     /// rather than a panic that takes the whole run down.
     #[test]
     fn zero_column_result_with_rows() {
-        let out = format_table(&[], &[vec![]], "");
+        let out = format_table(&Printing::default(), &[], &[vec![]]);
         assert_eq!(out, "\n\n\n(1 row)\n\n");
     }
 
     #[test]
     fn configured_null_marker_affects_width_but_not_empty_strings() {
-        let out = format_table(&[field("a", 25)], &[vec![None], vec![text("")]], "(null)");
+        let out = format_table(
+            &Printing {
+                null_display: "(null)".into(),
+                ..Printing::default()
+            },
+            &[field("a", 25)],
+            &[vec![None], vec![text("")]],
+        );
         assert_eq!(out, "   a    \n--------\n (null)\n \n(2 rows)\n\n");
     }
 
