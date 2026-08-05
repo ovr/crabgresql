@@ -1472,6 +1472,39 @@ pub fn plan_outer_ref_slots(plan: &LogicalPlan) -> Option<Vec<(usize, PgType)>> 
     (!escapes_further).then(|| slots.into_iter().collect())
 }
 
+/// Whether `expr` holds a subquery marker whose subplan is *correlated* — one
+/// the executor cannot fold to a constant before the scan starts.
+///
+/// The distinction is what separates a marker that costs a subplan execution per
+/// row from one that costs a `Const` clone: `resolve_subqueries` folds every
+/// marker this returns `false` for, once, before any row is read, using this
+/// very predicate ([`plan_has_outer_refs`]).
+///
+/// Only the expression's own markers are asked. A marker nested inside another
+/// marker's subplan does not matter: if the enclosing one folds, the whole
+/// subtree folds with it, and if it does not, the enclosing one already answers
+/// `true`.
+pub fn expr_contains_correlated_subquery(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    for_each_subexpr(expr, 1, &mut |expr, depth| {
+        // `depth > 1` is a node inside some marker's subplan; the walk pushes a
+        // level at exactly that boundary.
+        if depth != 1 {
+            return;
+        }
+        let subplan = match expr {
+            BoundExpr::ScalarSubquery { subplan, .. }
+            | BoundExpr::Exists { subplan, .. }
+            | BoundExpr::QuantifiedSubquery { subplan, .. } => subplan,
+            _ => return,
+        };
+        if plan_has_outer_refs(&subplan.plan) {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Whether `plan` calls a volatile function (or a routine, which PostgreSQL
 /// defaults to volatile) anywhere.
 ///

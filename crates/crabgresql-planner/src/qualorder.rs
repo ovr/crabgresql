@@ -18,10 +18,15 @@
 //!
 //! PostgreSQL orders quals by estimated cost per unit of selectivity; with no
 //! cost model here the pass makes the one distinction that matters by orders of
-//! magnitude and leaves everything else alone: **a conjunct containing a subquery
-//! marker sinks to the end, every other conjunct keeps its written order.**
-//! Narrower is safer — reordering two ordinary conjuncts could only move which of
-//! two errors a row raises, for a gain too small to measure.
+//! magnitude and leaves everything else alone: **a conjunct containing a
+//! *correlated* subquery marker sinks to the end, every other conjunct keeps its
+//! written order.** Narrower is safer — reordering two ordinary conjuncts could
+//! only move which of two errors a row raises, for a gain too small to measure.
+//!
+//! *Correlated* is the operative word. An uncorrelated marker is folded to a
+//! `Const` by `resolve_subqueries` before the scan starts, and evaluating a
+//! `Const` is a clone — so sinking one buys nothing while costing whatever it
+//! was gating.
 //!
 //! # Volatility
 //!
@@ -134,14 +139,24 @@ fn reorder(predicate: &mut Option<BoundExpr>) {
     // Nothing to gain from a single conjunct, and a volatile one forbids any
     // move at all (see the module comment).
     let movable = conjuncts.len() > 1
-        && conjuncts.iter().any(BoundExpr::contains_subquery)
+        && conjuncts.iter().any(is_expensive)
         && !conjuncts.iter().any(BoundExpr::contains_volatile_fn);
     if movable {
         // `sort_by_key` is stable, so conjuncts within each class keep their
         // written order relative to one another.
-        conjuncts.sort_by_key(|conjunct| u8::from(conjunct.contains_subquery()));
+        conjuncts.sort_by_key(|conjunct| u8::from(is_expensive(conjunct)));
     }
     *predicate = rebuild_and(conjuncts);
+}
+
+/// Whether this conjunct is the kind worth sinking: one holding a *correlated*
+/// subquery, which costs a subplan execution for every row it reaches.
+///
+/// An uncorrelated marker is deliberately not included. `resolve_subqueries`
+/// folds one to a `Const` before the scan starts, and evaluating a `Const` is a
+/// clone — so sinking it buys nothing and costs whatever it was gating.
+fn is_expensive(conjunct: &BoundExpr) -> bool {
+    crabgresql_binder::expr_contains_correlated_subquery(conjunct)
 }
 
 #[cfg(test)]
@@ -189,6 +204,18 @@ mod tests {
         assert!(!quals[0].contains_subquery());
         assert!(!quals[1].contains_subquery());
         assert!(matches!(quals[2], BoundExpr::Exists { .. }));
+    }
+
+    #[test]
+    fn an_uncorrelated_subquery_conjunct_does_not_move() {
+        // `resolve_subqueries` folds this one to a `Const` before the scan
+        // starts, so sinking it would cost whatever it was gating and save
+        // nothing. It has to stay exactly where it was written.
+        let quals = quals(plan_sql(
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t c WHERE c.id = 1) AND t.id = 1",
+        ));
+        assert_eq!(quals.len(), 2);
+        assert!(matches!(quals[0], BoundExpr::Exists { .. }));
     }
 
     #[test]
