@@ -46,6 +46,7 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
         pretty,
         calls: None,
         zone: None,
+        unqualify: None,
     };
 
     let mut out = String::from(" SELECT ");
@@ -106,6 +107,18 @@ struct Cx<'a> {
     /// The reading session's display zone, when there is one — see
     /// [`stored_expr`]. `None` leaves every constant as written.
     zone: Option<&'a FmtCtx>,
+    /// The relation a CHECK constrains, when this walk is deparsing one.
+    ///
+    /// A CHECK binds in a scope holding exactly one relation, so `t.x` and `x`
+    /// resolve to the same column and PostgreSQL prints the second — it stores
+    /// bare `Var`s and has no qualifier left to print. Dropping ours matters for
+    /// more than cosmetics: the stored text is re-bound against *inheritance
+    /// children*, whose scope is qualified with the child's name, so a retained
+    /// `parent.x` would fail there with 42P01.
+    ///
+    /// `None` everywhere else. A view's `t.c` really does select among several
+    /// relations and must keep its qualifier.
+    unqualify: Option<&'a str>,
 }
 
 /// Canonicalize an expression on its way *into* the catalog — a column default
@@ -122,12 +135,36 @@ struct Cx<'a> {
 /// the catalog; psql asks for the pretty one and [`stored_expr`] derives it by
 /// re-parsing.
 pub fn deparse_stored_expr(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
+    deparse_into_catalog(sql, None, catalog)
+}
+
+/// [`deparse_stored_expr`] for a CHECK predicate, which additionally drops the
+/// `relation.` qualifier from any column that carries one.
+///
+/// PostgreSQL stores bare `Var`s, so `CHECK (t.x > 0)` comes back as
+/// `CHECK ((x > 0))`. Reproducing that is what lets the stored text be re-bound
+/// against an inheritance child, whose scope answers to the child's name rather
+/// than the parent's — see [`Cx::unqualify`].
+pub fn deparse_check_expr(
+    sql: &str,
+    relation: &str,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Option<String> {
+    deparse_into_catalog(sql, Some(relation), catalog)
+}
+
+fn deparse_into_catalog(
+    sql: &str,
+    unqualify: Option<&str>,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Option<String> {
     let e = parse_expression(sql)?;
     let resolve = |f: &ast::Function| call_arg_types(f, catalog);
     let cx = Cx {
         pretty: false,
         calls: Some(&resolve),
         zone: None,
+        unqualify,
     };
     Some(top_expr(&e, cx))
 }
@@ -158,6 +195,7 @@ pub fn stored_expr(sql: &str, pretty: bool, fmt: &FmtCtx) -> Option<String> {
         pretty,
         calls: None,
         zone: Some(fmt),
+        unqualify: None,
     };
     Some(top_expr(&e, cx))
 }
@@ -370,9 +408,18 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
     let prec = precedence(e);
     let body = match e {
         ast::Expr::Identifier(id) => ident(id),
-        ast::Expr::CompoundIdentifier(parts) => {
-            parts.iter().map(ident).collect::<Vec<_>>().join(".")
-        }
+        // `relation.column` inside a CHECK loses its qualifier: see
+        // [`Cx::unqualify`]. Guarded on the qualifier actually naming this
+        // relation — a mismatched one is not ours to rewrite, and binding has
+        // already rejected it with 42P01 by the time we deparse.
+        ast::Expr::CompoundIdentifier(parts) => match (cx.unqualify, parts.as_slice()) {
+            (Some(relation), [qualifier, column])
+                if crate::expr::normalize_ident(qualifier) == relation =>
+            {
+                ident(column)
+            }
+            _ => parts.iter().map(ident).collect::<Vec<_>>().join("."),
+        },
         ast::Expr::AtTimeZone {
             timestamp,
             time_zone,

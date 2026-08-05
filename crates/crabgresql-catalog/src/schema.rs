@@ -1063,14 +1063,21 @@ pub fn pg_constraint_rows(
                 // connoinherit: `NO INHERIT` has no parser support, so nothing
                 // that exists here can be marked with it.
                 Value::Bool(false),
-                Value::Text(format!(
-                    "{{{}}}",
-                    c.columns
-                        .iter()
-                        .map(|column| (*column + 1).to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )),
+                // NULL, not an empty array, when the constraint reads no column
+                // — PostgreSQL stores NULL for a predicate like `CHECK (1 > 0)`,
+                // so a client testing `conkey IS NULL` agrees. Probed against
+                // 18.4.
+                match c.columns.is_empty() {
+                    true => Value::Null,
+                    false => Value::Text(format!(
+                        "{{{}}}",
+                        c.columns
+                            .iter()
+                            .map(|column| (*column + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )),
+                },
                 match &c.expr {
                     Some(expr) => Value::Text(expr.clone()),
                     None => Value::Null,

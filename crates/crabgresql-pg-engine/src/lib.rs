@@ -2121,10 +2121,15 @@ impl TableEngine for PgEngine {
                 .cloned()
                 .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?
         };
-        // Heap only, for the same reason `set_column_not_null` is: an
-        // engine-managed relation writes its rows through a fragment schema this
-        // does not reach, and a constraint the DDL accepted but the write path
-        // never consults is worse than a refusal.
+        // Heap only — but not for `set_column_not_null`'s reason. NOT NULL bleeds
+        // into the Arrow field nullability an engine-managed relation writes into
+        // its fragment footers; a CHECK does not reach storage at all, being
+        // enforced in the executor off `TableAm::schema()`. What blocks it here
+        // is narrower: only `HeapTable` keeps its schema behind a lock and can
+        // republish it, while `BufferedParquetTable`/`BufferTable` freeze theirs
+        // at open, so the constraint would be durable yet invisible to every
+        // handle until a restart. `CREATE TABLE` refuses the same combination, so
+        // the two DDL paths agree.
         let ManagedTable::Heap(heap) = target.as_ref() else {
             let method = target.schema().access_method.as_str();
             return Err(StorageError::UnsupportedOperation(format!(

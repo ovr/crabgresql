@@ -1794,14 +1794,6 @@ pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecE
     eval(expr, &[], ctx)
 }
 
-/// Evaluate an expression against one whole row, for a caller outside the plan
-/// tree — `ALTER TABLE ... ADD CHECK` scanning the rows already in the table
-/// against the predicate it is about to record. `tuple` must be the relation's
-/// full row, which is the shape the expression was bound against.
-pub fn eval_in_row(expr: &BoundExpr, tuple: &Tuple, ctx: &ExecContext) -> Result<Value, ExecError> {
-    eval(expr, tuple, ctx)
-}
-
 /// A source node that replays already-computed output rows. `RETURNING`
 /// projects eagerly and streams the finished rows through this — unlike
 /// [`Values`], which evaluates `BoundExpr`s on each pull.

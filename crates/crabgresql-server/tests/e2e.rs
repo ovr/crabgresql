@@ -6466,9 +6466,9 @@ async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
         &SqlState::CHECK_VIOLATION
     );
 
-    // The name is taken now, and a CHECK collides as 42710 — not the 42P07 an
-    // index-backed constraint raises, because a check enters no relation
-    // namespace.
+    // The name is taken now. A collision in the *constraint* namespace is 42710;
+    // 42P07 is what a collision in the *relation* namespace raises (a plain
+    // index, a table), which a CHECK never enters.
     let e = client
         .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a < 9)")
         .await

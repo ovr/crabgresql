@@ -827,13 +827,27 @@ impl SystemCatalog {
     /// Column *names* rather than positions, because the caller renders DDL and
     /// has no schema in hand. An unknown OID is `None`, which PostgreSQL reports
     /// as a NULL result rather than an error.
+    ///
+    /// Both lookups index rather than scan: each block is one dense run, so the
+    /// offset from its base *is* the position. `pg_get_constraintdef` runs once
+    /// per output row, and a linear scan here made
+    /// `SELECT pg_get_constraintdef(oid) FROM pg_constraint` quadratic — over a
+    /// list whose elements are whole `TableSchema`s. The stored OID is still
+    /// compared afterwards, so a future non-positional assignment degrades to
+    /// not-found rather than to the wrong constraint (as in [`Self::relation_ref`]).
     pub fn constraint_def(&self, oid: u32) -> Option<(String, Vec<String>, Option<String>)> {
-        let constraint = self.constraint_oids().iter().find(|c| c.oid == oid)?;
-        let schema = self
-            .relation_oids()
-            .iter()
-            .find(|(rel_oid, _)| *rel_oid == constraint.table_oid)
-            .map(|(_, schema)| schema)?;
+        let constraints = self.constraint_oids();
+        let base = constraints.first()?.oid;
+        let constraint = constraints.get(oid.checked_sub(base)? as usize)?;
+        if constraint.oid != oid {
+            return None;
+        }
+        let relations = self.relation_oids();
+        let (stored, schema) =
+            relations.get(constraint.table_oid.checked_sub(FIRST_REL_OID)? as usize)?;
+        if *stored != constraint.table_oid {
+            return None;
+        }
         let columns = constraint
             .columns
             .iter()
