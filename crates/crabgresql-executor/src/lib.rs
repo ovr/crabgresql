@@ -7610,6 +7610,19 @@ mod tests {
     }
 
     #[test]
+    fn a_key_type_the_hash_cannot_separate_is_not_memoized() {
+        // `point` is outside `hashes_distinctly`, so `hash_key` puts every key
+        // in one bucket and `compare_values` — which has no `Point` arm — is
+        // asked to resolve it. Without the guard the *second* outer row lands in
+        // the first one's bucket and hits `unreachable!`.
+        let (_c, rows) = run_rows(
+            "SELECT (SELECT count(*) FROM (VALUES (1)) c(x) WHERE c.x = 1 AND o.p IS NOT NULL) \
+             FROM (VALUES ('(1,2)'::point), ('(3,4)'::point)) o(p)",
+        );
+        assert_eq!(rows, vec![vec![Value::Int8(1)], vec![Value::Int8(1)]]);
+    }
+
+    #[test]
     fn memoized_scalar_subquery_answers_each_distinct_key_once() -> anyhow::Result<()> {
         // Four outer rows over two distinct correlation keys: the second row of
         // each key is answered from the memo, and must get its own key's answer
