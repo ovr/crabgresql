@@ -1200,7 +1200,7 @@ fn fold_subquery(
                 array: Box::new(BoundExpr::Const {
                     value: Value::Array {
                         elem,
-                        elems: subquery_column(rows),
+                        elems: dedup_candidates(subquery_column(rows)),
                     },
                     ty: PgType::Array(elem.oid()),
                 }),
@@ -1211,6 +1211,53 @@ fn fold_subquery(
         // Not a subquery marker (unreachable — the caller matched one).
         other => Ok(other),
     }
+}
+
+/// Drop candidates a quantified comparison would ask the same question of twice.
+///
+/// `x op ANY/ALL (SELECT …)` compares the needle against every candidate for
+/// every outer row, so a subquery returning 10 000 rows over 100 distinct values
+/// does a hundred times the work it needs to. Two equal candidates give the same
+/// answer under any of the six comparison operators — they compare identically
+/// against everything, being equal — and duplicate NULLs are equally redundant,
+/// since the evaluator only records *that* it saw one.
+///
+/// The type is read off the values themselves rather than from the comparison's
+/// hole: the candidates arrive as the subquery produced them and are coerced
+/// only later, per row, so `float_col IN (SELECT num_col …)` hands numerics to a
+/// float8 comparison. Values of mixed types, or of a type whose hash does not
+/// separate them the way its comparison does (interval, inet, …), are left as
+/// they came — the same refusal the hash join makes.
+///
+/// Deduplicating on the *source* type is conservative in the right direction:
+/// coercion is a function, so values equal before it are equal after it, while
+/// values it would map together are simply kept apart.
+fn dedup_candidates(values: Vec<Value>) -> Vec<Value> {
+    let Some(elem) = values.iter().find_map(Value::pg_type) else {
+        return values;
+    };
+    let uniform = values
+        .iter()
+        .all(|value| value.pg_type().is_none_or(|ty| ty == elem));
+    if values.len() < 2 || !uniform || !elem.hashes_distinctly() {
+        return values;
+    }
+    let tys = [elem];
+    let mut seen: FxHashMap<u64, Vec<Value>> = FxHashMap::default();
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let bucket = seen.entry(agg::hash_key(&tys, &[&value])).or_default();
+        // A bucket hit can be a hash collision, so confirm on the values.
+        if bucket
+            .iter()
+            .any(|other| agg::keys_equal(&tys, &[other], &[&value]))
+        {
+            continue;
+        }
+        bucket.push(value.clone());
+        out.push(value);
+    }
+    out
 }
 
 /// The value a scalar subquery folds to from its materialized `rows`: no row →
@@ -7510,6 +7557,54 @@ mod tests {
             rows,
             vec![vec![Value::Int8(0)]],
             "o.v = 10 matches no inner key, and the NULL key is not one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn in_subquery_candidates_of_a_foreign_type_are_left_alone() {
+        // The candidates are numerics while the comparison is on float8, since
+        // they are coerced per row and not at fold time. Hashing them as float8
+        // would reach the wrong accumulator; the dedup has to read the type off
+        // the values. `1.000000000000000000001` is a distinct numeric that still
+        // rounds to 1.0, so it must not be dropped either.
+        let (_c, rows) = run_rows(
+            "SELECT f FROM (VALUES (1::float8), (2::float8)) t(f) \
+             WHERE f IN (SELECT n FROM (VALUES (1::numeric), \
+                                               (1.000000000000000000001::numeric)) u(n)) \
+             ORDER BY f",
+        );
+        assert_eq!(rows, vec![vec![Value::Float8(1.0)]]);
+    }
+
+    #[test]
+    fn in_subquery_candidates_are_deduplicated() -> anyhow::Result<()> {
+        // Six candidate rows over two distinct values, plus NULLs. Dropping the
+        // duplicates must not change either answer: `IN` still matches, and
+        // `NOT IN` is still NULL rather than false because a NULL candidate
+        // survives the dedup.
+        let engine = exists_engine(
+            &[(1, 0), (3, 0)],
+            &[
+                (Some(1), 0),
+                (Some(1), 0),
+                (Some(2), 0),
+                (Some(2), 0),
+                (None, 0),
+                (None, 0),
+            ],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT o.k, o.k IN (SELECT i.k FROM i) FROM o ORDER BY o.k",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Bool(true)],
+                // 3 matches nothing, but a NULL candidate makes the answer NULL.
+                vec![Value::Int4(3), Value::Null],
+            ]
         );
         Ok(())
     }
