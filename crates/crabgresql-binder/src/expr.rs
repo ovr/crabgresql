@@ -5438,7 +5438,12 @@ fn resolve_temporal(
         matches!(
             t,
             Some(
-                PgType::Interval | PgType::Timestamp | PgType::Date | PgType::Time | PgType::TimeTz
+                PgType::Interval
+                    | PgType::Timestamp
+                    | PgType::TimestampTz
+                    | PgType::Date
+                    | PgType::Time
+                    | PgType::TimeTz
             )
         )
     };
@@ -5446,7 +5451,9 @@ fn resolve_temporal(
         return Ok(None);
     }
 
-    use PgType::{Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T};
+    use PgType::{
+        Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T, TimestampTz as TSZ,
+    };
     // Only int2/int4 pair with `date` (PG has `date + int4`; int2 widens to it).
     // int8 has no `date + bigint` operator, so it must fall through to an error.
     let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4));
@@ -5480,6 +5487,27 @@ fn resolve_temporal(
             (None, Some(T)) => call(
                 ScalarFn::TimestampPlInterval,
                 T,
+                typed(rb),
+                resolve_operand(lb, I)?,
+            ),
+            // timestamptz + interval -> timestamptz. There is no
+            // `timestamptz + timestamptz`, so an untyped literal opposite a
+            // timestamptz can only be the interval.
+            (Some(TSZ), Some(I)) => {
+                call(ScalarFn::TimestampTzPlInterval, TSZ, typed(lb), typed(rb))
+            }
+            (Some(I), Some(TSZ)) => {
+                call(ScalarFn::TimestampTzPlInterval, TSZ, typed(rb), typed(lb))
+            }
+            (Some(TSZ), None) => call(
+                ScalarFn::TimestampTzPlInterval,
+                TSZ,
+                typed(lb),
+                resolve_operand(rb, I)?,
+            ),
+            (None, Some(TSZ)) => call(
+                ScalarFn::TimestampTzPlInterval,
+                TSZ,
                 typed(rb),
                 resolve_operand(lb, I)?,
             ),
@@ -5541,6 +5569,29 @@ fn resolve_temporal(
             // while `ts - '<date>'` and `<date> - ts` produce an interval.
             (Some(T), None) => call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?),
             (None, Some(T)) => call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb)),
+            (Some(TSZ), Some(I)) => {
+                call(ScalarFn::TimestampTzMiInterval, TSZ, typed(lb), typed(rb))
+            }
+            // `timestamptz - {timestamptz, timestamp, date, unknown}` and the
+            // reverses, all `timestamptz_mi -> interval`. `timestamptz` is the
+            // preferred type of the datetime category and both
+            // `timestamp -> timestamptz` and `date -> timestamptz` are implicit
+            // casts, so a mixed pair widens the *other* side rather than
+            // narrowing this one — and that widening stays a runtime `Coerce`
+            // (`fold_needs_session`), which is what makes it read the executing
+            // session's zone. `resolve_operand` is a no-op on the side that is
+            // already a timestamptz.
+            (Some(TSZ), _) | (_, Some(TSZ))
+                if matches!(lt, Some(TSZ | T | D) | None)
+                    && matches!(rt, Some(TSZ | T | D) | None) =>
+            {
+                call(
+                    ScalarFn::TimestampTzMi,
+                    I,
+                    resolve_operand(lb, TSZ)?,
+                    resolve_operand(rb, TSZ)?,
+                )
+            }
             // date - date -> int4; date - int -> date; date - interval -> timestamp.
             (Some(D), Some(D)) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), typed(rb)),
             (Some(D), _) if is_int(rt) => call(

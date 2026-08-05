@@ -24,6 +24,7 @@ use crabgresql_txn::{
     CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
 };
 use crabgresql_types::fmt::Clock;
+use crabgresql_types::interval::IntervalStyle;
 use crabgresql_types::tz::SessionZone;
 use crabgresql_types::{FmtCtx, PgType, Value};
 
@@ -370,6 +371,9 @@ pub struct Session {
     /// rendered in. Behind an `Arc` because it is cloned into the formatting
     /// context of every statement and every plan node.
     pub timezone: Arc<SessionZone>,
+    /// `IntervalStyle` GUC — which of `interval_out`'s four renderings a value
+    /// takes on the wire.
+    pub interval_style: IntervalStyle,
     /// When the protocol message being processed arrived, backing
     /// `statement_timestamp()`. Stamped once per message — not per statement —
     /// so every statement of a multi-statement simple query shares it, as in
@@ -678,6 +682,7 @@ impl Session {
             // PG's boot value is the host zone; ours is UTC, which keeps every
             // expected output in the test suites stable.
             timezone: Arc::new(SessionZone::utc()),
+            interval_style: IntervalStyle::default(),
             // Restamped by every incoming message; seeded here so the value is
             // never an invented instant even before the first one arrives.
             stmt_start: crabgresql_types::tz::now_micros(),
@@ -741,7 +746,8 @@ impl Session {
     }
 
     /// The formatting context for this session: `extra_float_digits`, the
-    /// display zone and the clock, as the value layer wants them.
+    /// display zone, `IntervalStyle` and the clock, as the value layer wants
+    /// them.
     ///
     /// The transaction start comes from the innermost thing that is one: an
     /// explicit block, else the implicit block an extended-query batch forms,
@@ -753,6 +759,7 @@ impl Session {
         FmtCtx::new(
             self.extra_float_digits,
             Arc::clone(&self.timezone),
+            self.interval_style,
             Clock {
                 xact_start,
                 stmt_start: self.stmt_start,

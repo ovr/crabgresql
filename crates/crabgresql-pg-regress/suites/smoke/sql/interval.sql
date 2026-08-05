@@ -168,3 +168,43 @@ SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
 SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
        interval '4:05:06.789' minute to second(1) AS range_second_p,
        interval '1.6 seconds' second(0) AS rounds_away_from_zero;
+
+-- `@` is a delimiter, not a keyword: every ASCII punctuation character except
+-- `+ - . :` separates fields exactly as whitespace does, which is what makes the
+-- verbose `@ ... ago` input form parse. A literal with nothing but delimiters
+-- has no fields at all, and that is an error rather than a zero interval.
+SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
+       interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
+SELECT interval '@';
+SELECT interval '@ 30 eons ago';
+-- `ago` may appear once, and only as the last field
+SELECT interval '1 day ago ago';
+SELECT interval '2 minutes ago 5 days';
+SELECT interval 'ago';
+-- an infinity must be the whole value, delimiters aside
+SELECT interval '@ infinity' AS at_inf, interval 'infinity @' AS inf_at;
+SELECT interval 'infinity ago';
+SELECT interval '+infinity -infinity';
+
+-- IntervalStyle picks among the four renderings of the same stored value
+CREATE TABLE iv_styles(id int4, span interval);
+INSERT INTO iv_styles VALUES
+  (1, '0'), (2, '1-2'), (3, '1 2:03:04'), (4, '1 day -1 hours'),
+  (5, '-10 mons'), (6, '-1 mon -1 day'), (7, '-0.1 sec'), (8, 'infinity');
+SHOW IntervalStyle;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO postgres_verbose;
+SHOW IntervalStyle;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO sql_standard;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO iso_8601;
+SELECT id, span FROM iv_styles ORDER BY id;
+-- the name is case-insensitive; an unknown one is 22023 with a HINT
+SET IntervalStyle TO 'POSTGRES';
+SHOW IntervalStyle;
+SET IntervalStyle TO bogus;
+-- back to the default, so nothing downstream inherits a style
+RESET IntervalStyle;
+SHOW IntervalStyle;
+DROP TABLE iv_styles;

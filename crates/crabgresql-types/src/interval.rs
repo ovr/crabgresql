@@ -137,7 +137,54 @@ fn division_by_zero() -> IntervalError {
     }
 }
 
-// --- output (interval_out, IntervalStyle = postgres) -----------------------
+// --- output ----------------------------------------------------------------
+
+/// The `IntervalStyle` GUC: which of the four renderings `interval_out`
+/// produces.
+///
+/// Output only. PostgreSQL's `sql_standard` also changes *input* — it makes a
+/// leading minus propagate to the following unsigned fields — which we do not
+/// implement yet; see the note on [`parse_with_default`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IntervalStyle {
+    /// `1 year 2 mons 3 days 04:05:06` — PostgreSQL's default.
+    #[default]
+    Postgres,
+    /// `@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs`, with `ago` for a
+    /// wholly-negative span.
+    PostgresVerbose,
+    /// `+1-2 +3 +4:05:06`, the SQL specification's literal forms.
+    SqlStandard,
+    /// `P1Y2M3DT4H5M6S`, the ISO-8601 duration form.
+    Iso8601,
+}
+
+/// The values `SET IntervalStyle` accepts, in the order and spelling PG's HINT
+/// lists them.
+pub const INTERVAL_STYLE_VALUES: &str = "postgres, postgres_verbose, sql_standard, iso_8601";
+
+impl IntervalStyle {
+    /// Parse a `SET IntervalStyle` value. Names are case-insensitive in PG.
+    pub fn from_name(name: &str) -> Option<IntervalStyle> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "postgres" => Some(IntervalStyle::Postgres),
+            "postgres_verbose" => Some(IntervalStyle::PostgresVerbose),
+            "sql_standard" => Some(IntervalStyle::SqlStandard),
+            "iso_8601" => Some(IntervalStyle::Iso8601),
+            _ => None,
+        }
+    }
+
+    /// The canonical lower-case spelling `SHOW IntervalStyle` prints.
+    pub fn name(self) -> &'static str {
+        match self {
+            IntervalStyle::Postgres => "postgres",
+            IntervalStyle::PostgresVerbose => "postgres_verbose",
+            IntervalStyle::SqlStandard => "sql_standard",
+            IntervalStyle::Iso8601 => "iso_8601",
+        }
+    }
+}
 
 /// `interval_out` at the default (`postgres`) IntervalStyle.
 pub fn format(iv: Interval) -> String {
@@ -201,17 +248,18 @@ pub fn format_verbose(iv: Interval) -> String {
     let ago = iv.months < 0
         || (iv.months == 0 && iv.days < 0)
         || (iv.months == 0 && iv.days == 0 && iv.usec < 0);
-    // Widen the month/day counts before negating: `i32::MIN` months is a
-    // reachable interval that is *not* the infinity sentinel
-    // (`'-178956970 years -8 mons'`), so negating in place would overflow and
-    // panic. `usec` saturates instead, which only the sentinel could reach.
+    // Nothing may be negated at its stored width: `i32::MIN` months and days
+    // and `i64::MIN` micros are all reachable intervals rather than the
+    // sentinels. Widening the month and day counts is enough for them; the
+    // microseconds are split *first*, because `-i64::MIN` has no i64 answer
+    // while each of its four components does.
     let (months, days) = (iv.months as i64, iv.days as i64);
-    let (months, days, usec) = if ago {
-        (-months, -days, iv.usec.saturating_neg())
+    let (hour, min, sec, fsec) = split_time(iv.usec);
+    let (months, days, hour, min, sec, fsec) = if ago {
+        (-months, -days, -hour, -min, -sec, -fsec)
     } else {
-        (months, days, iv.usec)
+        (months, days, hour, min, sec, fsec)
     };
-    let (hour, min, sec, fsec) = split_time(usec);
     let mut parts: Vec<String> = Vec::new();
     // Only an exact `1` is singular — `-1` pluralizes, so a mixed-sign interval
     // reads `@ 1 mon -1 days`. (The seconds field below is the exception: PG
@@ -230,18 +278,8 @@ pub fn format_verbose(iv: Interval) -> String {
     push(hour, "hour");
     push(min, "min");
     if sec != 0 || fsec != 0 {
-        let mut secs = String::new();
-        append_seconds(&mut secs, sec.abs(), fsec.abs());
-        // `append_seconds` zero-pads for the `HH:MM:SS` form; verbose style does not.
-        let secs = secs.trim_start_matches('0');
-        let secs = if secs.starts_with('.') || secs.is_empty() {
-            format!("0{secs}")
-        } else {
-            secs.to_string()
-        };
-        let sign = if sec < 0 || fsec < 0 { "-" } else { "" };
         let plural = if sec.abs() == 1 && fsec == 0 { "" } else { "s" };
-        parts.push(format!("{sign}{secs} sec{plural}"));
+        parts.push(format!("{} sec{plural}", seconds_unpadded(sec, fsec)));
     }
     if parts.is_empty() {
         return "@ 0".to_string();
@@ -251,6 +289,122 @@ pub fn format_verbose(iv: Interval) -> String {
         format!("@ {body} ago")
     } else {
         format!("@ {body}")
+    }
+}
+
+/// `IntervalStyle = sql_standard`: the SQL specification's two literal forms,
+/// `<years>-<months>` and `<days> <hours>:<mins>:<secs>`.
+///
+/// The spec allows exactly one sign, in front of the whole value, so that form
+/// can only be used when the interval is unambiguous: every field of one sign,
+/// and only one of the two groups populated. Anything else falls back to a
+/// non-standard third form that spells all three groups out with a sign each —
+/// `interval '1 day -1 hour'` is `+0-0 +1 -1:00:00`. Read off a live PostgreSQL
+/// 18.4.
+pub fn format_sql_standard(iv: Interval) -> String {
+    if iv == POS_INFINITY {
+        return "infinity".to_string();
+    }
+    if iv == NEG_INFINITY {
+        return "-infinity".to_string();
+    }
+    // Widen before anything can negate: `i32::MIN` days and `i64::MIN` micros
+    // are reachable intervals, not the sentinels, and `split_time` divides
+    // first so its four components always negate safely.
+    let (mut year, mut mon) = ((iv.months / 12) as i64, (iv.months % 12) as i64);
+    let mut day = iv.days as i64;
+    let (mut hour, mut min, mut sec, mut fsec) = split_time(iv.usec);
+
+    let fields = [year, mon, day, hour, min, sec, fsec];
+    let has_negative = fields.iter().any(|&f| f < 0);
+    let has_positive = fields.iter().any(|&f| f > 0);
+    let has_year_month = year != 0 || mon != 0;
+    let has_day_time = day != 0 || hour != 0 || min != 0 || sec != 0 || fsec != 0;
+    // Whether the one-sign spec form applies at all.
+    let standard = !(has_negative && has_positive) && !(has_year_month && has_day_time);
+
+    let mut out = String::new();
+    if has_negative && standard {
+        out.push('-');
+        year = -year;
+        mon = -mon;
+        day = -day;
+        hour = -hour;
+        min = -min;
+        sec = -sec;
+        fsec = -fsec;
+    }
+    let group_sign = |negative: bool| if negative { '-' } else { '+' };
+
+    if !has_year_month && !has_day_time {
+        out.push('0');
+    } else if !standard {
+        out.push(group_sign(year < 0 || mon < 0));
+        out.push_str(&format!("{}-{} ", year.abs(), mon.abs()));
+        out.push(group_sign(day < 0));
+        out.push_str(&format!("{} ", day.abs()));
+        out.push(group_sign(hour < 0 || min < 0 || sec < 0 || fsec < 0));
+        out.push_str(&format!("{}:{:02}:", hour.abs(), min.abs()));
+        append_seconds(&mut out, sec.abs(), fsec.abs());
+    } else if has_year_month {
+        out.push_str(&format!("{year}-{mon}"));
+    } else {
+        // Hours are not zero-padded in this style, unlike `postgres`'s.
+        if day != 0 {
+            out.push_str(&format!("{day} "));
+        }
+        out.push_str(&format!("{hour}:{min:02}:"));
+        append_seconds(&mut out, sec, fsec);
+    }
+    out
+}
+
+/// `IntervalStyle = iso_8601`: the `PnYnMnDTnHnMnS` duration form.
+///
+/// A zero interval is `PT0S`; otherwise every zero field is dropped and every
+/// nonzero one carries its own sign, so a mixed-sign span survives the round
+/// trip (`P1Y2M-3DT-4H-5M-6.7S`). Unlike the other styles the seconds are not
+/// zero-padded. Read off a live PostgreSQL 18.4.
+pub fn format_iso8601(iv: Interval) -> String {
+    if iv == POS_INFINITY {
+        return "infinity".to_string();
+    }
+    if iv == NEG_INFINITY {
+        return "-infinity".to_string();
+    }
+    if iv.months == 0 && iv.days == 0 && iv.usec == 0 {
+        return "PT0S".to_string();
+    }
+    let (year, mon) = ((iv.months / 12) as i64, (iv.months % 12) as i64);
+    let (hour, min, sec, fsec) = split_time(iv.usec);
+    let mut out = String::from("P");
+    for (value, designator) in [(year, 'Y'), (mon, 'M'), (iv.days as i64, 'D')] {
+        if value != 0 {
+            out.push_str(&format!("{value}{designator}"));
+        }
+    }
+    if hour != 0 || min != 0 || sec != 0 || fsec != 0 {
+        out.push('T');
+        for (value, designator) in [(hour, 'H'), (min, 'M')] {
+            if value != 0 {
+                out.push_str(&format!("{value}{designator}"));
+            }
+        }
+        if sec != 0 || fsec != 0 {
+            out.push_str(&seconds_unpadded(sec, fsec));
+            out.push('S');
+        }
+    }
+    out
+}
+
+/// `interval_out` under `style`.
+pub fn format_with(iv: Interval, style: IntervalStyle) -> String {
+    match style {
+        IntervalStyle::Postgres => format(iv),
+        IntervalStyle::PostgresVerbose => format_verbose(iv),
+        IntervalStyle::SqlStandard => format_sql_standard(iv),
+        IntervalStyle::Iso8601 => format_iso8601(iv),
     }
 }
 
@@ -280,6 +434,21 @@ fn add_postgres_part(
     ));
     *is_before = value < 0;
     *is_zero = false;
+}
+
+/// The same seconds, signed and *not* zero-padded: `1`, `0.1`, `-54.775808`.
+/// The `postgres_verbose` and `iso_8601` styles both want this form.
+fn seconds_unpadded(sec: i64, fsec: i64) -> String {
+    let mut out = String::new();
+    if sec < 0 || fsec < 0 {
+        out.push('-');
+    }
+    out.push_str(&sec.abs().to_string());
+    if fsec != 0 {
+        out.push('.');
+        out.push_str(format!("{:06}", fsec.abs()).trim_end_matches('0'));
+    }
+    out
 }
 
 /// Whole seconds + fractional microseconds → `SS[.ffffff]` with trailing zeros
@@ -955,33 +1124,88 @@ pub fn parse(input: &str) -> Result<Interval, IntervalError> {
     parse_with_default(input, Unit::Second)
 }
 
+/// Split an interval literal into its fields.
+///
+/// PostgreSQL's field splitter treats every ASCII punctuation character
+/// **except `+ - . :`** as a separator, exactly like whitespace — the four
+/// exceptions being the ones that carry meaning inside a field (a sign, a
+/// decimal point, a `HH:MM:SS` time, a `Y-M` year-month). Nothing is a keyword
+/// here, so the `@` of the `postgres_verbose` form is not a prefix to strip: it
+/// is simply invisible, anywhere, any number of times. That one rule is why
+/// `'@ 14 seconds ago'` parses at all, why `'@'` alone is a syntax error rather
+/// than a zero interval, and why `'1 day, 2 hours'` and `'1 day(2 hours'` mean
+/// what `'1 day 2 hours'` means. Probed against PostgreSQL 18.4.
+fn interval_fields(s: &str) -> Vec<&str> {
+    s.split(|c: char| {
+        c.is_whitespace() || (c.is_ascii_punctuation() && !matches!(c, '+' | '-' | '.' | ':'))
+    })
+    .filter(|f| !f.is_empty())
+    .collect()
+}
+
+/// `Some(1)`/`Some(-1)` if this field spells an infinity, else `None`.
+fn infinity_sign(field: &str) -> Option<i32> {
+    match field.to_ascii_lowercase().as_str() {
+        "infinity" | "+infinity" => Some(1),
+        "-infinity" => Some(-1),
+        _ => None,
+    }
+}
+
 /// `interval_in`, using `default` as the unit for a bare number that carries no
 /// unit of its own (the SQL-standard `INTERVAL '1' DAY` leading-field form).
+///
+/// Divergence: PostgreSQL's `IntervalStyle = sql_standard` also changes what a
+/// literal *means* — a leading minus propagates to every following unsigned
+/// field, so `'-1 year 2 months'` is `-1-2` under that style and `-10 mons`
+/// under the others. We always parse the way `postgres` style does. Fixing it
+/// means threading the style down here, and it changes the meaning of literals
+/// that already work, so it is deliberately a separate change.
 pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, IntervalError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
     }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "infinity" | "+infinity" => return Ok(POS_INFINITY),
-        "-infinity" => return Ok(NEG_INFINITY),
-        _ => {}
-    }
 
+    // ISO-8601 is decided on the string, before it is split into fields: the
+    // `P…` designators are punctuation-free but the form is positional, and
+    // `'@ P1Y2M'` must stay a syntax error rather than becoming `P1Y2M`.
     let mut acc = Acc::default();
     if is_iso8601(trimmed) {
         parse_iso8601(trimmed, input, &mut acc)?;
         return acc.finish(input);
     }
 
-    let mut ago = false;
-    let mut pending: Option<(i128, f64)> = None;
-    for tok in trimmed.split_whitespace() {
-        let tl = tok.to_ascii_lowercase();
-        if tl == "ago" {
-            ago = true;
-            continue;
+    let fields = interval_fields(trimmed);
+    // Nothing but delimiters — `'@'`, `'@@@'`.
+    let Some((last, rest)) = fields.split_last() else {
+        return Err(invalid_syntax(input));
+    };
+
+    // `infinity` is decided on the *fields*, not the string, so the delimiters
+    // around it are as invisible here as anywhere else (`'@ infinity'` and
+    // `'infinity @'` are both accepted) while anything alongside it is a
+    // syntax error: `'infinity ago'`, `'infinity years'`, `'+infinity
+    // -infinity'`. Probed against PostgreSQL 18.4.
+    if let Some(sign) = fields.iter().find_map(|f| infinity_sign(f)) {
+        if fields.len() != 1 {
+            return Err(invalid_syntax(input));
         }
+        return Ok(if sign > 0 { POS_INFINITY } else { NEG_INFINITY });
+    }
+
+    // `ago` negates the whole span, and may appear exactly once, as the final
+    // field, and never alone: `'2 days ago'` is fine, `'1 day ago ago'`,
+    // `'2 minutes ago 5 days'`, `'ago 5 days'` and a bare `'ago'` are 22007.
+    let ago = last.eq_ignore_ascii_case("ago");
+    let fields = if ago { rest } else { &fields[..] };
+    if fields.is_empty() || fields.iter().any(|f| f.eq_ignore_ascii_case("ago")) {
+        return Err(invalid_syntax(input));
+    }
+
+    let mut pending: Option<(i128, f64)> = None;
+    for &tok in fields {
+        let tl = tok.to_ascii_lowercase();
         // A `:`-bearing token is an `HH:MM[:SS[.f]]` time.
         if tok.contains(':') {
             // A unit-less number sitting immediately before a time is *days*,
@@ -1479,19 +1703,12 @@ mod tests {
     /// `ERROR: interval out of range`.
     #[test]
     fn rounding_overflow_is_out_of_range() {
-        let extremes = [
-            Interval {
-                months: 0,
-                days: 0,
-                usec: i64::MAX,
-            },
-            Interval {
-                months: 0,
-                days: 0,
-                usec: i64::MIN,
-            },
-        ];
-        for src in extremes {
+        let at = |usec| Interval {
+            months: 0,
+            days: 0,
+            usec,
+        };
+        for src in [at(i64::MAX), at(i64::MIN)] {
             assert_eq!(
                 apply_typmod(src, pack_typmod(MASK_SECOND, Some(2))),
                 Err(out_of_range()),
@@ -1502,6 +1719,23 @@ mod tests {
             // way entirely — the value stands.
             assert_eq!(coerce(src, pack_typmod(MASK_SECOND, Some(6))), src);
             assert_eq!(coerce(src, pack_typmod(FULL_RANGE, None)), src);
+        }
+
+        // The boundary is exact, and it is the half-increment that sets it:
+        // `i64::MAX - 5000` still has room at `second(2)`, one microsecond more
+        // does not, and `i64::MIN + 1` fails on the magnitude step instead.
+        // Read off PostgreSQL 18.4.
+        let second_2 = pack_typmod(FULL_RANGE, Some(2));
+        assert_eq!(
+            coerce(at(i64::MAX - 5000), second_2).usec,
+            9_223_372_036_854_770_000
+        );
+        for usec in [i64::MAX - 4999, i64::MIN + 1] {
+            assert_eq!(
+                apply_typmod(at(usec), second_2),
+                Err(out_of_range()),
+                "{usec}"
+            );
         }
     }
 
@@ -1838,5 +2072,292 @@ mod tests {
         assert_eq!(format_verbose(NEG_INFINITY), "-infinity");
 
         Ok(())
+    }
+
+    /// Every style's rendering of the same span, read off a live PostgreSQL
+    /// 18.4. The literals are parsed under `IntervalStyle = postgres` — the
+    /// `sql_standard` *input* rule (a leading minus propagating to later
+    /// unsigned fields) would otherwise change what is being rendered.
+    ///
+    /// `(input, postgres, postgres_verbose, sql_standard, iso_8601)`
+    const STYLE_CASES: &[(&str, &str, &str, &str, &str)] = &[
+        ("0", "00:00:00", "@ 0", "0", "PT0S"),
+        ("1-2", "1 year 2 mons", "@ 1 year 2 mons", "1-2", "P1Y2M"),
+        (
+            "-1-2",
+            "-1 years -2 mons",
+            "@ 1 year 2 mons ago",
+            "-1-2",
+            "P-1Y-2M",
+        ),
+        (
+            "1 2:03:04",
+            "1 day 02:03:04",
+            "@ 1 day 2 hours 3 mins 4 secs",
+            "1 2:03:04",
+            "P1DT2H3M4S",
+        ),
+        (
+            "-1 days -2:03:04",
+            "-1 days -02:03:04",
+            "@ 1 day 2 hours 3 mins 4 secs ago",
+            "-1 2:03:04",
+            "P-1DT-2H-3M-4S",
+        ),
+        (
+            "-0.1 sec",
+            "-00:00:00.1",
+            "@ 0.1 secs ago",
+            "-0:00:00.1",
+            "PT-0.1S",
+        ),
+        ("1 min", "00:01:00", "@ 1 min", "0:01:00", "PT1M"),
+        ("1 mon", "1 mon", "@ 1 mon", "0-1", "P1M"),
+        ("1 day", "1 day", "@ 1 day", "1 0:00:00", "P1D"),
+        (
+            "-14 mons",
+            "-1 years -2 mons",
+            "@ 1 year 2 mons ago",
+            "-1-2",
+            "P-1Y-2M",
+        ),
+        // The `-0` trap: the year-month group's sign comes from the whole
+        // month count, not from `months / 12`.
+        ("-10 mons", "-10 mons", "@ 10 mons ago", "-0-10", "P-10M"),
+        ("-1 mon", "-1 mons", "@ 1 mon ago", "-0-1", "P-1M"),
+        ("1 year -1 mon", "11 mons", "@ 11 mons", "0-11", "P11M"),
+        // Mixed signs, or both groups populated, force sql_standard's
+        // three-group fallback.
+        (
+            "1 day -1 hours",
+            "1 day -01:00:00",
+            "@ 1 day -1 hours",
+            "+0-0 +1 -1:00:00",
+            "P1DT-1H",
+        ),
+        (
+            "-1 days +1 hours",
+            "-1 days +01:00:00",
+            "@ 1 day -1 hours ago",
+            "+0-0 -1 +1:00:00",
+            "P-1DT1H",
+        ),
+        (
+            "-1 mon -1 hour",
+            "-1 mons -01:00:00",
+            "@ 1 mon 1 hour ago",
+            "-0-1 +0 -1:00:00",
+            "P-1MT-1H",
+        ),
+        (
+            "-1 mon -1 day",
+            "-1 mons -1 days",
+            "@ 1 mon 1 day ago",
+            "-0-1 -1 +0:00:00",
+            "P-1M-1D",
+        ),
+        (
+            "1 mon 1 day",
+            "1 mon 1 day",
+            "@ 1 mon 1 day",
+            "+0-1 +1 +0:00:00",
+            "P1M1D",
+        ),
+        (
+            "-1 mon -0.000001 sec",
+            "-1 mons -00:00:00.000001",
+            "@ 1 mon 0.000001 secs ago",
+            "-0-1 +0 -0:00:00.000001",
+            "P-1MT-0.000001S",
+        ),
+        (
+            "90000 hours",
+            "90000:00:00",
+            "@ 90000 hours",
+            "90000:00:00",
+            "PT90000H",
+        ),
+        (
+            "2:03:04.45679",
+            "02:03:04.45679",
+            "@ 2 hours 3 mins 4.45679 secs",
+            "2:03:04.45679",
+            "PT2H3M4.45679S",
+        ),
+        (
+            "1 year 2 mons -3 days -04:05:06.7",
+            "1 year 2 mons -3 days -04:05:06.7",
+            "@ 1 year 2 mons -3 days -4 hours -5 mins -6.7 secs",
+            "+1-2 -3 -4:05:06.7",
+            "P1Y2M-3DT-4H-5M-6.7S",
+        ),
+        (
+            "1 year 2 mons 3 days 04:05:06.7",
+            "1 year 2 mons 3 days 04:05:06.7",
+            "@ 1 year 2 mons 3 days 4 hours 5 mins 6.7 secs",
+            "+1-2 +3 +4:05:06.7",
+            "P1Y2M3DT4H5M6.7S",
+        ),
+        ("1 sec", "00:00:01", "@ 1 sec", "0:00:01", "PT1S"),
+        ("-1 sec", "-00:00:01", "@ 1 sec ago", "-0:00:01", "PT-1S"),
+        ("24:00:00", "24:00:00", "@ 24 hours", "24:00:00", "PT24H"),
+        (
+            "-00:00:00.000001",
+            "-00:00:00.000001",
+            "@ 0.000001 secs ago",
+            "-0:00:00.000001",
+            "PT-0.000001S",
+        ),
+        // The overflow canary: `i32::MIN` days and `i64::MIN` micros are
+        // reachable intervals, so no style may negate a field in place.
+        (
+            "-2147483647 months -2147483648 days -9223372036854775808 microseconds",
+            "-178956970 years -7 mons -2147483648 days -2562047788:00:54.775808",
+            "@ 178956970 years 7 mons 2147483648 days 2562047788 hours 54.775808 secs ago",
+            "-178956970-7 -2147483648 -2562047788:00:54.775808",
+            "P-178956970Y-7M-2147483648DT-2562047788H-54.775808S",
+        ),
+    ];
+
+    #[test]
+    fn every_style_matches_pg() {
+        for (input, pg, verbose, sql, iso) in STYLE_CASES {
+            let v = iv(input);
+            assert_eq!(&format(v), pg, "postgres: {input}");
+            assert_eq!(&format_verbose(v), verbose, "postgres_verbose: {input}");
+            assert_eq!(&format_sql_standard(v), sql, "sql_standard: {input}");
+            assert_eq!(&format_iso8601(v), iso, "iso_8601: {input}");
+            // `format_with` is the dispatcher every caller goes through.
+            for (style, want) in [
+                (IntervalStyle::Postgres, pg),
+                (IntervalStyle::PostgresVerbose, verbose),
+                (IntervalStyle::SqlStandard, sql),
+                (IntervalStyle::Iso8601, iso),
+            ] {
+                assert_eq!(&format_with(v, style), want, "{style:?}: {input}");
+            }
+        }
+        // Both infinities render the same under every style.
+        for style in [
+            IntervalStyle::Postgres,
+            IntervalStyle::PostgresVerbose,
+            IntervalStyle::SqlStandard,
+            IntervalStyle::Iso8601,
+        ] {
+            assert_eq!(format_with(POS_INFINITY, style), "infinity", "{style:?}");
+            assert_eq!(format_with(NEG_INFINITY, style), "-infinity", "{style:?}");
+        }
+    }
+
+    #[test]
+    fn style_names_round_trip() {
+        for style in [
+            IntervalStyle::Postgres,
+            IntervalStyle::PostgresVerbose,
+            IntervalStyle::SqlStandard,
+            IntervalStyle::Iso8601,
+        ] {
+            assert_eq!(IntervalStyle::from_name(style.name()), Some(style));
+        }
+        // PG matches the name case-insensitively and trims it.
+        assert_eq!(
+            IntervalStyle::from_name(" SQL_Standard "),
+            Some(IntervalStyle::SqlStandard)
+        );
+        assert_eq!(IntervalStyle::from_name("bogus"), None);
+        assert_eq!(IntervalStyle::default(), IntervalStyle::Postgres);
+    }
+
+    /// The error every rejected literal reports, so the cases below assert the
+    /// SQLSTATE and the quoted input rather than just "it failed".
+    fn rejects(input: &str) {
+        match parse(input) {
+            Ok(v) => panic!("{input:?} should be a syntax error, parsed as {v:?}"),
+            Err(e) => {
+                assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{input:?}");
+                assert_eq!(
+                    e.message,
+                    format!("invalid input syntax for type interval: \"{input}\""),
+                    "{input:?}"
+                );
+            }
+        }
+    }
+
+    /// `@` is a delimiter, not a keyword: it disappears anywhere it appears,
+    /// and so does every other ASCII punctuation character except `+ - . :`.
+    /// A literal made of nothing but delimiters has no fields at all, which is
+    /// a syntax error rather than a zero interval. Read off PostgreSQL 18.4.
+    #[test]
+    fn punctuation_is_a_field_delimiter() {
+        for (input, want) in [
+            ("@ 14 seconds ago", "-00:00:14"),
+            ("@1 day", "1 day"),
+            ("@@ 5 days", "5 days"),
+            ("5 days @", "5 days"),
+            ("5 days ago @", "-5 days"),
+            ("1 day @ 2 hours", "1 day 02:00:00"),
+            ("1 day, 2 hours", "1 day 02:00:00"),
+            ("1 day # 2 hours", "1 day 02:00:00"),
+            ("1 day_2 hours", "1 day 02:00:00"),
+            ("1 day(2 hours", "1 day 02:00:00"),
+            ("@ 1 day 2 hours ago", "-1 days -02:00:00"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+        for input in ["@", "@@@", "@ 30 eons ago", "@ P1Y2M"] {
+            rejects(input);
+        }
+        // `- . :` keep their meaning, so a token they join stays one field and
+        // fails as the malformed unit word it is.
+        for input in ["1 day-2 hours", "1 day+2 hours", "1 day.5"] {
+            rejects(input);
+        }
+    }
+
+    /// `ago` negates the whole span. It may appear once, must be the last
+    /// field, and cannot stand alone.
+    #[test]
+    fn ago_appears_once_and_last() {
+        assert_eq!(out("2 days ago"), "-2 days");
+        assert_eq!(out("@ 14 seconds ago"), "-00:00:14");
+        assert_eq!(out("1 mon -1 day ago"), "-1 mons +1 day");
+        for input in [
+            "ago",
+            "@ ago",
+            "1 day ago ago",
+            "42 days 2 seconds ago ago",
+            "2 minutes ago 5 days",
+            "ago 5 days",
+        ] {
+            rejects(input);
+        }
+    }
+
+    /// An infinity must be the whole value. Because that is decided on the
+    /// fields, the delimiters around it are as invisible as anywhere else.
+    #[test]
+    fn infinity_must_stand_alone() {
+        for (input, want) in [
+            ("infinity", "infinity"),
+            ("+infinity", "infinity"),
+            ("-infinity", "-infinity"),
+            ("@ infinity", "infinity"),
+            ("infinity @", "infinity"),
+            ("@ -infinity", "-infinity"),
+            ("  Infinity  ", "infinity"),
+        ] {
+            assert_eq!(out(input), want, "input {input}");
+        }
+        for input in [
+            "infinity ago",
+            "infinity years",
+            "infinity infinity",
+            "+infinity -infinity",
+            "-infinity -infinity",
+            "1 day infinity",
+        ] {
+            rejects(input);
+        }
     }
 }

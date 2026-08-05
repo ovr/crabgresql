@@ -1222,7 +1222,7 @@ fn interval_out_of_range() -> TimestampError {
 }
 
 /// `Some(1)`/`Some(-1)` for `±infinity`, `None` for a finite timestamp.
-fn inf_sign(micros: i64) -> Option<i32> {
+pub(crate) fn inf_sign(micros: i64) -> Option<i32> {
     match micros {
         POS_INFINITY => Some(1),
         NEG_INFINITY => Some(-1),
@@ -1231,7 +1231,7 @@ fn inf_sign(micros: i64) -> Option<i32> {
 }
 
 /// Rewrap an interval-layer error as a timestamp-layer one (same code/message).
-fn from_interval_err(e: interval::IntervalError) -> TimestampError {
+pub(crate) fn from_interval_err(e: interval::IntervalError) -> TimestampError {
     TimestampError {
         sqlstate: e.sqlstate,
         message: e.message,

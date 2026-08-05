@@ -475,3 +475,142 @@ SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
  00:00:01.23   | 04:05:06.8     | 00:00:02
 (1 row)
 
+-- `@` is a delimiter, not a keyword: every ASCII punctuation character except
+-- `+ - . :` separates fields exactly as whitespace does, which is what makes the
+-- verbose `@ ... ago` input form parse. A literal with nothing but delimiters
+-- has no fields at all, and that is an error rather than a zero interval.
+SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
+       interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
+ verbose_ago | fused |     comma      | trailing_at 
+-------------+-------+----------------+-------------
+ -00:00:14   | 1 day | 1 day 02:00:00 | -5 days
+(1 row)
+
+SELECT interval '@';
+ERROR:  invalid input syntax for type interval: "@"
+LINE 1: SELECT interval '@';
+                        ^
+SELECT interval '@ 30 eons ago';
+ERROR:  invalid input syntax for type interval: "@ 30 eons ago"
+LINE 1: SELECT interval '@ 30 eons ago';
+                        ^
+-- `ago` may appear once, and only as the last field
+SELECT interval '1 day ago ago';
+ERROR:  invalid input syntax for type interval: "1 day ago ago"
+LINE 1: SELECT interval '1 day ago ago';
+                        ^
+SELECT interval '2 minutes ago 5 days';
+ERROR:  invalid input syntax for type interval: "2 minutes ago 5 days"
+LINE 1: SELECT interval '2 minutes ago 5 days';
+                        ^
+SELECT interval 'ago';
+ERROR:  invalid input syntax for type interval: "ago"
+LINE 1: SELECT interval 'ago';
+                        ^
+-- an infinity must be the whole value, delimiters aside
+SELECT interval '@ infinity' AS at_inf, interval 'infinity @' AS inf_at;
+  at_inf  |  inf_at  
+----------+----------
+ infinity | infinity
+(1 row)
+
+SELECT interval 'infinity ago';
+ERROR:  invalid input syntax for type interval: "infinity ago"
+LINE 1: SELECT interval 'infinity ago';
+                        ^
+SELECT interval '+infinity -infinity';
+ERROR:  invalid input syntax for type interval: "+infinity -infinity"
+LINE 1: SELECT interval '+infinity -infinity';
+                        ^
+-- IntervalStyle picks among the four renderings of the same stored value
+CREATE TABLE iv_styles(id int4, span interval);
+INSERT INTO iv_styles VALUES
+  (1, '0'), (2, '1-2'), (3, '1 2:03:04'), (4, '1 day -1 hours'),
+  (5, '-10 mons'), (6, '-1 mon -1 day'), (7, '-0.1 sec'), (8, 'infinity');
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |      span       
+----+-----------------
+  1 | 00:00:00
+  2 | 1 year 2 mons
+  3 | 1 day 02:03:04
+  4 | 1 day -01:00:00
+  5 | -10 mons
+  6 | -1 mons -1 days
+  7 | -00:00:00.1
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO postgres_verbose;
+SHOW IntervalStyle;
+  IntervalStyle   
+------------------
+ postgres_verbose
+(1 row)
+
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |             span              
+----+-------------------------------
+  1 | @ 0
+  2 | @ 1 year 2 mons
+  3 | @ 1 day 2 hours 3 mins 4 secs
+  4 | @ 1 day -1 hours
+  5 | @ 10 mons ago
+  6 | @ 1 mon 1 day ago
+  7 | @ 0.1 secs ago
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO sql_standard;
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |       span       
+----+------------------
+  1 | 0
+  2 | 1-2
+  3 | 1 2:03:04
+  4 | +0-0 +1 -1:00:00
+  5 | -0-10
+  6 | -0-1 -1 +0:00:00
+  7 | -0:00:00.1
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO iso_8601;
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |    span    
+----+------------
+  1 | PT0S
+  2 | P1Y2M
+  3 | P1DT2H3M4S
+  4 | P1DT-1H
+  5 | P-10M
+  6 | P-1M-1D
+  7 | PT-0.1S
+  8 | infinity
+(8 rows)
+
+-- the name is case-insensitive; an unknown one is 22023 with a HINT
+SET IntervalStyle TO 'POSTGRES';
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+SET IntervalStyle TO bogus;
+ERROR:  invalid value for parameter "IntervalStyle": "bogus"
+HINT:  Available values: postgres, postgres_verbose, sql_standard, iso_8601.
+-- back to the default, so nothing downstream inherits a style
+RESET IntervalStyle;
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+DROP TABLE iv_styles;

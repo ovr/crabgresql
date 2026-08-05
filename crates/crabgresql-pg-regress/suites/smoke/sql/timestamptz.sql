@@ -277,3 +277,74 @@ SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2'
        timestamp '2001-01-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2' AS spec_jan,
        timestamp '2001-06-16 12:00:00' AT TIME ZONE '<+07>-07' AS quoted_spec;
 SELECT 'still alive' AS status;
+
+
+--
+-- Arithmetic. `timestamptz - timestamptz` measures the *instants* and so needs
+-- no zone; `timestamptz ± interval` is a calendar operation on the *local wall
+-- clock*, and the two disagree across a DST transition by exactly the hour it
+-- adds or removes.
+--
+SET TimeZone = 'UTC';
+SELECT timestamptz '2001-02-16 20:38:40+00' - timestamptz '2001-01-01 00:00:00+00' AS diff,
+       timestamptz '2001-01-01 00:00:00+00' - timestamptz '2001-02-16 20:38:40+00' AS neg_diff;
+-- the difference is justified to 24-hour days, as `timestamp - timestamp` is
+SELECT timestamptz '2001-01-02 03:00:00+00' - timestamptz '2001-01-01 00:00:00+00' AS justified;
+SELECT timestamptz '2001-01-01 00:00:00+00' + interval '1 mon 2 days 3 hours' AS plus,
+       timestamptz '2001-01-01 00:00:00+00' - interval '1 day' AS minus,
+       interval '1 day' + timestamptz '2001-01-01 00:00:00+00' AS commuted;
+-- a month add clamps the day of month, here in the instant's own zone
+SELECT timestamptz '2001-03-31 12:00:00+00' + interval '1 mon' AS clamp_eom;
+-- `timestamptz` is the preferred datetime type, so a mixed pair widens the
+-- other side rather than narrowing this one
+SELECT timestamptz '2001-01-02 00:00:00+00' - timestamp '2001-01-01 00:00:00' AS minus_ts,
+       timestamptz '2001-01-02 00:00:00+00' - date '2001-01-01' AS minus_date,
+       date '2001-01-01' - timestamptz '2001-01-02 00:00:00+00' AS date_minus;
+-- an infinity swallows a finite interval; opposite infinities conflict
+SELECT timestamptz 'infinity' + interval '1 day' AS inf_plus,
+       timestamptz '2001-01-01+00' + interval 'infinity' AS to_inf,
+       timestamptz '2001-01-01+00' - interval 'infinity' AS to_neg_inf;
+SELECT timestamptz 'infinity' - interval 'infinity';
+-- operators PostgreSQL does not have
+SELECT timestamptz '2001-01-01+00' + timestamptz '2001-01-01+00';
+SELECT interval '1 day' - timestamptz '2001-01-01+00';
+
+-- Under a DST zone, `1 day` keeps the wall-clock hour and `24 hours` keeps the
+-- elapsed time. Spring forward makes the day 23 hours long, fall back 25.
+SET TimeZone = 'America/New_York';
+SELECT timestamptz '2024-03-09 12:00:00-05' + interval '1 day' AS calendar_day,
+       timestamptz '2024-03-09 12:00:00-05' + interval '24 hours' AS elapsed_day;
+SELECT timestamptz '2024-11-02 12:00:00-04' + interval '1 day' AS calendar_day,
+       timestamptz '2024-11-02 12:00:00-04' + interval '24 hours' AS elapsed_day;
+-- months and days each re-resolve the offset before the next part is applied
+SELECT timestamptz '2024-03-09 12:00:00-05' + interval '1 mon 1 day 1 hour' AS stepped;
+-- a shifted wall clock in the spring-forward gap moves forward past it; one in
+-- the fall-back fold takes the offset after the transition
+SELECT timestamptz '2024-03-09 02:30:00-05' + interval '1 day' AS gap,
+       timestamptz '2024-11-02 01:30:00-04' + interval '1 day' AS fold;
+
+--
+-- age() reads the *wall clocks*, so it answers in calendar units: two noons
+-- either side of a spring-forward are `2 days` apart even though only 47 hours
+-- elapsed. The one-argument form measures from `current_date`.
+--
+SELECT age(timestamptz '2024-03-11 12:00:00-04', timestamptz '2024-03-09 12:00:00-05') AS calendar,
+       timestamptz '2024-03-11 12:00:00-04' - timestamptz '2024-03-09 12:00:00-05' AS elapsed;
+SET TimeZone = 'UTC';
+SELECT age(timestamptz '2001-04-10 00:00:00+00', timestamptz '1957-06-13 00:00:00+00') AS age2;
+-- `timestamptz` wins the overload for two dates, and for a mixed pair
+SELECT pg_typeof(age(date '2001-01-01', date '2000-01-01')) AS resolved,
+       age(date '2001-01-01', date '2000-01-01') AS from_dates,
+       age(timestamptz '2001-01-01+00', timestamp '2000-01-01') AS mixed;
+-- the one-argument forms anchor at today, so pin them by comparison
+SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
+       age(current_date::timestamptz) = interval '0' AS today_tz_is_zero,
+       age(current_date::timestamptz - interval '1 mon') = interval '1 mon' AS one_month_ago;
+-- the infinity matrix is the same for both types
+SELECT age(timestamptz 'infinity') AS inf, age(timestamptz '-infinity') AS neg_inf;
+SELECT age(timestamp 'infinity') AS inf, age(timestamp '-infinity') AS neg_inf;
+SELECT age(timestamptz 'infinity', timestamptz '-infinity') AS opposite,
+       age(timestamptz '-infinity', timestamptz 'infinity') AS reversed;
+SELECT age(timestamptz 'infinity', timestamptz 'infinity');
+SELECT age(timestamp '-infinity', timestamp '-infinity');
+SELECT 'still alive' AS status;

@@ -137,6 +137,16 @@ pub enum ScalarFn {
     TimestampMiInterval,
     /// `timestamp - timestamp -> interval`.
     TimestampMi,
+    /// `timestamptz + interval -> timestamptz`. Reads the session zone: the
+    /// months and days are calendar quantities, so they move the local wall
+    /// clock rather than the instant.
+    TimestampTzPlInterval,
+    /// `timestamptz - interval -> timestamptz`.
+    TimestampTzMiInterval,
+    /// `timestamptz - timestamptz -> interval`. Zone-independent, and so a
+    /// separate variant from [`ScalarFn::TimestampMi`] only because the
+    /// executor's value accessors are typed by `Value` variant.
+    TimestampTzMi,
 
     // --- interval functions ---
     /// `date_part(text, interval) -> float8`.
@@ -157,6 +167,13 @@ pub enum ScalarFn {
     JustifyInterval,
     /// `age(timestamp, timestamp) -> interval`.
     Age,
+    /// `age(timestamptz, timestamptz) -> interval`; the symbolic difference of
+    /// the two session-zone wall clocks.
+    AgeTz,
+    /// `age(timestamp) -> interval` = `age(current_date::timestamp, $1)`.
+    AgeToday,
+    /// `age(timestamptz) -> interval` = `age(current_date::timestamptz, $1)`.
+    AgeTodayTz,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
     /// `to_char(timestamp, text) -> text`.
@@ -1907,11 +1924,35 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[IV],
             ret: IV,
         }],
-        "age" => &[Signature {
-            func: ScalarFn::Age,
-            args: &[TS, TS],
-            ret: IV,
-        }],
+        // The one-argument forms are PG's SQL wrappers around
+        // `age(current_date::…, $1)`. Order is load-bearing for the same reason
+        // it is in `to_char` and `date_bin` below: two already-typed `date`
+        // arguments only reach `resolve_call`'s best-coercible pass, where an
+        // equal-cost tie is broken by list order, and PG picks the
+        // `timestamptz` overload by the preferred-type rule. TSTZ leads TS at
+        // each arity.
+        "age" => &[
+            Signature {
+                func: ScalarFn::AgeTz,
+                args: &[TSTZ, TSTZ],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::Age,
+                args: &[TS, TS],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::AgeTodayTz,
+                args: &[TSTZ],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::AgeToday,
+                args: &[TS],
+                ret: IV,
+            },
+        ],
         // PG has no `to_char(date)` and no `to_char(time)` overload: a `date`
         // reaches the timestamptz form through the preferred-type rule
         // (`to_char(date, 'TZ')` is `UTC`, not the empty string), and a `time`

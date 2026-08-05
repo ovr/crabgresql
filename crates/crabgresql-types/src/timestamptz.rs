@@ -20,7 +20,7 @@ use crate::fmt::FmtCtx;
 use crate::timestamp::{
     self, DATETIME_FIELD_OVERFLOW, INVALID_DATETIME_FORMAT, INVALID_PARAMETER_VALUE,
     INVALID_TIME_ZONE_DISPLACEMENT, NEG_INFINITY, POS_INFINITY, Parsed, TimestampError, decode,
-    encode, format_parts, is_finite, validate_fields,
+    encode, format_parts, from_interval_err, inf_sign, is_finite, validate_fields,
 };
 use crate::tz::{self, SessionZone, TmLite, ZoneError};
 
@@ -371,6 +371,137 @@ fn redo_zone(unit: &str) -> bool {
     )
 }
 
+// --- arithmetic ------------------------------------------------------------
+//
+// `timestamptz - timestamptz` has no entry here: PostgreSQL's `timestamptz_mi`
+// *is* `timestamp_mi` (one C function under two names), because the difference
+// of two instants is the same span whatever zone you look at them from. The
+// executor calls [`timestamp::mi`] directly.
+
+/// `timestamptz + interval` (`timestamptz_pl_interval`): the months and days
+/// are calendar quantities and so are added to the **local wall clock**, while
+/// the sub-day part is added to the instant.
+///
+/// That split is the whole of DST-aware interval arithmetic. In
+/// `America/New_York`, `'2024-03-09 12:00-05' + '1 day'` is
+/// `2024-03-10 12:00-04` — the same wall-clock hour, 23 real hours later —
+/// while `+ '24 hours'` is `2024-03-10 13:00-04`.
+///
+/// Three details are load-bearing:
+///
+/// * The offset is **re-resolved from the shifted wall clock**, not carried
+///   over from the input; that is what moves the result onto the other side of
+///   a transition. A shifted wall clock that lands in a spring-forward gap or a
+///   fall-back fold is resolved by [`tz::offset_for_local`]'s existing rule —
+///   there is no second rule here.
+/// * Months and days take **separate** round trips through the zone, as they do
+///   in PG. Folding them into one differs whenever the month shift and the day
+///   shift straddle a transition.
+/// * Infinities are settled before any of it: [`instant_to_wall`] would pass a
+///   sentinel through unharmed, but the microsecond step below would not, and
+///   an infinite interval has no wall clock at all.
+pub fn pl_interval(
+    micros: i64,
+    span: crate::interval::Interval,
+    zone: &tz::Zone,
+) -> Result<i64, TimestampError> {
+    // An infinite timestamp swallows a finite interval; an infinite interval
+    // pushes a finite timestamp to that infinity. Opposite infinities conflict.
+    match (inf_sign(micros), span.infinity_sign()) {
+        (Some(a), Some(b)) if a != b => return Err(out_of_range_bare()),
+        (Some(_), _) => return Ok(micros),
+        (None, Some(b)) => return Ok(if b > 0 { POS_INFINITY } else { NEG_INFINITY }),
+        (None, None) => {}
+    }
+    let mut result = micros;
+    if span.months != 0 {
+        result = shift_wall_clock(result, span.months, 0, zone)?;
+    }
+    if span.days != 0 {
+        result = shift_wall_clock(result, 0, span.days, zone)?;
+    }
+    if span.usec != 0 {
+        result = result
+            .checked_add(span.usec)
+            .ok_or_else(out_of_range_bare)?;
+        if !in_range(result) {
+            return Err(out_of_range_bare());
+        }
+    }
+    Ok(result)
+}
+
+/// `timestamptz - interval` (`timestamptz_mi_interval`): the negation of the
+/// add, so the two cannot drift apart.
+pub fn mi_interval(
+    micros: i64,
+    span: crate::interval::Interval,
+    zone: &tz::Zone,
+) -> Result<i64, TimestampError> {
+    let neg = crate::interval::negate(span).map_err(from_interval_err)?;
+    pl_interval(micros, neg, zone)
+}
+
+/// One calendar round trip: rotate the instant into `zone`, add whole months
+/// and/or days there (reusing [`timestamp::pl_interval`] for the day-of-month
+/// clamping and the year-range guard), and rotate the result back.
+fn shift_wall_clock(
+    micros: i64,
+    months: i32,
+    days: i32,
+    zone: &tz::Zone,
+) -> Result<i64, TimestampError> {
+    let wall = instant_to_wall(micros, zone)?;
+    let shifted = timestamp::pl_interval(
+        wall,
+        crate::interval::Interval {
+            months,
+            days,
+            usec: 0,
+        },
+    )?;
+    wall_to_instant(shifted, zone)
+}
+
+/// `age(timestamptz, timestamptz)` (`timestamptz_age`): the symbolic
+/// year/month/day difference of the two **local wall clocks**.
+///
+/// Reading the wall clocks first is what makes `age` a calendar answer rather
+/// than an elapsed-time one: in `America/New_York`, noon on 2024-03-09 and noon
+/// on 2024-03-11 are 47 real hours apart, and `age` still reports `2 days`.
+/// (`timestamptz - timestamptz`, which measures the instants, reports
+/// `1 day 23:00:00`.)
+///
+/// [`instant_to_wall`], not `to_wall_clock`: the former passes the infinity
+/// sentinels through untouched, so [`timestamp::age`] sees them and reproduces
+/// PG's infinity matrix — including `age(infinity, infinity)` raising
+/// `interval out of range`.
+pub fn age(
+    dt1: i64,
+    dt2: i64,
+    zone: &tz::Zone,
+) -> Result<crate::interval::Interval, TimestampError> {
+    timestamp::age(instant_to_wall(dt1, zone)?, instant_to_wall(dt2, zone)?)
+}
+
+/// The anchor of the one-argument `age()`: midnight of the transaction's local
+/// date, as a zone-less `timestamp`.
+///
+/// PostgreSQL defines `age(x)` as a SQL wrapper around
+/// `age(cast(current_date as …), x)`, so this is spelled as the same two casts
+/// — instant to local wall clock, then wall clock to `date` and back — rather
+/// than as a `date_trunc('day', …)` that would be a second, independently
+/// maintained flooring rule.
+pub fn today_midnight_local(xact_start: i64, zone: &tz::Zone) -> Result<i64, TimestampError> {
+    let wall = instant_to_wall(xact_start, zone)?;
+    crate::date::to_timestamp_micros(crate::date::from_timestamp_micros(wall)).map_err(|e| {
+        TimestampError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        }
+    })
+}
+
 /// `isfinite(timestamptz) -> bool`.
 pub fn is_finite_tstz(micros: i64) -> bool {
     is_finite(micros)
@@ -530,14 +661,18 @@ pub fn timestamp_at_offset(off_east: i32, micros: i64) -> Result<i64, TimestampE
 
 /// An `INTERVAL` used in a zone position, as seconds east of UTC. PG rejects one
 /// carrying months or days — those are not a fixed displacement — quoting the
-/// interval as it renders.
-pub fn interval_zone_offset(iv: crate::interval::Interval) -> Result<i32, TimestampError> {
+/// interval as it renders it, which means under the session's `IntervalStyle`:
+/// the same value is reported as `"1 mon"` or `"P1M"` depending on the GUC.
+pub fn interval_zone_offset(
+    iv: crate::interval::Interval,
+    style: crate::interval::IntervalStyle,
+) -> Result<i32, TimestampError> {
     if iv.months != 0 || iv.days != 0 {
         return Err(TimestampError {
             sqlstate: INVALID_PARAMETER_VALUE,
             message: format!(
                 "interval time zone \"{}\" must not include months or days",
-                crate::interval::format(iv)
+                crate::interval::format_with(iv, style)
             ),
         });
     }
@@ -1121,5 +1256,220 @@ mod tests {
         // A zone token on a relative date overrides the session's, so this is
         // midnight EST of the session's today.
         assert_eq!(rel("today EST", "UTC"), "2024-03-15 05:00:00+00");
+    }
+
+    // --- arithmetic (pinned against PostgreSQL 18.4) -----------------------
+
+    fn iv(s: &str) -> crate::interval::Interval {
+        crate::interval::parse(s).expect("test fixture is a valid interval")
+    }
+
+    /// `ts + span` in `zone`, rendered back in the same zone.
+    fn plus(zone: &str, ts: &str, span: &str) -> String {
+        let z = zone_of(zone);
+        match pl_interval(p(ts), iv(span), z.zone()) {
+            Ok(v) => format(v, &z),
+            Err(e) => panic!("{ts:?} + {span:?} in {zone}: {e:?}"),
+        }
+    }
+
+    fn minus(zone: &str, ts: &str, span: &str) -> String {
+        let z = zone_of(zone);
+        match mi_interval(p(ts), iv(span), z.zone()) {
+            Ok(v) => format(v, &z),
+            Err(e) => panic!("{ts:?} - {span:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// The point of the whole feature: a `1 day` step keeps the wall-clock hour
+    /// across a DST transition, a `24 hours` step keeps the elapsed time.
+    #[test]
+    fn day_is_calendar_and_hours_are_elapsed() {
+        let ny = "America/New_York";
+        // Spring forward: the day between them is only 23 real hours long.
+        assert_eq!(
+            plus(ny, "2024-03-09 12:00:00-05", "1 day"),
+            "2024-03-10 12:00:00-04"
+        );
+        assert_eq!(
+            plus(ny, "2024-03-09 12:00:00-05", "24 hours"),
+            "2024-03-10 13:00:00-04"
+        );
+        // Fall back: 25 hours long.
+        assert_eq!(
+            plus(ny, "2024-11-02 12:00:00-04", "1 day"),
+            "2024-11-03 12:00:00-05"
+        );
+        assert_eq!(
+            plus(ny, "2024-11-02 12:00:00-04", "24 hours"),
+            "2024-11-03 11:00:00-05"
+        );
+        // Subtraction is the mirror image.
+        assert_eq!(
+            minus(ny, "2024-03-10 12:00:00-04", "1 day"),
+            "2024-03-09 12:00:00-05"
+        );
+    }
+
+    /// Months carry `timestamp`'s day-of-month clamping through the round trip,
+    /// and months, days and microseconds are applied in that order — each of
+    /// the first two re-resolving the offset before the next one starts.
+    #[test]
+    fn months_clamp_and_the_three_parts_apply_in_order() {
+        let ny = "America/New_York";
+        assert_eq!(
+            plus(ny, "2024-01-31 12:00:00-05", "1 month"),
+            "2024-02-29 12:00:00-05"
+        );
+        assert_eq!(
+            plus(ny, "2023-01-31 12:00:00-05", "1 month"),
+            "2023-02-28 12:00:00-05"
+        );
+        assert_eq!(
+            plus(ny, "2024-03-09 12:00:00-05", "1 mon 1 day 1 hour"),
+            "2024-04-10 13:00:00-04"
+        );
+    }
+
+    /// A shifted wall clock landing in a spring-forward gap or a fall-back fold
+    /// is resolved by `tz::offset_for_local`'s rule — gap takes the offset
+    /// *before* the transition, fold the one *after* — which is what PG shows.
+    #[test]
+    fn shifted_wall_clock_in_a_gap_or_fold() {
+        let ny = "America/New_York";
+        // 2024-03-10 02:30 does not exist; PG reports 03:30-04.
+        assert_eq!(
+            plus(ny, "2024-03-09 02:30:00-05", "1 day"),
+            "2024-03-10 03:30:00-04"
+        );
+        // 2024-11-03 01:30 happens twice; PG takes the second (EST).
+        assert_eq!(
+            plus(ny, "2024-11-02 01:30:00-04", "1 day"),
+            "2024-11-03 01:30:00-05"
+        );
+    }
+
+    /// Under a fixed-offset zone the arithmetic degenerates to the zone-less
+    /// `timestamp` form — no transition can move anything.
+    #[test]
+    fn utc_arithmetic_matches_the_zoneless_form() {
+        assert_eq!(
+            plus("UTC", "2024-03-09 12:00:00+00", "1 day"),
+            "2024-03-10 12:00:00+00"
+        );
+        assert_eq!(
+            plus("UTC", "2024-03-09 12:00:00+00", "24 hours"),
+            "2024-03-10 12:00:00+00"
+        );
+    }
+
+    /// The rendered span an arithmetic result carries.
+    fn span(r: Result<crate::interval::Interval, TimestampError>) -> String {
+        match r {
+            Ok(v) => crate::interval::format(v),
+            Err(e) => panic!("expected an interval, got {e:?}"),
+        }
+    }
+
+    /// The message a rejected step reports.
+    fn failure<T: std::fmt::Debug>(r: Result<T, TimestampError>) -> String {
+        match r {
+            Ok(v) => panic!("expected an error, got {v:?}"),
+            Err(e) => e.message,
+        }
+    }
+
+    /// The infinity matrix, settled before any zone rotation: `to_wall_clock`'s
+    /// saturating add would quietly turn a sentinel into a finite instant.
+    #[test]
+    fn infinities_short_circuit_the_zone() {
+        let ny = zone_of("America/New_York");
+        let z = ny.zone();
+        assert_eq!(pl_interval(POS_INFINITY, iv("1 day"), z), Ok(POS_INFINITY));
+        assert_eq!(pl_interval(NEG_INFINITY, iv("1 day"), z), Ok(NEG_INFINITY));
+        assert_eq!(
+            pl_interval(p("2024-01-01 00:00:00+00"), iv("infinity"), z),
+            Ok(POS_INFINITY)
+        );
+        assert_eq!(
+            pl_interval(p("2024-01-01 00:00:00+00"), iv("-infinity"), z),
+            Ok(NEG_INFINITY)
+        );
+        // Opposite infinities conflict; `- infinity` is `+ -infinity`.
+        assert_eq!(
+            failure(pl_interval(POS_INFINITY, iv("-infinity"), z)),
+            "timestamp out of range"
+        );
+        assert_eq!(
+            mi_interval(p("2024-01-01 00:00:00+00"), iv("infinity"), z),
+            Ok(NEG_INFINITY)
+        );
+    }
+
+    /// Stepping past the representable range is `timestamp out of range`,
+    /// whichever of the three parts does it.
+    #[test]
+    fn out_of_range_steps_raise() {
+        let z = zone_of("UTC");
+        let z = z.zone();
+        let last = p("294276-12-31 23:59:59.999999+00");
+        for span in ["1 microsecond", "1 day", "1 month"] {
+            assert_eq!(
+                failure(pl_interval(last, iv(span), z)),
+                "timestamp out of range",
+                "+{span}"
+            );
+        }
+    }
+
+    /// `age` is a calendar answer read off the local wall clocks; the plain
+    /// difference is an elapsed-time one read off the instants. Across a
+    /// spring-forward the two disagree by the missing hour.
+    #[test]
+    fn age_reads_wall_clocks_and_subtraction_reads_instants() {
+        let ny = zone_of("America/New_York");
+        let (a, b) = (p("2024-03-11 12:00:00-04"), p("2024-03-09 12:00:00-05"));
+        assert_eq!(span(age(a, b, ny.zone())), "2 days");
+        assert_eq!(span(timestamp::mi(a, b)), "1 day 23:00:00");
+    }
+
+    /// PG's `age` infinity matrix, byte-identical between `timestamp` and
+    /// `timestamptz` because both go through the same symbolic difference.
+    #[test]
+    fn age_infinities_match_pg() {
+        let z = zone_of("America/New_York");
+        let z = z.zone();
+        let f = p("2024-01-01 00:00:00+00");
+        assert_eq!(span(age(POS_INFINITY, f, z)), "infinity");
+        assert_eq!(span(age(f, POS_INFINITY, z)), "-infinity");
+        assert_eq!(span(age(POS_INFINITY, NEG_INFINITY, z)), "infinity");
+        assert_eq!(
+            failure(age(POS_INFINITY, POS_INFINITY, z)),
+            "interval out of range"
+        );
+        assert_eq!(
+            failure(age(NEG_INFINITY, NEG_INFINITY, z)),
+            "interval out of range"
+        );
+    }
+
+    /// `today_midnight_local`, rendered.
+    fn midnight(instant: i64, zone: &SessionZone) -> String {
+        match today_midnight_local(instant, zone.zone()) {
+            Ok(v) => timestamp::format(v),
+            Err(e) => panic!("expected a timestamp, got {e:?}"),
+        }
+    }
+
+    /// The one-argument `age()` anchor is midnight of the *local* date, which
+    /// in a western zone is a different calendar day from UTC's.
+    #[test]
+    fn today_midnight_is_local() {
+        // 2024-03-15 02:30 UTC is still 22:30 on the 14th in New York (EDT).
+        let instant = p("2024-03-15 02:30:00+00");
+        let ny = zone_of("America/New_York");
+        assert_eq!(midnight(instant, &ny), "2024-03-14 00:00:00");
+        let utc = zone_of("UTC");
+        assert_eq!(midnight(instant, &utc), "2024-03-15 00:00:00");
     }
 }

@@ -1,12 +1,13 @@
 //! The session state that value formatting, casting and date/time input depend
 //! on.
 //!
-//! Three things reach down this far. Two GUCs: `extra_float_digits`, which sets
-//! float output precision, and `TimeZone`, the display zone `timestamptz` input
-//! and output are relative to. And the transaction clock, which is what the
-//! relative input specials (`'now'`, `'today'`, `'tomorrow'`, `'yesterday'`)
-//! read. They travel together in [`FmtCtx`] rather than as separate parameters
-//! so that adding the next one (`DateStyle`, `IntervalStyle`) does not mean
+//! Four things reach down this far. Three GUCs: `extra_float_digits`, which
+//! sets float output precision, `TimeZone`, the display zone `timestamptz`
+//! input and output are relative to, and `IntervalStyle`, which picks among
+//! `interval_out`'s four renderings. And the transaction clock, which is what
+//! the relative input specials (`'now'`, `'today'`, `'tomorrow'`,
+//! `'yesterday'`) read. They travel together in [`FmtCtx`] rather than as
+//! separate parameters so that adding the next one (`DateStyle`) does not mean
 //! touching every call site again.
 //!
 //! There is deliberately **no `Default` impl**. A missing zone renders as UTC,
@@ -18,6 +19,7 @@
 
 use std::sync::Arc;
 
+use crate::interval::IntervalStyle;
 use crate::tz::SessionZone;
 
 /// `XX000` — see the note in `timestamp.rs` on why the types crate spells its
@@ -46,8 +48,8 @@ pub struct ClockError {
     pub message: String,
 }
 
-/// `extra_float_digits`, the display `TimeZone` and the transaction clock, as
-/// one bag.
+/// `extra_float_digits`, the display `TimeZone`, `IntervalStyle` and the
+/// transaction clock, as one bag.
 ///
 /// Cheap to clone: the zone is shared behind an `Arc` because the executor's
 /// context is cloned into every plan node, and [`Clock`] is two words.
@@ -57,15 +59,23 @@ pub struct FmtCtx {
     pub efd: i32,
     /// The session display zone.
     pub zone: Arc<SessionZone>,
+    /// `IntervalStyle` — which rendering `interval_out` produces.
+    pub interval_style: IntervalStyle,
     /// The statement's instants, absent in contexts with no session.
     clock: Option<Clock>,
 }
 
 impl FmtCtx {
-    pub fn new(efd: i32, zone: Arc<SessionZone>, clock: Clock) -> FmtCtx {
+    pub fn new(
+        efd: i32,
+        zone: Arc<SessionZone>,
+        interval_style: IntervalStyle,
+        clock: Clock,
+    ) -> FmtCtx {
         FmtCtx {
             efd,
             zone,
+            interval_style,
             clock: Some(clock),
         }
     }
@@ -75,10 +85,15 @@ impl FmtCtx {
     /// DETAIL text. Every use is a place where a real session would be more
     /// faithful — and a place where a `'now'` literal cannot appear, which the
     /// missing clock enforces rather than assumes.
+    ///
+    /// The interval style is PG's default `postgres`, for the same reason the
+    /// zone is UTC: it is the answer a session that never issued a `SET` would
+    /// give.
     pub fn utc(efd: i32) -> FmtCtx {
         FmtCtx {
             efd,
             zone: Arc::new(SessionZone::utc()),
+            interval_style: IntervalStyle::Postgres,
             clock: None,
         }
     }
@@ -94,6 +109,7 @@ impl FmtCtx {
         FmtCtx {
             efd,
             zone: Arc::new(SessionZone::utc()),
+            interval_style: IntervalStyle::Postgres,
             clock: Some(Clock {
                 xact_start,
                 stmt_start,
@@ -106,9 +122,17 @@ impl FmtCtx {
     /// an already-resolved zone.
     pub fn with_zone(&self, zone: Arc<SessionZone>) -> FmtCtx {
         FmtCtx {
-            efd: self.efd,
             zone,
-            clock: self.clock,
+            ..self.clone()
+        }
+    }
+
+    /// The same context under a different `IntervalStyle`. The counterpart of
+    /// [`FmtCtx::with_zone`], for the tests that pin a style-sensitive answer.
+    pub fn with_interval_style(&self, interval_style: IntervalStyle) -> FmtCtx {
+        FmtCtx {
+            interval_style,
+            ..self.clone()
         }
     }
 
