@@ -934,7 +934,7 @@ pub(crate) fn execute_statement_with(
                 ..
             } => return execute_drop_cast(global_catalog, source, target, *if_exists),
             ast::Statement::DropFunction(drop) => {
-                return execute_drop_function(global_catalog, drop);
+                return execute_drop_function(global_catalog, &catalog, &type_catalog, drop);
             }
             ast::Statement::CreateProcedure(create) => {
                 return execute_create_procedure(global_catalog, create);
@@ -946,6 +946,8 @@ pub(crate) fn execute_statement_with(
             } => {
                 return execute_drop_routine(
                     global_catalog,
+                    &catalog,
+                    &type_catalog,
                     RoutineKind::Procedure,
                     proc_desc,
                     *if_exists,
@@ -8263,10 +8265,14 @@ fn execute_drop_type(
 /// of the lookup signature.
 fn execute_drop_function(
     catalog: &GlobalCatalog,
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
     drop: &ast::DropFunction,
 ) -> Result<QueryResult, PgError> {
     execute_drop_routine(
         catalog,
+        engine,
+        type_catalog,
         RoutineKind::Function,
         &drop.func_desc,
         drop.if_exists,
@@ -8280,6 +8286,8 @@ fn execute_drop_function(
 /// success is worse than a clear refusal.
 fn execute_drop_routine(
     catalog: &GlobalCatalog,
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
     kind: RoutineKind,
     descs: &[ast::FunctionDesc],
     if_exists: bool,
@@ -8304,10 +8312,38 @@ fn execute_drop_routine(
         specs.push(FuncDropSpec { name, args });
     }
     // Naming the same routine twice — via two identical signatures, or a bare
-    // name and its signature — is rejected in drop_functions once each target is
-    // resolved to a concrete routine.
+    // name and its signature — is rejected while resolving, once each target is
+    // a concrete routine.
     let cascade = matches!(drop_behavior, Some(ast::DropBehavior::Cascade));
-    let notices = catalog.drop_functions(&specs, kind, cascade, if_exists)?;
+    let resolved = catalog.resolve_drop_routines(&specs, kind, if_exists)?;
+    // A procedure cannot appear in an expression (the binder rejects one with
+    // 42809), so nothing this scan looks at could depend on it.
+    let dependents = match kind {
+        RoutineKind::Function => {
+            crate::func_deps::routine_dependents(engine, type_catalog, &resolved)
+        }
+        RoutineKind::Procedure => Vec::new(),
+    };
+    if !dependents.is_empty() {
+        // PostgreSQL's CASCADE drops the dependent constraint / clears the
+        // default. Nothing here can do either — there is no
+        // `ALTER TABLE DROP CONSTRAINT`, no `ALTER COLUMN DROP DEFAULT`, and no
+        // engine method behind them — so CASCADE is refused rather than
+        // reported as done. The alternative is the silent success this guard
+        // exists to remove. CASCADE with no dependents is unaffected.
+        if cascade {
+            return Err(PgError::feature_not_supported(
+                "DROP FUNCTION ... CASCADE is not supported yet",
+            )
+            .with_detail(
+                crate::func_deps::dependency_error(&resolved, &dependents)
+                    .detail
+                    .unwrap_or_default(),
+            ));
+        }
+        return Err(crate::func_deps::dependency_error(&resolved, &dependents));
+    }
+    let notices = catalog.drop_resolved_routines(&specs, &resolved);
     Ok(QueryResult::Command {
         tag: match kind {
             RoutineKind::Function => "DROP FUNCTION".into(),

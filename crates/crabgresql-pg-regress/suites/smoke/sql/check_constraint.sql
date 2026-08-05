@@ -80,9 +80,67 @@ CREATE TABLE chk_conflict (CONSTRAINT chk_p CHECK (a > 5)) INHERITS (chk_parent)
 CREATE TABLE chk_other (a integer, CONSTRAINT chk_p CHECK (a > 9));
 CREATE TABLE chk_two_parents () INHERITS (chk_parent, chk_other);
 
+-- A predicate reading no column stores NULL conkey, not an empty array.
+CREATE TABLE chk_nocol (a integer, CHECK (1 > 0));
+SELECT conname, conkey, conkey IS NULL AS conkey_is_null FROM pg_constraint
+ WHERE conrelid = 'chk_nocol'::regclass;
+
+-- A table-qualified column is stored bare, so the text re-binds against a child.
+CREATE TABLE chk_q (x integer, CONSTRAINT chk_q1 CHECK (chk_q.x > 0));
+ALTER TABLE chk_q ADD CONSTRAINT chk_q2 CHECK (chk_q.x < 100);
+CREATE TABLE chk_qc () INHERITS (chk_q);
+SELECT conrelid::regclass::text AS rel, conname, pg_get_constraintdef(oid)
+  FROM pg_constraint
+ WHERE conrelid IN ('chk_q'::regclass, 'chk_qc'::regclass) ORDER BY rel, conname;
+INSERT INTO chk_qc VALUES (-1);
+
+-- Two namespaces. A CHECK and an index-backed constraint share the constraint
+-- namespace (42710); only a *relation* name collides as 42P07, and a plain index
+-- is a relation but not a constraint.
+CREATE TABLE chk_ns (a integer, b integer);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_c1 CHECK (a > 0);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_c1 UNIQUE (b);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_c2 UNIQUE (b);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_c2 CHECK (a < 9);
+CREATE INDEX chk_plain ON chk_ns(b);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_plain CHECK (a > 2);
+ALTER TABLE chk_ns ADD CONSTRAINT chk_plain UNIQUE (a);
+
+-- A generated name steps around one about to be inherited.
+CREATE TABLE chk_ip (x integer, CONSTRAINT chk_ic_x_check CHECK (x > 0));
+CREATE TABLE chk_ic (x integer CHECK (x < 100)) INHERITS (chk_ip);
+SELECT conname, pg_get_constraintdef(oid), conislocal, coninhcount FROM pg_constraint
+ WHERE conrelid = 'chk_ic'::regclass ORDER BY conname;
+
+-- ONLY is refused on a table with children rather than silently over-applied.
+CREATE TABLE chk_only_p (a integer);
+ALTER TABLE ONLY chk_only_p ADD CONSTRAINT chk_only1 CHECK (a > 0);
+CREATE TABLE chk_only_c () INHERITS (chk_only_p);
+ALTER TABLE ONLY chk_only_p ADD CONSTRAINT chk_only2 CHECK (a < 9);
+
+-- A diamond descendant counts both links.
+CREATE TABLE chk_dp (a integer);
+CREATE TABLE chk_da () INHERITS (chk_dp);
+CREATE TABLE chk_db () INHERITS (chk_dp);
+CREATE TABLE chk_dd () INHERITS (chk_da, chk_db);
+ALTER TABLE chk_dp ADD CONSTRAINT chk_diamond CHECK (a > 0);
+SELECT conrelid::regclass::text AS rel, conname, conislocal, coninhcount
+  FROM pg_constraint WHERE conname = 'chk_diamond' ORDER BY rel;
+INSERT INTO chk_dd VALUES (-1);
+
 -- The suite shares one database, and the inheritance links above are visible to
 -- every later test that reads pg_inherits — so this one cleans up after itself.
 DROP TABLE chk_merge;
 DROP TABLE chk_child;
 DROP TABLE chk_parent;
 DROP TABLE chk_other;
+DROP TABLE chk_qc;
+DROP TABLE chk_q;
+DROP TABLE chk_ic;
+DROP TABLE chk_ip;
+DROP TABLE chk_only_c;
+DROP TABLE chk_only_p;
+DROP TABLE chk_dd;
+DROP TABLE chk_da;
+DROP TABLE chk_db;
+DROP TABLE chk_dp;

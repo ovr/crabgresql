@@ -6404,6 +6404,156 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The pre-flight scan of `ALTER TABLE ... ADD CHECK` runs under the same
+/// fully-wired runtime a statement gets, so a predicate calling a routine, a
+/// sequence or a catalog function validates instead of failing internally. It
+/// used to run under a bare formatting context, which made the DDL succeed on an
+/// empty table and fail with XX000 on a populated one.
+#[tokio::test]
+async fn alter_table_add_check_evaluates_a_routine_over_existing_rows() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION positive(int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0';
+             CREATE TABLE t (x int);
+             INSERT INTO t VALUES (5)",
+        )
+        .await?;
+    // The row satisfies it, so the constraint lands.
+    client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT c1 CHECK (positive(x))")
+        .await?;
+    // And enforces from then on — the same predicate, the same runtime.
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (-1)")
+        .await
+        .expect_err("-1 fails positive()");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::CHECK_VIOLATION
+    );
+    // A row that violates it is reported as a constraint violation, not as an
+    // internal error from an unwired context.
+    client.batch_execute("CREATE TABLE u (x int)").await?;
+    client.batch_execute("INSERT INTO u VALUES (-3)").await?;
+    let e = client
+        .batch_execute("ALTER TABLE u ADD CONSTRAINT c2 CHECK (positive(x))")
+        .await
+        .expect_err("the existing row fails");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "check constraint \"c2\" of relation \"u\" is violated by some row"
+    );
+    Ok(())
+}
+
+/// `DROP FUNCTION` refuses to strand a stored expression that calls it, the way
+/// PostgreSQL's `pg_depend` does — for a CHECK predicate and a column DEFAULT
+/// alike. Without this the drop succeeded and left the relation unwritable.
+#[tokio::test]
+async fn drop_function_reports_stored_expression_dependents() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION g(int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0';
+             CREATE TABLE gt (x int, CHECK (g(x)));
+             CREATE FUNCTION h() RETURNS int LANGUAGE sql AS 'SELECT 7';
+             CREATE TABLE dt (y int DEFAULT h())",
+        )
+        .await?;
+
+    let e = client
+        .batch_execute("DROP FUNCTION g(int)")
+        .await
+        .expect_err("a CHECK depends on it");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        db.message(),
+        "cannot drop function g(integer) because other objects depend on it"
+    );
+    assert_eq!(
+        db.detail(),
+        Some("constraint gt_x_check on table gt depends on function g(integer)")
+    );
+    assert_eq!(
+        db.hint(),
+        Some("Use DROP ... CASCADE to drop the dependent objects too.")
+    );
+
+    let e = client
+        .batch_execute("DROP FUNCTION h()")
+        .await
+        .expect_err("a DEFAULT depends on it");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.detail(),
+        Some("default value for column y of table dt depends on function h()")
+    );
+
+    // The refusal is total: the function is still callable and the relation is
+    // still writable.
+    client.batch_execute("INSERT INTO gt VALUES (1)").await?;
+
+    // A different overload is a different object.
+    client
+        .batch_execute(
+            "CREATE FUNCTION g(text) RETURNS bool LANGUAGE sql AS 'SELECT true';
+             DROP FUNCTION g(text)",
+        )
+        .await?;
+
+    // CASCADE would have to drop the constraint, and nothing here can — so it is
+    // refused rather than reported as done.
+    let e = client
+        .batch_execute("DROP FUNCTION g(int) CASCADE")
+        .await
+        .expect_err("CASCADE cannot drop the dependent constraint");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // Once the dependent is gone, so is the objection.
+    client
+        .batch_execute("DROP TABLE gt; DROP FUNCTION g(int)")
+        .await?;
+    Ok(())
+}
+
+/// A dependency is *direct*, as in PostgreSQL: a routine reached only through an
+/// inlined SQL body is not one, so dropping it succeeds — while the routine the
+/// expression names itself stays protected, even after that inner drop has made
+/// the body unbindable.
+#[tokio::test]
+async fn drop_function_dependency_is_direct_only() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION base() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE FUNCTION wrap() RETURNS int LANGUAGE sql AS 'SELECT base()';
+             CREATE TABLE wt (x int DEFAULT wrap())",
+        )
+        .await?;
+    // Reached only through `wrap`'s inlined body — not a dependency.
+    client.batch_execute("DROP FUNCTION base()").await?;
+    // Named by the default itself — still a dependency, even though the body no
+    // longer binds.
+    let e = client
+        .batch_execute("DROP FUNCTION wrap()")
+        .await
+        .expect_err("the default names wrap() directly");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
+    );
+    Ok(())
+}
+
 /// A subquery in a CHECK predicate is refused with PostgreSQL's own wording and
 /// SQLSTATE — `0A000`, not the `42P17` the constraint-violation family might
 /// suggest. Lives here rather than in the smoke suite because PostgreSQL puts

@@ -3779,6 +3779,15 @@ fn resolve_user_routine_call(
         .with_hint(Some("To call a procedure, use CALL.".into())));
     }
 
+    // Report the *chosen overload* to anyone tracking dependencies, but only at
+    // the top level: a routine reached from inside an inlined SQL body is not a
+    // dependency in PostgreSQL, and recording it would over-block `DROP
+    // FUNCTION`. Placed before the inlining below so it runs for both routine
+    // kinds and cannot be skipped by an early return further down.
+    if INLINE_DEPTH.with(|d| d.get()) == 0 {
+        catalog.note_routine_use(sig.oid);
+    }
+
     let body = match &sig.imp {
         RoutineImpl::Sql(body) => body,
         // Not inlinable: the body is an imperative program, so the call

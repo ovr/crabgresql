@@ -1643,6 +1643,20 @@ pub trait TypeCatalog: Send + Sync {
         false
     }
 
+    /// Called once for each user routine a call resolves to **directly**.
+    ///
+    /// The default does nothing; only a caller that wants to know what an
+    /// expression depends on — `DROP FUNCTION`, deciding whether a stored
+    /// default or CHECK still needs the routine — wraps a catalog to record it.
+    ///
+    /// "Directly" is the whole contract, and it mirrors PostgreSQL: a routine
+    /// reached through an *inlined* SQL body is not a dependency there either
+    /// (dropping a function that an inlined body calls succeeds, and the
+    /// breakage surfaces at the next call as 42883). Reporting it is also the
+    /// only way to see a `LANGUAGE SQL` routine at all — it is inlined during
+    /// binding, so no OID survives in the bound tree to walk for.
+    fn note_routine_use(&self, _oid: u32) {}
+
     /// The catalog name for a user type OID, for PG-compatible diagnostics.
     fn user_type_name(&self, _oid: u32) -> Option<String> {
         None

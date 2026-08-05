@@ -9,6 +9,7 @@ mod copy_access;
 mod cursor;
 mod error;
 mod explain;
+mod func_deps;
 mod global_catalog;
 mod guc;
 mod query;
