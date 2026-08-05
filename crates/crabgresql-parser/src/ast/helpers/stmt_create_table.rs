@@ -723,7 +723,6 @@ pub(crate) struct CreateTableConfiguration {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::ast::helpers::stmt_create_table::CreateTableBuilder;
     use crate::ast::{Ident, ObjectName, Statement};
@@ -751,7 +750,8 @@ mod tests {
         };
 
         assert_eq!(
-            CreateTableBuilder::try_from(stmt).unwrap_err(),
+            CreateTableBuilder::try_from(stmt)
+                .expect_err("a statement that is not CREATE TABLE must be rejected"),
             ParserError::ParserError(
                 "Expected create table statement, but received: COMMIT".to_owned()
             )

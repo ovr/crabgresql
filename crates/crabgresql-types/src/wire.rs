@@ -208,7 +208,6 @@ impl Value {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -386,9 +385,12 @@ mod tests {
 
     #[test]
     fn unsupported_binary_is_feature_error() {
-        let err = Value::Date(0).encode_binary().unwrap_err();
+        let err = Value::Date(0)
+            .encode_binary()
+            .expect_err("date has no binary send yet");
         assert_eq!(err.sqlstate, FEATURE_NOT_SUPPORTED);
-        let err = decode_binary(PgType::Date, &[0, 0, 0, 0]).unwrap_err();
+        let err =
+            decode_binary(PgType::Date, &[0, 0, 0, 0]).expect_err("date has no binary recv yet");
         assert_eq!(err.sqlstate, FEATURE_NOT_SUPPORTED);
     }
 }

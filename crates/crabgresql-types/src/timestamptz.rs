@@ -567,7 +567,6 @@ fn wall_to_instant(micros: i64, zone: &tz::Zone) -> Result<i64, TimestampError> 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -659,13 +658,14 @@ mod tests {
         assert!(parse("4714-11-24 00:00:00+00 BC", &in_zone(utc())).is_ok());
         assert!(parse("4714-11-23 16:00:00-08 BC", &in_zone(utc())).is_ok()); // == the same instant
         // One second earlier is out of range.
-        let e = parse("4714-11-23 23:59:59+00 BC", &in_zone(utc())).unwrap_err();
+        let e = parse("4714-11-23 23:59:59+00 BC", &in_zone(utc()))
+            .expect_err("one second below the lower boundary is out of range");
         assert_eq!(e.sqlstate, DATETIME_FIELD_OVERFLOW);
         // Upper boundary.
         assert!(parse("294276-12-31 23:59:59+00", &in_zone(utc())).is_ok());
         assert_eq!(
             parse("294277-01-01 00:00:00+00", &in_zone(utc()))
-                .unwrap_err()
+                .expect_err("294277-01-01 is one past the upper boundary")
                 .sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
@@ -673,7 +673,8 @@ mod tests {
 
     #[test]
     fn errors() {
-        let e = parse("garbage", &in_zone(utc())).unwrap_err();
+        let e =
+            parse("garbage", &in_zone(utc())).expect_err("'garbage' is not a datetime spelling");
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
         assert_eq!(
             e.message,
@@ -681,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             parse("2001-01-01 00:00 Nowhere/Nozone", &in_zone(utc()))
-                .unwrap_err()
+                .expect_err("Nowhere/Nozone is not a recognized zone token")
                 .sqlstate,
             INVALID_PARAMETER_VALUE
         );
@@ -782,7 +783,7 @@ mod tests {
         // the upper boundary.
         assert_eq!(
             make_timestamptz(294276, 12, 31, 23, 0, 0.0, Some("-10"), &utc())
-                .unwrap_err()
+                .expect_err("the -10 zone pushes an in-range civil value past the upper boundary")
                 .sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
@@ -790,7 +791,7 @@ mod tests {
         let near_max = timestamp::parse("294276-12-31 23:59:59", &in_zone(utc()))?;
         assert_eq!(
             timestamp_at_zone("America/New_York", near_max)
-                .unwrap_err()
+                .expect_err("reading the near-maximum wall clock in New York leaves the range")
                 .sqlstate,
             DATETIME_FIELD_OVERFLOW
         );
@@ -803,7 +804,8 @@ mod tests {
     #[test]
     fn glued_date_zone_requires_numeric_offset() {
         assert_eq!(format(p("2001-02-16+00"), &utc()), "2001-02-16 00:00:00+00");
-        let e = parse("2001-02-16+garbage", &in_zone(utc())).unwrap_err();
+        let e = parse("2001-02-16+garbage", &in_zone(utc()))
+            .expect_err("a glued zone must be a numeric offset, and '+garbage' is not");
         assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT);
     }
 

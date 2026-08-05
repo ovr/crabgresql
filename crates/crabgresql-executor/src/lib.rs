@@ -4409,7 +4409,6 @@ fn jsonb_path_query_series(values: &[Value]) -> Result<Series, ExecError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crabgresql_binder::{BinOp, UnaryOp};
@@ -4661,7 +4660,7 @@ mod tests {
     #[test]
     fn arithmetic_overflow_is_22003() {
         let expr = binary(BinOp::Add, PgType::Int4, int4(i32::MAX), int4(1));
-        let e = eval_const(&expr).unwrap_err();
+        let e = eval_const(&expr).expect_err("an int4 addition that overflows must be rejected");
         assert_eq!(e.code, "22003");
         assert_eq!(e.message, "integer out of range");
 
@@ -4678,7 +4677,9 @@ mod tests {
             },
         );
         assert_eq!(
-            eval_const(&expr).unwrap_err().message,
+            eval_const(&expr)
+                .expect_err("an int8 multiplication that overflows must be rejected")
+                .message,
             "bigint out of range"
         );
     }
@@ -4686,7 +4687,8 @@ mod tests {
     #[test]
     fn division_and_modulo_by_zero_are_22012() {
         for op in [BinOp::Div, BinOp::Mod] {
-            let e = eval_const(&binary(op, PgType::Int4, int4(1), int4(0))).unwrap_err();
+            let e = eval_const(&binary(op, PgType::Int4, int4(1), int4(0)))
+                .expect_err("a division by zero must be rejected");
             assert_eq!(e.code, "22012");
             assert_eq!(e.message, "division by zero");
         }
@@ -4695,8 +4697,8 @@ mod tests {
     #[test]
     fn min_over_minus_one_edge_cases() -> anyhow::Result<()> {
         // MIN / -1 overflows ...
-        let e =
-            eval_const(&binary(BinOp::Div, PgType::Int4, int4(i32::MIN), int4(-1))).unwrap_err();
+        let e = eval_const(&binary(BinOp::Div, PgType::Int4, int4(i32::MIN), int4(-1)))
+            .expect_err("int4 MIN divided by -1 must be rejected as out of range");
         assert_eq!(e.code, "22003");
         // ... but MIN % -1 is 0, as in PG.
         assert_eq!(
@@ -4713,7 +4715,12 @@ mod tests {
             op: UnaryOp::Neg,
             expr: Box::new(int4(i32::MIN)),
         };
-        assert_eq!(eval_const(&expr).unwrap_err().code, "22003");
+        assert_eq!(
+            eval_const(&expr)
+                .expect_err("negating int4 MIN must be rejected as out of range")
+                .code,
+            "22003"
+        );
     }
 
     #[test]
@@ -4743,7 +4750,8 @@ mod tests {
             coerce_value(Value::Int8(7), PgType::Int4, &ctx)?,
             Value::Int4(7)
         );
-        let e = coerce_value(Value::Int8(i64::MAX), PgType::Int4, &ctx).unwrap_err();
+        let e = coerce_value(Value::Int8(i64::MAX), PgType::Int4, &ctx)
+            .expect_err("an int8 beyond the int4 range must be rejected");
         assert_eq!(e.code, "22003");
         assert_eq!(coerce_value(Value::Null, PgType::Int4, &ctx)?, Value::Null);
 
@@ -4762,7 +4770,8 @@ mod tests {
             );
         }
         for n in [2, -1, -42] {
-            let e = coerce_value_assign(Value::Int4(n), PgType::Bool, ctx).unwrap_err();
+            let e = coerce_value_assign(Value::Int4(n), PgType::Bool, ctx)
+                .expect_err("an integer other than 0 or 1 must be rejected by boolin");
             assert_eq!(e.code, "22P02");
             assert_eq!(
                 e.message,

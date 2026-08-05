@@ -405,7 +405,6 @@ fn spell_three(n: u16) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -434,7 +433,13 @@ mod tests {
         // A sign nested in parentheses, or more than one sign indicator, is an
         // error in PG rather than a silently cancelled/duplicated sign.
         for bad in ["(-1)", "(+1)", "--1", "+-1", "-$-1", "-1-", "1)"] {
-            assert_eq!(parse(bad).unwrap_err().sqlstate, "22P02", "input {bad:?}");
+            assert_eq!(
+                parse(bad)
+                    .expect_err("a nested or duplicated sign indicator is not money")
+                    .sqlstate,
+                "22P02",
+                "input {bad:?}"
+            );
         }
     }
 
@@ -450,26 +455,47 @@ mod tests {
     fn documented_min_max_boundary() {
         assert_eq!(parse("92233720368547758.07"), Ok(i64::MAX));
         assert_eq!(parse("-92233720368547758.08"), Ok(i64::MIN));
-        assert_eq!(parse("92233720368547758.08").unwrap_err().sqlstate, "22003");
         assert_eq!(
-            parse("-92233720368547758.09").unwrap_err().sqlstate,
+            parse("92233720368547758.08")
+                .expect_err("one cent above the money maximum is out of range")
+                .sqlstate,
+            "22003"
+        );
+        assert_eq!(
+            parse("-92233720368547758.09")
+                .expect_err("one cent below the money minimum is out of range")
+                .sqlstate,
             "22003"
         );
         // Rounding into overflow.
         assert_eq!(
-            parse("92233720368547758.075").unwrap_err().sqlstate,
+            parse("92233720368547758.075")
+                .expect_err("a third digit that rounds up past the money maximum is out of range")
+                .sqlstate,
             "22003"
         );
         assert_eq!(
-            parse("-92233720368547758.085").unwrap_err().sqlstate,
+            parse("-92233720368547758.085")
+                .expect_err("a third digit that rounds down past the money minimum is out of range")
+                .sqlstate,
             "22003"
         );
     }
 
     #[test]
     fn rejects_garbage() {
-        assert_eq!(parse("\\x0001").unwrap_err().sqlstate, "22P02");
-        assert_eq!(parse("").unwrap_err().sqlstate, "22P02");
+        assert_eq!(
+            parse("\\x0001")
+                .expect_err("a backslash-hex byte string is not money")
+                .sqlstate,
+            "22P02"
+        );
+        assert_eq!(
+            parse("")
+                .expect_err("an empty string is not money")
+                .sqlstate,
+            "22P02"
+        );
     }
 
     #[test]
@@ -503,7 +529,12 @@ mod tests {
         assert_eq!(div_int(87808, 11), Ok(7982));
         assert_eq!(div_float(87808, 11.0), Ok(7983));
         assert_eq!(div_cash(12300, 200), Ok(61.5));
-        assert_eq!(div_int(1, 0).unwrap_err().sqlstate, "22012");
+        assert_eq!(
+            div_int(1, 0)
+                .expect_err("dividing money by an integer zero is rejected")
+                .sqlstate,
+            "22012"
+        );
     }
 
     #[test]
@@ -511,18 +542,32 @@ mod tests {
         assert_eq!(neg(500), Ok(-500));
         assert_eq!(neg(-500), Ok(500));
         // i64::MIN has no positive money image.
-        assert_eq!(neg(i64::MIN).unwrap_err().message, "money out of range");
+        assert_eq!(
+            neg(i64::MIN)
+                .expect_err("the money minimum has no positive image")
+                .message,
+            "money out of range"
+        );
     }
 
     #[test]
     fn overflow_arithmetic() {
-        assert_eq!(add(i64::MAX, 1).unwrap_err().message, "money out of range");
         assert_eq!(
-            mul_float(4200, f64::NAN).unwrap_err().message,
+            add(i64::MAX, 1)
+                .expect_err("adding one cent to the money maximum overflows")
+                .message,
             "money out of range"
         );
         assert_eq!(
-            mul_float(4200, f64::INFINITY).unwrap_err().message,
+            mul_float(4200, f64::NAN)
+                .expect_err("multiplying money by NaN has no money result")
+                .message,
+            "money out of range"
+        );
+        assert_eq!(
+            mul_float(4200, f64::INFINITY)
+                .expect_err("multiplying money by infinity has no money result")
+                .message,
             "money out of range"
         );
     }

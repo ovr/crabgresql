@@ -1431,7 +1431,6 @@ fn is_known_internal(name: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1555,7 +1554,9 @@ mod tests {
     #[test]
     fn drop_restrict_refuses_with_hint() -> anyhow::Result<()> {
         let cat = bootstrap_xfloat8();
-        let err = cat.drop_types(&["xfloat8"], false, false).unwrap_err();
+        let err = cat
+            .drop_types(&["xfloat8"], false, false)
+            .expect_err("dropping a type other objects depend on must be refused without CASCADE");
         assert_eq!(err.code, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST);
         assert_eq!(
             err.message,
@@ -1583,7 +1584,7 @@ mod tests {
         let cat = bootstrap_xfloat8();
         let err = cat
             .drop_types(&["xfloat8", "nope"], true, false)
-            .unwrap_err();
+            .expect_err("a drop list naming a type that does not exist must be rejected");
         assert_eq!(err.code, sqlstate::UNDEFINED_OBJECT);
         assert!(cat.is_user_type("xfloat8"));
     }
@@ -1592,7 +1593,9 @@ mod tests {
     fn redeclaring_a_type_is_a_duplicate_error() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
         cat.create_shell_type("foo")?;
-        let err = cat.create_shell_type("foo").unwrap_err();
+        let err = cat
+            .create_shell_type("foo")
+            .expect_err("redeclaring an existing type must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "type \"foo\" already exists");
 
@@ -1632,7 +1635,7 @@ mod tests {
                 TypeRef::Builtin(PgType::Int8),
                 true,
             )
-            .unwrap_err();
+            .expect_err("a cast that already exists must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(
             err.message,
@@ -1649,7 +1652,7 @@ mod tests {
                 TypeRef::Builtin(PgType::Int8),
                 true,
             )
-            .unwrap_err();
+            .expect_err("a cast from a type to itself must be rejected");
         assert_eq!(err.code, sqlstate::INVALID_OBJECT_DEFINITION);
         assert_eq!(
             err.message,
@@ -1667,7 +1670,7 @@ mod tests {
                 TypeRef::Builtin(PgType::Int8),
                 FuncBody::Internal("nope".into()),
             ))
-            .unwrap_err();
+            .expect_err("an internal body naming no built-in function must be rejected");
         assert_eq!(err.code, sqlstate::UNDEFINED_FUNCTION);
         assert_eq!(err.message, "there is no built-in function named \"nope\"");
     }
@@ -1721,7 +1724,7 @@ mod tests {
                 TypeRef::Builtin(PgType::Int4),
                 FuncBody::Sql("SELECT 0".into()),
             ))
-            .unwrap_err();
+            .expect_err("a function with an already-declared signature must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
 
         Ok(())
@@ -1812,7 +1815,9 @@ mod tests {
             name: None,
             position: None,
         });
-        let err = cat.create_function(with_out).unwrap_err();
+        let err = cat
+            .create_function(with_out)
+            .expect_err("an OUT argument must not make an otherwise duplicate signature distinct");
         assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
 
         Ok(())
@@ -1845,7 +1850,7 @@ mod tests {
                 TypeRef::Builtin(PgType::Int8),
                 true,
             )
-            .unwrap_err();
+            .expect_err("a binary-coercible cast between differently sized types must be rejected");
         assert_eq!(err.code, sqlstate::INVALID_OBJECT_DEFINITION);
     }
 
@@ -1877,7 +1882,7 @@ mod tests {
         let cat = GlobalCatalog::new();
         let err = cat
             .create_enum_type("dup", vec!["a".into(), "b".into(), "a".into()])
-            .unwrap_err();
+            .expect_err("an enum definition repeating a label must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "enum label \"a\" used more than once");
         // A rejected definition registers nothing.
@@ -1888,7 +1893,9 @@ mod tests {
     fn create_enum_duplicate_name_rejected() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
         cat.create_enum_type("e", vec!["a".into()])?;
-        let err = cat.create_enum_type("e", vec!["b".into()]).unwrap_err();
+        let err = cat
+            .create_enum_type("e", vec!["b".into()])
+            .expect_err("an enum reusing an existing type name must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "type \"e\" already exists");
 
@@ -1928,19 +1935,27 @@ mod tests {
         let cat = GlobalCatalog::new();
         cat.create_enum_type("a", vec!["x".into()])?;
         cat.create_enum_type("b", vec!["y".into()])?;
-        let missing = cat.rename_type("nope", "z").unwrap_err();
+        let missing = cat
+            .rename_type("nope", "z")
+            .expect_err("renaming a type that does not exist must be rejected");
         assert_eq!(missing.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(missing.message, "type \"nope\" does not exist");
-        let collide = cat.rename_type("a", "b").unwrap_err();
+        let collide = cat
+            .rename_type("a", "b")
+            .expect_err("renaming onto an existing type name must be rejected");
         assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(collide.message, "type \"b\" already exists");
         // A target that collides with a builtin name is a duplicate-object error.
-        let builtin = cat.rename_type("a", "int4").unwrap_err();
+        let builtin = cat
+            .rename_type("a", "int4")
+            .expect_err("renaming onto a built-in type name must be rejected");
         assert_eq!(builtin.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(builtin.message, "type \"int4\" already exists");
         // Source existence is checked before the target collision: a missing
         // source with a builtin target still reports the source, not the target.
-        let order = cat.rename_type("nope", "int4").unwrap_err();
+        let order = cat
+            .rename_type("nope", "int4")
+            .expect_err("a missing source type must be reported before the target collision");
         assert_eq!(order.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(order.message, "type \"nope\" does not exist");
 
@@ -1987,7 +2002,9 @@ mod tests {
     fn add_enum_value_duplicate_and_if_not_exists() -> anyhow::Result<()> {
         let cat = GlobalCatalog::new();
         cat.create_enum_type("e", vec!["a".into()])?;
-        let err = cat.add_enum_value("e", "a", false, None).unwrap_err();
+        let err = cat
+            .add_enum_value("e", "a", false, None)
+            .expect_err("adding a label the enum already has must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(err.message, "enum label \"a\" already exists");
         // IF NOT EXISTS turns the duplicate into a skip NOTICE, no mutation.
@@ -2008,16 +2025,20 @@ mod tests {
         cat.create_enum_type("e", vec!["a".into()])?;
         let neighbor = cat
             .add_enum_value("e", "b", false, Some((false, "zzz".into())))
-            .unwrap_err();
+            .expect_err("adding a label next to a neighbor that is not a label must be rejected");
         assert_eq!(neighbor.code, sqlstate::INVALID_PARAMETER_VALUE);
         assert_eq!(neighbor.message, "\"zzz\" is not an existing enum label");
         // A base (non-enum) user type rejects ADD VALUE, unquoted name.
         cat.define_type("base", 4, None)?;
-        let non_enum = cat.add_enum_value("base", "x", false, None).unwrap_err();
+        let non_enum = cat
+            .add_enum_value("base", "x", false, None)
+            .expect_err("ADD VALUE on a non-enum type must be rejected");
         assert_eq!(non_enum.code, sqlstate::WRONG_OBJECT_TYPE);
         assert_eq!(non_enum.message, "base is not an enum");
         // A missing type reports undefined-object with the quoted name.
-        let missing = cat.add_enum_value("nope", "x", false, None).unwrap_err();
+        let missing = cat
+            .add_enum_value("nope", "x", false, None)
+            .expect_err("ADD VALUE on a type that does not exist must be rejected");
         assert_eq!(missing.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(missing.message, "type \"nope\" does not exist");
 
@@ -2036,10 +2057,14 @@ mod tests {
             vec!["crimson", "green", "blue"]
         );
         // Missing source label is reported before a colliding target.
-        let missing = cat.rename_enum_value("e", "red", "green").unwrap_err();
+        let missing = cat
+            .rename_enum_value("e", "red", "green")
+            .expect_err("renaming a label the enum does not have must be rejected");
         assert_eq!(missing.code, sqlstate::INVALID_PARAMETER_VALUE);
         assert_eq!(missing.message, "\"red\" is not an existing enum label");
-        let collide = cat.rename_enum_value("e", "blue", "green").unwrap_err();
+        let collide = cat
+            .rename_enum_value("e", "blue", "green")
+            .expect_err("renaming a label onto an existing label must be rejected");
         assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(collide.message, "enum label \"green\" already exists");
 

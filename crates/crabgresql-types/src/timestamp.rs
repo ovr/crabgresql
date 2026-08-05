@@ -1450,7 +1450,6 @@ pub fn age(dt1: i64, dt2: i64) -> Result<Interval, TimestampError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1549,7 +1548,7 @@ mod tests {
         // "timestamp out of range" error. Same for an enormous day span.
         assert_eq!(
             pl_interval(ts("2001-01-01"), span("2000000000 mons"))
-                .unwrap_err()
+                .expect_err("two billion months past 2001 lands far outside the timestamp range")
                 .message,
             "timestamp out of range"
         );
@@ -1604,7 +1603,7 @@ mod tests {
         // zone (PG rejects `2001-02-16+garbage`).
         assert_eq!(
             parse("2001-02-16+garbage", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("a glued suffix that is not a zone offset is not silently ignored")
                 .sqlstate,
             INVALID_DATETIME_FORMAT
         );
@@ -1638,19 +1637,19 @@ mod tests {
     fn syntax_and_range_errors() {
         assert_eq!(
             parse("garbage", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("`garbage` spells no date in any accepted form")
                 .sqlstate,
             "22007"
         );
         assert_eq!(
             parse("2001-13-01", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("there is no thirteenth month")
                 .sqlstate,
             "22008"
         );
         assert_eq!(
             parse("2001-02-30", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("February 2001 has no thirtieth day")
                 .sqlstate,
             "22008"
         );
@@ -1691,7 +1690,9 @@ mod tests {
     #[test]
     fn date_part_unknown_unit() {
         assert_eq!(
-            date_part("bogus", ts("2001-02-16")).unwrap_err().sqlstate,
+            date_part("bogus", ts("2001-02-16"))
+                .expect_err("`bogus` names no timestamp field")
+                .sqlstate,
             "22023"
         );
     }
@@ -1751,7 +1752,9 @@ mod tests {
         assert_eq!(extract("day", POS_INFINITY)?, None);
         // An unknown unit still errors even on ±infinity.
         assert_eq!(
-            date_part("bogus", POS_INFINITY).unwrap_err().sqlstate,
+            date_part("bogus", POS_INFINITY)
+                .expect_err("an unknown unit is rejected on infinity too, not answered with NULL")
+                .sqlstate,
             "22023"
         );
 
@@ -1783,21 +1786,21 @@ mod tests {
         assert_eq!(format(ts("February 10 1997")), "1997-02-10 00:00:00");
         assert_eq!(
             parse("marble 5 2001", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("`marble` merely starts like `mar`; it is not a month name")
                 .sqlstate,
             "22007"
         );
         // Non-ASCII input must error, not panic (regression for &name[..3]).
         assert_eq!(
             parse("aa\u{e9} 2001", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("a non-ASCII leading word is no month name")
                 .sqlstate,
             "22007"
         );
         // Out-of-range years error instead of overflowing i64.
         assert_eq!(
             parse("5000000000-01-01", &FmtCtx::utc_default())
-                .unwrap_err()
+                .expect_err("the year five billion is far past the end of the timestamp range")
                 .sqlstate,
             "22008"
         );

@@ -1,8 +1,6 @@
 //! End-to-end tests: a real driver (tokio-postgres) against an in-process
 //! server on an ephemeral port, plus raw-socket checks of the startup phase.
 
-#![allow(clippy::unwrap_used)]
-
 use anyhow::Context as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -111,7 +109,7 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE shell_table (value shell_only)")
         .await
-        .unwrap_err();
+        .expect_err("a column of a shell type must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_OBJECT
@@ -124,7 +122,7 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TYPE int4 AS ENUM ('shadow')")
         .await
-        .unwrap_err();
+        .expect_err("a type name that collides with a built-in must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_OBJECT
@@ -136,7 +134,7 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE unsupported (value xml)")
         .await
-        .unwrap_err();
+        .expect_err("a column of a catalog type this build does not model must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -159,7 +157,10 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
 
     for target in ["varchar", "name", "bpchar"] {
         let sql = format!("SELECT 'red'::rainbow::{target}");
-        let err = client.simple_query(&sql).await.unwrap_err();
+        let err = client
+            .simple_query(&sql)
+            .await
+            .expect_err("an enum must not coerce to a string type other than text");
         assert_eq!(
             err.as_db_error().expect("database error").code(),
             &SqlState::CANNOT_COERCE
@@ -170,7 +171,7 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT 'red'::rainbow > 1")
         .await
-        .unwrap_err();
+        .expect_err("comparing an enum with an integer must find no operator");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -205,7 +206,7 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT 1::int8::xbase > 0::int8::xbase")
         .await
-        .unwrap_err();
+        .expect_err("a user type with no comparison operator must not be orderable");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -280,7 +281,7 @@ async fn information_schema_reflects_live_relations_and_session_identity() -> an
     let err = client
         .simple_query("SELECT * FROM tables")
         .await
-        .unwrap_err();
+        .expect_err("an unqualified information_schema view name must not resolve");
     assert_eq!(
         err.code().expect("database error has SQLSTATE").code(),
         "42P01"
@@ -288,7 +289,7 @@ async fn information_schema_reflects_live_relations_and_session_identity() -> an
     let err = client
         .simple_query("INSERT INTO information_schema.tables VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("writing to an information_schema view must be refused");
     assert_eq!(
         err.code().expect("database error has SQLSTATE").code(),
         "42501"
@@ -628,7 +629,10 @@ async fn out_of_range_declared_length_is_rejected() -> anyhow::Result<()> {
         "CREATE TABLE t (a bit(83886081))",
         "CREATE TABLE t (a varchar(0))",
     ] {
-        let err = client.simple_query(ddl).await.unwrap_err();
+        let err = client
+            .simple_query(ddl)
+            .await
+            .expect_err("an out-of-range type modifier must be rejected");
         assert_eq!(
             err.code(),
             Some(&SqlState::INVALID_PARAMETER_VALUE),
@@ -677,7 +681,10 @@ async fn reg_types_are_rejected_as_stored_columns() -> anyhow::Result<()> {
         "CREATE TABLE hold (r regclass[])",
         "CREATE TABLE hold AS SELECT 'zz'::regclass AS r",
     ] {
-        let err = client.simple_query(ddl).await.unwrap_err();
+        let err = client
+            .simple_query(ddl)
+            .await
+            .expect_err("regclass in a table definition must be rejected");
         assert_eq!(
             err.code(),
             Some(&SqlState::FEATURE_NOT_SUPPORTED),
@@ -802,7 +809,10 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     assert_eq!(rows(&schemata)[0].get(0), Some("app"));
 
     // Duplicate without IF NOT EXISTS → 42P06; with it → success (a NOTICE).
-    let err = client.simple_query("CREATE SCHEMA app").await.unwrap_err();
+    let err = client
+        .simple_query("CREATE SCHEMA app")
+        .await
+        .expect_err("a duplicate CREATE SCHEMA without IF NOT EXISTS must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42P06")
@@ -815,7 +825,7 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE SCHEMA pg_evil")
         .await
-        .unwrap_err();
+        .expect_err("a pg_-prefixed schema name is reserved and must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42939")
@@ -871,14 +881,17 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE TABLE nope.t (id int)")
         .await
-        .unwrap_err();
+        .expect_err("creating a table in a schema that does not exist must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("3F000")
     );
 
     // DROP SCHEMA RESTRICT on a non-empty schema → 2BP01.
-    let err = client.simple_query("DROP SCHEMA app").await.unwrap_err();
+    let err = client
+        .simple_query("DROP SCHEMA app")
+        .await
+        .expect_err("DROP SCHEMA RESTRICT on a non-empty schema must be refused");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
@@ -897,7 +910,7 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     let err = client
         .simple_query("SELECT * FROM app.item")
         .await
-        .unwrap_err();
+        .expect_err("a relation in a dropped schema must no longer resolve");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_TABLE
@@ -906,7 +919,10 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     client.simple_query("SELECT id FROM item").await?;
 
     // DROP SCHEMA of a missing schema → 3F000; IF EXISTS → success.
-    let err = client.simple_query("DROP SCHEMA nope").await.unwrap_err();
+    let err = client
+        .simple_query("DROP SCHEMA nope")
+        .await
+        .expect_err("dropping a schema that does not exist without IF EXISTS must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("3F000")
@@ -970,7 +986,7 @@ async fn subqueries_in_expressions_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT (SELECT val FROM sq)")
         .await
-        .unwrap_err();
+        .expect_err("a scalar subquery returning more than one row must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::CARDINALITY_VIOLATION);
     assert_eq!(
@@ -1155,7 +1171,7 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT a, (SELECT max(c) FROM t2 WHERE t2.a = t1.a) FROM t1 GROUP BY a")
         .await
-        .unwrap_err();
+        .expect_err("a scalar subquery correlated to a grouped outer query must be rejected");
     assert_eq!(
         err.as_db_error().map(|e| e.code()),
         Some(&SqlState::FEATURE_NOT_SUPPORTED)
@@ -1276,7 +1292,10 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
 
     // --- A non-array right side is PG's `op ANY/ALL (array) requires ...` error,
     // with the cursor on the operator as PG places it. ---
-    let err = client.simple_query("SELECT 1 = ANY(2)").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT 1 = ANY(2)")
+        .await
+        .expect_err("ANY with a non-array right side must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(
@@ -1486,7 +1505,7 @@ async fn substring_pattern_extraction() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT substring('XYZ' similar 'X#\"Y#\"Z#\"' escape '#')")
         .await
-        .unwrap_err();
+        .expect_err("more than two escape-double-quote separators must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code().code(), "2200C");
     assert_eq!(
@@ -1501,7 +1520,10 @@ async fn substring_pattern_extraction() -> anyhow::Result<()> {
         "SELECT 'x' SIMILAR TO 'x' ESCAPE '##'",
         "SELECT 'x' LIKE 'x' ESCAPE '##'",
     ] {
-        let err = client.simple_query(query).await.unwrap_err();
+        let err = client
+            .simple_query(query)
+            .await
+            .expect_err("a multi-character escape string must be rejected");
         let db = err.as_db_error().expect("database error");
         assert_eq!(db.code(), &SqlState::INVALID_ESCAPE_SEQUENCE, "{query}");
         assert_eq!(db.message(), "invalid escape string", "{query}");
@@ -1530,7 +1552,10 @@ async fn substring_similar_is_rejected_under_the_substr_spelling() -> anyhow::Re
         "SELECT substr('abcdef' SIMILAR '2' ESCAPE '3')",
         "SELECT substr('abcdef' SIMILAR '%#\"cd#\"%' ESCAPE '#')",
     ] {
-        let err = client.simple_query(query).await.unwrap_err();
+        let err = client
+            .simple_query(query)
+            .await
+            .expect_err("the substr spelling must not accept the SIMILAR form");
         let db = err.as_db_error().expect("database error");
         assert_eq!(db.code(), &SqlState::SYNTAX_ERROR, "{query}");
     }
@@ -1592,7 +1617,10 @@ async fn a_deeply_nested_operator_error_binds_in_linear_time() -> anyhow::Result
     // an already-set position.
     let query = format!("SELECT (1 IN (1, 'x'::text)){}", " + 1".repeat(24));
     let started = std::time::Instant::now();
-    let err = client.simple_query(&query).await.unwrap_err();
+    let err = client
+        .simple_query(&query)
+        .await
+        .expect_err("comparing an integer with text must find no operator");
     let elapsed = started.elapsed();
 
     let db = err
@@ -1646,7 +1674,7 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT 1 OPERATOR(pg_catalog.###) 2")
         .await
-        .unwrap_err();
+        .expect_err("an operator symbol that names no operator must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::UNDEFINED_FUNCTION);
     assert!(
@@ -1666,7 +1694,7 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT missing_col OPERATOR(pg_catalog.###) 1")
         .await
-        .unwrap_err();
+        .expect_err("an undefined operand column must be reported before the operator");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_COLUMN
@@ -1678,7 +1706,7 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT 1 OPERATOR(myschema.=) 2")
         .await
-        .unwrap_err();
+        .expect_err("an operator qualified by a schema other than pg_catalog must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -1798,7 +1826,7 @@ async fn undefined_table_reports_sqlstate_42p01() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT * FROM missing")
         .await
-        .unwrap_err();
+        .expect_err("a relation that does not exist must be rejected");
     let db_err = err.as_db_error().expect("should be a server error");
     assert_eq!(
         db_err.code(),
@@ -1912,7 +1940,10 @@ async fn drop_table_resolves_temp_first() {
 #[tokio::test]
 async fn syntax_error_reports_sqlstate_42601() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    let err = client.simple_query("SELEC 1").await.unwrap_err();
+    let err = client
+        .simple_query("SELEC 1")
+        .await
+        .expect_err("a misspelled keyword must be rejected");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -1931,7 +1962,7 @@ async fn integer_out_of_range_on_insert() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO t VALUES (5000000000)")
         .await
-        .unwrap_err();
+        .expect_err("an integer literal beyond the column type's range must be rejected");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -1953,7 +1984,10 @@ async fn unsupported_clauses_error_instead_of_silently_dropping() {
         "SELECT 1 GROUP BY ROLLUP (1)",
         "SELECT 1 GROUP BY GROUPING SETS ((1))",
     ] {
-        let err = client.simple_query(sql).await.unwrap_err();
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("an unsupported GROUP BY extension must be rejected");
         let db_err = err
             .as_db_error()
             .unwrap_or_else(|| panic!("{sql} should error"));
@@ -2099,7 +2133,7 @@ async fn a_user_function_may_shadow_a_window_function_name() -> anyhow::Result<(
     let err = client
         .simple_query("SELECT rank() FROM t")
         .await
-        .unwrap_err();
+        .expect_err("a window function without an OVER clause must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.message(), "window function rank requires an OVER clause");
@@ -2124,7 +2158,7 @@ async fn a_window_call_in_a_sql_function_body_is_rejected() -> anyhow::Result<()
             "CREATE FUNCTION wr() RETURNS bigint LANGUAGE SQL AS 'SELECT row_number() OVER ()'",
         )
         .await
-        .unwrap_err();
+        .expect_err("a window function in a SQL function body must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
     assert_eq!(
@@ -2145,7 +2179,7 @@ async fn a_window_call_in_a_column_default_is_rejected() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE d (a int DEFAULT rank() OVER (), b int)")
         .await
-        .unwrap_err();
+        .expect_err("a window function in a DEFAULT expression must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::WINDOWING_ERROR);
     assert_eq!(
@@ -2276,7 +2310,7 @@ async fn aggregates_over_a_table() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT a, count(*) FROM t")
         .await
-        .unwrap_err();
+        .expect_err("an ungrouped column outside an aggregate must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2321,7 +2355,7 @@ async fn multi_row_insert_is_atomic() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO t VALUES (1), (2), (5000000000)")
         .await
-        .unwrap_err();
+        .expect_err("an out-of-range value in any row must fail the whole INSERT");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2345,7 +2379,7 @@ async fn duplicate_insert_column_is_rejected() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO t (a, a) VALUES (1, 2)")
         .await
-        .unwrap_err();
+        .expect_err("a column named twice in the INSERT column list must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2373,7 +2407,7 @@ async fn insert_without_column_list_pads_missing_columns_with_null() -> anyhow::
     let err = client
         .simple_query("INSERT INTO t (a, b) VALUES (2)")
         .await
-        .unwrap_err();
+        .expect_err("fewer values than named columns must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2403,7 +2437,7 @@ async fn quoted_literals_coerce_to_column_types() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO t (id) VALUES ('abc')")
         .await
-        .unwrap_err();
+        .expect_err("a non-numeric literal for an integer column must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2426,7 +2460,7 @@ async fn create_table_if_not_exists_is_idempotent() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE t (id integer)")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate CREATE TABLE without IF NOT EXISTS must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2492,7 +2526,10 @@ async fn unenforceable_ddl_is_rejected() -> anyhow::Result<()> {
         "CREATE TEMP TABLE c (x int) ON COMMIT DROP",
         "CREATE TEMP TABLE c (x int) ON COMMIT DELETE ROWS",
     ] {
-        let err = client.simple_query(sql).await.unwrap_err();
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("an unsupported ON COMMIT action must be rejected");
         assert_eq!(
             err.as_db_error()
                 .context("database error details are missing")?
@@ -2549,7 +2586,7 @@ async fn create_table_as_select() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE t AS SELECT 9 AS a")
         .await
-        .unwrap_err();
+        .expect_err("CREATE TABLE AS over an existing relation must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -2609,7 +2646,10 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     assert_eq!(values.len(), 3);
     assert!(values.iter().all(|row| row.get(1) == Some("3")));
 
-    let update_duplicate = client.simple_query("UPDATE c SET u = 9").await.unwrap_err();
+    let update_duplicate = client
+        .simple_query("UPDATE c SET u = 9")
+        .await
+        .expect_err("an UPDATE collapsing a unique column onto one value must be rejected");
     assert_eq!(
         update_duplicate
             .as_db_error()
@@ -2625,7 +2665,7 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     let duplicate = client
         .simple_query("INSERT INTO c (id, u, n) VALUES (4, 9, 40), (5, 9, 50)")
         .await
-        .unwrap_err();
+        .expect_err("two rows of one INSERT sharing a unique key must be rejected");
     assert_eq!(
         duplicate
             .as_db_error()
@@ -2642,7 +2682,7 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     let not_null = client
         .simple_query("INSERT INTO c (id, n) VALUES (4, NULL)")
         .await
-        .unwrap_err();
+        .expect_err("a NULL in a NOT NULL column must be rejected");
     assert_eq!(
         not_null
             .as_db_error()
@@ -2675,7 +2715,7 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     let null_duplicate = client
         .simple_query("INSERT INTO null_equal VALUES (NULL)")
         .await
-        .unwrap_err();
+        .expect_err("a second NULL under UNIQUE NULLS NOT DISTINCT must be rejected");
     assert_eq!(
         null_duplicate
             .as_db_error()
@@ -2693,7 +2733,7 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     let build = client
         .simple_query("CREATE UNIQUE INDEX ix_a_idx ON ix(a)")
         .await
-        .unwrap_err();
+        .expect_err("a unique index build over duplicate rows must be rejected");
     assert_eq!(
         build
             .as_db_error()
@@ -3020,7 +3060,7 @@ async fn set_transaction_after_a_query_errors_25001() -> anyhow::Result<()> {
     let err = client
         .simple_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .await
-        .unwrap_err();
+        .expect_err("SET TRANSACTION ISOLATION LEVEL after a query in the block must be rejected");
     let db = err.as_db_error().expect("should be a server error");
     assert_eq!(
         db.code(),
@@ -3067,7 +3107,7 @@ async fn set_transaction_read_only_after_a_query_is_allowed() -> anyhow::Result<
     let err = client
         .simple_query("INSERT INTO t VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("a write under SET TRANSACTION READ ONLY must be refused");
     assert_eq!(
         err.as_db_error().expect("server error").code(),
         &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
@@ -3087,7 +3127,7 @@ async fn set_transaction_isolation_after_ddl_errors_25001() -> anyhow::Result<()
     let err = client
         .simple_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .await
-        .unwrap_err();
+        .expect_err("SET TRANSACTION ISOLATION LEVEL after DDL in the block must be rejected");
     assert_eq!(
         err.as_db_error().expect("server error").code(),
         &tokio_postgres::error::SqlState::ACTIVE_SQL_TRANSACTION
@@ -3123,7 +3163,7 @@ async fn read_only_transaction_rejects_writes_25006() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO t VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("a write in a BEGIN READ ONLY block must be refused");
     let db = err.as_db_error().expect("should be a server error");
     assert_eq!(
         db.code(),
@@ -3151,7 +3191,7 @@ async fn read_only_transaction_rejects_ddl_before_resolution() -> anyhow::Result
     let err = client
         .simple_query("CREATE TABLE t (id integer)")
         .await
-        .unwrap_err();
+        .expect_err("DDL in a BEGIN READ ONLY block must be refused");
     let db = err.as_db_error().expect("server error");
     assert_eq!(
         db.code(),
@@ -3165,7 +3205,10 @@ async fn read_only_transaction_rejects_ddl_before_resolution() -> anyhow::Result
 
     // DROP of a missing table also reports 25006, not 42P01.
     client.simple_query("BEGIN READ ONLY").await?;
-    let err = client.simple_query("DROP TABLE nope").await.unwrap_err();
+    let err = client
+        .simple_query("DROP TABLE nope")
+        .await
+        .expect_err("a DROP of a missing table in a read-only block must be refused as read-only");
     assert_eq!(
         err.as_db_error().expect("server error").code(),
         &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
@@ -3214,7 +3257,7 @@ async fn default_read_only_guc_blocks_autocommit_writes() -> anyhow::Result<()> 
     let err = client
         .simple_query("INSERT INTO t VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("a write under default_transaction_read_only must be refused");
     assert_eq!(
         err.as_db_error().expect("server error").code(),
         &tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION
@@ -3322,7 +3365,7 @@ async fn failing_update_leaves_no_rows_modified() -> anyhow::Result<()> {
     let err = client
         .simple_query("UPDATE t SET v = v / (id - 2)")
         .await
-        .unwrap_err();
+        .expect_err("a row whose UPDATE expression divides by zero must fail the statement");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -3351,7 +3394,7 @@ async fn mid_stream_error_aborts_remaining_statements() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT 10 / id FROM t; INSERT INTO t VALUES (7)")
         .await
-        .unwrap_err();
+        .expect_err("the failing SELECT must abort the rest of the simple-query batch");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -3392,7 +3435,10 @@ async fn expression_type_errors_report_pg_sqlstates() -> anyhow::Result<()> {
             "operator is not unique: unknown + unknown",
         ),
     ] {
-        let err = client.simple_query(sql).await.unwrap_err();
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("each listed expression must be rejected");
         let db_err = err
             .as_db_error()
             .context("database error details are missing")?;
@@ -3404,7 +3450,7 @@ async fn expression_type_errors_report_pg_sqlstates() -> anyhow::Result<()> {
     let err = client
         .simple_query("UPDATE t SET id = id + 1")
         .await
-        .unwrap_err();
+        .expect_err("UPDATE arithmetic overflowing the column type must be rejected");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -3439,7 +3485,7 @@ async fn insert_source_query_clauses_execute_and_ragged_values_are_rejected() ->
     let err = client
         .simple_query("INSERT INTO t VALUES (1, 2), (3)")
         .await
-        .unwrap_err();
+        .expect_err("a VALUES list with rows of differing width must be rejected");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -3464,7 +3510,7 @@ async fn insert_source_query_clauses_execute_and_ragged_values_are_rejected() ->
     let err = client
         .simple_query("INSERT INTO u (a) SELECT a + 2147483647 FROM t")
         .await
-        .unwrap_err();
+        .expect_err("overflow while evaluating the source query must abort the INSERT");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -3491,7 +3537,7 @@ async fn constant_update_overflow_errors_even_with_no_matching_rows() -> anyhow:
     let err = client
         .simple_query("UPDATE t SET id = 2147483648")
         .await
-        .unwrap_err();
+        .expect_err("a constant beyond the column type's range must be rejected even with no rows");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -3523,7 +3569,7 @@ async fn integer_literals_distinguish_out_of_range_from_malformed() -> anyhow::R
     let err = client
         .simple_query("SELECT id FROM t WHERE id = '3000000000'")
         .await
-        .unwrap_err();
+        .expect_err("a comparison literal beyond the column type's range must be rejected");
     let db_err = err
         .as_db_error()
         .context("database error details are missing")?;
@@ -4142,7 +4188,10 @@ async fn truncate_empties_tables() -> anyhow::Result<()> {
     );
 
     // A missing table fails the statement with 42P01.
-    let err = client.simple_query("TRUNCATE nope").await.unwrap_err();
+    let err = client
+        .simple_query("TRUNCATE nope")
+        .await
+        .expect_err("truncating a table that does not exist must be rejected");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -4219,7 +4268,7 @@ async fn truncate_resolves_every_table_before_emptying() -> anyhow::Result<()> {
     let err = client
         .simple_query("TRUNCATE a, missing")
         .await
-        .unwrap_err();
+        .expect_err("a TRUNCATE list naming a missing table must fail as a whole");
     assert_eq!(
         err.as_db_error()
             .context("database error details are missing")?
@@ -4248,7 +4297,10 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
         "TRUNCATE t CASCADE",
         "TRUNCATE t RESTART IDENTITY",
     ] {
-        let err = client.simple_query(sql).await.unwrap_err();
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("an unsupported TRUNCATE option must be rejected");
         assert_eq!(
             err.as_db_error()
                 .unwrap_or_else(|| panic!("{sql} should error"))
@@ -4888,7 +4940,10 @@ async fn temp_tables_are_not_reachable_across_sessions() -> anyhow::Result<()> {
         format!("INSERT INTO {a_temp_schema}.secret VALUES (99)"),
         format!("DROP TABLE {a_temp_schema}.secret"),
     ] {
-        let err = b.simple_query(&stmt).await.unwrap_err();
+        let err = b
+            .simple_query(&stmt)
+            .await
+            .expect_err("another session's temp schema must not be reachable");
         assert_eq!(
             err.as_db_error().expect("db error").code(),
             &tokio_postgres::error::SqlState::UNDEFINED_TABLE,
@@ -4993,7 +5048,7 @@ async fn time_plus_time_reports_ambiguous_operator_over_the_wire() -> anyhow::Re
     let err = client
         .simple_query("SELECT time '00:01' + time '00:02'")
         .await
-        .unwrap_err();
+        .expect_err("adding two time values must find no unique operator");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::AMBIGUOUS_FUNCTION);
     assert_eq!(
@@ -5091,7 +5146,7 @@ async fn create_view_replace_and_collisions() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE VIEW v AS SELECT 1")
         .await
-        .unwrap_err();
+        .expect_err("a plain CREATE VIEW over an existing view must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::DUPLICATE_TABLE);
     assert_eq!(db.message(), "relation \"v\" already exists");
@@ -5105,7 +5160,7 @@ async fn create_view_replace_and_collisions() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE v (x int4)")
         .await
-        .unwrap_err();
+        .expect_err("a table cannot take a name a view already holds");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::DUPLICATE_TABLE
@@ -5118,7 +5173,7 @@ async fn create_view_replace_and_collisions() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE OR REPLACE VIEW two AS SELECT id FROM t")
         .await
-        .unwrap_err();
+        .expect_err("CREATE OR REPLACE VIEW dropping a column must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.message(), "cannot drop columns from view");
 
@@ -5138,20 +5193,29 @@ async fn drop_view_object_type_and_dependencies() -> anyhow::Result<()> {
         .await?;
 
     // Wrong object type both ways.
-    let err = client.simple_query("DROP TABLE v").await.unwrap_err();
+    let err = client
+        .simple_query("DROP TABLE v")
+        .await
+        .expect_err("DROP TABLE naming a view must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.message(), "\"v\" is not a table");
     assert_eq!(db.hint(), Some("Use DROP VIEW to remove a view."));
 
-    let err = client.simple_query("DROP VIEW t").await.unwrap_err();
+    let err = client
+        .simple_query("DROP VIEW t")
+        .await
+        .expect_err("DROP VIEW naming a table must be rejected");
     assert_eq!(
         err.as_db_error().expect("db error").message(),
         "\"t\" is not a view"
     );
 
     // RESTRICT: the table refuses to drop while the view depends on it.
-    let err = client.simple_query("DROP TABLE t").await.unwrap_err();
+    let err = client
+        .simple_query("DROP TABLE t")
+        .await
+        .expect_err("dropping a table a view depends on must be refused under RESTRICT");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
     assert_eq!(
@@ -5162,7 +5226,10 @@ async fn drop_view_object_type_and_dependencies() -> anyhow::Result<()> {
 
     // CASCADE drops the table and its dependent view.
     client.simple_query("DROP TABLE t CASCADE").await?;
-    let err = client.simple_query("SELECT id FROM v").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT id FROM v")
+        .await
+        .expect_err("a view dropped by CASCADE must no longer resolve");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::UNDEFINED_TABLE
@@ -5187,7 +5254,7 @@ async fn views_are_not_updatable() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO v VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("inserting into a view must be refused");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
     assert_eq!(db.message(), "cannot insert into view \"v\"");
@@ -5195,13 +5262,16 @@ async fn views_are_not_updatable() -> anyhow::Result<()> {
     let err = client
         .simple_query("UPDATE v SET id = 2")
         .await
-        .unwrap_err();
+        .expect_err("updating a view must be refused");
     assert_eq!(
         err.as_db_error().expect("db error").message(),
         "cannot update view \"v\""
     );
 
-    let err = client.simple_query("DELETE FROM v").await.unwrap_err();
+    let err = client
+        .simple_query("DELETE FROM v")
+        .await
+        .expect_err("deleting from a view must be refused");
     assert_eq!(
         err.as_db_error().expect("db error").message(),
         "cannot delete from view \"v\""
@@ -5228,7 +5298,10 @@ async fn recursive_view_definition_errors_on_use_not_creation() -> anyhow::Resul
         .await?;
     // Using it detects the cycle rather than overflowing the stack.
     assert_view_recursion(
-        client.simple_query("SELECT a FROM v2").await.unwrap_err(),
+        client
+            .simple_query("SELECT a FROM v2")
+            .await
+            .expect_err("a view cycle must be detected rather than overflow the stack"),
         "v2",
     );
 
@@ -5241,7 +5314,10 @@ async fn recursive_view_definition_errors_on_use_not_creation() -> anyhow::Resul
         .simple_query("CREATE OR REPLACE VIEW v AS SELECT a FROM v")
         .await?;
     assert_view_recursion(
-        client.simple_query("SELECT a FROM v").await.unwrap_err(),
+        client
+            .simple_query("SELECT a FROM v")
+            .await
+            .expect_err("a view that reads itself must be detected as recursive"),
         "v",
     );
     Ok(())
@@ -5267,7 +5343,10 @@ async fn a_view_cycle_through_an_expression_subquery_is_detected() -> anyhow::Re
         .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT (SELECT a FROM v3 LIMIT 1) AS a")
         .await?;
     assert_view_recursion(
-        client.simple_query("SELECT a FROM v2").await.unwrap_err(),
+        client
+            .simple_query("SELECT a FROM v2")
+            .await
+            .expect_err("a cycle closed through a scalar subquery must be detected"),
         "v2",
     );
 
@@ -5281,7 +5360,10 @@ async fn a_view_cycle_through_an_expression_subquery_is_detected() -> anyhow::Re
         .simple_query("CREATE OR REPLACE VIEW v2 AS SELECT a FROM t WHERE a IN (SELECT a FROM v3)")
         .await?;
     assert_view_recursion(
-        client.simple_query("SELECT a FROM v2").await.unwrap_err(),
+        client
+            .simple_query("SELECT a FROM v2")
+            .await
+            .expect_err("a cycle closed through an IN subquery must be detected"),
         "v2",
     );
     Ok(())
@@ -5310,7 +5392,9 @@ async fn view_recursion_is_detected_across_schemas() -> anyhow::Result<()> {
         .simple_query("CREATE OR REPLACE VIEW s.v AS SELECT a FROM public.v")
         .await?;
     assert_view_recursion(
-        client.simple_query("SELECT a FROM s.v").await.unwrap_err(),
+        client.simple_query("SELECT a FROM s.v").await.expect_err(
+            "a cycle across two same-named views in different schemas must be detected",
+        ),
         "v",
     );
     Ok(())
@@ -5383,7 +5467,7 @@ async fn a_recursion_error_does_not_poison_later_statements() -> anyhow::Result<
         client
             .simple_query("SELECT a FROM outer_v")
             .await
-            .unwrap_err(),
+            .expect_err("a view over a recursive view must be detected as recursive"),
         "bad",
     );
     // Same failure again: if the first attempt leaked, the second would report a
@@ -5392,7 +5476,7 @@ async fn a_recursion_error_does_not_poison_later_statements() -> anyhow::Result<
         client
             .simple_query("SELECT a FROM outer_v")
             .await
-            .unwrap_err(),
+            .expect_err("the repeated attempt must report the same relation, not a stale one"),
         "bad",
     );
     // And an unrelated view still binds against a clean stack.
@@ -5483,7 +5567,7 @@ async fn creating_a_view_over_a_recursive_view_errors_unlike_pg() -> anyhow::Res
         client
             .simple_query("CREATE VIEW v7 AS SELECT a FROM v2")
             .await
-            .unwrap_err(),
+            .expect_err("CREATE VIEW over a recursive view must be detected as recursive"),
         "v2",
     );
     Ok(())
@@ -5513,7 +5597,7 @@ async fn create_view_accepts_fewer_column_names() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE VIEW w (p, q, r) AS SELECT a, b FROM t")
         .await
-        .unwrap_err();
+        .expect_err("more column names than the query outputs must be rejected");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
     assert_eq!(
@@ -5578,7 +5662,7 @@ async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
     let err = client
         .simple_query("SELECT currval('s')")
         .await
-        .unwrap_err();
+        .expect_err("currval before nextval in the session must be rejected");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
@@ -5626,7 +5710,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .query_one("SELECT setval('b', 999)", &[])
         .await
-        .unwrap_err();
+        .expect_err("setval outside the sequence's own bounds must be rejected");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::NUMERIC_VALUE_OUT_OF_RANGE
@@ -5651,7 +5735,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .batch_execute("CREATE SEQUENCE toobig AS smallint MAXVALUE 100000")
         .await
-        .unwrap_err();
+        .expect_err("a sequence bound outside its declared type must be rejected");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::INVALID_PARAMETER_VALUE
@@ -5662,7 +5746,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .query_one("SELECT nextval('tab')", &[])
         .await
-        .unwrap_err();
+        .expect_err("nextval on a table must be rejected as the wrong object type");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
@@ -5675,7 +5759,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .query_one("SELECT currval('gone')", &[])
         .await
-        .unwrap_err();
+        .expect_err("currval after the sequence is dropped must not return a cached value");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::UNDEFINED_TABLE
@@ -5685,7 +5769,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .batch_execute("CREATE INDEX a ON tab (id)")
         .await
-        .unwrap_err();
+        .expect_err("an index cannot take a name a sequence already holds");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::DUPLICATE_TABLE
@@ -5696,7 +5780,7 @@ async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP SEQUENCE ser_id_seq")
         .await
-        .unwrap_err();
+        .expect_err("dropping a serial-owned sequence under RESTRICT must be refused");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
@@ -5730,14 +5814,20 @@ async fn drop_index_semantics() -> anyhow::Result<()> {
     assert_eq!(count(&msgs), "2");
 
     // A table name is not an index (42809).
-    let e = client.batch_execute("DROP INDEX t").await.unwrap_err();
+    let e = client
+        .batch_execute("DROP INDEX t")
+        .await
+        .expect_err("DROP INDEX naming a table must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
     );
 
     // A constraint-backing index cannot be dropped directly (2BP01).
-    let e = client.batch_execute("DROP INDEX t_pkey").await.unwrap_err();
+    let e = client
+        .batch_execute("DROP INDEX t_pkey")
+        .await
+        .expect_err("dropping a constraint-backing index directly must be refused");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::DEPENDENT_OBJECTS_STILL_EXIST
@@ -5745,7 +5835,10 @@ async fn drop_index_semantics() -> anyhow::Result<()> {
 
     // A missing index is 42704 (UNDEFINED_OBJECT) — PG uses that for indexes,
     // not the 42P01 it uses for tables. IF EXISTS turns it into a skip NOTICE.
-    let e = client.batch_execute("DROP INDEX nope").await.unwrap_err();
+    let e = client
+        .batch_execute("DROP INDEX nope")
+        .await
+        .expect_err("dropping an index that does not exist must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_OBJECT
@@ -5764,7 +5857,7 @@ async fn drop_index_semantics() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP INDEX t_a_idx, t_a_idx")
         .await
-        .unwrap_err();
+        .expect_err("one index named twice in a DROP INDEX must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_OBJECT
@@ -5793,7 +5886,7 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP FUNCTION f_in")
         .await
-        .unwrap_err();
+        .expect_err("a bare name with two overloads must be rejected as ambiguous");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::AMBIGUOUS_FUNCTION
@@ -5804,7 +5897,7 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP FUNCTION f_in(int8), f_in(int8)")
         .await
-        .unwrap_err();
+        .expect_err("the same function named twice in one DROP must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_OBJECT
@@ -5819,7 +5912,7 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP FUNCTION f_in(cstring)")
         .await
-        .unwrap_err();
+        .expect_err("dropping a signature that no longer exists must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -5831,7 +5924,7 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP FUNCTION nosuch(int4)")
         .await
-        .unwrap_err();
+        .expect_err("dropping a function whose name does not exist must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -5910,7 +6003,7 @@ async fn create_index_generates_name() -> anyhow::Result<()> {
     let e = client
         .batch_execute("INSERT INTO q VALUES (1)")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate key under the implicitly named unique index must be rejected");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
@@ -5937,7 +6030,7 @@ async fn create_index_generates_name() -> anyhow::Result<()> {
     let e = client
         .batch_execute("CREATE INDEX ON t (nope)")
         .await
-        .unwrap_err();
+        .expect_err("a key column that does not exist must be reported as such");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &tokio_postgres::error::SqlState::UNDEFINED_COLUMN
@@ -6045,7 +6138,7 @@ async fn alter_table_add_primary_key() -> anyhow::Result<()> {
     let e = client
         .batch_execute("INSERT INTO t VALUES (NULL, 30)")
         .await
-        .unwrap_err();
+        .expect_err("a NULL in the NOT NULL column must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::NOT_NULL_VIOLATION);
     assert_eq!(
@@ -6055,7 +6148,7 @@ async fn alter_table_add_primary_key() -> anyhow::Result<()> {
     let e = client
         .batch_execute("INSERT INTO t VALUES (1, 40)")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate key in the unique column must be rejected");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &SqlState::UNIQUE_VIOLATION
@@ -6084,7 +6177,7 @@ async fn alter_table_add_constraint_validates_existing_rows() -> anyhow::Result<
     let e = client
         .batch_execute("ALTER TABLE n ADD PRIMARY KEY (a)")
         .await
-        .unwrap_err();
+        .expect_err("a primary key over a column holding NULLs must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::NOT_NULL_VIOLATION);
     assert_eq!(
@@ -6106,7 +6199,7 @@ async fn alter_table_add_constraint_validates_existing_rows() -> anyhow::Result<
     let e = client
         .batch_execute("ALTER TABLE d ADD PRIMARY KEY (a)")
         .await
-        .unwrap_err();
+        .expect_err("a primary key over duplicate values must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::UNIQUE_VIOLATION);
     assert_eq!(e.message(), "could not create unique index \"d_pkey\"");
@@ -6120,7 +6213,7 @@ async fn alter_table_add_constraint_validates_existing_rows() -> anyhow::Result<
     let e = client
         .batch_execute("ALTER TABLE o ADD PRIMARY KEY (b, a)")
         .await
-        .unwrap_err();
+        .expect_err("the lowest-numbered NULL key column must be the one reported");
     assert_eq!(
         e.as_db_error().context("missing error details")?.message(),
         "column \"b\" of relation \"o\" contains null values"
@@ -6180,7 +6273,7 @@ async fn alter_table_add_constraint_names_and_conflicts() -> anyhow::Result<()> 
     let e = client
         .batch_execute("ALTER TABLE u ADD CONSTRAINT c1 UNIQUE (c)")
         .await
-        .unwrap_err();
+        .expect_err("a constraint name already in use must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::DUPLICATE_TABLE);
     assert_eq!(e.message(), "relation \"c1\" already exists");
@@ -6189,7 +6282,7 @@ async fn alter_table_add_constraint_names_and_conflicts() -> anyhow::Result<()> 
     let e = client
         .batch_execute("ALTER TABLE u ADD PRIMARY KEY (a)")
         .await
-        .unwrap_err();
+        .expect_err("a second primary key on the table must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::INVALID_TABLE_DEFINITION);
     assert_eq!(
@@ -6202,7 +6295,7 @@ async fn alter_table_add_constraint_names_and_conflicts() -> anyhow::Result<()> 
     let e = client
         .batch_execute("ALTER TABLE w ADD PRIMARY KEY (a), ADD PRIMARY KEY (b)")
         .await
-        .unwrap_err();
+        .expect_err("two primary keys in one statement must be rejected");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &SqlState::INVALID_TABLE_DEFINITION
@@ -6224,7 +6317,7 @@ async fn alter_table_multi_action_is_atomic() -> anyhow::Result<()> {
     let e = client
         .batch_execute("ALTER TABLE m ADD UNIQUE (a), ADD UNIQUE (b)")
         .await
-        .unwrap_err();
+        .expect_err("a UNIQUE clause over duplicate values must fail the whole statement");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &SqlState::UNIQUE_VIOLATION
@@ -6246,7 +6339,10 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
     let client = connect(spawn_server().await).await;
     let code = async |sql: &str| -> anyhow::Result<SqlState> {
-        let e = client.batch_execute(sql).await.unwrap_err();
+        let e = client
+            .batch_execute(sql)
+            .await
+            .expect_err("the statement must be rejected");
         Ok(e.as_db_error()
             .context("missing error details")?
             .code()
@@ -6320,7 +6416,7 @@ async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
     let e = client
         .batch_execute("ALTER TABLE par ADD PRIMARY KEY (b)")
         .await
-        .unwrap_err();
+        .expect_err("a primary key on a table with inheritance children must be rejected");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -6370,7 +6466,7 @@ async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
     let e = client
         .batch_execute("ALTER TABLE g1 ADD PRIMARY KEY (a)")
         .await
-        .unwrap_err();
+        .expect_err("a primary key on a table with a grandchild must be rejected");
     assert_eq!(
         e.as_db_error().context("missing error details")?.code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -6423,7 +6519,7 @@ async fn alter_table_add_primary_key_rejects_non_heap() -> anyhow::Result<()> {
     let e = client
         .batch_execute("ALTER TABLE p ADD PRIMARY KEY (a)")
         .await
-        .unwrap_err();
+        .expect_err("a primary key on a parquet table must be rejected");
     let e = e.as_db_error().context("missing error details")?;
     assert_eq!(e.code(), &SqlState::FEATURE_NOT_SUPPORTED);
     assert_eq!(
@@ -6439,7 +6535,7 @@ async fn alter_table_add_primary_key_rejects_non_heap() -> anyhow::Result<()> {
         client
             .batch_execute("ALTER TABLE q ADD PRIMARY KEY (a)")
             .await
-            .unwrap_err()
+            .expect_err("a primary key on an ordered parquet table must be rejected")
             .as_db_error()
             .context("missing error details")?
             .code(),
@@ -6507,7 +6603,7 @@ async fn sequence_write_rejected_read_only() -> anyhow::Result<()> {
     let e = client
         .query_one("SELECT nextval('s')", &[])
         .await
-        .unwrap_err();
+        .expect_err("nextval in a read-only transaction must be refused");
     assert_eq!(
         e.as_db_error().expect("a database error").code(),
         &SqlState::READ_ONLY_SQL_TRANSACTION
@@ -7719,7 +7815,10 @@ async fn copy_in_bad_value_aborts_load() -> anyhow::Result<()> {
     let sink = client.copy_in("COPY t FROM STDIN").await?;
     futures_util::pin_mut!(sink);
     sink.send(Bytes::from_static(b"1\nnot_an_int\n3\n")).await?;
-    let err = sink.finish().await.unwrap_err();
+    let err = sink
+        .finish()
+        .await
+        .expect_err("a row whose value is not a valid integer must fail the COPY");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::INVALID_TEXT_REPRESENTATION
@@ -7786,7 +7885,10 @@ async fn copy_in_invalid_utf8_byte_errors() -> anyhow::Result<()> {
     let sink = client.copy_in("COPY m FROM STDIN").await?;
     futures_util::pin_mut!(sink);
     sink.send(Bytes::from_static(b"\\351\n")).await?; // 0xe9 alone: invalid UTF-8
-    let err = sink.finish().await.unwrap_err();
+    let err = sink
+        .finish()
+        .await
+        .expect_err("a byte sequence that is not valid UTF-8 must fail the COPY");
     let db = err.as_db_error().expect("db error");
     assert_eq!(db.code(), &SqlState::CHARACTER_NOT_IN_REPERTOIRE);
     assert!(db.message().contains("0xe9"), "{}", db.message());
@@ -7850,8 +7952,7 @@ async fn copy_in_rejected_in_aborted_transaction() -> anyhow::Result<()> {
     let err = client
         .simple_query("COPY z FROM STDIN")
         .await
-        .err()
-        .expect("COPY in an aborted txn should error");
+        .expect_err("COPY in an aborted transaction block must be refused");
     assert_eq!(
         err.as_db_error().expect("db error").code(),
         &SqlState::IN_FAILED_SQL_TRANSACTION
@@ -8754,7 +8855,7 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
              AS $$ SELECT value * 2 $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("a body naming a quoted argument in the wrong case must be rejected");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::UNDEFINED_COLUMN);
     assert_eq!(dberr.message(), "column \"value\" does not exist");
@@ -8774,7 +8875,7 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
     let err = client
         .simple_query("CREATE FUNCTION bad(value int) RETURNS int LANGUAGE SQL AS $$ SELECT zz $$")
         .await
-        .unwrap_err();
+        .expect_err("a body naming no declared argument must be rejected");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::UNDEFINED_COLUMN);
     assert_eq!(dberr.message(), "column \"zz\" does not exist");
@@ -8784,7 +8885,7 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
             "CREATE FUNCTION bad2(value int) RETURNS int LANGUAGE SQL AS $$ SELECT bad2.nope $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("a routine-qualified name that is not an argument must be rejected");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::UNDEFINED_TABLE);
     assert_eq!(
@@ -8798,7 +8899,7 @@ async fn create_function_language_sql_body_resolves_argument_names() -> anyhow::
             "CREATE FUNCTION dupname(a int, a int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("two arguments sharing one name must be rejected");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::INVALID_FUNCTION_DEFINITION);
     assert_eq!(dberr.message(), "parameter name \"a\" used more than once");
@@ -8817,7 +8918,7 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE FUNCTION bad(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + $9 $$")
         .await
-        .unwrap_err();
+        .expect_err("a $n past the declared argument list must be rejected");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::UNDEFINED_PARAMETER);
     assert_eq!(dberr.message(), "there is no parameter $9");
@@ -8826,7 +8927,9 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE FUNCTION badret(int) RETURNS bool LANGUAGE SQL AS $$ SELECT $1 $$")
         .await
-        .unwrap_err();
+        .expect_err(
+            "a body whose type is not assignable to the declared return type must be rejected",
+        );
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::INVALID_FUNCTION_DEFINITION);
     assert_eq!(
@@ -8841,7 +8944,7 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
             "CREATE FUNCTION nested(int) RETURNS int LANGUAGE SQL AS $$ SELECT nope($1) $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("a body calling a function that does not exist must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -8852,7 +8955,7 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE FUNCTION scan() RETURNS int LANGUAGE SQL AS $$ SELECT a FROM t $$")
         .await
-        .unwrap_err();
+        .expect_err("a body reading from a table must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -8865,14 +8968,17 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     let err = client
         .simple_query("CREATE FUNCTION dup(int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + 1 $$")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate name and signature must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_FUNCTION
     );
 
     // Calling with a wrong argument count finds no matching overload.
-    let err = client.simple_query("SELECT dup(1, 2)").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT dup(1, 2)")
+        .await
+        .expect_err("a call with an argument count no overload matches must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -8899,7 +9005,7 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
     let err = client
         .simple_query("SELECT twice(nextval('s'))")
         .await
-        .unwrap_err();
+        .expect_err("a volatile argument referenced more than once must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -8926,7 +9032,10 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
         .await?;
     let out = client.simple_query("SELECT g(1::bigint)").await?;
     assert_eq!(rows(&out)[0].get(0), Some("1")); // exact bigint overload
-    let err = client.simple_query("SELECT g(1::int)").await.unwrap_err();
+    let err = client
+        .simple_query("SELECT g(1::int)")
+        .await
+        .expect_err("a call matching two overloads equally well must be rejected as ambiguous");
     let dberr = err.as_db_error().expect("database error");
     assert_eq!(dberr.code(), &SqlState::AMBIGUOUS_FUNCTION);
     assert_eq!(dberr.message(), "function g(integer) is not unique");
@@ -8944,7 +9053,7 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
     let err = client
         .simple_query("CREATE FUNCTION agg() RETURNS bigint LANGUAGE SQL AS $$ SELECT sum(1) $$")
         .await
-        .unwrap_err();
+        .expect_err("an aggregate in a SQL function body must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -9017,7 +9126,7 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO m VALUES (3, '2020-01-01')")
         .await
-        .unwrap_err();
+        .expect_err("a key admitted by no partition must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9038,7 +9147,7 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE l (id int) PARTITION BY LIST (id)")
         .await
-        .unwrap_err();
+        .expect_err("LIST partitioning must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -9048,7 +9157,7 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
             "CREATE TABLE m_ov PARTITION OF m FOR VALUES FROM ('2024-06-01') TO ('2024-07-01')",
         )
         .await
-        .unwrap_err();
+        .expect_err("a partition bound overlapping an existing partition must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42P17")
@@ -9061,7 +9170,7 @@ async fn range_partitioning_ddl_and_catalog_reflection() -> anyhow::Result<()> {
                 .simple_query("CREATE TABLE p2 PARTITION OF plain FOR VALUES FROM (1) TO (2)")
                 .await,
         )
-        .unwrap_err();
+        .expect_err("PARTITION OF a table that is not partitioned must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
@@ -9083,7 +9192,7 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE mn PARTITION OF m FOR VALUES FROM (NULL) TO ('2024-01-01')")
         .await
-        .unwrap_err();
+        .expect_err("a NULL partition bound must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::from_code("42P17")
@@ -9097,7 +9206,7 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE jm (j json) PARTITION BY RANGE (j)")
         .await
-        .unwrap_err();
+        .expect_err("a RANGE key of a non-orderable type must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_OBJECT
@@ -9119,7 +9228,7 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
             "CREATE TABLE m_2024 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
         )
         .await
-        .unwrap_err();
+        .expect_err("a partition name already in use must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_TABLE
@@ -9130,7 +9239,10 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
 
     // TRUNCATE / CREATE INDEX on the parent are rejected (0A000), not applied to
     // the empty parent relation.
-    let err = client.simple_query("TRUNCATE m").await.unwrap_err();
+    let err = client
+        .simple_query("TRUNCATE m")
+        .await
+        .expect_err("TRUNCATE on the partitioned parent must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -9138,7 +9250,7 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE INDEX m_idx ON m (d)")
         .await
-        .unwrap_err();
+        .expect_err("CREATE INDEX on the partitioned parent must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -9151,7 +9263,7 @@ async fn range_partitioning_error_paths_and_cascade() -> anyhow::Result<()> {
     let err = client
         .simple_query("CREATE TABLE cv PARTITION OF vv FOR VALUES FROM (1) TO (2)")
         .await
-        .unwrap_err();
+        .expect_err("PARTITION OF a view must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
@@ -9195,7 +9307,7 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO m_2024 VALUES (3, '2023-03-01')")
         .await
-        .unwrap_err();
+        .expect_err("a key below the leaf's range must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
     assert_eq!(
@@ -9208,7 +9320,7 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO m_2024 VALUES (4, '2025-01-01')")
         .await
-        .unwrap_err();
+        .expect_err("a key equal to the exclusive upper bound must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9218,7 +9330,7 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO m_2024 VALUES (5, NULL)")
         .await
-        .unwrap_err();
+        .expect_err("a NULL partition key must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
     assert_eq!(db.detail(), Some("Failing row contains (5, null)."));
@@ -9232,7 +9344,7 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
     let err = client
         .simple_query("UPDATE m_2024 SET d = '2030-01-01' WHERE id = 1")
         .await
-        .unwrap_err();
+        .expect_err("an UPDATE moving the key out of the leaf's range must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9251,7 +9363,7 @@ async fn range_partitioning_enforces_leaf_bounds() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO m_early VALUES (7, '2024-06-01')")
         .await
-        .unwrap_err();
+        .expect_err("a key above an open-ended leaf's upper bound must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9278,7 +9390,7 @@ async fn range_partitioning_detail_clips_long_field() -> anyhow::Result<()> {
     let err = client
         .simple_query(&format!("INSERT INTO tp_ab VALUES ('{long}')"))
         .await
-        .unwrap_err();
+        .expect_err("a key admitted by no partition must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
     assert_eq!(
@@ -9317,7 +9429,7 @@ async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> a
     let err = client
         .simple_query("INSERT INTO m VALUES (1, '2023-06-01', 20)")
         .await
-        .unwrap_err();
+        .expect_err("a duplicate key in the destination leaf must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNIQUE_VIOLATION
@@ -9328,7 +9440,9 @@ async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> a
     let err = client
         .simple_query("INSERT INTO m VALUES (2, '2023-02-01', 1), (2, '2023-05-01', 2)")
         .await
-        .unwrap_err();
+        .expect_err(
+            "two rows of one INSERT routing to the same leaf with one key must be rejected",
+        );
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNIQUE_VIOLATION
@@ -9344,7 +9458,9 @@ async fn range_partitioning_routed_insert_enforces_unique_and_error_order() -> a
     let err = client
         .simple_query("INSERT INTO m VALUES (3, '2023-04-01', NULL), (4, '1990-01-01', 1)")
         .await
-        .unwrap_err();
+        .expect_err(
+            "the earlier row's not-null violation must be reported, not the later routing failure",
+        );
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::NOT_NULL_VIOLATION
@@ -9401,7 +9517,10 @@ async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
     let sink = client.copy_in("COPY m FROM STDIN").await?;
     futures_util::pin_mut!(sink);
     sink.send(Bytes::from_static(b"9\t2019-01-01\n")).await?;
-    let err = sink.finish().await.unwrap_err();
+    let err = sink
+        .finish()
+        .await
+        .expect_err("a copied row admitted by no partition must fail the COPY");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9450,7 +9569,7 @@ async fn range_partitioning_routed_update_delete_copy() -> anyhow::Result<()> {
     let err = client
         .simple_query("UPDATE m SET d = '2019-05-01' WHERE id = 2")
         .await
-        .unwrap_err();
+        .expect_err("a key-changing UPDATE that fits no partition must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION
@@ -9508,7 +9627,7 @@ async fn range_partitioning_row_movement_respects_leaf_unique() -> anyhow::Resul
     let err = client
         .simple_query("UPDATE m SET d = '2024-03-01' WHERE id = 1 AND d = '2023-06-01'")
         .await
-        .unwrap_err();
+        .expect_err("a moved row colliding in the destination leaf must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNIQUE_VIOLATION
@@ -9796,7 +9915,10 @@ async fn plpgsql_raise_reaches_the_client_with_context() -> anyhow::Result<()> {
         )
         .await?;
 
-    let e = client.query_one("SELECT boom(7)", &[]).await.unwrap_err();
+    let e = client
+        .query_one("SELECT boom(7)", &[])
+        .await
+        .expect_err("the body's RAISE must surface as an error");
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code().code(), "22023");
     assert_eq!(db.message(), "bad value 7");
@@ -9844,7 +9966,7 @@ async fn plpgsql_recursion_works_and_is_bounded() -> anyhow::Result<()> {
     let e = client
         .query_one("SELECT forever(1)", &[])
         .await
-        .unwrap_err();
+        .expect_err("unbounded recursion must be stopped rather than exhaust the stack");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::from_code("54001")
@@ -9866,7 +9988,7 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
             "CREATE FUNCTION bad() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  x := 1;\nEND $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("a body assigning to an undeclared variable must be rejected");
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
     assert_eq!(db.message(), "\"x\" is not a known variable");
@@ -9886,7 +10008,7 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
              BEGIN RAISE NOTICE 'a % b %', 1; RETURN 1; END $$",
         )
         .await
-        .unwrap_err();
+        .expect_err("a RAISE with fewer arguments than format placeholders must be rejected");
     let db = e.as_db_error().expect("database error");
     // PostgreSQL reports this from `check_raise_parameters` as a syntax error.
     assert_eq!(db.code().code(), "42601");
@@ -9942,7 +10064,7 @@ async fn do_blocks_run_and_emit_notices() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DO LANGUAGE sql $$ SELECT 1 $$")
         .await
-        .unwrap_err();
+        .expect_err("DO in a language that cannot run inline code must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::FEATURE_NOT_SUPPORTED
@@ -9950,7 +10072,7 @@ async fn do_blocks_run_and_emit_notices() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DO LANGUAGE nope $$ BEGIN END $$")
         .await
-        .unwrap_err();
+        .expect_err("DO in a language that does not exist must be rejected");
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::UNDEFINED_OBJECT);
     assert_eq!(db.message(), "language \"nope\" does not exist");
@@ -9983,7 +10105,10 @@ async fn procedures_are_created_called_and_dropped() -> anyhow::Result<()> {
     );
 
     // A procedure is not callable as a function...
-    let e = client.query_one("SELECT add_n(1)", &[]).await.unwrap_err();
+    let e = client
+        .query_one("SELECT add_n(1)", &[])
+        .await
+        .expect_err("a procedure called as a function must be rejected");
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.message(), "add_n(integer) is a procedure");
@@ -9994,7 +10119,10 @@ async fn procedures_are_created_called_and_dropped() -> anyhow::Result<()> {
         // A LANGUAGE SQL body refers to its arguments only as `$n`.
         .batch_execute("CREATE FUNCTION fn_n(v int) RETURNS int LANGUAGE sql AS 'SELECT $1'")
         .await?;
-    let e = client.batch_execute("CALL fn_n(1)").await.unwrap_err();
+    let e = client
+        .batch_execute("CALL fn_n(1)")
+        .await
+        .expect_err("a function invoked with CALL must be rejected");
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
     assert_eq!(db.hint(), Some("To call a function, use SELECT."));
@@ -10003,13 +10131,16 @@ async fn procedures_are_created_called_and_dropped() -> anyhow::Result<()> {
     let e = client
         .batch_execute("DROP FUNCTION add_n(int)")
         .await
-        .unwrap_err();
+        .expect_err("DROP FUNCTION naming a procedure must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::WRONG_OBJECT_TYPE
     );
     client.batch_execute("DROP PROCEDURE add_n(int)").await?;
-    let e = client.batch_execute("CALL add_n(1)").await.unwrap_err();
+    let e = client
+        .batch_execute("CALL add_n(1)")
+        .await
+        .expect_err("calling the dropped procedure must be rejected");
     assert_eq!(
         e.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_FUNCTION
@@ -10116,7 +10247,10 @@ async fn read_only_rejects_dml_that_calls_a_routine() -> anyhow::Result<()> {
         "DELETE FROM t WHERE n = pure(1)",
     ] {
         client.batch_execute("BEGIN READ ONLY").await?;
-        let e = client.batch_execute(sql).await.unwrap_err();
+        let e = client
+            .batch_execute(sql)
+            .await
+            .expect_err("a write in a read-only transaction must be refused");
         assert_eq!(
             e.as_db_error().expect("database error").code(),
             &SqlState::READ_ONLY_SQL_TRANSACTION,
@@ -10160,7 +10294,10 @@ async fn routine_error_while_draining_rolls_its_writes_back() -> anyhow::Result<
         )
         .await?;
 
-    let e = client.query_one("SELECT boom()", &[]).await.unwrap_err();
+    let e = client
+        .query_one("SELECT boom()", &[])
+        .await
+        .expect_err("the body's RAISE EXCEPTION must surface as an error");
     assert_eq!(e.as_db_error().expect("database error").message(), "boom");
 
     // The body's insert is rolled back, and the connection is still usable —
@@ -10811,7 +10948,7 @@ async fn guc_errors_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SET TimeZone = 'Nowhere/Nozone'")
         .await
-        .unwrap_err();
+        .expect_err("an unknown time zone name must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::INVALID_PARAMETER_VALUE);
     assert_eq!(
@@ -10821,7 +10958,10 @@ async fn guc_errors_match_pg() -> anyhow::Result<()> {
     // The failed SET left the old value in place.
     assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
 
-    let err = client.simple_query("SHOW bogus_param").await.unwrap_err();
+    let err = client
+        .simple_query("SHOW bogus_param")
+        .await
+        .expect_err("an unrecognized configuration parameter must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::UNDEFINED_OBJECT);
     assert_eq!(
@@ -10832,7 +10972,7 @@ async fn guc_errors_match_pg() -> anyhow::Result<()> {
     let err = client
         .simple_query("SET server_version = '1'")
         .await
-        .unwrap_err();
+        .expect_err("setting a read-only parameter must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::CANT_CHANGE_RUNTIME_PARAM);
     assert_eq!(
@@ -11050,7 +11190,10 @@ async fn numeric_timezone_is_east_signed_in_both_spellings() -> anyhow::Result<(
     // PG takes up to ±167 hours and rejects 168.
     client.simple_query("SET TIME ZONE 167").await?;
     assert_eq!(scalar(&client, "SHOW TimeZone").await, "<+167>-167");
-    let err = client.simple_query("SET TIME ZONE 168").await.unwrap_err();
+    let err = client
+        .simple_query("SET TIME ZONE 168")
+        .await
+        .expect_err("a UTC offset beyond the accepted range must be rejected");
     let db = err.as_db_error().expect("database error");
     assert_eq!(
         db.message(),
@@ -11068,7 +11211,7 @@ async fn reset_distinguishes_named_from_all() -> anyhow::Result<()> {
     let err = client
         .simple_query("RESET server_version")
         .await
-        .unwrap_err();
+        .expect_err("resetting a read-only parameter must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CANT_CHANGE_RUNTIME_PARAM
@@ -11141,7 +11284,7 @@ async fn partition_bounds_use_the_session_zone() -> anyhow::Result<()> {
     let err = client
         .simple_query("INSERT INTO p VALUES ('2023-12-31 20:00:00')")
         .await
-        .unwrap_err();
+        .expect_err("a timestamp outside the partition's local-time range must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::CHECK_VIOLATION

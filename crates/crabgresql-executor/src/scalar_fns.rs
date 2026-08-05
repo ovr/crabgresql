@@ -2610,7 +2610,6 @@ fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2687,7 +2686,7 @@ mod tests {
                 &[Value::Float8(2.0)],
                 &FmtCtx::utc_default()
             )
-            .unwrap_err()
+            .expect_err("atanh of an argument outside [-1, 1] must be rejected")
             .code,
             "22003"
         );

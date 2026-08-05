@@ -208,7 +208,6 @@ fn int2vector_in(input: &str) -> Result<Vec<Value>, CastError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -243,7 +242,8 @@ mod tests {
             assert_eq!(oids(&format!("7{sep}8"))?, "7 8", "oidvector sep {sep:?}");
         }
         for sep in ["\t", "\n", "\x0b", "\x0c", "\r"] {
-            let e = vector_in(&format!("7{sep}8"), VectorKind::Int2).unwrap_err();
+            let e = vector_in(&format!("7{sep}8"), VectorKind::Int2)
+                .expect_err("int2vector separates on the space character alone");
             assert_eq!(e.sqlstate, "22P02", "int2vector sep {sep:?}");
         }
 
@@ -289,7 +289,8 @@ mod tests {
         assert_eq!(int2s("1 010")?, "1 10");
         assert_eq!(int2s("+5 -0")?, "5 0");
         assert_eq!(int2s("-32768 32767")?, "-32768 32767");
-        let e = vector_in("0x10 -1", VectorKind::Int2).unwrap_err();
+        let e = vector_in("0x10 -1", VectorKind::Int2)
+            .expect_err("int2vector is decimal-only, so the hex spelling 0x10 is not an element");
         assert_eq!(e.sqlstate, "22P02");
         assert_eq!(
             e.message,
@@ -313,7 +314,8 @@ mod tests {
             ("1 abc 5", "abc 5"),
             ("1 -", "-"),
         ] {
-            let e = vector_in(input, VectorKind::Oid).unwrap_err();
+            let e = vector_in(input, VectorKind::Oid)
+                .expect_err("an oidvector element scan stops on a character that converts nothing");
             assert_eq!(e.sqlstate, "22P02", "input {input:?}");
             assert_eq!(
                 e.message,
@@ -333,7 +335,8 @@ mod tests {
             ("1 5.5", "5.5"),
             ("1 -", "-"),
         ] {
-            let e = vector_in(input, VectorKind::Int2).unwrap_err();
+            let e = vector_in(input, VectorKind::Int2)
+                .expect_err("an int2vector element is not a whole decimal smallint");
             assert_eq!(e.sqlstate, "22P02", "input {input:?}");
             assert_eq!(
                 e.message,
@@ -354,7 +357,8 @@ mod tests {
             ("1 18446744073709551616", "18446744073709551616"),
             ("1 -2147483649", "-2147483649"),
         ] {
-            let e = vector_in(input, VectorKind::Oid).unwrap_err();
+            let e = vector_in(input, VectorKind::Oid)
+                .expect_err("an oidvector element falls outside oid's accepted band");
             assert_eq!(e.sqlstate, "22003", "input {input:?}");
             assert_eq!(
                 e.message,
@@ -369,7 +373,8 @@ mod tests {
             ("1 -32769", "-32769"),
             ("1 99999abc", "99999abc"),
         ] {
-            let e = vector_in(input, VectorKind::Int2).unwrap_err();
+            let e = vector_in(input, VectorKind::Int2)
+                .expect_err("an int2vector element's digit run overflows smallint");
             assert_eq!(e.sqlstate, "22003", "input {input:?}");
             assert_eq!(
                 e.message,
@@ -378,7 +383,9 @@ mod tests {
         }
         // An in-range run with trailing garbage stays a syntax error.
         assert_eq!(
-            vector_in("1 5abc", VectorKind::Int2).unwrap_err().sqlstate,
+            vector_in("1 5abc", VectorKind::Int2)
+                .expect_err("'5abc' is an in-range digit run with trailing garbage")
+                .sqlstate,
             "22P02"
         );
     }

@@ -277,7 +277,6 @@ pub fn set7bit(b: &[u8; 8]) -> [u8; 8] {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -303,7 +302,8 @@ mod tests {
     #[test]
     fn macaddr_rejects() {
         for bad in ["0800:2b01:0203", "not even close", "08:00:2b:01:02", ""] {
-            let e = parse_macaddr(bad).unwrap_err();
+            let e = parse_macaddr(bad)
+                .expect_err("not one of macaddr's six-byte groupings of 12 hex digits");
             assert_eq!(e.sqlstate, "22P02", "{bad}");
             assert_eq!(
                 e.message,
@@ -366,7 +366,9 @@ mod tests {
             "08:00-2b:01:02:03:04:05",
             "08:00:2b:01.02:03:04:05",
         ] {
-            let e = parse_macaddr8(bad).unwrap_err();
+            let e = parse_macaddr8(bad).expect_err(
+                "not 12 or 16 hex digits under a single delimiter kind, as macaddr8 requires",
+            );
             assert_eq!(e.sqlstate, "22P02", "{bad}");
             assert_eq!(
                 e.message,
