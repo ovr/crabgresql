@@ -15,6 +15,7 @@ mod md5;
 pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
+mod subplan;
 mod unique;
 mod uuid_gen;
 pub mod vector;
@@ -307,6 +308,11 @@ pub struct ExecContext {
     /// statement would reuse a command id the body already stamped rows with,
     /// and those rows would be invisible to it.
     pub command_counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// What the executor has learned about this statement's subplans (see
+    /// [`subplan`]). Created by the outermost [`execute`] and inherited, not
+    /// replaced, by the nested executions a correlated subquery drives — a cache
+    /// scoped to a single outer row would never be hit.
+    pub subplans: Option<Arc<subplan::SubplanCache>>,
 }
 
 impl Default for ExecContext {
@@ -324,6 +330,7 @@ impl Default for ExecContext {
             read_only: false,
             call_depth: 0,
             command_counter: None,
+            subplans: None,
         }
     }
 }
@@ -481,15 +488,17 @@ pub fn execute(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Fold every *non-correlated* subquery to a constant/comparison before any
-    // node evaluates an expression. Correlated subqueries are left in place and
-    // folded per outer row by `eval`, which needs the transaction to re-run their
-    // subplans — so thread it through the context every node is built with (and
-    // nested `run_subplan` → `execute` re-injects it, so deeper levels see it too).
-    resolve_subqueries(&mut plan, ctx, txn)?;
     // Build the enriched context by copying only the fields we keep — not
     // `..ctx.clone()`, which would clone the old `txn` Snapshot (a `Vec<Xid>`)
     // only to overwrite it. One `txn.clone()` per execute, none wasted.
+    //
+    // Correlated subqueries are left in place by the fold below and evaluated per
+    // outer row by `eval`, which needs the transaction to re-run their subplans —
+    // so thread it through the context every node is built with (and nested
+    // `run_subplan` → `execute` re-injects it, so deeper levels see it too). The
+    // subplan cache is threaded the same way, but *inherited* where one already
+    // exists: a cache that started over at each nested execution would be built
+    // per outer row and hit never.
     let ctx = &ExecContext {
         fmt: ctx.fmt.clone(),
         sequences: ctx.sequences.clone(),
@@ -502,7 +511,11 @@ pub fn execute(
         read_only: ctx.read_only,
         call_depth: ctx.call_depth,
         command_counter: ctx.command_counter.clone(),
+        subplans: Some(ctx.subplans.clone().unwrap_or_default()),
     };
+    // Fold every *non-correlated* subquery to a constant/comparison before any
+    // node evaluates an expression.
+    resolve_subqueries(&mut plan, ctx, txn)?;
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -1258,6 +1271,13 @@ pub(crate) fn eval_correlated_subquery(
             ));
         }
     };
+    // An `EXISTS` whose correlation is plain equality is answered from a hash
+    // table built once for the whole statement — no clone, no plan, no scan.
+    if let BoundExpr::Exists { negated, .. } = marker
+        && let Some(hashed) = subplan::hashed_exists(subplan, ctx, txn)?
+    {
+        return Ok(Value::Bool(hashed.probe(row) != *negated));
+    }
     let mut logical = (*subplan.plan).clone();
     crabgresql_binder::substitute_outer(&mut logical, row);
     match marker {
@@ -1281,7 +1301,7 @@ pub(crate) fn eval_correlated_subquery(
 }
 
 /// Plan and execute a subplan, draining its result set into materialized rows.
-fn run_subplan(
+pub(crate) fn run_subplan(
     logical: LogicalPlan,
     ctx: &ExecContext,
     txn: &TxnContext,
@@ -7397,6 +7417,95 @@ mod tests {
              JOIN (VALUES (1, 9), (1, 3), (2, 1)) b(x, v) ON a.x = b.x AND a.v < b.v",
         );
         assert_eq!(rows, vec![vec![Value::Int4(5), Value::Int4(9)]]);
+    }
+
+    /// Two tables of `(k, v)` int4 rows, for the hashed-`EXISTS` tests.
+    fn exists_engine(
+        outer: &[(i32, i32)],
+        inner: &[(Option<i32>, i32)],
+    ) -> anyhow::Result<Arc<dyn TableEngine>> {
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let o = engine.create_table(TableSchema::in_namespace(
+            "o",
+            "public",
+            vec![
+                Column::new("k", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        ))?;
+        let i = engine.create_table(TableSchema::in_namespace(
+            "i",
+            "public",
+            vec![
+                Column::new("k", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        ))?;
+        let txn = wtxn();
+        for (k, v) in outer {
+            o.insert(vec![Value::Int4(*k), Value::Int4(*v)], &txn)?;
+        }
+        for (k, v) in inner {
+            let k = k.map_or(Value::Null, Value::Int4);
+            i.insert(vec![k, Value::Int4(*v)], &txn)?;
+        }
+        Ok(engine as Arc<dyn TableEngine>)
+    }
+
+    #[test]
+    fn hashed_exists_matches_the_per_row_answer() -> anyhow::Result<()> {
+        // The correlation `i.k = o.k` is stripped and hashed; the residual
+        // `i.v > 0` still applies. o.k = 3 has an inner row but it fails the
+        // residual, and o.k = 4 has none at all.
+        let engine = exists_engine(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            &[(Some(1), 1), (Some(2), 5), (Some(3), -1)],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 0) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]);
+
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 0) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(3)], vec![Value::Int4(4)]]);
+        Ok(())
+    }
+
+    #[test]
+    fn hashed_exists_never_matches_a_null_key() -> anyhow::Result<()> {
+        // `i.k = o.k` is never true when either side is NULL, so a NULL inner key
+        // must stay out of the hash table and a NULL outer key must match nothing
+        // — the same rule the hash join follows. Without it, NULL would collide
+        // with NULL in one bucket and `EXISTS` would wrongly report a row.
+        let engine = exists_engine(&[(1, 10)], &[(None, 1), (Some(1), 1)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.v)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int8(0)]],
+            "o.v = 10 matches no inner key, and the NULL key is not one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn correlated_exists_on_an_inequality_still_answers_per_row() -> anyhow::Result<()> {
+        // `i.k < o.k` is not an equality, so nothing is hashable and the marker
+        // falls back to the per-outer-row path. The answer has to be the same.
+        let engine = exists_engine(&[(1, 10), (5, 50)], &[(Some(3), 1)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k < o.k) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(5)]]);
+        Ok(())
     }
 
     #[test]

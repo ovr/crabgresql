@@ -1091,10 +1091,10 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         }
         // A nested expression-subquery is one query level deeper.
         BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-            subst_outer_plan(&mut subplan.plan, outer, depth + 1);
+            subst_nested(subplan, outer, depth + 1);
         }
         BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-            subst_outer_plan(&mut subplan.plan, outer, depth + 1);
+            subst_nested(subplan, outer, depth + 1);
             subst_outer_expr(cmp, outer, depth);
         }
         // The array operand and the needle live at this query level.
@@ -1102,6 +1102,21 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
             subst_outer_expr(array, outer, depth);
             subst_outer_expr(cmp, outer, depth);
         }
+    }
+}
+
+/// Substitute into a nested subplan, and tell it when that actually changed it.
+///
+/// A subplan whose own body this pass rewrote no longer matches the template its
+/// [`SubplanId`](crate::SubplanId) names — the executor would otherwise cache one
+/// outer row's answer and serve it to the next. `plan_has_outer_refs_at` is the
+/// exact test for "substitution at this depth or beyond will touch something",
+/// which is why it is asked *before* the rewrite rather than after.
+fn subst_nested(subplan: &mut crate::expr::Subplan, outer: &[Value], depth: usize) {
+    let rebound = plan_has_outer_refs_at(&subplan.plan, depth);
+    subst_outer_plan(&mut subplan.plan, outer, depth);
+    if rebound {
+        subplan.mark_rebound();
     }
 }
 
