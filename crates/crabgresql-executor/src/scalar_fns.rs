@@ -840,10 +840,12 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             });
         }
         ScalarFn::IntervalTypmod => {
-            return Ok(match &args[0] {
-                Value::Interval(iv) => Value::Interval(interval::apply_typmod(*iv, i4(&args[1]))),
+            return match &args[0] {
+                Value::Interval(iv) => interval::apply_typmod(*iv, i4(&args[1]))
+                    .map(Value::Interval)
+                    .map_err(iv_err),
                 other => unreachable!("expected an interval arg, got {other:?}"),
-            });
+            };
         }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
