@@ -928,6 +928,9 @@ impl Numeric {
     }
 
     /// `log(base, x)`: logarithm of `x` to base `base` = ln(x)/ln(base).
+    ///
+    /// NaN in either operand wins, then zero/negative raise, then the infinities
+    /// resolve as limits of the ratio — the order PostgreSQL applies them in.
     pub fn log_base(&self, x: &Numeric) -> Result<Numeric, NumErr> {
         if self.is_nan() || x.is_nan() {
             return Ok(Numeric::nan());
@@ -942,6 +945,17 @@ impl Numeric {
                     "cannot take logarithm of a negative number",
                 ));
             }
+        }
+        // `ln` and `log10` special-case infinity; this one has to as well, or an
+        // infinite operand reaches `ln_internal`, which has no finite series to
+        // sum for it. PG's rules, the limits of ln(x)/ln(base): an infinite base
+        // sends the ratio to 0, an infinite argument to infinity, and both at
+        // once is the indeterminate ∞/∞ — NaN, not 1.
+        match (self.is_infinite(), x.is_infinite()) {
+            (true, true) => return Ok(Numeric::nan()),
+            (true, false) => return Ok(Numeric::zero(0)),
+            (false, true) => return Ok(Numeric::pos_inf()),
+            (false, false) => {}
         }
         let guard = 30;
         let val = x
@@ -1136,7 +1150,41 @@ impl Numeric {
 
     /// Natural log to `guard` fractional digits, by reducing the argument to
     /// near 1 with repeated square roots and summing the `atanh` series.
+    ///
+    /// The magnitude is taken out first — `ln(m · 10^e) = ln(m) + e·ln(10)`,
+    /// with `m` the coefficient read at weight 0, so `m ∈ [1, 10)`. Without
+    /// that, the square-root reduction runs at an *absolute* working scale and
+    /// underflows: `sqrt(1.234e-89)` is `1.1e-45`, which rounds to zero at
+    /// `work` fractional digits, and a zero `t` never leaves the reduction loop.
+    /// The series then ran on `w = (0-1)/(0+1) = -1`, diverged to its 100 000-term
+    /// cap, and the result was multiplied by `2^100` — a second of work for an
+    /// answer off by thirty orders of magnitude.
     fn ln_internal(&self, guard: i32) -> Numeric {
+        let work = guard + 8;
+        // The coefficient read at weight 0 is the mantissa; the old weight is
+        // the power of ten that was factored out.
+        let mantissa = Numeric::from_coeff(
+            false,
+            self.digits.clone(),
+            1 - self.digits.len() as i32,
+            work,
+        );
+        mantissa
+            .ln_near_one(guard)
+            .add(&Numeric::from_i128(self.weight as i128).mul(&ln10(work)))
+            .round(guard)
+    }
+
+    /// The `ln` kernel: reduce toward 1 by repeated square root and sum the
+    /// `atanh` series. Only sound for an argument of moderate magnitude — the
+    /// reduction works at an absolute scale, so a very small one would round to
+    /// zero — which is why [`ln_internal`](Self::ln_internal) takes the magnitude
+    /// out first and only ever hands this a mantissa in `[1, 10)`.
+    ///
+    /// [`ln10`] calls it directly, on 10 itself; it must not go through
+    /// `ln_internal`, which would ask `ln10` for the factored-out `10^1` and
+    /// recurse until the stack ran out.
+    fn ln_near_one(&self, guard: i32) -> Numeric {
         let work = guard + 8;
         // Reduce t toward 1 by repeated sqrt; ln(self) = 2^s * ln(t).
         let mut t = self.clone();
@@ -1149,8 +1197,9 @@ impl Numeric {
             Ok(value) => value,
             Err(_) => panic!("internal numeric literal 1.1 is invalid"),
         };
-        // The reduction needs only ~20 square roots for any representable
-        // numeric; cap well below 127 so the `1i128 << s` below can't overflow.
+        // With the magnitude already out, `t` starts in [1, 10) and six square
+        // roots bring it inside [0.9, 1.1]; the cap is a backstop, kept well
+        // below 127 so the `1i128 << s` below can't overflow.
         while t.cmp(&lo) == std::cmp::Ordering::Less || t.cmp(&hi) == std::cmp::Ordering::Greater {
             t = t.sqrt_to_scale(work);
             s += 1;
@@ -1256,10 +1305,10 @@ fn ln10(guard: i32) -> Numeric {
     if guard <= CACHED_SCALE {
         static LN10: std::sync::OnceLock<Numeric> = std::sync::OnceLock::new();
         return LN10
-            .get_or_init(|| Numeric::from_i128(10).ln_internal(CACHED_SCALE))
+            .get_or_init(|| Numeric::from_i128(10).ln_near_one(CACHED_SCALE))
             .clone();
     }
-    Numeric::from_i128(10).ln_internal(guard)
+    Numeric::from_i128(10).ln_near_one(guard)
 }
 
 /// Result scale for ln/log: 16 significant digits, i.e. `16 - max(0, weight)`,
@@ -1941,6 +1990,41 @@ mod tests {
             "2201E"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn ln_of_a_tiny_value_converges() -> anyhow::Result<()> {
+        // The square-root reduction works at an absolute scale: without the
+        // magnitude taken out first, `sqrt(1.234567e-89)` rounds to zero, the
+        // reduction never terminates, the series diverges to its term cap and
+        // the answer comes back as `-7037630508829274846715832734222`.
+        //
+        // The digits are PostgreSQL's. The *scale* is not: PG carries the
+        // input's own 95 fractional digits into the result and prints 98, where
+        // `log_scale` here asks only for 16 significant digits. That gap is
+        // older than this test and is a display-scale question, not a
+        // convergence one.
+        assert_eq!(
+            n("1.234567e-89").log10()?.to_display(),
+            "-88.908485335913737"
+        );
+        assert_eq!(n("1.234567e-89").ln()?.to_display(), "-204.71935297515468");
+        assert_eq!(n("1e-300").log10()?.to_display(), "-300.00000000000000");
+        Ok(())
+    }
+
+    #[test]
+    fn log_base_resolves_the_infinities_as_limits() -> anyhow::Result<()> {
+        // Without these the infinite operand reaches the series, which has no
+        // finite sum for it: it ran to the term cap and returned a 32-digit
+        // integer after a second and a half.
+        let inf = n("inf");
+        assert_eq!(inf.log_base(&n("4.2"))?.to_display(), "0");
+        assert_eq!(n("4.2").log_base(&inf)?.to_display(), "Infinity");
+        // ∞/∞ is indeterminate — NaN, not 1.
+        assert_eq!(inf.log_base(&inf)?.to_display(), "NaN");
+        assert_eq!(n("nan").log_base(&inf)?.to_display(), "NaN");
         Ok(())
     }
 
