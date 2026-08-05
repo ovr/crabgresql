@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use crabgresql_pg_regress::report::{format_duration, markdown_summary};
 use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
 
@@ -22,8 +23,17 @@ struct Args {
     #[arg(long, value_delimiter = ',', value_name = "NAME,NAME")]
     tests: Option<Vec<String>>,
 
-    /// Schedule file to run [default: <regress-dir>/parallel_schedule]
+    /// Run the tests named in a list file, one per line, # comments ignored
     #[arg(long, value_name = "PATH", conflicts_with = "tests")]
+    tests_from: Option<PathBuf>,
+
+    /// Schedule file to run [default: <regress-dir>/parallel_schedule]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "tests",
+        conflicts_with = "tests_from"
+    )]
     schedule: Option<PathBuf>,
 
     /// Directory containing sql/ and expected/
@@ -41,13 +51,43 @@ struct Args {
     /// Do not run test_setup before --tests
     #[arg(long)]
     no_setup: bool,
+
+    /// Also write a markdown summary of the run here (for CI)
+    #[arg(long, value_name = "PATH")]
+    summary: Option<PathBuf>,
+
+    /// Suite name used in the --summary heading
+    #[arg(long, value_name = "NAME", default_value = "regress")]
+    suite_name: String,
+}
+
+/// A `--tests-from` list: one test name per line, blank lines and `#` comments
+/// skipped — the shape of `suites/upstream_must_pass.txt`.
+fn parse_test_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let (setup, tests) = match &args.tests {
+    let explicit = match (&args.tests, &args.tests_from) {
+        (Some(tests), _) => Some(tests.clone()),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(parse_test_list(&text)),
+            Err(e) => {
+                eprintln!("regress: cannot read test list {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+        (None, None) => None,
+    };
+
+    let (setup, tests) = match explicit {
         Some(tests) => {
             // Mirror pg_regress: an explicit test list still needs the shared
             // tables test_setup creates, but its own output is not checked.
@@ -59,7 +99,7 @@ async fn main() -> ExitCode {
                 } else {
                     vec![]
                 };
-            (setup, tests.clone())
+            (setup, tests)
         }
         None => {
             let path = args
@@ -97,14 +137,35 @@ async fn main() -> ExitCode {
         }
     };
 
-    for (name, passed) in &report.outcomes {
-        println!("{} {name}", if *passed { "ok    " } else { "FAILED" });
+    let width = report
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.name.len())
+        .max()
+        .unwrap_or(0);
+    for outcome in &report.outcomes {
+        println!(
+            "{} {:width$}  {}",
+            if outcome.passed { "ok    " } else { "FAILED" },
+            outcome.name,
+            format_duration(outcome.duration),
+        );
     }
     let (passed, total) = (report.passed(), report.total());
     println!(
-        "\n{passed} of {total} tests passed ({}%).",
-        passed * 100 / total
+        "\n{passed} of {total} tests passed ({}%) in {}.",
+        passed * 100 / total,
+        format_duration(report.duration),
     );
+
+    if let Some(path) = &args.summary {
+        let markdown = markdown_summary(&args.suite_name, &report);
+        if let Err(e) = std::fs::write(path, markdown) {
+            eprintln!("regress: cannot write summary {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    }
+
     if report.all_passed() {
         ExitCode::SUCCESS
     } else {

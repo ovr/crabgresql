@@ -10,6 +10,7 @@ pub mod client;
 pub mod describe;
 pub mod format;
 pub mod psql_var;
+pub mod report;
 pub mod runner;
 pub mod schedule;
 pub mod script;

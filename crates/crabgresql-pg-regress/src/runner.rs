@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use similar::TextDiff;
 use tokio::net::TcpListener;
@@ -76,14 +76,25 @@ pub fn regress_environment(regress_dir: &Path, outdir: &Path) -> BTreeMap<String
     .collect()
 }
 
+pub struct TestOutcome {
+    pub name: String,
+    pub passed: bool,
+    /// Wall-clock time spent executing the script, without the diff against
+    /// `expected/`.
+    pub duration: Duration,
+}
+
 pub struct SuiteReport {
-    /// `(test name, passed)` in run order, setup tests excluded.
-    pub outcomes: Vec<(String, bool)>,
+    /// One entry per checked test in run order; setup tests are excluded.
+    pub outcomes: Vec<TestOutcome>,
+    /// Wall-clock time of the whole run, including server startup and the
+    /// setup tests that `outcomes` leaves out.
+    pub duration: Duration,
 }
 
 impl SuiteReport {
     pub fn passed(&self) -> usize {
-        self.outcomes.iter().filter(|(_, ok)| *ok).count()
+        self.outcomes.iter().filter(|o| o.passed).count()
     }
 
     pub fn total(&self) -> usize {
@@ -93,12 +104,25 @@ impl SuiteReport {
     pub fn all_passed(&self) -> bool {
         self.passed() == self.total()
     }
+
+    pub fn failed(&self) -> impl Iterator<Item = &TestOutcome> {
+        self.outcomes.iter().filter(|o| !o.passed)
+    }
+
+    /// The `n` longest-running tests, slowest first.
+    pub fn slowest(&self, n: usize) -> Vec<&TestOutcome> {
+        let mut sorted: Vec<&TestOutcome> = self.outcomes.iter().collect();
+        sorted.sort_by(|a, b| b.duration.cmp(&a.duration));
+        sorted.truncate(n);
+        sorted
+    }
 }
 
 /// Run the whole suite against one server + engine instance, mirroring how
 /// pg_regress runs every test in a single cluster. Each test gets a fresh
 /// connection, as each pg_regress test gets a fresh psql.
 pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
+    let started = Instant::now();
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     // The whole suite runs against one durable pg-engine over a throwaway data
@@ -128,14 +152,20 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
         // Lossy: a few upstream scripts are deliberately not UTF-8 (encoding
         // tests); they can only fail, but they must not abort the run.
         let sql = String::from_utf8_lossy(&std::fs::read(&sql_path)?).into_owned();
+        let test_started = Instant::now();
         let output = run_test(port, &sql, config.statement_timeout, &environment).await?;
+        let duration = test_started.elapsed();
         let result_path = results_dir.join(format!("{name}.out"));
         std::fs::write(&result_path, &output)?;
         if !check {
             continue;
         }
         let passed = compare(config, name, &output, &result_path, &mut diffs)?;
-        outcomes.push((name.clone(), passed));
+        outcomes.push(TestOutcome {
+            name: name.clone(),
+            passed,
+            duration,
+        });
     }
     server.abort();
 
@@ -144,7 +174,10 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     } else {
         std::fs::write(&diffs_path, diffs)?;
     }
-    Ok(SuiteReport { outcomes })
+    Ok(SuiteReport {
+        outcomes,
+        duration: started.elapsed(),
+    })
 }
 
 /// True if the output matches any expected candidate exactly; otherwise the
