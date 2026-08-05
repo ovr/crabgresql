@@ -6387,9 +6387,11 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
         "ALTER TABLE t DROP CONSTRAINT nope",
         "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
         "ALTER TABLE t RENAME TO t2",
-        "ALTER TABLE t ADD CHECK (a > 0)",
         "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES t (a)",
         "ALTER TABLE t ADD PRIMARY KEY (a) NOT VALID",
+        // A CHECK *is* supported now; only these two spellings of it are not.
+        "ALTER TABLE t ADD CHECK (a > 0) NOT VALID",
+        "ALTER TABLE t ADD CHECK (a > 0) NOT ENFORCED",
         "ALTER TABLE t ADD UNIQUE (b) DEFERRABLE",
         "ALTER TABLE public.t ADD UNIQUE (b)",
     ] {
@@ -6399,6 +6401,100 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
             "expected {sql} to be rejected as unsupported"
         );
     }
+    Ok(())
+}
+
+/// A subquery in a CHECK predicate is refused with PostgreSQL's own wording and
+/// SQLSTATE — `0A000`, not the `42P17` the constraint-violation family might
+/// suggest. Lives here rather than in the smoke suite because PostgreSQL puts
+/// the error cursor on the subquery's opening paren and this parser's span for a
+/// parenthesised subquery starts at `SELECT`, so the `LINE n: … ^` line cannot
+/// match byte-for-byte.
+#[tokio::test]
+async fn check_constraint_rejects_a_subquery() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let e = client
+        .batch_execute("CREATE TABLE t (a int CHECK ((SELECT true)))")
+        .await
+        .expect_err("a subquery in a CHECK is refused");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(db.message(), "cannot use subquery in check constraint");
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD CONSTRAINT ... CHECK`: the existing rows are scanned
+/// before it lands, and the constraint enforces from then on.
+#[tokio::test]
+async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (5)")
+        .await?;
+
+    // A row already in the table fails the predicate: rejected, and — unlike a
+    // DML-time violation — with no DETAIL naming the row.
+    let e = client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a > 3)")
+        .await
+        .expect_err("row a = 1 violates a > 3");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "check constraint \"vc\" of relation \"t\" is violated by some row"
+    );
+    assert_eq!(db.detail(), None);
+    // The refusal is total: nothing was recorded.
+    let msgs = client
+        .simple_query("SELECT count(*) FROM pg_constraint WHERE contype = 'c'")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("0"));
+
+    // A predicate every row satisfies lands, and enforces from then on.
+    client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a > 0)")
+        .await?;
+    let e = client
+        .batch_execute("INSERT INTO t VALUES (-1)")
+        .await
+        .expect_err("-1 violates the constraint just added");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::CHECK_VIOLATION
+    );
+
+    // The name is taken now, and a CHECK collides as 42710 — not the 42P07 an
+    // index-backed constraint raises, because a check enters no relation
+    // namespace.
+    let e = client
+        .batch_execute("ALTER TABLE t ADD CONSTRAINT vc CHECK (a < 9)")
+        .await
+        .expect_err("the name is taken");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::DUPLICATE_OBJECT);
+    assert_eq!(
+        db.message(),
+        "constraint \"vc\" for relation \"t\" already exists"
+    );
+
+    // An unnamed one is named from the predicate, not from where it was written:
+    // one referenced column gives `{table}_{column}_check`.
+    client
+        .batch_execute("ALTER TABLE t ADD CHECK (a < 1000)")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE contype = 'c' ORDER BY conname",
+        )
+        .await?;
+    let found = rows(&msgs);
+    assert_eq!(found[0].get(0), Some("t_a_check"));
+    assert_eq!(found[0].get(1), Some("CHECK ((a < 1000))"));
+    assert_eq!(found[1].get(0), Some("vc"));
     Ok(())
 }
 

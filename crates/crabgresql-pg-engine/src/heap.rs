@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelPersistence, RelStats,
-    StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelPersistence,
+    RelStats, StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -351,6 +351,19 @@ impl HeapTable {
         for &c in columns {
             next.columns[c].nullable = false;
         }
+        *guard = Arc::new(next);
+    }
+
+    /// Republish the relation's shape with one more `CHECK` constraint, so the
+    /// next statement's `schema()` snapshot carries it. The durable catalog has
+    /// already accepted it; this is the in-memory half.
+    pub fn add_check_constraint(&self, check: CheckConstraint) {
+        let mut guard = self
+            .schema
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let mut next = (**guard).clone();
+        next.checks.push(check);
         *guard = Arc::new(next);
     }
 

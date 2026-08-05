@@ -6,6 +6,7 @@
 //! row stream projected over the affected tuples the function already owns.
 
 mod agg;
+mod checks;
 pub mod eval;
 mod generate_series;
 mod md5;
@@ -32,11 +33,12 @@ use crabgresql_planner::{
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
-    TableSchema, Tid, Tuple,
+    TableSchema, Tid, Tuple, TypeCatalog,
 };
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{FmtCtx, PgType, Value};
 
+use checks::CheckSet;
 use eval::eval;
 pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
@@ -124,6 +126,24 @@ pub trait CatalogOps: Send + Sync {
     /// what a `SELECT *` in the body expands to, frozen at `CREATE VIEW` time.
     /// Backs `pg_get_viewdef`.
     fn view_sql(&self, namespace: Option<&str>, name: &str) -> Option<(String, Vec<String>)>;
+    /// The constraint `oid` identifies, or `None` if this snapshot has none.
+    /// Backs `pg_get_constraintdef`, which resolves *by OID* and so needs the
+    /// reverse of the numbering `pg_constraint`'s rows are built from.
+    fn constraint_def(&self, oid: u32) -> Option<ConstraintDef>;
+}
+
+/// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering
+/// lives in the executor, so an implementation never learns the SQL surface —
+/// the same split [`CatalogOps::view_sql`] makes.
+#[derive(Clone, Debug)]
+pub struct ConstraintDef {
+    /// `pg_constraint.contype`: `c` check, `p` primary key, `u` unique,
+    /// `n` not-null.
+    pub contype: String,
+    /// The constrained columns' names, in key order.
+    pub columns: Vec<String>,
+    /// The stored predicate of a check constraint; `None` for the rest.
+    pub expr: Option<String>,
 }
 
 /// Severity of a diagnostic produced during execution. `Debug` and `Log` reach
@@ -218,6 +238,14 @@ pub struct ExecContext {
     /// non-executing contexts as `sequences`, and an internal `XX000` if one
     /// reaches it.
     pub gucs: Option<Arc<dyn GucOps>>,
+    /// Resolves type and function names when the executor has to *bind* stored
+    /// SQL text, which today means a relation's CHECK constraints: they are
+    /// kept as canonical SQL (like a column default) and bound once per
+    /// statement, against a schema the executor may only discover mid-flight —
+    /// a partition leaf or an inheritance child. `None` in the same
+    /// non-executing contexts as `sequences`; a schema carrying checks that
+    /// reaches a `None` context is an internal wiring error (`XX000`).
+    pub types: Option<Arc<dyn TypeCatalog>>,
     /// The transaction a correlated subquery re-executes against, per outer row.
     /// Injected by [`execute`] once, at the top of the statement, and cloned into
     /// every node so `eval` can run a correlated subplan when it reaches one.
@@ -255,6 +283,7 @@ impl Default for ExecContext {
             sequences: None,
             catalog: None,
             gucs: None,
+            types: None,
             txn: None,
             routines: None,
             notices: None,
@@ -432,6 +461,7 @@ pub fn execute(
         sequences: ctx.sequences.clone(),
         catalog: ctx.catalog.clone(),
         gucs: ctx.gucs.clone(),
+        types: ctx.types.clone(),
         txn: Some(txn.clone()),
         routines: ctx.routines.clone(),
         notices: ctx.notices.clone(),
@@ -1764,6 +1794,14 @@ pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecE
     eval(expr, &[], ctx)
 }
 
+/// Evaluate an expression against one whole row, for a caller outside the plan
+/// tree — `ALTER TABLE ... ADD CHECK` scanning the rows already in the table
+/// against the predicate it is about to record. `tuple` must be the relation's
+/// full row, which is the shape the expression was bound against.
+pub fn eval_in_row(expr: &BoundExpr, tuple: &Tuple, ctx: &ExecContext) -> Result<Value, ExecError> {
+    eval(expr, tuple, ctx)
+}
+
 /// A source node that replays already-computed output rows. `RETURNING`
 /// projects eagerly and streams the finished rows through this — unlike
 /// [`Values`], which evaluates `BoundExpr`s on each pull.
@@ -1925,12 +1963,14 @@ fn insert_direct(
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     // Existing rows are only consulted to enforce UNIQUE keys; a table with no
-    // unique index reads nothing at all (NOT NULL checks only the new row).
+    // unique index reads nothing at all (NOT NULL and CHECK read only the new
+    // row). The checks bind once here rather than per tuple.
     let schema = table.schema();
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
+    let checks = CheckSet::for_schema(&schema, ctx)?;
     for tuple in &tuples {
-        validate_constraints(&schema, tuple, &mut visible, ctx)?;
+        validate_constraints(&schema, tuple, &mut visible, &checks, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -1977,6 +2017,10 @@ fn insert_routed(
     // materializing all of them would make a single-row INSERT cost
     // O(partitions) reads of a lock-guarded schema and index list.
     let mut shapes: Vec<Option<(Arc<TableSchema>, Vec<IndexMetadata>)>> = vec![None; leaves.len()];
+    // Each leaf's bound checks, lazily for the same reason and on the same
+    // schedule as `shapes` — kept in its own vector because binding can fail and
+    // `get_or_insert_with` has no room for a `Result`.
+    let mut leaf_checks: Vec<Option<CheckSet>> = (0..leaves.len()).map(|_| None).collect();
     let mut routes: Vec<usize> = Vec::with_capacity(tuples.len());
     for tuple in &tuples {
         let leaf = route_tuple(&parent_schema, leaves, tuple, ctx)?;
@@ -1991,12 +2035,18 @@ fn insert_routed(
                 leaf_indexes,
             )?);
         }
+        if leaf_checks[leaf].is_none() {
+            leaf_checks[leaf] = Some(CheckSet::for_schema(leaf_schema, ctx)?);
+        }
+        let checks = leaf_checks[leaf].as_ref().expect("just seeded");
         match visible[leaf].as_mut() {
             Some(seen) => {
-                validate_constraints(leaf_schema, tuple, seen, ctx)?;
+                validate_constraints(leaf_schema, tuple, seen, checks, ctx)?;
                 seen.record(tuple, None);
             }
-            None => validate_constraints(leaf_schema, tuple, &mut UniqueKeySet::none(), ctx)?,
+            None => {
+                validate_constraints(leaf_schema, tuple, &mut UniqueKeySet::none(), checks, ctx)?
+            }
         }
         routes.push(leaf);
     }
@@ -2169,6 +2219,12 @@ fn update_inherited(
         })
         .collect();
 
+    // One bound check set per target relation, alongside `simulated`.
+    let checks: Vec<CheckSet> = shapes
+        .iter()
+        .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
+        .collect::<Result<_, _>>()?;
+
     let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
     let mut new_rows: Vec<Tuple> = Vec::new();
     for (i, rows) in scans.iter().enumerate() {
@@ -2196,14 +2252,21 @@ fn update_inherited(
                 if !simulated[i].forget(old, *tid) {
                     continue;
                 }
-                if let Err(error) = validate_constraints(&shapes[i].0, &new, &mut simulated[i], ctx)
+                if let Err(error) =
+                    validate_constraints(&shapes[i].0, &new, &mut simulated[i], &checks[i], ctx)
                 {
                     simulated[i].record(old, Some(*tid));
                     return Err(error);
                 }
                 simulated[i].record(&new, Some(*tid));
             } else {
-                validate_constraints(&shapes[i].0, &new, &mut UniqueKeySet::none(), ctx)?;
+                validate_constraints(
+                    &shapes[i].0,
+                    &new,
+                    &mut UniqueKeySet::none(),
+                    &checks[i],
+                    ctx,
+                )?;
             }
             if let Some(view) = returned {
                 new_rows.push(view);
@@ -2273,6 +2336,10 @@ fn update_direct(
     } else {
         UniqueKeySet::none()
     };
+    // Unlike the unique snapshot, this is not conditional on which columns the
+    // statement assigns: PostgreSQL re-evaluates *every* check against the new
+    // row, not only those reading an updated column.
+    let checks = CheckSet::for_schema(&schema, ctx)?;
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
     for (tid, old) in original {
         if !predicate_holds(predicate, &old, ctx)? {
@@ -2292,13 +2359,13 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) = validate_constraints(&schema, &new, &mut simulated, ctx) {
+            if let Err(error) = validate_constraints(&schema, &new, &mut simulated, &checks, ctx) {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
             simulated.record(&new, Some(tid));
         } else {
-            validate_constraints(&schema, &new, &mut UniqueKeySet::none(), ctx)?;
+            validate_constraints(&schema, &new, &mut UniqueKeySet::none(), &checks, ctx)?;
         }
         pending.push((tid, new));
     }
@@ -2401,6 +2468,13 @@ fn update_routed(
         })
         .collect();
 
+    // One bound check set per leaf, alongside `simulated`. Every leaf is already
+    // materialized here (`leaf_shapes` above), so there is nothing to defer.
+    let leaf_checks: Vec<CheckSet> = leaf_shapes
+        .iter()
+        .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
+        .collect::<Result<_, _>>()?;
+
     // Writes are grouped per leaf: in-place updates, deletes of moved-out rows,
     // and inserts of moved-in rows. `new_rows` records every affected NEW row in
     // scan order for RETURNING.
@@ -2433,22 +2507,38 @@ fn update_routed(
                     if !simulated[dst].forget(old, tid) {
                         continue;
                     }
-                    if let Err(error) =
-                        validate_constraints(&leaf_shapes[dst].0, &new, &mut simulated[dst], ctx)
-                    {
+                    if let Err(error) = validate_constraints(
+                        &leaf_shapes[dst].0,
+                        &new,
+                        &mut simulated[dst],
+                        &leaf_checks[dst],
+                        ctx,
+                    ) {
                         simulated[dst].record(old, Some(tid));
                         return Err(error);
                     }
                     simulated[dst].record(&new, Some(tid));
                 } else {
-                    validate_constraints(&leaf_shapes[dst].0, &new, &mut simulated[dst], ctx)?;
+                    validate_constraints(
+                        &leaf_shapes[dst].0,
+                        &new,
+                        &mut simulated[dst],
+                        &leaf_checks[dst],
+                        ctx,
+                    )?;
                     // Recorded without its tid: in the destination the row is an
                     // insert, and its tid belongs to the source leaf's space —
                     // retracting it here would have to name a row of *this* leaf.
                     simulated[dst].record(&new, None);
                 }
             } else {
-                validate_constraints(&leaf_shapes[dst].0, &new, &mut UniqueKeySet::none(), ctx)?;
+                validate_constraints(
+                    &leaf_shapes[dst].0,
+                    &new,
+                    &mut UniqueKeySet::none(),
+                    &leaf_checks[dst],
+                    ctx,
+                )?;
             }
             // A moved-out row leaves its source leaf's simulation so a later row
             // routed back to that leaf does not see the stale OLD value.
@@ -2506,6 +2596,7 @@ fn validate_constraints(
     schema: &TableSchema,
     tuple: &Tuple,
     existing: &mut UniqueKeySet,
+    checks: &CheckSet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
     for (column, value) in schema.columns.iter().zip(tuple) {
@@ -2524,9 +2615,13 @@ fn validate_constraints(
         }
     }
 
-    // Order matches PostgreSQL's observable behavior: a not-null violation (above)
-    // is reported before a partition-constraint violation, which is reported
-    // before a unique-key violation (checked below).
+    // Order matches PostgreSQL's observable behavior, probed against 18.4 on
+    // both INSERT and UPDATE: not-null (above), then CHECK, then the partition
+    // constraint, then the unique key (below). CHECK really does precede the
+    // partition bound — a row violating both reports the check constraint —
+    // which is the one pair here that reads backwards from how the two are
+    // usually described.
+    checks.validate(schema, tuple, ctx)?;
     check_partition_bound(schema, tuple, ctx)?;
 
     let Some(conflict) = existing.conflict(tuple)? else {

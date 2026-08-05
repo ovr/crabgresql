@@ -609,7 +609,7 @@ fn eval_deparse_fn(
         // crabgresql stores a `pg_node_tree` as the SQL text it deparses to,
         // written when the row is: a partition's `relpartbound` by
         // `crabgresql_catalog`'s `deparse_partbound`, a column default by the
-        // binder (`deparse_literal_default` and `ruleutils::column_default`).
+        // binder (`deparse_literal_default` and `ruleutils::deparse_stored_expr`).
         //
         // Two things about a default belong to the *reader* rather than the
         // writer — the `pretty` parenthesisation and the session's time zone —
@@ -618,8 +618,60 @@ fn eval_deparse_fn(
         // NULL, as in PG.
         ScalarFn::PgGetExpr => Some(Ok(eval_pg_get_expr(args, ctx))),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
+        ScalarFn::PgGetConstraintdef => Some(eval_pg_get_constraintdef(args, ctx)),
         _ => None,
     }
+}
+
+/// `pg_get_constraintdef(oid[, pretty])`: the constraint's DDL text.
+///
+/// An OID no constraint answers to yields **NULL** — verified against
+/// PostgreSQL 18.4, which does not raise for it here.
+///
+/// A check constraint is doubly parenthesised in the non-pretty form:
+/// `CHECK ((x > 3))`, the outer pair from the `CHECK` syntax and the inner from
+/// `pg_get_expr`. `pretty` drops the inner one, giving psql's `CHECK (x > 3)`.
+///
+/// **Known divergence, in `ruleutils` rather than here:** PostgreSQL's pretty
+/// mode keeps the parentheses around an operator nested in another operator, so
+/// `CHECK (x + y < 100)` renders as `CHECK ((x + y) < 100)`, while
+/// [`crabgresql_binder::ruleutils`] drops them by precedence and renders
+/// `CHECK (x + y < 100)`. The non-pretty form — what `pg_constraint.conbin`
+/// stores and what `information_schema` reads — agrees exactly. This predates
+/// CHECK support (the same deparser renders column defaults) and is left alone
+/// here rather than changed underneath every DEFAULT in the tree.
+fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Value::Oid(oid) = &args[0] else {
+        return Ok(Value::Null);
+    };
+    let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_constraintdef evaluated without a catalog context",
+        ));
+    };
+    let Some(def) = catalog.constraint_def(*oid) else {
+        return Ok(Value::Null);
+    };
+    let columns = || def.columns.join(", ");
+    let text = match def.contype.as_str() {
+        "c" => {
+            let expr = def.expr.as_deref().unwrap_or_default();
+            // Re-rendered rather than echoed, so the reader's `pretty` flag and
+            // session time zone apply — the same round trip `pg_get_expr` makes.
+            let rendered = crabgresql_binder::ruleutils::stored_expr(expr, pretty, &ctx.fmt)
+                .unwrap_or_else(|| expr.to_string());
+            format!("CHECK ({rendered})")
+        }
+        "p" => format!("PRIMARY KEY ({})", columns()),
+        "u" => format!("UNIQUE ({})", columns()),
+        "n" => format!("NOT NULL {}", columns()),
+        // A contype this build does not render is better reported as absent
+        // than as a definition that omits half of itself.
+        _ => return Ok(Value::Null),
+    };
+    Ok(Value::Text(text))
 }
 
 /// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
@@ -1616,6 +1668,9 @@ mod format_type_tests {
                 _namespace: Option<&str>,
                 _name: &str,
             ) -> Option<(String, Vec<String>)> {
+                None
+            }
+            fn constraint_def(&self, _oid: u32) -> Option<crate::ConstraintDef> {
                 None
             }
         }

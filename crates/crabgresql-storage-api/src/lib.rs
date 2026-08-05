@@ -202,6 +202,41 @@ impl Column {
     }
 }
 
+/// A `CHECK` constraint: a boolean predicate every row of the relation must
+/// satisfy, kept as canonical SQL text for the same reason [`Column::default`]
+/// is — this crate depends on neither the parser nor the binder, and the
+/// on-disk catalog is a frozen format that a binder IR must not be pinned to.
+/// The binder reparses and binds it once per DML statement; the executor
+/// evaluates it per row.
+///
+/// PostgreSQL rejects only a predicate that evaluates to **false**: an unknown
+/// (NULL) result passes, which is why a `CHECK (x > 3)` admits a NULL `x`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckConstraint {
+    /// Always resolved at DDL time — PostgreSQL has no anonymous constraints in
+    /// its catalog. An unnamed one is given `{table}_{column}_check` or
+    /// `{table}_check`, deduplicated with a numeric suffix.
+    pub name: String,
+    /// The predicate in `pg_get_expr`'s *non-pretty* spelling, every operator
+    /// node parenthesised — `CHECK (x + y < 100)` stores `((x + y) < 100)`.
+    /// This is `pg_constraint.conbin` as we model it.
+    pub expr: String,
+    /// `pg_constraint.conkey`: the column positions the predicate references,
+    /// ascending and deduplicated. Derived from the bound expression at DDL
+    /// time, so it follows the relation's *final* column layout.
+    pub columns: Vec<usize>,
+    /// `pg_constraint.convalidated`. Always `true` for now — `NOT VALID` is
+    /// rejected at DDL, so no unvalidated constraint can be created.
+    pub validated: bool,
+    /// `pg_constraint.conislocal`: declared on this relation itself, rather than
+    /// only inherited. A child that redeclares a parent's constraint has both
+    /// this and a non-zero [`Self::inhcount`].
+    pub islocal: bool,
+    /// `pg_constraint.coninhcount`: how many direct parents contributed it.
+    /// Zero on a relation that is not an inheritance child.
+    pub inhcount: i16,
+}
+
 /// Access method recorded for a semantic index. Physical index access arrives
 /// later; this metadata already reproduces DDL, catalogs, and uniqueness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,6 +569,15 @@ pub struct TableSchema {
     /// working while its own `CREATE TABLE` no longer replays, which a
     /// dump/restore of one has to reckon with.
     pub sort_key: Vec<IndexKey>,
+    /// The relation's `CHECK` constraints, including those inherited from a
+    /// parent — inheritance copies the predicate into the child (as it copies
+    /// columns), so enforcing a child's own list enforces its parents' too.
+    ///
+    /// Order is creation order, which is *not* the order violations are
+    /// reported in: PostgreSQL resolves a failing row against the constraints
+    /// sorted by name, so two violated checks always name the alphabetically
+    /// first one.
+    pub checks: Vec<CheckConstraint>,
 }
 
 impl TableSchema {
@@ -549,6 +593,7 @@ impl TableSchema {
             partition_of: None,
             inherits: Vec::new(),
             sort_key: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -568,6 +613,7 @@ impl TableSchema {
             partition_of: None,
             inherits: Vec::new(),
             sort_key: Vec::new(),
+            checks: Vec::new(),
         }
     }
 }
@@ -1280,6 +1326,25 @@ pub trait TableEngine: Send + Sync {
     ) -> Result<(), StorageError> {
         Err(StorageError::UnsupportedOperation(
             "this engine does not support a NOT NULL column constraint".to_string(),
+        ))
+    }
+
+    /// Append a `CHECK` constraint to `table`, durably — what
+    /// `ALTER TABLE ... ADD CONSTRAINT ... CHECK` does. The caller has already
+    /// bound the predicate, resolved its name, and scanned the table's existing
+    /// rows against it.
+    ///
+    /// The default rejects for the same reason [`Self::set_column_not_null`]'s
+    /// does: an engine that cannot record the constraint must fail loudly rather
+    /// than accept DDL declaring a rule it will never enforce.
+    fn add_check_constraint(
+        &self,
+        _namespace: &str,
+        _table: &str,
+        _check: CheckConstraint,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "this engine does not support CHECK constraints".to_string(),
         ))
     }
 

@@ -50,10 +50,10 @@ use crabgresql_parquet_engine::{
     BufferedParquetTable, ParquetRedo, ParquetTable, RMGR_PARQUET, validate_schema,
 };
 use crabgresql_storage_api::{
-    BatchStream, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelStats,
-    RelationMetadata, RelfilenodeAllocator, SequenceAdvance, SequenceDefinition, StorageError,
-    TableAccessMethod, TableAm, TableCapabilities, TableEngine, TableSchema, Tid, Tuple,
-    TupleStream, UpdateResult, ViewDefinition,
+    BatchStream, CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe,
+    RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance, SequenceDefinition,
+    StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_types::Value;
@@ -2102,6 +2102,43 @@ impl TableEngine for PgEngine {
             .set_column_not_null(namespace, table, columns)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         heap.set_columns_not_null(columns);
+        Ok(())
+    }
+
+    fn add_check_constraint(
+        &self,
+        namespace: &str,
+        table: &str,
+        check: CheckConstraint,
+    ) -> Result<(), StorageError> {
+        let target = {
+            let tables = self
+                .tables
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            tables
+                .get(&(namespace.to_string(), table.to_string()))
+                .cloned()
+                .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?
+        };
+        // Heap only, for the same reason `set_column_not_null` is: an
+        // engine-managed relation writes its rows through a fragment schema this
+        // does not reach, and a constraint the DDL accepted but the write path
+        // never consults is worse than a refusal.
+        let ManagedTable::Heap(heap) = target.as_ref() else {
+            let method = target.schema().access_method.as_str();
+            return Err(StorageError::UnsupportedOperation(format!(
+                "table access method \"{method}\" does not support CHECK constraints"
+            )));
+        };
+        let _guard = heap.begin_index_ddl();
+        // Durable first, in-memory second: a crash between the two re-reads the
+        // constraint from the catalog, whereas the other order could publish a
+        // constraint no restart would find.
+        self.catalog
+            .add_check_constraint(namespace, table, check.clone())
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        heap.add_check_constraint(check);
         Ok(())
     }
 

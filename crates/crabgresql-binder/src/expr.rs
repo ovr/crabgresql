@@ -2604,6 +2604,12 @@ fn bind_subscript(
     }))
 }
 
+/// What a scope with no subquery context says when a subquery reaches it.
+/// Named so a caller that *deliberately* builds such a scope — a CHECK
+/// constraint, which PostgreSQL forbids subqueries in — can recognize its own
+/// refusal and restate it in PostgreSQL's words.
+pub(crate) const NO_SUBQUERY_CONTEXT: &str = "subqueries are not supported in this context";
+
 /// Bind a nested query into a [`LogicalPlan`] against the enclosing scope's
 /// subquery context (table engine + visible CTEs). The subquery body is bound
 /// in its own name scope, but with the enclosing scope's relations attached as
@@ -2614,9 +2620,10 @@ fn bind_subquery_plan(
     query: &ast::Query,
     scope: &Scope,
 ) -> Result<(crate::plan::LogicalPlan, Vec<crate::OutputColumn>), BindError> {
-    let ctx = scope.subquery.as_ref().ok_or_else(|| {
-        BindError::feature_not_supported("subqueries are not supported in this context")
-    })?;
+    let ctx = scope
+        .subquery
+        .as_ref()
+        .ok_or_else(|| BindError::feature_not_supported(NO_SUBQUERY_CONTEXT))?;
     let plan = crate::plan::bind_query_scoped(
         &ctx.engine,
         &scope.catalog,
@@ -8822,6 +8829,85 @@ pub fn bind_column_default(
     Ok(bound)
 }
 
+/// Bind a `CHECK` constraint against the relation it constrains, returning the
+/// predicate and the column positions it reads (`pg_constraint.conkey`).
+///
+/// Unlike a DEFAULT, a CHECK binds in a scope over `schema`'s columns — it is a
+/// statement about the row. The scope is unqualified-plus-`schema.name`, so both
+/// `x > 3` and `t.x > 3` resolve, as they do in PostgreSQL.
+///
+/// The rejections and their SQLSTATEs were probed against PostgreSQL 18.4:
+///
+/// * a non-boolean predicate is `42804`, via the same [`to_bool_operand`] every
+///   other boolean position uses, so it carries the `LINE n: … ^` cursor;
+/// * an aggregate is `42803` and a window function `42P20`, which is what
+///   [`reject_agg_or_window`] already distinguishes;
+/// * a set-returning function is `0A000`;
+/// * a subquery is `0A000` — *not* a `42P17` — and is detected by
+///   [`BoundExpr::collect_column_refs`] refusing. That refusal is exact here:
+///   its only other refusing variant is a window marker, ruled out one line
+///   above, so a `false` at this point is a subplan and nothing else.
+///
+/// A **volatile** function is deliberately allowed. PostgreSQL accepts
+/// `CHECK (a < nextval('s'))` and leaves the consequences to whoever wrote it;
+/// the upstream `constraints` regress test depends on that.
+pub fn bind_check_constraint(
+    expr: &ast::Expr,
+    schema: &TableSchema,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(BoundExpr, Vec<usize>), BindError> {
+    bind_check_inner(expr, schema, catalog).map_err(|e| match e.location {
+        // PostgreSQL points its cursor at the start of the CHECK expression for
+        // every one of these — the unknown column, the subquery, the aggregate.
+        // Only `to_bool_operand` sets a finer one of its own, so anything still
+        // location-less gets the predicate's own span.
+        None => e.at(expr.span()),
+        Some(_) => e,
+    })
+}
+
+fn bind_check_inner(
+    expr: &ast::Expr,
+    schema: &TableSchema,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(BoundExpr, Vec<usize>), BindError> {
+    let params = param_ctx_none();
+    // Deliberately built with no subquery context, which is what makes a
+    // subquery in the predicate fail — restated below in PostgreSQL's words.
+    let scope = Scope::table(schema, schema.name.clone(), catalog, &params);
+    let bound = to_bool_operand(
+        bind_expr(expr, &scope).map_err(subquery_in_check)?,
+        "CHECK",
+        expr.span(),
+    )?;
+    if bound.contains_srf() {
+        return Err(BindError::feature_not_supported(
+            "set-returning functions are not allowed in check constraints",
+        ));
+    }
+    reject_agg_or_window(&bound, "check constraints")?;
+    let mut columns = BTreeSet::new();
+    if !bound.collect_column_refs(&mut columns) {
+        return Err(subquery_in_check_error());
+    }
+    Ok((bound, columns.into_iter().collect()))
+}
+
+/// PostgreSQL's wording for a subquery inside a CHECK: `0A000`, and *not* the
+/// `42P17` the SQLSTATE name might suggest. Probed against 18.4.
+fn subquery_in_check_error() -> BindError {
+    BindError::feature_not_supported("cannot use subquery in check constraint")
+}
+
+/// Restate the generic "no subquery context here" refusal as the CHECK-specific
+/// one. Any other error passes through untouched.
+fn subquery_in_check(e: BindError) -> BindError {
+    match e.message == NO_SUBQUERY_CONTEXT {
+        true => subquery_in_check_error(),
+        false => e,
+    }
+}
+
 /// The text PostgreSQL's `pg_get_expr(adbin, adrelid, true)` prints for a column
 /// default that is a bare *literal*, or `None` when this expression is not one —
 /// in which case the caller keeps the statement's own source text.
@@ -8856,7 +8942,7 @@ pub fn bind_column_default(
 ///
 /// Deliberately left alone, keeping the source text it has always stored:
 ///
-/// * **Non-literals**, which go to [`crate::ruleutils::column_default`] instead
+/// * **Non-literals**, which go to [`crate::ruleutils::deparse_stored_expr`] instead
 ///   — it has the precedence rules an operator expression needs. `DEFAULT (1 +
 ///   2)` must not be folded to `3`, which is why the split is between *literal*
 ///   and everything else rather than between constant and non-constant. An

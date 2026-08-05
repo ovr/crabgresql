@@ -108,19 +108,20 @@ struct Cx<'a> {
     zone: Option<&'a FmtCtx>,
 }
 
-/// `pg_get_expr` for a stored expression that is not a whole query — today, a
-/// column default. Returns `None` if `sql` does not re-parse as one expression,
-/// leaving the caller to fall back to the text as written.
+/// Canonicalize an expression on its way *into* the catalog — a column default
+/// or a CHECK constraint. Returns `None` if `sql` does not re-parse as one
+/// expression, leaving the caller to fall back to the text as written.
 ///
 /// `catalog` resolves the function calls inside, so a literal argument carries
 /// the type its signature gives it.
 ///
 /// The result is the *non-pretty* form, every operator node parenthesised —
-/// `DEFAULT (1 + 2)` stays `(1 + 2)`. That is what `pg_get_expr` returns without
-/// its `pretty` flag, and it is the form `information_schema.columns` echoes
-/// straight out of the catalog; psql asks for the pretty one and
-/// [`stored_expr`] derives it by re-parsing.
-pub fn column_default(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
+/// `DEFAULT (1 + 2)` stays `(1 + 2)`, and `CHECK (x + y < 100)` stores
+/// `((x + y) < 100)`. That is what `pg_get_expr` returns without its `pretty`
+/// flag, and it is the form `information_schema.columns` echoes straight out of
+/// the catalog; psql asks for the pretty one and [`stored_expr`] derives it by
+/// re-parsing.
+pub fn deparse_stored_expr(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
     let e = parse_expression(sql)?;
     let resolve = |f: &ast::Function| call_arg_types(f, catalog);
     let cx = Cx {
@@ -197,7 +198,7 @@ fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<V
     }
 }
 
-fn parse_expression(sql: &str) -> Option<ast::Expr> {
+pub fn parse_expression(sql: &str) -> Option<ast::Expr> {
     let query = parse_query(&format!("SELECT {sql}"))?;
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return None;

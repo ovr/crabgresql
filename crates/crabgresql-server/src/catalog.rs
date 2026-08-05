@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use crabgresql_catalog::SystemCatalog;
-use crabgresql_executor::CatalogOps;
+use crabgresql_executor::{CatalogOps, ConstraintDef};
 use crabgresql_storage_api::{
-    IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition, StorageError, TableAm,
-    TableEngine, TableSchema, ViewDefinition,
+    CheckConstraint, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
+    StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{TxnContext, Xid};
 
@@ -151,6 +151,15 @@ impl CatalogOps for SessionCatalogOps {
             .as_ref()?
             .resolve_view(namespace, name)
             .map(|v| (v.sql, v.columns.into_iter().map(|c| c.name).collect()))
+    }
+
+    fn constraint_def(&self, oid: u32) -> Option<ConstraintDef> {
+        let (contype, columns, expr) = self.system.constraint_def(oid)?;
+        Some(ConstraintDef {
+            contype,
+            columns,
+            expr,
+        })
     }
 }
 
@@ -323,6 +332,22 @@ impl TableEngine for SessionCatalog {
             Err(StorageError::IndexTableNotFound(table.to_string()))
         } else {
             self.global.set_column_not_null(namespace, table, columns)
+        }
+    }
+
+    fn add_check_constraint(
+        &self,
+        namespace: &str,
+        table: &str,
+        check: CheckConstraint,
+    ) -> Result<(), StorageError> {
+        if namespace == "public" && self.temp_has(table) {
+            self.global
+                .add_check_constraint(&self.temp_schema, table, check)
+        } else if self.is_foreign_temp(namespace) {
+            Err(StorageError::IndexTableNotFound(table.to_string()))
+        } else {
+            self.global.add_check_constraint(namespace, table, check)
         }
     }
 

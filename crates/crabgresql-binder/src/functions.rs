@@ -575,6 +575,12 @@ pub enum ScalarFn {
     /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
     /// in PostgreSQL's canonical shape by [`crate::ruleutils`].
     PgGetViewdef,
+    /// `pg_get_constraintdef(oid[, bool]) -> text`: a constraint's DDL, as
+    /// `CHECK ((x > 3))` / `PRIMARY KEY (a, b)` / `UNIQUE (a)`. The optional
+    /// flag is PostgreSQL's `pretty`, which for a check drops the parentheses
+    /// `pg_get_expr` adds. An OID no constraint answers to is NULL, not an
+    /// error.
+    PgGetConstraintdef,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
@@ -2252,6 +2258,18 @@ fn lookup(name: &str) -> &'static [Signature] {
             Signature {
                 func: ScalarFn::PgGetViewdef,
                 args: &[TEXT, BOOL],
+                ret: TEXT,
+            },
+        ],
+        "pg_get_constraintdef" => &[
+            Signature {
+                func: ScalarFn::PgGetConstraintdef,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetConstraintdef,
+                args: &[OID, BOOL],
                 ret: TEXT,
             },
         ],

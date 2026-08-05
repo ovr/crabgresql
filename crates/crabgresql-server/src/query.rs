@@ -23,10 +23,11 @@ use crabgresql_executor::{
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent, PartitionBound,
-    PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy, RelPersistence,
-    RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig, SequenceDefinition, StorageError,
-    TableAccessMethod, TableAm, TableEngine, TableSchema, TypeCatalog, ViewDefinition,
+    CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
+    PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
+    RelPersistence, RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig,
+    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema,
+    TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{FmtCtx, PgType, Value};
@@ -1022,7 +1023,7 @@ pub(crate) fn execute_statement_with(
                 return execute_vacuum(&catalog, txnmgr, session, vacuum);
             }
             ast::Statement::AlterTable(alter) => {
-                return execute_alter_table(&catalog, txnmgr, session, alter);
+                return execute_alter_table(&catalog, &type_catalog, txnmgr, session, alter);
             }
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
@@ -1123,6 +1124,7 @@ pub(crate) fn execute_statement_with(
                 let exec_ctx = session.exec_context_for_statement(
                     engine,
                     &catalog_ops,
+                    &type_catalog,
                     Arc::clone(&routines),
                     Arc::clone(&command_counter),
                     read_only,
@@ -1168,6 +1170,7 @@ pub(crate) fn execute_statement_with(
     let exec_ctx = session.exec_context_for_statement(
         engine,
         &catalog_ops,
+        &type_catalog,
         routines,
         Arc::clone(&command_counter),
         read_only,
@@ -1578,6 +1581,7 @@ pub fn run_copy_rows(
     let exec_ctx = session.exec_context_for_statement(
         engine,
         &prepared.catalog_ops,
+        &prepared.catalog,
         routines,
         Arc::clone(&command_counter),
         read_only,
@@ -2312,12 +2316,47 @@ fn execute_create_index(
     Ok(QueryResult::command("CREATE INDEX"))
 }
 
-/// One `ADD CONSTRAINT` resolved against the table but not yet applied: the
-/// index to create, and — for a PRIMARY KEY — the key columns that are still
-/// nullable and therefore have to be marked NOT NULL.
-struct PendingConstraint {
-    index: IndexMetadata,
-    not_null: Vec<usize>,
+/// One `ADD CONSTRAINT` as pass 1 classified it, before the relation is even
+/// resolved.
+enum Requested {
+    Index {
+        name: Option<String>,
+        columns: Vec<ast::IndexColumn>,
+        kind: IndexConstraint,
+        nulls_distinct: bool,
+    },
+    Check {
+        name: Option<String>,
+        expr: ast::Expr,
+    },
+}
+
+/// One `ADD CONSTRAINT` resolved against the table but not yet applied.
+enum PendingConstraint {
+    /// The index to create, and — for a PRIMARY KEY — the key columns that are
+    /// still nullable and therefore have to be marked NOT NULL.
+    Index {
+        index: IndexMetadata,
+        not_null: Vec<usize>,
+    },
+    /// The relations the constraint lands on: the named one first, then every
+    /// inheritance descendant, since PostgreSQL recurses `ADD CHECK` down the
+    /// tree.
+    Check { targets: Vec<CheckTarget> },
+}
+
+/// One relation an `ADD CHECK` applies to, with the constraint as it lands
+/// *there* — a descendant's copy differs from the parent's in `conislocal` and
+/// `coninhcount`, and its predicate is bound against its own column layout.
+///
+/// The bound predicate travels with the constraint so pass 4's scan cannot drift
+/// from the text pass 5 stores.
+struct CheckTarget {
+    table: Arc<dyn TableAm>,
+    namespace: String,
+    relation: String,
+    check: CheckConstraint,
+    bound: crabgresql_binder::BoundExpr,
 }
 
 /// `ALTER TABLE ... ADD [CONSTRAINT n] {PRIMARY KEY|UNIQUE} (cols)`. Every other
@@ -2349,6 +2388,7 @@ struct PendingConstraint {
 /// bespoke TRUNCATE registry.
 fn execute_alter_table(
     engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
     txnmgr: &TransactionManager,
     session: &mut Session,
     alter: &ast::AlterTable,
@@ -2373,7 +2413,7 @@ fn execute_alter_table(
                 "ALTER TABLE operation is not supported yet: {op}"
             )));
         };
-        let (name, columns, kind, nulls_distinct, characteristics) = match constraint {
+        let (action, characteristics) = match constraint {
             ast::TableConstraint::PrimaryKey(pk) => {
                 if *not_valid {
                     // PostgreSQL rejects this in its grammar; we reach it here
@@ -2385,10 +2425,12 @@ fn execute_alter_table(
                 }
                 reject_primary_key_options(pk)?;
                 (
-                    pk.name.as_ref().map(normalize_ident),
-                    pk.columns.clone(),
-                    IndexConstraint::PrimaryKey,
-                    true,
+                    Requested::Index {
+                        name: pk.name.as_ref().map(normalize_ident),
+                        columns: pk.columns.clone(),
+                        kind: IndexConstraint::PrimaryKey,
+                        nulls_distinct: true,
+                    },
                     pk.characteristics,
                 )
             }
@@ -2401,11 +2443,35 @@ fn execute_alter_table(
                 }
                 reject_unique_options(unique)?;
                 (
-                    unique.name.as_ref().map(normalize_ident),
-                    unique.columns.clone(),
-                    IndexConstraint::Unique,
-                    !matches!(unique.nulls_distinct, ast::NullsDistinctOption::NotDistinct),
+                    Requested::Index {
+                        name: unique.name.as_ref().map(normalize_ident),
+                        columns: unique.columns.clone(),
+                        kind: IndexConstraint::Unique,
+                        nulls_distinct: !matches!(
+                            unique.nulls_distinct,
+                            ast::NullsDistinctOption::NotDistinct
+                        ),
+                    },
                     unique.characteristics,
+                )
+            }
+            ast::TableConstraint::Check(check) => {
+                // PostgreSQL supports `NOT VALID` here — the constraint lands
+                // unvalidated and a later `VALIDATE CONSTRAINT` scans. Neither
+                // half exists yet, and accepting the suffix while validating
+                // anyway would reject rows the user asked us to tolerate.
+                if *not_valid {
+                    return Err(PgError::feature_not_supported(
+                        "CHECK constraints cannot be marked NOT VALID yet",
+                    ));
+                }
+                reject_not_enforced(check.enforced)?;
+                (
+                    Requested::Check {
+                        name: check.name.as_ref().map(normalize_ident),
+                        expr: (*check.expr).clone(),
+                    },
+                    None,
                 )
             }
             ast::TableConstraint::PrimaryKeyUsingIndex(_)
@@ -2421,7 +2487,7 @@ fn execute_alter_table(
             }
         };
         reject_deferred_characteristics(characteristics)?;
-        requested.push((name, columns, kind, nulls_distinct));
+        requested.push(action);
     }
 
     // Pass 2: resolve the relation.
@@ -2450,9 +2516,15 @@ fn execute_alter_table(
     reject_partitioned_parent(&table, &table_name)?;
 
     let schema = table.schema();
-    let wants_primary_key = requested
-        .iter()
-        .any(|(_, _, kind, _)| *kind == IndexConstraint::PrimaryKey);
+    let wants_primary_key = requested.iter().any(|r| {
+        matches!(
+            r,
+            Requested::Index {
+                kind: IndexConstraint::PrimaryKey,
+                ..
+            }
+        )
+    });
 
     // Only the heap can record a column as NOT NULL, so a PRIMARY KEY on any
     // other method is refused here rather than discovered from the engine in the
@@ -2489,6 +2561,22 @@ fn execute_alter_table(
         )));
     }
 
+    // PostgreSQL recurses `ADD CHECK` down the inheritance tree, giving every
+    // descendant its own copy — which is what makes the constraint hold for rows
+    // written through a child. Resolved here, before pass 3, so a descendant
+    // that cannot take the constraint fails the statement before anything lands.
+    //
+    // `alter.only` is still a no-op: `ONLY` would suppress exactly this
+    // recursion, and honoring it would leave a parent's constraint unenforced on
+    // its children — a half-applied state nothing here can express.
+    let descendants = match requested
+        .iter()
+        .any(|r| matches!(r, Requested::Check { .. }))
+    {
+        true => crabgresql_binder::inheritance_descendants(engine, &schema)?,
+        false => Vec::new(),
+    };
+
     // Pass 3: turn each action into the index it creates, raising every name,
     // column and cardinality error. `claimed` holds the names this statement has
     // taken but not yet created — invisible to the engine until the apply pass.
@@ -2499,7 +2587,101 @@ fn execute_alter_table(
         .iter()
         .any(|index| index.constraint == Some(IndexConstraint::PrimaryKey));
     let mut added_primary_key = false;
-    for (explicit_name, columns, kind, nulls_distinct) in requested {
+    // A CHECK name lives in the relation's constraint namespace, not the
+    // relation namespace an index enters, so it dedupes against a different set
+    // — the relation's existing checks, its NOT NULL constraints, and its index
+    // names — and collides with a different SQLSTATE (42710, not 42P07).
+    let mut claimed_checks: HashSet<String> = schema
+        .checks
+        .iter()
+        .map(|c| c.name.clone())
+        .chain(
+            schema
+                .columns
+                .iter()
+                .filter_map(|c| c.not_null_constraint.clone()),
+        )
+        .chain(table.indexes().iter().map(|i| i.name.clone()))
+        .collect();
+    for action in requested {
+        let (explicit_name, columns, kind, nulls_distinct) = match action {
+            Requested::Index {
+                name,
+                columns,
+                kind,
+                nulls_distinct,
+            } => (name, columns, kind, nulls_distinct),
+            Requested::Check { name, expr } => {
+                let (bound, key_columns) =
+                    crabgresql_binder::bind_check_constraint(&expr, &schema, type_catalog)?;
+                let name = name.unwrap_or_else(|| {
+                    fresh_local_name(&claimed_checks, &check_name_base(&schema, &key_columns))
+                });
+                if !claimed_checks.insert(name.clone()) {
+                    return Err(PgError::new(
+                        "42710",
+                        format!(
+                            "constraint \"{name}\" for relation \"{table_name}\" already exists"
+                        ),
+                    ));
+                }
+                let source = expr.to_string();
+                let text = crabgresql_binder::ruleutils::deparse_stored_expr(&source, type_catalog)
+                    .unwrap_or(source);
+                let mut targets = vec![CheckTarget {
+                    table: Arc::clone(&table),
+                    namespace: "public".to_string(),
+                    relation: table_name.clone(),
+                    check: CheckConstraint {
+                        name: name.clone(),
+                        expr: text.clone(),
+                        columns: key_columns,
+                        validated: true,
+                        islocal: true,
+                        inhcount: 0,
+                    },
+                    bound,
+                }];
+                for child in &descendants {
+                    let child_schema = child.schema();
+                    // A descendant that already carries this name would need its
+                    // `coninhcount` bumped instead of a second row, and nothing
+                    // here can express that — so it is refused rather than
+                    // silently left with whichever predicate it already had.
+                    if child_schema.checks.iter().any(|c| c.name == name) {
+                        return Err(PgError::feature_not_supported(format!(
+                            "ADD CHECK would collide with constraint \"{name}\" already on \
+                             inheritance child \"{}\"",
+                            child_schema.name
+                        )));
+                    }
+                    // Bound against the *child's* layout: an inheritance child
+                    // may carry extra columns of its own, so the parent's
+                    // positions do not transfer.
+                    let (child_bound, child_columns) = crabgresql_binder::bind_check_constraint(
+                        &expr,
+                        &child_schema,
+                        type_catalog,
+                    )?;
+                    targets.push(CheckTarget {
+                        table: Arc::clone(child),
+                        namespace: child_schema.namespace.clone(),
+                        relation: child_schema.name.clone(),
+                        check: CheckConstraint {
+                            name: name.clone(),
+                            expr: text.clone(),
+                            columns: child_columns,
+                            validated: true,
+                            islocal: false,
+                            inhcount: 1,
+                        },
+                        bound: child_bound,
+                    });
+                }
+                pending.push(PendingConstraint::Check { targets });
+                continue;
+            }
+        };
         let keys = simple_index_keys(&schema, &columns)?;
         if kind == IndexConstraint::PrimaryKey {
             if existing_primary_key || added_primary_key {
@@ -2544,7 +2726,7 @@ fn execute_alter_table(
                 .collect(),
             IndexConstraint::Unique => Vec::new(),
         };
-        pending.push(PendingConstraint {
+        pending.push(PendingConstraint::Index {
             index: IndexMetadata {
                 name: index_name,
                 method: IndexMethod::BTree,
@@ -2562,10 +2744,30 @@ fn execute_alter_table(
     // duplicate and a NULL reports the duplicate — the opposite of the order the
     // same two constraints are reported in on INSERT.
     let txn = build_txn(txnmgr, session, false);
+    let exec_ctx = session.exec_context();
     for p in &pending {
-        validate_unique_index_build(&table, &p.index, &txn, &session.fmt_ctx())?;
-        if p.index.constraint == Some(IndexConstraint::PrimaryKey) {
-            validate_primary_key_not_null(&table, &p.index, &txn)?;
+        match p {
+            PendingConstraint::Index { index, .. } => {
+                validate_unique_index_build(&table, index, &txn, &session.fmt_ctx())?;
+                if index.constraint == Some(IndexConstraint::PrimaryKey) {
+                    validate_primary_key_not_null(&table, index, &txn)?;
+                }
+            }
+            // Every target is scanned, descendants included: a child holding a
+            // row the parent's new constraint rejects must fail the statement
+            // before the parent's copy lands.
+            PendingConstraint::Check { targets } => {
+                for t in targets {
+                    validate_check_constraint(
+                        &t.table,
+                        &t.relation,
+                        &t.check,
+                        &t.bound,
+                        &txn,
+                        &exec_ctx,
+                    )?;
+                }
+            }
         }
     }
 
@@ -2574,12 +2776,28 @@ fn execute_alter_table(
     // that still accept NULL is the dangerous half to lose.
     let mut created: Vec<String> = Vec::new();
     for p in pending {
-        let applied = (|| {
-            if !p.not_null.is_empty() {
-                engine.set_column_not_null("public", &table_name, &p.not_null)?;
+        let (applied, index_name) = match p {
+            PendingConstraint::Index { index, not_null } => {
+                let applied = (|| {
+                    if !not_null.is_empty() {
+                        engine.set_column_not_null("public", &table_name, &not_null)?;
+                    }
+                    engine.create_index("public", &table_name, index.clone())
+                })();
+                (applied, Some(index.name))
             }
-            engine.create_index("public", &table_name, p.index.clone())
-        })();
+            // A landed check is not undone by the compensation below: like the
+            // NOT NULL flips, it is the conservative direction — it rejects
+            // strictly more rows, and re-running the statement re-converges.
+            // That also covers a partly-applied fan-out, where the parent has
+            // the constraint and some descendant does not yet.
+            PendingConstraint::Check { targets } => {
+                let applied = targets.into_iter().try_for_each(|t| {
+                    engine.add_check_constraint(&t.namespace, &t.relation, t.check)
+                });
+                (applied, None)
+            }
+        };
         if let Err(e) = applied {
             // Passes 1-4 raise everything a statement can be wrong about, so what
             // reaches here is an engine or IO failure. Undo the indexes that did
@@ -2596,7 +2814,7 @@ fn execute_alter_table(
             }
             return Err(e.into());
         }
-        created.push(p.index.name);
+        created.extend(index_name);
     }
     Ok(QueryResult::command("ALTER TABLE"))
 }
@@ -2629,6 +2847,44 @@ fn validate_primary_key_not_null(
                     ),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject `ALTER TABLE ... ADD CONSTRAINT ... CHECK` when a row already in the
+/// table fails the new predicate.
+///
+/// Scans the whole row rather than the predicate's own columns: a projection
+/// would have to be reflected in the tuple positions the bound expression reads,
+/// and a full row is what it was bound against.
+///
+/// PostgreSQL's message here names the *constraint and relation* rather than the
+/// offending row, and carries **no DETAIL** — unlike the DML-time violation,
+/// which prints `Failing row contains (…)`. Probed against 18.4. A predicate
+/// evaluating to NULL passes, as at DML time.
+fn validate_check_constraint(
+    table: &Arc<dyn TableAm>,
+    table_name: &str,
+    check: &CheckConstraint,
+    bound: &crabgresql_binder::BoundExpr,
+    txn: &TxnContext,
+    ctx: &crabgresql_executor::ExecContext,
+) -> Result<(), PgError> {
+    let projection = crabgresql_storage_api::ColumnProjection::All;
+    for row in table.scan(txn, &projection) {
+        let (_, tuple) = row?;
+        if matches!(
+            crabgresql_executor::eval_in_row(bound, &tuple, ctx)?,
+            crabgresql_types::Value::Bool(false)
+        ) {
+            return Err(PgError::new(
+                "23514",
+                format!(
+                    "check constraint \"{}\" of relation \"{table_name}\" is violated by some row",
+                    check.name
+                ),
+            ));
         }
     }
     Ok(())
@@ -3597,8 +3853,18 @@ fn execute_create_table(
         characteristics: Option<ast::ConstraintCharacteristics>,
     }
 
+    /// A `CHECK` clause in the shape the parser handed over, held until the
+    /// inherited-column merge below has fixed the final column positions its
+    /// predicate binds against. Binding earlier would index a layout that the
+    /// merge then rearranges — silently, and only for a table with `INHERITS`.
+    struct PendingCheck {
+        explicit_name: Option<String>,
+        expr: ast::Expr,
+    }
+
     let mut columns = Vec::new();
     let mut pending = Vec::<PendingIndex>::new();
+    let mut pending_checks = Vec::<PendingCheck>::new();
     let mut constraint_names = HashSet::new();
     // `serial`/`bigserial`/`smallserial` desugar to an int column plus an owned
     // sequence and a `nextval(...)` default. The sequences are created together
@@ -3712,7 +3978,7 @@ fn execute_create_table(
                         crabgresql_binder::ColumnDefault::Source => Some(
                             session_literal_default(&bound, &column, session)
                                 .or_else(|| {
-                                    crabgresql_binder::ruleutils::column_default(
+                                    crabgresql_binder::ruleutils::deparse_stored_expr(
                                         &source,
                                         type_catalog,
                                     )
@@ -3762,6 +4028,21 @@ fn execute_create_table(
                     }
                     column.collation = Some(crabgresql_binder::resolve_collation(collation)?);
                 }
+                // `col int CHECK (col > 3)`. The parser leaves
+                // `CheckConstraint.name` empty for a column clause and puts a
+                // `CONSTRAINT n` on the enclosing option instead, which is where
+                // the NOT NULL arm above reads it from too.
+                ast::ColumnOption::Check(check) => {
+                    reject_not_enforced(check.enforced)?;
+                    pending_checks.push(PendingCheck {
+                        explicit_name: check
+                            .name
+                            .as_ref()
+                            .or(option.name.as_ref())
+                            .map(normalize_ident),
+                        expr: (*check.expr).clone(),
+                    });
+                }
                 other => {
                     return Err(PgError::feature_not_supported(format!(
                         "column constraint is not supported yet: {other}"
@@ -3804,6 +4085,13 @@ fn execute_create_table(
                     characteristics: unique.characteristics,
                 });
             }
+            ast::TableConstraint::Check(check) => {
+                reject_not_enforced(check.enforced)?;
+                pending_checks.push(PendingCheck {
+                    explicit_name: check.name.as_ref().map(normalize_ident),
+                    expr: (*check.expr).clone(),
+                });
+            }
             other => {
                 return Err(PgError::feature_not_supported(format!(
                     "table constraint is not supported yet: {other}"
@@ -3836,6 +4124,16 @@ fn execute_create_table(
             if !serial_defs.is_empty() {
                 return Err(PgError::feature_not_supported(
                     "serial columns in partitioned tables are not supported yet",
+                ));
+            }
+            // PostgreSQL copies a partitioned parent's checks into every leaf, so
+            // that a row routed to a leaf still meets the parent's constraint. We
+            // create leaves from the parent's columns alone, so accepting one
+            // here would declare a constraint and then never enforce it — the one
+            // failure worse than refusing the DDL.
+            if !pending_checks.is_empty() {
+                return Err(PgError::feature_not_supported(
+                    "CHECK constraints on partitioned tables are not supported yet",
                 ));
             }
             Some(build_partition_scheme(expr, &columns)?)
@@ -3875,6 +4173,9 @@ fn execute_create_table(
         inherits: inherit_links,
         // Resolved below, once the PRIMARY KEY's columns are known.
         sort_key: Vec::new(),
+        // Resolved below, once the inherited-column merge has fixed the final
+        // column positions a CHECK predicate binds against.
+        checks: Vec::new(),
     };
     // Ask the access method about the column types before any index or sort-key
     // rule looks at them, so "this method cannot store `json`" wins over the
@@ -3921,6 +4222,37 @@ fn execute_create_table(
             .iter()
             .find(|index| index.constraint == Some(IndexConstraint::PrimaryKey)),
     )?;
+    // Resolve the CHECK clauses last: their names dedupe against the index-backed
+    // ones claimed just above, and their predicates bind against the layout the
+    // inherited-column merge settled — including the PRIMARY KEY's nullability
+    // flips, which nothing here reads but which a future `conkey` consumer might.
+    let own_checks = resolve_checks(
+        pending_checks
+            .into_iter()
+            .map(|p| (p.explicit_name, p.expr)),
+        &schema,
+        &mut constraint_names,
+        type_catalog,
+    )?;
+    schema.checks = if inherits.is_empty() {
+        own_checks
+    } else {
+        // Re-resolve the parents rather than threading handles down from the
+        // column merge: it has already accepted every one of them, so this
+        // cannot fail differently, and the alternative widens a five-argument
+        // helper for one caller.
+        let parents = inherits
+            .iter()
+            .map(|p| resolve_parent_relation(engine, p, &session.temp_schema).map(|(t, _)| t))
+            .collect::<Result<Vec<_>, _>>()?;
+        merge_inherited_checks(
+            &parents,
+            own_checks,
+            &schema,
+            type_catalog,
+            &session.notices,
+        )?
+    };
     // Create the serial columns' owned sequences before the table. Names were
     // chosen unique above, so a failure here is unexpected; clean up on it.
     for def in &serial_defs {
@@ -4771,6 +5103,10 @@ fn execute_create_partition(
         inherits: Vec::new(),
         // A leaf partition is always a heap, which declares no layout order.
         sort_key: Vec::new(),
+        // PostgreSQL copies a partitioned parent's CHECK constraints into every
+        // leaf. Nothing to copy here: declaring one on a partitioned table is
+        // refused at DDL, so the parent never has any.
+        checks: Vec::new(),
     };
     match engine.create_table(schema) {
         Ok(_) => Ok(QueryResult::command("CREATE TABLE")),
@@ -4916,6 +5252,9 @@ fn execute_create_table_as(
         // CTAS derives its shape from a query; `INHERITS` is rejected above.
         inherits: Vec::new(),
         sort_key: Vec::new(),
+        // A `CREATE TABLE AS` carries no constraint clauses at all — the form
+        // that would declare one is rejected as unsupported.
+        checks: Vec::new(),
     };
     // As on the plain path: an `IF NOT EXISTS` re-run against an existing
     // relation is a no-op and must not trip over the sort-key rule.
@@ -4988,6 +5327,7 @@ fn execute_create_table_as(
     let exec_ctx = session.exec_context_for_statement(
         engine,
         catalog_ops,
+        type_catalog,
         routines,
         Arc::clone(&command_counter),
         read_only,
@@ -5010,6 +5350,199 @@ fn execute_create_table_as(
         _ => unreachable!("CTAS populate is a RETURNING-less INSERT"),
     };
     Ok(QueryResult::command(format!("SELECT {n}")))
+}
+
+/// `CHECK (...) NOT ENFORCED` declares a constraint the server records but never
+/// applies. Nothing here models that, and silently enforcing one anyway would be
+/// the opposite of what was asked for, so it is refused. `ENFORCED` is the
+/// default and is accepted as a no-op.
+fn reject_not_enforced(enforced: Option<bool>) -> Result<(), PgError> {
+    match enforced {
+        Some(false) => Err(PgError::feature_not_supported(
+            "not-enforced constraints are not supported yet",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Bind, name, and canonicalize a relation's `CHECK` clauses.
+///
+/// Must run against the relation's **final** column layout: the predicate is
+/// stored with `conkey` positions into it, and an expression bound against an
+/// earlier layout would silently read the wrong columns.
+///
+/// Naming follows PostgreSQL: an explicit `CONSTRAINT n` is taken verbatim and
+/// collides with 42710, while a generated one comes from [`check_name_base`] and
+/// is deduplicated by [`fresh_local_name`] into `base`, `base1`, `base2`… — so
+/// two checks on one column become `t_c_check` and `t_c_check1`. `claimed`
+/// carries the names already taken by NOT NULL and index-backed constraints, and
+/// grows as this runs.
+///
+/// The collision message is `CREATE TABLE`'s, which names no relation —
+/// PostgreSQL says `check constraint "dup" already exists` here and
+/// `constraint "dup" for relation "t" already exists` from `ALTER TABLE`, a
+/// distinction probed against 18.4.
+///
+/// The stored text is the deparsed form, not the source: `CHECK (x + y < 100)`
+/// becomes `((x + y) < 100)`, which is what `pg_get_expr(conbin, conrelid)`
+/// returns and what a later re-bind at DML time re-parses.
+/// Fold the `CHECK` constraints of a table's `INHERITS (...)` parents together
+/// with its own, the way [`merge_inherited_columns`] does for columns.
+///
+/// Inheritance here is a *copy*: the child gets its own entry for each of its
+/// parents' constraints, which is what makes enforcing the child's own list
+/// enforce its parents' too. Each parent's predicate is re-bound against the
+/// child's merged layout rather than copied with its positions, because the
+/// merge may have placed the same column elsewhere.
+///
+/// Merging is by **name**, and the rules were probed against PostgreSQL 18.4:
+///
+/// * two parents contributing the same name with different predicates is
+///   `42710 check constraint name "pc" appears multiple times but with
+///   different expressions`;
+/// * the child redeclaring a parent's constraint with the *same* predicate
+///   merges — `NOTICE: merging constraint "pc" with inherited definition`,
+///   leaving `conislocal = true` over the inherited `coninhcount`;
+/// * the child redeclaring it with a *different* predicate is
+///   `42710 constraint "pc" for relation "c" already exists`.
+///
+/// Notices go to the session sink rather than the return value, for the reason
+/// [`merge_inherited_columns`] spells out: PostgreSQL raises them even when the
+/// merge then fails.
+fn merge_inherited_checks(
+    parents: &[Arc<dyn TableAm>],
+    own: Vec<CheckConstraint>,
+    child: &TableSchema,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    notices: &SessionNotices,
+) -> Result<Vec<CheckConstraint>, PgError> {
+    let mut merged: Vec<CheckConstraint> = Vec::new();
+    for parent in parents {
+        let parent_schema = parent.schema();
+        for check in &parent_schema.checks {
+            // Re-bound, not copied: `conkey` has to index the child's layout,
+            // and this also proves every column the predicate reads survived the
+            // merge.
+            let columns = rebind_check_columns(&check.expr, child, type_catalog)?;
+            match merged.iter_mut().find(|c| c.name == check.name) {
+                Some(existing) if existing.expr == check.expr => existing.inhcount += 1,
+                Some(_) => {
+                    return Err(PgError::new(
+                        "42710",
+                        format!(
+                            "check constraint name \"{}\" appears multiple times but with different expressions",
+                            check.name
+                        ),
+                    ));
+                }
+                None => merged.push(CheckConstraint {
+                    name: check.name.clone(),
+                    expr: check.expr.clone(),
+                    columns,
+                    validated: check.validated,
+                    // Inherited, not declared here — until the child's own
+                    // clauses below say otherwise.
+                    islocal: false,
+                    inhcount: 1,
+                }),
+            }
+        }
+    }
+    for check in own {
+        match merged.iter_mut().find(|c| c.name == check.name) {
+            Some(existing) if existing.expr == check.expr => {
+                notices.push(Notice::notice(
+                    format!(
+                        "merging constraint \"{}\" with inherited definition",
+                        check.name
+                    ),
+                    None,
+                ));
+                existing.islocal = true;
+            }
+            Some(_) => {
+                return Err(PgError::new(
+                    "42710",
+                    format!(
+                        "constraint \"{}\" for relation \"{}\" already exists",
+                        check.name, child.name
+                    ),
+                ));
+            }
+            None => merged.push(check),
+        }
+    }
+    Ok(merged)
+}
+
+/// The generated-name stem for an unnamed `CHECK`.
+///
+/// PostgreSQL keys this on the *predicate*, not on where the clause was written:
+/// one referenced column gives `{table}_{column}_check` and anything else gives
+/// `{table}_check`. So the table-level `CHECK (y <> 0)` is named `t_y_check`
+/// exactly like the column-level spelling, while `CHECK (x + y < 100)` — two
+/// columns — is `t_check`. Probed against 18.4.
+fn check_name_base(schema: &TableSchema, columns: &[usize]) -> String {
+    match columns {
+        [only] => format!("{}_{}_check", schema.name, schema.columns[*only].name),
+        _ => format!("{}_check", schema.name),
+    }
+}
+
+/// The column positions a stored predicate reads when bound against `schema` —
+/// how an inherited constraint's `conkey` is recomputed for the child.
+fn rebind_check_columns(
+    expr: &str,
+    schema: &TableSchema,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<usize>, PgError> {
+    let parsed = crabgresql_binder::ruleutils::parse_expression(expr).ok_or_else(|| {
+        PgError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("stored check constraint \"{expr}\" is not a single expression"),
+        )
+    })?;
+    let (_, columns) = crabgresql_binder::bind_check_constraint(&parsed, schema, type_catalog)?;
+    Ok(columns)
+}
+
+fn resolve_checks(
+    pending: impl Iterator<Item = (Option<String>, ast::Expr)>,
+    schema: &TableSchema,
+    claimed: &mut HashSet<String>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<CheckConstraint>, PgError> {
+    let mut out = Vec::new();
+    for (explicit_name, expr) in pending {
+        let (_, columns) = crabgresql_binder::bind_check_constraint(&expr, schema, type_catalog)?;
+        let name = explicit_name
+            .unwrap_or_else(|| fresh_local_name(claimed, &check_name_base(schema, &columns)));
+        if !claimed.insert(name.clone()) {
+            return Err(PgError::new(
+                "42710",
+                format!("check constraint \"{name}\" already exists"),
+            ));
+        }
+        // Deparsing re-parses the source text rather than rendering the bound
+        // tree, the same split the DEFAULT path uses: the deparser has the
+        // precedence rules, and folding a constant here would rewrite the user's
+        // predicate. If it cannot re-parse its own input, keep the source.
+        let source = expr.to_string();
+        let text = crabgresql_binder::ruleutils::deparse_stored_expr(&source, type_catalog)
+            .unwrap_or(source);
+        out.push(CheckConstraint {
+            name,
+            expr: text,
+            columns,
+            // `NOT VALID` is rejected at parse-to-plan time, so everything that
+            // reaches here was validated by construction — the relation is empty
+            // at `CREATE TABLE`, and `ALTER TABLE ADD` scans before it lands.
+            validated: true,
+            islocal: true,
+            inhcount: 0,
+        });
+    }
+    Ok(out)
 }
 
 fn reject_deferred_characteristics(
@@ -5894,6 +6427,7 @@ fn execute_do(
     let exec_ctx = session.exec_context_for_statement(
         engine,
         &catalog_ops,
+        &type_catalog,
         Arc::clone(&routines),
         Arc::clone(&command_counter),
         read_only,
@@ -5957,6 +6491,7 @@ fn execute_call(
         ..session.exec_context_for_statement(
             engine,
             &catalog_ops,
+            &type_catalog,
             Arc::clone(&routines),
             Arc::clone(&command_counter),
             read_only,
