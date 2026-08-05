@@ -63,6 +63,13 @@ use crabgresql_types::{PgType, Value};
 
 use crate::{ExecContext, ExecError, agg, run_subplan};
 
+/// The outer row slots a memoizable subplan reads, with the type each is read
+/// as — the shape [`crabgresql_binder::plan_outer_ref_slots`] returns.
+type Slots = Arc<[(usize, PgType)]>;
+
+/// One memo bucket: the key values that hashed here, each with its answer.
+type MemoBucket = Vec<(Vec<Value>, Value)>;
+
 /// Everything the executor has learned about the subplans of one statement.
 ///
 /// Created by the top-level [`execute`](crate::execute) and shared, through
@@ -73,7 +80,35 @@ pub struct SubplanCache {
     /// `None` records a subplan the analysis rejected, so the analysis runs once
     /// per subplan rather than once per outer row.
     exists: Mutex<FxHashMap<SubplanId, Option<Arc<HashedExists>>>>,
+    /// The outer row slots each memoizable subplan reads, with their types;
+    /// `None` records a subplan that may not be memoized at all.
+    memo_slots: Mutex<FxHashMap<SubplanId, Option<Slots>>>,
+    /// Answers already computed. `Value` is neither `Eq` nor `Hash` — its
+    /// `PartialEq` is IEEE, so `NaN != NaN` — so the key values are hashed the
+    /// way the aggregates and the hash join hash a group key, and a bucket hit
+    /// is confirmed with `keys_equal` rather than `==`.
+    memo: Mutex<FxHashMap<(SubplanId, u64), MemoBucket>>,
+    /// Entries in `memo`, for the [`MEMO_CAPACITY`] check (which a `HashMap` of
+    /// buckets cannot answer with `len`).
+    memo_len: Mutex<usize>,
 }
+
+/// One outer row's identity for the memo: the subplan, the hash of the values it
+/// reads from that row, and those values.
+pub(crate) struct MemoKey {
+    id: SubplanId,
+    hash: u64,
+    tys: Slots,
+    values: Vec<Value>,
+}
+
+/// How many memoized answers one statement may accumulate.
+///
+/// The memo pays for itself only when outer rows repeat their key, and a query
+/// whose keys are all distinct would otherwise grow one entry per row for no
+/// hits at all. Past the cap the cache stops growing and keeps serving what it
+/// has, so the worst case is bounded memory and the existing per-row work.
+const MEMO_CAPACITY: usize = 1 << 16;
 
 /// The hashed inner side of one correlated `EXISTS`.
 pub(crate) struct HashedExists {
@@ -134,6 +169,82 @@ pub(crate) fn hashed_exists(
         .expect("subplan cache mutex")
         .insert(id, built.clone());
     Ok(built)
+}
+
+/// The memo key for `subplan` under this outer `row`, or `None` when this
+/// subplan may not be memoized.
+///
+/// Two outer rows agreeing on the slots the subplan reads run *the same plan*,
+/// so they must produce the same answer — that is the whole argument for the
+/// memo, and it is why the key is the values in those slots rather than the row.
+pub(crate) fn memo_key(subplan: &Subplan, row: &[Value], ctx: &ExecContext) -> Option<MemoKey> {
+    let (cache, id) = (ctx.subplans.as_ref()?, subplan.id()?);
+    let tys = match cache
+        .memo_slots
+        .lock()
+        .expect("subplan cache mutex")
+        .entry(id)
+    {
+        std::collections::hash_map::Entry::Occupied(hit) => hit.get().clone(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            // A volatile body must run as many times as it would have; a plan
+            // reading past the immediately enclosing row has no key at all.
+            let slots = (!crabgresql_binder::plan_contains_volatile_fn(&subplan.plan))
+                .then(|| crabgresql_binder::plan_outer_ref_slots(&subplan.plan))
+                .flatten()
+                .map(Arc::<[(usize, PgType)]>::from);
+            slot.insert(slots).clone()
+        }
+    }?;
+    let values: Vec<Value> = tys
+        .iter()
+        .map(|(slot, _)| row.get(*slot).cloned().unwrap_or(Value::Null))
+        .collect();
+    let hash = agg::hash_key(&key_tys(&tys), &values);
+    Some(MemoKey {
+        id,
+        hash,
+        tys,
+        values,
+    })
+}
+
+/// The answer already computed for this key, if any.
+pub(crate) fn memo_get(key: &MemoKey, ctx: &ExecContext) -> Option<Value> {
+    let tys = key_tys(&key.tys);
+    ctx.subplans
+        .as_ref()?
+        .memo
+        .lock()
+        .expect("subplan cache mutex")
+        .get(&(key.id, key.hash))?
+        .iter()
+        .find(|(values, _)| agg::keys_equal(&tys, values, &key.values))
+        .map(|(_, answer)| answer.clone())
+}
+
+/// Record an answer, unless the memo has already reached [`MEMO_CAPACITY`].
+pub(crate) fn memo_put(key: MemoKey, value: &Value, ctx: &ExecContext) {
+    let Some(cache) = ctx.subplans.as_ref() else {
+        return;
+    };
+    let mut len = cache.memo_len.lock().expect("subplan cache mutex");
+    if *len >= MEMO_CAPACITY {
+        return;
+    }
+    *len += 1;
+    cache
+        .memo
+        .lock()
+        .expect("subplan cache mutex")
+        .entry((key.id, key.hash))
+        .or_default()
+        .push((key.values, value.clone()));
+}
+
+/// Just the types out of a slot list, for the hashing helpers.
+fn key_tys(slots: &[(usize, PgType)]) -> Vec<PgType> {
+    slots.iter().map(|(_, ty)| *ty).collect()
 }
 
 /// A subplan rewritten for one hashed build: the plan to run, and the outer row

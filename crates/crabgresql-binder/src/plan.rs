@@ -1446,6 +1446,54 @@ fn plan_for_each_subexpr(plan: &LogicalPlan, depth: usize, f: &mut dyn FnMut(&Bo
     });
 }
 
+/// The slots of the *immediately enclosing* row that `plan` reads, with the type
+/// each is read as, deduplicated and in slot order — everything
+/// [`substitute_outer`] would fill in from that row.
+///
+/// `None` when the plan reads a row further out than the enclosing one, which
+/// [`substitute_outer`] leaves for a boundary above: the value then is not a
+/// function of the enclosing row alone, so nothing may be keyed on it.
+///
+/// The executor uses this to memoize a correlated subplan: two outer rows
+/// agreeing on these slots must produce the same answer, since the plan run for
+/// them is the same plan.
+pub fn plan_outer_ref_slots(plan: &LogicalPlan) -> Option<Vec<(usize, PgType)>> {
+    let mut slots = std::collections::BTreeMap::new();
+    let mut escapes_further = false;
+    plan_for_each_subexpr(plan, 1, &mut |expr, depth| {
+        if let BoundExpr::OuterColumnRef { level, index, ty } = expr {
+            if *level == depth {
+                slots.insert(*index, *ty);
+            } else if *level > depth {
+                escapes_further = true;
+            }
+        }
+    });
+    (!escapes_further).then(|| slots.into_iter().collect())
+}
+
+/// Whether `plan` calls a volatile function (or a routine, which PostgreSQL
+/// defaults to volatile) anywhere.
+///
+/// Running such a plan once and reusing the answer would change how many times
+/// it fires, which is observable — a sequence advances by a different amount, a
+/// routine's writes happen a different number of times.
+/// Unlike [`BoundExpr::contains_volatile_fn`], which stops at a subquery marker
+/// because a subquery's body is a plan of its own, this descends into those
+/// bodies: they all run under the plan being asked about.
+pub fn plan_contains_volatile_fn(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    // The node-level test, not the subtree one: the walk already reaches every
+    // descendant, and it crosses the subquery markers `contains_volatile_fn`
+    // stops at.
+    plan_for_each_subexpr(plan, 1, &mut |expr, _| {
+        if expr.is_volatile_call() {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Whether `expr` holds a subquery marker whose subplan is *correlated* — one
 /// the executor cannot fold to a constant before the scan starts.
 ///

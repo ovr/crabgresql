@@ -1278,26 +1278,45 @@ pub(crate) fn eval_correlated_subquery(
     {
         return Ok(Value::Bool(hashed.probe(row) != *negated));
     }
+    // Otherwise the subplan really is re-run — but only for an outer row that
+    // does not agree with an earlier one on every slot the subplan reads. A
+    // quantified marker is excluded: its needle is evaluated against the outer
+    // row *outside* the subplan, so the subplan's own slots do not determine the
+    // answer.
+    let memo = match marker {
+        BoundExpr::QuantifiedSubquery { .. } => None,
+        _ => subplan::memo_key(subplan, row, ctx),
+    };
+    if let Some(key) = &memo
+        && let Some(hit) = subplan::memo_get(key, ctx)
+    {
+        return Ok(hit);
+    }
+
     let mut logical = (*subplan.plan).clone();
     crabgresql_binder::substitute_outer(&mut logical, row);
-    match marker {
+    let value = match marker {
         BoundExpr::ScalarSubquery { ty, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
-            scalar_subquery_value(rows, *ty, ctx)
+            scalar_subquery_value(rows, *ty, ctx)?
         }
         BoundExpr::Exists { negated, .. } => {
             let exists = subplan_has_rows(logical, ctx, txn)?;
-            Ok(Value::Bool(exists != *negated))
+            Value::Bool(exists != *negated)
         }
         BoundExpr::QuantifiedSubquery { all, cmp, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
             // The template's needle reads the current row, so the quantifier is
             // evaluated against `row` (needle once, then each candidate).
-            eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)
+            eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)?
         }
         // Unreachable: `subplan` above already matched these three variants.
-        _ => Ok(Value::Null),
+        _ => Value::Null,
+    };
+    if let Some(key) = memo {
+        subplan::memo_put(key, &value, ctx);
     }
+    Ok(value)
 }
 
 /// Plan and execute a subplan, draining its result set into materialized rows.
@@ -7491,6 +7510,51 @@ mod tests {
             rows,
             vec![vec![Value::Int8(0)]],
             "o.v = 10 matches no inner key, and the NULL key is not one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memoized_scalar_subquery_answers_each_distinct_key_once() -> anyhow::Result<()> {
+        // Four outer rows over two distinct correlation keys: the second row of
+        // each key is answered from the memo, and must get its own key's answer
+        // rather than the previously computed one.
+        let engine = exists_engine(
+            &[(1, 0), (2, 0), (1, 0), (2, 0)],
+            &[(Some(1), 7), (Some(2), 9)],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT (SELECT i.v FROM i WHERE i.k = o.k) FROM o ORDER BY 1",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(7)],
+                vec![Value::Int4(7)],
+                vec![Value::Int4(9)],
+                vec![Value::Int4(9)],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memo_key_covers_every_outer_column_the_subplan_reads() -> anyhow::Result<()> {
+        // Two outer rows share `k` but differ in `v`, and the subplan reads
+        // both. Keying on only one of them would serve the first row's answer
+        // to the second.
+        let engine = exists_engine(&[(1, 7), (1, 9)], &[(Some(1), 7), (Some(1), 9)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT o.v, (SELECT count(*) FROM i WHERE i.k = o.k AND i.v = o.v) FROM o ORDER BY o.v",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(7), Value::Int8(1)],
+                vec![Value::Int4(9), Value::Int8(1)],
+            ]
         );
         Ok(())
     }
