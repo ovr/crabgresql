@@ -372,7 +372,7 @@ fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, Bi
         ));
     };
     Ok(Binding::Typed(BoundExpr::ScalarSubquery {
-        subplan: Subplan(Box::new(plan)),
+        subplan: Subplan::new(plan),
         ty: col.ty,
     }))
 }
@@ -384,7 +384,7 @@ fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, Bi
 fn bind_exists(query: &ast::Query, negated: bool, scope: &Scope) -> Result<Binding, BindError> {
     let (plan, _columns) = bind_subquery_plan(query, scope)?;
     Ok(Binding::Typed(BoundExpr::Exists {
-        subplan: Subplan(Box::new(crate::plan::strip_to_existence(plan))),
+        subplan: Subplan::new(crate::plan::strip_to_existence(plan)),
         negated,
     }))
 }
@@ -485,7 +485,7 @@ fn bind_quantified_subquery(
     let needle = bind_expr(left, scope)?;
     let cmp = bind_hole_template(op, needle, elem_ty, col.collation, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedSubquery {
-        subplan: Subplan(Box::new(plan)),
+        subplan: Subplan::new(plan),
         all,
         cmp: Box::new(cmp),
     }))

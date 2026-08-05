@@ -9,6 +9,18 @@ use crabgresql_types::{PgType, Value};
 
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn};
 
+/// Identity of one subplan *template*, handed out by [`Subplan::new`] and never
+/// reused.
+///
+/// A correlated subplan is cloned and re-substituted for every outer row, so the
+/// plan value itself cannot identify "the same subquery" across rows — but the id
+/// rides along through `Clone`, and so does. The executor keys its per-statement
+/// subplan cache on it: without a stable identity there is nothing to cache
+/// against, and pointer identity is not it, since the per-row clone is a fresh
+/// allocation whose address the allocator is free to hand out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubplanId(u64);
+
 /// A subquery's bound plan, embedded in a [`BoundExpr`]. Wrapped so `BoundExpr`
 /// keeps its `Debug`/`PartialEq` derives without imposing them on
 /// [`crate::LogicalPlan`], which holds trait objects (`Arc<dyn TableAm>`) that
@@ -16,7 +28,28 @@ use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn};
 /// equality is needed nowhere, and treating them as distinct keeps optimizations
 /// that dedup expressions (e.g. ORDER BY target reuse) conservatively correct.
 #[derive(Clone)]
-pub struct Subplan(pub Box<crate::logical_plan::LogicalPlan>);
+pub struct Subplan {
+    pub plan: Box<crate::logical_plan::LogicalPlan>,
+    /// See [`SubplanId`]. Deliberately copied by `Clone` rather than freshened:
+    /// every clone of a template *is* that template, differing only in the outer
+    /// values substituted into it.
+    pub id: SubplanId,
+}
+
+impl Subplan {
+    /// Wrap a bound plan, giving it a fresh [`SubplanId`].
+    ///
+    /// The counter is process-wide rather than per-statement because the binder
+    /// threads no such counter, and a monotone `u64` cannot run out: at one id
+    /// per nanosecond it lasts some 585 years.
+    pub fn new(plan: crate::logical_plan::LogicalPlan) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Subplan {
+            plan: Box::new(plan),
+            id: SubplanId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+}
 
 impl std::fmt::Debug for Subplan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -573,10 +606,10 @@ impl BoundExpr {
                 }) || else_.as_ref().is_some_and(|expr| expr.contains_routine())
             }
             BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-                crate::plan::plan_calls_routine(&subplan.0)
+                crate::plan::plan_calls_routine(&subplan.plan)
             }
             BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-                cmp.contains_routine() || crate::plan::plan_calls_routine(&subplan.0)
+                cmp.contains_routine() || crate::plan::plan_calls_routine(&subplan.plan)
             }
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_routine() || cmp.contains_routine()
@@ -1209,7 +1242,7 @@ mod collect_column_refs_tests {
 
     /// A trivially empty subplan, enough to build the marker variants.
     fn subplan() -> Subplan {
-        Subplan(Box::new(crate::logical_plan::LogicalPlan::Values(
+        Subplan::new(crate::logical_plan::LogicalPlan::Values(
             crate::logical_plan::ValuesPlan {
                 columns: Vec::new(),
                 rows: Vec::new(),
@@ -1217,7 +1250,7 @@ mod collect_column_refs_tests {
                 sort: Vec::new(),
                 distinct: None,
             },
-        )))
+        ))
     }
 
     #[test]
@@ -1235,7 +1268,7 @@ mod collect_column_refs_tests {
             }],
         };
         let marker = BoundExpr::Exists {
-            subplan: Subplan(Box::new(crate::logical_plan::LogicalPlan::Values(
+            subplan: Subplan::new(crate::logical_plan::LogicalPlan::Values(
                 crate::logical_plan::ValuesPlan {
                     columns: Vec::new(),
                     rows: vec![vec![nextval.clone()]],
@@ -1243,7 +1276,7 @@ mod collect_column_refs_tests {
                     sort: Vec::new(),
                     distinct: None,
                 },
-            ))),
+            )),
             negated: false,
         };
         assert!(nextval.is_volatile_call());
