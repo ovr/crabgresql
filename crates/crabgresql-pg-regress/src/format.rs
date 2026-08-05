@@ -192,9 +192,9 @@ pub fn format_notice(notice: &ErrorFields, query: &str) -> String {
 }
 
 /// Deterministic stand-in for psql metacommands, which the runner does not
-/// implement. `command` is the line's text after the backslash.
-pub fn metacommand_stub(command: &str) -> String {
-    let name = command.split_whitespace().next().unwrap_or("");
+/// implement. `name` is the command name the lexer sliced off, without the
+/// leading backslash.
+pub fn metacommand_stub(name: &str) -> String {
     format!("\\{name}: metacommand not supported by crabgresql regress runner\n")
 }
 
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn metacommand_stub_uses_command_name() {
         assert_eq!(
-            metacommand_stub("d crabs"),
+            metacommand_stub("d"),
             "\\d: metacommand not supported by crabgresql regress runner\n"
         );
     }

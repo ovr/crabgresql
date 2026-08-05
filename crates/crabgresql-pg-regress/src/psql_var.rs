@@ -298,12 +298,31 @@ pub struct MetaArgs {
 /// in `regproc.sql` hangs a comment off a `\set`).
 pub fn split_args(input: &str, vars: &Variables) -> MetaArgs {
     let chars: Vec<char> = input.chars().collect();
+    let (args, end) = scan_args(&chars, 0, vars);
+    MetaArgs {
+        args,
+        rest: chars[end..].iter().collect(),
+    }
+}
+
+/// Where a backslash command's argument list ends, without needing the variable
+/// store: the index of the unquoted `\` that begins the next command, or the end
+/// of `chars`. The lexer needs this to know how much of a line a metacommand
+/// covers before SQL scanning resumes, and it is exact by construction —
+/// [`scan_args`] advances by a reference's *length*, never by its value.
+pub fn arguments_extent(chars: &[char], start: usize) -> usize {
+    scan_args(chars, start, &Variables::new()).1
+}
+
+/// The shared scanner behind [`split_args`] and [`arguments_extent`]: returns the
+/// arguments and the index just past them.
+fn scan_args(chars: &[char], start: usize, vars: &Variables) -> (Vec<String>, usize) {
     let mut args = Vec::new();
     let mut current = String::new();
     // Distinguishes "no argument yet" from "an argument that is the empty
     // string", which `\set x ''` needs.
     let mut started = false;
-    let mut i = 0;
+    let mut i = start;
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' {
@@ -352,7 +371,7 @@ pub fn split_args(input: &str, vars: &Variables) -> MetaArgs {
             continue;
         }
         if c == ':'
-            && let Some((quoting, name, len)) = variable_at(&chars, i)
+            && let Some((quoting, name, len)) = variable_at(chars, i)
         {
             // An undefined variable stays verbatim, as in statement text.
             match vars.get(&name) {
@@ -368,10 +387,7 @@ pub fn split_args(input: &str, vars: &Variables) -> MetaArgs {
     if started {
         args.push(current);
     }
-    MetaArgs {
-        args,
-        rest: chars[i..].iter().collect(),
-    }
+    (args, i)
 }
 
 #[cfg(test)]
@@ -489,6 +505,28 @@ mod tests {
         );
         assert_eq!(parsed.args, ["VERBOSITY", "sqlstate"]);
         assert_eq!(parsed.rest, r"\\ -- encoding-dependent");
+    }
+
+    /// The lexer slices a metacommand's arguments with [`arguments_extent`] and
+    /// only later expands them with [`split_args`]; the two must agree on where
+    /// the list ends no matter what the variables hold.
+    #[test]
+    fn arguments_extent_matches_split_args() {
+        for input in [
+            "",
+            "   ",
+            "VERBOSITY sqlstate",
+            r"VERBOSITY sqlstate \\ -- note",
+            r"x 'it\'s' 'a\\b' \g",
+            r"false \\ (bogus \else",
+            "null '#null#'",
+            ":'a' :b::int",
+            "'unterminated",
+        ] {
+            let chars: Vec<char> = input.chars().collect();
+            let expected = input.len() - split_args(input, &vars(&[("a", "hi")])).rest.len();
+            assert_eq!(arguments_extent(&chars, 0), expected, "for {input:?}");
+        }
     }
 
     #[test]

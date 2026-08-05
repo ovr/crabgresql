@@ -15,7 +15,7 @@ use crate::client::{Client, Field, QueryEvent};
 use crate::describe;
 use crate::format;
 use crate::psql_var::{self, Variables};
-use crate::script::{ScriptItem, is_copy_from_stdin, lex};
+use crate::script::{QueryEnd, ScriptItem, is_copy_from_stdin, lex};
 
 pub struct SuiteConfig {
     /// Directory containing `sql/` and `expected/`.
@@ -220,7 +220,18 @@ async fn run_test(
     // A `COPY … FROM STDIN` statement is held here until its `CopyData` payload
     // arrives (the data lines are lexed after the statement), then run together.
     let mut pending_copy: Option<String> = None;
+    // psql's `previous_buf`: what a `\g`-family command on an empty buffer
+    // re-runs (`psql.out:4579`).
+    let mut last_query = String::new();
+    // psql's `query_buf`: the runner owns it, not the lexer, because text
+    // scanned inside an inactive `\if` branch has to be thrown away while the
+    // text around it survives.
+    let mut buffer = String::new();
+    let mut branches: Vec<Branch> = Vec::new();
     for item in lex(sql) {
+        // Every input line echoes regardless of branch state; only the work
+        // is skipped.
+        let active = branches_active(&branches);
         match item {
             // Echoed verbatim: `psql -a` prints the source line, so a variable
             // reference is visible unexpanded even though the statement sent to
@@ -229,12 +240,36 @@ async fn run_test(
                 out.push_str(&line);
                 out.push('\n');
             }
+            // Text scanned while an `\if` branch is inactive is discarded, as
+            // psql truncates its query buffer back to where the scan started.
+            ScriptItem::Sql(text) => {
+                if active {
+                    buffer.push_str(&text);
+                }
+            }
             // `\d <relation>` is the one metacommand that has to talk to the
             // server, so it is dispatched here rather than in the sync
             // `run_metacommand`. It declines far more often than it succeeds
             // (see `describe`), and a declined one falls through to the stub.
-            ScriptItem::Metacommand(command) => {
-                let described = match describe_pattern(&command) {
+            ScriptItem::Metacommand { name, args } => {
+                // The conditional commands are the only ones that run while a
+                // branch is inactive; everything else — including the
+                // "not supported" stub — stays silent (`psql.out:4680`).
+                if matches!(name.as_str(), "if" | "elif" | "else" | "endif") {
+                    let parsed = psql_var::split_args(&args, &vars);
+                    let args: Vec<&str> = parsed.args.iter().map(String::as_str).collect();
+                    run_conditional(&name, &args, &mut branches, &mut out);
+                    continue;
+                }
+                if !active {
+                    continue;
+                }
+                // `\quit` ends the script at once: psql stops reading, so not
+                // even the remaining lines are echoed (`json_encoding_2.out`).
+                if matches!(name.as_str(), "q" | "quit") {
+                    break;
+                }
+                let described = match describe_pattern(&name, &args) {
                     Some(pattern) => {
                         match describe::describe(&mut client, pattern, statement_timeout).await {
                             Ok(described) => described,
@@ -251,7 +286,8 @@ async fn run_test(
                 match described {
                     Some(text) => out.push_str(&text),
                     None => run_metacommand(
-                        &command,
+                        &name,
+                        &args,
                         environment,
                         &mut vars,
                         &mut null_display,
@@ -259,24 +295,102 @@ async fn run_test(
                     ),
                 }
             }
-            ScriptItem::Statement(statement) => {
-                let statement = psql_var::substitute(&statement, &vars);
-                // Defer a COPY FROM STDIN: it runs once its data is collected.
-                if is_copy_from_stdin(&statement) {
-                    pending_copy = Some(statement);
+            ScriptItem::Statement { end } => {
+                // psql resets the buffer whether or not it sent it, so an
+                // inactive branch's half-built statement does not leak forward.
+                let scanned = std::mem::take(&mut buffer);
+                if !active {
                     continue;
                 }
-                match tokio::time::timeout(statement_timeout, client.simple_query(&statement)).await
+                // `\gdesc` and `\crosstabview` re-render the result rather than
+                // just sending it; neither is implemented, so they stub and
+                // drop the buffer.
+                if let QueryEnd::Backslash { name, .. } = &end
+                    && !matches!(name.as_str(), "g" | "gset" | "gexec")
                 {
-                    Ok(Ok(events)) => render_events(&mut out, &events, &statement, &null_display),
-                    Ok(Err(_)) => {
-                        out.push_str("connection to server was lost\n");
-                        break;
+                    out.push_str(&format::metacommand_stub(name));
+                    continue;
+                }
+                // A `\g`-family command on an empty buffer re-runs the previous
+                // query (`psql.out:4579`); a bare `;` on an empty buffer does not.
+                let text = match (scanned.trim().is_empty(), &end) {
+                    (true, QueryEnd::Backslash { .. }) => last_query.clone(),
+                    (true, _) => continue,
+                    (false, _) => psql_var::substitute(&scanned, &vars),
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                last_query = text.clone();
+                // Defer a COPY FROM STDIN: it runs once its data is collected.
+                if is_copy_from_stdin(&text) {
+                    pending_copy = Some(text);
+                    continue;
+                }
+                let events =
+                    match tokio::time::timeout(statement_timeout, client.simple_query(&text)).await
+                    {
+                        Ok(Ok(events)) => events,
+                        Ok(Err(_)) => {
+                            out.push_str("connection to server was lost\n");
+                            break;
+                        }
+                        Err(_) => {
+                            out.push_str(
+                                "FATAL:  statement timeout in crabgresql regress runner\n",
+                            );
+                            break;
+                        }
+                    };
+                match &end {
+                    QueryEnd::Backslash { name, args } if name == "gset" => {
+                        let prefix = psql_var::split_args(args, &vars)
+                            .args
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        capture_gset(&mut out, &events, &text, &prefix, &mut vars);
                     }
-                    Err(_) => {
-                        out.push_str("FATAL:  statement timeout in crabgresql regress runner\n");
-                        break;
+                    // `\gexec` runs every cell of the result as a query, in
+                    // row-major order, echoing each before it runs.
+                    QueryEnd::Backslash { name, .. } if name == "gexec" => {
+                        // A failed generating query prints its error and
+                        // generates nothing.
+                        if events.iter().any(|e| matches!(e, QueryEvent::Error(_))) {
+                            render_events(&mut out, &events, &text, &null_display);
+                            continue;
+                        }
+                        let mut lost = None;
+                        for generated in gexec_queries(&events) {
+                            out.push_str(&generated);
+                            out.push('\n');
+                            match tokio::time::timeout(
+                                statement_timeout,
+                                client.simple_query(&generated),
+                            )
+                            .await
+                            {
+                                Ok(Ok(events)) => {
+                                    render_events(&mut out, &events, &generated, &null_display)
+                                }
+                                Ok(Err(_)) => {
+                                    lost = Some("connection to server was lost\n");
+                                    break;
+                                }
+                                Err(_) => {
+                                    lost = Some(
+                                        "FATAL:  statement timeout in crabgresql regress runner\n",
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(marker) = lost {
+                            out.push_str(marker);
+                            break;
+                        }
                     }
+                    _ => render_events(&mut out, &events, &text, &null_display),
                 }
             }
             ScriptItem::CopyData(data) => {
@@ -327,79 +441,248 @@ fn render_events(out: &mut String, events: &[QueryEvent], query: &str, null_disp
     }
 }
 
+/// One level of psql's `\if` stack.
+#[derive(Clone, Copy, PartialEq)]
+enum Branch {
+    /// The `\if` condition was true and we are in that arm.
+    IfTrue,
+    /// The `\if` condition was false; a later `\elif` may still fire.
+    IfFalse,
+    /// An arm already ran (or the whole block sits inside an inactive one), so
+    /// nothing further in this block runs and no condition is even evaluated.
+    Ignored,
+    ElseTrue,
+    ElseFalse,
+}
+
+/// Whether commands and query text at this point run or are thrown away.
+fn branches_active(branches: &[Branch]) -> bool {
+    branches
+        .last()
+        .is_none_or(|b| matches!(b, Branch::IfTrue | Branch::ElseTrue))
+}
+
+/// psql's `ParseVariableBool`: the six spellings, matched case-insensitively by
+/// unique prefix, plus the numeric forms. `None` is psql's parse failure.
+fn parse_bool(value: &str) -> Option<bool> {
+    let value = value.to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    for (word, result) in [
+        ("true", true),
+        ("false", false),
+        ("yes", true),
+        ("no", false),
+        ("on", true),
+        ("off", false),
+    ] {
+        // "o" is ambiguous between "on" and "off", so psql requires two
+        // characters there; every other word is unique at one.
+        let minimum = if word.starts_with('o') { 2 } else { 1 };
+        if value.len() >= minimum && word.starts_with(&value) {
+            return Some(result);
+        }
+    }
+    value.parse::<i64>().ok().map(|n| n != 0)
+}
+
+/// psql joins a conditional's arguments into one boolean expression; an
+/// unparsable one is reported and taken as false (`psql.out:4666`).
+fn evaluate_condition(args: &[&str], out: &mut String) -> bool {
+    let expression = args.join(" ");
+    parse_bool(&expression).unwrap_or_else(|| {
+        out.push_str(&format!(
+            "unrecognized value \"{expression}\" for \"\\if expression\": Boolean expected\n"
+        ));
+        false
+    })
+}
+
+/// Apply an `\if`-family command to the branch stack, appending whatever psql
+/// prints (nothing, except for the malformed-block errors).
+fn run_conditional(name: &str, args: &[&str], branches: &mut Vec<Branch>, out: &mut String) {
+    let active = branches_active(branches);
+    match name {
+        "if" => branches.push(if !active {
+            Branch::Ignored
+        } else if evaluate_condition(args, out) {
+            Branch::IfTrue
+        } else {
+            Branch::IfFalse
+        }),
+        "elif" => {
+            let next = match branches.last() {
+                None => return out.push_str("\\elif: no matching \\if\n"),
+                Some(Branch::ElseTrue | Branch::ElseFalse) => {
+                    return out.push_str("\\elif: cannot occur after \\else\n");
+                }
+                // An arm already ran, or the block is inside an inactive one:
+                // the condition is not even evaluated.
+                Some(Branch::IfTrue) => Branch::Ignored,
+                Some(Branch::Ignored) => Branch::Ignored,
+                Some(Branch::IfFalse) => {
+                    if evaluate_condition(args, out) {
+                        Branch::IfTrue
+                    } else {
+                        Branch::IfFalse
+                    }
+                }
+            };
+            *branches.last_mut().expect("checked above") = next;
+        }
+        "else" => {
+            let next = match branches.last() {
+                None => return out.push_str("\\else: no matching \\if\n"),
+                Some(Branch::ElseTrue | Branch::ElseFalse) => {
+                    return out.push_str("\\else: cannot occur after \\else\n");
+                }
+                Some(Branch::IfFalse) => Branch::ElseTrue,
+                Some(Branch::IfTrue | Branch::Ignored) => Branch::ElseFalse,
+            };
+            *branches.last_mut().expect("checked above") = next;
+        }
+        "endif" => {
+            if branches.pop().is_none() {
+                out.push_str("\\endif: no matching \\if\n");
+            }
+        }
+        _ => unreachable!("not an \\if-family command: {name}"),
+    }
+}
+
+/// A result set as `\gset` and `\gexec` consume it: column names and rows of
+/// already-rendered text.
+type ResultSet = (Vec<String>, Vec<Vec<Option<String>>>);
+
+/// The last result set in `events`. `\gset` and `\gexec` both act on it and
+/// both ignore everything a multi-statement query produced before it, as psql
+/// does.
+fn last_result(events: &[QueryEvent]) -> Option<ResultSet> {
+    let mut result: Option<ResultSet> = None;
+    for event in events {
+        match event {
+            QueryEvent::RowDescription(fields) => {
+                result = Some((fields.iter().map(|f| f.name.clone()).collect(), Vec::new()));
+            }
+            QueryEvent::Row(row) => {
+                if let Some((_, rows)) = result.as_mut() {
+                    rows.push(row.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// `\gset [prefix]`: bind the single result row's columns to psql variables.
+/// The wording of the two failure messages is psql's, verbatim and unprefixed
+/// (`psql.out:262`); a NULL column *unsets* its variable rather than emptying it.
+fn capture_gset(
+    out: &mut String,
+    events: &[QueryEvent],
+    query: &str,
+    prefix: &str,
+    vars: &mut Variables,
+) {
+    // An error means there is no result to bind; psql prints it and stops.
+    if events.iter().any(|e| matches!(e, QueryEvent::Error(_))) {
+        render_events(out, events, query, "");
+        return;
+    }
+    let Some((names, rows)) = last_result(events) else {
+        return;
+    };
+    match rows.len() {
+        1 => {}
+        0 => {
+            out.push_str("no rows returned for \\gset\n");
+            return;
+        }
+        _ => {
+            out.push_str("more than one row returned for \\gset\n");
+            return;
+        }
+    }
+    for (name, value) in names.iter().zip(&rows[0]) {
+        let name = format!("{prefix}{name}");
+        if !is_valid_variable_name(&name) {
+            out.push_str(&format!("invalid variable name: \"{name}\"\n"));
+            continue;
+        }
+        match value {
+            Some(value) => vars.set(&name, value.clone()),
+            None => vars.unset(&name),
+        }
+    }
+}
+
+/// psql's `VALID_VARIABLE_CHARS` applied to a whole name, which is what rejects
+/// a `\gset` target built from a column alias containing a space.
+fn is_valid_variable_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The queries `\gexec` generates: every non-NULL cell of the last result set,
+/// row-major.
+fn gexec_queries(events: &[QueryEvent]) -> Vec<String> {
+    let Some((_, rows)) = last_result(events) else {
+        return Vec::new();
+    };
+    rows.iter().flatten().flatten().cloned().collect()
+}
+
 /// The relation `\d <name>` describes, or `None` for any other metacommand —
 /// including `\d` with no argument (which lists relations), `\d+`, and a `\d`
-/// with several arguments or another command chained onto it.
-fn describe_pattern(command: &str) -> Option<&str> {
-    let (name, arguments) = split_command_name(command);
+/// with several arguments. The lexer has already stripped anything chained on
+/// after a `\`, so only the whitespace guard is left to enforce here.
+fn describe_pattern<'a>(name: &str, arguments: &'a str) -> Option<&'a str> {
+    let arguments = arguments.trim();
     if name != "d" || arguments.is_empty() {
         return None;
     }
-    (!arguments.contains(char::is_whitespace) && !arguments.contains('\\')).then_some(arguments)
+    (!arguments.contains(char::is_whitespace)).then_some(arguments)
 }
 
 /// Run one backslash command, appending whatever psql would print. The four
 /// implemented commands (`\set`, `\unset`, `\getenv`, `\pset null`) print
 /// nothing on success; everything else gets the "not supported" stub.
 ///
-/// A command may be followed by another on the same line, introduced by an
-/// unquoted `\` — the corpus uses `\\` purely to hang a trailing comment off a
-/// `\set` (`regproc.sql:108`). Chained commands are dispatched in turn, so the
-/// no-output `\\` stays silent instead of being mistaken for an argument.
+/// Chaining is the lexer's job: `\set x y \\ -- note` (`regproc.sql:108`)
+/// arrives here as a `\set` and then a separate, argument-less `\\`.
 fn run_metacommand(
-    command: &str,
+    name: &str,
+    arguments: &str,
     environment: &BTreeMap<String, String>,
     vars: &mut Variables,
     null_display: &mut String,
     out: &mut String,
 ) {
-    let mut command = command.to_string();
-    loop {
-        let (name, arguments) = split_command_name(&command);
-        // Arguments expand against the variables as they stand *before* this
-        // command runs, which is what makes `\set dobody :dobody '…'` append.
-        let parsed = psql_var::split_args(arguments, vars);
-        let args: Vec<&str> = parsed.args.iter().map(String::as_str).collect();
-        match (name, args.as_slice()) {
-            // `\set name [value …]` concatenates every value with no
-            // separator; with no value at all the variable becomes empty.
-            ("set", [variable, values @ ..]) => vars.set(variable, values.concat()),
-            ("unset", [variable, ..]) => vars.unset(variable),
-            // `\getenv name ENVVAR` leaves `name` unset when the environment
-            // has no such entry.
-            ("getenv", [variable, source, ..]) => match environment.get(*source) {
-                Some(value) => vars.set(variable, value.clone()),
-                None => vars.unset(variable),
-            },
-            ("pset", ["null", value, ..]) => *null_display = (*value).to_string(),
-            // `\pset null` with no value queries the setting, which is silent
-            // under `-q`.
-            ("pset", ["null"]) => {}
-            // `\\` ends the query buffer and swallows the rest of the line.
-            ("\\", _) => {}
-            _ => out.push_str(&format::metacommand_stub(&command)),
-        }
-        if parsed.rest.is_empty() {
-            return;
-        }
-        // Drop the `\` that introduced the next command.
-        command = parsed.rest[1..].to_string();
+    // Arguments expand against the variables as they stand *before* this
+    // command runs, which is what makes `\set dobody :dobody '…'` append.
+    let parsed = psql_var::split_args(arguments, vars);
+    let args: Vec<&str> = parsed.args.iter().map(String::as_str).collect();
+    match (name, args.as_slice()) {
+        // `\set name [value …]` concatenates every value with no
+        // separator; with no value at all the variable becomes empty.
+        ("set", [variable, values @ ..]) => vars.set(variable, values.concat()),
+        ("unset", [variable, ..]) => vars.unset(variable),
+        // `\getenv name ENVVAR` leaves `name` unset when the environment
+        // has no such entry.
+        ("getenv", [variable, source, ..]) => match environment.get(*source) {
+            Some(value) => vars.set(variable, value.clone()),
+            None => vars.unset(variable),
+        },
+        ("pset", ["null", value, ..]) => *null_display = (*value).to_string(),
+        // `\pset null` with no value queries the setting, which is silent
+        // under `-q`.
+        ("pset", ["null"]) => {}
+        // `\\` is a bare separator between commands: it does nothing and
+        // prints nothing.
+        ("\\", _) => {}
+        _ => out.push_str(&format::metacommand_stub(name)),
     }
-}
-
-/// Split `set VERBOSITY terse` into `("set", "VERBOSITY terse")`. psql ends a
-/// command name at the first character that cannot be part of one, so
-/// `\pset null` splits on the space while a lone `\\` yields the name `\`.
-fn split_command_name(command: &str) -> (&str, &str) {
-    let end = command
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '?' && c != '!')
-        .unwrap_or(command.len());
-    if end == 0 {
-        // A non-alphanumeric command is a single character, e.g. `\\` or `\.`.
-        return command.split_at(1.min(command.len()));
-    }
-    let (name, rest) = command.split_at(end);
-    (name, rest.trim_start())
 }
 
 #[cfg(test)]
@@ -414,8 +697,12 @@ mod tests {
         let mut null_display = String::new();
         let mut out = String::new();
         for command in commands {
+            let chars: Vec<char> = command.chars().collect();
+            let (name, name_end) = crate::script::command_name_at(&chars, 0);
+            let arguments: String = chars[name_end..].iter().collect();
             run_metacommand(
-                command,
+                &name,
+                &arguments,
                 &environment,
                 &mut vars,
                 &mut null_display,
@@ -449,12 +736,11 @@ mod tests {
     /// chained command — is left to the stub.
     #[test]
     fn only_a_plain_relation_name_is_described() {
-        assert_eq!(describe_pattern("d bit_defaults"), Some("bit_defaults"));
-        assert_eq!(describe_pattern("d"), None);
-        assert_eq!(describe_pattern("d+ t"), None);
-        assert_eq!(describe_pattern("dt"), None);
-        assert_eq!(describe_pattern("d a b"), None);
-        assert_eq!(describe_pattern(r"d t \\ trailing"), None);
+        assert_eq!(describe_pattern("d", " bit_defaults"), Some("bit_defaults"));
+        assert_eq!(describe_pattern("d", ""), None);
+        assert_eq!(describe_pattern("d+", " t"), None);
+        assert_eq!(describe_pattern("dt", ""), None);
+        assert_eq!(describe_pattern("d", " a b"), None);
     }
 
     #[test]
@@ -505,6 +791,155 @@ mod tests {
             vars.get("body"),
             Some("lo_export(loid, '/src/data/onek.data');")
         );
+    }
+
+    /// psql's `ParseVariableBool`, including the `o` prefix that is ambiguous
+    /// between `on` and `off`.
+    #[test]
+    fn boolean_spellings_match_psql() {
+        for value in ["true", "TRUE", "t", "yes", "Y", "on", "1", "42", "-1"] {
+            assert_eq!(parse_bool(value), Some(true), "for {value}");
+        }
+        for value in ["false", "f", "no", "off", "0"] {
+            assert_eq!(parse_bool(value), Some(false), "for {value}");
+        }
+        for value in ["", "o", "maybe", ":skip_test", "invalid boolean expression"] {
+            assert_eq!(parse_bool(value), None, "for {value}");
+        }
+    }
+
+    /// Drive a script's worth of `\if`-family commands, returning the printed
+    /// output and whether each step left the branch active.
+    fn run_conditionals(commands: &[&str]) -> (String, Vec<bool>) {
+        let mut branches = Vec::new();
+        let mut out = String::new();
+        let mut active = Vec::new();
+        for command in commands {
+            let mut words = command.split_whitespace();
+            let name = words.next().expect("a command name");
+            let args: Vec<&str> = words.collect();
+            run_conditional(name, &args, &mut branches, &mut out);
+            active.push(branches_active(&branches));
+        }
+        (out, active)
+    }
+
+    /// `psql.out:4655` — false, then a true `\elif`, then an `\else` that must
+    /// not fire because an arm already ran.
+    #[test]
+    fn false_then_true_elif_wins_and_else_is_skipped() {
+        let (out, active) = run_conditionals(&["if false", "elif true", "else", "endif"]);
+        assert_eq!(out, "");
+        assert_eq!(active, [false, true, false, true]);
+    }
+
+    /// An `\if` nested inside an inactive branch never evaluates its condition
+    /// and stays inactive through its own `\else` (`psql.out:4694`).
+    #[test]
+    fn nested_block_inside_a_false_branch_stays_inactive() {
+        let (out, active) =
+            run_conditionals(&["if false", "if true", "else", "endif", "else", "endif"]);
+        assert_eq!(out, "");
+        assert_eq!(active, [false, false, false, false, true, true]);
+    }
+
+    /// An unparsable expression is reported and taken as false, so the `\else`
+    /// arm runs (`psql.out:4666`).
+    #[test]
+    fn invalid_boolean_expression_is_reported_and_false() {
+        let (out, active) = run_conditionals(&["if invalid boolean expression", "else", "endif"]);
+        assert_eq!(
+            out,
+            "unrecognized value \"invalid boolean expression\" for \"\\if expression\": \
+             Boolean expected\n"
+        );
+        assert_eq!(active, [false, true, true]);
+    }
+
+    #[test]
+    fn unmatched_and_double_else_report_psqls_wording() {
+        let (out, _) = run_conditionals(&["endif", "else", "elif"]);
+        assert_eq!(
+            out,
+            "\\endif: no matching \\if\n\\else: no matching \\if\n\\elif: no matching \\if\n"
+        );
+
+        let (out, _) = run_conditionals(&["if true", "else", "else", "endif"]);
+        assert_eq!(out, "\\else: cannot occur after \\else\n");
+
+        let (out, _) = run_conditionals(&["if false", "else", "elif", "endif"]);
+        assert_eq!(out, "\\elif: cannot occur after \\else\n");
+    }
+
+    fn result_events(names: &[&str], rows: &[&[Option<&str>]]) -> Vec<QueryEvent> {
+        let mut events = vec![QueryEvent::RowDescription(
+            names
+                .iter()
+                .map(|name| Field {
+                    name: (*name).to_string(),
+                    type_oid: 25,
+                })
+                .collect(),
+        )];
+        for row in rows {
+            events.push(QueryEvent::Row(
+                row.iter().map(|v| v.map(str::to_string)).collect(),
+            ));
+        }
+        events.push(QueryEvent::CommandComplete("SELECT".to_string()));
+        events
+    }
+
+    #[track_caller]
+    fn gset(events: &[QueryEvent], prefix: &str) -> (String, Variables) {
+        let mut out = String::new();
+        let mut vars = Variables::new();
+        capture_gset(&mut out, events, "SELECT 1", prefix, &mut vars);
+        (out, vars)
+    }
+
+    #[test]
+    fn gset_binds_one_row_and_unsets_nulls() {
+        // psql.out:262 — a NULL column removes the variable rather than
+        // emptying it.
+        let events = result_events(&["var1", "var2", "var3"], &[&[Some("1"), None, Some("3")]]);
+        let (out, vars) = gset(&events, "");
+        assert_eq!(out, "");
+        assert_eq!(vars.get("var1"), Some("1"));
+        assert_eq!(vars.get("var2"), None);
+        assert_eq!(vars.get("var3"), Some("3"));
+
+        let (_, vars) = gset(&events, "pre_");
+        assert_eq!(vars.get("pre_var1"), Some("1"));
+    }
+
+    #[test]
+    fn gset_reports_the_wrong_row_count_verbatim() {
+        let (out, _) = gset(&result_events(&["a"], &[]), "");
+        assert_eq!(out, "no rows returned for \\gset\n");
+
+        let (out, _) = gset(&result_events(&["a"], &[&[Some("1")], &[Some("2")]]), "");
+        assert_eq!(out, "more than one row returned for \\gset\n");
+    }
+
+    #[test]
+    fn gset_rejects_a_column_that_is_not_a_variable_name() {
+        // psql.out:238 — `SELECT 1 AS "bad name" \gset`.
+        let (out, vars) = gset(&result_events(&["bad name"], &[&[Some("1")]]), "");
+        assert_eq!(out, "invalid variable name: \"bad name\"\n");
+        assert_eq!(vars.get("bad name"), None);
+    }
+
+    #[test]
+    fn gexec_generates_every_non_null_cell_row_major() {
+        let events = result_events(
+            &["a", "b"],
+            &[
+                &[Some("SELECT 1"), None],
+                &[Some("SELECT 2"), Some("SELECT 3")],
+            ],
+        );
+        assert_eq!(gexec_queries(&events), ["SELECT 1", "SELECT 2", "SELECT 3"]);
     }
 
     #[test]
