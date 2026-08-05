@@ -344,7 +344,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
 
         // ---- text → interval (interval_in) ----
         (Value::Text(s), PgType::Interval) => {
-            interval::parse(s)
+            interval::parse_with_style(s, interval::Unit::Second, fmt.interval_style)
                 .map(Value::Interval)
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,

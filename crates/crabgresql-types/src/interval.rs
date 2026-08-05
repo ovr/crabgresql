@@ -143,9 +143,10 @@ fn division_by_zero() -> IntervalError {
 /// The `IntervalStyle` GUC: which of the four renderings `interval_out`
 /// produces.
 ///
-/// Output only. PostgreSQL's `sql_standard` also changes *input* — it makes a
-/// leading minus propagate to the following unsigned fields — which we do not
-/// implement yet; see the note on [`parse_with_default`].
+/// It picks the *input* reading too: `sql_standard` makes a leading minus
+/// propagate to the following unsigned fields, which is what lets its own
+/// one-sign output read back as the value it was printed from. See
+/// [`parse_with_style`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IntervalStyle {
     /// `1 year 2 mons 3 days 04:05:06` — PostgreSQL's default.
@@ -1108,6 +1109,33 @@ pub enum Unit {
     Millennium,
 }
 
+impl Unit {
+    /// The wire encoding for a deferred `interval_in`: the binder cannot fold a
+    /// style-sensitive literal, so it emits a call carrying the text and the
+    /// leading-field default, and this is how the default travels.
+    pub fn as_code(self) -> i32 {
+        self as i32
+    }
+
+    pub fn from_code(code: i32) -> Option<Unit> {
+        Some(match code {
+            0 => Unit::Microsecond,
+            1 => Unit::Millisecond,
+            2 => Unit::Second,
+            3 => Unit::Minute,
+            4 => Unit::Hour,
+            5 => Unit::Day,
+            6 => Unit::Week,
+            7 => Unit::Month,
+            8 => Unit::Year,
+            9 => Unit::Decade,
+            10 => Unit::Century,
+            11 => Unit::Millennium,
+            _ => return None,
+        })
+    }
+}
+
 fn unit_from_word(word: &str) -> Option<Unit> {
     Some(match word {
         "microsecond" | "microseconds" | "us" | "usec" | "usecs" => Unit::Microsecond,
@@ -1128,9 +1156,44 @@ fn unit_from_word(word: &str) -> Option<Unit> {
     })
 }
 
-/// `interval_in` with `Second` as the default unit for bare numbers.
+/// `interval_in` with `Second` as the default unit for bare numbers, at the
+/// default `postgres` style.
 pub fn parse(input: &str) -> Result<Interval, IntervalError> {
-    parse_with_default(input, Unit::Second)
+    parse_with_style(input, Unit::Second, IntervalStyle::Postgres)
+}
+
+/// Whether `IntervalStyle` can change what this literal *means*.
+///
+/// Only `sql_standard` does, and only when a leading `-` has some later
+/// unsigned field to propagate to — so a single-field literal is never
+/// style-sensitive, because negating its positive fields is a no-op when it has
+/// only one and that one is already negative. Never true for an ISO-8601
+/// duration, which the rule does not reach. Unparseable text is `false`, so a
+/// syntax error is still reported from wherever it was reported before.
+///
+/// The binder uses this to decide whether a literal may still be folded at bind
+/// time; almost every one may.
+pub fn style_sensitive(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || is_iso8601(trimmed) {
+        return false;
+    }
+    match interval_fields(trimmed) {
+        Ok(fields) => leading_minus_propagates(&fields),
+        Err(()) => false,
+    }
+}
+
+/// PG's `sql_standard` sign rule, as a question about the scanned fields: the
+/// first field carries a `-` and no later one carries a sign of its own.
+///
+/// All-or-nothing, and any later sign — `+` as much as `-` — turns it off for
+/// the whole literal, which is what keeps a fully-signed rendering (the shape
+/// `postgres` style emits) reading back unchanged.
+fn leading_minus_propagates(fields: &[Field<'_>]) -> bool {
+    fields.len() >= 2
+        && fields[0].text.starts_with('-')
+        && !fields[1..].iter().any(|f| f.text.starts_with(['+', '-']))
 }
 
 /// What a scanned field is, which its text alone cannot always say.
@@ -1348,23 +1411,36 @@ enum Piece {
 /// `'1:30 days 5 days'` is five days past one — the discarded word claims no
 /// field. Exactly one may be absorbed, and a number in between cancels the
 /// opportunity, which is what rejects `'1:30 days days'` and `'5 days days'`.
-fn decode_fields(fields: &[Field<'_>], input: &str) -> Result<Vec<Piece>, IntervalError> {
+fn decode_fields(
+    fields: &[Field<'_>],
+    force_negative: bool,
+    input: &str,
+) -> Result<Vec<Piece>, IntervalError> {
+    // `sql_standard`'s leading minus reaches each field's *decoded value*, not
+    // the accumulated total: `'-1.5 days 2 hours'` is `-1 14:00:00`, where
+    // negating the sum would give `-1 -10:00:00`.
+    let signed = |v: i128| if force_negative && v > 0 { -v } else { v };
     let mut out: Vec<Piece> = Vec::with_capacity(fields.len());
     let mut absorb = false;
     for field in fields {
         let tok: &str = &field.text;
         match field.kind {
             FieldKind::Time => {
-                out.push(Piece::Time(parse_time_token(tok, input)?));
+                let usec = parse_time_token(tok, input)?;
+                out.push(Piece::Time(if force_negative && usec > 0 {
+                    -usec
+                } else {
+                    usec
+                }));
                 absorb = true;
             }
             // The only legal `Date` field is the SQL-standard `Y-M` year-month.
             // Everything else the scanner marked — `'1/5'`, `'1-2-3'`,
             // `'1.days'`, `'day/2'` — reaches here to be rejected.
             FieldKind::Date => {
-                out.push(Piece::YearMonth(
+                out.push(Piece::YearMonth(signed(
                     try_year_month(tok).ok_or_else(|| invalid_syntax(input))?,
-                ));
+                )));
                 absorb = true;
             }
             FieldKind::Plain => {
@@ -1375,14 +1451,14 @@ fn decode_fields(fields: &[Field<'_>], input: &str) -> Result<Vec<Piece>, Interv
                     (false, false) => {
                         let unit = unit_from_word(word).ok_or_else(|| invalid_syntax(input))?;
                         out.push(Piece::Value {
-                            n: parse_number(num, input)?,
+                            n: signed_number(parse_number(num, input)?, force_negative),
                             unit: Some(unit),
                         });
                         absorb = false;
                     }
                     (false, true) => {
                         out.push(Piece::Value {
-                            n: parse_number(num, input)?,
+                            n: signed_number(parse_number(num, input)?, force_negative),
                             unit: None,
                         });
                         absorb = false;
@@ -1403,6 +1479,17 @@ fn decode_fields(fields: &[Field<'_>], input: &str) -> Result<Vec<Piece>, Interv
         }
     }
     Ok(out)
+}
+
+/// A decoded `(whole, frac)` number under the `sql_standard` sign rule: negated
+/// when it is positive, left alone when it already carries a sign.
+fn signed_number(n: (i128, f64), force_negative: bool) -> (i128, f64) {
+    let (whole, frac) = n;
+    if force_negative && (whole > 0 || (whole == 0 && frac > 0.0)) {
+        (-whole, -frac)
+    } else {
+        n
+    }
 }
 
 /// Assign a unit to every number that still lacks one, and fold the whole list
@@ -1468,15 +1555,24 @@ fn infinity_sign(field: &str) -> Option<i32> {
 }
 
 /// `interval_in`, using `default` as the unit for a bare number that carries no
-/// unit of its own (the SQL-standard `INTERVAL '1' DAY` leading-field form).
-///
-/// Divergence: PostgreSQL's `IntervalStyle = sql_standard` also changes what a
-/// literal *means* — a leading minus propagates to every following unsigned
-/// field, so `'-1 year 2 months'` is `-1-2` under that style and `-10 mons`
-/// under the others. We always parse the way `postgres` style does. Fixing it
-/// means threading the style down here, and it changes the meaning of literals
-/// that already work, so it is deliberately a separate change.
+/// unit of its own (the SQL-standard `INTERVAL '1' DAY` leading-field form), at
+/// the default `postgres` style.
 pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, IntervalError> {
+    parse_with_style(input, default, IntervalStyle::Postgres)
+}
+
+/// `interval_in` under a session `IntervalStyle`.
+///
+/// Only `sql_standard` reads differently: a leading minus propagates to every
+/// later unsigned field, so `'-1 year 2 months'` is fourteen months under that
+/// style and ten under the others. It is what makes PG's own `sql_standard`
+/// output — which prints one sign for the whole value — read back as the value
+/// it was printed from.
+pub fn parse_with_style(
+    input: &str,
+    default: Unit,
+    style: IntervalStyle,
+) -> Result<Interval, IntervalError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(invalid_syntax(input));
@@ -1492,6 +1588,10 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
     }
 
     let fields = interval_fields(trimmed).map_err(|()| invalid_syntax(input))?;
+    // Computed on the whole field list, `ago` included — it carries no sign, so
+    // where it sits cannot change the answer, and PG asks the same question of
+    // the same array.
+    let force_negative = style == IntervalStyle::SqlStandard && leading_minus_propagates(&fields);
     // Nothing but separators — `'@'`, `'@@@'`.
     let Some((last, rest)) = fields.split_last() else {
         return Err(invalid_syntax(input));
@@ -1518,7 +1618,12 @@ pub fn parse_with_default(input: &str, default: Unit) -> Result<Interval, Interv
         return Err(invalid_syntax(input));
     }
 
-    combine(&decode_fields(fields, input)?, default, &mut acc, input)?;
+    combine(
+        &decode_fields(fields, force_negative, input)?,
+        default,
+        &mut acc,
+        input,
+    )?;
 
     if ago {
         acc.negate();
@@ -2829,6 +2934,87 @@ mod tests {
         }
         for input in ["1:30 days days", "5 days days", "days 5", "5 hours days"] {
             rejects(input);
+        }
+    }
+
+    /// Under `sql_standard` a leading minus propagates to every later unsigned
+    /// field — all-or-nothing, and any later sign of its own turns it off for
+    /// the whole literal. It does not reach the ISO-8601 form, and `ago`
+    /// composes after it. Read off PostgreSQL 18.4.
+    #[test]
+    fn sql_standard_input_propagates_a_leading_minus() {
+        let sql =
+            |input: &str| match parse_with_style(input, Unit::Second, IntervalStyle::SqlStandard) {
+                Ok(v) => format(v),
+                Err(e) => panic!("{input:?}: {e:?}"),
+            };
+        for (input, pg_style, sql_style) in [
+            ("-1 2:03:04", "-1 days +02:03:04", "-1 days -02:03:04"),
+            // The discriminator for per-field rather than per-total negation:
+            // negating the sum would give `-1 days -10:00:00`.
+            (
+                "-1.5 days 2 hours",
+                "-1 days -10:00:00",
+                "-1 days -14:00:00",
+            ),
+            ("-1 year 2 months", "-10 mons", "-1 years -2 mons"),
+            ("-0 2:00", "02:00:00", "-02:00:00"),
+            ("-1:30 2 days", "2 days -01:30:00", "-2 days -01:30:00"),
+            ("- 1 day 2 hours", "-1 days +02:00:00", "-1 days -02:00:00"),
+            ("@ -1 day 2 hours", "-1 days +02:00:00", "-1 days -02:00:00"),
+            // `ago` negates the whole span afterwards.
+            ("-1 day 2 hours ago", "1 day -02:00:00", "1 day 02:00:00"),
+            // A later sign of its own — `+` as much as `-` — turns it off.
+            ("1 day -2 hours", "1 day -02:00:00", "1 day -02:00:00"),
+            ("-1 day +2 hours", "-1 days +02:00:00", "-1 days +02:00:00"),
+            // A single field has nothing to propagate to.
+            ("-1", "-00:00:01", "-00:00:01"),
+            ("-2 hours", "-02:00:00", "-02:00:00"),
+            ("-1-2", "-1 years -2 mons", "-1 years -2 mons"),
+            // The ISO-8601 form is exempt.
+            ("P-1Y2M", "-10 mons", "-10 mons"),
+        ] {
+            assert_eq!(out(input), pg_style, "postgres: {input}");
+            assert_eq!(sql(input), sql_style, "sql_standard: {input}");
+        }
+    }
+
+    /// The predicate the binder folds on. It must be conservative: a `false`
+    /// that should be `true` silently reads a literal under the wrong style,
+    /// and a `true` that should be `false` only costs a deferred fold.
+    #[test]
+    fn style_sensitive_is_conservative() {
+        for input in [
+            "-1 2:03:04",
+            "-1 year 2 months",
+            "- 1 day 2 hours",
+            "@ -1 day 2 hours",
+            "-1 day 2 hours ago",
+            // Over-reported: the unit word is a second *field*, but it decodes
+            // into the number before it, so there is nothing for the sign to
+            // propagate to. Erring this way only costs a deferred fold.
+            "-2 hours",
+        ] {
+            assert!(style_sensitive(input), "input {input}");
+        }
+        for input in [
+            // one field has nothing to propagate to
+            "-1",
+            "-1-2",
+            "-infinity",
+            // a later sign turns the rule off
+            "1 day -2 hours",
+            "-1 day +2 hours",
+            // no leading minus at all
+            "1 day 2 hours",
+            "2 days ago",
+            // ISO-8601 is exempt, and garbage keeps its diagnostic where it was
+            "P-1Y2M",
+            "garbage",
+            "1 day/2 hours",
+            "",
+        ] {
+            assert!(!style_sensitive(input), "input {input}");
         }
     }
 

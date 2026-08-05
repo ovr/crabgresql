@@ -850,6 +850,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 other => unreachable!("expected an interval arg, got {other:?}"),
             };
         }
+        // A literal the binder could not fold, because `sql_standard` reads a
+        // leading minus as propagating to the later fields and only the session
+        // knows the style.
+        ScalarFn::IntervalIn => {
+            let unit = interval::Unit::from_code(i4(&args[1]))
+                .unwrap_or_else(|| unreachable!("the binder emits a real unit code"));
+            return interval::parse_with_style(text(&args[0]), unit, fmt.interval_style)
+                .map(Value::Interval)
+                .map_err(iv_err);
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {

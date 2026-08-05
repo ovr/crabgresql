@@ -174,6 +174,11 @@ pub enum ScalarFn {
     AgeToday,
     /// `age(timestamptz) -> interval` = `age(current_date::timestamptz, $1)`.
     AgeTodayTz,
+    /// `interval_in(text, int4)`: parse an interval literal at execution time,
+    /// under the session's `IntervalStyle`, with the second argument carrying
+    /// the leading-field default unit. Only reached for a literal whose meaning
+    /// the style can change (see `interval::style_sensitive`).
+    IntervalIn,
     /// `age(xid) -> int4`: how many transactions have started since `xid`.
     /// Reads the live transaction counter, so it is dispatched from `eval.rs`
     /// rather than from the pure `eval_scalar`.

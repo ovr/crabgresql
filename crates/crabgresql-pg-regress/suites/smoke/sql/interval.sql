@@ -245,6 +245,22 @@ SET IntervalStyle TO sql_standard;
 SELECT id, span FROM iv_styles ORDER BY id;
 SET IntervalStyle TO iso_8601;
 SELECT id, span FROM iv_styles ORDER BY id;
+-- sql_standard also picks the *input* reading: a leading minus propagates to
+-- every later unsigned field, all-or-nothing, and any later sign of its own
+-- turns it off. That is what makes its one-sign output read back unchanged.
+SET IntervalStyle TO sql_standard;
+SELECT interval '-1 2:03:04' AS forced, interval '-1.5 days 2 hours' AS forced_frac,
+       interval '1 day -2 hours' AS not_forced, interval '-1 day +2 hours' AS not_forced2;
+SELECT interval '-1 day 2 hours ago' AS ago_composes, interval 'P-1Y2M' AS iso_exempt,
+       interval '-2 hours' AS single_field;
+SELECT '-1 day 2 hours'::interval AS via_cast;
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+SELECT ('-1 days -2:03:04'::interval)::text::interval = '-1 days -2:03:04'::interval AS round_trips;
+-- the same literals under the default style, side by side
+SET IntervalStyle TO postgres;
+SELECT interval '-1 2:03:04' AS not_forced, interval '-1.5 days 2 hours' AS not_forced_frac;
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+SET IntervalStyle TO iso_8601;
 -- the name is case-insensitive, and nothing more: padding is part of the value.
 -- An unrecognized one is 22023 with a HINT listing the four.
 SET IntervalStyle TO 'POSTGRES';
