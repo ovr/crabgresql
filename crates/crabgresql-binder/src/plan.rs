@@ -1516,10 +1516,29 @@ pub fn expr_contains_correlated_subquery(expr: &BoundExpr) -> bool {
 /// bodies: they all run under the plan being asked about.
 pub fn plan_contains_volatile_fn(plan: &LogicalPlan) -> bool {
     let mut found = false;
+    // The node-level test, not the subtree one: the walk already reaches every
+    // descendant, and it crosses the subquery markers `contains_volatile_fn`
+    // stops at.
     plan_for_each_subexpr(plan, 1, &mut |expr, _| {
-        // Asked of every node rather than only the root: `contains_volatile_fn`
-        // does not cross a subquery marker, and the walk does.
-        if expr.contains_volatile_fn() {
+        if expr.is_volatile_call() {
+            found = true;
+        }
+    });
+    found
+}
+
+/// [`plan_contains_volatile_fn`] for an expression rather than a plan.
+///
+/// Unlike [`BoundExpr::contains_volatile_fn`] this descends into the body of a
+/// subquery marker. That matters wherever the decision being made is about the
+/// marker itself: a conjunct holding `EXISTS (SELECT … nextval('s') …)` is
+/// volatile in every sense that counts, since moving it changes how many rows
+/// reach it and so how many times the sequence advances — but the shallow
+/// predicate reports `false`, because a subquery's body is a plan of its own.
+pub fn expr_contains_volatile_fn(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    for_each_subexpr(expr, 1, &mut |expr, _| {
+        if expr.is_volatile_call() {
             found = true;
         }
     });

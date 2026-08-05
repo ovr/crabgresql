@@ -37,6 +37,12 @@
 //! speed-up. That is the same reason [`pushdown::is_relocatable`] refuses to sink
 //! a volatile conjunct.
 //!
+//! The test has to be the *deep* one. `BoundExpr::contains_volatile_fn` stops at
+//! a subquery marker, which is exactly the kind of conjunct this pass moves — so
+//! asking it would leave the guarantee above unmet for
+//! `(SELECT nextval('s') FROM u WHERE u.k = t.k) > 0`, where the volatility is
+//! one level down.
+//!
 //! [`pushdown::is_relocatable`]: crate::pushdown::is_relocatable
 
 use crabgresql_binder::BoundExpr;
@@ -140,7 +146,9 @@ fn reorder(predicate: &mut Option<BoundExpr>) {
     // move at all (see the module comment).
     let movable = conjuncts.len() > 1
         && conjuncts.iter().any(is_expensive)
-        && !conjuncts.iter().any(BoundExpr::contains_volatile_fn);
+        && !conjuncts
+            .iter()
+            .any(crabgresql_binder::expr_contains_volatile_fn);
     if movable {
         // `sort_by_key` is stable, so conjuncts within each class keep their
         // written order relative to one another.
@@ -204,6 +212,20 @@ mod tests {
         assert!(!quals[0].contains_subquery());
         assert!(!quals[1].contains_subquery());
         assert!(matches!(quals[2], BoundExpr::Exists { .. }));
+    }
+
+    #[test]
+    fn volatility_inside_a_subquery_body_freezes_the_filter_too() {
+        // The volatility lives one level down, where
+        // `BoundExpr::contains_volatile_fn` does not look — and it is the very
+        // conjunct the pass would move, so asking the shallow predicate would
+        // let `nextval` fire on a different number of rows.
+        let quals = quals(plan_sql(
+            "SELECT * FROM t WHERE (SELECT nextval('s') FROM t c WHERE c.id = t.id) > 0 \
+             AND t.id = 1",
+        ));
+        assert_eq!(quals.len(), 2);
+        assert!(quals[0].contains_subquery(), "nothing moved");
     }
 
     #[test]

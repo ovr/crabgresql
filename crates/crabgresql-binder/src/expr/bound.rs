@@ -808,6 +808,30 @@ impl BoundExpr {
         }
     }
 
+    /// Whether **this node alone** is a volatile call, ignoring its arguments.
+    ///
+    /// The list of volatile scalar functions lives here and only here, so a walk
+    /// that visits every node (see [`crate::plan_contains_volatile_fn`]) and the
+    /// subtree predicate below cannot drift apart. A routine's body is opaque
+    /// and PostgreSQL defaults a routine to VOLATILE, so every call counts.
+    pub fn is_volatile_call(&self) -> bool {
+        match self {
+            BoundExpr::FuncCall { func, .. } => matches!(
+                func,
+                ScalarFn::Nextval
+                    | ScalarFn::Currval
+                    | ScalarFn::Setval
+                    | ScalarFn::Lastval
+                    | ScalarFn::ClockTimestamp
+                    | ScalarFn::GenRandomUuid
+                    | ScalarFn::UuidV7
+                    | ScalarFn::UuidV7Shift
+            ),
+            BoundExpr::Routine { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Whether this expression contains a volatile function call. The volatile
     /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
     /// side effects, `currval`/`lastval` read mutable session state),
@@ -825,23 +849,16 @@ impl BoundExpr {
     /// marks them `STABLE`, and they are. Calling them volatile would cost a
     /// real optimization — `WHERE ts > now() - interval '1 day'` could no
     /// longer be pushed to a leaf — for no change in the answer.
+    ///
+    /// Note this stops at a subquery marker: a subquery's body is a plan of its
+    /// own. A caller that needs to see inside one wants
+    /// [`crate::plan_contains_volatile_fn`] or
+    /// [`crate::expr_contains_volatile_fn`].
     pub fn contains_volatile_fn(&self) -> bool {
         match self {
-            BoundExpr::FuncCall { func, args, .. } => {
-                matches!(
-                    func,
-                    ScalarFn::Nextval
-                        | ScalarFn::Currval
-                        | ScalarFn::Setval
-                        | ScalarFn::Lastval
-                        | ScalarFn::ClockTimestamp
-                        | ScalarFn::GenRandomUuid
-                        | ScalarFn::UuidV7
-                        | ScalarFn::UuidV7Shift
-                ) || args.iter().any(BoundExpr::contains_volatile_fn)
+            BoundExpr::FuncCall { args, .. } => {
+                self.is_volatile_call() || args.iter().any(BoundExpr::contains_volatile_fn)
             }
-            // A routine's body is opaque here and PostgreSQL defaults a
-            // routine to VOLATILE, so treat every call as volatile.
             BoundExpr::Routine { .. } => true,
             BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
             BoundExpr::WindowFunc { kind, spec, .. } => {
