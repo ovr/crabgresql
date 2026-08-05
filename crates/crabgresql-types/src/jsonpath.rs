@@ -2763,18 +2763,16 @@ mod tests {
         );
     }
 
-    /// `match_predicate` for a path/target pair, lifted into `anyhow`.
-    fn mp(path: &str, target: &str) -> Result<Option<bool>> {
-        match_predicate(&parse(path)?, &jb(target), None, false)
-            .map_err(|e| anyhow!("match_predicate failed: {}", e.message))
+    fn mp(target: &str, path: &str) -> Result<Option<bool>> {
+        Ok(match_predicate(&parse(path)?, &jb(target), None, false)?)
     }
 
     #[test]
     fn predicates_and_matching() -> Result<()> {
-        assert_eq!(mp("$.a == 1", "{\"a\":1}")?, Some(true));
-        assert_eq!(mp("$.a == 2", "{\"a\":1}")?, Some(false));
+        assert_eq!(mp("{\"a\":1}", "$.a == 1")?, Some(true));
+        assert_eq!(mp("{\"a\":1}", "$.a == 2")?, Some(false));
         // Type-mismatch comparison → Unknown → SQL NULL.
-        assert_eq!(mp("$.a > 1", "{\"a\":\"x\"}")?, None);
+        assert_eq!(mp("{\"a\":\"x\"}", "$.a > 1")?, None);
         // Predicate query yields one boolean item.
         assert_eq!(q("{\"a\":1}", "$.a > 0")?, vec!["true"]);
         assert_eq!(q("{\"a\":\"x\"}", "$.a > 1")?, vec!["null"]);
@@ -2798,8 +2796,7 @@ mod tests {
             .expect_err("strict member-not-found must error");
         assert_eq!(e.message, "JSON object does not contain key \"b\"");
         // silent suppresses it.
-        let silent = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true)
-            .map_err(|e| anyhow!("silent query failed: {}", e.message))?;
+        let silent = query(&parse("strict $.b")?, &jb("{\"a\":1}"), None, true)?;
         assert!(silent.is_empty());
         // out-of-range subscript: strict errors, lax skips.
         assert_eq!(

@@ -134,8 +134,6 @@ pub fn flip_byte(path: &Path, offset: u64) -> std::io::Result<()> {
 /// below a redo point proves recovery never read it. If it does read one byte
 /// below, the first `decode` fails, the log reads as empty, and everything below
 /// the redo point vanishes — so such a test cannot pass by accident.
-///
-/// Returns `Result` and is propagated with `?` per AGENTS.md.
 pub fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().write(true).open(path)?;

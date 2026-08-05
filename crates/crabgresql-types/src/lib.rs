@@ -1531,6 +1531,7 @@ impl_message_error!(
     date::DateError,
     float::FloatParseError,
     float::FloatError,
+    formatting::FormatError,
     geo::GeoError,
     interval::IntervalError,
     json::JsonError,

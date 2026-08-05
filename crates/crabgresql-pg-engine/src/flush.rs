@@ -505,13 +505,23 @@ mod tests {
         // promptly, and clearing it must wake the waiter.
         engine.buffer_pressure().set(true);
         let waiter = Arc::clone(&engine);
-        // Time the wait from this thread. The spawned thread cannot: its clock
-        // starts whenever the OS gets around to running it, which may be after
-        // the sleep below has already begun, so its own elapsed can come in
-        // just under the sleep even though it waited the whole time.
-        let started = Instant::now();
-        let released = std::thread::spawn(move || waiter.await_write_capacity());
+        let (running, started_waiting) = std::sync::mpsc::channel();
+        let released = std::thread::spawn(move || {
+            // Signalled from inside the thread, immediately before blocking, so
+            // that "still unfinished" below cannot instead mean "never
+            // scheduled". Nothing clears the flag until after the sleep, so the
+            // few instructions between this and the wait cannot lose a wakeup.
+            running
+                .send(())
+                .expect("the main thread is waiting on this");
+            waiter.await_write_capacity();
+        });
+        started_waiting.recv_timeout(Duration::from_secs(5))?;
 
+        // Both ends of every interval below come from this one clock: an elapsed
+        // time measured across two threads' clocks can come in under the sleep
+        // it in fact outlasted.
+        let started = Instant::now();
         // Long enough to distinguish "waited" from "returned immediately", short
         // enough not to slow the suite.
         std::thread::sleep(Duration::from_millis(200));
@@ -523,10 +533,9 @@ mod tests {
 
         released
             .join()
-            .unwrap_or_else(|_| panic!("waiter panicked"));
-        let waited = started.elapsed();
+            .map_err(|_| anyhow::anyhow!("waiter panicked"))?;
         assert!(
-            waited < WRITE_CAPACITY_TIMEOUT,
+            started.elapsed() < WRITE_CAPACITY_TIMEOUT,
             "the writer rode out the timeout instead of being woken"
         );
         Ok(())

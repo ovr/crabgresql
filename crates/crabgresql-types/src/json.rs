@@ -1204,7 +1204,7 @@ mod tests {
             Some("\\u0000 cannot be converted to text.")
         );
         // `json` preserves the raw text verbatim.
-        let raw = json_in("\"\\u0000\"").map_err(|e| anyhow!("json_in failed: {}", e.message))?;
+        let raw = json_in("\"\\u0000\"")?;
         assert_eq!(raw, "\"\\u0000\"");
         Ok(())
     }
