@@ -177,6 +177,13 @@ pub(crate) fn hashed_exists(
 /// Two outer rows agreeing on the slots the subplan reads run *the same plan*,
 /// so they must produce the same answer — that is the whole argument for the
 /// memo, and it is why the key is the values in those slots rather than the row.
+///
+/// A key type must hash distinctly, for a harder reason than the hash join's:
+/// `agg::hash_key` contributes nothing for the types outside that set, so every
+/// key would share one bucket and be resolved by `agg::keys_equal` — and
+/// `compare_values` has no arm at all for the geometric and json types, so the
+/// second outer row would reach its `unreachable!` rather than merely scan a
+/// long bucket.
 pub(crate) fn memo_key(subplan: &Subplan, row: &[Value], ctx: &ExecContext) -> Option<MemoKey> {
     let (cache, id) = (ctx.subplans.as_ref()?, subplan.id()?);
     let tys = match cache
@@ -188,10 +195,12 @@ pub(crate) fn memo_key(subplan: &Subplan, row: &[Value], ctx: &ExecContext) -> O
         std::collections::hash_map::Entry::Occupied(hit) => hit.get().clone(),
         std::collections::hash_map::Entry::Vacant(slot) => {
             // A volatile body must run as many times as it would have; a plan
-            // reading past the immediately enclosing row has no key at all.
+            // reading past the immediately enclosing row has no key at all; and
+            // a key type the hash cannot separate has no usable key either.
             let slots = (!crabgresql_binder::plan_contains_volatile_fn(&subplan.plan))
                 .then(|| crabgresql_binder::plan_outer_ref_slots(&subplan.plan))
                 .flatten()
+                .filter(|slots| slots.iter().all(|(_, ty)| ty.hashes_distinctly()))
                 .map(Arc::<[(usize, PgType)]>::from);
             slot.insert(slots).clone()
         }
