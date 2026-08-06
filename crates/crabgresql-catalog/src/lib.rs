@@ -133,6 +133,7 @@ pub struct PgTypeRow {
     pub typsend: &'static str,
     pub typalign: &'static str,
     pub typstorage: &'static str,
+    pub typcollation: u32,
 }
 
 /// A built-in `pg_cast` row, generated from `pg_cast.dat`. `castsource`/
@@ -1388,6 +1389,20 @@ mod tests {
                 "{symbolic} typalign must be substituted"
             );
         }
+        // typcollation comes from the .dat too — including for types this build
+        // does not model, whose collation it is the only source of.
+        assert_eq!(
+            type_col(&by_name("pg_node_tree"), &schema, "typcollation"),
+            Value::Oid(100)
+        );
+        assert_eq!(
+            type_col(&by_name("name"), &schema, "typcollation"),
+            Value::Oid(950)
+        );
+        assert_eq!(
+            type_col(&by_name("internal"), &schema, "typcollation"),
+            Value::Oid(0)
+        );
         // Every row is full-width.
         assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
     }
@@ -1649,6 +1664,29 @@ mod tests {
         assert_eq!(col("_record", "oid"), Value::Oid(2287));
         assert_eq!(col("_record", "typcategory"), Value::Text("P".to_string()));
         assert_eq!(col("record", "typarray"), Value::Oid(2287));
+    }
+
+    /// `pg_type.typcollation` comes from the vendored data; `pg_attribute.
+    /// attcollation` is computed at runtime by `schema::typcollation_of`. psql's
+    /// `\d` compares the two literally (`a.attcollation <> t.typcollation`) to
+    /// decide whether to print a Collation column, so any drift between them
+    /// shows up as a spurious collation on every column of the drifted type.
+    #[test]
+    fn typcollation_agrees_between_pg_type_and_pg_attribute() {
+        use crabgresql_types::PgType;
+        for row in PG_TYPE_ROWS {
+            // Only types this build models can be a column type at all; the
+            // rest have no runtime answer to compare against.
+            if PgType::from_oid(row.oid).is_none() {
+                continue;
+            }
+            assert_eq!(
+                row.typcollation,
+                schema::typcollation_of(row.oid),
+                "{} typcollation drift (pg_type vs pg_attribute)",
+                row.typname
+            );
+        }
     }
 
     #[test]

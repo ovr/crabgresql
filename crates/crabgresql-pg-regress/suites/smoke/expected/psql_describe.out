@@ -365,6 +365,32 @@ CREATE TABLE dfmt_def (
  co     | text           | de-x-icu  |          | 
 
 DROP TABLE dfmt_def;
+-- An array column's Collation stays empty. `\d` fills that cell only when the
+-- column's attcollation differs from its type's typcollation, so this is the
+-- test that the two agree: `text[]` carries `default` and `name[]` carries `C`
+-- in both pg_type and pg_attribute, exactly as their elements do.
+CREATE TABLE arrcoll (t text[], n name[], i integer[]);
+\d arrcoll
+               Table "public.arrcoll"
+ Column |   Type    | Collation | Nullable | Default 
+--------+-----------+-----------+----------+---------
+ t      | text[]    |           |          | 
+ n      | name[]    |           |          | 
+ i      | integer[] |           |          | 
+
+SELECT a.attname, a.attcollation = t.typcollation AS agrees
+  FROM pg_catalog.pg_attribute a
+       JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+ WHERE a.attrelid = 'arrcoll'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+ attname | agrees 
+---------+--------
+ t       | t
+ n       | t
+ i       | t
+(3 rows)
+
+DROP TABLE arrcoll;
 -- `DEFAULT NULL` is recorded only when the column's type needs a length
 -- coercion to accept it; for everything else PostgreSQL drops the default
 -- outright, leaving `atthasdef` false. `name` is the one type that looks like it

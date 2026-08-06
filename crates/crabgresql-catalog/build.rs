@@ -222,6 +222,11 @@ struct TypeRow<'a> {
     typsend: &'a str,
     typalign: &'a str,
     typstorage: &'a str,
+    /// A Rust *expression* for the collation OID, not the OID itself: the
+    /// generated file is `include!`d into the crate, so a named constant reads
+    /// better than the bare number. Emitted with `{}`, unlike its string
+    /// neighbours — `{:?}` here would quote it into a `u32` field.
+    typcollation: &'a str,
 }
 
 impl TypeRow<'_> {
@@ -243,6 +248,7 @@ impl TypeRow<'_> {
             typsend,
             typalign,
             typstorage,
+            typcollation,
         } = self;
         format!(
             "    PgTypeRow {{ oid: {oid}, typname: {typname:?}, typnamespace: 11, \
@@ -251,12 +257,25 @@ typtype: {typtype:?}, \
 typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
 typdelim: {typdelim:?}, typrelid: {typrelid}, typelem: {typelem}, typarray: {typarray}, \
 typinput: {typinput:?}, typoutput: {typoutput:?}, typreceive: {typreceive:?}, \
-typsend: {typsend:?}, typalign: {typalign:?}, typstorage: {typstorage:?} }},\n",
+typsend: {typsend:?}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
+typcollation: {typcollation} }},\n",
             // typrelid references a catalog relation's pg_class OID, which we do
             // not codegen yet — 0 until pg_class OIDs are available (only the
             // handful of catalog composite types carry a nonzero value).
             typrelid = 0,
         )
+    }
+}
+
+/// `typcollation` as `pg_type.dat` writes it: the *name* of the collation a
+/// value of the type sorts under, or absent when the type is not collatable.
+/// Only two names appear, and both have a constant in `crabgresql-types`.
+fn resolve_typcollation(e: &Entry) -> &'static str {
+    match get(e, "typcollation") {
+        None => "0",
+        Some("C") => "crabgresql_types::collation::C_COLLATION_OID",
+        Some("default") => "crabgresql_types::collation::DEFAULT_COLLATION_OID",
+        Some(other) => panic!("unexpected typcollation {other:?}"),
     }
 }
 
@@ -318,6 +337,7 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
             typsend: str_field(e, "typsend", "-"),
             typalign: resolve_typalign(str_field(e, "typalign", "i")),
             typstorage: str_field(e, "typstorage", "p"),
+            typcollation: resolve_typcollation(e),
         };
         out.push_str(&base.emit());
 
@@ -346,10 +366,11 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
 /// The array type PostgreSQL serves for an entry carrying `array_type_oid`. A
 /// varlena of the element type with the array I/O functions: `typname` gets the
 /// conventional `_` prefix, `typcategory` is `A`, and storage is extended.
-/// `typdelim` is inherited (`box` separates with `;`, so `_box` does too), but
-/// `typalign` is *not* — it widens to `i` for everything narrower, since the
-/// array header is int-aligned. Every value here is pinned against a live
-/// `pg_type` by `array_rows_are_derived_from_their_element`.
+/// `typdelim` and `typcollation` are inherited (`box` separates with `;`, so
+/// `_box` does too; `_text` sorts under the element's collation), but `typalign`
+/// is *not* — it widens to `i` for everything narrower, since the array header
+/// is int-aligned. Every value here is pinned against a live `pg_type` by
+/// `array_rows_are_derived_from_their_element`.
 fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32) -> TypeRow<'a> {
     TypeRow {
         oid,
@@ -369,6 +390,7 @@ fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32) -> TypeRow<'a> {
         typsend: "array_send",
         typalign: if base.typalign == "d" { "d" } else { "i" },
         typstorage: "x",
+        typcollation: base.typcollation,
     }
 }
 
