@@ -8189,10 +8189,10 @@ fn unify_types(
     // requires a shared type category, which is why `"char"` unifies with
     // `varchar` for an operator but a UNION over the two still fails — exactly
     // as in PG, where `"char"` is category `Z` and `varchar` is `S`.
-    // The same third-type rule for `oid`, which is how PG resolves `oideq` for
-    // a `reg*` against an integer literal: `pg_type.typinput = 0` and
-    // `relnamespace = 11` both compare as OIDs. Ahead of the text rule because
-    // `reg* -> text` is not an implicit cast, so only this one can fire.
+    //
+    // `oid` is tried before `text`: it is how PG resolves `oideq` for a `reg*`
+    // against an integer literal (`pg_type.typinput = 0`, `relnamespace = 11`).
+    // `reg* -> text` is not an implicit cast, so the two can never both apply.
     if implicit_castable(lty, PgType::Oid) && implicit_castable(rty, PgType::Oid) {
         let left = coerce_expr(left, PgType::Oid)?;
         let right = coerce_expr(right, PgType::Oid)?;

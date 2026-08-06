@@ -795,9 +795,8 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   rather than upstream's list. `every_regproc_reference_resolves_to_an_emitted_row`
   fails if a reference ever dangles.
 - Known `pg_catalog` gaps, in the order upstream's `type_sanity` trips over
-  them: no rows for array types (a base type's `typarray` records the OID, but
-  the array type has no row of its own), `typrelid` is 0 for the catalog
-  composite types, no `pg_range`/`pg_opclass`, no domain or range types, and
+  them: `typrelid` is 0 for the catalog composite types, there is no
+  `pg_range`/`pg_opclass`, there are no domain or range types, and
   `pg_attribute` carries neither system columns nor `attislocal`/`attinhcount`
   (per-column inheritance provenance is not recorded — the parent↔child
   correspondence is recomputed by name).

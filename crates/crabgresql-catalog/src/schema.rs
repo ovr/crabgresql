@@ -79,8 +79,8 @@ fn regproc_by_name(name: &str) -> Value {
 }
 
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
-/// query. Trailing rarely-read columns (`typmodin`, `typnotnull`, `typbasetype`,
-/// `typdefault`, `typacl`, …) are omitted for now.
+/// query. The rarely-read domain and ACL columns (`typnotnull`, `typtypmod`,
+/// `typndims`, `typdefaultbin`, `typdefault`, `typacl`) are omitted for now.
 pub fn pg_type_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_type",
@@ -2242,14 +2242,6 @@ pub fn pg_proc_schema() -> TableSchema {
     )
 }
 
-/// The `pg_proc` rows for the routines this server holds.
-///
-/// Honest for everything the catalog actually knows. The stubs are the columns
-/// nothing here can have an opinion about yet, each set to PostgreSQL's own
-/// default rather than to zero: `procost`/`prorows` (no planner cost model),
-/// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
-/// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
-/// honestly — there are no C functions.
 /// The built-in `pg_proc` rows generated from `pg_proc.dat` — the functions the
 /// other catalogs reference, and only those (see `gen_pg_proc` in `build.rs`).
 /// Callers append the session's `CREATE FUNCTION` routines after these.
@@ -2328,6 +2320,15 @@ pub fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
         .collect()
 }
 
+/// The `pg_proc` rows for the routines this server holds, appended after
+/// [`pg_proc_builtin_rows`].
+///
+/// Honest for everything the catalog actually knows. The stubs are the columns
+/// nothing here can have an opinion about yet, each set to PostgreSQL's own
+/// default rather than to zero: `procost`/`prorows` (no planner cost model),
+/// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
+/// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
+/// honestly — there are no C functions.
 pub fn pg_proc_rows(
     routines: &[CatalogRoutine],
     namespace_oids: &HashMap<String, u32>,

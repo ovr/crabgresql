@@ -122,6 +122,7 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::INTERVAL, oid::INTERVAL_ARRAY),
     (oid::BIT, oid::BIT_ARRAY),
     (oid::VARBIT, oid::VARBIT_ARRAY),
+    (oid::REGPROC, oid::REGPROC_ARRAY),
     (oid::REGCLASS, oid::REGCLASS_ARRAY),
     (oid::REGTYPE, oid::REGTYPE_ARRAY),
     (oid::REGNAMESPACE, oid::REGNAMESPACE_ARRAY),

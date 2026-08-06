@@ -2195,7 +2195,8 @@ mod tests {
         assert_eq!(cell("nn", "atttypmod")?, Value::Int4(264194));
         assert_eq!(cell("i", "atttypmod")?, Value::Int4(-1));
         // Identity and generated columns do not exist, and PG spells "neither"
-        // as the empty string rather than NULL — psql projects both directly.
+        // as `\0` rather than NULL — a `"char"` that prints as the empty
+        // string, which psql projects directly.
         assert_eq!(cell("i", "attidentity")?, Value::Char(0));
         assert_eq!(cell("i", "attgenerated")?, Value::Char(0));
 
