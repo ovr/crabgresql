@@ -68,8 +68,15 @@ pub use static_table::StaticTable;
 
 /// First OID handed to a synthetic user relation in `pg_class`. Runtime type,
 /// function, and cast OIDs grow upward from PostgreSQL's user-object floor, so
-/// relations use a separate high partition until storage owns persistent OIDs.
-/// This preserves catalog-wide uniqueness in every reflected snapshot.
+/// relations use a separate high partition, which preserves catalog-wide
+/// uniqueness in every reflected snapshot.
+///
+/// TODO: these OIDs are assigned per snapshot rather than stored, and the
+/// assignment is positional (see [`SystemCatalog::relation_oids`]). A relation's
+/// OID is therefore stable only while the set of relations is — creating one
+/// renumbers every relation sorting after it — so a client that holds an OID
+/// across DDL can address the wrong relation. Storage owning a persistent OID
+/// per relation is what fixes it.
 const FIRST_REL_OID: u32 = 0x4000_0000;
 
 /// The namespace PostgreSQL keeps TOAST relations in. Never on the search path,
@@ -776,9 +783,11 @@ impl SystemCatalog {
 
     /// The `(namespace, name)` of the user type `oid` identifies, or `None` for
     /// an OID no `CREATE TYPE` has. Built-in types are not here — they resolve
-    /// without a catalog. User types carry no namespace of their own yet
-    /// (`CREATE TYPE app.t` is unsupported), so they all report `public`, which
-    /// is where an unqualified name finds them.
+    /// without a catalog.
+    ///
+    /// TODO: user types carry no namespace of their own — `CREATE TYPE app.t`
+    /// is rejected — so every one of them reports `public`, which is where an
+    /// unqualified name finds them.
     pub fn user_type_ref(&self, oid: u32) -> Option<(&str, &str)> {
         self.user_types()
             .iter()

@@ -26,8 +26,8 @@ pub(crate) fn pg_namespace_schema() -> TableSchema {
 /// OIDs match PostgreSQL's stable assignments (`pg_catalog` = 11, `pg_toast` =
 /// 99, `public` = 2200). `information_schema` has an initdb-assigned OID, so
 /// it remains absent here; its named discovery surface lives in
-/// `information_schema.schemata`. Owners are reported as the bootstrap
-/// superuser (10) for now.
+/// `information_schema.schemata`. Owners are the bootstrap superuser — see
+/// `BOOTSTRAP_ROLE_OID` for why there is only the one.
 pub(crate) fn pg_namespace_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let user_schemas = cat.user_schemas();
     let row = |oid: u32, name: &str| {

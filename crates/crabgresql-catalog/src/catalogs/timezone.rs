@@ -46,9 +46,10 @@ pub(crate) fn pg_timezone_names_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
 /// change to value parsing, not to a view). Consequences a reader should
 /// expect: `count(*)` is 15, the offsets span 9 distinct values, and upstream's
 /// `sysviews` check `count(distinct utc_offset) >= 24` reports false.
-/// PostgreSQL 18's second half of this view — the abbreviations from the
-/// *session zone's* own history, which is where its `LMT` rows come from — is
-/// not implemented.
+///
+/// TODO: PostgreSQL 18 also emits a second group — the abbreviations from the
+/// *session zone's* own history, which is where its `LMT` rows come from — and
+/// this view omits it.
 pub(crate) fn pg_timezone_abbrevs_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_timezone_abbrevs",

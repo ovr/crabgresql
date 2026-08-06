@@ -31,8 +31,12 @@ pub(crate) fn pg_language_schema() -> TableSchema {
 /// 12/13/14 are PostgreSQL's bootstrap OIDs and are stable across versions.
 /// `plpgsql`'s is not: PostgreSQL assigns it through `CREATE EXTENSION` at
 /// initdb time, so it varies by build and there is nothing to reproduce —
-/// clients match on `lanname`. The handler OIDs stay 0 until `pg_proc` carries
-/// built-in rows for them to point at.
+/// clients match on `lanname`.
+///
+/// TODO: `lanplcallfoid`/`laninline`/`lanvalidator` are 0. `pg_proc` publishes
+/// only the functions the other catalogs reference and no language handler is
+/// among them, so pointing these at a row means emitting it first — until then
+/// a non-zero value here would dangle.
 pub(crate) fn pg_language_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let row = |oid: u32, name: &str, ispl: bool, trusted: bool| {
         vec![

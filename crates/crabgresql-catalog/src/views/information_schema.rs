@@ -8,8 +8,11 @@ use crate::SystemCatalog;
 use crate::catalogs::attribute::attcollation_of;
 use crate::cols::*;
 
-/// `information_schema.schemata`. Information-schema domains are represented
-/// as text until the engine supports domains over the built-in types.
+/// `information_schema.schemata`.
+///
+/// TODO: the SQL standard types these columns as domains (`sql_identifier`,
+/// `character_data`); they are plain `text` until the engine has domains over
+/// the built-in types.
 pub(crate) fn schemata_schema() -> TableSchema {
     TableSchema::in_namespace(
         "schemata",

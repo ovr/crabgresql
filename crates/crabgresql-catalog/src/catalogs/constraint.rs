@@ -29,7 +29,10 @@ pub(crate) fn pg_constraint_schema() -> TableSchema {
             col("conislocal", PgType::Bool),
             col("coninhcount", PgType::Int2),
             col("connoinherit", PgType::Bool),
-            // int2[] is represented as PG array text until catalog arrays land.
+            // TODO: `int2[]` upstream, rendered here as the text an array
+            // prints as. `PgType::Array` exists now, so nothing blocks it —
+            // the column and the value in `pg_constraint_rows` have to move
+            // together.
             col("conkey", PgType::Text),
             // pg_node_tree in PostgreSQL, modelled as the stored SQL text the
             // same way `pg_class.relpartbound` is. `pg_get_expr` re-renders it

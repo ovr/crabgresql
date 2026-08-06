@@ -11,8 +11,11 @@ use crabgresql_types::{Reg, RegKind};
 use crate::{CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
 
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
-/// query. The rarely-read domain and ACL columns (`typnotnull`, `typtypmod`,
-/// `typndims`, `typdefaultbin`, `typdefault`, `typacl`) are omitted for now.
+/// query.
+///
+/// TODO: the domain and ACL columns (`typnotnull`, `typtypmod`, `typndims`,
+/// `typdefaultbin`, `typdefault`, `typacl`) are absent, so a query naming one
+/// fails with "column does not exist" rather than reading a default.
 pub(crate) fn pg_type_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_type",

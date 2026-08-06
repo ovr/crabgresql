@@ -31,9 +31,12 @@ pub(crate) const BTREE_AM_OID: u32 = 403;
 pub(crate) const HASH_AM_OID: u32 = 405;
 
 /// OID reported as the owner of every relation, type, and schema. PostgreSQL
-/// assigns 10 to the bootstrap superuser; crabgresql has no role catalog yet, so
-/// one owner stands for the whole cluster. `pg_get_userbyid` resolves it back to
+/// assigns 10 to the bootstrap superuser. `pg_get_userbyid` resolves it back to
 /// the session user, so the two must agree — hence the shared constant.
+///
+/// TODO: one owner stands for the whole cluster. Nothing creates a second role,
+/// so every `relowner`/`typowner`/`nspowner` reports this OID whoever connects;
+/// per-object ownership needs `CREATE ROLE` and an owner stored per object.
 pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 
 /// `pg_namespace.oid` of `public`, PostgreSQL's fixed value. Where a user type
