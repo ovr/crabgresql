@@ -310,6 +310,14 @@ impl CatalogOps for SessionCatalogOps {
         }
     }
 
+    fn proc_name(&self, oid: u32) -> Option<String> {
+        self.system.proc_name(oid)
+    }
+
+    fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        self.system.proc_oid(namespace, name)
+    }
+
     fn namespace_name(&self, oid: u32) -> Option<String> {
         self.system.namespace_name(oid)
     }

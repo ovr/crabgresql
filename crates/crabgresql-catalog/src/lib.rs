@@ -109,9 +109,20 @@ struct CatalogToast {
     stats: RelStats,
 }
 
+/// A `regproc` reference: the function's OID and the name it prints as.
+///
+/// PostgreSQL stores only the OID and resolves the name in `regprocout`. The
+/// catalog rows here are static, so codegen resolves both at build time and the
+/// pair travels together — the same trade [`crabgresql_types::Reg`] makes.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcRef {
+    pub oid: u32,
+    pub name: &'static str,
+}
+
 /// A built-in `pg_type` row, generated from `pg_type.dat`. Field types mirror
 /// the runtime column types in [`schema::pg_type_schema`]; string fields are the
-/// catalog `name`/`"char"`/`regproc` text.
+/// catalog `name`/`"char"` text.
 pub struct PgTypeRow {
     pub oid: u32,
     pub typname: &'static str,
@@ -127,29 +138,54 @@ pub struct PgTypeRow {
     pub typrelid: u32,
     pub typelem: u32,
     pub typarray: u32,
-    pub typinput: &'static str,
-    pub typoutput: &'static str,
-    pub typreceive: &'static str,
-    pub typsend: &'static str,
+    pub typinput: ProcRef,
+    pub typoutput: ProcRef,
+    pub typreceive: ProcRef,
+    pub typsend: ProcRef,
     pub typalign: &'static str,
     pub typstorage: &'static str,
     pub typcollation: u32,
 }
 
-/// A built-in `pg_cast` row, generated from `pg_cast.dat`. `castsource`/
-/// `casttarget` are resolved type OIDs; `castfunc` is the upstream text
-/// reference (a `regprocedure`), not yet a resolved OID.
+/// A built-in `pg_cast` row, generated from `pg_cast.dat`. `castsource`,
+/// `casttarget` and `castfunc` are resolved OIDs; `castfunc` is `0` for a
+/// binary-coercible cast, which needs no function.
 pub struct PgCastRow {
     pub oid: u32,
     pub castsource: u32,
     pub casttarget: u32,
-    pub castfunc: &'static str,
+    pub castfunc: u32,
     pub castcontext: &'static str,
     pub castmethod: &'static str,
 }
 
+/// A built-in `pg_proc` row, generated from `pg_proc.dat` — restricted to the
+/// functions the other catalogs reference (see `gen_pg_proc` in `build.rs` for
+/// why the rest are left out).
+pub struct PgProcRow {
+    pub oid: u32,
+    pub proname: &'static str,
+    pub prolang: u32,
+    pub procost: f32,
+    pub prorows: f32,
+    pub provariadic: u32,
+    pub prosupport: ProcRef,
+    pub prokind: &'static str,
+    pub prosecdef: bool,
+    pub proleakproof: bool,
+    pub proisstrict: bool,
+    pub proretset: bool,
+    pub provolatile: &'static str,
+    pub proparallel: &'static str,
+    pub pronargs: i16,
+    pub prorettype: u32,
+    pub proargtypes: &'static [u32],
+    pub prosrc: &'static str,
+}
+
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including
 /// types crabgresql recognizes but does not implement yet (for example
@@ -157,6 +193,25 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 /// user type without maintaining a second hand-written name list.
 pub fn is_builtin_type_name(name: &str) -> bool {
     PG_TYPE_ROWS.iter().any(|row| row.typname == name)
+}
+
+/// The OID of the built-in function `name`, or `None` if this build publishes
+/// no `pg_proc` row for it. Only the functions the other catalogs reference are
+/// published, so a name that is real upstream can still be absent here.
+pub fn builtin_proc_oid(name: &str) -> Option<u32> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.proname == name)
+        .map(|row| row.oid)
+}
+
+/// The name of the built-in function `oid`, the inverse of
+/// [`builtin_proc_oid`].
+pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.oid == oid)
+        .map(|row| row.proname)
 }
 
 /// PostgreSQL's fixed OIDs for the `pg_catalog` relations this build serves.
@@ -1040,6 +1095,38 @@ impl SystemCatalog {
         (oid == schema::BOOTSTRAP_ROLE_OID).then_some(self.source.owner())
     }
 
+    /// The name of the function `oid` identifies, or `None` if this snapshot
+    /// has none. Backs `regproc` output: built-in rows first, then this
+    /// session's `CREATE FUNCTION` routines.
+    pub fn proc_name(&self, oid: u32) -> Option<String> {
+        builtin_proc_name(oid)
+            .map(str::to_string)
+            .or_else(|| self.routine_by_oid(oid).map(|r| r.name.clone()))
+    }
+
+    /// The OID of the function `namespace.name` names, or `None` when there is
+    /// no such function *or* the name is carried by more than one — `regprocin`
+    /// resolves a bare name, so an overloaded one is not resolvable this way.
+    pub fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        // Built-ins all live in `pg_catalog`, so any other qualifier names a
+        // user routine instead.
+        let in_catalog = !matches!(namespace, Some(ns) if ns != "pg_catalog");
+        if let Some(oid) = builtin_proc_oid(name).filter(|_| in_catalog) {
+            return Some(oid);
+        }
+        let mut matched = self
+            .routines()
+            .iter()
+            .filter(|r| r.name == name && namespace.is_none_or(|ns| ns == r.namespace))
+            .map(|r| r.oid);
+        let first = matched.next()?;
+        matched.next().is_none().then_some(first)
+    }
+
+    fn routine_by_oid(&self, oid: u32) -> Option<CatalogRoutine> {
+        self.routines().iter().find(|r| r.oid == oid).cloned()
+    }
+
     /// The database this snapshot's session is connected to. Backs
     /// `current_database()`/`current_catalog`.
     pub fn database(&self) -> &str {
@@ -1256,10 +1343,11 @@ impl SystemCatalog {
                 schema::pg_settings_rows(self.settings()),
             )),
             "pg_language" => Some((schema::pg_language_schema(), schema::pg_language_rows())),
-            "pg_proc" => Some((
-                schema::pg_proc_schema(),
-                schema::pg_proc_rows(self.routines(), self.namespace_oids()),
-            )),
+            "pg_proc" => {
+                let mut rows = schema::pg_proc_builtin_rows();
+                rows.extend(schema::pg_proc_rows(self.routines(), self.namespace_oids()));
+                Some((schema::pg_proc_schema(), rows))
+            }
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             "pg_collation" => Some((schema::pg_collation_schema(), schema::pg_collation_rows())),
             "pg_inherits" => Some((
@@ -1375,9 +1463,16 @@ mod tests {
             type_col(&by_name("int4"), &schema, "typlen"),
             Value::Int2(4)
         );
+        // `typinput` is a `regproc`: codegen resolved the `.dat` name against
+        // `pg_proc.dat`, so it carries PostgreSQL's own OID and prints as the
+        // function's name.
         assert_eq!(
             type_col(&by_name("bool"), &schema, "typinput"),
-            Value::Text("boolin".to_string())
+            Value::Reg(crabgresql_types::Reg {
+                kind: crabgresql_types::RegKind::Proc,
+                oid: 1242,
+                name: "boolin".to_string(),
+            })
         );
         // The two entries whose alignment pg_type.dat spells symbolically must
         // arrive substituted: PG serves a single character here, never the
@@ -1649,9 +1744,15 @@ mod tests {
         assert_eq!(col("_int4", "typlen"), Value::Int2(-1));
         assert_eq!(col("_int4", "typbyval"), Value::Bool(false));
         assert_eq!(col("_int4", "typcategory"), Value::Char(b'A'));
+        // A derived array row's `regproc` columns are the array family's own,
+        // resolved to PostgreSQL's OIDs like every other reference.
         assert_eq!(
             col("_int4", "typinput"),
-            Value::Text("array_in".to_string())
+            Value::Reg(crabgresql_types::Reg {
+                kind: crabgresql_types::RegKind::Proc,
+                oid: 750,
+                name: "array_in".to_string(),
+            })
         );
         assert_eq!(col("_int4", "typstorage"), Value::Char(b'x'));
         // An array of arrays is not a type of its own.
@@ -1791,6 +1892,68 @@ mod tests {
                 .all(|r| r[src] != Value::Oid(0) && r[tgt] != Value::Oid(0))
         );
 
+        Ok(())
+    }
+
+    /// Every `regproc`/`regprocedure` reference the catalogs publish resolves to
+    /// a `pg_proc` row this build actually emits.
+    ///
+    /// This is the invariant that makes the references worth having: upstream's
+    /// `oidjoins` test exists to catch exactly this kind of dangling pointer,
+    /// and codegen picks the emitted `pg_proc` subset *from* these references,
+    /// so the two can only drift by mistake.
+    #[test]
+    fn every_regproc_reference_resolves_to_an_emitted_row() -> anyhow::Result<()> {
+        let published: Vec<u32> = schema::pg_proc_builtin_rows()
+            .iter()
+            .map(|r| match r[0] {
+                Value::Oid(oid) => oid,
+                ref other => panic!("pg_proc.oid is not an OID: {other:?}"),
+            })
+            .collect();
+        let resolves = |value: &Value, what: &str| match value {
+            // 0 is a legitimate "no function", which `regprocout` prints as `-`.
+            Value::Reg(r) if r.oid == 0 => {}
+            Value::Reg(r) => assert!(
+                published.contains(&r.oid),
+                "{what} points at {} (oid {}), which pg_proc does not publish",
+                r.name,
+                r.oid
+            ),
+            Value::Oid(0) => {}
+            Value::Oid(oid) => assert!(
+                published.contains(oid),
+                "{what} points at oid {oid}, which pg_proc does not publish"
+            ),
+            other => panic!("{what} is not a function reference: {other:?}"),
+        };
+
+        let type_schema = schema::pg_type_schema();
+        for row in schema::pg_type_builtin_rows() {
+            for col in ["typinput", "typoutput", "typreceive", "typsend"] {
+                let i = required(type_schema.column_index(col), "column is missing")?;
+                resolves(&row[i], col);
+            }
+        }
+        let cast_schema = schema::pg_cast_schema();
+        let castfunc = required(cast_schema.column_index("castfunc"), "castfunc missing")?;
+        for row in schema::pg_cast_rows() {
+            resolves(&row[castfunc], "pg_cast.castfunc");
+        }
+        let am_schema = schema::pg_am_schema();
+        let amhandler = required(am_schema.column_index("amhandler"), "amhandler missing")?;
+        for row in schema::pg_am_rows() {
+            // Unlike the other two, an access method always has a handler —
+            // including crabgresql's own, which get rows of their own.
+            assert_ne!(
+                row[amhandler],
+                Value::Reg(crabgresql_types::Reg::unresolved(
+                    crabgresql_types::RegKind::Proc,
+                    0
+                ))
+            );
+            resolves(&row[amhandler], "pg_am.amhandler");
+        }
         Ok(())
     }
 

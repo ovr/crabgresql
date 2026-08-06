@@ -28,6 +28,11 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         return None;
     }
     match kind {
+        // A function prints under its bare name. PG schema-qualifies one that
+        // an unqualified name would not reach, but every function this build
+        // publishes lives in `pg_catalog` or on the search path, so there is
+        // nothing here that needs qualifying yet.
+        RegKind::Proc => ops.proc_name(oid),
         // A relation is printed bare when an unqualified name reaches it, and
         // schema-qualified when it does not — the same reachability rule
         // `pg_table_is_visible` answers, so the two can never disagree.
@@ -71,6 +76,7 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     }
     let (namespace, name) = split_qualified_name(trimmed).ok_or_else(|| not_found(kind, s))?;
     let oid = match kind {
+        RegKind::Proc => ops.proc_oid(namespace.as_deref(), &name),
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
         RegKind::Type => builtin_type_oid_from_syntax(trimmed)
             .or_else(|| builtin_type_oid(namespace.as_deref(), &name))
@@ -124,6 +130,7 @@ fn pseudo_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
 /// input as written: `relation "nosuchtable" does not exist`.
 fn not_found(kind: RegKind, s: &str) -> ExecError {
     let state = match kind {
+        RegKind::Proc => sqlstate::UNDEFINED_FUNCTION,
         RegKind::Class => sqlstate::UNDEFINED_TABLE,
         RegKind::Type => sqlstate::UNDEFINED_OBJECT,
         RegKind::Namespace => sqlstate::INVALID_SCHEMA_NAME,

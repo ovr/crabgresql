@@ -4,9 +4,7 @@
 //! The column list for each relation follows PostgreSQL's column *names* and
 //! order for the frequently-queried leading columns. Fidelity deviations are
 //! deliberate and documented (see the crate root): catalog-only types we do not
-//! model yet are represented pragmatically — `regproc` columns hold the
-//! referenced function's `text` name (which is what PostgreSQL's `regprocout`
-//! prints anyway) rather than an OID.
+//! model yet are omitted rather than faked.
 
 use std::collections::HashMap;
 
@@ -14,12 +12,12 @@ use crabgresql_storage_api::{
     Column, IndexConstraint, IndexMethod, PartitionBoundDatum, PartitionOf, PartitionStrategy,
     RelStats, TableAccessMethod, TableSchema,
 };
-use crabgresql_types::{PgType, Value, VectorKind};
+use crabgresql_types::{PgType, Reg, RegKind, Value, VectorKind};
 
 use crate::{
     CatalogConstraint, CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine,
-    CatalogSequence, CatalogSetting, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
-    RelKind, TOAST_NAMESPACE,
+    CatalogSequence, CatalogSetting, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_PROC_ROWS,
+    PG_TYPE_ROWS, ProcRef, RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -35,7 +33,7 @@ const CHARLIKE: PgType = PgType::Char;
 /// function's name. Distinct from [`CHARLIKE`], which the two shared until the
 /// alias was split — `typinput` and friends hold multi-character names a
 /// one-byte type would truncate.
-const REGPROC: PgType = PgType::Text;
+const REGPROC: PgType = PgType::Reg(RegKind::Proc);
 
 fn col(name: &str, ty: PgType) -> Column {
     Column::new(name, ty)
@@ -51,6 +49,33 @@ fn chr(c: char) -> Value {
 /// flag and prints back as the empty string.
 fn str_char(s: &str) -> Value {
     Value::Char(s.bytes().next().unwrap_or(0))
+}
+
+/// A `regproc` datum from a codegen-resolved reference.
+fn regproc(r: ProcRef) -> Value {
+    Value::Reg(Reg {
+        kind: RegKind::Proc,
+        oid: r.oid,
+        name: r.name.to_string(),
+    })
+}
+
+/// A `regproc` datum for a function named at runtime rather than by codegen —
+/// an access method handler, say. An unknown name is `0`, which prints as `-`
+/// exactly as PostgreSQL renders a missing reference.
+fn regproc_by_name(name: &str) -> Value {
+    let own = OWN_AM_HANDLERS
+        .iter()
+        .find(|(_, handler)| *handler == name)
+        .map(|(oid, _)| *oid);
+    match own.or_else(|| crate::builtin_proc_oid(name)) {
+        Some(oid) => Value::Reg(Reg {
+            kind: RegKind::Proc,
+            oid,
+            name: name.to_string(),
+        }),
+        None => Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+    }
 }
 
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
@@ -176,10 +201,10 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Oid(r.typrelid),
                 Value::Oid(r.typelem),
                 Value::Oid(r.typarray),
-                Value::Text(r.typinput.to_string()),
-                Value::Text(r.typoutput.to_string()),
-                Value::Text(r.typreceive.to_string()),
-                Value::Text(r.typsend.to_string()),
+                regproc(r.typinput),
+                regproc(r.typoutput),
+                regproc(r.typreceive),
+                regproc(r.typsend),
                 str_char(r.typalign),
                 str_char(r.typstorage),
                 Value::Oid(r.typcollation),
@@ -217,10 +242,10 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 Value::Oid(0),
                 Value::Oid(0),
                 Value::Oid(0),
-                Value::Text("enum_in".to_string()),
-                Value::Text("enum_out".to_string()),
-                Value::Text("enum_recv".to_string()),
-                Value::Text("enum_send".to_string()),
+                regproc_by_name("enum_in"),
+                regproc_by_name("enum_out"),
+                regproc_by_name("enum_recv"),
+                regproc_by_name("enum_send"),
                 chr('i'),
                 chr('p'),
                 // An enum is not collatable.
@@ -280,8 +305,7 @@ pub fn pg_cast_schema() -> TableSchema {
             col("oid", PgType::Oid),
             col("castsource", PgType::Oid),
             col("casttarget", PgType::Oid),
-            // regproc; rendered as the upstream function reference text for now.
-            col("castfunc", PgType::Text),
+            col("castfunc", PgType::Oid),
             col("castcontext", CHARLIKE),
             col("castmethod", CHARLIKE),
         ],
@@ -298,7 +322,7 @@ pub fn pg_cast_rows() -> Vec<Vec<Value>> {
                 Value::Oid(r.oid),
                 Value::Oid(r.castsource),
                 Value::Oid(r.casttarget),
-                Value::Text(r.castfunc.to_string()),
+                Value::Oid(r.castfunc),
                 str_char(r.castcontext),
                 str_char(r.castmethod),
             ]
@@ -399,6 +423,16 @@ pub(crate) const PUBLIC_NAMESPACE_OID: u32 = 2200;
 /// or `CREATE TYPE` the server ever ran, since that is where the OID allocator
 /// starts.
 const DATABASE_OID: u32 = 16_002;
+
+/// The `pg_proc` rows for crabgresql's own access-method handlers, which have no
+/// upstream function to point at. `pg_am.amhandler` is a reference into
+/// `pg_proc`, so leaving these at 0 would print `-` where PostgreSQL prints a
+/// handler name for every method it ships. They sit in the same reserved band as
+/// [`PARQUET_AM_OID`], and for the same reason.
+const OWN_AM_HANDLERS: [(u32, &str); 2] = [
+    (16_003, "parquet_tableam_handler"),
+    (16_004, "buffer_tableam_handler"),
+];
 
 /// `pg_default` and `pg_global`, PostgreSQL's two bootstrap tablespaces.
 /// crabgresql has no `CREATE TABLESPACE`, so these two rows are the whole
@@ -789,7 +823,7 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
         vec![
             Value::Oid(oid),
             Value::Text(amname.to_string()),
-            Value::Text(amhandler.to_string()),
+            regproc_by_name(amhandler),
             chr(amtype),
         ]
     };
@@ -2161,6 +2195,84 @@ pub fn pg_proc_schema() -> TableSchema {
 /// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
 /// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
 /// honestly — there are no C functions.
+/// The built-in `pg_proc` rows generated from `pg_proc.dat` — the functions the
+/// other catalogs reference, and only those (see `gen_pg_proc` in `build.rs`).
+/// Callers append the session's `CREATE FUNCTION` routines after these.
+///
+/// `proallargtypes`/`proargmodes`/`proargnames` are NULL for every one: none of
+/// these take OUT parameters, and codegen refuses to emit an entry that does
+/// rather than drop the columns silently.
+pub fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
+    // crabgresql's own table-AM handlers, so `pg_am.amhandler` resolves for
+    // every method this build ships rather than only the upstream ones. They
+    // are shaped like PostgreSQL's: volatile, strict, `internal` argument,
+    // returning `table_am_handler` (oid 269).
+    let own = OWN_AM_HANDLERS.iter().map(|(oid, name)| {
+        vec![
+            Value::Oid(*oid),
+            Value::Text((*name).to_string()),
+            Value::Oid(11),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(12),
+            Value::Float4(1.0),
+            Value::Float4(0.0),
+            Value::Oid(0),
+            Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+            chr('f'),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(false),
+            chr('v'),
+            chr('s'),
+            Value::Int2(1),
+            Value::Int2(0),
+            Value::Oid(269),
+            oidvector([2281]),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Text((*name).to_string()),
+            Value::Null,
+        ]
+    });
+    PG_PROC_ROWS
+        .iter()
+        .map(|r| {
+            vec![
+                Value::Oid(r.oid),
+                Value::Text(r.proname.to_string()),
+                // Every built-in lives in `pg_catalog`, owned by the bootstrap
+                // superuser.
+                Value::Oid(11),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(r.prolang),
+                Value::Float4(r.procost),
+                Value::Float4(r.prorows),
+                Value::Oid(r.provariadic),
+                regproc(r.prosupport),
+                str_char(r.prokind),
+                Value::Bool(r.prosecdef),
+                Value::Bool(r.proleakproof),
+                Value::Bool(r.proisstrict),
+                Value::Bool(r.proretset),
+                str_char(r.provolatile),
+                str_char(r.proparallel),
+                Value::Int2(r.pronargs),
+                Value::Int2(0),
+                Value::Oid(r.prorettype),
+                oidvector(r.proargtypes.iter().copied()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text(r.prosrc.to_string()),
+                Value::Null,
+            ]
+        })
+        .chain(own)
+        .collect()
+}
+
 pub fn pg_proc_rows(
     routines: &[CatalogRoutine],
     namespace_oids: &HashMap<String, u32>,
@@ -2195,7 +2307,8 @@ pub fn pg_proc_rows(
                 }),
                 Value::Float4(if r.retset { 1000.0 } else { 0.0 }),
                 Value::Oid(0),
-                Value::Text("-".to_string()),
+                // prosupport: a user routine has no planner support function.
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
                 chr(r.kind),
                 Value::Bool(r.secdef),
                 Value::Bool(false),

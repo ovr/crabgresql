@@ -123,6 +123,8 @@ pub mod oid {
     /// no [`crate::PgType`] of its own — the binder models it as
     /// `Binding::Unknown` — but `pg_typeof` and `705::regtype` have to name it.
     pub const UNKNOWN: u32 = 705;
+    /// `regproc`: an OID that renders as a function name. See [`crate::Reg`].
+    pub const REGPROC: u32 = 24;
     /// `regclass`: an OID that renders as a relation name. See [`crate::Reg`].
     pub const REGCLASS: u32 = 2205;
     /// `regtype`: an OID that renders as a type name. See [`crate::Reg`].
@@ -181,6 +183,7 @@ pub mod oid {
     pub const INTERVAL_ARRAY: u32 = 1187;
     pub const BIT_ARRAY: u32 = 1561;
     pub const VARBIT_ARRAY: u32 = 1563;
+    pub const REGPROC_ARRAY: u32 = 1008;
     pub const REGCLASS_ARRAY: u32 = 2210;
     pub const REGTYPE_ARRAY: u32 = 2211;
     pub const REGNAMESPACE_ARRAY: u32 = 4090;
@@ -401,12 +404,13 @@ pub enum PgType {
 /// PostgreSQL type that stores an OID and renders as that object's name, so
 /// `'pg_class'::regclass` and `1259::regclass` are the same value.
 ///
-/// PG has more of these (`regproc`, `regoper`, `regconfig`, `regrole`, …);
-/// only the three crabgresql can actually resolve are modeled. `regproc` in
-/// particular needs a `pg_proc` this build does not have, so `pg_type.typinput`
-/// and friends stay `text` in the catalog.
+/// PG has more of these (`regoper`, `regconfig`, `regrole`, `regprocedure`, …);
+/// only the four crabgresql can actually resolve are modeled.
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
+    /// `regproc`: names a function by its bare name. Distinct from
+    /// `regprocedure`, which carries the argument types too.
+    Proc,
     /// `regclass`: names a relation (table, view, sequence, index).
     Class,
     /// `regtype`: names a type.
@@ -418,6 +422,7 @@ pub enum RegKind {
 impl RegKind {
     pub fn oid(self) -> u32 {
         match self {
+            RegKind::Proc => oid::REGPROC,
             RegKind::Class => oid::REGCLASS,
             RegKind::Type => oid::REGTYPE,
             RegKind::Namespace => oid::REGNAMESPACE,
@@ -427,6 +432,7 @@ impl RegKind {
     /// Catalog `typname`, which for these is also the SQL spelling.
     pub fn typname(self) -> &'static str {
         match self {
+            RegKind::Proc => "regproc",
             RegKind::Class => "regclass",
             RegKind::Type => "regtype",
             RegKind::Namespace => "regnamespace",
@@ -438,6 +444,7 @@ impl RegKind {
     /// `type "x" does not exist` for `regtype`.
     pub fn object_noun(self) -> &'static str {
         match self {
+            RegKind::Proc => "function",
             RegKind::Class => "relation",
             RegKind::Type => "type",
             RegKind::Namespace => "schema",
@@ -666,6 +673,7 @@ impl PgType {
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
+            oid::REGPROC => PgType::Reg(RegKind::Proc),
             oid::REGCLASS => PgType::Reg(RegKind::Class),
             oid::REGTYPE => PgType::Reg(RegKind::Type),
             oid::REGNAMESPACE => PgType::Reg(RegKind::Namespace),
@@ -755,6 +763,7 @@ impl PgType {
             "jsonpath" => PgType::Jsonpath,
             "tsvector" => PgType::Tsvector,
             "tsquery" => PgType::Tsquery,
+            "regproc" => PgType::Reg(RegKind::Proc),
             "regclass" => PgType::Reg(RegKind::Class),
             "regtype" => PgType::Reg(RegKind::Type),
             "regnamespace" => PgType::Reg(RegKind::Namespace),

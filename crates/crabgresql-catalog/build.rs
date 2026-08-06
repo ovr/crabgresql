@@ -23,23 +23,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let type_entries = read_dat(&catalog_dir, "pg_type.dat")?;
     let cast_entries = read_dat(&catalog_dir, "pg_cast.dat")?;
+    let proc_entries = read_dat(&catalog_dir, "pg_proc.dat")?;
 
     // Base type name -> OID, used to resolve name references in pg_type
     // (`typelem`) and pg_cast (`castsource`/`casttarget`).
-    let name_to_oid: HashMap<&str, u32> = type_entries
+    let mut name_to_oid: HashMap<String, u32> = type_entries
         .iter()
-        .filter_map(|e| Some((get(e, "typname")?, oid_field(e, "oid"))))
+        .filter_map(|e| Some((get(e, "typname")?.to_string(), oid_field(e, "oid"))))
         .collect();
+    // Array types have no `.dat` entry of their own — each base type names its
+    // array's OID, and the array's name is the base's with a leading underscore.
+    // `pg_proc` argument lists reference those names (`_cstring`, `_text`), so
+    // the map has to carry them.
+    for e in &type_entries {
+        let (Some(name), array_oid) = (get(e, "typname"), oid_field(e, "array_type_oid")) else {
+            continue;
+        };
+        if array_oid != 0 {
+            name_to_oid.insert(format!("_{name}"), array_oid);
+        }
+    }
+    let procs = ProcIndex::build(&proc_entries);
+
+    // Every function OID the other catalogs point at. Emitting `pg_proc` rows
+    // for exactly these keeps each row justified by an inbound reference and
+    // keeps the catalog from advertising thousands of functions this build
+    // cannot run.
+    let mut referenced: Vec<u32> = Vec::new();
+    for e in &type_entries {
+        for key in TYPE_REGPROC_COLUMNS {
+            if let Some(oid) = procs.by_name(str_field(e, key, "-")) {
+                referenced.push(oid);
+            }
+        }
+    }
+    for e in &cast_entries {
+        if let Some(oid) = procs.by_signature(str_field(e, "castfunc", "0")) {
+            referenced.push(oid);
+        }
+    }
+    for handler in AM_HANDLERS {
+        if let Some(oid) = procs.by_name(handler) {
+            referenced.push(oid);
+        }
+    }
+    // The derived array rows name these rather than inheriting the element's,
+    // so they are referenced by rows no `.dat` entry spells out.
+    for name in ARRAY_ROW_PROCS {
+        if let Some(oid) = procs.by_name(name) {
+            referenced.push(oid);
+        }
+    }
+    referenced.sort_unstable();
+    referenced.dedup();
 
     std::fs::write(
         out_dir.join("pg_type_rows.rs"),
-        gen_pg_type(&type_entries, &name_to_oid),
+        gen_pg_type(&type_entries, &name_to_oid, &procs),
     )?;
     std::fs::write(
         out_dir.join("pg_cast_rows.rs"),
-        gen_pg_cast(&cast_entries, &name_to_oid),
+        gen_pg_cast(&cast_entries, &name_to_oid, &procs),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_proc_rows.rs"),
+        gen_pg_proc(&proc_entries, &name_to_oid, &referenced),
     )?;
     Ok(())
+}
+
+/// The `pg_type` columns that hold a bare `regproc` name.
+const TYPE_REGPROC_COLUMNS: &[&str] = &[
+    "typinput",
+    "typoutput",
+    "typreceive",
+    "typsend",
+    "typmodin",
+    "typmodout",
+    "typanalyze",
+    "typsubscript",
+];
+
+/// The `regproc` names [`array_row_for`] gives every derived array row. They
+/// belong to the array family rather than to the element, so nothing in
+/// `pg_type.dat` necessarily references them.
+const ARRAY_ROW_PROCS: &[&str] = &["array_in", "array_out", "array_recv", "array_send"];
+
+/// The `pg_am.amhandler` names `schema::pg_am_rows` publishes that upstream
+/// also has. crabgresql's own access methods (`parquet`, `buffer`) have no
+/// upstream function to point at, and their handlers are resolved to 0 there.
+const AM_HANDLERS: &[&str] = &[
+    "heap_tableam_handler",
+    "bthandler",
+    "hashhandler",
+    "gisthandler",
+    "ginhandler",
+    "brinhandler",
+    "spghandler",
+];
+
+/// `pg_proc.dat` indexed the two ways the other catalogs reference a function:
+/// by bare name (`regproc`, as `pg_type.typinput` spells it) and by full
+/// signature (`regprocedure`, as `pg_cast.castfunc` spells it).
+struct ProcIndex<'a> {
+    /// Bare `proname` -> OID. A name carried by more than one entry is dropped:
+    /// upstream's own `regproc` references must be unambiguous, so a duplicate
+    /// here would mean the reference cannot be resolved by name either.
+    by_name: HashMap<&'a str, Option<u32>>,
+    /// `name(argtype,argtype)` -> OID, the spelling `pg_cast.dat` uses.
+    by_signature: HashMap<String, u32>,
+}
+
+impl<'a> ProcIndex<'a> {
+    fn build(entries: &'a [Entry]) -> Self {
+        let mut by_name: HashMap<&'a str, Option<u32>> = HashMap::new();
+        let mut by_signature = HashMap::new();
+        for e in entries {
+            let (Some(name), oid) = (get(e, "proname"), oid_field(e, "oid")) else {
+                continue;
+            };
+            by_name
+                .entry(name)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(oid));
+            by_signature.insert(signature(name, str_field(e, "proargtypes", "")), oid);
+        }
+        Self {
+            by_name,
+            by_signature,
+        }
+    }
+
+    /// The OID a bare `regproc` reference names. `-` (the `.dat` spelling of
+    /// "none") and an ambiguous name both resolve to nothing.
+    fn by_name(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied().flatten()
+    }
+
+    /// The OID a `regprocedure` reference names. `0` is upstream's spelling of
+    /// a binary-coercible cast, which has no function.
+    fn by_signature(&self, sig: &str) -> Option<u32> {
+        self.by_signature.get(sig).copied()
+    }
+}
+
+/// A `regprocedure` spelling: `name(arg,arg)`, or `name()` for no arguments.
+/// `pg_proc.dat` writes the argument types space-separated, `pg_cast.dat`
+/// comma-separated.
+fn signature(name: &str, argtypes: &str) -> String {
+    let args: Vec<&str> = argtypes.split_whitespace().collect();
+    format!("{name}({})", args.join(","))
 }
 
 fn read_dat(dir: &std::path::Path, file: &str) -> std::io::Result<Vec<Entry>> {
@@ -216,10 +349,10 @@ struct TypeRow<'a> {
     typdelim: &'a str,
     typelem: u32,
     typarray: u32,
-    typinput: &'a str,
-    typoutput: &'a str,
-    typreceive: &'a str,
-    typsend: &'a str,
+    typinput: String,
+    typoutput: String,
+    typreceive: String,
+    typsend: String,
     typalign: &'a str,
     typstorage: &'a str,
     /// A Rust *expression* for the collation OID, not the OID itself: the
@@ -256,8 +389,8 @@ typowner: crate::schema::BOOTSTRAP_ROLE_OID, typlen: {typlen}, typbyval: {typbyv
 typtype: {typtype:?}, \
 typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
 typdelim: {typdelim:?}, typrelid: {typrelid}, typelem: {typelem}, typarray: {typarray}, \
-typinput: {typinput:?}, typoutput: {typoutput:?}, typreceive: {typreceive:?}, \
-typsend: {typsend:?}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
+typinput: {typinput}, typoutput: {typoutput}, typreceive: {typreceive}, \
+typsend: {typsend}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
 typcollation: {typcollation} }},\n",
             // typrelid references a catalog relation's pg_class OID, which we do
             // not codegen yet — 0 until pg_class OIDs are available (only the
@@ -279,12 +412,25 @@ fn resolve_typcollation(e: &Entry) -> &'static str {
     }
 }
 
+/// A `regproc` column as the `ProcRef` expression the generated file carries:
+/// the name as written, plus the OID it resolves to. `-` is the catalog's
+/// spelling of "no function" and resolves to 0, which prints back as `-`.
+fn proc_ref(procs: &ProcIndex<'_>, name: &str) -> String {
+    let oid = procs.by_name(name).unwrap_or(0);
+    format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+}
+
 /// Emit `PG_TYPE_ROWS: &[PgTypeRow]` from `pg_type.dat`. Each base entry that
 /// names an `array_type_oid` is followed by the row for its array type (see
 /// [`array_row_for`]); the few array types the `.dat` spells out itself
 /// (`_record`) come through as ordinary entries. Omitted columns fall back to
 /// PostgreSQL's `pg_type` BKI defaults.
-fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
+fn gen_pg_type(
+    entries: &[Entry],
+    name_to_oid: &HashMap<String, u32>,
+    procs: &ProcIndex<'_>,
+) -> String {
+    let regproc = |e: &Entry, key: &str| proc_ref(procs, str_field(e, key, "-"));
     // Every OID and name the file itself claims, so a derived array row that
     // collides with a real type is a build failure rather than a duplicate row.
     // Both maps are filled before the loop: an entry that collides with a
@@ -331,10 +477,10 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
                 .map(|n| name_to_oid.get(n).copied().unwrap_or(0))
                 .unwrap_or(0),
             typarray,
-            typinput: str_field(e, "typinput", "-"),
-            typoutput: str_field(e, "typoutput", "-"),
-            typreceive: str_field(e, "typreceive", "-"),
-            typsend: str_field(e, "typsend", "-"),
+            typinput: regproc(e, "typinput"),
+            typoutput: regproc(e, "typoutput"),
+            typreceive: regproc(e, "typreceive"),
+            typsend: regproc(e, "typsend"),
             typalign: resolve_typalign(str_field(e, "typalign", "i")),
             typstorage: str_field(e, "typstorage", "p"),
             typcollation: resolve_typcollation(e),
@@ -344,7 +490,7 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
         if array_oid == 0 {
             continue;
         }
-        let array = array_row_for(&base, array_oid);
+        let array = array_row_for(&base, array_oid, procs);
         if let Some(other) = used_oids.insert(array_oid, array.typname.clone()) {
             panic!(
                 "array type OID {array_oid} for {typname:?} collides with existing type {other:?}"
@@ -369,9 +515,11 @@ fn gen_pg_type(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
 /// `typdelim` and `typcollation` are inherited (`box` separates with `;`, so
 /// `_box` does too; `_text` sorts under the element's collation), but `typalign`
 /// is *not* — it widens to `i` for everything narrower, since the array header
-/// is int-aligned. Every value here is pinned against a live `pg_type` by
+/// is int-aligned. The `regproc` columns are the array family's own, not the
+/// element's: `array_in`/`array_out`/`array_recv`/`array_send`. Every value here
+/// is pinned against a live `pg_type` by
 /// `array_rows_are_derived_from_their_element`.
-fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32) -> TypeRow<'a> {
+fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32, procs: &ProcIndex<'_>) -> TypeRow<'a> {
     TypeRow {
         oid,
         typname: format!("_{}", base.typname),
@@ -384,10 +532,10 @@ fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32) -> TypeRow<'a> {
         typelem: base.oid,
         // An array of arrays is not a type of its own here, as upstream.
         typarray: 0,
-        typinput: "array_in",
-        typoutput: "array_out",
-        typreceive: "array_recv",
-        typsend: "array_send",
+        typinput: proc_ref(procs, "array_in"),
+        typoutput: proc_ref(procs, "array_out"),
+        typreceive: proc_ref(procs, "array_recv"),
+        typsend: proc_ref(procs, "array_send"),
         typalign: if base.typalign == "d" { "d" } else { "i" },
         typstorage: "x",
         typcollation: base.typcollation,
@@ -398,9 +546,14 @@ fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32) -> TypeRow<'a> {
 /// `casttarget` are written as type names (resolved here against `pg_type`);
 /// a cast whose source or target is a type crabgresql does not expose is
 /// skipped, so the emitted `pg_cast` stays consistent with the exposed
-/// `pg_type`. OIDs are synthetic (upstream assigns none). `castfunc` is kept as
-/// the `.dat` text (a `regprocedure` reference) rather than a resolved OID.
-fn gen_pg_cast(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
+/// `pg_type`. OIDs are synthetic (upstream assigns none). `castfunc` is a
+/// resolved `pg_proc` OID, as PostgreSQL declares the column — `0` for a
+/// binary-coercible cast, which needs no function.
+fn gen_pg_cast(
+    entries: &[Entry],
+    name_to_oid: &HashMap<String, u32>,
+    procs: &ProcIndex<'_>,
+) -> String {
     // Casts have no manual OIDs upstream; assign stable synthetic ones above the
     // built-in floor so they never collide with a real object OID.
     const FIRST_CAST_OID: u32 = 10000;
@@ -417,14 +570,122 @@ fn gen_pg_cast(entries: &[Entry], name_to_oid: &HashMap<&str, u32>) -> String {
         };
         let row = format!(
             "    PgCastRow {{ oid: {oid}, castsource: {source}, casttarget: {target}, \
-castfunc: {castfunc:?}, castcontext: {castcontext:?}, castmethod: {castmethod:?} }},\n",
+castfunc: {castfunc}, castcontext: {castcontext:?}, castmethod: {castmethod:?} }},\n",
             oid = next_oid,
-            castfunc = str_field(e, "castfunc", "-"),
+            castfunc = procs
+                .by_signature(str_field(e, "castfunc", "0"))
+                .unwrap_or(0),
             castcontext = str_field(e, "castcontext", "e"),
             castmethod = str_field(e, "castmethod", "f"),
         );
         next_oid += 1;
         out.push_str(&row);
+    }
+    out.push_str("];\n");
+    let _ = writeln!(out);
+    out
+}
+
+/// Emit `PG_PROC_ROWS: &[PgProcRow]` for the functions listed in `referenced` —
+/// the ones `pg_type`, `pg_cast` and `pg_am` point at. The rest of
+/// `pg_proc.dat` is deliberately left out: a `pg_proc` row is a claim that the
+/// function exists, and this build implements its SQL surface from its own
+/// registry, not from upstream's list. Every row emitted here is justified by
+/// an inbound reference that would otherwise dangle.
+///
+/// Omitted fields fall back to PostgreSQL's `pg_proc` BKI defaults (authored
+/// from the public catalog docs and checked against a running 18.4).
+fn gen_pg_proc(
+    entries: &[Entry],
+    name_to_oid: &HashMap<String, u32>,
+    referenced: &[u32],
+) -> String {
+    let type_oid = |name: &str| {
+        name_to_oid
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("pg_proc references type {name:?}, which pg_type.dat lacks"))
+    };
+    let mut out = String::new();
+    out.push_str("// @generated by build.rs from vendor/postgres/catalog/pg_proc.dat\n");
+    out.push_str("pub static PG_PROC_ROWS: &[PgProcRow] = &[\n");
+    let mut rows: Vec<(u32, String)> = Vec::new();
+    for e in entries {
+        let oid = oid_field(e, "oid");
+        if referenced.binary_search(&oid).is_err() {
+            continue;
+        }
+        let proname = str_field(e, "proname", "");
+        // The emitted subset is I/O, cast and handler functions, none of which
+        // take OUT parameters or defaults. Anything else would need those
+        // columns filled rather than left NULL, so refuse rather than lie.
+        for unsupported in [
+            "proallargtypes",
+            "proargmodes",
+            "proargnames",
+            "proargdefaults",
+        ] {
+            assert!(
+                get(e, unsupported).is_none(),
+                "pg_proc entry {proname} carries {unsupported}, which codegen does not emit"
+            );
+        }
+        let argtypes: Vec<u32> = str_field(e, "proargtypes", "")
+            .split_whitespace()
+            .map(type_oid)
+            .collect();
+        let retset = bool_field(e, "proretset", false);
+        let args = argtypes
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let row = format!(
+            "    PgProcRow {{ oid: {oid}, proname: {proname:?}, prolang: {prolang}, \
+procost: {procost:?}, prorows: {prorows:?}, provariadic: {provariadic}, \
+prosupport: {prosupport}, prokind: {prokind:?}, prosecdef: false, \
+proleakproof: {proleakproof}, proisstrict: {proisstrict}, proretset: {retset}, \
+provolatile: {provolatile:?}, proparallel: {proparallel:?}, pronargs: {pronargs}, \
+prorettype: {prorettype}, proargtypes: &[{args}], prosrc: {prosrc:?} }},\n",
+            prolang = match str_field(e, "prolang", "internal") {
+                "c" => 13,
+                "sql" => 14,
+                other => {
+                    assert_eq!(other, "internal", "unknown prolang {other:?}");
+                    12
+                }
+            },
+            procost = str_field(e, "procost", "1")
+                .parse::<f32>()
+                .unwrap_or_else(|_| panic!("bad procost on {proname}")),
+            // A set-returning function with no explicit estimate reports
+            // PostgreSQL's 1000-row planner default; a scalar one reports 0.
+            prorows = match get(e, "prorows") {
+                Some(rows) => rows
+                    .parse::<f32>()
+                    .unwrap_or_else(|_| panic!("bad prorows on {proname}")),
+                None if retset => 1000.0,
+                None => 0.0,
+            },
+            provariadic = get(e, "provariadic").map_or(0, type_oid),
+            // A planner support routine is itself a `pg_proc` row this codegen
+            // does not emit, so pointing at one would dangle. Report none —
+            // which is also true of what the planner here actually consults.
+            prosupport = "ProcRef { oid: 0, name: \"-\" }",
+            prokind = str_field(e, "prokind", "f"),
+            proleakproof = bool_field(e, "proleakproof", false),
+            proisstrict = bool_field(e, "proisstrict", true),
+            provolatile = str_field(e, "provolatile", "i"),
+            proparallel = str_field(e, "proparallel", "s"),
+            pronargs = argtypes.len(),
+            prorettype = type_oid(str_field(e, "prorettype", "")),
+            prosrc = str_field(e, "prosrc", ""),
+        );
+        rows.push((oid, row));
+    }
+    rows.sort_by_key(|(oid, _)| *oid);
+    for (_, row) in &rows {
+        out.push_str(row);
     }
     out.push_str("];\n");
     let _ = writeln!(out);

@@ -110,6 +110,13 @@ pub trait CatalogOps: Send + Sync {
     /// such relation. `None` for `namespace` searches the unqualified path, as
     /// `pg_table_is_visible` reports it. Backs `regclass` input.
     fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The name of the function `oid` identifies, or `None` if there is no such
+    /// function. Backs `regproc` output.
+    fn proc_name(&self, oid: u32) -> Option<String>;
+    /// The OID of the function `namespace.name` names, or `None` if there is no
+    /// such function. `Some` only when the name is unambiguous, as `regprocin`
+    /// requires. Backs `regproc` input.
+    fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
     /// The name of the schema `oid` identifies, and its inverse. Back
     /// `regnamespace`.
     fn namespace_name(&self, oid: u32) -> Option<String>;
