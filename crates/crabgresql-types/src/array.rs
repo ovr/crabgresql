@@ -69,6 +69,13 @@ pub fn elem_oid_for_array(arr: u32) -> Option<u32> {
         .map(|(e, _)| *e)
 }
 
+/// Every (element OID, array OID) pair this build models, for callers that need
+/// to sweep them rather than look one up — the drift tests against `pg_type` in
+/// `crabgresql-catalog`, and the name round-trip here.
+pub fn pairs() -> impl Iterator<Item = (u32, u32)> {
+    ARRAY_OID_PAIRS.iter().copied()
+}
+
 /// (element OID, array OID) pairs, matching PostgreSQL's `pg_type.typarray`.
 const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::BOOL, oid::BOOL_ARRAY),

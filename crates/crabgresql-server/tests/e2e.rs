@@ -130,21 +130,15 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
 
     // A built-in type the catalog knows about but this build does not model is
     // `0A000`, not the `42704` a nonexistent type would get. (`xml` is the stand-in
-    // here; it used to be `box`, which is now a real type.) `_int4` is the same
-    // case: pg_type now carries a row per array type, so the catalog name is
-    // known even though declaring a column by that spelling is not wired up.
-    for unmodeled in ["xml", "_int4"] {
-        let sql = format!("CREATE TABLE unsupported (value {unmodeled})");
-        let err = client
-            .simple_query(&sql)
-            .await
-            .expect_err("a column of a catalog type this build does not model must be rejected");
-        assert_eq!(
-            err.as_db_error().expect("database error").code(),
-            &SqlState::FEATURE_NOT_SUPPORTED,
-            "{unmodeled} must be 0A000, not 42704"
-        );
-    }
+    // here; it used to be `box`, which is now a real type.)
+    let err = client
+        .simple_query("CREATE TABLE unsupported (value xml)")
+        .await
+        .expect_err("a column of a catalog type this build does not model must be rejected");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
     let err = client
         .simple_query("CREATE TABLE unsupported (value _nosuchtype)")
         .await
@@ -152,6 +146,37 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::UNDEFINED_OBJECT
+    );
+
+    // `_int4` is not in that group: it is PostgreSQL's own name for integer[],
+    // and it declares exactly the same column the bracket spelling does.
+    client
+        .simple_query("CREATE TABLE arrspelling (a _int4, b integer[])")
+        .await?;
+    let spelled = client
+        .simple_query(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty \
+             FROM pg_attribute a \
+             WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = 'arrspelling') \
+               AND a.attnum > 0 ORDER BY a.attnum",
+        )
+        .await?;
+    let spelled = rows(&spelled);
+    assert_eq!(spelled[0].get(1), Some("integer[]"));
+    assert_eq!(spelled[1].get(1), Some("integer[]"));
+    // …and it resolves as a type reference, not just as DDL syntax.
+    let regt = client.simple_query("SELECT '_int4'::regtype").await?;
+    assert_eq!(rows(&regt)[0].get(0), Some("integer[]"));
+
+    // There is no array-of-array type, so the composition stays an error rather
+    // than minting an Array whose own OID would be 0.
+    let err = client
+        .simple_query("CREATE TABLE nested (a _int4[])")
+        .await
+        .expect_err("an array of an array must be rejected");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
     );
 
     client

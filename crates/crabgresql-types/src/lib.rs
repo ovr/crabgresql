@@ -685,8 +685,10 @@ impl PgType {
     /// [`PgType::typname`] and [`PgType::name`]. Every built-in answers to both
     /// its catalog spelling (`int4`, `float8`, `timestamptz`) and its SQL
     /// spelling (`integer`, `double precision`, `timestamp with time zone`),
-    /// plus the aliases SQL allows (`int`, `decimal`, `char`). `None` for a name
-    /// this build has no built-in for — a user type, or an unsupported one.
+    /// plus the aliases SQL allows (`int`, `decimal`, `char`) and the `_elem`
+    /// spelling of an array type (see [`array_from_name`](Self::array_from_name)).
+    /// `None` for a name this build has no built-in for — a user type, or an
+    /// unsupported one.
     ///
     /// Built-in type names live in `pg_catalog`, so this is what a bare or
     /// `pg_catalog.`-qualified name resolves against before the user-type
@@ -758,8 +760,31 @@ impl PgType {
             "regnamespace" => PgType::Reg(RegKind::Namespace),
             "oidvector" => PgType::Vector(VectorKind::Oid),
             "int2vector" => PgType::Vector(VectorKind::Int2),
-            _ => return None,
+            _ => return Self::array_from_name(name),
         })
+    }
+
+    /// The `_elem` half of [`from_name`](Self::from_name): PostgreSQL names an
+    /// array type by prefixing its element's, and `_int4` is as good a spelling
+    /// of `integer[]` as the bracket form. Kept out of the table above so the
+    /// common path stays one jump.
+    ///
+    /// Three things are deliberately not accepted. There is no array-of-array
+    /// type, so `__int4` is nothing. The prefix applies to the *catalog* name
+    /// only — PostgreSQL has `_int4`, never `_integer` — which is what the
+    /// `typname` round-trip enforces. And an element with no array type of its
+    /// own is refused rather than yielding an `Array` whose `oid()` is 0.
+    ///
+    /// A `_`-prefixed pseudo-type stays `None` for the same reason its element
+    /// does: `record` is not in the table above, so neither is `_record`.
+    fn array_from_name(name: &str) -> Option<PgType> {
+        let elem_name = name.strip_prefix('_')?;
+        let elem = PgType::from_name(elem_name)?;
+        if elem.is_array() || elem.typname() != elem_name {
+            return None;
+        }
+        array::array_oid_for_elem(elem.oid())?;
+        Some(PgType::Array(elem.oid()))
     }
 
     /// `pg_type.typlen`: byte width for fixed-size types, -1 for varlena.
@@ -1233,6 +1258,12 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Tsquery) => "_tsquery",
         Some(PgType::Vector(VectorKind::Oid)) => "_oidvector",
         Some(PgType::Vector(VectorKind::Int2)) => "_int2vector",
+        Some(PgType::Reg(RegKind::Class)) => "_regclass",
+        Some(PgType::Reg(RegKind::Type)) => "_regtype",
+        Some(PgType::Reg(RegKind::Namespace)) => "_regnamespace",
+        // Only reached for an element with no array type of its own, which has
+        // no catalog name to give. `array_names_round_trip_through_typname`
+        // keeps every modeled pair off this arm.
         _ => "array",
     }
 }
@@ -1591,6 +1622,52 @@ impl std::error::Error for tz::ZoneError {}
 mod tests {
     use super::*;
     use deepsize::DeepSizeOf;
+
+    /// PostgreSQL's own name for an array type is its element's with an `_`
+    /// prefix, and that spelling is as declarable as `integer[]`. Every accepted
+    /// name here was probed against PostgreSQL 18.4 (`'_int4'::regtype` is
+    /// `integer[]`), as was every rejected one (`'_integer'::regtype` errors).
+    #[test]
+    fn an_underscore_prefix_names_the_array_type() {
+        let f = |n: &str| PgType::from_name(n);
+        assert_eq!(f("_int4"), Some(PgType::Array(oid::INT4)));
+        assert_eq!(f("_text"), Some(PgType::Array(oid::TEXT)));
+        // oid 18's catalog name is `char`, so its array is `_char` — distinct
+        // from `_bpchar`, which is oid 1042's.
+        assert_eq!(f("_char"), Some(PgType::Array(oid::CHAR)));
+        assert_eq!(f("_bpchar"), Some(PgType::Array(oid::BPCHAR)));
+        assert_eq!(f("_oidvector"), Some(PgType::Array(oid::OIDVECTOR)));
+        assert_eq!(f("_timestamptz"), Some(PgType::Array(oid::TIMESTAMPTZ)));
+
+        // The prefix applies to the catalog name, not to a SQL alias.
+        assert_eq!(f("_integer"), None);
+        assert_eq!(f("_boolean"), None);
+        // There is no array-of-array type.
+        assert_eq!(f("__int4"), None);
+        // A pseudo-type's array is not declarable either, because the
+        // pseudo-type itself is not in the table.
+        assert_eq!(f("_record"), None);
+        // An element this build does not model has no array type to name.
+        assert_eq!(f("_xml"), None);
+        assert_eq!(f("_"), None);
+        assert_eq!(f("_nosuchtype"), None);
+    }
+
+    /// The names round-trip: what the catalog calls a type is what resolves
+    /// back to it, in both directions, for arrays as much as for scalars.
+    #[test]
+    fn array_names_round_trip_through_typname() {
+        for (elem, array_oid) in array::pairs() {
+            let ty = PgType::Array(elem);
+            assert_eq!(ty.oid(), array_oid);
+            let name = ty.typname();
+            assert_eq!(
+                PgType::from_name(name),
+                Some(ty),
+                "{name} does not resolve back to its PgType"
+            );
+        }
+    }
 
     /// `bpchar` and `bit` are the two types whose spelling depends on *whether*
     /// a modifier was given, not just on its value. Probed against PostgreSQL

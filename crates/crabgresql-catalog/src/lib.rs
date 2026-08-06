@@ -1411,10 +1411,13 @@ mod tests {
     fn built_in_name_lookup_includes_unimplemented_types() {
         assert!(is_builtin_type_name("int4"));
         assert!(is_builtin_type_name("point"));
-        // An array type is a built-in name in its own right, so declaring a
-        // column `_int4` reports "not supported yet" rather than "does not
-        // exist" — PostgreSQL accepts the name, this build just does not map it.
+        // An array type is a built-in name in its own right, and one this build
+        // resolves: `_int4` declares an integer[] column, as in PostgreSQL.
         assert!(is_builtin_type_name("_int4"));
+        assert_eq!(
+            crabgresql_types::PgType::from_name("_int4"),
+            Some(crabgresql_types::PgType::Array(crabgresql_types::oid::INT4))
+        );
         assert!(!is_builtin_type_name("definitely_not_a_pg_type"));
     }
 
@@ -1506,6 +1509,17 @@ mod tests {
             ("float4", PgType::Float4),
             ("float8", PgType::Float8),
             ("numeric", PgType::Numeric),
+            ("money", PgType::Money),
+            ("bit", PgType::Bit),
+            ("varbit", PgType::Varbit),
+            ("macaddr", PgType::Macaddr),
+            ("macaddr8", PgType::Macaddr8),
+            ("regclass", PgType::Reg(crabgresql_types::RegKind::Class)),
+            ("regtype", PgType::Reg(crabgresql_types::RegKind::Type)),
+            (
+                "regnamespace",
+                PgType::Reg(crabgresql_types::RegKind::Namespace),
+            ),
             ("text", PgType::Text),
             ("varchar", PgType::Varchar),
             ("bpchar", PgType::Bpchar),

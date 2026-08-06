@@ -6035,6 +6035,17 @@ fn type_shape_from_options(
                     Some(_) => n.as_deref().and_then(builtin_type_by_name),
                 });
                 if let Some(t) = builtin {
+                    // An array's representation is not something a base type can
+                    // borrow: the `WITHOUT FUNCTION` casts a backing enables
+                    // assume a fixed scalar layout. `LIKE _int4` became
+                    // reachable once `_elem` names resolved, so refuse it here
+                    // rather than mint a base type backed by an array.
+                    if t.is_array() {
+                        return Err(PgError::feature_not_supported(format!(
+                            "type \"{}\" is not a valid base type for LIKE",
+                            t.name()
+                        )));
+                    }
                     typlen = t.typlen() as i32;
                     backing = Some(t);
                 } else if let Some(len) = n.as_deref().and_then(|n| catalog.user_type_typlen(n)) {
