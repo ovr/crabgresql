@@ -83,3 +83,92 @@ SELECT count(*) AS misplaced_enumvals
 SELECT count(*) AS with_a_source_file
   FROM pg_settings
  WHERE sourcefile IS NOT NULL OR sourceline IS NOT NULL OR pending_restart;
+--
+-- SET LOCAL and SET are two levels, not one
+--
+-- PostgreSQL keeps a session value and a local value per parameter, and the two
+-- can be assigned in either order in one block. Every sequence below was diffed
+-- against PostgreSQL 18.4 and matches.
+--
+-- a SET LOCAL then a plain SET: the plain SET wins, and COMMIT keeps it
+BEGIN;
+SET LOCAL extra_float_digits = 3;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+SET extra_float_digits = 2;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+RESET extra_float_digits;
+-- a plain SET then a SET LOCAL: COMMIT unmasks the session value
+BEGIN;
+SET extra_float_digits = 2;
+SET LOCAL extra_float_digits = 3;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+RESET extra_float_digits;
+-- ...and ROLLBACK discards both levels
+BEGIN;
+SET extra_float_digits = 2;
+SET LOCAL extra_float_digits = 3;
+ROLLBACK;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+-- two SET LOCALs mask one session value, which COMMIT restores
+SET extra_float_digits = 0;
+BEGIN;
+SET LOCAL extra_float_digits = 3;
+SET LOCAL extra_float_digits = 2;
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+RESET extra_float_digits;
+-- a SET LOCAL alone never manufactures a source: COMMIT restores the pre-block
+-- one, and so does ROLLBACK
+BEGIN;
+SET LOCAL extra_float_digits = 3;
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+-- ...including for a parameter with no value to restore. The two DateStyle rows
+-- below read 'configuration file' on a stock PostgreSQL and 'default' here, the
+-- divergence the file header describes; what is being checked is that the
+-- source comes back unchanged, whichever it started as.
+BEGIN;
+SET LOCAL DateStyle = 'ISO, MDY';
+COMMIT;
+SELECT name, source FROM pg_settings WHERE name = 'DateStyle';
+BEGIN;
+SET LOCAL DateStyle = 'ISO, MDY';
+ROLLBACK;
+SELECT name, source FROM pg_settings WHERE name = 'DateStyle';
+-- PostgreSQL's own oddity, reproduced: it stores no source for a masked value
+-- and restores it as 'session' outright, so a RESET that a SET LOCAL then masks
+-- comes back reporting 'session' over the boot value.
+SET extra_float_digits = 0;
+BEGIN;
+SET LOCAL extra_float_digits = 3;
+RESET extra_float_digits;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+SET LOCAL extra_float_digits = 2;
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+RESET extra_float_digits;
+-- SET x = DEFAULT is RESET x, so the source goes back to 'default' too
+SET extra_float_digits = 2;
+SET extra_float_digits = DEFAULT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+SET extra_float_digits = 2;
+BEGIN;
+SET extra_float_digits = DEFAULT;
+COMMIT;
+SELECT setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+RESET extra_float_digits;
+-- SET SESSION CHARACTERISTICS marks only the parameters it names
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
+SELECT name, setting, source FROM pg_settings
+ WHERE name LIKE 'default_transaction%' ORDER BY name COLLATE "C";
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT name, setting, source FROM pg_settings
+ WHERE name LIKE 'default_transaction%' ORDER BY name COLLATE "C";
+-- ...and both are put back, or every statement after this one runs read-only
+RESET ALL;
+SELECT name, setting, source FROM pg_settings
+ WHERE name LIKE 'default_transaction%' ORDER BY name COLLATE "C";

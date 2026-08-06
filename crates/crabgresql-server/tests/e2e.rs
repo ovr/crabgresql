@@ -11176,6 +11176,118 @@ async fn set_local_and_set_are_transactional() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A block may issue both spellings on one parameter, in either order, and
+/// PostgreSQL keeps two levels to answer that: COMMIT unmasks the *session*
+/// value a plain SET established rather than reverting to the pre-block one.
+/// One save slot could only ever restore the latter, which was wrong both ways
+/// round.
+#[tokio::test]
+async fn a_plain_set_survives_the_set_local_masking_it() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // SET LOCAL then SET: the plain SET wins outright, during and after.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'")
+        .await?;
+    client.simple_query("SET TimeZone = 'Europe/Paris'").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Europe/Paris");
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Europe/Paris");
+
+    // SET then SET LOCAL: the local masks it until COMMIT unmasks.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET TimeZone = 'Europe/Berlin'")
+        .await?;
+    client
+        .simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'")
+        .await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Asia/Tokyo");
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Europe/Berlin");
+
+    // ROLLBACK still discards both levels.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET TimeZone = 'America/Denver'")
+        .await?;
+    client
+        .simple_query("SET LOCAL TimeZone = 'Asia/Tokyo'")
+        .await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, "SHOW TimeZone").await, "Europe/Berlin");
+    Ok(())
+}
+
+/// `SET x = DEFAULT` is `RESET x`, so it returns `pg_settings.source` to
+/// `default` — it used to report `session`, disagreeing with the RESET spelling
+/// of the same operation.
+#[tokio::test]
+async fn set_to_default_reports_source_default() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let source = |name: &str| format!("SELECT source FROM pg_settings WHERE name = '{name}'");
+
+    client.simple_query("SET extra_float_digits = 2").await?;
+    assert_eq!(
+        scalar(&client, &source("extra_float_digits")).await,
+        "session"
+    );
+    client
+        .simple_query("SET extra_float_digits = DEFAULT")
+        .await?;
+    assert_eq!(
+        scalar(&client, &source("extra_float_digits")).await,
+        "default"
+    );
+
+    // `SET TIME ZONE DEFAULT` and `SET TIME ZONE LOCAL` reduce to the same
+    // value, so they answer the same way.
+    for reset in ["DEFAULT", "LOCAL"] {
+        client.simple_query("SET TimeZone = 'Asia/Tokyo'").await?;
+        assert_eq!(scalar(&client, &source("TimeZone")).await, "session");
+        client
+            .simple_query(&format!("SET TIME ZONE {reset}"))
+            .await?;
+        assert_eq!(scalar(&client, &source("TimeZone")).await, "default");
+        assert_eq!(scalar(&client, "SHOW TimeZone").await, "UTC");
+    }
+    Ok(())
+}
+
+/// `SET SESSION CHARACTERISTICS` writes only the modes it names, so only those
+/// become `source = session`. It used to mark both parameters whichever was
+/// given.
+#[tokio::test]
+async fn session_characteristics_marks_only_named_parameters() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let iso = "SELECT source FROM pg_settings WHERE name = 'default_transaction_isolation'";
+    let ro = "SELECT source FROM pg_settings WHERE name = 'default_transaction_read_only'";
+
+    client
+        .simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .await?;
+    assert_eq!(scalar(&client, iso).await, "default");
+    assert_eq!(scalar(&client, ro).await, "session");
+
+    client
+        .simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await?;
+    assert_eq!(scalar(&client, iso).await, "session");
+    assert_eq!(scalar(&client, ro).await, "session");
+
+    // ...and both are transactional, like a plain SET of either.
+    client.simple_query("RESET ALL").await?;
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, iso).await, "default");
+    assert_eq!(scalar(&client, ro).await, "default");
+    Ok(())
+}
+
 /// Outside a block there is nothing for a `SET LOCAL` to be local to, so PG
 /// warns and does nothing.
 #[tokio::test]
@@ -11328,6 +11440,19 @@ async fn timezone_changes_emit_parameter_status() -> anyhow::Result<()> {
         query(&mut socket, "COMMIT").await?,
         vec![("TimeZone".to_string(), "UTC".to_string())]
     );
+
+    // Unmasking at commit is a change too, and it lands on the *session* value a
+    // plain SET established rather than on the pre-block one — which is the
+    // cheapest wire-level guard on the two-level save stack, since a one-slot
+    // one could only ever announce `UTC` here.
+    query(&mut socket, "SET TimeZone = 'Europe/Paris'").await?;
+    query(&mut socket, "BEGIN").await?;
+    query(&mut socket, "SET LOCAL TimeZone = 'Asia/Tokyo'").await?;
+    assert_eq!(
+        query(&mut socket, "COMMIT").await?,
+        vec![("TimeZone".to_string(), "Europe/Paris".to_string())]
+    );
+    query(&mut socket, "RESET TimeZone").await?;
 
     // An ordinary statement carries none.
     assert_eq!(query(&mut socket, "SELECT 1").await?, vec![]);
