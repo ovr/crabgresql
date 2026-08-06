@@ -44,8 +44,11 @@ pub struct SessionCatalogSource {
     /// Eager for the same reason as `cursors`: every value is rendered from the
     /// session, which this source outlives.
     settings: Vec<CatalogSetting>,
-    /// The statement timestamp, so the timezone views resolve their offsets at
-    /// the same instant `now()` reports in this statement.
+    /// The transaction timestamp, so the timezone views resolve their offsets at
+    /// the same instant `now()` reports. Not the *statement* timestamp: `now()`
+    /// is `transaction_timestamp()` here as in PostgreSQL, and the two differ
+    /// for every statement after the first in a block — visibly so for a
+    /// transaction that spans a DST transition.
     now: i64,
 }
 
@@ -83,7 +86,7 @@ impl SessionCatalogSource {
             temp_namespace_oid: session.temp_namespace_oid,
             cursors,
             settings: crate::guc::catalog_settings(session),
-            now: session.stmt_start,
+            now: session.xact_start(),
         }
     }
 }

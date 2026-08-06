@@ -362,7 +362,12 @@ pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 /// fresh OID per `CREATE DATABASE`, so there is no upstream value to reuse: this
 /// one is fixed here so `pg_database.oid` joins against itself consistently and
 /// `current_database()::regclass`-style round-trips stay stable across restarts.
-const DATABASE_OID: u32 = 16_384;
+///
+/// It sits in the same reserved band as [`PARQUET_AM_OID`], and for the same
+/// reason: at 16384 it would have shared its OID with the first `CREATE SCHEMA`
+/// or `CREATE TYPE` the server ever ran, since that is where the OID allocator
+/// starts.
+const DATABASE_OID: u32 = 16_002;
 
 /// `pg_default` and `pg_global`, PostgreSQL's two bootstrap tablespaces.
 /// crabgresql has no `CREATE TABLESPACE`, so these two rows are the whole
