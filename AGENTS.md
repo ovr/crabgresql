@@ -70,6 +70,22 @@ for the entire codebase:
   which observable PG behavior it reproduces, what breaks if it is changed, or
   which non-obvious alternative was rejected and why.
 - If nothing of that kind is true of a line, leave it uncommented.
+- **Missing functionality is a `TODO`, not prose.** When a comment says that
+  something is not built yet — a column held at a constant until a subsystem
+  lands, a relation served in reduced form, a slow path kept until an index
+  exists — write it as `TODO: <what is missing>`, optionally tagged
+  (`TODO(perf):`). Phrasings like "for now", "a follow-up" or "in a later slice"
+  say the same thing to a human and nothing to `grep`, so when the blocking
+  change finally lands nobody finds the places that were waiting for it.
+- A `TODO` names the missing capability, not a plan. Ticket numbers, wave names
+  and workspace-local planning documents are not in the repository and do not
+  travel with the branch; a reader who greps `TODO` a year from now must be able
+  to tell what is absent from the line itself.
+- **A deliberate difference from PostgreSQL is not a `TODO`.** State it plainly
+  and say why it is correct — `pg_group` is empty because no DDL creates a
+  group, and `pg_am` carries methods upstream does not have. Marking a settled
+  decision as unfinished work invites someone to "fix" it, and dilutes the
+  `TODO`s that are real.
 
 ## Rust error handling
 

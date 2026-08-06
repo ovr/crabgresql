@@ -828,8 +828,9 @@ fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
     let mut seen = std::collections::HashSet::new();
     for def in registry::CATALOG_RELATIONS {
         if def.namespace != CatalogNamespace::PgCatalog {
-            // The information_schema views are Rust row builders with no
-            // `pg_class` row yet, so they have no OID to check (W4).
+            // The information_schema entries have no OID to check; the TODO on
+            // `CatalogRelDef::oid` says why, and this pins the sentinel so it
+            // cannot be read as a real assignment.
             assert_eq!(def.oid, 0, "{} must not claim an OID yet", def.name);
             continue;
         }

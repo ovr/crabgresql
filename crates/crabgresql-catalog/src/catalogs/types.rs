@@ -48,14 +48,16 @@ pub(crate) fn pg_type_schema() -> TableSchema {
     )
 }
 
-/// The built-in `pg_type` rows generated from `pg_type.dat`. Callers append any
-/// user-defined-type rows (a later slice) after these.
+/// The built-ins first, then this session's `CREATE TYPE`s. The order is what
+/// keeps a built-in OID at the same row index across snapshots that differ only
+/// in their user types.
 pub(crate) fn pg_type_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let mut rows = pg_type_builtin_rows();
     rows.extend(pg_type_user_rows(cat.user_types()));
     rows
 }
 
+/// The built-in `pg_type` rows generated from `pg_type.dat`.
 pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
     PG_TYPE_ROWS
         .iter()

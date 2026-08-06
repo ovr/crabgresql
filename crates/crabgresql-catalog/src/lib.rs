@@ -4,8 +4,8 @@
 //! The core seam: a bound `SELECT` lowers to a scan over an `Arc<dyn TableAm>`,
 //! and the executor treats every access method alike. So each supported
 //! `pg_catalog` relation is materialized as a [`StaticTable`] (rows built from
-//! codegen'd built-in data plus, in later slices, live server state) and handed
-//! to the same pipeline user tables use — no bespoke executor node.
+//! codegen'd built-in data and from live server state) and handed to the same
+//! pipeline user tables use — no bespoke executor node.
 //!
 //! [`SystemCatalog`] implements [`TableEngine`] so the server's session catalog
 //! can layer it into name resolution: `pg_catalog.<rel>` routes here directly,
@@ -29,11 +29,12 @@
 //!
 //! Built-in rows are generated at build time from PostgreSQL's vendored catalog
 //! `.dat` *data* (`vendor/postgres/catalog/`), never from its C/Perl source; see
-//! `build.rs` and `AGENTS.md`. Column coverage is a curated, PG-ordered subset
-//! keyed by the names real clients query; several catalog-only types are
-//! represented pragmatically (`oid` is real; `"char"`/`regproc` render as
-//! `text`). Full column/type parity with upstream `type_sanity`/`\d` is a
-//! follow-up.
+//! `build.rs` and `AGENTS.md`.
+//!
+//! TODO: column coverage is a curated, PG-ordered subset keyed by the names real
+//! clients query, not parity — upstream's `type_sanity` and psql's `\d` read
+//! columns no relation here publishes. The catalog-only column *types* are real
+//! (`oid`, `"char"`, `regproc`); it is the column list that is short.
 
 pub(crate) mod catalogs;
 pub(crate) mod cols;
@@ -811,10 +812,13 @@ impl SystemCatalog {
 
     /// Materialize `namespace.name` from the registry.
     ///
-    /// The rows are built on every call: a `SystemCatalog` lives one statement,
-    /// but `pg_class a, pg_class b` still pays twice. Memoizing that is step
-    /// 0.2.2 of the catalog plan, and it belongs here, where every relation
-    /// funnels through one call.
+    /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
+    /// relation twice and every scan of `pg_proc` rebuilds 503 rows. The cache
+    /// belongs one level up, in `open_table`/`resolve`: both wrap this in a
+    /// [`StaticTable`], which already holds its schema and rows behind `Arc`s,
+    /// so caching the `Arc<dyn TableAm>` is a refcount bump where caching the
+    /// owned pair returned here would clone every row on each hit. Safe either
+    /// way — a `SystemCatalog` lives exactly one statement.
     fn build(
         &self,
         namespace: CatalogNamespace,

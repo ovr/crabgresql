@@ -38,9 +38,12 @@ pub(crate) enum CatalogNamespace {
 /// whole table stays a `static` with no initialization at run time.
 pub(crate) struct CatalogRelDef {
     pub(crate) name: &'static str,
-    /// PostgreSQL's own OID for the relation, probed from 18.4 — `0` for the
-    /// `information_schema` views, which have none here yet (they are Rust row
-    /// builders, not the `pg_class`-reflected views W4 turns them into).
+    /// PostgreSQL's own OID for the relation, probed from 18.4.
+    ///
+    /// TODO: `0` for the three `information_schema` entries. They are built as
+    /// Rust rows rather than reflected into `pg_class`, so a client has nothing
+    /// to cast `'information_schema.tables'::regclass` to; publishing them as
+    /// relations is what would give them an OID worth recording here.
     pub(crate) oid: u32,
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
