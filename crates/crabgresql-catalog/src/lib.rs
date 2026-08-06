@@ -1378,6 +1378,16 @@ mod tests {
             type_col(&by_name("bool"), &schema, "typinput"),
             Value::Text("boolin".to_string())
         );
+        // The two entries whose alignment pg_type.dat spells symbolically must
+        // arrive substituted: PG serves a single character here, never the
+        // symbol's name.
+        for symbolic in ["internal", "pg_ddl_command"] {
+            assert_eq!(
+                type_col(&by_name(symbolic), &schema, "typalign"),
+                Value::Text("d".to_string()),
+                "{symbolic} typalign must be substituted"
+            );
+        }
         // Every row is full-width.
         assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
     }
