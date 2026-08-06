@@ -555,22 +555,17 @@ fn eval_catalog_fn(
     ) {
         return None;
     }
-    // Four of the session-identity functions take no argument at all, so the
-    // STRICT check below would index an empty slice; they are answered first.
-    let zero_arity = matches!(
-        func,
-        ScalarFn::CurrentDatabase
-            | ScalarFn::CurrentUser
-            | ScalarFn::SessionUser
-            | ScalarFn::CurrentSchema
-            | ScalarFn::PgMyTempSchema
-    );
     // Every function here but `pg_typeof` is STRICT, and this path runs ahead of
     // `eval_scalar`'s NULL short-circuit, so the check is hand-rolled.
     // `pg_typeof(NULL)` reports the argument's declared type, not NULL. Kept
     // ahead of the handle check so a NULL argument answers NULL whether or not
     // the statement was given a catalog context.
-    if !zero_arity && !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args[0], Value::Null) {
+    //
+    // `args.first()` rather than a hand-listed set of the zero-argument
+    // functions: several of the session-identity ones take none, and a list
+    // would be a `matches!` — not exhaustive, so the next zero-arity function
+    // added past it would index an empty slice and panic.
+    if !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args.first(), Some(Value::Null)) {
         return Some(Ok(Value::Null));
     }
     let Some(ops) = ctx.catalog.as_deref() else {

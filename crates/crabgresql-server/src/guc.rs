@@ -174,6 +174,12 @@ const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL V
 /// the order PostgreSQL's `pg_show_all_settings` returns, and therefore the
 /// order both `SHOW ALL` and `pg_settings` inherit for free. `gucs_are_sorted`
 /// below fails if an entry is appended out of place.
+///
+/// The name order is the only grouping: the read-only reported constants
+/// (`server_version`, `server_encoding`, `integer_datetimes`, …) are scattered
+/// among the settable ones rather than sectioned off. They are all `GUC_REPORT`
+/// in PG, which is what drivers rely on to parse the version and pick their
+/// quoting rules.
 pub static GUCS: &[GucDef] = &[
     GucDef {
         key: "client_encoding",
@@ -299,10 +305,6 @@ pub static GUCS: &[GucDef] = &[
             },
         },
     },
-    // --- reported constants -------------------------------------------------
-    // Read-only here, and all `GUC_REPORT` in PG: drivers parse `server_version`
-    // and rely on `client_encoding` / `standard_conforming_strings` to pick
-    // quoting rules.
     GucDef {
         key: "integer_datetimes",
         name: "integer_datetimes",
