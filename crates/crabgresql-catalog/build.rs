@@ -347,12 +347,16 @@ struct TypeRow<'a> {
     typcategory: &'a str,
     typispreferred: bool,
     typdelim: &'a str,
+    typsubscript: String,
     typelem: u32,
     typarray: u32,
     typinput: String,
     typoutput: String,
     typreceive: String,
     typsend: String,
+    typmodin: String,
+    typmodout: String,
+    typanalyze: String,
     typalign: &'a str,
     typstorage: &'a str,
     /// A Rust *expression* for the collation OID, not the OID itself: the
@@ -373,12 +377,16 @@ impl TypeRow<'_> {
             typcategory,
             typispreferred,
             typdelim,
+            typsubscript,
             typelem,
             typarray,
             typinput,
             typoutput,
             typreceive,
             typsend,
+            typmodin,
+            typmodout,
+            typanalyze,
             typalign,
             typstorage,
             typcollation,
@@ -388,9 +396,11 @@ impl TypeRow<'_> {
 typowner: crate::schema::BOOTSTRAP_ROLE_OID, typlen: {typlen}, typbyval: {typbyval}, \
 typtype: {typtype:?}, \
 typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
-typdelim: {typdelim:?}, typrelid: {typrelid}, typelem: {typelem}, typarray: {typarray}, \
+typdelim: {typdelim:?}, typrelid: {typrelid}, typsubscript: {typsubscript}, \
+typelem: {typelem}, typarray: {typarray}, \
 typinput: {typinput}, typoutput: {typoutput}, typreceive: {typreceive}, \
-typsend: {typsend}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
+typsend: {typsend}, typmodin: {typmodin}, typmodout: {typmodout}, \
+typanalyze: {typanalyze}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
 typcollation: {typcollation} }},\n",
             // typrelid references a catalog relation's pg_class OID, which we do
             // not codegen yet — 0 until pg_class OIDs are available (only the
@@ -472,6 +482,7 @@ fn gen_pg_type(
             typcategory: str_field(e, "typcategory", "X"),
             typispreferred: bool_field(e, "typispreferred", false),
             typdelim: str_field(e, "typdelim", ","),
+            typsubscript: regproc(e, "typsubscript"),
             // typelem: element type by name (0 when the type is not an array/vector).
             typelem: get(e, "typelem")
                 .map(|n| name_to_oid.get(n).copied().unwrap_or(0))
@@ -481,6 +492,9 @@ fn gen_pg_type(
             typoutput: regproc(e, "typoutput"),
             typreceive: regproc(e, "typreceive"),
             typsend: regproc(e, "typsend"),
+            typmodin: regproc(e, "typmodin"),
+            typmodout: regproc(e, "typmodout"),
+            typanalyze: regproc(e, "typanalyze"),
             typalign: resolve_typalign(str_field(e, "typalign", "i")),
             typstorage: str_field(e, "typstorage", "p"),
             typcollation: resolve_typcollation(e),
@@ -516,9 +530,9 @@ fn gen_pg_type(
 /// `_box` does too; `_text` sorts under the element's collation), but `typalign`
 /// is *not* — it widens to `i` for everything narrower, since the array header
 /// is int-aligned. The `regproc` columns are the array family's own, not the
-/// element's: `array_in`/`array_out`/`array_recv`/`array_send`. Every value here
-/// is pinned against a live `pg_type` by
-/// `array_rows_are_derived_from_their_element`.
+/// element's: `array_in`/`array_out`/`array_recv`/`array_send`,
+/// `array_subscript_handler` and `array_typanalyze`. Every value here is pinned
+/// against a live `pg_type` by `array_rows_are_derived_from_their_element`.
 fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32, procs: &ProcIndex<'_>) -> TypeRow<'a> {
     TypeRow {
         oid,
@@ -529,6 +543,7 @@ fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32, procs: &ProcIndex<'_>) -> Typ
         typcategory: "A",
         typispreferred: false,
         typdelim: base.typdelim,
+        typsubscript: proc_ref(procs, "array_subscript_handler"),
         typelem: base.oid,
         // An array of arrays is not a type of its own here, as upstream.
         typarray: 0,
@@ -536,6 +551,10 @@ fn array_row_for<'a>(base: &TypeRow<'a>, oid: u32, procs: &ProcIndex<'_>) -> Typ
         typoutput: proc_ref(procs, "array_out"),
         typreceive: proc_ref(procs, "array_recv"),
         typsend: proc_ref(procs, "array_send"),
+        // An array takes no typmod and uses the array-wide statistics routine.
+        typmodin: proc_ref(procs, "-"),
+        typmodout: proc_ref(procs, "-"),
+        typanalyze: proc_ref(procs, "array_typanalyze"),
         typalign: if base.typalign == "d" { "d" } else { "i" },
         typstorage: "x",
         typcollation: base.typcollation,

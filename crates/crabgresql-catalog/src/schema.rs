@@ -98,14 +98,19 @@ pub fn pg_type_schema() -> TableSchema {
             col("typisdefined", PgType::Bool),
             col("typdelim", CHARLIKE),
             col("typrelid", PgType::Oid),
+            col("typsubscript", REGPROC),
             col("typelem", PgType::Oid),
             col("typarray", PgType::Oid),
             col("typinput", REGPROC),
             col("typoutput", REGPROC),
             col("typreceive", REGPROC),
             col("typsend", REGPROC),
+            col("typmodin", REGPROC),
+            col("typmodout", REGPROC),
+            col("typanalyze", REGPROC),
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
+            col("typbasetype", PgType::Oid),
             col("typcollation", PgType::Oid),
         ],
     )
@@ -199,14 +204,22 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Bool(r.typisdefined),
                 str_char(r.typdelim),
                 Value::Oid(r.typrelid),
+                regproc(r.typsubscript),
                 Value::Oid(r.typelem),
                 Value::Oid(r.typarray),
                 regproc(r.typinput),
                 regproc(r.typoutput),
                 regproc(r.typreceive),
                 regproc(r.typsend),
+                regproc(r.typmodin),
+                regproc(r.typmodout),
+                regproc(r.typanalyze),
                 str_char(r.typalign),
                 str_char(r.typstorage),
+                // typbasetype: nonzero only for a domain, and `pg_type.dat` has
+                // none — every entry in it is a base or pseudo type, and a
+                // derived array row is not a domain either.
+                Value::Oid(0),
                 Value::Oid(r.typcollation),
             ]
         })
@@ -239,15 +252,26 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 Value::Bool(true),
                 chr(','),
+                // typrelid / typsubscript: an enum is not a composite and is
+                // not subscriptable.
                 Value::Oid(0),
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
                 Value::Oid(0),
                 Value::Oid(0),
                 regproc_by_name("enum_in"),
                 regproc_by_name("enum_out"),
                 regproc_by_name("enum_recv"),
                 regproc_by_name("enum_send"),
+                // typmodin / typmodout / typanalyze: an enum takes no modifier
+                // and uses the default statistics routine. All three are `-` on
+                // a `CREATE TYPE ... AS ENUM` row (probed against 18.4).
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
                 chr('i'),
                 chr('p'),
+                // typbasetype: an enum is not a domain.
+                Value::Oid(0),
                 // An enum is not collatable.
                 Value::Oid(0),
             ]
@@ -1455,6 +1479,9 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("attlen", PgType::Int2),
             col("attnum", PgType::Int2),
             col("atttypmod", PgType::Int4),
+            col("attbyval", PgType::Bool),
+            col("attalign", CHARLIKE),
+            col("attstorage", CHARLIKE),
             col("attnotnull", PgType::Bool),
             col("atthasdef", PgType::Bool),
             col("attidentity", CHARLIKE),
@@ -1463,6 +1490,22 @@ pub fn pg_attribute_schema() -> TableSchema {
             col("attcollation", PgType::Oid),
         ],
     )
+}
+
+/// A column's physical layout — `attbyval`, `attalign`, `attstorage` — taken
+/// from the *type's* `pg_type` row rather than restated here, which is what
+/// upstream's `type_sanity` checks the two agree on. A type with no built-in
+/// row (a `CREATE TYPE` enum) reports the fixed 4-byte pass-by-value layout
+/// [`pg_type_user_rows`] gives it.
+fn attlayout_of(ty: PgType) -> (Value, Value, Value) {
+    match PG_TYPE_ROWS.iter().find(|row| row.oid == ty.oid()) {
+        Some(row) => (
+            Value::Bool(row.typbyval),
+            str_char(row.typalign),
+            str_char(row.typstorage),
+        ),
+        None => (Value::Bool(true), chr('i'), chr('p')),
+    }
 }
 
 /// `attcollation`: the column's explicit `COLLATE`, else the type's own
@@ -1484,6 +1527,7 @@ pub fn pg_attribute_rows(
     let mut rows = Vec::new();
     for (oid, schema) in relations {
         for (i, c) in schema.columns.iter().enumerate() {
+            let (byval, align, storage) = attlayout_of(c.ty);
             rows.push(vec![
                 Value::Oid(*oid),
                 Value::Text(c.name.clone()),
@@ -1491,6 +1535,9 @@ pub fn pg_attribute_rows(
                 Value::Int2(c.ty.typlen()),
                 Value::Int2((i + 1) as i16),
                 Value::Int4(c.atttypmod()),
+                byval,
+                align,
+                storage,
                 Value::Bool(!c.nullable),
                 Value::Bool(c.default.is_some()),
                 // attidentity / attgenerated: no identity or generated columns.
@@ -1505,6 +1552,7 @@ pub fn pg_attribute_rows(
     for index in indexes {
         for (position, key) in index.metadata.keys.iter().enumerate() {
             let column = &index.table_schema.columns[key.column];
+            let (byval, align, storage) = attlayout_of(column.ty);
             rows.push(vec![
                 Value::Oid(index.oid),
                 Value::Text(column.name.clone()),
@@ -1512,6 +1560,9 @@ pub fn pg_attribute_rows(
                 Value::Int2(column.ty.typlen()),
                 Value::Int2((position + 1) as i16),
                 Value::Int4(column.atttypmod()),
+                byval,
+                align,
+                storage,
                 Value::Bool(false),
                 Value::Bool(false),
                 chr('\0'),
@@ -1524,6 +1575,7 @@ pub fn pg_attribute_rows(
     // A TOAST relation's columns, so its `pg_class.relnatts` has rows to join.
     for toast in toasts {
         for (i, (name, ty)) in TOAST_COLUMNS.iter().enumerate() {
+            let (byval, align, storage) = attlayout_of(*ty);
             rows.push(vec![
                 Value::Oid(toast.oid),
                 Value::Text((*name).to_string()),
@@ -1531,6 +1583,9 @@ pub fn pg_attribute_rows(
                 Value::Int2(ty.typlen()),
                 Value::Int2((i + 1) as i16),
                 Value::Int4(-1),
+                byval,
+                align,
+                storage,
                 // PostgreSQL marks all three NOT NULL.
                 Value::Bool(true),
                 Value::Bool(false),
