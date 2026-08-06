@@ -19,7 +19,7 @@ use crabgresql_types::{PgType, Value, VectorKind};
 use crate::{
     CatalogConstraint, CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine,
     CatalogSequence, CatalogSetting, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
-    RelKind, TOAST_NAMESPACE,
+    PgTypeRow, RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -132,6 +132,18 @@ fn typcollation_of(oid: u32) -> u32 {
     PgType::from_oid(oid).map_or(0, crabgresql_types::collation::type_collation)
 }
 
+/// `typcollation` for a built-in row. An array takes its element's collation
+/// (`_text` sorts by `default`, `_name` by `C`), which is why this cannot go
+/// through [`typcollation_of`] alone: `PgType::Array` is not itself collatable,
+/// and the array OIDs this build does not model do not even resolve.
+fn row_typcollation(r: &PgTypeRow) -> u32 {
+    if r.typcategory == "A" && r.typelem != 0 {
+        typcollation_of(r.typelem)
+    } else {
+        typcollation_of(r.oid)
+    }
+}
+
 /// The built-in `pg_type` rows generated from `pg_type.dat`. Callers append any
 /// user-defined-type rows (a later slice) after these.
 pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
@@ -159,7 +171,7 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Text(r.typsend.to_string()),
                 Value::Text(r.typalign.to_string()),
                 Value::Text(r.typstorage.to_string()),
-                Value::Oid(typcollation_of(r.oid)),
+                Value::Oid(row_typcollation(r)),
             ]
         })
         .collect()

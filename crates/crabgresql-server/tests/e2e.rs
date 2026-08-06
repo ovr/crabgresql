@@ -130,14 +130,28 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
 
     // A built-in type the catalog knows about but this build does not model is
     // `0A000`, not the `42704` a nonexistent type would get. (`xml` is the stand-in
-    // here; it used to be `box`, which is now a real type.)
+    // here; it used to be `box`, which is now a real type.) `_int4` is the same
+    // case: pg_type now carries a row per array type, so the catalog name is
+    // known even though declaring a column by that spelling is not wired up.
+    for unmodeled in ["xml", "_int4"] {
+        let sql = format!("CREATE TABLE unsupported (value {unmodeled})");
+        let err = client
+            .simple_query(&sql)
+            .await
+            .expect_err("a column of a catalog type this build does not model must be rejected");
+        assert_eq!(
+            err.as_db_error().expect("database error").code(),
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            "{unmodeled} must be 0A000, not 42704"
+        );
+    }
     let err = client
-        .simple_query("CREATE TABLE unsupported (value xml)")
+        .simple_query("CREATE TABLE unsupported (value _nosuchtype)")
         .await
-        .expect_err("a column of a catalog type this build does not model must be rejected");
+        .expect_err("a column of a type no catalog knows must be rejected");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
-        &SqlState::FEATURE_NOT_SUPPORTED
+        &SqlState::UNDEFINED_OBJECT
     );
 
     client
@@ -154,6 +168,32 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         )
         .await?;
     assert_eq!(rows(&oid_overlap)[0].get(0), Some("0"));
+
+    // An array column's atttypid is the array type's own OID, so the join every
+    // client driver builds its type map with has to land on a real pg_type row.
+    client
+        .simple_query("CREATE TABLE arrcols (tags int[], notes text[])")
+        .await?;
+    let arr = client
+        .simple_query(
+            "SELECT a.attname, t.oid, t.typname, t.typelem, t.typcategory \
+             FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = 'arrcols') \
+               AND a.attnum > 0 ORDER BY a.attnum",
+        )
+        .await?;
+    let arr = rows(&arr);
+    assert_eq!(
+        arr.len(),
+        2,
+        "both array columns must join to a pg_type row"
+    );
+    assert_eq!(arr[0].get(1), Some("1007"));
+    assert_eq!(arr[0].get(2), Some("_int4"));
+    assert_eq!(arr[0].get(3), Some("23"));
+    assert_eq!(arr[0].get(4), Some("A"));
+    assert_eq!(arr[1].get(2), Some("_text"));
+    assert_eq!(arr[1].get(3), Some("25"));
 
     for target in ["varchar", "name", "bpchar"] {
         let sql = format!("SELECT 'red'::rainbow::{target}");

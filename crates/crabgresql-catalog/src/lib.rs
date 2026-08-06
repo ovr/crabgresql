@@ -1386,6 +1386,10 @@ mod tests {
     fn built_in_name_lookup_includes_unimplemented_types() {
         assert!(is_builtin_type_name("int4"));
         assert!(is_builtin_type_name("point"));
+        // An array type is a built-in name in its own right, so declaring a
+        // column `_int4` reports "not supported yet" rather than "does not
+        // exist" — PostgreSQL accepts the name, this build just does not map it.
+        assert!(is_builtin_type_name("_int4"));
         assert!(!is_builtin_type_name("definitely_not_a_pg_type"));
     }
 
@@ -1468,7 +1472,7 @@ mod tests {
         use crabgresql_types::PgType;
         // Types crabgresql models: their .dat-generated pg_type row must agree
         // with the authoritative PgType::oid()/typlen() used everywhere else, or
-        // a pg_attribute.atttypid -> pg_type.oid join silently mismatches.
+        // a pg_attribute.atttypid -> pg_type.oid join silently finds nothing.
         let modeled = [
             ("bool", PgType::Bool),
             ("int2", PgType::Int2),
@@ -1540,6 +1544,116 @@ mod tests {
             );
             assert_eq!(ty.typname(), typname, "{typname} typname drift");
         }
+    }
+
+    /// `pg_type` and the array-OID table in `crabgresql-types` are two
+    /// independent statements of the same fact — the first generated from
+    /// `pg_type.dat`, the second hand-written (it cannot depend on this crate's
+    /// codegen). Pin them against each other in both directions: an element
+    /// whose array OID they disagree on would send `PgType::Array` values out on
+    /// the wire under an OID whose catalog row describes a different element.
+    #[test]
+    fn array_rows_agree_with_the_array_oid_table() {
+        use crabgresql_types::array::{array_oid_for_elem, elem_oid_for_array};
+
+        let row_for = |oid: u32| PG_TYPE_ROWS.iter().find(|r| r.oid == oid);
+        for row in PG_TYPE_ROWS {
+            // Element -> array: the table's answer must be the row this build
+            // actually emits, and that row must exist.
+            if let Some(array_oid) = array_oid_for_elem(row.oid) {
+                assert_eq!(
+                    row.typarray, array_oid,
+                    "{}: typarray {} but the array-OID table says {array_oid}",
+                    row.typname, row.typarray
+                );
+                let array = row_for(array_oid).unwrap_or_else(|| {
+                    panic!(
+                        "no pg_type row for {}'s array (oid {array_oid})",
+                        row.typname
+                    )
+                });
+                assert_eq!(array.typelem, row.oid, "{} typelem drift", array.typname);
+                assert_eq!(array.typname, format!("_{}", row.typname));
+            }
+            // Array -> element, for the arrays the table models at all.
+            if let Some(elem_oid) = elem_oid_for_array(row.oid) {
+                assert_eq!(
+                    row.typelem, elem_oid,
+                    "{}: typelem {} but the array-OID table says {elem_oid}",
+                    row.typname, row.typelem
+                );
+            }
+        }
+    }
+
+    /// Every array type gets its own row, derived from its element's. Values
+    /// pinned against PostgreSQL: an array is a varlena with extended storage
+    /// and the array I/O functions, it inherits `typdelim` from its element but
+    /// widens `typalign` to `i` unless the element is double-aligned, and it
+    /// takes its element's collation.
+    #[test]
+    fn array_rows_are_derived_from_their_element() {
+        let schema = schema::pg_type_schema();
+        let rows = schema::pg_type_builtin_rows();
+        let by_name = |name: &str| {
+            rows.iter()
+                .find(|r| type_col(r, &schema, "typname") == Value::Text(name.to_string()))
+                .unwrap_or_else(|| panic!("{name} row present"))
+                .clone()
+        };
+        let col = |name: &str, column: &str| type_col(&by_name(name), &schema, column);
+
+        // Driver-critical: _int4 is the OID every client's type map keys on.
+        assert_eq!(col("_int4", "oid"), Value::Oid(1007));
+        assert_eq!(col("int4", "typarray"), Value::Oid(1007));
+        assert_eq!(col("_int4", "typelem"), Value::Oid(23));
+        assert_eq!(col("_int4", "typlen"), Value::Int2(-1));
+        assert_eq!(col("_int4", "typbyval"), Value::Bool(false));
+        assert_eq!(col("_int4", "typcategory"), Value::Text("A".to_string()));
+        assert_eq!(
+            col("_int4", "typinput"),
+            Value::Text("array_in".to_string())
+        );
+        assert_eq!(col("_int4", "typstorage"), Value::Text("x".to_string()));
+        // An array of arrays is not a type of its own.
+        assert_eq!(col("_int4", "typarray"), Value::Oid(0));
+
+        // typalign: `i` for everything but a double-aligned element — note bool
+        // is `c`, yet _bool is still `i`.
+        assert_eq!(col("_int4", "typalign"), Value::Text("i".to_string()));
+        assert_eq!(col("_bool", "typalign"), Value::Text("i".to_string()));
+        assert_eq!(col("_float8", "typalign"), Value::Text("d".to_string()));
+        // typdelim, in contrast, is inherited: box separates with `;`.
+        assert_eq!(col("box", "typdelim"), Value::Text(";".to_string()));
+        assert_eq!(col("_box", "typdelim"), Value::Text(";".to_string()));
+
+        // An array is collatable exactly when its element is, with the same
+        // collation — `name` is C-collated, so `_name` is too.
+        assert_eq!(col("_text", "typcollation"), Value::Oid(100));
+        assert_eq!(col("_name", "typcollation"), Value::Oid(950));
+        assert_eq!(col("_int4", "typcollation"), Value::Oid(0));
+
+        // `_record` is spelled out in pg_type.dat (arrays of records keep
+        // typcategory P, so they cannot be autogenerated) — it must come
+        // through as that entry, not as a derived row.
+        assert_eq!(col("_record", "oid"), Value::Oid(2287));
+        assert_eq!(col("_record", "typcategory"), Value::Text("P".to_string()));
+        assert_eq!(col("record", "typarray"), Value::Oid(2287));
+    }
+
+    #[test]
+    fn pg_type_rows_are_unique_by_oid_and_name() {
+        let mut oids: Vec<u32> = PG_TYPE_ROWS.iter().map(|r| r.oid).collect();
+        oids.sort_unstable();
+        let before = oids.len();
+        oids.dedup();
+        assert_eq!(before, oids.len(), "duplicate oid in PG_TYPE_ROWS");
+
+        let mut names: Vec<&str> = PG_TYPE_ROWS.iter().map(|r| r.typname).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate typname in PG_TYPE_ROWS");
     }
 
     /// The pseudo-type table in `crabgresql-types` is hand-written (it cannot
