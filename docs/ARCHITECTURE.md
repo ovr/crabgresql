@@ -786,10 +786,14 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   objects** as PG (otherwise drivers that hardcode type OIDs break:
   `23 = int4`, `25 = text`, …).
 - Bootstrap: the initial catalog is generated from upstream
-  `pg_type.dat`/`pg_proc.dat`/`pg_cast.dat` (build-time codegen). Codegen
-  resolves the `regproc` references between them — `pg_type.typinput`,
-  `pg_cast.castfunc`, `pg_am.amhandler` — to real OIDs, and emits `pg_proc`
-  rows for **exactly the functions those references name**. The rest of
+  `pg_type.dat`/`pg_proc.dat`/`pg_cast.dat` by `crabgresql-bki`, a build-time
+  codegen library. It runs in two phases — every catalog first declares the
+  symbols it defines, and only then does emission resolve references — because
+  the reference graph is cyclic: `pg_type.typinput` names a `pg_proc` row whose
+  `prorettype` names a `pg_type` row, and no ordering of the files makes a
+  single pass work. The `regproc` references — `pg_type.typinput`,
+  `pg_cast.castfunc`, `pg_am.amhandler` — resolve to real OIDs, and `pg_proc`
+  gets rows for **exactly the functions those references name**. The rest of
   `pg_proc.dat` is deliberately left out: a `pg_proc` row is a claim that a
   function exists, and this build runs its SQL surface from its own registry
   rather than upstream's list. `every_regproc_reference_resolves_to_an_emitted_row`
@@ -838,6 +842,7 @@ crates/
   crabgresql-protocol        # pgwire: message codecs, auth, TLS
   crabgresql-parser          # sqlparser wrapper (PG dialect) + AST utilities
   crabgresql-catalog         # system catalogs, bootstrap, cache
+  crabgresql-bki             # build-time codegen of pg_catalog from vendored .dat
   crabgresql-types           # type system: values, codecs, casts, numeric, datetime
   crabgresql-binder          # semantic analysis: AST -> logical plan
   crabgresql-planner         # optimizer: logical -> physical plan
