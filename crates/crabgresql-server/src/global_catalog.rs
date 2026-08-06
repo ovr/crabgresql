@@ -680,7 +680,11 @@ impl GlobalCatalog {
                 format!("type \"{old}\" does not exist"),
             ));
         }
-        if crabgresql_catalog::is_builtin_type_name(new) || cat.types.contains_key(new) {
+        // Only a collision within this type's own namespace counts. A rename
+        // stays in `public`, so a built-in's name is free to take — PostgreSQL
+        // accepts `ALTER TYPE mine RENAME TO int4`, leaving `public.int4`
+        // beside the built-in that unqualified references keep resolving to.
+        if cat.types.contains_key(new) {
             return Err(PgError::new(
                 sqlstate::DUPLICATE_OBJECT,
                 format!("type \"{new}\" already exists"),
@@ -1986,16 +1990,14 @@ mod tests {
             .expect_err("renaming onto an existing type name must be rejected");
         assert_eq!(collide.code, sqlstate::DUPLICATE_OBJECT);
         assert_eq!(collide.message, "type \"b\" already exists");
-        // A target that collides with a builtin name is a duplicate-object error.
-        let builtin = cat
-            .rename_type("a", "int4")
-            .expect_err("renaming onto a built-in type name must be rejected");
-        assert_eq!(builtin.code, sqlstate::DUPLICATE_OBJECT);
-        assert_eq!(builtin.message, "type \"int4\" already exists");
-        // Source existence is checked before the target collision: a missing
-        // source with a builtin target still reports the source, not the target.
+        // A built-in's name is not a collision: the rename stays in `public`,
+        // and PostgreSQL likewise accepts `ALTER TYPE a RENAME TO int4`,
+        // leaving public.int4 beside the built-in.
+        cat.rename_type("a", "int4")?;
+        assert!(cat.resolve_type("int4").is_some());
+        // Source existence is checked before the target collision.
         let order = cat
-            .rename_type("nope", "int4")
+            .rename_type("nope", "b")
             .expect_err("a missing source type must be reported before the target collision");
         assert_eq!(order.code, sqlstate::UNDEFINED_OBJECT);
         assert_eq!(order.message, "type \"nope\" does not exist");

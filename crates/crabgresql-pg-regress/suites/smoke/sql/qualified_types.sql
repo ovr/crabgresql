@@ -33,3 +33,19 @@ SELECT 1::pg_catalog.int4 AS builtin_still;
 DROP TABLE qt;
 DROP TABLE qt2;
 DROP TYPE qmood;
+-- A user type may take a builtin's name. CREATE names the schema to create in
+-- rather than resolving through the search path, so `public.int4` is created
+-- beside `pg_catalog.int4` — but pg_catalog comes first for an unqualified
+-- reference, so `int4` keeps meaning the builtin, and DROP, which does resolve
+-- through the path, names the builtin and refuses.
+CREATE TYPE int4 AS ENUM ('shadow');
+SELECT 1::int4 AS builtin_wins;
+SELECT count(*) AS both FROM pg_type WHERE typname = 'int4';
+SELECT typnamespace FROM pg_type WHERE typname = 'int4' ORDER BY typnamespace;
+DROP TYPE int4;
+-- A second one in the same schema is still a duplicate.
+CREATE TYPE int4 AS ENUM ('again');
+-- Saying `public.` is the only way to name the shadowing type, so it is also
+-- the only way to drop one.
+DROP TYPE public.int4;
+SELECT count(*) AS just_the_builtin FROM pg_type WHERE typname = 'int4';
