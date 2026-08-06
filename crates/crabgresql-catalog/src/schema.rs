@@ -191,8 +191,11 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
             vec![
                 Value::Oid(t.oid),
                 Value::Text(t.name.clone()),
-                // pg_catalog namespace / bootstrap superuser, as elsewhere.
-                Value::Oid(11),
+                // `public`, where CREATE TYPE puts a user type — which is also
+                // what `SystemCatalog::user_type_ref` reports for it, and what
+                // lets a user type share a name with a built-in. Owner is the
+                // bootstrap superuser, as elsewhere.
+                Value::Oid(PUBLIC_NAMESPACE_OID),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 // Enums are a fixed 4-byte, pass-by-value, OID-backed type.
                 Value::Int2(4),
@@ -371,6 +374,11 @@ const HASH_AM_OID: u32 = 405;
 /// one owner stands for the whole cluster. `pg_get_userbyid` resolves it back to
 /// the session user, so the two must agree — hence the shared constant.
 pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
+
+/// `pg_namespace.oid` of `public`, PostgreSQL's fixed value. Where a user type
+/// lives, and so what its `typnamespace` reports — the schema an unqualified
+/// name reaches only after `pg_catalog`.
+pub(crate) const PUBLIC_NAMESPACE_OID: u32 = 2200;
 
 /// OID of the one database a crabgresql server serves. PostgreSQL assigns a
 /// fresh OID per `CREATE DATABASE`, so there is no upstream value to reuse: this

@@ -6093,13 +6093,14 @@ fn execute_create_type(
     name: &ast::ObjectName,
     representation: &Option<ast::UserDefinedTypeRepresentation>,
 ) -> Result<QueryResult, PgError> {
+    // No built-in-name check: CREATE names a *namespace* to create in rather
+    // than resolving through the search path, and a user type is created in
+    // `public`, which cannot collide with `pg_catalog`. PostgreSQL accepts
+    // `CREATE TYPE int4` for exactly this reason — the new `public.int4` sits
+    // alongside the built-in, which unqualified references still win, because
+    // pg_catalog precedes public in the search path. The collision that does
+    // apply, against another type in `public`, is checked by the catalog below.
     let tname = single_object_name(name, "type")?;
-    if crabgresql_catalog::is_builtin_type_name(&tname) {
-        return Err(PgError::new(
-            sqlstate::DUPLICATE_OBJECT,
-            format!("type \"{tname}\" already exists"),
-        ));
-    }
     let notices = match representation {
         None => catalog.create_shell_type(&tname)?,
         Some(ast::UserDefinedTypeRepresentation::SqlDefinition { options }) => {
@@ -8170,10 +8171,35 @@ fn execute_drop_type(
     cascade: bool,
     if_exists: bool,
 ) -> Result<QueryResult, PgError> {
-    let tnames = names
+    let split = names
         .iter()
-        .map(|name| single_object_name(name, "type"))
+        .map(|name| split_object_name(name, "type"))
         .collect::<Result<Vec<_>, _>>()?;
+    // Unlike CREATE, DROP resolves its target through the search path, where
+    // pg_catalog comes first — so an unqualified built-in name names the
+    // built-in even when a user type of the same name sits in `public`, and a
+    // built-in cannot be dropped. Saying `public.` picks the user type, which
+    // is the only way to name one that shadows a built-in.
+    for (schema, tname) in &split {
+        match schema.as_deref() {
+            Some("public") => continue,
+            Some(ns) if ns != "pg_catalog" => {
+                return Err(PgError::feature_not_supported(format!(
+                    "qualified type names are not supported yet: {ns}.{tname}"
+                )));
+            }
+            _ => {}
+        }
+        if crabgresql_catalog::is_builtin_type_name(tname) {
+            let display = builtin_type_by_name(tname)
+                .map_or_else(|| tname.to_string(), |t| t.name().to_string());
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop type {display} because it is required by the database system"),
+            ));
+        }
+    }
+    let tnames: Vec<String> = split.into_iter().map(|(_, name)| name).collect();
     let refs: Vec<&str> = tnames.iter().map(String::as_str).collect();
     let notices = catalog.drop_types(&refs, cascade, if_exists)?;
     Ok(QueryResult::Command {

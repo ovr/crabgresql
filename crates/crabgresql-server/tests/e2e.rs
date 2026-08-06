@@ -119,10 +119,36 @@ async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
         "type \"shell_only\" is only a shell"
     );
 
-    let err = client
+    // CREATE names the namespace to create in rather than resolving through the
+    // search path, so a built-in's name is free: PostgreSQL puts the new type in
+    // `public` beside `pg_catalog.int4`. What must not change is which one an
+    // unqualified reference finds — pg_catalog precedes public, so `int4` keeps
+    // meaning the built-in, and the shadow type is reachable only by OID here.
+    client
         .simple_query("CREATE TYPE int4 AS ENUM ('shadow')")
+        .await?;
+    let still_builtin = client.simple_query("SELECT 1::int4 AS v").await?;
+    assert_eq!(rows(&still_builtin)[0].get(0), Some("1"));
+    let both = client
+        .simple_query("SELECT count(*) FROM pg_type WHERE typname = 'int4'")
+        .await?;
+    assert_eq!(rows(&both)[0].get(0), Some("2"));
+    // A built-in cannot be dropped, and an unqualified DROP names it.
+    let err = client
+        .simple_query("DROP TYPE int4")
         .await
-        .expect_err("a type name that collides with a built-in must be rejected");
+        .expect_err("an unqualified DROP resolves to the built-in, which is not droppable");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        err.message(),
+        "cannot drop type integer because it is required by the database system"
+    );
+    // A second CREATE in the same namespace is still a duplicate.
+    let err = client
+        .simple_query("CREATE TYPE int4 AS ENUM ('again')")
+        .await
+        .expect_err("two user types of one name in public must collide");
     assert_eq!(
         err.as_db_error().expect("database error").code(),
         &SqlState::DUPLICATE_OBJECT
