@@ -3162,21 +3162,11 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
             snapshot,
             session: is_session,
         } => {
-            // Writes `default_transaction_isolation` / `default_read_only`
-            // directly, so it has to enter the save stack the same way a plain
-            // `SET` of those parameters does — otherwise the two spellings of
-            // one parameter disagree about being transactional.
-            if *is_session {
-                for key in [
-                    "default_transaction_isolation",
-                    "default_transaction_read_only",
-                ] {
-                    if let Some(def) = guc::lookup(key) {
-                        session.save_guc_for_transaction(def, false);
-                        session.mark_guc_set(def);
-                    }
-                }
-            }
+            // `SET SESSION CHARACTERISTICS` writes the same two parameters a
+            // plain `SET` of them writes, so it has to go through the same save
+            // stack — but only for the modes it actually names, and only once
+            // the statement can no longer fail. Both live in
+            // `apply_set_transaction`, which is where that is known.
             return apply_set_transaction(session, modes, snapshot.is_some(), *is_session);
         }
         ast::Set::SingleAssignment {
@@ -3221,10 +3211,7 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
             notices,
         });
     }
-    session.save_guc_for_transaction(def, local);
-    def.set(session, value)?;
-    // Only after the setter accepted it: a rejected `SET` leaves `source` alone.
-    session.mark_guc_set(def);
+    session.assign_guc(def, value, local)?;
     Ok(QueryResult::Command {
         tag: "SET".into(),
         notices,
@@ -3386,11 +3373,28 @@ fn apply_set_transaction(
     let (iso, read_only) = apply_modes(modes)?;
     if is_session {
         // SET SESSION CHARACTERISTICS: change the defaults new blocks inherit.
+        // Each mode is applied through the same seam a plain `SET` of the
+        // parameter uses, so the two spellings agree about being transactional
+        // and about `pg_settings.source`. Only the modes the statement actually
+        // named are touched — `AS TRANSACTION READ ONLY` leaves the isolation
+        // level's source at `default`, as in PG — and nothing is recorded until
+        // `has_snapshot` and `apply_modes` above have both had their chance to
+        // fail.
         if let Some(iso) = iso {
-            session.default_iso = iso;
+            let def = guc::lookup("default_transaction_isolation")
+                .ok_or_else(|| guc::unrecognized("default_transaction_isolation"))?;
+            session.assign_guc_with(def, false, true, |s| {
+                s.default_iso = iso;
+                Ok(())
+            })?;
         }
         if let Some(read_only) = read_only {
-            session.default_read_only = read_only;
+            let def = guc::lookup("default_transaction_read_only")
+                .ok_or_else(|| guc::unrecognized("default_transaction_read_only"))?;
+            session.assign_guc_with(def, false, true, |s| {
+                s.default_read_only = read_only;
+                Ok(())
+            })?;
         }
         return Ok(QueryResult::command("SET"));
     }
@@ -3471,18 +3475,21 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
     match &reset.reset {
         ast::Reset::ALL => {
             for def in guc::GUCS {
-                session.save_guc_for_transaction(def, false);
-                def.reset_in_all(session)?;
-                session.mark_guc_reset(def);
+                // `RESET ALL` silently skips a read-only parameter where
+                // `RESET <name>` on the same one raises 55P02. Skipping it here
+                // rather than inside the setter also keeps it out of the save
+                // stack, where it could neither change nor ever be a `session`.
+                if def.is_read_only() {
+                    continue;
+                }
+                session.assign_guc(def, guc::GucValue::Default, false)?;
             }
         }
         ast::Reset::ConfigurationParameter(name) => {
             let Some(def) = single_ident_lower(name).and_then(|n| guc::lookup(&n)) else {
                 return Ok(QueryResult::command("RESET"));
             };
-            session.save_guc_for_transaction(def, false);
-            def.reset(session)?;
-            session.mark_guc_reset(def);
+            session.assign_guc(def, guc::GucValue::Default, false)?;
         }
     }
     Ok(QueryResult::command("RESET"))

@@ -341,21 +341,37 @@ impl ActiveTxn {
     }
 }
 
-/// A configuration parameter's value from before the current transaction block
-/// changed it, captured verbatim (see [`guc::SavedValue`] for why it is not the
-/// rendered form).
+/// One parameter's two saved levels for the current transaction block, captured
+/// verbatim (see [`guc::SavedValue`] for why they are not the rendered form).
+///
+/// PostgreSQL keeps two, and so must this: a plain `SET` inside a block survives
+/// `COMMIT`, a `SET LOCAL` does not, and the two can be issued on the same
+/// parameter in either order. One slot cannot express that — it can only ever
+/// restore the pre-block value, which is wrong for both orders. These fields are
+/// `guc.c`'s `GucStack.prior` and `GucStack.masked` under different names.
+///
+/// A `None` value never means "not captured yet": `session` is initialised from
+/// `outer` on first touch, so `None` only ever means this parameter has no value
+/// to restore (`SET client_encoding` is accepted and ignored). Its
+/// `pg_settings.source` still moves, which is why such a parameter is saved.
 struct SavedGuc {
     def: &'static guc::GucDef,
-    /// Set by `SET LOCAL`, which reverts on commit as well as rollback.
-    local: bool,
-    /// `None` for a parameter whose value cannot change (`SET client_encoding`
-    /// is accepted and ignored). Its `pg_settings.source` still moves, which is
-    /// why such a parameter is saved at all.
-    value: Option<guc::SavedValue>,
-    /// Whether the parameter counted as explicitly assigned before this block —
-    /// `pg_settings.source`. Rolled back with the value, or the column would
-    /// keep reporting `session` after a `ROLLBACK` put `setting` back.
-    was_explicitly_set: bool,
+    /// The state at block entry — what `ROLLBACK` restores.
+    outer: Option<guc::SavedValue>,
+    outer_explicit: bool,
+    /// The session-level state a `SET LOCAL` is masking — what `COMMIT`
+    /// restores. Re-captured by every plain assignment in the block.
+    session: Option<guc::SavedValue>,
+    /// Whether the masked value counts as explicitly assigned. Latched `true` by
+    /// *any* plain assignment, `RESET` included: PostgreSQL stores no source for
+    /// a masked value and restores it as `PGC_S_SESSION` outright, so
+    /// `BEGIN; RESET x; SET LOCAL x = …; COMMIT` really does leave the boot
+    /// value reporting `source = session`. Verified against 18.4.
+    session_explicit: bool,
+    /// Whether the *current* value came from a `SET LOCAL` and so has to be
+    /// unmasked at commit. Assigned, not OR'd — a later plain `SET` makes the
+    /// current value the session value again.
+    local_active: bool,
 }
 
 pub struct Session {
@@ -718,70 +734,115 @@ impl Session {
 
     /// The execution context with no sequence or catalog handle — for utility
     /// paths (e.g. `EXPLAIN`'s `Values` node) that never call either family.
-    /// Record a parameter's pre-change value so the transaction can put it back.
+    /// Capture a parameter's block-entry state so the transaction can put it
+    /// back.
     ///
-    /// PostgreSQL's configuration parameters are transactional. A plain `SET`
-    /// inside a block is undone by `ROLLBACK` but survives `COMMIT`; a
-    /// `SET LOCAL` is undone by *either*. Both are the same save-stack with
-    /// different restore predicates, which is what `local` records.
-    ///
-    /// Only the first change to a given parameter in a block is saved — later
-    /// ones would overwrite the original with an already-modified value. Called
-    /// before the setter runs, and a no-op outside a block, where there is
-    /// nothing to restore to.
-    pub fn save_guc_for_transaction(&mut self, def: &'static guc::GucDef, local: bool) {
-        if self.tx_status == TransactionStatus::Idle {
-            return;
-        }
-        if let Some(saved) = self.saved_gucs.iter_mut().find(|s| s.def.key == def.key) {
-            // Already saved. A later `SET LOCAL` over a plain `SET` still has to
-            // revert at commit, so the flag is sticky once set.
-            saved.local |= local;
+    /// Only the first touch in a block is captured — a later one would overwrite
+    /// the original with an already-modified value. A no-op outside a block,
+    /// where there is nothing to restore to. Runs before the setter, so a
+    /// statement that goes on to fail leaves an entry whose `outer` equals the
+    /// unchanged current value: a harmless identity restore, and unavoidable
+    /// since the pre-change value is only readable before the change.
+    fn save_guc_for_transaction(&mut self, def: &'static guc::GucDef) {
+        if self.tx_status == TransactionStatus::Idle
+            || self.saved_gucs.iter().any(|s| s.def.key == def.key)
+        {
             return;
         }
         // A parameter whose value cannot change still has a `source` to restore,
         // so it is saved with no value rather than skipped.
         let value = def.capture(self);
-        let was_explicitly_set = self.explicitly_set.contains(def.key);
+        let explicit = self.explicitly_set.contains(def.key);
         self.saved_gucs.push(SavedGuc {
             def,
-            local,
-            value,
-            was_explicitly_set,
+            outer: value.clone(),
+            outer_explicit: explicit,
+            session: value,
+            session_explicit: explicit,
+            local_active: false,
         });
     }
 
-    /// Undo the block's parameter changes as it ends: everything on `ROLLBACK`,
-    /// only the `SET LOCAL`s on `COMMIT`.
+    /// Assign one parameter, whole: capture the pre-change state, apply the
+    /// change, record the result. The three steps used to be three statements
+    /// per call site, and the four sites had already drifted into two
+    /// user-visible bugs — hence one seam.
+    ///
+    /// `explicit` is what `pg_settings.source` becomes: `false` for
+    /// `SET x = DEFAULT`, which PostgreSQL treats as identical to `RESET x`.
+    /// `apply` runs only after the save, and its failure records nothing — a
+    /// rejected `SET` must leave both the value and the source alone.
+    ///
+    /// Takes a closure rather than a [`guc::GucValue`] because
+    /// `SET SESSION CHARACTERISTICS` writes the session fields directly; routing
+    /// it back through `GucValue::Str(isolation_name(..))` would add a parse that
+    /// can silently disagree with the setter it is imitating.
+    pub fn assign_guc_with(
+        &mut self,
+        def: &'static guc::GucDef,
+        local: bool,
+        explicit: bool,
+        apply: impl FnOnce(&mut Session) -> Result<(), PgError>,
+    ) -> Result<(), PgError> {
+        self.save_guc_for_transaction(def);
+        apply(self)?;
+        // Unconditional: a session's `source` moves whether or not it is in a
+        // block. Only the two-level bookkeeping below is block-scoped.
+        if explicit {
+            self.explicitly_set.insert(def.key);
+        } else {
+            self.explicitly_set.remove(def.key);
+        }
+        let Some(index) = self.saved_gucs.iter().position(|s| s.def.key == def.key) else {
+            return Ok(());
+        };
+        if !local {
+            // The new value *is* the session value now, so the mask (if any) is
+            // gone. `session_explicit` latches rather than following `explicit`
+            // — see the field's doc comment.
+            let captured = def.capture(self);
+            self.saved_gucs[index].session = captured;
+            self.saved_gucs[index].session_explicit = true;
+        }
+        self.saved_gucs[index].local_active = local;
+        Ok(())
+    }
+
+    /// [`Session::assign_guc_with`] for the ordinary `SET`/`RESET` path, where
+    /// the value decides the source: `DEFAULT` is `RESET`.
+    pub fn assign_guc(
+        &mut self,
+        def: &'static guc::GucDef,
+        value: guc::GucValue,
+        local: bool,
+    ) -> Result<(), PgError> {
+        let explicit = !matches!(value, guc::GucValue::Default);
+        self.assign_guc_with(def, local, explicit, |session| def.set(session, value))
+    }
+
+    /// Undo the block's parameter changes as it ends.
+    ///
+    /// `ROLLBACK` discards both levels and restores the block-entry state.
+    /// `COMMIT` keeps whatever a plain `SET` established and only unmasks the
+    /// parameters a `SET LOCAL` is currently masking.
     pub fn restore_gucs_at_transaction_end(&mut self, committed: bool) {
         for saved in std::mem::take(&mut self.saved_gucs) {
-            if committed && !saved.local {
+            let (value, explicit) = if !committed {
+                (saved.outer, saved.outer_explicit)
+            } else if saved.local_active {
+                (saved.session, saved.session_explicit)
+            } else {
                 continue;
-            }
-            if let Some(value) = saved.value {
+            };
+            if let Some(value) = value {
                 saved.def.restore(self, value);
             }
-            if saved.was_explicitly_set {
+            if explicit {
                 self.explicitly_set.insert(saved.def.key);
             } else {
                 self.explicitly_set.remove(saved.def.key);
             }
         }
-    }
-
-    /// Record that `def` was explicitly assigned this session —
-    /// `pg_settings.source` moves from `default` to `session`.
-    ///
-    /// PostgreSQL reports `session` after any successful `SET`, even one that
-    /// assigns the value the parameter already had, so this is keyed on the
-    /// statement having run rather than on the value having changed.
-    pub fn mark_guc_set(&mut self, def: &'static guc::GucDef) {
-        self.explicitly_set.insert(def.key);
-    }
-
-    /// Record that `def` was `RESET` back to its boot value.
-    pub fn mark_guc_reset(&mut self, def: &'static guc::GucDef) {
-        self.explicitly_set.remove(def.key);
     }
 
     /// Whether `key` names a parameter this session assigned —
