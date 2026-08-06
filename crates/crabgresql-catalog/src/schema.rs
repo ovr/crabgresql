@@ -4,9 +4,9 @@
 //! The column list for each relation follows PostgreSQL's column *names* and
 //! order for the frequently-queried leading columns. Fidelity deviations are
 //! deliberate and documented (see the crate root): catalog-only types we do not
-//! model yet are represented pragmatically — `"char"` columns as `text`, and
-//! `regproc` I/O columns as the referenced function's `text` name (which is what
-//! PostgreSQL's `regprocout` prints anyway).
+//! model yet are represented pragmatically — `regproc` columns hold the
+//! referenced function's `text` name (which is what PostgreSQL's `regprocout`
+//! prints anyway) rather than an OID.
 
 use std::collections::HashMap;
 
@@ -26,22 +26,31 @@ use crate::{
 /// built-in ranges so a per-label OID never collides with a type/relation OID.
 const FIRST_ENUM_OID: u32 = 0x8000_0000;
 
-/// A `"char"`/`regproc` column: a single- or short-name catalog column we render
-/// as `text` for now. Kept as a named alias so the deviation is greppable.
-///
-/// `"char"` is now a real [`PgType::Char`], but this alias cannot simply point
-/// at it, because it conflates two upstream types. Most uses (`typtype`,
-/// `typcategory`, `relkind`, `provolatile`, `castcontext`, …) really are
-/// `"char"`; six — `typinput`/`typoutput`/`typreceive`/`typsend`, `amhandler`
-/// and `prosupport` — are `regproc`, and hold multi-character function names
-/// that a one-byte type would truncate. Splitting this into `CHARLIKE` (→
-/// `PgType::Char`) and a `REGPROCLIKE` (→ `text`) is therefore a separate
-/// change, and one that shifts the reported type OID of `relkind` and friends
-/// from 25 to 18 — which eight smoke expected-files pin.
-const CHARLIKE: PgType = PgType::Text;
+/// A `"char"` column: PostgreSQL's one-byte ad-hoc type, which is what the
+/// catalog's flag columns (`typtype`, `typcategory`, `relkind`, `provolatile`,
+/// `castcontext`, …) really are.
+const CHARLIKE: PgType = PgType::Char;
+
+/// A `regproc` column: an OID that names a function and prints as that
+/// function's name. Distinct from [`CHARLIKE`], which the two shared until the
+/// alias was split — `typinput` and friends hold multi-character names a
+/// one-byte type would truncate.
+const REGPROC: PgType = PgType::Text;
 
 fn col(name: &str, ty: PgType) -> Column {
     Column::new(name, ty)
+}
+
+/// A `"char"` datum from the single character the catalogs spell it with.
+fn chr(c: char) -> Value {
+    Value::Char(c as u8)
+}
+
+/// A `"char"` datum from a string the codegen or a catalog struct carries as
+/// text. An empty string becomes `\0`, which is how PostgreSQL stores an unset
+/// flag and prints back as the empty string.
+fn str_char(s: &str) -> Value {
+    Value::Char(s.bytes().next().unwrap_or(0))
 }
 
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
@@ -66,10 +75,10 @@ pub fn pg_type_schema() -> TableSchema {
             col("typrelid", PgType::Oid),
             col("typelem", PgType::Oid),
             col("typarray", PgType::Oid),
-            col("typinput", CHARLIKE),
-            col("typoutput", CHARLIKE),
-            col("typreceive", CHARLIKE),
-            col("typsend", CHARLIKE),
+            col("typinput", REGPROC),
+            col("typoutput", REGPROC),
+            col("typreceive", REGPROC),
+            col("typsend", REGPROC),
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
             col("typcollation", PgType::Oid),
@@ -115,7 +124,7 @@ pub fn pg_collation_rows() -> Vec<Vec<Value>> {
                 // bootstrap superuser.
                 Value::Oid(11),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
-                Value::Text(c.provider.as_char().to_string()),
+                chr(c.provider.as_char()),
                 Value::Bool(c.deterministic),
                 Value::Int4(c.encoding),
                 opt_text(c.libc_locale),
@@ -159,11 +168,11 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Oid(r.typowner),
                 Value::Int2(r.typlen),
                 Value::Bool(r.typbyval),
-                Value::Text(r.typtype.to_string()),
-                Value::Text(r.typcategory.to_string()),
+                str_char(r.typtype),
+                str_char(r.typcategory),
                 Value::Bool(r.typispreferred),
                 Value::Bool(r.typisdefined),
-                Value::Text(r.typdelim.to_string()),
+                str_char(r.typdelim),
                 Value::Oid(r.typrelid),
                 Value::Oid(r.typelem),
                 Value::Oid(r.typarray),
@@ -171,8 +180,8 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Text(r.typoutput.to_string()),
                 Value::Text(r.typreceive.to_string()),
                 Value::Text(r.typsend.to_string()),
-                Value::Text(r.typalign.to_string()),
-                Value::Text(r.typstorage.to_string()),
+                str_char(r.typalign),
+                str_char(r.typstorage),
                 Value::Oid(r.typcollation),
             ]
         })
@@ -200,11 +209,11 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 // Enums are a fixed 4-byte, pass-by-value, OID-backed type.
                 Value::Int2(4),
                 Value::Bool(true),
-                Value::Text("e".to_string()),
-                Value::Text("E".to_string()),
+                chr('e'),
+                chr('E'),
                 Value::Bool(false),
                 Value::Bool(true),
-                Value::Text(",".to_string()),
+                chr(','),
                 Value::Oid(0),
                 Value::Oid(0),
                 Value::Oid(0),
@@ -212,8 +221,8 @@ pub fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
                 Value::Text("enum_out".to_string()),
                 Value::Text("enum_recv".to_string()),
                 Value::Text("enum_send".to_string()),
-                Value::Text("i".to_string()),
-                Value::Text("p".to_string()),
+                chr('i'),
+                chr('p'),
                 // An enum is not collatable.
                 Value::Oid(0),
             ]
@@ -290,8 +299,8 @@ pub fn pg_cast_rows() -> Vec<Vec<Value>> {
                 Value::Oid(r.castsource),
                 Value::Oid(r.casttarget),
                 Value::Text(r.castfunc.to_string()),
-                Value::Text(r.castcontext.to_string()),
-                Value::Text(r.castmethod.to_string()),
+                str_char(r.castcontext),
+                str_char(r.castmethod),
             ]
         })
         .collect()
@@ -446,7 +455,7 @@ pub fn pg_database_rows(database: &str) -> Vec<Vec<Value>> {
         Value::Oid(BOOTSTRAP_ROLE_OID),
         Value::Int4(6),
         // 'c' — the libc locale provider, which is what a bytewise default is.
-        Value::Text("c".to_string()),
+        chr('c'),
         Value::Bool(false),
         Value::Bool(true),
         Value::Bool(false),
@@ -767,7 +776,7 @@ pub fn pg_am_schema() -> TableSchema {
         vec![
             col("oid", PgType::Oid),
             col("amname", PgType::Name),
-            col("amhandler", CHARLIKE),
+            col("amhandler", REGPROC),
             col("amtype", CHARLIKE),
         ],
     )
@@ -776,24 +785,24 @@ pub fn pg_am_schema() -> TableSchema {
 /// The fixed `pg_am` rows. `amtype` is `'t'` for a table access method and
 /// `'i'` for an index one.
 pub fn pg_am_rows() -> Vec<Vec<Value>> {
-    let row = |oid: u32, amname: &str, amhandler: &str, amtype: &str| {
+    let row = |oid: u32, amname: &str, amhandler: &str, amtype: char| {
         vec![
             Value::Oid(oid),
             Value::Text(amname.to_string()),
             Value::Text(amhandler.to_string()),
-            Value::Text(amtype.to_string()),
+            chr(amtype),
         ]
     };
     vec![
-        row(HEAP_AM_OID, "heap", "heap_tableam_handler", "t"),
-        row(BTREE_AM_OID, "btree", "bthandler", "i"),
-        row(HASH_AM_OID, "hash", "hashhandler", "i"),
-        row(783, "gist", "gisthandler", "i"),
-        row(2742, "gin", "ginhandler", "i"),
-        row(3580, "brin", "brinhandler", "i"),
-        row(4000, "spgist", "spghandler", "i"),
-        row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", "t"),
-        row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", "t"),
+        row(HEAP_AM_OID, "heap", "heap_tableam_handler", 't'),
+        row(BTREE_AM_OID, "btree", "bthandler", 'i'),
+        row(HASH_AM_OID, "hash", "hashhandler", 'i'),
+        row(783, "gist", "gisthandler", 'i'),
+        row(2742, "gin", "ginhandler", 'i'),
+        row(3580, "brin", "brinhandler", 'i'),
+        row(4000, "spgist", "spghandler", 'i'),
+        row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", 't'),
+        row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", 't'),
     ]
 }
 
@@ -1142,17 +1151,17 @@ pub fn pg_class_rows(
                         TableAccessMethod::Parquet => PARQUET_AM_OID,
                         TableAccessMethod::Buffer => BUFFER_AM_OID,
                     },
-                    "r",
+                    'r',
                 ),
-                RelKind::PartitionedTable => (0, "p"),
-                RelKind::View => (0, "v"),
-                RelKind::Sequence => (0, "S"),
+                RelKind::PartitionedTable => (0, 'p'),
+                RelKind::View => (0, 'v'),
+                RelKind::Sequence => (0, 'S'),
             };
             // Heap-backed relations (ordinary + partitioned tables) default their
             // replica identity to the primary key; the rest carry none.
             let relreplident = match kind {
-                RelKind::Table | RelKind::PartitionedTable => "d",
-                RelKind::View | RelKind::Sequence => "n",
+                RelKind::Table | RelKind::PartitionedTable => 'd',
+                RelKind::View | RelKind::Sequence => 'n',
             };
             let relpartbound = match &schema.partition_of {
                 Some(part) => Value::Text(deparse_partbound(part)),
@@ -1191,8 +1200,8 @@ pub fn pg_class_rows(
                         .map_or(0, |t| t.oid),
                 ),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
-                Value::Text(schema.persistence.as_char().to_string()),
-                Value::Text(relkind.to_string()),
+                chr(schema.persistence.as_char()),
+                chr(relkind),
                 Value::Int2(schema.columns.len() as i16),
                 // relchecks: the CHECK constraints on this relation, inherited
                 // ones included — PostgreSQL counts a child's copies too.
@@ -1203,7 +1212,7 @@ pub fn pg_class_rows(
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Text(relreplident.to_string()),
+                chr(relreplident),
                 Value::Bool(schema.partition_of.is_some()),
                 relpartbound,
             ]
@@ -1230,8 +1239,8 @@ pub fn pg_class_rows(
             Value::Int4(0),
             Value::Oid(0),
             Value::Bool(false),
-            Value::Text("p".to_string()),
-            Value::Text("i".to_string()),
+            chr('p'),
+            chr('i'),
             Value::Int2(index.metadata.keys.len() as i16),
             Value::Int2(0),
             Value::Bool(false),
@@ -1239,7 +1248,7 @@ pub fn pg_class_rows(
             Value::Bool(false),
             Value::Bool(false),
             // An index has no replica identity of its own.
-            Value::Text("n".to_string()),
+            chr('n'),
             Value::Bool(false),
             Value::Null,
         ]
@@ -1270,15 +1279,15 @@ pub fn pg_class_rows(
             // there is no `pg_toast_<oid>_index`, and claiming one would be the
             // dangling reference this block exists to avoid.
             Value::Bool(false),
-            Value::Text(toast.persistence.as_char().to_string()),
-            Value::Text("t".to_string()),
+            chr(toast.persistence.as_char()),
+            chr('t'),
             Value::Int2(TOAST_COLUMNS.len() as i16),
             Value::Int2(0),
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
-            Value::Text("n".to_string()),
+            chr('n'),
             Value::Bool(false),
             Value::Null,
         ]
@@ -1384,12 +1393,12 @@ pub fn pg_partitioned_table_rows(relations: &[(u32, TableSchema)]) -> Vec<Vec<Va
     for (oid, schema) in relations {
         if let Some(scheme) = &schema.partition_scheme {
             let strat = match scheme.strategy {
-                PartitionStrategy::Range => "r",
+                PartitionStrategy::Range => 'r',
             };
             let attrs = attnum_vector(scheme.key_columns.iter().copied());
             rows.push(vec![
                 Value::Oid(*oid),
-                Value::Text(strat.to_string()),
+                chr(strat),
                 Value::Int2(scheme.key_columns.len() as i16),
                 Value::Oid(0),
                 attrs,
@@ -1451,8 +1460,9 @@ pub fn pg_attribute_rows(
                 Value::Bool(!c.nullable),
                 Value::Bool(c.default.is_some()),
                 // attidentity / attgenerated: no identity or generated columns.
-                Value::Text(String::new()),
-                Value::Text(String::new()),
+                // PostgreSQL spells "not one" as `\0`, which prints empty.
+                chr('\0'),
+                chr('\0'),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(c)),
             ]);
@@ -1470,8 +1480,8 @@ pub fn pg_attribute_rows(
                 Value::Int4(column.atttypmod()),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Text(String::new()),
-                Value::Text(String::new()),
+                chr('\0'),
+                chr('\0'),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(column)),
             ]);
@@ -1490,8 +1500,8 @@ pub fn pg_attribute_rows(
                 // PostgreSQL marks all three NOT NULL.
                 Value::Bool(true),
                 Value::Bool(false),
-                Value::Text(String::new()),
-                Value::Text(String::new()),
+                chr('\0'),
+                chr('\0'),
                 Value::Bool(false),
                 Value::Oid(0),
             ]);
@@ -1580,7 +1590,7 @@ pub fn pg_constraint_rows(
                 Value::Oid(c.oid),
                 Value::Text(c.name.clone()),
                 Value::Oid(nsp_oid(&c.namespace)),
-                Value::Text(c.contype.to_string()),
+                str_char(c.contype),
                 // condeferrable / condeferred: DEFERRABLE is refused at DDL.
                 Value::Bool(false),
                 Value::Bool(false),
@@ -2122,7 +2132,7 @@ pub fn pg_proc_schema() -> TableSchema {
             col("procost", PgType::Float4),
             col("prorows", PgType::Float4),
             col("provariadic", PgType::Oid),
-            col("prosupport", CHARLIKE),
+            col("prosupport", REGPROC),
             col("prokind", CHARLIKE),
             col("prosecdef", PgType::Bool),
             col("proleakproof", PgType::Bool),
@@ -2186,13 +2196,13 @@ pub fn pg_proc_rows(
                 Value::Float4(if r.retset { 1000.0 } else { 0.0 }),
                 Value::Oid(0),
                 Value::Text("-".to_string()),
-                Value::Text(r.kind.to_string()),
+                chr(r.kind),
                 Value::Bool(r.secdef),
                 Value::Bool(false),
                 Value::Bool(r.strict),
                 Value::Bool(r.retset),
-                Value::Text(r.volatile.to_string()),
-                Value::Text("u".to_string()),
+                chr(r.volatile),
+                chr('u'),
                 Value::Int2(r.arg_types.len() as i16),
                 Value::Int2(0),
                 Value::Oid(r.ret_type),

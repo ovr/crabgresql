@@ -10515,9 +10515,11 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
         .await?;
     assert_eq!(row.get::<_, &str>("proname"), "shown");
     assert_eq!(row.get::<_, &str>("lanname"), "plpgsql");
-    assert_eq!(row.get::<_, &str>("prokind"), "f");
+    // `prokind`/`provolatile` are `"char"`, so the client decodes a single byte
+    // rather than text — the same thing `tokio-postgres` does against PG.
+    assert_eq!(row.get::<_, i8>("prokind"), b'f' as i8);
     // The attributes CREATE FUNCTION used to parse and silently drop.
-    assert_eq!(row.get::<_, &str>("provolatile"), "i");
+    assert_eq!(row.get::<_, i8>("provolatile"), b'i' as i8);
     assert!(row.get::<_, bool>("proisstrict"));
     assert_eq!(row.get::<_, i16>("pronargs"), 2);
     // `proargtypes` is a real `oidvector`, not text: it must advertise PG's
@@ -10547,8 +10549,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
                 &[]
             )
             .await?
-            .get::<_, &str>(0),
-        "p"
+            .get::<_, i8>(0),
+        b'p' as i8
     );
 
     // The four languages this build knows, and only those.
