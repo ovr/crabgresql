@@ -94,6 +94,12 @@ const ALIASES: &[(&str, i32)] = &[
     ("unicode", 6),
     ("vscii", 19),
     ("win", 23),
+    // The CJK code pages answer to both the `win` and the `windows` prefix, and
+    // to neither canonical name: 932/936/949/950 are SJIS, GBK, UHC and BIG5.
+    ("win932", 35),
+    ("win936", 37),
+    ("win949", 38),
+    ("win950", 36),
     ("windows1250", 29),
     ("windows1251", 23),
     ("windows1252", 24),
@@ -105,6 +111,7 @@ const ALIASES: &[(&str, i32)] = &[
     ("windows1258", 19),
     ("windows866", 20),
     ("windows874", 21),
+    ("windows932", 35),
     ("windows936", 37),
     ("windows949", 38),
     ("windows950", 36),
@@ -196,6 +203,13 @@ mod tests {
             ("alt", 20),
             ("koi8", 22),
             ("euc_cn", 2),
+            // The CJK code pages: neither prefix is derivable from the
+            // canonical name, so each spelling has to be in the table.
+            ("win932", 35),
+            ("windows932", 35),
+            ("win936", 37),
+            ("win949", 38),
+            ("win950", 36),
         ] {
             assert_eq!(char_to_encoding(name), want, "{name}");
         }

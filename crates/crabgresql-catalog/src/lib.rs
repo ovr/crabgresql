@@ -476,8 +476,9 @@ pub trait CatalogSource: Send + Sync {
 
     /// The instant `pg_timezone_names`/`pg_timezone_abbrevs` resolve their
     /// offsets at, in `timestamptz` micros. PostgreSQL reports a zone's offset
-    /// and DST flag as of *now*, so a session supplies its statement timestamp
-    /// and the view agrees with `now()` in the same statement.
+    /// and DST flag as of *now*, so a session supplies its transaction
+    /// timestamp — `now()`, not `statement_timestamp()` — and the view agrees
+    /// with `now()` for every statement in the block.
     fn now(&self) -> i64 {
         crabgresql_types::tz::now_micros()
     }
