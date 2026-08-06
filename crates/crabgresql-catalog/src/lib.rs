@@ -661,6 +661,7 @@ pub struct SystemCatalog {
     user_schemas: OnceLock<Vec<(String, u32)>>,
     cursors: OnceLock<Vec<CatalogCursor>>,
     settings: OnceLock<Vec<CatalogSetting>>,
+    namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
 }
 
 impl Default for SystemCatalog {
@@ -717,6 +718,7 @@ impl SystemCatalog {
             user_schemas: OnceLock::new(),
             cursors: OnceLock::new(),
             settings: OnceLock::new(),
+            namespace_oids: OnceLock::new(),
         }
     }
 
@@ -752,15 +754,22 @@ impl SystemCatalog {
     /// Map every namespace name to its OID: the built-in namespaces plus each
     /// user-created schema. Feeds `pg_class.relnamespace` /
     /// `pg_constraint.connamespace`.
-    fn namespace_oids(&self) -> std::collections::HashMap<String, u32> {
-        let mut map = std::collections::HashMap::new();
-        map.insert("pg_catalog".to_string(), 11);
-        map.insert(TOAST_NAMESPACE.to_string(), 99);
-        map.insert("public".to_string(), 2200);
-        for (name, oid) in self.user_schemas() {
-            map.insert(name.clone(), *oid);
-        }
-        map
+    ///
+    /// Memoized like the accessors above, and for a sharper reason: this one
+    /// backs `pg_my_temp_schema()` and `pg_is_other_temp_schema()`, which the
+    /// executor evaluates once per *row*. Rebuilt per call it was `O(#schemas)`
+    /// of `String` cloning on every row that reached it.
+    fn namespace_oids(&self) -> &std::collections::HashMap<String, u32> {
+        self.namespace_oids.get_or_init(|| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("pg_catalog".to_string(), 11);
+            map.insert(TOAST_NAMESPACE.to_string(), 99);
+            map.insert("public".to_string(), 2200);
+            for (name, oid) in self.user_schemas() {
+                map.insert(name.clone(), *oid);
+            }
+            map
+        })
     }
 
     /// Assign a stable synthetic OID to each user relation, computed once and
@@ -1099,11 +1108,20 @@ impl SystemCatalog {
             .map(|index| index.oid)
     }
 
-    /// Whether `name` is a `pg_catalog` relation this catalog serves. Cheap for
-    /// a name that is not one (the builders run only on a match), which is the
-    /// common case — it is consulted per relation when deciding visibility.
+    /// Whether `name` is a `pg_catalog` relation this catalog serves.
+    ///
+    /// A name lookup, not a build. It used to answer with
+    /// `build_pg_catalog(name).is_some()`, which materialized the relation's
+    /// whole row set and threw it away — and `rel_oid` calls this per row, so
+    /// `SELECT 'pg_timezone_names'::regclass FROM generate_series(1, 10000)`
+    /// enumerated the tz database ten thousand times (measured: 2.1 s against
+    /// 0.03 s for `pg_class`).
+    ///
+    /// [`BUILTIN_RELATION_OIDS`] is exactly the set `build_pg_catalog` serves —
+    /// `builtin_relation_oids_cover_every_served_relation` fails if the two ever
+    /// drift — so asking it costs one scan of a 28-entry table.
     pub fn has_catalog_relation(&self, name: &str) -> bool {
-        self.build_pg_catalog(name).is_some()
+        builtin_relation_oid(name).is_some()
     }
 
     /// The name of the schema `oid` identifies, or `None` if this snapshot has
@@ -1111,9 +1129,9 @@ impl SystemCatalog {
     /// `regnamespace`, and both read the same table `pg_namespace` is built from.
     pub fn namespace_name(&self, oid: u32) -> Option<String> {
         self.namespace_oids()
-            .into_iter()
-            .find(|(_, o)| *o == oid)
-            .map(|(name, _)| name)
+            .iter()
+            .find(|(_, o)| **o == oid)
+            .map(|(name, _)| name.clone())
     }
 
     pub fn namespace_oid(&self, name: &str) -> Option<u32> {
@@ -1168,7 +1186,7 @@ impl SystemCatalog {
                     self.relation_stats(),
                     self.index_oids(),
                     self.toast_oids(),
-                    &self.namespace_oids(),
+                    self.namespace_oids(),
                 ),
             )),
             "pg_attribute" => Some((
@@ -1185,7 +1203,7 @@ impl SystemCatalog {
             )),
             "pg_constraint" => Some((
                 schema::pg_constraint_schema(),
-                schema::pg_constraint_rows(self.constraint_oids(), &self.namespace_oids()),
+                schema::pg_constraint_rows(self.constraint_oids(), self.namespace_oids()),
             )),
             "pg_index" => Some((
                 schema::pg_index_schema(),
@@ -1239,7 +1257,7 @@ impl SystemCatalog {
             "pg_language" => Some((schema::pg_language_schema(), schema::pg_language_rows())),
             "pg_proc" => Some((
                 schema::pg_proc_schema(),
-                schema::pg_proc_rows(self.routines(), &self.namespace_oids()),
+                schema::pg_proc_rows(self.routines(), self.namespace_oids()),
             )),
             "pg_cast" => Some((schema::pg_cast_schema(), schema::pg_cast_rows())),
             "pg_collation" => Some((schema::pg_collation_schema(), schema::pg_collation_rows())),
@@ -1869,12 +1887,17 @@ mod tests {
     /// mapping round trips. Without this a newly served relation would be
     /// nameable in a query but not castable to `regclass`, which is the exact
     /// gap the OID table exists to close.
+    ///
+    /// Both directions ask `build_pg_catalog` rather than
+    /// [`SystemCatalog::has_catalog_relation`]: the latter answers *from* the
+    /// OID table, so using it here would make the first loop a tautology and
+    /// the second one blind to a relation that is served but unlisted.
     #[test]
     fn builtin_relation_oids_cover_every_served_relation() -> anyhow::Result<()> {
         let cat = SystemCatalog::new();
         for (name, oid) in BUILTIN_RELATION_OIDS {
             assert!(
-                cat.has_catalog_relation(name),
+                cat.build_pg_catalog(name).is_some(),
                 "{name} has a fixed OID but is not served"
             );
             assert_eq!(builtin_relation_oid(name), Some(*oid));
@@ -1908,13 +1931,20 @@ mod tests {
             "pg_shadow",
             "pg_group",
             "pg_auth_members",
+            "pg_cursors",
+            "pg_language",
+            "pg_proc",
         ] {
-            assert!(cat.has_catalog_relation(name), "{name} is not served");
+            assert!(cat.build_pg_catalog(name).is_some(), "{name} is not served");
             assert!(
                 builtin_relation_oid(name).is_some(),
                 "{name} is served but has no fixed OID"
             );
         }
+        // ...and the list above is itself complete: as many names as the table
+        // has entries, so a relation added to `build_pg_catalog` and to
+        // `BUILTIN_RELATION_OIDS` but forgotten here still fails.
+        assert_eq!(BUILTIN_RELATION_OIDS.len(), 28);
         // A relation that is not a catalog one has no fixed OID.
         assert_eq!(builtin_relation_oid("no_such_catalog"), None);
         assert_eq!(builtin_relation_name(0), None);
