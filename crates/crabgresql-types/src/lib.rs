@@ -1436,8 +1436,8 @@ impl Value {
     }
 
     /// Text-format encoding as sent in `DataRow`; `None` encodes SQL NULL.
-    /// `fmt` carries `extra_float_digits` (float output) and the session
-    /// display zone (`timestamptz` output).
+    /// `fmt` carries `extra_float_digits` (float output), the session display
+    /// zone (`timestamptz` output) and `IntervalStyle` (`interval` output).
     pub fn encode_text_with(&self, fmt: &FmtCtx) -> Option<String> {
         let efd = fmt.efd;
         match self {
@@ -1478,7 +1478,7 @@ impl Value {
             Value::TimeTz(v) => Some(timetz::format(*v)),
             Value::Timestamp(micros) => Some(timestamp::format(*micros)),
             Value::TimestampTz(micros) => Some(timestamptz::format(*micros, &fmt.zone)),
-            Value::Interval(iv) => Some(interval::format(*iv)),
+            Value::Interval(iv) => Some(interval::format_with(*iv, fmt.interval_style)),
             Value::Uuid(b) => Some(uuid::format(b)),
             Value::Inet(v) => Some(net::inet_out(v)),
             Value::Cidr(v) => Some(net::cidr_out(v)),

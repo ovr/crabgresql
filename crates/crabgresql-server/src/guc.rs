@@ -24,6 +24,7 @@
 //! rejecting it would break restores that worked before this table existed.
 
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_types::interval::{INTERVAL_STYLE_VALUES, IntervalStyle};
 use crabgresql_types::tz::SessionZone;
 
 use crate::error::PgError;
@@ -53,6 +54,7 @@ pub enum GucValue {
 pub enum SavedValue {
     TimeZone(std::sync::Arc<SessionZone>),
     ExtraFloatDigits(i32),
+    IntervalStyle(IntervalStyle),
     DefaultIsolation(IsolationLevel),
     DefaultReadOnly(bool),
 }
@@ -170,6 +172,24 @@ pub static GUCS: &[GucDef] = &[
             restore: |s, v| {
                 if let SavedValue::ExtraFloatDigits(n) = v {
                     s.extra_float_digits = n;
+                }
+            },
+        },
+    },
+    GucDef {
+        key: "intervalstyle",
+        name: "IntervalStyle",
+        description: "Sets the display format for interval values.",
+        // GUC_REPORT in PG: it rides in the startup ParameterStatus burst and
+        // every later `SET` echoes it (verified on the wire against PG 18.4).
+        report: true,
+        show: |s| s.interval_style.name().to_string(),
+        kind: GucKind::Settable {
+            set: set_interval_style,
+            capture: |s| SavedValue::IntervalStyle(s.interval_style),
+            restore: |s, v| {
+                if let SavedValue::IntervalStyle(x) = v {
+                    s.interval_style = x;
                 }
             },
         },
@@ -405,6 +425,22 @@ fn set_extra_float_digits(session: &mut Session, value: GucValue) -> Result<(), 
             }
             v
         }
+    };
+    Ok(())
+}
+
+/// `SET IntervalStyle`. The rejection carries PG's HINT listing the four
+/// accepted names — without it the message says what is wrong but not what
+/// would be right.
+fn set_interval_style(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let rejected = |written: String| {
+        invalid_value("IntervalStyle", &written)
+            .with_hint(format!("Available values: {INTERVAL_STYLE_VALUES}."))
+    };
+    session.interval_style = match value {
+        GucValue::Default => IntervalStyle::default(),
+        GucValue::OffsetSecondsEast(secs) => return Err(rejected(secs.to_string())),
+        GucValue::Str(s) => IntervalStyle::from_name(&s).ok_or_else(|| rejected(s.clone()))?,
     };
     Ok(())
 }

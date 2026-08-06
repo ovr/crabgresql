@@ -122,6 +122,14 @@ SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval hour AS h,
 SELECT (interval '0.005 sec')::interval second(2) AS pos,
        (interval '-0.005 sec')::interval second(2) AS neg,
        (interval '-1 day -2:30:00')::interval hour AS neg_trunc;
+-- rounding moves the value a half-unit outwards, so a span within half a unit
+-- of either `i64` microsecond limit has nowhere to go: 22008, symmetrically
+SELECT interval '9223372036854770807 microseconds' second(2) AS hi_ok,
+       interval '-9223372036854770808 microseconds' second(2) AS lo_ok,
+       interval '-9223372036854275808 microseconds' second(0) AS lo_ok_s0;
+SELECT interval '9223372036854770808 microseconds' second(2);
+SELECT interval '-9223372036854770809 microseconds' second(2);
+SELECT interval '2562047788:00:54.775807' second(2);
 -- assignment into a column applies the same modifier
 INSERT INTO interval_typmod_tbl(c, f, i)
   VALUES (interval '14 months 3 days', interval '1 day 2:30:45.6789', interval '1 day 2:30:45.6789');
@@ -168,3 +176,98 @@ SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
 SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
        interval '4:05:06.789' minute to second(1) AS range_second_p,
        interval '1.6 seconds' second(0) AS rounds_away_from_zero;
+
+-- `@` is a separator, not a keyword: twenty-seven ASCII punctuation characters
+-- separate fields exactly as whitespace does, which is what makes the verbose
+-- `@ ... ago` input form parse. A literal with nothing but separators has no
+-- fields at all, and that is an error rather than a zero interval.
+SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
+       interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
+SELECT interval '@';
+SELECT interval '@ 30 eons ago';
+-- The other five — `+ - . / :` — are positional. `/` and `:` are skipped
+-- between fields but glue into a token once one has begun, and a sign at a
+-- field start reaches across whitespace to fuse with the token after it.
+SELECT interval '- 2 hours' AS lone_sign, interval '1 day + 2 hours' AS plus,
+       interval '1 day - 2 hours' AS minus, interval '- infinity' AS signed_inf;
+SELECT interval '/2 hours' AS leading_slash, interval '1 day:2 hours' AS colon_word,
+       interval '2 hours:' AS trailing_colon, interval '1:' AS empty_minute;
+SELECT interval '1- 5 days' AS bare_year, interval '1. days' AS trailing_point;
+SELECT interval '1 day/2 hours';
+SELECT interval '1/5 days';
+SELECT interval '1.days';
+SELECT interval '2 hours -';
+SELECT interval '--2 hours';
+SELECT interval '-.5';
+
+-- A literal may name each field only once — a `HH:MM:SS` token names every
+-- sub-day field at once, a `Y-M` token only the month — and a number with no
+-- unit of its own is days when the next field is a time or an hour count,
+-- otherwise the default unit and only as the last field.
+SELECT interval '2 3 hours' AS promoted, interval '1 mon 3 2:00' AS with_month,
+       interval '1 day 2 hours 3' AS trailing, interval '5 days 1' AS trailing2;
+SELECT interval '1 second 5 milliseconds' AS distinct_subsecond,
+       interval '1 month 1 week' AS month_week, interval '1-2 3 years' AS ym_then_years,
+       interval '1.5 days 2 hours' AS cascade_is_free;
+SELECT interval '1,5 days';
+SELECT interval '1 5 days';
+SELECT interval '2 3 minutes';
+SELECT interval '1 day 1 day';
+SELECT interval '1:00 2:00';
+SELECT interval '1:30 2 seconds';
+SELECT interval '1 day 3 4:05:06';
+-- one stray unit word may trail a time or year-month token and is discarded,
+-- claiming no field
+SELECT interval '1:30 days' AS absorbed, interval '1-2 hours' AS absorbed_ym,
+       interval '1:30 days 5 days' AS absorbed_then_used;
+SELECT interval '1:30 days days';
+SELECT interval '5 days days';
+-- `ago` may appear once, and only as the last field
+SELECT interval '1 day ago ago';
+SELECT interval '2 minutes ago 5 days';
+SELECT interval 'ago';
+-- an infinity must be the whole value, delimiters aside
+SELECT interval '@ infinity' AS at_inf, interval 'infinity @' AS inf_at;
+SELECT interval 'infinity ago';
+SELECT interval '+infinity -infinity';
+
+-- IntervalStyle picks among the four renderings of the same stored value
+CREATE TABLE iv_styles(id int4, span interval);
+INSERT INTO iv_styles VALUES
+  (1, '0'), (2, '1-2'), (3, '1 2:03:04'), (4, '1 day -1 hours'),
+  (5, '-10 mons'), (6, '-1 mon -1 day'), (7, '-0.1 sec'), (8, 'infinity');
+SHOW IntervalStyle;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO postgres_verbose;
+SHOW IntervalStyle;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO sql_standard;
+SELECT id, span FROM iv_styles ORDER BY id;
+SET IntervalStyle TO iso_8601;
+SELECT id, span FROM iv_styles ORDER BY id;
+-- sql_standard also picks the *input* reading: a leading minus propagates to
+-- every later unsigned field, all-or-nothing, and any later sign of its own
+-- turns it off. That is what makes its one-sign output read back unchanged.
+SET IntervalStyle TO sql_standard;
+SELECT interval '-1 2:03:04' AS forced, interval '-1.5 days 2 hours' AS forced_frac,
+       interval '1 day -2 hours' AS not_forced, interval '-1 day +2 hours' AS not_forced2;
+SELECT interval '-1 day 2 hours ago' AS ago_composes, interval 'P-1Y2M' AS iso_exempt,
+       interval '-2 hours' AS single_field;
+SELECT '-1 day 2 hours'::interval AS via_cast;
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+SELECT ('-1 days -2:03:04'::interval)::text::interval = '-1 days -2:03:04'::interval AS round_trips;
+-- the same literals under the default style, side by side
+SET IntervalStyle TO postgres;
+SELECT interval '-1 2:03:04' AS not_forced, interval '-1.5 days 2 hours' AS not_forced_frac;
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+SET IntervalStyle TO iso_8601;
+-- the name is case-insensitive, and nothing more: padding is part of the value.
+-- An unrecognized one is 22023 with a HINT listing the four.
+SET IntervalStyle TO 'POSTGRES';
+SHOW IntervalStyle;
+SET IntervalStyle TO ' postgres ';
+SET IntervalStyle TO bogus;
+-- back to the default, so nothing downstream inherits a style
+RESET IntervalStyle;
+SHOW IntervalStyle;
+DROP TABLE iv_styles;

@@ -137,6 +137,16 @@ pub enum ScalarFn {
     TimestampMiInterval,
     /// `timestamp - timestamp -> interval`.
     TimestampMi,
+    /// `timestamptz + interval -> timestamptz`. Reads the session zone: the
+    /// months and days are calendar quantities, so they move the local wall
+    /// clock rather than the instant.
+    TimestampTzPlInterval,
+    /// `timestamptz - interval -> timestamptz`.
+    TimestampTzMiInterval,
+    /// `timestamptz - timestamptz -> interval`. Zone-independent, and so a
+    /// separate variant from [`ScalarFn::TimestampMi`] only because the
+    /// executor's value accessors are typed by `Value` variant.
+    TimestampTzMi,
 
     // --- interval functions ---
     /// `date_part(text, interval) -> float8`.
@@ -157,6 +167,22 @@ pub enum ScalarFn {
     JustifyInterval,
     /// `age(timestamp, timestamp) -> interval`.
     Age,
+    /// `age(timestamptz, timestamptz) -> interval`; the symbolic difference of
+    /// the two session-zone wall clocks.
+    AgeTz,
+    /// `age(timestamp) -> interval` = `age(current_date::timestamp, $1)`.
+    AgeToday,
+    /// `age(timestamptz) -> interval` = `age(current_date::timestamptz, $1)`.
+    AgeTodayTz,
+    /// `interval_in(text, int4)`: parse an interval literal at execution time,
+    /// under the session's `IntervalStyle`, with the second argument carrying
+    /// the leading-field default unit. Only reached for a literal whose meaning
+    /// the style can change (see `interval::style_sensitive`).
+    IntervalIn,
+    /// `age(xid) -> int4`: how many transactions have started since `xid`.
+    /// Reads the live transaction counter, so it is dispatched from `eval.rs`
+    /// rather than from the pure `eval_scalar`.
+    AgeXid,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
     /// `to_char(timestamp, text) -> text`.
@@ -1468,6 +1494,7 @@ const TSQUERY: PgType = PgType::Tsquery;
 const TEXTARR: PgType = PgType::Array(crabgresql_types::oid::TEXT);
 const OID: PgType = PgType::Oid;
 const TID: PgType = PgType::Tid;
+const XID: PgType = PgType::Xid;
 const XID8: PgType = PgType::Xid8;
 const PGLSN: PgType = PgType::PgLsn;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
@@ -1920,11 +1947,48 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[IV],
             ret: IV,
         }],
-        "age" => &[Signature {
-            func: ScalarFn::Age,
-            args: &[TS, TS],
-            ret: IV,
-        }],
+        // The one-argument forms are PG's SQL wrappers around
+        // `age(current_date::…, $1)`. Order is load-bearing for the same reason
+        // it is in `to_char` and `date_bin` below: two already-typed `date`
+        // arguments only reach `resolve_call`'s best-coercible pass, where an
+        // equal-cost tie is broken by list order, and PG picks the
+        // `timestamptz` overload by the preferred-type rule. TSTZ leads TS at
+        // each arity.
+        "age" => &[
+            Signature {
+                func: ScalarFn::AgeTz,
+                args: &[TSTZ, TSTZ],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::Age,
+                args: &[TS, TS],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::AgeTodayTz,
+                args: &[TSTZ],
+                ret: IV,
+            },
+            Signature {
+                func: ScalarFn::AgeToday,
+                args: &[TS],
+                ret: IV,
+            },
+            // PG's one-argument `age` spans two type categories — datetime for
+            // the two above, user-defined for this one — and that is what makes
+            // `age('2001-01-01')`, `age(NULL)` and `age($1)` report
+            // `function age(unknown) is not unique` instead of quietly picking a
+            // datetime overload. Listed last because nothing but an `xid` can
+            // reach it: `coerce_for_arg` finds no implicit cast into `xid` for
+            // any type, so it is dropped before any tie-break rather than by
+            // its position.
+            Signature {
+                func: ScalarFn::AgeXid,
+                args: &[XID],
+                ret: I4,
+            },
+        ],
         // PG has no `to_char(date)` and no `to_char(time)` overload: a `date`
         // reaches the timestamptz form through the preferred-type rule
         // (`to_char(date, 'TZ')` is `UTC`, not the empty string), and a `time`

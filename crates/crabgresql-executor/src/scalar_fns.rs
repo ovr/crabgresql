@@ -704,14 +704,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::TimezoneIntervalToTz => {
             // timezone(interval, timestamp) -> timestamptz.
-            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            let off = timestamptz::interval_zone_offset(iv(&args[0]), fmt.interval_style)
+                .map_err(ts_err)?;
             return timestamptz::timestamp_at_offset(off, ts(&args[1]))
                 .map(Value::TimestampTz)
                 .map_err(ts_err);
         }
         ScalarFn::TimezoneIntervalToTs => {
             // timezone(interval, timestamptz) -> timestamp.
-            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            let off = timestamptz::interval_zone_offset(iv(&args[0]), fmt.interval_style)
+                .map_err(ts_err)?;
             return timestamptz::at_offset_to_timestamp(off, tstz(&args[1]))
                 .map(Value::Timestamp)
                 .map_err(ts_err);
@@ -740,7 +742,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::TimezoneIntervalTimeTz => {
             // timezone(interval, timetz) -> timetz.
-            let off = timestamptz::interval_zone_offset(iv(&args[0])).map_err(ts_err)?;
+            let off = timestamptz::interval_zone_offset(iv(&args[0]), fmt.interval_style)
+                .map_err(ts_err)?;
             return Ok(Value::TimeTz(timetz::at_zone(ttz(&args[1]), off)));
         }
         ScalarFn::TimezoneLocalTimeTz => {
@@ -852,6 +855,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 other => unreachable!("expected an interval arg, got {other:?}"),
             };
         }
+        // A literal the binder could not fold, because `sql_standard` reads a
+        // leading minus as propagating to the later fields and only the session
+        // knows the style.
+        ScalarFn::IntervalIn => {
+            let unit = interval::Unit::from_code(i4(&args[1]))
+                .unwrap_or_else(|| unreachable!("the binder emits a real unit code"));
+            return interval::parse_with_style(text(&args[0]), unit, fmt.interval_style)
+                .map(Value::Interval)
+                .map_err(iv_err);
+        }
         // md5(text)/md5(bytea) hash the raw input bytes; both return the
         // 32-char lowercase hex digest as text.
         ScalarFn::Md5 => {
@@ -901,6 +914,24 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::TimestampMi => {
             return timestamp::mi(ts(&args[0]), ts(&args[1]))
+                .map(Value::Interval)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimestampTzPlInterval => {
+            return timestamptz::pl_interval(tstz(&args[0]), iv(&args[1]), fmt.zone.zone())
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        ScalarFn::TimestampTzMiInterval => {
+            return timestamptz::mi_interval(tstz(&args[0]), iv(&args[1]), fmt.zone.zone())
+                .map(Value::TimestampTz)
+                .map_err(ts_err);
+        }
+        // Not a missing zone argument: the difference of two instants is the
+        // same span from every zone, which is why PG's `timestamptz_mi` is
+        // literally the `timestamp_mi` C function under a second name.
+        ScalarFn::TimestampTzMi => {
+            return timestamp::mi(tstz(&args[0]), tstz(&args[1]))
                 .map(Value::Interval)
                 .map_err(ts_err);
         }
@@ -1044,6 +1075,31 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::Age => {
             return timestamp::age(ts(&args[0]), ts(&args[1]))
+                .map(Value::Interval)
+                .map_err(ts_err);
+        }
+        ScalarFn::AgeTz => {
+            return timestamptz::age(tstz(&args[0]), tstz(&args[1]), fmt.zone.zone())
+                .map(Value::Interval)
+                .map_err(ts_err);
+        }
+        // The one-argument forms anchor at `current_date`, so they need the
+        // transaction clock as well as the zone — PG spells them as SQL
+        // wrappers around `age(cast(current_date as …), $1)`.
+        ScalarFn::AgeToday => {
+            let anchor = today_midnight(fmt)?;
+            return timestamp::age(anchor, ts(&args[0]))
+                .map(Value::Interval)
+                .map_err(ts_err);
+        }
+        ScalarFn::AgeTodayTz => {
+            // Deliberately composed as the same two casts PG's wrapper uses:
+            // local midnight, read back as an instant, then compared as wall
+            // clocks. In a zone whose transition falls *at* midnight the round
+            // trip is not the identity — and PG shows that same quirk.
+            let anchor = timestamptz::timestamp_at_session_zone(today_midnight(fmt)?, &fmt.zone)
+                .map_err(ts_err)?;
+            return timestamptz::age(anchor, tstz(&args[0]), fmt.zone.zone())
                 .map(Value::Interval)
                 .map_err(ts_err);
         }
@@ -2499,6 +2555,14 @@ fn time_err(e: crabgresql_types::time::TimeError) -> ExecError {
 
 fn clock_err(e: crabgresql_types::fmt::ClockError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+/// `current_date` as a zone-less `timestamp`: the anchor the one-argument
+/// `age()` measures from. Reads the transaction clock, not the wall clock, so
+/// `age(x)` is stable across a transaction the way `now()` is.
+fn today_midnight(fmt: &FmtCtx) -> Result<i64, ExecError> {
+    let now = fmt.xact_start().map_err(clock_err)?;
+    timestamptz::today_midnight_local(now, fmt.zone.zone()).map_err(ts_err)
 }
 
 fn timetz_err(e: crabgresql_types::timetz::TimeTzError) -> ExecError {

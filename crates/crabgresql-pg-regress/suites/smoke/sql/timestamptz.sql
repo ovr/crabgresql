@@ -277,3 +277,129 @@ SELECT timestamp '2001-06-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2'
        timestamp '2001-01-16 12:00:00' AT TIME ZONE 'EST5EDT,M3.2.0/2,M11.1.0/2' AS spec_jan,
        timestamp '2001-06-16 12:00:00' AT TIME ZONE '<+07>-07' AS quoted_spec;
 SELECT 'still alive' AS status;
+
+
+--
+-- Arithmetic. `timestamptz - timestamptz` measures the *instants* and so needs
+-- no zone; `timestamptz ± interval` is a calendar operation on the *local wall
+-- clock*, and the two disagree across a DST transition by exactly the hour it
+-- adds or removes.
+--
+SET TimeZone = 'UTC';
+SELECT timestamptz '2001-02-16 20:38:40+00' - timestamptz '2001-01-01 00:00:00+00' AS diff,
+       timestamptz '2001-01-01 00:00:00+00' - timestamptz '2001-02-16 20:38:40+00' AS neg_diff;
+-- the difference is justified to 24-hour days, as `timestamp - timestamp` is
+SELECT timestamptz '2001-01-02 03:00:00+00' - timestamptz '2001-01-01 00:00:00+00' AS justified;
+SELECT timestamptz '2001-01-01 00:00:00+00' + interval '1 mon 2 days 3 hours' AS plus,
+       timestamptz '2001-01-01 00:00:00+00' - interval '1 day' AS minus,
+       interval '1 day' + timestamptz '2001-01-01 00:00:00+00' AS commuted;
+-- a month add clamps the day of month, here in the instant's own zone
+SELECT timestamptz '2001-03-31 12:00:00+00' + interval '1 mon' AS clamp_eom;
+-- `timestamptz` is the preferred datetime type, so a mixed pair widens the
+-- other side rather than narrowing this one
+SELECT timestamptz '2001-01-02 00:00:00+00' - timestamp '2001-01-01 00:00:00' AS minus_ts,
+       timestamptz '2001-01-02 00:00:00+00' - date '2001-01-01' AS minus_date,
+       date '2001-01-01' - timestamptz '2001-01-02 00:00:00+00' AS date_minus;
+-- an infinity swallows a finite interval; opposite infinities conflict
+SELECT timestamptz 'infinity' + interval '1 day' AS inf_plus,
+       timestamptz '2001-01-01+00' + interval 'infinity' AS to_inf,
+       timestamptz '2001-01-01+00' - interval 'infinity' AS to_neg_inf;
+SELECT timestamptz 'infinity' - interval 'infinity';
+-- operators PostgreSQL does not have
+SELECT timestamptz '2001-01-01+00' + timestamptz '2001-01-01+00';
+SELECT interval '1 day' - timestamptz '2001-01-01+00';
+
+-- Under a DST zone, `1 day` keeps the wall-clock hour and `24 hours` keeps the
+-- elapsed time. Spring forward makes the day 23 hours long, fall back 25.
+SET TimeZone = 'America/New_York';
+SELECT timestamptz '2024-03-09 12:00:00-05' + interval '1 day' AS calendar_day,
+       timestamptz '2024-03-09 12:00:00-05' + interval '24 hours' AS elapsed_day;
+SELECT timestamptz '2024-11-02 12:00:00-04' + interval '1 day' AS calendar_day,
+       timestamptz '2024-11-02 12:00:00-04' + interval '24 hours' AS elapsed_day;
+-- months and days each re-resolve the offset before the next part is applied
+SELECT timestamptz '2024-03-09 12:00:00-05' + interval '1 mon 1 day 1 hour' AS stepped;
+-- a shifted wall clock in the spring-forward gap moves forward past it; one in
+-- the fall-back fold takes the offset after the transition
+SELECT timestamptz '2024-03-09 02:30:00-05' + interval '1 day' AS gap,
+       timestamptz '2024-11-02 01:30:00-04' + interval '1 day' AS fold;
+
+--
+-- age() reads the *wall clocks*, so it answers in calendar units: two noons
+-- either side of a spring-forward are `2 days` apart even though only 47 hours
+-- elapsed. The one-argument form measures from `current_date`.
+--
+SELECT age(timestamptz '2024-03-11 12:00:00-04', timestamptz '2024-03-09 12:00:00-05') AS calendar,
+       timestamptz '2024-03-11 12:00:00-04' - timestamptz '2024-03-09 12:00:00-05' AS elapsed;
+SET TimeZone = 'UTC';
+SELECT age(timestamptz '2001-04-10 00:00:00+00', timestamptz '1957-06-13 00:00:00+00') AS age2;
+-- `timestamptz` wins the overload for two dates, and for a mixed pair
+SELECT pg_typeof(age(date '2001-01-01', date '2000-01-01')) AS resolved,
+       age(date '2001-01-01', date '2000-01-01') AS from_dates,
+       age(timestamptz '2001-01-01+00', timestamp '2000-01-01') AS mixed;
+-- The one-argument forms anchor at today, so pin them by comparison. The step
+-- has to be a day: `- interval '1 mon'` clamps the day of month, so on the 31st
+-- of a month whose predecessor is shorter the answer is `1 mon 3 days`, and the
+-- assertion would be false seven days a year.
+SELECT age(current_date::timestamp) = interval '0' AS today_is_zero,
+       age(current_date::timestamptz) = interval '0' AS today_tz_is_zero,
+       age(current_date::timestamptz - interval '1 day') = interval '1 day' AS one_day_ago;
+-- PG's one-argument `age` spans two type categories — the two datetime forms
+-- and `age(xid)` — so an untyped argument has no best candidate: 42725, not a
+-- quiet pick. Nothing but an xid can reach the xid overload, so every typed
+-- call resolves as it did before it existed.
+SELECT age('2001-01-01');
+SELECT age(NULL);
+SELECT pg_typeof(age(date '2001-01-01')) AS from_date,
+       pg_typeof(age(timestamp '2001-01-01')) AS from_ts,
+       pg_typeof(age(timestamptz '2001-01-01+00')) AS from_tstz;
+-- xids below the first normal one are permanent, and report as infinitely old
+SELECT age('0'::xid) AS zero, age('1'::xid) AS one, age('2'::xid) AS two;
+SELECT age(NULL::xid) IS NULL AS strict;
+-- the counter itself is not reproducible, so pin the differences: a 32-bit
+-- wrapping subtract puts an xid past the counter just above the lowest one
+SELECT age('3'::xid) - age('4'::xid) AS adjacent,
+       age('100'::xid) - age('1100'::xid) AS thousand,
+       age('4294967295'::xid) - age('3'::xid) AS wrapped;
+-- the infinity matrix is the same for both types
+SELECT age(timestamptz 'infinity') AS inf, age(timestamptz '-infinity') AS neg_inf;
+SELECT age(timestamp 'infinity') AS inf, age(timestamp '-infinity') AS neg_inf;
+SELECT age(timestamptz 'infinity', timestamptz '-infinity') AS opposite,
+       age(timestamptz '-infinity', timestamptz 'infinity') AS reversed;
+SELECT age(timestamptz 'infinity', timestamptz 'infinity');
+SELECT age(timestamp '-infinity', timestamp '-infinity');
+SELECT 'still alive' AS status;
+
+
+--
+-- Range edges. The timestamp range bounds a wall clock only when the wall clock
+-- is the answer: `AT TIME ZONE` and the `timestamptz -> timestamp` cast hand one
+-- back and so reject, while `age` and `± interval` only pass through one and so
+-- answer. What bounds those is the resulting *instant*.
+--
+SET TimeZone = 'Asia/Tokyo';
+-- +09 puts this instant's wall clock in year 294277, one past the top
+SELECT timestamptz '294276-12-31 20:00:00+00' AT TIME ZONE 'Asia/Tokyo';
+SELECT timestamptz '294276-12-31 20:00:00+00'::timestamp;
+SELECT age(timestamptz '294276-12-31 20:00:00+00', timestamptz '2000-01-01+00') AS age_answers;
+SELECT timestamptz '294276-12-31 20:00:00+00' - interval '1 day' AS minus_day,
+       timestamptz '294276-12-31 20:00:00+00' - interval '1 month' AS minus_month,
+       timestamptz '294276-12-31 20:00:00+00' - interval '5 hours' AS minus_hours;
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 microsecond' AS plus_us;
+-- the instant leaves the range
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 day';
+-- a month at the top edge cannot be encoded at all
+SELECT timestamptz '294276-12-31 20:00:00+00' + interval '1 month';
+-- an absurd shift is an error, not a panic
+SELECT timestamptz '2024-01-01+00' + interval '2147483647 months';
+-- the same rule mirrored at the low edge
+SET TimeZone = 'Pacific/Honolulu';
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' AT TIME ZONE 'Pacific/Honolulu';
+SELECT age(timestamptz '4714-11-24 05:00:00+00 BC', timestamptz '2000-01-01+00') AS age_answers;
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' + interval '1 day' AS plus_day,
+       timestamptz '4714-11-24 05:00:00+00 BC' + interval '1 month' AS plus_month;
+SELECT timestamptz '4714-11-24 05:00:00+00 BC' - interval '1 day';
+-- the zone-less type keeps its own band, which is what the range applies to there
+SET TimeZone = 'UTC';
+SELECT timestamp '294276-12-31 05:00:00' + interval '1 day';
+SELECT timestamp '294276-12-01 05:00:00' + interval '1 month';
+SELECT 'still alive' AS status;

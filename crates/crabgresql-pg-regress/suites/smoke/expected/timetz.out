@@ -204,9 +204,14 @@ SELECT timetz '12:00' AS lit,
 (1 row)
 
 RESET TimeZone;
--- an interval zone must be a fixed displacement (22023)
+-- an interval zone must be a fixed displacement (22023), and an infinite one is
+-- rejected for being infinite rather than for the months its sentinel carries
 SELECT timetz '00:01-07' AT TIME ZONE INTERVAL '1 month';
 ERROR:  interval time zone "1 mon" must not include months or days
+SELECT timetz '00:01-07' AT TIME ZONE INTERVAL 'infinity';
+ERROR:  interval time zone "infinity" must be finite
+SELECT timetz '00:01-07' AT TIME ZONE INTERVAL '-infinity';
+ERROR:  interval time zone "-infinity" must be finite
 SELECT 'still alive' AS status;
    status    
 -------------

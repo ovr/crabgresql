@@ -11334,6 +11334,199 @@ async fn timezone_changes_emit_parameter_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `IntervalStyle` is GUC_REPORT in PostgreSQL — it rides in the startup burst
+/// and every change is echoed — and it is transactional like every other GUC.
+#[tokio::test]
+async fn interval_style_changes_emit_parameter_status() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    async fn query(
+        socket: &mut tokio::net::TcpStream,
+        sql: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        socket.write_all(&frontend_message(b'Q', &body)).await?;
+        Ok(read_until_ready(socket)
+            .await
+            .into_iter()
+            .filter(|(tag, _)| *tag == b'S')
+            .map(|(_, body)| {
+                let mut parts = body.split(|b| *b == 0);
+                let name = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                let value = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                (name, value)
+            })
+            .collect())
+    }
+    let reported = |value: &str| vec![("IntervalStyle".to_string(), value.to_string())];
+
+    assert_eq!(
+        query(&mut socket, "SET IntervalStyle TO iso_8601").await?,
+        reported("iso_8601")
+    );
+    // Same value again is not a change.
+    assert_eq!(
+        query(&mut socket, "SET IntervalStyle TO iso_8601").await?,
+        vec![]
+    );
+    assert_eq!(
+        query(&mut socket, "RESET IntervalStyle").await?,
+        reported("postgres")
+    );
+
+    // The revert at the end of a block is a change, and must be reported.
+    query(&mut socket, "BEGIN").await?;
+    assert_eq!(
+        query(&mut socket, "SET LOCAL IntervalStyle TO sql_standard").await?,
+        reported("sql_standard")
+    );
+    assert_eq!(query(&mut socket, "COMMIT").await?, reported("postgres"));
+
+    // So is a rollback of a plain SET inside a block.
+    query(&mut socket, "BEGIN").await?;
+    query(&mut socket, "SET IntervalStyle TO postgres_verbose").await?;
+    assert_eq!(query(&mut socket, "ROLLBACK").await?, reported("postgres"));
+    Ok(())
+}
+
+/// The GUC picks the rendering, and a rejected value carries PG's HINT.
+/// The per-style expectations themselves are pinned in `interval.rs`'s unit
+/// tests; this only proves the session state reaches `interval_out`.
+#[tokio::test]
+async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert_eq!(scalar(&client, "SHOW IntervalStyle").await, "postgres");
+    for (style, want) in [
+        ("postgres", "1 day -01:00:00"),
+        ("postgres_verbose", "@ 1 day -1 hours"),
+        ("sql_standard", "+0-0 +1 -1:00:00"),
+        ("iso_8601", "P1DT-1H"),
+    ] {
+        client
+            .simple_query(&format!("SET IntervalStyle TO {style}"))
+            .await?;
+        assert_eq!(scalar(&client, "SHOW IntervalStyle").await, style);
+        assert_eq!(
+            scalar(&client, "SELECT interval '1 day -1 hour'").await,
+            want,
+            "style {style}"
+        );
+    }
+    // The name is matched case-insensitively, quoted or not.
+    client
+        .simple_query("SET intervalstyle TO 'SQL_STANDARD'")
+        .await?;
+    assert_eq!(scalar(&client, "SHOW IntervalStyle").await, "sql_standard");
+
+    // Case-insensitively and nothing more: padding is part of the value, so a
+    // padded name is rejected like any other unrecognized one.
+    for value in ["bogus", "' postgres '"] {
+        let err = client
+            .simple_query(&format!("SET IntervalStyle TO {value}"))
+            .await
+            .expect_err("an unrecognized IntervalStyle must be rejected");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "22023", "{value}");
+        assert_eq!(
+            db.message(),
+            format!(
+                "invalid value for parameter \"IntervalStyle\": \"{}\"",
+                value.trim_matches('\'')
+            ),
+            "{value}"
+        );
+        assert_eq!(
+            db.hint(),
+            Some("Available values: postgres, postgres_verbose, sql_standard, iso_8601."),
+            "{value}"
+        );
+    }
+    Ok(())
+}
+
+/// PostgreSQL's one-argument `age` spans two type categories — the two datetime
+/// forms and `age(xid)` — so an untyped argument has no best candidate and the
+/// call is ambiguous rather than quietly resolving to a datetime overload.
+#[tokio::test]
+async fn one_argument_age_is_ambiguous_for_an_untyped_argument() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    for sql in ["SELECT age('2001-01-01')", "SELECT age(NULL)"] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("an untyped one-argument age must be ambiguous");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "42725", "{sql}");
+        assert_eq!(db.message(), "function age(unknown) is not unique", "{sql}");
+        assert_eq!(
+            db.hint(),
+            Some(
+                "Could not choose a best candidate function. You might need to add explicit type casts."
+            ),
+            "{sql}"
+        );
+    }
+
+    // The load-bearing half: the ambiguity must fire *only* for the untyped
+    // case. Nothing can reach the xid overload but an xid, so every typed call
+    // resolves exactly as it did before it existed.
+    for (sql, want) in [
+        ("SELECT pg_typeof(age(DATE '2001-01-01'))", "interval"),
+        ("SELECT pg_typeof(age(TIMESTAMP '2001-01-01'))", "interval"),
+        (
+            "SELECT pg_typeof(age(TIMESTAMPTZ '2001-01-01+00'))",
+            "interval",
+        ),
+        ("SELECT age(DATE '2001-01-01', DATE '2000-01-01')", "1 year"),
+        (
+            "SELECT age(TIMESTAMP '2001-01-01', TIMESTAMP '2000-01-01')",
+            "1 year",
+        ),
+    ] {
+        assert_eq!(scalar(&client, sql).await, want, "{sql}");
+    }
+
+    // `age(xid)` itself: how many transactions have started since that one.
+    // Pinned relatively, because the absolute counter is not reproducible.
+    assert_eq!(
+        scalar(&client, "SELECT age('3'::xid) - age('4'::xid)").await,
+        "1"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT age('100'::xid) - age('1100'::xid)").await,
+        "1000"
+    );
+    // A 32-bit wrapping difference, so an xid past the counter reads as one
+    // more than the lowest normal one rather than as a huge number.
+    assert_eq!(
+        scalar(&client, "SELECT age('4294967295'::xid) - age('3'::xid)").await,
+        "4"
+    );
+    // XIDs below the first normal one are permanent, and report as infinitely
+    // old rather than as a difference.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT age('0'::xid), age('1'::xid), age('2'::xid)"
+        )
+        .await,
+        "2147483647"
+    );
+    assert_eq!(scalar(&client, "SELECT age(NULL::xid) IS NULL").await, "t");
+    // Read-only transactions never allocate an XID, so the answer cannot come
+    // from `TxnContext::xid`.
+    client.simple_query("BEGIN READ ONLY").await?;
+    assert_eq!(
+        scalar(&client, "SELECT age('3'::xid) - age('4'::xid)").await,
+        "1"
+    );
+    client.simple_query("COMMIT").await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn show_all_lists_the_known_parameters() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

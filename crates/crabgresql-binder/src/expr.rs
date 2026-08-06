@@ -4170,15 +4170,51 @@ fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     } else {
         leading
     };
-    let iv = interval::parse_with_default(
-        &s,
-        default.map_or(interval::Unit::Second, datetime_field_to_unit),
-    )
-    .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    let unit = default.map_or(interval::Unit::Second, datetime_field_to_unit);
+    // Parse now either way: under `postgres` style the answer *is* the value,
+    // and under `sql_standard` it is still the right validity check — the style
+    // can only change signs, never whether the literal parses — so the syntax
+    // error keeps its position even for a literal whose value must be deferred.
+    let iv = interval::parse_with_default(&s, unit)
+        .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+    let typmod = interval_literal_typmod(node);
+
+    // A literal whose meaning the session style can change cannot be folded
+    // here: the binder has no session, and re-binding on every Execute means a
+    // bind-time answer would be wrong for whichever session ran the statement.
+    if crabgresql_types::interval::style_sensitive(&s) {
+        // Mask now as well, and throw the result away. The style can only flip
+        // signs, never magnitudes, so whether the modifier fits is the same
+        // question under either reading — and asking it here is what keeps the
+        // `LINE n: … ^` cursor on a literal that has to be evaluated later.
+        if let Some(typmod) = typmod {
+            interval::apply_typmod(iv, typmod)
+                .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?;
+        }
+        let call = BoundExpr::FuncCall {
+            func: ScalarFn::IntervalIn,
+            ret: PgType::Interval,
+            args: vec![
+                BoundExpr::Const {
+                    value: Value::Text(s),
+                    ty: PgType::Text,
+                },
+                BoundExpr::Const {
+                    value: Value::Int4(unit.as_code()),
+                    ty: PgType::Int4,
+                },
+            ],
+        };
+        return Ok(Binding::Typed(match typmod {
+            Some(typmod) => apply_interval_typmod(call, typmod)?,
+            None => call,
+        }));
+    }
+
     // The qualifier masks the result, through the same modifier a column or a
     // cast would carry. No qualifier at all leaves the literal's own units to
     // speak for themselves.
-    let iv = match interval_literal_typmod(node) {
+    let iv = match typmod {
         Some(typmod) => interval::apply_typmod(iv, typmod)
             .map_err(|e| BindError::new(e.sqlstate, e.message).at(span))?,
         None => iv,
@@ -5445,7 +5481,12 @@ fn resolve_temporal(
         matches!(
             t,
             Some(
-                PgType::Interval | PgType::Timestamp | PgType::Date | PgType::Time | PgType::TimeTz
+                PgType::Interval
+                    | PgType::Timestamp
+                    | PgType::TimestampTz
+                    | PgType::Date
+                    | PgType::Time
+                    | PgType::TimeTz
             )
         )
     };
@@ -5453,7 +5494,9 @@ fn resolve_temporal(
         return Ok(None);
     }
 
-    use PgType::{Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T};
+    use PgType::{
+        Date as D, Interval as I, Time as TI, TimeTz as TZ, Timestamp as T, TimestampTz as TSZ,
+    };
     // Only int2/int4 pair with `date` (PG has `date + int4`; int2 widens to it).
     // int8 has no `date + bigint` operator, so it must fall through to an error.
     let is_int = |t: Option<PgType>| matches!(t, Some(PgType::Int2 | PgType::Int4));
@@ -5487,6 +5530,27 @@ fn resolve_temporal(
             (None, Some(T)) => call(
                 ScalarFn::TimestampPlInterval,
                 T,
+                typed(rb),
+                resolve_operand(lb, I)?,
+            ),
+            // timestamptz + interval -> timestamptz. There is no
+            // `timestamptz + timestamptz`, so an untyped literal opposite a
+            // timestamptz can only be the interval.
+            (Some(TSZ), Some(I)) => {
+                call(ScalarFn::TimestampTzPlInterval, TSZ, typed(lb), typed(rb))
+            }
+            (Some(I), Some(TSZ)) => {
+                call(ScalarFn::TimestampTzPlInterval, TSZ, typed(rb), typed(lb))
+            }
+            (Some(TSZ), None) => call(
+                ScalarFn::TimestampTzPlInterval,
+                TSZ,
+                typed(lb),
+                resolve_operand(rb, I)?,
+            ),
+            (None, Some(TSZ)) => call(
+                ScalarFn::TimestampTzPlInterval,
+                TSZ,
                 typed(rb),
                 resolve_operand(lb, I)?,
             ),
@@ -5548,6 +5612,29 @@ fn resolve_temporal(
             // while `ts - '<date>'` and `<date> - ts` produce an interval.
             (Some(T), None) => call(ScalarFn::TimestampMi, I, typed(lb), resolve_operand(rb, T)?),
             (None, Some(T)) => call(ScalarFn::TimestampMi, I, resolve_operand(lb, T)?, typed(rb)),
+            (Some(TSZ), Some(I)) => {
+                call(ScalarFn::TimestampTzMiInterval, TSZ, typed(lb), typed(rb))
+            }
+            // `timestamptz - {timestamptz, timestamp, date, unknown}` and the
+            // reverses, all `timestamptz_mi -> interval`. `timestamptz` is the
+            // preferred type of the datetime category and both
+            // `timestamp -> timestamptz` and `date -> timestamptz` are implicit
+            // casts, so a mixed pair widens the *other* side rather than
+            // narrowing this one — and that widening stays a runtime `Coerce`
+            // (`fold_needs_session`), which is what makes it read the executing
+            // session's zone. `resolve_operand` is a no-op on the side that is
+            // already a timestamptz.
+            (Some(TSZ), _) | (_, Some(TSZ))
+                if matches!(lt, Some(TSZ | T | D) | None)
+                    && matches!(rt, Some(TSZ | T | D) | None) =>
+            {
+                call(
+                    ScalarFn::TimestampTzMi,
+                    I,
+                    resolve_operand(lb, TSZ)?,
+                    resolve_operand(rb, TSZ)?,
+                )
+            }
             // date - date -> int4; date - int -> date; date - interval -> timestamp.
             (Some(D), Some(D)) => call(ScalarFn::DateMi, PgType::Int4, typed(lb), typed(rb)),
             (Some(D), _) if is_int(rt) => call(
@@ -8261,7 +8348,9 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
         BoundExpr::Const {
             value,
             ty: value_ty,
-        } if !fold_needs_session(value.pg_type(), ty) => {
+        } if !fold_needs_session(value.pg_type(), ty)
+            && !interval_input_needs_style(&value, ty) =>
+        {
             // Safe to fold *unless the value reads the clock*: `fold_needs_session`
             // rules out every pair `FmtCtx::utc` could change by GUC, but it is a
             // question about types, and whether a literal is relative is a question
@@ -8324,6 +8413,20 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 /// needs a plan cache. What the deferral *does* still cost is nothing at DDL
 /// time: a column default resolves through `zoned_literal_default`, where the
 /// session is in hand, so `DEFAULT 'now'` freezes exactly as PG's does.
+/// Whether folding this string-to-`interval` conversion at bind time would
+/// read the literal under the wrong `IntervalStyle`.
+///
+/// A companion to [`fold_needs_session`] rather than a case inside it:
+/// `fold_needs_session` asks about a pair of *types*, and every string is
+/// convertible to an interval, so answering there would defer every interval
+/// literal to execution and move its syntax errors out of parse analysis. Only
+/// the text can say, and for almost every literal the answer is no — see
+/// [`interval::style_sensitive`].
+fn interval_input_needs_style(value: &Value, to: PgType) -> bool {
+    to == PgType::Interval
+        && matches!(value, Value::Text(s) if crabgresql_types::interval::style_sensitive(s))
+}
+
 fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
     if matches!(
         to,
@@ -8475,6 +8578,24 @@ pub(crate) fn resolve_unknown(
             ty,
         });
     }
+    // An interval literal whose meaning `sql_standard` would change cannot be
+    // folded either, for the same reason and with the same shape — validated
+    // here for the diagnostic, evaluated under the executing session's style.
+    if ty == PgType::Interval
+        && lit
+            .as_deref()
+            .is_some_and(crabgresql_types::interval::style_sensitive)
+    {
+        let s = lit.unwrap_or_else(|| unreachable!("checked as Some above"));
+        parse_unknown(&s, ty, &FmtCtx::utc_default()).map_err(|e| e.at(span))?;
+        return Ok(BoundExpr::Coerce {
+            expr: Box::new(BoundExpr::Const {
+                value: Value::Text(s),
+                ty: PgType::Text,
+            }),
+            ty,
+        });
+    }
     let value = match lit {
         None => Value::Null,
         Some(s) => match parse_unknown(&s, ty, &FmtCtx::utc_default()) {
@@ -8572,9 +8693,11 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
         PgType::Timestamp => timestamp::parse(s, fmt)
             .map(Value::Timestamp)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
-        PgType::Interval => interval::parse(s)
-            .map(Value::Interval)
-            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Interval => {
+            interval::parse_with_style(s, interval::Unit::Second, fmt.interval_style)
+                .map(Value::Interval)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
         // Unreachable from `resolve_unknown`, which defers every zone-dependent
         // type to runtime; this serves only `pg_input_is_valid`, which asks
         // whether the *syntax* is acceptable. Validity is zone-independent
