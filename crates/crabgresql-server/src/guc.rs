@@ -149,27 +149,18 @@ impl GucDef {
         }
     }
 
-    /// Apply a `RESET <name>`, which is `SET … = DEFAULT`. A read-only parameter
-    /// raises here, as in PG — unlike `RESET ALL`, which skips it (see
-    /// [`GucDef::reset_in_all`]).
-    pub fn reset(&self, session: &mut Session) -> Result<(), PgError> {
-        self.set(session, GucValue::Default)
-    }
-
-    /// `RESET ALL` restores every parameter it can and silently skips the rest,
-    /// where `RESET <name>` on the same parameter would error.
-    pub fn reset_in_all(&self, session: &mut Session) -> Result<(), PgError> {
-        match self.kind {
-            GucKind::ReadOnly => Ok(()),
-            _ => self.reset(session),
-        }
-    }
-
     /// Whether this parameter's value can ever change, and so is worth
     /// snapshotting for the transactional save stack and the ParameterStatus
     /// diff.
     pub fn is_mutable(&self) -> bool {
         matches!(self.kind, GucKind::Settable { .. })
+    }
+
+    /// Whether assigning this parameter raises `55P02`. `RESET <name>` on one
+    /// does raise, as in PG — but `RESET ALL` skips it, which is why the caller
+    /// needs to ask rather than letting the setter answer.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.kind, GucKind::ReadOnly)
     }
 }
 
