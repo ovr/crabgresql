@@ -28,8 +28,8 @@
 //! # Fidelity & clean-room
 //!
 //! Built-in rows are generated at build time from PostgreSQL's vendored catalog
-//! `.dat` *data* (`vendor/postgres/catalog/`), never from its C/Perl source; see
-//! `build.rs` and `AGENTS.md`.
+//! `.dat` *data* (`vendor/postgres/catalog/`), never from its C/Perl source; the
+//! codegen is the `crabgresql-bki` crate, and `AGENTS.md` carries the policy.
 //!
 //! TODO: column coverage is a curated, PG-ordered subset keyed by the names real
 //! clients query, not parity — upstream's `type_sanity` and psql's `\d` read
@@ -200,8 +200,8 @@ pub struct PgCastRow {
 }
 
 /// A built-in `pg_proc` row, generated from `pg_proc.dat` — restricted to the
-/// functions the other catalogs reference (see `gen_pg_proc` in `build.rs` for
-/// why the rest are left out).
+/// functions the other catalogs reference (see `crabgresql-bki`'s `pg_proc`
+/// module for why the rest are left out).
 pub struct PgProcRow {
     pub oid: u32,
     pub proname: &'static str,
