@@ -130,6 +130,28 @@ pub trait CatalogOps: Send + Sync {
     /// Backs `pg_get_constraintdef`, which resolves *by OID* and so needs the
     /// reverse of the numbering `pg_constraint`'s rows are built from.
     fn constraint_def(&self, oid: u32) -> Option<ConstraintDef>;
+
+    /// The database this connection was opened against — `current_database()`
+    /// and `current_catalog`.
+    fn current_database(&self) -> String;
+
+    /// The role this connection authenticated as. crabgresql has no `SET ROLE`,
+    /// so `current_user` and `session_user` are always the same string; the
+    /// split lives here so a future `SET ROLE` changes one method rather than
+    /// the SQL surface.
+    fn current_user(&self) -> String;
+    fn session_user(&self) -> String;
+
+    /// The schemas an unqualified name is searched in, outermost first, as
+    /// `current_schemas` reports them. `include_implicit` adds the ones
+    /// PostgreSQL never lists in `search_path` itself: this session's temp
+    /// namespace, once instantiated, and `pg_catalog`.
+    fn search_path(&self, include_implicit: bool) -> Vec<String>;
+
+    /// This session's temp namespace OID, or `None` before a temp relation has
+    /// instantiated it. Backs `pg_my_temp_schema()`, which reports 0 for the
+    /// `None` case.
+    fn my_temp_schema(&self) -> Option<u32>;
 }
 
 /// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering

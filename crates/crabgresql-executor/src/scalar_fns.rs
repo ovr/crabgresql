@@ -152,6 +152,20 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         ScalarFn::Version => {
             return Ok(Value::Text(crabgresql_types::version::version_string()));
         }
+        // The encoding table is a compile-time constant too, so these two are
+        // pure despite sitting beside the session-identity functions in SQL.
+        // Both are STRICT, and both report a sentinel rather than NULL for a
+        // miss: the empty string one way, `-1` the other.
+        ScalarFn::PgEncodingToChar => {
+            return Ok(Value::Text(
+                crabgresql_types::encoding::encoding_to_char(i4(&args[0])).to_string(),
+            ));
+        }
+        ScalarFn::PgCharToEncoding => {
+            return Ok(Value::Int4(crabgresql_types::encoding::char_to_encoding(
+                text(&args[0]),
+            )));
+        }
         // Sequence functions are side-effecting and are dispatched by `eval`
         // (which has the session's SequenceOps handle) before it ever reaches
         // this pure evaluator; seeing one here is an internal wiring error.
@@ -165,7 +179,16 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // session's CatalogOps handle.
         // `pg_typeof` is here too: it needs the catalog to name a user type, and
         // it is not STRICT, so the NULL short-circuit above would be wrong for it.
-        ScalarFn::PgGetUserById | ScalarFn::PgTableIsVisible | ScalarFn::PgTypeof(_) => {
+        ScalarFn::PgGetUserById
+        | ScalarFn::PgTableIsVisible
+        | ScalarFn::PgTypeof(_)
+        | ScalarFn::CurrentDatabase
+        | ScalarFn::CurrentSchema
+        | ScalarFn::CurrentSchemas
+        | ScalarFn::CurrentUser
+        | ScalarFn::SessionUser
+        | ScalarFn::PgMyTempSchema
+        | ScalarFn::PgIsOtherTempSchema => {
             return Err(ExecError::new(
                 sqlstate::INTERNAL_ERROR,
                 "catalog function reached the pure scalar evaluator",

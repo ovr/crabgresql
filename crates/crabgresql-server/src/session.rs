@@ -3,7 +3,7 @@
 //! `I`/`T`/`E` byte) and the data-level transaction ([`ActiveTxn`], the XID and
 //! snapshot MVCC runs against) are tracked side by side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
@@ -348,7 +348,14 @@ struct SavedGuc {
     def: &'static guc::GucDef,
     /// Set by `SET LOCAL`, which reverts on commit as well as rollback.
     local: bool,
-    value: guc::SavedValue,
+    /// `None` for a parameter whose value cannot change (`SET client_encoding`
+    /// is accepted and ignored). Its `pg_settings.source` still moves, which is
+    /// why such a parameter is saved at all.
+    value: Option<guc::SavedValue>,
+    /// Whether the parameter counted as explicitly assigned before this block —
+    /// `pg_settings.source`. Rolled back with the value, or the column would
+    /// keep reporting `session` after a `ROLLBACK` put `setting` back.
+    was_explicitly_set: bool,
 }
 
 pub struct Session {
@@ -401,6 +408,10 @@ pub struct Session {
     /// with the value each held before the *first* change — see
     /// [`Session::save_guc_for_transaction`].
     saved_gucs: Vec<SavedGuc>,
+    /// The `GucDef::key`s this session has explicitly assigned, whether or not
+    /// the assignment changed anything — `pg_settings.source`. Rolled back with
+    /// the save stack above.
+    explicitly_set: HashSet<&'static str>,
     /// Current transaction state, reported in every `ReadyForQuery`. `Idle`
     /// outside a block, `InTransaction` after `BEGIN`, `Failed` once a statement
     /// errors inside a block (only `COMMIT`/`ROLLBACK` clear it).
@@ -688,6 +699,7 @@ impl Session {
             stmt_start: crabgresql_types::tz::now_micros(),
             implicit_xact_start: None,
             saved_gucs: Vec::new(),
+            explicitly_set: HashSet::new(),
             default_iso: IsolationLevel::ReadCommitted,
             default_read_only: false,
             tx_status: TransactionStatus::Idle,
@@ -727,11 +739,16 @@ impl Session {
             saved.local |= local;
             return;
         }
-        // Nothing to restore for a parameter whose value cannot change.
-        let Some(value) = def.capture(self) else {
-            return;
-        };
-        self.saved_gucs.push(SavedGuc { def, local, value });
+        // A parameter whose value cannot change still has a `source` to restore,
+        // so it is saved with no value rather than skipped.
+        let value = def.capture(self);
+        let was_explicitly_set = self.explicitly_set.contains(def.key);
+        self.saved_gucs.push(SavedGuc {
+            def,
+            local,
+            value,
+            was_explicitly_set,
+        });
     }
 
     /// Undo the block's parameter changes as it ends: everything on `ROLLBACK`,
@@ -741,8 +758,36 @@ impl Session {
             if committed && !saved.local {
                 continue;
             }
-            saved.def.restore(self, saved.value);
+            if let Some(value) = saved.value {
+                saved.def.restore(self, value);
+            }
+            if saved.was_explicitly_set {
+                self.explicitly_set.insert(saved.def.key);
+            } else {
+                self.explicitly_set.remove(saved.def.key);
+            }
         }
+    }
+
+    /// Record that `def` was explicitly assigned this session —
+    /// `pg_settings.source` moves from `default` to `session`.
+    ///
+    /// PostgreSQL reports `session` after any successful `SET`, even one that
+    /// assigns the value the parameter already had, so this is keyed on the
+    /// statement having run rather than on the value having changed.
+    pub fn mark_guc_set(&mut self, def: &'static guc::GucDef) {
+        self.explicitly_set.insert(def.key);
+    }
+
+    /// Record that `def` was `RESET` back to its boot value.
+    pub fn mark_guc_reset(&mut self, def: &'static guc::GucDef) {
+        self.explicitly_set.remove(def.key);
+    }
+
+    /// Whether `key` names a parameter this session assigned —
+    /// `pg_settings.source` is `session` rather than `default`.
+    pub fn guc_is_explicitly_set(&self, key: &str) -> bool {
+        self.explicitly_set.contains(key)
     }
 
     /// The formatting context for this session: `extra_float_digits`, the

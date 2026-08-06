@@ -12,6 +12,7 @@ pub mod char;
 pub mod collation;
 pub mod date;
 pub mod datum;
+pub mod encoding;
 pub mod float;
 pub mod fmt;
 pub mod formatting;

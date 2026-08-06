@@ -545,13 +545,32 @@ fn eval_catalog_fn(
             | ScalarFn::RegIn(_)
             | ScalarFn::RegFromOid(_)
             | ScalarFn::PgTypeof(_)
+            | ScalarFn::CurrentDatabase
+            | ScalarFn::CurrentSchema
+            | ScalarFn::CurrentSchemas
+            | ScalarFn::CurrentUser
+            | ScalarFn::SessionUser
+            | ScalarFn::PgMyTempSchema
+            | ScalarFn::PgIsOtherTempSchema
     ) {
         return None;
     }
+    // Four of the session-identity functions take no argument at all, so the
+    // STRICT check below would index an empty slice; they are answered first.
+    let zero_arity = matches!(
+        func,
+        ScalarFn::CurrentDatabase
+            | ScalarFn::CurrentUser
+            | ScalarFn::SessionUser
+            | ScalarFn::CurrentSchema
+            | ScalarFn::PgMyTempSchema
+    );
     // Every function here but `pg_typeof` is STRICT, and this path runs ahead of
     // `eval_scalar`'s NULL short-circuit, so the check is hand-rolled.
-    // `pg_typeof(NULL)` reports the argument's declared type, not NULL.
-    if !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args[0], Value::Null) {
+    // `pg_typeof(NULL)` reports the argument's declared type, not NULL. Kept
+    // ahead of the handle check so a NULL argument answers NULL whether or not
+    // the statement was given a catalog context.
+    if !zero_arity && !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args[0], Value::Null) {
         return Some(Ok(Value::Null));
     }
     let Some(ops) = ctx.catalog.as_deref() else {
@@ -560,6 +579,39 @@ fn eval_catalog_fn(
             "catalog function evaluated without a catalog context",
         )));
     };
+    match func {
+        ScalarFn::CurrentDatabase => return Some(Ok(Value::Text(ops.current_database()))),
+        ScalarFn::CurrentUser => return Some(Ok(Value::Text(ops.current_user()))),
+        ScalarFn::SessionUser => return Some(Ok(Value::Text(ops.session_user()))),
+        // The first schema an unqualified CREATE would land in. PG returns NULL
+        // when the path names none that exist, which cannot happen here:
+        // `public` is always on it.
+        ScalarFn::CurrentSchema => {
+            return Some(Ok(ops
+                .search_path(false)
+                .into_iter()
+                .next()
+                .map_or(Value::Null, Value::Text)));
+        }
+        // PG reports 0, not NULL, before the temp namespace is instantiated.
+        ScalarFn::PgMyTempSchema => {
+            return Some(Ok(Value::Oid(ops.my_temp_schema().unwrap_or(0))));
+        }
+        // `current_schemas` takes a bool rather than an OID, so it too returns
+        // before the `oid_of` below.
+        ScalarFn::CurrentSchemas => {
+            let include_implicit = matches!(args[0], Value::Bool(true));
+            return Some(Ok(Value::Array {
+                elem: crabgresql_types::PgType::Name,
+                elems: ops
+                    .search_path(include_implicit)
+                    .into_iter()
+                    .map(Value::Text)
+                    .collect(),
+            }));
+        }
+        _ => {}
+    }
     // `pg_typeof` names the type the binder recorded on the call. It returns
     // before `oid_of` below, which accepts only `Value::Oid` — the argument here
     // is the user's own expression, of any type, already evaluated for its errors
@@ -587,6 +639,14 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // "Other" means a temp namespace that is not this session's. An OID
+        // naming nothing is `false`, not NULL — verified against PG 18.4 for 0,
+        // 2200 and 999999 — and so is this session's own.
+        ScalarFn::PgIsOtherTempSchema => Value::Bool(
+            ops.namespace_name(oid)
+                .is_some_and(|name| name.starts_with("pg_temp_"))
+                && ops.my_temp_schema() != Some(oid),
+        ),
         // `'name'::reg*` must find the object; `oid::reg*` takes the OID as
         // given and only resolves how it renders, so it cannot fail.
         ScalarFn::RegIn(kind) => match &args[0] {
@@ -1722,6 +1782,21 @@ mod format_type_tests {
                 None
             }
             fn constraint_def(&self, _oid: u32) -> Option<crate::ConstraintDef> {
+                None
+            }
+            fn current_database(&self) -> String {
+                "postgres".to_string()
+            }
+            fn current_user(&self) -> String {
+                "postgres".to_string()
+            }
+            fn session_user(&self) -> String {
+                "postgres".to_string()
+            }
+            fn search_path(&self, _include_implicit: bool) -> Vec<String> {
+                vec!["public".to_string()]
+            }
+            fn my_temp_schema(&self) -> Option<u32> {
                 None
             }
         }

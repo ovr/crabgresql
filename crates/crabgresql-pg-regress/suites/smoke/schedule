@@ -73,3 +73,7 @@ test: to_char
 test: toast
 test: psql_vars
 test: oidvector
+test: pg_database
+test: pg_settings
+test: timezone_views
+test: session_identity

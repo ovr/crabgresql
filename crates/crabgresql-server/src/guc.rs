@@ -81,15 +81,45 @@ pub enum GucKind {
 }
 
 /// One configuration parameter.
+///
+/// The metadata below is transcribed from `pg_settings` on a stock PostgreSQL
+/// 18.4 rather than invented: `category`, `context`, `vartype`, `extra_desc`,
+/// `min_val`/`max_val` and `enumvals` are PostgreSQL facts about a parameter of
+/// this name, and a client that reads them expects PostgreSQL's answers. Only
+/// `boot_val` may diverge, and only where crabgresql genuinely boots elsewhere
+/// — see `TimeZone`.
 pub struct GucDef {
     /// Lower-cased lookup key. GUC names are case-insensitive in PG.
     pub key: &'static str,
     /// Canonical spelling: the `ParameterStatus` name and `SHOW`'s column name.
     pub name: &'static str,
-    /// One-line description, for `SHOW ALL`.
+    /// One-line description: `SHOW ALL`'s third column, `pg_settings.short_desc`.
     pub description: &'static str,
+    /// `pg_settings.extra_desc` — PG's `long_desc`.
+    pub extra_desc: Option<&'static str>,
     /// PG's `GUC_REPORT`: a change is echoed to the client as `ParameterStatus`.
     pub report: bool,
+    /// The inverse of PG's `GUC_NO_SHOW_ALL`. A parameter flagged there is
+    /// readable by name (`SHOW is_superuser` works) but appears in neither
+    /// `SHOW ALL` nor `pg_settings`.
+    pub show_all: bool,
+    /// PG's `config_group`, verbatim.
+    pub category: &'static str,
+    /// PG's `GucContext`, verbatim: `user` or `internal` for everything here.
+    /// Stored rather than derived from [`GucKind`] — the two coincide today
+    /// only because no parameter is `postmaster`/`sighup` yet, and the first one
+    /// would mislabel itself silently.
+    pub context: &'static str,
+    /// `bool` | `string` | `integer` | `real` | `enum`.
+    pub vartype: &'static str,
+    /// Non-NULL only for `integer`/`real`.
+    pub min_val: Option<&'static str>,
+    pub max_val: Option<&'static str>,
+    /// Non-NULL only for `enum`, in PostgreSQL's declaration order.
+    pub enumvals: Option<&'static [&'static str]>,
+    /// What `RESET` restores, rendered. For a [`GucKind::Settable`] parameter
+    /// this must equal what `show` returns right after `set(_, Default)`.
+    pub boot_val: &'static str,
     pub show: fn(&Session) -> String,
     pub kind: GucKind,
 }
@@ -143,62 +173,76 @@ impl GucDef {
     }
 }
 
+/// PostgreSQL's `config_group` names, spelled once each.
+const LOCALE: &str = "Client Connection Defaults / Locale and Formatting";
+const STATEMENT: &str = "Client Connection Defaults / Statement Behavior";
+const PRESET: &str = "Preset Options";
+const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL Versions";
+
+/// Every parameter this server models, **sorted by name case-insensitively** —
+/// the order PostgreSQL's `pg_show_all_settings` returns, and therefore the
+/// order both `SHOW ALL` and `pg_settings` inherit for free. `gucs_are_sorted`
+/// below fails if an entry is appended out of place.
 pub static GUCS: &[GucDef] = &[
     GucDef {
-        key: "timezone",
-        name: "TimeZone",
-        description: "Sets the time zone for displaying and interpreting time stamps.",
+        key: "client_encoding",
+        name: "client_encoding",
+        description: "Sets the client's character set encoding.",
+        extra_desc: None,
         report: true,
-        show: |s| s.timezone.name().to_string(),
-        kind: GucKind::Settable {
-            set: set_timezone,
-            capture: |s| SavedValue::TimeZone(std::sync::Arc::clone(&s.timezone)),
-            restore: |s, v| {
-                if let SavedValue::TimeZone(z) = v {
-                    s.timezone = z;
-                }
-            },
-        },
+        show_all: true,
+        category: LOCALE,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        // PostgreSQL's own boot value, which its `initdb` then overrides — so a
+        // stock server also reports `boot_val` SQL_ASCII next to a UTF8
+        // `setting`. Reproduced rather than smoothed over.
+        boot_val: "SQL_ASCII",
+        show: |_| "UTF8".to_string(),
+        kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
-        key: "extra_float_digits",
-        name: "extra_float_digits",
-        description: "Sets the number of digits displayed for floating-point values.",
-        report: false,
-        show: |s| s.extra_float_digits.to_string(),
-        kind: GucKind::Settable {
-            set: set_extra_float_digits,
-            capture: |s| SavedValue::ExtraFloatDigits(s.extra_float_digits),
-            restore: |s, v| {
-                if let SavedValue::ExtraFloatDigits(n) = v {
-                    s.extra_float_digits = n;
-                }
-            },
-        },
-    },
-    GucDef {
-        key: "intervalstyle",
-        name: "IntervalStyle",
-        description: "Sets the display format for interval values.",
-        // GUC_REPORT in PG: it rides in the startup ParameterStatus burst and
-        // every later `SET` echoes it (verified on the wire against PG 18.4).
+        key: "datestyle",
+        name: "DateStyle",
+        description: "Sets the display format for date and time values.",
+        extra_desc: Some("Also controls interpretation of ambiguous date inputs."),
         report: true,
-        show: |s| s.interval_style.name().to_string(),
-        kind: GucKind::Settable {
-            set: set_interval_style,
-            capture: |s| SavedValue::IntervalStyle(s.interval_style),
-            restore: |s, v| {
-                if let SavedValue::IntervalStyle(x) = v {
-                    s.interval_style = x;
-                }
-            },
-        },
+        show_all: true,
+        category: LOCALE,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "ISO, MDY",
+        show: |_| "ISO, MDY".to_string(),
+        kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
         key: "default_transaction_isolation",
         name: "default_transaction_isolation",
         description: "Sets the transaction isolation level of each new transaction.",
+        extra_desc: None,
         report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "enum",
+        min_val: None,
+        max_val: None,
+        // PostgreSQL's declaration order, which is what `enumvals` prints.
+        // `read uncommitted` is accepted and behaves as `read committed`, as in
+        // PostgreSQL.
+        enumvals: Some(&[
+            "serializable",
+            "repeatable read",
+            "read committed",
+            "read uncommitted",
+        ]),
+        boot_val: "read committed",
         show: |s| isolation_name(s.default_iso).to_string(),
         kind: GucKind::Settable {
             set: set_default_isolation,
@@ -214,7 +258,16 @@ pub static GUCS: &[GucDef] = &[
         key: "default_transaction_read_only",
         name: "default_transaction_read_only",
         description: "Sets the default read-only status of new transactions.",
+        extra_desc: None,
         report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "bool",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "off",
         show: |s| on_off(s.default_read_only),
         kind: GucKind::Settable {
             set: set_default_read_only,
@@ -226,15 +279,139 @@ pub static GUCS: &[GucDef] = &[
             },
         },
     },
+    GucDef {
+        key: "extra_float_digits",
+        name: "extra_float_digits",
+        description: "Sets the number of digits displayed for floating-point values.",
+        extra_desc: Some(
+            "This affects real, double precision, and geometric data types. A zero or negative parameter value is added to the standard number of digits (FLT_DIG or DBL_DIG as appropriate). Any value greater than zero selects precise output mode.",
+        ),
+        report: false,
+        show_all: true,
+        category: LOCALE,
+        context: "user",
+        vartype: "integer",
+        // The band `set_extra_float_digits` enforces, published so a client can
+        // read it instead of discovering it by being rejected.
+        min_val: Some("-15"),
+        max_val: Some("3"),
+        enumvals: None,
+        boot_val: "1",
+        show: |s| s.extra_float_digits.to_string(),
+        kind: GucKind::Settable {
+            set: set_extra_float_digits,
+            capture: |s| SavedValue::ExtraFloatDigits(s.extra_float_digits),
+            restore: |s, v| {
+                if let SavedValue::ExtraFloatDigits(n) = v {
+                    s.extra_float_digits = n;
+                }
+            },
+        },
+    },
     // --- reported constants -------------------------------------------------
     // Read-only here, and all `GUC_REPORT` in PG: drivers parse `server_version`
     // and rely on `client_encoding` / `standard_conforming_strings` to pick
     // quoting rules.
     GucDef {
+        key: "integer_datetimes",
+        name: "integer_datetimes",
+        description: "Shows whether datetimes are integer based.",
+        extra_desc: None,
+        report: true,
+        show_all: true,
+        category: PRESET,
+        context: "internal",
+        vartype: "bool",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "on",
+        show: |_| "on".to_string(),
+        kind: GucKind::ReadOnly,
+    },
+    GucDef {
+        key: "intervalstyle",
+        name: "IntervalStyle",
+        description: "Sets the display format for interval values.",
+        extra_desc: None,
+        // GUC_REPORT in PG: it rides in the startup ParameterStatus burst and
+        // every later `SET` echoes it (verified on the wire against PG 18.4).
+        report: true,
+        show_all: true,
+        category: LOCALE,
+        context: "user",
+        vartype: "enum",
+        min_val: None,
+        max_val: None,
+        // PostgreSQL's declaration order, which is what `enumvals` prints. The
+        // same four names `INTERVAL_STYLE_VALUES` lists for the rejection HINT,
+        // in the same order — spelled out here because `enumvals` is an array
+        // and that one is a rendered sentence.
+        enumvals: Some(&["postgres", "postgres_verbose", "sql_standard", "iso_8601"]),
+        boot_val: "postgres",
+        show: |s| s.interval_style.name().to_string(),
+        kind: GucKind::Settable {
+            set: set_interval_style,
+            capture: |s| SavedValue::IntervalStyle(s.interval_style),
+            restore: |s, v| {
+                if let SavedValue::IntervalStyle(x) = v {
+                    s.interval_style = x;
+                }
+            },
+        },
+    },
+    GucDef {
+        key: "is_superuser",
+        name: "is_superuser",
+        description: "Shows whether the current user is a superuser.",
+        extra_desc: None,
+        report: true,
+        // PostgreSQL flags this `GUC_NO_SHOW_ALL`: `SHOW is_superuser` answers,
+        // but it appears in neither `SHOW ALL` nor `pg_settings`. Verified
+        // against 18.4, where `select count(*) from pg_settings where name =
+        // 'is_superuser'` is 0.
+        show_all: false,
+        category: PRESET,
+        context: "internal",
+        vartype: "bool",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "off",
+        show: |_| "on".to_string(),
+        kind: GucKind::ReadOnly,
+    },
+    GucDef {
+        key: "server_encoding",
+        name: "server_encoding",
+        description: "Sets the server (database) character set encoding.",
+        extra_desc: None,
+        report: true,
+        show_all: true,
+        category: PRESET,
+        context: "internal",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "SQL_ASCII",
+        show: |_| "UTF8".to_string(),
+        kind: GucKind::ReadOnly,
+    },
+    GucDef {
         key: "server_version",
         name: "server_version",
         description: "Shows the server version.",
+        extra_desc: None,
         report: true,
+        show_all: true,
+        category: PRESET,
+        context: "internal",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: crabgresql_types::version::SERVER_VERSION,
         show: |_| crabgresql_types::version::SERVER_VERSION.to_string(),
         kind: GucKind::ReadOnly,
     },
@@ -244,57 +421,65 @@ pub static GUCS: &[GucDef] = &[
         key: "server_version_num",
         name: "server_version_num",
         description: "Shows the server version as an integer.",
+        extra_desc: None,
         report: false,
+        show_all: true,
+        category: PRESET,
+        context: "internal",
+        vartype: "integer",
+        // PostgreSQL publishes a preset integer's bounds as the value itself.
+        min_val: Some(crabgresql_types::version::SERVER_VERSION_NUM),
+        max_val: Some(crabgresql_types::version::SERVER_VERSION_NUM),
+        enumvals: None,
+        boot_val: crabgresql_types::version::SERVER_VERSION_NUM,
         show: |_| crabgresql_types::version::SERVER_VERSION_NUM.to_string(),
-        kind: GucKind::ReadOnly,
-    },
-    GucDef {
-        key: "server_encoding",
-        name: "server_encoding",
-        description: "Sets the server (database) character set encoding.",
-        report: true,
-        show: |_| "UTF8".to_string(),
-        kind: GucKind::ReadOnly,
-    },
-    GucDef {
-        key: "client_encoding",
-        name: "client_encoding",
-        description: "Sets the client's character set encoding.",
-        report: true,
-        show: |_| "UTF8".to_string(),
-        kind: GucKind::AcceptedAndIgnored,
-    },
-    GucDef {
-        key: "datestyle",
-        name: "DateStyle",
-        description: "Sets the display format for date and time values.",
-        report: true,
-        show: |_| "ISO, MDY".to_string(),
-        kind: GucKind::AcceptedAndIgnored,
-    },
-    GucDef {
-        key: "integer_datetimes",
-        name: "integer_datetimes",
-        description: "Shows whether datetimes are integer based.",
-        report: true,
-        show: |_| "on".to_string(),
         kind: GucKind::ReadOnly,
     },
     GucDef {
         key: "standard_conforming_strings",
         name: "standard_conforming_strings",
         description: "Causes '...' strings to treat backslashes literally.",
+        extra_desc: None,
         report: true,
+        show_all: true,
+        category: COMPAT,
+        context: "user",
+        vartype: "bool",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "on",
         show: |_| "on".to_string(),
         kind: GucKind::AcceptedAndIgnored,
     },
     GucDef {
-        key: "is_superuser",
-        name: "is_superuser",
-        description: "Shows whether the current user is a superuser.",
+        key: "timezone",
+        name: "TimeZone",
+        description: "Sets the time zone for displaying and interpreting time stamps.",
+        extra_desc: None,
         report: true,
-        show: |_| "on".to_string(),
-        kind: GucKind::ReadOnly,
+        show_all: true,
+        category: LOCALE,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        // PostgreSQL boots at `GMT`; this server boots at `UTC`. `boot_val` must
+        // agree with what `RESET TimeZone` actually leaves behind, so reporting
+        // PostgreSQL's value here would make the column contradict observable
+        // behaviour — a worse divergence than the one it hides.
+        boot_val: "UTC",
+        show: |s| s.timezone.name().to_string(),
+        kind: GucKind::Settable {
+            set: set_timezone,
+            capture: |s| SavedValue::TimeZone(std::sync::Arc::clone(&s.timezone)),
+            restore: |s, v| {
+                if let SavedValue::TimeZone(z) = v {
+                    s.timezone = z;
+                }
+            },
+        },
     },
 ];
 
@@ -314,6 +499,49 @@ pub fn lookup(name: &str) -> Option<&'static GucDef> {
 pub fn snapshot(session: &Session) -> std::collections::HashMap<String, String> {
     GUCS.iter()
         .map(|g| (g.key.to_string(), (g.show)(session)))
+        .collect()
+}
+
+/// Every parameter `pg_settings` shows, in `GUCS` order (already sorted by
+/// name, as PostgreSQL's view is).
+///
+/// Lives here rather than in the catalog crate so every rendering of a GUC —
+/// this one, `SHOW`, `SHOW ALL` and `ParameterStatus` — reads the same table
+/// through the same `show` functions and cannot disagree.
+pub fn catalog_settings(session: &Session) -> Vec<crabgresql_catalog::CatalogSetting> {
+    GUCS.iter()
+        .filter(|def| def.show_all)
+        .map(|def| {
+            let setting = (def.show)(session);
+            crabgresql_catalog::CatalogSetting {
+                name: def.name,
+                // `RESET` puts a settable parameter back to its boot value; one
+                // that cannot change is already at its reset value, whatever
+                // `boot_val` records PostgreSQL booting from.
+                reset_val: if def.is_mutable() {
+                    def.boot_val.to_string()
+                } else {
+                    setting.clone()
+                },
+                setting,
+                // No parameter modelled here is measured in kB or ms.
+                unit: None,
+                category: def.category,
+                short_desc: def.description,
+                extra_desc: def.extra_desc,
+                context: def.context,
+                vartype: def.vartype,
+                source: if session.guc_is_explicitly_set(def.key) {
+                    "session"
+                } else {
+                    "default"
+                },
+                min_val: def.min_val,
+                max_val: def.max_val,
+                enumvals: def.enumvals,
+                boot_val: def.boot_val,
+            }
+        })
         .collect()
 }
 
@@ -479,4 +707,53 @@ fn requires_boolean(param: &str) -> PgError {
         sqlstate::INVALID_PARAMETER_VALUE,
         format!("parameter \"{param}\" requires a Boolean value"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `GUCS` is the row order of both `SHOW ALL` and `pg_settings`, and
+    /// PostgreSQL returns those sorted by name case-insensitively. Keeping the
+    /// array itself sorted gives both consumers that order for free — and makes
+    /// appending an entry in the wrong place a test failure rather than a
+    /// silently diverging expected-file.
+    #[test]
+    fn gucs_are_sorted_by_name() {
+        let names: Vec<String> = GUCS.iter().map(|g| g.name.to_ascii_lowercase()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "GUCS must be sorted by name, case-insensitively"
+        );
+    }
+
+    /// The lookup key is the canonical name lower-cased. `lookup` scans on
+    /// `key`, `pg_settings` and `ParameterStatus` print `name`, and
+    /// `Session::explicitly_set` is keyed on `key` — a mismatch would make a
+    /// `SET` mark a parameter nothing reads back.
+    #[test]
+    fn every_key_is_its_name_lowercased() {
+        for def in GUCS {
+            assert_eq!(def.key, def.name.to_ascii_lowercase(), "{}", def.name);
+        }
+    }
+
+    /// Metadata that only makes sense for one `vartype` is present exactly
+    /// there: bounds on numbers, `enumvals` on enums.
+    #[test]
+    fn typed_metadata_matches_vartype() {
+        for def in GUCS {
+            let numeric = matches!(def.vartype, "integer" | "real");
+            assert_eq!(def.min_val.is_some(), numeric, "{}", def.name);
+            assert_eq!(def.max_val.is_some(), numeric, "{}", def.name);
+            assert_eq!(
+                def.enumvals.is_some(),
+                def.vartype == "enum",
+                "{}",
+                def.name
+            );
+        }
+    }
 }

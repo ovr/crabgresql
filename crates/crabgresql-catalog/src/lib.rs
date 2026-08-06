@@ -171,7 +171,11 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 /// `builtin_relation_oid_is_complete` keeps this in step with what
 /// `build_pg_catalog` actually serves.
 const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
+    ("pg_tablespace", 1213),
     ("pg_type", 1247),
+    ("pg_authid", 1260),
+    ("pg_auth_members", 1261),
+    ("pg_database", 1262),
     ("pg_attribute", 1249),
     ("pg_proc", 1255),
     ("pg_class", 1259),
@@ -187,10 +191,18 @@ const BUILTIN_RELATION_OIDS: &[(&str, u32)] = &[
     ("pg_partitioned_table", 3350),
     ("pg_collation", 3456),
     ("pg_enum", 3501),
-    // A view defined by initdb rather than a bootstrap catalog, so its OID comes
+    // Views defined by initdb rather than bootstrap catalogs, so their OIDs come
     // from the auto-assigned band. Deterministic for a given major version, and
-    // probed from the same 18.4 as the rest.
+    // all probed from the same 18.4 as the rest — `pg_cursors` reading back
+    // 12077 there is what confirms the whole band came from one `initdb`.
+    ("pg_roles", 12000),
+    ("pg_shadow", 12005),
+    ("pg_group", 12010),
+    ("pg_user", 12014),
     ("pg_cursors", 12077),
+    ("pg_settings", 12104),
+    ("pg_timezone_abbrevs", 12122),
+    ("pg_timezone_names", 12126),
 ];
 
 /// The fixed OID of the `pg_catalog` relation `name`, if this build serves one.
@@ -409,29 +421,212 @@ pub struct CatalogRoutine {
     pub src: String,
 }
 
-/// Produces the live user relations to reflect into `pg_class`/`pg_attribute`
-/// and `information_schema`.
-/// Boxed so it can capture the server engines and run lazily — only a query that
-/// actually opens `pg_class`/`pg_attribute` pays the cost of enumerating them.
-type RelationsFn = Box<dyn Fn() -> Vec<CatalogRelation> + Send + Sync>;
+/// The live server state one [`SystemCatalog`] snapshot reflects.
+///
+/// Every method is called **at most once** per snapshot, and only when a query
+/// actually opens the relation it feeds — `SystemCatalog` owns that
+/// memoization, so an implementation is free to be expensive: `relations()`
+/// enumerates the whole database, and a `SELECT 1` must never pay for it.
+///
+/// `relations`, `database` and `owner` have no default on purpose. A silent
+/// `Vec::new()` for the first would empty `pg_class`, `pg_attribute` and the
+/// information schema at once, and a `"postgres"` default for the other two
+/// would label every catalog row with a session identity nobody chose. The
+/// optional methods are ones whose empty answer is a truthful "this deployment
+/// has none".
+pub trait CatalogSource: Send + Sync {
+    /// The live user relations to reflect into `pg_class`/`pg_attribute` and
+    /// `information_schema`.
+    fn relations(&self) -> Vec<CatalogRelation>;
 
-/// Produces the user-defined types to reflect into `pg_type`/`pg_enum`. Boxed and
-/// lazy like [`RelationsFn`] — only a query that opens `pg_type`/`pg_enum` pays.
-type UserTypesFn = Box<dyn Fn() -> Vec<CatalogUserType> + Send + Sync>;
+    /// The database this snapshot's session is connected to.
+    fn database(&self) -> &str;
 
-/// Produces the user-defined routines to reflect into `pg_proc`. Boxed and
-/// lazy for the same reason as the others: only a query that opens `pg_proc`
-/// pays for enumerating them.
-type RoutinesFn = Box<dyn Fn() -> Vec<CatalogRoutine> + Send + Sync>;
+    /// The session user. Every catalog row reports it as its owner, and it is
+    /// the one name [`SystemCatalog::role_name`] resolves.
+    fn owner(&self) -> &str;
 
-/// Produces the user-created schemas (`CREATE SCHEMA`) as `(name, oid)`, to
-/// reflect into `pg_namespace` and `information_schema.schemata`. Boxed and lazy
-/// like [`RelationsFn`].
-type SchemasFn = Box<dyn Fn() -> Vec<(String, u32)> + Send + Sync>;
+    /// The user-defined types to reflect into `pg_type`/`pg_enum`.
+    fn user_types(&self) -> Vec<CatalogUserType> {
+        Vec::new()
+    }
 
-/// Produces the session's open SQL cursors, to reflect into `pg_cursors`. Boxed
-/// and lazy like [`RelationsFn`].
-type CursorsFn = Box<dyn Fn() -> Vec<CatalogCursor> + Send + Sync>;
+    /// The user-defined routines to reflect into `pg_proc`.
+    fn routines(&self) -> Vec<CatalogRoutine> {
+        Vec::new()
+    }
+
+    /// The user-created schemas (`CREATE SCHEMA`) as `(name, oid)`, to reflect
+    /// into `pg_namespace` and `information_schema.schemata`.
+    fn schemas(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
+    /// The session's open SQL cursors, to reflect into `pg_cursors`.
+    fn cursors(&self) -> Vec<CatalogCursor> {
+        Vec::new()
+    }
+
+    /// The configuration parameters, to reflect into `pg_settings`. The GUC
+    /// table lives in the server, so this crate takes the rendered rows rather
+    /// than depending on it.
+    fn settings(&self) -> Vec<CatalogSetting> {
+        Vec::new()
+    }
+
+    /// The instant `pg_timezone_names`/`pg_timezone_abbrevs` resolve their
+    /// offsets at, in `timestamptz` micros. PostgreSQL reports a zone's offset
+    /// and DST flag as of *now*, so a session supplies its statement timestamp
+    /// and the view agrees with `now()` in the same statement.
+    fn now(&self) -> i64 {
+        crabgresql_types::tz::now_micros()
+    }
+}
+
+/// A [`CatalogSource`] over data known up front. Clones its vectors on every
+/// call, which is harmless under `SystemCatalog`'s memoization and is why this
+/// is for tests, fixtures and empty catalogs rather than for a live server.
+#[derive(Clone, Debug)]
+pub struct StaticSource {
+    relations: Vec<CatalogRelation>,
+    database: String,
+    owner: String,
+    user_types: Vec<CatalogUserType>,
+    routines: Vec<CatalogRoutine>,
+    schemas: Vec<(String, u32)>,
+    cursors: Vec<CatalogCursor>,
+    settings: Vec<CatalogSetting>,
+}
+
+impl Default for StaticSource {
+    /// Written out rather than derived: `database` and `owner` default to
+    /// `postgres`, not to the empty string.
+    fn default() -> Self {
+        Self {
+            relations: Vec::new(),
+            database: "postgres".to_string(),
+            owner: "postgres".to_string(),
+            user_types: Vec::new(),
+            routines: Vec::new(),
+            schemas: Vec::new(),
+            cursors: Vec::new(),
+            settings: Vec::new(),
+        }
+    }
+}
+
+impl StaticSource {
+    pub fn new(relations: Vec<CatalogRelation>) -> Self {
+        Self {
+            relations,
+            ..Self::default()
+        }
+    }
+
+    pub fn database(mut self, database: impl Into<String>) -> Self {
+        self.database = database.into();
+        self
+    }
+
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = owner.into();
+        self
+    }
+
+    pub fn user_types(mut self, user_types: Vec<CatalogUserType>) -> Self {
+        self.user_types = user_types;
+        self
+    }
+
+    pub fn routines(mut self, routines: Vec<CatalogRoutine>) -> Self {
+        self.routines = routines;
+        self
+    }
+
+    pub fn schemas(mut self, schemas: Vec<(String, u32)>) -> Self {
+        self.schemas = schemas;
+        self
+    }
+
+    pub fn cursors(mut self, cursors: Vec<CatalogCursor>) -> Self {
+        self.cursors = cursors;
+        self
+    }
+
+    pub fn settings(mut self, settings: Vec<CatalogSetting>) -> Self {
+        self.settings = settings;
+        self
+    }
+}
+
+impl CatalogSource for StaticSource {
+    fn relations(&self) -> Vec<CatalogRelation> {
+        self.relations.clone()
+    }
+
+    fn database(&self) -> &str {
+        &self.database
+    }
+
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    fn user_types(&self) -> Vec<CatalogUserType> {
+        self.user_types.clone()
+    }
+
+    fn routines(&self) -> Vec<CatalogRoutine> {
+        self.routines.clone()
+    }
+
+    fn schemas(&self) -> Vec<(String, u32)> {
+        self.schemas.clone()
+    }
+
+    fn cursors(&self) -> Vec<CatalogCursor> {
+        self.cursors.clone()
+    }
+
+    fn settings(&self) -> Vec<CatalogSetting> {
+        self.settings.clone()
+    }
+}
+
+/// One configuration parameter, as `pg_settings` shows it. Session-local like
+/// [`CatalogCursor`]: `setting` and `source` differ per connection.
+///
+/// Column-for-column with PostgreSQL's view, minus `sourcefile`, `sourceline`
+/// and `pending_restart` — crabgresql has no configuration file and nothing
+/// that needs a restart, so those three are constants the row builder supplies
+/// rather than fields every caller would fill identically.
+///
+/// The metadata borrows rather than owning: it comes straight off the server's
+/// `static GUCS` table, so `&'static str` is both free and a guarantee that
+/// `pg_settings` shows the same strings `SHOW` does. Only `setting` and
+/// `reset_val` are session-derived.
+#[derive(Clone, Debug)]
+pub struct CatalogSetting {
+    /// Canonical spelling (`TimeZone`), not the lower-cased lookup key.
+    pub name: &'static str,
+    /// The current value, rendered exactly as `SHOW` prints it.
+    pub setting: String,
+    pub unit: Option<&'static str>,
+    pub category: &'static str,
+    pub short_desc: &'static str,
+    pub extra_desc: Option<&'static str>,
+    pub context: &'static str,
+    pub vartype: &'static str,
+    /// `default` or `session`.
+    pub source: &'static str,
+    pub min_val: Option<&'static str>,
+    pub max_val: Option<&'static str>,
+    /// `None` unless `vartype` is `enum`, in PostgreSQL's declaration order.
+    pub enumvals: Option<&'static [&'static str]>,
+    pub boot_val: &'static str,
+    /// What `RESET <name>` would leave behind.
+    pub reset_val: String,
+}
 
 /// One open cursor, as `pg_cursors` shows it. Cursors are session-local in
 /// PostgreSQL too, so this is never shared between connections.
@@ -448,17 +643,11 @@ pub struct CatalogCursor {
 }
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
-/// its rows reflect current server state; live user relations are supplied by a
-/// closure that is invoked at most once (and only when `pg_class`/`pg_attribute`
-/// is opened), memoized in `oids`.
+/// its rows reflect current server state; the live state comes from a
+/// [`CatalogSource`] whose every method is invoked at most once, and only when
+/// the relation it feeds is opened.
 pub struct SystemCatalog {
-    relations: RelationsFn,
-    user_types_fn: UserTypesFn,
-    routines_fn: RoutinesFn,
-    schemas_fn: SchemasFn,
-    cursors_fn: CursorsFn,
-    database: String,
-    owner: String,
+    source: Arc<dyn CatalogSource>,
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     kinds: OnceLock<Vec<RelKind>>,
@@ -470,49 +659,51 @@ pub struct SystemCatalog {
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
     cursors: OnceLock<Vec<CatalogCursor>>,
+    settings: OnceLock<Vec<CatalogSetting>>,
 }
 
 impl Default for SystemCatalog {
     fn default() -> Self {
-        Self::with_relations_fn(Vec::new)
+        Self::new()
     }
 }
 
 impl SystemCatalog {
     /// A catalog with no live relations (built-in metadata only).
     pub fn new() -> Self {
-        Self::default()
+        Self::from_source(Arc::new(StaticSource::default()))
     }
 
     /// A catalog reflecting a fixed set of live user relations into
     /// `pg_class`/`pg_attribute`.
     pub fn with_relations(relations: Vec<TableSchema>) -> Self {
-        Self::with_relations_fn(move || relations.clone())
+        Self::from_source(Arc::new(StaticSource::new(
+            relations
+                .into_iter()
+                .map(CatalogRelation::permanent)
+                .collect(),
+        )))
     }
 
-    /// A catalog that enumerates its live user relations lazily via `f` (invoked
-    /// at most once, only if a relation-backed catalog is opened).
-    pub fn with_relations_fn(f: impl Fn() -> Vec<TableSchema> + Send + Sync + 'static) -> Self {
-        Self::with_catalog_relations_fn("postgres", "postgres", move || {
-            f().into_iter().map(CatalogRelation::permanent).collect()
-        })
-    }
-
-    /// A catalog with session identity and live relation metadata for the
-    /// information schema. The callback is memoized per catalog snapshot.
-    pub fn with_catalog_relations_fn(
+    /// A catalog with session identity and a fixed set of live relations.
+    pub fn with_catalog_relations(
         database: impl Into<String>,
         owner: impl Into<String>,
-        f: impl Fn() -> Vec<CatalogRelation> + Send + Sync + 'static,
+        relations: Vec<CatalogRelation>,
     ) -> Self {
+        Self::from_source(Arc::new(
+            StaticSource::new(relations).database(database).owner(owner),
+        ))
+    }
+
+    /// A catalog reflecting `source`.
+    ///
+    /// The snapshot is per statement, not per session: every memoized answer
+    /// below goes stale the moment any DDL runs. The `source` itself may be
+    /// long-lived; the `SystemCatalog` wrapped around it must not be.
+    pub fn from_source(source: Arc<dyn CatalogSource>) -> Self {
         Self {
-            relations: Box::new(f),
-            user_types_fn: Box::new(Vec::new),
-            routines_fn: Box::new(Vec::new),
-            schemas_fn: Box::new(Vec::new),
-            cursors_fn: Box::new(Vec::new),
-            database: database.into(),
-            owner: owner.into(),
+            source,
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
             kinds: OnceLock::new(),
@@ -524,68 +715,37 @@ impl SystemCatalog {
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
             cursors: OnceLock::new(),
+            settings: OnceLock::new(),
         }
     }
 
-    /// Attach a provider of user-defined types to reflect into `pg_type`/`pg_enum`
-    /// (invoked at most once, only if one of those relations is opened).
-    pub fn with_user_types_fn(
-        mut self,
-        f: impl Fn() -> Vec<CatalogUserType> + Send + Sync + 'static,
-    ) -> Self {
-        self.user_types_fn = Box::new(f);
-        self
-    }
-
-    /// Attach a provider of user-defined routines to reflect into `pg_proc`
-    /// (invoked at most once, only if `pg_proc` is opened).
-    pub fn with_routines_fn(
-        mut self,
-        f: impl Fn() -> Vec<CatalogRoutine> + Send + Sync + 'static,
-    ) -> Self {
-        self.routines_fn = Box::new(f);
-        self
-    }
-
-    /// Attach a provider of user-created schemas to reflect into `pg_namespace`
-    /// and `information_schema.schemata` (invoked at most once, only if one of
-    /// those relations is opened).
-    pub fn with_schemas_fn(
-        mut self,
-        f: impl Fn() -> Vec<(String, u32)> + Send + Sync + 'static,
-    ) -> Self {
-        self.schemas_fn = Box::new(f);
-        self
-    }
-
-    /// Attach a provider of the session's open SQL cursors to reflect into
-    /// `pg_cursors` (invoked at most once, only if that relation is opened).
-    pub fn with_cursors_fn(
-        mut self,
-        f: impl Fn() -> Vec<CatalogCursor> + Send + Sync + 'static,
-    ) -> Self {
-        self.cursors_fn = Box::new(f);
-        self
-    }
-
+    /// The accessors below are the only places `self.source` is read, apart
+    /// from the three cheap answers (`database`, `owner`, `now`) that need no
+    /// memoization. Keeping it that way is what makes the source's cost a
+    /// per-snapshot one: a call site outside a `OnceLock` would re-enumerate
+    /// the database on every row that reached it.
     fn live_relations(&self) -> &[CatalogRelation] {
-        self.live_relations.get_or_init(|| (self.relations)())
+        self.live_relations.get_or_init(|| self.source.relations())
     }
 
     fn user_types(&self) -> &[CatalogUserType] {
-        self.user_types.get_or_init(|| (self.user_types_fn)())
+        self.user_types.get_or_init(|| self.source.user_types())
     }
 
     fn routines(&self) -> &[CatalogRoutine] {
-        self.routines.get_or_init(|| (self.routines_fn)())
+        self.routines.get_or_init(|| self.source.routines())
     }
 
     fn user_schemas(&self) -> &[(String, u32)] {
-        self.user_schemas.get_or_init(|| (self.schemas_fn)())
+        self.user_schemas.get_or_init(|| self.source.schemas())
     }
 
     fn cursors(&self) -> &[CatalogCursor] {
-        self.cursors.get_or_init(|| (self.cursors_fn)())
+        self.cursors.get_or_init(|| self.source.cursors())
+    }
+
+    fn settings(&self) -> &[CatalogSetting] {
+        self.settings.get_or_init(|| self.source.settings())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each
@@ -866,7 +1026,19 @@ impl SystemCatalog {
     /// (crabgresql has no role catalog), so exactly one OID resolves — to this
     /// snapshot's session user. Backs `pg_get_userbyid`.
     pub fn role_name(&self, oid: u32) -> Option<&str> {
-        (oid == schema::BOOTSTRAP_ROLE_OID).then_some(self.owner.as_str())
+        (oid == schema::BOOTSTRAP_ROLE_OID).then_some(self.source.owner())
+    }
+
+    /// The database this snapshot's session is connected to. Backs
+    /// `current_database()`/`current_catalog`.
+    pub fn database(&self) -> &str {
+        self.source.database()
+    }
+
+    /// The session user. Backs `current_user`/`session_user`, and is the name
+    /// every catalog row's owner OID resolves to.
+    pub fn owner(&self) -> &str {
+        self.source.owner()
     }
 
     /// The `(namespace, name)` of the relation `oid` identifies — a
@@ -1019,9 +1191,49 @@ impl SystemCatalog {
                 schema::pg_index_rows(self.index_oids()),
             )),
             "pg_am" => Some((schema::pg_am_schema(), schema::pg_am_rows())),
+            "pg_database" => Some((
+                schema::pg_database_schema(),
+                schema::pg_database_rows(self.database()),
+            )),
+            "pg_tablespace" => Some((schema::pg_tablespace_schema(), schema::pg_tablespace_rows())),
+            // The six role relations all derive from the one session role; see
+            // `schema::roles`.
+            "pg_authid" => Some((
+                schema::pg_authid_schema(),
+                schema::pg_authid_rows(self.owner()),
+            )),
+            "pg_roles" => Some((
+                schema::pg_roles_schema(),
+                schema::pg_roles_rows(self.owner()),
+            )),
+            "pg_user" => Some((schema::pg_user_schema(), schema::pg_user_rows(self.owner()))),
+            "pg_shadow" => Some((
+                schema::pg_shadow_schema(),
+                schema::pg_shadow_rows(self.owner()),
+            )),
+            "pg_group" => Some((
+                schema::pg_group_schema(),
+                schema::pg_group_rows(self.owner()),
+            )),
+            "pg_auth_members" => Some((
+                schema::pg_auth_members_schema(),
+                schema::pg_auth_members_rows(),
+            )),
             "pg_cursors" => Some((
                 schema::pg_cursors_schema(),
                 schema::pg_cursors_rows(self.cursors()),
+            )),
+            "pg_timezone_names" => Some((
+                schema::pg_timezone_names_schema(),
+                schema::pg_timezone_names_rows(self.source.now()),
+            )),
+            "pg_timezone_abbrevs" => Some((
+                schema::pg_timezone_abbrevs_schema(),
+                schema::pg_timezone_abbrevs_rows(self.source.now()),
+            )),
+            "pg_settings" => Some((
+                schema::pg_settings_schema(),
+                schema::pg_settings_rows(self.settings()),
             )),
             "pg_language" => Some((schema::pg_language_schema(), schema::pg_language_rows())),
             "pg_proc" => Some((
@@ -1051,19 +1263,19 @@ impl SystemCatalog {
             "schemata" => Some((
                 schema::information_schema_schemata_schema(),
                 schema::information_schema_schemata_rows(
-                    &self.database,
-                    &self.owner,
+                    self.database(),
+                    self.owner(),
                     self.live_relations(),
                     self.user_schemas(),
                 ),
             )),
             "tables" => Some((
                 schema::information_schema_tables_schema(),
-                schema::information_schema_tables_rows(&self.database, self.live_relations()),
+                schema::information_schema_tables_rows(self.database(), self.live_relations()),
             )),
             "columns" => Some((
                 schema::information_schema_columns_schema(),
-                schema::information_schema_columns_rows(&self.database, self.live_relations()),
+                schema::information_schema_columns_rows(self.database(), self.live_relations()),
             )),
             _ => None,
         }
@@ -1477,7 +1689,7 @@ mod tests {
             strategy: PartitionStrategy::Range,
             key_columns: vec![0],
         });
-        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+        let cat = SystemCatalog::with_catalog_relations("db", "owner", {
             vec![
                 CatalogRelation::permanent(plain("tbl")),
                 CatalogRelation::view(plain("vw")),
@@ -1684,6 +1896,17 @@ mod tests {
             "pg_inherits",
             "pg_partitioned_table",
             "pg_sequence",
+            "pg_settings",
+            "pg_timezone_names",
+            "pg_timezone_abbrevs",
+            "pg_database",
+            "pg_tablespace",
+            "pg_authid",
+            "pg_roles",
+            "pg_user",
+            "pg_shadow",
+            "pg_group",
+            "pg_auth_members",
         ] {
             assert!(cat.has_catalog_relation(name), "{name} is not served");
             assert!(
@@ -1704,14 +1927,16 @@ mod tests {
     /// that row reports.
     #[test]
     fn catalog_lookups_agree_with_pg_class_rows() -> anyhow::Result<()> {
-        let cat = SystemCatalog::with_catalog_relations_fn("db", "alice", || {
-            vec![CatalogRelation::permanent(TableSchema::in_namespace(
+        let cat = SystemCatalog::from_source(Arc::new(
+            StaticSource::new(vec![CatalogRelation::permanent(TableSchema::in_namespace(
                 "t",
                 "app",
                 vec![Column::new("a", PgType::Int4)],
-            ))]
-        })
-        .with_schemas_fn(|| vec![("app".to_string(), 16_000)]);
+            ))])
+            .database("db")
+            .owner("alice")
+            .schemas(vec![("app".to_string(), 16_000)]),
+        ));
         let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
         let oid = required(schema.column_index("oid"), "oid column is missing")?;
         let relowner = required(
@@ -1789,7 +2014,7 @@ mod tests {
         use crabgresql_storage_api::{Column, TableSchema};
         use crabgresql_types::PgType;
 
-        let cat = SystemCatalog::with_catalog_relations_fn("appdb", "appuser", || {
+        let cat = SystemCatalog::with_catalog_relations("appdb", "appuser", {
             vec![
                 CatalogRelation::permanent(TableSchema::new(
                     "widgets",
@@ -1932,7 +2157,7 @@ mod tests {
         // `analyzed_stats` stands in for a relation ANALYZE has measured; the
         // others have not been analyzed and must report the sentinel.
         let analyzed = RelStats::exact(1234, &table);
-        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+        let cat = SystemCatalog::with_catalog_relations("db", "owner", {
             let mut measured = CatalogRelation::permanent(TableSchema::new(
                 "measured",
                 vec![Column::new("a", PgType::Int4)],
@@ -2004,7 +2229,7 @@ mod tests {
         fn plain(name: &str) -> TableSchema {
             TableSchema::new(name, vec![Column::new("id", PgType::Int4)])
         }
-        let cat = SystemCatalog::with_catalog_relations_fn("db", "owner", move || {
+        let cat = SystemCatalog::with_catalog_relations("db", "owner", {
             let mut toasted = CatalogRelation::permanent(plain("toasted"));
             toasted.toast = Some(RelStats {
                 relpages: 7,
