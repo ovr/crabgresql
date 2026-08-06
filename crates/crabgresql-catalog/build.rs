@@ -109,9 +109,9 @@ const TYPE_REGPROC_COLUMNS: &[&str] = &[
 /// `pg_type.dat` necessarily references them.
 const ARRAY_ROW_PROCS: &[&str] = &["array_in", "array_out", "array_recv", "array_send"];
 
-/// The `pg_am.amhandler` names `schema::pg_am_rows` publishes that upstream
+/// The `pg_am.amhandler` names `catalogs::am::pg_am_rows` publishes that upstream
 /// also has. crabgresql's own access methods (`parquet`, `buffer`) have no
-/// upstream entry to resolve against; `schema::OWN_AM_HANDLERS` gives those
+/// upstream entry to resolve against; `oids::OWN_AM_HANDLERS` gives those
 /// two `pg_proc` rows of their own.
 const AM_HANDLERS: &[&str] = &[
     "heap_tableam_handler",
@@ -394,7 +394,7 @@ impl TypeRow<'_> {
         } = self;
         format!(
             "    PgTypeRow {{ oid: {oid}, typname: {typname:?}, typnamespace: 11, \
-typowner: crate::schema::BOOTSTRAP_ROLE_OID, typlen: {typlen}, typbyval: {typbyval}, \
+typowner: crate::oids::BOOTSTRAP_ROLE_OID, typlen: {typlen}, typbyval: {typbyval}, \
 typtype: {typtype:?}, \
 typcategory: {typcategory:?}, typispreferred: {typispreferred}, typisdefined: true, \
 typdelim: {typdelim:?}, typrelid: {typrelid}, typsubscript: {typsubscript}, \

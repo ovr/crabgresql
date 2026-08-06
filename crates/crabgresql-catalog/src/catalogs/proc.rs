@@ -1,0 +1,211 @@
+//! `pg_proc`: the referenced built-in functions plus this server's routines.
+
+use crabgresql_storage_api::TableSchema;
+use crabgresql_types::{PgType, Value};
+
+use crate::SystemCatalog;
+use crate::cols::*;
+use crate::oids::*;
+use std::collections::HashMap;
+
+use crabgresql_types::{Reg, RegKind};
+
+use crate::{CatalogRoutine, PG_PROC_ROWS};
+
+/// `pg_catalog.pg_proc` — the columns clients read, in PostgreSQL's order.
+pub(crate) fn pg_proc_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_proc",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("proname", PgType::Name),
+            col("pronamespace", PgType::Oid),
+            col("proowner", PgType::Oid),
+            col("prolang", PgType::Oid),
+            col("procost", PgType::Float4),
+            col("prorows", PgType::Float4),
+            col("provariadic", PgType::Oid),
+            col("prosupport", REGPROC),
+            col("prokind", CHARLIKE),
+            col("prosecdef", PgType::Bool),
+            col("proleakproof", PgType::Bool),
+            col("proisstrict", PgType::Bool),
+            col("proretset", PgType::Bool),
+            col("provolatile", CHARLIKE),
+            col("proparallel", CHARLIKE),
+            col("pronargs", PgType::Int2),
+            col("pronargdefaults", PgType::Int2),
+            col("prorettype", PgType::Oid),
+            col("proargtypes", OIDVECTOR),
+            col("proallargtypes", PgType::Array(crabgresql_types::oid::OID)),
+            col("proargmodes", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("proargnames", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("prosrc", PgType::Text),
+            col("probin", PgType::Text),
+        ],
+    )
+}
+
+/// The built-in `pg_proc` rows generated from `pg_proc.dat` — the functions the
+/// other catalogs reference, and only those (see `gen_pg_proc` in `build.rs`).
+/// Callers append the session's `CREATE FUNCTION` routines after these.
+///
+/// `proallargtypes`/`proargmodes`/`proargnames` are NULL for every one: none of
+/// these take OUT parameters, and codegen refuses to emit an entry that does
+/// rather than drop the columns silently.
+pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
+    // crabgresql's own table-AM handlers, so `pg_am.amhandler` resolves for
+    // every method this build ships rather than only the upstream ones. They
+    // are shaped like PostgreSQL's: volatile, strict, `internal` argument,
+    // returning `table_am_handler` (oid 269).
+    let own = OWN_AM_HANDLERS.iter().map(|(oid, name)| {
+        vec![
+            Value::Oid(*oid),
+            Value::Text((*name).to_string()),
+            Value::Oid(11),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(12),
+            Value::Float4(1.0),
+            Value::Float4(0.0),
+            Value::Oid(0),
+            Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+            chr('f'),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(false),
+            chr('v'),
+            chr('s'),
+            Value::Int2(1),
+            Value::Int2(0),
+            Value::Oid(269),
+            oidvector([2281]),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Text((*name).to_string()),
+            Value::Null,
+        ]
+    });
+    PG_PROC_ROWS
+        .iter()
+        .map(|r| {
+            vec![
+                Value::Oid(r.oid),
+                Value::Text(r.proname.to_string()),
+                // Every built-in lives in `pg_catalog`, owned by the bootstrap
+                // superuser.
+                Value::Oid(11),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(r.prolang),
+                Value::Float4(r.procost),
+                Value::Float4(r.prorows),
+                Value::Oid(r.provariadic),
+                regproc(r.prosupport),
+                str_char(r.prokind),
+                Value::Bool(r.prosecdef),
+                Value::Bool(r.proleakproof),
+                Value::Bool(r.proisstrict),
+                Value::Bool(r.proretset),
+                str_char(r.provolatile),
+                str_char(r.proparallel),
+                Value::Int2(r.pronargs),
+                Value::Int2(0),
+                Value::Oid(r.prorettype),
+                oidvector(r.proargtypes.iter().copied()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text(r.prosrc.to_string()),
+                Value::Null,
+            ]
+        })
+        .chain(own)
+        .collect()
+}
+
+/// The `pg_proc` rows for the routines this server holds, appended after
+/// [`pg_proc_builtin_rows`].
+///
+/// Honest for everything the catalog actually knows. The stubs are the columns
+/// nothing here can have an opinion about yet, each set to PostgreSQL's own
+/// default rather than to zero: `procost`/`prorows` (no planner cost model),
+/// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
+/// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
+/// honestly — there are no C functions.
+pub(crate) fn pg_proc_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
+    let mut rows = pg_proc_builtin_rows();
+    rows.extend(user_rows(cat.routines(), cat.namespace_oids()));
+    rows
+}
+
+/// The rows for the routines this server holds, appended after the built-ins.
+fn user_rows(
+    routines: &[CatalogRoutine],
+    namespace_oids: &HashMap<String, u32>,
+) -> Vec<Vec<Value>> {
+    routines
+        .iter()
+        .map(|r| {
+            // PostgreSQL leaves these NULL rather than empty when there is
+            // nothing to report, and clients test for NULL.
+            let optional_array = |elem: PgType, values: Vec<Value>| {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Array {
+                        elem,
+                        elems: values,
+                    }
+                }
+            };
+            vec![
+                Value::Oid(r.oid),
+                Value::Text(r.name.clone()),
+                Value::Oid(namespace_oids.get(&r.namespace).copied().unwrap_or(2200)),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(r.lang),
+                // PostgreSQL's defaults: 1 for a built-in, 100 for anything
+                // whose body it has to run.
+                Value::Float4(if r.lang == 12 || r.lang == 13 {
+                    1.0
+                } else {
+                    100.0
+                }),
+                Value::Float4(if r.retset { 1000.0 } else { 0.0 }),
+                Value::Oid(0),
+                // prosupport: a user routine has no planner support function.
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+                chr(r.kind),
+                Value::Bool(r.secdef),
+                Value::Bool(false),
+                Value::Bool(r.strict),
+                Value::Bool(r.retset),
+                chr(r.volatile),
+                chr('u'),
+                Value::Int2(r.arg_types.len() as i16),
+                Value::Int2(0),
+                Value::Oid(r.ret_type),
+                oidvector(r.arg_types.iter().copied()),
+                optional_array(
+                    PgType::Oid,
+                    r.all_arg_types.iter().map(|t| Value::Oid(*t)).collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.arg_modes
+                        .iter()
+                        .map(|m| Value::Text(m.to_string()))
+                        .collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.arg_names.iter().map(|n| Value::Text(n.clone())).collect(),
+                ),
+                Value::Text(r.src.clone()),
+                Value::Null,
+            ]
+        })
+        .collect()
+}
