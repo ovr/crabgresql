@@ -583,6 +583,31 @@ pub enum ScalarFn {
     // pure `eval_scalar`, which has no view of the session's pg_catalog) ---
     /// `pg_get_userbyid(oid) -> name`: the role's name, or `unknown (OID=n)`.
     PgGetUserById,
+    /// `current_database() -> name`, and the `current_catalog` keyword.
+    CurrentDatabase,
+    /// `current_schema[()] -> name`: the head of the explicit search path.
+    CurrentSchema,
+    /// `current_schemas(bool) -> name[]`: the search path, optionally including
+    /// the implicit `pg_catalog` and temp entries.
+    CurrentSchemas,
+    /// `current_user -> name`, and its `current_role` / `user` spellings. One
+    /// variant for all three because PostgreSQL has one `pg_proc` row: the other
+    /// two are grammar that rewrites to it.
+    CurrentUser,
+    /// `session_user -> name`.
+    SessionUser,
+    /// `pg_my_temp_schema() -> oid`: this session's temp namespace, or 0 before
+    /// a temp relation instantiates it.
+    PgMyTempSchema,
+    /// `pg_is_other_temp_schema(oid) -> bool`: whether the OID names *another*
+    /// session's temp namespace.
+    PgIsOtherTempSchema,
+    /// `pg_encoding_to_char(int4) -> name`: the name of the encoding numbered
+    /// `n`, or the empty string past the end of PostgreSQL's fixed table.
+    PgEncodingToChar,
+    /// `pg_char_to_encoding(name) -> int4`: the inverse, `-1` for a name no
+    /// encoding answers to.
+    PgCharToEncoding,
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
@@ -1499,6 +1524,7 @@ const XID8: PgType = PgType::Xid8;
 const PGLSN: PgType = PgType::PgLsn;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
+const NAMEARR: PgType = PgType::Array(crabgresql_types::oid::NAME);
 
 /// How many leading entries of [`SUBSTRING_SIGS`] are the regex-extraction
 /// forms. `substr` is the same list without them.
@@ -2298,6 +2324,59 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::Version,
             args: &[],
             ret: TEXT,
+        }],
+        // The connection identity. `current_catalog` is PostgreSQL grammar for
+        // the same function — there is no `pg_proc` row for it — so both keys
+        // land on one signature, and `current_catalog()` is a syntax error in
+        // both systems because the parser never produces a call for it.
+        "current_database" | "current_catalog" => &[Signature {
+            func: ScalarFn::CurrentDatabase,
+            args: &[],
+            ret: NAME,
+        }],
+        // PostgreSQL spells this both ways: `current_schema` is a keyword *and*
+        // a real `pg_proc` entry, so `current_schema()` is legal — unlike
+        // `current_user()`.
+        "current_schema" => &[Signature {
+            func: ScalarFn::CurrentSchema,
+            args: &[],
+            ret: NAME,
+        }],
+        "current_schemas" => &[Signature {
+            func: ScalarFn::CurrentSchemas,
+            args: &[BOOL],
+            ret: NAMEARR,
+        }],
+        // `current_role` and `user` have no `pg_proc` row of their own either.
+        "current_user" | "current_role" | "user" => &[Signature {
+            func: ScalarFn::CurrentUser,
+            args: &[],
+            ret: NAME,
+        }],
+        "session_user" => &[Signature {
+            func: ScalarFn::SessionUser,
+            args: &[],
+            ret: NAME,
+        }],
+        "pg_my_temp_schema" => &[Signature {
+            func: ScalarFn::PgMyTempSchema,
+            args: &[],
+            ret: OID,
+        }],
+        "pg_is_other_temp_schema" => &[Signature {
+            func: ScalarFn::PgIsOtherTempSchema,
+            args: &[OID],
+            ret: BOOL,
+        }],
+        "pg_encoding_to_char" => &[Signature {
+            func: ScalarFn::PgEncodingToChar,
+            args: &[I4],
+            ret: NAME,
+        }],
+        "pg_char_to_encoding" => &[Signature {
+            func: ScalarFn::PgCharToEncoding,
+            args: &[NAME],
+            ret: I4,
         }],
         // Catalog lookups. `int -> oid` is implicit, so an OID written as an
         // integer literal resolves too. Dispatched by the executor's `eval`

@@ -5,13 +5,192 @@
 
 use std::sync::Arc;
 
-use crabgresql_catalog::SystemCatalog;
+use crabgresql_catalog::{
+    CatalogCursor, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
+    CatalogUserType, SystemCatalog,
+};
 use crabgresql_executor::{CatalogOps, ConstraintDef};
 use crabgresql_storage_api::{
     CheckConstraint, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
     StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{TxnContext, Xid};
+
+use crate::global_catalog::GlobalCatalog;
+use crate::query::{catalog_routine, partition_session_relations};
+use crate::session::Session;
+
+/// The live server state one session's [`SystemCatalog`] snapshot reflects.
+///
+/// Every method but `cursors` reads through the captured engine handles when
+/// called, which is what keeps a `SELECT 1` from enumerating the database:
+/// `SystemCatalog` invokes each at most once, and only when the relation it
+/// feeds is opened.
+pub struct SessionCatalogSource {
+    /// Backs `relations` and `schemas`: relation metadata, views, sequences and
+    /// the temp-namespace instantiation check all come from here.
+    engine: Arc<dyn TableEngine>,
+    /// Backs `user_types` and `routines`.
+    global_catalog: Arc<GlobalCatalog>,
+    database: String,
+    owner: String,
+    temp_schema: String,
+    temp_namespace_oid: u32,
+    /// The one eager field. This source outlives the `&Session` borrow it is
+    /// built from, so the cursor metadata is snapshotted here rather than read
+    /// on demand. Only names and statement texts are copied — never rows — and
+    /// a session with no open cursor copies nothing.
+    cursors: Vec<CatalogCursor>,
+    /// Eager for the same reason as `cursors`: every value is rendered from the
+    /// session, which this source outlives.
+    settings: Vec<CatalogSetting>,
+    /// The statement timestamp, so the timezone views resolve their offsets at
+    /// the same instant `now()` reports in this statement.
+    now: i64,
+}
+
+impl SessionCatalogSource {
+    pub fn new(
+        engine: Arc<dyn TableEngine>,
+        global_catalog: Arc<GlobalCatalog>,
+        session: &Session,
+    ) -> Self {
+        // Sorted so `SELECT * FROM pg_cursors` is stable across runs, where
+        // PostgreSQL's hash order is not.
+        let mut cursors: Vec<_> = session
+            .cursors
+            .iter()
+            .map(|(name, cursor)| CatalogCursor {
+                name: name.clone(),
+                statement: cursor.statement.clone(),
+                is_holdable: cursor.hold,
+                // `DECLARE … BINARY` is rejected outright, so no open cursor is
+                // ever a binary one.
+                is_binary: false,
+                // Every materialised cursor can scan backward unless it was
+                // declared NO SCROLL.
+                is_scrollable: cursor.scroll != Some(false),
+                creation_time: cursor.creation_time,
+            })
+            .collect();
+        cursors.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            engine,
+            global_catalog,
+            database: session.database.clone(),
+            owner: session.user.clone(),
+            temp_schema: session.temp_schema.clone(),
+            temp_namespace_oid: session.temp_namespace_oid,
+            cursors,
+            settings: crate::guc::catalog_settings(session),
+            now: session.stmt_start,
+        }
+    }
+}
+
+impl CatalogSource for SessionCatalogSource {
+    fn relations(&self) -> Vec<CatalogRelation> {
+        // Reflect the permanent relations plus only THIS session's temp
+        // relations (the shared visibility rule).
+        let (permanent, own_temp) =
+            partition_session_relations(self.engine.relation_metadata(), &self.temp_schema);
+        let mut rels: Vec<_> = permanent
+            .into_iter()
+            .map(CatalogRelation::permanent_metadata)
+            .collect();
+        rels.extend(own_temp.into_iter().map(|metadata| {
+            let mut relation =
+                CatalogRelation::temporary(metadata.schema, self.temp_schema.clone());
+            relation.indexes = metadata.indexes;
+            relation.stats = metadata.stats;
+            // A temp table toasts like any other, so its chunk store must reach
+            // `pg_class` too — the constructor defaults this to `None`, so it
+            // has to be carried across explicitly like the two fields above.
+            relation.toast = metadata.toast;
+            relation
+        }));
+        // Views reflect into pg_class as relkind='v' / pg_attribute columns /
+        // information_schema.tables as VIEW.
+        rels.extend(self.engine.views().into_iter().map(|view| {
+            CatalogRelation::view(TableSchema::in_namespace(
+                view.name,
+                view.namespace,
+                view.columns,
+            ))
+        }));
+        // Sequences reflect into pg_class as relkind='S' and feed
+        // pg_catalog.pg_sequence.
+        rels.extend(self.engine.sequences().into_iter().map(|seq| {
+            CatalogRelation::sequence(
+                seq.name,
+                seq.namespace,
+                CatalogSequence {
+                    type_oid: seq.data_type.oid(),
+                    start: seq.start,
+                    increment: seq.increment,
+                    min: seq.min,
+                    max: seq.max,
+                    cache: seq.cache,
+                    cycle: seq.cycle,
+                },
+            )
+        }));
+        rels
+    }
+
+    fn database(&self) -> &str {
+        &self.database
+    }
+
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    fn user_types(&self) -> Vec<CatalogUserType> {
+        self.global_catalog
+            .user_types()
+            .into_iter()
+            .map(|t| CatalogUserType {
+                oid: t.oid,
+                name: t.name,
+                enum_labels: t.enum_labels,
+            })
+            .collect()
+    }
+
+    fn routines(&self) -> Vec<CatalogRoutine> {
+        self.global_catalog
+            .functions()
+            .iter()
+            .map(catalog_routine)
+            .collect()
+    }
+
+    fn schemas(&self) -> Vec<(String, u32)> {
+        let mut schemas = self.engine.schemas();
+        // Reflect this session's `pg_temp_N` namespace with a stable synthetic
+        // OID, but only once it holds a temp relation (as PG instantiates
+        // pg_temp_N lazily). Feeding it through the one `schemas` list keeps
+        // `pg_namespace` and `pg_class.relnamespace` consistent; nothing is
+        // persisted. `relation_names_in` is cheap.
+        if !self.engine.relation_names_in(&self.temp_schema).is_empty() {
+            schemas.push((self.temp_schema.clone(), self.temp_namespace_oid));
+        }
+        schemas
+    }
+
+    fn cursors(&self) -> Vec<CatalogCursor> {
+        self.cursors.clone()
+    }
+
+    fn settings(&self) -> Vec<CatalogSetting> {
+        self.settings.clone()
+    }
+
+    fn now(&self) -> i64 {
+        self.now
+    }
+}
 
 /// The executor-facing catalog handle: answers `pg_get_userbyid` and
 /// `pg_table_is_visible` against the same [`SystemCatalog`] snapshot that built
@@ -160,6 +339,45 @@ impl CatalogOps for SessionCatalogOps {
             columns,
             expr,
         })
+    }
+
+    fn current_database(&self) -> String {
+        self.system.database().to_string()
+    }
+
+    fn current_user(&self) -> String {
+        self.system.owner().to_string()
+    }
+
+    /// The same string as [`CatalogOps::current_user`]: there is no `SET ROLE`
+    /// to make the two differ.
+    fn session_user(&self) -> String {
+        self.system.owner().to_string()
+    }
+
+    /// Mirrors the resolution order `table_is_visible` and `rel_oid` above
+    /// already implement — temp, then `pg_catalog`, then `public` — because
+    /// there is no `search_path` GUC yet (`SET search_path` is among the names
+    /// [`crate::guc`] silently accepts and ignores). With PostgreSQL's default
+    /// `"$user", public` and no `$user` schema, the two agree exactly; once
+    /// `search_path` becomes real, this is where it plugs in.
+    fn search_path(&self, include_implicit: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        if include_implicit {
+            // Only once the namespace exists — the same lazy rule
+            // `pg_namespace` reflects it by, so this agrees with
+            // `pg_my_temp_schema()`.
+            if self.my_temp_schema().is_some() {
+                out.push(self.temp_schema.clone());
+            }
+            out.push("pg_catalog".to_string());
+        }
+        out.push("public".to_string());
+        out
+    }
+
+    fn my_temp_schema(&self) -> Option<u32> {
+        self.system.namespace_oid(&self.temp_schema)
     }
 }
 
@@ -537,17 +755,17 @@ mod tests {
     #[test]
     fn visibility_follows_resolution_order() -> anyhow::Result<()> {
         let temp_schema = "pg_temp_1";
-        let system = Arc::new(
-            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn("db", "owner", || {
-                RELATIONS.iter().map(|(ns, n)| table(ns, n)).collect()
-            })
-            .with_schemas_fn(|| {
-                vec![
-                    ("app".to_string(), 16_000),
-                    ("pg_temp_1".to_string(), 16_001),
-                ]
-            }),
-        );
+        let system = Arc::new(crabgresql_catalog::SystemCatalog::from_source(Arc::new(
+            crabgresql_catalog::StaticSource::new(
+                RELATIONS.iter().map(|(ns, n)| table(ns, n)).collect(),
+            )
+            .database("db")
+            .owner("owner")
+            .schemas(vec![
+                ("app".to_string(), 16_000),
+                ("pg_temp_1".to_string(), 16_001),
+            ]),
+        )));
         let ops = SessionCatalogOps::new(Arc::clone(&system), temp_schema);
         let catalog = SessionCatalog::new(
             Arc::new(StubEngine(RELATIONS.to_vec())),
@@ -710,9 +928,11 @@ mod tests {
             ],
             dropped: std::sync::Mutex::new(Vec::new()),
         });
-        let system = Arc::new(
-            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn("db", "owner", Vec::new),
-        );
+        let system = Arc::new(crabgresql_catalog::SystemCatalog::with_catalog_relations(
+            "db",
+            "owner",
+            Vec::new(),
+        ));
         let catalog = SessionCatalog::new(
             Arc::clone(&engine) as Arc<dyn TableEngine>,
             system as Arc<dyn TableEngine>,

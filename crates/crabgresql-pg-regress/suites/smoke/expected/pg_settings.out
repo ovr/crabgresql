@@ -1,0 +1,180 @@
+--
+-- PG_SETTINGS
+--
+-- Never `SELECT * FROM pg_settings`: the row set is crabgresql's curated GUC
+-- table, and every parameter added would rewrite this file. The row *count*
+-- canary lives in a unit test in guc.rs, where it fails at the definition site.
+-- server_version/server_version_num are never projected either — they embed
+-- CARGO_PKG_VERSION and churn every release.
+--
+-- Output hand-written, not copied: a stock PostgreSQL reports
+-- source = 'configuration file' with a non-NULL sourcefile/sourceline for
+-- TimeZone, DateStyle and client_encoding after initdb, where this server
+-- reports default/NULL/NULL, and its TimeZone boots at GMT rather than UTC.
+-- Everything else below matches PostgreSQL 18.4 verbatim.
+--
+-- all seventeen columns, in PostgreSQL's order, on one deterministic row
+SELECT name, setting, unit, category, short_desc, extra_desc, context,
+       vartype, source, min_val, max_val, enumvals, boot_val, reset_val,
+       sourcefile, sourceline, pending_restart
+  FROM pg_settings WHERE name = 'default_transaction_read_only';
+             name              | setting | unit |                    category                     |                       short_desc                       | extra_desc | context | vartype | source  | min_val | max_val | enumvals | boot_val | reset_val | sourcefile | sourceline | pending_restart 
+-------------------------------+---------+------+-------------------------------------------------+--------------------------------------------------------+------------+---------+---------+---------+---------+---------+----------+----------+-----------+------------+------------+-----------------
+ default_transaction_read_only | off     |      | Client Connection Defaults / Statement Behavior | Sets the default read-only status of new transactions. |            | user    | bool    | default |         |         |          | off      | off       |            |            | f
+(1 row)
+
+-- the declared types the all-NULL columns above cannot show
+SELECT pg_typeof(enumvals) AS enumvals_type,
+       pg_typeof(sourceline) AS sourceline_type,
+       pg_typeof(pending_restart) AS pending_type
+  FROM pg_settings WHERE name = 'TimeZone';
+ enumvals_type | sourceline_type | pending_type 
+---------------+-----------------+--------------
+ text[]        | integer         | boolean
+(1 row)
+
+-- ORDER BY name COLLATE "C", never bare: TimeZone and DateStyle sort
+-- differently under C than under the default collation
+SELECT name, vartype, context, source, min_val, max_val, enumvals
+  FROM pg_settings
+ WHERE name IN ('TimeZone', 'extra_float_digits',
+                'default_transaction_isolation', 'client_encoding')
+ ORDER BY name COLLATE "C";
+             name              | vartype | context | source  | min_val | max_val |                               enumvals                               
+-------------------------------+---------+---------+---------+---------+---------+----------------------------------------------------------------------
+ TimeZone                      | string  | user    | default |         |         | 
+ client_encoding               | string  | user    | default |         |         | 
+ default_transaction_isolation | enum    | user    | default |         |         | {serializable,"repeatable read","read committed","read uncommitted"}
+ extra_float_digits            | integer | user    | default | -15     | 3       | 
+(4 rows)
+
+-- PostgreSQL's own oddity, reproduced: client_encoding and server_encoding boot
+-- at SQL_ASCII and are then overridden, so boot_val and setting disagree while
+-- source stays 'default'
+SELECT name, setting, boot_val, source
+  FROM pg_settings
+ WHERE name IN ('client_encoding', 'server_encoding')
+ ORDER BY name COLLATE "C";
+      name       | setting | boot_val  | source  
+-----------------+---------+-----------+---------
+ client_encoding | UTF8    | SQL_ASCII | default
+ server_encoding | UTF8    | SQL_ASCII | default
+(2 rows)
+
+-- is_superuser is readable by name but appears in neither SHOW ALL nor
+-- pg_settings, as PostgreSQL flags it GUC_NO_SHOW_ALL
+SHOW is_superuser;
+ is_superuser 
+--------------
+ on
+(1 row)
+
+SELECT count(*) AS is_superuser_rows FROM pg_settings WHERE name = 'is_superuser';
+ is_superuser_rows 
+-------------------
+                 0
+(1 row)
+
+-- source follows SET and RESET, and reset_val is what RESET would restore
+SET extra_float_digits = 2;
+SELECT name, setting, source, boot_val, reset_val
+  FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  | boot_val | reset_val 
+--------------------+---------+---------+----------+-----------
+ extra_float_digits | 2       | session | 1        | 1
+(1 row)
+
+RESET extra_float_digits;
+SELECT name, setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  
+--------------------+---------+---------
+ extra_float_digits | 1       | default
+(1 row)
+
+-- PostgreSQL reports 'session' even when the assignment changes nothing
+SET extra_float_digits = 1;
+SELECT name, setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  
+--------------------+---------+---------
+ extra_float_digits | 1       | session
+(1 row)
+
+RESET extra_float_digits;
+-- GUCs are transactional, and so is the source column: a ROLLBACK that puts
+-- `setting` back must put `source` back too
+BEGIN;
+SET extra_float_digits = 3;
+SELECT name, setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  
+--------------------+---------+---------
+ extra_float_digits | 3       | session
+(1 row)
+
+ROLLBACK;
+SELECT name, setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  
+--------------------+---------+---------
+ extra_float_digits | 1       | default
+(1 row)
+
+-- ...including for a parameter that is accepted and ignored, which has no value
+-- to restore but still has a source
+BEGIN;
+SET DateStyle = 'ISO, MDY';
+SELECT name, source FROM pg_settings WHERE name = 'DateStyle';
+   name    | source  
+-----------+---------
+ DateStyle | session
+(1 row)
+
+ROLLBACK;
+SELECT name, source FROM pg_settings WHERE name = 'DateStyle';
+   name    | source  
+-----------+---------
+ DateStyle | default
+(1 row)
+
+-- a rejected SET leaves source alone
+SET extra_float_digits = 99;
+ERROR:  99 is outside the valid range for parameter "extra_float_digits" (-15 .. 3)
+SELECT name, setting, source FROM pg_settings WHERE name = 'extra_float_digits';
+        name        | setting | source  
+--------------------+---------+---------
+ extra_float_digits | 1       | default
+(1 row)
+
+-- the view and current_setting() read the same table, so they cannot disagree
+SELECT count(*) = 1 AS agrees
+  FROM pg_settings
+ WHERE name = 'TimeZone' AND setting = current_setting('TimeZone');
+ agrees 
+--------
+ t
+(1 row)
+
+-- every row PostgreSQL fills only for one vartype is filled only there
+SELECT count(*) AS misplaced_bounds
+  FROM pg_settings
+ WHERE (min_val IS NOT NULL) <> (vartype IN ('integer', 'real'));
+ misplaced_bounds 
+------------------
+                0
+(1 row)
+
+SELECT count(*) AS misplaced_enumvals
+  FROM pg_settings
+ WHERE (enumvals IS NOT NULL) <> (vartype = 'enum');
+ misplaced_enumvals 
+--------------------
+                  0
+(1 row)
+
+-- no configuration file exists, so these three are constants
+SELECT count(*) AS with_a_source_file
+  FROM pg_settings
+ WHERE sourcefile IS NOT NULL OR sourceline IS NOT NULL OR pending_restart;
+ with_a_source_file 
+--------------------
+                  0
+(1 row)
+

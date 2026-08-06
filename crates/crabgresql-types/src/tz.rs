@@ -695,8 +695,10 @@ fn parse_fixed(token: &str) -> Option<Result<i32, ZoneError>> {
 /// `'00:01 PDT'` is meaningful on its own; a [`Abbrev::Zone`] entry only means
 /// something at an instant, so `'15:36:39 MSK'` with no date is an error.
 pub(crate) enum Abbrev {
-    /// A constant offset (seconds east of UTC).
-    Fixed(i32),
+    /// A constant offset (seconds east of UTC), and whether the abbreviation
+    /// names daylight time — PG's `D` marker in `src/timezone/tznames/*`, and
+    /// `pg_timezone_abbrevs.is_dst`.
+    Fixed { secs: i32, is_dst: bool },
     /// A DST-varying abbreviation: resolve through this reference IANA zone so
     /// the offset tracks the zone's history, as PG does.
     Zone(&'static str),
@@ -713,19 +715,97 @@ pub(crate) enum Abbrev {
 /// this table at all — see its doc comment.
 static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
     // North America, standard and daylight.
-    ("AST", Abbrev::Fixed(-4 * 3600)),
-    ("ADT", Abbrev::Fixed(-3 * 3600)),
-    ("EST", Abbrev::Fixed(-5 * 3600)),
-    ("EDT", Abbrev::Fixed(-4 * 3600)),
-    ("CST", Abbrev::Fixed(-6 * 3600)),
-    ("CDT", Abbrev::Fixed(-5 * 3600)),
-    ("MST", Abbrev::Fixed(-7 * 3600)),
-    ("MDT", Abbrev::Fixed(-6 * 3600)),
-    ("PST", Abbrev::Fixed(-8 * 3600)),
-    ("PDT", Abbrev::Fixed(-7 * 3600)),
-    ("AKST", Abbrev::Fixed(-9 * 3600)),
-    ("AKDT", Abbrev::Fixed(-8 * 3600)),
-    ("HST", Abbrev::Fixed(-10 * 3600)),
+    (
+        "AST",
+        Abbrev::Fixed {
+            secs: -4 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "ADT",
+        Abbrev::Fixed {
+            secs: -3 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "EST",
+        Abbrev::Fixed {
+            secs: -5 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "EDT",
+        Abbrev::Fixed {
+            secs: -4 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "CST",
+        Abbrev::Fixed {
+            secs: -6 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "CDT",
+        Abbrev::Fixed {
+            secs: -5 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "MST",
+        Abbrev::Fixed {
+            secs: -7 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "MDT",
+        Abbrev::Fixed {
+            secs: -6 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "PST",
+        Abbrev::Fixed {
+            secs: -8 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "PDT",
+        Abbrev::Fixed {
+            secs: -7 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "AKST",
+        Abbrev::Fixed {
+            secs: -9 * 3600,
+            is_dst: false,
+        },
+    ),
+    (
+        "AKDT",
+        Abbrev::Fixed {
+            secs: -8 * 3600,
+            is_dst: true,
+        },
+    ),
+    (
+        "HST",
+        Abbrev::Fixed {
+            secs: -10 * 3600,
+            is_dst: false,
+        },
+    ),
     // `MSK` tracks Moscow's DST history (it moved +1h in Mar 2011 and back in
     // Oct 2014), so it maps to the zone rather than a constant — and therefore
     // needs a date.
@@ -740,6 +820,92 @@ static DATETIME_ABBREVS: &[(&str, Abbrev)] = &[
     // divergence documented in `crate::timetz`.
     ("VET", Abbrev::Zone("America/Caracas")),
 ];
+
+/// One row of `pg_timezone_names`.
+pub struct ZoneListing {
+    pub name: String,
+    /// The zone's abbreviation at the instant asked for — `PDT`, `+07`.
+    pub abbrev: String,
+    /// Seconds east of UTC, the sign convention [`Zone::Fixed`] uses.
+    pub utc_offset_secs: i32,
+    pub is_dst: bool,
+}
+
+/// One row of `pg_timezone_abbrevs`.
+pub struct AbbrevListing {
+    pub abbrev: &'static str,
+    pub utc_offset_secs: i32,
+    pub is_dst: bool,
+}
+
+/// Every IANA zone the bundled tz database knows, resolved at `at_micros`.
+///
+/// PostgreSQL reports the offset and DST flag **at the current instant**, not at
+/// a fixed one: `America/New_York` reads `-05:00`/`f` in January and
+/// `-04:00`/`t` in July. The instant is a parameter rather than a `now()` call
+/// inside so the caller's statement timestamp is used, keeping the view
+/// consistent with `now()` in the same statement.
+///
+/// Sorted by name. PostgreSQL leaves the order unspecified and `jiff-tzdb`
+/// documents none, so imposing one is strictly more stable than inheriting it.
+pub fn timezone_names(at_micros: i64) -> Vec<ZoneListing> {
+    let ts = instant(at_micros);
+    let mut out: Vec<ZoneListing> = jiff::tz::db()
+        .available()
+        .filter_map(|name| {
+            // A name the database lists but cannot load is skipped rather than
+            // reported as a broken row — PostgreSQL's enumerator does the same.
+            let tz = TimeZone::get(name.as_str()).ok()?;
+            let info = tz.to_offset_info(ts);
+            Some(ZoneListing {
+                name: name.as_str().to_string(),
+                abbrev: info.abbreviation().to_string(),
+                utc_offset_secs: info.offset().seconds(),
+                is_dst: info.dst().is_dst(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The abbreviations a datetime literal accepts, resolved at `at_micros`,
+/// sorted by abbreviation.
+///
+/// A deliberate and visible divergence: PostgreSQL 18.4 loads 198 abbreviations from
+/// whichever file `timezone_abbreviations` names, while [`DATETIME_ABBREVS`] is
+/// a curated 15. That table is the *parser's* accept-list — every entry added to
+/// it becomes newly valid inside `timestamptz` literals and `AT TIME ZONE` — so
+/// growing it to match a catalog view would change value-parsing surface for the
+/// benefit of a listing. It stays curated; this view reports what the parser
+/// actually accepts, which is the honest answer to "which abbreviations does
+/// this server know".
+pub fn timezone_abbrevs(at_micros: i64) -> Vec<AbbrevListing> {
+    let ts = instant(at_micros);
+    let mut out: Vec<AbbrevListing> = DATETIME_ABBREVS
+        .iter()
+        .filter_map(|(abbrev, kind)| {
+            let (utc_offset_secs, is_dst) = match kind {
+                Abbrev::Fixed { secs, is_dst } => (*secs, *is_dst),
+                // PG's `DYNTZ`: resolve through the reference zone at the
+                // instant, so `MSK` follows Moscow's history rather than a
+                // frozen offset.
+                Abbrev::Zone(zone) => {
+                    let tz = TimeZone::get(zone).ok()?;
+                    let info = tz.to_offset_info(ts);
+                    (info.offset().seconds(), info.dst().is_dst())
+                }
+            };
+            Some(AbbrevListing {
+                abbrev,
+                utc_offset_secs,
+                is_dst,
+            })
+        })
+        .collect();
+    out.sort_by_key(|a| a.abbrev);
+    out
+}
 
 /// Look up a datetime-literal abbreviation, case-insensitively.
 pub(crate) fn lookup_abbrev(token: &str) -> Option<&'static Abbrev> {
@@ -759,7 +925,7 @@ pub(crate) fn lookup_abbrev(token: &str) -> Option<&'static Abbrev> {
 fn resolve_named(token: &str) -> Option<Option<Zone>> {
     if let Some(kind) = lookup_abbrev(token) {
         return Some(match kind {
-            Abbrev::Fixed(secs) => Some(Zone::Fixed(*secs)),
+            Abbrev::Fixed { secs, .. } => Some(Zone::Fixed(*secs)),
             Abbrev::Zone(zone) => TimeZone::get(zone).ok().map(Zone::Named),
         });
     }

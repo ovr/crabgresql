@@ -1,0 +1,126 @@
+--
+-- PG_DATABASE / PG_TABLESPACE / THE ROLE RELATIONS
+--
+-- Output hand-written rather than copied from a stock PostgreSQL: the database
+-- and role names are this server's (the regress client connects as "postgres"
+-- to "regression"), the database OID is crabgresql's own, and the locale
+-- columns report C because the default collation compares bytewise. The column
+-- lists and every other value are PostgreSQL's, probed from 18.4.
+--
+-- exactly one database: the one this session is connected to
+SELECT datname, datdba, encoding, datlocprovider, datistemplate, datallowconn,
+       dathasloginevt, datconnlimit, dattablespace, datcollate, datctype
+  FROM pg_database;
+  datname   | datdba | encoding | datlocprovider | datistemplate | datallowconn | dathasloginevt | datconnlimit | dattablespace | datcollate | datctype 
+------------+--------+----------+----------------+---------------+--------------+----------------+--------------+---------------+------------+----------
+ regression |     10 |        6 | c              | f             | t            | f              |           -1 |          1663 | C          | C
+(1 row)
+
+SELECT datname = current_database() AS is_the_connected_one,
+       datlocale IS NULL AND daticurules IS NULL AND datcollversion IS NULL
+         AS locale_columns_are_null
+  FROM pg_database;
+ is_the_connected_one | locale_columns_are_null 
+----------------------+-------------------------
+ t                    | t
+(1 row)
+
+-- the encoding column is a number that resolves through the encoding table
+SELECT pg_encoding_to_char(encoding) FROM pg_database;
+ pg_encoding_to_char 
+---------------------
+ UTF8
+(1 row)
+
+-- the two bootstrap tablespaces, as in PostgreSQL; nothing creates a third
+SELECT oid, spcname, spcowner, spcoptions FROM pg_tablespace ORDER BY oid;
+ oid  |  spcname   | spcowner | spcoptions 
+------+------------+----------+------------
+ 1663 | pg_default |       10 | 
+ 1664 | pg_global  |       10 | 
+(2 rows)
+
+-- one role, the bootstrap superuser, whose OID is PostgreSQL's own 10
+SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+       rolcanlogin, rolreplication, rolbypassrls, rolconnlimit
+  FROM pg_authid;
+ oid | rolname  | rolsuper | rolinherit | rolcreaterole | rolcreatedb | rolcanlogin | rolreplication | rolbypassrls | rolconnlimit 
+-----+----------+----------+------------+---------------+-------------+-------------+----------------+--------------+--------------
+  10 | postgres | t        | t          | t             | t           | t           | t              | t            |           -1
+(1 row)
+
+SELECT rolname = current_user AS is_the_session_user,
+       rolpassword IS NULL AS no_password,
+       rolvaliduntil IS NULL AS no_expiry
+  FROM pg_authid;
+ is_the_session_user | no_password | no_expiry 
+---------------------+-------------+-----------
+ t                   | t           | t
+(1 row)
+
+-- pg_roles is pg_authid with the password masked; note PostgreSQL's own column
+-- order, which differs from pg_authid's
+SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin,
+       rolreplication, rolconnlimit, rolpassword, rolvaliduntil, rolbypassrls,
+       rolconfig, oid
+  FROM pg_roles;
+ rolname  | rolsuper | rolinherit | rolcreaterole | rolcreatedb | rolcanlogin | rolreplication | rolconnlimit | rolpassword | rolvaliduntil | rolbypassrls | rolconfig | oid 
+----------+----------+------------+---------------+-------------+-------------+----------------+--------------+-------------+---------------+--------------+-----------+-----
+ postgres | t        | t          | t             | t           | t           | t              |           -1 | ********    |               | t            |           |  10
+(1 row)
+
+-- pg_user is the login roles under the pre-8.1 names, also masked...
+SELECT usename, usesysid, usecreatedb, usesuper, userepl, usebypassrls, passwd,
+       valuntil, useconfig
+  FROM pg_user;
+ usename  | usesysid | usecreatedb | usesuper | userepl | usebypassrls |  passwd  | valuntil | useconfig 
+----------+----------+-------------+----------+---------+--------------+----------+----------+-----------
+ postgres |       10 | t           | t        | t       | t            | ******** |          | 
+(1 row)
+
+-- ...and pg_shadow is the same view with the password column unmasked, which
+-- here is NULL because nothing stores one
+SELECT usename, usesysid, passwd IS NULL AS no_password FROM pg_shadow;
+ usename  | usesysid | no_password 
+----------+----------+-------------
+ postgres |       10 | t
+(1 row)
+
+-- pg_group holds the roles that CANNOT log in. It is empty as a consequence of
+-- that rule, not as a constant: crabgresql's one role is a login role, and it
+-- creates none of PostgreSQL's predefined pg_read_all_data/pg_monitor/... roles.
+SELECT count(*) AS groups FROM pg_group;
+ groups 
+--------
+      0
+(1 row)
+
+-- role membership needs two roles and a GRANT, and there is neither
+SELECT count(*) AS members FROM pg_auth_members;
+ members 
+---------
+       0
+(1 row)
+
+-- every one of these resolves by name through the fixed OID table, so a client
+-- that hardcodes a catalog OID means the same relation here
+SELECT 'pg_database'::regclass, 'pg_tablespace'::regclass,
+       'pg_authid'::regclass, 'pg_auth_members'::regclass;
+  regclass   |   regclass    | regclass  |    regclass     
+-------------+---------------+-----------+-----------------
+ pg_database | pg_tablespace | pg_authid | pg_auth_members
+(1 row)
+
+SELECT 1262::regclass, 1213::regclass, 1260::regclass, 1261::regclass;
+  regclass   |   regclass    | regclass  |    regclass     
+-------------+---------------+-----------+-----------------
+ pg_database | pg_tablespace | pg_authid | pg_auth_members
+(1 row)
+
+SELECT 'pg_roles'::regclass, 'pg_user'::regclass, 'pg_shadow'::regclass,
+       'pg_group'::regclass;
+ regclass | regclass | regclass  | regclass 
+----------+----------+-----------+----------
+ pg_roles | pg_user  | pg_shadow | pg_group
+(1 row)
+

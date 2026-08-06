@@ -1282,11 +1282,37 @@ impl<'a> Parser<'a> {
                 self.prev_token();
                 Ok(Some(Expr::Value(self.parse_value()?)))
             }
+            // Bare keywords that PostgreSQL's grammar rewrites into a zero-arg
+            // call. None of them accepts parentheses — `current_user()` is a
+            // syntax error there and here, because no `pg_proc` row carries
+            // these names.
             Keyword::CURRENT_CATALOG
+            | Keyword::CURRENT_ROLE
             | Keyword::CURRENT_USER
             | Keyword::SESSION_USER
             | Keyword::USER
                 if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
+            {
+                Ok(Some(Expr::Function(Function {
+                    name: ObjectName::from(vec![w.to_ident(w_span)]),
+                    uses_odbc_syntax: false,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::None,
+                    null_treatment: None,
+                    filter: None,
+                    over: None,
+                    within_group: vec![],
+                })))
+            }
+            // `current_schema` is the odd one out: a keyword *and* a real
+            // function, so PostgreSQL accepts both spellings. Declining when a
+            // `(` follows hands the parenthesised form to the unreserved-word
+            // path below, which parses it as an ordinary empty call — whereas
+            // folding it into the arm above would leave the `(` unconsumed and
+            // raise a spurious syntax error.
+            Keyword::CURRENT_SCHEMA
+                if dialect_of!(self is PostgreSqlDialect | GenericDialect)
+                    && !matches!(self.peek_token_ref().token, Token::LParen) =>
             {
                 Ok(Some(Expr::Function(Function {
                     name: ObjectName::from(vec![w.to_ident(w_span)]),

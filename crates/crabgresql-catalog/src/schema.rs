@@ -18,8 +18,8 @@ use crabgresql_types::{PgType, Value, VectorKind};
 
 use crate::{
     CatalogConstraint, CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine,
-    CatalogSequence, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS, RelKind,
-    TOAST_NAMESPACE,
+    CatalogSequence, CatalogSetting, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
+    RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -358,6 +358,372 @@ const HASH_AM_OID: u32 = 405;
 /// the session user, so the two must agree — hence the shared constant.
 pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 
+/// OID of the one database a crabgresql server serves. PostgreSQL assigns a
+/// fresh OID per `CREATE DATABASE`, so there is no upstream value to reuse: this
+/// one is fixed here so `pg_database.oid` joins against itself consistently and
+/// `current_database()::regclass`-style round-trips stay stable across restarts.
+const DATABASE_OID: u32 = 16_384;
+
+/// `pg_default` and `pg_global`, PostgreSQL's two bootstrap tablespaces.
+/// crabgresql has no `CREATE TABLESPACE`, so these two rows are the whole
+/// relation — which is also true of a stock PostgreSQL cluster nobody has added
+/// one to.
+const DEFAULT_TABLESPACE_OID: u32 = 1663;
+const GLOBAL_TABLESPACE_OID: u32 = 1664;
+
+/// `pg_catalog.pg_database` — one row, for the database this session is
+/// connected to. PostgreSQL lists every database in the cluster; a crabgresql
+/// server serves exactly one, so the connected database *is* the relation.
+///
+/// `datacl` (`aclitem[]`) is omitted: no `GRANT` exists to populate it, and
+/// `aclitem` is not a type this build models. Same reasoning as `pg_type.typacl`
+/// at the top of this file.
+pub fn pg_database_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_database",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("datname", PgType::Name),
+            col("datdba", PgType::Oid),
+            col("encoding", PgType::Int4),
+            col("datlocprovider", CHARLIKE),
+            col("datistemplate", PgType::Bool),
+            col("datallowconn", PgType::Bool),
+            col("dathasloginevt", PgType::Bool),
+            col("datconnlimit", PgType::Int4),
+            col("datfrozenxid", PgType::Xid),
+            col("datminmxid", PgType::Xid),
+            col("dattablespace", PgType::Oid),
+            col("datcollate", PgType::Text),
+            col("datctype", PgType::Text),
+            col("datlocale", PgType::Text),
+            col("daticurules", PgType::Text),
+            col("datcollversion", PgType::Text),
+        ],
+    )
+}
+
+/// The single `pg_database` row.
+///
+/// `encoding` is 6 (`UTF8`) because that is the only encoding the server
+/// advertises (`server_encoding`), and the locale columns report `C`: the
+/// default collation compares bytewise, and `datcollate`/`datctype` must name
+/// the collation a `CREATE TABLE` with no `COLLATE` clause actually gets.
+/// `datfrozenxid`/`datminmxid` report 1, PostgreSQL's `FirstNormalTransactionId`
+/// — this build never advances a per-database freeze horizon.
+pub fn pg_database_rows(database: &str) -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::Oid(DATABASE_OID),
+        Value::Text(database.to_string()),
+        Value::Oid(BOOTSTRAP_ROLE_OID),
+        Value::Int4(6),
+        // 'c' — the libc locale provider, which is what a bytewise default is.
+        Value::Text("c".to_string()),
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Bool(false),
+        Value::Int4(-1),
+        Value::Xid(1),
+        Value::Xid(1),
+        Value::Oid(DEFAULT_TABLESPACE_OID),
+        Value::Text("C".to_string()),
+        Value::Text("C".to_string()),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]]
+}
+
+/// `pg_catalog.pg_tablespace` — the two bootstrap tablespaces, as in
+/// PostgreSQL. `spcacl` (`aclitem[]`) is omitted for the reason given on
+/// [`pg_database_schema`].
+pub fn pg_tablespace_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_tablespace",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("spcname", PgType::Name),
+            col("spcowner", PgType::Oid),
+            col("spcoptions", PgType::Array(crabgresql_types::oid::TEXT)),
+        ],
+    )
+}
+
+pub fn pg_tablespace_rows() -> Vec<Vec<Value>> {
+    let row = |oid: u32, name: &str| {
+        vec![
+            Value::Oid(oid),
+            Value::Text(name.to_string()),
+            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Null,
+        ]
+    };
+    vec![
+        row(DEFAULT_TABLESPACE_OID, "pg_default"),
+        row(GLOBAL_TABLESPACE_OID, "pg_global"),
+    ]
+}
+
+/// The one role a crabgresql server has: the session user, a superuser that can
+/// log in.
+///
+/// All six role relations below are built from this, rather than each writing
+/// its own literals, so they cannot drift apart — `pg_user` must always show
+/// exactly the `pg_authid` rows that can log in, and `pg_group` exactly the ones
+/// that cannot. Replacing this with an enumeration of a real role catalog is
+/// then a change to one function.
+struct BootstrapRole<'a> {
+    oid: u32,
+    name: &'a str,
+    superuser: bool,
+    inherit: bool,
+    createrole: bool,
+    createdb: bool,
+    canlogin: bool,
+    replication: bool,
+    bypassrls: bool,
+    connlimit: i32,
+}
+
+fn roles(owner: &str) -> Vec<BootstrapRole<'_>> {
+    vec![BootstrapRole {
+        oid: BOOTSTRAP_ROLE_OID,
+        name: owner,
+        superuser: true,
+        inherit: true,
+        createrole: true,
+        createdb: true,
+        canlogin: true,
+        replication: true,
+        bypassrls: true,
+        // -1: no per-role connection limit, PostgreSQL's default.
+        connlimit: -1,
+    }]
+}
+
+/// `pg_catalog.pg_authid` — the role catalog. One row, the bootstrap superuser.
+///
+/// `rolpassword` is NULL here (and `********` in `pg_roles`/`pg_user` below),
+/// exactly as in PostgreSQL: the shadow relations mask the hash rather than
+/// omitting the column, and `pg_authid` itself is the superuser-only relation
+/// that would hold it. crabgresql stores no password at all, so the mask is the
+/// whole truth.
+pub fn pg_authid_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_authid",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("rolname", PgType::Name),
+            col("rolsuper", PgType::Bool),
+            col("rolinherit", PgType::Bool),
+            col("rolcreaterole", PgType::Bool),
+            col("rolcreatedb", PgType::Bool),
+            col("rolcanlogin", PgType::Bool),
+            col("rolreplication", PgType::Bool),
+            col("rolbypassrls", PgType::Bool),
+            col("rolconnlimit", PgType::Int4),
+            col("rolpassword", PgType::Text),
+            col("rolvaliduntil", PgType::TimestampTz),
+        ],
+    )
+}
+
+pub fn pg_authid_rows(owner: &str) -> Vec<Vec<Value>> {
+    roles(owner)
+        .into_iter()
+        .map(|r| {
+            vec![
+                Value::Oid(r.oid),
+                Value::Text(r.name.to_string()),
+                Value::Bool(r.superuser),
+                Value::Bool(r.inherit),
+                Value::Bool(r.createrole),
+                Value::Bool(r.createdb),
+                Value::Bool(r.canlogin),
+                Value::Bool(r.replication),
+                Value::Bool(r.bypassrls),
+                Value::Int4(r.connlimit),
+                Value::Null,
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
+/// `pg_catalog.pg_roles` — `pg_authid` with the password masked. Note the
+/// column order is PostgreSQL's own and differs from `pg_authid`: `rolbypassrls`
+/// comes after `rolvaliduntil`, and `oid` is last.
+pub fn pg_roles_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_roles",
+        "pg_catalog",
+        vec![
+            col("rolname", PgType::Name),
+            col("rolsuper", PgType::Bool),
+            col("rolinherit", PgType::Bool),
+            col("rolcreaterole", PgType::Bool),
+            col("rolcreatedb", PgType::Bool),
+            col("rolcanlogin", PgType::Bool),
+            col("rolreplication", PgType::Bool),
+            col("rolconnlimit", PgType::Int4),
+            col("rolpassword", PgType::Text),
+            col("rolvaliduntil", PgType::TimestampTz),
+            col("rolbypassrls", PgType::Bool),
+            col("rolconfig", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("oid", PgType::Oid),
+        ],
+    )
+}
+
+pub fn pg_roles_rows(owner: &str) -> Vec<Vec<Value>> {
+    roles(owner)
+        .into_iter()
+        .map(|r| {
+            vec![
+                Value::Text(r.name.to_string()),
+                Value::Bool(r.superuser),
+                Value::Bool(r.inherit),
+                Value::Bool(r.createrole),
+                Value::Bool(r.createdb),
+                Value::Bool(r.canlogin),
+                Value::Bool(r.replication),
+                Value::Int4(r.connlimit),
+                Value::Text(MASKED_PASSWORD.to_string()),
+                Value::Null,
+                Value::Bool(r.bypassrls),
+                // `ALTER ROLE … SET` is unsupported, so no per-role GUCs exist.
+                Value::Null,
+                Value::Oid(r.oid),
+            ]
+        })
+        .collect()
+}
+
+/// What `pg_roles`/`pg_user` print instead of a password hash. PostgreSQL emits
+/// this literal rather than NULL, so a client cannot tell a role with no
+/// password from one whose hash it may not read.
+const MASKED_PASSWORD: &str = "********";
+
+/// The shared column list of `pg_user` and `pg_shadow`: the login roles, under
+/// the pre-8.1 `use*` names.
+fn pg_user_columns(name: &str) -> TableSchema {
+    TableSchema::in_namespace(
+        name,
+        "pg_catalog",
+        vec![
+            col("usename", PgType::Name),
+            col("usesysid", PgType::Oid),
+            col("usecreatedb", PgType::Bool),
+            col("usesuper", PgType::Bool),
+            col("userepl", PgType::Bool),
+            col("usebypassrls", PgType::Bool),
+            col("passwd", PgType::Text),
+            col("valuntil", PgType::TimestampTz),
+            col("useconfig", PgType::Array(crabgresql_types::oid::TEXT)),
+        ],
+    )
+}
+
+/// `pg_catalog.pg_user` — the roles that can log in, password masked.
+pub fn pg_user_schema() -> TableSchema {
+    pg_user_columns("pg_user")
+}
+
+/// `pg_catalog.pg_shadow` — `pg_user` with the password column unmasked. The
+/// two differ only there, and here both are as truthful as each other: nothing
+/// stores a password.
+pub fn pg_shadow_schema() -> TableSchema {
+    pg_user_columns("pg_shadow")
+}
+
+fn user_rows(owner: &str, passwd: Value) -> Vec<Vec<Value>> {
+    roles(owner)
+        .into_iter()
+        .filter(|r| r.canlogin)
+        .map(|r| {
+            vec![
+                Value::Text(r.name.to_string()),
+                Value::Oid(r.oid),
+                Value::Bool(r.createdb),
+                Value::Bool(r.superuser),
+                Value::Bool(r.replication),
+                Value::Bool(r.bypassrls),
+                passwd.clone(),
+                Value::Null,
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
+pub fn pg_user_rows(owner: &str) -> Vec<Vec<Value>> {
+    user_rows(owner, Value::Text(MASKED_PASSWORD.to_string()))
+}
+
+pub fn pg_shadow_rows(owner: &str) -> Vec<Vec<Value>> {
+    user_rows(owner, Value::Null)
+}
+
+/// `pg_catalog.pg_group` — the roles that cannot log in, with their members.
+///
+/// Empty here, and empty as a *consequence*: the one role crabgresql has is a
+/// login role. A stock PostgreSQL 18 shows 16 rows because `initdb` creates the
+/// predefined `pg_read_all_data`/`pg_monitor`/… roles, which this build does not.
+pub fn pg_group_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_group",
+        "pg_catalog",
+        vec![
+            col("groname", PgType::Name),
+            col("grosysid", PgType::Oid),
+            col("grolist", PgType::Array(crabgresql_types::oid::OID)),
+        ],
+    )
+}
+
+pub fn pg_group_rows(owner: &str) -> Vec<Vec<Value>> {
+    roles(owner)
+        .into_iter()
+        .filter(|r| !r.canlogin)
+        .map(|r| {
+            vec![
+                Value::Text(r.name.to_string()),
+                Value::Oid(r.oid),
+                Value::Array {
+                    elem: PgType::Oid,
+                    elems: Vec::new(),
+                },
+            ]
+        })
+        .collect()
+}
+
+/// `pg_catalog.pg_auth_members` — role membership. Always empty: `GRANT <role>`
+/// does not exist here, and with a single role there is nothing to be a member
+/// of. (A stock PostgreSQL 18 has three rows, all between predefined roles.)
+pub fn pg_auth_members_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_auth_members",
+        "pg_catalog",
+        vec![
+            col("oid", PgType::Oid),
+            col("roleid", PgType::Oid),
+            col("member", PgType::Oid),
+            col("grantor", PgType::Oid),
+            col("admin_option", PgType::Bool),
+            col("inherit_option", PgType::Bool),
+            col("set_option", PgType::Bool),
+        ],
+    )
+}
+
+pub fn pg_auth_members_rows() -> Vec<Vec<Value>> {
+    Vec::new()
+}
+
 /// `pg_catalog.pg_am` — the access methods. PostgreSQL lists the methods its
 /// build actually registered; crabgresql adds its managed `parquet` and `buffer`
 /// table methods alongside PostgreSQL's built-ins so a client that
@@ -402,6 +768,151 @@ pub fn pg_am_rows() -> Vec<Vec<Value>> {
         row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", "t"),
         row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", "t"),
     ]
+}
+
+/// `pg_catalog.pg_timezone_names` — every IANA zone the bundled tz database
+/// knows, with its offset and DST flag **at the given instant** (PostgreSQL
+/// reports these as of `now()`, so a zone's row changes with the season).
+pub fn pg_timezone_names_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_timezone_names",
+        "pg_catalog",
+        vec![
+            col("name", PgType::Text),
+            col("abbrev", PgType::Text),
+            col("utc_offset", PgType::Interval),
+            col("is_dst", PgType::Bool),
+        ],
+    )
+}
+
+pub fn pg_timezone_names_rows(at_micros: i64) -> Vec<Vec<Value>> {
+    crabgresql_types::tz::timezone_names(at_micros)
+        .into_iter()
+        .map(|z| {
+            vec![
+                Value::Text(z.name),
+                Value::Text(z.abbrev),
+                offset_interval(z.utc_offset_secs),
+                Value::Bool(z.is_dst),
+            ]
+        })
+        .collect()
+}
+
+/// `pg_catalog.pg_timezone_abbrevs` — the abbreviations a datetime literal
+/// accepts.
+///
+/// Divergence, deliberate: PostgreSQL 18.4 loads 198 abbreviations from the file
+/// its `timezone_abbreviations` names, and this server has a curated 15 (see
+/// `crabgresql_types::tz::timezone_abbrevs` for why growing that table is a
+/// change to value parsing, not to a view). Consequences a reader should
+/// expect: `count(*)` is 15, the offsets span 9 distinct values, and upstream's
+/// `sysviews` check `count(distinct utc_offset) >= 24` reports false.
+/// PostgreSQL 18's second half of this view — the abbreviations from the
+/// *session zone's* own history, which is where its `LMT` rows come from — is
+/// not implemented.
+pub fn pg_timezone_abbrevs_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_timezone_abbrevs",
+        "pg_catalog",
+        vec![
+            col("abbrev", PgType::Text),
+            col("utc_offset", PgType::Interval),
+            col("is_dst", PgType::Bool),
+        ],
+    )
+}
+
+pub fn pg_timezone_abbrevs_rows(at_micros: i64) -> Vec<Vec<Value>> {
+    crabgresql_types::tz::timezone_abbrevs(at_micros)
+        .into_iter()
+        .map(|a| {
+            vec![
+                Value::Text(a.abbrev.to_string()),
+                offset_interval(a.utc_offset_secs),
+                Value::Bool(a.is_dst),
+            ]
+        })
+        .collect()
+}
+
+/// A UTC offset as the `interval` both timezone views report it. Whole seconds
+/// only: no tz database entry carries a sub-second offset.
+fn offset_interval(secs: i32) -> Value {
+    Value::Interval(crabgresql_types::interval::Interval {
+        months: 0,
+        days: 0,
+        usec: i64::from(secs) * 1_000_000,
+    })
+}
+
+/// `pg_catalog.pg_settings` — the configuration parameters.
+///
+/// A view over `pg_show_all_settings()` in PostgreSQL; served here as a
+/// relation whose rows the session supplies, which is indistinguishable to a
+/// client reading it. Rows come in `SHOW ALL`'s order (by name,
+/// case-insensitively), and a parameter PostgreSQL flags `GUC_NO_SHOW_ALL` —
+/// `is_superuser` — is absent from both, as it is upstream.
+///
+/// `sourcefile`/`sourceline` are always NULL and `pending_restart` always
+/// false: this server reads no configuration file and has nothing that a
+/// restart would change.
+pub fn pg_settings_schema() -> TableSchema {
+    TableSchema::in_namespace(
+        "pg_settings",
+        "pg_catalog",
+        vec![
+            col("name", PgType::Text),
+            col("setting", PgType::Text),
+            col("unit", PgType::Text),
+            col("category", PgType::Text),
+            col("short_desc", PgType::Text),
+            col("extra_desc", PgType::Text),
+            col("context", PgType::Text),
+            col("vartype", PgType::Text),
+            col("source", PgType::Text),
+            col("min_val", PgType::Text),
+            col("max_val", PgType::Text),
+            col("enumvals", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("boot_val", PgType::Text),
+            col("reset_val", PgType::Text),
+            col("sourcefile", PgType::Text),
+            col("sourceline", PgType::Int4),
+            col("pending_restart", PgType::Bool),
+        ],
+    )
+}
+
+pub fn pg_settings_rows(settings: &[CatalogSetting]) -> Vec<Vec<Value>> {
+    let text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Text(s.to_string()));
+    settings
+        .iter()
+        .map(|s| {
+            vec![
+                Value::Text(s.name.to_string()),
+                Value::Text(s.setting.clone()),
+                text(s.unit),
+                Value::Text(s.category.to_string()),
+                Value::Text(s.short_desc.to_string()),
+                text(s.extra_desc),
+                Value::Text(s.context.to_string()),
+                Value::Text(s.vartype.to_string()),
+                Value::Text(s.source.to_string()),
+                text(s.min_val),
+                text(s.max_val),
+                s.enumvals.map_or(Value::Null, |vals| Value::Array {
+                    elem: PgType::Text,
+                    elems: vals.iter().map(|v| Value::Text(v.to_string())).collect(),
+                }),
+                Value::Text(s.boot_val.to_string()),
+                Value::Text(s.reset_val.clone()),
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ]
+        })
+        .collect()
 }
 
 /// `pg_catalog.pg_cursors` — the session's open `DECLARE … CURSOR` cursors.

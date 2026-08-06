@@ -32,7 +32,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{FmtCtx, PgType, Value};
 
-use crate::catalog::{SessionCatalog, SessionCatalogOps};
+use crate::catalog::{SessionCatalog, SessionCatalogOps, SessionCatalogSource};
 use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
@@ -259,7 +259,7 @@ pub struct Analyzed {
 /// Splits an engine-wide `relation_metadata()` snapshot into `(permanent, own_temp)`;
 /// foreign temp relations fall out of both. Used by the catalog reflection and by
 /// `execute_drop_index` so the rule is not re-derived per call site.
-fn partition_session_relations(
+pub(crate) fn partition_session_relations(
     all: Vec<RelationMetadata>,
     temp_schema: &str,
 ) -> (Vec<RelationMetadata>, Vec<RelationMetadata>) {
@@ -302,125 +302,10 @@ fn bind_catalogs(
     // relation enumeration is lazy — only a query that actually opens
     // pg_class/pg_attribute pays for it. It sits behind temp + global on the
     // search path.
-    let system: Arc<crabgresql_catalog::SystemCatalog> = {
-        let global = engine.clone();
-        let schemas_engine = engine.clone();
-        let database = session.database.clone();
-        let owner = session.user.clone();
-        let temp_schema = session.temp_schema.clone();
-        let temp_schema_for_nsp = session.temp_schema.clone();
-        let temp_namespace_oid = session.temp_namespace_oid;
-        // User-defined types are reflected into pg_type/pg_enum on demand.
-        let types = global_catalog.clone();
-        let routines = global_catalog.clone();
-        // Cursors can't be enumerated lazily like the rest: the closure outlives
-        // this borrow of the session, so their metadata is snapshotted here. Only
-        // the names and statement texts are copied — never the rows — and a
-        // session with no open cursor copies nothing. Sorted so `SELECT * FROM
-        // pg_cursors` is stable across runs, where PG's hash order is not.
-        let mut cursors: Vec<_> = session
-            .cursors
-            .iter()
-            .map(|(name, cursor)| crabgresql_catalog::CatalogCursor {
-                name: name.clone(),
-                statement: cursor.statement.clone(),
-                is_holdable: cursor.hold,
-                // `DECLARE … BINARY` is rejected outright, so no open cursor is
-                // ever a binary one.
-                is_binary: false,
-                // Every materialised cursor can scan backward unless it was
-                // declared NO SCROLL.
-                is_scrollable: cursor.scroll != Some(false),
-                creation_time: cursor.creation_time,
-            })
-            .collect();
-        cursors.sort_by(|a, b| a.name.cmp(&b.name));
-        Arc::new(
-            crabgresql_catalog::SystemCatalog::with_catalog_relations_fn(
-                database,
-                owner,
-                move || {
-                    // Reflect the permanent relations plus only THIS session's temp
-                    // relations (the shared visibility rule).
-                    let (permanent, own_temp) =
-                        partition_session_relations(global.relation_metadata(), &temp_schema);
-                    let mut rels: Vec<_> = permanent
-                        .into_iter()
-                        .map(crabgresql_catalog::CatalogRelation::permanent_metadata)
-                        .collect();
-                    rels.extend(own_temp.into_iter().map(|metadata| {
-                        let mut relation = crabgresql_catalog::CatalogRelation::temporary(
-                            metadata.schema,
-                            temp_schema.clone(),
-                        );
-                        relation.indexes = metadata.indexes;
-                        relation.stats = metadata.stats;
-                        // A temp table toasts like any other, so its chunk store
-                        // must reach `pg_class` too — the constructor defaults
-                        // this to `None`, so it has to be carried across
-                        // explicitly like the two fields above.
-                        relation.toast = metadata.toast;
-                        relation
-                    }));
-                    // Views reflect into pg_class as relkind='v' / pg_attribute
-                    // columns / information_schema.tables as VIEW.
-                    rels.extend(global.views().into_iter().map(|view| {
-                        crabgresql_catalog::CatalogRelation::view(TableSchema::in_namespace(
-                            view.name,
-                            view.namespace,
-                            view.columns,
-                        ))
-                    }));
-                    // Sequences reflect into pg_class as relkind='S' and feed
-                    // pg_catalog.pg_sequence.
-                    rels.extend(global.sequences().into_iter().map(|seq| {
-                        crabgresql_catalog::CatalogRelation::sequence(
-                            seq.name,
-                            seq.namespace,
-                            crabgresql_catalog::CatalogSequence {
-                                type_oid: seq.data_type.oid(),
-                                start: seq.start,
-                                increment: seq.increment,
-                                min: seq.min,
-                                max: seq.max,
-                                cache: seq.cache,
-                                cycle: seq.cycle,
-                            },
-                        )
-                    }));
-                    rels
-                },
-            )
-            .with_user_types_fn(move || {
-                types
-                    .user_types()
-                    .into_iter()
-                    .map(|t| crabgresql_catalog::CatalogUserType {
-                        oid: t.oid,
-                        name: t.name,
-                        enum_labels: t.enum_labels,
-                    })
-                    .collect()
-            })
-            .with_routines_fn(move || routines.functions().iter().map(catalog_routine).collect())
-            .with_schemas_fn(move || {
-                let mut schemas = schemas_engine.schemas();
-                // Reflect this session's `pg_temp_N` namespace with a stable
-                // synthetic OID, but only once it holds a temp relation (as PG
-                // instantiates pg_temp_N lazily). Feeding it through the one
-                // `schemas` list keeps `pg_namespace` and `pg_class.relnamespace`
-                // consistent; nothing is persisted. `relation_names_in` is cheap.
-                if !schemas_engine
-                    .relation_names_in(&temp_schema_for_nsp)
-                    .is_empty()
-                {
-                    schemas.push((temp_schema_for_nsp.clone(), temp_namespace_oid));
-                }
-                schemas
-            })
-            .with_cursors_fn(move || cursors.clone()),
-        )
-    };
+    let system: Arc<crabgresql_catalog::SystemCatalog> =
+        Arc::new(crabgresql_catalog::SystemCatalog::from_source(Arc::new(
+            SessionCatalogSource::new(engine.clone(), global_catalog.clone(), session),
+        )));
     let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
         engine.clone(),
         system.clone(),
@@ -441,7 +326,7 @@ fn bind_catalogs(
 /// A type that does not resolve is reported as OID 0 rather than dropping the
 /// row: `pg_proc` should show every routine that exists, and PostgreSQL also
 /// prints 0 for a type it cannot name.
-fn catalog_routine(info: &FuncInfo) -> crabgresql_catalog::CatalogRoutine {
+pub(crate) fn catalog_routine(info: &FuncInfo) -> crabgresql_catalog::CatalogRoutine {
     let oid_of = |r: &TypeRef| match r {
         TypeRef::Builtin(t) => t.oid(),
         TypeRef::User(_) | TypeRef::Cstring => 0,
@@ -3288,6 +3173,7 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
                 ] {
                     if let Some(def) = guc::lookup(key) {
                         session.save_guc_for_transaction(def, false);
+                        session.mark_guc_set(def);
                     }
                 }
             }
@@ -3337,6 +3223,8 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
     }
     session.save_guc_for_transaction(def, local);
     def.set(session, value)?;
+    // Only after the setter accepted it: a rejected `SET` leaves `source` alone.
+    session.mark_guc_set(def);
     Ok(QueryResult::Command {
         tag: "SET".into(),
         notices,
@@ -3585,6 +3473,7 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
             for def in guc::GUCS {
                 session.save_guc_for_transaction(def, false);
                 def.reset_in_all(session)?;
+                session.mark_guc_reset(def);
             }
         }
         ast::Reset::ConfigurationParameter(name) => {
@@ -3593,6 +3482,7 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
             };
             session.save_guc_for_transaction(def, false);
             def.reset(session)?;
+            session.mark_guc_reset(def);
         }
     }
     Ok(QueryResult::command("RESET"))
@@ -3609,6 +3499,9 @@ fn execute_show(variable: &[ast::Ident], session: &Session) -> Result<QueryResul
     if is_show_all(variable) {
         let rows = guc::GUCS
             .iter()
+            // `SHOW ALL` skips the parameters PG flags `GUC_NO_SHOW_ALL`, which
+            // `SHOW <name>` still answers for. Already sorted by name: `GUCS` is.
+            .filter(|def| def.show_all)
             .map(|def| {
                 vec![
                     Value::Text(def.name.to_string()),
