@@ -149,3 +149,18 @@ reproduce values from PostgreSQL's `pg_am` catalog, transcribed from the
 observable output of `SELECT * FROM pg_am` on a stock server rather than from
 `pg_am.dat` — borrowed as data, not source, under the PostgreSQL License, on the
 same footing as the tz.rs table above.
+
+The encoding tables in crates/crabgresql-types/src/encoding.rs (PostgreSQL's
+`pg_enc` numbering, `SQL_ASCII` = 0 … `SHIFT_JIS_2004` = 41, and the alias list
+`unicode` -> UTF8, `win936` -> GBK, …) reproduce values from PostgreSQL's
+character-set catalog, transcribed from the observable output of
+`pg_encoding_to_char`/`pg_char_to_encoding` on a stock server rather than from
+`encnames.c` — borrowed as data, not source, under the PostgreSQL License, on
+the same footing as the two tables above.
+
+The configuration-parameter metadata in crates/crabgresql-server/src/guc.rs
+(each parameter's `category`, `short_desc`, `extra_desc`, `context`, `vartype`,
+bounds and `enumvals`) reproduces values from PostgreSQL's `pg_settings` view,
+transcribed from the observable output of a `SELECT` against it on a stock
+server rather than from `guc_tables.c` — borrowed as data, not source, under the
+PostgreSQL License, on the same footing as the tables above.
