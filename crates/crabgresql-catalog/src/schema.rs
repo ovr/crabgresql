@@ -19,7 +19,7 @@ use crabgresql_types::{PgType, Value, VectorKind};
 use crate::{
     CatalogConstraint, CatalogCursor, CatalogIndex, CatalogRelation, CatalogRoutine,
     CatalogSequence, CatalogSetting, CatalogToast, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS,
-    PgTypeRow, RelKind, TOAST_NAMESPACE,
+    RelKind, TOAST_NAMESPACE,
 };
 
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
@@ -126,21 +126,23 @@ pub fn pg_collation_rows() -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// `typcollation`: the collation of values of `oid`'s type, or `0` when the type
-/// is not collatable. An OID this build does not model has no collation.
-fn typcollation_of(oid: u32) -> u32 {
-    PgType::from_oid(oid).map_or(0, crabgresql_types::collation::type_collation)
-}
-
-/// `typcollation` for a built-in row. An array takes its element's collation
-/// (`_text` sorts by `default`, `_name` by `C`), which is why this cannot go
-/// through [`typcollation_of`] alone: `PgType::Array` is not itself collatable,
-/// and the array OIDs this build does not model do not even resolve.
-fn row_typcollation(r: &PgTypeRow) -> u32 {
-    if r.typcategory == "A" && r.typelem != 0 {
-        typcollation_of(r.typelem)
-    } else {
-        typcollation_of(r.oid)
+/// The collation of values of `oid`'s type, or `0` when the type is not
+/// collatable. An OID this build does not model has no collation.
+///
+/// An array takes its element's collation, as PostgreSQL records it — `text[]`
+/// sorts under `default`, `name[]` under `C`. That is deliberately *not* spelled
+/// as `PgType::is_collatable`, which stays false for `Array`: it also answers
+/// `is_text_family`, so widening it would change operator selection and the
+/// `COLLATE` acceptance gate. Nothing is lost by the split, because comparing
+/// two arrays already compares their elements under the default collation.
+///
+/// The generated rows carry their own `typcollation` (from `pg_type.dat`); this
+/// is the runtime path, for a column whose type this build models.
+pub(crate) fn typcollation_of(oid: u32) -> u32 {
+    match PgType::from_oid(oid) {
+        Some(PgType::Array(elem)) => typcollation_of(elem),
+        Some(ty) => crabgresql_types::collation::type_collation(ty),
+        None => 0,
     }
 }
 
@@ -171,7 +173,7 @@ pub fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Text(r.typsend.to_string()),
                 Value::Text(r.typalign.to_string()),
                 Value::Text(r.typstorage.to_string()),
-                Value::Oid(row_typcollation(r)),
+                Value::Oid(r.typcollation),
             ]
         })
         .collect()
