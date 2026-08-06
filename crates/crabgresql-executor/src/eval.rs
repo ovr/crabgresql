@@ -1757,6 +1757,12 @@ mod format_type_tests {
             fn rel_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
             }
+            fn proc_name(&self, _oid: u32) -> Option<String> {
+                None
+            }
+            fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
+                None
+            }
             fn namespace_name(&self, _oid: u32) -> Option<String> {
                 None
             }
