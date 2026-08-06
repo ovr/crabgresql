@@ -786,7 +786,21 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   objects** as PG (otherwise drivers that hardcode type OIDs break:
   `23 = int4`, `25 = text`, …).
 - Bootstrap: the initial catalog is generated from upstream
-  `pg_type.dat`/`pg_proc.dat` (build-time codegen).
+  `pg_type.dat`/`pg_proc.dat`/`pg_cast.dat` (build-time codegen). Codegen
+  resolves the `regproc` references between them — `pg_type.typinput`,
+  `pg_cast.castfunc`, `pg_am.amhandler` — to real OIDs, and emits `pg_proc`
+  rows for **exactly the functions those references name**. The rest of
+  `pg_proc.dat` is deliberately left out: a `pg_proc` row is a claim that a
+  function exists, and this build runs its SQL surface from its own registry
+  rather than upstream's list. `every_regproc_reference_resolves_to_an_emitted_row`
+  fails if a reference ever dangles.
+- Known `pg_catalog` gaps, in the order upstream's `type_sanity` trips over
+  them: no rows for array types (a base type's `typarray` records the OID, but
+  the array type has no row of its own), `typrelid` is 0 for the catalog
+  composite types, no `pg_range`/`pg_opclass`, no domain or range types, and
+  `pg_attribute` carries neither system columns nor `attislocal`/`attinhcount`
+  (per-column inheritance provenance is not recorded — the parent↔child
+  correspondence is recomputed by name).
 - `information_schema` — views over pg_catalog, as in PG.
 - An in-memory catalog cache with DDL-driven invalidation (sinval analog).
 
