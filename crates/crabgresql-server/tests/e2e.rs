@@ -11738,6 +11738,39 @@ async fn partition_bounds_use_the_session_zone() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A bound may name the session identity, and PostgreSQL folds the *value* into
+/// the stored bound at CREATE time. The fold used to run with a context that
+/// carried the session's GUCs but no catalog handle, so `current_setting()` in a
+/// bound worked while `current_user` raised XX000.
+#[tokio::test]
+async fn partition_bounds_fold_session_identity() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let user = scalar(&client, "SELECT current_user").await;
+    client
+        .simple_query("CREATE TABLE ident (a text) PARTITION BY RANGE (a)")
+        .await?;
+    client
+        .simple_query(
+            "CREATE TABLE ident1 PARTITION OF ident FOR VALUES FROM (current_user) TO ('zzz')",
+        )
+        .await?;
+
+    // The leaf carries the value, not the call.
+    let bound = scalar(
+        &client,
+        "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname = 'ident1'",
+    )
+    .await;
+    assert_eq!(bound, format!("FOR VALUES FROM ('{user}') TO ('zzz')"));
+
+    // ...and that stored value is what routes a row.
+    client
+        .simple_query("INSERT INTO ident VALUES (current_user)")
+        .await?;
+    assert_eq!(scalar(&client, "SELECT count(*) FROM ident1").await, "1");
+    Ok(())
+}
+
 /// `SHOW` returns rows, so Describe must answer with a RowDescription. The
 /// utility catch-all reported NoData and Execute then streamed DataRows the
 /// client had been told not to expect.

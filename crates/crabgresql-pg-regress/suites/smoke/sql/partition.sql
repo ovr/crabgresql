@@ -98,3 +98,24 @@ CREATE TABLE plain_part PARTITION OF plain FOR VALUES FROM (1) TO (2);
 DROP TABLE sales;
 SELECT relname FROM pg_class WHERE relname LIKE 'sales%' ORDER BY relname;
 DROP TABLE plain;
+-- A bound is folded at CREATE time, so a session-identity function in one is
+-- resolved and *stored*: the leaf carries the value, not the call. The regress
+-- client connects as "postgres" to "regression", the identity upstream
+-- pg_regress uses, so the folded values are literal here; the three sort
+-- postgres < public < regression under C, which is what makes the two ranges
+-- adjacent rather than overlapping.
+CREATE TABLE ident (a text) PARTITION BY RANGE (a);
+CREATE TABLE ident_lo PARTITION OF ident FOR VALUES FROM (current_user) TO (current_schema);
+CREATE TABLE ident_hi PARTITION OF ident
+  FOR VALUES FROM (current_schema) TO (current_database());
+SELECT c.relname, pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS bound
+  FROM pg_catalog.pg_class c
+ WHERE c.relname LIKE 'ident%'
+ ORDER BY relname;
+-- ...and the stored bound is what routes a row, not a re-evaluated call.
+INSERT INTO ident VALUES (current_user), (current_schema);
+SELECT 'ident_lo' AS leaf, count(*) FROM ident_lo
+UNION ALL
+SELECT 'ident_hi', count(*) FROM ident_hi
+ ORDER BY leaf;
+DROP TABLE ident;

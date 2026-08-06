@@ -724,7 +724,7 @@ pub(crate) fn execute_statement_with(
                 );
             }
             ast::Statement::CreateTable(create) => {
-                return execute_create_table(engine, &type_catalog, create, session);
+                return execute_create_table(engine, &type_catalog, &catalog_ops, create, session);
             }
             ast::Statement::CreateView(create) => {
                 return execute_create_view(&catalog, &type_catalog, create);
@@ -3749,6 +3749,7 @@ fn session_literal_default(
 fn execute_create_table(
     engine: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
+    catalog_ops: &Arc<dyn CatalogOps>,
     create: &ast::CreateTable,
     session: &Session,
 ) -> Result<QueryResult, PgError> {
@@ -3892,7 +3893,20 @@ fn execute_create_table(
             &name,
             parent,
             &session.temp_schema,
-            &session.exec_context(),
+            // A bound may name the session identity (`current_user`,
+            // `current_schema`, `pg_my_temp_schema()`), which PostgreSQL folds
+            // into the stored bound — so the fold needs this statement's
+            // catalog snapshot. `exec_context()` deliberately leaves it unset
+            // for EXPLAIN's constant rendering, where no user expression runs.
+            //
+            // Only `catalog`: `sequences`/`routines` stay unset because
+            // PostgreSQL does not fold a volatile function into a bound either,
+            // and implementing that without a probed reference does not belong
+            // in a bug fix. `nextval(…)` in a bound therefore still raises.
+            &ExecContext {
+                catalog: Some(Arc::clone(catalog_ops)),
+                ..session.exec_context()
+            },
         );
     }
     #[derive(Clone)]

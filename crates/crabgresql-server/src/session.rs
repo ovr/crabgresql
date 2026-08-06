@@ -904,9 +904,14 @@ impl Session {
     }
 
     /// A context for evaluation outside a statement's normal execution path —
-    /// `EXPLAIN`'s constant rendering, a folded partition bound. It carries the
-    /// session's formatting *and* its GUC values, so a `current_setting()` in
-    /// one of those positions answers rather than raising an internal error.
+    /// `EXPLAIN`'s constant rendering. It carries the session's formatting *and*
+    /// its GUC values, so a `current_setting()` in one of those positions
+    /// answers rather than raising an internal error.
+    ///
+    /// It carries no catalog handle, so anything reaching it that might evaluate
+    /// a *user* expression needs one added: a folded partition bound spreads
+    /// `catalog` over this (see `execute_create_table`), because a bound may
+    /// name `current_user` and friends.
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
             fmt: self.fmt_ctx(),
