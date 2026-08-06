@@ -27,7 +27,8 @@ mod schema;
 pub use schema::PLPGSQL_LANG_OID;
 mod static_table;
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crabgresql_storage_api::{
     Column, IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationMetadata,
@@ -703,6 +704,15 @@ pub struct CatalogCursor {
     pub creation_time: i64,
 }
 
+/// Which of the two catalog schemas a relation name is being looked up in.
+/// `information_schema.tables` and a `pg_catalog` name are different relations,
+/// so each namespace memoizes into its own map — indexed by this discriminant.
+#[derive(Clone, Copy)]
+enum CatalogNs {
+    PgCatalog = 0,
+    InformationSchema = 1,
+}
+
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; the live state comes from a
 /// [`CatalogSource`] whose every method is invoked at most once, and only when
@@ -721,7 +731,17 @@ pub struct SystemCatalog {
     user_schemas: OnceLock<Vec<(String, u32)>>,
     cursors: OnceLock<Vec<CatalogCursor>>,
     settings: OnceLock<Vec<CatalogSetting>>,
-    namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
+    namespace_oids: OnceLock<HashMap<String, u32>>,
+    /// Relations already materialized under this snapshot, one map per
+    /// [`CatalogNs`]. The `OnceLock`s above memoize the *inputs* a builder reads;
+    /// this memoizes the built rows, which a statement naming one relation more
+    /// than once would otherwise pay for twice. Statement-scoped like the rest:
+    /// it dies with the snapshot, so DDL never sees a stale entry.
+    ///
+    /// Keyed by `&str` rather than by an owned pair so that a lookup allocates
+    /// nothing: the session catalog offers *every* unqualified user relation
+    /// here before trying user storage, and those all miss.
+    built: [Mutex<HashMap<String, Arc<dyn TableAm>>>; 2],
 }
 
 impl Default for SystemCatalog {
@@ -779,6 +799,7 @@ impl SystemCatalog {
             cursors: OnceLock::new(),
             settings: OnceLock::new(),
             namespace_oids: OnceLock::new(),
+            built: [Mutex::new(HashMap::new()), Mutex::new(HashMap::new())],
         }
     }
 
@@ -1370,6 +1391,35 @@ impl SystemCatalog {
         }
     }
 
+    /// The relation `ns.name` as an access method, materialized at most once per
+    /// snapshot.
+    ///
+    /// A miss is not memoized: an unknown name falls straight off the end of the
+    /// builder's `match`, and the session catalog routes *every* unqualified user
+    /// relation through here before trying user storage — caching those would
+    /// grow the map with names this engine does not serve.
+    fn catalog_table(&self, ns: CatalogNs, name: &str) -> Option<Arc<dyn TableAm>> {
+        let cache = &self.built[ns as usize];
+        if let Some(table) = cache.lock().expect("catalog cache poisoned").get(name) {
+            return Some(Arc::clone(table));
+        }
+        // Built outside the lock: a builder reads other memoized state, and
+        // holding the cache while it runs would let one relation's build block an
+        // unrelated one. Two racing builds would produce identical rows, so the
+        // loser is simply dropped.
+        let (schema, rows) = match ns {
+            CatalogNs::PgCatalog => self.build_pg_catalog(name),
+            CatalogNs::InformationSchema => self.build_information_schema(name),
+        }?;
+        Some(Arc::clone(
+            cache
+                .lock()
+                .expect("catalog cache poisoned")
+                .entry(name.to_string())
+                .or_insert_with(|| StaticTable::arc(schema, rows)),
+        ))
+    }
+
     fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         match name {
             "schemata" => Some((
@@ -1404,10 +1454,8 @@ impl TableEngine for SystemCatalog {
     }
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        match self.build_pg_catalog(name) {
-            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
-            None => Err(StorageError::TableNotFound(name.to_string())),
-        }
+        self.catalog_table(CatalogNs::PgCatalog, name)
+            .ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
     fn resolve(
@@ -1416,14 +1464,11 @@ impl TableEngine for SystemCatalog {
         name: &str,
     ) -> Result<Arc<dyn TableAm>, StorageError> {
         let relation = match namespace {
-            None | Some("pg_catalog") => self.build_pg_catalog(name),
-            Some("information_schema") => self.build_information_schema(name),
+            None | Some("pg_catalog") => self.catalog_table(CatalogNs::PgCatalog, name),
+            Some("information_schema") => self.catalog_table(CatalogNs::InformationSchema, name),
             Some(_) => None,
         };
-        match relation {
-            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
-            None => Err(StorageError::TableNotFound(name.to_string())),
-        }
+        relation.ok_or_else(|| StorageError::TableNotFound(name.to_string()))
     }
 
     fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
@@ -2691,6 +2736,96 @@ mod tests {
             cat.relation_ref(toast_oid),
             Some(("pg_toast", format!("pg_toast_{parent_oid}").as_str()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_relation_is_materialized_once_per_snapshot() -> anyhow::Result<()> {
+        let cat = SystemCatalog::new();
+        // `pg_proc` is the costliest relation to build, and a statement naming it
+        // twice — a self-join, or a bind that also probes for existence — used to
+        // pay for it twice.
+        let first = cat.open_table("pg_proc")?;
+        let second = cat.open_table("pg_proc")?;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second open must reuse the built rows"
+        );
+
+        // The two entry points share one memo: an unqualified name and its
+        // `pg_catalog.` spelling are the same relation.
+        let qualified = cat.resolve(Some("pg_catalog"), "pg_class")?;
+        assert!(Arc::ptr_eq(&qualified, &cat.open_table("pg_class")?));
+
+        // Different relations stay different.
+        assert!(!Arc::ptr_eq(&first, &qualified));
+        Ok(())
+    }
+
+    #[test]
+    fn the_memo_keys_on_the_namespace() -> anyhow::Result<()> {
+        let cat = SystemCatalog::new();
+        // `information_schema.tables` is not `pg_catalog.tables`; the latter does
+        // not exist, and must not be answered from the former's entry.
+        let tables = cat.resolve(Some("information_schema"), "tables")?;
+        assert!(cat.open_table("tables").is_err());
+        assert!(Arc::ptr_eq(
+            &tables,
+            &cat.resolve(Some("information_schema"), "tables")?
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn the_memo_does_not_outlive_the_snapshot() -> anyhow::Result<()> {
+        // Statement scope is what makes the cache safe: DDL between statements
+        // invalidates everything, and each statement gets a fresh snapshot.
+        let source = Arc::new(StaticSource::default());
+        let first = SystemCatalog::from_source(source.clone());
+        let second = SystemCatalog::from_source(source);
+        assert!(!Arc::ptr_eq(
+            &first.open_table("pg_proc")?,
+            &second.open_table("pg_proc")?
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_memoized_pg_proc_still_carries_the_user_routines() -> anyhow::Result<()> {
+        let routine = CatalogRoutine {
+            oid: 20000,
+            name: "add_one".to_string(),
+            namespace: "public".to_string(),
+            kind: 'f',
+            lang: 14,
+            arg_types: vec![crabgresql_types::oid::INT4],
+            all_arg_types: Vec::new(),
+            arg_modes: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: crabgresql_types::oid::INT4,
+            retset: false,
+            volatile: 'i',
+            strict: false,
+            secdef: false,
+            src: "select $1 + 1".to_string(),
+        };
+        let cat = SystemCatalog::from_source(Arc::new(
+            StaticSource::default()
+                .routines(vec![routine])
+                .schemas(vec![("public".to_string(), 2200)]),
+        ));
+        let (schema, rows) = required(cat.build_pg_catalog("pg_proc"), "pg_proc is missing")?;
+        let proname = required(schema.column_index("proname"), "proname column is missing")?;
+        assert!(
+            rows.iter()
+                .any(|r| r[proname] == Value::Text("add_one".to_string())),
+            "the user routine is missing from pg_proc"
+        );
+        // The handed-out table is that full build, not a builtin-only one — and
+        // the memoized second open is the same table.
+        let table = cat.open_table("pg_proc")?;
+        assert_eq!(table.statistics().reltuples as usize, rows.len());
+        assert!(Arc::ptr_eq(&table, &cat.open_table("pg_proc")?));
         Ok(())
     }
 }
