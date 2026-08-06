@@ -501,9 +501,22 @@ fn every_regproc_reference_resolves_to_an_emitted_row() -> anyhow::Result<()> {
         other => panic!("{what} is not a function reference: {other:?}"),
     };
 
+    // All eight `regproc` columns codegen emits, not just the four I/O ones:
+    // `typsubscript` and `typanalyze` are what `oidjoins` joins on for the
+    // derived array rows.
+    let type_regprocs = [
+        "typinput",
+        "typoutput",
+        "typreceive",
+        "typsend",
+        "typmodin",
+        "typmodout",
+        "typanalyze",
+        "typsubscript",
+    ];
     let type_schema = catalogs::types::pg_type_schema();
     for row in catalogs::types::pg_type_builtin_rows() {
-        for col in ["typinput", "typoutput", "typreceive", "typsend"] {
+        for col in type_regprocs {
             let i = required(type_schema.column_index(col), "column is missing")?;
             resolves(&row[i], col);
         }
