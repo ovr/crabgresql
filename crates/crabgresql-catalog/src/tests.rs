@@ -527,6 +527,34 @@ fn every_regproc_reference_resolves_to_an_emitted_row() -> anyhow::Result<()> {
         );
         resolves(&row[amhandler], "pg_am.amhandler");
     }
+    // A user enum's row is built here rather than read from a `.dat`, so
+    // codegen cannot record its four I/O references the way it records a
+    // generated catalog's — they are declared to it by `crabgresql-bki`'s
+    // hand-written-catalog list, and this is what fails when that declaration
+    // goes missing. Like an access method's handler, an enum always has all
+    // four.
+    let enum_row = required(
+        catalogs::types::pg_type_user_rows(&[CatalogUserType {
+            oid: 20000,
+            name: "mood".to_string(),
+            enum_labels: Some(vec!["ok".to_string()]),
+        }])
+        .into_iter()
+        .next(),
+        "a user enum publishes no pg_type row",
+    )?;
+    for col in ["typinput", "typoutput", "typreceive", "typsend"] {
+        let i = required(type_schema.column_index(col), "column is missing")?;
+        assert_ne!(
+            enum_row[i],
+            Value::Reg(crabgresql_types::Reg::unresolved(
+                crabgresql_types::RegKind::Proc,
+                0
+            )),
+            "a user enum's {col} is `-`"
+        );
+        resolves(&enum_row[i], col);
+    }
     Ok(())
 }
 

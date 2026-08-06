@@ -32,13 +32,23 @@ use dat::read_dat;
 use symbols::SymbolKind::Proc;
 use symbols::SymbolTable;
 
-/// The `pg_am.amhandler` names `crabgresql-catalog`'s `catalogs::am::pg_am_rows`
-/// publishes that upstream also has. That catalog is hand-written rather than
-/// generated, so its references are declared here instead of being recorded
-/// while it is emitted. crabgresql's own access methods (`parquet`, `buffer`)
-/// have no upstream entry to resolve against; `oids::OWN_AM_HANDLERS` gives
-/// those two `pg_proc` rows of their own.
-const AM_HANDLERS: &[&str] = &[
+/// The functions the catalogs `crabgresql-catalog` builds **by hand**
+/// reference. Their references cannot be recorded the way a generated
+/// catalog's are — no `.dat` spells them out — so they are declared here, and
+/// the census emits their `pg_proc` rows like any other.
+///
+/// Two catalogs are on this list:
+///
+///   - `catalogs::am::pg_am_rows` publishes upstream's access methods;
+///     crabgresql's own (`parquet`, `buffer`) have no upstream entry to resolve
+///     against, so `oids::OWN_AM_HANDLERS` gives those two `pg_proc` rows of
+///     their own.
+///   - `catalogs::types::pg_type_user_rows` gives every `CREATE TYPE ... AS
+///     ENUM` the four enum I/O functions, exactly as upstream does.
+///     `pg_type.dat` names only `anyenum_in`/`anyenum_out`, so without this the
+///     columns rendered `-` and the type claimed to have no input function at
+///     all.
+const HANDWRITTEN_CATALOG_PROCS: &[&str] = &[
     "heap_tableam_handler",
     "bthandler",
     "hashhandler",
@@ -46,6 +56,10 @@ const AM_HANDLERS: &[&str] = &[
     "ginhandler",
     "brinhandler",
     "spghandler",
+    "enum_in",
+    "enum_out",
+    "enum_recv",
+    "enum_send",
 ];
 
 /// Read the vendored `.dat` files in `catalog_dir` and write the generated row
@@ -73,8 +87,12 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         out_dir.join("pg_cast_rows.rs"),
         pg_cast::emit(&cast_entries, &symbols),
     )?;
-    for handler in AM_HANDLERS {
-        symbols.resolve_name(Proc, handler);
+    for name in HANDWRITTEN_CATALOG_PROCS {
+        assert!(
+            symbols.resolve_name(Proc, name).is_some(),
+            "{name} is referenced by a hand-written catalog but pg_proc.dat \
+             defines no unique entry for it"
+        );
     }
     std::fs::write(
         out_dir.join("pg_proc_rows.rs"),
