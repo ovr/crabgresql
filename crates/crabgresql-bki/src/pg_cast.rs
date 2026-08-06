@@ -12,8 +12,8 @@ use crate::symbols::SymbolTable;
 /// a cast whose source or target is a type crabgresql does not expose is
 /// skipped, so the emitted `pg_cast` stays consistent with the exposed
 /// `pg_type`. OIDs are synthetic (upstream assigns none). `castfunc` is a
-/// resolved `pg_proc` OID, as PostgreSQL declares the column — `0` for a
-/// binary-coercible cast, which needs no function.
+/// resolved `pg_proc` OID, as PostgreSQL declares the column — see
+/// [`resolve_castfunc`].
 pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
     // Casts have no manual OIDs upstream; assign stable synthetic ones above the
     // built-in floor so they never collide with a real object OID.
@@ -33,9 +33,7 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
             "    PgCastRow {{ oid: {oid}, castsource: {source}, casttarget: {target}, \
 castfunc: {castfunc}, castcontext: {castcontext:?}, castmethod: {castmethod:?} }},\n",
             oid = next_oid,
-            castfunc = symbols
-                .resolve_signature(Proc, str_field(e, "castfunc", "0"))
-                .unwrap_or(0),
+            castfunc = resolve_castfunc(symbols, e),
             castcontext = str_field(e, "castcontext", "e"),
             castmethod = str_field(e, "castmethod", "f"),
         );
@@ -47,6 +45,36 @@ castfunc: {castfunc}, castcontext: {castcontext:?}, castmethod: {castmethod:?} }
     out
 }
 
+/// The `pg_proc` OID an entry's `castfunc` names. The column is a
+/// `regprocedure`, and `pg_cast.dat` writes it two ways: as a full signature
+/// (`int4(int2)`) where the name alone would be ambiguous, and as a bare name
+/// (`oid`, `xml`, `path`) where it is not — the same rule the catalog applies
+/// to a `regproc` column, which [`SymbolTable::resolve_name`] already carries,
+/// since a name defined twice resolves to nothing.
+///
+/// `0` is upstream's spelling of a binary-coercible cast, which needs no
+/// function. Anything else that fails to resolve is a reference into a catalog
+/// this build claims to have generated, so it fails the build rather than
+/// emitting a function cast whose function is `-`.
+fn resolve_castfunc(symbols: &SymbolTable, e: &Entry) -> u32 {
+    let reference = str_field(e, "castfunc", "0");
+    if reference == "0" {
+        return 0;
+    }
+    let oid = if reference.contains('(') {
+        symbols.resolve_signature(Proc, reference)
+    } else {
+        symbols.resolve_name(Proc, reference)
+    };
+    oid.unwrap_or_else(|| {
+        panic!(
+            "pg_cast {} -> {}: castfunc {reference:?} names no pg_proc entry",
+            str_field(e, "castsource", "?"),
+            str_field(e, "casttarget", "?"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,8 +84,12 @@ mod tests {
         let mut symbols = SymbolTable::default();
         symbols.define_name(Type, "int2", 21);
         symbols.define_name(Type, "int4", 23);
+        symbols.define_name(Type, "int8", 20);
         symbols.define_name(Type, "oid", 26);
         symbols.define_signature(Proc, "int4", "int2", 313);
+        // `oid(int8)`, which pg_cast.dat references by its bare name.
+        symbols.define_name(Proc, "oid", 1287);
+        symbols.define_signature(Proc, "oid", "int8", 1287);
         symbols
     }
 
@@ -79,6 +111,26 @@ mod tests {
             "PgCastRow { oid: 10001, castsource: 23, casttarget: 26, castfunc: 0, \
              castcontext: \"i\", castmethod: \"b\" }"
         ));
+    }
+
+    #[test]
+    fn a_castfunc_written_as_a_bare_name_resolves() {
+        // `{ castsource => 'int8', casttarget => 'oid', castfunc => 'oid' }` —
+        // the spelling pg_cast.dat uses where the name is unambiguous.
+        let casts = parse_dat(
+            "[{ castsource => 'int8', casttarget => 'oid', castfunc => 'oid', \
+             castcontext => 'i', castmethod => 'f' }]",
+        );
+        let emitted = emit(&casts, &symbols());
+        assert!(emitted.contains("castfunc: 1287"));
+    }
+
+    #[test]
+    #[should_panic(expected = "names no pg_proc entry")]
+    fn an_unresolvable_castfunc_fails_the_build() {
+        let casts =
+            parse_dat("[{ castsource => 'int2', casttarget => 'int4', castfunc => 'nosuchfunc' }]");
+        emit(&casts, &symbols());
     }
 
     #[test]
