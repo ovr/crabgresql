@@ -146,6 +146,21 @@ take a slice with `--rows` until the engine grows out-of-core execution.
   `query_numbers` alongside it names the query each slot belongs to; a
   `--query`-filtered run would otherwise read as Q1..Qn.
 
+## In CI
+
+Both suites run on every pull request, alongside pgbench, from
+`.github/workflows/ci.yml`. The dataset steps are scripts so the CI run and a
+local one are the same run: `scripts/bench/fetch-clickbench.sh <rows> <out.tsv>`
+takes the ClickBench slice with a range request, and
+`scripts/bench/gen-tpch.sh <sf> <outdir>` is the DuckDB recipe above.
+
+ClickBench runs at 10M rows on `parquet`; TPC-H runs at `sf=0.01` twice, once
+on `heap` and once on `parquet`. The jobs report timings but gate only on
+breakage — a query that errored or timed out. There is no timing threshold: a
+shared runner's variance is wider than most real regressions, so a threshold
+would only teach people to ignore the job. Reading the numbers is the reviewer's
+job, and they arrive as one pull request comment.
+
 ## Adding a benchmark
 
 Drop the benchmark's `create.sql` and `queries.sql` under `suites/<name>/`,
