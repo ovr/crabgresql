@@ -103,7 +103,7 @@ prorettype: {prorettype}, proargtypes: &[{args}], prosrc: {prosrc:?} }},\n",
             // A planner support routine is itself a `pg_proc` row this codegen
             // does not emit, so pointing at one would dangle. Report none —
             // which is also true of what the planner here actually consults.
-            prosupport = "ProcRef { oid: 0, name: \"-\" }",
+            prosupport = crate::proc_ref(symbols, "-"),
             prokind = str_field(e, "prokind", "f"),
             proleakproof = bool_field(e, "proleakproof", false),
             proisstrict = bool_field(e, "proisstrict", true),
