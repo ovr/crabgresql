@@ -1267,6 +1267,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Tsquery) => "_tsquery",
         Some(PgType::Vector(VectorKind::Oid)) => "_oidvector",
         Some(PgType::Vector(VectorKind::Int2)) => "_int2vector",
+        Some(PgType::Reg(RegKind::Proc)) => "_regproc",
         Some(PgType::Reg(RegKind::Class)) => "_regclass",
         Some(PgType::Reg(RegKind::Type)) => "_regtype",
         Some(PgType::Reg(RegKind::Namespace)) => "_regnamespace",

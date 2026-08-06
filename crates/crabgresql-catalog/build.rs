@@ -111,7 +111,8 @@ const ARRAY_ROW_PROCS: &[&str] = &["array_in", "array_out", "array_recv", "array
 
 /// The `pg_am.amhandler` names `schema::pg_am_rows` publishes that upstream
 /// also has. crabgresql's own access methods (`parquet`, `buffer`) have no
-/// upstream function to point at, and their handlers are resolved to 0 there.
+/// upstream entry to resolve against; `schema::OWN_AM_HANDLERS` gives those
+/// two `pg_proc` rows of their own.
 const AM_HANDLERS: &[&str] = &[
     "heap_tableam_handler",
     "bthandler",
