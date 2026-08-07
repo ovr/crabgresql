@@ -131,4 +131,14 @@ SELECT count(DISTINCT grp), sum(DISTINCT grp), avg(DISTINCT grp), min(DISTINCT g
      3 |   6 | 2.0000000000000000 |   1 |   3
 (1 row)
 
+-- sum/avg over bigint accumulate past what a bigint can hold, and the quotient's
+-- display scale falls to zero at that magnitude
+CREATE TABLE wide (v bigint);
+INSERT INTO wide VALUES (9223372036854775807), (9223372036854775807), (9223372036854775807);
+SELECT sum(v), avg(v) FROM wide;
+         sum          |         avg         
+----------------------+---------------------
+ 27670116110564327421 | 9223372036854775807
+(1 row)
+
 -- End aggregate tests.

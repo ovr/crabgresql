@@ -48,4 +48,9 @@ SELECT max(min(val)) FROM agg;
 SELECT sum(txt) FROM agg;
 -- DISTINCT eliminates duplicate non-NULL aggregate inputs
 SELECT count(DISTINCT grp), sum(DISTINCT grp), avg(DISTINCT grp), min(DISTINCT grp), max(DISTINCT grp) FROM agg;
+-- sum/avg over bigint accumulate past what a bigint can hold, and the quotient's
+-- display scale falls to zero at that magnitude
+CREATE TABLE wide (v bigint);
+INSERT INTO wide VALUES (9223372036854775807), (9223372036854775807), (9223372036854775807);
+SELECT sum(v), avg(v) FROM wide;
 -- End aggregate tests.
