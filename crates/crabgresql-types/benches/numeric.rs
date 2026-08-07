@@ -56,8 +56,10 @@ fn division(c: &mut Criterion) {
 fn accumulation(c: &mut Criterion) {
     let mut g = c.benchmark_group("numeric_accumulate");
 
-    // What the aggregate accumulators used to do per row before they moved to
-    // registers; kept as the reference the register path is measured against.
+    // The per-row cost an aggregate pays to accumulate in `Numeric` rather than
+    // a register: `avg`/`sum` over an exact type still do this once per input
+    // row, so it is the yardstick for whether a register accumulator is worth
+    // it. Division above is the once-per-group cost; this is the per-row one.
     g.bench_function("add_small", |b| {
         let x = Numeric::from_i128(1913);
         b.iter(|| {

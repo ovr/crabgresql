@@ -211,6 +211,20 @@ SELECT ln(0.0);
 ERROR:  cannot take logarithm of zero
 SELECT ln(-1.0);
 ERROR:  cannot take logarithm of a negative number
+-- log's own domain errors keep 2201E, but base 1 divides by ln(1) = 0 and is
+-- reported as that division; a base merely near 1 still computes
+SELECT log(0.0, 12.34);
+ERROR:  cannot take logarithm of zero
+SELECT log(12.34, 0.0);
+ERROR:  cannot take logarithm of zero
+SELECT log(1.0, 12.34);
+ERROR:  division by zero
+SELECT log(1.000016, 8.452010e18) AS near_one;
+      near_one      
+--------------------
+ 2723830.2877097365
+(1 row)
+
 -- the ^ operator: numeric ^ numeric is numeric
 SELECT 2.0 ^ 10 AS two_ten, 2.0 ^ 0.5 AS root2, 10 ^ 3.0 AS thousand;
       two_ten       |       root2        |      thousand      

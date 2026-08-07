@@ -126,11 +126,28 @@ jobs:
           echo "smoke: ${{ steps.smoke.outcome }}, upstream: ${{ steps.upstream.outcome }}"
           exit 1
 
-  # The three benchmark jobs below report numbers but gate only on breakage: a
-  # query that errored or timed out, or a pgbench run with failed transactions.
+  # The benchmark jobs below report numbers but gate only on breakage: a query
+  # that errored or timed out, or a pgbench run with failed transactions.
   # Timing thresholds are deliberately absent — a shared runner's variance is
   # wider than most real regressions, so a threshold would only teach people to
   # ignore the job.
+
+  # The criterion microbenchmarks are compiled by `lint` (`--all-targets`), and
+  # `lint` gates every job here — so without this one, a bench that stops
+  # compiling would block the whole pipeline for a target nothing runs.
+  # `--test` executes each benchmark once and skips measurement: it proves the
+  # harness still works in seconds, and a shared runner's timings would be noise
+  # anyway.
+  bench-micro:
+    name: microbenchmarks
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench --test
+        run: cargo bench -p crabgresql-types --benches --locked -- --test
 
   bench-clickbench:
     name: clickbench (parquet)
