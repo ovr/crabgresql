@@ -455,7 +455,10 @@ impl HeapTable {
                 let mut out = Vec::new();
                 for off in 1..=page::max_offset(pg) {
                     if let Some(bytes) = page::get_item(pg, off) {
-                        out.push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
+                        // SAFETY: `bytes` is an item off a pinned page, whose
+                        // CRC-32C `smgr` verified when it read the block.
+                        let raw = unsafe { tuple::decode_raw(bytes) };
+                        out.push((Tid { block, offset: off }, raw));
                     }
                 }
                 out
@@ -466,7 +469,10 @@ impl HeapTable {
                 // page's frame lock. A chunk store that cannot be read fails the
                 // statement; it must not take the process down, since CREATE INDEX
                 // is an ordinary user command.
-                let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
+                // SAFETY: `detoast` reassembles the chain out of the same
+                // checksum-verified pages the tuple itself came off.
+                let tuple =
+                    raw.and_then(|raw| unsafe { raw.resolve(|p| detoast(&self.engine, p)) })?;
                 if let Some(key) = btkey::encode_row(&schema, &cols, &tuple) {
                     Self::index_row_fits(&key, tid, &meta.name, &schema.name)?;
                     btree.insert(&key, tid);
@@ -1397,11 +1403,15 @@ impl TableAm for HeapTable {
         let raw = page.read(|pg| {
             let bytes = page::get_item(pg, tid.offset)?;
             let head = tuple::decode_header(bytes);
-            satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
-                .then(|| tuple::decode_raw(bytes))
+            satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid).then(|| {
+                // SAFETY: `bytes` is an item off a pinned, checksum-verified page.
+                unsafe { tuple::decode_raw(bytes) }
+            })
         });
         match raw {
-            Some(raw) => Ok(Some(raw?.resolve(|p| detoast(&self.engine, p))?)),
+            // SAFETY: the detoast chain lives on pages of the same checksummed
+            // relation file.
+            Some(raw) => Ok(Some(unsafe { raw?.resolve(|p| detoast(&self.engine, p)) }?)),
             None => Ok(None),
         }
     }
@@ -1707,8 +1717,10 @@ impl TableAm for HeapTable {
                             // when the row owns chunks to reclaim. `has_external`
                             // keeps the common case free.
                             if !phys.is_empty() || head.has_external {
-                                victims
-                                    .push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
+                                // SAFETY: `bytes` is an item off a pinned,
+                                // checksum-verified page.
+                                let raw = unsafe { tuple::decode_raw(bytes) };
+                                victims.push((Tid { block, offset: off }, raw));
                             }
                         }
                     }
@@ -1734,7 +1746,11 @@ impl TableAm for HeapTable {
                 victims
                     .into_iter()
                     .filter_map(|(tid, raw)| {
-                        match raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p))) {
+                        // SAFETY: the chain lives on pages of the same
+                        // checksummed relation file.
+                        match raw
+                            .and_then(|raw| unsafe { raw.resolve(|p| detoast(&self.engine, p)) })
+                        {
                             Ok(vals) => Some((tid, vals)),
                             // Vacuum is advisory maintenance and cannot report an
                             // error to anyone, but it must not abort the process
@@ -1855,7 +1871,10 @@ impl Iterator for HeapScan {
                             self.txn.xid,
                             self.txn.cid,
                         ) {
-                            out.push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
+                            // SAFETY: `bytes` is an item off a pinned,
+                            // checksum-verified page.
+                            let raw = unsafe { tuple::decode_raw(bytes) };
+                            out.push((Tid { block, offset: off }, raw));
                         }
                     }
                 }
@@ -1865,7 +1884,9 @@ impl Iterator for HeapScan {
             // buffers a whole block before yielding, so this costs no extra pass.
             self.buffer.reserve(raw.len());
             for (tid, t) in raw {
-                match t.and_then(|t| t.resolve(|p| detoast(&self.engine, p))) {
+                // SAFETY: the chain lives on pages of the same checksummed
+                // relation file.
+                match t.and_then(|t| unsafe { t.resolve(|p| detoast(&self.engine, p)) }) {
                     Ok(vals) => self.buffer.push((tid, vals)),
                     // Stop the scan rather than skipping the rest of the block: a
                     // consumer that keeps polling must not silently receive a

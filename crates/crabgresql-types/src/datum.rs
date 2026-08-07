@@ -408,7 +408,44 @@ impl<'a> Reader<'a> {
 }
 
 /// Decode one datum starting at `*pos`, advancing `*pos` past it.
+///
+/// Every text-bearing kind re-validates its UTF-8, so a corrupt page fails with
+/// a panic rather than producing an ill-formed `String`. Callers that have
+/// already established the bytes' integrity can skip that scan with
+/// [`decode_datum_trusted`].
 pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
+    decode_datum_inner::<false>(buf, pos)
+}
+
+/// [`decode_datum`], minus the UTF-8 re-validation on the two kinds where it
+/// shows up in profiles (`text` and `numeric`).
+///
+/// The bytes were written by [`encode_datum`] from a `String`, so they were
+/// well-formed when they left memory; the only way they are not well-formed on
+/// the way back is if the storage medium corrupted them. This function trusts
+/// the caller to have ruled that out.
+///
+/// # Safety
+///
+/// The caller must have verified the integrity of `buf` — in this codebase that
+/// means the bytes came from a source with a checked CRC-32C:
+///
+/// * a buffer-pool page, whose checksum `smgr` verifies on every read from disk
+///   (`crabgresql-pg-engine/src/smgr.rs`), or bytes reassembled out of such
+///   pages (the heap's detoast path);
+/// * a WAL record, whose CRC `Record::decode` verifies before returning the
+///   payload (`crabgresql-wal/src/record.rs`).
+///
+/// Bytes read straight out of a file with no checksum — the relation catalog's
+/// image, for instance — must go through [`decode_datum`] instead.
+pub unsafe fn decode_datum_trusted(buf: &[u8], pos: &mut usize) -> Value {
+    decode_datum_inner::<true>(buf, pos)
+}
+
+/// `TRUSTED` selects between the two entry points above; it threads through the
+/// array recursion so a nested `text` element is decoded under the same rule as
+/// its parent.
+fn decode_datum_inner<const TRUSTED: bool>(buf: &[u8], pos: &mut usize) -> Value {
     let mut r = Reader { buf, pos: *pos };
     let tag = r.take(1)[0];
     let v = match tag {
@@ -421,10 +458,29 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_FLOAT4 => Value::Float4(f32::from_bits(r.u32())),
         T_FLOAT8 => Value::Float8(f64::from_bits(r.u64())),
         T_NUMERIC => {
-            let s = std::str::from_utf8(r.var()).expect("numeric text is valid utf-8");
+            let bytes = r.var();
+            let s = if TRUSTED {
+                debug_assert!(std::str::from_utf8(bytes).is_ok(), "numeric text is utf-8");
+                // SAFETY: `decode_datum_trusted`'s contract puts the integrity
+                // of `buf` on its caller, and `encode_datum` only ever writes a
+                // `Numeric`'s decimal rendering here.
+                unsafe { std::str::from_utf8_unchecked(bytes) }
+            } else {
+                std::str::from_utf8(bytes).expect("numeric text is valid utf-8")
+            };
             Value::Numeric(Numeric::parse(s).expect("stored numeric re-parses"))
         }
-        T_TEXT => Value::Text(String::from_utf8(r.var().to_vec()).expect("text is valid utf-8")),
+        T_TEXT => {
+            let bytes = r.var().to_vec();
+            Value::Text(if TRUSTED {
+                debug_assert!(std::str::from_utf8(&bytes).is_ok(), "text is utf-8");
+                // SAFETY: as above — the caller has vouched for `buf`, and these
+                // bytes were written by `encode_datum` out of a `String`.
+                unsafe { String::from_utf8_unchecked(bytes) }
+            } else {
+                String::from_utf8(bytes).expect("text is valid utf-8")
+            })
+        }
         T_BYTEA => Value::Bytea(r.var().to_vec()),
         T_BIT => {
             let len = r.u32();
@@ -585,7 +641,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 if r.take(1)[0] == 0 {
                     elems.push(Value::Null);
                 } else {
-                    elems.push(decode_datum(buf, &mut r.pos));
+                    elems.push(decode_datum_inner::<TRUSTED>(buf, &mut r.pos));
                 }
             }
             Value::Array { elem, elems }
