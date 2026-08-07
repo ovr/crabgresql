@@ -1819,7 +1819,13 @@ impl Iterator for HeapScan {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.buf_idx < self.buffer.len() {
-                let row = self.buffer[self.buf_idx].clone();
+                // Move the values out rather than cloning them: `buf_idx` only
+                // ever advances, and the whole buffer is cleared before the next
+                // block is read, so an emptied slot is never looked at again.
+                // Cloning here would double every text and bytea allocation the
+                // decode above just made.
+                let (tid, vals) = &mut self.buffer[self.buf_idx];
+                let row = (*tid, std::mem::take(vals));
                 self.buf_idx += 1;
                 return Some(Ok(row));
             }
@@ -1832,8 +1838,12 @@ impl Iterator for HeapScan {
             self.buf_idx = 0;
             let page = HeapTable::io(self.engine.bufpool.pin(self.rel, block));
             let raw: Vec<(Tid, Result<tuple::RawTuple, StorageError>)> = page.read(|pg| {
-                let mut out = Vec::new();
-                for off in 1..=page::max_offset(pg) {
+                let max_off = page::max_offset(pg);
+                // Sized up front so the growth ladder does not run inside the
+                // frame lock. Dead line pointers make this a slight over-reserve,
+                // bounded by the page's item count.
+                let mut out = Vec::with_capacity(max_off as usize);
+                for off in 1..=max_off {
                     if let Some(bytes) = page::get_item(pg, off) {
                         // A visible tuple must at least be a full header long.
                         debug_assert!(bytes.len() >= TUPLE_HEADER_LEN);
@@ -1853,6 +1863,7 @@ impl Iterator for HeapScan {
             });
             // Detoast only after the frame lock is released — the scan already
             // buffers a whole block before yielding, so this costs no extra pass.
+            self.buffer.reserve(raw.len());
             for (tid, t) in raw {
                 match t.and_then(|t| t.resolve(|p| detoast(&self.engine, p))) {
                     Ok(vals) => self.buffer.push((tid, vals)),
