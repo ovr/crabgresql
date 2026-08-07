@@ -360,8 +360,8 @@ impl EngineInner {
                         // No visibility test: every tuple in this file is doomed.
                         // The only question is whether the row owns chunks at all,
                         // which `has_external` answers without a full decode.
-                        // SAFETY: `bytes` is an item off a pinned,
-                        // checksum-verified page.
+                        // SAFETY: `bytes` is an item off a pinned page of the
+                        // relation file being discarded.
                         if tuple::decode_header(bytes).has_external
                             && let Ok(raw) = unsafe { tuple::decode_raw(bytes) }
                         {

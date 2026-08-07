@@ -420,24 +420,39 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 /// [`decode_datum`], minus the UTF-8 re-validation on the two kinds where it
 /// shows up in profiles (`text` and `numeric`).
 ///
-/// The bytes were written by [`encode_datum`] from a `String`, so they were
-/// well-formed when they left memory; the only way they are not well-formed on
-/// the way back is if the storage medium corrupted them. This function trusts
-/// the caller to have ruled that out.
-///
 /// # Safety
 ///
-/// The caller must have verified the integrity of `buf` — in this codebase that
-/// means the bytes came from a source with a checked CRC-32C:
+/// `buf` must hold datums that [`encode_datum`] produced and that nothing has
+/// altered since. That is the whole of the requirement, and it is worth stating
+/// plainly, because the two halves of it are underwritten very differently:
 ///
-/// * a buffer-pool page, whose checksum `smgr` verifies on every read from disk
-///   (`crabgresql-pg-engine/src/smgr.rs`), or bytes reassembled out of such
-///   pages (the heap's detoast path);
-/// * a WAL record, whose CRC `Record::decode` verifies before returning the
-///   payload (`crabgresql-wal/src/record.rs`).
+/// * **That the bytes started out well-formed** is a property of this module.
+///   `encode_datum` writes a `text` payload out of a `String` and a `numeric`
+///   payload out of its own decimal rendering, so both are UTF-8 by
+///   construction. This half holds unconditionally.
+/// * **That nothing altered them in between** is a property of the medium, and
+///   it is only *checked* for some media. A page read off disk has its CRC-32C
+///   verified by `smgr` (`crabgresql-pg-engine/src/smgr.rs`), and a WAL record
+///   has its CRC verified by `Record::decode` (`crabgresql-wal/src/record.rs`).
+///   A page belonging to a RAM-backed relation is **not** checksummed at all —
+///   `smgr::read` returns it straight from the memory store — and neither is a
+///   page already resident in the buffer pool re-verified on later reads.
 ///
-/// Bytes read straight out of a file with no checksum — the relation catalog's
-/// image, for instance — must go through [`decode_datum`] instead.
+/// So do not read the CRC as the source of the guarantee; it is a backstop on
+/// the one path where the bytes leave the process's memory and can come back
+/// changed. Where there is no CRC, the caller is relying on the first half
+/// alone: that the encoder wrote these bytes and no memory-safety bug has
+/// scribbled on them since.
+///
+/// A caller that cannot make even that claim — because the bytes came from a
+/// file this module did not write, or from a format whose framing is not
+/// otherwise validated — must use [`decode_datum`]. The relation catalog's
+/// image is the live example: it is a plain `fs::read` with no checksum and no
+/// framing check, so a truncated or garbled file could hand this function
+/// arbitrary bytes, and it stays on the validating path for exactly that reason.
+///
+/// Both trusted arms carry a `debug_assert!` on the encoding, so a bug in the
+/// encoder fails loudly under test rather than silently in release.
 pub unsafe fn decode_datum_trusted(buf: &[u8], pos: &mut usize) -> Value {
     decode_datum_inner::<true>(buf, pos)
 }

@@ -197,11 +197,18 @@ pub struct RawTuple {
 ///
 /// # Safety
 ///
-/// `buf` must be a heap tuple whose integrity has been established — in this
-/// engine, an item read out of a buffer-pool page, whose CRC-32C `smgr` verifies
-/// on every read from disk. The datum codec is invoked in its trusted mode (see
-/// [`decode_datum_trusted`]), so ill-formed UTF-8 in a `text` or `numeric`
-/// attribute is undefined behaviour rather than a panic.
+/// `buf` must be a tuple [`encode_tuple`] wrote, unaltered since. The datum
+/// codec runs in its trusted mode ([`decode_datum_trusted`]), so ill-formed
+/// UTF-8 in a `text` or `numeric` attribute is undefined behaviour here rather
+/// than the panic [`crabgresql_types::datum::decode_datum`] would raise.
+///
+/// In this engine that means an item off a buffer-pool page. Note what does and
+/// does not back that up: a page read from disk has had its CRC-32C checked by
+/// `smgr`, but a page belonging to a RAM-backed relation is never checksummed,
+/// and a page already resident in the pool is not re-verified. The CRC is a
+/// backstop on the disk round trip, not the source of the guarantee — see
+/// [`decode_datum_trusted`] for the full statement of what is actually being
+/// relied on.
 pub unsafe fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
     let head = decode_header(buf);
     // The header is decoded again here rather than passed in: callers run the
@@ -229,8 +236,8 @@ pub unsafe fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
             // `external`.
             vals.push(Value::Null);
         } else {
-            // SAFETY: `decode_raw`'s own contract is that `buf` came off a
-            // checksum-verified page, which is exactly what the trusted decode
+            // SAFETY: `decode_raw`'s own contract is that `buf` is a tuple
+            // `encode_tuple` wrote, which is exactly what the trusted decode
             // asks for.
             vals.push(unsafe { decode_datum_trusted(buf, &mut pos) });
         }
@@ -253,10 +260,12 @@ impl RawTuple {
     ///
     /// # Safety
     ///
-    /// `detoast` must return bytes with the same integrity guarantee
-    /// [`decode_raw`] requires of its own input — the chunks are reassembled with
-    /// the trusted datum codec. Every caller in this engine reads them back off
-    /// checksum-verified pages, so the guarantee carries through.
+    /// `detoast` must return a datum [`encode_datum`] wrote, unaltered since —
+    /// the same requirement [`decode_raw`] places on its own input, and for the
+    /// same reason: the chunks are reassembled with the trusted datum codec.
+    /// Every caller in this engine concatenates them out of pages of the same
+    /// relation file, so the claim carries through unchanged, with the same
+    /// caveats about where the CRC does and does not reach.
     pub unsafe fn resolve(
         mut self,
         detoast: impl Fn(&ToastPointer) -> Result<Vec<u8>, StorageError>,
