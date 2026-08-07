@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: build + test (${{ matrix.os }})
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --workspace --all-targets --locked
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  regress:
+    name: regress (linux)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release -p crabgresql-pg-regress --bin regress --locked
+
+      # Both suites run to completion even when one is red, so the report
+      # covers everything; the job is failed at the end instead.
+      - name: smoke suite
+        id: smoke
+        continue-on-error: true
+        run: |
+          ./target/release/regress \
+            --regress-dir crates/crabgresql-pg-regress/suites/smoke \
+            --schedule crates/crabgresql-pg-regress/suites/smoke/schedule \
+            --no-setup \
+            --outdir target/regress/smoke \
+            --suite-name smoke \
+            --summary target/regress/smoke.md \
+            --summary-full target/regress/smoke-full.md
+
+      - name: upstream must-pass suite
+        id: upstream
+        continue-on-error: true
+        run: |
+          ./target/release/regress \
+            --tests-from crates/crabgresql-pg-regress/suites/upstream_must_pass.txt \
+            --outdir target/regress/upstream \
+            --suite-name upstream_must_pass \
+            --summary target/regress/upstream.md \
+            --summary-full target/regress/upstream-full.md
+
+      # The job summary page has room for every test; the pull request comment
+      # gets the same report with only the slowest ones ("" vs "-full").
+      - name: build report
+        if: always()
+        run: |
+          render() {
+            echo "## Regress (linux) — ${GITHUB_SHA::7}"
+            echo
+            cat "target/regress/smoke$1.md" 2>/dev/null \
+              || echo '### ⚠️ smoke — did not produce a summary'
+            echo
+            cat "target/regress/upstream$1.md" 2>/dev/null \
+              || echo '### ⚠️ upstream_must_pass — did not produce a summary'
+            echo
+          }
+          {
+            echo '<!-- crabgresql-regress-report -->'
+            render ""
+            echo "[Full list and run details](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          } > target/regress/report.md
+          render "-full" >> "$GITHUB_STEP_SUMMARY"
+
+      # Fork pull requests get a read-only token, so commenting would fail.
+      - name: comment on the pull request
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.body | contains("<!-- crabgresql-regress-report -->")) | .id' \
+            | head -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -F body=@target/regress/report.md > /dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              -F body=@target/regress/report.md > /dev/null
+          fi
+
+      - name: upload diffs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-diffs
+          path: target/regress/**/regression.diffs
+          if-no-files-found: ignore
+
+      - name: fail on regressions
+        if: steps.smoke.outcome != 'success' || steps.upstream.outcome != 'success'
+        run: |
+          echo "smoke: ${{ steps.smoke.outcome }}, upstream: ${{ steps.upstream.outcome }}"
+          exit 1

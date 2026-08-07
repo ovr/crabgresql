@@ -1,0 +1,134 @@
+--
+-- AGGREGATE
+-- The five standard aggregates (count, min, max, sum, avg) over a whole table
+-- and with GROUP BY / HAVING. Covers NULL handling (ignored, except count(*)),
+-- empty-group semantics (count 0, others NULL), sum/avg output types, and the
+-- grouping errors PG reports for ungrouped columns and misplaced aggregates.
+--
+CREATE TABLE agg (id integer, grp integer, val integer, big bigint, txt text);
+INSERT INTO agg VALUES
+  (1, 1, 10, 1000000000000, 'apple'),
+  (2, 1, 20, 2000000000000, 'banana'),
+  (3, 2, 5, 3000000000000, NULL),
+  (4, 2, NULL, NULL, 'cherry'),
+  (5, 3, 7, 4000000000000, 'date');
+-- whole-table aggregates: count(*) counts rows, count(val) skips the NULL
+SELECT count(*), count(val), count(txt) FROM agg;
+ count | count | count 
+-------+-------+-------
+     5 |     4 |     4
+(1 row)
+
+-- min/max/sum ignore NULL; sum(int) widens to bigint; avg(int) is numeric
+SELECT min(val), max(val), sum(val), avg(val) FROM agg;
+ min | max | sum |         avg         
+-----+-----+-----+---------------------
+   5 |  20 |  42 | 10.5000000000000000
+(1 row)
+
+-- min/max over text
+SELECT min(txt), max(txt) FROM agg;
+  min  | max  
+-------+------
+ apple | date
+(1 row)
+
+-- sum(bigint) is numeric, avg(bigint) is numeric
+SELECT sum(big), avg(big) FROM agg;
+      sum       |        avg         
+----------------+--------------------
+ 10000000000000 | 2500000000000.0000
+(1 row)
+
+-- an aggregate expression and an alias
+SELECT max(val) - min(val) AS span FROM agg;
+ span 
+------
+   15
+(1 row)
+
+-- a bare constant alongside an aggregate
+SELECT 'total' AS label, count(*) FROM agg;
+ label | count 
+-------+-------
+ total |     5
+(1 row)
+
+-- GROUP BY with ORDER BY on the grouping column
+SELECT grp, count(*), sum(val), min(val), max(val) FROM agg GROUP BY grp ORDER BY grp;
+ grp | count | sum | min | max 
+-----+-------+-----+-----+-----
+   1 |     2 |  30 |  10 |  20
+   2 |     2 |   5 |   5 |   5
+   3 |     1 |   7 |   7 |   7
+(3 rows)
+
+-- a compound expression over the grouping column
+SELECT grp, grp * 10 AS scaled, count(*) FROM agg GROUP BY grp ORDER BY 1;
+ grp | scaled | count 
+-----+--------+-------
+   1 |     10 |     2
+   2 |     20 |     2
+   3 |     30 |     1
+(3 rows)
+
+-- GROUP BY ordinal
+SELECT grp, count(*) FROM agg GROUP BY 1 ORDER BY 1;
+ grp | count 
+-----+-------
+   1 |     2
+   2 |     2
+   3 |     1
+(3 rows)
+
+-- HAVING filters groups after aggregation
+SELECT grp, count(*) FROM agg GROUP BY grp HAVING count(*) > 1 ORDER BY grp;
+ grp | count 
+-----+-------
+   1 |     2
+   2 |     2
+(2 rows)
+
+-- GROUP BY with no aggregate is a distinct
+SELECT grp FROM agg GROUP BY grp ORDER BY grp;
+ grp 
+-----
+   1
+   2
+   3
+(3 rows)
+
+-- WHERE filters before aggregation; an empty group still yields one row
+SELECT count(*), sum(val) FROM agg WHERE id > 100;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+-- a FROM-less aggregate runs over the single virtual row
+SELECT count(*);
+ count 
+-------
+     1
+(1 row)
+
+-- errors: an ungrouped column may not appear outside an aggregate
+SELECT grp, count(*) FROM agg;
+ERROR:  column "agg.grp" must appear in the GROUP BY clause or be used in an aggregate function
+-- errors: aggregates are not allowed in WHERE
+SELECT count(*) FROM agg WHERE count(*) > 1;
+ERROR:  aggregate functions are not allowed in WHERE
+-- errors: aggregate calls cannot be nested
+SELECT max(min(val)) FROM agg;
+ERROR:  aggregate function calls cannot be nested
+-- errors: no sum over text
+SELECT sum(txt) FROM agg;
+ERROR:  function sum(text) does not exist
+-- DISTINCT eliminates duplicate non-NULL aggregate inputs
+SELECT count(DISTINCT grp), sum(DISTINCT grp), avg(DISTINCT grp), min(DISTINCT grp), max(DISTINCT grp) FROM agg;
+ count | sum |        avg         | min | max 
+-------+-----+--------------------+-----+-----
+     3 |   6 | 2.0000000000000000 |   1 |   3
+(1 row)
+
+-- End aggregate tests.

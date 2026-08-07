@@ -1,0 +1,114 @@
+--
+-- SCHEMA-QUALIFIED TYPE NAMES
+-- Built-in types live in pg_catalog, so `pg_catalog.int4` and a bare `int4`
+-- name the same type. psql's \d leans on the qualified spelling throughout
+-- (`::pg_catalog.text`, `::pg_catalog.int2[]`), including inside array types.
+--
+-- the qualified and bare spellings are the same type, and name the column alike
+SELECT 1::pg_catalog.int4 AS qualified, 1::int4 AS bare;
+ qualified | bare 
+-----------+------
+         1 |    1
+(1 row)
+
+-- every builtin answers to its catalog spelling under the qualifier
+SELECT 'a'::pg_catalog.text AS t, 1::pg_catalog.int8 AS i8, true::pg_catalog.bool AS b;
+ t | i8 | b 
+---+----+---
+ a |  1 | t
+(1 row)
+
+-- the SQL spelling of a type resolves the same way when written bare
+SELECT 1::integer AS spelled_out, 1.5::decimal AS dec;
+ spelled_out | dec 
+-------------+-----
+           1 | 1.5
+(1 row)
+
+-- a qualified element type inside an array type
+SELECT ARRAY[1,2]::pg_catalog.int2[] AS arr;
+  arr  
+-------
+ {1,2}
+(1 row)
+
+-- casting through a qualified name in a WHERE clause
+CREATE TABLE qt (id integer, label text);
+INSERT INTO qt VALUES (1, 'one'), (2, 'two');
+SELECT label FROM qt WHERE id = '2'::pg_catalog.int4;
+ label 
+-------
+ two
+(1 row)
+
+-- and in a column definition
+CREATE TABLE qt2 (a pg_catalog.int4, b pg_catalog.text);
+INSERT INTO qt2 VALUES (7, 'seven');
+SELECT a, b FROM qt2;
+ a |   b   
+---+-------
+ 7 | seven
+(1 row)
+
+-- A name that is not a builtin still falls through to the user-type catalog,
+-- and a builtin stays reachable alongside it.
+CREATE TYPE qmood AS ENUM ('ok', 'bad');
+SELECT 'ok'::qmood AS user_type;
+ user_type 
+-----------
+ ok
+(1 row)
+
+SELECT 1::pg_catalog.int4 AS builtin_still;
+ builtin_still 
+---------------
+             1
+(1 row)
+
+-- A qualifier other than pg_catalog does not reach a builtin: it names a type
+-- in that schema. Two cases are left out of this suite as known divergences —
+-- `SELECT 1::public.int4` errors in both, but PG reports the quirky
+-- `type "public.int4" is only a shell`; and a qualified *user* type name
+-- (`CREATE TYPE qs.int4` / `'x'::qs.int4`) is not supported yet at all.
+DROP TABLE qt;
+DROP TABLE qt2;
+DROP TYPE qmood;
+-- A user type may take a builtin's name. CREATE names the schema to create in
+-- rather than resolving through the search path, so `public.int4` is created
+-- beside `pg_catalog.int4` — but pg_catalog comes first for an unqualified
+-- reference, so `int4` keeps meaning the builtin, and DROP, which does resolve
+-- through the path, names the builtin and refuses.
+CREATE TYPE int4 AS ENUM ('shadow');
+SELECT 1::int4 AS builtin_wins;
+ builtin_wins 
+--------------
+            1
+(1 row)
+
+SELECT count(*) AS both FROM pg_type WHERE typname = 'int4';
+ both 
+------
+    2
+(1 row)
+
+SELECT typnamespace FROM pg_type WHERE typname = 'int4' ORDER BY typnamespace;
+ typnamespace 
+--------------
+           11
+         2200
+(2 rows)
+
+DROP TYPE int4;
+ERROR:  cannot drop type integer because it is required by the database system
+-- A second one in the same schema is still a duplicate.
+CREATE TYPE int4 AS ENUM ('again');
+ERROR:  type "int4" already exists
+-- Saying `public.` is the only way to name the shadowing type, so it is also
+-- the only way to drop one.
+DROP TYPE public.int4;
+SELECT count(*) AS just_the_builtin FROM pg_type WHERE typname = 'int4';
+ just_the_builtin 
+------------------
+                1
+(1 row)
+

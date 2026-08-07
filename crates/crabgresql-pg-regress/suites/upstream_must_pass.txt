@@ -1,0 +1,23 @@
+# Upstream regression tests (vendor/postgres/regress) that must pass.
+# `cargo test -p crabgresql-pg-regress` fails if any test listed here regresses.
+# Promote tests here as SQL coverage grows; one name per line.
+bit
+boolean
+char
+circle
+comments
+float4
+float8
+int2
+line
+lseg
+macaddr
+macaddr8
+md5
+money
+oid
+path
+portals_p2
+time
+timetz
+varchar

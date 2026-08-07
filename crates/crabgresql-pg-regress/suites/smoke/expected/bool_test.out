@@ -1,0 +1,168 @@
+--
+-- BOOLEAN TESTS
+-- IS [NOT] TRUE / FALSE / UNKNOWN: the standard way to collapse three-valued
+-- logic to two. Unlike a comparison, these never yield NULL.
+--
+-- the full truth table over the three boolean values
+SELECT b,
+       b IS TRUE      AS is_t,
+       b IS NOT TRUE  AS is_not_t,
+       b IS FALSE     AS is_f,
+       b IS NOT FALSE AS is_not_f
+  FROM (VALUES (true), (false), (NULL::boolean)) v(b);
+ b | is_t | is_not_t | is_f | is_not_f 
+---+------+----------+------+----------
+ t | t    | f        | f    | t
+ f | f    | t        | t    | f
+   | f    | t        | f    | t
+(3 rows)
+
+-- IS UNKNOWN is IS NULL on a boolean operand
+SELECT b, b IS UNKNOWN AS unk, b IS NULL AS nul, b IS NOT UNKNOWN AS not_unk
+  FROM (VALUES (true), (false), (NULL::boolean)) v(b);
+ b | unk | nul | not_unk 
+---+-----+-----+---------
+ t | f   | f   | t
+ f | f   | f   | t
+   | t   | t   | f
+(3 rows)
+
+-- the default column name is ?column?, not the clause spelling
+SELECT true IS TRUE;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- an untyped literal takes boolean from the test, so 'true'/'f' parse
+SELECT 'true' IS TRUE AS lit_t, 'f' IS FALSE AS lit_f;
+ lit_t | lit_f 
+-------+-------
+ t     | t
+(1 row)
+
+-- over a table column, including a NULL row
+CREATE TABLE flags (name text, ok boolean);
+INSERT INTO flags VALUES ('a', true), ('b', false), ('c', NULL);
+SELECT name, ok IS TRUE AS yes, ok IS NOT TRUE AS not_yes FROM flags ORDER BY name;
+ name | yes | not_yes 
+------+-----+---------
+ a    | t   | f
+ b    | f   | t
+ c    | f   | t
+(3 rows)
+
+-- in a WHERE predicate: IS NOT TRUE keeps the NULL row, <> true drops it
+SELECT name FROM flags WHERE ok IS NOT TRUE ORDER BY name;
+ name 
+------
+ b
+ c
+(2 rows)
+
+SELECT name FROM flags WHERE ok <> true ORDER BY name;
+ name 
+------
+ b
+(1 row)
+
+-- IS UNKNOWN in WHERE selects exactly the NULL row
+SELECT name FROM flags WHERE ok IS UNKNOWN;
+ name 
+------
+ c
+(1 row)
+
+-- a comparison is itself a boolean, so the tests compose with one
+SELECT name FROM flags WHERE (ok = true) IS NOT TRUE ORDER BY name;
+ name 
+------
+ b
+ c
+(2 rows)
+
+-- IS binds tighter than NOT. Only a NULL operand tells the two parses apart:
+-- NOT (NULL IS FALSE) is true, whereas (NOT NULL) IS FALSE is false.
+SELECT NOT NULL::boolean IS FALSE AS chained;
+ chained 
+---------
+ t
+(1 row)
+
+-- EXPLAIN prints every spelling back, and IS UNKNOWN does not become IS NULL
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS TRUE;
+       QUERY PLAN       
+------------------------
+ Seq Scan on flags
+   Filter: (ok IS TRUE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT TRUE;
+         QUERY PLAN         
+----------------------------
+ Seq Scan on flags
+   Filter: (ok IS NOT TRUE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS FALSE;
+       QUERY PLAN        
+-------------------------
+ Seq Scan on flags
+   Filter: (ok IS FALSE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT FALSE;
+         QUERY PLAN          
+-----------------------------
+ Seq Scan on flags
+   Filter: (ok IS NOT FALSE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS UNKNOWN;
+        QUERY PLAN         
+---------------------------
+ Seq Scan on flags
+   Filter: (ok IS UNKNOWN)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE ok IS NOT UNKNOWN;
+          QUERY PLAN           
+-------------------------------
+ Seq Scan on flags
+   Filter: (ok IS NOT UNKNOWN)
+(2 rows)
+
+-- a composite operand is parenthesized, and IS NULL renders alongside
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE (name IS NULL) IS TRUE;
+             QUERY PLAN             
+------------------------------------
+ Seq Scan on flags
+   Filter: ((name IS NULL) IS TRUE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name FROM flags WHERE name IS NOT NULL;
+          QUERY PLAN          
+------------------------------
+ Seq Scan on flags
+   Filter: (name IS NOT NULL)
+(2 rows)
+
+-- error: the operand must be boolean, and the cursor points at the operand
+SELECT 1 IS TRUE;
+ERROR:  argument of IS TRUE must be type boolean, not type integer
+LINE 1: SELECT 1 IS TRUE;
+               ^
+SELECT 1 IS UNKNOWN;
+ERROR:  argument of IS UNKNOWN must be type boolean, not type integer
+LINE 1: SELECT 1 IS UNKNOWN;
+               ^
+SELECT 1 IS NOT FALSE;
+ERROR:  argument of IS NOT FALSE must be type boolean, not type integer
+LINE 1: SELECT 1 IS NOT FALSE;
+               ^
+-- error: an untyped literal that is not a valid boolean
+SELECT 'a' IS TRUE;
+ERROR:  invalid input syntax for type boolean: "a"
+LINE 1: SELECT 'a' IS TRUE;
+               ^
+DROP TABLE flags;

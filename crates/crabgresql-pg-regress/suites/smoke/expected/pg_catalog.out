@@ -1,0 +1,141 @@
+--
+-- PG_CATALOG
+-- Core pg_catalog relations are queryable, both schema-qualified
+-- (pg_catalog.pg_type) and unqualified (pg_catalog is implicitly on the search
+-- path). Queries touch only columns/values that match PostgreSQL exactly;
+-- count(*) is avoided because crabgresql exposes a curated subset of the
+-- built-in types. Output hand-checked against PostgreSQL's psql -a -q format.
+--
+-- unqualified pg_type resolves via the implicit pg_catalog search path
+SELECT oid, typname, typlen, typbyval
+  FROM pg_type
+ WHERE typname IN ('bool', 'int4', 'text')
+ ORDER BY oid;
+ oid | typname | typlen | typbyval 
+-----+---------+--------+----------
+  16 | bool    |      1 | t
+  23 | int4    |      4 | t
+  25 | text    |     -1 | f
+(3 rows)
+
+-- driver-critical OIDs match PostgreSQL (23 = int4, 25 = text, 26 = oid)
+SELECT typname FROM pg_type WHERE oid = 23;
+ typname 
+---------
+ int4
+(1 row)
+
+-- schema-qualified access routes straight to pg_catalog
+SELECT oid, typname, typcategory FROM pg_catalog.pg_type WHERE typname = 'oid';
+ oid | typname | typcategory 
+-----+---------+-------------
+  26 | oid     | N
+(1 row)
+
+-- ORDER BY on an oid column
+SELECT typname
+  FROM pg_type
+ WHERE typname IN ('text', 'bool', 'int4')
+ ORDER BY oid;
+ typname 
+---------
+ bool
+ int4
+ text
+(3 rows)
+
+-- pg_namespace exposes the reserved schemas and public
+SELECT oid, nspname
+  FROM pg_namespace
+ WHERE nspname IN ('pg_catalog', 'pg_toast', 'public')
+ ORDER BY oid;
+ oid  |  nspname   
+------+------------
+   11 | pg_catalog
+   99 | pg_toast
+ 2200 | public
+(3 rows)
+
+-- a user table and pg_catalog resolve independently on the same statement stream
+CREATE TABLE pgcat_demo (a int, b text);
+INSERT INTO pgcat_demo VALUES (1, 'x');
+SELECT typname FROM pg_catalog.pg_type WHERE typname = 'int4';
+ typname 
+---------
+ int4
+(1 row)
+
+SELECT a, b FROM pgcat_demo;
+ a | b 
+---+---
+ 1 | x
+(1 row)
+
+-- pg_class reflects a live user relation
+CREATE TABLE pgcat_reflect (id int4, label text);
+SELECT relname, relkind, relnatts, relpersistence
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
+    relname    | relkind | relnatts | relpersistence 
+---------------+---------+----------+----------------
+ pgcat_reflect | r       |        2 | p
+(1 row)
+
+-- size bookkeeping is only written by ANALYZE, so a fresh relation reports
+-- PG's never-analyzed sentinel: no pages, reltuples = -1 (unknown, not zero)
+SELECT relname, relpages, reltuples, relallvisible
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
+    relname    | relpages | reltuples | relallvisible 
+---------------+----------+-----------+---------------
+ pgcat_reflect |        0 |        -1 |             0
+(1 row)
+
+-- pg_attribute joined to pg_class lists that relation's columns, in order,
+-- with PG's type OIDs (23 = int4, 25 = text) and typlen (-1 = varlena)
+SELECT a.attname, a.atttypid, a.attlen, a.attnum
+  FROM pg_class c, pg_attribute a
+ WHERE a.attrelid = c.oid AND c.relname = 'pgcat_reflect'
+ ORDER BY a.attnum;
+ attname | atttypid | attlen | attnum 
+---------+----------+--------+--------
+ id      |       23 |      4 |      1
+ label   |       25 |     -1 |      2
+(2 rows)
+
+-- pg_cast: int4 -> int8 is an implicit cast, int8 -> int4 is assignment-only
+SELECT castsource, casttarget, castcontext
+  FROM pg_cast
+ WHERE castsource IN (20, 23) AND casttarget IN (20, 23)
+ ORDER BY castsource, casttarget;
+ castsource | casttarget | castcontext 
+------------+------------+-------------
+         20 |         23 | a
+         23 |         20 | i
+(2 rows)
+
+-- a schema-qualified write reaches the permanent relation (INSERT accepts the
+-- public. qualifier symmetrically with SELECT/UPDATE)
+CREATE TABLE pgcat_pub (v int);
+INSERT INTO public.pgcat_pub VALUES (7);
+UPDATE public.pgcat_pub SET v = v + 1;
+SELECT v FROM public.pgcat_pub;
+ v 
+---
+ 8
+(1 row)
+
+-- a temp relation is reflected into pg_class
+CREATE TEMP TABLE pgcat_tmp (z int);
+SELECT relname, relnatts FROM pg_class WHERE relname = 'pgcat_tmp';
+  relname  | relnatts 
+-----------+----------
+ pgcat_tmp |        1
+(1 row)
+
+-- a qualified miss reports the schema in the 42P01 message, as PG does
+SELECT * FROM pg_catalog.no_such_catalog;
+ERROR:  relation "pg_catalog.no_such_catalog" does not exist
+-- writing a system catalog is refused
+INSERT INTO pg_catalog.pg_type VALUES (1);
+ERROR:  permission denied for table pg_type

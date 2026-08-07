@@ -1,0 +1,79 @@
+--
+-- CIDR
+-- cidr: a network specification. Input canonicalizes (masks host bits, infers
+-- the masklen from the octet count) and always prints the `/bits` suffix; host
+-- bits set to the right of the mask are rejected. Output hand-checked against
+-- PostgreSQL's aligned format.
+--
+-- typed-literal output; the masklen is inferred from the octets written
+SELECT cidr '192.168.1' AS three_octets, cidr '10' AS one_octet;
+  three_octets  | one_octet  
+----------------+------------
+ 192.168.1.0/24 | 10.0.0.0/8
+(1 row)
+
+-- the bare masklen follows the first octet's historical class, widened to the
+-- octets written (class B/C/E are not a flat octets*8)
+SELECT cidr '128' AS class_b, cidr '192' AS class_c, cidr '240' AS class_e;
+   class_b    |   class_c    |   class_e    
+--------------+--------------+--------------
+ 128.0.0.0/16 | 192.0.0.0/24 | 240.0.0.0/32
+(1 row)
+
+-- an explicit mask, and IPv6
+SELECT cidr '192.168.100.0/24' AS v4, cidr '2001:db8::/32' AS v6;
+        v4        |      v6       
+------------------+---------------
+ 192.168.100.0/24 | 2001:db8::/32
+(1 row)
+
+-- casts: text -> cidr and cidr -> text
+SELECT '10.1.0.0/16'::cidr;
+    cidr     
+-------------
+ 10.1.0.0/16
+(1 row)
+
+SELECT (cidr '10.1.0.0/16')::text;
+    text     
+-------------
+ 10.1.0.0/16
+(1 row)
+
+-- ordering (network_cmp)
+SELECT c FROM (VALUES
+    (cidr '10.0.0.0/16'),
+    (cidr '10.0.0.0/8'),
+    (cidr '192.168.0.0/16')
+) AS t(c) ORDER BY 1;
+       c        
+----------------
+ 10.0.0.0/8
+ 10.0.0.0/16
+ 192.168.0.0/16
+(3 rows)
+
+-- field functions on cidr
+SELECT masklen(cidr '10.1.0.0/16') AS masklen,
+       family(cidr '10.1.0.0/16')  AS family,
+       network(cidr '10.1.2.0/24') AS network,
+       abbrev(cidr '10.1.0.0/16')  AS abbrev;
+ masklen | family |   network   | abbrev  
+---------+--------+-------------+---------
+      16 |      4 | 10.1.2.0/24 | 10.1/16
+(1 row)
+
+-- abbrev on IPv6 truncates the address to the masked prefix
+SELECT abbrev(cidr '2001:db8::/32')     AS a32,
+       abbrev(cidr '2001:db8:0:1::/64') AS a64;
+     a32     |      a64       
+-------------+----------------
+ 2001:db8/32 | 2001:db8::1/64
+(1 row)
+
+-- host bits set to the right of the mask are rejected, with DETAIL
+SELECT cidr '192.168.1.1/24';
+ERROR:  invalid cidr value: "192.168.1.1/24"
+LINE 1: SELECT cidr '192.168.1.1/24';
+                    ^
+DETAIL:  Value has bits set to right of mask.

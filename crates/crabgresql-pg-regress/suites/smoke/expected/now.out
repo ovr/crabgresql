@@ -1,0 +1,228 @@
+--
+-- NOW (the transaction clock)
+-- the clock functions, the CURRENT_TIMESTAMP keyword family, and the
+-- current-relative input specials. Every answer here is a boolean, a
+-- difference or a fixed value: the expected output is golden text, so a real
+-- timestamp in it would go stale one microsecond later. Output hand-checked
+-- against PostgreSQL.
+--
+SET TimeZone = 'UTC';
+-- now() is the transaction timestamp; the statement's is at or after it, and
+-- the wall clock at or after that.
+BEGIN;
+SELECT now() = transaction_timestamp() AS same_thing,
+       now() <= statement_timestamp() AS xact_first,
+       statement_timestamp() <= clock_timestamp() AS stmt_before_wall;
+ same_thing | xact_first | stmt_before_wall 
+------------+------------+------------------
+ t          | t          | t
+(1 row)
+
+-- and it stays put across the block, unlike the wall clock
+SELECT now() = transaction_timestamp() AS still_the_same;
+ still_the_same 
+----------------
+ t
+(1 row)
+
+-- 'now' is the transaction timestamp, to the microsecond
+SELECT 'now'::timestamptz = now() AS now_is_xact,
+       'now'::timestamp = now()::timestamp AS now_is_local_wall_clock;
+ now_is_xact | now_is_local_wall_clock 
+-------------+-------------------------
+ t           | t
+(1 row)
+
+-- the keyword forms are exactly casts of now()
+SELECT current_timestamp = now() AS cts,
+       localtimestamp = now()::timestamp AS lts,
+       current_date = now()::date AS cd,
+       current_time = now()::timetz AS ct,
+       localtime = now()::time AS lt;
+ cts | lts | cd | ct | lt 
+-----+-----+----+----+----
+ t   | t   | t  | t  | t
+(1 row)
+
+-- a precision modifier rounds to that many fractional digits, so the result is
+-- within half a second of the unrounded one either way. (Compared as
+-- `timestamp`, since `timestamptz` has no subtraction operator yet.)
+SELECT localtimestamp(0) - localtimestamp <= interval '500 milliseconds'
+   AND localtimestamp - localtimestamp(0) <= interval '500 milliseconds'
+       AS rounds_to_seconds;
+ rounds_to_seconds 
+-------------------
+ t
+(1 row)
+
+-- (`current_timestamp(7)` clamps to 6 here but also raises a WARNING in
+-- PostgreSQL, so it is pinned by an e2e test rather than by golden text.)
+COMMIT;
+-- under autocommit the transaction is the statement
+SELECT now() = statement_timestamp() AS autocommit_coincides;
+ autocommit_coincides 
+----------------------
+ t
+(1 row)
+
+-- today/tomorrow/yesterday are date field tokens, one day apart
+SELECT 'tomorrow'::date - 'today'::date AS ahead,
+       'today'::date - 'yesterday'::date AS behind;
+ ahead | behind 
+-------+--------
+     1 |      1
+(1 row)
+
+SELECT 'today'::date = current_date AS today_is_today;
+ today_is_today 
+----------------
+ t
+(1 row)
+
+-- being fields, they combine with a time, in either order
+SELECT 'today 10:00'::timestamp - 'today'::timestamp AS ten_hours;
+ ten_hours 
+-----------
+ 10:00:00
+(1 row)
+
+SELECT '10:00 today'::timestamp = 'today 10:00'::timestamp AS order_free;
+ order_free 
+------------
+ t
+(1 row)
+
+SELECT 'yesterday 23:59:59.5'::timestamp - 'yesterday'::timestamp AS almost_a_day;
+ almost_a_day 
+--------------
+ 23:59:59.5
+(1 row)
+
+-- 'now' is not a field: it takes no company
+SELECT 'now 10:00'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "now 10:00"
+LINE 1: SELECT 'now 10:00'::timestamp;
+               ^
+SELECT 'now EST'::timestamptz;
+ERROR:  invalid input syntax for type timestamp with time zone: "now EST"
+LINE 1: SELECT 'now EST'::timestamptz;
+               ^
+-- ...and a relative token conflicts with any other field that fixes the date,
+-- a month name included
+SELECT 'today today'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "today today"
+LINE 1: SELECT 'today today'::timestamp;
+               ^
+SELECT '2020-01-01 today'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "2020-01-01 today"
+LINE 1: SELECT '2020-01-01 today'::timestamp;
+               ^
+SELECT 'Feb today'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "Feb today"
+LINE 1: SELECT 'Feb today'::timestamp;
+               ^
+SELECT 'today 5'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "today 5"
+LINE 1: SELECT 'today 5'::timestamp;
+               ^
+-- the reserved words that are whole values everywhere are errors in company
+SELECT '2020-01-01 epoch'::timestamp;
+ERROR:  invalid input syntax for type timestamp: "2020-01-01 epoch"
+LINE 1: SELECT '2020-01-01 epoch'::timestamp;
+               ^
+SELECT 'now 10:00'::time;
+ERROR:  invalid input syntax for type time: "now 10:00"
+LINE 1: SELECT 'now 10:00'::time;
+               ^
+SELECT 'today 10:00'::time;
+ERROR:  invalid input syntax for type time: "today 10:00"
+LINE 1: SELECT 'today 10:00'::time;
+               ^
+SELECT '10:00 allballs'::timetz;
+ERROR:  invalid input syntax for type time with time zone: "10:00 allballs"
+LINE 1: SELECT '10:00 allballs'::timetz;
+               ^
+-- a relative literal resolves through every route to the type, not just a bare
+-- one: an explicit text cast and an array element reach the same input function
+SELECT 'now'::text::timestamp = now()::timestamp AS via_text_cast,
+       ('{now}'::timestamp[])[1] = now()::timestamp AS via_array;
+ via_text_cast | via_array 
+---------------+-----------
+ t             | t
+(1 row)
+
+SELECT pg_input_is_valid('{now}', 'timestamp[]') AS array_soft_input;
+ array_soft_input 
+------------------
+ t
+(1 row)
+
+-- allballs is midnight, and always at +00 — unlike 'now', which takes the
+-- session zone's offset
+SELECT 'allballs'::time AS t, 'allballs'::timetz AS ttz;
+    t     |     ttz     
+----------+-------------
+ 00:00:00 | 00:00:00+00
+(1 row)
+
+SET TimeZone = 'America/New_York';
+SELECT 'allballs'::timetz AS still_utc;
+  still_utc  
+-------------
+ 00:00:00+00
+(1 row)
+
+SELECT 'today'::date = now()::date AS today_follows_the_session_zone;
+ today_follows_the_session_zone 
+--------------------------------
+ t
+(1 row)
+
+SET TimeZone = 'UTC';
+-- time and timetz take only those two specials; the date-shaped ones have no
+-- time of day to name
+SELECT 'today'::time;
+ERROR:  invalid input syntax for type time: "today"
+LINE 1: SELECT 'today'::time;
+               ^
+SELECT 'epoch'::time;
+ERROR:  invalid input syntax for type time: "epoch"
+LINE 1: SELECT 'epoch'::time;
+               ^
+SELECT 'infinity'::time;
+ERROR:  invalid input syntax for type time: "infinity"
+LINE 1: SELECT 'infinity'::time;
+               ^
+SELECT 'today'::timetz;
+ERROR:  invalid input syntax for type time with time zone: "today"
+LINE 1: SELECT 'today'::timetz;
+               ^
+-- ...and a date takes no time-only special
+SELECT 'allballs'::date;
+ERROR:  invalid input syntax for type date: "allballs"
+LINE 1: SELECT 'allballs'::date;
+               ^
+-- case and surrounding space are insignificant
+SELECT '  ToDaY  '::date = current_date AS lenient;
+ lenient 
+---------
+ t
+(1 row)
+
+-- the keyword forms are grammar, so their modifier is a bare integer literal
+SELECT current_date(0);
+ERROR:  syntax error at or near "("
+LINE 1: SELECT current_date(0);
+                           ^
+SELECT current_timestamp(-1);
+ERROR:  syntax error at or near "-"
+LINE 1: SELECT current_timestamp(-1);
+                                 ^
+SELECT current_timestamp(1+1);
+ERROR:  syntax error at or near "+"
+LINE 1: SELECT current_timestamp(1+1);
+                                  ^
+SELECT current_time(3::int);
+ERROR:  syntax error at or near "::"
+LINE 1: SELECT current_time(3::int);
+                             ^

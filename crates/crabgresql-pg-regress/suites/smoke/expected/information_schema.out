@@ -1,0 +1,54 @@
+-- INFORMATION_SCHEMA
+-- Core discovery views are schema-qualified, live, and derived from the table
+-- metadata CrabgreSQL currently represents.
+CREATE TABLE is_demo (id int4, label varchar(12), created_at timestamptz);
+SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into, is_typed
+  FROM information_schema.tables
+ WHERE table_name = 'is_demo';
+ table_catalog | table_schema | table_name | table_type | is_insertable_into | is_typed 
+---------------+--------------+------------+------------+--------------------+----------
+ regression    | public       | is_demo    | BASE TABLE | YES                | NO
+(1 row)
+
+SELECT column_name, ordinal_position, data_type, character_maximum_length,
+       datetime_precision, udt_schema, udt_name, is_generated, is_updatable
+  FROM information_schema.columns
+ WHERE table_name = 'is_demo'
+ ORDER BY ordinal_position;
+ column_name | ordinal_position |        data_type         | character_maximum_length | datetime_precision | udt_schema |  udt_name   | is_generated | is_updatable 
+-------------+------------------+--------------------------+--------------------------+--------------------+------------+-------------+--------------+--------------
+ id          |                1 | integer                  |                          |                    | pg_catalog | int4        | NEVER        | YES
+ label       |                2 | character varying        |                       12 |                    | pg_catalog | varchar     | NEVER        | YES
+ created_at  |                3 | timestamp with time zone |                          |                  6 | pg_catalog | timestamptz | NEVER        | YES
+(3 rows)
+
+SELECT schema_name, schema_owner
+  FROM information_schema.schemata
+ WHERE schema_name IN ('information_schema', 'pg_catalog', 'public')
+ ORDER BY schema_name;
+    schema_name     | schema_owner 
+--------------------+--------------
+ information_schema | postgres
+ pg_catalog         | postgres
+ public             | postgres
+(3 rows)
+
+CREATE TEMP TABLE is_tmp (v int4);
+SELECT table_name, table_type
+  FROM information_schema.tables
+ WHERE table_name = 'is_tmp';
+ table_name |   table_type    
+------------+-----------------
+ is_tmp     | LOCAL TEMPORARY
+(1 row)
+
+DROP TABLE is_demo;
+SELECT table_name FROM information_schema.tables WHERE table_name = 'is_demo';
+ table_name 
+------------
+(0 rows)
+
+SELECT * FROM tables;
+ERROR:  relation "tables" does not exist
+INSERT INTO information_schema.tables VALUES (1);
+ERROR:  permission denied for table tables

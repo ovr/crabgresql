@@ -1,0 +1,314 @@
+--
+-- JSONPATH
+-- The SQL/JSON path language and the jsonb_path_* functions / @? @@ operators.
+-- Covers jsonpath I/O (canonical output), casts, navigation, filters, item
+-- methods, arithmetic, lax vs strict, variables, silent mode, and the operator
+-- forms. Output hand-checked against PostgreSQL.
+--
+-- jsonpath input is re-emitted in canonical form: keys are always double-quoted,
+-- arithmetic is fully parenthesized, and 'lax' is the (elided) default.
+SELECT '$.a.b[*] ? (@ > 3)'::jsonpath;
+       jsonpath       
+----------------------
+ $."a"."b"[*]?(@ > 3)
+(1 row)
+
+SELECT 'lax $."a b"[1 to 3, 5].size()'::jsonpath;
+         jsonpath         
+--------------------------
+ $."a b"[1 to 3,5].size()
+(1 row)
+
+SELECT 'strict $.a.**{2 to 4}.c'::jsonpath;
+          jsonpath           
+-----------------------------
+ strict $."a".**{2 to 4}."c"
+(1 row)
+
+SELECT '$.a + $.b * 2 - (-3)'::jsonpath AS arith;
+           arith            
+----------------------------
+ (($."a" + $."b" * 2) - -3)
+(1 row)
+
+SELECT '$ ? (@ like_regex "ab.*c" flag "i")'::jsonpath AS re;
+                re                 
+-----------------------------------
+ $?(@ like_regex "ab.*c" flag "i")
+(1 row)
+
+-- like_regex flags are re-emitted from the parsed set: fixed order, deduped,
+-- and omitted when empty
+SELECT '$ ? (@ like_regex "a" flag "qmi")'::jsonpath AS re_ord,
+       '$ ? (@ like_regex "a" flag "ii")'::jsonpath AS re_dup,
+       '$ ? (@ like_regex "a" flag "")'::jsonpath AS re_none,
+       '$ ? (@ like_regex "a" flag "xq")'::jsonpath AS re_xq;
+             re_ord              |            re_dup             |       re_none        |             re_xq              
+---------------------------------+-------------------------------+----------------------+--------------------------------
+ $?(@ like_regex "a" flag "imq") | $?(@ like_regex "a" flag "i") | $?(@ like_regex "a") | $?(@ like_regex "a" flag "xq")
+(1 row)
+
+-- like_regex flags are validated when the path is parsed, not when it is used
+SELECT '$ like_regex "a" flag "z"'::jsonpath;
+ERROR:  invalid input syntax for type jsonpath
+LINE 1: SELECT '$ like_regex "a" flag "z"'::jsonpath;
+               ^
+DETAIL:  Unrecognized flag character "z" in LIKE_REGEX predicate.
+SELECT '$ like_regex "a" flag "x"'::jsonpath;
+ERROR:  XQuery "x" flag (expanded regular expressions) is not implemented
+LINE 1: SELECT '$ like_regex "a" flag "x"'::jsonpath;
+               ^
+-- ... so an empty array, which iterates nothing, still raises
+SELECT jsonb_path_match('[]'::jsonb, '$[*] ? (@ like_regex "a b" flag "x")'::jsonpath);
+ERROR:  XQuery "x" flag (expanded regular expressions) is not implemented
+LINE 1: SELECT jsonb_path_match('[]'::jsonb, '$[*] ? (@ like_regex "...
+                                             ^
+SELECT pg_input_is_valid('$ like_regex "a" flag "z"', 'jsonpath') AS bad_flag,
+       pg_input_is_valid('$ like_regex "a" flag "qx"', 'jsonpath') AS ok_flag;
+ bad_flag | ok_flag 
+----------+---------
+ f        | t
+(1 row)
+
+-- q matches the pattern literally, and composes with i
+SELECT jsonb_path_match('"A.C"'::jsonb, '$ like_regex "a.c" flag "qi"') AS q_i,
+       jsonb_path_match('"ABC"'::jsonb, '$ like_regex "a.c" flag "q"') AS q_only,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "^b" flag "m"') AS m_flag,
+       jsonb_path_match('"a\nb"'::jsonb, '$ like_regex "a.b"') AS no_s;
+ q_i | q_only | m_flag | no_s 
+-----+--------+--------+------
+ t   | f      | t      | f
+(1 row)
+
+SELECT '$ ? (@.name starts with "Jo")'::jsonpath AS sw;
+              sw               
+-------------------------------
+ $?(@."name" starts with "Jo")
+(1 row)
+
+SELECT '$ ? (exists (@.x))'::jsonpath AS ex;
+         ex         
+--------------------
+ $?(exists (@."x"))
+(1 row)
+
+SELECT '$[last]'::jsonpath AS last;
+  last   
+---------
+ $[last]
+(1 row)
+
+-- a jsonpath round-trips through text
+SELECT '$.a[*]'::jsonpath::text AS as_text;
+ as_text  
+----------
+ $."a"[*]
+(1 row)
+
+-- pg_input_is_valid reports a bad path without raising
+SELECT pg_input_is_valid('$.a', 'jsonpath') AS ok, pg_input_is_valid('$.', 'jsonpath') AS bad;
+ ok | bad 
+----+-----
+ t  | f
+(1 row)
+
+-- jsonb_path_query: navigation and filters return an SQL/JSON sequence
+SELECT jsonb_path_query('{"a":[1,2,3]}', '$.a[*] ? (@ > 1)');
+ jsonb_path_query 
+------------------
+ 2
+ 3
+(2 rows)
+
+SELECT jsonb_path_query('[{"x":1},{"x":9}]', '$ ? (@.x > 5)');
+ jsonb_path_query 
+------------------
+ {"x": 9}
+(1 row)
+
+-- recursive .** descends into every level
+SELECT jsonb_path_query('{"a":{"b":1,"c":{"b":2}}}', '$.**.b');
+ jsonb_path_query 
+------------------
+ 1
+ 2
+(2 rows)
+
+-- item methods
+SELECT jsonb_path_query('[1,"x",true,null,{},[2]]', '$[*].type()');
+ jsonb_path_query 
+------------------
+ "number"
+ "string"
+ "boolean"
+ "null"
+ "object"
+ "array"
+(6 rows)
+
+SELECT jsonb_path_query('[1,2,3]', '$.size()') AS size,
+       jsonb_path_query('"1.5"', '$.double()') AS dbl,
+       jsonb_path_query('-2.3', '$.abs()') AS abs;
+ size | dbl | abs 
+------+-----+-----
+ 3    | 1.5 | 2.3
+(1 row)
+
+SELECT jsonb_path_query('{"a":1,"b":2}', '$.keyvalue()');
+         jsonb_path_query          
+-----------------------------------
+ {"id": 0, "key": "a", "value": 1}
+ {"id": 0, "key": "b", "value": 2}
+(2 rows)
+
+-- arithmetic (numeric scale is preserved, matching jsonb numbers)
+SELECT jsonb_path_query('{"a":5,"b":2}', '$.a + $.b') AS sum,
+       jsonb_path_query('{}', '(1.50 + 2.5)') AS scaled,
+       jsonb_path_query('{}', '(7 % 3)') AS modulo;
+ sum | scaled | modulo 
+-----+--------+--------
+ 7   | 4.00   | 1
+(1 row)
+
+-- a predicate path yields a single boolean item (unknown -> json null)
+SELECT jsonb_path_query('{"a":1}', '$.a > 0') AS t,
+       jsonb_path_query('{"a":"x"}', '$.a > 1') AS unknown;
+  t   | unknown 
+------+---------
+ true | null
+(1 row)
+
+-- jsonb_path_query_array wraps the matches; _first returns the first (or NULL)
+SELECT jsonb_path_query_array('{"a":[1,2]}', '$.a[*]') AS arr,
+       jsonb_path_query_first('{"a":[5,6]}', '$.a[*]') AS first,
+       jsonb_path_query_first('{"a":[]}', '$.a[*]') AS none;
+  arr   | first | none 
+--------+-------+------
+ [1, 2] | 5     | 
+(1 row)
+
+-- jsonb_path_exists / jsonb_path_match and their operator forms @? / @@
+SELECT jsonb_path_exists('{"a":1}', '$.a') AS y,
+       jsonb_path_exists('{"a":1}', '$.b') AS n;
+ y | n 
+---+---
+ t | f
+(1 row)
+
+SELECT jsonb_path_match('{"a":1}', '$.a == 1') AS t,
+       jsonb_path_match('{"a":1}', '$.a == 2') AS f;
+ t | f 
+---+---
+ t | f
+(1 row)
+
+-- a comparison whose operand types differ is unknown -> SQL NULL
+SELECT jsonb_path_match('{"a":"x"}', '$.a > 1') IS NULL AS is_null;
+ is_null 
+---------
+ t
+(1 row)
+
+SELECT '{"a":1}'::jsonb @? '$ ? (@.a > 0)' AS e,
+       '{"a":"hello"}'::jsonb @@ '$.a starts with "he"' AS m;
+ e | m 
+---+---
+ t | t
+(1 row)
+
+-- the @? / @@ operators are silent: a strict structural error becomes NULL
+SELECT '1'::jsonb @? 'strict $.a' AS q, '1'::jsonb @@ 'strict $.a == 1' AS a;
+ q | a 
+---+---
+   | 
+(1 row)
+
+-- variables are supplied via the vars argument
+SELECT jsonb_path_query('{"x":5}', '$.x ? (@ >= $min)', '{"min":3}') AS withvars;
+ withvars 
+----------
+ 5
+(1 row)
+
+-- lax (default) suppresses structural errors; strict raises them
+SELECT jsonb_path_query('1', '$.a') AS lax_empty;
+ lax_empty 
+-----------
+(0 rows)
+
+SELECT jsonb_path_query('{"a":1}', 'strict $.b');
+ERROR:  JSON object does not contain key "b"
+-- silent => true suppresses the same error
+SELECT jsonb_path_exists('{"a":1}', 'strict $.b', '{}', true) AS silent;
+ silent 
+--------
+ 
+(1 row)
+
+-- out-of-bounds subscript: strict errors, lax skips (yielding no rows)
+SELECT jsonb_path_query('[1,2]', 'strict $[5]');
+ERROR:  jsonpath array subscript is out of bounds
+SELECT * FROM jsonb_path_query('[1,2]', 'lax $[5]') AS t(v);
+ v 
+---
+(0 rows)
+
+-- jsonb_path_query in FROM position, with a column alias
+SELECT * FROM jsonb_path_query('{"a":[10,20,30]}', '$.a[*] ? (@ >= 20)') AS t(v);
+ v  
+----
+ 20
+ 30
+(2 rows)
+
+-- the jsonb_path_* functions are STRICT: a NULL vars/silent argument makes the
+-- whole result NULL (and the set-returning form yields no rows)
+SELECT jsonb_path_exists('{"a":1}', '$.a', NULL) AS ex_null,
+       jsonb_path_match('{"a":1}', '$.a == 1', '{}', NULL) AS m_null;
+ ex_null | m_null 
+---------+--------
+         | 
+(1 row)
+
+SELECT * FROM jsonb_path_query('1', '$', NULL) AS t(v);
+ v 
+---
+(0 rows)
+
+-- lax mode unwraps a bare array (one level) for the numeric / keyvalue methods
+SELECT jsonb_path_query('[1,-2,3]', '$.abs()') AS abs,
+       jsonb_path_query('[1.5,2.5]', '$.floor()') AS floor;
+ abs | floor 
+-----+-------
+ 1   | 1
+ 2   | 2
+ 3   | 
+(3 rows)
+
+-- but only one level: an array element that is itself an array errors
+SELECT jsonb_path_query('[[1],[-2]]', '$.abs()');
+ERROR:  jsonpath item method .abs() can only be applied to a numeric value
+-- .size()/.type() describe the container and never unwrap
+SELECT jsonb_path_query('[1,2,3]', '$.size()') AS size,
+       jsonb_path_query('[1,2]', '$.type()') AS type;
+ size |  type   
+------+---------
+ 3    | "array"
+(1 row)
+
+-- strict .size() on a non-array is an error
+SELECT jsonb_path_query('5', 'strict $.size()');
+ERROR:  jsonpath item method .size() can only be applied to an array
+-- an arithmetic "single numeric value" error names the actual operator, and
+-- unary minus has its own wording
+SELECT jsonb_path_query('[1,2]', '$[*] * 1');
+ERROR:  left operand of jsonpath operator * is not a single numeric value
+SELECT jsonb_path_query('{"a":"x"}', '- $.a');
+ERROR:  operand of unary jsonpath operator - is not a numeric value
+-- errors: a member method on the wrong kind, and a bad path literal
+SELECT jsonb_path_query('"x"', '$.abs()');
+ERROR:  jsonpath item method .abs() can only be applied to a numeric value
+SELECT '$ ? (@ >)'::jsonpath;
+ERROR:  syntax error at or near ")" of jsonpath input
+LINE 1: SELECT '$ ? (@ >)'::jsonpath;
+               ^

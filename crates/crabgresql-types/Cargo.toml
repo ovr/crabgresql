@@ -1,0 +1,20 @@
+[package]
+name = "crabgresql-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deepsize = { workspace = true }
+pg-ryu = { workspace = true }
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
+jiff = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+
+[dev-dependencies]
+anyhow.workspace = true

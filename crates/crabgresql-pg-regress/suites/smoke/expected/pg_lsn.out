@@ -1,0 +1,472 @@
+--
+-- PG_LSN
+-- WAL log sequence numbers: input parsing, the `X/YYYYYYYY` output, ordering,
+-- and the arithmetic against `numeric` with its three failure modes.
+--
+-- Ported from vendor/postgres/regress/sql/pg_lsn.sql. Every `pg_lsn`-specific
+-- result there is reproduced exactly; upstream `pg_lsn` is nonetheless not on
+-- the promotion list in suites/upstream_must_pass.txt, because one thing
+-- unrelated to this type still blocks it: `EXPLAIN (COSTS OFF)`, whose plan
+-- text this planner does not reproduce. It is dropped below.
+--
+-- NOTE ON OUTPUT FORMAT: the low half is zero-padded to eight hex digits
+-- (`0/00000000`), which is what the vendored 19devel corpus expects and what
+-- the version this server advertises does. PostgreSQL 18 prints it unpadded.
+--
+CREATE TABLE PG_LSN_TBL (f1 pg_lsn);
+-- Largest and smallest input
+INSERT INTO PG_LSN_TBL VALUES ('0/0');
+INSERT INTO PG_LSN_TBL VALUES ('FFFFFFFF/FFFFFFFF');
+-- Incorrect input
+INSERT INTO PG_LSN_TBL VALUES ('G/0');
+ERROR:  invalid input syntax for type pg_lsn: "G/0"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('G/0');
+                                       ^
+INSERT INTO PG_LSN_TBL VALUES ('-1/0');
+ERROR:  invalid input syntax for type pg_lsn: "-1/0"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('-1/0');
+                                       ^
+INSERT INTO PG_LSN_TBL VALUES (' 0/12345678');
+ERROR:  invalid input syntax for type pg_lsn: " 0/12345678"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES (' 0/12345678');
+                                       ^
+INSERT INTO PG_LSN_TBL VALUES ('ABCD/');
+ERROR:  invalid input syntax for type pg_lsn: "ABCD/"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('ABCD/');
+                                       ^
+INSERT INTO PG_LSN_TBL VALUES ('/ABCD');
+ERROR:  invalid input syntax for type pg_lsn: "/ABCD"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('/ABCD');
+                                       ^
+-- a second slash lands in the low half, and neither half takes nine digits
+INSERT INTO PG_LSN_TBL VALUES ('0/1/2');
+ERROR:  invalid input syntax for type pg_lsn: "0/1/2"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('0/1/2');
+                                       ^
+INSERT INTO PG_LSN_TBL VALUES ('000000000/1');
+ERROR:  invalid input syntax for type pg_lsn: "000000000/1"
+LINE 1: INSERT INTO PG_LSN_TBL VALUES ('000000000/1');
+                                       ^
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('16AE7F7', 'pg_lsn');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('16AE7F7', 'pg_lsn');
+                     message                     | detail | hint | sql_error_code 
+-------------------------------------------------+--------+------+----------------
+ invalid input syntax for type pg_lsn: "16AE7F7" |        |      | 22P02
+(1 row)
+
+-- Min/Max aggregation
+SELECT MIN(f1), MAX(f1) FROM PG_LSN_TBL;
+    min     |        max        
+------------+-------------------
+ 0/00000000 | FFFFFFFF/FFFFFFFF
+(1 row)
+
+DROP TABLE PG_LSN_TBL;
+-- input is case-insensitive; output is uppercase with the low half padded
+SELECT 'abcd/ef'::pg_lsn, 'ABCD/EF'::pg_lsn;
+    pg_lsn     |    pg_lsn     
+---------------+---------------
+ ABCD/000000EF | ABCD/000000EF
+(1 row)
+
+-- the `<type name> '<literal>'` spelling: the column is named after the type,
+-- and the qualified and quoted forms name the same type
+SELECT pg_lsn '0/16AE7F7';
+   pg_lsn   
+------------
+ 0/016AE7F7
+(1 row)
+
+SELECT pg_catalog.pg_lsn '0/1', "pg_lsn" '0/2';
+   pg_lsn   |   pg_lsn   
+------------+------------
+ 0/00000001 | 0/00000002
+(1 row)
+
+SELECT pg_lsn 'zzz';
+ERROR:  invalid input syntax for type pg_lsn: "zzz"
+LINE 1: SELECT pg_lsn 'zzz';
+                      ^
+-- a bare type name is still just a column reference when no literal follows it
+CREATE TABLE lsn_name_tbl (pg_lsn int);
+SELECT pg_lsn FROM lsn_name_tbl;
+ pg_lsn 
+--------
+(0 rows)
+
+DROP TABLE lsn_name_tbl;
+-- Operators
+SELECT '0/16AE7F8' = '0/16AE7F8'::pg_lsn;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '0/16AE7F8'::pg_lsn != '0/16AE7F7';
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '0/16AE7F7' < '0/16AE7F8'::pg_lsn;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '0/16AE7F8' > pg_lsn '0/16AE7F7';
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT '0/16AE7F7'::pg_lsn - '0/16AE7F8'::pg_lsn;
+ ?column? 
+----------
+       -1
+(1 row)
+
+SELECT '0/16AE7F8'::pg_lsn - '0/16AE7F7'::pg_lsn;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT '0/16AE7F7'::pg_lsn + 16::numeric;
+  ?column?  
+------------
+ 0/016AE807
+(1 row)
+
+SELECT 16::numeric + '0/16AE7F7'::pg_lsn;
+  ?column?  
+------------
+ 0/016AE807
+(1 row)
+
+SELECT '0/16AE7F7'::pg_lsn - 16::numeric;
+  ?column?  
+------------
+ 0/016AE7E7
+(1 row)
+
+-- an untyped or integer operand takes numeric, so no explicit cast is needed
+SELECT '0/16AE7F7'::pg_lsn + 16;
+  ?column?  
+------------
+ 0/016AE807
+(1 row)
+
+SELECT '0/16AE7F7'::pg_lsn + 16::int;
+  ?column?  
+------------
+ 0/016AE807
+(1 row)
+
+-- a fractional operand rounds half away from zero
+SELECT '0/16AE7F7'::pg_lsn + 1.5, '0/16AE7F7'::pg_lsn + 1.7;
+  ?column?  |  ?column?  
+------------+------------
+ 0/016AE7F9 | 0/016AE7F9
+(1 row)
+
+SELECT 'FFFFFFFF/FFFFFFFE'::pg_lsn + 1::numeric;
+     ?column?      
+-------------------
+ FFFFFFFF/FFFFFFFF
+(1 row)
+
+SELECT 'FFFFFFFF/FFFFFFFE'::pg_lsn + 2::numeric; -- out of range error
+ERROR:  pg_lsn out of range
+SELECT '0/1'::pg_lsn - 1::numeric;
+  ?column?  
+------------
+ 0/00000000
+(1 row)
+
+SELECT '0/1'::pg_lsn - 2::numeric; -- out of range error
+ERROR:  pg_lsn out of range
+SELECT '0/0'::pg_lsn + ('FFFFFFFF/FFFFFFFF'::pg_lsn - '0/0'::pg_lsn);
+     ?column?      
+-------------------
+ FFFFFFFF/FFFFFFFF
+(1 row)
+
+SELECT 'FFFFFFFF/FFFFFFFF'::pg_lsn - ('FFFFFFFF/FFFFFFFF'::pg_lsn - '0/0'::pg_lsn);
+  ?column?  
+------------
+ 0/00000000
+(1 row)
+
+SELECT '0/16AE7F7'::pg_lsn + 'NaN'::numeric;
+ERROR:  cannot add NaN to pg_lsn
+SELECT '0/16AE7F7'::pg_lsn - 'NaN'::numeric;
+ERROR:  cannot subtract NaN from pg_lsn
+SELECT '0/16AE7F7'::pg_lsn + 'Infinity'::numeric;
+ERROR:  cannot convert infinity to pg_lsn
+-- an untyped literal resolves per operator: to pg_lsn under `-` (the only
+-- operator with a pg_lsn on both sides) and to numeric under `+`
+SELECT '0/16AE7F8'::pg_lsn - '0/16AE7F7';
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT '0/16AE7F8' - '0/16AE7F7'::pg_lsn;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT '0/1'::pg_lsn + '16';
+  ?column?  
+------------
+ 0/00000011
+(1 row)
+
+SELECT '16' + '0/1'::pg_lsn;
+  ?column?  
+------------
+ 0/00000011
+(1 row)
+
+-- float8 -> numeric is an assignment cast, not an implicit one, so there is no
+-- operator for a float operand
+SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
+ERROR:  operator does not exist: pg_lsn + double precision
+LINE 1: SELECT '0/16AE7F7'::pg_lsn + 1.5::float8;
+                                   ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
+ERROR:  operator does not exist: pg_lsn - double precision
+LINE 1: SELECT '0/16AE7F7'::pg_lsn - 1.5::float8;
+                                   ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+-- an operand too wide for the internal accumulator is out of range, not a crash
+SELECT '0/1'::pg_lsn + 170141183460469231731687303715884105727;
+ERROR:  pg_lsn out of range
+SELECT '0/2'::pg_lsn - (-170141183460469231731687303715884105728);
+ERROR:  pg_lsn out of range
+-- the combinations with no operator at all
+SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
+ERROR:  operator does not exist: pg_lsn * pg_lsn
+LINE 1: SELECT '0/1'::pg_lsn * '0/1'::pg_lsn;
+                             ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
+ERROR:  operator does not exist: pg_lsn / pg_lsn
+LINE 1: SELECT '0/1'::pg_lsn / '0/1'::pg_lsn;
+                             ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+SELECT 16::numeric - '0/1'::pg_lsn;
+ERROR:  operator does not exist: numeric - pg_lsn
+LINE 1: SELECT 16::numeric - '0/1'::pg_lsn;
+                           ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+-- pg_lsn(numeric)
+SELECT pg_lsn(23783416::numeric);
+   pg_lsn   
+------------
+ 0/016AE7F8
+(1 row)
+
+SELECT pg_lsn(0::numeric);
+   pg_lsn   
+------------
+ 0/00000000
+(1 row)
+
+SELECT pg_lsn(18446744073709551615::numeric);
+      pg_lsn       
+-------------------
+ FFFFFFFF/FFFFFFFF
+(1 row)
+
+SELECT pg_lsn(-1::numeric);
+ERROR:  pg_lsn out of range
+SELECT pg_lsn(18446744073709551616::numeric);
+ERROR:  pg_lsn out of range
+SELECT pg_lsn('NaN'::numeric);
+ERROR:  cannot convert NaN to pg_lsn
+-- ordering, grouping and indexing all work: pg_lsn is a plain ordered counter
+CREATE TABLE lsn_tbl (l pg_lsn);
+INSERT INTO lsn_tbl VALUES ('0/2'), ('0/1'), ('1/0'), ('0/1');
+SELECT l FROM lsn_tbl ORDER BY l;
+     l      
+------------
+ 0/00000001
+ 0/00000001
+ 0/00000002
+ 1/00000000
+(4 rows)
+
+SELECT l, count(*) FROM lsn_tbl GROUP BY l ORDER BY l;
+     l      | count 
+------------+-------
+ 0/00000001 |     2
+ 0/00000002 |     1
+ 1/00000000 |     1
+(3 rows)
+
+SELECT DISTINCT l FROM lsn_tbl ORDER BY l;
+     l      
+------------
+ 0/00000001
+ 0/00000002
+ 1/00000000
+(3 rows)
+
+-- the index is physical, not metadata-only: this must plan as an Index Scan
+CREATE INDEX lsn_tbl_ix ON lsn_tbl(l);
+EXPLAIN SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
+               QUERY PLAN               
+----------------------------------------
+ Index Scan using lsn_tbl_ix on lsn_tbl
+   Index Cond: (l = 0/00000002)
+(2 rows)
+
+SELECT l FROM lsn_tbl WHERE l = '0/2'::pg_lsn;
+     l      
+------------
+ 0/00000002
+(1 row)
+
+SELECT l::text FROM lsn_tbl ORDER BY 1;
+     l      
+------------
+ 0/00000001
+ 0/00000001
+ 0/00000002
+ 1/00000000
+(4 rows)
+
+SELECT ARRAY['0/1'::pg_lsn, '2/3'::pg_lsn] AS arr;
+           arr           
+-------------------------
+ {0/00000001,2/00000003}
+(1 row)
+
+DROP TABLE lsn_tbl;
+-- Check btree and hash opclasses (upstream's generate_series form: each FROM
+-- item's alias names its single output column)
+SELECT DISTINCT (i || '/' || j)::pg_lsn f
+  FROM generate_series(1, 10) i,
+       generate_series(1, 10) j,
+       generate_series(1, 5) k
+  WHERE i <= 10 AND j > 0 AND j <= 10
+  ORDER BY f;
+      f      
+-------------
+ 1/00000001
+ 1/00000002
+ 1/00000003
+ 1/00000004
+ 1/00000005
+ 1/00000006
+ 1/00000007
+ 1/00000008
+ 1/00000009
+ 1/00000010
+ 2/00000001
+ 2/00000002
+ 2/00000003
+ 2/00000004
+ 2/00000005
+ 2/00000006
+ 2/00000007
+ 2/00000008
+ 2/00000009
+ 2/00000010
+ 3/00000001
+ 3/00000002
+ 3/00000003
+ 3/00000004
+ 3/00000005
+ 3/00000006
+ 3/00000007
+ 3/00000008
+ 3/00000009
+ 3/00000010
+ 4/00000001
+ 4/00000002
+ 4/00000003
+ 4/00000004
+ 4/00000005
+ 4/00000006
+ 4/00000007
+ 4/00000008
+ 4/00000009
+ 4/00000010
+ 5/00000001
+ 5/00000002
+ 5/00000003
+ 5/00000004
+ 5/00000005
+ 5/00000006
+ 5/00000007
+ 5/00000008
+ 5/00000009
+ 5/00000010
+ 6/00000001
+ 6/00000002
+ 6/00000003
+ 6/00000004
+ 6/00000005
+ 6/00000006
+ 6/00000007
+ 6/00000008
+ 6/00000009
+ 6/00000010
+ 7/00000001
+ 7/00000002
+ 7/00000003
+ 7/00000004
+ 7/00000005
+ 7/00000006
+ 7/00000007
+ 7/00000008
+ 7/00000009
+ 7/00000010
+ 8/00000001
+ 8/00000002
+ 8/00000003
+ 8/00000004
+ 8/00000005
+ 8/00000006
+ 8/00000007
+ 8/00000008
+ 8/00000009
+ 8/00000010
+ 9/00000001
+ 9/00000002
+ 9/00000003
+ 9/00000004
+ 9/00000005
+ 9/00000006
+ 9/00000007
+ 9/00000008
+ 9/00000009
+ 9/00000010
+ 10/00000001
+ 10/00000002
+ 10/00000003
+ 10/00000004
+ 10/00000005
+ 10/00000006
+ 10/00000007
+ 10/00000008
+ 10/00000009
+ 10/00000010
+(100 rows)
+

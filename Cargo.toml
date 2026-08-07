@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "vendor/ryu"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# internal crates
+crabgresql-binder = { path = "crates/crabgresql-binder" }
+crabgresql-buffer-engine = { path = "crates/crabgresql-buffer-engine" }
+crabgresql-catalog = { path = "crates/crabgresql-catalog" }
+crabgresql-config = { path = "crates/crabgresql-config" }
+crabgresql-executor = { path = "crates/crabgresql-executor" }
+crabgresql-planner = { path = "crates/crabgresql-planner" }
+crabgresql-parser = { path = "crates/crabgresql-parser" }
+crabgresql-parquet-engine = { path = "crates/crabgresql-parquet-engine" }
+crabgresql-pg-engine = { path = "crates/crabgresql-pg-engine" }
+crabgresql-pg-wire = { path = "crates/crabgresql-pg-wire" }
+crabgresql-plpgsql = { path = "crates/crabgresql-plpgsql" }
+crabgresql-server = { path = "crates/crabgresql-server" }
+crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
+crabgresql-txn = { path = "crates/crabgresql-txn" }
+crabgresql-types = { path = "crates/crabgresql-types" }
+crabgresql-wal = { path = "crates/crabgresql-wal" }
+pg-ryu = { path = "vendor/ryu" }
+
+# external
+bytes = "1"
+arrow-arith = "59.1"
+arrow-array = "59.1"
+arrow-ord = "59.1"
+arrow-schema = "59.1"
+arrow-select = "59.1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32c = "0.6"
+deepsize = "0.2"
+icu_collator = "2"
+icu_locale_core = "2"
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+regex = "1"
+# `regex::Error` is opaque, so classifying a compile failure (an unsupported
+# construct versus a malformed pattern) needs the parser's own error enum.
+regex-syntax = "0.8"
+parquet = { version = "59.1", default-features = false, features = ["arrow", "snap"] }
+similar = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# dev
+anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tempfile = "3"
+tokio-postgres = "0.7"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+unwrap_used = "deny"

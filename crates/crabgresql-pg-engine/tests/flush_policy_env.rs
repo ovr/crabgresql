@@ -1,0 +1,63 @@
+//! That the flush policy actually reads the environment it documents.
+//!
+//! Its own test binary on purpose: setting a variable is `unsafe` under the
+//! 2024 edition because it races any other thread reading the environment, and
+//! a binary with a single test has no other thread to race. The parsing itself
+//! is covered by `crabgresql-config`'s unit tests; what is checked here is the
+//! wiring — that each field is fed by the variable it claims.
+
+use std::time::Duration;
+
+use crabgresql_pg_engine::BufferFlushPolicy;
+
+#[test]
+fn sizes_and_intervals_come_from_the_documented_variables() {
+    let defaults = BufferFlushPolicy::default();
+
+    // SAFETY: this binary holds exactly one test, so no other thread is
+    // reading the environment while these are set.
+    unsafe {
+        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64MB");
+        std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1gb");
+        std::env::set_var(crabgresql_config::BUFFER_MAX_AGE.name, "5m");
+        std::env::set_var(crabgresql_config::BUFFER_TICK.name, "250");
+    }
+
+    let policy = BufferFlushPolicy::from_env();
+    assert_eq!(policy.table_soft_bytes, 64 * 1024 * 1024);
+    assert_eq!(policy.global_hard_bytes, 1024 * 1024 * 1024);
+    assert_eq!(policy.max_age, Duration::from_secs(5 * 60));
+    assert_eq!(policy.tick, Duration::from_millis(250));
+
+    // A size we cannot parse leaves the default in place rather than the
+    // server refusing to start.
+    unsafe {
+        std::env::set_var(
+            crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name,
+            "32 quatloos",
+        );
+    }
+    assert_eq!(
+        BufferFlushPolicy::from_env().table_soft_bytes,
+        defaults.table_soft_bytes
+    );
+
+    // One past the supported range is corrected to the nearest legal value,
+    // again without refusing to start.
+    unsafe {
+        std::env::set_var(crabgresql_config::BUFFER_TABLE_SOFT_BYTES.name, "64GB");
+        std::env::set_var(crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.name, "1B");
+        std::env::set_var(crabgresql_config::BUFFER_TICK.name, "0");
+    }
+    let policy = BufferFlushPolicy::from_env();
+    assert_eq!(
+        policy.table_soft_bytes,
+        crabgresql_config::BUFFER_TABLE_SOFT_BYTES.max
+    );
+    assert_eq!(
+        policy.global_hard_bytes,
+        crabgresql_config::BUFFER_GLOBAL_HARD_BYTES.min
+    );
+    // The tick's minimum is what keeps the worker from spinning on a zero.
+    assert_eq!(policy.tick, crabgresql_config::BUFFER_TICK.min);
+}

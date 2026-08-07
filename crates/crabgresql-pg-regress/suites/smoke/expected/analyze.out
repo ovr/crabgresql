@@ -1,0 +1,81 @@
+--
+-- ANALYZE
+-- ANALYZE measures a relation and records the result in pg_class.relpages /
+-- reltuples. PostgreSQL only writes those columns during VACUUM/ANALYZE, so a
+-- relation that has never been analyzed reports reltuples = -1 ("unknown"),
+-- distinct from a genuine zero-row relation. The result is NON-transactional: a
+-- ROLLBACK does not undo it, exactly as for a sequence counter. Output
+-- hand-checked against PostgreSQL (psql -a -q).
+--
+CREATE TABLE an_t (id int, label text);
+INSERT INTO an_t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+-- Before ANALYZE: the size is unknown, not zero.
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+        -1
+(1 row)
+
+ANALYZE an_t;
+-- After ANALYZE: the measured row count.
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+         3
+(1 row)
+
+-- An empty relation is measurable, and 0 is then a real answer rather than the
+-- -1 sentinel.
+CREATE TABLE an_empty (id int);
+ANALYZE an_empty;
+SELECT reltuples FROM pg_class WHERE relname = 'an_empty';
+ reltuples 
+-----------
+         0
+(1 row)
+
+-- The measurement is not transactional: it stands after a ROLLBACK.
+BEGIN;
+INSERT INTO an_t VALUES (4, 'd');
+ANALYZE an_t;
+ROLLBACK;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+         4
+(1 row)
+
+-- Re-measuring after the rollback sees the rows that are actually there.
+ANALYZE an_t;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+         3
+(1 row)
+
+-- A bare ANALYZE covers every relation.
+DELETE FROM an_t WHERE id = 3;
+ANALYZE;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+         2
+(1 row)
+
+-- TRUNCATE discards the measurement: it described the file that was swapped
+-- away, so the relation goes back to unknown rather than reporting stale rows.
+TRUNCATE an_t;
+SELECT reltuples FROM pg_class WHERE relname = 'an_t';
+ reltuples 
+-----------
+        -1
+(1 row)
+
+-- ANALYZE is accepted inside a READ ONLY transaction: it writes statistics, not
+-- data, and PostgreSQL does not treat that as a write.
+BEGIN TRANSACTION READ ONLY;
+ANALYZE an_t;
+COMMIT;
+-- A missing relation is a 42P01, as for any other statement.
+ANALYZE no_such_relation;
+ERROR:  relation "no_such_relation" does not exist

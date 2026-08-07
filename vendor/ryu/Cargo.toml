@@ -1,0 +1,14 @@
+[package]
+name = "pg-ryu"
+version = "1.0.23"
+edition = "2021"
+license = "Apache-2.0 OR BSL-1.0"
+description = "Vendored fork of the ryu crate with PostgreSQL's STRICTLY_SHORTEST-disabled rounding (accept_bounds = false), producing float output that matches PG float4out/float8out byte-for-byte."
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "pg_ryu"
+path = "src/lib.rs"

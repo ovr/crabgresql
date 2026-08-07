@@ -1,0 +1,532 @@
+//! `time` (without time zone): parsing, output, comparison, interval
+//! arithmetic, and the field functions (`date_part`/`extract`/`make_time`).
+//!
+//! Clean-room (see AGENTS.md): this reproduces PostgreSQL's *observable*
+//! behavior — the `HH:MM:SS[.ffffff]` output, the field values, the
+//! `24:00:00` boundary, and the SQLSTATE/message of range and syntax errors —
+//! pinned by differential tests against real PG, implemented independently.
+//!
+//! Representation: microseconds since midnight, held in an `i64` in the closed
+//! range `[0, 86_400_000_000]` (the upper bound is `24:00:00`, which PG allows).
+//! There are no infinity values.
+//!
+//! Deviations from PG, acceptable while no passing test needs them: a precision
+//! modifier above 6 is clamped silently where PG also warns; a trailing numeric
+//! offset or fixed abbreviation is
+//! accepted and ignored, but a bare IANA zone name without a date is rejected
+//! (as PG does).
+
+use crate::Numeric;
+use crate::fmt::FmtCtx;
+use crate::interval::Interval;
+use crate::timestamp::{self, fixed_point};
+
+const INVALID_DATETIME_FORMAT: &str = "22007";
+const DATETIME_FIELD_OVERFLOW: &str = "22008";
+const INVALID_PARAMETER_VALUE: &str = "22023";
+
+pub const USECS_PER_DAY: i64 = 86_400_000_000;
+const USECS_PER_HOUR: i64 = 3_600_000_000;
+const USECS_PER_MINUTE: i64 = 60_000_000;
+const USECS_PER_SEC: i64 = 1_000_000;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeError {
+    pub sqlstate: &'static str,
+    pub message: String,
+}
+
+fn invalid_syntax(input: &str) -> TimeError {
+    TimeError {
+        sqlstate: INVALID_DATETIME_FORMAT,
+        message: format!("invalid input syntax for type time: \"{input}\""),
+    }
+}
+
+fn field_out_of_range(input: &str) -> TimeError {
+    TimeError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: format!("date/time field value out of range: \"{input}\""),
+    }
+}
+
+pub fn cmp(a: i64, b: i64) -> std::cmp::Ordering {
+    a.cmp(&b)
+}
+
+/// Round `usec` to `precision` fractional-second digits — the `time(p)` /
+/// `timetz(p)` type modifier, applied in both cast and assignment context.
+///
+/// A time is microseconds since midnight and so never negative, which makes this
+/// a plain half-up round; the shared implementation lives in
+/// [`crate::timestamp::apply_typmod`]. Rounding can reach the `24:00:00` upper
+/// bound (`'23:59:59.5'::time(0)`, verified against PostgreSQL 18.4) but cannot
+/// pass it, since the largest representable value is already exactly that.
+pub fn apply_typmod(usec: i64, precision: i32) -> i64 {
+    timestamp::apply_typmod(usec, precision)
+}
+
+// --- output (time_out) -----------------------------------------------------
+
+/// `time_out`: `HH:MM:SS`, plus up to six fractional digits (trailing zeros
+/// trimmed). `24:00:00` is a representable value.
+pub fn format(usec: i64) -> String {
+    let hour = usec / USECS_PER_HOUR;
+    let mut rem = usec % USECS_PER_HOUR;
+    let min = rem / USECS_PER_MINUTE;
+    rem %= USECS_PER_MINUTE;
+    let sec = rem / USECS_PER_SEC;
+    let frac = rem % USECS_PER_SEC;
+    let mut out = format!("{hour:02}:{min:02}:{sec:02}");
+    if frac != 0 {
+        let f = format!("{frac:06}");
+        out.push('.');
+        out.push_str(f.trim_end_matches('0'));
+    }
+    out
+}
+
+// --- input (time_in) -------------------------------------------------------
+
+/// `time_in`. Accepts `HH:MM[:SS[.ffffff]]` with an optional `AM`/`PM` and an
+/// optional leading date and/or trailing zone (both ignored). A 7th fractional
+/// digit rounds half-up (carrying into the day, so `23:59:59.9999999` becomes
+/// `24:00:00`). Unparseable input is `22007`; an out-of-range value is `22008`.
+///
+/// Two whole-value specials, and only two: `now` (the transaction timestamp's
+/// time of day, in the session zone) and `allballs` (midnight). A `time` has no
+/// date, so the date-shaped specials PG accepts for `timestamp` and `date` —
+/// `today`, `tomorrow`, `yesterday`, `epoch`, `infinity` — are all `22007` here.
+pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimeError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_syntax(input));
+    }
+    // Compared without allocating: this runs for every `time` value parsed,
+    // and the specials are vanishingly rare.
+    if trimmed.eq_ignore_ascii_case("now") {
+        let wall = timestamp::session_wall_clock(fmt).map_err(|e| TimeError {
+            sqlstate: e.sqlstate,
+            message: e.message,
+        })?;
+        return Ok(wall.rem_euclid(USECS_PER_DAY));
+    }
+    if trimmed.eq_ignore_ascii_case("allballs") {
+        return Ok(0);
+    }
+    let mut time_tok: Option<&str> = None;
+    let mut ampm: Option<&str> = None;
+    let mut have_date = false;
+
+    for tok in trimmed.split_whitespace() {
+        let lower = tok.to_ascii_lowercase();
+        if lower == "am" || lower == "pm" {
+            ampm = Some(if lower == "am" { "am" } else { "pm" });
+            continue;
+        }
+        if tok.contains(':') && !tok.starts_with(['+', '-']) {
+            if time_tok.is_some() {
+                return Err(invalid_syntax(input));
+            }
+            // A numeric offset glued to the time (`13:30:00-04`, `13:30:00+05:30`)
+            // is accepted and ignored — this type carries no zone. It begins at
+            // the first sign after the time digits.
+            time_tok = Some(match tok.find(['+', '-']) {
+                Some(pos) => &tok[..pos],
+                None => tok,
+            });
+            continue;
+        }
+        // A `YYYY-MM-DD` date token is decorative for `time`.
+        if is_date_token(tok) {
+            have_date = true;
+            continue;
+        }
+        // A reserved word is only ever a whole value, so in company it is a
+        // format error — never a decorative zone, which the catch-all below
+        // would otherwise make it. Without this `'now 10:00'` silently answered
+        // `10:00:00`, disagreeing with `timestamp`, which rejects it.
+        if timestamp::is_reserved_word(&lower) {
+            return Err(invalid_syntax(input));
+        }
+        // A numeric offset (`-07`, `+05:30`) or a fixed abbreviation is
+        // accepted and ignored; a bare IANA zone name (`America/New_York`)
+        // without a date has no determinable offset — reject it as PG does.
+        if tok.contains('/') && !have_date {
+            return Err(invalid_syntax(input));
+        }
+        // Otherwise treat the token as a decorative zone/abbreviation.
+    }
+
+    let time_tok = time_tok.ok_or_else(|| invalid_syntax(input))?;
+    let (mut hour, min, sec, frac) = parse_hms(time_tok).ok_or_else(|| invalid_syntax(input))?;
+    // Fold a 12-hour clock reading.
+    if let Some(ap) = ampm {
+        hour = match (ap, hour) {
+            ("am", 12) => 0,
+            ("pm", 12) => 12,
+            ("pm", h) => h + 12,
+            (_, h) => h,
+        };
+    }
+    // Field bounds: PG allows the leap `sec == 60` and the `24:00:00` boundary;
+    // the final micro count is range-checked against a whole day.
+    if hour > 24 || min > 59 || sec > 60 {
+        return Err(field_out_of_range(input));
+    }
+    let usec = hour * USECS_PER_HOUR + min * USECS_PER_MINUTE + sec * USECS_PER_SEC + frac;
+    if !(0..=USECS_PER_DAY).contains(&usec) {
+        return Err(field_out_of_range(input));
+    }
+    Ok(usec)
+}
+
+/// A bare `YYYY-MM-DD` (dash-separated, digits only) token.
+fn is_date_token(tok: &str) -> bool {
+    let parts: Vec<&str> = tok.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Parse `HH:MM[:SS[.ffffff]]`, returning `(hour, min, sec, usec)`. A 7th+
+/// fractional digit rounds half-up. `am`/`pm` is folded by the caller.
+fn parse_hms(tok: &str) -> Option<(i64, i64, i64, i64)> {
+    let mut parts = tok.split(':');
+    let hour: i64 = parts.next()?.parse().ok()?;
+    let min: i64 = parts.next()?.parse().ok()?;
+    let (sec, frac) = match parts.next() {
+        None => (0, 0),
+        Some(secpart) => {
+            let (whole, fr) = secpart.split_once('.').unwrap_or((secpart, ""));
+            let sec: i64 = whole.parse().ok()?;
+            (sec, timestamp::parse_fraction(fr)?)
+        }
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((hour, min, sec, frac))
+}
+
+// --- interval arithmetic ---------------------------------------------------
+
+/// `time + interval` (`time_pl_interval`): add the interval's time-of-day part
+/// (its month/day fields are irrelevant to a bare time) and wrap into the day.
+pub fn pl_interval(usec: i64, span: Interval) -> i64 {
+    // Fold the interval into a single day first: for a large interval `span.usec`
+    // can be near `i64::MAX`, so adding it directly would overflow. Modular
+    // reduction commutes with the add, so the result is unchanged.
+    (usec + span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY)
+}
+
+/// `time - interval` (`time_mi_interval`): the negation of the add.
+pub fn mi_interval(usec: i64, span: Interval) -> i64 {
+    (usec - span.usec.rem_euclid(USECS_PER_DAY)).rem_euclid(USECS_PER_DAY)
+}
+
+/// `time - time` (`time_mi_time`): the microsecond difference, as an interval
+/// whose only nonzero field is `usec`.
+pub fn mi(a: i64, b: i64) -> Interval {
+    Interval {
+        months: 0,
+        days: 0,
+        usec: a - b,
+    }
+}
+
+// --- field extraction (date_part / extract) --------------------------------
+
+/// Classify a (lowercased) unit spelling for `time`: `Some(true)` supported,
+/// `Some(false)` a known field `time` does not carry, `None` unknown.
+fn classify(unit: &str) -> Option<bool> {
+    match unit {
+        "microseconds" | "microsecond" | "usec" | "usecs" | "milliseconds" | "millisecond"
+        | "msec" | "msecs" | "second" | "seconds" | "minute" | "minutes" | "hour" | "hours"
+        | "epoch" => Some(true),
+        // Known date/zone fields, not defined on a bare time.
+        "day" | "days" | "month" | "months" | "year" | "years" | "quarter" | "week" | "dow"
+        | "isodow" | "doy" | "decade" | "century" | "millennium" | "isoyear" | "timezone"
+        | "timezone_hour" | "timezone_h" | "timezone_minute" | "timezone_m" => Some(false),
+        _ => None,
+    }
+}
+
+fn err_unit(unit: &str, supported: bool) -> TimeError {
+    let verb = if supported {
+        "not supported"
+    } else {
+        "not recognized"
+    };
+    TimeError {
+        sqlstate: INVALID_PARAMETER_VALUE,
+        message: format!("unit \"{unit}\" {verb} for type time without time zone"),
+    }
+}
+
+/// `date_part(unit, time) -> float8`.
+pub fn date_part(unit: &str, usec: i64) -> Result<f64, TimeError> {
+    let lu = unit.trim().to_ascii_lowercase();
+    match classify(&lu) {
+        None => Err(err_unit(&lu, false)),
+        Some(false) => Err(err_unit(&lu, true)),
+        Some(true) => Ok(field_f64(&canon(&lu), usec)),
+    }
+}
+
+/// `extract(unit FROM time) -> numeric`, with PG's per-field scale.
+pub fn extract(unit: &str, usec: i64) -> Result<Numeric, TimeError> {
+    let lu = unit.trim().to_ascii_lowercase();
+    match classify(&lu) {
+        None => Err(err_unit(&lu, false)),
+        Some(false) => Err(err_unit(&lu, true)),
+        Some(true) => {
+            let (_, _, _, _, sub_usec) = split(usec);
+            let s = match canon(&lu).as_str() {
+                "second" => fixed_point(sub_usec, 6),
+                "milliseconds" => fixed_point(sub_usec, 3),
+                "microseconds" => sub_usec.to_string(),
+                "epoch" => fixed_point(usec, 6),
+                other => (field_f64(other, usec) as i64).to_string(),
+            };
+            match Numeric::parse(&s) {
+                Ok(value) => Ok(value),
+                Err(_) => panic!("time extraction must form a valid numeric literal"),
+            }
+        }
+    }
+}
+
+/// `(hour, min, sec, frac, sub_usec)` where `sub_usec = sec*1e6 + frac` is the
+/// sub-minute microsecond count used by the seconds-scale fields.
+fn split(usec: i64) -> (i64, i64, i64, i64, i64) {
+    let hour = usec / USECS_PER_HOUR;
+    let mut rem = usec % USECS_PER_HOUR;
+    let min = rem / USECS_PER_MINUTE;
+    rem %= USECS_PER_MINUTE;
+    let sec = rem / USECS_PER_SEC;
+    let frac = rem % USECS_PER_SEC;
+    (hour, min, sec, frac, rem)
+}
+
+fn field_f64(unit: &str, usec: i64) -> f64 {
+    let (hour, min, sec, frac, sub_usec) = split(usec);
+    match unit {
+        "microseconds" => sub_usec as f64,
+        "milliseconds" => sub_usec as f64 / 1000.0,
+        "second" => sec as f64 + frac as f64 / 1e6,
+        "minute" => min as f64,
+        "hour" => hour as f64,
+        "epoch" => usec as f64 / 1e6,
+        _ => unreachable!("field_f64 called with an unsupported unit"),
+    }
+}
+
+/// Fold plural/alias spellings to the canonical seconds/minute/hour names.
+fn canon(unit: &str) -> String {
+    match unit {
+        "microsecond" | "usec" | "usecs" => "microseconds",
+        "millisecond" | "msec" | "msecs" => "milliseconds",
+        "seconds" => "second",
+        "minutes" => "minute",
+        "hours" => "hour",
+        other => other,
+    }
+    .to_string()
+}
+
+// --- make_time -------------------------------------------------------------
+
+/// `make_time(hour, min, sec)`. Fields out of range raise `22008`.
+pub fn make_time(hour: i64, min: i64, sec: f64) -> Result<i64, TimeError> {
+    // PG prints the raw arguments (no zero-padding on hour/sec) in the error.
+    let err = || TimeError {
+        sqlstate: DATETIME_FIELD_OVERFLOW,
+        message: format!(
+            "time field value out of range: {hour}:{min:02}:{}",
+            fmt_secs(sec)
+        ),
+    };
+    if !(0..=24).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0.0..60.0).contains(&sec)
+        || (hour == 24 && (min != 0 || sec != 0.0))
+    {
+        return Err(err());
+    }
+    let whole = sec.trunc() as i64;
+    let frac = (sec.fract() * 1e6).round() as i64;
+    Ok(hour * USECS_PER_HOUR + min * USECS_PER_MINUTE + whole * USECS_PER_SEC + frac)
+}
+
+/// Format a seconds argument the way PG's error does: no trailing `.0`
+/// (`2.1` → "2.1", `100.1` → "100.1", `5` → "5").
+fn fmt_secs(sec: f64) -> String {
+    if sec.fract() == 0.0 {
+        format!("{}", sec as i64)
+    } else {
+        format!("{sec}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: &str) -> i64 {
+        match parse(s, &FmtCtx::utc_default()) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid time test fixture `{s}`: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_format_and_edges() {
+        assert_eq!(format(t("13:30:25.575401")), "13:30:25.575401");
+        assert_eq!(format(t("00:00")), "00:00:00");
+        assert_eq!(format(t("23:59:59.999999")), "23:59:59.999999");
+        assert_eq!(format(t("23:59:59.9999999")), "24:00:00"); // rounds up
+        assert_eq!(format(t("23:59:60")), "24:00:00"); // rounds up
+        assert_eq!(format(t("24:00:00")), "24:00:00");
+        assert_eq!(format(t("02:03 PST")), "02:03:00"); // abbrev ignored
+        assert!(parse("24:00:00.01", &FmtCtx::utc_default()).is_err());
+        assert!(parse("25:00:00", &FmtCtx::utc_default()).is_err());
+        assert!(parse("15:36:39 America/New_York", &FmtCtx::utc_default()).is_err());
+    }
+
+    #[test]
+    fn extract_fields() -> anyhow::Result<()> {
+        let x = t("13:30:25.575401");
+        assert_eq!(date_part("hour", x)?, 13.0);
+        assert_eq!(date_part("epoch", x)?, 48625.575401);
+        assert_eq!(extract("microsecond", x)?.to_display(), "25575401");
+        assert_eq!(extract("second", x)?.to_display(), "25.575401");
+        assert_eq!(extract("epoch", x)?.to_display(), "48625.575401");
+        assert!(date_part("day", x).is_err());
+        assert!(date_part("fortnight", x).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn arithmetic() {
+        let base = t("10:00:00");
+        assert_eq!(format(pl_interval(base, interval("01:30:00"))), "11:30:00");
+        assert_eq!(mi(t("10:00:00"), t("08:00:00")).usec, 2 * USECS_PER_HOUR);
+
+        // A huge interval must fold into the day, not overflow i64.
+        let huge = Interval {
+            months: 0,
+            days: 0,
+            usec: i64::MAX,
+        };
+        let folded = i64::MAX.rem_euclid(USECS_PER_DAY);
+        assert_eq!(
+            pl_interval(base, huge),
+            (base + folded).rem_euclid(USECS_PER_DAY)
+        );
+        assert_eq!(
+            mi_interval(base, huge),
+            (base - folded).rem_euclid(USECS_PER_DAY)
+        );
+    }
+
+    #[test]
+    fn make_time_ok_and_err() -> anyhow::Result<()> {
+        assert_eq!(format(make_time(8, 20, 0.0)?), "08:20:00");
+        assert!(make_time(10, 55, 100.1).is_err());
+        assert!(make_time(24, 0, 2.1).is_err());
+
+        Ok(())
+    }
+
+    fn interval(s: &str) -> Interval {
+        match crate::interval::parse(s) {
+            Ok(value) => value,
+            Err(error) => panic!("invalid interval test fixture `{s}`: {error:?}"),
+        }
+    }
+
+    // --- the whole-value specials (pinned against PostgreSQL 18.4) ---------
+
+    fn at(zone: &str) -> FmtCtx {
+        FmtCtx::utc_at(1, 763_860_600_123_456, 763_860_600_123_456).with_zone(std::sync::Arc::new(
+            crate::tz::SessionZone::resolve(zone).expect("real zone"),
+        ))
+    }
+
+    fn rel(input: &str, zone: &str) -> String {
+        match parse(input, &at(zone)) {
+            Ok(v) => format(v),
+            Err(e) => panic!("{input:?} in {zone}: {e:?}"),
+        }
+    }
+
+    /// `time` accepts exactly two specials. `now` is the transaction
+    /// timestamp's time of day in the session zone; `allballs` is midnight.
+    #[test]
+    fn now_and_allballs_are_the_only_specials() {
+        assert_eq!(rel("now", "UTC"), "23:30:00.123456");
+        assert_eq!(rel("now", "America/New_York"), "19:30:00.123456");
+        assert_eq!(rel("allballs", "UTC"), "00:00:00");
+        assert_eq!(rel("ALLBALLS", "UTC"), "00:00:00");
+    }
+
+    /// The date-shaped specials have no time of day to name, so PG rejects
+    /// every one of them for this type — including `epoch` and `infinity`,
+    /// which `timestamp` and `date` do accept.
+    #[test]
+    fn the_date_shaped_specials_are_rejected() {
+        for bad in [
+            "today",
+            "tomorrow",
+            "yesterday",
+            "epoch",
+            "infinity",
+            "-infinity",
+        ] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type time: \"{bad}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn now_without_a_clock_is_an_internal_error() {
+        assert_eq!(
+            parse("now", &FmtCtx::utc_default())
+                .expect_err("now")
+                .sqlstate,
+            "XX000"
+        );
+    }
+
+    /// A reserved word is a whole value or nothing. In company it used to fall
+    /// into the scanner's decorative-zone catch-all and be dropped, so
+    /// `'now 10:00'` silently answered `10:00:00` — while `timestamp`, which
+    /// shares the concept, rejected the very same input.
+    #[test]
+    fn a_reserved_word_in_company_is_a_syntax_error() {
+        for bad in [
+            "now 10:00",
+            "10:00 now",
+            "today 10:00",
+            "allballs 10:00",
+            "10:00 epoch",
+            "10:00 infinity",
+        ] {
+            let e = parse(bad, &at("UTC")).expect_err(bad);
+            assert_eq!(e.sqlstate, INVALID_DATETIME_FORMAT, "{bad}");
+            assert_eq!(
+                e.message,
+                format!("invalid input syntax for type time: \"{bad}\"")
+            );
+        }
+        // A real zone abbreviation is still decorative, as before.
+        assert_eq!(rel("13:30:25 PST", "UTC"), "13:30:25");
+    }
+}

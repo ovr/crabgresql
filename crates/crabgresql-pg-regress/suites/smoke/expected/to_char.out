@@ -1,0 +1,569 @@
+--
+-- TO_CHAR / TO_DATE / TO_TIMESTAMP / TO_NUMBER
+-- Format-picture rendering and parsing. Covers the datetime code set
+-- (YYYY/MM/DD, HH/HH12/HH24, MI/SS/MS/US, AM/PM, month and day names, TZ/OF,
+-- FM, TH, quoted literals), the numeric picture codes (9/0/./,/S/MI/PL/SG/PR/
+-- L/V/RN/EEEE/FM), overload resolution across the two families, and the error
+-- paths. Output hand-checked against PostgreSQL's aligned format.
+--
+-- The codes Q, W, WW, IW, IYYY, DDD, J, SSSS, RM, CC, BC/AD, SP, TM and D are
+-- deliberately not implemented and pass through as literal text, so no picture
+-- below uses them (nor any unquoted letter that would be read as one).
+--
+-- Render everything in UTC so TZ/OF and to_timestamp are deterministic.
+SET timezone = 'UTC';
+-- numeric datetime codes
+SELECT to_char(timestamp '2024-03-05 14:07:09.987654',
+               'YYYY|YYY|YY|Y|MM|DD|HH|HH12|HH24|MI|SS|MS|US') AS codes;
+                     codes                     
+-----------------------------------------------
+ 2024|024|24|4|03|05|02|02|14|07|09|987|987654
+(1 row)
+
+-- sub-second fields truncate and are left-scaled: .9 is 900 ms
+SELECT to_char(timestamp '2024-03-05 14:07:09.999999', 'HH24:MI:SS') AS truncated,
+       to_char(timestamp '2024-03-05 14:07:09.9', 'MS|US') AS scaled;
+ truncated |   scaled   
+-----------+------------
+ 14:07:09  | 900|900000
+(1 row)
+
+-- month and day names, blank-padded to nine characters
+SELECT to_char(timestamp '2024-03-05', 'Month|MONTH|month') AS full_month;
+          full_month           
+-------------------------------
+ March    |MARCH    |march    
+(1 row)
+
+SELECT to_char(timestamp '2024-03-05', 'Mon|MON|mon') AS abbr_month;
+ abbr_month  
+-------------
+ Mar|MAR|mar
+(1 row)
+
+SELECT to_char(timestamp '2024-03-05', 'Day|DAY|day') AS full_day;
+           full_day            
+-------------------------------
+ Tuesday  |TUESDAY  |tuesday  
+(1 row)
+
+SELECT to_char(timestamp '2024-03-05', 'Dy|DY|dy') AS abbr_day;
+  abbr_day   
+-------------
+ Tue|TUE|tue
+(1 row)
+
+-- only the exact spellings are codes; anything else passes through
+SELECT to_char(timestamp '2024-03-05', '[MOnth][moNTH][MOn][aM][Am]') AS passthrough;
+         passthrough         
+-----------------------------
+ [MOnth][moNTH][MOn][aM][Am]
+(1 row)
+
+-- FM strips both zero padding and blank padding
+SELECT to_char(timestamp '2024-03-05', 'FMYYYY FMMM FMDD') AS fm_numeric,
+       to_char(timestamp '2024-03-05', 'FMMonth|FMDay|FMMon|FMDy') AS fm_names;
+ fm_numeric |       fm_names        
+------------+-----------------------
+ 2024 3 5   | March|Tuesday|Mar|Tue
+(1 row)
+
+-- the meridiem codes render the value, not the spelling
+SELECT to_char(timestamp '2024-03-05 00:30:00',
+               'HH|HH12|AM|am|A.M.|a.m.|PM|pm|P.M.|p.m.') AS midnight;
+               midnight                
+---------------------------------------
+ 12|12|AM|am|A.M.|a.m.|AM|am|A.M.|a.m.
+(1 row)
+
+SELECT to_char(timestamp '2024-03-05 13:30:00',
+               'AM|am|A.M.|a.m.|PM|pm|P.M.|p.m.') AS afternoon;
+            afternoon            
+---------------------------------
+ PM|pm|P.M.|p.m.|PM|pm|P.M.|p.m.
+(1 row)
+
+-- the TH/th ordinal suffix
+SELECT to_char(timestamp '2024-03-05 14:00:00',
+               'DDTH|DDth|MMth|HH24th|FMDDTH') AS ordinals;
+        ordinals         
+-------------------------
+ 05TH|05th|03rd|14th|5TH
+(1 row)
+
+-- BC years render their display (positive) year
+SELECT to_char(timestamp '0001-01-01 BC', 'YYYY|YYY|YY|Y|MM|DD') AS bc;
+         bc          
+---------------------
+ 0001|001|01|1|01|01
+(1 row)
+
+-- quoted literal text, and a backslash which is not an escape
+SELECT to_char(timestamp '2024-03-05 14:00:00', '\HH24 "q"" YYYY"') AS quoted;
+   quoted   
+------------
+ \14 q YYYY
+(1 row)
+
+-- zone codes: a timestamptz has an abbreviation, a plain timestamp does not
+SELECT to_char(timestamptz '2024-03-05 14:00:00+00', 'TZ|tz|OF') AS with_zone;
+  with_zone  
+-------------
+ UTC|utc|+00
+(1 row)
+
+SELECT '[' || to_char(timestamp '2024-03-05', 'TZ') || ']['
+            || to_char(timestamp '2024-03-05', 'OF') || ']' AS without_zone;
+ without_zone 
+--------------
+ [][+00]
+(1 row)
+
+-- TZH/TZM take exactly the two spellings TZ does; a mixed-case TzH is literal,
+-- and neither honors FM
+SELECT to_char(timestamptz '2024-03-05 14:00:00+00', 'TZH|TZM|tzh|tzm|TzH|FMTZH') AS tzh_tzm;
+        tzh_tzm        
+-----------------------
+ +00|00|+00|00|TzH|+00
+(1 row)
+
+SELECT '[' || to_char(timestamp '2024-03-05', 'TZH:TZM') || ']' AS tzh_without_zone;
+ tzh_without_zone 
+------------------
+ [+00:00]
+(1 row)
+
+-- NULL input and non-finite values yield NULL
+SELECT to_char(timestamp 'infinity', 'YYYY') IS NULL AS inf_is_null,
+       to_char(timestamp '2024-03-05', NULL) IS NULL AS null_fmt,
+       to_char(NULL::timestamp, 'YYYY') IS NULL AS null_value;
+ inf_is_null | null_fmt | null_value 
+-------------+----------+------------
+ t           | t        | t
+(1 row)
+
+-- date and time reach the timestamptz and interval overloads through casts
+SELECT to_char(date '2024-03-05', 'YYYY-MM-DD HH24:MI:SS|TZ|OF') AS from_date;
+          from_date          
+-----------------------------
+ 2024-03-05 00:00:00|UTC|+00
+(1 row)
+
+SELECT to_char(time '14:07:09.5', 'HH24:MI:SS.MS|YYYY|MM|DD') AS from_time;
+        from_time        
+-------------------------
+ 14:07:09.500|0000|00|00
+(1 row)
+
+-- interval formatting, including its signed-field quirks
+SELECT to_char(interval '1 year 2 mons 3 days 04:05:06',
+               'YYYY-MM-DD HH24:MI:SS') AS iv,
+       to_char(interval '25 hours', 'HH24|HH12') AS iv_hours,
+       to_char(interval '-2 days -3 hours', 'DD HH24') AS iv_negative;
+         iv          | iv_hours | iv_negative 
+---------------------+----------+-------------
+ 0001-02-03 04:05:06 | 25|01    | -2 -03
+(1 row)
+
+-- the calendar codes are not meaningful for an interval
+SELECT to_char(interval '1 day', 'Month');
+ERROR:  invalid format specification for an interval value
+HINT:  Intervals are not tied to specific calendar dates.
+SELECT to_char(interval '1 day', 'TZ');
+ERROR:  invalid format specification for an interval value
+HINT:  Intervals are not tied to specific calendar dates.
+SELECT to_char(interval '1 day', 'TZH');
+ERROR:  invalid format specification for an interval value
+HINT:  Intervals are not tied to specific calendar dates.
+-- to_date / to_timestamp: defaults, separators, trailing garbage
+SELECT to_date('2024', 'YYYY') AS year_only,
+       to_date('2024-02', 'YYYY-MM') AS year_month,
+       to_date('', 'YYYY-MM-DD') AS empty;
+ year_only  | year_month |     empty     
+------------+------------+---------------
+ 2024-01-01 | 2024-02-01 | 0001-01-01 BC
+(1 row)
+
+SELECT to_date('2024/03/05', 'YYYY-MM-DD') AS separators,
+       to_date('2024-01-01xyz', 'YYYY-MM-DD') AS garbage,
+       to_date('  2024   03 ', 'YYYY MM') AS spaces;
+ separators |  garbage   |   spaces   
+------------+------------+------------
+ 2024-03-05 | 2024-01-01 | 2024-03-01
+(1 row)
+
+SELECT to_timestamp('2024-03-05 14:07:09', 'YYYY-MM-DD HH24:MI:SS') AS full,
+       to_timestamp('2024-03-05', 'YYYY-MM-DD HH24:MI:SS') AS short;
+          full          |         short          
+------------------------+------------------------
+ 2024-03-05 14:07:09+00 | 2024-03-05 00:00:00+00
+(1 row)
+
+-- short-year completion: the window comes from the value, and four spelled-out
+-- digits (or a YYYY code) never complete
+SELECT to_date('5', 'Y') AS y1,
+       to_date('69', 'YY') AS y69,
+       to_date('70', 'YY') AS y70,
+       to_date('070', 'YYY') AS y070,
+       to_date('520', 'YYY') AS y520,
+       to_date('515', 'YYY') AS y515;
+     y1     |    y69     |    y70     |    y070    |    y520    |    y515    
+------------+------------+------------+------------+------------+------------
+ 2005-01-01 | 2069-01-01 | 1970-01-01 | 1970-01-01 | 1520-01-01 | 2515-01-01
+(1 row)
+
+SELECT to_date('0070', 'YYYY') AS yyyy,
+       to_date('0070', 'YYY') AS four_digits,
+       to_date('70', 'YYYY') AS short_yyyy;
+    yyyy    | four_digits | short_yyyy 
+------------+-------------+------------
+ 0070-01-01 | 0070-01-01  | 0070-01-01
+(1 row)
+
+-- a field's width is capped only when another field follows it directly
+SELECT to_date('20240305', 'YYYYMMDD') AS packed,
+       to_date('2024', 'YY') AS greedy,
+       to_date('2024-01', 'YY-MM') AS greedy_sep;
+   packed   |   greedy   | greedy_sep 
+------------+------------+------------
+ 2024-03-05 | 2024-01-01 | 2024-01-01
+(1 row)
+
+-- names, ordinals and the twelve-hour clock on input
+SELECT to_date('05 MARCH 2024', 'DD MONTH YYYY') AS month_name,
+       to_date('05 mar 2024', 'DD Mon YYYY') AS month_abbr,
+       to_date('5th 2024', 'DDTH YYYY') AS ordinal;
+ month_name | month_abbr |  ordinal   
+------------+------------+------------
+ 2024-03-05 | 2024-03-05 | 2024-01-05
+(1 row)
+
+SELECT to_timestamp('2024-03-05 12:00 PM', 'YYYY-MM-DD HH12:MI AM') AS noon,
+       to_timestamp('2024-03-05 12:00 AM', 'YYYY-MM-DD HH12:MI AM') AS midnight;
+          noon          |        midnight        
+------------------------+------------------------
+ 2024-03-05 12:00:00+00 | 2024-03-05 00:00:00+00
+(1 row)
+
+-- MS/US are left-scaled on input too
+SELECT to_timestamp('2024 3', 'YYYY MS') AS ms,
+       to_timestamp('2024 12', 'YYYY US') AS us;
+            ms            |            us             
+--------------------------+---------------------------
+ 2024-01-01 00:00:00.3+00 | 2024-01-01 00:00:00.12+00
+(1 row)
+
+-- to_timestamp(float8): seconds since the Unix epoch
+SELECT to_timestamp(0) AS epoch,
+       to_timestamp(1700000000.123456) AS fractional,
+       to_timestamp(-1) AS before_epoch;
+         epoch          |          fractional           |      before_epoch      
+------------------------+-------------------------------+------------------------
+ 1970-01-01 00:00:00+00 | 2023-11-14 22:13:20.123456+00 | 1969-12-31 23:59:59+00
+(1 row)
+
+SELECT to_timestamp('infinity'::float8) AS inf;
+   inf    
+----------
+ infinity
+(1 row)
+
+SELECT to_timestamp('NaN'::float8);
+ERROR:  timestamp cannot be NaN
+SELECT to_timestamp(1e18);
+ERROR:  timestamp out of range: "1e+18"
+-- a separator must leave the offset its sign, and FM binds to the very next
+-- node -- quoted text and passthrough included
+SELECT to_timestamp('2024-03-05 10:00:00 -05', 'YYYY-MM-DD HH24:MI:SS OF') AS spaced_of,
+       to_timestamp('2024-03-05 10:00:00-05', 'YYYY-MM-DD HH24:MI:SSOF') AS tight_of,
+       to_date('2024 -03', 'YYYY MM') AS separator_eats_one;
+       spaced_of        |        tight_of        | separator_eats_one 
+------------------------+------------------------+--------------------
+ 2024-03-05 15:00:00+00 | 2024-03-05 15:00:00+00 | 2024-03-01
+(1 row)
+
+-- TZH keeps its own sign the same way, and TZM takes it; both spacings work
+SELECT to_timestamp('2024-03-05 10:00:00 -05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS spaced_tzh,
+       to_timestamp('2024-03-05 10:00:00+0530', 'YYYY-MM-DD HH24:MI:SSTZHTZM') AS tight_tzh;
+       spaced_tzh       |       tight_tzh        
+------------------------+------------------------
+ 2024-03-05 15:30:00+00 | 2024-03-05 04:30:00+00
+(1 row)
+
+-- TZ, OF, TZH and TZM are one field type: a repetition that agrees is fine,
+-- one that contradicts is an error naming the code that noticed
+SELECT to_timestamp('2024-03-05 10:00:00 -05 -05', 'YYYY-MM-DD HH24:MI:SS OF TZH') AS agreeing;
+        agreeing        
+------------------------
+ 2024-03-05 15:00:00+00
+(1 row)
+
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS OF TZH');
+ERROR:  conflicting values for "TZH" field in formatting string
+DETAIL:  This value contradicts a previous setting for the same field type.
+SELECT to_timestamp('2024-03-05 10:00:00 -05 +07', 'YYYY-MM-DD HH24:MI:SS TZH OF');
+ERROR:  conflicting values for "OF" field in formatting string
+DETAIL:  This value contradicts a previous setting for the same field type.
+-- and the scanned displacement is bounded like one inside a literal
+SELECT to_timestamp('2024-03-05 10:00 +15:59', 'YYYY-MM-DD HH24:MI TZH:TZM') AS in_range;
+        in_range        
+------------------------
+ 2024-03-04 18:01:00+00
+(1 row)
+
+SELECT to_timestamp('2024-03-05 10:00 +16:00', 'YYYY-MM-DD HH24:MI TZH:TZM');
+ERROR:  time zone displacement out of range: "2024-03-05 10:00 +16:00"
+SELECT to_timestamp('2024-03-05 10:00 +99', 'YYYY-MM-DD HH24:MI OF');
+ERROR:  time zone displacement out of range: "2024-03-05 10:00 +99"
+SELECT to_date('2024-03-05 +99', 'YYYY-MM-DD TZH');
+ERROR:  time zone displacement out of range: "2024-03-05 +99"
+SELECT to_char(timestamp '2024-03-05 04:00:00', 'FM"a"HH24') AS fm_then_quote,
+       to_char(interval '1 day', 'TH FM YYYY th') AS fm_then_space;
+ fm_then_quote | fm_then_space 
+---------------+---------------
+ a04           | TH  0000 th
+(1 row)
+
+-- the date range's upper bound is exclusive
+SELECT to_date('5874897-12-31', 'YYYY-MM-DD') AS max_date;
+   max_date    
+---------------
+ 5874897-12-31
+(1 row)
+
+SELECT to_date('5874898', 'YYYY');
+ERROR:  date out of range: "5874898"
+SELECT '5874898-01-01'::date;
+ERROR:  date out of range: "5874898-01-01"
+LINE 1: SELECT '5874898-01-01'::date;
+               ^
+-- an oversized field is reported, not overflowed into the calendar arithmetic
+SELECT to_date('100000000000000000', 'YYYY');
+ERROR:  value for "YYYY" in source string is out of range
+DETAIL:  Value must be in the range -2147483648 to 2147483647.
+SELECT to_timestamp('2024 999999999999999999', 'YYYY US');
+ERROR:  value for "US" in source string is out of range
+DETAIL:  Value must be in the range -2147483648 to 2147483647.
+SELECT to_timestamp('2024 9999999', 'YYYY US');
+ERROR:  date/time field value out of range: "2024 9999999"
+-- datetime parse errors
+SELECT to_date('2024-XX-05', 'YYYY-MM-DD');
+ERROR:  invalid value "XX" for "MM"
+DETAIL:  Value must be an integer.
+SELECT to_date('garbage', 'YYYY-MM-DD');
+ERROR:  invalid value "garb" for "YYYY"
+DETAIL:  Value must be an integer.
+SELECT to_timestamp('abc', 'Mon');
+ERROR:  invalid value "abc" for "Mon"
+DETAIL:  The given value did not match any of the allowed values for this field.
+SELECT to_timestamp('2024-03-05 13:00 PM', 'YYYY-MM-DD HH12:MI AM');
+ERROR:  hour "13" is invalid for the 12-hour clock
+HINT:  Use the 24-hour clock, or give an hour between 1 and 12.
+SELECT to_timestamp('2024-03-05 25:00', 'YYYY-MM-DD HH24:MI');
+ERROR:  date/time field value out of range: "2024-03-05 25:00"
+SELECT to_date('2024-02-30', 'YYYY-MM-DD');
+ERROR:  date/time field value out of range: "2024-02-30"
+--
+-- numeric pictures
+--
+-- overload resolution: int4, int8, numeric, float4, float8
+SELECT to_char(1, '999') AS int4,
+       to_char(1::int8, '999') AS int8,
+       to_char(1.5, '999.9') AS numeric,
+       to_char(1.5::float4, '999.9999999') AS float4,
+       to_char(0.1::float8, '0.999999999999999999') AS float8;
+ int4 | int8 | numeric |   float4   |      float8       
+------+------+---------+------------+-------------------
+    1 |    1 |    1.5  |    1.50000 |  0.10000000000000
+(1 row)
+
+-- an untyped first argument cannot pick a best candidate. Overload-resolution
+-- errors carry no source span here, so the expected output omits PG's
+-- `LINE 1:` caret (and the undefined-function HINT), as `aggregate.out` does.
+SELECT to_char('2024-01-01', 'YYYY');
+ERROR:  function to_char(unknown, unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT to_char('x'::text, 'y');
+ERROR:  function to_char(text, unknown) does not exist
+-- the same rule, on other names: a category with no preferred type can never
+-- break the tie, while a typed argument that needs converting is steered to its
+-- category's preferred type (date -> timestamptz, so TZ is UTC not empty)
+SELECT area('((0,0),(2,2))');
+ERROR:  function area(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT mod('5', '3');
+ERROR:  function mod(unknown, unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT to_hex('255');
+ERROR:  function to_hex(unknown) is not unique
+HINT:  Could not choose a best candidate function. You might need to add explicit type casts.
+SELECT area(box '((0,0),(2,2))') AS typed_box,
+       to_char(date '2024-03-05', 'YYYY-MM-DD|TZ') AS date_to_tstz;
+ typed_box |  date_to_tstz  
+-----------+----------------
+         4 | 2024-03-05|UTC
+(1 row)
+
+-- sign placement: the default sign and S float, MI/PL/SG/PR are anchored
+SELECT '[' || to_char(1, '99') || '][' || to_char(-1, '99') || ']' AS plain,
+       '[' || to_char(1, 'S99') || '][' || to_char(-1, 'S99') || ']' AS lead_s,
+       '[' || to_char(1, '99S') || '][' || to_char(-1, '99S') || ']' AS trail_s;
+   plain    |   lead_s   |  trail_s   
+------------+------------+------------
+ [  1][ -1] | [ +1][ -1] | [ 1+][ 1-]
+(1 row)
+
+SELECT '[' || to_char(1, 'MI99') || '][' || to_char(-1, 'MI99') || ']' AS mi,
+       '[' || to_char(1, 'PL99') || '][' || to_char(-1, 'PL99') || ']' AS pl,
+       '[' || to_char(1, 'SG99') || '][' || to_char(-1, 'SG99') || ']' AS sg,
+       '[' || to_char(1, '99PR') || '][' || to_char(-1, '99PR') || ']' AS pr;
+     mi     |      pl      |     sg     |      pr      
+------------+--------------+------------+--------------
+ [  1][- 1] | [+  1][  -1] | [+ 1][- 1] | [  1 ][ <1>]
+(1 row)
+
+SELECT '[' || to_char(1, 'L99') || '][' || to_char(-1, 'L99') || ']' AS lead_l,
+       '[' || to_char(1, '99L') || '][' || to_char(-1, '99L') || ']' AS trail_l;
+    lead_l    |   trail_l    
+--------------+--------------
+ [$  1][$ -1] | [  1$][ -1$]
+(1 row)
+
+-- zero suppression, forced zeros and blanked group separators
+SELECT '[' || to_char(1, '0999') || '][' || to_char(1, '9099') || ']' AS zeros,
+       '[' || to_char(1, '9,999') || '][' || to_char(1234, '9,999') || ']' AS groups;
+     zeros      |      groups      
+----------------+------------------
+ [ 0001][  001] | [     1][ 1,234]
+(1 row)
+
+SELECT '[' || to_char(0, '99') || '][' || to_char(0, '9999.9999') || ']' AS zero,
+       '[' || to_char(0.5, '9999.99') || ']' AS half;
+       zero        |    half    
+-------------------+------------
+ [  0][     .0000] | [     .50]
+(1 row)
+
+-- rounding is half away from zero, and a value rounding to zero loses its sign
+SELECT '[' || to_char(2.5, '9') || '][' || to_char(-2.5, '9') || ']' AS halves,
+       '[' || to_char(1.005, '9.99') || '][' || to_char(-0.01, '99.9') || ']' AS carry;
+  halves  |     carry      
+----------+----------------
+ [ 3][-3] | [ 1.01][   .0]
+(1 row)
+
+-- overflow fills the digit positions with #, keeping the punctuation
+SELECT '[' || to_char(1234, '99') || '][' || to_char(12345, '9,999.99') || ']' AS over,
+       '[' || to_char(-12345, '9,999.99PR') || '][' || to_char(1, '.9') || ']' AS over_pr;
+       over       |      over_pr      
+------------------+-------------------
+ [ ##][ #,###.##] | [<#,###.##>][ .#]
+(1 row)
+
+-- FM suppresses all padding, and trims trailing 9-coded fraction zeros
+SELECT '[' || to_char(1, 'FM9') || '][' || to_char(1.5, 'FM99.999') || ']' AS fm,
+       '[' || to_char(1.5, 'FM99.990') || '][' || to_char(0, 'FM999.999') || ']' AS fm_zero,
+       '[' || to_char(-1, 'FM99PR') || ']' AS fm_pr;
+    fm    |   fm_zero   | fm_pr 
+----------+-------------+-------
+ [1][1.5] | [1.500][0.] | [<1>]
+(1 row)
+
+-- NaN and the infinities
+SELECT '[' || to_char('NaN'::numeric, '999') || '][' || to_char('NaN'::numeric, '9999.99') || ']' AS nan,
+       '[' || to_char('Infinity'::numeric, '9999.99') || '][' || to_char('-Infinity'::numeric, '9999PR') || ']' AS inf;
+      nan      |        inf         
+---------------+--------------------
+ [ NaN][  NaN] | [ ####.##][<####>]
+(1 row)
+
+-- an infinity has no exponent form either, so EEEE overflows too
+SELECT '[' || to_char('Infinity'::numeric, '9.99EEEE') || '][' || to_char('-Infinity'::numeric, '9.99EEEE') || ']' AS inf_sci;
+        inf_sci         
+------------------------
+ [ #.######][ #.######]
+(1 row)
+
+-- more digit positions than an i64 holds, for the TH accumulator
+SELECT '[' || to_char(99999999999999999999999::numeric, '99999999999999999999999TH') || ']' AS wide_th;
+           wide_th            
+------------------------------
+ [ 99999999999999999999999TH]
+(1 row)
+
+-- V shifts the value, TH suffixes it, RN spells it out
+SELECT '[' || to_char(1234, '999V9') || '][' || to_char(1.2, '99V9') || ']' AS v,
+       '[' || to_char(1, '999th') || '][' || to_char(2, '999TH') || '][' || to_char(-1, '999th') || ']' AS th;
+       v       |           th           
+---------------+------------------------
+ [ ####][  12] | [   1st][   2ND][  -1]
+(1 row)
+
+SELECT '[' || to_char(4, 'RN') || ']' AS rn,
+       '[' || to_char(1999, 'FMRN') || '][' || to_char(4000, 'RN') || ']' AS rn_edge;
+        rn         |          rn_edge           
+-------------------+----------------------------
+ [             IV] | [MCMXCIX][###############]
+(1 row)
+
+-- EEEE
+SELECT '[' || to_char(-0.0004859, '9.99EEEE') || '][' || to_char(12345, '9.99EEEE') || ']' AS sci,
+       '[' || to_char(0, '9.99EEEE') || '][' || to_char(1234, '9EEEE') || ']' AS sci_edge;
+          sci           |      sci_edge       
+------------------------+---------------------
+ [-4.86e-04][ 1.23e+04] | [ 0.00e+00][ 1e+03]
+(1 row)
+
+-- degenerate pictures
+SELECT '[' || to_char(1234, '') || '][' || to_char(1234, 'FM') || ']' AS empty,
+       '[' || to_char(1234, '9 9 9 9') || '][' || to_char(1234, '"x"999') || ']' AS spaced;
+ empty |      spaced       
+-------+-------------------
+ [][]  | [ 1 2 3 4][x ###]
+(1 row)
+
+-- picture syntax errors
+SELECT to_char(1, 'S9S');
+ERROR:  cannot use "S" twice
+SELECT to_char(1, '9.9.9');
+ERROR:  multiple decimal points
+SELECT to_char(1, 'MI9PR');
+ERROR:  cannot use "PR" and "S"/"PL"/"MI"/"SG" together
+SELECT to_char(1, '9EEEE9');
+ERROR:  "EEEE" must be the last pattern used
+SELECT to_char(1, '999.9V9');
+ERROR:  cannot use "V" and decimal point together
+SELECT to_char(1, '9PR9');
+ERROR:  "9" must be ahead of "PR"
+SELECT to_char(1, '9V9EEEE');
+ERROR:  "EEEE" is incompatible with other formats
+DETAIL:  "EEEE" may only be used together with digit and decimal point patterns.
+-- to_number is permissive: it lifts digits out positionally
+SELECT to_number('12,454.8-', '99G999D9S') AS signed,
+       to_number('$1,234.56', 'L9G999D99') AS currency,
+       to_number('<123>', '999PR') AS bracketed,
+       to_number('12-', '99MI') AS trailing_minus;
+  signed  | currency | bracketed | trailing_minus 
+----------+----------+-----------+----------------
+ -12454.8 |  1234.56 |      -123 |            -12
+(1 row)
+
+SELECT to_number('  1234', '9999') AS leading_blanks,
+       to_number('1 2 3', '999') AS interleaved,
+       to_number('a1c', '9999') AS letters,
+       to_number('1.2.3', '9.9') AS extra_point;
+ leading_blanks | interleaved | letters | extra_point 
+----------------+-------------+---------+-------------
+            123 |         123 |       1 |         1.2
+(1 row)
+
+SELECT to_number('123', '') IS NULL AS empty_format;
+ empty_format 
+--------------
+ t
+(1 row)
+
+SELECT to_number('abc', '9999');
+ERROR:  invalid input syntax for type numeric: " "
+SELECT to_number('-', '999');
+ERROR:  invalid input syntax for type numeric: "-"

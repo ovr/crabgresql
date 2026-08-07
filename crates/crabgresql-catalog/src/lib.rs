@@ -1,0 +1,884 @@
+//! `pg_catalog` and `information_schema` system catalogs, served as read-only
+//! relations.
+//!
+//! The core seam: a bound `SELECT` lowers to a scan over an `Arc<dyn TableAm>`,
+//! and the executor treats every access method alike. So each supported
+//! `pg_catalog` relation is materialized as a [`StaticTable`] (rows built from
+//! codegen'd built-in data and from live server state) and handed to the same
+//! pipeline user tables use — no bespoke executor node.
+//!
+//! [`SystemCatalog`] implements [`TableEngine`] so the server's session catalog
+//! can layer it into name resolution: `pg_catalog.<rel>` routes here directly,
+//! and an unqualified name falls back here (pg_catalog is implicitly on the
+//! search path).
+//!
+//! # Layout
+//!
+//! - [`registry`] — the one table of served relations. Which relations exist,
+//!   their OIDs, and the two `fn` pointers that build each one.
+//! - `catalogs/` and `views/` — a module per relation family, each publishing a
+//!   `*_schema()` and a `*_rows(&SystemCatalog)`. Adding a relation is a module
+//!   here plus one registry line; nothing else in the crate changes.
+//! - [`cols`] and [`oids`] — what those modules share: the catalog-only column
+//!   types and every fixed OID.
+//! - [`source`] — the live state a session hands in ([`CatalogSource`]).
+//! - This file — [`SystemCatalog`]: the per-statement snapshot, the memoized OID
+//!   assignments the relation modules read, and the [`TableEngine`] impl.
+//!
+//! # Fidelity & clean-room
+//!
+//! Built-in rows are generated at build time from PostgreSQL's vendored catalog
+//! `.dat` *data* (`vendor/postgres/catalog/`), never from its C/Perl source; see
+//! `build.rs` and `AGENTS.md`.
+//!
+//! TODO: column coverage is a curated, PG-ordered subset keyed by the names real
+//! clients query, not parity — upstream's `type_sanity` and psql's `\d` read
+//! columns no relation here publishes. The catalog-only column *types* are real
+//! (`oid`, `"char"`, `regproc`); it is the column list that is short.
+
+pub(crate) mod catalogs;
+pub(crate) mod cols;
+pub(crate) mod oids;
+pub(crate) mod registry;
+mod source;
+mod static_table;
+pub(crate) mod views;
+
+pub use oids::PLPGSQL_LANG_OID;
+pub use registry::{builtin_relation_name, builtin_relation_oid};
+pub use source::{
+    CatalogCursor, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
+    CatalogUserType, RelKind, StaticSource,
+};
+
+#[cfg(test)]
+mod tests;
+
+use std::sync::{Arc, OnceLock};
+
+use crabgresql_storage_api::{
+    IndexConstraint, IndexMetadata, RelPersistence, RelStats, StorageError, TableAm, TableEngine,
+    TableSchema,
+};
+use crabgresql_types::Value;
+
+use crate::registry::CatalogNamespace;
+
+pub use static_table::StaticTable;
+
+/// First OID handed to a synthetic user relation in `pg_class`. Runtime type,
+/// function, and cast OIDs grow upward from PostgreSQL's user-object floor, so
+/// relations use a separate high partition, which preserves catalog-wide
+/// uniqueness in every reflected snapshot.
+///
+/// TODO: these OIDs are assigned per snapshot rather than stored, and the
+/// assignment is positional (see [`SystemCatalog::relation_oids`]). A relation's
+/// OID is therefore stable only while the set of relations is — creating one
+/// renumbers every relation sorting after it — so a client that holds an OID
+/// across DDL can address the wrong relation. Storage owning a persistent OID
+/// per relation is what fixes it.
+const FIRST_REL_OID: u32 = 0x4000_0000;
+
+/// The namespace PostgreSQL keeps TOAST relations in. Never on the search path,
+/// so nothing here is reachable by an unqualified name.
+const TOAST_NAMESPACE: &str = "pg_toast";
+
+#[derive(Clone)]
+struct CatalogIndex {
+    oid: u32,
+    table_oid: u32,
+    table_schema: TableSchema,
+    metadata: IndexMetadata,
+}
+
+/// One row of `pg_constraint`, resolved to an OID before anything renders it.
+///
+/// The rows used to be built and numbered in the same pass, from a counter local
+/// to the renderer. That was enough while `pg_constraint` was only ever read as a
+/// table, but `pg_get_constraintdef(oid)` looks a constraint up *by* its OID, so
+/// the numbering has to exist independently of the rendering — and in the same
+/// monotone band as every other relation-shaped object, or a constraint OID
+/// could collide with a relation's.
+#[derive(Clone)]
+pub struct CatalogConstraint {
+    pub oid: u32,
+    pub name: String,
+    /// `pg_constraint.contype`: `n` not-null, `p` primary key, `u` unique,
+    /// `c` check.
+    pub contype: &'static str,
+    /// The namespace of the table it constrains — resolved to `connamespace` by
+    /// whoever renders the row.
+    pub namespace: String,
+    pub table_oid: u32,
+    /// The backing index for `p`/`u`, `0` for a constraint with no index.
+    pub index_oid: u32,
+    /// Constrained column positions, zero-based; rendered as `conkey`'s
+    /// one-based array.
+    pub columns: Vec<usize>,
+    /// `pg_constraint.conbin` for a check constraint: the predicate as stored
+    /// SQL. `None` for every other `contype`, which has no expression.
+    pub expr: Option<String>,
+    /// `convalidated` / `conislocal` / `coninhcount`. The non-check contypes
+    /// have no way to be unvalidated or inherited here, so they report
+    /// `(true, true, 0)`.
+    pub validated: bool,
+    pub islocal: bool,
+    pub inhcount: i16,
+}
+
+/// A table's out-of-line ("TOAST") relation, as `pg_class` publishes it.
+///
+/// PostgreSQL puts one of these in the `pg_toast` namespace for every table with
+/// a varlena column and points the table's `reltoastrelid` at it. Ours is
+/// created lazily — only once a row actually needs it — so a table of narrow
+/// columns keeps `reltoastrelid = 0`, which is also legitimate PostgreSQL state
+/// (it is what `\d` reports for a table with no TOAST relation).
+struct CatalogToast {
+    oid: u32,
+    /// The `pg_class` OID of the table this belongs to, whose `reltoastrelid`
+    /// names `oid`.
+    table_oid: u32,
+    /// PostgreSQL's name for it: `pg_toast_<parent oid>`.
+    name: String,
+    /// Mirrors the parent's, as PostgreSQL's does.
+    persistence: RelPersistence,
+    stats: RelStats,
+}
+
+/// A `regproc` reference: the function's OID and the name it prints as.
+///
+/// PostgreSQL stores only the OID and resolves the name in `regprocout`. The
+/// catalog rows here are static, so codegen resolves both at build time and the
+/// pair travels together — the same trade [`crabgresql_types::Reg`] makes.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcRef {
+    pub oid: u32,
+    pub name: &'static str,
+}
+
+/// A built-in `pg_type` row, generated from `pg_type.dat`. Field types mirror
+/// the runtime column types in [`catalogs::types::pg_type_schema`]; string fields are the
+/// catalog `name`/`"char"` text.
+pub struct PgTypeRow {
+    pub oid: u32,
+    pub typname: &'static str,
+    pub typnamespace: u32,
+    pub typowner: u32,
+    pub typlen: i16,
+    pub typbyval: bool,
+    pub typtype: &'static str,
+    pub typcategory: &'static str,
+    pub typispreferred: bool,
+    pub typisdefined: bool,
+    pub typdelim: &'static str,
+    pub typrelid: u32,
+    pub typsubscript: ProcRef,
+    pub typelem: u32,
+    pub typarray: u32,
+    pub typinput: ProcRef,
+    pub typoutput: ProcRef,
+    pub typreceive: ProcRef,
+    pub typsend: ProcRef,
+    pub typmodin: ProcRef,
+    pub typmodout: ProcRef,
+    pub typanalyze: ProcRef,
+    pub typalign: &'static str,
+    pub typstorage: &'static str,
+    pub typcollation: u32,
+}
+
+/// A built-in `pg_cast` row, generated from `pg_cast.dat`. `castsource`,
+/// `casttarget` and `castfunc` are resolved OIDs; `castfunc` is `0` for a
+/// binary-coercible cast, which needs no function.
+pub struct PgCastRow {
+    pub oid: u32,
+    pub castsource: u32,
+    pub casttarget: u32,
+    pub castfunc: u32,
+    pub castcontext: &'static str,
+    pub castmethod: &'static str,
+}
+
+/// A built-in `pg_proc` row, generated from `pg_proc.dat` — restricted to the
+/// functions the other catalogs reference (see `gen_pg_proc` in `build.rs` for
+/// why the rest are left out).
+pub struct PgProcRow {
+    pub oid: u32,
+    pub proname: &'static str,
+    pub prolang: u32,
+    pub procost: f32,
+    pub prorows: f32,
+    pub provariadic: u32,
+    pub prosupport: ProcRef,
+    pub prokind: &'static str,
+    pub prosecdef: bool,
+    pub proleakproof: bool,
+    pub proisstrict: bool,
+    pub proretset: bool,
+    pub provolatile: &'static str,
+    pub proparallel: &'static str,
+    pub pronargs: i16,
+    pub prorettype: u32,
+    pub proargtypes: &'static [u32],
+    pub prosrc: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
+
+/// Whether `name` is the catalog name of a PostgreSQL built-in type, including
+/// types crabgresql recognizes but does not implement yet (for example
+/// `xml`). This distinguishes an unsupported built-in from a nonexistent
+/// user type without maintaining a second hand-written name list.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    PG_TYPE_ROWS.iter().any(|row| row.typname == name)
+}
+
+/// The OID of the built-in function `name`, or `None` if this build publishes
+/// no `pg_proc` row for it. Only the functions the other catalogs reference are
+/// published, so a name that is real upstream can still be absent here.
+pub fn builtin_proc_oid(name: &str) -> Option<u32> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.proname == name)
+        .map(|row| row.oid)
+}
+
+/// The name of the built-in function `oid`, the inverse of
+/// [`builtin_proc_oid`].
+pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.oid == oid)
+        .map(|row| row.proname)
+}
+
+/// Read-only engine serving `pg_catalog` relations. Constructed per statement so
+/// its rows reflect current server state; the live state comes from a
+/// [`CatalogSource`] whose every method is invoked at most once, and only when
+/// the relation it feeds is opened.
+pub struct SystemCatalog {
+    source: Arc<dyn CatalogSource>,
+    live_relations: OnceLock<Vec<CatalogRelation>>,
+    oids: OnceLock<Vec<(u32, TableSchema)>>,
+    kinds: OnceLock<Vec<RelKind>>,
+    stats: OnceLock<Vec<RelStats>>,
+    index_oids: OnceLock<Vec<CatalogIndex>>,
+    toast_oids: OnceLock<Vec<CatalogToast>>,
+    constraint_oids: OnceLock<Vec<CatalogConstraint>>,
+    user_types: OnceLock<Vec<CatalogUserType>>,
+    routines: OnceLock<Vec<CatalogRoutine>>,
+    user_schemas: OnceLock<Vec<(String, u32)>>,
+    cursors: OnceLock<Vec<CatalogCursor>>,
+    settings: OnceLock<Vec<CatalogSetting>>,
+    namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
+}
+
+impl Default for SystemCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemCatalog {
+    /// A catalog with no live relations (built-in metadata only).
+    pub fn new() -> Self {
+        Self::from_source(Arc::new(StaticSource::default()))
+    }
+
+    /// A catalog reflecting a fixed set of live user relations into
+    /// `pg_class`/`pg_attribute`.
+    pub fn with_relations(relations: Vec<TableSchema>) -> Self {
+        Self::from_source(Arc::new(StaticSource::new(
+            relations
+                .into_iter()
+                .map(CatalogRelation::permanent)
+                .collect(),
+        )))
+    }
+
+    /// A catalog with session identity and a fixed set of live relations.
+    pub fn with_catalog_relations(
+        database: impl Into<String>,
+        owner: impl Into<String>,
+        relations: Vec<CatalogRelation>,
+    ) -> Self {
+        Self::from_source(Arc::new(
+            StaticSource::new(relations).database(database).owner(owner),
+        ))
+    }
+
+    /// A catalog reflecting `source`.
+    ///
+    /// The snapshot is per statement, not per session: every memoized answer
+    /// below goes stale the moment any DDL runs. The `source` itself may be
+    /// long-lived; the `SystemCatalog` wrapped around it must not be.
+    pub fn from_source(source: Arc<dyn CatalogSource>) -> Self {
+        Self {
+            source,
+            live_relations: OnceLock::new(),
+            oids: OnceLock::new(),
+            kinds: OnceLock::new(),
+            stats: OnceLock::new(),
+            index_oids: OnceLock::new(),
+            toast_oids: OnceLock::new(),
+            constraint_oids: OnceLock::new(),
+            user_types: OnceLock::new(),
+            routines: OnceLock::new(),
+            user_schemas: OnceLock::new(),
+            cursors: OnceLock::new(),
+            settings: OnceLock::new(),
+            namespace_oids: OnceLock::new(),
+        }
+    }
+
+    /// The accessors below are the only places `self.source` is read, apart
+    /// from the three cheap answers (`database`, `owner`, `now`) that need no
+    /// memoization. Keeping it that way is what makes the source's cost a
+    /// per-snapshot one: a call site outside a `OnceLock` would re-enumerate
+    /// the database on every row that reached it.
+    pub(crate) fn live_relations(&self) -> &[CatalogRelation] {
+        self.live_relations.get_or_init(|| self.source.relations())
+    }
+
+    fn user_types(&self) -> &[CatalogUserType] {
+        self.user_types.get_or_init(|| self.source.user_types())
+    }
+
+    fn routines(&self) -> &[CatalogRoutine] {
+        self.routines.get_or_init(|| self.source.routines())
+    }
+
+    pub(crate) fn user_schemas(&self) -> &[(String, u32)] {
+        self.user_schemas.get_or_init(|| self.source.schemas())
+    }
+
+    fn cursors(&self) -> &[CatalogCursor] {
+        self.cursors.get_or_init(|| self.source.cursors())
+    }
+
+    fn settings(&self) -> &[CatalogSetting] {
+        self.settings.get_or_init(|| self.source.settings())
+    }
+
+    /// Map every namespace name to its OID: the built-in namespaces plus each
+    /// user-created schema. Feeds `pg_class.relnamespace` /
+    /// `pg_constraint.connamespace`.
+    ///
+    /// Memoized like the accessors above, and for a sharper reason: this one
+    /// backs `pg_my_temp_schema()` and `pg_is_other_temp_schema()`, which the
+    /// executor evaluates once per *row*. Rebuilt per call it was `O(#schemas)`
+    /// of `String` cloning on every row that reached it.
+    pub(crate) fn namespace_oids(&self) -> &std::collections::HashMap<String, u32> {
+        self.namespace_oids.get_or_init(|| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("pg_catalog".to_string(), 11);
+            map.insert(TOAST_NAMESPACE.to_string(), 99);
+            map.insert("public".to_string(), 2200);
+            for (name, oid) in self.user_schemas() {
+                map.insert(name.clone(), *oid);
+            }
+            map
+        })
+    }
+
+    /// Assign a stable synthetic OID to each user relation, computed once and
+    /// memoized. Sorted by name so `pg_class` and `pg_attribute` (built by
+    /// separate `open_table` calls) agree on every relation's OID, keeping their
+    /// join consistent.
+    pub(crate) fn relation_oids(&self) -> &[(u32, TableSchema)] {
+        self.oids.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter()
+                .enumerate()
+                .map(|(i, r)| (FIRST_REL_OID + i as u32, r.schema))
+                .collect()
+        })
+    }
+
+    /// The relation kind for each entry of [`SystemCatalog::relation_oids`], in
+    /// the same sorted order, so `pg_class` can emit the right `relkind`.
+    pub(crate) fn relation_kinds(&self) -> &[RelKind] {
+        self.kinds.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter().map(|r| r.kind).collect()
+        })
+    }
+
+    /// The size estimates for each entry of [`SystemCatalog::relation_oids`], in
+    /// the same sorted order, feeding `pg_class.relpages`/`reltuples`.
+    pub(crate) fn relation_stats(&self) -> &[RelStats] {
+        self.stats.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter().map(|r| r.stats).collect()
+        })
+    }
+
+    /// The `(pg_class OID, params)` of each sequence, for `pg_sequence`. The OID
+    /// matches the one [`SystemCatalog::relation_oids`] assigns (same sort), so
+    /// `pg_sequence.seqrelid` joins `pg_class.oid`.
+    pub(crate) fn sequence_entries(&self) -> Vec<(u32, CatalogSequence)> {
+        let mut rels = self.live_relations().to_vec();
+        rels.sort_by(|a, b| {
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.schema.name.cmp(&b.schema.name))
+        });
+        rels.into_iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.sequence.map(|s| (FIRST_REL_OID + i as u32, s)))
+            .collect()
+    }
+
+    pub(crate) fn index_oids(&self) -> &[CatalogIndex] {
+        self.index_oids.get_or_init(|| {
+            let mut relations = self.live_relations().to_vec();
+            relations.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            let first_index_oid = FIRST_REL_OID + relations.len() as u32;
+            let mut pending = Vec::new();
+            for (position, relation) in relations.into_iter().enumerate() {
+                let table_oid = FIRST_REL_OID + position as u32;
+                for index in relation.indexes {
+                    pending.push((table_oid, relation.schema.clone(), index));
+                }
+            }
+            pending.sort_by(|a, b| a.2.name.cmp(&b.2.name));
+            pending
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(position, (table_oid, table_schema, metadata))| CatalogIndex {
+                        oid: first_index_oid + position as u32,
+                        table_oid,
+                        table_schema,
+                        metadata,
+                    },
+                )
+                .collect()
+        })
+    }
+
+    /// The TOAST relations of this snapshot, assigned OIDs from a **third block**
+    /// that begins after the index block.
+    ///
+    /// Ordering matters: relations occupy `[FIRST_REL_OID, +nrels)` and indexes
+    /// the range straight after, both keyed by position in a sorted list. Putting
+    /// TOAST relations last means adding them shifted no OID that already
+    /// existed. They are deliberately absent from
+    /// [`SystemCatalog::live_relations`], so they never enter unqualified name
+    /// resolution or `pg_table_is_visible` — matching PostgreSQL, where
+    /// `pg_toast` is never on the search path.
+    pub(crate) fn toast_oids(&self) -> &[CatalogToast] {
+        self.toast_oids.get_or_init(|| {
+            let mut relations = self.live_relations().to_vec();
+            relations.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            let first_toast_oid =
+                FIRST_REL_OID + relations.len() as u32 + self.index_oids().len() as u32;
+            relations
+                .into_iter()
+                .enumerate()
+                .filter_map(|(position, relation)| {
+                    let table_oid = FIRST_REL_OID + position as u32;
+                    relation
+                        .toast
+                        .map(|stats| (table_oid, relation.schema, stats))
+                })
+                .enumerate()
+                .map(|(slot, (table_oid, schema, stats))| CatalogToast {
+                    oid: first_toast_oid + slot as u32,
+                    table_oid,
+                    // PostgreSQL names it after the parent's OID.
+                    name: format!("pg_toast_{table_oid}"),
+                    persistence: schema.persistence,
+                    stats,
+                })
+                .collect()
+        })
+    }
+
+    /// The constraints of this snapshot, assigned OIDs from a **fourth block**
+    /// beginning after the TOAST block — extending the invariant
+    /// [`SystemCatalog::toast_oids`] documents by one more segment, for the same
+    /// reason: appending keeps every OID that already existed where it was.
+    ///
+    /// Order within the block is not-null constraints first (by relation, then
+    /// column position), then the index-backed ones in index-OID order. It only
+    /// has to be *deterministic* — `pg_constraint` rows carry no inherent order,
+    /// and callers that want one sort by `conname`.
+    pub(crate) fn constraint_oids(&self) -> &[CatalogConstraint] {
+        self.constraint_oids.get_or_init(|| {
+            let indexes = self.index_oids();
+            let first = FIRST_REL_OID
+                + self.relation_oids().len() as u32
+                + indexes.len() as u32
+                + self.toast_oids().len() as u32;
+            let mut out = Vec::new();
+            for (table_oid, schema) in self.relation_oids() {
+                for (position, column) in schema.columns.iter().enumerate() {
+                    // A PRIMARY KEY implies non-nullability without a catalog
+                    // entry of its own, so only an explicitly named one is a row.
+                    let Some(name) = &column.not_null_constraint else {
+                        continue;
+                    };
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: name.clone(),
+                        contype: "n",
+                        namespace: schema.namespace.clone(),
+                        table_oid: *table_oid,
+                        index_oid: 0,
+                        columns: vec![position],
+                        expr: None,
+                        validated: true,
+                        islocal: true,
+                        inhcount: 0,
+                    });
+                }
+                for check in &schema.checks {
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: check.name.clone(),
+                        contype: "c",
+                        namespace: schema.namespace.clone(),
+                        table_oid: *table_oid,
+                        // A check is not index-backed.
+                        index_oid: 0,
+                        columns: check.columns.clone(),
+                        expr: Some(check.expr.clone()),
+                        validated: check.validated,
+                        islocal: check.islocal,
+                        inhcount: check.inhcount,
+                    });
+                }
+            }
+            for index in indexes {
+                let Some(constraint) = index.metadata.constraint else {
+                    continue;
+                };
+                out.push(CatalogConstraint {
+                    oid: first + out.len() as u32,
+                    // An index-backed constraint and its index share a name.
+                    name: index.metadata.name.clone(),
+                    contype: match constraint {
+                        IndexConstraint::PrimaryKey => "p",
+                        IndexConstraint::Unique => "u",
+                    },
+                    namespace: index.table_schema.namespace.clone(),
+                    table_oid: index.table_oid,
+                    index_oid: index.oid,
+                    columns: index.metadata.keys.iter().map(|key| key.column).collect(),
+                    expr: None,
+                    validated: true,
+                    islocal: true,
+                    inhcount: 0,
+                });
+            }
+            out
+        })
+    }
+
+    /// The constraint `oid` identifies, resolved against the same numbering
+    /// [`SystemCatalog::constraint_oids`] hands out — so `pg_get_constraintdef`
+    /// and the `pg_constraint` rows agree by construction.
+    ///
+    /// Column *names* rather than positions, because the caller renders DDL and
+    /// has no schema in hand. An unknown OID is `None`, which PostgreSQL reports
+    /// as a NULL result rather than an error.
+    ///
+    /// Both lookups index rather than scan: each block is one dense run, so the
+    /// offset from its base *is* the position. `pg_get_constraintdef` runs once
+    /// per output row, and a linear scan here made
+    /// `SELECT pg_get_constraintdef(oid) FROM pg_constraint` quadratic — over a
+    /// list whose elements are whole `TableSchema`s. The stored OID is still
+    /// compared afterwards, so a future non-positional assignment degrades to
+    /// not-found rather than to the wrong constraint (as in [`Self::relation_ref`]).
+    pub fn constraint_def(&self, oid: u32) -> Option<(String, Vec<String>, Option<String>)> {
+        let constraints = self.constraint_oids();
+        let base = constraints.first()?.oid;
+        let constraint = constraints.get(oid.checked_sub(base)? as usize)?;
+        if constraint.oid != oid {
+            return None;
+        }
+        let relations = self.relation_oids();
+        let (stored, schema) =
+            relations.get(constraint.table_oid.checked_sub(FIRST_REL_OID)? as usize)?;
+        if *stored != constraint.table_oid {
+            return None;
+        }
+        let columns = constraint
+            .columns
+            .iter()
+            .filter_map(|position| schema.columns.get(*position))
+            .map(|column| column.name.clone())
+            .collect();
+        Some((
+            constraint.contype.to_string(),
+            columns,
+            constraint.expr.clone(),
+        ))
+    }
+
+    /// The name of the role `oid` identifies, or `None` if no role has that OID.
+    /// Every catalog row reports [`oids::BOOTSTRAP_ROLE_OID`] as its owner
+    /// (crabgresql has no role catalog), so exactly one OID resolves — to this
+    /// snapshot's session user. Backs `pg_get_userbyid`.
+    pub fn role_name(&self, oid: u32) -> Option<&str> {
+        (oid == oids::BOOTSTRAP_ROLE_OID).then_some(self.source.owner())
+    }
+
+    /// The name of the function `oid` identifies, or `None` if this snapshot
+    /// has none. Backs `regproc` output: built-in rows first, then this
+    /// session's `CREATE FUNCTION` routines.
+    pub fn proc_name(&self, oid: u32) -> Option<String> {
+        builtin_proc_name(oid)
+            .map(str::to_string)
+            .or_else(|| self.routine_by_oid(oid).map(|r| r.name.clone()))
+    }
+
+    /// The OID of the function `namespace.name` names, or `None` when there is
+    /// no such function *or* the name is carried by more than one — `regprocin`
+    /// resolves a bare name, so an overloaded one is not resolvable this way.
+    pub fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        // Built-ins all live in `pg_catalog`, so any other qualifier names a
+        // user routine instead.
+        let in_catalog = !matches!(namespace, Some(ns) if ns != "pg_catalog");
+        if let Some(oid) = builtin_proc_oid(name).filter(|_| in_catalog) {
+            return Some(oid);
+        }
+        let mut matched = self
+            .routines()
+            .iter()
+            .filter(|r| r.name == name && namespace.is_none_or(|ns| ns == r.namespace))
+            .map(|r| r.oid);
+        let first = matched.next()?;
+        matched.next().is_none().then_some(first)
+    }
+
+    fn routine_by_oid(&self, oid: u32) -> Option<CatalogRoutine> {
+        self.routines().iter().find(|r| r.oid == oid).cloned()
+    }
+
+    /// The database this snapshot's session is connected to. Backs
+    /// `current_database()`/`current_catalog`.
+    pub fn database(&self) -> &str {
+        self.source.database()
+    }
+
+    /// The session user. Backs `current_user`/`session_user`, and is the name
+    /// every catalog row's owner OID resolves to.
+    pub fn owner(&self) -> &str {
+        self.source.owner()
+    }
+
+    /// The `(namespace, name)` of the relation `oid` identifies — a
+    /// table/view/sequence or an index — or `None` if this snapshot has no such
+    /// relation. Backs `pg_table_is_visible`, which needs the name as well as
+    /// the namespace to answer *reachability* rather than mere membership.
+    ///
+    /// Reads exactly the fields [`catalogs::class::pg_class_rows`] reports as
+    /// `relnamespace`/`relname`: `schema.namespace` for a relation and
+    /// `table_schema.namespace` for an index. Note that `schema.namespace` is a
+    /// distinct field from [`CatalogRelation::namespace`]; they agree for temp
+    /// relations only because the server selects those on `schema.namespace`.
+    /// Diverging here would make a relation `pg_class` lists invisible.
+    ///
+    /// OIDs are assigned positionally by [`SystemCatalog::relation_oids`] and
+    /// [`SystemCatalog::index_oids`], so this indexes rather than scans — it is
+    /// called once per row when a `\d` listing filters on
+    /// `pg_table_is_visible`, which a linear scan would make quadratic. The
+    /// stored OID is still compared, so a future non-positional assignment
+    /// degrades to "not found" rather than to a wrong answer.
+    pub fn relation_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        // Below the synthetic floor no relation can match, and answering here
+        // avoids forcing the lazy relation enumeration for an unrelated OID
+        // (`SELECT pg_table_is_visible(1)` should not enumerate the database).
+        let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
+        let relations = self.relation_oids();
+        if let Some((stored, schema)) = relations.get(offset) {
+            return (*stored == oid).then_some((schema.namespace.as_str(), schema.name.as_str()));
+        }
+        let indexes = self.index_oids();
+        if let Some(index) = indexes.get(offset - relations.len()) {
+            return (index.oid == oid).then_some((
+                index.table_schema.namespace.as_str(),
+                index.metadata.name.as_str(),
+            ));
+        }
+        let toast = self
+            .toast_oids()
+            .get(offset - relations.len() - indexes.len())?;
+        (toast.oid == oid).then_some((TOAST_NAMESPACE, toast.name.as_str()))
+    }
+
+    /// The OID of `namespace.name` in this snapshot, or `None` if it holds no
+    /// such relation. The inverse of [`SystemCatalog::relation_ref`]; feeds the
+    /// shadowing check in `pg_table_is_visible`.
+    pub fn relation_oid_in(&self, namespace: &str, name: &str) -> Option<u32> {
+        let relation = self
+            .relation_oids()
+            .iter()
+            .find(|(_, schema)| schema.namespace == namespace && schema.name == name);
+        if let Some((oid, _)) = relation {
+            return Some(*oid);
+        }
+        self.index_oids()
+            .iter()
+            .find(|index| index.table_schema.namespace == namespace && index.metadata.name == name)
+            .map(|index| index.oid)
+    }
+
+    /// Whether `name` is a `pg_catalog` relation this catalog serves.
+    ///
+    /// A name lookup, not a build. It used to answer with
+    /// `build_pg_catalog(name).is_some()`, which materialized the relation's
+    /// whole row set and threw it away — and `rel_oid` calls this per row, so
+    /// `SELECT 'pg_timezone_names'::regclass FROM generate_series(1, 10000)`
+    /// enumerated the tz database ten thousand times (measured: 2.1 s against
+    /// 0.03 s for `pg_class`).
+    ///
+    /// The served set and the OID table are the same table since the registry
+    /// (`registry::CATALOG_RELATIONS`), so the two cannot drift and this is a
+    /// binary search rather than a build.
+    pub fn has_catalog_relation(&self, name: &str) -> bool {
+        builtin_relation_oid(name).is_some()
+    }
+
+    /// The name of the schema `oid` identifies, or `None` if this snapshot has
+    /// no such schema. The inverse of [`SystemCatalog::namespace_oid`]; both back
+    /// `regnamespace`, and both read the same table `pg_namespace` is built from.
+    pub fn namespace_name(&self, oid: u32) -> Option<String> {
+        self.namespace_oids()
+            .iter()
+            .find(|(_, o)| **o == oid)
+            .map(|(name, _)| name.clone())
+    }
+
+    pub fn namespace_oid(&self, name: &str) -> Option<u32> {
+        self.namespace_oids().get(name).copied()
+    }
+
+    /// The `(namespace, name)` of the user type `oid` identifies, or `None` for
+    /// an OID no `CREATE TYPE` has. Built-in types are not here — they resolve
+    /// without a catalog.
+    ///
+    /// TODO: user types carry no namespace of their own — `CREATE TYPE app.t`
+    /// is rejected — so every one of them reports `public`, which is where an
+    /// unqualified name finds them.
+    pub fn user_type_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        self.user_types()
+            .iter()
+            .find(|t| t.oid == oid)
+            .map(|t| ("public", t.name.as_str()))
+    }
+
+    /// The OID of the user type `namespace.name` names. A qualifier other than
+    /// `public` matches nothing, for the reason above.
+    pub fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+        if matches!(namespace, Some(ns) if ns != "public") {
+            return None;
+        }
+        self.user_types()
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.oid)
+    }
+
+    /// Build the requested relation's rows + schema, or `None` if unknown.
+    /// The schema and rows of the `pg_catalog` relation `name`, or `None` if
+    /// this build serves no such relation.
+    fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
+        self.build(CatalogNamespace::PgCatalog, name)
+    }
+
+    /// The `information_schema` counterpart of [`SystemCatalog::build_pg_catalog`].
+    fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
+        self.build(CatalogNamespace::InformationSchema, name)
+    }
+
+    /// Materialize `namespace.name` from the registry.
+    ///
+    /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
+    /// relation twice and every scan of `pg_proc` rebuilds 503 rows. The cache
+    /// belongs one level up, in `open_table`/`resolve`: both wrap this in a
+    /// [`StaticTable`], which already holds its schema and rows behind `Arc`s,
+    /// so caching the `Arc<dyn TableAm>` is a refcount bump where caching the
+    /// owned pair returned here would clone every row on each hit. Safe either
+    /// way — a `SystemCatalog` lives exactly one statement.
+    fn build(
+        &self,
+        namespace: CatalogNamespace,
+        name: &str,
+    ) -> Option<(TableSchema, Vec<Vec<Value>>)> {
+        let def = registry::lookup(namespace, name)?;
+        Some(((def.schema)(), (def.rows)(self)))
+    }
+
+    /// The instant the timezone relations resolve their offsets at; see
+    /// [`CatalogSource::now`].
+    pub(crate) fn now(&self) -> i64 {
+        self.source.now()
+    }
+}
+
+impl TableEngine for SystemCatalog {
+    fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+        // The session catalog never routes CREATE here (DDL targets user data).
+        unreachable!(
+            "cannot create relation \"{}\" in the system catalog",
+            schema.name
+        )
+    }
+
+    fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
+        match self.build_pg_catalog(name) {
+            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
+            None => Err(StorageError::TableNotFound(name.to_string())),
+        }
+    }
+
+    fn resolve(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        let relation = match namespace {
+            None | Some("pg_catalog") => self.build_pg_catalog(name),
+            Some("information_schema") => self.build_information_schema(name),
+            Some(_) => None,
+        };
+        match relation {
+            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
+            None => Err(StorageError::TableNotFound(name.to_string())),
+        }
+    }
+
+    fn drop_table(&self, _namespace: &str, name: &str) -> Result<(), StorageError> {
+        // The session catalog routes DROP through temp/global, never here; a
+        // system catalog relation is not droppable.
+        unreachable!("cannot drop relation \"{name}\" from the system catalog")
+    }
+}

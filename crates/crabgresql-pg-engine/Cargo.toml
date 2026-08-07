@@ -1,0 +1,32 @@
+[package]
+name = "crabgresql-pg-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crabgresql-buffer-engine.workspace = true
+crabgresql-config.workspace = true
+crabgresql-parquet-engine.workspace = true
+crabgresql-storage-api.workspace = true
+crabgresql-txn.workspace = true
+crabgresql-types.workspace = true
+crabgresql-wal.workspace = true
+crc32c.workspace = true
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# Exposes `ephemeral()` — a fully-wired durable engine over a throwaway temp
+# directory — so downstream crates can spin up a real pg-engine in their tests
+# without a persistent data dir. Not compiled into production builds.
+test-support = ["dep:tempfile"]
+
+[dev-dependencies]
+anyhow.workspace = true
+crabgresql-executor.workspace = true
+tempfile.workspace = true

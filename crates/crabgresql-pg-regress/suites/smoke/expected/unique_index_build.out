@@ -1,0 +1,53 @@
+-- BUILDING A UNIQUE INDEX OVER ROWS THAT ARE ALREADY THERE
+--
+-- A build-time duplicate reports differently from a run-time one: the message
+-- names the index that could not be created, and the DETAIL says the key "is
+-- duplicated" rather than that it "already exists".
+--
+-- Every case below holds exactly ONE duplicated key. Which key is named when
+-- several are duplicated is not a contract: PostgreSQL finds the collision
+-- inside its build sort, so its answer follows neither scan nor sort order.
+CREATE TABLE uix (a integer, b text);
+INSERT INTO uix VALUES (1, 'x'), (2, 'y'), (1, 'z');
+CREATE UNIQUE INDEX uix_a_key ON uix(a);
+ERROR:  could not create unique index "uix_a_key"
+DETAIL:  Key (a)=(1) is duplicated.
+ALTER TABLE uix ADD PRIMARY KEY (a);
+ERROR:  could not create unique index "uix_pkey"
+DETAIL:  Key (a)=(1) is duplicated.
+ALTER TABLE uix ADD UNIQUE (a);
+ERROR:  could not create unique index "uix_a_key"
+DETAIL:  Key (a)=(1) is duplicated.
+-- A non-unique index over the same rows is not affected.
+CREATE INDEX uix_a_idx ON uix(a);
+-- A composite key repeats only when every column does, so (1,'x') and (1,'z')
+-- coexist under it.
+CREATE UNIQUE INDEX uix_a_b_key ON uix(a, b);
+CREATE TABLE uixc (a integer, b text);
+INSERT INTO uixc VALUES (1, 'x'), (2, 'y'), (1, 'x');
+CREATE UNIQUE INDEX uixc_a_b_key ON uixc(a, b);
+ERROR:  could not create unique index "uixc_a_b_key"
+DETAIL:  Key (a, b)=(1, x) is duplicated.
+-- A key column may repeat, and then the value is named once per position.
+CREATE UNIQUE INDEX uixc_a_a_key ON uixc(a, a);
+ERROR:  could not create unique index "uixc_a_a_key"
+DETAIL:  Key (a, a)=(1, 1) is duplicated.
+-- NULL keys are exempt by default and collide only under NULLS NOT DISTINCT.
+CREATE TABLE uixn (i integer);
+INSERT INTO uixn VALUES (NULL), (NULL), (5);
+CREATE UNIQUE INDEX uixn_i_key ON uixn(i);
+CREATE UNIQUE INDEX uixn_i_nnd ON uixn(i) NULLS NOT DISTINCT;
+ERROR:  could not create unique index "uixn_i_nnd"
+DETAIL:  Key (i)=(null) is duplicated.
+-- A table holding both a duplicate and a NULL reports the duplicate: the index
+-- is built before not-null is verified, the reverse of the order the same two
+-- constraints are reported in on INSERT.
+CREATE TABLE uixd (a integer);
+INSERT INTO uixd VALUES (1), (1), (NULL);
+ALTER TABLE uixd ADD PRIMARY KEY (a);
+ERROR:  could not create unique index "uixd_pkey"
+DETAIL:  Key (a)=(1) is duplicated.
+DROP TABLE uix;
+DROP TABLE uixc;
+DROP TABLE uixn;
+DROP TABLE uixd;

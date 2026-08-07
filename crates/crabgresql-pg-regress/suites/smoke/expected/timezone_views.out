@@ -1,0 +1,100 @@
+--
+-- PG_TIMEZONE_NAMES / PG_TIMEZONE_ABBREVS
+--
+-- Both views report a zone's offset and DST flag AT THE CURRENT INSTANT, so
+-- nothing here may name a zone that observes DST: America/New_York would print
+-- -05/f in January and -04/t in July. The Etc/* zones are frozen by definition,
+-- and the rest of this file checks bulk properties rather than contents.
+--
+-- The rows below were verified byte-for-byte against PostgreSQL 18.4.
+--
+SELECT name, abbrev, utc_offset, is_dst FROM pg_timezone_names WHERE name = 'UTC';
+ name | abbrev | utc_offset | is_dst 
+------+--------+------------+--------
+ UTC  | UTC    | 00:00:00   | f
+(1 row)
+
+SELECT name, abbrev, utc_offset, is_dst
+  FROM pg_timezone_names
+ WHERE name IN ('Etc/GMT+5', 'Etc/GMT-8')
+ ORDER BY name COLLATE "C";
+   name    | abbrev | utc_offset | is_dst 
+-----------+--------+------------+--------
+ Etc/GMT+5 | -05    | -05:00:00  | f
+ Etc/GMT-8 | +08    | 08:00:00   | f
+(2 rows)
+
+SELECT pg_typeof(utc_offset) AS offset_type, pg_typeof(is_dst) AS dst_type
+  FROM pg_timezone_names WHERE name = 'UTC';
+ offset_type | dst_type 
+-------------+----------
+ interval    | boolean
+(1 row)
+
+-- bulk properties, which survive a tz-database update where a row listing
+-- would not. The second is upstream's own sysviews check.
+SELECT count(*) > 300 AS enough_zones,
+       count(DISTINCT utc_offset) >= 24 AS enough_offsets
+  FROM pg_timezone_names;
+ enough_zones | enough_offsets 
+--------------+----------------
+ t            | t
+(1 row)
+
+-- pg_timezone_abbrevs is small enough to dump in full: unlike the zone list it
+-- is crabgresql's own curated table, not the tz database's.
+--
+-- MSK and VET are the two entries that resolve through a reference zone rather
+-- than a constant offset (PostgreSQL's DYNTZ), so their rows track Moscow's and
+-- Caracas's current offsets — a future change there breaks this file, as it
+-- would break PostgreSQL's own output.
+SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs ORDER BY abbrev COLLATE "C";
+ abbrev | utc_offset | is_dst 
+--------+------------+--------
+ ADT    | -03:00:00  | t
+ AKDT   | -08:00:00  | t
+ AKST   | -09:00:00  | f
+ AST    | -04:00:00  | f
+ CDT    | -05:00:00  | t
+ CST    | -06:00:00  | f
+ EDT    | -04:00:00  | t
+ EST    | -05:00:00  | f
+ HST    | -10:00:00  | f
+ MDT    | -06:00:00  | t
+ MSK    | 03:00:00   | f
+ MST    | -07:00:00  | f
+ PDT    | -07:00:00  | t
+ PST    | -08:00:00  | f
+ VET    | -04:00:00  | f
+(15 rows)
+
+-- The divergence, pinned deliberately rather than left to be discovered:
+-- PostgreSQL 18.4 loads 198 abbreviations from src/timezone/tznames/Default
+-- spanning 40 offsets, and crabgresql curates 15 spanning 9. The abbreviation
+-- table is the datetime *parser's* accept-list, so growing it is a change to
+-- value parsing rather than to this view; see crabgresql_types::tz.
+--
+-- The consequence for upstream: sysviews.sql's `count(distinct utc_offset) >= 24`
+-- reports false here, so that test must not enter upstream_must_pass.txt.
+SELECT count(*) AS abbrevs, count(DISTINCT utc_offset) AS offsets
+  FROM pg_timezone_abbrevs;
+ abbrevs | offsets 
+---------+---------
+      15 |       9
+(1 row)
+
+-- every abbreviation this view lists is one a datetime literal accepts, which
+-- is what makes the curated list the honest answer rather than an arbitrary one
+SELECT timestamptz '2020-06-01 12:00:00 PDT', timestamptz '2020-06-01 12:00:00 EST';
+      timestamptz       |      timestamptz       
+------------------------+------------------------
+ 2020-06-01 19:00:00+00 | 2020-06-01 17:00:00+00
+(1 row)
+
+-- both views resolve by name through the fixed OID table
+SELECT 'pg_timezone_names'::regclass, 'pg_timezone_abbrevs'::regclass;
+     regclass      |      regclass       
+-------------------+---------------------
+ pg_timezone_names | pg_timezone_abbrevs
+(1 row)
+

@@ -1,0 +1,52 @@
+--
+-- BASIC
+-- Smoke test for the regression runner: only M0-supported SQL, expected
+-- output hand-checked against psql's aligned format.
+--
+SELECT 1 AS one;
+ one 
+-----
+   1
+(1 row)
+
+-- alignment: int right, text/bool left, NULL renders empty (trailing space)
+SELECT 1 AS id, 'crab' AS name, true AS ok, NULL AS missing;
+ id | name | ok | missing 
+----+------+----+---------
+  1 | crab | t  | 
+(1 row)
+
+CREATE TABLE crabs (id integer, name text, big boolean);
+INSERT INTO crabs VALUES (1, 'ferris', true);
+INSERT INTO crabs VALUES (2, 'hermit', false), (3, NULL, NULL);
+SELECT * FROM crabs;
+ id |  name  | big 
+----+--------+-----
+  1 | ferris | t
+  2 | hermit | f
+  3 |        | 
+(3 rows)
+
+-- SET is accepted and quiet
+SET search_path = public;
+-- a statement spanning several lines
+SELECT
+    42 AS answer,
+    'multi line' AS style;
+ answer |   style    
+--------+------------
+     42 | multi line
+(1 row)
+
+-- two statements on one line: echoed once, two results
+SELECT 1; SELECT 2;
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        2
+(1 row)
+

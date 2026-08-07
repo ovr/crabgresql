@@ -1,0 +1,131 @@
+--
+-- CREATE VIEW
+-- A view is a stored query: SELECT expands it, an explicit column list renames
+-- its outputs, a view may read another view, OR REPLACE swaps the definition
+-- (and may only add trailing columns), and it reflects into the catalogs as
+-- relkind 'v'. Output hand-checked against PostgreSQL (psql -a -q).
+--
+CREATE TABLE t (id integer, name text);
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE VIEW v AS SELECT id, name FROM t WHERE id < 3;
+SELECT id, name FROM v ORDER BY id;
+ id | name 
+----+------
+  1 | one
+  2 | two
+(2 rows)
+
+-- An explicit column list renames the view's output columns.
+CREATE VIEW v_alias (num, label) AS SELECT id, name FROM t;
+SELECT num, label FROM v_alias ORDER BY num;
+ num | label 
+-----+-------
+   1 | one
+   2 | two
+   3 | three
+(3 rows)
+
+-- A view can select from another view.
+CREATE VIEW v_over AS SELECT label FROM v_alias WHERE num = 2;
+SELECT label FROM v_over;
+ label 
+-------
+ two
+(1 row)
+
+-- OR REPLACE swaps the body; adding a trailing column is allowed.
+CREATE OR REPLACE VIEW v AS SELECT id, name, id * 10 AS scaled FROM t WHERE id < 3;
+SELECT id, name, scaled FROM v ORDER BY id;
+ id | name | scaled 
+----+------+--------
+  1 | one  |     10
+  2 | two  |     20
+(2 rows)
+
+-- A plain re-create of an existing name is an error.
+CREATE VIEW v AS SELECT 1;
+ERROR:  relation "v" already exists
+-- IF NOT EXISTS downgrades that to a skip NOTICE.
+CREATE VIEW IF NOT EXISTS v AS SELECT 1;
+NOTICE:  relation "v" already exists, skipping
+-- A table cannot take a view's name either.
+CREATE TABLE v (x integer);
+ERROR:  relation "v" already exists
+-- Views reflect into pg_class as relkind 'v'.
+SELECT relname, relkind FROM pg_class WHERE relname IN ('t', 'v') ORDER BY relname;
+ relname | relkind 
+---------+---------
+ t       | r
+ v       | v
+(2 rows)
+
+-- ... and into information_schema.tables as VIEW.
+SELECT table_name, table_type FROM information_schema.tables
+  WHERE table_name IN ('v', 'v_alias') ORDER BY table_name;
+ table_name | table_type 
+------------+------------
+ v          | VIEW
+ v_alias    | VIEW
+(2 rows)
+
+-- A view's columns carry the type modifier the query's output does: a plain
+-- reference and an explicit cast keep theirs, anything computed loses it.
+CREATE TABLE tm(a varchar(20), b numeric(8,2), c timestamp(3), d char(5),
+                e interval day to second(2));
+CREATE VIEW v_tm AS
+  SELECT a, b, c, d, e,
+         a || 'x' AS cat,
+         (SELECT a) AS sq,
+         a::varchar(9) AS cst,
+         upper(a) AS up,
+         'abc'::varchar(7) AS lit,
+         CASE WHEN true THEN a ELSE a END AS arms
+    FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'v_tm'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |            spelling            
+---------+--------------------------------
+ a       | character varying(20)
+ b       | numeric(8,2)
+ c       | timestamp(3) without time zone
+ d       | character(5)
+ e       | interval day to second(2)
+ cat     | text
+ sq      | character varying(20)
+ cst     | character varying(9)
+ up      | text
+ lit     | character varying(7)
+ arms    | character varying(20)
+(11 rows)
+
+-- A set operation keeps a modifier only when every arm declares the same one.
+CREATE VIEW v_tm_same AS SELECT a FROM tm UNION ALL SELECT a FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'v_tm_same'::regclass AND attnum > 0;
+ attname |       spelling        
+---------+-----------------------
+ a       | character varying(20)
+(1 row)
+
+-- CREATE TABLE AS carries them across the same way.
+CREATE TABLE tm_copy AS SELECT a, b, c, d, e FROM tm;
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'tm_copy'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |            spelling            
+---------+--------------------------------
+ a       | character varying(20)
+ b       | numeric(8,2)
+ c       | timestamp(3) without time zone
+ d       | character(5)
+ e       | interval day to second(2)
+(5 rows)
+
+DROP VIEW v_tm_same;
+DROP VIEW v_tm;
+DROP TABLE tm_copy;
+DROP TABLE tm;
+-- Clean up (this suite shares one database across tests).
+DROP VIEW v_over;
+DROP VIEW v_alias;
+DROP VIEW v;
+DROP TABLE t;

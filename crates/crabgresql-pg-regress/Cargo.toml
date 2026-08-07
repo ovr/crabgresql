@@ -1,0 +1,22 @@
+[package]
+name = "crabgresql-pg-regress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "regress"
+path = "src/bin/regress.rs"
+
+[dependencies]
+clap.workspace = true
+crabgresql-server.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -1,0 +1,261 @@
+--
+-- JSONB
+-- jsonb: input is parsed and canonicalized -- insignificant whitespace is
+-- dropped, object keys are sorted (shorter keys first, then by byte order) with
+-- duplicates collapsed keeping the last value, and numbers are normalized
+-- through numeric. Covers canonical output, casts, jsonb -> scalar extraction,
+-- equality/ordering, and DISTINCT. Output hand-checked against PostgreSQL.
+--
+-- object keys are sorted and duplicates keep the last value
+SELECT '{"b": 1, "a": 2, "a": 3}'::jsonb;
+      jsonb       
+------------------
+ {"a": 3, "b": 1}
+(1 row)
+
+-- key ordering is length-first, then byte order (shorter keys sort first)
+SELECT '{"aa": 1, "b": 2}'::jsonb;
+       jsonb       
+-------------------
+ {"b": 2, "aa": 1}
+(1 row)
+
+-- insignificant whitespace is removed; nesting is preserved
+SELECT '  [1,   2 , ["x" ,null, true]]  '::jsonb;
+           jsonb           
+---------------------------
+ [1, 2, ["x", null, true]]
+(1 row)
+
+-- numbers are normalized via numeric (scale is preserved, exponents expanded)
+SELECT '1.0'::jsonb AS a, '1.00'::jsonb AS b, '1e2'::jsonb AS c, '-0'::jsonb AS d;
+  a  |  b   |  c  | d 
+-----+------+-----+---
+ 1.0 | 1.00 | 100 | 0
+(1 row)
+
+-- casts to text (canonical) and to json
+SELECT '{"b":1,"a":2}'::jsonb::text AS as_text,
+       '{"b":1,"a":2}'::jsonb::json AS as_json;
+     as_text      |     as_json      
+------------------+------------------
+ {"a": 2, "b": 1} | {"a": 2, "b": 1}
+(1 row)
+
+-- jsonb scalar -> SQL scalar extraction
+SELECT 'true'::jsonb::bool AS b,
+       '42'::jsonb::int4 AS i,
+       '3.5'::jsonb::numeric AS n;
+ b | i  |  n  
+---+----+-----
+ t | 42 | 3.5
+(1 row)
+
+-- extracting a scalar of the wrong kind is an error (22023)
+SELECT '"x"'::jsonb::numeric;
+ERROR:  cannot cast jsonb string to type numeric
+SELECT '[1]'::jsonb::bool;
+ERROR:  cannot cast jsonb array to type boolean
+-- malformed input: after a comma a key is required (its DETAIL says
+-- "Expected string", not "or }"); a too-large number is a 22003 error
+SELECT '{"a":1,}'::jsonb;
+ERROR:  invalid input syntax for type jsonb
+LINE 1: SELECT '{"a":1,}'::jsonb;
+               ^
+DETAIL:  Expected string, but found "}".
+SELECT '1e1000000'::jsonb;
+ERROR:  value overflows numeric format
+LINE 1: SELECT '1e1000000'::jsonb;
+               ^
+-- equality is value-based: 1.0 and 1.00 are equal, and whitespace is irrelevant
+SELECT '[1, 2]'::jsonb = '[1,2]'::jsonb AS eq_ws,
+       '1.0'::jsonb = '1.00'::jsonb AS eq_num,
+       '{"a":1}'::jsonb = '{"a":2}'::jsonb AS neq;
+ eq_ws | eq_num | neq 
+-------+--------+-----
+ t     | t      | f
+(1 row)
+
+-- ordering follows PG's rule: Null < String < Number < Bool < Array < Object,
+-- with arrays/objects compared by length first
+SELECT j FROM (VALUES
+    ('{"a": 1}'::jsonb),
+    ('[1, 2, 3]'::jsonb),
+    ('[5]'::jsonb),
+    ('42'::jsonb),
+    ('"hello"'::jsonb),
+    ('true'::jsonb),
+    ('null'::jsonb)
+) AS t(j) ORDER BY j;
+     j     
+-----------
+ null
+ "hello"
+ 42
+ true
+ [5]
+ [1, 2, 3]
+ {"a": 1}
+(7 rows)
+
+-- round-trip through a table column, plus GROUP BY (which hashes jsonb):
+-- rows that are jsonb-equal despite different spelling collapse into one group
+CREATE TABLE btest (id int, doc jsonb);
+INSERT INTO btest VALUES
+    (1, '{"a": 1, "b": 2}'),
+    (2, '{"b":2,"a":1}'),
+    (3, '[1]'),
+    (4, '{"x":  [1,2,3], "k": "v"}');
+SELECT id, doc FROM btest ORDER BY id;
+ id |            doc             
+----+----------------------------
+  1 | {"a": 1, "b": 2}
+  2 | {"a": 1, "b": 2}
+  3 | [1]
+  4 | {"k": "v", "x": [1, 2, 3]}
+(4 rows)
+
+SELECT doc, count(*) AS n FROM btest GROUP BY doc ORDER BY doc;
+            doc             | n 
+----------------------------+---
+ [1]                        | 1
+ {"a": 1, "b": 2}           | 2
+ {"k": "v", "x": [1, 2, 3]} | 1
+(3 rows)
+
+DROP TABLE btest;
+-- extraction returns a canonicalized value, unlike the verbatim json operators
+SELECT '{"a":{"b" :1}}'::jsonb -> 'a' AS canonical;
+ canonical 
+-----------
+ {"b": 1}
+(1 row)
+
+-- ->> yields text: a string loses its quotes, other values render canonically
+-- (numeric scale is kept, but the exponent form is normalized)
+SELECT '{"a":"x"}'::jsonb ->> 'a' AS str, '{"a": 1.500}'::jsonb ->> 'a' AS scale,
+       '{"a": 1e2}'::jsonb ->> 'a' AS exponent;
+ str | scale | exponent 
+-----+-------+----------
+ x   | 1.500 | 100
+(1 row)
+
+-- a JSON null is SQL NULL through ->>
+SELECT '{"a": null}'::jsonb -> 'a' AS raw, '{"a": null}'::jsonb ->> 'a' AS as_text;
+ raw  | as_text 
+------+---------
+ null | 
+(1 row)
+
+-- array subscripts are 0-based and count from the end when negative
+SELECT '[10,20,30]'::jsonb -> 1 AS second, '[10,20,30]'::jsonb -> -1 AS last,
+       '[10,20,30]'::jsonb -> 9 AS past_end;
+ second | last | past_end 
+--------+------+----------
+ 20     | 30   | 
+(1 row)
+
+-- a missing key or a wrong container kind is NULL, not an error
+SELECT '{"a":1}'::jsonb -> 'zz' AS missing, '1'::jsonb -> 'a' AS scalar,
+       '[1,2]'::jsonb -> 'a' AS array_by_key, '{"a":1}'::jsonb -> 0 AS object_by_index;
+ missing | scalar | array_by_key | object_by_index 
+---------+--------+--------------+-----------------
+         |        |              | 
+(1 row)
+
+-- #> / #>> walk a text[] path; the empty path returns the whole value
+SELECT '{"a":{"b":["c","d"]}}'::jsonb #> '{a,b,1}' AS path,
+       '{"a":{"b":["c","d"]}}'::jsonb #>> '{a,b,1}' AS path_text,
+       '{"a":1}'::jsonb #> '{}' AS empty_path;
+ path | path_text | empty_path 
+------+-----------+------------
+ "d"  | d         | {"a": 1}
+(1 row)
+
+-- a path element indexes an array only when it parses as an integer; a NULL
+-- element, or a path running past the end, makes the whole result NULL
+SELECT '[1,2,3]'::jsonb #> '{-1}' AS neg_step, '[1,2]'::jsonb #> '{xx}' AS bad_step,
+       '{"a":1}'::jsonb #> '{a,b}' AS too_deep,
+       '{"a":1}'::jsonb #> ARRAY['a', NULL] AS null_step;
+ neg_step | bad_step | too_deep | null_step 
+----------+----------+----------+-----------
+ 3        |          |          | 
+(1 row)
+
+-- a NULL key propagates (the operators are strict in both arguments)
+SELECT '{"a":1}'::jsonb -> NULL::text AS null_key;
+ null_key 
+----------
+ 
+(1 row)
+
+-- int2 widens to the int4 subscript operator, and varchar[] to the text[] path
+SELECT '[1,2]'::jsonb -> 1::smallint AS int2_ok,
+       '{"a":1}'::jsonb #> ARRAY['a']::varchar[] AS varchar_path;
+ int2_ok | varchar_path 
+---------+--------------
+ 2       | 1
+(1 row)
+
+-- no operator for other right-hand types: the subscript operator is on integer,
+-- so bigint and integer[] find no candidate
+SELECT '{"a":1}'::jsonb -> 1.5;
+ERROR:  operator does not exist: jsonb -> numeric
+LINE 1: SELECT '{"a":1}'::jsonb -> 1.5;
+                                ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+SELECT '[1,2]'::jsonb -> 1::bigint;
+ERROR:  operator does not exist: jsonb -> bigint
+LINE 1: SELECT '[1,2]'::jsonb -> 1::bigint;
+                              ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+SELECT '{"a":1}'::jsonb #> ARRAY[1];
+ERROR:  operator does not exist: jsonb #> integer[]
+LINE 1: SELECT '{"a":1}'::jsonb #> ARRAY[1];
+                                ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+-- nor for a non-json left operand
+SELECT 'x'::text -> 'a';
+ERROR:  operator does not exist: text -> unknown
+LINE 1: SELECT 'x'::text -> 'a';
+                         ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+-- with both operands untyped every candidate applies equally (42725, not 42883)
+SELECT '{"a":1}' -> 'a';
+ERROR:  operator is not unique: unknown -> unknown
+LINE 1: SELECT '{"a":1}' -> 'a';
+                         ^
+DETAIL:  Could not choose a best candidate operator.
+HINT:  You might need to add explicit type casts.
+-- every text-family element type reaches the text[] path operator implicitly,
+-- matching what the scalar key accepts
+SELECT '{"a":1}'::jsonb #> ARRAY['a']::name[] AS name_path,
+       '{"a":1}'::jsonb #> ARRAY['a']::char(3)[] AS bpchar_path,
+       '{"a":1}'::jsonb -> 'a'::name AS name_key;
+ name_path | bpchar_path | name_key 
+-----------+-------------+----------
+ 1         | 1           | 1
+(1 row)
+
+-- the schema-qualified operator spelling resolves to the same operator
+SELECT '{"a":1}'::jsonb OPERATOR(pg_catalog.->) 'a' AS qualified_arrow,
+       '{"a":{"b":2}}'::jsonb OPERATOR(pg_catalog.#>>) '{a,b}' AS qualified_hash;
+ qualified_arrow | qualified_hash 
+-----------------+----------------
+ 1               | 2
+(1 row)
+
+-- a path element is a subscript only if strtol accepts it whole: C whitespace
+-- (here a tab) is skipped, but a Unicode space is not whitespace to strtol and
+-- makes the element a non-number, hence NULL
+SELECT '[1,2,3]'::jsonb #> ARRAY[chr(9) || '1'] AS c_whitespace_step,
+       '[1,2,3]'::jsonb #> ARRAY[chr(12288) || '1'] AS unicode_space_step;
+ c_whitespace_step | unicode_space_step 
+-------------------+--------------------
+ 2                 | 
+(1 row)
+

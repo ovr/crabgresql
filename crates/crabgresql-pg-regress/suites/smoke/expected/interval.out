@@ -1,0 +1,804 @@
+--
+-- INTERVAL
+-- interval: input parsing (verbose, SQL-standard, ISO-8601), postgres-style
+-- output, comparisons, casts, arithmetic (interval/interval, timestamp/interval,
+-- timestamp-timestamp), the justify/age/make constructors, the field functions
+-- (date_part / extract / date_trunc), to_char, and infinite intervals. Output
+-- hand-checked against PostgreSQL's postgres IntervalStyle.
+--
+-- output formatting: years/mons/days then a signed HH:MM:SS, sub-second zeros
+-- trimmed, zero is 00:00:00
+SELECT interval '1 year 2 mons 3 days 04:05:06' AS full;
+             full              
+-------------------------------
+ 1 year 2 mons 3 days 04:05:06
+(1 row)
+
+SELECT interval '1 mon' AS one_mon, interval '2 mons' AS two_mons, interval '-1 mon' AS neg_mon;
+ one_mon | two_mons | neg_mon 
+---------+----------+---------
+ 1 mon   | 2 mons   | -1 mons
+(1 row)
+
+SELECT interval '1.5 days' AS day_half, interval '2.5 hours' AS hour_half, interval '1.5 mons' AS mon_half;
+    day_half    | hour_half |   mon_half    
+----------------+-----------+---------------
+ 1 day 12:00:00 | 02:30:00  | 1 mon 15 days
+(1 row)
+
+SELECT interval '-1 day 2 hours' AS mixed_sign, interval '-00:00:01' AS neg_sec, interval '0' AS zero;
+    mixed_sign     |  neg_sec  |   zero   
+-------------------+-----------+----------
+ -1 days +02:00:00 | -00:00:01 | 00:00:00
+(1 row)
+
+SELECT interval '90 minutes' AS minutes, interval '100000000 days' AS many_days, interval '24:00:00' AS full_day;
+ minutes  |   many_days    | full_day 
+----------+----------------+----------
+ 01:30:00 | 100000000 days | 24:00:00
+(1 row)
+
+SELECT interval '2 days ago' AS ago, interval '00:00:01.234567' AS micros;
+   ago   |     micros      
+---------+-----------------
+ -2 days | 00:00:01.234567
+(1 row)
+
+-- the default column name of a typed literal is the type name
+SELECT interval '1 day';
+ interval 
+----------
+ 1 day
+(1 row)
+
+-- input forms: SQL-standard leading/trailing fields and ISO-8601 durations
+SELECT interval '1' day AS one_day, interval '1-2' year to month AS year_month;
+ one_day |  year_month   
+---------+---------------
+ 1 day   | 1 year 2 mons
+(1 row)
+
+SELECT interval '3 4:05:06' day to second AS day_time, interval 'P1Y2M3DT4H5M6S' AS iso;
+    day_time     |              iso              
+-----------------+-------------------------------
+ 3 days 04:05:06 | 1 year 2 mons 3 days 04:05:06
+(1 row)
+
+-- comparisons use the canonical span (30-day months, 24-hour days)
+SELECT interval '2 mons' < interval '70 days' AS lt,
+       interval '1 day' = interval '24 hours' AS eq,
+       interval '1 hour' > interval '59 minutes' AS gt;
+ lt | eq | gt 
+----+----+----
+ t  | t  | t
+(1 row)
+
+-- casts both directions; a column named after the target type
+SELECT '1 day 2 hours'::interval AS from_text;
+   from_text    
+----------------
+ 1 day 02:00:00
+(1 row)
+
+SELECT (interval '1 day 2 hours')::text AS to_text;
+    to_text     
+----------------
+ 1 day 02:00:00
+(1 row)
+
+-- an interval column: insert, filter, order
+CREATE TABLE iv_tbl (id int4, span interval);
+INSERT INTO iv_tbl VALUES (1, '1 day'), (2, interval '2 mons 3 days'),
+                          (3, '-1 day'), (4, '01:30:00');
+SELECT id, span FROM iv_tbl WHERE span < interval '1 mon' ORDER BY 2;
+ id |   span   
+----+----------
+  3 | -1 days
+  4 | 01:30:00
+  1 | 1 day
+(3 rows)
+
+SELECT id FROM iv_tbl WHERE span = interval '1 day';
+ id 
+----
+  1
+(1 row)
+
+-- interval arithmetic: add, subtract, negate, scale by a number
+SELECT interval '1 day' + interval '2 hours' AS add,
+       interval '5 mons' - interval '2 mons 10 days' AS sub;
+      add       |       sub       
+----------------+-----------------
+ 1 day 02:00:00 | 3 mons -10 days
+(1 row)
+
+SELECT - interval '1 day 2 hours' AS neg;
+        neg        
+-------------------
+ -1 days -02:00:00
+(1 row)
+
+SELECT interval '1 day 3 hours' * 2.5 AS mul, 3 * interval '2 mons' AS scale,
+       interval '1 day 3 hours' / 2 AS div;
+       mul       | scale  |   div    
+-----------------+--------+----------
+ 2 days 19:30:00 | 6 mons | 13:30:00
+(1 row)
+
+-- timestamp / interval arithmetic (month add clamps the day of month)
+SELECT timestamp '2001-01-01 12:00:00' + interval '1 mon 3 days 4 hours' AS ts_plus;
+       ts_plus       
+---------------------
+ 2001-02-04 16:00:00
+(1 row)
+
+SELECT timestamp '2001-03-31' + interval '1 mon' AS clamp_eom;
+      clamp_eom      
+---------------------
+ 2001-04-30 00:00:00
+(1 row)
+
+SELECT timestamp '2001-01-01' - interval '1 day' AS ts_minus;
+      ts_minus       
+---------------------
+ 2000-12-31 00:00:00
+(1 row)
+
+SELECT timestamp '2001-01-01' - timestamp '1997-01-02' AS ts_diff;
+  ts_diff  
+-----------
+ 1460 days
+(1 row)
+
+SELECT timestamp '2001-09-22 18:19:20' - timestamp '2001-09-22 12:00:00' AS same_day;
+ same_day 
+----------
+ 06:19:20
+(1 row)
+
+-- justify_days (30-day months), justify_hours (24-hour days), justify_interval
+SELECT justify_days(interval '35 days') AS jdays,
+       justify_hours(interval '27 hours') AS jhours,
+       justify_interval(interval '1 mon 33 days 27 hours') AS jinterval;
+    jdays     |     jhours     |       jinterval        
+--------------+----------------+------------------------
+ 1 mon 5 days | 1 day 03:00:00 | 2 mons 4 days 03:00:00
+(1 row)
+
+-- make_interval and age
+SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5) AS made, make_interval(0, 0, 0, 0, 0, 0, 0) AS zero;
+               made               |   zero   
+----------------------------------+----------
+ 1 year 2 mons 25 days 05:06:07.5 | 00:00:00
+(1 row)
+
+SELECT age(timestamp '2001-04-10', timestamp '1957-06-13') AS age1,
+       age(timestamp '2010-01-01', timestamp '2009-03-15') AS age2;
+          age1           |      age2      
+-------------------------+----------------
+ 43 years 9 mons 27 days | 9 mons 17 days
+(1 row)
+
+-- date_part (float8)
+SELECT date_part('year', interval '14 months') AS year,
+       date_part('month', interval '14 months') AS month,
+       date_part('day', interval '1 day 02:03:04') AS day;
+ year | month | day 
+------+-------+-----
+    1 |     2 |   1
+(1 row)
+
+SELECT date_part('hour', interval '1 day 02:03:04') AS hour,
+       date_part('minute', interval '1 day 02:03:04') AS minute,
+       date_part('second', interval '00:00:04.5') AS second;
+ hour | minute | second 
+------+--------+--------
+    2 |      3 |    4.5
+(1 row)
+
+SELECT date_part('epoch', interval '1 year 2 mons 3 days 04:05:06') AS epoch,
+       date_part('quarter', interval '14 months') AS quarter;
+  epoch   | quarter 
+----------+---------
+ 37015506 |       1
+(1 row)
+
+-- extract (numeric): sub-second scales, epoch
+SELECT extract(second from interval '00:00:04.5') AS second,
+       extract(milliseconds from interval '00:00:04.5') AS ms,
+       extract(microseconds from interval '00:00:04.5') AS us;
+  second  |    ms    |   us    
+----------+----------+---------
+ 4.500000 | 4500.000 | 4500000
+(1 row)
+
+SELECT extract(epoch from interval '1 day 02:03:04') AS epoch;
+    epoch     
+--------------
+ 93784.000000
+(1 row)
+
+-- date_trunc
+SELECT date_trunc('hour', interval '1 day 02:03:04.55') AS hour,
+       date_trunc('day', interval '1 mon 2 days 3 hours') AS day;
+      hour      |     day      
+----------------+--------------
+ 1 day 02:00:00 | 1 mon 2 days
+(1 row)
+
+-- isfinite and to_char
+SELECT isfinite(interval '1 day') AS finite, isfinite(interval 'infinity') AS not_finite;
+ finite | not_finite 
+--------+------------
+ t      | f
+(1 row)
+
+SELECT to_char(interval '1 year 2 mons 3 days 04:05:06', 'YYYY-MM-DD HH24:MI:SS') AS formatted;
+      formatted      
+---------------------
+ 0001-02-03 04:05:06
+(1 row)
+
+SELECT to_char(interval '1 day 02:03:04.567', 'FMHH24:FMMI:FMSS.MS.US') AS fm;
+        fm        
+------------------
+ 2:3:4.567.567000
+(1 row)
+
+-- infinite intervals: parse, output, arithmetic, comparison, fields
+SELECT interval 'infinity' AS pos, interval '-infinity' AS neg, interval '+infinity' AS plus;
+   pos    |    neg    |   plus   
+----------+-----------+----------
+ infinity | -infinity | infinity
+(1 row)
+
+SELECT interval 'infinity' + interval '1 day' AS still_inf, - interval 'infinity' AS negated;
+ still_inf |  negated  
+-----------+-----------
+ infinity  | -infinity
+(1 row)
+
+SELECT interval '-infinity' < interval '1 day' AS lt, interval 'infinity' > interval '1 day' AS gt;
+ lt | gt 
+----+----
+ t  | t
+(1 row)
+
+SELECT date_part('epoch', interval 'infinity') AS epoch, date_part('month', interval 'infinity') AS oscillating;
+  epoch   | oscillating 
+----------+-------------
+ Infinity |            
+(1 row)
+
+SELECT timestamp '2020-01-01' + interval 'infinity' AS ts_inf;
+  ts_inf  
+----------
+ infinity
+(1 row)
+
+-- type modifier: the admitted fields and the precision pack into one atttypmod,
+-- which format_type decodes back to the spelling that was written
+CREATE TABLE interval_typmod_tbl(
+  a interval, b interval(3), c interval year, d interval month, e interval day,
+  f interval hour, g interval minute, h interval second, i interval second(2),
+  j interval year to month, k interval day to hour, l interval day to minute,
+  m interval day to second, n interval day to second(4), o interval hour to minute,
+  p interval hour to second, q interval hour to second(1), r interval minute to second,
+  s interval minute to second(0));
+SELECT attname, atttypmod, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'interval_typmod_tbl'::regclass AND attnum > 0
+  ORDER BY attnum;
+ attname | atttypmod  |           spelling           
+---------+------------+------------------------------
+ a       |         -1 | interval
+ b       | 2147418115 | interval(3)
+ c       |     327679 | interval year
+ d       |     196607 | interval month
+ e       |     589823 | interval day
+ f       |   67174399 | interval hour
+ g       |  134283263 | interval minute
+ h       |  268500991 | interval second
+ i       |  268435458 | interval second(2)
+ j       |     458751 | interval year to month
+ k       |   67698687 | interval day to hour
+ l       |  201916415 | interval day to minute
+ m       |  470351871 | interval day to second
+ n       |  470286340 | interval day to second(4)
+ o       |  201392127 | interval hour to minute
+ p       |  469827583 | interval hour to second
+ q       |  469762049 | interval hour to second(1)
+ r       |  402718719 | interval minute to second
+ s       |  402653184 | interval minute to second(0)
+(19 rows)
+
+-- information_schema names the fields separately from the precision
+SELECT column_name, interval_type, datetime_precision, interval_precision
+  FROM information_schema.columns WHERE table_name = 'interval_typmod_tbl'
+  ORDER BY ordinal_position;
+ column_name |    interval_type    | datetime_precision | interval_precision 
+-------------+---------------------+--------------------+--------------------
+ a           |                     |                  6 |                   
+ b           |                     |                  3 |                   
+ c           | YEAR                |                  6 |                   
+ d           | MONTH               |                  6 |                   
+ e           | DAY                 |                  6 |                   
+ f           | HOUR                |                  6 |                   
+ g           | MINUTE              |                  6 |                   
+ h           | SECOND              |                  6 |                   
+ i           | SECOND(2)           |                  2 |                   
+ j           | YEAR TO MONTH       |                  6 |                   
+ k           | DAY TO HOUR         |                  6 |                   
+ l           | DAY TO MINUTE       |                  6 |                   
+ m           | DAY TO SECOND       |                  6 |                   
+ n           | DAY TO SECOND(4)    |                  4 |                   
+ o           | HOUR TO MINUTE      |                  6 |                   
+ p           | HOUR TO SECOND      |                  6 |                   
+ q           | HOUR TO SECOND(1)   |                  1 |                   
+ r           | MINUTE TO SECOND    |                  6 |                   
+ s           | MINUTE TO SECOND(0) |                  0 |                   
+(19 rows)
+
+-- casting applies the modifier: the lowest admitted field decides what survives,
+-- the fields above it are untouched, and a range reaching SECOND rounds
+SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval year AS y,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval month AS mo,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval day AS d;
+   y    |      mo       |          d           
+--------+---------------+----------------------
+ 1 year | 1 year 2 mons | 1 year 2 mons 3 days
+(1 row)
+
+SELECT (interval '1 year 2 months 3 days 4:05:06.789')::interval hour AS h,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval minute AS mi,
+       (interval '1 year 2 months 3 days 4:05:06.789')::interval second(1) AS s1;
+               h               |              mi               |               s1                
+-------------------------------+-------------------------------+---------------------------------
+ 1 year 2 mons 3 days 04:00:00 | 1 year 2 mons 3 days 04:05:00 | 1 year 2 mons 3 days 04:05:06.8
+(1 row)
+
+-- rounding is half away from zero, truncation is toward zero
+SELECT (interval '0.005 sec')::interval second(2) AS pos,
+       (interval '-0.005 sec')::interval second(2) AS neg,
+       (interval '-1 day -2:30:00')::interval hour AS neg_trunc;
+     pos     |     neg      |     neg_trunc     
+-------------+--------------+-------------------
+ 00:00:00.01 | -00:00:00.01 | -1 days -02:00:00
+(1 row)
+
+-- rounding moves the value a half-unit outwards, so a span within half a unit
+-- of either `i64` microsecond limit has nowhere to go: 22008, symmetrically
+SELECT interval '9223372036854770807 microseconds' second(2) AS hi_ok,
+       interval '-9223372036854770808 microseconds' second(2) AS lo_ok,
+       interval '-9223372036854275808 microseconds' second(0) AS lo_ok_s0;
+        hi_ok        |        lo_ok         |     lo_ok_s0      
+---------------------+----------------------+-------------------
+ 2562047788:00:54.77 | -2562047788:00:54.77 | -2562047788:00:54
+(1 row)
+
+SELECT interval '9223372036854770808 microseconds' second(2);
+ERROR:  interval out of range
+LINE 1: SELECT interval '9223372036854770808 microseconds' second(2)...
+                        ^
+SELECT interval '-9223372036854770809 microseconds' second(2);
+ERROR:  interval out of range
+LINE 1: SELECT interval '-9223372036854770809 microseconds' second(2...
+                        ^
+SELECT interval '2562047788:00:54.775807' second(2);
+ERROR:  interval out of range
+LINE 1: SELECT interval '2562047788:00:54.775807' second(2);
+                        ^
+-- assignment into a column applies the same modifier
+INSERT INTO interval_typmod_tbl(c, f, i)
+  VALUES (interval '14 months 3 days', interval '1 day 2:30:45.6789', interval '1 day 2:30:45.6789');
+SELECT c, f, i FROM interval_typmod_tbl;
+   c    |       f        |         i         
+--------+----------------+-------------------
+ 1 year | 1 day 02:00:00 | 1 day 02:30:45.68
+(1 row)
+
+DROP TABLE interval_typmod_tbl;
+-- errors: unparseable input is 22007, an unknown unit is 22023; recovery works
+SELECT interval 'garbage';
+ERROR:  invalid input syntax for type interval: "garbage"
+LINE 1: SELECT interval 'garbage';
+                        ^
+SELECT date_part('bogus', interval '1 day');
+ERROR:  unit "bogus" not recognized for type interval
+SELECT 'still alive' AS status;
+   status    
+-------------
+ still alive
+(1 row)
+
+-- an infinite stride cannot define a bin
+SELECT date_bin(interval 'infinity', timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00');
+ERROR:  timestamps cannot be binned into infinite intervals
+SELECT date_bin(interval '-infinity', timestamp '2001-02-16 20:38:40', timestamp '2001-02-16 20:05:00');
+ERROR:  timestamps cannot be binned into infinite intervals
+-- a bare `m` in an interval literal is minutes, not months
+SELECT interval '1 m' AS one_minute, interval '1 mon' AS one_month;
+ one_minute | one_month 
+------------+-----------
+ 00:01:00   | 1 mon
+(1 row)
+
+-- an SQL field qualifier masks the literal: fields coarser than its *trailing*
+-- field are kept, finer ones dropped, truncating toward zero
+SELECT interval '1 year 2 mons 3 days 4:05:06' year AS yr,
+       interval '1 year 2 mons 3 days 4:05:06' month AS mo,
+       interval '1 year 2 mons 3 days 4:05:06' day AS dy;
+   yr   |      mo       |          dy          
+--------+---------------+----------------------
+ 1 year | 1 year 2 mons | 1 year 2 mons 3 days
+(1 row)
+
+SELECT interval '1 year 2 mons 3 days 4:05:06' hour AS hr,
+       interval '1 year 2 mons 3 days 4:05:06' minute AS mi;
+              hr               |              mi               
+-------------------------------+-------------------------------
+ 1 year 2 mons 3 days 04:00:00 | 1 year 2 mons 3 days 04:05:00
+(1 row)
+
+SELECT interval '1 2:03:04' day to hour AS day_to_hour,
+       interval '-1.75 hours' hour AS neg_truncates_toward_zero,
+       interval '-13 mons' year AS neg_year;
+  day_to_hour   | neg_truncates_toward_zero | neg_year 
+----------------+---------------------------+----------
+ 1 day 02:00:00 | -01:00:00                 | -1 years
+(1 row)
+
+-- a lone number takes the range's *fine* end; a `D HH:MM:SS` form takes its
+-- coarse end, because that is where the SQL form puts the leading integer
+SELECT interval '1' year to month AS lone_ytm, interval '5' day to hour AS lone_dth,
+       interval '90' minute to second AS lone_mts,
+       interval '3 4:05:06' day to second AS with_time;
+ lone_ytm | lone_dth | lone_mts |    with_time    
+----------+----------+----------+-----------------
+ 1 mon    | 05:00:00 | 00:01:30 | 3 days 04:05:06
+(1 row)
+
+-- a bare `m` is minutes, so a MONTH qualifier masks it away entirely
+SELECT interval '1 m' AS bare_m, interval '1 m' month AS masked_m;
+  bare_m  | masked_m 
+----------+----------
+ 00:01:00 | 00:00:00
+(1 row)
+
+-- an infinite interval masks to itself
+SELECT interval 'infinity' month AS inf;
+   inf    
+----------
+ infinity
+(1 row)
+
+-- the SQL `D HH:MM:SS` form: a unit-less number before a time is days, whatever
+-- default unit a field qualifier would otherwise supply
+SELECT interval '3 4:05:06' AS unqualified, interval '3 4:05:06' day AS q_day,
+       interval '3 4:05:06' hour AS q_hour, interval '3 4:05:06' month AS q_month;
+   unqualified   | q_day  |     q_hour      | q_month  
+-----------------+--------+-----------------+----------
+ 3 days 04:05:06 | 3 days | 3 days 04:00:00 | 00:00:00
+(1 row)
+
+SELECT interval '-3 4:05:06' AS neg_days, interval '3 -4:05:06' AS neg_time;
+     neg_days      |     neg_time     
+-------------------+------------------
+ -3 days +04:05:06 | 3 days -04:05:06
+(1 row)
+
+-- a precision on a literal's qualifier is the same modifier a column carries, so
+-- it rounds the same way; the parser files a bare SECOND(n) separately from a
+-- range's TO SECOND(n), and both reach it
+SELECT interval '1.2345 seconds' second(2) AS bare_second_p,
+       interval '4:05:06.789' minute to second(1) AS range_second_p,
+       interval '1.6 seconds' second(0) AS rounds_away_from_zero;
+ bare_second_p | range_second_p | rounds_away_from_zero 
+---------------+----------------+-----------------------
+ 00:00:01.23   | 04:05:06.8     | 00:00:02
+(1 row)
+
+-- `@` is a separator, not a keyword: twenty-seven ASCII punctuation characters
+-- separate fields exactly as whitespace does, which is what makes the verbose
+-- `@ ... ago` input form parse. A literal with nothing but separators has no
+-- fields at all, and that is an error rather than a zero interval.
+SELECT interval '@ 14 seconds ago' AS verbose_ago, interval '@1 day' AS fused,
+       interval '1 day, 2 hours' AS comma, interval '5 days ago @' AS trailing_at;
+ verbose_ago | fused |     comma      | trailing_at 
+-------------+-------+----------------+-------------
+ -00:00:14   | 1 day | 1 day 02:00:00 | -5 days
+(1 row)
+
+SELECT interval '@';
+ERROR:  invalid input syntax for type interval: "@"
+LINE 1: SELECT interval '@';
+                        ^
+SELECT interval '@ 30 eons ago';
+ERROR:  invalid input syntax for type interval: "@ 30 eons ago"
+LINE 1: SELECT interval '@ 30 eons ago';
+                        ^
+-- The other five — `+ - . / :` — are positional. `/` and `:` are skipped
+-- between fields but glue into a token once one has begun, and a sign at a
+-- field start reaches across whitespace to fuse with the token after it.
+SELECT interval '- 2 hours' AS lone_sign, interval '1 day + 2 hours' AS plus,
+       interval '1 day - 2 hours' AS minus, interval '- infinity' AS signed_inf;
+ lone_sign |      plus      |      minus      | signed_inf 
+-----------+----------------+-----------------+------------
+ -02:00:00 | 1 day 02:00:00 | 1 day -02:00:00 | -infinity
+(1 row)
+
+SELECT interval '/2 hours' AS leading_slash, interval '1 day:2 hours' AS colon_word,
+       interval '2 hours:' AS trailing_colon, interval '1:' AS empty_minute;
+ leading_slash |   colon_word   | trailing_colon | empty_minute 
+---------------+----------------+----------------+--------------
+ 02:00:00      | 1 day 02:00:00 | 02:00:00       | 01:00:00
+(1 row)
+
+SELECT interval '1- 5 days' AS bare_year, interval '1. days' AS trailing_point;
+   bare_year   | trailing_point 
+---------------+----------------
+ 1 year 5 days | 1 day
+(1 row)
+
+SELECT interval '1 day/2 hours';
+ERROR:  invalid input syntax for type interval: "1 day/2 hours"
+LINE 1: SELECT interval '1 day/2 hours';
+                        ^
+SELECT interval '1/5 days';
+ERROR:  invalid input syntax for type interval: "1/5 days"
+LINE 1: SELECT interval '1/5 days';
+                        ^
+SELECT interval '1.days';
+ERROR:  invalid input syntax for type interval: "1.days"
+LINE 1: SELECT interval '1.days';
+                        ^
+SELECT interval '2 hours -';
+ERROR:  invalid input syntax for type interval: "2 hours -"
+LINE 1: SELECT interval '2 hours -';
+                        ^
+SELECT interval '--2 hours';
+ERROR:  invalid input syntax for type interval: "--2 hours"
+LINE 1: SELECT interval '--2 hours';
+                        ^
+SELECT interval '-.5';
+ERROR:  invalid input syntax for type interval: "-.5"
+LINE 1: SELECT interval '-.5';
+                        ^
+-- A literal may name each field only once — a `HH:MM:SS` token names every
+-- sub-day field at once, a `Y-M` token only the month — and a number with no
+-- unit of its own is days when the next field is a time or an hour count,
+-- otherwise the default unit and only as the last field.
+SELECT interval '2 3 hours' AS promoted, interval '1 mon 3 2:00' AS with_month,
+       interval '1 day 2 hours 3' AS trailing, interval '5 days 1' AS trailing2;
+    promoted     |      with_month       |    trailing    |    trailing2    
+-----------------+-----------------------+----------------+-----------------
+ 2 days 03:00:00 | 1 mon 3 days 02:00:00 | 1 day 02:00:03 | 5 days 00:00:01
+(1 row)
+
+SELECT interval '1 second 5 milliseconds' AS distinct_subsecond,
+       interval '1 month 1 week' AS month_week, interval '1-2 3 years' AS ym_then_years,
+       interval '1.5 days 2 hours' AS cascade_is_free;
+ distinct_subsecond |  month_week  | ym_then_years  | cascade_is_free 
+--------------------+--------------+----------------+-----------------
+ 00:00:01.005       | 1 mon 7 days | 4 years 2 mons | 1 day 14:00:00
+(1 row)
+
+SELECT interval '1,5 days';
+ERROR:  invalid input syntax for type interval: "1,5 days"
+LINE 1: SELECT interval '1,5 days';
+                        ^
+SELECT interval '1 5 days';
+ERROR:  invalid input syntax for type interval: "1 5 days"
+LINE 1: SELECT interval '1 5 days';
+                        ^
+SELECT interval '2 3 minutes';
+ERROR:  invalid input syntax for type interval: "2 3 minutes"
+LINE 1: SELECT interval '2 3 minutes';
+                        ^
+SELECT interval '1 day 1 day';
+ERROR:  invalid input syntax for type interval: "1 day 1 day"
+LINE 1: SELECT interval '1 day 1 day';
+                        ^
+SELECT interval '1:00 2:00';
+ERROR:  invalid input syntax for type interval: "1:00 2:00"
+LINE 1: SELECT interval '1:00 2:00';
+                        ^
+SELECT interval '1:30 2 seconds';
+ERROR:  invalid input syntax for type interval: "1:30 2 seconds"
+LINE 1: SELECT interval '1:30 2 seconds';
+                        ^
+SELECT interval '1 day 3 4:05:06';
+ERROR:  invalid input syntax for type interval: "1 day 3 4:05:06"
+LINE 1: SELECT interval '1 day 3 4:05:06';
+                        ^
+-- one stray unit word may trail a time or year-month token and is discarded,
+-- claiming no field
+SELECT interval '1:30 days' AS absorbed, interval '1-2 hours' AS absorbed_ym,
+       interval '1:30 days 5 days' AS absorbed_then_used;
+ absorbed |  absorbed_ym  | absorbed_then_used 
+----------+---------------+--------------------
+ 01:30:00 | 1 year 2 mons | 5 days 01:30:00
+(1 row)
+
+SELECT interval '1:30 days days';
+ERROR:  invalid input syntax for type interval: "1:30 days days"
+LINE 1: SELECT interval '1:30 days days';
+                        ^
+SELECT interval '5 days days';
+ERROR:  invalid input syntax for type interval: "5 days days"
+LINE 1: SELECT interval '5 days days';
+                        ^
+-- `ago` may appear once, and only as the last field
+SELECT interval '1 day ago ago';
+ERROR:  invalid input syntax for type interval: "1 day ago ago"
+LINE 1: SELECT interval '1 day ago ago';
+                        ^
+SELECT interval '2 minutes ago 5 days';
+ERROR:  invalid input syntax for type interval: "2 minutes ago 5 days"
+LINE 1: SELECT interval '2 minutes ago 5 days';
+                        ^
+SELECT interval 'ago';
+ERROR:  invalid input syntax for type interval: "ago"
+LINE 1: SELECT interval 'ago';
+                        ^
+-- an infinity must be the whole value, delimiters aside
+SELECT interval '@ infinity' AS at_inf, interval 'infinity @' AS inf_at;
+  at_inf  |  inf_at  
+----------+----------
+ infinity | infinity
+(1 row)
+
+SELECT interval 'infinity ago';
+ERROR:  invalid input syntax for type interval: "infinity ago"
+LINE 1: SELECT interval 'infinity ago';
+                        ^
+SELECT interval '+infinity -infinity';
+ERROR:  invalid input syntax for type interval: "+infinity -infinity"
+LINE 1: SELECT interval '+infinity -infinity';
+                        ^
+-- IntervalStyle picks among the four renderings of the same stored value
+CREATE TABLE iv_styles(id int4, span interval);
+INSERT INTO iv_styles VALUES
+  (1, '0'), (2, '1-2'), (3, '1 2:03:04'), (4, '1 day -1 hours'),
+  (5, '-10 mons'), (6, '-1 mon -1 day'), (7, '-0.1 sec'), (8, 'infinity');
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |      span       
+----+-----------------
+  1 | 00:00:00
+  2 | 1 year 2 mons
+  3 | 1 day 02:03:04
+  4 | 1 day -01:00:00
+  5 | -10 mons
+  6 | -1 mons -1 days
+  7 | -00:00:00.1
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO postgres_verbose;
+SHOW IntervalStyle;
+  IntervalStyle   
+------------------
+ postgres_verbose
+(1 row)
+
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |             span              
+----+-------------------------------
+  1 | @ 0
+  2 | @ 1 year 2 mons
+  3 | @ 1 day 2 hours 3 mins 4 secs
+  4 | @ 1 day -1 hours
+  5 | @ 10 mons ago
+  6 | @ 1 mon 1 day ago
+  7 | @ 0.1 secs ago
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO sql_standard;
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |       span       
+----+------------------
+  1 | 0
+  2 | 1-2
+  3 | 1 2:03:04
+  4 | +0-0 +1 -1:00:00
+  5 | -0-10
+  6 | -0-1 -1 +0:00:00
+  7 | -0:00:00.1
+  8 | infinity
+(8 rows)
+
+SET IntervalStyle TO iso_8601;
+SELECT id, span FROM iv_styles ORDER BY id;
+ id |    span    
+----+------------
+  1 | PT0S
+  2 | P1Y2M
+  3 | P1DT2H3M4S
+  4 | P1DT-1H
+  5 | P-10M
+  6 | P-1M-1D
+  7 | PT-0.1S
+  8 | infinity
+(8 rows)
+
+-- sql_standard also picks the *input* reading: a leading minus propagates to
+-- every later unsigned field, all-or-nothing, and any later sign of its own
+-- turns it off. That is what makes its one-sign output read back unchanged.
+SET IntervalStyle TO sql_standard;
+SELECT interval '-1 2:03:04' AS forced, interval '-1.5 days 2 hours' AS forced_frac,
+       interval '1 day -2 hours' AS not_forced, interval '-1 day +2 hours' AS not_forced2;
+   forced   | forced_frac |    not_forced    |   not_forced2    
+------------+-------------+------------------+------------------
+ -1 2:03:04 | -1 14:00:00 | +0-0 +1 -2:00:00 | +0-0 -1 +2:00:00
+(1 row)
+
+SELECT interval '-1 day 2 hours ago' AS ago_composes, interval 'P-1Y2M' AS iso_exempt,
+       interval '-2 hours' AS single_field;
+ ago_composes | iso_exempt | single_field 
+--------------+------------+--------------
+ 1 2:00:00    | -0-10      | -2:00:00
+(1 row)
+
+SELECT '-1 day 2 hours'::interval AS via_cast;
+  via_cast  
+------------
+ -1 2:00:00
+(1 row)
+
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+ extracted 
+-----------
+        -2
+(1 row)
+
+SELECT ('-1 days -2:03:04'::interval)::text::interval = '-1 days -2:03:04'::interval AS round_trips;
+ round_trips 
+-------------
+ t
+(1 row)
+
+-- the same literals under the default style, side by side
+SET IntervalStyle TO postgres;
+SELECT interval '-1 2:03:04' AS not_forced, interval '-1.5 days 2 hours' AS not_forced_frac;
+    not_forced     |  not_forced_frac  
+-------------------+-------------------
+ -1 days +02:03:04 | -1 days -10:00:00
+(1 row)
+
+SELECT extract(hour FROM interval '-1 2:03:04') AS extracted;
+ extracted 
+-----------
+         2
+(1 row)
+
+SET IntervalStyle TO iso_8601;
+-- the name is case-insensitive, and nothing more: padding is part of the value.
+-- An unrecognized one is 22023 with a HINT listing the four.
+SET IntervalStyle TO 'POSTGRES';
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+SET IntervalStyle TO ' postgres ';
+ERROR:  invalid value for parameter "IntervalStyle": " postgres "
+HINT:  Available values: postgres, postgres_verbose, sql_standard, iso_8601.
+SET IntervalStyle TO bogus;
+ERROR:  invalid value for parameter "IntervalStyle": "bogus"
+HINT:  Available values: postgres, postgres_verbose, sql_standard, iso_8601.
+-- back to the default, so nothing downstream inherits a style
+RESET IntervalStyle;
+SHOW IntervalStyle;
+ IntervalStyle 
+---------------
+ postgres
+(1 row)
+
+DROP TABLE iv_styles;
