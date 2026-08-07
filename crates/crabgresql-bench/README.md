@@ -155,11 +155,24 @@ takes the ClickBench slice with a range request, and
 `scripts/bench/gen-tpch.sh <sf> <outdir>` is the DuckDB recipe above.
 
 ClickBench runs at 10M rows on `parquet`; TPC-H runs at `sf=0.01` twice, once
-on `heap` and once on `parquet`. The jobs report timings but gate only on
-breakage — a query that errored or timed out. There is no timing threshold: a
-shared runner's variance is wider than most real regressions, so a threshold
-would only teach people to ignore the job. Reading the numbers is the reviewer's
-job, and they arrive as one pull request comment.
+on `heap` and once on `parquet`. The jobs gate only on breakage — a query that
+errored or timed out. There is no timing threshold: a shared runner's variance
+is wider than most real regressions, so a threshold would only teach people to
+ignore the job. The numbers arrive as one pull request comment.
+
+The history is kept by `benchmark-action/github-action-benchmark` on the
+`gh-pages` branch: a push to `main` appends a point, a pull request only reads
+the branch to compare and comments when something is more than 2× worse.
+`scripts/bench/trend-json.sh` converts a `--json` report into the action's
+`customSmallerIsBetter` shape, one entry per query plus one for the load, so
+the chart says *which* query moved; pgbench emits its own
+`customBiggerIsBetter` file, since throughput is the metric that should go up.
+
+Two things about that branch: it has to exist before anything compares against
+it — `git checkout --orphan gh-pages && git push origin gh-pages:gh-pages`, and
+until then the trend steps skip themselves rather than fail — and rendering the
+charts as a site needs GitHub Pages, which a private repository only gets on a
+paid plan. The data accumulates on the branch either way.
 
 ## Adding a benchmark
 

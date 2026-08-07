@@ -98,6 +98,19 @@ for log in "$outdir/tpcb.log" "$outdir/select.log"; do
 done
 
 tps() { sed -n 's/^tps = \([0-9.]*\).*/\1/p' "$1" | tail -n 1; }
+nfailed() { sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' "$1"; }
+
+# github-action-benchmark's `customBiggerIsBetter` shape; unlike the query
+# suites, throughput is the metric that should go up.
+cat > "$outdir/pgbench-trend.json" <<JSON
+[
+  { "name": "pgbench — tpcb-like", "unit": "tps", "value": $(tps "$outdir/tpcb.log"),
+    "extra": "scale $SCALE, $CLIENTS clients, ${DURATION}s, shared_buffers=$CRABGRESQL_SHARED_BUFFERS" },
+  { "name": "pgbench — read-only", "unit": "tps", "value": $(tps "$outdir/select.log"),
+    "extra": "scale $SCALE, $CLIENTS clients, ${DURATION}s, shared_buffers=$CRABGRESQL_SHARED_BUFFERS" }
+]
+JSON
+
 {
     echo "### pgbench — heap, scale $SCALE, ${CLIENTS} clients, ${DURATION}s"
     echo
@@ -105,8 +118,8 @@ tps() { sed -n 's/^tps = \([0-9.]*\).*/\1/p' "$1" | tail -n 1; }
     echo
     echo '| workload | tps | failed |'
     echo '| --- | ---: | ---: |'
-    echo "| tpcb-like (\`-c $CLIENTS -j $THREADS -T $DURATION\`) | $(tps "$outdir/tpcb.log") | $(sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' "$outdir/tpcb.log") |"
-    echo "| read-only (\`-S\`) | $(tps "$outdir/select.log") | $(sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' "$outdir/select.log") |"
+    echo "| tpcb-like (\`-c $CLIENTS -j $THREADS -T $DURATION\`) | $(tps "$outdir/tpcb.log") | $(nfailed "$outdir/tpcb.log") |"
+    echo "| read-only (\`-S\`) | $(tps "$outdir/select.log") | $(nfailed "$outdir/select.log") |"
     echo
 } > "$outdir/pgbench.md"
 cat "$outdir/pgbench.md"

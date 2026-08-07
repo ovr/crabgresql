@@ -307,8 +307,11 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # `contents: write` is for the gh-pages history below, which only the
+    # push-to-main path writes; a pull request run compares and comments.
     permissions:
-      contents: read
+      contents: write
+      deployments: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
@@ -342,3 +345,74 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
         run: scripts/ci-pr-comment.sh '<!-- crabgresql-bench-report -->' report.md
+
+      # The history lives on the gh-pages branch: a push to main appends to it,
+      # a pull request only reads it to compare. Before main has ever run, the
+      # branch does not exist and there is nothing to compare against — hence
+      # the probe rather than a `continue-on-error` that would also swallow
+      # real failures.
+      - name: is there a baseline
+        id: baseline
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "no gh-pages branch yet; the first push to main seeds it"
+          fi
+
+      - name: build trend data
+        id: trend
+        if: steps.baseline.outputs.exists == 'true' || github.event_name == 'push'
+        run: |
+          {
+            scripts/bench/trend-json.sh "ClickBench parquet" artifacts/clickbench.json
+            scripts/bench/trend-json.sh "TPC-H heap"         artifacts/tpch-heap.json
+            scripts/bench/trend-json.sh "TPC-H parquet"      artifacts/tpch-parquet.json
+          } | jq -s add > trend-latency.json
+          if [ -s artifacts/pgbench-trend.json ]; then
+            cp artifacts/pgbench-trend.json trend-throughput.json
+          else
+            echo '[]' > trend-throughput.json
+          fi
+          # A job that died uploaded nothing, and the action treats an empty
+          # array as a broken result file rather than as "no news".
+          for half in latency throughput; do
+            n=$(jq 'length' "trend-$half.json")
+            echo "$half=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "trend-$half.json: $n entries"
+          done
+
+      # Two invocations because the two halves point opposite ways: a query
+      # time going up is a regression, a tps going up is not.
+      - name: trend — query latency
+        if: steps.trend.outputs.latency == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Query latency
+          tool: customSmallerIsBetter
+          output-file-path: trend-latency.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          # A shared runner swings ±10-20% on its own, and these benchmarks do
+          # real file I/O; anything tighter than 2x would cry every week.
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: trend — throughput
+        if: steps.trend.outputs.throughput == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Throughput
+          tool: customBiggerIsBetter
+          output-file-path: trend-throughput.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
