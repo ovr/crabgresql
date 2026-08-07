@@ -63,6 +63,26 @@ SELECT 'abc' LIKE 'a%' AS l1, 'abc' LIKE 'a_c' AS l2, 'abc' LIKE 'a_' AS l3,
        'ABC' ILIKE 'a%c' AS l4, 'abc' NOT LIKE 'x%' AS l5;
 SELECT 'a%b' LIKE 'a\%b' AS esc1, 'axb' LIKE 'a\%b' AS esc2,
        'a%b' LIKE 'a$%b' ESCAPE '$' AS esc3;
+-- the shapes a pattern can take: anchored both ends, prefix, suffix, contains,
+-- doubled and interior wildcards, and a pattern that is nothing but wildcards
+SELECT 'abc' LIKE 'abc' AS exact, 'abc' LIKE 'abc%' AS prefix,
+       'abc' LIKE '%abc' AS suffix, 'xabcx' LIKE '%abc%' AS contains,
+       'xabcx' LIKE '%%abc%%' AS doubled, 'abcde' LIKE 'a%c%e' AS interior,
+       'abc' LIKE '%' AS anything, '' LIKE '%%' AS empty_anything;
+-- `_` is a character, not a byte, and `%` may match nothing at all
+SELECT 'é' LIKE '_' AS one_char, 'é' LIKE '__' AS two_chars,
+       'aéb' LIKE 'a_b' AS mid_char, 'ab' LIKE 'a%b' AS star_matches_empty,
+       'abab' LIKE '%ab' AS greedy_still_finds_the_end;
+-- the escape character may itself be a wildcard, which then loses its meaning
+SELECT 'maca' LIKE 'm%aca' ESCAPE '%' AS pct_escape,
+       'be_r' LIKE 'b_e__r' ESCAPE '_' AS underscore_escape,
+       'h%awkeye' LIKE 'h#%a%k%e' ESCAPE '#' AS escaped_then_wild;
+-- ESCAPE '' disables escaping; a trailing bare escape is an error
+SELECT 'a\b' LIKE 'a\b' ESCAPE '' AS no_escape;
+SELECT 'ab' LIKE 'a\';
+-- ILIKE folds both sides; a NULL operand makes the whole predicate NULL
+SELECT 'FooBar' ILIKE '%oob%' AS i1, 'FooBar' NOT ILIKE '%oob%' AS i2,
+       NULL LIKE 'a%' AS n1, 'abc' LIKE NULL AS n2;
 
 -- POSIX regex operators: ~ / ~* / !~, with anchors and case-insensitivity
 SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,
