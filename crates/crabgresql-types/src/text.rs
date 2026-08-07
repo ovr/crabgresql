@@ -1340,8 +1340,20 @@ where
 {
     cache.with(|cache| {
         let cache = &mut *cache.borrow_mut();
-        match cache
-            .entries
+        // More consecutive misses than the cache could ever hold means the
+        // pattern varies per row rather than being merely cold, and everything
+        // the cache does is then pure overhead. Both halves shrink: only the
+        // most recent entry is consulted, and a new one is recorded once every
+        // `PATTERN_CACHE_PROBE` misses — often enough that a pattern which does
+        // turn hot lands in slot 0 and starts hitting, which zeroes the counter
+        // and restores the full cache.
+        let thrashing = cache.misses > PATTERN_CACHE_MAX as u32;
+        let scan = if thrashing {
+            1.min(cache.entries.len())
+        } else {
+            cache.entries.len()
+        };
+        match cache.entries[..scan]
             .iter()
             .position(|(p, k, _)| *k == kind && p == pattern)
         {
@@ -1356,13 +1368,7 @@ where
             None => {
                 let compiled = compile(pattern, kind)?;
                 cache.misses = cache.misses.saturating_add(1);
-                // More consecutive misses than the cache could ever hold means
-                // the pattern is varying, not merely cold, so stop paying to
-                // record it — but probe now and then, or a pattern that turns
-                // hot later could never get in.
-                if cache.misses > PATTERN_CACHE_MAX as u32
-                    && !cache.misses.is_multiple_of(PATTERN_CACHE_PROBE)
-                {
+                if thrashing && !cache.misses.is_multiple_of(PATTERN_CACHE_PROBE) {
                     return Ok(f(&compiled));
                 }
                 cache
