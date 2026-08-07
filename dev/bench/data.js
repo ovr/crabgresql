@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786134168464,
+  "lastUpdate": 1786134170247,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -1264,6 +1264,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 22276.670869,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9494c8846e2b00497e35ec5588a7576a6c569b70",
+          "message": "perf(agg): accumulate integer sum and avg in registers, not Numeric (#182)\n\n`avg` over any exact type, and `sum(bigint)`, kept their running total in\na `Numeric` — whose coefficient is a heap `Vec<u8>`, one decimal digit\nper byte. That is two mallocs and a free per row (`Numeric::from_i128`\nthen `add`), plus one live allocation per group for as long as the hash\ntable exists. `sum(int2|int4)` had shown the alternative all along with\n`SumI64`.\n\n`avg(int2|int4|int8)` now accumulates into `AvgI128 { sum, count }` and\n`sum(int8)` into `SumI128`; `numeric` inputs keep the unbounded states.\n`avg` adds unchecked: `count` counts the same values `sum` adds, so it\ncaps them at `i64::MAX`, and (2^63-1)·2^63 < i128::MAX means `count` is\nwhat overflows first. `sum` has no such companion, so its overflow is\nonly physically unreachable (2^64 bigints is ~147 exabytes) and it keeps\na `checked_add` that promotes into `SumNumeric` rather than raising —\nPostgreSQL's `sum(bigint)` is numeric and never overflows.\n\nOutput is byte-identical. For integer inputs the accumulated sum's\n`dscale` is always 0 (`from_i128` ends in `from_coeff(.., 0, 0)`, `add`\ntakes `max(dscale)`) and `normalize` leaves exactly one canonical form\nper value, so `Numeric::from_i128(sum)` reconstructs what the old code\nheld. That matters because `select_div_scale` reads the magnitude *and*\ndscale of both operands: 42/4 renders `10.5000000000000000` but\n10000000000000/4 renders `2500000000000.0000`. The single\n`div(sum, from_i128(count))` at finalize is preserved verbatim, now\nbehind `avg_quotient` so the two exact states cannot drift apart.\n\nMeasured on a 2M-row parquet table, A/B over two rounds each:\n\n  avg, 800 groups x 2500 rows    628 ms -> 410 ms   (1.53x)\n  avg, 2M groups x 1 row        5.78 s  -> 5.66 s   (-2%)\n\nThis does *not* fix ClickBench q33, which is what sent me here. q33\ngroups by a near-unique key, so its groups are singletons and there is\nnothing per-row left to save. The isolating measurement: at 2M groups\n`avg(float8)` costs 1.50 s against `avg(int2)`'s 5.45 s on identical\naccumulate paths, so ~3.9 s is `Numeric::div` alone, once per group.\n`long_divide` allocates ten `Vec<u8>` multiples of the denominator on\nevery call plus two per quotient digit — roughly 50 mallocs per\ndivision. That is the next lever, and it lives in `numeric.rs`.\n\n`agg.rs` had no accumulator tests at all; it gains four, driving real\naccumulators through `Accumulator::new` so the type dispatch is covered\nwith the arithmetic. The smoke suite gains the case that separates the\nold path from the new: a bigint sum wider than i64, whose quotient's\ndisplay scale falls to 0. Every expected value here was taken from\nPostgreSQL 18.4 rather than from this implementation.\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-08-07T21:23:59+02:00",
+          "tree_id": "264bd1a1aee5eaeb286e21332dddd90143d95d19",
+          "url": "https://github.com/ovr/crabgresql/commit/9494c8846e2b00497e35ec5588a7576a6c569b70"
+        },
+        "date": 1786134170225,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 486.025071,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 25155.644848,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
