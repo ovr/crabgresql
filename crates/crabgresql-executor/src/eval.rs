@@ -22,10 +22,28 @@ use crate::{CatalogOps, ExecContext, ExecError};
 /// The value an argument already *is*, when evaluating it would only copy it.
 /// A parameter placeholder is substituted into a `Const` before the portal
 /// runs, so `$1` takes this path too.
+///
+/// Two wrappers are transparent here and have to be, because the binder inserts
+/// them around a bare column: `Collate` never touches the value, and a `Coerce`
+/// into `text` from another type that is *already* `Value::Text` reaches
+/// `cast_value`'s `from == to` early return. Without them the borrow path would
+/// miss every `varchar` column, which is most real schemas.
+///
+/// The gate is on the source type, not the target. `char` (OID 18) also coerces
+/// to text but holds a `Value::Char`, and unwrapping it would hand `eval_like` a
+/// non-text value; `bpchar` reaches text through a `BpcharToText` call that
+/// trims, and `Reinterpret` rewrites bits. All three must stay on the slow path.
 fn arg_ref<'a>(expr: &'a BoundExpr, row: &'a [Value]) -> Option<&'a Value> {
     match expr {
         BoundExpr::Const { value, .. } => Some(value),
         BoundExpr::ColumnRef { index, .. } => row.get(*index),
+        BoundExpr::Collate { expr, .. } => arg_ref(expr, row),
+        BoundExpr::Coerce {
+            expr,
+            ty: PgType::Text,
+        } if matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name) => {
+            arg_ref(expr, row)
+        }
         _ => None,
     }
 }
@@ -1999,5 +2017,69 @@ mod enum_cmp_tests {
             ),
             Ordering::Less
         );
+    }
+}
+
+#[cfg(test)]
+mod arg_ref_tests {
+    use super::arg_ref;
+    use crabgresql_binder::BoundExpr;
+    use crabgresql_types::{PgType, Value};
+
+    fn col(ty: PgType) -> BoundExpr {
+        BoundExpr::ColumnRef { index: 0, ty }
+    }
+
+    fn coerce_to_text(expr: BoundExpr) -> BoundExpr {
+        BoundExpr::Coerce {
+            expr: Box::new(expr),
+            ty: PgType::Text,
+        }
+    }
+
+    /// The borrow path exists to skip a `String` clone per row, so which
+    /// wrappers it sees through decides whether it fires at all — a `varchar`
+    /// column reaches `LIKE` as `Coerce{ColumnRef, Text}`, never bare.
+    #[test]
+    fn borrows_through_runtime_identity_wrappers() {
+        let row = [Value::Text("abc".into())];
+        let collate = |e| BoundExpr::Collate {
+            expr: Box::new(e),
+            collation: 950,
+            explicit: true,
+        };
+        for (label, expr) in [
+            ("text", col(PgType::Text)),
+            ("varchar", coerce_to_text(col(PgType::Varchar))),
+            ("name", coerce_to_text(col(PgType::Name))),
+            ("collated text", collate(col(PgType::Text))),
+            (
+                "collated varchar",
+                coerce_to_text(collate(col(PgType::Varchar))),
+            ),
+        ] {
+            assert_eq!(arg_ref(&expr, &row), Some(&row[0]), "{label} should borrow");
+        }
+    }
+
+    /// These reach text through a conversion that changes the value, so
+    /// borrowing the operand would hand `eval_like` something that is not text.
+    #[test]
+    fn refuses_wrappers_that_change_the_value() {
+        let row = [Value::Char(b'a')];
+        for (label, expr) in [
+            ("char (OID 18)", coerce_to_text(col(PgType::Char))),
+            ("int4", coerce_to_text(col(PgType::Int4))),
+            (
+                "binary-coercible",
+                BoundExpr::Reinterpret {
+                    expr: Box::new(col(PgType::Text)),
+                    reported: PgType::Text,
+                    rep: PgType::Text,
+                },
+            ),
+        ] {
+            assert_eq!(arg_ref(&expr, &row), None, "{label} must not borrow");
+        }
     }
 }

@@ -83,6 +83,12 @@ SELECT 'ab' LIKE 'a\';
 -- ILIKE folds both sides; a NULL operand makes the whole predicate NULL
 SELECT 'FooBar' ILIKE '%oob%' AS i1, 'FooBar' NOT ILIKE '%oob%' AS i2,
        NULL LIKE 'a%' AS n1, 'abc' LIKE NULL AS n2;
+-- the ESCAPE is validated as part of the pattern, so a malformed one is an
+-- error even when the subject is NULL -- but a NULL pattern suppresses it
+SELECT NULL::text LIKE 'y' ESCAPE '\' AS null_subject;
+SELECT 'x' LIKE NULL ESCAPE 'ab' AS null_pattern;
+SELECT NULL::text LIKE 'y' ESCAPE 'ab';
+SELECT NULL::text ILIKE 'y' ESCAPE 'ab';
 
 -- POSIX regex operators: ~ / ~* / !~, with anchors and case-insensitivity
 SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,

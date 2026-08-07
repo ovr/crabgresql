@@ -473,19 +473,33 @@ impl CaseCmp for Exact {
 /// Only ever reached with an all-ASCII `hay` (see [`like`]), so every byte
 /// offset it produces is a character boundary. A needle carrying non-ASCII
 /// simply never matches, which is the same answer the slow path reaches.
+///
+/// That precondition is the whole proof that comparing raw bytes is sound, and
+/// it is established by the caller, so the methods assert it over the bytes
+/// they actually read — a second caller that forgets (a batch kernel over an
+/// Arrow `StringArray` is the obvious candidate) fails a test instead of
+/// silently answering wrong. `Prefix`/`Suffix` only need their compared window
+/// to be ASCII (see [`LikeProgram::ascii_window`]), which is why the assertion
+/// lives on [`CaseCmp::eq`] rather than on the whole subject, and why the two
+/// windowed methods index with `get` instead of slicing.
 struct AsciiFold;
 
 impl CaseCmp for AsciiFold {
     fn eq(hay: &str, needle: &str) -> bool {
+        debug_assert!(hay.is_ascii(), "AsciiFold compared a non-ASCII window");
         hay.as_bytes().eq_ignore_ascii_case(needle.as_bytes())
     }
     fn starts_with(hay: &str, needle: &str) -> bool {
-        hay.len() >= needle.len() && Self::eq(&hay[..needle.len()], needle)
+        hay.get(..needle.len()).is_some_and(|w| Self::eq(w, needle))
     }
     fn ends_with(hay: &str, needle: &str) -> bool {
-        hay.len() >= needle.len() && Self::eq(&hay[hay.len() - needle.len()..], needle)
+        hay.len()
+            .checked_sub(needle.len())
+            .and_then(|at| hay.get(at..))
+            .is_some_and(|w| Self::eq(w, needle))
     }
     fn find(hay: &str, needle: &str) -> Option<usize> {
+        debug_assert!(hay.is_ascii(), "AsciiFold scanned a non-ASCII subject");
         let (hay, needle) = (hay.as_bytes(), needle.as_bytes());
         let Some(&first) = needle.first() else {
             return Some(0);
@@ -577,7 +591,11 @@ fn find_segment<C: CaseCmp>(s: &str, from: usize, end: usize, seg: &Segment) -> 
     let mut search = base;
     loop {
         let at = search + C::find(s.get(search..end)?, needle)?;
-        match match_at::<C>(s, at, rest) {
+        // `C::find` has already compared `needle`, so resume past it rather
+        // than letting `match_at` redo that comparison. When the segment is a
+        // lone literal — the `%lit%` shape — `rest[1..]` is empty and the
+        // confirm cannot fail, so the retry below never runs.
+        match match_at::<C>(s, at + needle.len(), &rest[1..]) {
             // Occurrences are found left to right and the segment's width is
             // fixed, so once a placement overruns `end` every later one does.
             Some(e) if e > end => return None,
@@ -599,6 +617,26 @@ impl LikeProgram {
             LikeProgram::Contains(_) => "Contains",
             LikeProgram::Whole(_) => "Whole",
             LikeProgram::Segments { .. } => "Segments",
+        }
+    }
+
+    /// The subject bytes whose ASCII-ness decides whether folding per byte is
+    /// equivalent to lowering the whole subject, or `None` when only the whole
+    /// subject can answer that.
+    ///
+    /// `Prefix` and `Suffix` compare a bounded window and ignore everything
+    /// else, and non-ASCII outside that window cannot change how the ASCII
+    /// inside it lowers. The other shapes have no such window: `'K'` (U+212A)
+    /// lowers into the ASCII `k` a `Contains` scan would otherwise miss, and
+    /// `İ` changes how many characters `_` has to count.
+    ///
+    /// A subject shorter than the literal yields `None`, not `false`: lowering
+    /// can *lengthen* a subject, so a short one can still match.
+    fn ascii_window<'a>(&self, s: &'a str) -> Option<&'a [u8]> {
+        match self {
+            LikeProgram::Prefix(lit) => s.as_bytes().get(..lit.len()),
+            LikeProgram::Suffix(lit) => s.as_bytes().get(s.len().checked_sub(lit.len())?..),
+            _ => None,
         }
     }
 
@@ -770,8 +808,8 @@ thread_local! {
     /// Compiled LIKE patterns, most-recently-used first. See [`with_cached`]
     /// for the discipline; entries are lent out by reference rather than
     /// cloned, since a program owns its literals.
-    static LIKE_CACHE: std::cell::RefCell<Vec<(String, LikeKind, LikeProgram)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static LIKE_CACHE: std::cell::RefCell<Patterns<LikeKind, LikeProgram>> =
+        const { std::cell::RefCell::new(Patterns::new()) };
 }
 
 /// `LIKE` (and `ILIKE` when `case_insensitive`). `escape` defaults to `\` at
@@ -783,8 +821,16 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
     };
     with_cached(&LIKE_CACHE, pattern, kind, compile_like, |prog| {
         if !case_insensitive {
-            prog.matches::<Exact>(s)
-        } else if s.is_ascii() {
+            return prog.matches::<Exact>(s);
+        }
+        // Scanning the whole subject to classify it costs more than a `Prefix`
+        // or `Suffix` match does, so those shapes only classify the window they
+        // compare; everything else has to look at all of it.
+        let ascii = match prog.ascii_window(s) {
+            Some(window) => window.is_ascii(),
+            None => s.is_ascii(),
+        };
+        if ascii {
             // The pattern was lowercased at compile time, so an ASCII subject
             // only needs per-byte folding — no allocation. This is exactly
             // equal to lowering it: over ASCII, `to_lowercase` maps `A-Z` to
@@ -792,16 +838,34 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
             // contextual rule, final sigma, needs a non-ASCII `Σ`).
             prog.matches::<AsciiFold>(s)
         } else {
-            // Unicode lowering is *not* per character — `İ` lowers to two
-            // characters (changing what `_` counts) and `K` (U+212A) lowers to
-            // plain `k` — so a non-ASCII subject takes the allocating path.
+            // Rust lowers with *full* contextual mapping where PostgreSQL maps
+            // each character independently, so this branch is wrong in both
+            // directions: `İ` lowers to two characters here (changing what `_`
+            // counts) against PG's one, and `'ΑΣ' ILIKE 'ασ'` is true in PG but
+            // false here because of the final-sigma rule.
             //
-            // Note this is Unicode-default rather than collation-aware, so it
-            // can still differ from PG under e.g. a Turkish collation. That
-            // divergence predates the compiled matcher and is left as is.
+            // TODO: PostgreSQL's simple (per-character, 1:1) case mapping, and
+            // the collation tailoring on top of it — `lower('İ' COLLATE
+            // "tr-x-icu")` differs from `"en-x-icu"`, and neither is reachable
+            // while `like` takes no collation. Fixing it means a simple-mapping
+            // table (`icu_casemap`) shared with `lower`/`upper`/`initcap`, plus
+            // a collation OID threaded through `ScalarFn::{Lower,Upper,Initcap}`
+            // and `text::like`.
             prog.matches::<Exact>(&s.to_lowercase())
         }
     })
+}
+
+/// How many compiled LIKE patterns this thread is holding.
+#[cfg(test)]
+fn like_cache_len() -> usize {
+    LIKE_CACHE.with(|c| c.borrow().entries.len())
+}
+
+/// This thread's consecutive-miss count for the LIKE cache.
+#[cfg(test)]
+fn like_cache_misses() -> u32 {
+    LIKE_CACHE.with(|c| c.borrow().misses)
 }
 
 #[cfg(test)]
@@ -1215,16 +1279,41 @@ enum PatternKind {
 /// is not observable, so any small number would do.
 const PATTERN_CACHE_MAX: usize = 32;
 
-/// A thread-local, most-recently-used-first store of patterns compiled to `V`,
-/// keyed on the user's pattern text plus a `K` describing how to read it.
-type PatternCache<K, V> = std::thread::LocalKey<std::cell::RefCell<Vec<(String, K, V)>>>;
+/// How often a thrashing cache still records an entry. Without a periodic probe
+/// a cache that has stopped recording could never register a hit, so it could
+/// never recover once a pattern did become hot.
+const PATTERN_CACHE_PROBE: u32 = 16;
+
+/// Patterns compiled to `V`, keyed on the user's pattern text plus a `K`
+/// describing how to read it.
+struct Patterns<K, V> {
+    /// Most-recently-used first.
+    entries: Vec<(String, K, V)>,
+    /// Consecutive misses. A pattern that varies per row — `a LIKE b`, or a
+    /// computed `a LIKE '%' || b || '%'` — has a hit rate of zero, and paying
+    /// the key copy, the memmove to the front and the evicted entry's drop on
+    /// every row is slower than never caching at all.
+    misses: u32,
+}
+
+/// A thread-local [`Patterns`].
+type PatternCache<K, V> = std::thread::LocalKey<std::cell::RefCell<Patterns<K, V>>>;
+
+impl<K, V> Patterns<K, V> {
+    const fn new() -> Self {
+        Patterns {
+            entries: Vec::new(),
+            misses: 0,
+        }
+    }
+}
 
 thread_local! {
     /// Most-recently-used first. Cloning a `Regex` is *not* free — it allocates
     /// a fresh, empty match-state pool — so entries are lent out by reference
     /// (see [`with_cached`]) rather than cloned per row.
-    static RE_CACHE: std::cell::RefCell<Vec<(String, PatternKind, regex::Regex)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static RE_CACHE: std::cell::RefCell<Patterns<PatternKind, regex::Regex>> =
+        const { std::cell::RefCell::new(Patterns::new()) };
 }
 
 /// Compile `pattern` according to `kind` (reusing a live cache entry when there
@@ -1250,25 +1339,39 @@ where
     V: 'static,
 {
     cache.with(|cache| {
-        let mut cache = cache.borrow_mut();
+        let cache = &mut *cache.borrow_mut();
         match cache
+            .entries
             .iter()
             .position(|(p, k, _)| *k == kind && p == pattern)
         {
             Some(idx) => {
+                cache.misses = 0;
                 // Promote to most-recently-used. Already-hot patterns (the
                 // common case for a per-row scan) need no shuffling at all.
                 if idx != 0 {
-                    cache[..=idx].rotate_right(1);
+                    cache.entries[..=idx].rotate_right(1);
                 }
             }
             None => {
                 let compiled = compile(pattern, kind)?;
-                cache.insert(0, (pattern.to_string(), kind, compiled));
-                cache.truncate(PATTERN_CACHE_MAX);
+                cache.misses = cache.misses.saturating_add(1);
+                // More consecutive misses than the cache could ever hold means
+                // the pattern is varying, not merely cold, so stop paying to
+                // record it — but probe now and then, or a pattern that turns
+                // hot later could never get in.
+                if cache.misses > PATTERN_CACHE_MAX as u32
+                    && !cache.misses.is_multiple_of(PATTERN_CACHE_PROBE)
+                {
+                    return Ok(f(&compiled));
+                }
+                cache
+                    .entries
+                    .insert(0, (pattern.to_string(), kind, compiled));
+                cache.entries.truncate(PATTERN_CACHE_MAX);
             }
         }
-        Ok(f(&cache[0].2))
+        Ok(f(&cache.entries[0].2))
     })
 }
 
@@ -2988,25 +3091,17 @@ mod tests {
         Ok(())
     }
 
-    /// Every string of length `len` over `alphabet`, appended to `out`.
-    fn words(alphabet: &[char], len: usize, out: &mut Vec<String>) {
-        if len == 0 {
-            out.push(String::new());
-            return;
-        }
-        let mut shorter = Vec::new();
-        words(alphabet, len - 1, &mut shorter);
-        for w in shorter {
-            for c in alphabet {
-                out.push(format!("{w}{c}"));
-            }
-        }
-    }
-
+    /// Every string over `alphabet` of length `max` or shorter. Each word is
+    /// built once, by extending the previous length.
     fn words_upto(alphabet: &[char], max: usize) -> Vec<String> {
-        let mut out = Vec::new();
-        for len in 0..=max {
-            words(alphabet, len, &mut out);
+        let mut level = vec![String::new()];
+        let mut out = level.clone();
+        for _ in 0..max {
+            level = level
+                .iter()
+                .flat_map(|w| alphabet.iter().map(move |c| format!("{w}{c}")))
+                .collect();
+            out.extend_from_slice(&level);
         }
         out
     }
@@ -3043,13 +3138,17 @@ mod tests {
         }
     }
 
-    /// The proof obligation behind the ASCII `ILIKE` fast path: `İ` lowers to
-    /// *two* characters (so it changes what `_` counts) and `K` (U+212A) lowers
-    /// to a plain ASCII `k`. Both must still agree with whole-string lowering.
+    /// The compiled matcher must fold exactly as the interpreted one did, which
+    /// is what makes the ASCII fast path safe to take. This is a
+    /// self-consistency proof, **not** a PostgreSQL one: the oracle shares the
+    /// full-Unicode lowering that the `TODO` in [`like`] is about, so answers
+    /// here can still be wrong — `'İ' ILIKE '_'` is true in PG and false in
+    /// both implementations. Assertions that would pin those divergent answers
+    /// as correct belong with the fix, not here.
     #[test]
     fn ilike_folding_agrees_with_the_oracle_on_unicode() -> anyhow::Result<()> {
-        let alphabet = ['a', 'A', 'é', 'İ', 'K', 'Σ'];
-        let patterns = words_upto(&['a', 'A', 'İ', 'K', '%', '_'], 3);
+        let alphabet = ['a', 'A', 'é', 'İ', 'K', 'Σ', 'Ⱥ', 'ⱥ'];
+        let patterns = words_upto(&['a', 'A', 'İ', 'K', 'ⱥ', '%', '_'], 3);
         let subjects = words_upto(&alphabet, 3);
         for pattern in &patterns {
             for ci in [false, true] {
@@ -3062,10 +3161,63 @@ mod tests {
                 }
             }
         }
-        // The two headline cases, spelled out.
+        // `K` (U+212A) lowers to a plain ASCII `k`, so an ASCII-looking pattern
+        // matches a non-ASCII subject. This one PG agrees with.
         assert!(like("K", "%k%", Some('\\'), true)?);
-        assert!(like("İ", "__", Some('\\'), true)?);
-        assert!(!like("İ", "_", Some('\\'), true)?);
+        Ok(())
+    }
+
+    /// A `Prefix`/`Suffix` subject is classified by the window it compares
+    /// rather than in full, so non-ASCII outside that window must not change
+    /// the answer — and a subject shorter than the literal must fall back to
+    /// the full check rather than be rejected, since lowering can lengthen it.
+    #[test]
+    fn ilike_windowed_ascii_check_agrees_with_the_oracle() -> anyhow::Result<()> {
+        for (s, pattern) in [
+            ("abcé", "ABC%"),
+            ("éabc", "%ABC"),
+            ("Kabc", "%abc"),
+            ("abcK", "abc%"),
+            ("İ", "i%"),
+            ("İ", "%i"),
+            ("i", "İ%"),
+            ("Ⱥ", "ⱥ%"),
+            ("ⱥ", "Ⱥ%"),
+            ("é", "ABCDEF%"),
+            ("é", "%ABCDEF"),
+        ] {
+            assert_eq!(
+                like(s, pattern, Some('\\'), true)?,
+                reference_like(s, pattern, Some('\\'), true)?,
+                "{s:?} ILIKE {pattern:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A pattern that varies per row misses on every lookup. Recording each one
+    /// costs more than compiling it, so the cache stops recording — but it must
+    /// still let a pattern that later turns hot back in, and it must not change
+    /// any answer while it is doing that.
+    #[test]
+    fn a_thrashing_cache_stops_growing_but_still_recovers() -> anyhow::Result<()> {
+        for i in 0..500 {
+            let pattern = format!("%p{i}%");
+            assert!(like(&format!("xp{i}y"), &pattern, Some('\\'), false)?);
+            assert!(!like("zzz", &pattern, Some('\\'), false)?);
+        }
+        assert!(
+            like_cache_len() <= PATTERN_CACHE_MAX,
+            "the cache must stay bounded under thrash"
+        );
+        // A pattern repeated after the thrash has to get back in and stay.
+        for _ in 0..PATTERN_CACHE_PROBE * 2 {
+            assert!(like("xhoty", "%hot%", Some('\\'), false)?);
+        }
+        assert!(
+            like_cache_misses() == 0,
+            "a repeated pattern must register as a hit"
+        );
         Ok(())
     }
 

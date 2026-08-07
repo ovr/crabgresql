@@ -198,6 +198,26 @@ SELECT 'FooBar' ILIKE '%oob%' AS i1, 'FooBar' NOT ILIKE '%oob%' AS i2,
  t  | f  |    | 
 (1 row)
 
+-- the ESCAPE is validated as part of the pattern, so a malformed one is an
+-- error even when the subject is NULL -- but a NULL pattern suppresses it
+SELECT NULL::text LIKE 'y' ESCAPE '\' AS null_subject;
+ null_subject 
+--------------
+ 
+(1 row)
+
+SELECT 'x' LIKE NULL ESCAPE 'ab' AS null_pattern;
+ null_pattern 
+--------------
+ 
+(1 row)
+
+SELECT NULL::text LIKE 'y' ESCAPE 'ab';
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
+SELECT NULL::text ILIKE 'y' ESCAPE 'ab';
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
 -- POSIX regex operators: ~ / ~* / !~, with anchors and case-insensitivity
 SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,
        'ABC' ~* 'abc' AS r4, 'abc' !~ 'z' AS r5;
