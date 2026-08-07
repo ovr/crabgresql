@@ -14,6 +14,7 @@ pub(crate) mod index;
 pub(crate) mod inherits;
 pub(crate) mod language;
 pub(crate) mod namespace;
+pub(crate) mod prepared;
 pub(crate) mod proc;
 pub(crate) mod sequence;
 pub(crate) mod settings;

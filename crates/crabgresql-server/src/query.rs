@@ -287,7 +287,7 @@ pub(crate) fn partition_session_relations(
 /// The third view wraps the *same* `SystemCatalog` the first is built from, so
 /// `pg_table_is_visible(c.oid)` resolves the very OIDs the `pg_class` scan in
 /// the same statement emitted.
-fn bind_catalogs(
+pub(crate) fn bind_catalogs(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     session: &Session,
@@ -522,6 +522,17 @@ pub fn analyze_statement(
                 result_columns: None,
             });
         }
+        // `EXECUTE` returns whatever the statement it names would, so Describe
+        // answers from that statement's recorded shape — the utility catch-all
+        // below would report NoData and then Execute would stream DataRows the
+        // client was told not to expect. An unknown name reports NoData and
+        // leaves the 26000 to Execute, as the `FETCH` arm above does.
+        ast::Statement::Execute { name, .. } => {
+            return Ok(Analyzed {
+                param_types: Vec::new(),
+                result_columns: executed_columns(session, name.as_ref()),
+            });
+        }
         // `SHOW` takes no parameters but *does* return rows, so it needs its own
         // arm: the utility catch-all below would report NoData and then Execute
         // would stream DataRows the client was told not to expect. An
@@ -573,6 +584,24 @@ pub(crate) fn fetch_columns(session: &Session, name: &ast::Ident) -> Option<Vec<
         .cursors
         .get(&name)
         .map(|cursor| cursor.columns.clone())
+}
+
+/// The result shape an `EXECUTE` of `name` would produce, or `None` when no such
+/// prepared statement exists (`Describe` then answers `NoData` and leaves the
+/// 26000 to Execute).
+///
+/// Resolved from the live statement every time it is asked, for the reason
+/// [`fetch_columns`] is: the named statement can be deallocated and re-prepared
+/// with a different shape while a prepared `EXECUTE` sits unchanged.
+fn executed_columns(
+    session: &Session,
+    name: Option<&ast::ObjectName>,
+) -> Option<Vec<OutputColumn>> {
+    let name = single_object_name(name?, "prepared statement").ok()?;
+    session
+        .prepared
+        .get(&name)
+        .and_then(|prepared| prepared.result_columns.clone())
 }
 
 /// The body of a single `DECLARE … CURSOR FOR <query>`, or `None` for any other
@@ -869,6 +898,37 @@ pub(crate) fn execute_statement_with(
             } => return crate::cursor::execute_move(name, direction, session),
             ast::Statement::Close { cursor } => {
                 return crate::cursor::execute_close(cursor, session);
+            }
+            ast::Statement::Prepare {
+                name,
+                data_types,
+                statement,
+            } => {
+                return crate::prepare::execute_prepare(
+                    engine,
+                    global_catalog,
+                    stmt,
+                    name,
+                    data_types,
+                    statement,
+                    session,
+                );
+            }
+            // The prepared statement's own result passes straight through, so
+            // `force_materialize` has to travel with it: an `EXECUTE` inside a
+            // `DECLARE … CURSOR` must still drain its rows in this transaction.
+            ast::Statement::Execute { .. } => {
+                return crate::prepare::execute_execute(
+                    engine,
+                    global_catalog,
+                    txnmgr,
+                    stmt,
+                    session,
+                    force_materialize,
+                );
+            }
+            ast::Statement::Deallocate { name, .. } => {
+                return crate::prepare::execute_deallocate(name, session);
             }
             ast::Statement::Set(set) => return apply_set(set, session),
             ast::Statement::ShowVariable { variable } => {
@@ -1167,7 +1227,7 @@ pub(crate) fn execute_statement_with(
 /// ids advanced *inside* a routine body are not lost — without that, the next
 /// top-level statement would reuse an id the body already stamped rows with and
 /// could not see them.
-fn statement_runtime(
+pub(crate) fn statement_runtime(
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
     global_catalog: &Arc<GlobalCatalog>,
@@ -1622,7 +1682,7 @@ fn apply_modes(
 /// Whether the statement about to run is in a read-only context: an explicit
 /// `READ ONLY` block, or (under autocommit) the `default_transaction_read_only`
 /// GUC. Writes in such a context are rejected with SQLSTATE 25006.
-fn read_only_active(session: &Session) -> bool {
+pub(crate) fn read_only_active(session: &Session) -> bool {
     match &session.xact {
         Some(active) => active.read_only,
         None => session.default_read_only,
@@ -3584,7 +3644,7 @@ fn single_ident_lower(name: &ast::ObjectName) -> Option<String> {
     name.0[0].as_ident().map(normalize_ident)
 }
 
-fn statement_kind(stmt: &ast::Statement) -> String {
+pub(crate) fn statement_kind(stmt: &ast::Statement) -> String {
     // First word of the SQL rendering, e.g. "DROP" or "TRUNCATE".
     stmt.to_string()
         .split_whitespace()
@@ -3604,7 +3664,7 @@ pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
 /// A single-part object name, lowercased. `noun` names the object class for the
 /// error text ("relation", "type", "function"). Qualified names are not yet
 /// supported.
-fn single_object_name(name: &ast::ObjectName, noun: &str) -> Result<String, PgError> {
+pub(crate) fn single_object_name(name: &ast::ObjectName, noun: &str) -> Result<String, PgError> {
     if name.0.len() != 1 {
         return Err(PgError::feature_not_supported(format!(
             "qualified {noun} names are not supported yet: {name}"
@@ -5916,7 +5976,7 @@ fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
     }
 }
 
-fn resolve_column_type(
+pub(crate) fn resolve_column_type(
     type_catalog: &Arc<dyn TypeCatalog>,
     dt: &ast::DataType,
 ) -> Result<PgType, PgError> {

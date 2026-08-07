@@ -12,6 +12,7 @@ mod explain;
 mod func_deps;
 mod global_catalog;
 mod guc;
+mod prepare;
 mod query;
 mod routines;
 mod session;

@@ -8887,25 +8887,70 @@ pub fn coerce_to_column(
     column: &Column,
     scope: &Scope,
 ) -> Result<BoundExpr, BindError> {
-    let base = match binding {
+    let base = coerce_assign(binding, column.ty, scope, |from, to| {
+        BindError::new(
+            sqlstate::DATATYPE_MISMATCH,
+            format!(
+                "column \"{}\" is of type {} but expression is of type {}",
+                column.name, to, from
+            ),
+        )
+    })?;
+    apply_length_to_column(base, column)
+}
+
+/// Coerce an `EXECUTE` argument to the type its prepared statement declared for
+/// `$n`. The rules are a column assignment's — `EXECUTE p(1.7)` rounds into an
+/// `int` parameter — but the rejection is PG's parameter-context message, which
+/// names the parameter rather than a column.
+pub fn coerce_to_param(
+    binding: Binding,
+    n1: usize,
+    ty: PgType,
+    span: Span,
+    scope: &Scope,
+) -> Result<BoundExpr, BindError> {
+    coerce_assign(binding, ty, scope, |from, to| {
+        BindError::new(
+            sqlstate::DATATYPE_MISMATCH,
+            format!("parameter ${n1} of type {from} cannot be coerced to the expected type {to}"),
+        )
+        .with_hint(Some(
+            "You will need to rewrite or cast the expression.".to_string(),
+        ))
+        .at(span)
+    })
+}
+
+/// PostgreSQL's assignment-context coercion, shared by column assignment and
+/// `EXECUTE` parameter binding. The two differ only in how they word a
+/// mismatch, so `mismatch` builds that error from `(source, target)` type
+/// labels.
+fn coerce_assign(
+    binding: Binding,
+    target: PgType,
+    scope: &Scope,
+    mismatch: impl FnOnce(String, String) -> BindError,
+) -> Result<BoundExpr, BindError> {
+    let bound = match binding {
         Binding::Unknown { lit, span, param } => {
-            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
+            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
         }
         Binding::Typed(e) => {
             let ty = e.ty();
-            if ty == column.ty {
+            if ty == target {
                 e
-            } else if ty.is_numeric() && column.ty.is_numeric() {
-                coerce_expr(e, column.ty)?
+            } else if ty.is_numeric() && target.is_numeric() {
+                coerce_expr(e, target)?
             // PG assignment context permits coercion via I/O to a string-category
             // target (the source's output function), so any type assigns to
             // text/varchar/char/name (e.g. INSERT ... VALUES (2) into varchar).
-            } else if is_text_family(column.ty) {
-                coerce_expr(e, column.ty)?
+            } else if is_text_family(target) {
+                coerce_expr(e, target)?
             // `bit` and `bit varying` assign to each other (shared value); the
             // length rule is applied by `apply_length_to_column`.
-            } else if is_bit_family(Some(ty)) && is_bit_family(Some(column.ty)) {
-                coerce_expr(e, column.ty)?
+            } else if is_bit_family(Some(ty)) && is_bit_family(Some(target)) {
+                coerce_expr(e, target)?
             // Assignment context also permits the implicit `timestamp ->
             // timestamptz` cast and its assignment-only reverse (both are plain
             // microsecond reinterprets under the UTC session zone), so inserting
@@ -8916,30 +8961,25 @@ pub fn coerce_to_column(
             // so `text`/`varchar`/`bpchar` assign into a `"char"` column
             // (truncating to the first byte) while `name`, `int4` and every
             // other source are rejected there too.
-            } else if implicit_castable(ty, column.ty)
+            } else if implicit_castable(ty, target)
                 || matches!(
-                    (ty, column.ty),
+                    (ty, target),
                     (PgType::TimestampTz, PgType::Timestamp)
                         | (PgType::Text, PgType::Char)
                         | (PgType::Varchar, PgType::Char)
                         | (PgType::Bpchar, PgType::Char)
                 )
             {
-                coerce_expr(e, column.ty)?
+                coerce_expr(e, target)?
             } else {
-                return Err(BindError::new(
-                    sqlstate::DATATYPE_MISMATCH,
-                    format!(
-                        "column \"{}\" is of type {} but expression is of type {}",
-                        column.name,
-                        type_label(column.ty, scope.catalog().as_ref()),
-                        type_label(ty, scope.catalog().as_ref())
-                    ),
+                return Err(mismatch(
+                    type_label(ty, scope.catalog().as_ref()),
+                    type_label(target, scope.catalog().as_ref()),
                 ));
             }
         }
     };
-    apply_length_to_column(base, column)
+    Ok(bound)
 }
 
 /// Bind and assignment-coerce a column default in an empty scope. PostgreSQL
@@ -9036,6 +9076,16 @@ fn subquery_in_check_error() -> BindError {
 fn subquery_in_check(e: BindError) -> BindError {
     match e.message == NO_SUBQUERY_CONTEXT {
         true => subquery_in_check_error(),
+        false => e,
+    }
+}
+
+/// [`subquery_in_check`] for an `EXECUTE` argument, which PostgreSQL refuses
+/// with its own wording — also `0A000`, probed against 18.4. Any other error
+/// passes through untouched.
+pub fn subquery_in_execute_param(e: BindError) -> BindError {
+    match e.message == NO_SUBQUERY_CONTEXT {
+        true => BindError::feature_not_supported("cannot use subquery in EXECUTE parameter"),
         false => e,
     }
 }

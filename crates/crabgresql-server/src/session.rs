@@ -35,10 +35,14 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 /// without persisting the temp schema. `backend_id + this` stays well below u32 max.
 pub(crate) const TEMP_NAMESPACE_OID_BASE: u32 = 0x7000_0000;
 
-/// A prepared statement (extended protocol `Parse`). Parse-analysis runs once,
-/// here, so `Describe` can answer without executing and `Bind` knows each
-/// parameter's type. Re-binding at `Execute` uses these resolved types, so the
-/// plan is deterministic across executions.
+/// A prepared statement, from the extended protocol's `Parse` or from SQL
+/// `PREPARE`. Parse-analysis runs once, at preparation, so `Describe` can answer
+/// without executing and `Bind` knows each parameter's type. Re-binding at
+/// `Execute` uses these resolved types, so the plan is deterministic across
+/// executions.
+///
+/// Both spellings share one namespace, as in PostgreSQL: SQL `DEALLOCATE` drops
+/// a statement the protocol prepared, and `PREPARE` collides with one.
 pub struct PreparedStatement {
     /// The parsed statement; `None` for an empty query string (its `Execute`
     /// answers `EmptyQueryResponse`).
@@ -49,6 +53,19 @@ pub struct PreparedStatement {
     /// Result-column shape, or `None` for a statement that returns no rows
     /// (utility or data-modifying) — `Describe` then answers `NoData`.
     pub result_columns: Option<Vec<OutputColumn>>,
+    /// The statement text, for `pg_prepared_statements.statement`. The protocol
+    /// path stores the client's `Parse` string verbatim; SQL `PREPARE` re-renders
+    /// its AST (see [`crate::prepare`]).
+    pub statement: String,
+    /// Prepared by SQL `PREPARE` rather than by a `Parse` message.
+    pub from_sql: bool,
+    /// The preparing statement's timestamp, for
+    /// `pg_prepared_statements.prepare_time`.
+    pub prepare_time: i64,
+    /// How many times this statement has been executed, which is what
+    /// `pg_prepared_statements.custom_plans` reports — every execution re-plans
+    /// here, so no execution is ever a generic one.
+    pub executions: i64,
 }
 
 /// A portal (extended protocol `Bind`): a prepared statement plus concrete

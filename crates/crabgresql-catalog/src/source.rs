@@ -253,6 +253,12 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
+    /// The session's prepared statements, to reflect into
+    /// `pg_prepared_statements`.
+    fn prepared_statements(&self) -> Vec<CatalogPreparedStatement> {
+        Vec::new()
+    }
+
     /// The configuration parameters, to reflect into `pg_settings`. The GUC
     /// table lives in the server, so this crate takes the rendered rows rather
     /// than depending on it.
@@ -282,6 +288,7 @@ pub struct StaticSource {
     routines: Vec<CatalogRoutine>,
     schemas: Vec<(String, u32)>,
     cursors: Vec<CatalogCursor>,
+    prepared_statements: Vec<CatalogPreparedStatement>,
     settings: Vec<CatalogSetting>,
 }
 
@@ -297,6 +304,7 @@ impl Default for StaticSource {
             routines: Vec::new(),
             schemas: Vec::new(),
             cursors: Vec::new(),
+            prepared_statements: Vec::new(),
             settings: Vec::new(),
         }
     }
@@ -340,6 +348,11 @@ impl StaticSource {
         self
     }
 
+    pub fn prepared_statements(mut self, prepared: Vec<CatalogPreparedStatement>) -> Self {
+        self.prepared_statements = prepared;
+        self
+    }
+
     pub fn settings(mut self, settings: Vec<CatalogSetting>) -> Self {
         self.settings = settings;
         self
@@ -373,6 +386,10 @@ impl CatalogSource for StaticSource {
 
     fn cursors(&self) -> Vec<CatalogCursor> {
         self.cursors.clone()
+    }
+
+    fn prepared_statements(&self) -> Vec<CatalogPreparedStatement> {
+        self.prepared_statements.clone()
     }
 
     fn settings(&self) -> Vec<CatalogSetting> {
@@ -427,4 +444,24 @@ pub struct CatalogCursor {
     pub is_scrollable: bool,
     /// When the cursor was declared, in `timestamptz` micros.
     pub creation_time: i64,
+}
+
+/// One prepared statement, as `pg_prepared_statements` shows it. Session-local
+/// in PostgreSQL too, and holding both spellings — the SQL `PREPARE` and the
+/// extended protocol's `Parse`, told apart by `from_sql`.
+#[derive(Clone, Debug)]
+pub struct CatalogPreparedStatement {
+    pub name: String,
+    /// The statement text, as the session recorded it.
+    pub statement: String,
+    /// When the statement was prepared, in `timestamptz` micros.
+    pub prepare_time: i64,
+    /// Type OID per `$n`, rendered as `regtype[]`.
+    pub parameter_types: Vec<u32>,
+    /// Type OID per result column, or `None` for a statement that returns no
+    /// rows — which PostgreSQL reports as NULL, not as an empty array.
+    pub result_types: Option<Vec<u32>>,
+    pub from_sql: bool,
+    pub generic_plans: i64,
+    pub custom_plans: i64,
 }

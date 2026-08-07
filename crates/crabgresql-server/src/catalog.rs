@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crabgresql_catalog::{
-    CatalogCursor, CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
-    CatalogUserType, SystemCatalog,
+    CatalogCursor, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
+    CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
 };
 use crabgresql_executor::{CatalogOps, ConstraintDef};
 use crabgresql_storage_api::{
@@ -41,6 +41,9 @@ pub struct SessionCatalogSource {
     /// on demand. Only names and statement texts are copied — never rows — and
     /// a session with no open cursor copies nothing.
     cursors: Vec<CatalogCursor>,
+    /// Eager for the same reason as `cursors`, and just as cheap: only names,
+    /// statement texts and type OIDs are copied — never a plan.
+    prepared_statements: Vec<CatalogPreparedStatement>,
     /// Eager for the same reason as `cursors`: every value is rendered from the
     /// session, which this source outlives.
     settings: Vec<CatalogSetting>,
@@ -77,6 +80,29 @@ impl SessionCatalogSource {
             })
             .collect();
         cursors.sort_by(|a, b| a.name.cmp(&b.name));
+        // Sorted for the same reason the cursors are.
+        let mut prepared_statements: Vec<_> = session
+            .prepared
+            .iter()
+            // The unnamed statement is not a row: PostgreSQL's
+            // `pg_prepared_statements` lists only statements a client could name.
+            .filter(|(name, _)| !name.is_empty())
+            .map(|(name, prepared)| CatalogPreparedStatement {
+                name: name.clone(),
+                statement: prepared.statement.clone(),
+                prepare_time: prepared.prepare_time,
+                parameter_types: prepared.param_types.iter().map(|t| t.oid()).collect(),
+                result_types: prepared
+                    .result_columns
+                    .as_ref()
+                    .map(|cols| cols.iter().map(|c| c.ty.oid()).collect()),
+                from_sql: prepared.from_sql,
+                // Every execution re-plans, so none of them is generic.
+                generic_plans: 0,
+                custom_plans: prepared.executions,
+            })
+            .collect();
+        prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
             engine,
             global_catalog,
@@ -85,6 +111,7 @@ impl SessionCatalogSource {
             temp_schema: session.temp_schema.clone(),
             temp_namespace_oid: session.temp_namespace_oid,
             cursors,
+            prepared_statements,
             settings: crate::guc::catalog_settings(session),
             now: session.xact_start(),
         }
@@ -184,6 +211,10 @@ impl CatalogSource for SessionCatalogSource {
 
     fn cursors(&self) -> Vec<CatalogCursor> {
         self.cursors.clone()
+    }
+
+    fn prepared_statements(&self) -> Vec<CatalogPreparedStatement> {
+        self.prepared_statements.clone()
     }
 
     fn settings(&self) -> Vec<CatalogSetting> {

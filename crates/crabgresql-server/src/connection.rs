@@ -750,12 +750,22 @@ fn handle_parse(
         }
         None => (Vec::new(), None),
     };
+    let prepare_time = session
+        .fmt_ctx()
+        .stmt_start()
+        .map_err(|e| PgError::new(e.sqlstate, e.message))?;
     session.prepared.insert(
         name.to_string(),
         PreparedStatement {
             stmt,
             param_types,
             result_columns,
+            // The client's own text, which is what PostgreSQL reports for a
+            // protocol-prepared statement — no trailing semicolon.
+            statement: query.to_string(),
+            from_sql: false,
+            prepare_time,
+            executions: 0,
         },
     );
     writer.write(&BackendMessage::ParseComplete);
