@@ -194,11 +194,18 @@ jobs:
           echo "clickbench: ${{ steps.run.outcome }}"
           exit 1
 
+  # One job per access method: they run in parallel, and the checks list says
+  # which of the two is red without anyone opening a log.
   bench-tpch:
-    name: tpch (heap + parquet)
+    name: tpch (${{ matrix.am }})
     needs: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
+    strategy:
+      # A red heap must not cancel parquet — the report covers the pair.
+      fail-fast: false
+      matrix:
+        am: [heap, parquet]
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
@@ -206,57 +213,50 @@ jobs:
       - name: cargo build --release
         run: cargo build --release -p crabgresql-bench --bin bench --locked
 
+      # Cheap enough to repeat per access method: sf=0.01 is a DuckDB CLI
+      # download plus seconds of dbgen, less than a job that ships a dataset
+      # artifact to two consumers.
       - name: generate the dataset
         run: scripts/bench/gen-tpch.sh 0.01 "$RUNNER_TEMP/tpch"
 
-      # Both access methods run even when one is red, so the report covers the
-      # pair. Q19's whole WHERE is one top-level OR, so it degenerates into a
-      # cross product and takes ~85s on a developer machine — the per-query
-      # timeout is sized for a shared runner being several times slower, not
-      # for the other 21 queries, which finish in well under a second.
-      - name: tpch on heap
-        id: heap
+      # Q19's whole WHERE is one top-level OR, so it degenerates into a cross
+      # product and takes ~85s on a developer machine — the per-query timeout
+      # is sized for a shared runner being several times slower, not for the
+      # other 21 queries, which finish in well under a second.
+      - name: tpch on ${{ matrix.am }}
+        id: run
         continue-on-error: true
         run: |
           mkdir -p target/bench
           ./target/release/bench run tpch \
             --data "$RUNNER_TEMP/tpch" \
-            --data-dir "$RUNNER_TEMP/tpch-heap" \
-            --using heap --runs 3 --timeout 600 \
-            --json target/bench/tpch-heap.json \
-            | tee target/bench/tpch-heap.txt
-
-      - name: tpch on parquet
-        id: parquet
-        continue-on-error: true
-        run: |
-          ./target/release/bench run tpch \
-            --data "$RUNNER_TEMP/tpch" \
-            --data-dir "$RUNNER_TEMP/tpch-parquet" \
-            --using parquet --runs 3 --timeout 600 \
-            --json target/bench/tpch-parquet.json \
-            | tee target/bench/tpch-parquet.txt
+            --data-dir "$RUNNER_TEMP/tpch-${{ matrix.am }}" \
+            --using ${{ matrix.am }} --runs 3 --timeout 600 \
+            --json target/bench/tpch-${{ matrix.am }}.json \
+            | tee target/bench/tpch-${{ matrix.am }}.txt
 
       - name: build report
         if: always()
         run: |
-          {
-            scripts/bench/report.sh "TPC-H — heap, sf=0.01" target/bench/tpch-heap.txt
-            scripts/bench/report.sh "TPC-H — parquet, sf=0.01" target/bench/tpch-parquet.txt
-          } > target/bench/tpch.md
+          scripts/bench/report.sh \
+            "TPC-H — ${{ matrix.am }}, sf=0.01" \
+            target/bench/tpch-${{ matrix.am }}.txt \
+            > target/bench/tpch-${{ matrix.am }}.md
 
+      # The name has to keep the `bench-` prefix: that is what bench-report
+      # downloads by pattern.
       - name: upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bench-tpch
-          path: target/bench/tpch*
+          name: bench-tpch-${{ matrix.am }}
+          path: target/bench/tpch-${{ matrix.am }}.*
           if-no-files-found: ignore
 
       - name: fail on query failures
-        if: steps.heap.outcome != 'success' || steps.parquet.outcome != 'success'
+        if: steps.run.outcome != 'success'
         run: |
-          echo "heap: ${{ steps.heap.outcome }}, parquet: ${{ steps.parquet.outcome }}"
+          echo "tpch ${{ matrix.am }}: ${{ steps.run.outcome }}"
           exit 1
 
   bench-pgbench:
@@ -329,8 +329,10 @@ jobs:
             echo
             cat artifacts/clickbench.md 2>/dev/null \
               || echo '### ⚠️ ClickBench — did not produce a summary'
-            cat artifacts/tpch.md 2>/dev/null \
-              || echo '### ⚠️ TPC-H — did not produce a summary'
+            cat artifacts/tpch-heap.md 2>/dev/null \
+              || echo '### ⚠️ TPC-H (heap) — did not produce a summary'
+            cat artifacts/tpch-parquet.md 2>/dev/null \
+              || echo '### ⚠️ TPC-H (parquet) — did not produce a summary'
             cat artifacts/pgbench.md 2>/dev/null \
               || echo '### ⚠️ pgbench — did not produce a summary'
             echo "Numbers come from a shared runner and are indicative; these jobs gate on failed queries only."
