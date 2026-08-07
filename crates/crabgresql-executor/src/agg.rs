@@ -75,9 +75,18 @@ enum AggState {
     SumF4(Option<f32>),
     /// `sum(float8)` → `float8`.
     SumF8(Option<f64>),
-    /// `sum(int8|numeric)` → `numeric`.
+    /// `sum(int8)` → `numeric`, accumulated in a register rather than a
+    /// `Numeric`, whose coefficient is a heap `Vec`: one group-by group per
+    /// distinct key means one live allocation per group and two malloc/free
+    /// per row. Promotes to `SumNumeric` if it ever overflows.
+    SumI128(Option<i128>),
+    /// `sum(numeric)` → `numeric`. Also where an overflowing
+    /// [`AggState::SumI128`] lands, which is why it is still unbounded.
     SumNumeric(Option<Numeric>),
-    /// `avg(int2|int4|int8|numeric)` → `numeric`: running sum and count.
+    /// `avg(int2|int4|int8)` → `numeric`: running sum and count, in registers.
+    /// See [`AggState::SumI128`] for why this is not a `Numeric`.
+    AvgI128 { sum: i128, count: i64 },
+    /// `avg(numeric)` → `numeric`: running sum and count.
     AvgNumeric { sum: Numeric, count: i64 },
     /// `avg(float4|float8)` → `float8`: running sum and count.
     AvgFloat { sum: f64, count: i64 },
@@ -85,6 +94,12 @@ enum AggState {
     /// `None` until the first non-null value (an empty group finalizes to NULL).
     StringAgg { cur: Option<String> },
 }
+
+// A group-by group holds one accumulator per aggregate, and a query like
+// ClickBench's `GROUP BY WatchID, ClientIP` has as many groups as rows — so this
+// size is multiplied by tens of millions. `Extreme`'s `Option<Value>` is what
+// sets it; the `i128` states only raise the alignment.
+const _: () = assert!(std::mem::size_of::<AggState>() <= 80);
 
 impl Accumulator {
     /// A fresh accumulator for `agg`, seeded to its empty-group state.
@@ -105,13 +120,17 @@ impl Accumulator {
             },
             AggFn::Sum => match agg.input_ty {
                 PgType::Int2 | PgType::Int4 => AggState::SumI64(None),
-                PgType::Int8 | PgType::Numeric => AggState::SumNumeric(None),
+                PgType::Int8 => AggState::SumI128(None),
+                PgType::Numeric => AggState::SumNumeric(None),
                 PgType::Float4 => AggState::SumF4(None),
                 PgType::Float8 => AggState::SumF8(None),
                 other => unreachable!("binder rejected sum({other:?})"),
             },
             AggFn::Avg => match agg.input_ty {
                 PgType::Float4 | PgType::Float8 => AggState::AvgFloat { sum: 0.0, count: 0 },
+                PgType::Int2 | PgType::Int4 | PgType::Int8 => {
+                    AggState::AvgI128 { sum: 0, count: 0 }
+                }
                 _ => AggState::AvgNumeric {
                     sum: Numeric::from_i128(0),
                     count: 0,
@@ -134,6 +153,9 @@ impl Accumulator {
     /// value (already known non-null); `string_agg` also reads `values[1]` as the
     /// per-row delimiter.
     pub fn accumulate(&mut self, values: &[Value]) -> Result<(), ExecError> {
+        // Set by the register states when their `i128` runs out of room. The
+        // switch happens after the borrow below ends.
+        let mut promote = None;
         match &mut self.state {
             AggState::Count(n) => *n += 1,
             AggState::Extreme {
@@ -185,12 +207,33 @@ impl Accumulator {
                 };
                 *acc = Some(next);
             }
+            AggState::SumI128(acc) => {
+                let x = as_i128(&values[0]);
+                match acc {
+                    None => *acc = Some(x),
+                    // Unlike `AvgI128` there is no count to cap the row number
+                    // here, so the overflow is only *physically* unreachable
+                    // (2^64 bigints is ~147 exabytes). Promote rather than raise:
+                    // PostgreSQL's `sum(bigint)` is numeric and never overflows.
+                    Some(a) => match a.checked_add(x) {
+                        Some(next) => *a = next,
+                        None => promote = Some((*a, x)),
+                    },
+                }
+            }
             AggState::SumNumeric(acc) => {
                 let x = as_numeric(&values[0]);
                 *acc = Some(match acc {
                     None => x,
                     Some(a) => a.add(&x),
                 });
+            }
+            AggState::AvgI128 { sum, count } => {
+                // No `checked_add`: `count` counts the same values `sum` adds, so
+                // it caps them at `i64::MAX`, and (2^63-1)·2^63 < i128::MAX means
+                // `count` overflows first. `sum` cannot be the one to run out.
+                *sum += as_i128(&values[0]);
+                *count += 1;
             }
             AggState::AvgNumeric { sum, count } => {
                 *sum = sum.add(&as_numeric(&values[0]));
@@ -220,6 +263,14 @@ impl Accumulator {
                 }
             }
         }
+        // A register sum is exactly `Numeric::from_i128` of itself — `from_i128`
+        // fixes `dscale` at 0 and `normalize` leaves one canonical form per value
+        // — so resuming in `Numeric` from here is the same running sum
+        // `SumNumeric` would be holding, and finalize is unchanged.
+        if let Some((sum, x)) = promote {
+            self.state =
+                AggState::SumNumeric(Some(Numeric::from_i128(sum).add(&Numeric::from_i128(x))));
+        }
         Ok(())
     }
 
@@ -237,17 +288,22 @@ impl Accumulator {
             AggState::SumI64(acc) => acc.map(Value::Int8).unwrap_or(Value::Null),
             AggState::SumF4(acc) => acc.map(Value::Float4).unwrap_or(Value::Null),
             AggState::SumF8(acc) => acc.map(Value::Float8).unwrap_or(Value::Null),
+            AggState::SumI128(acc) => acc
+                .map(|n| Value::Numeric(Numeric::from_i128(n)))
+                .unwrap_or(Value::Null),
             AggState::SumNumeric(acc) => acc.clone().map(Value::Numeric).unwrap_or(Value::Null),
+            AggState::AvgI128 { sum, count } => {
+                if *count == 0 {
+                    Value::Null
+                } else {
+                    avg_quotient(&Numeric::from_i128(*sum), *count)?
+                }
+            }
             AggState::AvgNumeric { sum, count } => {
                 if *count == 0 {
                     Value::Null
                 } else {
-                    // count > 0, so the division never divides by zero.
-                    Value::Numeric(
-                        sum.div(&Numeric::from_i128(*count as i128)).map_err(|e| {
-                            ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
-                        })?,
-                    )
+                    avg_quotient(sum, *count)?
                 }
             }
             AggState::AvgFloat { sum, count } => {
@@ -503,6 +559,26 @@ pub fn keys_equal<A: Borrow<Value>, B: Borrow<Value>>(tys: &[PgType], a: &[A], b
         })
 }
 
+/// `avg`'s one division, shared so the two exact states cannot drift on the
+/// display scale: `select_div_scale` reads the magnitude *and* `dscale` of both
+/// operands, so the divisor has to stay `Numeric::from_i128(count)`.
+fn avg_quotient(sum: &Numeric, count: i64) -> Result<Value, ExecError> {
+    // count > 0, so the division never divides by zero.
+    let q = sum
+        .div(&Numeric::from_i128(count as i128))
+        .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))?;
+    Ok(Value::Numeric(q))
+}
+
+fn as_i128(v: &Value) -> i128 {
+    match v {
+        Value::Int2(n) => *n as i128,
+        Value::Int4(n) => *n as i128,
+        Value::Int8(n) => *n as i128,
+        other => unreachable!("integer accumulator got {other:?}"),
+    }
+}
+
 fn as_i64(v: &Value) -> i64 {
     match v {
         Value::Int2(n) => *n as i64,
@@ -543,8 +619,84 @@ fn bigint_out_of_range() -> ExecError {
 
 #[cfg(test)]
 mod tests {
-    use super::hash_key;
+    use super::{Accumulator, hash_key};
+    use crabgresql_binder::{AggFn, BoundAggregate};
     use crabgresql_types::{PgType, Value};
+
+    /// Fold `values` through a real accumulator for `func` over `input_ty`, and
+    /// render what it finalizes to — so the dispatch in `Accumulator::new` is
+    /// under test alongside the arithmetic.
+    fn run(func: AggFn, input_ty: PgType, values: &[Value]) -> String {
+        let agg = BoundAggregate {
+            func,
+            distinct: false,
+            args: Vec::new(),
+            input_ty,
+            ret: PgType::Numeric,
+            collation: 0,
+        };
+        let mut acc = Accumulator::new(&agg);
+        for v in values {
+            acc.accumulate(std::slice::from_ref(v)).expect("accumulate");
+        }
+        match acc.finalize().expect("finalize") {
+            Value::Numeric(n) => n.to_display(),
+            Value::Null => "NULL".to_string(),
+            other => panic!("expected numeric, got {other:?}"),
+        }
+    }
+
+    /// A register sum that stopped short of what a `Numeric` held would shift the
+    /// quotient's display scale, so it has to carry a total wider than `i64`
+    /// exactly. These are PostgreSQL 18.4's answers.
+    #[test]
+    fn an_integer_sum_wider_than_i64_keeps_its_scale() {
+        let max = Value::Int8(i64::MAX);
+        let rows = [max.clone(), max.clone(), max];
+
+        assert_eq!(run(AggFn::Sum, PgType::Int8, &rows), "27670116110564327421");
+        // That total over 3 divides exactly, and its magnitude drives
+        // `select_div_scale` to rscale 0 — no decimal point at all.
+        assert_eq!(run(AggFn::Avg, PgType::Int8, &rows), "9223372036854775807");
+    }
+
+    /// A sum cancelling to zero must canonicalize the way `Numeric` does, or the
+    /// quotient's trailing zeros move.
+    #[test]
+    fn a_sum_that_cancels_to_zero_averages_at_full_scale() {
+        let rows = [Value::Int4(-5), Value::Int4(5)];
+        assert_eq!(
+            run(AggFn::Avg, PgType::Int4, &rows),
+            "0.00000000000000000000"
+        );
+        assert_eq!(
+            run(AggFn::Sum, PgType::Int8, &rows[..1]),
+            "-5",
+            "a lone negative keeps its sign"
+        );
+    }
+
+    /// An empty group is NULL, not zero — `count == 0` must short-circuit before
+    /// the division.
+    #[test]
+    fn an_empty_integer_aggregate_is_null() {
+        assert_eq!(run(AggFn::Avg, PgType::Int2, &[]), "NULL");
+        assert_eq!(run(AggFn::Sum, PgType::Int8, &[]), "NULL");
+    }
+
+    /// `avg` of the narrow integer types still divides at full scale, which is
+    /// what `select_div_scale` gives for a small quotient.
+    #[test]
+    fn narrow_integer_averages_divide_at_full_scale() {
+        assert_eq!(
+            run(AggFn::Avg, PgType::Int2, &[Value::Int2(5), Value::Int2(20)]),
+            "12.5000000000000000"
+        );
+        assert_eq!(
+            run(AggFn::Avg, PgType::Int4, &[Value::Int4(1), Value::Int4(2)]),
+            "1.5000000000000000"
+        );
+    }
 
     #[test]
     fn enum_hash_uses_definition_ordinal() {
