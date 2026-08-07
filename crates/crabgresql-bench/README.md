@@ -173,11 +173,15 @@ carries the context and the entries are just `load` and `Q1`…`Qn`.
 pgbench writes its own file with `customBiggerIsBetter`, since throughput is
 the one metric here that should go up.
 
-Two things about that branch: it has to exist before anything compares against
-it — `git checkout --orphan gh-pages && git push origin gh-pages:gh-pages`, and
-until then the trend steps skip themselves rather than fail — and rendering the
+Three things about that branch. It has to exist before anything is recorded —
+`git checkout --orphan gh-pages && git push origin gh-pages:gh-pages` — and
+until then the trend steps skip themselves rather than fail. Rendering the
 charts as a site needs GitHub Pages, which a private repository only gets on a
-paid plan. The data accumulates on the branch either way.
+paid plan; the data accumulates on the branch either way. And the workflow
+fetches the branch itself, once, before the four steps, which then all run with
+`skip-fetch-gh-pages`: the action commits to the local branch whether or not it
+pushes, so on a pull request the second invocation's own fetch would be
+rejected as a non-fast-forward.
 
 ## Adding a benchmark
 

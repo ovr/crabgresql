@@ -347,18 +347,26 @@ jobs:
         run: scripts/ci-pr-comment.sh '<!-- crabgresql-bench-report -->' report.md
 
       # The history lives on the gh-pages branch: a push to main appends to it,
-      # a pull request only reads it to compare. Before main has ever run, the
-      # branch does not exist and there is nothing to compare against — hence
-      # the probe rather than a `continue-on-error` that would also swallow
-      # real failures.
-      - name: is there a baseline
+      # a pull request only reads it to compare. The branch has to be created by
+      # hand once (`git checkout --orphan gh-pages`), and until it is, there is
+      # nothing to compare against — hence the probe rather than a
+      # `continue-on-error` that would also swallow real failures.
+      #
+      # The fetch happens here, exactly once, and every trend step below runs
+      # with `skip-fetch-gh-pages`. The action commits to the local gh-pages
+      # branch whether or not it pushes, so on a pull request — where it never
+      # pushes — the branch ends up one commit ahead of the remote, and the
+      # *next* invocation's own `fetch origin gh-pages:gh-pages` is rejected as
+      # a non-fast-forward. One fetch for all four suites avoids that entirely.
+      - name: fetch the baseline
         id: baseline
         run: |
           if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git fetch origin gh-pages:gh-pages
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "no gh-pages branch yet; the first push to main seeds it"
+            echo "no gh-pages branch yet; create it once and the trends start"
           fi
 
       # One file per run rather than one pile: the action keys its history by
@@ -368,7 +376,7 @@ jobs:
       # nothing.
       - name: build trend data
         id: trend
-        if: steps.baseline.outputs.exists == 'true' || github.event_name == 'push'
+        if: steps.baseline.outputs.exists == 'true'
         run: |
           scripts/bench/trend-json.sh artifacts/clickbench.json   > trend-clickbench.json
           scripts/bench/trend-json.sh artifacts/tpch-heap.json    > trend-tpch-heap.json
@@ -399,6 +407,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
           # A shared runner swings ±10-20% on its own, and these benchmarks do
           # real file I/O; anything tighter than 2x would cry every week.
           alert-threshold: "200%"
@@ -416,6 +425,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
           alert-threshold: "200%"
           comment-on-alert: true
           fail-on-alert: false
@@ -431,6 +441,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
           alert-threshold: "200%"
           comment-on-alert: true
           fail-on-alert: false
@@ -448,6 +459,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
           alert-threshold: "200%"
           comment-on-alert: true
           fail-on-alert: false
