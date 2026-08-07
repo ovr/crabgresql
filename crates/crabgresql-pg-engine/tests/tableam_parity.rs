@@ -109,6 +109,53 @@ fn insert_then_scan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The scan buffers a whole block and then hands its rows out one at a time by
+/// moving them out of that buffer. Nothing may be yielded twice, nothing may
+/// arrive emptied, and the order must stay ascending by tid — across a row count
+/// large enough to span several pages, so the buffer is refilled repeatedly.
+///
+/// Asserting the *contents* is the point: a slot read after it was emptied comes
+/// back as a zero-length tuple, which a `count()`-only check would sail past.
+#[test]
+fn a_multi_block_scan_yields_every_row_intact_and_in_order() -> anyhow::Result<()> {
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    // Wide enough that a few hundred rows cannot fit on one 8 KB page, so the
+    // scan crosses block boundaries several times.
+    const ROWS: i32 = 400;
+    for i in 0..ROWS {
+        insert_committed(
+            &h.tm,
+            &*table,
+            vec![
+                Value::Int4(i),
+                Value::Text(format!("{i}-{}", "x".repeat(60))),
+            ],
+        );
+    }
+    let rows = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(rows.len() as i32, ROWS);
+    for (i, (_, tuple)) in rows.iter().enumerate() {
+        let i = i as i32;
+        assert_eq!(
+            tuple,
+            &vec![
+                Value::Int4(i),
+                Value::Text(format!("{i}-{}", "x".repeat(60)))
+            ],
+            "row {i} came back wrong"
+        );
+    }
+    let tids: Vec<Tid> = rows.iter().map(|(tid, _)| *tid).collect();
+    assert!(
+        tids.windows(2)
+            .all(|w| (w[0].block, w[0].offset) < (w[1].block, w[1].offset)),
+        "scan order must be ascending by tid"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn insert_returns_distinct_ascending_tids() -> anyhow::Result<()> {
     let h = setup();
