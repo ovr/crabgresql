@@ -70,10 +70,25 @@ pub struct PreparedStatement {
 
 /// A portal (extended protocol `Bind`): a prepared statement plus concrete
 /// parameter values and the client's requested result formats.
+///
+/// A portal owns everything it needs to run, rather than looking its statement
+/// up by name at `Execute`. PostgreSQL's portal holds a reference to the plan it
+/// was built from, so `DEALLOCATE` (or a re-`Parse` of the same name) cannot pull
+/// the ground out from under a portal already bound; copying here buys the same
+/// guarantee without a plan cache to refcount. The name is kept only to attribute
+/// the execution back to `pg_prepared_statements`.
 pub struct Portal {
-    /// Name of the prepared statement this portal was bound from.
+    /// Name of the prepared statement this portal was bound from. May name a
+    /// statement that no longer exists — the portal does not need it to run.
     pub statement: String,
-    /// Decoded parameter values, parallel to the statement's `param_types`.
+    /// The statement this portal runs, copied at `Bind`; `None` for one prepared
+    /// from an empty query string.
+    pub stmt: Option<ast::Statement>,
+    /// Resolved type per `$n`, parallel to `params`.
+    pub param_types: Vec<PgType>,
+    /// Result-column shape, or `None` for a statement returning no rows.
+    pub result_columns: Option<Vec<OutputColumn>>,
+    /// Decoded parameter values, parallel to `param_types`.
     pub params: Vec<Value>,
     /// Per-column result formats. Length 0 = all text, 1 = applies to every
     /// column, otherwise one entry per column (as the `Bind` message encodes).
@@ -476,6 +491,14 @@ pub struct Session {
     /// by the [`Drop`] impl, which needs no help because the rows are plain
     /// owned memory.
     pub cursors: HashMap<String, Cursor>,
+    /// How many `EXECUTE`s are on the stack right now. A prepared statement may
+    /// name another one — including itself, which a `Parse` message is free to
+    /// prepare — so the executor re-enters itself; this bounds that recursion
+    /// before it exhausts the thread's stack. Lives here rather than on
+    /// `ExecContext` because the recursion never travels through the executor:
+    /// it is `execute_statement_with` calling itself through
+    /// [`crate::prepare::execute_execute`].
+    pub execute_depth: u32,
     /// Per-session `currval`/`lastval` state, updated by `nextval`/`setval`.
     /// Shared behind an `Arc<Mutex<_>>` so a [`SessionSequences`] handle (which
     /// the executor holds through [`ExecContext`], possibly in a suspended
@@ -743,6 +766,7 @@ impl Session {
             prepared: HashMap::new(),
             portals: HashMap::new(),
             cursors: HashMap::new(),
+            execute_depth: 0,
             seq_state: Arc::new(Mutex::new(SessionSeqState::default())),
             notices: Arc::new(SessionNotices::default()),
             routine_cache: Arc::new(RoutineCache::new()),

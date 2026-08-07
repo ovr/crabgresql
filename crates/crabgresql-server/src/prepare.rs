@@ -7,22 +7,28 @@
 //! both (telling them apart by `from_sql`).
 //!
 //! Reproduces PostgreSQL's observable behavior (parameter rules, command tags,
-//! SQLSTATEs) rather than porting its plan cache. Three deliberate divergences:
+//! SQLSTATEs) rather than porting its plan cache.
 //!
-//! * `pg_prepared_statements.statement` is re-rendered from the AST for a SQL
-//!   `PREPARE`, because the parser reports no span for it — the same tradeoff
-//!   [`crate::cursor`] makes for `pg_cursors`.
-//! * Every `EXECUTE` re-plans, so `generic_plans` is always 0 and
-//!   `custom_plans` counts executions. There is no plan cache to choose between.
-//! * `PREPARE p AS SELECT $1` is `42P18` here, where PostgreSQL resolves the
-//!   bare parameter to `text`. That is the binder's existing extended-protocol
-//!   behavior, unchanged by this module.
+//! One deliberate difference: every execution re-plans, so `generic_plans` and
+//! `custom_plans` are split by whether the statement takes parameters rather
+//! than by a plan cache's choice. That is correct because it reports the column
+//! PostgreSQL fills for each shape — a parameterless statement is generic from
+//! its first execution there too — and this build has no cached plan for the two
+//! counters to distinguish.
+//!
+//! TODO: record a span for `Statement::Prepare` in the parser, so
+//! `pg_prepared_statements.statement` can carry the client's raw text instead of
+//! the AST's rendering of it, and so a `PREPARE` of a utility statement can point
+//! a caret at the offending keyword. `pg_cursors` waits on the same change.
+//! TODO: resolve a bare `$n` in a target list to `text`, as PostgreSQL does;
+//! `PREPARE p AS SELECT $1` raises `42P18` until then. The gap is the binder's,
+//! shared with the extended protocol, not this module's.
 
 use std::sync::Arc;
 
 use crabgresql_parser::ast::{self, Spanned};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::TableEngine;
+use crabgresql_storage_api::{TableEngine, TypeCatalog};
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::{PgType, Value};
 
@@ -66,7 +72,11 @@ pub(crate) fn execute_prepare(
     }
     // A declared type list seeds the inference; an omitted one leaves every `$n`
     // to be deduced from its use, exactly as an all-zero `Parse` OID list does.
-    let (_, type_catalog, _) = bind_catalogs(engine, global_catalog, session);
+    // The global catalog *is* what `bind_catalogs` hands back as the type view,
+    // so resolving a declared type needs nothing built: a `SystemCatalog`
+    // snapshot here would eagerly copy every cursor, prepared statement and GUC
+    // row only to be dropped unread.
+    let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
     let declared = data_types
         .iter()
         .map(|dt| resolve_column_type(&type_catalog, dt).map(Some))
@@ -87,9 +97,10 @@ pub(crate) fn execute_prepare(
             stmt: Some(inner.clone()),
             param_types,
             result_columns,
-            // Divergence: PostgreSQL keeps the client's raw text. The parser
-            // reports no span for PREPARE, so there is nothing to slice; the
-            // AST's own rendering round-trips for canonical input.
+            // TODO: slice the client's raw text once the parser records a span
+            // for PREPARE. PostgreSQL stores what the client wrote; the AST's own
+            // rendering round-trips for canonical input, which is why the smoke
+            // suite matches, but comments and spacing are lost.
             statement: format!("{stmt};"),
             from_sql: true,
             prepare_time,
@@ -101,6 +112,24 @@ pub(crate) fn execute_prepare(
         notices: session.notices.drain(),
     })
 }
+
+/// How deep `EXECUTE` may nest.
+///
+/// A prepared statement can name another one, so `EXECUTE` re-enters the
+/// statement executor. PostgreSQL bounds that with `max_stack_depth`, a *byte*
+/// budget checked by probing the actual stack pointer; there is no equivalent
+/// here, so this is a frame count. A level costs a whole
+/// bind/plan/execute recursion, measured by chaining prepared statements until
+/// the process died: a 2 MB thread stack survives 64 levels and overflows by 68,
+/// so roughly 31 KB each.
+///
+/// Set far below half of that because the budget is shared: a PL/pgSQL call can
+/// nest on top of an `EXECUTE` chain, and its own cap of 24 frames
+/// (`crabgresql_plpgsql`'s `MAX_CALL_DEPTH`, at ~40 KB each) already claims
+/// about half the stack. The failure mode being guarded against is a process
+/// abort — one connection's recursion killing every other session — not an
+/// error.
+const MAX_EXECUTE_DEPTH: u32 = 16;
 
 /// `EXECUTE name [(expr, …)]`.
 ///
@@ -114,34 +143,67 @@ pub(crate) fn execute_execute(
     session: &mut Session,
     force_materialize: bool,
 ) -> Result<QueryResult, PgError> {
-    let ast::Statement::Execute {
-        name,
-        parameters,
-        immediate,
-        into,
-        using,
-        output,
-        default,
-        ..
-    } = execute
-    else {
-        return Err(PgError::syntax(
-            "EXECUTE requires a prepared statement name",
-        ));
+    let Resolved { stmt, params } = resolve_execute(engine, global_catalog, execute, session)?;
+    let Some(stmt) = stmt else {
+        // Only reachable for a statement the protocol prepared from an empty
+        // query string; SQL `PREPARE` always carries one.
+        return Ok(QueryResult::Command {
+            tag: String::new(),
+            notices: session.notices.drain(),
+        });
     };
-    // `EXECUTE IMMEDIATE`, `INTO`, `USING`, `OUTPUT` and `DEFAULT` are other
-    // dialects' spellings the shared parser accepts; PostgreSQL's EXECUTE has
-    // none of them.
-    if *immediate || *output || *default || !into.is_empty() || !using.is_empty() {
-        return Err(PgError::feature_not_supported(
-            "this form of EXECUTE is not supported yet",
+    // The statement being run may itself be an `EXECUTE` — nothing stops a
+    // `Parse` message from preparing one, including one that names itself — so
+    // this call is what recursion travels through, and the counter has to wrap
+    // exactly it. Checked before the increment so the depth cannot be exceeded
+    // by the frame that reports it.
+    if session.execute_depth >= MAX_EXECUTE_DEPTH {
+        return Err(PgError::new(
+            sqlstate::STATEMENT_TOO_COMPLEX,
+            "stack depth limit exceeded",
+        )
+        .with_hint(
+            "Increase the configuration parameter max_stack_depth, after ensuring \
+             the platform's stack depth limit is adequate.",
         ));
     }
-    let Some(name) = name else {
-        return Err(PgError::syntax(
-            "EXECUTE requires a prepared statement name",
-        ));
-    };
+    session.execute_depth += 1;
+    let result = execute_statement_with(
+        engine,
+        global_catalog,
+        txnmgr,
+        &stmt,
+        session,
+        &params,
+        force_materialize,
+    );
+    // Decremented on both paths: an error unwinds through here, and leaving the
+    // depth raised would make every later statement on this session look nested.
+    session.execute_depth -= 1;
+    result
+}
+
+/// What an `EXECUTE` resolves to: the statement it names and the parameters its
+/// arguments evaluated to.
+pub(crate) struct Resolved {
+    /// `None` for a statement the protocol prepared from an empty query string.
+    pub stmt: Option<ast::Statement>,
+    pub params: BoundParams,
+}
+
+/// Resolve `EXECUTE name (args)` to the statement it runs, evaluating the
+/// arguments against the parameter types the statement was prepared with.
+///
+/// Shared with the `EXPLAIN EXECUTE` path, which needs the same statement and
+/// the same parameters but plans them instead of running them — reusing the
+/// caller's `BoundParams` there would explain the wrong values.
+pub(crate) fn resolve_execute(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    execute: &ast::Statement,
+    session: &mut Session,
+) -> Result<Resolved, PgError> {
+    let (name, parameters) = execute_parts(execute)?;
     let name = single_object_name(name, "prepared statement")?;
     let (stmt, param_types) = {
         let prepared = lookup(session, &name)?;
@@ -160,30 +222,49 @@ pub(crate) fn execute_execute(
     if let Some(prepared) = session.prepared.get_mut(&name) {
         prepared.executions += 1;
     }
-    let Some(stmt) = stmt else {
-        // Only reachable for a statement the protocol prepared from an empty
-        // query string; SQL `PREPARE` always carries one.
-        return Ok(QueryResult::Command {
-            tag: String::new(),
-            notices: session.notices.drain(),
-        });
+    Ok(Resolved {
+        stmt,
+        params: BoundParams {
+            types: param_types,
+            values,
+            // The plan is built with the parameters folded in, which is what the
+            // `Bind`/`Execute` path does with the values it decoded off the wire.
+            extended: true,
+        },
+    })
+}
+
+/// The two fields PostgreSQL's `EXECUTE` has, rejecting the spellings the shared
+/// parser accepts for other dialects (`EXECUTE IMMEDIATE`, `INTO`, `USING`,
+/// `OUTPUT`, `DEFAULT`), which PostgreSQL's grammar has none of.
+fn execute_parts(execute: &ast::Statement) -> Result<(&ast::ObjectName, &[ast::Expr]), PgError> {
+    let ast::Statement::Execute {
+        name,
+        parameters,
+        immediate,
+        into,
+        using,
+        output,
+        default,
+        ..
+    } = execute
+    else {
+        return Err(PgError::new(
+            sqlstate::INTERNAL_ERROR,
+            "statement is not an EXECUTE",
+        ));
     };
-    let params = BoundParams {
-        types: param_types,
-        values,
-        // The plan is built with the parameters folded in, which is what the
-        // `Bind`/`Execute` path does with the values it decoded off the wire.
-        extended: true,
+    if *immediate || *output || *default || !into.is_empty() || !using.is_empty() {
+        return Err(PgError::feature_not_supported(
+            "this form of EXECUTE is not supported yet",
+        ));
+    }
+    let Some(name) = name else {
+        return Err(PgError::syntax(
+            "EXECUTE requires a prepared statement name",
+        ));
     };
-    execute_statement_with(
-        engine,
-        global_catalog,
-        txnmgr,
-        &stmt,
-        session,
-        &params,
-        force_materialize,
-    )
+    Ok((name, parameters))
 }
 
 /// `DEALLOCATE [PREPARE] { name | ALL }`.
@@ -214,9 +295,11 @@ pub(crate) fn execute_deallocate(
 
 /// The statements `PREPARE` accepts. PostgreSQL's grammar takes only
 /// `PreparableStmt` — SELECT (including VALUES and a leading WITH, both of which
-/// parse to a Query here), INSERT, UPDATE, DELETE and MERGE. There is no MERGE
-/// in this build, so anything else is refused as a syntax error, which is what
-/// PostgreSQL's parser does with a utility statement here.
+/// parse to a Query here), INSERT, UPDATE and DELETE. Anything else is refused as
+/// a syntax error, which is what PostgreSQL's parser does with a utility
+/// statement here.
+///
+/// TODO: admit MERGE once it is implemented; PostgreSQL prepares it too.
 fn is_preparable(stmt: &ast::Statement) -> bool {
     matches!(
         stmt,
@@ -267,13 +350,19 @@ fn bind_arguments(
         // context it refused them in.
         let binding = crabgresql_binder::bind_expr(arg, &scope)
             .map_err(crabgresql_binder::subquery_in_execute_param)?;
-        bound.push(crabgresql_binder::coerce_to_param(
-            binding,
-            i + 1,
-            param_types[i],
-            arg.span(),
-            &scope,
-        )?);
+        let expr =
+            crabgresql_binder::coerce_to_param(binding, i + 1, param_types[i], arg.span(), &scope)?;
+        // The guards every other empty-scope binder applies, in the order
+        // `bind_column_default` applies them. Without these an aggregate reaches
+        // the evaluator and reports its generic 0A000 instead of PostgreSQL's
+        // 42803, which names the clause it was rejected from.
+        if expr.contains_srf() {
+            return Err(PgError::feature_not_supported(
+                "set-returning functions are not allowed in EXECUTE parameters",
+            ));
+        }
+        crabgresql_binder::reject_agg_or_window(&expr, "EXECUTE parameters")?;
+        bound.push(expr);
     }
     // No transaction is attached: these expressions are constants evaluated
     // before the statement opens its own, exactly as a partition bound is folded.

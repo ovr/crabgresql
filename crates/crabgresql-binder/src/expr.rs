@@ -1513,7 +1513,7 @@ pub(crate) fn reject_window(expr: &BoundExpr, clause: &str) -> Result<(), BindEr
 
 /// Reject an aggregate *or* a window call in a clause that allows neither,
 /// blaming whichever comes first in source order — as PostgreSQL does.
-pub(crate) fn reject_agg_or_window(expr: &BoundExpr, clause: &str) -> Result<(), BindError> {
+pub fn reject_agg_or_window(expr: &BoundExpr, clause: &str) -> Result<(), BindError> {
     match expr.first_agg_or_window() {
         Some(BoundExpr::WindowFunc { .. }) => Err(window_not_allowed(clause)),
         Some(_) => Err(BindError::new(

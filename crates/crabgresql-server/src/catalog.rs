@@ -97,9 +97,21 @@ impl SessionCatalogSource {
                     .as_ref()
                     .map(|cols| cols.iter().map(|c| c.ty.oid()).collect()),
                 from_sql: prepared.from_sql,
-                // Every execution re-plans, so none of them is generic.
-                generic_plans: 0,
-                custom_plans: prepared.executions,
+                // PostgreSQL splits executions by the plan they used: a
+                // statement with no parameters has nothing to specialize on, so
+                // its plan is generic from the first execution, while a
+                // parameterized one is planned per argument set. This build
+                // re-plans everything, so the split is decided by the parameter
+                // count alone rather than by a plan cache's choice — which lands
+                // on the same column PostgreSQL fills for both shapes.
+                generic_plans: match prepared.param_types.is_empty() {
+                    true => prepared.executions,
+                    false => 0,
+                },
+                custom_plans: match prepared.param_types.is_empty() {
+                    true => 0,
+                    false => prepared.executions,
+                },
             })
             .collect();
         prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));

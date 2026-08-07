@@ -20,7 +20,7 @@ use crate::global_catalog::GlobalCatalog;
 use crate::guc;
 use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
-    fetch_columns, prepare_copy_from, run_copy_insert,
+    executed_columns, fetch_columns, prepare_copy_from, run_copy_insert,
 };
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
@@ -828,10 +828,18 @@ fn handle_bind(
         };
         values.push(value);
     }
+    // Copied, not looked up again at Execute: see [`Portal`] for why a portal
+    // must survive its statement being deallocated or re-prepared.
+    let stmt = prepared.stmt.clone();
+    let param_types = prepared.param_types.clone();
+    let result_columns = prepared.result_columns.clone();
     session.portals.insert(
         portal,
         Portal {
             statement: statement.to_string(),
+            stmt,
+            param_types,
+            result_columns,
             params: values,
             result_formats,
             state: PortalState::Ready,
@@ -876,21 +884,19 @@ fn handle_describe(
                     format!("portal \"{name}\" does not exist"),
                 )
             })?;
-            let prepared = session.prepared.get(&portal.statement).ok_or_else(|| {
-                PgError::new(
-                    sqlstate::INTERNAL_ERROR,
-                    "portal references a dropped prepared statement",
-                )
-            })?;
             // A portal's shape is resolved now, not read from the shape Parse
-            // recorded. `FETCH` is the case where the two differ: its columns
-            // come from a cursor that may have been declared — or closed and
-            // redeclared with different columns — since the statement was
-            // prepared, and PG re-derives the portal's descriptor at Bind for
-            // exactly this reason.
-            let columns = match &prepared.stmt {
+            // recorded. `FETCH` and `EXECUTE` are the cases where the two
+            // differ: their columns come from a cursor or a prepared statement
+            // that may have been declared — or dropped and redefined with
+            // different columns — since this statement was prepared, and PG
+            // re-derives the portal's descriptor at Bind for exactly this
+            // reason.
+            let columns = match &portal.stmt {
                 Some(ast::Statement::Fetch { name, .. }) => fetch_columns(session, name),
-                _ => prepared.result_columns.clone(),
+                Some(ast::Statement::Execute { name, .. }) => {
+                    executed_columns(session, name.as_ref())
+                }
+                _ => portal.result_columns.clone(),
             };
             let formats = &session.portals[name].result_formats;
             match &columns {
@@ -952,15 +958,17 @@ fn handle_execute(
     let stmt_name = session.portals[portal_name].statement.clone();
     let param_values = session.portals[portal_name].params.clone();
     let result_formats = session.portals[portal_name].result_formats.clone();
-    let (stmt, param_types) = {
-        let prepared = session.prepared.get(&stmt_name).ok_or_else(|| {
-            PgError::new(
-                sqlstate::INTERNAL_ERROR,
-                "portal references a dropped prepared statement",
-            )
-        })?;
-        (prepared.stmt.clone(), prepared.param_types.clone())
-    };
+    let stmt = session.portals[portal_name].stmt.clone();
+    let param_types = session.portals[portal_name].param_types.clone();
+    // Counted here and not on the suspended/finished arms above: those resume or
+    // re-report an execution this one already counted. Without it
+    // `pg_prepared_statements` would report every protocol client's statements —
+    // which is every real client's — as having never run. Best-effort by name:
+    // the portal runs even when the statement it came from is gone, and then
+    // there is no row left to attribute the execution to.
+    if let Some(prepared) = session.prepared.get_mut(&stmt_name) {
+        prepared.executions += 1;
+    }
     let Some(stmt) = stmt else {
         writer.write(&BackendMessage::EmptyQueryResponse);
         return Ok(());

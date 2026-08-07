@@ -24,9 +24,9 @@ EXECUTE p2 (1 / 0);
 EXECUTE nosuch (1);
 DEALLOCATE nosuch;
 -- Only an optimizable statement can be prepared; a utility statement is a
--- syntax error at its leading keyword. The refusal itself is covered by the
--- e2e tests, not here: PostgreSQL points a caret at that keyword and the parser
--- reports no span for PREPARE, so there is nothing to point one at.
+-- syntax error at its leading keyword. The refusal is covered by the e2e tests
+-- rather than here, because PostgreSQL also points a caret at that keyword.
+-- TODO: move those cases here once the parser records a span for PREPARE.
 -- VALUES and a leading WITH are SELECTs, so both prepare.
 PREPARE v1 AS VALUES (1), (2);
 PREPARE w1 AS WITH c AS (SELECT 1 AS x) SELECT * FROM c;
@@ -53,11 +53,27 @@ EXECUTE del;
 PREPARE Foo AS SELECT 1;
 EXECUTE FOO;
 PREPARE "Bar" AS SELECT 1;
+-- A user-defined type names itself in the regtype arrays, as any other does.
+CREATE TYPE mood AS ENUM ('ok', 'bad');
+PREPARE m (mood) AS SELECT $1;
+SELECT parameter_types, result_types FROM pg_prepared_statements WHERE name = 'm';
+-- EXPLAIN EXECUTE plans the statement the name refers to, with its own arguments.
+INSERT INTO pt VALUES (1, 'x'), (2, 'y');
+PREPARE pa (int) AS SELECT a, b FROM pt WHERE a = $1;
+EXPLAIN (COSTS OFF) EXECUTE pa (2);
+DELETE FROM pt;
 -- A statement with no result set reports NULL result_types, not an empty array.
 SELECT name, statement, parameter_types, result_types, from_sql
-  FROM pg_prepared_statements ORDER BY name;
+  FROM pg_prepared_statements WHERE name NOT IN ('m', 'pa') ORDER BY name;
 SELECT prepare_time > now() - interval '1 hour' AS recent
   FROM pg_prepared_statements WHERE name = 'p2';
+-- Executions are counted per plan kind: a statement with no parameters has
+-- nothing to specialize on, so it is planned generically from the first run.
+EXECUTE pa (1);
+EXECUTE pa (2);
+EXECUTE p2;
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements
+  WHERE name IN ('pa', 'p2') ORDER BY name;
 -- PREPARE is not transactional: a rolled-back block leaves its statement behind.
 BEGIN;
 PREPARE t1 AS SELECT 1;
@@ -70,4 +86,5 @@ DEALLOCATE p1;
 SELECT count(*) > 0 AS some_left FROM pg_prepared_statements;
 DEALLOCATE ALL;
 SELECT count(*) FROM pg_prepared_statements;
+DROP TYPE mood;
 DROP TABLE pt;

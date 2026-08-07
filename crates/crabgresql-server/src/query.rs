@@ -477,6 +477,16 @@ pub fn analyze_statement(
                 ast::Statement::Delete(d) => {
                     bind_delete_with_params(&catalog, &type_catalog, d, &ctx)?
                 }
+                // `EXPLAIN EXECUTE` returns the plan, so it reports EXPLAIN's own
+                // shape — unconditionally, even for a name that does not exist
+                // yet, because that shape is fixed and the 26000 belongs to
+                // Execute. Its arguments are plain expressions, not `$n`.
+                ast::Statement::Execute { .. } => {
+                    return Ok(Analyzed {
+                        param_types: Vec::new(),
+                        result_columns: Some(explain_columns()),
+                    });
+                }
                 // EXPLAIN of a non-DML statement: no parameters, error at Execute.
                 _ => {
                     return Ok(Analyzed {
@@ -593,7 +603,7 @@ pub(crate) fn fetch_columns(session: &Session, name: &ast::Ident) -> Option<Vec<
 /// Resolved from the live statement every time it is asked, for the reason
 /// [`fetch_columns`] is: the named statement can be deallocated and re-prepared
 /// with a different shape while a prepared `EXECUTE` sits unchanged.
-fn executed_columns(
+pub(crate) fn executed_columns(
     session: &Session,
     name: Option<&ast::ObjectName>,
 ) -> Option<Vec<OutputColumn>> {
@@ -723,6 +733,31 @@ pub(crate) fn execute_statement_with(
             )
         }
         other => (other, None),
+    };
+    // `EXPLAIN EXECUTE p (…)` plans the statement `p` names. Resolved here rather
+    // than left to the utility dispatch below, which never runs under EXPLAIN:
+    // the inner statement is optimizable by construction, so from this point on
+    // it is planned like any other. It carries its *own* arguments — the caller's
+    // `params` belong to the EXPLAIN — so the parameters are rebound too.
+    // Only one level: an `EXECUTE` naming another `EXECUTE` reports the
+    // unsupported-statement error below rather than recursing.
+    let resolved = match (&explain_options, stmt) {
+        (Some(_), ast::Statement::Execute { .. }) => Some(crate::prepare::resolve_execute(
+            engine,
+            global_catalog,
+            stmt,
+            session,
+        )?),
+        _ => None,
+    };
+    let (stmt, params) = match &resolved {
+        Some(crate::prepare::Resolved {
+            stmt: Some(inner),
+            params,
+        }) => (inner, params),
+        // A statement prepared from an empty query string has nothing to plan;
+        // it falls through to the unsupported-statement arm below.
+        _ => (stmt, params),
     };
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,

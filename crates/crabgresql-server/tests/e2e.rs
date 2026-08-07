@@ -10976,6 +10976,88 @@ async fn prepared_statement_counts_its_executions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A prepared statement may name another one, and nothing stops a `Parse` from
+/// preparing one that names *itself* — SQL `PREPARE` refuses an `EXECUTE` body,
+/// but the protocol has no such filter. That recursion used to run until the
+/// thread's stack was gone, killing the whole process and every other session
+/// with it; it must be a plain error instead, as PostgreSQL's 54001 is.
+#[tokio::test]
+async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    // The driver names its Parse messages sequentially, so preparing one
+    // statement reveals what the *next* one will be called — which is how a
+    // statement gets to name itself. Asserted below rather than assumed.
+    let probe = client.prepare("SELECT 1").await?;
+    let taken = client
+        .simple_query("SELECT name FROM pg_prepared_statements WHERE NOT from_sql")
+        .await?;
+    let taken = rows(&taken)[0].get("name").expect("a name").to_string();
+    let n: u32 = taken
+        .trim_start_matches('s')
+        .parse()
+        .expect("driver names statements sN");
+    let self_name = format!("s{}", n + 1);
+    drop(probe);
+
+    let stmt = client.prepare(&format!("EXECUTE {self_name}")).await?;
+    let named = client
+        .simple_query(&format!(
+            "SELECT count(*) AS n FROM pg_prepared_statements WHERE name = '{self_name}'"
+        ))
+        .await?;
+    assert_eq!(
+        rows(&named)[0].get("n"),
+        Some("1"),
+        "the statement must name itself for this to test anything"
+    );
+
+    let err = client
+        .query(&stmt, &[])
+        .await
+        .expect_err("recursion must be refused");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code().code(), "54001");
+    assert_eq!(err.message(), "stack depth limit exceeded");
+
+    // The point of the test: the connection — and the server behind it — is
+    // still there afterwards, and the depth counter unwound.
+    assert_eq!(
+        client
+            .query_one("SELECT 1 AS n", &[])
+            .await?
+            .get::<_, i32>("n"),
+        1
+    );
+    Ok(())
+}
+
+/// An `EXECUTE` argument is parse-analyzed like any other expression in a clause
+/// that allows neither aggregates nor window functions, so it is refused with the
+/// SQLSTATE naming that clause rather than the evaluator's generic 0A000.
+#[tokio::test]
+async fn execute_arguments_reject_aggregates_and_window_functions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("PREPARE q (int) AS SELECT $1").await?;
+    for (sql, code, message) in [
+        (
+            "EXECUTE q (sum(1))",
+            "42803",
+            "aggregate functions are not allowed in EXECUTE parameters",
+        ),
+        (
+            "EXECUTE q (row_number() OVER ())",
+            "42P20",
+            "window functions are not allowed in EXECUTE parameters",
+        ),
+    ] {
+        let err = client.batch_execute(sql).await.expect_err("not allowed");
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(err.code().code(), code, "{sql}");
+        assert_eq!(err.message(), message);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_large_value_round_trips_in_binary_over_the_extended_protocol() {
     // The smoke suite drives the simple protocol in text; this covers the other
