@@ -801,6 +801,14 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   (per-column inheritance provenance is not recorded — the parent↔child
   correspondence is recomputed by name).
 - `information_schema` — views over pg_catalog, as in PG.
+- Which relations are served is one table: `registry::CATALOG_RELATIONS` in
+  `crabgresql-catalog`, pairing each name and OID with the two `fn` pointers
+  that build it (`fn() -> TableSchema` and `fn(&SystemCatalog) -> rows`). The
+  served set and the OID table are therefore the same set by construction, so
+  `'pg_class'::regclass` cannot resolve for a relation nothing serves. Adding a
+  catalog is a module under `src/catalogs/` plus one registry line; the single
+  `rows` signature means a relation with unusual inputs adds no argument to any
+  shared call site.
 - An in-memory catalog cache with DDL-driven invalidation (sinval analog).
 
 ### 3.2 Type system
