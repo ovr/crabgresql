@@ -76,6 +76,12 @@ SELECT exp(1.0) AS e, exp(0.0) AS one, exp(-1.0) AS e_inv;
 -- ln domain errors (zero / negative)
 SELECT ln(0.0);
 SELECT ln(-1.0);
+-- log's own domain errors keep 2201E, but base 1 divides by ln(1) = 0 and is
+-- reported as that division; a base merely near 1 still computes
+SELECT log(0.0, 12.34);
+SELECT log(12.34, 0.0);
+SELECT log(1.0, 12.34);
+SELECT log(1.000016, 8.452010e18) AS near_one;
 
 -- the ^ operator: numeric ^ numeric is numeric
 SELECT 2.0 ^ 10 AS two_ten, 2.0 ^ 0.5 AS root2, 10 ^ 3.0 AS thousand;

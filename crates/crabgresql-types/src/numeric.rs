@@ -561,18 +561,46 @@ impl Numeric {
         if self.is_zero() {
             return Numeric::zero(rscale);
         }
+        // Every caller must have raised `22012` already: `long_divide` cannot,
+        // and with a zero denominator its trial loop takes every quotient digit
+        // to 9 and returns that as an answer. `div` and `modulo` screen it; the
+        // one that did not, `log_base` via `div_guard`, is why this is here.
+        debug_assert!(
+            !other.is_zero(),
+            "div_to_scale by zero: the caller owes a 22012"
+        );
         let neg = self.is_neg() != other.is_neg();
         let a_low = self.low();
         let b_low = other.low();
         // quotient*10^rscale = A*10^(a_low - b_low + rscale) / B
         let shift = a_low - b_low + rscale;
+        let (num_pad, den_pad) = if shift >= 0 {
+            (shift as usize, 0)
+        } else {
+            (0, (-shift) as usize)
+        };
+
+        // A divisor that fits in a register replaces the schoolbook
+        // trial-and-subtract with one machine divide per digit, and allocates
+        // nothing but the quotient. This is every `avg`, whose divisor is the
+        // row count — and `avg` runs one division per group, so a `GROUP BY`
+        // over a near-unique key runs it once per row.
+        if let Some(den) = as_register(&other.digits, den_pad) {
+            let (mut q, rem) = divide_by_register(&self.digits, num_pad, den);
+            // Half away from zero, in the same registers: 2*rem >= den.
+            if round && (rem as u128) * 2 >= den as u128 {
+                inc_be(&mut q);
+            }
+            return Numeric::from_coeff(neg, q, -rscale, rscale);
+        }
+
+        // At most one pad is nonzero, so both extends can run unconditionally —
+        // branching on either one would encode the sign of `shift` in a derived
+        // value that no longer says so.
         let mut num = self.digits.clone();
         let mut den = other.digits.clone();
-        if shift >= 0 {
-            num.extend(std::iter::repeat(0u8).take(shift as usize));
-        } else {
-            den.extend(std::iter::repeat(0u8).take((-shift) as usize));
-        }
+        num.extend(std::iter::repeat_n(0u8, num_pad));
+        den.extend(std::iter::repeat_n(0u8, den_pad));
         let (mut q, rem) = long_divide(&num, &den);
         if round {
             // Half away from zero: 2*rem >= den → round the magnitude up.
@@ -958,9 +986,16 @@ impl Numeric {
             (false, false) => {}
         }
         let guard = 30;
-        let val = x
-            .ln_internal(guard)
-            .div_guard(&self.ln_internal(guard), guard);
+        // Base 1 has no logarithm, and PG reports that as the division by zero
+        // it literally is rather than as a domain error. Keying on the computed
+        // `ln(base)` instead of `base == 1` is what keeps a base merely *near*
+        // one working: PG computes `log(1.000016, 8.452010e18)` fine, and it
+        // would not if it tested the base itself.
+        let ln_base = self.ln_internal(guard);
+        if ln_base.is_zero() {
+            return Err(NumErr::new("22012", "division by zero"));
+        }
+        let val = x.ln_internal(guard).div_guard(&ln_base, guard);
         let rscale = log_scale(&val);
         Ok(val.round(rscale))
     }
@@ -1528,6 +1563,66 @@ fn mul_small_be(a: &[u8], m: u8) -> Vec<u8> {
     out
 }
 
+/// The divisor as a machine word, with `pad` trailing zeros folded in — the
+/// scale shift [`Numeric::div_to_scale`] would otherwise append as digits.
+///
+/// `None` once it no longer fits. `MAX` is the whole safety property, and it is
+/// [`divide_by_register`]'s: the running remainder there is always below the
+/// divisor, so `rem*10 + digit <= 10*MAX - 1`, and `(u64::MAX - 9) / 10` is the
+/// largest bound that keeps that inside a `u64`. Raising it breaks that loop,
+/// not this one.
+///
+/// Zero also returns `None` — but only the schoolbook path *accepts* it, it does
+/// not handle it; see the `debug_assert!` in [`Numeric::div_to_scale`].
+fn as_register(den: &[u8], pad: usize) -> Option<u64> {
+    const MAX: u64 = (u64::MAX - 9) / 10;
+    // 10^19 already exceeds MAX, so a wider pad can only be rejected — and
+    // returning before the loop keeps this probe off the fallback's back.
+    if pad >= 19 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &d in trim_leading(den) {
+        value = value * 10 + d as u64;
+        if value > MAX {
+            return None;
+        }
+    }
+    for _ in 0..pad {
+        value = value * 10;
+        if value > MAX {
+            return None;
+        }
+    }
+    (value != 0).then_some(value)
+}
+
+/// Long division by a register-sized divisor: returns the quotient big-endian
+/// (untrimmed — `from_coeff` normalizes) and the remainder as a word. `pad`
+/// trailing zeros extend the numerator without materializing them.
+fn divide_by_register(num: &[u8], pad: usize, den: u64) -> (Vec<u8>, u64) {
+    let mut quotient = Vec::with_capacity(num.len() + pad);
+    let mut rem: u64 = 0;
+    for d in num.iter().copied().chain(std::iter::repeat_n(0u8, pad)) {
+        rem = rem * 10 + d as u64;
+        quotient.push((rem / den) as u8);
+        rem %= den;
+    }
+    (quotient, rem)
+}
+
+/// `q += 1` in place, big-endian; grows by a digit only on an all-nines carry.
+fn inc_be(q: &mut Vec<u8>) {
+    for d in q.iter_mut().rev() {
+        if *d < 9 {
+            *d += 1;
+            return;
+        }
+        *d = 0;
+    }
+    q.insert(0, 1);
+}
+
 /// Schoolbook long division of big-endian base-10 integers: returns
 /// `(quotient, remainder)`, both big-endian and trimmed. `den` must be nonzero.
 fn long_divide(num: &[u8], den: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -1784,6 +1879,105 @@ mod tests {
         assert_eq!(arith("1000", '/', "3"), "333.3333333333333333");
         assert_eq!(arith("1", '/', "30000"), "0.000033333333333333333333");
         assert_eq!(arith("6", '/', "2"), "3.0000000000000000");
+    }
+
+    /// The register divider is only ever taken for a divisor small enough to
+    /// fit, and it has to be indistinguishable from the schoolbook loop it
+    /// replaces — otherwise a quotient digit or the rounding remainder moves and
+    /// every `avg` shifts with it. Compare the two directly over random
+    /// operands, since which one runs is an internal choice callers cannot see.
+    #[test]
+    fn the_register_divider_agrees_with_schoolbook() {
+        // A xorshift keeps the operands reproducible without a dev-dependency.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let digits = |v: u64| -> Vec<u8> { v.to_string().bytes().map(|b| b - b'0').collect() };
+        let trim = |v: &[u8]| {
+            let t = trim_leading(v);
+            if t.is_empty() { vec![0] } else { t.to_vec() }
+        };
+
+        for case in 0..2_000 {
+            let num: Vec<u8> = (0..=(next() % 40)).map(|_| (next() % 10) as u8).collect();
+            let pad = (next() % 22) as usize;
+            // Span the whole register range, including the bound itself.
+            let den = match case % 4 {
+                0 => next() % 10 + 1,
+                1 => next() % 100_000 + 1,
+                2 => (u64::MAX - 9) / 10,
+                _ => next() % (u64::MAX / 16) + 1,
+            };
+
+            let (q_reg, rem_reg) = divide_by_register(&num, pad, den);
+
+            let mut padded = num.clone();
+            padded.extend(std::iter::repeat_n(0u8, pad));
+            let (q_school, rem_school) = long_divide(&padded, &digits(den));
+
+            assert_eq!(
+                trim(&q_reg),
+                q_school,
+                "quotient diverged for {num:?} padded by {pad} / {den}"
+            );
+            assert_eq!(
+                trim(&digits(rem_reg)),
+                rem_school,
+                "remainder diverged for {num:?} padded by {pad} / {den}"
+            );
+        }
+    }
+
+    /// The register path must decline exactly when `rem*10 + digit` would stop
+    /// fitting, and fold the scale shift into the divisor rather than the digits.
+    #[test]
+    fn the_register_bound_is_where_the_running_remainder_stops_fitting() {
+        const MAX: u64 = (u64::MAX - 9) / 10;
+        assert_eq!(as_register(&[4], 0), Some(4));
+        assert_eq!(as_register(&[0, 0, 4], 0), Some(4), "leading zeros trimmed");
+        assert_eq!(as_register(&[4], 2), Some(400), "pad multiplies by ten");
+        assert_eq!(as_register(&[0], 0), None, "zero is left to schoolbook");
+        assert_eq!(as_register(&[], 0), None);
+
+        let max_digits: Vec<u8> = MAX.to_string().bytes().map(|b| b - b'0').collect();
+        assert_eq!(
+            as_register(&max_digits, 0),
+            Some(MAX),
+            "the bound itself fits"
+        );
+        assert_eq!(
+            as_register(&max_digits, 1),
+            None,
+            "one decade past it does not"
+        );
+    }
+
+    /// A helper-level test: the register path cannot actually reach the growth
+    /// carry (an all-nines quotient needs `den == 1`, which makes every
+    /// remainder 0, so the rounding guard never fires), but `inc_be` is written
+    /// as a general increment and is pinned as one.
+    #[test]
+    fn incrementing_carries_across_all_nines() {
+        let mut q = vec![1, 2, 8];
+        inc_be(&mut q);
+        assert_eq!(q, vec![1, 2, 9]);
+
+        let mut q = vec![0, 9, 9];
+        inc_be(&mut q);
+        assert_eq!(q, vec![1, 0, 0], "carry stops at a leading zero");
+
+        let mut q = vec![9, 9];
+        inc_be(&mut q);
+        assert_eq!(q, vec![1, 0, 0], "an all-nines carry grows the quotient");
+
+        let mut q = Vec::new();
+        inc_be(&mut q);
+        assert_eq!(q, vec![1]);
     }
 
     #[test]
@@ -2049,6 +2243,23 @@ mod tests {
         assert_eq!(n("0.5").log10()?.to_display(), "-0.3010299956639812");
         assert_eq!(n("1e20").log10()?.to_display(), "20.000000000000000");
         assert_eq!(n("2").log_base(&n("8"))?.to_display(), "3.0000000000000000");
+
+        // Base 1 is `ln(x)/0`, and PG reports the division rather than a
+        // logarithm domain error — the `2201E` cases above keep their own text.
+        let e = n("1")
+            .log_base(&n("12.34"))
+            .expect_err("base 1 has no logarithm");
+        assert_eq!(
+            (e.sqlstate, e.message.as_str()),
+            ("22012", "division by zero")
+        );
+
+        // But a base merely *near* one still computes: the guard has to key on
+        // `ln(base)` rounding to zero, not on the base being 1.
+        assert_eq!(
+            n("1.000016").log_base(&n("8.452010e18"))?.to_display(),
+            "2723830.2877097365"
+        );
 
         Ok(())
     }
