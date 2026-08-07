@@ -146,6 +146,43 @@ take a slice with `--rows` until the engine grows out-of-core execution.
   `query_numbers` alongside it names the query each slot belongs to; a
   `--query`-filtered run would otherwise read as Q1..Qn.
 
+## In CI
+
+Both suites run on every pull request, alongside pgbench, from
+`.github/workflows/ci.yml`. The dataset steps are scripts so the CI run and a
+local one are the same run: `scripts/bench/fetch-clickbench.sh <rows> <out.tsv>`
+takes the ClickBench slice with a range request, and
+`scripts/bench/gen-tpch.sh <sf> <outdir>` is the DuckDB recipe above.
+
+ClickBench runs at 10M rows on `parquet`; TPC-H runs at `sf=0.01` twice, once
+on `heap` and once on `parquet`. The jobs gate only on breakage — a query that
+errored or timed out. There is no timing threshold: a shared runner's variance
+is wider than most real regressions, so a threshold would only teach people to
+ignore the job. The numbers arrive as one pull request comment.
+
+The history is kept by `benchmark-action/github-action-benchmark` on the
+`gh-pages` branch: a push to `main` appends a point, a pull request only reads
+the branch to compare and comments when something is more than 2× worse.
+
+Each run gets its own suite there — `ClickBench (parquet)`, `TPC-H (heap)`,
+`TPC-H (parquet)`, `pgbench (heap)` — because the action keys its history by
+the step's `name`, renders one heading per key with one chart per entry inside
+it, and takes the regression direction from that run's tool. So the suite name
+carries the context and the entries are just `load` and `Q1`…`Qn`.
+`scripts/bench/trend-json.sh` produces that shape from a `--json` report;
+pgbench writes its own file with `customBiggerIsBetter`, since throughput is
+the one metric here that should go up.
+
+Three things about that branch. It has to exist before anything is recorded —
+`git checkout --orphan gh-pages && git push origin gh-pages:gh-pages` — and
+until then the trend steps skip themselves rather than fail. Rendering the
+charts as a site needs GitHub Pages, which a private repository only gets on a
+paid plan; the data accumulates on the branch either way. And the workflow
+fetches the branch itself, once, before the four steps, which then all run with
+`skip-fetch-gh-pages`: the action commits to the local branch whether or not it
+pushes, so on a pull request the second invocation's own fetch would be
+rejected as a non-fast-forward.
+
 ## Adding a benchmark
 
 Drop the benchmark's `create.sql` and `queries.sql` under `suites/<name>/`,

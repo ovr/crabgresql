@@ -110,17 +110,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
-        run: |
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-            --jq '.[] | select(.body | contains("<!-- crabgresql-regress-report -->")) | .id' \
-            | head -n 1)
-          if [ -n "$existing" ]; then
-            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
-              -F body=@target/regress/report.md > /dev/null
-          else
-            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
-              -F body=@target/regress/report.md > /dev/null
-          fi
+        run: scripts/ci-pr-comment.sh '<!-- crabgresql-regress-report -->' target/regress/report.md
 
       - name: upload diffs
         if: always()
@@ -135,3 +125,342 @@ jobs:
         run: |
           echo "smoke: ${{ steps.smoke.outcome }}, upstream: ${{ steps.upstream.outcome }}"
           exit 1
+
+  # The three benchmark jobs below report numbers but gate only on breakage: a
+  # query that errored or timed out, or a pgbench run with failed transactions.
+  # Timing thresholds are deliberately absent — a shared runner's variance is
+  # wider than most real regressions, so a threshold would only teach people to
+  # ignore the job.
+
+  bench-clickbench:
+    name: clickbench (parquet)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CLICKBENCH_ROWS: "10000000"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+
+      # 10M rows is ~7 GB of TSV plus the parquet directory it loads into, and
+      # the runner ships with ~14 GB free. These toolchains are not used by any
+      # job here.
+      - name: free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: cargo build --release
+        run: cargo build --release -p crabgresql-bench --bin bench --locked
+
+      - name: fetch the dataset
+        run: scripts/bench/fetch-clickbench.sh "$CLICKBENCH_ROWS" "$RUNNER_TEMP/hits.tsv"
+
+      - name: clickbench
+        id: run
+        continue-on-error: true
+        run: |
+          mkdir -p target/bench
+          ./target/release/bench run clickbench \
+            --data "$RUNNER_TEMP/hits.tsv" \
+            --data-dir "$RUNNER_TEMP/clickbench-data" \
+            --using parquet \
+            --runs 3 \
+            --timeout 300 \
+            --json target/bench/clickbench.json \
+            | tee target/bench/clickbench.txt
+
+      - name: build report
+        if: always()
+        run: |
+          scripts/bench/report.sh \
+            "ClickBench — parquet, ${CLICKBENCH_ROWS} rows" \
+            target/bench/clickbench.txt > target/bench/clickbench.md
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-clickbench
+          path: target/bench/clickbench.*
+          if-no-files-found: ignore
+
+      - name: fail on query failures
+        if: steps.run.outcome != 'success'
+        run: |
+          echo "clickbench: ${{ steps.run.outcome }}"
+          exit 1
+
+  bench-tpch:
+    name: tpch (heap + parquet)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release -p crabgresql-bench --bin bench --locked
+
+      - name: generate the dataset
+        run: scripts/bench/gen-tpch.sh 0.01 "$RUNNER_TEMP/tpch"
+
+      # Both access methods run even when one is red, so the report covers the
+      # pair. Q19's whole WHERE is one top-level OR, so it degenerates into a
+      # cross product and takes ~85s on a developer machine — the per-query
+      # timeout is sized for a shared runner being several times slower, not
+      # for the other 21 queries, which finish in well under a second.
+      - name: tpch on heap
+        id: heap
+        continue-on-error: true
+        run: |
+          mkdir -p target/bench
+          ./target/release/bench run tpch \
+            --data "$RUNNER_TEMP/tpch" \
+            --data-dir "$RUNNER_TEMP/tpch-heap" \
+            --using heap --runs 3 --timeout 600 \
+            --json target/bench/tpch-heap.json \
+            | tee target/bench/tpch-heap.txt
+
+      - name: tpch on parquet
+        id: parquet
+        continue-on-error: true
+        run: |
+          ./target/release/bench run tpch \
+            --data "$RUNNER_TEMP/tpch" \
+            --data-dir "$RUNNER_TEMP/tpch-parquet" \
+            --using parquet --runs 3 --timeout 600 \
+            --json target/bench/tpch-parquet.json \
+            | tee target/bench/tpch-parquet.txt
+
+      - name: build report
+        if: always()
+        run: |
+          {
+            scripts/bench/report.sh "TPC-H — heap, sf=0.01" target/bench/tpch-heap.txt
+            scripts/bench/report.sh "TPC-H — parquet, sf=0.01" target/bench/tpch-parquet.txt
+          } > target/bench/tpch.md
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-tpch
+          path: target/bench/tpch*
+          if-no-files-found: ignore
+
+      - name: fail on query failures
+        if: steps.heap.outcome != 'success' || steps.parquet.outcome != 'success'
+        run: |
+          echo "heap: ${{ steps.heap.outcome }}, parquet: ${{ steps.parquet.outcome }}"
+          exit 1
+
+  bench-pgbench:
+    name: pgbench (heap)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+
+      # pgbench lives in postgresql-contrib, not postgresql-client, and neither
+      # puts it on PATH on Debian; the script finds it under /usr/lib/postgresql.
+      - name: install pgbench
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client postgresql-contrib
+
+      - name: cargo build --release
+        run: cargo build --release -p crabgresql-server --bin crabgresql --locked
+
+      - name: pgbench
+        id: run
+        continue-on-error: true
+        run: |
+          mkdir -p target/bench
+          scripts/bench/pgbench.sh "$RUNNER_TEMP/pgbench-data" 55432 target/bench/pgbench
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-pgbench
+          path: target/bench/pgbench/*
+          if-no-files-found: ignore
+
+      - name: fail on a broken run
+        if: steps.run.outcome != 'success'
+        run: |
+          echo "pgbench: ${{ steps.run.outcome }}"
+          exit 1
+
+  # One comment for all three tools, which is why this is a job of its own
+  # rather than a step in each: three comments per push would be noise.
+  bench-report:
+    name: bench report
+    needs: [bench-clickbench, bench-tpch, bench-pgbench]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `contents: write` is for the gh-pages history below, which only the
+    # push-to-main path writes; a pull request run compares and comments.
+    permissions:
+      contents: write
+      deployments: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: bench-*
+          merge-multiple: true
+
+      - name: build report
+        run: |
+          {
+            echo '<!-- crabgresql-bench-report -->'
+            echo "## Benchmarks — ${GITHUB_SHA::7}"
+            echo
+            cat artifacts/clickbench.md 2>/dev/null \
+              || echo '### ⚠️ ClickBench — did not produce a summary'
+            cat artifacts/tpch.md 2>/dev/null \
+              || echo '### ⚠️ TPC-H — did not produce a summary'
+            cat artifacts/pgbench.md 2>/dev/null \
+              || echo '### ⚠️ pgbench — did not produce a summary'
+            echo "Numbers come from a shared runner and are indicative; these jobs gate on failed queries only."
+            echo
+            echo "[Run details](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          } > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: comment on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: scripts/ci-pr-comment.sh '<!-- crabgresql-bench-report -->' report.md
+
+      # The history lives on the gh-pages branch: a push to main appends to it,
+      # a pull request only reads it to compare. The branch has to be created by
+      # hand once (`git checkout --orphan gh-pages`), and until it is, there is
+      # nothing to compare against — hence the probe rather than a
+      # `continue-on-error` that would also swallow real failures.
+      #
+      # The fetch happens here, exactly once, and every trend step below runs
+      # with `skip-fetch-gh-pages`. The action commits to the local gh-pages
+      # branch whether or not it pushes, so on a pull request — where it never
+      # pushes — the branch ends up one commit ahead of the remote, and the
+      # *next* invocation's own `fetch origin gh-pages:gh-pages` is rejected as
+      # a non-fast-forward. One fetch for all four suites avoids that entirely.
+      - name: fetch the baseline
+        id: baseline
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git fetch origin gh-pages:gh-pages
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "no gh-pages branch yet; create it once and the trends start"
+          fi
+
+      # One file per run rather than one pile: the action keys its history by
+      # the step's `name`, renders a heading per key and a chart per entry, and
+      # takes the regression direction from that run's tool. Merging the suites
+      # would give one heading with 88 charts and a tool field that says
+      # nothing.
+      - name: build trend data
+        id: trend
+        if: steps.baseline.outputs.exists == 'true'
+        run: |
+          scripts/bench/trend-json.sh artifacts/clickbench.json   > trend-clickbench.json
+          scripts/bench/trend-json.sh artifacts/tpch-heap.json    > trend-tpch-heap.json
+          scripts/bench/trend-json.sh artifacts/tpch-parquet.json > trend-tpch-parquet.json
+          if [ -s artifacts/pgbench-trend.json ]; then
+            cp artifacts/pgbench-trend.json trend-pgbench.json
+          else
+            echo '[]' > trend-pgbench.json
+          fi
+          # A job that died uploaded nothing, and the action treats an empty
+          # array as a broken result file rather than as "no news". Per suite,
+          # so one dead job does not take the others' history with it.
+          # The output name is underscored because `outputs.tpch-heap` reads as
+          # a subtraction in a workflow expression.
+          for suite in clickbench tpch-heap tpch-parquet pgbench; do
+            n=$(jq 'length' "trend-$suite.json")
+            echo "${suite//-/_}=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "trend-$suite.json: $n entries"
+          done
+
+      - name: trend — clickbench
+        if: steps.trend.outputs.clickbench == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ClickBench (parquet)
+          tool: customSmallerIsBetter
+          output-file-path: trend-clickbench.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
+          # A shared runner swings ±10-20% on its own, and these benchmarks do
+          # real file I/O; anything tighter than 2x would cry every week.
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: trend — tpch heap
+        if: steps.trend.outputs.tpch_heap == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: TPC-H (heap)
+          tool: customSmallerIsBetter
+          output-file-path: trend-tpch-heap.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: trend — tpch parquet
+        if: steps.trend.outputs.tpch_parquet == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: TPC-H (parquet)
+          tool: customSmallerIsBetter
+          output-file-path: trend-tpch-parquet.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      # The one suite that points the other way: a tps going up is not a
+      # regression.
+      - name: trend — pgbench
+        if: steps.trend.outputs.pgbench == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: pgbench (heap)
+          tool: customBiggerIsBetter
+          output-file-path: trend-pgbench.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          skip-fetch-gh-pages: true
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
