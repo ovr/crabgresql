@@ -1485,10 +1485,14 @@ pub fn run_copy_rows(
 
     let mut loaded = 0u64;
     let outcome = produce(&mut |rows| {
-        // Turn the decoded rows into an INSERT ... VALUES plan (each field parses
-        // via its column's input function against the type catalog bound at
-        // prepare time).
-        let logical = prepared.plan.build_insert(&prepared.catalog, rows)?;
+        // Turn the decoded rows into an INSERT plan: each field parses via its
+        // column's input function against the type catalog bound at prepare
+        // time. The session's `FmtCtx` goes along because a load *has* the
+        // session the binder normally lacks, so a `timestamptz` or `'now'` field
+        // resolves here instead of becoming a per-row runtime coercion.
+        let logical = prepared
+            .plan
+            .build_insert(&prepared.catalog, &exec_ctx.fmt, rows)?;
         // Each batch runs at its own command id so it can see the rows the
         // previous batches wrote. Without this a UNIQUE index is only enforced
         // *within* a batch, because the duplicate check scans the table through

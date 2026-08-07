@@ -8864,25 +8864,29 @@ fn enum_const(
 ) -> Result<BoundExpr, BindError> {
     let value = match lit {
         None => Value::Null,
-        Some(s) => match info.labels.iter().position(|l| *l == s) {
-            Some(ord) => Value::Enum {
-                type_oid: oid,
-                ordinal: ord as u32,
-                label: s,
-            },
-            None => {
-                return Err(BindError::new(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    format!("invalid input value for enum {}: \"{s}\"", info.name),
-                )
-                .at(span));
-            }
-        },
+        Some(s) => enum_value(oid, info, s).map_err(|e| e.at(span))?,
     };
     Ok(BoundExpr::Const {
         value,
         ty: PgType::User(oid),
     })
+}
+
+/// Map an enum label to its [`Value`]. Split out of [`enum_const`] so COPY's
+/// direct value path resolves labels through the same lookup and raises the same
+/// `enum_in` error, without building an expression to unwrap.
+pub(crate) fn enum_value(oid: u32, info: &EnumInfo, label: String) -> Result<Value, BindError> {
+    match info.labels.iter().position(|l| *l == label) {
+        Some(ord) => Ok(Value::Enum {
+            type_oid: oid,
+            ordinal: ord as u32,
+            label,
+        }),
+        None => Err(BindError::new(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            format!("invalid input value for enum {}: \"{label}\"", info.name),
+        )),
+    }
 }
 
 /// Coerce an expression for assignment into a column (INSERT / UPDATE SET),
@@ -9648,6 +9652,133 @@ fn apply_length_to_column(expr: BoundExpr, column: &Column) -> Result<BoundExpr,
         ret: column.ty,
         args,
     })
+}
+
+/// [`apply_length_to_column`] for a value that is already in hand.
+///
+/// COPY parses each field straight into its column's [`Value`], so there is no
+/// expression for the folding half of `apply_length_to_column` to look inside.
+/// Both call the same value-level cores — `apply_typmod`, `varchar_input`,
+/// `bpchar_input`, `name_input`, `bit::coerce` — so this is a second caller of
+/// the length rules, not a second copy of them.
+///
+/// `false` to the input functions is assignment context: an over-long
+/// `varchar(n)`/`char(n)` whose excess is not blank errors rather than
+/// truncating.
+pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindError> {
+    // A NULL takes no length. On the expression path this falls out of the fold
+    // guards and reaches the runtime call, which returns NULL; here it is said
+    // once, up front.
+    if matches!(value, Value::Null) {
+        return Ok(value);
+    }
+    // `parse_unknown` produced this value *for* `column.ty`, so a shape that
+    // does not match the type is a bug in this file rather than bad input.
+    let mismatch = || {
+        BindError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("copy value does not match column type {}", column.ty.name()),
+        )
+    };
+    // `numeric` and the datetime types round rather than truncating; each arm
+    // returns, so the length pass below only sees the types it handles.
+    if column.typmod >= 0 {
+        match column.ty {
+            PgType::Numeric => {
+                let Value::Numeric(n) = value else {
+                    return Err(mismatch());
+                };
+                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                return n
+                    .apply_typmod(precision, scale)
+                    .map(Value::Numeric)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail));
+            }
+            PgType::Time => {
+                let Value::Time(usec) = value else {
+                    return Err(mismatch());
+                };
+                return Ok(Value::Time(time::apply_typmod(usec, column.typmod)));
+            }
+            PgType::TimeTz => {
+                let Value::TimeTz(t) = value else {
+                    return Err(mismatch());
+                };
+                return Ok(Value::TimeTz(crabgresql_types::TimeTz {
+                    usec: time::apply_typmod(t.usec, column.typmod),
+                    zone: t.zone,
+                }));
+            }
+            PgType::Timestamp => {
+                let Value::Timestamp(usec) = value else {
+                    return Err(mismatch());
+                };
+                return Ok(Value::Timestamp(timestamp::apply_typmod(
+                    usec,
+                    column.typmod,
+                )));
+            }
+            PgType::TimestampTz => {
+                let Value::TimestampTz(usec) = value else {
+                    return Err(mismatch());
+                };
+                return Ok(Value::TimestampTz(timestamp::apply_typmod(
+                    usec,
+                    column.typmod,
+                )));
+            }
+            PgType::Interval => {
+                let Value::Interval(iv) = value else {
+                    return Err(mismatch());
+                };
+                return crabgresql_types::interval::apply_typmod(iv, column.typmod)
+                    .map(Value::Interval)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message));
+            }
+            _ => {}
+        }
+    }
+    // `name` truncates whatever its typmod says, and a `name` column's is always
+    // -1 — hence the unconditional arm, exactly as in `apply_length_to_column`.
+    match column.ty {
+        PgType::Varchar if column.typmod >= 0 => {
+            let Value::Text(s) = value else {
+                return Err(mismatch());
+            };
+            crabgresql_types::text::varchar_input(&s, column.typmod, false)
+                .map(Value::Text)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
+        PgType::Bpchar if column.typmod >= 0 => {
+            let Value::Text(s) = value else {
+                return Err(mismatch());
+            };
+            crabgresql_types::text::bpchar_input(&s, column.typmod, false)
+                .map(Value::Text)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
+        PgType::Name => {
+            let Value::Text(s) = value else {
+                return Err(mismatch());
+            };
+            Ok(Value::Text(crabgresql_types::text::name_input(&s)))
+        }
+        PgType::Bit | PgType::Varbit if column.typmod >= 0 => {
+            let Value::Bit { len, data } = value else {
+                return Err(mismatch());
+            };
+            crabgresql_types::bit::coerce(
+                len,
+                &data,
+                column.typmod,
+                column.ty == PgType::Varbit,
+                false,
+            )
+            .map(|(len, data)| Value::Bit { len, data })
+            .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
+        _ => Ok(value),
+    }
 }
 
 /// The result-column name PG derives from an expression's syntax: column
