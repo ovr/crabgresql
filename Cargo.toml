@@ -36,6 +36,7 @@ arrow-schema = "59.1"
 arrow-select = "59.1"
 clap = { version = "4", features = ["derive", "env"] }
 crc32c = "0.6"
+criterion = { version = "0.7", default-features = false }
 deepsize = "0.2"
 icu_collator = "2"
 icu_locale_core = "2"
