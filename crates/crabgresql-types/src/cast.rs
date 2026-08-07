@@ -11,16 +11,25 @@ use crate::{
 };
 
 /// SQLSTATE + message for a failed cast.
+///
+/// `detail` is the optional DETAIL line PG prints below the message. Most cast
+/// failures have none — the message says everything — so the field is `None`
+/// throughout except where PG spells out what it expected.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CastError {
     pub sqlstate: &'static str,
     pub message: String,
+    pub detail: Option<String>,
 }
 
 const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 const CANNOT_COERCE: &str = "42846";
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
+/// `22023` — a conversion function rejected the *shape* of its argument, as
+/// distinct from its value being out of range (`22003`). Raised by the
+/// `bytea -> uuid` cast on anything but 16 bytes.
+const INVALID_PARAMETER_VALUE: &str = "22023";
 /// `22021` — see the `"char" -> bpchar` arm in [`cast_value`] for the one place
 /// this engine raises it that PostgreSQL does not.
 const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
@@ -29,6 +38,7 @@ fn out_of_range(ty: PgType) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
         message: format!("{} out of range", ty.name()),
+        detail: None,
     }
 }
 
@@ -39,6 +49,7 @@ fn json_err(e: json::JsonError) -> CastError {
     CastError {
         sqlstate: e.sqlstate,
         message: e.message,
+        detail: None,
     }
 }
 
@@ -46,6 +57,7 @@ fn ts_err(e: crate::tsvector::TsError) -> CastError {
     CastError {
         sqlstate: e.sqlstate,
         message: e.message,
+        detail: None,
     }
 }
 
@@ -53,6 +65,7 @@ fn cannot_coerce(from: PgType, to: PgType) -> CastError {
     CastError {
         sqlstate: CANNOT_COERCE,
         message: format!("cannot cast type {} to {}", from.name(), to.name()),
+        detail: None,
     }
 }
 
@@ -61,6 +74,7 @@ pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("invalid input syntax for type {}: \"{s}\"", ty.name()),
+        detail: None,
     }
 }
 
@@ -70,6 +84,7 @@ pub(crate) fn value_out_of_range(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
         message: format!("value \"{s}\" is out of range for type {}", ty.name()),
+        detail: None,
     }
 }
 
@@ -79,6 +94,7 @@ fn cannot_convert(what: &str, ty: PgType) -> CastError {
     CastError {
         sqlstate: FEATURE_NOT_SUPPORTED,
         message: format!("cannot convert {what} to {}", ty.name()),
+        detail: None,
     }
 }
 
@@ -120,6 +136,7 @@ fn cast_err(e: crate::timestamp::TimestampError) -> CastError {
     CastError {
         sqlstate: e.sqlstate,
         message: e.message,
+        detail: None,
     }
 }
 
@@ -200,12 +217,14 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 return Err(CastError {
                     sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
                     message: "value out of range: overflow".into(),
+                    detail: None,
                 });
             }
             if r == 0.0 && *f != 0.0 {
                 return Err(CastError {
                     sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
                     message: "value out of range: underflow".into(),
+                    detail: None,
                 });
             }
             Ok(Value::Float4(r))
@@ -274,6 +293,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         (Value::Char(c), PgType::Bpchar) if *c & 0x80 != 0 => Err(CastError {
             sqlstate: CHARACTER_NOT_IN_REPERTOIRE,
             message: format!("invalid byte sequence for encoding \"UTF8\": 0x{c:02x}"),
+            detail: None,
         }),
 
         // ---- anything → text / varchar / bpchar / name (float uses efd) ----
@@ -308,6 +328,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Float8) => {
@@ -316,6 +337,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Numeric) => Numeric::parse(s)
@@ -340,6 +362,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- text → interval (interval_in) ----
@@ -349,6 +372,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -358,6 +382,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- timestamp ↔ timestamptz ----
@@ -380,12 +405,14 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             date::parse(s, fmt).map(Value::Date).map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             })
         }
         (Value::Text(s), PgType::Time) => {
             time::parse(s, fmt).map(Value::Time).map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             })
         }
         (Value::Text(s), PgType::TimeTz) => {
@@ -394,6 +421,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -407,11 +435,13 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
         (Value::Date(d), PgType::TimestampTz) => date::to_timestamp_micros(*d)
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             })
             .and_then(|midnight| {
                 timestamptz::timestamp_at_session_zone(midnight, &fmt.zone)
@@ -501,6 +531,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- bit ↔ varbit: identity on the value (they share the storage);
@@ -517,8 +548,22 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
+
+        // ---- uuid ↔ bytea: the 16 stored bytes, unchanged in either
+        // direction. Explicit-only in both systems (`pg_cast` marks them `e`),
+        // which `implicit_castable` already enforces. ----
+        (Value::Uuid(u), PgType::Bytea) => Ok(Value::Bytea(u.to_vec())),
+        (Value::Bytea(b), PgType::Uuid) => match <[u8; 16]>::try_from(b.as_slice()) {
+            Ok(bytes) => Ok(Value::Uuid(bytes)),
+            Err(_) => Err(CastError {
+                sqlstate: INVALID_PARAMETER_VALUE,
+                message: "invalid input length for type uuid".into(),
+                detail: Some(format!("Expected 16 bytes, got {}.", b.len())),
+            }),
+        },
 
         // ---- text → inet / cidr (inet_in / cidr_in) ----
         (Value::Text(s), PgType::Inet) => {
@@ -527,6 +572,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Cidr) => {
@@ -535,6 +581,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -546,6 +593,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             money::parse(s).map(Value::Money).map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             })
         }
 
@@ -595,12 +643,14 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
         (Value::Text(s), PgType::Macaddr8) => crate::macaddr::parse_macaddr8(s)
             .map(Value::Macaddr8)
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- macaddr <-> macaddr8 ----
@@ -610,6 +660,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- text → tid (tidin). The reverse is the generic → text arm. ----
@@ -618,6 +669,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- text → xid / xid8 (xidin / xid8in) ----
@@ -627,6 +679,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Xid8) => {
@@ -635,6 +688,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -649,6 +703,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -659,6 +714,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Lseg) => {
@@ -667,6 +723,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Path) => {
@@ -675,6 +732,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
 
@@ -684,6 +742,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Line) => {
@@ -692,6 +751,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Circle) => {
@@ -700,6 +760,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Text(s), PgType::Polygon) => crate::geo::parse_polygon(s)
@@ -707,6 +768,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- intra-family geometric casts (all explicit in PG's pg_cast) ----
@@ -726,6 +788,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         (Value::Polygon(p), PgType::Point) => Ok(Value::Point(crate::geo::poly_center(p))),
@@ -739,6 +802,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
             .map_err(|e| CastError {
                 sqlstate: e.sqlstate,
                 message: e.message,
+                detail: None,
             }),
 
         // ---- tsvector / tsquery input ----
@@ -797,6 +861,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
+                    detail: None,
                 })
         }
         // `array` → `array` with a different element type: recast every element
@@ -948,10 +1013,12 @@ fn numeric_parse_error(e: ParseError, s: &str) -> CastError {
         ParseError::Syntax => CastError {
             sqlstate: INVALID_TEXT_REPRESENTATION,
             message: format!("invalid input syntax for type numeric: \"{s}\""),
+            detail: None,
         },
         ParseError::Overflow => CastError {
             sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,
             message: "value overflows numeric format".to_string(),
+            detail: None,
         },
     }
 }
@@ -1109,6 +1176,35 @@ pub fn reinterpret_value(v: Value, rep: PgType) -> Result<Value, CastError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `uuid ↔ bytea` moves the 16 stored bytes with no reinterpretation, and
+    /// rejects any other length.
+    ///
+    /// The SQLSTATE is not observable against PostgreSQL 18.4, which has no
+    /// such cast at all (`42846 cannot cast type bytea to uuid`); the cast and
+    /// its "invalid input length for type uuid" message arrive in a later
+    /// release. `22023` is the code PG uses when a conversion rejects the
+    /// *shape* of its argument rather than its value.
+    #[test]
+    fn uuid_bytea_roundtrip() -> anyhow::Result<()> {
+        let fmt = FmtCtx::utc_default();
+        let bytes = crate::uuid::parse("5b35380a-7143-4912-9b55-f322699c6770")?;
+
+        let as_bytea = cast_value(Value::Uuid(bytes), PgType::Bytea, &fmt)?;
+        assert_eq!(as_bytea, Value::Bytea(bytes.to_vec()));
+        assert_eq!(
+            cast_value(as_bytea, PgType::Uuid, &fmt)?,
+            Value::Uuid(bytes)
+        );
+
+        let e = cast_value(Value::Bytea(vec![0x12; 8]), PgType::Uuid, &fmt)
+            .expect_err("a uuid is exactly 16 bytes");
+        assert_eq!(e.sqlstate, "22023");
+        assert_eq!(e.message, "invalid input length for type uuid");
+        assert_eq!(e.detail.as_deref(), Some("Expected 16 bytes, got 8."));
+
+        Ok(())
+    }
 
     #[test]
     fn byteain_escape_and_hex() -> anyhow::Result<()> {

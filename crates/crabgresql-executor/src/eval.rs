@@ -125,6 +125,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             if let Some(result) = eval_clock_fn(*func, ctx) {
                 return result;
             }
+            // The uuid generators read the wall clock and fresh randomness, so
+            // they sit beside the clock family rather than in `eval_scalar`.
+            if let Some(result) = eval_uuid_gen_fn(*func, &arg_values, ctx) {
+                return result;
+            }
             // `age(xid)` reads the live transaction counter, which lives on the
             // transaction context rather than in `FmtCtx`.
             if let Some(result) = eval_txn_fn(*func, &arg_values, ctx) {
@@ -294,7 +299,8 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
-    cast::cast_value(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value(value, ty, &ctx.fmt)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
 /// Assignment-context sibling of [`coerce_value`], for PL/pgSQL's `:=`,
@@ -306,7 +312,8 @@ pub fn coerce_value_assign(
     ty: PgType,
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    cast::cast_value_assign(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value_assign(value, ty, &ctx.fmt)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
 /// Dispatch the non-strict array constructor functions (`array_cat`,
@@ -491,6 +498,82 @@ fn eval_clock_fn(func: ScalarFn, ctx: &ExecContext) -> Option<Result<Value, Exec
             .map(Value::TimestampTz)
             .map_err(|e| ExecError::new(e.sqlstate, e.message)),
     )
+}
+
+/// Dispatch the UUID generators. Returns `None` for any other function.
+///
+/// They read the wall clock and fresh randomness, so — like `clock_timestamp`
+/// above — a pure `eval_scalar` could not hold them. The extract functions are
+/// immutable and do live there.
+fn eval_uuid_gen_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    let bytes = match func {
+        ScalarFn::GenRandomUuid => crate::uuid_gen::gen_v4(),
+        ScalarFn::UuidV7 => crate::uuid_gen::gen_v7(unix_now()),
+        ScalarFn::UuidV7Shift => {
+            let Value::Interval(span) = args[0] else {
+                return Some(Ok(Value::Null));
+            };
+            match shifted_v7_instant(span, ctx) {
+                Ok(unix) => crate::uuid_gen::gen_v7_at(unix),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        _ => return None,
+    };
+    Some(Ok(Value::Uuid(bytes)))
+}
+
+/// The wall clock as microseconds since the Unix epoch, which is the era a
+/// version 7 UUID counts in.
+fn unix_now() -> i64 {
+    crabgresql_types::tz::to_unix_micros(crabgresql_types::tz::now_micros())
+}
+
+/// Resolve `uuidv7(shift)`'s instant: now, moved by `span`, in Unix
+/// microseconds — or the error PG reports when that lands outside the 48-bit
+/// millisecond field.
+///
+/// The shift goes through the same `timestamptz + interval` helper an explicit
+/// `now() + shift` would, so a month or year component moves the calendar
+/// rather than a fixed count of microseconds.
+fn shifted_v7_instant(span: Interval, ctx: &ExecContext) -> Result<i64, ExecError> {
+    if !span.is_finite() {
+        return Err(ExecError::new(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "interval out of range for UUID version 7",
+        )
+        .with_detail(Some(
+            "UUID version 7 does not support infinite intervals.".into(),
+        )));
+    }
+    // Any failure inside the shift is a range failure, and reporting it as a
+    // bare "timestamp out of range" would name a type the caller never wrote.
+    let shifted = crabgresql_types::timestamptz::pl_interval(
+        crabgresql_types::tz::now_micros(),
+        span,
+        ctx.fmt.zone.zone(),
+    )
+    .map_err(|_| v7_timestamp_out_of_range())?;
+    let unix = crabgresql_types::tz::to_unix_micros(shifted);
+    let ms = unix.div_euclid(1000);
+    if unix < 0 || ms > crabgresql_types::uuid::V7_MAX_UNIX_MS as i64 {
+        return Err(v7_timestamp_out_of_range());
+    }
+    Ok(unix)
+}
+
+fn v7_timestamp_out_of_range() -> ExecError {
+    ExecError::new(
+        sqlstate::DATETIME_FIELD_OVERFLOW,
+        "timestamp out of range for UUID version 7",
+    )
+    .with_detail(Some(
+        "UUID version 7 supports timestamps from 1970-01-01 to approximately year 10889.".into(),
+    ))
 }
 
 /// Dispatch `current_setting`, which reads the session GUC table through the

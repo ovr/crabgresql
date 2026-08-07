@@ -21,6 +21,7 @@ fn invalid_binary(ty: PgType) -> CastError {
     CastError {
         sqlstate: INVALID_BINARY,
         message: format!("invalid binary representation for type {}", ty.name()),
+        detail: None,
     }
 }
 
@@ -28,6 +29,7 @@ fn no_binary(ty: PgType) -> CastError {
     CastError {
         sqlstate: FEATURE_NOT_SUPPORTED,
         message: format!("binary format is not supported for type {}", ty.name()),
+        detail: None,
     }
 }
 
@@ -67,6 +69,8 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         PgType::Xid => Value::Xid(u32::from_be_bytes(fixed(b, ty)?)),
         PgType::Xid8 => Value::Xid8(u64::from_be_bytes(fixed(b, ty)?)),
         PgType::PgLsn => Value::PgLsn(u64::from_be_bytes(fixed(b, ty)?)),
+        // `uuid_recv`: the 16 stored bytes, no punctuation.
+        PgType::Uuid => Value::Uuid(fixed::<16>(b, ty)?),
         // `tid` is the only composite here: a 4-byte block then a 2-byte
         // offset, six bytes with no padding.
         PgType::Tid => {
@@ -164,6 +168,8 @@ impl Value {
             Value::Xid(v) => v.to_be_bytes().to_vec(),
             Value::Xid8(v) => v.to_be_bytes().to_vec(),
             Value::PgLsn(v) => v.to_be_bytes().to_vec(),
+            // `uuid_send`: the stored bytes, which are already the wire form.
+            Value::Uuid(u) => u.to_vec(),
             // Block then offset, six bytes (PG's `tidsend`).
             Value::Tid { block, offset } => {
                 let mut out = Vec::with_capacity(6);
@@ -218,6 +224,25 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("int4 encoded as NULL"))?;
         assert_eq!(bytes, (-12345i32).to_be_bytes());
         assert_eq!(decode_binary(PgType::Int4, &bytes)?, Value::Int4(-12345));
+
+        Ok(())
+    }
+
+    /// `uuid_send`/`uuid_recv` put the 16 stored bytes on the wire unpunctuated,
+    /// so the binary form is not the 36-character text one.
+    #[test]
+    fn uuid_binary_round_trips() -> anyhow::Result<()> {
+        let value = Value::Uuid(crate::uuid::parse("5b35380a-7143-4912-9b55-f322699c6770")?);
+        let bytes = value
+            .encode_binary()?
+            .ok_or_else(|| anyhow::anyhow!("uuid encoded as NULL"))?;
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 0x5b);
+        assert_eq!(decode_binary(PgType::Uuid, &bytes)?, value);
+
+        let e = decode_binary(PgType::Uuid, &bytes[..15])
+            .expect_err("a uuid is exactly 16 bytes on the wire");
+        assert_eq!(e.sqlstate, "22P03");
 
         Ok(())
     }

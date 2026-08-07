@@ -258,6 +258,25 @@ pub enum ScalarFn {
     /// started. Fixed for the life of the process, so every session and every
     /// row sees the same instant.
     PgPostmasterStartTime,
+
+    // --- uuid generation. Volatile and clock-reading like the family above, so
+    // these dispatch in `eval` too; the extractors below are pure and do not.
+    /// `gen_random_uuid() -> uuid`, and its RFC-spelled alias `uuidv4()`:
+    /// 122 random bits. PG gives both names one implementation, so we do too.
+    GenRandomUuid,
+    /// `uuidv7() -> uuid`: the current instant, then randomness. Successive
+    /// calls sort in generation order.
+    UuidV7,
+    /// `uuidv7(interval) -> uuid`: as above, but stamped with the current
+    /// instant shifted by the argument.
+    UuidV7Shift,
+    /// `uuid_extract_version(uuid) -> int2`: the version nibble, or NULL when
+    /// the value is not an RFC 9562 variant. Immutable.
+    UuidExtractVersion,
+    /// `uuid_extract_timestamp(uuid) -> timestamptz`: the instant a version 1
+    /// or version 7 value carries, NULL for any other. Immutable.
+    UuidExtractTimestamp,
+
     /// `timezone(text, timestamp) -> timestamptz` (`ts AT TIME ZONE zone`).
     TimezoneToTz,
     /// `timezone(text, timestamptz) -> timestamp` (`tstz AT TIME ZONE zone`).
@@ -1525,6 +1544,8 @@ const PGLSN: PgType = PgType::PgLsn;
 const REGCLASS: PgType = PgType::Reg(RegKind::Class);
 const NAME: PgType = PgType::Name;
 const NAMEARR: PgType = PgType::Array(crabgresql_types::oid::NAME);
+const UUID: PgType = PgType::Uuid;
+const I2: PgType = PgType::Int2;
 
 /// How many leading entries of [`SUBSTRING_SIGS`] are the regex-extraction
 /// forms. `substr` is the same list without them.
@@ -2186,6 +2207,18 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: PgType::Text,
             },
         ],
+        // The uuid readers. Unlike the generators above these are pure — they
+        // answer from their argument alone — so `eval_scalar` holds them.
+        "uuid_extract_version" => &[Signature {
+            func: ScalarFn::UuidExtractVersion,
+            args: &[UUID],
+            ret: I2,
+        }],
+        "uuid_extract_timestamp" => &[Signature {
+            func: ScalarFn::UuidExtractTimestamp,
+            args: &[UUID],
+            ret: TSTZ,
+        }],
         // --- string functions ---
         // `length(bit)`/`length(varbit)` count bits, not characters. PG has only
         // `length(bit)` in the bit-string family; `char_length`/`character_length`
@@ -2311,6 +2344,28 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[],
             ret: TSTZ,
         }],
+        // UUID generation. Zero-arity (bar the shift) and impure, so `eval`
+        // dispatches these from the clock and the RNG, next to the family above.
+        //
+        // `uuidv4` is PG's RFC-9562 spelling of `gen_random_uuid`, sharing one
+        // implementation upstream; one `ScalarFn` for both says the same thing.
+        "gen_random_uuid" | "uuidv4" => &[Signature {
+            func: ScalarFn::GenRandomUuid,
+            args: &[],
+            ret: UUID,
+        }],
+        "uuidv7" => &[
+            Signature {
+                func: ScalarFn::UuidV7,
+                args: &[],
+                ret: UUID,
+            },
+            Signature {
+                func: ScalarFn::UuidV7Shift,
+                args: &[IV],
+                ret: UUID,
+            },
+        ],
         // Not a clock reading but an instant like one: fixed for the life of the
         // process, so `eval` answers it alongside the family above.
         "pg_postmaster_start_time" => &[Signature {

@@ -21,7 +21,7 @@ use crabgresql_types::jsonpath;
 use crabgresql_types::{
     FmtCtx, Inet, Interval, Numeric, PgType, TimeTz, Value, bit, date, float, formatting,
     formatting_num, geo, interval, macaddr, money, net, pg_lsn, text, time, timestamp, timestamptz,
-    timetz,
+    timetz, tz, uuid,
 };
 
 use crate::ExecError;
@@ -897,6 +897,18 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 other => unreachable!("expected text/bytea arg, got {other:?}"),
             };
             return Ok(Value::Text(crate::md5::md5_hex(bytes)));
+        }
+        // The uuid readers. Both answer NULL rather than erroring when the
+        // value carries no such field — a version 4 value has no timestamp, and
+        // a non-RFC-9562 variant has no version — so they are total.
+        ScalarFn::UuidExtractVersion => {
+            return Ok(uuid::extract_version(uuid_arg(&args[0])).map_or(Value::Null, Value::Int2));
+        }
+        ScalarFn::UuidExtractTimestamp => {
+            return Ok(uuid::extract_timestamp_unix_micros(uuid_arg(&args[0]))
+                .map_or(Value::Null, |unix| {
+                    Value::TimestampTz(tz::from_unix_micros(unix))
+                }));
         }
 
         // --- interval operators ---
@@ -2505,6 +2517,13 @@ fn text(v: &Value) -> &str {
     match v {
         Value::Text(s) => s,
         other => unreachable!("expected text arg, got {other:?}"),
+    }
+}
+
+fn uuid_arg(v: &Value) -> &[u8; 16] {
+    match v {
+        Value::Uuid(u) => u,
+        other => unreachable!("expected uuid arg, got {other:?}"),
     }
 }
 
