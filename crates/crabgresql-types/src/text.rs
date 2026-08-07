@@ -373,15 +373,447 @@ pub fn to_hex_i64(n: i64) -> String {
 
 // --- LIKE / ILIKE ----------------------------------------------------------
 
+/// One item of a `%`-free run: either literal text or a run of `_`.
+enum SegItem {
+    /// A literal run. Already lowercased when the program is case-insensitive.
+    Lit(String),
+    /// `n` consecutive `_`, each matching exactly one *character*.
+    Skip(usize),
+}
+
+/// A `%`-free run of a pattern. Its width is fixed *because* it contains no
+/// `%`, which is what makes the greedy scan in [`find_segment`] complete.
+struct Segment {
+    /// Alternating `Lit`/`Skip` — adjacent items of a kind are merged.
+    items: Vec<SegItem>,
+    /// Width in characters, not bytes.
+    width: usize,
+}
+
+impl Segment {
+    /// The segment's text when it is one literal run and nothing else. Drives
+    /// the `Exact`/`Prefix`/`Suffix`/`Contains` specializations.
+    fn as_lit(&self) -> Option<&str> {
+        match self.items.as_slice() {
+            [SegItem::Lit(s)] => Some(s),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// A pattern compiled to the shape it actually has. The four string
+/// specializations are degenerate `Segments`: there is one compiler, which
+/// builds `Segments` and narrows at the end, so they cannot disagree.
+enum LikeProgram {
+    /// No wildcards: the subject must equal this text.
+    Exact(String),
+    /// `lit%`
+    Prefix(String),
+    /// `%lit`
+    Suffix(String),
+    /// `%lit%`
+    Contains(String),
+    /// No `%`, but at least one `_`: the whole subject is one segment.
+    Whole(Segment),
+    /// `head % mid … mid % tail`. `head`/`tail` are `None` when the pattern
+    /// begins/ends with `%`; empty middle runs (from `%%`) are dropped.
+    Segments {
+        head: Option<Segment>,
+        mids: Vec<Segment>,
+        tail: Option<Segment>,
+    },
+}
+
+/// Everything besides the pattern text that changes what it compiles to. Both
+/// fields are load-bearing cache-key material: `'m%aca' ESCAPE '%'` compiles to
+/// `Exact("maca")`, and the same text under `ESCAPE '\'` to two segments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LikeKind {
+    escape: Option<char>,
+    case_insensitive: bool,
+}
+
+/// How a compiled literal is compared against subject text. Two zero-sized
+/// implementations rather than a runtime flag, so the hot loop carries no case
+/// branch.
+trait CaseCmp {
+    fn eq(hay: &str, needle: &str) -> bool;
+    fn starts_with(hay: &str, needle: &str) -> bool;
+    fn ends_with(hay: &str, needle: &str) -> bool;
+    /// Leftmost byte offset of `needle` in `hay`, or `None`.
+    fn find(hay: &str, needle: &str) -> Option<usize>;
+}
+
+/// Byte-exact comparison, for `LIKE` and for the non-ASCII `ILIKE` fallback
+/// (where the subject has already been lowercased in full).
+struct Exact;
+
+impl CaseCmp for Exact {
+    fn eq(hay: &str, needle: &str) -> bool {
+        hay == needle
+    }
+    fn starts_with(hay: &str, needle: &str) -> bool {
+        hay.starts_with(needle)
+    }
+    fn ends_with(hay: &str, needle: &str) -> bool {
+        hay.ends_with(needle)
+    }
+    fn find(hay: &str, needle: &str) -> Option<usize> {
+        hay.find(needle)
+    }
+}
+
+/// ASCII case folding, for `ILIKE` against an ASCII subject. The needle is
+/// already lowercased (see [`compile_like`]), so only the haystack side folds.
+///
+/// Only ever reached with an all-ASCII `hay` (see [`like`]), so every byte
+/// offset it produces is a character boundary. A needle carrying non-ASCII
+/// simply never matches, which is the same answer the slow path reaches.
+struct AsciiFold;
+
+impl CaseCmp for AsciiFold {
+    fn eq(hay: &str, needle: &str) -> bool {
+        hay.as_bytes().eq_ignore_ascii_case(needle.as_bytes())
+    }
+    fn starts_with(hay: &str, needle: &str) -> bool {
+        hay.len() >= needle.len() && Self::eq(&hay[..needle.len()], needle)
+    }
+    fn ends_with(hay: &str, needle: &str) -> bool {
+        hay.len() >= needle.len() && Self::eq(&hay[hay.len() - needle.len()..], needle)
+    }
+    fn find(hay: &str, needle: &str) -> Option<usize> {
+        let (hay, needle) = (hay.as_bytes(), needle.as_bytes());
+        let Some(&first) = needle.first() else {
+            return Some(0);
+        };
+        let last = hay.len().checked_sub(needle.len())?;
+        // Scan for either case of the needle's first byte, then confirm. A
+        // non-ASCII first byte has no other case, so one candidate suffices.
+        let upper = first.to_ascii_uppercase();
+        let mut from = 0;
+        while from <= last {
+            let window = &hay[from..=last];
+            let hit = if first == upper {
+                memchr::memchr(first, window)?
+            } else {
+                memchr::memchr2(first, upper, window)?
+            };
+            let at = from + hit;
+            if hay[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+}
+
+/// Byte offset just past the character starting at `at`.
+fn next_char(s: &str, at: usize) -> Option<usize> {
+    Some(at + s[at..].chars().next()?.len_utf8())
+}
+
+/// Byte offset `n` characters past `at`, or `None` if the string ends first.
+fn skip_chars(s: &str, at: usize, n: usize) -> Option<usize> {
+    let mut at = at;
+    for _ in 0..n {
+        at = next_char(s, at)?;
+    }
+    Some(at)
+}
+
+/// Match `items` against `s` starting at `at`, returning the byte offset just
+/// past the match. No backtracking is possible or needed: a `%`-free run has a
+/// fixed width, so each item consumes a determined amount.
+fn match_at<C: CaseCmp>(s: &str, at: usize, items: &[SegItem]) -> Option<usize> {
+    let mut at = at;
+    for item in items {
+        match item {
+            SegItem::Lit(lit) => {
+                if !C::starts_with(s.get(at..)?, lit) {
+                    return None;
+                }
+                // Safe because a successful `starts_with` under either policy
+                // consumed exactly `lit.len()` bytes of the subject.
+                at += lit.len();
+            }
+            // The one place the "`_` is a character, not a byte" rule lives.
+            SegItem::Skip(n) => at = skip_chars(s, at, *n)?,
+        }
+    }
+    Some(at)
+}
+
+/// Byte offset of the character `width` characters from the end of `s`.
+fn start_from_end(s: &str, width: usize) -> Option<usize> {
+    if width == 0 {
+        return Some(s.len());
+    }
+    Some(s.char_indices().rev().nth(width - 1)?.0)
+}
+
+/// Leftmost placement of `seg` starting at or after `from` and ending at or
+/// before `end`, returning the byte offset just past it.
+///
+/// The residual worst case is the confirm-and-retry loop below (`%aaa…ab%`),
+/// which is naive substring search — the same complexity class PG accepts.
+fn find_segment<C: CaseCmp>(s: &str, from: usize, end: usize, seg: &Segment) -> Option<usize> {
+    // Items alternate by construction, so a leading `Skip` is followed by a
+    // `Lit` unless the segment is nothing but that `Skip`.
+    let (lead, rest) = match seg.items.first() {
+        Some(SegItem::Skip(n)) => (*n, &seg.items[1..]),
+        _ => (0, &seg.items[..]),
+    };
+    // A pure run of `_` is only a length constraint; the leftmost placement is
+    // the earliest one.
+    let base = skip_chars(s, from, lead)?;
+    let Some(SegItem::Lit(needle)) = rest.first() else {
+        return (base <= end).then_some(base);
+    };
+    let mut search = base;
+    loop {
+        let at = search + C::find(s.get(search..end)?, needle)?;
+        match match_at::<C>(s, at, rest) {
+            // Occurrences are found left to right and the segment's width is
+            // fixed, so once a placement overruns `end` every later one does.
+            Some(e) if e > end => return None,
+            Some(e) => return Some(e),
+            None => search = next_char(s, at)?,
+        }
+    }
+}
+
+impl LikeProgram {
+    /// The variant's name, so a test can assert a pattern specialized rather
+    /// than silently falling back to the general path.
+    #[cfg(test)]
+    fn shape(&self) -> &'static str {
+        match self {
+            LikeProgram::Exact(_) => "Exact",
+            LikeProgram::Prefix(_) => "Prefix",
+            LikeProgram::Suffix(_) => "Suffix",
+            LikeProgram::Contains(_) => "Contains",
+            LikeProgram::Whole(_) => "Whole",
+            LikeProgram::Segments { .. } => "Segments",
+        }
+    }
+
+    fn matches<C: CaseCmp>(&self, s: &str) -> bool {
+        match self {
+            LikeProgram::Exact(lit) => C::eq(s, lit),
+            LikeProgram::Prefix(lit) => C::starts_with(s, lit),
+            LikeProgram::Suffix(lit) => C::ends_with(s, lit),
+            LikeProgram::Contains(lit) => C::find(s, lit).is_some(),
+            LikeProgram::Whole(seg) => match_at::<C>(s, 0, &seg.items) == Some(s.len()),
+            LikeProgram::Segments { head, mids, tail } => {
+                self.match_segments::<C>(s, head.as_ref(), mids, tail.as_ref())
+            }
+        }
+    }
+
+    fn match_segments<C: CaseCmp>(
+        &self,
+        s: &str,
+        head: Option<&Segment>,
+        mids: &[Segment],
+        tail: Option<&Segment>,
+    ) -> bool {
+        let Some(mut cur) = (match head {
+            Some(h) => match_at::<C>(s, 0, &h.items),
+            None => Some(0),
+        }) else {
+            return false;
+        };
+        let end = match tail {
+            None => s.len(),
+            Some(t) => {
+                let Some(start) = start_from_end(s, t.width) else {
+                    return false;
+                };
+                if match_at::<C>(s, start, &t.items) != Some(s.len()) {
+                    return false;
+                }
+                start
+            }
+        };
+        if end < cur {
+            return false;
+        }
+        // Greedy leftmost placement is complete, which is what separates glob
+        // from regex: every segment has a fixed width, so if some placement
+        // p₁<…<p_k succeeds then the leftmost choices q_i satisfy q_i ≤ p_i by
+        // induction (q_i is the earliest match at or after q_{i-1}+w_{i-1} ≤
+        // p_{i-1}+w_{i-1} ≤ p_i, so p_i is inside q_i's search window).
+        // Hence no backtracking: `%a%a%a%b` over `aaa…a` is a single pass.
+        for m in mids {
+            match find_segment::<C>(s, cur, end, m) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Compile a LIKE pattern, honoring `escape` (which makes the next character a
+/// literal). A pattern ending in a bare escape character is an error, as in PG.
+///
+/// For a case-insensitive program the pattern and escape are lowercased first,
+/// exactly as the interpreted implementation did, so the compiled literals live
+/// in "lowered" space and matching against a lowered subject is case-sensitive.
+fn compile_like(pattern: &str, kind: LikeKind) -> Result<LikeProgram> {
+    let lowered;
+    let (pattern, escape) = if kind.case_insensitive {
+        lowered = pattern.to_lowercase();
+        (
+            lowered.as_str(),
+            kind.escape.and_then(|e| e.to_lowercase().next()),
+        )
+    } else {
+        (pattern, kind.escape)
+    };
+
+    let mut parts: Vec<Segment> = Vec::new();
+    let mut items: Vec<SegItem> = Vec::new();
+    let mut lit = String::new();
+    let mut width = 0usize;
+
+    fn flush(items: &mut Vec<SegItem>, lit: &mut String) {
+        if !lit.is_empty() {
+            items.push(SegItem::Lit(std::mem::take(lit)));
+        }
+    }
+
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        // The escape check must precede `%`/`_`: `ESCAPE '%'` is legal.
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => {
+                    lit.push(next);
+                    width += 1;
+                }
+                None => {
+                    return Err(TextError::new(
+                        sqlstate::INVALID_ESCAPE_SEQUENCE,
+                        "LIKE pattern must not end with escape character",
+                    ));
+                }
+            }
+        } else if c == '%' {
+            flush(&mut items, &mut lit);
+            parts.push(Segment {
+                items: std::mem::take(&mut items),
+                width,
+            });
+            width = 0;
+        } else if c == '_' {
+            flush(&mut items, &mut lit);
+            match items.last_mut() {
+                Some(SegItem::Skip(n)) => *n += 1,
+                _ => items.push(SegItem::Skip(1)),
+            }
+            width += 1;
+        } else {
+            lit.push(c);
+            width += 1;
+        }
+    }
+    flush(&mut items, &mut lit);
+    parts.push(Segment { items, width });
+
+    Ok(narrow(parts))
+}
+
+/// Turn the parsed runs into the narrowest program that expresses them.
+fn narrow(mut parts: Vec<Segment>) -> LikeProgram {
+    // No `%` at all: the single run must cover the whole subject.
+    if parts.len() == 1 {
+        let whole = parts.pop().expect("one part");
+        return match whole.as_lit() {
+            Some(lit) => LikeProgram::Exact(lit.to_string()),
+            None if whole.is_empty() => LikeProgram::Exact(String::new()),
+            None => LikeProgram::Whole(whole),
+        };
+    }
+    let tail = parts.pop().expect("at least two parts");
+    let mut rest = parts.into_iter();
+    let head = rest.next().expect("at least two parts");
+    // Empty middle runs come from `%%` and constrain nothing.
+    let mids: Vec<Segment> = rest.filter(|m| !m.is_empty()).collect();
+
+    let head = (!head.is_empty()).then_some(head);
+    let tail = (!tail.is_empty()).then_some(tail);
+    match (&head, mids.as_slice(), &tail) {
+        (None, [], None) => LikeProgram::Contains(String::new()),
+        (None, [only], None) => match only.as_lit() {
+            Some(lit) => LikeProgram::Contains(lit.to_string()),
+            None => LikeProgram::Segments { head, mids, tail },
+        },
+        (Some(h), [], None) => match h.as_lit() {
+            Some(lit) => LikeProgram::Prefix(lit.to_string()),
+            None => LikeProgram::Segments { head, mids, tail },
+        },
+        (None, [], Some(t)) => match t.as_lit() {
+            Some(lit) => LikeProgram::Suffix(lit.to_string()),
+            None => LikeProgram::Segments { head, mids, tail },
+        },
+        _ => LikeProgram::Segments { head, mids, tail },
+    }
+}
+
+thread_local! {
+    /// Compiled LIKE patterns, most-recently-used first. See [`with_cached`]
+    /// for the discipline; entries are lent out by reference rather than
+    /// cloned, since a program owns its literals.
+    static LIKE_CACHE: std::cell::RefCell<Vec<(String, LikeKind, LikeProgram)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `LIKE` (and `ILIKE` when `case_insensitive`). `escape` defaults to `\` at
+/// the call site; pass `None` here to disable escaping (`ESCAPE ''`).
+pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> Result<bool> {
+    let kind = LikeKind {
+        escape,
+        case_insensitive,
+    };
+    with_cached(&LIKE_CACHE, pattern, kind, compile_like, |prog| {
+        if !case_insensitive {
+            prog.matches::<Exact>(s)
+        } else if s.is_ascii() {
+            // The pattern was lowercased at compile time, so an ASCII subject
+            // only needs per-byte folding — no allocation. This is exactly
+            // equal to lowering it: over ASCII, `to_lowercase` maps `A-Z` to
+            // `a-z`, touches nothing else, and preserves length (its one
+            // contextual rule, final sigma, needs a non-ASCII `Σ`).
+            prog.matches::<AsciiFold>(s)
+        } else {
+            // Unicode lowering is *not* per character — `İ` lowers to two
+            // characters (changing what `_` counts) and `K` (U+212A) lowers to
+            // plain `k` — so a non-ASCII subject takes the allocating path.
+            //
+            // Note this is Unicode-default rather than collation-aware, so it
+            // can still differ from PG under e.g. a Turkish collation. That
+            // divergence predates the compiled matcher and is left as is.
+            prog.matches::<Exact>(&s.to_lowercase())
+        }
+    })
+}
+
+#[cfg(test)]
 enum LikeTok {
     Any,       // %
     One,       // _
     Lit(char), // an ordinary (or escaped) literal character
 }
 
-/// Parse a LIKE pattern into tokens, honoring `escape` (which makes the next
-/// character a literal). A pattern ending in a bare escape character is an
-/// error, as in PG.
+/// The interpreted matcher `compile_like` replaced, kept as the oracle the
+/// compiled one is differentially tested against. Do not use outside tests.
+#[cfg(test)]
 fn parse_like(pattern: &str, escape: Option<char>) -> Result<Vec<LikeTok>> {
     let mut toks = Vec::new();
     let mut chars = pattern.chars().peekable();
@@ -407,6 +839,7 @@ fn parse_like(pattern: &str, escape: Option<char>) -> Result<Vec<LikeTok>> {
     Ok(toks)
 }
 
+#[cfg(test)]
 fn match_tokens(text: &[char], toks: &[LikeTok]) -> bool {
     let (mut ti, mut pi) = (0usize, 0usize);
     let mut star: Option<usize> = None;
@@ -438,9 +871,14 @@ fn match_tokens(text: &[char], toks: &[LikeTok]) -> bool {
     pi == toks.len()
 }
 
-/// `LIKE` (and `ILIKE` when `case_insensitive`). `escape` defaults to `\` at
-/// the call site; pass `None` here to disable escaping (`ESCAPE ''`).
-pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> Result<bool> {
+/// The oracle's entry point: what [`like`] did before it compiled patterns.
+#[cfg(test)]
+fn reference_like(
+    s: &str,
+    pattern: &str,
+    escape: Option<char>,
+    case_insensitive: bool,
+) -> Result<bool> {
     if case_insensitive {
         let s = s.to_lowercase();
         let pattern = pattern.to_lowercase();
@@ -772,10 +1210,14 @@ enum PatternKind {
     SimilarTo(Option<char>),
 }
 
-/// How many compiled patterns to keep per thread. The bound exists to cap
-/// per-thread memory for a cache consulted once per row; the exact depth is not
-/// observable, so any small number would do.
-const RE_CACHE_MAX: usize = 32;
+/// How many compiled patterns to keep per thread, per cache. The bound exists
+/// to cap per-thread memory for a cache consulted once per row; the exact depth
+/// is not observable, so any small number would do.
+const PATTERN_CACHE_MAX: usize = 32;
+
+/// A thread-local, most-recently-used-first store of patterns compiled to `V`,
+/// keyed on the user's pattern text plus a `K` describing how to read it.
+type PatternCache<K, V> = std::thread::LocalKey<std::cell::RefCell<Vec<(String, K, V)>>>;
 
 thread_local! {
     /// Most-recently-used first. Cloning a `Regex` is *not* free — it allocates
@@ -785,18 +1227,29 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Compile `pattern` according to `kind` (reusing a cached `Regex` when one is
-/// live) and run `f` against it.
+/// Compile `pattern` according to `kind` (reusing a live cache entry when there
+/// is one) and run `f` against it. Shared by the regex/`SIMILAR TO` cache and
+/// the `LIKE` one; they differ only in what a compiled pattern *is*.
 ///
 /// `f` must not itself call back into the cache: the entry is lent out while
 /// the thread-local is borrowed, so re-entering would panic. Every caller in
 /// this module runs a single match and returns an owned result.
-fn with_cached<T>(
+///
+/// A failed compile is never inserted, so a bad pattern misses on every row and
+/// re-raises its error each time — which is what PG does, and what a future
+/// "cache the `Err` too" would silently break.
+fn with_cached<K, V, T>(
+    cache: &'static PatternCache<K, V>,
     pattern: &str,
-    kind: PatternKind,
-    f: impl FnOnce(&regex::Regex) -> T,
-) -> Result<T> {
-    RE_CACHE.with(|cache| {
+    kind: K,
+    compile: impl FnOnce(&str, K) -> Result<V>,
+    f: impl FnOnce(&V) -> T,
+) -> Result<T>
+where
+    K: Copy + PartialEq + 'static,
+    V: 'static,
+{
+    cache.with(|cache| {
         let mut cache = cache.borrow_mut();
         match cache
             .iter()
@@ -810,27 +1263,30 @@ fn with_cached<T>(
                 }
             }
             None => {
-                // The `q` flag makes the whole pattern a literal string;
-                // otherwise apply the rewrites the crate cannot express.
-                let (opts, source) = match kind {
-                    PatternKind::SimilarTo(escape) => {
-                        (ReOpts::default(), similar_to_regex(pattern, escape)?)
-                    }
-                    PatternKind::Regex(opts) if opts.literal => (opts, regex::escape(pattern)),
-                    PatternKind::Regex(opts) => (opts, rewrite_pattern(pattern, opts)?),
-                };
-                let re = regex::RegexBuilder::new(&source)
-                    .case_insensitive(opts.case_insensitive)
-                    .multi_line(opts.multi_line)
-                    .dot_matches_new_line(opts.dot_all)
-                    .build()
-                    .map_err(|e| invalid_regex(e, &source, opts))?;
-                cache.insert(0, (pattern.to_string(), kind, re));
-                cache.truncate(RE_CACHE_MAX);
+                let compiled = compile(pattern, kind)?;
+                cache.insert(0, (pattern.to_string(), kind, compiled));
+                cache.truncate(PATTERN_CACHE_MAX);
             }
         }
         Ok(f(&cache[0].2))
     })
+}
+
+/// Build the `Regex` behind a [`PatternKind`].
+fn compile_regex(pattern: &str, kind: PatternKind) -> Result<regex::Regex> {
+    // The `q` flag makes the whole pattern a literal string; otherwise apply
+    // the rewrites the crate cannot express.
+    let (opts, source) = match kind {
+        PatternKind::SimilarTo(escape) => (ReOpts::default(), similar_to_regex(pattern, escape)?),
+        PatternKind::Regex(opts) if opts.literal => (opts, regex::escape(pattern)),
+        PatternKind::Regex(opts) => (opts, rewrite_pattern(pattern, opts)?),
+    };
+    regex::RegexBuilder::new(&source)
+        .case_insensitive(opts.case_insensitive)
+        .multi_line(opts.multi_line)
+        .dot_matches_new_line(opts.dot_all)
+        .build()
+        .map_err(|e| invalid_regex(e, &source, opts))
 }
 
 /// POSIX regex match, backing the `~` (case-sensitive) and `~*`
@@ -841,7 +1297,13 @@ pub fn regex_match(s: &str, pattern: &str, case_insensitive: bool) -> Result<boo
         case_insensitive,
         ..ReOpts::default()
     };
-    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(opts),
+        compile_regex,
+        |re| re.is_match(s),
+    )
 }
 
 /// The flag set jsonpath's `like_regex ... flag "..."` accepts. It is
@@ -920,9 +1382,13 @@ impl LikeRegexFlags {
 
 /// jsonpath's `like_regex`.
 pub fn like_regex_match(s: &str, pattern: &str, flags: LikeRegexFlags) -> Result<bool> {
-    with_cached(pattern, PatternKind::Regex(flags.opts()), |re| {
-        re.is_match(s)
-    })
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(flags.opts()),
+        compile_regex,
+        |re| re.is_match(s),
+    )
 }
 
 /// Compile-check a `like_regex` pattern without matching anything, as PG does
@@ -930,7 +1396,13 @@ pub fn like_regex_match(s: &str, pattern: &str, flags: LikeRegexFlags) -> Result
 /// row. The compile is not wasted work: it seats the pattern at the head of the
 /// per-thread cache, where the first evaluation finds it.
 pub fn like_regex_compile(pattern: &str, flags: LikeRegexFlags) -> Result<()> {
-    with_cached(pattern, PatternKind::Regex(flags.opts()), |_| ())
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(flags.opts()),
+        compile_regex,
+        |_| (),
+    )
 }
 
 /// `SIMILAR TO`: an SQL-standard pattern language distinct from both LIKE and
@@ -939,7 +1411,13 @@ pub fn like_regex_compile(pattern: &str, flags: LikeRegexFlags) -> Result<()> {
 pub fn similar_to_match(s: &str, pattern: &str, escape: Option<char>) -> Result<bool> {
     // The cache is keyed on the SIMILAR TO pattern itself, so a repeated row
     // skips the translation as well as the compile.
-    with_cached(pattern, PatternKind::SimilarTo(escape), |re| re.is_match(s))
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::SimilarTo(escape),
+        compile_regex,
+        |re| re.is_match(s),
+    )
 }
 
 /// The value the two-and-three-argument `substring` forms extract from a match:
@@ -967,9 +1445,13 @@ fn extracted(re: &regex::Regex, s: &str) -> Option<String> {
 /// than a boolean. Fixing it means replacing the engine, not the translation —
 /// reordering a user's alternation branches is not sound.
 pub fn substring_regex(s: &str, pattern: &str) -> Result<Option<String>> {
-    with_cached(pattern, PatternKind::Regex(ReOpts::default()), |re| {
-        extracted(re, s)
-    })
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(ReOpts::default()),
+        compile_regex,
+        |re| extracted(re, s),
+    )
 }
 
 /// `substring(string, pattern, escape)`: the SQL-regex form, spelled
@@ -978,9 +1460,13 @@ pub fn substring_regex(s: &str, pattern: &str) -> Result<Option<String>> {
 /// the part to extract (see [`similar_to_regex`]); with no separators the whole
 /// match is returned.
 pub fn substring_similar(s: &str, pattern: &str, escape: Option<char>) -> Result<Option<String>> {
-    with_cached(pattern, PatternKind::SimilarTo(escape), |re| {
-        extracted(re, s)
-    })
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::SimilarTo(escape),
+        compile_regex,
+        |re| extracted(re, s),
+    )
 }
 
 // --- regexp_* functions ----------------------------------------------------
@@ -1110,35 +1596,41 @@ pub fn regexp_replace_at(
     let Some(offset) = offset else {
         return Ok(s.to_string());
     };
-    with_cached(pattern, PatternKind::Regex(opts), |re| {
-        // Walking the matches explicitly rather than calling `replace_all`,
-        // which suppresses a zero-width match sitting where the previous match
-        // ended; PG replaces it.
-        let mut out = String::with_capacity(s.len());
-        let mut copied = 0;
-        let mut cursor = offset;
-        let mut seen = 0;
-        while let Some(caps) = re.captures_at(s, cursor) {
-            let m = caps.get(0).expect("group 0 always participates");
-            seen += 1;
-            if n.is_none_or(|k| k == 0 || k == seen) {
-                out.push_str(&s[copied..m.start()]);
-                caps.expand(&replacement, &mut out);
-                copied = m.end();
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(opts),
+        compile_regex,
+        |re| {
+            // Walking the matches explicitly rather than calling `replace_all`,
+            // which suppresses a zero-width match sitting where the previous match
+            // ended; PG replaces it.
+            let mut out = String::with_capacity(s.len());
+            let mut copied = 0;
+            let mut cursor = offset;
+            let mut seen = 0;
+            while let Some(caps) = re.captures_at(s, cursor) {
+                let m = caps.get(0).expect("group 0 always participates");
+                seen += 1;
+                if n.is_none_or(|k| k == 0 || k == seen) {
+                    out.push_str(&s[copied..m.start()]);
+                    caps.expand(&replacement, &mut out);
+                    copied = m.end();
+                }
+                let last = match n {
+                    Some(0) => false,
+                    Some(k) => seen >= k,
+                    None => !global,
+                };
+                cursor = advance(s, &m);
+                if last || cursor > s.len() {
+                    break;
+                }
             }
-            let last = match n {
-                Some(0) => false,
-                Some(k) => seen >= k,
-                None => !global,
-            };
-            cursor = advance(s, &m);
-            if last || cursor > s.len() {
-                break;
-            }
-        }
-        out.push_str(&s[copied..]);
-        out
-    })
+            out.push_str(&s[copied..]);
+            out
+        },
+    )
 }
 
 /// `regexp_like(string, pattern [, flags])` — the functional spelling of `~`.
@@ -1147,7 +1639,13 @@ pub fn regexp_like(s: &str, pattern: &str, flags: &str) -> Result<bool> {
     if global {
         return Err(reject_global("regexp_like"));
     }
-    with_cached(pattern, PatternKind::Regex(opts), |re| re.is_match(s))
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(opts),
+        compile_regex,
+        |re| re.is_match(s),
+    )
 }
 
 /// Where the scan resumes after `m`. Emptiness is decided by the *match*, not
@@ -1176,22 +1674,28 @@ pub fn regexp_count(s: &str, pattern: &str, start: i32, flags: &str) -> Result<i
     let Some(offset) = offset else {
         return Ok(0);
     };
-    with_cached(pattern, PatternKind::Regex(opts), |re| {
-        // PG re-seeds the non-overlapping scan *at* `start`, so a match that
-        // began earlier is re-found clipped rather than skipped. `find_at`
-        // keeps `^` and look-behind aware of the text before `start`, which
-        // slicing the haystack would not.
-        let mut cursor = offset;
-        let mut count: i32 = 0;
-        while let Some(m) = re.find_at(s, cursor) {
-            count = count.saturating_add(1);
-            cursor = advance(s, &m);
-            if cursor > s.len() {
-                break;
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(opts),
+        compile_regex,
+        |re| {
+            // PG re-seeds the non-overlapping scan *at* `start`, so a match that
+            // began earlier is re-found clipped rather than skipped. `find_at`
+            // keeps `^` and look-behind aware of the text before `start`, which
+            // slicing the haystack would not.
+            let mut cursor = offset;
+            let mut count: i32 = 0;
+            while let Some(m) = re.find_at(s, cursor) {
+                count = count.saturating_add(1);
+                cursor = advance(s, &m);
+                if cursor > s.len() {
+                    break;
+                }
             }
-        }
-        count
-    })
+            count
+        },
+    )
 }
 
 /// `regexp_substr(string, pattern [, start [, n [, flags [, subexpr]]]])` — the
@@ -1220,28 +1724,34 @@ pub fn regexp_substr(
     let Some(offset) = offset else {
         return Ok(None);
     };
-    with_cached(pattern, PatternKind::Regex(opts), |re| {
-        // Walk to the `n`th match the same way `regexp_count` counts them.
-        let mut cursor = offset;
-        for _ in 1..n {
-            let m = re.find_at(s, cursor)?;
-            cursor = advance(s, &m);
-            if cursor > s.len() {
-                return None;
+    with_cached(
+        &RE_CACHE,
+        pattern,
+        PatternKind::Regex(opts),
+        compile_regex,
+        |re| {
+            // Walk to the `n`th match the same way `regexp_count` counts them.
+            let mut cursor = offset;
+            for _ in 1..n {
+                let m = re.find_at(s, cursor)?;
+                cursor = advance(s, &m);
+                if cursor > s.len() {
+                    return None;
+                }
             }
-        }
-        let caps = re.captures_at(s, cursor)?;
-        // A pattern with no subexpressions has no group to ask for, so PG
-        // treats `subexpr` 1 as the whole match. Anything genuinely out of
-        // range, or a group that did not participate, is NULL rather than an
-        // error.
-        let group = if subexpr == 1 && re.captures_len() == 1 {
-            0
-        } else {
-            subexpr as usize
-        };
-        caps.get(group).map(|m| m.as_str().to_string())
-    })
+            let caps = re.captures_at(s, cursor)?;
+            // A pattern with no subexpressions has no group to ask for, so PG
+            // treats `subexpr` 1 as the whole match. Anything genuinely out of
+            // range, or a group that did not participate, is NULL rather than an
+            // error.
+            let group = if subexpr == 1 && re.captures_len() == 1 {
+                0
+            } else {
+                subexpr as usize
+            };
+            caps.get(group).map(|m| m.as_str().to_string())
+        },
+    )
 }
 
 /// Which match preference a `SIMILAR TO` segment must have as a whole.
@@ -2461,7 +2971,7 @@ mod tests {
             assert!(regex_match("abc", "b", false)?);
         }
         // Evict past the bound, then come back to the first pattern.
-        for i in 0..RE_CACHE_MAX + 8 {
+        for i in 0..PATTERN_CACHE_MAX + 8 {
             let p = format!("p{i}");
             assert!(!regex_match("abc", &p, false)?);
         }
@@ -2475,6 +2985,166 @@ mod tests {
         assert!(similar_to_match("a%c", "a$%c", Some('$'))?);
         assert!(!similar_to_match("a%c", "a$%c", Some('\\'))?);
 
+        Ok(())
+    }
+
+    /// Every string of length `len` over `alphabet`, appended to `out`.
+    fn words(alphabet: &[char], len: usize, out: &mut Vec<String>) {
+        if len == 0 {
+            out.push(String::new());
+            return;
+        }
+        let mut shorter = Vec::new();
+        words(alphabet, len - 1, &mut shorter);
+        for w in shorter {
+            for c in alphabet {
+                out.push(format!("{w}{c}"));
+            }
+        }
+    }
+
+    fn words_upto(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for len in 0..=max {
+            words(alphabet, len, &mut out);
+        }
+        out
+    }
+
+    const ESCAPES: [Option<char>; 4] = [None, Some('\\'), Some('%'), Some('_')];
+
+    /// The compiled matcher must reproduce the interpreted one it replaced,
+    /// answer for answer — including which patterns are errors. Exhaustive
+    /// rather than randomized: no seed, no flakes, and it covers the escape
+    /// precedence and empty-run cases a hand-written list would miss.
+    #[test]
+    fn compiled_like_agrees_with_the_oracle() {
+        let patterns = words_upto(&['a', 'b', '%', '_', '\\'], 4);
+        let subjects = words_upto(&['a', 'b', '\\'], 4);
+        for pattern in &patterns {
+            for escape in ESCAPES {
+                for ci in [false, true] {
+                    for s in &subjects {
+                        let got = like(s, pattern, escape, ci);
+                        let want = reference_like(s, pattern, escape, ci);
+                        match (&got, &want) {
+                            (Ok(a), Ok(b)) => {
+                                assert_eq!(a, b, "{s:?} LIKE {pattern:?} ESCAPE {escape:?} ci={ci}")
+                            }
+                            (Err(a), Err(b)) => {
+                                assert_eq!(a.sqlstate, b.sqlstate);
+                                assert_eq!(a.message, b.message);
+                            }
+                            _ => panic!("{pattern:?} ESCAPE {escape:?}: {got:?} vs {want:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The proof obligation behind the ASCII `ILIKE` fast path: `İ` lowers to
+    /// *two* characters (so it changes what `_` counts) and `K` (U+212A) lowers
+    /// to a plain ASCII `k`. Both must still agree with whole-string lowering.
+    #[test]
+    fn ilike_folding_agrees_with_the_oracle_on_unicode() -> anyhow::Result<()> {
+        let alphabet = ['a', 'A', 'é', 'İ', 'K', 'Σ'];
+        let patterns = words_upto(&['a', 'A', 'İ', 'K', '%', '_'], 3);
+        let subjects = words_upto(&alphabet, 3);
+        for pattern in &patterns {
+            for ci in [false, true] {
+                for s in &subjects {
+                    assert_eq!(
+                        like(s, pattern, Some('\\'), ci)?,
+                        reference_like(s, pattern, Some('\\'), ci)?,
+                        "{s:?} LIKE {pattern:?} ci={ci}"
+                    );
+                }
+            }
+        }
+        // The two headline cases, spelled out.
+        assert!(like("K", "%k%", Some('\\'), true)?);
+        assert!(like("İ", "__", Some('\\'), true)?);
+        assert!(!like("İ", "_", Some('\\'), true)?);
+        Ok(())
+    }
+
+    /// A pattern that lands in the general path when it should have
+    /// specialized still gives the right answer, so nothing else would catch
+    /// the compiler silently downgrading.
+    #[test]
+    fn patterns_compile_to_the_narrowest_shape() -> anyhow::Result<()> {
+        let kind = LikeKind {
+            escape: Some('\\'),
+            case_insensitive: false,
+        };
+        for (pattern, want) in [
+            ("abc", "Exact"),
+            ("", "Exact"),
+            ("a\\%c", "Exact"),
+            ("abc%", "Prefix"),
+            ("%abc", "Suffix"),
+            ("%google%", "Contains"),
+            ("%%google%%", "Contains"),
+            ("%", "Contains"),
+            ("a_c", "Whole"),
+            ("_%", "Segments"),
+            ("a%b%c", "Segments"),
+        ] {
+            assert_eq!(compile_like(pattern, kind)?.shape(), want, "{pattern:?}");
+        }
+        Ok(())
+    }
+
+    /// `_` matches one character, never one byte.
+    #[test]
+    fn underscore_counts_characters() -> anyhow::Result<()> {
+        assert!(like("é", "_", Some('\\'), false)?);
+        assert!(!like("é", "__", Some('\\'), false)?);
+        assert!(like("🦀", "_", Some('\\'), false)?);
+        assert!(!like("🦀", "____", Some('\\'), false)?);
+        assert!(like("aéb", "a_b", Some('\\'), false)?);
+        assert!(like("xé", "%_", Some('\\'), false)?);
+        assert!(like("éx", "_%", Some('\\'), false)?);
+        Ok(())
+    }
+
+    /// Failed compiles are never cached, so a bad pattern errors on *every*
+    /// row rather than only the first. Pinned because caching the `Err` looks
+    /// like a free optimization and would silently change which rows fail.
+    #[test]
+    fn a_bad_pattern_errors_every_time() {
+        for _ in 0..3 {
+            let Err(err) = like("x", "a\\", Some('\\'), false) else {
+                panic!("a pattern ending in the escape character must be rejected");
+            };
+            assert_eq!(err.sqlstate, sqlstate::INVALID_ESCAPE_SEQUENCE);
+            assert_eq!(
+                err.message,
+                "LIKE pattern must not end with escape character"
+            );
+        }
+    }
+
+    /// The escape and the case flag are part of the key: the same pattern text
+    /// compiles to different programs under each, and a missing key field only
+    /// shows up when queries interleave.
+    #[test]
+    fn like_cache_keys_on_escape_and_case() -> anyhow::Result<()> {
+        for _ in 0..4 {
+            // Under `ESCAPE '%'` the pattern is the literal `ab`; under `\` the
+            // `%` is a wildcard.
+            assert!(!like("axb", "a%b", Some('%'), false)?);
+            assert!(like("axb", "a%b", Some('\\'), false)?);
+            assert!(like("ab", "a%b", Some('%'), false)?);
+            assert!(!like("ABC", "abc", Some('\\'), false)?);
+            assert!(like("ABC", "abc", Some('\\'), true)?);
+        }
+        // Evict past the bound, then come back to the first pattern.
+        for i in 0..PATTERN_CACHE_MAX + 8 {
+            assert!(!like("abc", &format!("p{i}"), Some('\\'), false)?);
+        }
+        assert!(!like("axb", "a%b", Some('%'), false)?);
         Ok(())
     }
 

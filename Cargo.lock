@@ -642,6 +642,7 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "jiff",
+ "memchr",
  "pg-ryu",
  "regex",
  "regex-syntax",

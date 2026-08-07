@@ -19,6 +19,17 @@ use crabgresql_types::{
 
 use crate::{CatalogOps, ExecContext, ExecError};
 
+/// The value an argument already *is*, when evaluating it would only copy it.
+/// A parameter placeholder is substituted into a `Const` before the portal
+/// runs, so `$1` takes this path too.
+fn arg_ref<'a>(expr: &'a BoundExpr, row: &'a [Value]) -> Option<&'a Value> {
+    match expr {
+        BoundExpr::Const { value, .. } => Some(value),
+        BoundExpr::ColumnRef { index, .. } => row.get(*index),
+        _ => None,
+    }
+}
+
 pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     match expr {
         BoundExpr::Const { value, .. } => Ok(value.clone()),
@@ -87,6 +98,28 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 .map_err(|e| ExecError::new(e.sqlstate, e.message))
         }
         BoundExpr::FuncCall { func, ret, args } => {
+            // `LIKE` is the one scalar hot enough for the generic path's cost
+            // to matter: it allocates a `Vec<Value>` and deep-clones both
+            // operands — for `col LIKE 'lit'` that is two `String` copies per
+            // row, on top of the match itself. When both operands are already
+            // sitting somewhere borrowable, hand them over by reference.
+            // Anything else (a cast, a concat, a subquery) falls through to the
+            // generic path untouched. Safe to place ahead of the dispatchers
+            // below because none of them handles `Like`/`ILike`.
+            if matches!(func, ScalarFn::Like | ScalarFn::ILike)
+                && let Some(subject) = arg_ref(&args[0], row)
+                && let Some(pattern) = arg_ref(&args[1], row)
+                && let Some(escape) = args
+                    .get(2)
+                    .map_or(Some(None), |a| arg_ref(a, row).map(Some))
+            {
+                return crate::scalar_fns::eval_like(
+                    matches!(func, ScalarFn::ILike),
+                    subject,
+                    pattern,
+                    escape,
+                );
+            }
             let arg_values = args
                 .iter()
                 .map(|a| eval(a, row, ctx))
