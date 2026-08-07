@@ -137,6 +137,105 @@ COPY vistest FROM '/dev/null' DELIMITER ',' DELIMITER ',';
 -- rather than a redundant option.
 COPY vistest FROM '/dev/null' (FREEZE OFF) CSV FREEZE;
 
+-- A field that its column's input function rejects aborts the whole load, and
+-- the message is the input function's own. COPY has no statement text to point
+-- at, so unlike the same literal in an INSERT there is no `LINE n: ... ^`.
+-- (PostgreSQL adds a `CONTEXT: COPY <table>, line n, column c: "..."` line here
+-- that this server does not yet emit.)
+CREATE TABLE bad (a integer, b text);
+COPY bad FROM stdin;
+1	one
+zzz	two
+\.
+SELECT count(*) AS loaded FROM bad;
+-- Wrong arity, both directions.
+COPY bad FROM stdin;
+1	one	extra
+\.
+COPY bad FROM stdin;
+1
+\.
+-- Rows are read in order, so the first bad row wins even when a later row is
+-- bad in a different way.
+COPY bad FROM stdin;
+1	one
+nope	two
+1	one	extra
+\.
+-- Same, for a column whose value the binder cannot fold without a session: the
+-- literal is still checked where it is read, so a bad `timestamptz` in row 1
+-- beats an arity error in row 2 rather than the load reporting them backwards.
+CREATE TABLE ord (z timestamptz, b text);
+COPY ord FROM stdin;
+not-a-time	one
+2020-01-01	two	extra
+\.
+-- The column's length typmod applies in assignment context: an over-long
+-- varchar errors rather than truncating, while `name` always truncates.
+CREATE TABLE lens (v varchar(3), n name);
+COPY lens (v) FROM stdin;
+abcd
+\.
+COPY lens (n) FROM stdin;
+0123456789012345678901234567890123456789012345678901234567890123456789
+\.
+SELECT octet_length(n) AS name_len FROM lens WHERE n IS NOT NULL;
+-- numeric(p,s) rounds to the scale, and overflows once the integer part no
+-- longer fits.
+CREATE TABLE num (v numeric(5,2));
+COPY num FROM stdin;
+1.005
+-1.005
+\.
+SELECT v FROM num ORDER BY v;
+COPY num FROM stdin;
+12345.6
+\.
+-- An enum column takes its labels by name, through the type catalog.
+CREATE TYPE cpmood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE en (m cpmood);
+COPY en FROM stdin;
+ok
+\.
+SELECT m FROM en;
+COPY en FROM stdin;
+elated
+\.
+-- A NULL marker in a length-modified column is a NULL, not a padded blank: it
+-- never reaches the typmod.
+CREATE TABLE nul (c char(5));
+COPY nul FROM stdin;
+\N
+\.
+SELECT c IS NULL AS is_null, octet_length(c) AS len FROM nul;
+-- `now` reads the transaction clock, which only the executing session holds.
+CREATE TABLE clk (t timestamp, z timestamptz);
+BEGIN;
+COPY clk FROM stdin;
+now	now
+\.
+SELECT t = transaction_timestamp()::timestamp AS t_is_xact,
+       z = transaction_timestamp() AS z_is_xact FROM clk;
+COMMIT;
+-- An interval literal whose meaning IntervalStyle changes is read under the
+-- session's style.
+CREATE TABLE iv (v interval);
+SET IntervalStyle = 'sql_standard';
+COPY iv FROM stdin;
+-1 2:03:04
+\.
+SELECT v FROM iv;
+-- COPY and INSERT must read the same text into the same value. Asserted on
+-- interval[] because array elements take a different route through the input
+-- functions than the scalar above.
+CREATE TABLE ivd (a interval[]);
+COPY ivd FROM stdin;
+{-1 2:03:04}
+\.
+INSERT INTO ivd VALUES ('{-1 2:03:04}');
+SELECT count(*) AS rows, count(DISTINCT a) AS distinct_values FROM ivd;
+RESET IntervalStyle;
+
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative
 -- data path, and `:'filename'` interpolates the result as a quoted literal.
