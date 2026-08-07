@@ -163,10 +163,15 @@ ignore the job. The numbers arrive as one pull request comment.
 The history is kept by `benchmark-action/github-action-benchmark` on the
 `gh-pages` branch: a push to `main` appends a point, a pull request only reads
 the branch to compare and comments when something is more than 2× worse.
-`scripts/bench/trend-json.sh` converts a `--json` report into the action's
-`customSmallerIsBetter` shape, one entry per query plus one for the load, so
-the chart says *which* query moved; pgbench emits its own
-`customBiggerIsBetter` file, since throughput is the metric that should go up.
+
+Each run gets its own suite there — `ClickBench (parquet)`, `TPC-H (heap)`,
+`TPC-H (parquet)`, `pgbench (heap)` — because the action keys its history by
+the step's `name`, renders one heading per key with one chart per entry inside
+it, and takes the regression direction from that run's tool. So the suite name
+carries the context and the entries are just `load` and `Q1`…`Qn`.
+`scripts/bench/trend-json.sh` produces that shape from a `--json` report;
+pgbench writes its own file with `customBiggerIsBetter`, since throughput is
+the one metric here that should go up.
 
 Two things about that branch: it has to exist before anything compares against
 it — `git checkout --orphan gh-pages && git push origin gh-pages:gh-pages`, and

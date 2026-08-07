@@ -101,12 +101,13 @@ tps() { sed -n 's/^tps = \([0-9.]*\).*/\1/p' "$1" | tail -n 1; }
 nfailed() { sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' "$1"; }
 
 # github-action-benchmark's `customBiggerIsBetter` shape; unlike the query
-# suites, throughput is the metric that should go up.
+# suites, throughput is the metric that should go up. The step names the suite,
+# so these are the workload names alone.
 cat > "$outdir/pgbench-trend.json" <<JSON
 [
-  { "name": "pgbench — tpcb-like", "unit": "tps", "value": $(tps "$outdir/tpcb.log"),
+  { "name": "tpcb-like", "unit": "tps", "value": $(tps "$outdir/tpcb.log"),
     "extra": "scale $SCALE, $CLIENTS clients, ${DURATION}s, shared_buffers=$CRABGRESQL_SHARED_BUFFERS" },
-  { "name": "pgbench — read-only", "unit": "tps", "value": $(tps "$outdir/select.log"),
+  { "name": "read-only", "unit": "tps", "value": $(tps "$outdir/select.log"),
     "extra": "scale $SCALE, $CLIENTS clients, ${DURATION}s, shared_buffers=$CRABGRESQL_SHARED_BUFFERS" }
 ]
 JSON

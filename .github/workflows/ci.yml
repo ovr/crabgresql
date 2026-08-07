@@ -361,37 +361,41 @@ jobs:
             echo "no gh-pages branch yet; the first push to main seeds it"
           fi
 
+      # One file per run rather than one pile: the action keys its history by
+      # the step's `name`, renders a heading per key and a chart per entry, and
+      # takes the regression direction from that run's tool. Merging the suites
+      # would give one heading with 88 charts and a tool field that says
+      # nothing.
       - name: build trend data
         id: trend
         if: steps.baseline.outputs.exists == 'true' || github.event_name == 'push'
         run: |
-          {
-            scripts/bench/trend-json.sh "ClickBench parquet" artifacts/clickbench.json
-            scripts/bench/trend-json.sh "TPC-H heap"         artifacts/tpch-heap.json
-            scripts/bench/trend-json.sh "TPC-H parquet"      artifacts/tpch-parquet.json
-          } | jq -s add > trend-latency.json
+          scripts/bench/trend-json.sh artifacts/clickbench.json   > trend-clickbench.json
+          scripts/bench/trend-json.sh artifacts/tpch-heap.json    > trend-tpch-heap.json
+          scripts/bench/trend-json.sh artifacts/tpch-parquet.json > trend-tpch-parquet.json
           if [ -s artifacts/pgbench-trend.json ]; then
-            cp artifacts/pgbench-trend.json trend-throughput.json
+            cp artifacts/pgbench-trend.json trend-pgbench.json
           else
-            echo '[]' > trend-throughput.json
+            echo '[]' > trend-pgbench.json
           fi
           # A job that died uploaded nothing, and the action treats an empty
-          # array as a broken result file rather than as "no news".
-          for half in latency throughput; do
-            n=$(jq 'length' "trend-$half.json")
-            echo "$half=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-            echo "trend-$half.json: $n entries"
+          # array as a broken result file rather than as "no news". Per suite,
+          # so one dead job does not take the others' history with it.
+          # The output name is underscored because `outputs.tpch-heap` reads as
+          # a subtraction in a workflow expression.
+          for suite in clickbench tpch-heap tpch-parquet pgbench; do
+            n=$(jq 'length' "trend-$suite.json")
+            echo "${suite//-/_}=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "trend-$suite.json: $n entries"
           done
 
-      # Two invocations because the two halves point opposite ways: a query
-      # time going up is a regression, a tps going up is not.
-      - name: trend — query latency
-        if: steps.trend.outputs.latency == 'true'
+      - name: trend — clickbench
+        if: steps.trend.outputs.clickbench == 'true'
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: Query latency
+          name: ClickBench (parquet)
           tool: customSmallerIsBetter
-          output-file-path: trend-latency.json
+          output-file-path: trend-clickbench.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
@@ -402,13 +406,45 @@ jobs:
           fail-on-alert: false
           summary-always: true
 
-      - name: trend — throughput
-        if: steps.trend.outputs.throughput == 'true'
+      - name: trend — tpch heap
+        if: steps.trend.outputs.tpch_heap == 'true'
         uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: Throughput
+          name: TPC-H (heap)
+          tool: customSmallerIsBetter
+          output-file-path: trend-tpch-heap.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: trend — tpch parquet
+        if: steps.trend.outputs.tpch_parquet == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: TPC-H (parquet)
+          tool: customSmallerIsBetter
+          output-file-path: trend-tpch-parquet.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          alert-threshold: "200%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      # The one suite that points the other way: a tps going up is not a
+      # regression.
+      - name: trend — pgbench
+        if: steps.trend.outputs.pgbench == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: pgbench (heap)
           tool: customBiggerIsBetter
-          output-file-path: trend-throughput.json
+          output-file-path: trend-pgbench.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
