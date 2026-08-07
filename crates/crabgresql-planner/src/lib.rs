@@ -17,7 +17,7 @@ use crabgresql_binder::{
     Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema,
+    ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema, Tuple,
 };
 use crabgresql_types::PgType;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
@@ -254,6 +254,13 @@ pub enum PhysicalInsertSource {
     /// Fully-formed rows, full-width in schema order, evaluated against the empty
     /// row.
     Values(Vec<Vec<BoundExpr>>),
+    /// Rows whose cells are already values, mirroring [`InsertSource::Tuples`].
+    /// `defaults` names the columns whose `DEFAULT` still needs evaluating once
+    /// per row.
+    Tuples {
+        rows: Vec<Tuple>,
+        defaults: Vec<(usize, BoundExpr)>,
+    },
     /// Rows pulled from `input`, each mapped through `projections` (full-width,
     /// schema order) evaluated against the source tuple.
     Query {
@@ -789,6 +796,9 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             table,
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
+                InsertSource::Tuples { rows, defaults } => {
+                    PhysicalInsertSource::Tuples { rows, defaults }
+                }
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
                     input: Box::new(lower(*input)),
                     projections,

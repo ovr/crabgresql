@@ -900,6 +900,14 @@ fn resolve_subqueries(
                         resolve_exprs(row, ctx, txn)?;
                     }
                 }
+                // The rows are values, so only the deferred defaults can hold a
+                // subquery. Not walking the rows is the point: a bulk load's
+                // per-cell walk is O(rows x columns) for nothing.
+                PhysicalInsertSource::Tuples { defaults, .. } => {
+                    for (_, default) in defaults.iter_mut() {
+                        resolve_expr(default, ctx, txn)?;
+                    }
+                }
                 PhysicalInsertSource::Query { input, projections } => {
                     resolve_subqueries(input, ctx, txn)?;
                     resolve_exprs(projections, ctx, txn)?;
@@ -1945,12 +1953,36 @@ fn collect_insert_tuples(
     let mut tuples: Vec<Tuple> = Vec::new();
     match source {
         PhysicalInsertSource::Values(rows) => {
-            for row in &rows {
+            for row in rows {
                 let mut tuple = Tuple::with_capacity(row.len());
                 for expr in row {
-                    tuple.push(eval(expr, &[], ctx)?);
+                    // A constant is already the value the tuple wants, so take
+                    // it rather than asking `eval` to clone it back out. The
+                    // rows are ours — nothing reads this plan again — and for a
+                    // bulk load that clone is a second deep copy of every text
+                    // cell. Everything else still evaluates: `VALUES` holds a
+                    // `Coerce` for a session-dependent literal, a `FuncCall` for
+                    // a `nextval`/`now()` default, a routine call, a subquery.
+                    tuple.push(match expr {
+                        BoundExpr::Const { value, .. } => value,
+                        expr => eval(&expr, &[], ctx)?,
+                    });
                 }
                 tuples.push(tuple);
+            }
+        }
+        // Already-formed rows: only the columns whose default did not fold are
+        // left to fill. Row-major and in ascending column order, which is the
+        // order the `Values` path evaluates a full-width row in — what makes a
+        // `serial` column's sequence advance identically.
+        PhysicalInsertSource::Tuples { rows, defaults } => {
+            tuples = rows;
+            if !defaults.is_empty() {
+                for tuple in &mut tuples {
+                    for (index, default) in &defaults {
+                        tuple[*index] = eval(default, &[], ctx)?;
+                    }
+                }
             }
         }
         PhysicalInsertSource::Query { input, projections } => {
