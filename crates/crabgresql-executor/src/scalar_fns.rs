@@ -25,7 +25,7 @@ use crabgresql_types::{
 };
 
 use crate::ExecError;
-use crate::eval::array_elems;
+use crate::eval::{array_elems, uuid_of};
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
 
@@ -200,6 +200,25 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             return Err(ExecError::new(
                 sqlstate::INTERNAL_ERROR,
                 "deparse function reached the pure scalar evaluator",
+            ));
+        }
+        // Likewise the two families that read the wall clock. Both are
+        // zero-arity, so without an arm here they would fall past every match
+        // below into the float8 tail and index an empty argument slice —
+        // a panic where the rest of this file promises an error.
+        ScalarFn::TransactionTimestamp
+        | ScalarFn::StatementTimestamp
+        | ScalarFn::ClockTimestamp
+        | ScalarFn::PgPostmasterStartTime => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "clock function reached the pure scalar evaluator",
+            ));
+        }
+        ScalarFn::GenRandomUuid | ScalarFn::UuidV7 | ScalarFn::UuidV7Shift => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "uuid generator reached the pure scalar evaluator",
             ));
         }
         // --- tid accessors (STRICT) ---
@@ -902,10 +921,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // value carries no such field — a version 4 value has no timestamp, and
         // a non-RFC-9562 variant has no version — so they are total.
         ScalarFn::UuidExtractVersion => {
-            return Ok(uuid::extract_version(uuid_arg(&args[0])).map_or(Value::Null, Value::Int2));
+            return Ok(uuid::extract_version(uuid_of(&args[0])).map_or(Value::Null, Value::Int2));
         }
         ScalarFn::UuidExtractTimestamp => {
-            return Ok(uuid::extract_timestamp_unix_micros(uuid_arg(&args[0]))
+            return Ok(uuid::extract_timestamp_unix_micros(uuid_of(&args[0]))
                 .map_or(Value::Null, |unix| {
                     Value::TimestampTz(tz::from_unix_micros(unix))
                 }));
@@ -2520,13 +2539,6 @@ fn text(v: &Value) -> &str {
     }
 }
 
-fn uuid_arg(v: &Value) -> &[u8; 16] {
-    match v {
-        Value::Uuid(u) => u,
-        other => unreachable!("expected uuid arg, got {other:?}"),
-    }
-}
-
 fn ts(v: &Value) -> i64 {
     match v {
         Value::Timestamp(t) => *t,
@@ -2725,6 +2737,33 @@ fn num_err(e: crabgresql_types::numeric::NumErr) -> ExecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every function `eval` dispatches ahead of this evaluator answers here
+    /// with a wiring error rather than a panic. The zero-arity families are the
+    /// ones that matter: without an arm they reach the float8 tail and index an
+    /// empty argument slice.
+    #[test]
+    fn impure_families_report_a_wiring_error() {
+        for func in [
+            ScalarFn::GenRandomUuid,
+            ScalarFn::UuidV7,
+            ScalarFn::UuidV7Shift,
+            ScalarFn::ClockTimestamp,
+            ScalarFn::TransactionTimestamp,
+            ScalarFn::StatementTimestamp,
+            ScalarFn::PgPostmasterStartTime,
+            ScalarFn::Nextval,
+        ] {
+            let e = eval_scalar(func, &[], &FmtCtx::utc_default())
+                .expect_err("an eval-dispatched function must not evaluate here");
+            assert_eq!(e.code, sqlstate::INTERNAL_ERROR, "{func:?}");
+            assert!(
+                e.message.ends_with("reached the pure scalar evaluator"),
+                "{func:?}: {}",
+                e.message
+            );
+        }
+    }
 
     #[test]
     fn boolean_equality_functions_are_strict() -> anyhow::Result<()> {

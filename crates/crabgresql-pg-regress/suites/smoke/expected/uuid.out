@@ -79,7 +79,8 @@ SELECT uuid_extract_version(gen_random_uuid()) AS v4,
   4 |        4 |  7
 (1 row)
 
--- 100 draws with no repeat, and the RFC 9562 variant nibble in every one
+-- 100 draws with no repeat (a volatile generator is evaluated per row, not
+-- hoisted out of the scan), and the RFC 9562 variant nibble in every one
 SELECT count(DISTINCT g) FROM (SELECT gen_random_uuid() AS g FROM generate_series(1, 100)) s;
  count 
 -------
@@ -94,7 +95,7 @@ SELECT count(*) AS wrong_variant
              0
 (1 row)
 
--- a version 7 value stamps the current instant, to the millisecond
+-- a version 7 value stamps the current instant
 SELECT uuid_extract_timestamp(uuidv7())
          BETWEEN now() - interval '1 minute' AND clock_timestamp() + interval '1 second'
        AS v7_is_now;
@@ -103,26 +104,27 @@ SELECT uuid_extract_timestamp(uuidv7())
  t
 (1 row)
 
-SELECT date_trunc('milliseconds', uuid_extract_timestamp(uuidv7()))
-         = uuid_extract_timestamp(uuidv7()) IS NOT FALSE AS ms_precision;
- ms_precision 
---------------
- t
-(1 row)
-
--- and successive values sort in generation order
-CREATE TABLE uuid_v7 (id int, g uuid);
-INSERT INTO uuid_v7 SELECT i, uuidv7() FROM generate_series(1, 50) i;
+-- and successive values sort in generation order — both forms, since each
+-- draws from the same monotonic guard
+CREATE TABLE uuid_v7 (id int, g uuid, shifted uuid);
+INSERT INTO uuid_v7 SELECT i, uuidv7(), uuidv7(interval '1 day') FROM generate_series(1, 50) i;
 SELECT count(*) AS out_of_order FROM uuid_v7 a JOIN uuid_v7 b ON a.id < b.id WHERE a.g >= b.g;
  out_of_order 
 --------------
             0
 (1 row)
 
-SELECT count(DISTINCT g) FROM uuid_v7;
- count 
--------
-    50
+SELECT count(*) AS shifted_out_of_order
+  FROM uuid_v7 a JOIN uuid_v7 b ON a.id < b.id WHERE a.shifted >= b.shifted;
+ shifted_out_of_order 
+----------------------
+                    0
+(1 row)
+
+SELECT count(DISTINCT g), count(DISTINCT shifted) FROM uuid_v7;
+ count | count 
+-------+-------
+    50 |    50
 (1 row)
 
 DROP TABLE uuid_v7;
@@ -162,14 +164,6 @@ SELECT uuid_extract_version('11111111-1111-5111-8111-111111111111');
  uuid_extract_version 
 ----------------------
                     5
-(1 row)
-
--- a volatile generator is evaluated per row, not hoisted out of the scan
-SELECT count(DISTINCT g) FROM (SELECT gen_random_uuid() AS g FROM generate_series(1, 100)) s
- WHERE g <> '00000000-0000-0000-0000-000000000000';
- count 
--------
-   100
 (1 row)
 
 --

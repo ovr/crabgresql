@@ -138,10 +138,17 @@ pub fn build_v7(unix_ms: u64, rand_a: u16, rand_b: [u8; 8]) -> [u8; 16] {
     stamp(b, 7)
 }
 
-/// The 12-bit `rand_a` payload for a sub-millisecond offset of `sub_us`
-/// microseconds: the fraction of a millisecond, scaled to 4096.
-pub fn sub_ms_fraction(sub_us: i64) -> u16 {
-    ((sub_us.rem_euclid(1000) * 4096) / 1000) as u16
+/// The 12-bit `rand_a` payload for an instant `sub_ns` nanoseconds from the
+/// epoch: the fraction of a millisecond it falls at, scaled to 4096.
+///
+/// Nanoseconds, not microseconds: the 4096 steps are ~244ns apart, so a
+/// microsecond reading reaches only 1000 of them while PostgreSQL's `rand_a`
+/// is spread over all 4096. A host whose clock is coarser than that simply
+/// never produces the values in between; nothing depends on it for
+/// correctness, only for how soon a burst has to borrow from the next
+/// millisecond.
+pub fn sub_ms_fraction_nanos(sub_ns: i128) -> u16 {
+    ((sub_ns.rem_euclid(1_000_000) * 4096) / 1_000_000) as u16
 }
 
 /// True when the two high bits of byte 8 are `10`, the RFC 9562 variant. The
@@ -330,20 +337,40 @@ mod tests {
 
     #[test]
     fn sub_ms_fraction_tracks_the_clock() {
-        assert_eq!(sub_ms_fraction(0), 0);
-        assert_eq!(sub_ms_fraction(999), 4091);
+        assert_eq!(sub_ms_fraction_nanos(0), 0);
+        assert_eq!(sub_ms_fraction_nanos(999_999), 4095);
         // Whole milliseconds fall away, so the fraction of an absolute instant
         // is the fraction of its remainder.
-        assert_eq!(sub_ms_fraction(1_234_567), sub_ms_fraction(567));
-        // A negative instant (before 1970) still lands in 0..1000.
-        assert_eq!(sub_ms_fraction(-1), sub_ms_fraction(999));
+        assert_eq!(
+            sub_ms_fraction_nanos(1_234_567_890),
+            sub_ms_fraction_nanos(567_890)
+        );
+        // A negative instant (before 1970) still lands in 0..1_000_000.
+        assert_eq!(sub_ms_fraction_nanos(-1), sub_ms_fraction_nanos(999_999));
 
         let mut prev = 0;
         for us in 0..1000 {
-            let f = sub_ms_fraction(us);
-            assert!(f >= prev, "fraction must not go backwards at {us}");
-            assert!(f < 4096, "fraction must fit 12 bits at {us}");
+            let f = sub_ms_fraction_nanos(us * 1000);
+            assert!(f >= prev, "fraction must not go backwards at {us}us");
+            assert!(f < 4096, "fraction must fit 12 bits at {us}us");
             prev = f;
+        }
+    }
+
+    /// Every one of the 4096 `rand_a` values must be reachable. PostgreSQL's
+    /// are spread over all of them; a microsecond-resolution clock can only
+    /// produce 1000, so this is what pins the nanosecond source.
+    #[test]
+    fn sub_ms_fraction_covers_all_4096_steps() {
+        // The first nanosecond that reaches `step` is the ceiling of the
+        // scaled boundary; the floor would land one step short.
+        let first_ns_of = |step: i128| (step * 1_000_000 + 4095) / 4096;
+        for step in 0..4096i128 {
+            assert_eq!(
+                sub_ms_fraction_nanos(first_ns_of(step)),
+                step as u16,
+                "step {step} must be reachable"
+            );
         }
     }
 }

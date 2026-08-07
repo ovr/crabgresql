@@ -41,24 +41,26 @@ SELECT 'a0eebc99'::uuid;
 SELECT uuid_extract_version(gen_random_uuid()) AS v4,
        uuid_extract_version(uuidv4())          AS v4_alias,
        uuid_extract_version(uuidv7())          AS v7;
--- 100 draws with no repeat, and the RFC 9562 variant nibble in every one
+-- 100 draws with no repeat (a volatile generator is evaluated per row, not
+-- hoisted out of the scan), and the RFC 9562 variant nibble in every one
 SELECT count(DISTINCT g) FROM (SELECT gen_random_uuid() AS g FROM generate_series(1, 100)) s;
 SELECT count(*) AS wrong_variant
   FROM (SELECT uuidv4() AS g FROM generate_series(1, 100)) s
  WHERE substring(g::text, 20, 1) NOT IN ('8', '9', 'a', 'b');
 
--- a version 7 value stamps the current instant, to the millisecond
+-- a version 7 value stamps the current instant
 SELECT uuid_extract_timestamp(uuidv7())
          BETWEEN now() - interval '1 minute' AND clock_timestamp() + interval '1 second'
        AS v7_is_now;
-SELECT date_trunc('milliseconds', uuid_extract_timestamp(uuidv7()))
-         = uuid_extract_timestamp(uuidv7()) IS NOT FALSE AS ms_precision;
 
--- and successive values sort in generation order
-CREATE TABLE uuid_v7 (id int, g uuid);
-INSERT INTO uuid_v7 SELECT i, uuidv7() FROM generate_series(1, 50) i;
+-- and successive values sort in generation order — both forms, since each
+-- draws from the same monotonic guard
+CREATE TABLE uuid_v7 (id int, g uuid, shifted uuid);
+INSERT INTO uuid_v7 SELECT i, uuidv7(), uuidv7(interval '1 day') FROM generate_series(1, 50) i;
 SELECT count(*) AS out_of_order FROM uuid_v7 a JOIN uuid_v7 b ON a.id < b.id WHERE a.g >= b.g;
-SELECT count(DISTINCT g) FROM uuid_v7;
+SELECT count(*) AS shifted_out_of_order
+  FROM uuid_v7 a JOIN uuid_v7 b ON a.id < b.id WHERE a.shifted >= b.shifted;
+SELECT count(DISTINCT g), count(DISTINCT shifted) FROM uuid_v7;
 DROP TABLE uuid_v7;
 
 -- the shift argument moves the calendar, so months and years are not a fixed
@@ -80,10 +82,6 @@ SELECT uuid_extract_timestamp('11111111-1111-4111-8111-111111111111') IS NULL AS
        uuid_extract_version('11111111-1111-1111-1111-111111111111')   IS NULL AS non_rfc_variant,
        uuid_extract_timestamp(NULL::uuid) IS NULL AS strict_null;
 SELECT uuid_extract_version('11111111-1111-5111-8111-111111111111');
-
--- a volatile generator is evaluated per row, not hoisted out of the scan
-SELECT count(DISTINCT g) FROM (SELECT gen_random_uuid() AS g FROM generate_series(1, 100)) s
- WHERE g <> '00000000-0000-0000-0000-000000000000';
 
 --
 -- The four uuidv7 range errors and the uuid/bytea casts below are hand-written

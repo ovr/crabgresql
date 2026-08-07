@@ -9,14 +9,14 @@
 use crate::{FmtCtx, PgType, Value, cast, oid};
 
 /// SQLSTATE + message (+ optional DETAIL) for a failed array input (`array_in`).
-/// The DETAIL mirrors PG's `array_in` (e.g. `Unexpected "," character.`); like
-/// `json`, it is carried through the binder's literal-input path and dropped on
-/// the runtime cast path (which has no DETAIL channel).
+/// The DETAIL is either one of PG's `array_in` lines (e.g. `Unexpected ","
+/// character.`) or whatever the failing element's own input function reported,
+/// which is why it is owned rather than `&'static str`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrayError {
     pub sqlstate: &'static str,
     pub message: String,
-    pub detail: Option<&'static str>,
+    pub detail: Option<String>,
 }
 
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -25,7 +25,7 @@ fn malformed(s: &str, detail: &'static str) -> ArrayError {
     ArrayError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("malformed array literal: \"{s}\""),
-        detail: Some(detail),
+        detail: Some(detail.to_string()),
     }
 }
 
@@ -230,7 +230,7 @@ pub fn array_in(input: &str, elem: PgType, fmt: &FmtCtx) -> Result<Vec<Value>, A
             let v = cast::cast_value(Value::Text(token), elem, fmt).map_err(|e| ArrayError {
                 sqlstate: e.sqlstate,
                 message: e.message,
-                detail: None,
+                detail: e.detail,
             })?;
             elems.push(v);
         }

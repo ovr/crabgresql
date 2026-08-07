@@ -572,15 +572,27 @@ pub fn offset_for_instant(zone: &Zone, micros: i64) -> i32 {
     }
 }
 
-/// The wall clock, as our microseconds since the 2000 epoch.
+/// The wall clock, as nanoseconds since the **Unix** epoch.
 ///
-/// The one place in the engine that reads real time. Everything time-dependent
-/// above this layer takes its instant from the session's clock
-/// ([`crate::fmt::Clock`]) so that a value is stable for as long as PostgreSQL
-/// says it is; only `clock_timestamp()`, which is volatile by definition, and
-/// the session stamping that fills that clock in call this.
+/// The one place in the engine that reads real time; [`now_micros`] below is
+/// this value, shifted and truncated. Everything time-dependent above this
+/// layer takes its instant from the session's clock ([`crate::fmt::Clock`]) so
+/// that a value is stable for as long as PostgreSQL says it is; only
+/// `clock_timestamp()`, which is volatile by definition, the session stamping
+/// that fills that clock in, and version 7 UUID generation read from here.
+///
+/// Nanoseconds rather than microseconds because a version 7 UUID quantizes the
+/// sub-millisecond remainder to 4096 steps of ~244ns each: a microsecond
+/// reading can only ever land on 1000 of them, where PostgreSQL's are spread
+/// over all 4096. The Unix epoch rather than ours because that is the era
+/// version 7 counts in, and it is the only caller that wants this resolution.
+pub fn now_unix_nanos() -> i128 {
+    Timestamp::now().as_nanosecond()
+}
+
+/// The wall clock, as our microseconds since the 2000 epoch.
 pub fn now_micros() -> i64 {
-    Timestamp::now().as_microsecond() - PG_EPOCH_UNIX_MICROS
+    from_unix_micros(now_unix_nanos().div_euclid(1_000) as i64)
 }
 
 /// When this server process started, as our microseconds since the 2000 epoch —

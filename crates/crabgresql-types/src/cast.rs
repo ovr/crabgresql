@@ -115,7 +115,7 @@ fn float_to_int_bounds(v: f64, lo: f64, hi: f64, ty: PgType) -> Result<f64, Cast
 ///
 /// * the pair is marked explicit-only (`pg_cast.castcontext = 'e'`), so it is
 ///   reachable from `CAST`/`::` but never from an assignment — `int4 -> bool`,
-///   and both `int4 <-> "char"` directions;
+///   both `int4 <-> "char"` directions, and both `uuid <-> bytea` directions;
 /// * there is no `pg_cast` entry between the two types *at all*, which is the
 ///   case for `oidvector` and `int2vector` in either direction. PostgreSQL still
 ///   accepts `x := y` between them by rendering and re-parsing, so
@@ -127,6 +127,8 @@ fn needs_io_fallback_on_assign(from: PgType, to: PgType) -> bool {
             | (PgType::Vector(_), PgType::Vector(_))
             | (PgType::Int4, PgType::Char)
             | (PgType::Char, PgType::Int4)
+            | (PgType::Uuid, PgType::Bytea)
+            | (PgType::Bytea, PgType::Uuid)
     )
 }
 
@@ -553,8 +555,10 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         }
 
         // ---- uuid ↔ bytea: the 16 stored bytes, unchanged in either
-        // direction. Explicit-only in both systems (`pg_cast` marks them `e`),
-        // which `implicit_castable` already enforces. ----
+        // direction. Explicit-only in both systems (`pg_cast` marks them `e`):
+        // `implicit_castable` keeps them out of implicit context, and
+        // `needs_io_fallback_on_assign` diverts an assignment to the I/O
+        // conversion PG uses there, so this arm is reached only from `::`. ----
         (Value::Uuid(u), PgType::Bytea) => Ok(Value::Bytea(u.to_vec())),
         (Value::Bytea(b), PgType::Uuid) => match <[u8; 16]>::try_from(b.as_slice()) {
             Ok(bytes) => Ok(Value::Uuid(bytes)),
@@ -1529,6 +1533,41 @@ mod tests {
         assert_eq!(
             cast_value_assign(Value::Null, PgType::Bool, &FmtCtx::utc(1))?,
             Value::Null
+        );
+
+        Ok(())
+    }
+
+    /// `uuid <-> bytea` is explicit-only, so an assignment takes the I/O route
+    /// rather than the 16-byte reinterpretation `::` performs: `uuid -> bytea`
+    /// renders the canonical text and stores those 36 ASCII bytes, and
+    /// `bytea -> uuid` hands `bytea_out`'s `\x…` spelling to `uuid_in`, which
+    /// rejects it. Both match PostgreSQL, where the pair has `castcontext 'e'`.
+    #[test]
+    fn assigning_uuid_and_bytea_goes_through_the_io_conversion() -> anyhow::Result<()> {
+        let fmt = FmtCtx::utc_default();
+        let text = "5b35380a-7143-4912-9b55-f322699c6770";
+        let bytes = crate::uuid::parse(text)?;
+
+        assert_eq!(
+            cast_value_assign(Value::Uuid(bytes), PgType::Bytea, &fmt)?,
+            Value::Bytea(text.as_bytes().to_vec()),
+            "assignment stores the text form, not the 16 raw bytes"
+        );
+
+        let e = cast_value_assign(Value::Bytea(bytes.to_vec()), PgType::Uuid, &fmt)
+            .expect_err("uuid_in cannot read a bytea's \\x spelling");
+        assert_eq!(e.sqlstate, "22P02");
+        assert!(
+            e.message.starts_with("invalid input syntax for type uuid:"),
+            "{}",
+            e.message
+        );
+
+        // The explicit cast is unaffected — it still moves the bytes.
+        assert_eq!(
+            cast_value(Value::Uuid(bytes), PgType::Bytea, &fmt)?,
+            Value::Bytea(bytes.to_vec())
         );
 
         Ok(())

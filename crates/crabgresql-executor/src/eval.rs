@@ -84,7 +84,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         BoundExpr::Coerce { expr, ty } => coerce_value(eval(expr, row, ctx)?, *ty, ctx),
         BoundExpr::Reinterpret { expr, rep, .. } => {
             cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
-                .map_err(|e| ExecError::new(e.sqlstate, e.message))
+                .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
         }
         BoundExpr::FuncCall { func, ret, args } => {
             let arg_values = args
@@ -512,14 +512,21 @@ fn eval_uuid_gen_fn(
 ) -> Option<Result<Value, ExecError>> {
     let bytes = match func {
         ScalarFn::GenRandomUuid => crate::uuid_gen::gen_v4(),
-        ScalarFn::UuidV7 => crate::uuid_gen::gen_v7(unix_now()),
+        ScalarFn::UuidV7 => crate::uuid_gen::gen_v7(crabgresql_types::tz::now_unix_nanos()),
         ScalarFn::UuidV7Shift => {
             let Value::Interval(span) = args[0] else {
                 return Some(Ok(Value::Null));
             };
-            match shifted_v7_instant(span, ctx) {
-                Ok(unix) => crate::uuid_gen::gen_v7_at(unix),
+            // One clock reading, used for both the displacement and the stamp,
+            // so the two cannot name different instants.
+            let now = crabgresql_types::tz::now_unix_nanos();
+            let shift_ms = match v7_shift_millis(span, now, ctx) {
+                Ok(ms) => ms,
                 Err(e) => return Some(Err(e)),
+            };
+            match crate::uuid_gen::gen_v7_shifted(now, shift_ms) {
+                Some(bytes) => bytes,
+                None => return Some(Err(v7_timestamp_out_of_range())),
             }
         }
         _ => return None,
@@ -527,20 +534,26 @@ fn eval_uuid_gen_fn(
     Some(Ok(Value::Uuid(bytes)))
 }
 
-/// The wall clock as microseconds since the Unix epoch, which is the era a
-/// version 7 UUID counts in.
-fn unix_now() -> i64 {
-    crabgresql_types::tz::to_unix_micros(crabgresql_types::tz::now_micros())
-}
-
-/// Resolve `uuidv7(shift)`'s instant: now, moved by `span`, in Unix
-/// microseconds — or the error PG reports when that lands outside the 48-bit
-/// millisecond field.
+/// How far `uuidv7(shift)` moves the stamp, in whole milliseconds.
 ///
-/// The shift goes through the same `timestamptz + interval` helper an explicit
-/// `now() + shift` would, so a month or year component moves the calendar
-/// rather than a fixed count of microseconds.
-fn shifted_v7_instant(span: Interval, ctx: &ExecContext) -> Result<i64, ExecError> {
+/// The displacement is *measured*, not applied: `now + span` goes through the
+/// same `timestamptz + interval` helper an explicit `now() + shift` would, so a
+/// month or year component moves the calendar rather than a fixed count of
+/// microseconds — but only the distance is kept, and the generator adds it to
+/// the latched key. That is what keeps a shifted value ordered against the
+/// others while leaving the guard's state a function of the clock alone.
+///
+/// Whole milliseconds because `rand_a` is a precision field, not a time field:
+/// folding a sub-millisecond remainder into it could carry into the stamp
+/// depending on what the latch happened to hold, so `uuidv7(interval '1.0005
+/// seconds')` would land on either of two milliseconds at random. PostgreSQL's
+/// shifted values sit at exactly the named offset, so the remainder is dropped
+/// — by `div_euclid`, which floors, keeping the mapping monotone across zero.
+fn v7_shift_millis(
+    span: Interval,
+    now_unix_nanos: i128,
+    ctx: &ExecContext,
+) -> Result<i64, ExecError> {
     if !span.is_finite() {
         return Err(ExecError::new(
             sqlstate::DATETIME_FIELD_OVERFLOW,
@@ -550,20 +563,12 @@ fn shifted_v7_instant(span: Interval, ctx: &ExecContext) -> Result<i64, ExecErro
             "UUID version 7 does not support infinite intervals.".into(),
         )));
     }
+    let base = crabgresql_types::tz::from_unix_micros(now_unix_nanos.div_euclid(1_000) as i64);
     // Any failure inside the shift is a range failure, and reporting it as a
     // bare "timestamp out of range" would name a type the caller never wrote.
-    let shifted = crabgresql_types::timestamptz::pl_interval(
-        crabgresql_types::tz::now_micros(),
-        span,
-        ctx.fmt.zone.zone(),
-    )
-    .map_err(|_| v7_timestamp_out_of_range())?;
-    let unix = crabgresql_types::tz::to_unix_micros(shifted);
-    let ms = unix.div_euclid(1000);
-    if unix < 0 || ms > crabgresql_types::uuid::V7_MAX_UNIX_MS as i64 {
-        return Err(v7_timestamp_out_of_range());
-    }
-    Ok(unix)
+    let shifted = crabgresql_types::timestamptz::pl_interval(base, span, ctx.fmt.zone.zone())
+        .map_err(|_| v7_timestamp_out_of_range())?;
+    Ok(shifted.saturating_sub(base).div_euclid(1_000))
 }
 
 fn v7_timestamp_out_of_range() -> ExecError {
@@ -1489,7 +1494,7 @@ fn char_of(v: &Value) -> u8 {
     }
 }
 
-fn uuid_of(v: &Value) -> &[u8; 16] {
+pub(crate) fn uuid_of(v: &Value) -> &[u8; 16] {
     match v {
         Value::Uuid(b) => b,
         other => unreachable!("expected uuid, got {other:?}"),

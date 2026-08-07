@@ -8813,9 +8813,7 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
             // transaction clock a scalar of that type would get.
             crabgresql_types::array::array_in(s, elem, fmt)
                 .map(|elems| Value::Array { elem, elems })
-                .map_err(|e| {
-                    BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
-                })
+                .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail))
         }
         // Both vector errors name the *element* type (`oid`/`smallint`), so the
         // message comes from `vector_in` rather than the `invalid` helper above.
