@@ -60,10 +60,22 @@ termination, per-row triggers. Therefore:
 
 v2 has begun. Columnar nodes live in `crabgresql-executor`'s `vector` module
 **beside** the row nodes, never replacing them: a scan, an append, a filter, a
-take-only projection and a sort. A columnar *segment* starts at a scan whose
-engine offers `TableAm::scan_batches` and runs as far up as every operator has a
-vectorized form; `Shred` turns batches back into tuples wherever it stops, so
-the row executor above is unchanged and remains correct on its own.
+take-only projection, a sort and a grouped aggregate. A columnar *segment* starts
+at a scan whose engine offers `TableAm::scan_batches` and runs as far up as every
+operator has a vectorized form; `Shred` turns batches back into tuples wherever it
+stops, so the row executor above is unchanged and remains correct on its own.
+
+The aggregate is the one node that ends a segment without a `Shred`, because its
+output is one row per group and that is what the row nodes above it want anyway.
+It is also deliberately *half* vectorized: the scan, the decode and the `WHERE`
+run on batches, but accumulation and grouping go one value at a time through the
+row engine's own accumulators and group index. Aggregation is where PostgreSQL's
+arithmetic lives — `sum(int8)` promoting to `numeric`, `avg`'s divide scale,
+`min`/`max` collation, order-dependent float summation, first-seen group order and
+representatives — and no Arrow kernel reproduces any of it. What the node deletes
+is the per-row full-width tuple, which on a wide relation read for two columns is
+the dominant cost; a `count` over a whole batch folds from the batch height and
+touches no value at all.
 
 Four rules keep this honest:
 
@@ -77,15 +89,18 @@ Four rules keep this honest:
 - **Declining is free.** Anything outside the provable subset falls back to the
   row node silently. A fallback is never an error.
 - **`EXPLAIN` says so.** A vectorized node renders a `(columnar: scan, filter,
-  sort)` suffix — a deliberate divergence from PG's output, on the grounds that
-  a plan which runs on a different engine than it appears to is worth less than
-  the compatibility it costs. Row-path plans render exactly as before.
+  sort, aggregate)` suffix — a deliberate divergence from PG's output, on the
+  grounds that a plan which runs on a different engine than it appears to is worth
+  less than the compatibility it costs. Row-path plans render exactly as before.
 
 Where Arrow's semantics differ from PostgreSQL's, the type is excluded rather
 than approximated: `numeric` (stored as text, so Arrow would compare `'9' >
 '10'`), floats under equality (PG defines `NaN = NaN` as true), `bpchar`
 (blank-trimmed comparison), `timetz`/`interval` (structs with their own orders),
-and text ordering under an ICU collation. Floats *are* usable as sort keys,
+and text ordering under an ICU collation. Those exclusions belong to *comparison*,
+so they do not apply to a grouping key: the aggregate decodes its keys and hands
+them to the row engine's `keys_equal`, which is why `GROUP BY` on a `numeric` or
+`float8` column vectorizes where a `WHERE` on one does not. Floats *are* usable as sort keys,
 because canonicalizing `-0.0` and NaN makes Arrow's total order coincide with
 PG's — ordering is repairable where equality is not. `AND`/`OR` use Arrow's
 Kleene kernels; the plain ones return NULL for `false AND NULL` and would

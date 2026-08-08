@@ -324,8 +324,19 @@ impl Accumulator {
     /// Count one row for `count(*)` (which takes no argument and skips no rows).
     /// A no-op for every other aggregate.
     pub fn count_row(&mut self) {
+        self.count_rows(1);
+    }
+
+    /// Count `rows` rows at once.
+    ///
+    /// The columnar aggregate uses this: a `count` over a whole batch is the batch
+    /// height (or the height less a column's nulls), both of which Arrow already
+    /// knows, so the batch folds in one add instead of one per row. Identical to
+    /// `count_row` called `rows` times — the state is a plain counter and nothing
+    /// in it depends on the row.
+    pub fn count_rows(&mut self, rows: i64) {
         if let AggState::Count(n) = &mut self.state {
-            *n += 1;
+            *n += rows;
         }
     }
 

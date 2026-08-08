@@ -1363,14 +1363,24 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         } => explain_join(source, predicate.as_ref()),
         PhysicalPlan::Aggregate {
             input, predicate, ..
-        } => match input {
-            // Only the join input is rendered in detail: it is the shape whose
-            // access strategy is worth observing, and the one pushdown changes.
-            PhysicalAggInput::Join(source) => {
-                nest_under("Aggregate", explain_join(source, predicate.as_ref()))
+        } => {
+            // The whole `(columnar: …)` suffix lands here, the scan included:
+            // nothing below an aggregate renders one of its own, because an
+            // `Append` gets its annotation from the wrapping `Subquery` a plain
+            // `SELECT` has and an aggregate's input does not.
+            let label = format!(
+                "Aggregate{}",
+                plan.vectorization().suffix().unwrap_or_default()
+            );
+            match input {
+                // Only the join input is rendered in detail: it is the shape whose
+                // access strategy is worth observing, and the one pushdown changes.
+                PhysicalAggInput::Join(source) => {
+                    nest_under(&label, explain_join(source, predicate.as_ref()))
+                }
+                _ => vec![label],
             }
-            _ => vec!["Aggregate".to_string()],
-        },
+        }
         // PG renders one `WindowAgg` per spec with a `Window: wN AS (…)`
         // property, numbering the specs in *evaluation* order — so the bottom
         // node of a chain is `w1`. Numbering here is by depth for the same

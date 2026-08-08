@@ -27,6 +27,7 @@
 //! schema order, so a `BoundExpr::ColumnRef { index }` indexes a batch column
 //! exactly as it indexes a row.
 
+pub mod agg;
 pub mod expr;
 pub mod sort;
 #[cfg(test)]

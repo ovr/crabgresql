@@ -14,10 +14,12 @@
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.
 
-use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, UnaryOp};
+use crabgresql_binder::{BinOp, BoundAggregate, BoundExpr, DistinctKey, SortKey, UnaryOp};
 use crabgresql_types::{PgType, collation};
 
-use crate::{PhysicalAppendArm, PhysicalPlan};
+use crate::{
+    PhysicalAggInput, PhysicalAppendArm, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
+};
 
 /// Which parts of one plan node run columnar. Rendered by
 /// [`explain`](crate::explain) and consulted by the executor as it builds.
@@ -29,11 +31,14 @@ pub struct Vectorization {
     pub filter: bool,
     /// The `ORDER BY` (with its projection) runs as an Arrow sort.
     pub sort: bool,
+    /// The `GROUP BY` consumes batches directly, instead of shredding each input
+    /// row into a tuple first.
+    pub agg: bool,
 }
 
 impl Vectorization {
     pub fn any(self) -> bool {
-        self.scan || self.filter || self.sort
+        self.scan || self.filter || self.sort || self.agg
     }
 
     /// The `EXPLAIN` suffix for a node, or `None` when nothing vectorized.
@@ -50,6 +55,7 @@ impl Vectorization {
             (self.scan, "scan"),
             (self.filter, "filter"),
             (self.sort, "sort"),
+            (self.agg, "aggregate"),
         ]
         .into_iter()
         .filter_map(|(on, name)| on.then_some(name))
@@ -208,6 +214,57 @@ fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
     }
 }
 
+/// Whether one grouping key or aggregate argument can be read straight out of a
+/// batch.
+///
+/// The same subset as a comparison operand, and for the same reason: there is no
+/// general vectorized expression evaluator, so anything computed —
+/// `GROUP BY a + b`, `sum(x + 1)`, `count(f(x))` — stays on the row path.
+///
+/// Note what is *not* required here, and is the point worth understanding about
+/// this gate. A grouping key needs no [`comparable`] check. Group identity is
+/// decided by `agg::hash_key` and `agg::keys_equal` over decoded
+/// [`Value`](crabgresql_types::Value)s — the row engine's own equality — so
+/// `numeric`, `float8` and `bpchar` keys are all admissible here even though a
+/// columnar *filter* must reject them. The columnar part of an aggregate is
+/// getting the values out of the batch, not comparing them.
+pub fn vectorizable_agg_cell(expr: &BoundExpr, width: usize) -> bool {
+    match strip_collate(expr) {
+        // A widening cast is admissible in a filter because Arrow does the
+        // comparing; here the value is decoded and handed to the row engine, so a
+        // cast would have to be *applied*, which is the computation this subset
+        // excludes. Hence `ColumnRef`/`Const` only, not `vectorizable_operand`.
+        BoundExpr::ColumnRef { index, .. } => *index < width,
+        BoundExpr::Const { ty, .. } => crabgresql_storage_api::arrow::supports_type(*ty),
+        _ => false,
+    }
+}
+
+fn strip_collate(expr: &BoundExpr) -> &BoundExpr {
+    match expr {
+        BoundExpr::Collate { expr, .. } => strip_collate(expr),
+        other => other,
+    }
+}
+
+/// Whether every grouping key and aggregate argument reads straight out of a
+/// batch, so the aggregate can consume batches instead of shredded tuples.
+///
+/// The aggregate functions themselves are unrestricted — `DISTINCT`, `string_agg`
+/// and all — because the accumulators are the row engine's own. Only the *inputs*
+/// are gated.
+pub fn vectorizable_aggregate(
+    group_exprs: &[BoundExpr],
+    aggregates: &[BoundAggregate],
+    width: usize,
+) -> bool {
+    let cell = |expr| vectorizable_agg_cell(expr, width);
+    group_exprs.iter().all(cell)
+        && aggregates
+            .iter()
+            .all(|aggregate| aggregate.args.iter().all(cell))
+}
+
 /// Whether a projection is a pure column take — a reorder or a constant, never
 /// a computation. Only such a projection keeps the columnar segment alive as far
 /// as a sort, because a [`SortKey`] indexes the *projected* tuple.
@@ -258,7 +315,14 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
             .sort
             .iter()
             .all(|key| key.column < tail.projections.len() && sortable_key(key));
-    Vectorization { scan, filter, sort }
+    // A scan-bearing node has no grouping of its own; `PhysicalPlan::Aggregate`
+    // is the only shape that sets `agg`.
+    Vectorization {
+        scan,
+        filter,
+        sort,
+        agg: false,
+    }
 }
 
 /// Whether every arm of an `Append` can hand up batches. All or none: their
@@ -281,6 +345,57 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
 /// column is not in any batch — it is appended by the row `Append` — so
 /// `crabgresql_executor::vector::BatchAppend::open` declines it, and this must
 /// decline with it or `EXPLAIN` claims a columnar scan that never runs.
+/// The width of the batches an aggregate's input can hand up, or `None` when it
+/// cannot hand up batches at all.
+///
+/// Consulted by both [`PhysicalPlan::vectorization`] and the executor's
+/// `agg_source`, so the annotation and the pipeline cannot disagree about which
+/// inputs qualify.
+///
+/// The `Join` arm is the load-bearing one, not a generalisation. A relation with
+/// storage leaves — which is *every* `USING parquet` relation, since its rows live
+/// in a durable chunk store and a RAM write buffer — binds as
+/// `JoinInput::Subplan(Append)`, so `build_query_block`'s `JoinInput::Scan`
+/// pattern misses and the aggregate's input is a one-input `Join`.
+/// `PhysicalAggInput::Scan` is reached only by a monolithic relation: a heap table
+/// (no batch path) or a standalone `USING buffer` table.
+pub fn agg_input_width(input: &PhysicalAggInput) -> Option<usize> {
+    let of_table = |table: &std::sync::Arc<dyn crabgresql_storage_api::TableAm>| {
+        table
+            .supports_batch_scan()
+            .then(|| table.schema().columns.len())
+    };
+    match input {
+        PhysicalAggInput::Scan { table, .. } => of_table(table),
+        PhysicalAggInput::Join(PhysicalJoinExpr::Input {
+            input, predicate, ..
+        }) => {
+            // A single-input `Input` carries no predicate of its own: only the
+            // `Join` arm runs `sink_leaf_filters`. Checked rather than assumed,
+            // because a sunk filter this classification skipped would be a
+            // dropped `WHERE` — a wrong answer, not a slow one.
+            if predicate.is_some() {
+                debug_assert!(false, "a single-input join expression carries no predicate");
+                return None;
+            }
+            match input {
+                PhysicalJoinInput::Scan { table, .. } => of_table(table),
+                PhysicalJoinInput::Subplan(source) => match source.as_ref() {
+                    // The width is the *named* relation's, which an arm's own
+                    // width equals only when it does not remap — and `arms_batch`
+                    // refuses a remapped arm.
+                    PhysicalPlan::Append { arms, columns } => {
+                        arms_batch(arms).then_some(columns.len())
+                    }
+                    _ => None,
+                },
+                PhysicalJoinInput::TableFunction { .. } => None,
+            }
+        }
+        PhysicalAggInput::Join(_) | PhysicalAggInput::SingleRow => None,
+    }
+}
+
 fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
     !arms.is_empty()
         && arms.iter().all(|arm| {
@@ -353,6 +468,49 @@ impl PhysicalPlan {
                 scan: arms_batch(arms),
                 ..Vectorization::default()
             },
+            // A grouped aggregate consumes batches directly instead of shredding
+            // each input row into a tuple — see
+            // `crabgresql_executor::vector::agg`.
+            //
+            // The whole suffix lands on *this* line, `scan` included, because under
+            // an aggregate nothing below it renders one. An `Append` gets its
+            // annotation from the `Subquery` that wraps it in a plain `SELECT`
+            // (see that arm), and an aggregate's input is a bare join input with no
+            // such wrapper — `PhysicalPlan::Append`'s own arm attaches nothing. So
+            // reporting `scan` here is the only way the columnar scan is visible at
+            // all; it would only double up if that arm ever gained a suffix of its
+            // own.
+            //
+            // `sort` stays `false` for a different reason: this node's
+            // `projections`, `sort` and `distinct` index the *post-grouping* row,
+            // not the input, so `tail_vectorization`'s rules do not apply to them.
+            PhysicalPlan::Aggregate {
+                input,
+                predicate,
+                group_exprs,
+                aggregates,
+                ..
+            } => {
+                let Some(width) = agg_input_width(input) else {
+                    return Vectorization::default();
+                };
+                let filter = predicate
+                    .as_ref()
+                    .is_some_and(|predicate| vectorizable_predicate(predicate, width));
+                // A predicate the columnar filter declined is still waiting for the
+                // row `Filter`, which has to run *before* grouping — and a row
+                // filter cannot be interposed in a batch stream. So the grouping
+                // goes back to rows, exactly as a leftover predicate blocks the
+                // columnar sort. The scan below it stays columnar either way.
+                let predicate_gone = predicate.is_none() || filter;
+                let agg = predicate_gone && vectorizable_aggregate(group_exprs, aggregates, width);
+                Vectorization {
+                    scan: true,
+                    filter,
+                    sort: false,
+                    agg,
+                }
+            }
             _ => Vectorization::default(),
         }
     }

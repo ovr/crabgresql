@@ -7747,6 +7747,199 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     Ok(())
 }
 
+/// A grouped aggregate over a batch-capable relation consumes batches directly
+/// instead of shredding every input row into a tuple first. The annotation names
+/// only what this node runs columnar — its `WHERE` and its grouping — because the
+/// scan belongs to the child line, which carries its own.
+#[tokio::test]
+async fn a_grouped_aggregate_over_a_split_relation_runs_columnar() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE h (id int4, flag int2, label text, d date, amount numeric) \
+             USING parquet ORDER BY (id)",
+        )
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO h VALUES (1, 0, 'a', '2013-07-01', 1.50), \
+             (2, 1, 'b', '2013-07-02', 2.25), (3, 0, 'a', '2013-07-01', 3.00)",
+        )
+        .await?;
+
+    for (query, expected) in [
+        // No WHERE: the grouping alone vectorizes.
+        (
+            "EXPLAIN SELECT label, count(*) FROM h GROUP BY label",
+            "Aggregate (columnar: scan, aggregate)",
+        ),
+        // With a WHERE the filter runs below the grouping, on batches.
+        (
+            "EXPLAIN SELECT label, count(*) FROM h WHERE flag = 0 GROUP BY label",
+            "Aggregate (columnar: scan, filter, aggregate)",
+        ),
+        // An unkeyed aggregate is the same node with one seeded group.
+        (
+            "EXPLAIN SELECT count(*) FROM h",
+            "Aggregate (columnar: scan, aggregate)",
+        ),
+        // A `numeric` key is admissible here although a columnar *filter* must
+        // refuse `numeric`: grouping identity comes from the row engine's own
+        // `keys_equal` over decoded values, not from an Arrow comparison.
+        (
+            "EXPLAIN SELECT amount, count(*) FROM h GROUP BY amount",
+            "Aggregate (columnar: scan, aggregate)",
+        ),
+        // A computed key has no vectorized evaluator, so the whole node declines.
+        (
+            "EXPLAIN SELECT id + 1, count(*) FROM h GROUP BY id + 1",
+            "Aggregate (columnar: scan)",
+        ),
+        // So does a computed aggregate argument.
+        (
+            "EXPLAIN SELECT sum(id + 1) FROM h",
+            "Aggregate (columnar: scan)",
+        ),
+        // A `WHERE` the filter cannot compile leaves a row `Filter` that has to
+        // run before grouping, and a row filter cannot sit inside a batch stream —
+        // so the node goes back to rows entirely rather than half way.
+        (
+            "EXPLAIN SELECT count(*) FROM h WHERE label LIKE 'a%'",
+            "Aggregate (columnar: scan)",
+        ),
+    ] {
+        let lines = explain_lines(&client, query).await?;
+        assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");
+    }
+
+    // A heap relation has no batch path, so nothing about its plan changes.
+    client.simple_query("CREATE TABLE hh (id int4)").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT count(*) FROM hh").await?;
+    assert_eq!(lines.first().map(String::as_str), Some("Aggregate"));
+
+    // And the annotation is earned: every one of those columnar shapes answers
+    // what the row path answers.
+    for (query, expected) in [
+        ("SELECT count(*) FROM h", vec!["3"]),
+        (
+            "SELECT label, count(*) FROM h GROUP BY label",
+            vec!["a|2", "b|1"],
+        ),
+        (
+            "SELECT label, count(*) FROM h WHERE flag = 0 GROUP BY label",
+            vec!["a|2"],
+        ),
+        (
+            "SELECT d, count(*) FROM h GROUP BY d",
+            vec!["2013-07-01|2", "2013-07-02|1"],
+        ),
+        (
+            "SELECT sum(id), avg(id), min(label), max(label) FROM h",
+            vec!["6|2.0000000000000000|a|b"],
+        ),
+        ("SELECT count(DISTINCT label) FROM h", vec!["2"]),
+        ("SELECT string_agg(label, ',') FROM h", vec!["a,b,a"]),
+        (
+            "SELECT amount, count(*) FROM h GROUP BY amount",
+            vec!["1.50|1", "2.25|1", "3.00|1"],
+        ),
+    ] {
+        let messages = client.simple_query(query).await?;
+        let got = rows(&messages)
+            .iter()
+            .map(|row| {
+                (0..expected[0].split('|').count())
+                    .map(|i| row.get(i).unwrap_or("<null>").to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got, expected, "{query}");
+    }
+    Ok(())
+}
+
+/// The highest-probability silent-wrong-answer in the columnar aggregate, pinned.
+///
+/// A batch carries `Value` semantics, not Arrow's: a `Date32` holds days since
+/// PostgreSQL's 2000-01-01 epoch and a `Timestamp` microseconds since the same,
+/// rebased at the storage boundary that owns the file format. A Parquet relation
+/// reads from *two* leaves — durable chunks, whose epoch conversion happens in the
+/// Parquet reader, and a RAM write buffer, which never saw a file at all — so a
+/// rebase applied on one side and not the other does not fail: it reports **two
+/// groups per date**, one of them ~30 years out.
+///
+/// Only a grouped aggregate over rows straddling the leaf boundary shows that, and
+/// only against a relation where some rows are flushed and some are not.
+#[tokio::test]
+async fn grouping_a_date_across_both_storage_leaves_forms_one_group_per_date() -> anyhow::Result<()>
+{
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (id int4, d date, ts timestamp) USING parquet ORDER BY (id)")
+        .await?;
+    // Two rows per date, then flushed to the chunk store.
+    client
+        .simple_query(
+            "INSERT INTO t VALUES (1, '2013-07-01', '2013-07-01 10:00:00'), \
+             (2, '2013-07-02', '2013-07-02 10:00:00')",
+        )
+        .await?;
+    client.simple_query("VACUUM t").await?;
+    // The matching rows now stay in the RAM buffer, unflushed.
+    client
+        .simple_query(
+            "INSERT INTO t VALUES (3, '2013-07-01', '2013-07-01 10:00:00'), \
+             (4, '2013-07-02', '2013-07-02 10:00:00')",
+        )
+        .await?;
+
+    // The plan really does read both leaves, and really does group columnar —
+    // otherwise this test would pass while proving nothing.
+    let lines = explain_lines(&client, "EXPLAIN SELECT d, count(*) FROM t GROUP BY d").await?;
+    assert_eq!(
+        lines,
+        vec![
+            "Aggregate (columnar: scan, aggregate)".to_string(),
+            "  ->  Append".to_string(),
+            "        ->  Seq Scan on t".to_string(),
+            "        ->  Buffer Scan on t".to_string(),
+        ],
+        "{lines:?}"
+    );
+
+    for (query, expected) in [
+        (
+            "SELECT d, count(*) FROM t GROUP BY d ORDER BY d",
+            vec!["2013-07-01|2", "2013-07-02|2"],
+        ),
+        (
+            "SELECT ts, count(*) FROM t GROUP BY ts ORDER BY ts",
+            vec!["2013-07-01 10:00:00|2", "2013-07-02 10:00:00|2"],
+        ),
+        // The keys also have to come back as the right *values*, not merely be
+        // consistent with each other: a rebase missed on both leaves alike would
+        // group correctly and still render 1983.
+        (
+            "SELECT min(d), max(d), min(ts), max(ts) FROM t",
+            vec!["2013-07-01|2013-07-02|2013-07-01 10:00:00|2013-07-02 10:00:00"],
+        ),
+    ] {
+        let messages = client.simple_query(query).await?;
+        let got = rows(&messages)
+            .iter()
+            .map(|row| {
+                (0..expected[0].split('|').count())
+                    .map(|i| row.get(i).unwrap_or("<null>").to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got, expected, "{query}");
+    }
+    Ok(())
+}
+
 /// A `smallint` column compared to an integer literal resolves in `int4`, so the
 /// binder wraps the *column* in a cast and the predicate is no longer a bare
 /// column beside a constant. Widening is total over the source type, so the
