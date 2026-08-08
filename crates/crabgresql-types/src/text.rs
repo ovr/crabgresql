@@ -388,9 +388,26 @@ struct Segment {
     items: Vec<SegItem>,
     /// Width in characters, not bytes.
     width: usize,
+    /// Searcher for the literal [`find_segment`] scans for, i.e. the first
+    /// `Lit`. Only the floating middle segments are ever searched for — an
+    /// anchored head or tail is compared in place — so only they carry one.
+    lead: Option<Needle>,
 }
 
 impl Segment {
+    /// Give the segment the searcher for its leading literal. Called only for
+    /// the middle segments, when the compiler knows they will be scanned for.
+    fn with_lead_searcher(mut self) -> Self {
+        let lead = match self.items.first() {
+            Some(SegItem::Skip(_)) => self.items.get(1),
+            other => other,
+        };
+        if let Some(SegItem::Lit(text)) = lead {
+            self.lead = Some(Needle::new(text.clone()));
+        }
+        self
+    }
+
     /// The segment's text when it is one literal run and nothing else. Drives
     /// the `Exact`/`Prefix`/`Suffix`/`Contains` specializations.
     fn as_lit(&self) -> Option<&str> {
@@ -416,7 +433,7 @@ enum LikeProgram {
     /// `%lit`
     Suffix(String),
     /// `%lit%`
-    Contains(String),
+    Contains(Needle),
     /// No `%`, but at least one `_`: the whole subject is one segment.
     Whole(Segment),
     /// `head % mid … mid % tail`. `head`/`tail` are `None` when the pattern
@@ -426,6 +443,26 @@ enum LikeProgram {
         mids: Vec<Segment>,
         tail: Option<Segment>,
     },
+}
+
+/// A literal that gets *searched for* rather than compared in place, carrying
+/// the substring searcher alongside it.
+///
+/// `str::find` builds a two-way searcher on every call, and for subjects the
+/// length of a URL that setup costs several times the search: measured over
+/// 800k 60-byte subjects, `str::find("google")` takes 35ms against 4.8ms for a
+/// searcher built once. Compilation is cached per pattern, so building it there
+/// takes the setup off the row path entirely.
+struct Needle {
+    text: String,
+    finder: memchr::memmem::Finder<'static>,
+}
+
+impl Needle {
+    fn new(text: String) -> Self {
+        let finder = memchr::memmem::Finder::new(text.as_bytes()).into_owned();
+        Needle { text, finder }
+    }
 }
 
 /// Everything besides the pattern text that changes what it compiles to. Both
@@ -441,11 +478,22 @@ struct LikeKind {
 /// implementations rather than a runtime flag, so the hot loop carries no case
 /// branch.
 trait CaseCmp {
+    /// Whether a searcher built over the compiled literal answers for this
+    /// policy. Folding needs both cases of every byte, and the literal is
+    /// stored lowercased, so only the case-sensitive one can use it.
+    const USES_LEAD_SEARCHER: bool;
+
     fn eq(hay: &str, needle: &str) -> bool;
     fn starts_with(hay: &str, needle: &str) -> bool;
     fn ends_with(hay: &str, needle: &str) -> bool;
     /// Leftmost byte offset of `needle` in `hay`, or `None`.
     fn find(hay: &str, needle: &str) -> Option<usize>;
+    /// Whether `needle` occurs in `hay`, given the searcher compiled for it.
+    /// Only the case-sensitive policy can use that searcher — it is built over
+    /// the lowercased literal, which would not match a folded haystack.
+    fn contains(hay: &str, needle: &Needle) -> bool {
+        Self::find(hay, &needle.text).is_some()
+    }
 }
 
 /// Byte-exact comparison, for `LIKE` and for the non-ASCII `ILIKE` fallback
@@ -453,6 +501,7 @@ trait CaseCmp {
 struct Exact;
 
 impl CaseCmp for Exact {
+    const USES_LEAD_SEARCHER: bool = true;
     fn eq(hay: &str, needle: &str) -> bool {
         hay == needle
     }
@@ -464,6 +513,9 @@ impl CaseCmp for Exact {
     }
     fn find(hay: &str, needle: &str) -> Option<usize> {
         hay.find(needle)
+    }
+    fn contains(hay: &str, needle: &Needle) -> bool {
+        needle.finder.find(hay.as_bytes()).is_some()
     }
 }
 
@@ -485,6 +537,7 @@ impl CaseCmp for Exact {
 struct AsciiFold;
 
 impl CaseCmp for AsciiFold {
+    const USES_LEAD_SEARCHER: bool = false;
     fn eq(hay: &str, needle: &str) -> bool {
         debug_assert!(hay.is_ascii(), "AsciiFold compared a non-ASCII window");
         hay.as_bytes().eq_ignore_ascii_case(needle.as_bytes())
@@ -590,7 +643,15 @@ fn find_segment<C: CaseCmp>(s: &str, from: usize, end: usize, seg: &Segment) -> 
     };
     let mut search = base;
     loop {
-        let at = search + C::find(s.get(search..end)?, needle)?;
+        let window = s.get(search..end)?;
+        // Prefer the searcher built at compile time; `C::find` would rebuild
+        // one per row. Only the case-sensitive policy can use it (see
+        // [`CaseCmp::contains`]), so the fallback stays.
+        let at = search
+            + match seg.lead.as_ref().filter(|_| C::USES_LEAD_SEARCHER) {
+                Some(lead) => lead.finder.find(window.as_bytes())?,
+                None => C::find(window, needle)?,
+            };
         // `C::find` has already compared `needle`, so resume past it rather
         // than letting `match_at` redo that comparison. When the segment is a
         // lone literal — the `%lit%` shape — `rest[1..]` is empty and the
@@ -645,7 +706,7 @@ impl LikeProgram {
             LikeProgram::Exact(lit) => C::eq(s, lit),
             LikeProgram::Prefix(lit) => C::starts_with(s, lit),
             LikeProgram::Suffix(lit) => C::ends_with(s, lit),
-            LikeProgram::Contains(lit) => C::find(s, lit).is_some(),
+            LikeProgram::Contains(needle) => C::contains(s, needle),
             LikeProgram::Whole(seg) => match_at::<C>(s, 0, &seg.items) == Some(s.len()),
             LikeProgram::Segments { head, mids, tail } => {
                 self.match_segments::<C>(s, head.as_ref(), mids, tail.as_ref())
@@ -747,6 +808,7 @@ fn compile_like(pattern: &str, kind: LikeKind) -> Result<LikeProgram> {
             parts.push(Segment {
                 items: std::mem::take(&mut items),
                 width,
+                lead: None,
             });
             width = 0;
         } else if c == '_' {
@@ -762,7 +824,11 @@ fn compile_like(pattern: &str, kind: LikeKind) -> Result<LikeProgram> {
         }
     }
     flush(&mut items, &mut lit);
-    parts.push(Segment { items, width });
+    parts.push(Segment {
+        items,
+        width,
+        lead: None,
+    });
 
     Ok(narrow(parts))
 }
@@ -782,14 +848,17 @@ fn narrow(mut parts: Vec<Segment>) -> LikeProgram {
     let mut rest = parts.into_iter();
     let head = rest.next().expect("at least two parts");
     // Empty middle runs come from `%%` and constrain nothing.
-    let mids: Vec<Segment> = rest.filter(|m| !m.is_empty()).collect();
+    let mids: Vec<Segment> = rest
+        .filter(|m| !m.is_empty())
+        .map(Segment::with_lead_searcher)
+        .collect();
 
     let head = (!head.is_empty()).then_some(head);
     let tail = (!tail.is_empty()).then_some(tail);
     match (&head, mids.as_slice(), &tail) {
-        (None, [], None) => LikeProgram::Contains(String::new()),
+        (None, [], None) => LikeProgram::Contains(Needle::new(String::new())),
         (None, [only], None) => match only.as_lit() {
-            Some(lit) => LikeProgram::Contains(lit.to_string()),
+            Some(lit) => LikeProgram::Contains(Needle::new(lit.to_string())),
             None => LikeProgram::Segments { head, mids, tail },
         },
         (Some(h), [], None) => match h.as_lit() {
