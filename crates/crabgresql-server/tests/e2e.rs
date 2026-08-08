@@ -7704,6 +7704,11 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
             "EXPLAIN SELECT id FROM p ORDER BY id + 1",
             "Append (columnar: scan)",
         ),
+        // `tableoid` is not a column of any batch — the row `Append` appends it
+        // — so `BatchAppend::open` declines the whole node. The annotation has to
+        // decline with it; claiming a columnar scan here would report work that
+        // never happens.
+        ("EXPLAIN SELECT tableoid, id FROM p", "Append"),
     ] {
         let lines = explain_lines(&client, query).await?;
         assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");

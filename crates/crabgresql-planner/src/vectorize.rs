@@ -243,15 +243,24 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
 /// has nowhere to apply a permutation, so it would concatenate mis-ordered
 /// columns rather than fail.
 ///
-/// Nothing pays for this today because DDL refuses an engine-managed relation on
-/// *either* side of an inheritance link, so no hierarchy can contain a
+/// Nothing pays for the *remap* rule today because DDL refuses an engine-managed
+/// relation on *either* side of an inheritance link, so no hierarchy can contain a
 /// batch-capable relation at all. That is what makes the all-or-none rule free
 /// rather than a silent de-optimization of the parent.
+///
+/// An arm that must emit a `tableoid` is a different matter and is reachable:
+/// `SELECT tableoid, id FROM p` on a Parquet relation stamps every arm with its
+/// own relation identity and widens the arm's column list by one. That extra
+/// column is not in any batch — it is appended by the row `Append` — so
+/// `crabgresql_executor::vector::BatchAppend::open` declines it, and this must
+/// decline with it or `EXPLAIN` claims a columnar scan that never runs.
 fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
     !arms.is_empty()
-        && arms
-            .iter()
-            .all(|arm| arm.relation.map.is_none() && arm.relation.table.supports_batch_scan())
+        && arms.iter().all(|arm| {
+            arm.relation.map.is_none()
+                && arm.relation.tableoid.is_none()
+                && arm.relation.table.supports_batch_scan()
+        })
 }
 
 impl PhysicalPlan {
