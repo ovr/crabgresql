@@ -3699,13 +3699,12 @@ impl Distinct {
             // rather than gathered into a `Vec`: a probe compares against every
             // candidate, and materializing each one would allocate per
             // comparison (a `String` per text key column at that).
-            let seen = lookup.find(&key, |i| {
+            let slot = lookup.find_or_insert(&key, out.len(), |i| {
                 keys.iter()
                     .zip(&key)
                     .all(|(k, probe)| agg::value_eq(k.ty, &out[i][k.column], probe))
             });
-            if seen.is_none() {
-                lookup.record(&key, out.len());
+            if slot == keyindex::Slot::Vacant {
                 out.push(row);
             }
         }
@@ -3796,11 +3795,12 @@ impl Aggregate {
                     .iter()
                     .map(|e| eval(e, &row, &self.ctx))
                     .collect::<Result<Vec<_>, _>>()?;
-                match lookup.find(&key, |i| agg::keys_equal(&key_tys, &groups[i].key, &key)) {
-                    Some(i) => i,
-                    None => {
-                        let i = groups.len();
-                        lookup.record(&key, i);
+                let next = groups.len();
+                match lookup.find_or_insert(&key, next, |i| {
+                    agg::keys_equal(&key_tys, &groups[i].key, &key)
+                }) {
+                    keyindex::Slot::Existing(i) => i,
+                    keyindex::Slot::Vacant => {
                         groups.push(AggGroup {
                             key,
                             accumulators: self
@@ -3816,7 +3816,7 @@ impl Aggregate {
                                 })
                                 .collect(),
                         });
-                        i
+                        next
                     }
                 }
             };

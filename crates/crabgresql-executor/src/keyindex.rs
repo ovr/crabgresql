@@ -17,10 +17,10 @@
 //! DISTINCT hot path, or an index that clones every group key, which is the
 //! per-key `String` clone `Distinct::new` exists to avoid.
 //!
-//! The API is two-phase — [`GroupIndex::find`] then [`GroupIndex::record`] —
-//! because the caller assigns the group's index only after deciding it is new,
-//! and because `find` taking `&self` lets its equality closure borrow the
-//! caller's groups freely.
+//! The one entry point is [`GroupIndex::find_or_insert`], which takes the index
+//! the caller *would* assign a new group and hashes the key once whether or not
+//! it turns out to be new. Its equality closure reads the caller's groups, which
+//! borrows cleanly because the index and the groups are separate values.
 
 use rustc_hash::FxHashMap;
 
@@ -91,51 +91,90 @@ impl GroupIndex {
         Self { kind }
     }
 
-    /// The group `key` belongs to, if it has one already.
+    /// The group `key` belongs to, recording `new_index` as its group if it has
+    /// none yet.
     ///
     /// `eq` is asked whether the group at an index has this key, and is called
     /// only in the general case — the specialized variants match on the key
     /// itself, which identifies the group outright.
-    pub fn find(&self, key: &[Value], eq: impl Fn(usize) -> bool) -> Option<usize> {
-        match &self.kind {
-            Kind::Scalar { ty, groups, null } => match one(key) {
-                Value::Null => *null,
-                v => groups.get(&agg::scalar_code(*ty, v)).copied(),
-            },
-            Kind::Text { ty, groups, null } => match one(key) {
-                Value::Null => *null,
-                v => groups.get(agg::text_key(*ty, v)).copied(),
-            },
-            Kind::Generic { tys, buckets } => buckets
-                .get(&agg::hash_key(tys, key))
-                .and_then(|bucket| bucket.iter().copied().find(|&i| eq(i))),
-        }
-    }
-
-    /// Record that `key` now belongs to the group at `index`. Call it only
-    /// after [`GroupIndex::find`] returned `None` for the same key.
-    pub fn record(&mut self, key: &[Value], index: usize) {
+    ///
+    /// A [`Slot::Vacant`] answer means the caller must now create the group at
+    /// exactly `new_index`; the index is already recorded, so skipping the
+    /// creation leaves a group number pointing at nothing.
+    pub fn find_or_insert(
+        &mut self,
+        key: &[Value],
+        new_index: usize,
+        eq: impl Fn(usize) -> bool,
+    ) -> Slot {
         match &mut self.kind {
             Kind::Scalar { ty, groups, null } => match one(key) {
-                Value::Null => *null = Some(index),
-                v => {
-                    groups.insert(agg::scalar_code(*ty, v), index);
-                }
+                Value::Null => Slot::of(*null.get_or_insert(new_index), new_index),
+                v => Slot::of(
+                    *groups.entry(agg::scalar_code(*ty, v)).or_insert(new_index),
+                    new_index,
+                ),
             },
+            // Deliberately not `entry(key.into())`: that allocates a `Box<str>`
+            // on every row, hits included, which costs far more on a
+            // low-cardinality `GROUP BY` than the second hash a miss pays here.
+            // A miss allocates anyway.
             Kind::Text { ty, groups, null } => match one(key) {
-                Value::Null => *null = Some(index),
+                Value::Null => Slot::of(*null.get_or_insert(new_index), new_index),
                 v => {
-                    groups.insert(agg::text_key(*ty, v).into(), index);
+                    let key = agg::text_key(*ty, v);
+                    match groups.get(key) {
+                        Some(&i) => Slot::Existing(i),
+                        None => {
+                            insert_text(groups, key, new_index);
+                            Slot::Vacant
+                        }
+                    }
                 }
             },
             Kind::Generic { tys, buckets } => {
-                buckets
-                    .entry(agg::hash_key(tys, key))
-                    .or_default()
-                    .push(index);
+                let bucket = buckets.entry(agg::hash_key(tys, key)).or_default();
+                match bucket.iter().copied().find(|&i| eq(i)) {
+                    Some(i) => Slot::Existing(i),
+                    None => {
+                        bucket.push(new_index);
+                        Slot::Vacant
+                    }
+                }
             }
         }
     }
+}
+
+/// What [`GroupIndex::find_or_insert`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot {
+    /// The key already belonged to this group.
+    Existing(usize),
+    /// The key was new and now belongs to the `new_index` that was passed in,
+    /// which the caller still has to create.
+    Vacant,
+}
+
+impl Slot {
+    /// Read an `or_insert`-style answer: the stored index, and the one that
+    /// would have been stored had the key been new.
+    fn of(stored: usize, new_index: usize) -> Slot {
+        if stored == new_index {
+            Slot::Vacant
+        } else {
+            Slot::Existing(stored)
+        }
+    }
+}
+
+/// Own a new text key. Kept out of line because it is the only allocating step
+/// in `find_or_insert`, and a `GROUP BY` over few distinct strings runs the
+/// lookup beside it millions of times without ever reaching it.
+#[cold]
+#[inline(never)]
+fn insert_text(groups: &mut FxHashMap<Box<str>, usize>, key: &str, new_index: usize) {
+    groups.insert(key.into(), new_index);
 }
 
 /// The single key column a specialized variant indexes. A key of any other
@@ -150,7 +189,7 @@ fn one(key: &[Value]) -> &Value {
 
 #[cfg(test)]
 mod tests {
-    use super::GroupIndex;
+    use super::{GroupIndex, Slot};
     use crabgresql_types::{Numeric, PgType, Value};
 
     /// Drive `keys` through an index the way `Aggregate::build` does, returning
@@ -161,13 +200,14 @@ mod tests {
         let mut groups: Vec<Vec<Value>> = Vec::new();
         let mut out = Vec::new();
         for key in keys {
-            let i = match index.find(key, |i| crate::agg::keys_equal(tys, &groups[i], key)) {
-                Some(i) => i,
-                None => {
-                    let i = groups.len();
-                    index.record(key, i);
+            let next = groups.len();
+            let i = match index
+                .find_or_insert(key, next, |i| crate::agg::keys_equal(tys, &groups[i], key))
+            {
+                Slot::Existing(i) => i,
+                Slot::Vacant => {
                     groups.push(key.clone());
-                    i
+                    next
                 }
             };
             out.push(i);
@@ -192,6 +232,37 @@ mod tests {
             .map(|v| vec![v])
             .collect();
         assert_eq!(assign(&[ty], &keys), vec![0, 0, 1, 1]);
+    }
+
+    /// Groups are numbered in first-seen order on every encoding. This is what
+    /// `find_or_insert` can silently break, by recording an index on the wrong
+    /// side of the caller's push.
+    #[test]
+    fn groups_are_numbered_in_first_seen_order() {
+        let text = |s: &str| vec![Value::Text(s.to_string())];
+
+        // Scalar.
+        let keys: Vec<Vec<Value>> = [30i64, 10, 30, 20, 10]
+            .into_iter()
+            .map(|n| vec![Value::Int8(n)])
+            .collect();
+        assert_eq!(assign(&[PgType::Int8], &keys), vec![0, 1, 0, 2, 1]);
+
+        // Text: bytewise, so case matters and trailing blanks do not fold.
+        let keys = [text("b"), text("a"), text("B"), text("a "), text("a")];
+        assert_eq!(assign(&[PgType::Text], &keys), vec![0, 1, 2, 3, 1]);
+
+        // bpchar folds trailing blanks, and only trailing ones.
+        let keys = [text("a"), text("a  "), text(" a"), text("A")];
+        assert_eq!(assign(&[PgType::Bpchar], &keys), vec![0, 0, 1, 2]);
+
+        // Generic, and multi-column — the arm that consults `eq`.
+        let pair = |a: i64, b: &str| vec![Value::Int8(a), Value::Text(b.to_string())];
+        let keys = [pair(1, "x"), pair(2, "x"), pair(1, "y"), pair(1, "x")];
+        assert_eq!(
+            assign(&[PgType::Int8, PgType::Text], &keys),
+            vec![0, 1, 2, 0]
+        );
     }
 
     /// Two NULL keys group together and share a group with nothing else, on
