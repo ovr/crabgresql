@@ -768,6 +768,91 @@ fn a_projection_constant_arrow_cannot_hold_is_declined() {
     assert!(ProjectBatch::compile(&ok, &layout).is_some());
 }
 
+fn coerce(expr: BoundExpr, ty: PgType) -> BoundExpr {
+    BoundExpr::Coerce {
+        expr: Box::new(expr),
+        ty,
+    }
+}
+
+/// `smallint_col <> 0` resolves in `int4`, so the binder wraps the **column** in
+/// a `Coerce` and leaves the constant alone. Arrow's comparison kernels need one
+/// `DataType` on both sides, so the column has to be widened — and the widening
+/// must agree with the row path's `cast_value` on every value, nulls included.
+#[test]
+fn a_widened_smallint_column_compares_as_it_does_on_rows() {
+    let schema = schema_of(&[PgType::Int2]);
+    let rows: Vec<Tuple> = [
+        Some(0i16),
+        Some(1),
+        Some(-1),
+        Some(i16::MIN),
+        Some(i16::MAX),
+        None,
+    ]
+    .into_iter()
+    .map(|v| vec![v.map_or(Value::Null, Value::Int2)])
+    .collect();
+
+    for op in [
+        BinOp::Eq,
+        BinOp::NotEq,
+        BinOp::Lt,
+        BinOp::LtEq,
+        BinOp::Gt,
+        BinOp::GtEq,
+    ] {
+        for literal in [0i32, 1, -1, i16::MIN as i32, i16::MAX as i32] {
+            // int2 -> int4, the shape the binder actually produces.
+            assert_same(
+                &schema,
+                &rows,
+                &compare(
+                    op,
+                    PgType::Int4,
+                    coerce(column(0, PgType::Int2), PgType::Int4),
+                    constant(Value::Int4(literal), PgType::Int4),
+                ),
+            );
+            // int2 -> int8, and with the widened side on the right, so neither
+            // the second widening pair nor operand order is left unexercised.
+            assert_same(
+                &schema,
+                &rows,
+                &compare(
+                    op,
+                    PgType::Int8,
+                    constant(Value::Int8(literal.into()), PgType::Int8),
+                    coerce(column(0, PgType::Int2), PgType::Int8),
+                ),
+            );
+        }
+    }
+    // A constant the source type cannot hold is the case the widening exists to
+    // make safe: on rows the comparison is simply false/true, and it must not
+    // become an out-of-range error or a wrapped match.
+    assert_same(
+        &schema,
+        &rows,
+        &compare(
+            BinOp::Gt,
+            PgType::Int4,
+            coerce(column(0, PgType::Int2), PgType::Int4),
+            constant(Value::Int4(i32::MAX), PgType::Int4),
+        ),
+    );
+    // Nulls must survive the widening: `IS NULL` reads the widened array's own
+    // null buffer, not the original's.
+    assert_same(
+        &schema,
+        &rows,
+        &BoundExpr::IsNull {
+            expr: Box::new(coerce(column(0, PgType::Int2), PgType::Int4)),
+            negated: false,
+        },
+    );
+}
+
 /// The planner decides *whether* and the executor decides *how*, so the two
 /// must agree exactly: a shape the planner accepts and the executor declines
 /// makes EXPLAIN advertise work that never happens, and the reverse hides work
@@ -775,7 +860,7 @@ fn a_projection_constant_arrow_cannot_hold_is_declined() {
 /// `BoundExpr` in separate crates.
 #[test]
 fn the_planner_and_the_executor_agree_on_every_shape() {
-    let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Numeric]);
+    let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Numeric, PgType::Int2]);
     let layout = layout_of(&schema);
     let int = || column(0, PgType::Int4);
     let one = || constant(Value::Int4(1), PgType::Int4);
@@ -803,11 +888,48 @@ fn the_planner_and_the_executor_agree_on_every_shape() {
             column(1, PgType::Text),
             constant(Value::Text("x".into()), PgType::Text),
         ),
+        // Widening integer casts, in both nesting depths.
+        compare(
+            BinOp::Eq,
+            PgType::Int4,
+            coerce(column(3, PgType::Int2), PgType::Int4),
+            one(),
+        ),
+        compare(
+            BinOp::Eq,
+            PgType::Int8,
+            coerce(coerce(column(3, PgType::Int2), PgType::Int4), PgType::Int8),
+            constant(Value::Int8(1), PgType::Int8),
+        ),
         // Declined, each for its own reason.
         compare(
             BinOp::Eq,
             PgType::Numeric,
             column(2, PgType::Numeric),
+            one(),
+        ),
+        // A *narrowing* cast raises `22003` on a value the source holds fine, so
+        // which row raises first is observable and no kernel reproduces it.
+        compare(
+            BinOp::Eq,
+            PgType::Int2,
+            coerce(int(), PgType::Int2),
+            constant(Value::Int2(1), PgType::Int2),
+        ),
+        // Not every cast between Arrow-representable types is total: `int4 ->
+        // text` is, but it is a *rendering*, and `text -> int4` raises.
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            coerce(int(), PgType::Text),
+            constant(Value::Text("1".into()), PgType::Text),
+        ),
+        // Out of range under the cast, so the widening check must not be the only
+        // thing consulted — the inner operand is still gated.
+        compare(
+            BinOp::Eq,
+            PgType::Int4,
+            coerce(column(9, PgType::Int2), PgType::Int4),
             one(),
         ),
         compare(BinOp::Eq, PgType::Int4, column(9, PgType::Int4), one()),

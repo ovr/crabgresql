@@ -7747,6 +7747,62 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
     Ok(())
 }
 
+/// A `smallint` column compared to an integer literal resolves in `int4`, so the
+/// binder wraps the *column* in a cast and the predicate is no longer a bare
+/// column beside a constant. Widening is total over the source type, so the
+/// columnar filter can take it — and it has to, because on an analytic relation
+/// most flag columns are `smallint` and they are what the selective predicates
+/// test. A narrowing cast raises `22003`, so it stays on the row path.
+#[tokio::test]
+async fn a_widening_cast_keeps_the_columnar_filter_but_a_narrowing_one_does_not()
+-> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE f (id int4, flag int2, big int8) USING parquet ORDER BY (id)")
+        .await?;
+    client
+        .simple_query("INSERT INTO f VALUES (1, 0, 10), (2, 1, 20)")
+        .await?;
+
+    for (query, expected) in [
+        // int2 column vs int4 literal: resolved in int4, column widened.
+        (
+            "EXPLAIN SELECT id FROM f WHERE flag <> 0",
+            "Append (columnar: scan, filter)",
+        ),
+        // int4 column vs int8 literal: the other widening pair.
+        (
+            "EXPLAIN SELECT id FROM f WHERE id = 9999999999",
+            "Append (columnar: scan, filter)",
+        ),
+        // Two widened columns in one conjunct, the ClickBench shape.
+        (
+            "EXPLAIN SELECT id FROM f WHERE flag = 0 AND id = 1",
+            "Append (columnar: scan, filter)",
+        ),
+        // int8 column vs an int4-typed cast is a *narrowing* of the column, which
+        // raises on a value int8 holds fine — no kernel reproduces that.
+        (
+            "EXPLAIN SELECT id FROM f WHERE big::int2 = 1",
+            "Append (columnar: scan)",
+        ),
+    ] {
+        let lines = explain_lines(&client, query).await?;
+        assert_eq!(lines.first().map(String::as_str), Some(expected), "{query}");
+    }
+
+    // And the annotation is earned: the rows it returns are the rows the row path
+    // returns, widening and all.
+    let messages = client
+        .simple_query("SELECT id FROM f WHERE flag <> 0 ORDER BY id")
+        .await?;
+    assert_eq!(
+        rows(&messages).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("2")]
+    );
+    Ok(())
+}
+
 /// A committed TRUNCATE empties the relation outright, even when the truncating
 /// transaction holds a snapshot that predates rows another session committed —
 /// the durable and buffered halves must not disagree about what "all rows" means.

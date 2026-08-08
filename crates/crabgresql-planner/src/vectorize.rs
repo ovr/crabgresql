@@ -164,9 +164,36 @@ fn is_comparison(op: BinOp) -> bool {
     )
 }
 
+/// Whether a `Coerce` from `from` to `to` is a *widening* integer cast.
+///
+/// The distinction is the whole reason a cast can be admitted at all. A widening
+/// cast is **total** over its source type — every `int2` is an `int4` — so it has
+/// no failure mode to reproduce and no error message to match. A narrowing one
+/// raises `22003 integer out of range` on a value the source type holds
+/// perfectly well, and reproducing *which* row raises first is exactly the kind
+/// of semantics `vectorize` refuses to re-derive.
+///
+/// Admitting this is load-bearing rather than a nicety. `smallint_col <> 0`
+/// resolves in `int4`, so the binder wraps the **column** in a `Coerce` and
+/// leaves the constant alone; on an analytic relation where much of the schema is
+/// `smallint` — every flag column in ClickBench's `hits`, and the flag columns are
+/// what the selective predicates test — declining this declines the filter on
+/// most real `WHERE`s, and with it everything the filter was going to save.
+pub fn widening_int_cast(from: PgType, to: PgType) -> bool {
+    matches!(
+        (from, to),
+        (PgType::Int2, PgType::Int4 | PgType::Int8) | (PgType::Int4, PgType::Int8)
+    )
+}
+
 fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
     match expr {
         BoundExpr::Collate { expr, .. } => vectorizable_operand(expr, width),
+        // See [`widening_int_cast`]. Nesting is fine: each step is checked, so
+        // `int2 -> int4 -> int8` widens twice and `int8 -> int4` never starts.
+        BoundExpr::Coerce { expr, ty } => {
+            widening_int_cast(expr.ty(), *ty) && vectorizable_operand(expr, width)
+        }
         // Batches are full width in schema order, so a schema ordinal is a batch
         // ordinal — but only if it is actually in range.
         BoundExpr::ColumnRef { index, .. } => *index < width,
