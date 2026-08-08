@@ -53,6 +53,17 @@ impl TypeRef {
             TypeRef::Cstring => None,
         }
     }
+
+    /// Whether this names an enum, which no `WITHOUT FUNCTION` cast may touch:
+    /// an enum value is the OID of a `pg_enum` row allocated when the type was
+    /// created, so the same bit pattern means a different label — or none — in
+    /// another database.
+    fn is_enum(&self, cat: &CatalogInner) -> bool {
+        match self {
+            TypeRef::User(name) => cat.types.get(name).is_some_and(|e| e.enum_labels.is_some()),
+            TypeRef::Builtin(_) | TypeRef::Cstring => false,
+        }
+    }
 }
 
 /// A single target of `DROP FUNCTION`: the function name and, when the
@@ -957,6 +968,16 @@ impl GlobalCatalog {
             return Err(PgError::new(
                 sqlstate::INVALID_OBJECT_DEFINITION,
                 "source and target data types are not physically compatible",
+            ));
+        }
+
+        // An enum is 4 bytes wide, so the width check above lets `int4` through;
+        // PG rejects it separately, and *after* that check — `int8 AS <enum>`
+        // reports the width, not this.
+        if source.is_enum(&cat) || target.is_enum(&cat) {
+            return Err(PgError::new(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "enum data types are not binary-compatible",
             ));
         }
 
