@@ -99,6 +99,48 @@ async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Cl
     client
 }
 
+/// No `WITHOUT FUNCTION` cast may name an enum. An enum value is the OID of a
+/// `pg_enum` row, so a binary cast would relabel an integer as a member that
+/// exists only in this database — and the executor would then hold a value whose
+/// variant contradicts its type, which its key paths are entitled to assume
+/// cannot happen.
+#[tokio::test]
+async fn enum_binary_coercible_cast_is_rejected() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        .await?;
+
+    // Both directions, and the same message either way.
+    for sql in [
+        "CREATE CAST (int4 AS mood) WITHOUT FUNCTION",
+        "CREATE CAST (mood AS int4) WITHOUT FUNCTION",
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("a binary-coercible cast naming an enum must be rejected");
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(err.code(), &SqlState::INVALID_OBJECT_DEFINITION, "{sql}");
+        assert_eq!(err.message(), "enum data types are not binary-compatible");
+    }
+
+    // The width check runs first, so a mismatched width reports the width —
+    // PostgreSQL 18.4 answers `int8 AS mood` this way, not with the enum rule.
+    let err = client
+        .simple_query("CREATE CAST (int8 AS mood) WITHOUT FUNCTION")
+        .await
+        .expect_err("a width mismatch must still be rejected");
+    assert_eq!(
+        err.as_db_error().expect("database error").message(),
+        "source and target data types are not physically compatible"
+    );
+
+    Ok(())
+}
+
 /// An enum key travels the same hash paths every other type does — the join's
 /// hash table, `GROUP BY`, and `count(DISTINCT)`. All three identify a value by
 /// `(type, ordinal)`, never by the label it prints as.
