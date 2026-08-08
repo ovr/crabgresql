@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786223661859,
+  "lastUpdate": 1786223663255,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -5800,6 +5800,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 22560.662061,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "zaets28rus@gmail.com",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "8a4539d3cff259ea93396102b308efb3375c64a8",
+          "message": "refactor(agg): one float canonicalization, and say what hashes_distinctly promises\n\n`canonical_f32` existed on the strength of a comment that was wrong on its own\nterms: it said `-0.0f32 as f64` is still `-0.0`, so widening first \"would not do\nit\" — true about the cast, but `canonical_f64` tests `x == 0.0`, and `-0.0`\nsatisfies that. So `float4` now widens and canonicalizes once, the way `hash_key`\nalready did. The encoding stays injective because `f32 -> f64` is exact, and the\nonly pairs that collapse are the ones `compare_values` calls equal.\n\n`distinct_floats_fold_both_zeros_and_every_nan` covers `float4` alongside\n`float8`; the suite had only the wider one, which is the case the widening cast\ncannot get wrong.\n\n`PgType::hashes_distinctly`'s doc now states its contract in three clauses,\nbecause the gloss it had left out the one that mattered: it is a planner hint,\nnever a correctness input; a `true` promises only that *well-formed* values\nspread across buckets; and for a user type well-formed means an enum value\ncarrying that type's own OID. Anything else contributes nothing to `hash_key` and\nshares one bucket — quadratic, not wrong.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-08-08T22:21:15+02:00",
+          "tree_id": "f8e7f221fa5e122b3ca62ca0a863ff269b0ec20d",
+          "url": "https://github.com/ovr/crabgresql/commit/8a4539d3cff259ea93396102b308efb3375c64a8"
+        },
+        "date": 1786223663222,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 494.826741,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 22452.637854,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
