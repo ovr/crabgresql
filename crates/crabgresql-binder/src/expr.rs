@@ -25,6 +25,7 @@ use crabgresql_types::{
 
 use crate::BindError;
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn, bind_function, bind_srf_projection};
+use crate::plan::TABLEOID;
 
 /// Shared, mutable bind state for one statement. A `$n` occurrence anywhere in
 /// the statement — target list, WHERE, a subquery, a CTE — refers to the same
@@ -1347,60 +1348,50 @@ pub enum Binding {
     },
 }
 
-/// What a FROM item's *system* columns (`tableoid`) answer for. Deliberately
-/// apart from `columns`: a system column is not part of the relation's row, so
-/// it must not widen it, be projected by `*`, or turn up in `pg_attribute` —
-/// exactly PostgreSQL's arrangement, where system attributes have negative
-/// `attnum` and are reachable only by an explicit reference.
-#[derive(Clone)]
-pub enum SysSource {
-    /// A plain relation scan — a table, a view's underlying table, or a
-    /// `pg_catalog` relation — named so the OID can be resolved at execution
-    /// time.
-    Relation { namespace: String, name: String },
-    /// An inheritance or partition parent, read as an `Append` over its
-    /// children. PostgreSQL reports each row's *child* OID here, which this
-    /// build cannot yet produce, so it refuses rather than answering the
-    /// parent's.
-    Inherited,
-    /// A row source with no relation behind it: subquery, CTE, view expansion,
-    /// table function. PostgreSQL exposes no system columns on one either.
-    None,
-}
-
 /// One FROM item as a name-resolution scope is built from it: the qualifier it
-/// is addressed by, the columns it exposes, and the relation its system columns
-/// belong to.
+/// is addressed by, the columns it exposes, and where its system column sits.
 #[derive(Clone)]
 pub struct ScopeItem {
     pub qualifier: String,
     pub columns: Vec<Column>,
-    pub sys: SysSource,
+    /// Local index of the `tableoid` slot within `columns`, when the query asked
+    /// for one. It is a real column of the row — that is what lets an outer
+    /// join null-extend it and an `Append` arm answer for itself — but it sits
+    /// past every declared column, so `*` never reaches it. `None` for a FROM
+    /// item that is not a relation scan.
+    pub system_slot: Option<usize>,
+}
+
+impl ScopeItem {
+    /// The columns `*` expands to: everything but the system slot.
+    pub fn declared(&self) -> &[Column] {
+        match self.system_slot {
+            Some(slot) => &self.columns[..slot],
+            None => &self.columns,
+        }
+    }
 }
 
 /// One relation in a name-resolution scope: its qualifier (alias, else table
 /// name), its columns, the base index its columns occupy in the combined
 /// row (0 for a single relation; the running total across FROM items in a
-/// cross join), and what its system columns resolve against.
+/// cross join), and where its system column sits among them.
 #[derive(Clone)]
 pub struct ScopeRel {
     qualifier: String,
     columns: Vec<Column>,
     offset: usize,
-    sys: SysSource,
+    system_slot: Option<usize>,
 }
 
 impl ScopeRel {
-    /// Bind `name` as one of this relation's system columns, unless a user
-    /// column of its own claims the name first. PostgreSQL rejects such a column
-    /// at `CREATE TABLE`, so the shadowing case cannot arise there; this build
-    /// accepts the name, and letting the user's own column win is the harmless
-    /// way to differ.
-    fn system_column(&self, name: &str) -> Option<Result<BoundExpr, BindError>> {
-        if self.columns.iter().any(|c| c.name == name) {
-            return None;
+    /// This relation's declared columns — everything `*` expands to, which is
+    /// every column but the system slot.
+    fn declared(&self) -> &[Column] {
+        match self.system_slot {
+            Some(slot) => &self.columns[..slot],
+            None => &self.columns,
         }
-        system_column(&self.sys, name)
     }
 }
 
@@ -1459,10 +1450,6 @@ enum NameLookup {
     Found(BoundExpr),
     Ambiguous,
     Missing,
-    /// The name *is* a system column of a relation in scope, but this build
-    /// cannot produce it there. Distinct from `Missing` so the caller reports
-    /// the real reason instead of "column does not exist".
-    Unsupported(BindError),
 }
 
 /// A column resolved by name: where it sits in the combined row, its type, and
@@ -1486,42 +1473,6 @@ pub(crate) fn with_column_collation(expr: BoundExpr, collation: Option<u32>) -> 
             explicit: false,
         },
         None => expr,
-    }
-}
-
-/// The one system column this build resolves. The others PostgreSQL exposes —
-/// `ctid`, `xmin`, `xmax`, `cmin`, `cmax` — are still out of reach: the scan
-/// discards each row's tid, and the storage API's `Tuple` does not surface the
-/// header the transaction ids live in.
-const TABLEOID: &str = "tableoid";
-
-/// Bind `name` as a system column of the relation `sys` describes.
-///
-/// `None` means "not a system column here", and the caller carries on with its
-/// ordinary 42703 — the answer for a subquery or CTE, on which PostgreSQL
-/// exposes no system columns either. The reference is a self-contained function
-/// call rather than a row position, which is why a correlated `t.tableoid` from
-/// an inner query needs no `OuterColumnRef` treatment.
-fn system_column(sys: &SysSource, name: &str) -> Option<Result<BoundExpr, BindError>> {
-    if name != TABLEOID {
-        return None;
-    }
-    let text = |s: &str| BoundExpr::Const {
-        value: Value::Text(s.to_string()),
-        ty: PgType::Text,
-    };
-    match sys {
-        SysSource::Relation { namespace, name } => Some(Ok(BoundExpr::FuncCall {
-            func: ScalarFn::TableOid,
-            ret: PgType::Oid,
-            args: vec![text(namespace), text(name)],
-        })),
-        // Answering the parent's OID would be a wrong answer rather than a
-        // missing one: PostgreSQL reports the child each row actually came from.
-        SysSource::Inherited => Some(Err(BindError::feature_not_supported(
-            "system column \"tableoid\" on an inherited or partitioned table is not supported yet",
-        ))),
-        SysSource::None => None,
     }
 }
 
@@ -1845,21 +1796,31 @@ impl Scope {
         }
     }
 
+    /// A one-relation scope over `schema`.
+    ///
+    /// `tableoid` says whether the row this scope describes carries the system
+    /// slot past its declared columns. The write paths set it when the statement
+    /// names `tableoid`, because there the value is appended per *target* — the
+    /// partition or child a row actually lives in, not the relation the
+    /// statement named.
     pub fn table(
         schema: &TableSchema,
         qualifier: String,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
+        tableoid: bool,
     ) -> Scope {
+        let mut columns = schema.columns.clone();
+        let system_slot = tableoid.then(|| {
+            columns.push(Column::new(TABLEOID, PgType::Oid));
+            columns.len() - 1
+        });
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
-                columns: schema.columns.clone(),
+                columns,
                 offset: 0,
-                sys: SysSource::Relation {
-                    namespace: schema.namespace.clone(),
-                    name: schema.name.clone(),
-                },
+                system_slot,
             }],
             visible: None,
             catalog: catalog.clone(),
@@ -1900,7 +1861,7 @@ impl Scope {
                 qualifier: item.qualifier,
                 columns: item.columns,
                 offset,
-                sys: item.sys,
+                system_slot: item.system_slot,
             });
             offset += width;
         }
@@ -2030,7 +1991,6 @@ impl Scope {
             // A SQL function body's parameter names are consulted only after its
             // relations, as in PG, where a column shadows a same-named parameter.
             // Moot today: a function body is FROM-less, so `rels` is empty.
-            NameLookup::Unsupported(e) => Err(e),
             NameLookup::Missing => match self.func_param(name)? {
                 Some(expr) => Ok(expr),
                 None => self.resolve_outer(name),
@@ -2060,13 +2020,14 @@ impl Scope {
         // columns: the join column appears once (never ambiguous), the merged
         // expression carrying its combined-row value.
         if let Some(visible) = &self.visible {
-            return match lookup_visible(visible, name) {
-                VisibleLookup::Found(expr) => NameLookup::Found(expr.clone()),
-                VisibleLookup::Ambiguous => NameLookup::Ambiguous,
-                // A merged join namespace hides the inputs' own columns but not
-                // their system ones — those never take part in `USING`.
-                VisibleLookup::Missing => self.system_local(name),
-            };
+            // A merged join namespace hides the inputs' own columns, but a
+            // system column never takes part in `USING`, so a name it does not
+            // claim still falls through to the relations below.
+            match lookup_visible(visible, name) {
+                VisibleLookup::Found(expr) => return NameLookup::Found(expr.clone()),
+                VisibleLookup::Ambiguous => return NameLookup::Ambiguous,
+                VisibleLookup::Missing => {}
+            }
         }
         match lookup_in_rels(&self.rels, name) {
             Some(Ok(col)) => NameLookup::Found(with_column_collation(
@@ -2077,31 +2038,6 @@ impl Scope {
                 col.collation,
             )),
             Some(Err(())) => NameLookup::Ambiguous,
-            // Only once no *user* column claims the name, so a column actually
-            // called `tableoid` shadows the system one. PostgreSQL forbids
-            // creating that column at all, which this build does not, so the
-            // shadowing case is reachable here and losing to the user's own
-            // column is the safe way to lose it.
-            None => self.system_local(name),
-        }
-    }
-
-    /// The system-column step of unqualified resolution: exactly one relation in
-    /// scope offering `name` binds it, several is 42702, none leaves the caller
-    /// on its ordinary path (SQL-function parameters, then enclosing queries).
-    fn system_local(&self, name: &str) -> NameLookup {
-        let mut found: Option<Result<BoundExpr, BindError>> = None;
-        for rel in &self.rels {
-            if let Some(expr) = rel.system_column(name) {
-                if found.is_some() {
-                    return NameLookup::Ambiguous;
-                }
-                found = Some(expr);
-            }
-        }
-        match found {
-            Some(Ok(expr)) => NameLookup::Found(expr),
-            Some(Err(e)) => NameLookup::Unsupported(e),
             None => NameLookup::Missing,
         }
     }
@@ -2171,9 +2107,6 @@ impl Scope {
             return Ok(expr);
         }
         if let Some(rel) = self.rels.iter().find(|r| r.qualifier == qualifier) {
-            if let Some(expr) = rel.system_column(column) {
-                return expr;
-            }
             let col = column_in_rel(rel, qualifier, column)?;
             return Ok(with_column_collation(
                 BoundExpr::ColumnRef {
@@ -2185,11 +2118,6 @@ impl Scope {
         }
         for (depth, level) in self.outer.iter().enumerate() {
             if let Some(rel) = level.rels.iter().find(|r| r.qualifier == qualifier) {
-                // The system column is a self-contained call, not a row
-                // position, so a correlated reference needs no outerizing.
-                if let Some(expr) = rel.system_column(column) {
-                    return expr;
-                }
                 let col = column_in_rel(rel, qualifier, column)?;
                 return Ok(with_column_collation(
                     BoundExpr::OuterColumnRef {
@@ -2294,10 +2222,11 @@ impl Scope {
     }
 }
 
-/// Append every column of `rel` as an `(output column, ColumnRef)` pair at its
-/// combined-row index.
+/// Append every *declared* column of `rel` as an `(output column, ColumnRef)`
+/// pair at its combined-row index. A system column is reachable by name and by
+/// name alone, so `*` and `q.*` skip the slot, as they do upstream.
 fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
-    for (i, col) in rel.columns.iter().enumerate() {
+    for (i, col) in rel.declared().iter().enumerate() {
         out.push((
             crate::OutputColumn {
                 name: col.name.clone(),
@@ -9219,7 +9148,14 @@ fn bind_check_inner(
     let params = param_ctx_none();
     // Deliberately built with no subquery context, which is what makes a
     // subquery in the predicate fail — restated below in PostgreSQL's words.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params);
+    // No system column: a stored CHECK is re-bound against each leaf it runs
+    // for, so a `tableoid` in one would silently mean a different relation per
+    // partition. PostgreSQL records the reference as a negative `conkey` and
+    // evaluates it per row instead.
+    //
+    // TODO: CHECK over a system column, which needs `conkey` to carry negative
+    // attnums and the predicate to be evaluated against the leaf's identity.
+    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false);
     let bound = to_bool_operand(
         bind_expr(expr, &scope).map_err(subquery_in_check)?,
         "CHECK",

@@ -20,7 +20,7 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, ScopeItem, SysSource, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
+    ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
     WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
     merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body,
@@ -96,6 +96,37 @@ pub struct SetOpArm {
 pub struct MappedRelation {
     pub table: Arc<dyn TableAm>,
     pub map: Option<Arc<[usize]>>,
+    /// Set when this relation's rows must carry a `tableoid` slot, appended
+    /// after `view` so `map` stays a pure gather and the write-back paths
+    /// (`scatter`, `rebuild`) never see a column with nowhere to write.
+    ///
+    /// Each arm names *itself*, which is what makes `tableoid` report the
+    /// partition or inheritance child a row actually came from rather than the
+    /// relation the query named.
+    pub tableoid: Option<RelationIdent>,
+}
+
+/// The relation a scan answers `tableoid` with.
+///
+/// A name rather than an OID: relation OIDs are positional over the catalog
+/// snapshot (`SystemCatalog::relation_oids` sorts by `(namespace, name)`), so a
+/// prepared statement holding a folded one would go stale the moment another
+/// relation is created ahead of it. The scan resolves it once when it opens —
+/// per statement, not per row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationIdent {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl RelationIdent {
+    /// The identity of the relation `schema` describes.
+    pub fn of(schema: &TableSchema) -> Self {
+        Self {
+            namespace: schema.namespace.clone(),
+            name: schema.name.clone(),
+        }
+    }
 }
 
 impl MappedRelation {
@@ -329,6 +360,12 @@ pub enum LogicalPlan {
         /// the statement happens to do — see
         /// [`crabgresql_txn::TxnContext::freeze_inserts`].
         freeze: bool,
+        /// Whether every row this statement forms carries a trailing `tableoid`
+        /// slot, because a WHERE, SET or RETURNING named it. The executor
+        /// appends the OID of the target the row actually lives in — the
+        /// partition or inheritance child, not the relation the statement
+        /// named.
+        tableoid: bool,
     },
     Update {
         table: Arc<dyn TableAm>,
@@ -353,6 +390,9 @@ pub enum LogicalPlan {
         /// notion — every row is updated where it lies, in its own relation, and
         /// nothing ever moves.
         inherited: Vec<MappedRelation>,
+        /// Whether every row this statement forms carries a trailing `tableoid`
+        /// slot; see the same field on [`Self::Insert`].
+        tableoid: bool,
     },
     Delete {
         table: Arc<dyn TableAm>,
@@ -366,6 +406,9 @@ pub enum LogicalPlan {
         /// Inheritance fan-out, as on [`Self::Update`]: rows are deleted from
         /// whichever descendant holds them.
         inherited: Vec<MappedRelation>,
+        /// Whether every row this statement forms carries a trailing `tableoid`
+        /// slot; see the same field on [`Self::Insert`].
+        tableoid: bool,
     },
 }
 
@@ -610,69 +653,61 @@ fn resolve_write_table(
 /// still expands to the leaves. A silently empty result is the worse surprise of
 /// the two, and nothing in the corpus asks for it; revisit if `DETACH PARTITION`
 /// ever lands, which is what makes PG's answer meaningful.
+/// `tableoid` — when the query asked for it — is stamped on each arm as the arm's
+/// *own* relation, which is what makes a partitioned or inherited read report the
+/// child a row came from. An access method's storage leaves are the exception
+/// handled by [`push_storage_leaves`]: they are pieces of one relation, not
+/// relations, so they all carry the name of the relation that owns them.
 fn scan_arms(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
     only: bool,
-) -> Result<Option<ScanFanout>, BindError> {
+    tableoid: bool,
+) -> Result<Option<Vec<MappedRelation>>, BindError> {
     let schema = table.schema();
+    let ident = |schema: &TableSchema| tableoid.then(|| RelationIdent::of(schema));
     if schema.partition_scheme.is_some() {
         let mut arms = Vec::new();
         for leaf in partition_leaves(engine, &schema)? {
             // A leaf is a verbatim clone of the parent's layout, so identity.
-            push_storage_leaves(&mut arms, leaf, None);
+            let leaf_ident = ident(&leaf.schema());
+            push_storage_leaves(&mut arms, leaf, None, leaf_ident);
         }
-        return Ok(Some(ScanFanout::relations(arms)));
+        return Ok(Some(arms));
     }
     if !only {
         let descendants = inheritance_descendants(engine, &schema)?;
         if !descendants.is_empty() {
             // The parent owns rows of its own and reads first, in its own layout.
             let mut arms = Vec::new();
-            push_storage_leaves(&mut arms, table.clone(), None);
+            push_storage_leaves(&mut arms, table.clone(), None, ident(&schema));
             for child in descendants {
-                let map = inherit_map(&schema, &child.schema())?;
-                push_storage_leaves(&mut arms, child, map);
+                let child_schema = child.schema();
+                let map = inherit_map(&schema, &child_schema)?;
+                let child_ident = ident(&child_schema);
+                push_storage_leaves(&mut arms, child, map, child_ident);
             }
-            return Ok(Some(ScanFanout::relations(arms)));
+            return Ok(Some(arms));
         }
     }
-    Ok(table
-        .storage_leaves()
-        .map(|leaves| ScanFanout::one_relation(leaves.into_iter().map(|t| arm(t, None)).collect())))
+    Ok(table.storage_leaves().map(|leaves| {
+        leaves
+            .into_iter()
+            .map(|t| arm(t, None, ident(&schema)))
+            .collect()
+    }))
 }
 
-/// The arms a fanned-out read produces, and whether they are *other relations*.
-///
-/// The distinction is invisible to the executor — every arm is scanned alike —
-/// but it decides what a row's `tableoid` is: an access method's own physical
-/// pieces all belong to the relation that was named, whereas a partition or an
-/// inheritance child is a relation in its own right and reports itself.
-struct ScanFanout {
-    arms: Vec<MappedRelation>,
-    multi_relation: bool,
-}
-
-impl ScanFanout {
-    /// Partitions or inheritance children: each arm is its own relation.
-    fn relations(arms: Vec<MappedRelation>) -> Self {
-        Self {
-            arms,
-            multi_relation: true,
-        }
+fn arm(
+    table: Arc<dyn TableAm>,
+    map: Option<Arc<[usize]>>,
+    tableoid: Option<RelationIdent>,
+) -> MappedRelation {
+    MappedRelation {
+        table,
+        map,
+        tableoid,
     }
-
-    /// One relation split across several physical sources by its access method.
-    fn one_relation(arms: Vec<MappedRelation>) -> Self {
-        Self {
-            arms,
-            multi_relation: false,
-        }
-    }
-}
-
-fn arm(table: Arc<dyn TableAm>, map: Option<Arc<[usize]>>) -> MappedRelation {
-    MappedRelation { table, map }
 }
 
 /// The relations an `UPDATE`/`DELETE` naming `table` must touch, or empty when
@@ -687,6 +722,7 @@ fn write_targets(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
     only: bool,
+    tableoid: bool,
 ) -> Result<Vec<MappedRelation>, BindError> {
     if only {
         return Ok(Vec::new());
@@ -696,10 +732,16 @@ fn write_targets(
     if descendants.is_empty() {
         return Ok(Vec::new());
     }
-    let mut targets = vec![arm(table.clone(), None)];
+    let ident = |schema: &TableSchema| tableoid.then(|| RelationIdent::of(schema));
+    // Each target names itself, so a RETURNING or WHERE that reads `tableoid`
+    // sees the child the row actually lives in — not the relation the statement
+    // named.
+    let mut targets = vec![arm(table.clone(), None, ident(&schema))];
     for child in descendants {
-        let map = inherit_map(&schema, &child.schema())?;
-        targets.push(arm(child, map));
+        let child_schema = child.schema();
+        let map = inherit_map(&schema, &child_schema)?;
+        let child_ident = ident(&child_schema);
+        targets.push(arm(child, map, child_ident));
     }
     Ok(targets)
 }
@@ -711,10 +753,19 @@ fn push_storage_leaves(
     arms: &mut Vec<MappedRelation>,
     table: Arc<dyn TableAm>,
     map: Option<Arc<[usize]>>,
+    tableoid: Option<RelationIdent>,
 ) {
     match table.storage_leaves() {
-        Some(inner) => arms.extend(inner.into_iter().map(|t| arm(t, map.clone()))),
-        None => arms.push(arm(table, map)),
+        // Every leaf carries the *owning* relation's name: an access method
+        // that keeps its rows in several places (durable chunks plus a write
+        // buffer) is still one relation, and `tableoid` must not report its
+        // internals.
+        Some(inner) => arms.extend(
+            inner
+                .into_iter()
+                .map(|t| arm(t, map.clone(), tableoid.clone())),
+        ),
+        None => arms.push(arm(table, map, tableoid)),
     }
 }
 
@@ -2640,6 +2691,7 @@ fn bind_select(
         ctes,
         outer_scope,
         &windows,
+        &TableoidDemand::of_select(select, order_by),
     )?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
         .with_subqueries(engine, ctes)
@@ -2862,11 +2914,14 @@ fn bind_table_query(
         sample: None,
         index_hints: Vec::new(),
     };
+    // `TABLE t` has no projection list to name a system column; only its ORDER
+    // BY can (`TABLE t ORDER BY tableoid`).
+    let demand = TableoidDemand::of_order_by(order_by);
     let BoundFrom {
         source,
         relations,
         visible,
-    } = bind_from_item(engine, catalog, params, &relation, ctes, &[])?.into_bound_from();
+    } = bind_from_item(engine, catalog, params, &relation, ctes, &[], &demand)?.into_bound_from();
     let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let mut columns = Vec::new();
     let mut projections = Vec::new();
@@ -2937,9 +2992,10 @@ struct BoundFromItem {
     qualifier: String,
     columns: Vec<OutputColumn>,
     input: JoinInput,
-    /// The relation this item's system columns (`tableoid`) answer for.
-    /// [`SysSource::None`] for everything that is not a bare relation scan.
-    sys: SysSource,
+    /// Where this item's `tableoid` sits in its own row, when the query asked
+    /// for it. `None` for everything that is not a relation scan — a subquery,
+    /// CTE, view or table function exposes no system columns, as upstream.
+    system_slot: Option<usize>,
 }
 
 /// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
@@ -2966,7 +3022,7 @@ impl BoundFromItem {
             relations: vec![ScopeItem {
                 qualifier: self.qualifier,
                 columns: to_columns(&self.columns),
-                sys: self.sys,
+                system_slot: self.system_slot,
             }],
             visible: None,
         }
@@ -3119,6 +3175,7 @@ fn bind_from_item(
     relation: &ast::TableFactor,
     ctes: &CteEnv,
     siblings: &[ScopeItem],
+    demand: &TableoidDemand,
 ) -> Result<BoundFromItem, BindError> {
     match relation {
         // A `Table` factor carrying call arguments is a set-returning function.
@@ -3198,7 +3255,7 @@ fn bind_from_item(
                     qualifier,
                     columns,
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
-                    sys: SysSource::None,
+                    system_slot: None,
                 });
             }
             // Read resolution honors the search path: temp → pg_catalog →
@@ -3226,41 +3283,56 @@ fn bind_from_item(
                             typmod: c.typmod,
                         })
                         .collect();
+                    // `information_schema` is the one namespace served as
+                    // relations here that PostgreSQL serves as views, and a view
+                    // exposes no system columns — so a reference there is the
+                    // same 42703 it is upstream, not an OID no relation answers
+                    // to.
+                    let wants_tableoid = demand.wants(&qualifier)
+                        && table.schema().namespace != "information_schema";
                     // A relation whose rows live in several places is read as a
                     // union scan. Bind it as a subplan wrapping an `Append` (raw
                     // relation columns), so the surrounding SELECT's
                     // projection/WHERE/ORDER BY — and any join or aggregate —
                     // apply through the existing subplan machinery.
-                    // `tableoid` names the relation unless the arms *are* other
-                    // relations, in which case PostgreSQL reports the child each
-                    // row came from — which the arms do not carry.
-                    let self_oid = || {
-                        let schema = table.schema();
-                        SysSource::Relation {
-                            namespace: schema.namespace.clone(),
-                            name: schema.name.clone(),
-                        }
+                    let mut arm_columns = columns.clone();
+                    if wants_tableoid {
+                        arm_columns.push(tableoid_column());
+                    }
+                    let arms = match scan_arms(engine, &table, *only, wants_tableoid)? {
+                        Some(arms) => Some(arms),
+                        // A monolithic relation is scanned directly — unless it
+                        // has to produce a `tableoid`, which only an `Append` arm
+                        // knows how to emit. One arm is the whole cost, and it
+                        // buys one emit path instead of two.
+                        None if wants_tableoid => Some(vec![arm(
+                            Arc::clone(&table),
+                            None,
+                            Some(RelationIdent::of(&table.schema())),
+                        )]),
+                        None => None,
                     };
-                    let (input, sys) = match scan_arms(engine, &table, *only)? {
-                        Some(fanout) => (
-                            JoinInput::Subplan(Box::new(LogicalPlan::Append {
-                                arms: fanout.arms,
-                                columns: columns.clone(),
-                            })),
-                            if fanout.multi_relation {
-                                SysSource::Inherited
-                            } else {
-                                self_oid()
-                            },
-                        ),
-                        None => (JoinInput::Scan(Arc::clone(&table)), self_oid()),
+                    let input = match arms {
+                        Some(arms) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
+                            arms,
+                            columns: arm_columns,
+                        })),
+                        None => JoinInput::Scan(Arc::clone(&table)),
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
+                    // Appended *after* the alias list is applied: `t(a, b)` counts
+                    // the relation's own columns, and PG's "table t has 2 columns
+                    // available but 3 columns specified" must not learn about a
+                    // system column.
+                    let system_slot = wants_tableoid.then(|| {
+                        columns.push(tableoid_column());
+                        columns.len() - 1
+                    });
                     Ok(BoundFromItem {
                         qualifier,
                         columns,
                         input,
-                        sys,
+                        system_slot,
                     })
                 }
                 Err(e) => {
@@ -3290,7 +3362,7 @@ fn bind_from_item(
                             input: JoinInput::Subplan(Box::new(inner)),
                             // A view is expanded into its body, and PostgreSQL
                             // exposes no system columns on one either.
-                            sys: SysSource::None,
+                            system_slot: None,
                         });
                     }
                     Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
@@ -3344,7 +3416,7 @@ fn bind_from_item(
                 qualifier,
                 columns,
                 input: JoinInput::Subplan(Box::new(inner)),
-                sys: SysSource::None,
+                system_slot: None,
             })
         }
         other => Err(BindError::feature_not_supported(format!(
@@ -3373,10 +3445,167 @@ fn aliased_qualifier(
     }
 }
 
+/// The name of the one system column this build resolves.
+///
+/// TODO: ctid, xmin, xmax, cmin and cmax. `ctid` needs the scan to stop
+/// discarding the `Tid` it already yields; the transaction ids need the storage
+/// API's `Tuple` to surface the on-page header they live in.
+pub(crate) const TABLEOID: &str = "tableoid";
+
+/// The `tableoid` slot as a column of the row that carries it. It sits past
+/// every declared column of the relation, so `*` — which expands the declared
+/// ones — never reaches it, exactly as a negative `attnum` is skipped upstream.
+fn tableoid_column() -> OutputColumn {
+    OutputColumn::new(TABLEOID, PgType::Oid)
+}
+
+/// Which FROM items of one query block must carry a `tableoid` slot.
+///
+/// `tableoid` is a value *in* the row rather than an expression over it — that
+/// is what makes an outer join's null-extended side report NULL and each
+/// `Append` arm report itself — so every FROM item's width has to be settled
+/// before any expression binds, while a reference to it is only resolved
+/// afterwards. This walks the block's expressions first and records the
+/// qualifiers that name it.
+///
+/// Deliberately an over-approximation. A slot nobody references costs one
+/// `Value::Oid` per row and is dropped by the projection above it, whereas a
+/// *missed* reference is a 42703 on a query PostgreSQL answers.
+#[derive(Default)]
+struct TableoidDemand {
+    /// An unqualified `tableoid` was named, and any relation in scope might be
+    /// the one that owns it.
+    bare: bool,
+    /// Qualifiers naming it explicitly (`t.tableoid`), normalized the way
+    /// [`relation_qualifier`] normalizes the names they are matched against.
+    qualified: HashSet<String>,
+}
+
+impl TableoidDemand {
+    /// Whether the FROM item addressed by `qualifier` needs the slot.
+    fn wants(&self, qualifier: &str) -> bool {
+        self.bare || self.qualified.contains(qualifier)
+    }
+
+    /// Whether anything at all named it — the fast path out for the queries
+    /// that do not, which is nearly all of them.
+    fn any(&self) -> bool {
+        self.bare || !self.qualified.is_empty()
+    }
+
+    /// The demand of one query block: everything its SELECT and ORDER BY name.
+    ///
+    /// The block is scanned as *rendered SQL* rather than by walking the
+    /// parser's `Expr` tree. A reference can sit in any expression position —
+    /// projection, WHERE, GROUP BY, HAVING, a join's ON, ORDER BY, or nested
+    /// arbitrarily deep inside a correlated subquery — and a walk that forgot
+    /// one of them would cost a 42703 on a query PostgreSQL answers. Rendering
+    /// cannot miss a position. It costs one `to_string` per bound block against
+    /// a bind that already walks the same tree many times, and its only failure
+    /// mode is the harmless one: a string literal spelling the word buys an
+    /// unreferenced slot.
+    fn of_select(select: &ast::Select, order_by: &Option<ast::OrderBy>) -> Self {
+        let mut demand = Self::of_order_by(order_by);
+        demand.scan_rendered(&select.to_string());
+        demand
+    }
+
+    /// The demand of a bare ORDER BY — all a `TABLE t` body can carry.
+    fn of_order_by(order_by: &Option<ast::OrderBy>) -> Self {
+        let mut demand = Self::default();
+        if let Some(order_by) = order_by {
+            demand.scan_rendered(&order_by.to_string());
+        }
+        demand
+    }
+
+    /// Whether a write statement names `tableoid` anywhere it could read one:
+    /// its WHERE, its RETURNING list, and (for UPDATE) its SET expressions.
+    ///
+    /// A write answers from the target the row actually lives in, so this only
+    /// decides whether the slot exists at all; *which* relation it names is
+    /// settled per target at execution.
+    fn in_write(
+        selection: &Option<ast::Expr>,
+        returning: &Option<Vec<ast::SelectItem>>,
+        assignments: &[ast::Assignment],
+    ) -> bool {
+        let mut demand = Self::default();
+        if let Some(selection) = selection {
+            demand.scan_rendered(&selection.to_string());
+        }
+        for item in returning.iter().flatten() {
+            demand.scan_rendered(&item.to_string());
+        }
+        for assignment in assignments {
+            demand.scan_rendered(&assignment.to_string());
+        }
+        demand.any()
+    }
+
+    /// Find `tableoid` in rendered SQL, taking the qualifier before it when it
+    /// has one. Quoting is honored on both halves: the parser re-quotes an
+    /// identifier that needs it, and `"tableoid"` names the system column just
+    /// as the bare spelling does.
+    fn scan_rendered(&mut self, text: &str) {
+        let lower = text.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let part_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        for (at, _) in lower.match_indices(TABLEOID) {
+            let end = at + TABLEOID.len();
+            // A longer identifier that merely contains the word is not it.
+            if bytes.get(end).is_some_and(|b| part_char(*b))
+                || at.checked_sub(1).is_some_and(|i| part_char(bytes[i]))
+            {
+                continue;
+            }
+            match qualifier_before(text, &lower, at) {
+                Some(qualifier) => {
+                    self.qualified.insert(qualifier);
+                }
+                None => self.bare = true,
+            }
+        }
+    }
+}
+
+/// The `q` of a rendered `q.tableoid`, or `None` when the reference is bare.
+///
+/// `at` is the offset of the column name in `lower`, possibly preceded by its
+/// own quote. `text` is the same string with its original case: only an ASCII
+/// case fold separates the two, so the offsets address the same bytes in both,
+/// and a *quoted* qualifier must be read from `text` because quoting is what
+/// preserves its case — the same rule [`normalize_ident`] applies.
+///
+/// A schema-qualified `s.t.tableoid` renders with both parts; the relation is
+/// addressed by `t`, the part nearest the column.
+fn qualifier_before(text: &str, lower: &str, at: usize) -> Option<String> {
+    let bytes = lower.as_bytes();
+    // Step back over the column's opening quote, then the dot that joins them.
+    let mut end = at;
+    if end > 0 && bytes[end - 1] == b'"' {
+        end -= 1;
+    }
+    if end == 0 || bytes[end - 1] != b'.' {
+        return None;
+    }
+    end -= 1;
+    if end > 0 && bytes[end - 1] == b'"' {
+        let close = end - 1;
+        let open = lower[..close].rfind('"')?;
+        return Some(text[open + 1..close].to_string());
+    }
+    let start = lower[..end]
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .map_or(0, |i| i + 1);
+    (start < end).then(|| lower[start..end].to_string())
+}
+
 /// Bind all comma-separated FROM groups. Each group owns its JOIN/ON namespace;
 /// only after its explicit join chain is complete is it combined with prior
 /// groups by a cross join. This makes `a, b JOIN c ON a.x = c.x` reject `a` in
 /// ON, matching SQL's join nesting rules.
+#[allow(clippy::too_many_arguments)]
 fn bind_from_clause(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -3385,6 +3614,7 @@ fn bind_from_clause(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
+    demand: &TableoidDemand,
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
     let mut relations: Vec<ScopeItem> = Vec::new();
@@ -3408,6 +3638,7 @@ fn bind_from_clause(
             outer_scope,
             windows,
             &relations,
+            demand,
         )?;
         for rel in &group_relations {
             ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
@@ -3458,6 +3689,7 @@ fn shift_visible(mut col: VisibleColumn, delta: usize) -> VisibleColumn {
 /// from other comma-delimited FROM groups. A `USING`/`NATURAL` join also builds
 /// a merged-column view (`visible`) so its join columns resolve once, before
 /// the rest; a chain with only `ON`/`CROSS` joins keeps that view `None`.
+#[allow(clippy::too_many_arguments)]
 fn bind_table_with_joins(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -3467,9 +3699,18 @@ fn bind_table_with_joins(
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
     siblings: &[ScopeItem],
+    demand: &TableoidDemand,
 ) -> Result<BoundFrom, BindError> {
-    let mut bound =
-        bind_from_item(engine, catalog, params, &table.relation, ctes, siblings)?.into_bound_from();
+    let mut bound = bind_from_item(
+        engine,
+        catalog,
+        params,
+        &table.relation,
+        ctes,
+        siblings,
+        demand,
+    )?
+    .into_bound_from();
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
@@ -3505,6 +3746,7 @@ fn bind_table_with_joins(
             &join.relation,
             ctes,
             &left_relations,
+            demand,
         )?
         .into_bound_from();
         left_relations.extend(right.relations.iter().cloned());
@@ -3583,7 +3825,10 @@ fn default_visible(relations: &[ScopeItem], base: usize) -> Vec<VisibleColumn> {
     let mut out = Vec::new();
     let mut index = base;
     for rel in relations {
-        for col in &rel.columns {
+        // The merged view drives unqualified resolution and `*`, and a system
+        // column belongs to neither: it never takes part in `USING`, and `*`
+        // does not expand it.
+        for col in rel.declared() {
             out.push(VisibleColumn {
                 name: col.name.clone(),
                 // Carry the column's declared collation, as unqualified
@@ -3606,7 +3851,7 @@ fn natural_join_names(left: &[VisibleColumn], right: &BoundFrom) -> Vec<String> 
     let right_names: HashSet<&str> = right
         .relations
         .iter()
-        .flat_map(|rel| rel.columns.iter())
+        .flat_map(|rel| rel.declared().iter())
         .map(|c| c.name.as_str())
         .collect();
     let mut names: Vec<String> = Vec::new();
@@ -4114,7 +4359,7 @@ fn bound_table_fn_item(
         qualifier,
         columns,
         input: JoinInput::TableFunction { func, args },
-        sys: SysSource::None,
+        system_slot: None,
     })
 }
 
@@ -5882,9 +6127,13 @@ pub fn bind_insert_with_params(
     // RETURNING references the inserted row's columns, addressed by the table
     // name (INSERT takes no alias). Its VALUES bound in the empty scope, so this
     // needs a fresh table scope.
+    // Only RETURNING can name `tableoid` on an INSERT — there is no WHERE, and
+    // the VALUES bound in the empty scope.
+    let tableoid = TableoidDemand::in_write(&None, &insert.returning, &[]);
     let returning = bind_returning(
         &insert.returning,
-        &Scope::table(&schema, name, catalog, params).with_subqueries(engine, &CteEnv::new()),
+        &Scope::table(&schema, name, catalog, params, tableoid)
+            .with_subqueries(engine, &CteEnv::new()),
     )?;
 
     Ok(LogicalPlan::Insert {
@@ -5894,6 +6143,7 @@ pub fn bind_insert_with_params(
         routing,
         // Only COPY can freeze; there is no `INSERT … FREEZE` in PostgreSQL.
         freeze: false,
+        tableoid,
     })
 }
 
@@ -6149,6 +6399,8 @@ impl CopyFromPlan {
             // The server has already verified the precondition against this very
             // target (it needs a transaction, which binding has no access to).
             freeze: self.freeze,
+            // COPY has no RETURNING, so nothing can read a system column.
+            tableoid: false,
         })
     }
 
@@ -6597,12 +6849,14 @@ pub fn bind_update_with_params(
     } else {
         None
     };
+    let tableoid =
+        TableoidDemand::in_write(&update.selection, &update.returning, &update.assignments);
     // An inheritance parent instead updates every descendant in place.
-    let inherited = write_targets(engine, &table, only)?;
+    let inherited = write_targets(engine, &table, only, tableoid)?;
     // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
     // so the CTE environment is empty.
-    let scope =
-        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(&schema, qualifier, catalog, params, tableoid)
+        .with_subqueries(engine, &CteEnv::new());
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -6648,6 +6902,7 @@ pub fn bind_update_with_params(
     // in schema order — the same scope the SET/WHERE clauses bound against.
     let returning = bind_returning(&update.returning, &scope)?;
     Ok(LogicalPlan::Update {
+        tableoid,
         table,
         predicate,
         assignments,
@@ -6711,11 +6966,15 @@ pub fn bind_delete_with_params(
     } else {
         None
     };
+    // A write answers `tableoid` from the target the row actually lives in, so
+    // WHERE reads it too — `DELETE FROM p WHERE tableoid = 'p1'::regclass` must
+    // match exactly the rows of that partition.
+    let tableoid = TableoidDemand::in_write(&delete.selection, &delete.returning, &[]);
     // An inheritance parent instead deletes from every descendant in place.
-    let inherited = write_targets(engine, &table, only)?;
+    let inherited = write_targets(engine, &table, only, tableoid)?;
     // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
-    let scope =
-        Scope::table(&schema, qualifier, catalog, params).with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(&schema, qualifier, catalog, params, tableoid)
+        .with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
     if let Some(predicate) = &predicate {
         reject_agg_or_window(predicate, "WHERE")?;
@@ -6723,6 +6982,7 @@ pub fn bind_delete_with_params(
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
     Ok(LogicalPlan::Delete {
+        tableoid,
         table,
         predicate,
         returning,
@@ -6752,6 +7012,82 @@ mod tests {
             panic!("failed to create binder test table: {error}");
         }
         engine
+    }
+
+    /// The `tableoid` demand of a SELECT, as `(bare, sorted qualifiers)`.
+    fn demand_of(sql: &str) -> (bool, Vec<String>) {
+        let stmts = match crabgresql_parser::parse(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+        };
+        let ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected a query: {sql}");
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected a plain SELECT: {sql}");
+        };
+        let demand = TableoidDemand::of_select(select, &query.order_by);
+        let mut qualified: Vec<String> = demand.qualified.into_iter().collect();
+        qualified.sort();
+        (demand.bare, qualified)
+    }
+
+    #[test]
+    fn tableoid_demand_finds_every_expression_position() {
+        // Nothing names it: the common case must widen nothing at all.
+        assert_eq!(demand_of("SELECT id FROM t").0, false);
+        assert!(demand_of("SELECT id FROM t").1.is_empty());
+
+        // Every clause an expression can sit in, including a correlated
+        // subquery, which is the position a structural walk is likeliest to
+        // miss.
+        for sql in [
+            "SELECT tableoid FROM t",
+            "SELECT id FROM t WHERE tableoid > 0",
+            "SELECT id FROM t GROUP BY tableoid",
+            "SELECT count(*) FROM t GROUP BY id HAVING max(tableoid) > 0",
+            "SELECT id FROM t ORDER BY tableoid",
+            "SELECT id FROM t JOIN t u ON u.id = tableoid",
+            "SELECT (SELECT tableoid) FROM t",
+            "SELECT CASE WHEN true THEN tableoid ELSE 0 END FROM t",
+        ] {
+            assert!(demand_of(sql).0, "unqualified reference missed in `{sql}`");
+        }
+
+        // Qualified references name the relation they belong to, and only it.
+        assert_eq!(
+            demand_of("SELECT t.tableoid FROM t, u"),
+            (false, vec!["t".to_string()])
+        );
+        assert_eq!(
+            demand_of("SELECT id FROM t WHERE (SELECT x.tableoid FROM u x) = 1"),
+            (false, vec!["x".to_string()])
+        );
+        // A quoted qualifier keeps its case, exactly as `normalize_ident` would
+        // leave it, so the two spellings match the same relation.
+        assert_eq!(
+            demand_of("SELECT \"T\".tableoid FROM t \"T\""),
+            (false, vec!["T".to_string()])
+        );
+        // Schema-qualified: the relation is addressed by its own name.
+        assert_eq!(
+            demand_of("SELECT public.t.tableoid FROM public.t"),
+            (false, vec!["t".to_string()])
+        );
+
+        // A longer identifier merely containing the word is not a reference.
+        for sql in [
+            "SELECT mytableoid FROM t",
+            "SELECT tableoid_x FROM t",
+            "SELECT t.tableoids FROM t",
+        ] {
+            let (bare, qualified) = demand_of(sql);
+            assert!(!bare && qualified.is_empty(), "false positive in `{sql}`");
+        }
+
+        // Documented over-approximation: a literal spelling the word costs an
+        // unreferenced slot, never a wrong answer.
+        assert!(demand_of("SELECT 'tableoid' FROM t").0);
     }
 
     fn bind_one(sql: &str) -> Result<LogicalPlan, BindError> {
@@ -11002,7 +11338,7 @@ mod tests {
         let engine = engine_with_table();
         let table = SplitTable::new("solo", Vec::new());
         assert!(
-            scan_arms(&engine, &table, false)
+            scan_arms(&engine, &table, false, false)
                 .expect("scan_arms must not fail on a plain relation")
                 .is_none(),
             "a monolithic relation must bind to a plain Scan, not a one-armed Append"
@@ -11019,23 +11355,22 @@ mod tests {
                 SplitTable::new("split_buffer", Vec::new()),
             ],
         );
-        let fanout = scan_arms(&engine, &table, false)
+        let arms = scan_arms(&engine, &table, false, true)
             .expect("scan_arms must not fail")
             .expect("a relation reporting storage leaves must fan out");
         // Order is the access method's, not sorted: a leaf order carries meaning
         // (durable storage before the write buffer, say) that must survive.
-        assert_eq!(
-            arm_names(&fanout.arms),
-            vec!["split_chunks", "split_buffer"]
-        );
+        assert_eq!(arm_names(&arms), vec!["split_chunks", "split_buffer"]);
         assert!(
-            fanout.arms.iter().all(|a| a.map.is_none()),
+            arms.iter().all(|a| a.map.is_none()),
             "one relation's storage leaves all carry its layout, so none remaps"
         );
+        // Storage leaves are one relation's own physical pieces, so every arm
+        // reports the relation that owns them — not the leaf's own name.
         assert!(
-            !fanout.multi_relation,
-            "storage leaves are one relation's own pieces, so `tableoid` still \
-             names that relation"
+            arms.iter()
+                .all(|a| a.tableoid.as_ref().is_some_and(|id| id.name == "split")),
+            "a storage leaf must answer `tableoid` with its owning relation"
         );
     }
 

@@ -12100,6 +12100,12 @@ async fn tableoid_on_a_user_relation() -> anyhow::Result<()> {
         scalar(&client, "SELECT t.tableoid FROM t").await,
         scalar(&client, "SELECT 't'::regclass::oid").await,
     );
+    // Unqualified and qualified must agree from a correlated subquery too — the
+    // unqualified spelling resolves through a different path.
+    assert_eq!(
+        scalar(&client, "SELECT (SELECT tableoid) FROM t").await,
+        scalar(&client, "SELECT (SELECT t.tableoid) FROM t").await,
+    );
 
     // `*` expands to the declared columns only, as in PG: a system column is
     // reachable by name and by name alone.
@@ -12144,9 +12150,18 @@ async fn tableoid_is_refused_off_a_plain_relation() -> anyhow::Result<()> {
         "WITH c AS (SELECT 1 AS a) SELECT tableoid FROM c",
         "SELECT tableoid FROM (SELECT 1 AS a) s",
         "SELECT tableoid FROM generate_series(1, 2)",
+        // `information_schema` is served here as relations but is views
+        // upstream, and a view exposes no system columns.
+        "SELECT tableoid FROM information_schema.tables",
     ] {
         assert_eq!(sqlstate(&client, sql).await?, "42703", "for `{sql}`");
     }
+    // It is a column of the row, so the grouping rules apply to it as to any
+    // other — PG spells the message with the relation.
+    assert_eq!(
+        sqlstate(&client, "SELECT tableoid, count(*) FROM t").await?,
+        "42803"
+    );
     // Two relations in scope, neither qualified: ambiguous, as any duplicated
     // column name would be.
     assert_eq!(
@@ -12158,8 +12173,151 @@ async fn tableoid_is_refused_off_a_plain_relation() -> anyhow::Result<()> {
         scalar(&client, "SELECT tableoid FROM p1").await,
         scalar(&client, "SELECT 'p1'::regclass::oid").await,
     );
-    // The parent would have to report the child each row came from.
-    assert_eq!(sqlstate(&client, "SELECT tableoid FROM p").await?, "0A000");
+    // Reading it through the parent reports the leaf, not the parent.
+    assert_eq!(
+        scalar(&client, "SELECT tableoid FROM p").await,
+        scalar(&client, "SELECT 'p1'::regclass::oid").await,
+    );
+    Ok(())
+}
+
+/// An outer join's null-extended side reports NULL for its system column, the
+/// same as for every other attribute of the row that is not there.
+///
+/// This is what a system column has to be a value *in* the row to get right: an
+/// expression over the row cannot tell which side was extended. Every expected
+/// value below is pinned against PostgreSQL 18.4, RIGHT and FULL included —
+/// those pad by the *declared* width of the other side, so a widened scan whose
+/// width did not travel with it would shift every column silently.
+#[tokio::test]
+async fn tableoid_is_null_on_an_outer_joins_extended_side() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE t (a int); INSERT INTO t VALUES (1); \
+             CREATE TABLE u (a int); INSERT INTO u VALUES (7)",
+        )
+        .await?;
+
+    let left = client
+        .simple_query("SELECT t.a, u.tableoid FROM t LEFT JOIN u ON false")
+        .await?;
+    assert_eq!(
+        rows(&left)[0].get(1),
+        None,
+        "the extended side must be NULL"
+    );
+
+    // The anti-join idiom, which is the shape that turns a wrong answer here
+    // into silently missing rows.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM t LEFT JOIN u ON false WHERE u.tableoid IS NULL",
+        )
+        .await,
+        "1",
+    );
+
+    // RIGHT pads a fixed-width all-NULL left side; FULL does both.
+    let right = client
+        .simple_query("SELECT t.tableoid, t.a, u.a FROM t RIGHT JOIN u ON false")
+        .await?;
+    let right = rows(&right);
+    assert_eq!((right[0].get(0), right[0].get(1)), (None, None));
+    assert_eq!(
+        right[0].get(2),
+        Some("7"),
+        "the preserved side must not shift"
+    );
+
+    let full = client
+        .simple_query(
+            "SELECT t.a, t.tableoid::regclass::text, u.a, u.tableoid::regclass::text \
+             FROM t FULL JOIN u ON false ORDER BY t.a NULLS LAST",
+        )
+        .await?;
+    let full = rows(&full);
+    assert_eq!(
+        (
+            full[0].get(0),
+            full[0].get(1),
+            full[0].get(2),
+            full[0].get(3)
+        ),
+        (Some("1"), Some("t"), None, None),
+    );
+    assert_eq!(
+        (
+            full[1].get(0),
+            full[1].get(1),
+            full[1].get(2),
+            full[1].get(3)
+        ),
+        (None, None, Some("7"), Some("u")),
+    );
+    Ok(())
+}
+
+/// A read of a partitioned or inherited relation reports the child each row
+/// actually came from, and a write matches and returns on the same basis — the
+/// canonical use of the column, and the one an expression frozen at bind time
+/// answered with the parent.
+#[tokio::test]
+async fn tableoid_names_the_leaf_a_row_lives_in() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a); \
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10); \
+             CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20); \
+             INSERT INTO p VALUES (1), (11)",
+        )
+        .await?;
+    let read = client
+        .simple_query("SELECT a, tableoid::regclass::text FROM p ORDER BY a")
+        .await?;
+    let read = rows(&read);
+    assert_eq!((read[0].get(0), read[0].get(1)), (Some("1"), Some("p1")));
+    assert_eq!((read[1].get(0), read[1].get(1)), (Some("11"), Some("p2")));
+
+    // RETURNING reports the leaf the row routed to.
+    assert_eq!(
+        scalar(
+            &client,
+            "INSERT INTO p VALUES (5) RETURNING tableoid::regclass::text",
+        )
+        .await,
+        "p1",
+    );
+    // ... and WHERE matches on it, so this deletes exactly p1's rows.
+    let deleted = client
+        .simple_query("DELETE FROM p WHERE tableoid = 'p1'::regclass RETURNING a")
+        .await?;
+    assert_eq!(rows(&deleted).len(), 2, "both p1 rows, and only those");
+    assert_eq!(scalar(&client, "SELECT count(*) FROM p").await, "1");
+
+    // Inheritance takes the same route through a different plan shape.
+    client
+        .simple_query(
+            "CREATE TABLE par (a int); CREATE TABLE chi (b int) INHERITS (par); \
+             INSERT INTO par VALUES (1); INSERT INTO chi VALUES (2, 20)",
+        )
+        .await?;
+    assert_eq!(
+        scalar(
+            &client,
+            "UPDATE par SET a = a + 100 WHERE tableoid = 'chi'::regclass \
+             RETURNING tableoid::regclass::text",
+        )
+        .await,
+        "chi",
+    );
+    assert_eq!(
+        scalar(&client, "SELECT a FROM ONLY chi").await,
+        "102",
+        "the child's row is the one that moved",
+    );
     Ok(())
 }
 
