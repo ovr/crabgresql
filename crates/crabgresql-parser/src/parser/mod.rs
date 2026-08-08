@@ -11035,10 +11035,17 @@ impl<'a> Parser<'a> {
             // `maybe_parse` turns every error but `RecursionLimitExceeded` into
             // `Ok(None)` and rewinds, so a refusal raised in there would silently
             // read as "the list ended here" instead of reaching the client.
-            if legacy_options
-                .iter()
-                .any(|seen| std::mem::discriminant(seen) == std::mem::discriminant(&opt))
-            {
+            //
+            // `CSV` and `BINARY` are alternative spellings of the *format*, so
+            // they conflict with each other and not only with themselves —
+            // `COPY … CSV BINARY` is the same refusal as `COPY … CSV CSV`.
+            let is_format = |o: &CopyLegacyOption| {
+                matches!(o, CopyLegacyOption::Csv(_) | CopyLegacyOption::Binary)
+            };
+            if legacy_options.iter().any(|seen| {
+                std::mem::discriminant(seen) == std::mem::discriminant(&opt)
+                    || (is_format(seen) && is_format(&opt))
+            }) {
                 return Err(Self::pg_syntax_diagnostic(
                     "conflicting or redundant options",
                     token.span.start,
@@ -11205,8 +11212,14 @@ impl<'a> Parser<'a> {
             }),
             Some(Keyword::QUOTE) => CopyOption::Quote(self.parse_literal_char()?),
             Some(Keyword::ESCAPE) => CopyOption::Escape(self.parse_literal_char()?),
+            // `FORCE_QUOTE { ( cols ) | * }` — the star form names every column
+            // and takes no parentheses.
             Some(Keyword::FORCE_QUOTE) => {
-                CopyOption::ForceQuote(self.parse_parenthesized_column_list(Mandatory, false)?)
+                CopyOption::ForceQuote(if self.consume_token(&Token::Mul) {
+                    CopyForceQuote::All
+                } else {
+                    CopyForceQuote::Columns(self.parse_parenthesized_column_list(Mandatory, false)?)
+                })
             }
             Some(Keyword::FORCE_NOT_NULL) => {
                 CopyOption::ForceNotNull(self.parse_parenthesized_column_list(Mandatory, false)?)
@@ -11468,9 +11481,11 @@ impl<'a> Parser<'a> {
                 )
             }
             Some(Keyword::FORCE) if self.parse_keywords(&[Keyword::QUOTE]) => {
-                CopyLegacyCsvOption::ForceQuote(
-                    self.parse_comma_separated(|p| p.parse_identifier())?,
-                )
+                CopyLegacyCsvOption::ForceQuote(if self.consume_token(&Token::Mul) {
+                    CopyForceQuote::All
+                } else {
+                    CopyForceQuote::Columns(self.parse_comma_separated(|p| p.parse_identifier())?)
+                })
             }
             _ => self.expected_ref("csv option", self.peek_token_ref())?,
         };

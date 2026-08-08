@@ -1023,6 +1023,14 @@ pub(crate) fn put_data_row<'a>(
     });
 }
 
+/// Encode a CopyData (`d`) frame from borrowed bytes. Shared with the
+/// `BackendWriter` convenience method so a copy-out stream can reuse one scratch
+/// buffer per row instead of allocating a `Vec` for every frame, which
+/// `BackendMessage::CopyData` (which owns its payload) would force.
+pub(crate) fn put_copy_data(buf: &mut BytesMut, data: &[u8]) {
+    framed(buf, b'd', |body| body.put_slice(data));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

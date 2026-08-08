@@ -104,9 +104,10 @@ pub(crate) fn execute_declare(
             notices,
             ..
         } => (columns, node, notices),
-        // The binder resolves a cursor's body as a query, so this is not
-        // reachable from any statement the grammar admits.
-        QueryResult::Command { .. } => {
+        // The binder resolves a cursor's body as a query, so neither of these is
+        // reachable from any statement the grammar admits (`DECLARE … CURSOR FOR
+        // COPY` is a syntax error).
+        QueryResult::CopyOut { .. } | QueryResult::Command { .. } => {
             return Err(PgError::syntax("DECLARE CURSOR requires a query"));
         }
     };

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use crabgresql_binder::CopyFormat;
 use crabgresql_executor::OutputColumn;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{
@@ -579,6 +580,40 @@ async fn write_result(
             }
             writer.command_complete(&tag.complete(count));
         }
+        QueryResult::CopyOut {
+            columns,
+            mut node,
+            format,
+            notices,
+        } => {
+            emit_notices(writer, &notices, Some(sql));
+            let mut copy = CopyOutStream::begin(writer, &columns, &format);
+            let mut count = 0usize;
+            loop {
+                match node.next() {
+                    Ok(Some(row)) => {
+                        if let Err(e) = copy.push(writer, &row, fmt) {
+                            writer.error_fields(e.to_fields(None));
+                            return Ok(WriteOutcome::Errored);
+                        }
+                        count += 1;
+                        if writer.buffered() >= STREAM_FLUSH_BYTES {
+                            writer.flush().await?;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // Mid-stream, as in the `Rows` arm: the CopyData already
+                        // sent stays sent, and the copy ends with an
+                        // ErrorResponse instead of CopyDone — PG cannot un-send
+                        // those frames either.
+                        writer.error_fields(PgError::from(e).to_fields(None));
+                        return Ok(WriteOutcome::Errored);
+                    }
+                }
+            }
+            copy.end(writer, count);
+        }
     }
     Ok(WriteOutcome::Completed)
 }
@@ -696,6 +731,94 @@ fn encode_row(
             Format::Binary => v.encode_binary().map_err(cast_error),
         })
         .collect()
+}
+
+/// Drives one `COPY … TO STDOUT` exchange onto the wire.
+///
+/// Both protocols emit the identical message sequence — CopyOutResponse, the
+/// preamble and optional HEADER, a CopyData frame per row, then CopyDone and
+/// `COPY n` — so it lives here rather than twice. Flushing is the caller's:
+/// the simple-query path is async and flushes as it streams, the extended path
+/// is synchronous and leaves it to the main loop.
+struct CopyOutStream {
+    encoder: crate::copy::CopyEncoder,
+    /// One scratch buffer reused for every frame, so a wide result does not
+    /// allocate per row.
+    buf: Vec<u8>,
+    /// The per-row rendered fields, likewise reused. Exactly one of the two is
+    /// ever non-empty — the format decides which — so carrying both costs one
+    /// empty `Vec` header rather than a per-row allocation.
+    text: Vec<Option<String>>,
+    binary: Vec<Option<Vec<u8>>>,
+}
+
+impl CopyOutStream {
+    /// Announce the copy and write the preamble plus any HEADER record.
+    fn begin(
+        writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+        columns: &[String],
+        format: &CopyFormat,
+    ) -> Self {
+        let encoder = crate::copy::CopyEncoder::new(format);
+        let wire = if encoder.is_binary() {
+            Format::Binary
+        } else {
+            Format::Text
+        };
+        writer.copy_out_response(columns.len(), wire);
+        let mut stream = CopyOutStream {
+            encoder,
+            buf: Vec::new(),
+            text: Vec::new(),
+            binary: Vec::new(),
+        };
+        stream.encoder.preamble(&mut stream.buf);
+        if stream.encoder.has_header() {
+            stream.encoder.header(columns, &mut stream.buf);
+        }
+        if !stream.buf.is_empty() {
+            writer.copy_data(&stream.buf);
+        }
+        stream
+    }
+
+    fn push(
+        &mut self,
+        writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+        row: &[Value],
+        fmt: &FmtCtx,
+    ) -> Result<(), PgError> {
+        self.buf.clear();
+        if self.encoder.is_binary() {
+            self.binary.clear();
+            for value in row {
+                self.binary.push(value.encode_binary().map_err(cast_error)?);
+            }
+            self.encoder.row_binary(&self.binary, &mut self.buf)?;
+        } else {
+            self.text.clear();
+            self.text
+                .extend(row.iter().map(|v| v.encode_text_with(fmt)));
+            self.encoder.row_text(&self.text, &mut self.buf);
+        }
+        writer.copy_data(&self.buf);
+        Ok(())
+    }
+
+    /// Close the copy: the trailer (binary only), CopyDone, then the tag.
+    fn end(
+        &mut self,
+        writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
+        count: usize,
+    ) {
+        self.buf.clear();
+        self.encoder.trailer(&mut self.buf);
+        if !self.buf.is_empty() {
+            writer.copy_data(&self.buf);
+        }
+        writer.copy_done();
+        writer.command_complete(&format!("COPY {count}"));
+    }
 }
 
 /// Parse (`P`): parse and analyze one statement into a prepared statement.
@@ -1029,6 +1152,36 @@ fn stream_execute(
             writer.command_complete(&tag);
             // No result set to re-report, so a further Execute is refused rather
             // than re-running the statement.
+            finish_portal(session, portal_name, None);
+            Ok(())
+        }
+        QueryResult::CopyOut {
+            columns,
+            mut node,
+            format,
+            notices,
+        } => {
+            emit_notices(writer, &notices, None);
+            let mut copy = CopyOutStream::begin(writer, &columns, &format);
+            let mut count = 0usize;
+            // `max_rows` is ignored: PostgreSQL never suspends a COPY portal —
+            // the copy sub-protocol has no partial-delivery state to resume from.
+            //
+            // TODO: this whole arm buffers into the writer without flushing,
+            // because `stream_execute` is synchronous. The `Rows` arm above has
+            // the same shape, so a large copy-out over the extended protocol is
+            // held in memory until the main loop flushes.
+            loop {
+                match node.next() {
+                    Ok(Some(row)) => {
+                        copy.push(writer, &row, fmt)?;
+                        count += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            copy.end(writer, count);
             finish_portal(session, portal_name, None);
             Ok(())
         }

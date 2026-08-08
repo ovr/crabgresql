@@ -8114,6 +8114,19 @@ pub enum CopyHeaderMode {
     Match,
 }
 
+/// What `COPY … TO … FORCE_QUOTE` names: an explicit column list, or every
+/// column. Both spellings of the option (`FORCE_QUOTE (a, b)` and the pre-9.0
+/// `FORCE QUOTE a, b`) accept the `*` form.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CopyForceQuote {
+    /// `FORCE_QUOTE *`
+    All,
+    /// `FORCE_QUOTE (a, b)`
+    Columns(Vec<Ident>),
+}
+
 /// An option in `COPY` statement.
 ///
 /// <https://www.postgresql.org/docs/14/sql-copy.html>
@@ -8136,7 +8149,7 @@ pub enum CopyOption {
     /// ESCAPE 'escape_character'
     Escape(char),
     /// FORCE_QUOTE { ( column_name [, ...] ) | * }
-    ForceQuote(Vec<Ident>),
+    ForceQuote(CopyForceQuote),
     /// FORCE_NOT_NULL ( column_name [, ...] )
     ForceNotNull(Vec<Ident>),
     /// FORCE_NULL ( column_name [, ...] )
@@ -8159,7 +8172,10 @@ impl fmt::Display for CopyOption {
             Header(CopyHeaderMode::Match) => write!(f, "HEADER MATCH"),
             Quote(char) => write!(f, "QUOTE '{char}'"),
             Escape(char) => write!(f, "ESCAPE '{char}'"),
-            ForceQuote(columns) => write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns)),
+            ForceQuote(CopyForceQuote::All) => write!(f, "FORCE_QUOTE *"),
+            ForceQuote(CopyForceQuote::Columns(columns)) => {
+                write!(f, "FORCE_QUOTE ({})", display_comma_separated(columns))
+            }
             ForceNotNull(columns) => {
                 write!(f, "FORCE_NOT_NULL ({})", display_comma_separated(columns))
             }
@@ -8485,7 +8501,7 @@ pub enum CopyLegacyCsvOption {
     /// ESCAPE \[ AS \] 'escape_character'
     Escape(char),
     /// FORCE QUOTE { column_name [, ...] | * }
-    ForceQuote(Vec<Ident>),
+    ForceQuote(CopyForceQuote),
     /// FORCE NOT NULL column_name [, ...]
     ForceNotNull(Vec<Ident>),
 }
@@ -8497,7 +8513,10 @@ impl fmt::Display for CopyLegacyCsvOption {
             Header => write!(f, "HEADER"),
             Quote(char) => write!(f, "QUOTE '{char}'"),
             Escape(char) => write!(f, "ESCAPE '{char}'"),
-            ForceQuote(columns) => write!(f, "FORCE QUOTE {}", display_comma_separated(columns)),
+            ForceQuote(CopyForceQuote::All) => write!(f, "FORCE QUOTE *"),
+            ForceQuote(CopyForceQuote::Columns(columns)) => {
+                write!(f, "FORCE QUOTE {}", display_comma_separated(columns))
+            }
             ForceNotNull(columns) => {
                 write!(f, "FORCE NOT NULL {}", display_comma_separated(columns))
             }

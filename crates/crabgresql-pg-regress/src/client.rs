@@ -56,6 +56,10 @@ impl ErrorFields {
 pub enum QueryEvent {
     RowDescription(Vec<Field>),
     Row(Vec<Option<String>>),
+    /// A completed `COPY … TO STDOUT`: every `CopyData` frame's payload,
+    /// concatenated. Per-frame granularity would be meaningless — psql renders a
+    /// copy-out by writing the bytes, so where the server split them cannot show.
+    CopyOut(Vec<u8>),
     CommandComplete(String),
     EmptyQuery,
     Error(ErrorFields),
@@ -125,20 +129,50 @@ impl Client {
         self.writer.flush().await?;
 
         let mut events = Vec::new();
+        // `Some` between CopyOutResponse and CopyDone; the payload accumulates
+        // here so a stray `d`/`c` outside a copy still reads as a violation.
+        let mut copy_out: Option<Vec<u8>> = None;
         loop {
             let (tag, body) = self.read_message().await?;
             match tag {
                 b'T' => events.push(QueryEvent::RowDescription(parse_row_description(&body)?)),
                 b'D' => events.push(QueryEvent::Row(parse_data_row(&body)?)),
+                // CopyOutResponse: the body only restates formats we already
+                // know (this client never asks for binary), so it is discarded.
+                b'H' => copy_out = Some(Vec::new()),
+                b'd' => match copy_out.as_mut() {
+                    Some(buffer) => buffer.extend_from_slice(&body),
+                    None => return Err(protocol_error("CopyData outside a copy-out")),
+                },
+                b'c' => match copy_out.take() {
+                    Some(buffer) => events.push(QueryEvent::CopyOut(buffer)),
+                    None => return Err(protocol_error("CopyDone outside a copy-out")),
+                },
                 b'C' => {
                     events.push(QueryEvent::CommandComplete(Cursor::new(&body).cstr()?));
                 }
                 b'I' => events.push(QueryEvent::EmptyQuery),
-                b'E' => events.push(QueryEvent::Error(parse_error_fields(&body))),
+                // A copy-out can also end in an error: the frames already sent
+                // stay sent (the server cannot un-send them) and no CopyDone
+                // follows. psql prints those rows and then the error, so the
+                // payload is flushed here rather than dropped.
+                b'E' => {
+                    if let Some(buffer) = copy_out.take() {
+                        events.push(QueryEvent::CopyOut(buffer));
+                    }
+                    events.push(QueryEvent::Error(parse_error_fields(&body)));
+                }
                 b'N' => events.push(QueryEvent::Notice(parse_error_fields(&body))),
                 // ParameterStatus, e.g. after SET once GUCs are reported.
                 b'S' => {}
-                b'Z' => return Ok(events),
+                b'Z' => {
+                    if copy_out.is_some() {
+                        return Err(protocol_error(
+                            "copy-out ended without CopyDone or an error",
+                        ));
+                    }
+                    return Ok(events);
+                }
                 other => {
                     return Err(protocol_error(format!(
                         "unexpected message '{}' in query response",
