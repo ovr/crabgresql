@@ -6,6 +6,8 @@
 //! source. Indexing is 1-based and character-based (not byte-based), matching
 //! `text`'s behavior in a UTF-8 database.
 
+use std::sync::Arc;
+
 /// SQLSTATE codes emitted by string functions. Kept local (like `interval.rs`)
 /// so `crabgresql-types` needs no dependency on the wire-protocol crate; the
 /// executor maps these onto `crabgresql_pg_wire::sqlstate::*`.
@@ -875,10 +877,19 @@ fn narrow(mut parts: Vec<Segment>) -> LikeProgram {
 
 thread_local! {
     /// Compiled LIKE patterns, most-recently-used first. See [`with_cached`]
-    /// for the discipline; entries are lent out by reference rather than
-    /// cloned, since a program owns its literals.
-    static LIKE_CACHE: std::cell::RefCell<Patterns<LikeKind, LikeProgram>> =
+    /// for the discipline.
+    ///
+    /// The program is behind an `Arc` so a caller can take one *out* of the
+    /// cache: [`like`] runs its match while holding the entry by reference and
+    /// needs nothing more, but [`LikeMatcher`] outlives the borrow, and a
+    /// program owns its literals and its searchers, so cloning it would be a
+    /// second compile by another name.
+    static LIKE_CACHE: std::cell::RefCell<Patterns<LikeKind, Arc<LikeProgram>>> =
         const { std::cell::RefCell::new(Patterns::new()) };
+}
+
+fn compile_shared(pattern: &str, kind: LikeKind) -> Result<Arc<LikeProgram>> {
+    compile_like(pattern, kind).map(Arc::new)
 }
 
 /// `LIKE` (and `ILIKE` when `case_insensitive`). `escape` defaults to `\` at
@@ -888,7 +899,7 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
         escape,
         case_insensitive,
     };
-    with_cached(&LIKE_CACHE, pattern, kind, compile_like, |prog| {
+    with_cached(&LIKE_CACHE, pattern, kind, compile_shared, |prog| {
         match_program(prog, s, case_insensitive)
     })
 }
@@ -934,32 +945,39 @@ fn match_program(prog: &LikeProgram, s: &str, case_insensitive: bool) -> bool {
     }
 }
 
-/// A `LIKE` pattern compiled once and owned by the caller.
+/// A compiled `LIKE` pattern the caller can hold.
 ///
-/// [`like`] compiles through a thread-local cache because the row path meets a
-/// pattern one subject at a time and cannot know it is the same pattern as last
-/// row. A caller that *does* know — the vectorized filter, which holds one
-/// constant pattern for the life of a plan — compiles here instead and pays no
-/// cache lookup per value at all.
+/// [`like`] looks the pattern up per subject because the row path meets one
+/// subject at a time and cannot know it is the same pattern as last row. A
+/// caller that *does* know — the vectorized filter, which holds one constant
+/// pattern for the life of a plan — takes the program out once and matches
+/// against it with no lookup at all.
 ///
-/// It is the same program run by the same matcher, so the two paths agree by
-/// construction rather than by test.
+/// It comes from the same cache and runs through the same [`match_program`], so
+/// the two paths agree by construction rather than by test.
+#[derive(Clone)]
 pub struct LikeMatcher {
-    program: LikeProgram,
+    program: Arc<LikeProgram>,
     case_insensitive: bool,
 }
 
 impl LikeMatcher {
-    /// Compile `pattern`. `escape` follows [`like`]: `Some('\\')` for the
-    /// default clause, `None` to disable escaping (`ESCAPE ''`). Fails exactly
-    /// where `like` fails — on a pattern ending in a bare escape character.
+    /// Compile `pattern`, or take it from this thread's cache. `escape` follows
+    /// [`like`]: `Some('\\')` for the default clause, `None` to disable
+    /// escaping (`ESCAPE ''`). Fails exactly where `like` fails — on a pattern
+    /// ending in a bare escape character.
+    ///
+    /// Going through the cache is what lets the planner's gate and the
+    /// executor's compiler each call this for the same pattern without
+    /// compiling it twice.
     pub fn compile(pattern: &str, escape: Option<char>, case_insensitive: bool) -> Result<Self> {
         let kind = LikeKind {
             escape,
             case_insensitive,
         };
+        let program = with_cached(&LIKE_CACHE, pattern, kind, compile_shared, Arc::clone)?;
         Ok(LikeMatcher {
-            program: compile_like(pattern, kind)?,
+            program,
             case_insensitive,
         })
     }

@@ -59,7 +59,9 @@ impl ProjectBatch {
         }
         projections
             .iter()
-            .map(|expr| match unwrap_collate(expr) {
+            // The same peel the planner's `vectorizable_projection` applies, so
+            // a projection it calls a pure take is one this can build.
+            .map(|expr| match vectorize::strip_relabel(expr) {
                 BoundExpr::ColumnRef { index, .. } => {
                     (*index < layout.len()).then_some(Take::Column(*index))
                 }
@@ -217,13 +219,6 @@ impl BatchNode for SortBatch {
         }
         self.emitted = true;
         Ok(self.rows.take())
-    }
-}
-
-fn unwrap_collate(expr: &BoundExpr) -> &BoundExpr {
-    match expr {
-        BoundExpr::Collate { expr, .. } => unwrap_collate(expr),
-        other => other,
     }
 }
 

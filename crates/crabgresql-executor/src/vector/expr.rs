@@ -31,11 +31,17 @@
 //! Arrow ships `like_utf8`/`ilike_utf8`, and neither is used. They have no user
 //! `ESCAPE` clause and their own idea of case folding, so either would be a
 //! second implementation of `LIKE` that has to be kept in step with the real
-//! one. Instead the pattern compiles — once, at plan time, via
-//! [`vectorize::like_call`] — to the *same* [`crabgresql_types::text`] matcher
-//! the row path runs, and the loop over the column is the only new code. What
-//! vectorizing buys here is not a faster match but the compile hoisted out of
-//! the row loop and the batch never shredded into tuples.
+//! one. Instead [`vectorize::like_call`] hands over the *same*
+//! [`crabgresql_types::text`] matcher the row path runs — out of the same
+//! thread-local cache, so the pattern is compiled once and every later caller
+//! takes a reference to it — and the loop over the column is the only new code.
+//! What vectorizing buys here is not a faster match but the pattern lookup
+//! hoisted out of the row loop and the batch never shredded into tuples.
+//!
+//! It is also the only node whose per-row cost is unbounded, which is why the
+//! tree carries a *selection*: an `AND` narrows its right operand to the rows
+//! the left did not already decide, so a selective conjunct still protects an
+//! expensive matcher the way it does on the row path. See [`undecided`].
 //!
 //! # Three-valued logic
 //!
@@ -49,7 +55,7 @@
 
 use std::sync::Arc;
 
-use arrow_arith::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
+use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or_kleene};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch, Scalar, StringArray};
 use arrow_ord::cmp;
 use arrow_schema::ArrowError;
@@ -72,7 +78,8 @@ impl VectorPredicate {
     /// The boolean mask for `batch`: `true` keeps the row, `false` and NULL drop
     /// it.
     pub fn evaluate(&self, batch: &RecordBatch) -> Result<BooleanArray, ExecError> {
-        self.root.boolean(batch)
+        // No selection at the root: every row's answer is the answer.
+        self.root.boolean(batch, None)
     }
 }
 
@@ -94,13 +101,33 @@ enum Node {
         left: Box<Node>,
         right: Box<Node>,
     },
-    /// `LIKE`/`ILIKE` against a pattern compiled once, at plan time. The
-    /// matcher is boxed because a compiled program owns its literals and its
-    /// searchers, and every other variant is pointer-sized.
+    /// `LIKE`/`ILIKE` against a pattern compiled before the scan starts. The
+    /// matcher holds the compiled program behind an `Arc` shared with the row
+    /// path's cache, so it is two words like every other variant here.
     Like {
         subject: Box<Node>,
-        matcher: Box<LikeMatcher>,
+        matcher: LikeMatcher,
     },
+}
+
+impl Node {
+    /// Whether this subtree runs a matcher, i.e. whether restricting it to
+    /// fewer rows can pay for the masks that restriction costs.
+    ///
+    /// Every other node is an Arrow kernel over the whole batch, and a kernel
+    /// has no cheaper form for a subset — the mask would be pure overhead.
+    fn has_matcher(&self) -> bool {
+        match self {
+            Node::Like { .. } => true,
+            Node::And(left, right) | Node::Or(left, right) => {
+                left.has_matcher() || right.has_matcher()
+            }
+            Node::Not(operand) => operand.has_matcher(),
+            Node::Column(_) | Node::Literal(_) | Node::IsNull { .. } | Node::Compare { .. } => {
+                false
+            }
+        }
+    }
 }
 
 /// An evaluated operand. The distinction is not cosmetic: Arrow broadcasts a
@@ -126,7 +153,18 @@ impl Operand {
 }
 
 impl Node {
-    fn evaluate(&self, batch: &RecordBatch) -> Result<Operand, ExecError> {
+    /// Evaluate this node over `batch`.
+    ///
+    /// `selection`, when present, marks the rows whose value can still change
+    /// the answer above; for any other row this node may return **anything**.
+    /// It is an optimization hint travelling downward, and only [`Node::Like`]
+    /// acts on it — see [`undecided`] for where it comes from and why it is
+    /// sound.
+    fn evaluate(
+        &self,
+        batch: &RecordBatch,
+        selection: Option<&BooleanArray>,
+    ) -> Result<Operand, ExecError> {
         match self {
             Node::Column(index) => batch
                 .columns()
@@ -135,18 +173,25 @@ impl Node {
                 .ok_or_else(|| internal("vectorized predicate names a missing column")),
             Node::Literal(scalar) => Ok(Operand::Scalar(scalar.clone())),
             Node::And(left, right) => {
-                let (left, right) = (left.boolean(batch)?, right.boolean(batch)?);
+                let left = left.boolean(batch, selection)?;
+                let narrowed = undecided(right, selection, &left, false)?;
+                let right = right.boolean(batch, narrowed.as_ref().or(selection))?;
                 and_kleene(&left, &right).map(boxed).map_err(kernel_error)
             }
             Node::Or(left, right) => {
-                let (left, right) = (left.boolean(batch)?, right.boolean(batch)?);
+                let left = left.boolean(batch, selection)?;
+                let narrowed = undecided(right, selection, &left, true)?;
+                let right = right.boolean(batch, narrowed.as_ref().or(selection))?;
                 or_kleene(&left, &right).map(boxed).map_err(kernel_error)
             }
-            Node::Not(operand) => not(&operand.boolean(batch)?)
+            // `NOT` is a bijection on the three values, so a row that decides
+            // the answer above decides it here too: the selection passes through
+            // unchanged.
+            Node::Not(operand) => not(&operand.boolean(batch, selection)?)
                 .map(boxed)
                 .map_err(kernel_error),
             Node::IsNull { operand, negated } => {
-                let operand = operand.evaluate(batch)?;
+                let operand = operand.evaluate(batch, None)?;
                 let array = operand.array();
                 let mask = if *negated {
                     is_not_null(array)
@@ -155,8 +200,11 @@ impl Node {
                 };
                 mask.map(boxed).map_err(kernel_error)
             }
+            // The comparison kernels have no cheaper form for a subset of the
+            // batch, so the selection stops here rather than costing a mask
+            // nothing would read.
             Node::Compare { op, left, right } => {
-                let (left, right) = (left.evaluate(batch)?, right.evaluate(batch)?);
+                let (left, right) = (left.evaluate(batch, None)?, right.evaluate(batch, None)?);
                 let (l, r) = (left.datum(), right.datum());
                 let mask = match op {
                     BinOp::Eq => cmp::eq(l, r),
@@ -171,7 +219,7 @@ impl Node {
                 mask.map(boxed).map_err(kernel_error)
             }
             Node::Like { subject, matcher } => {
-                let subject = subject.evaluate(batch)?;
+                let subject = subject.evaluate(batch, None)?;
                 let array = subject
                     .array()
                     .as_any()
@@ -183,17 +231,44 @@ impl Node {
                     .ok_or_else(|| internal("vectorized LIKE expected a text operand"))?;
                 // A NULL subject stays NULL, as `eval_like` returns NULL for
                 // one; the top-level filter drops NULL and `false` alike.
-                let mask: BooleanArray = array
-                    .iter()
-                    .map(|value| value.map(|s| matcher.matches(s)))
-                    .collect();
+                //
+                // The matcher is the one operation here whose per-row cost is
+                // unbounded — an ILIKE over non-ASCII text lowercases every
+                // subject — so this is the one node that honors the selection.
+                // Rows outside it get `false`, which is legal precisely because
+                // nothing above reads them.
+                let mask: BooleanArray = match selection {
+                    // A length mismatch means the subject is a broadcast
+                    // constant, and a NULL in the mask would make `value()`
+                    // meaningless; both fall back to evaluating everything,
+                    // which is always correct and, for one value, free.
+                    Some(keep) if keep.len() == array.len() && keep.null_count() == 0 => array
+                        .iter()
+                        .enumerate()
+                        .map(|(row, value)| {
+                            if keep.value(row) {
+                                value.map(|s| matcher.matches(s))
+                            } else {
+                                Some(false)
+                            }
+                        })
+                        .collect(),
+                    _ => array
+                        .iter()
+                        .map(|value| value.map(|s| matcher.matches(s)))
+                        .collect(),
+                };
                 Ok(Operand::Array(Arc::new(mask)))
             }
         }
     }
 
-    fn boolean(&self, batch: &RecordBatch) -> Result<BooleanArray, ExecError> {
-        let operand = self.evaluate(batch)?;
+    fn boolean(
+        &self,
+        batch: &RecordBatch,
+        selection: Option<&BooleanArray>,
+    ) -> Result<BooleanArray, ExecError> {
+        let operand = self.evaluate(batch, selection)?;
         let mask = operand
             .array()
             .as_any()
@@ -204,6 +279,51 @@ impl Node {
             // instead of the backend.
             .ok_or_else(|| internal("vectorized predicate expected a boolean operand"))?;
         Ok(fit(mask, batch.num_rows()))
+    }
+}
+
+/// The rows for which the right operand of an `AND`/`OR` still matters, or
+/// `None` when narrowing would not pay for itself.
+///
+/// This is the columnar form of short-circuiting, and it rests on the same two
+/// Kleene identities the row evaluator uses to skip its right operand:
+///
+/// - `false AND x` is `false` for every `x`, so `AND` needs its right operand
+///   only where the left is **not** `false` — `is_null(l) OR l`;
+/// - `true OR x` is `true` for every `x`, so `OR` needs it only where the left
+///   is **not** `true` — `is_null(l) OR NOT l`.
+///
+/// A NULL left operand keeps the row: `NULL AND true` is NULL while
+/// `NULL AND false` is `false`, and under a `NOT` those differ in what survives
+/// the filter. Both expressions above are total — `or_kleene` with a
+/// never-NULL `is_null` mask cannot produce NULL — which is what lets the
+/// consumer read the mask with `value()`.
+///
+/// Returns `None` when the right subtree runs no matcher, since every other
+/// node evaluates the whole batch regardless and the two extra kernels would be
+/// the only thing the narrowing cost.
+fn undecided(
+    right: &Node,
+    parent: Option<&BooleanArray>,
+    left: &BooleanArray,
+    decisive: bool,
+) -> Result<Option<BooleanArray>, ExecError> {
+    if !right.has_matcher() {
+        return Ok(None);
+    }
+    let open = if decisive {
+        not(left)
+    } else {
+        Ok(left.clone())
+    };
+    let still = open
+        .and_then(|open| or_kleene(&is_null(left)?, &open))
+        .map_err(kernel_error)?;
+    match parent {
+        Some(parent) if parent.len() == still.len() => {
+            and(parent, &still).map(Some).map_err(kernel_error)
+        }
+        _ => Ok(Some(still)),
     }
 }
 
@@ -324,7 +444,7 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
             let call = vectorize::like_call(*func, args, layout.len())?;
             Some(Node::Like {
                 subject: Box::new(compile_operand(call.subject, layout)?),
-                matcher: Box::new(call.matcher),
+                matcher: call.matcher,
             })
         }
         // A bare boolean column or constant is a legal `WHERE` on its own.
@@ -344,9 +464,12 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
 /// parameter, a correlated reference — ends the compile. Those are where the
 /// row evaluator's side effects and PostgreSQL-specific semantics live, and
 /// none of them is worth reproducing before the simple cases are proven.
+///
+/// The wrappers [`vectorize::strip_relabel`] removes are not computation: they
+/// rename a value without changing it. Peeling them here and in the planner's
+/// [`vectorize::vectorizable_operand`] is one decision made in one place.
 fn compile_operand(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
-    match expr {
-        BoundExpr::Collate { expr, .. } => compile_operand(expr, layout),
+    match vectorize::strip_relabel(expr) {
         BoundExpr::ColumnRef { index, .. } => {
             // Batches are full width in schema order, so a schema ordinal is a
             // batch ordinal. Checked rather than assumed: an out-of-range index

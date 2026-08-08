@@ -112,10 +112,16 @@ pub struct LikeCall<'a> {
 /// compiled pattern.
 ///
 /// Unlike every other rule here this one returns the *artifact* rather than a
-/// verdict, and deliberately: the pattern is compiled once, at plan time, and
-/// the executor must not be able to decide differently from `EXPLAIN`. Handing
-/// back the compiled matcher makes that structural rather than a convention
-/// two functions have to keep.
+/// verdict, and deliberately: the executor must not be able to decide
+/// differently from `EXPLAIN`, and handing back the compiled matcher makes that
+/// structural rather than a convention two functions have to keep.
+///
+/// Both callers really do call this — the gate
+/// ([`vectorizable_predicate`]) throws the matcher away and keeps the `is_some`,
+/// then the executor's compiler calls it again for the matcher it holds. That
+/// is the price of the gate, not an oversight, and it is not a second compile:
+/// [`LikeMatcher::compile`] goes through the thread's pattern cache, so the
+/// pattern is compiled once per thread and every later call is a lookup.
 ///
 /// There is no Arrow `like` kernel involved. Arrow's has no user `ESCAPE` and
 /// its own idea of case folding; PostgreSQL's semantics live in
@@ -168,31 +174,48 @@ pub fn like_call(func: ScalarFn, args: &[BoundExpr], width: usize) -> Option<Lik
 /// anyway — the binder coerces `bpchar` to `text` through a
 /// `ScalarFn::BpcharToText` call, which is computed and so refused — but naming
 /// it keeps the exclusion from looking accidental.
-///
-/// The `text` coercion the binder puts on a `varchar`/`name` operand *is*
-/// peeled: `Value::Text` is the one representation all three share, so that
-/// `Coerce` evaluates to its input unchanged. Without peeling it, no `varchar`
-/// column could ever be a columnar `LIKE` subject.
 fn like_subject(expr: &BoundExpr, width: usize) -> Option<&BoundExpr> {
+    let expr = strip_relabel(expr);
+    let text = matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name);
+    (text && vectorizable_operand(expr, width)).then_some(expr)
+}
+
+/// Peel the wrappers that change how a value is *labelled* without changing the
+/// value, so an operand is judged by the column or constant underneath.
+///
+/// Two of them:
+///
+/// - `Collate` — a collation decides how a *comparison* orders, and a
+///   comparison reads that from its own node, never from its operand.
+/// - `Coerce` to `text` over `text`/`varchar`/`name` — all three are backed by
+///   `Value::Text`, whose `pg_type()` is `text`, so `cast_value` returns on
+///   `from == to` and the node evaluates to its input unchanged.
+///
+/// The second one is load-bearing rather than cosmetic: the binder wraps a
+/// `varchar`/`name` operand the moment the other side is `text`
+/// (`to_text_operand`, `unify_types`), so without this peel `vc = t` and
+/// `vc = 'x'::text` decline while the same column under `vc = 'x'` does not.
+///
+/// `bpchar` is deliberately not here. It reaches `text` through a
+/// `ScalarFn::BpcharToText` call — a computed node, refused anyway — which is
+/// the binder's way of saying the conversion is *not* a relabel: it strips
+/// trailing blanks.
+pub fn strip_relabel(expr: &BoundExpr) -> &BoundExpr {
     match expr {
-        BoundExpr::Collate { expr, .. } => like_subject(expr, width),
+        BoundExpr::Collate { expr, .. } => strip_relabel(expr),
         BoundExpr::Coerce {
             expr,
             ty: PgType::Text,
         } if matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name) => {
-            like_subject(expr, width)
+            strip_relabel(expr)
         }
-        _ => {
-            let text = matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name);
-            (text && vectorizable_operand(expr, width)).then_some(expr)
-        }
+        _ => expr,
     }
 }
 
 /// A non-NULL text constant, whatever text type it is labelled with.
 fn text_const(expr: &BoundExpr) -> Option<&str> {
-    match expr {
-        BoundExpr::Collate { expr, .. } => text_const(expr),
+    match strip_relabel(expr) {
         BoundExpr::Const {
             value: Value::Text(s),
             ..
@@ -225,8 +248,9 @@ pub fn sortable_key(key: &SortKey) -> bool {
 /// which is where PostgreSQL's evaluation semantics and side effects live.
 ///
 /// The one function call admitted is `LIKE`/`ILIKE` against a constant pattern
-/// ([`like_call`]), because its pattern compiles once per plan and the compiled
-/// matcher is the same one the row path runs.
+/// ([`like_call`]), because its pattern compiles once for the whole scan rather
+/// than once per row, and the compiled matcher is the same one the row path
+/// runs.
 pub fn vectorizable_predicate(predicate: &BoundExpr, width: usize) -> bool {
     match predicate {
         // Value-transparent; a comparison reads its collation from its own node.
@@ -278,8 +302,7 @@ fn is_comparison(op: BinOp) -> bool {
 }
 
 fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
-    match expr {
-        BoundExpr::Collate { expr, .. } => vectorizable_operand(expr, width),
+    match strip_relabel(expr) {
         // Batches are full width in schema order, so a schema ordinal is a batch
         // ordinal — but only if it is actually in range.
         BoundExpr::ColumnRef { index, .. } => *index < width,

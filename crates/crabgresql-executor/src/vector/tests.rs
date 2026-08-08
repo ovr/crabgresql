@@ -407,7 +407,7 @@ fn every_like_pattern_agrees_with_the_row_filter() {
         "%b%",   // Contains
         "%%",    // Contains, empty
         "a_c",   // Whole
-        "_",     //
+        "_",     // Whole, one wildcard
         "a%c%e", // Segments
         "%a%b%", "a%_%c", "%",
     ];
@@ -449,15 +449,16 @@ fn like_honors_the_escape_clause() {
     assert_same(&schema, &rows, &like_escape(subject(), "%\\%", ""));
 }
 
-/// A `varchar`/`name` column reaches `LIKE` wrapped in the binder's coercion to
-/// `text`. The three share one value representation, so that coercion is a
-/// relabel — peeling it is what lets such a column vectorize at all.
+/// A `varchar`/`name` column reaches an operator wrapped in the binder's
+/// coercion to `text`. The three share one value representation, so that
+/// coercion is a relabel — peeling it is what lets such a column vectorize at
+/// all, under `LIKE` and equally under a comparison or `IS NULL`.
 #[test]
-fn like_sees_through_the_text_relabel() {
+fn operators_see_through_the_text_relabel() {
     for ty in [PgType::Varchar, PgType::Name] {
         let schema = schema_of(&[ty]);
         let rows = text_rows();
-        let coerced = BoundExpr::Coerce {
+        let coerced = || BoundExpr::Coerce {
             expr: Box::new(column(0, ty)),
             ty: PgType::Text,
         };
@@ -466,10 +467,84 @@ fn like_sees_through_the_text_relabel() {
             &rows,
             &like(
                 false,
-                coerced,
+                coerced(),
                 constant(Value::Text("a%".into()), PgType::Text),
             ),
         );
+        // The case the LIKE-only peel used to miss: `vc = 'x'::text` binds to
+        // exactly the node above, and declining it dropped the whole filter.
+        for op in [BinOp::Eq, BinOp::NotEq] {
+            assert_same(
+                &schema,
+                &rows,
+                &compare(
+                    op,
+                    PgType::Text,
+                    coerced(),
+                    constant(Value::Text("abc".into()), PgType::Text),
+                ),
+            );
+        }
+        assert_same(
+            &schema,
+            &rows,
+            &BoundExpr::IsNull {
+                expr: Box::new(coerced()),
+                negated: false,
+            },
+        );
+    }
+}
+
+/// A matcher is the one node whose per-row cost is unbounded, so `AND`/`OR`
+/// narrow it to the rows the other side left undecided. The narrowing must not
+/// change a single answer.
+///
+/// The load-bearing case is a NULL left operand under `NOT`. `NULL AND x` is
+/// `false` when `x` is `false` and NULL when `x` is `true`; both drop at the top
+/// level, so a selection that wrongly excluded NULL rows would look correct
+/// there — and `NOT` turns the first into a kept row and the second into a
+/// dropped one.
+#[test]
+fn a_narrowed_matcher_agrees_with_the_row_filter() {
+    let schema = schema_of(&[PgType::Text, PgType::Bool]);
+    let rows: Vec<Tuple> = text_rows()
+        .into_iter()
+        .zip([Some(true), Some(false), None].into_iter().cycle())
+        .map(|(mut row, flag)| {
+            row.push(flag.map_or(Value::Null, Value::Bool));
+            row
+        })
+        .collect();
+
+    let flag = || column(1, PgType::Bool);
+    let matches = |pattern: &str| {
+        like(
+            false,
+            column(0, PgType::Text),
+            constant(Value::Text(pattern.into()), PgType::Text),
+        )
+    };
+    for pattern in ["a%", "%c", "%", "zzz"] {
+        for op in [BinOp::And, BinOp::Or] {
+            // Both orders: only the right operand is ever narrowed, and the
+            // left one must keep answering for every row.
+            for predicate in [
+                logic(op, flag(), matches(pattern)),
+                logic(op, matches(pattern), flag()),
+                logic(op, matches(pattern), matches("%b%")),
+            ] {
+                assert_same(&schema, &rows, &predicate);
+                assert_same(
+                    &schema,
+                    &rows,
+                    &BoundExpr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(predicate),
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1013,6 +1088,33 @@ fn the_planner_and_the_executor_agree_on_every_shape() {
             )),
         },
         like_escape(column(1, PgType::Text), "a!%c", "!"),
+        // The binder's relabel to `text`, which both sides must peel or neither.
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            BoundExpr::Coerce {
+                expr: Box::new(column(1, PgType::Text)),
+                ty: PgType::Text,
+            },
+            constant(Value::Text("x".into()), PgType::Text),
+        ),
+        BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::Coerce {
+                expr: Box::new(column(1, PgType::Text)),
+                ty: PgType::Text,
+            }),
+            negated: false,
+        },
+        // …but only over a text-family input: `numeric::text` really computes.
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            BoundExpr::Coerce {
+                expr: Box::new(column(2, PgType::Numeric)),
+                ty: PgType::Text,
+            },
+            constant(Value::Text("x".into()), PgType::Text),
+        ),
         // Declined, each for its own reason.
         like(false, column(1, PgType::Text), column(1, PgType::Text)),
         like(
