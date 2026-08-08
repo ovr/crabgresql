@@ -28,8 +28,10 @@ pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
 };
 pub use plan::{
-    AggInput, CopyFormat, CopyFromPlan, CopyFromSource, CopyHeader, DistinctKey, InsertSource,
-    JoinExpr, JoinInput, JoinKind, LogicalPlan, MappedRelation, RelationIdent, Returning, SortKey,
+    AggInput, AggregatePlan, AppendPlan, CopyFormat, CopyFromPlan, CopyFromSource, CopyHeader,
+    DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan,
+    LimitPlan, LogicalPlan, MappedRelation, QueryPlan, RelationIdent, Returning, SetOpArm,
+    SetOpPlan, SortKey, SubqueryPlan, TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan,
     bind_copy_from, bind_delete, bind_delete_with_params, bind_insert, bind_insert_with_params,
     bind_query, bind_query_with_params, bind_update, bind_update_with_params,
     inheritance_descendants, output_columns_of, plan_calls_routine, plan_has_outer_refs,

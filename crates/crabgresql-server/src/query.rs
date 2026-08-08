@@ -11,10 +11,10 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
-    BoundExpr, CopyFromPlan, CopyFromSource, InsertSource, LogicalPlan, bind_copy_from,
-    bind_delete_with_params, bind_insert_with_params, bind_query, bind_query_with_params,
-    bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
-    require_all_resolved, substitute_params,
+    BoundExpr, CopyFromPlan, CopyFromSource, DeletePlan, InsertPlan, InsertSource, LogicalPlan,
+    UpdatePlan, bind_copy_from, bind_delete_with_params, bind_insert_with_params, bind_query,
+    bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
+    param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
 use crabgresql_executor::{
     CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, MaterializedRows, OutputColumn,
@@ -1052,9 +1052,9 @@ pub(crate) fn execute_statement_with(
     // observably harmless, since PostgreSQL defaults routines to VOLATILE anyway.
     let calls_routine = crabgresql_binder::plan_calls_routine(&logical);
     let dml_verb = match logical {
-        LogicalPlan::Insert { .. } => Some("INSERT"),
-        LogicalPlan::Update { .. } => Some("UPDATE"),
-        LogicalPlan::Delete { .. } => Some("DELETE"),
+        LogicalPlan::Insert(InsertPlan { .. }) => Some("INSERT"),
+        LogicalPlan::Update(UpdatePlan { .. }) => Some("UPDATE"),
+        LogicalPlan::Delete(DeletePlan { .. }) => Some("DELETE"),
         _ => None,
     };
     // A plain `EXPLAIN <write>` never executes, so it is not a write: PG accepts
@@ -5501,7 +5501,7 @@ fn execute_create_table_as(
         .enumerate()
         .map(|(index, c)| BoundExpr::ColumnRef { index, ty: c.ty })
         .collect();
-    let logical = LogicalPlan::Insert {
+    let logical = LogicalPlan::Insert(InsertPlan {
         table,
         source: InsertSource::Query {
             input: Box::new(plan),
@@ -5515,7 +5515,7 @@ fn execute_create_table_as(
         freeze: false,
         // No RETURNING, so nothing reads a system column.
         tableoid: false,
-    };
+    });
 
     // Run the populate INSERT through the standard write tail. The DDL catalog
     // write above is not MVCC-transactional (as with every DDL path here), so on

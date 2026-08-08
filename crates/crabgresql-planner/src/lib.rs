@@ -12,9 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crabgresql_binder::{
-    AggInput, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey,
-    InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, MappedRelation, OutputColumn,
-    RelationIdent, Returning, SortKey, TableFn,
+    AggInput, AggregatePlan, AppendPlan, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc,
+    BoundWindowSpec, DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput,
+    JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, OutputColumn, QueryPlan,
+    RelationIdent, Returning, SetOpPlan, SortKey, SubqueryPlan, TableFn, TableFunctionPlan,
+    UpdatePlan, ValuesPlan, WindowPlan,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema, Tuple,
@@ -609,27 +611,27 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
 /// projection pass runs exactly once, over the finished tree.
 fn lower(logical: LogicalPlan) -> PhysicalPlan {
     match logical {
-        LogicalPlan::Values {
+        LogicalPlan::Values(ValuesPlan {
             columns,
             rows,
             predicate,
             sort,
             distinct,
-        } => PhysicalPlan::Values {
+        }) => PhysicalPlan::Values {
             columns,
             rows,
             predicate,
             sort,
             distinct,
         },
-        LogicalPlan::Query {
+        LogicalPlan::Query(QueryPlan {
             table,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => match choose_access(&table, predicate) {
+        }) => match choose_access(&table, predicate) {
             AccessPath::Index {
                 index_name,
                 key,
@@ -655,7 +657,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             },
         },
-        LogicalPlan::Append { arms, columns } => PhysicalPlan::Append {
+        LogicalPlan::Append(AppendPlan { arms, columns }) => PhysicalPlan::Append {
             arms: arms
                 .into_iter()
                 .map(|relation| PhysicalAppendArm {
@@ -667,12 +669,12 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 .collect(),
             columns,
         },
-        LogicalPlan::SetOp {
+        LogicalPlan::SetOp(SetOpPlan {
             arms,
             columns,
             sort,
             distinct,
-        } => PhysicalPlan::SetOp {
+        }) => PhysicalPlan::SetOp {
             arms: arms
                 .into_iter()
                 .map(|arm| PhysicalSetOpArm {
@@ -684,14 +686,14 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
-        LogicalPlan::Subquery {
+        LogicalPlan::Subquery(SubqueryPlan {
             source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => PhysicalPlan::Subquery {
+        }) => PhysicalPlan::Subquery {
             source: Box::new(lower(*source)),
             columns,
             projections,
@@ -699,20 +701,20 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
-        LogicalPlan::Window {
+        LogicalPlan::Window(WindowPlan {
             source,
             spec,
             funcs,
             input_width,
             output_width,
-        } => PhysicalPlan::Window {
+        }) => PhysicalPlan::Window {
             source: Box::new(lower(*source)),
             spec,
             funcs,
             input_width,
             output_width,
         },
-        LogicalPlan::TableFunction {
+        LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
             columns,
@@ -720,7 +722,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        } => PhysicalPlan::TableFunction {
+        }) => PhysicalPlan::TableFunction {
             func,
             args,
             columns,
@@ -729,14 +731,14 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
-        LogicalPlan::Join {
+        LogicalPlan::Join(JoinPlan {
             mut source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => {
+        }) => {
             let predicate = pushdown::push_where_into_joins(&mut source, predicate);
             PhysicalPlan::Join {
                 source: plan_join_expr(source),
@@ -747,7 +749,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             }
         }
-        LogicalPlan::Aggregate {
+        LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -757,7 +759,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             projections,
             sort,
             distinct,
-        } => {
+        }) => {
             // A grouped query keeps its `WHERE` here — the same join-row predicate
             // an ungrouped one carries — so the extraction has to run on this path
             // too, or every aggregating join (most of TPC-H) misses it.
@@ -787,23 +789,23 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 distinct,
             }
         }
-        LogicalPlan::Limit {
+        LogicalPlan::Limit(LimitPlan {
             source,
             limit,
             offset,
-        } => PhysicalPlan::Limit {
+        }) => PhysicalPlan::Limit {
             source: Box::new(lower(*source)),
             limit,
             offset,
         },
-        LogicalPlan::Insert {
+        LogicalPlan::Insert(InsertPlan {
             table,
             source,
             returning,
             routing,
             freeze,
             tableoid,
-        } => PhysicalPlan::Insert {
+        }) => PhysicalPlan::Insert {
             tableoid,
             table,
             source: match source {
@@ -820,7 +822,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             routing,
             freeze,
         },
-        LogicalPlan::Update {
+        LogicalPlan::Update(UpdatePlan {
             table,
             predicate,
             assignments,
@@ -828,7 +830,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             routing,
             inherited,
             tableoid,
-        } => {
+        }) => {
             // A target whose UNIQUE check needs the whole-relation snapshot has
             // to be scanned: see `update_needs_unique_snapshot`. Row movement is
             // possible only through a partitioned parent.
@@ -862,14 +864,14 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 probe,
             }
         }
-        LogicalPlan::Delete {
+        LogicalPlan::Delete(DeletePlan {
             table,
             predicate,
             returning,
             routing,
             inherited,
             tableoid,
-        } => {
+        }) => {
             // A DELETE removes rows outright, so no target needs a snapshot.
             let (routing, inherited, probe) =
                 dml_targets(&table, routing, inherited, &predicate, None, tableoid);

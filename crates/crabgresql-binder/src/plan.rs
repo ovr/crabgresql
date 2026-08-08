@@ -176,240 +176,299 @@ impl MappedRelation {
     }
 }
 
+/// A bound query or DML statement.
+///
+/// Every variant is a one-field wrapper around a named struct, so a node can be
+/// passed, returned and destructured as a value of its own type instead of only
+/// through a `match` arm on the enum.
 #[derive(Clone)]
 pub enum LogicalPlan {
-    /// FROM-less SELECT (`SELECT 1`) or a standalone `VALUES` list: one or more
-    /// constant rows. A predicate (`SELECT 1 WHERE false`) contains no column
-    /// references — it bound in the empty scope.
-    Values {
-        columns: Vec<OutputColumn>,
-        rows: Vec<Vec<BoundExpr>>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
+    /// FROM-less SELECT (`SELECT 1`) or a standalone `VALUES` list.
+    Values(ValuesPlan),
     /// Single-table SELECT with optional predicate.
-    Query {
-        table: Arc<dyn TableAm>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// Union scan over the several relations one FROM item names: the leaf
-    /// partitions of a partitioned parent, or an inheritance parent together with
-    /// its descendants. The node emits every arm's rows in arm order, each
-    /// remapped to the full width of the relation that was named. It carries no
-    /// projection/predicate/sort of its own — such a FROM item is bound as a
-    /// [`Self::Subquery`] wrapping this Append, so the surrounding SELECT's
-    /// WHERE/projection/ORDER BY/DISTINCT apply on top (and joins / aggregates
-    /// reuse the same subplan machinery).
-    Append {
-        arms: Vec<MappedRelation>,
-        columns: Vec<OutputColumn>,
-    },
-    /// A `UNION` / `UNION ALL`: concatenate both arms, then optionally
-    /// deduplicate and sort. `columns` is the unified output layout (per-position
-    /// common types, named from the left arm).
+    Query(QueryPlan),
+    /// Union scan over the several relations one FROM item names.
+    Append(AppendPlan),
+    /// A `UNION` / `UNION ALL` (and, once supported, the other set operations).
+    SetOp(SetOpPlan),
+    /// SELECT over a subquery source in FROM, and the binder's general
+    /// same-level projection wrapper.
+    Subquery(SubqueryPlan),
+    /// SELECT over a set-returning function in FROM position.
+    TableFunction(TableFunctionPlan),
+    /// SELECT over a recursive join tree.
+    Join(JoinPlan),
+    /// LIMIT/OFFSET applied above a SELECT body.
+    Limit(LimitPlan),
+    /// Aggregation over a single row source.
+    Aggregate(AggregatePlan),
+    /// One step of window-function evaluation.
+    Window(WindowPlan),
+    /// INSERT from a `VALUES` list, formed values, or a query source.
+    Insert(InsertPlan),
+    /// UPDATE of one relation and, for a partitioned or inheriting target, the
+    /// relations it fans out to.
+    Update(UpdatePlan),
+    /// DELETE from one relation and the relations it fans out to.
+    Delete(DeletePlan),
+}
+
+/// [`LogicalPlan::Values`]: one or more constant rows. A predicate (`SELECT 1
+/// WHERE false`) contains no column references — it bound in the empty scope.
+#[derive(Clone)]
+pub struct ValuesPlan {
+    pub columns: Vec<OutputColumn>,
+    pub rows: Vec<Vec<BoundExpr>>,
+    pub predicate: Option<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Query`]: a single-table SELECT with optional predicate.
+#[derive(Clone)]
+pub struct QueryPlan {
+    pub table: Arc<dyn TableAm>,
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Append`]: the leaf partitions of a partitioned parent, or an
+/// inheritance parent together with its descendants. The node emits every arm's
+/// rows in arm order, each remapped to the full width of the relation that was
+/// named. It carries no projection/predicate/sort of its own — such a FROM item
+/// is bound as a [`SubqueryPlan`] wrapping this Append, so the surrounding
+/// SELECT's WHERE/projection/ORDER BY/DISTINCT apply on top (and joins /
+/// aggregates reuse the same subplan machinery).
+#[derive(Clone)]
+pub struct AppendPlan {
+    pub arms: Vec<MappedRelation>,
+    pub columns: Vec<OutputColumn>,
+}
+
+/// [`LogicalPlan::SetOp`]: concatenate every arm, then optionally deduplicate
+/// and sort. `columns` is the unified output layout (per-position common types,
+/// named from the left arm).
+///
+/// This node owns its whole tail rather than delegating to a wrapping
+/// [`SubqueryPlan`], so that an arm's projection and its coercion onto
+/// `columns` stay in the arm's own index space — a wrapper would have to
+/// re-derive both.
+///
+/// The node is N-ary, and [`bind_set_operation`] flattens a chain of
+/// equivalent operations into one node (`a UNION b UNION c` is three arms,
+/// not nested pairs), matching PG's single Append over N children. Besides
+/// keeping the plan shallow, that collapses the redundant per-level
+/// deduplication a nested encoding would produce.
+#[derive(Clone)]
+pub struct SetOpPlan {
+    /// Two or more arms, in query order.
+    pub arms: Vec<SetOpArm>,
+    pub columns: Vec<OutputColumn>,
+    /// A query-level `ORDER BY` over the combined result.
+    pub sort: Vec<SortKey>,
+    /// `Some(all output columns)` for `UNION`; `None` for `UNION ALL`.
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Subquery`]: a derived table (`(SELECT ...) s`) or a CTE
+/// reference. `source` produces the input rows; the same
+/// projection/predicate/sort pipeline as [`QueryPlan`] runs on top.
+///
+/// Also the binder's general **same-level projection wrapper**: it carries
+/// the tail for a window chain ([`finish_windowed_select`]), a sorted
+/// `Limit` ([`attach_sort`]) and a FROM-less SRF. So this node does *not*
+/// imply a query nesting level — see [`substitute_outer`].
+#[derive(Clone)]
+pub struct SubqueryPlan {
+    pub source: Box<LogicalPlan>,
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::TableFunction`]: source rows come from evaluating `func` with
+/// `args`; the same projection/predicate/sort pipeline as [`QueryPlan`] runs on
+/// top.
+#[derive(Clone)]
+pub struct TableFunctionPlan {
+    pub func: TableFn,
+    pub args: Vec<BoundExpr>,
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Join`]: leaf rows are laid out left-to-right in the combined
+/// row; the same projection/predicate/sort pipeline as [`QueryPlan`] runs on
+/// top, with `ColumnRef`s indexing that combined row.
+#[derive(Clone)]
+pub struct JoinPlan {
+    pub source: JoinExpr,
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
+    pub predicate: Option<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Limit`]: LIMIT/OFFSET applied above a SELECT body — after its
+/// ORDER BY, since PG evaluates the count clauses on the ordered result.
+/// `source` produces the (ordered) rows; this node skips `offset` of them and
+/// stops after `limit`. A wrapper rather than a field on every SELECT node:
+/// LIMIT/OFFSET is a query-level construct that sits above the whole select,
+/// mirroring PG's Limit plan node above the sort.
+#[derive(Clone)]
+pub struct LimitPlan {
+    pub source: Box<LogicalPlan>,
+    /// `None` = no limit (`LIMIT ALL` or clause absent).
+    pub limit: Option<i64>,
+    /// `None` = `OFFSET 0` (clause absent).
+    pub offset: Option<i64>,
+}
+
+/// [`LogicalPlan::Aggregate`]: `GROUP BY` / `HAVING` and/or aggregate calls in
+/// the target list. The physical pipeline is
+/// `input → Filter(predicate) → Aggregate → [Filter(having)] → Projection →
+/// Sort`: `predicate` (WHERE) filters the source *before* aggregation, the
+/// aggregate node emits one row per group laid out `[group keys…, aggregates…]`,
+/// `having` filters those rows, and `projections`/`sort` (whose aggregate and
+/// grouped-column references were rewritten to `ColumnRef`s into that row)
+/// produce the visible output. An empty `group_exprs` is the implicit single
+/// group (`SELECT count(*) …` — always one output row).
+#[derive(Clone)]
+pub struct AggregatePlan {
+    pub input: AggInput,
+    pub predicate: Option<BoundExpr>,
+    pub group_exprs: Vec<BoundExpr>,
+    pub aggregates: Vec<BoundAggregate>,
+    pub having: Option<BoundExpr>,
+    pub columns: Vec<OutputColumn>,
+    pub projections: Vec<BoundExpr>,
+    pub sort: Vec<SortKey>,
+    pub distinct: Option<Vec<DistinctKey>>,
+}
+
+/// [`LogicalPlan::Window`]: partition `source` by `spec`, order each partition,
+/// and fill this step's `funcs` into the row.
+///
+/// Windows are evaluated after WHERE and after GROUP BY/HAVING, but before
+/// the query's own projection, ORDER BY and DISTINCT. So this carries no
+/// projection tail of its own — it is a bare row source, and the surrounding
+/// SELECT is bound as a [`SubqueryPlan`] wrapping the chain. That wrapper
+/// is *not* a query nesting level (unlike a derived table, which shares the
+/// node); see [`substitute_outer`].
+///
+/// `source` is the query block the binder would have built anyway, but with
+/// identity projections and no sort/distinct, so this node's `spec` and
+/// `funcs` read the raw pre-window row and every `ColumnRef` the target list
+/// already held stays valid — unlike [`AggregatePlan`], which collapses the
+/// row.
+///
+/// Every node in a chain emits `output_width` columns: the input row, then
+/// one slot per window call in the *whole* chain. A node fills only the slots
+/// its own `funcs` name (see [`BoundWindowFunc::slot`]) and leaves the rest
+/// as they were, so the chain order and the slot order are independent. The
+/// bottom node widens the row; the others find it already wide.
+///
+/// PG evaluates the spec with the most keys first and the fewest last, and
+/// the last one's sort is what the query returns when it has no ORDER BY of
+/// its own — so the chain order is observable, not just a cost choice.
+#[derive(Clone)]
+pub struct WindowPlan {
+    pub source: Box<LogicalPlan>,
+    pub spec: BoundWindowSpec,
+    pub funcs: Vec<BoundWindowFunc>,
+    /// Width of the pre-window row: where the window slots begin.
+    pub input_width: usize,
+    /// `input_width` + the number of window calls in the whole chain.
+    pub output_width: usize,
+}
+
+/// [`LogicalPlan::Insert`]: rows come from a `VALUES` list (full-width, schema
+/// order, each cell already coerced), from already-formed values (a COPY load),
+/// or from a query source (`INSERT ... SELECT` / `INSERT ... TABLE t`). See
+/// [`InsertSource`].
+#[derive(Clone)]
+pub struct InsertPlan {
+    pub table: Arc<dyn TableAm>,
+    pub source: InsertSource,
+    /// `RETURNING`: a projection over each inserted row, bound against the
+    /// table schema. `None` when the clause is absent.
+    pub returning: Option<Returning>,
+    /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+    /// a partitioned parent, holding its leaf partitions. The executor routes
+    /// each row to the leaf whose RANGE bound admits its key (reading the
+    /// bound from each leaf's `partition_of`) and writes there instead of to
+    /// `table`. `None` for an ordinary table (rows go straight to `table`).
+    pub routing: Option<Vec<Arc<dyn TableAm>>>,
+    /// `COPY … FREEZE`: stamp the rows visible-to-everyone rather than
+    /// visible-once-this-transaction-commits. Carried on the node, not on the
+    /// transaction, so it reaches exactly this target's write and nothing else
+    /// the statement happens to do — see
+    /// [`crabgresql_txn::TxnContext::freeze_inserts`].
+    pub freeze: bool,
+    /// Whether every row this statement forms carries a trailing `tableoid`
+    /// slot, because a WHERE, SET or RETURNING named it. The executor
+    /// appends the OID of the target the row actually lives in — the
+    /// partition or inheritance child, not the relation the statement
+    /// named.
+    pub tableoid: bool,
+}
+
+/// [`LogicalPlan::Update`].
+#[derive(Clone)]
+pub struct UpdatePlan {
+    pub table: Arc<dyn TableAm>,
+    pub predicate: Option<BoundExpr>,
+    /// (column index, value expression bound against the OLD row).
+    pub assignments: Vec<(usize, BoundExpr)>,
+    /// `RETURNING`: a projection over each updated (NEW) row.
+    pub returning: Option<Returning>,
+    /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+    /// a partitioned parent, holding its leaf partitions. The executor scans
+    /// every leaf, and for each updated row re-routes the NEW tuple to the
+    /// leaf whose RANGE bound admits it — moving the row (delete from the old
+    /// leaf, insert into the new) when the key change lands it elsewhere.
+    /// `None` for an ordinary table.
+    pub routing: Option<Vec<Arc<dyn TableAm>>>,
+    /// Inheritance fan-out: `table`'s descendants, each with the map that
+    /// reads one of its rows as a `table` row. Empty unless `table` has
+    /// inheritance children and the statement did not say `ONLY`.
     ///
-    /// This node owns its whole tail rather than delegating to a wrapping
-    /// [`Self::Subquery`], so that an arm's projection and its coercion onto
-    /// `columns` stay in the arm's own index space — a wrapper would have to
-    /// re-derive both.
-    ///
-    /// The node is N-ary, and [`bind_set_operation`] flattens a chain of
-    /// equivalent operations into one node (`a UNION b UNION c` is three arms,
-    /// not nested pairs), matching PG's single Append over N children. Besides
-    /// keeping the plan shallow, that collapses the redundant per-level
-    /// deduplication a nested encoding would produce.
-    SetOp {
-        /// Two or more arms, in query order.
-        arms: Vec<SetOpArm>,
-        columns: Vec<OutputColumn>,
-        /// A query-level `ORDER BY` over the combined result.
-        sort: Vec<SortKey>,
-        /// `Some(all output columns)` for `UNION`; `None` for `UNION ALL`.
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// SELECT over a subquery source in FROM: a derived table (`(SELECT ...) s`)
-    /// or a CTE reference. `source` produces the input rows; the same
-    /// projection/predicate/sort pipeline as `Query` runs on top.
-    ///
-    /// Also the binder's general **same-level projection wrapper**: it carries
-    /// the tail for a window chain ([`finish_windowed_select`]), a sorted
-    /// `Limit` ([`attach_sort`]) and a FROM-less SRF. So this variant does *not*
-    /// imply a query nesting level — see [`substitute_outer`].
-    Subquery {
-        source: Box<LogicalPlan>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// SELECT over a set-returning function in FROM position. The source rows
-    /// come from evaluating `func` with `args`; the same projection/predicate/
-    /// sort pipeline as `Query` runs on top.
-    TableFunction {
-        func: TableFn,
-        args: Vec<BoundExpr>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// SELECT over a recursive join tree. Leaf rows are laid out left-to-right
-    /// in the combined row; the same projection/predicate/sort pipeline as
-    /// `Query` runs on top, with `ColumnRef`s indexing that combined row.
-    Join {
-        source: JoinExpr,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// LIMIT/OFFSET applied above a SELECT body — after its ORDER BY, since PG
-    /// evaluates the count clauses on the ordered result. `source` produces the
-    /// (ordered) rows; this node skips `offset` of them and stops after `limit`.
-    /// A wrapper rather than a field on every SELECT variant: LIMIT/OFFSET is a
-    /// query-level construct that sits above the whole select, mirroring PG's
-    /// Limit plan node above the sort.
-    Limit {
-        source: Box<LogicalPlan>,
-        /// `None` = no limit (`LIMIT ALL` or clause absent).
-        limit: Option<i64>,
-        /// `None` = `OFFSET 0` (clause absent).
-        offset: Option<i64>,
-    },
-    /// Aggregation over a single row source: `GROUP BY` / `HAVING` and/or
-    /// aggregate calls in the target list. The physical pipeline is
-    /// `input → Filter(predicate) → Aggregate → [Filter(having)] → Projection →
-    /// Sort`: `predicate` (WHERE) filters the source *before* aggregation, the
-    /// aggregate node emits one row per group laid out `[group keys…, aggregates…]`,
-    /// `having` filters those rows, and `projections`/`sort` (whose aggregate and
-    /// grouped-column references were rewritten to `ColumnRef`s into that row)
-    /// produce the visible output. An empty `group_exprs` is the implicit single
-    /// group (`SELECT count(*) …` — always one output row).
-    Aggregate {
-        input: AggInput,
-        predicate: Option<BoundExpr>,
-        group_exprs: Vec<BoundExpr>,
-        aggregates: Vec<BoundAggregate>,
-        having: Option<BoundExpr>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// One step of window-function evaluation: partition `source` by `spec`,
-    /// order each partition, and fill this step's `funcs` into the row.
-    ///
-    /// Windows are evaluated after WHERE and after GROUP BY/HAVING, but before
-    /// the query's own projection, ORDER BY and DISTINCT. So this carries no
-    /// projection tail of its own — it is a bare row source, and the surrounding
-    /// SELECT is bound as a [`Self::Subquery`] wrapping the chain. That wrapper
-    /// is *not* a query nesting level (unlike a derived table, which shares the
-    /// variant); see [`substitute_outer`].
-    ///
-    /// `source` is the query block the binder would have built anyway, but with
-    /// identity projections and no sort/distinct, so this node's `spec` and
-    /// `funcs` read the raw pre-window row and every `ColumnRef` the target list
-    /// already held stays valid — unlike [`Self::Aggregate`], which collapses the
-    /// row.
-    ///
-    /// Every node in a chain emits `output_width` columns: the input row, then
-    /// one slot per window call in the *whole* chain. A node fills only the slots
-    /// its own `funcs` name (see [`BoundWindowFunc::slot`]) and leaves the rest
-    /// as they were, so the chain order and the slot order are independent. The
-    /// bottom node widens the row; the others find it already wide.
-    ///
-    /// PG evaluates the spec with the most keys first and the fewest last, and
-    /// the last one's sort is what the query returns when it has no ORDER BY of
-    /// its own — so the chain order is observable, not just a cost choice.
-    Window {
-        source: Box<LogicalPlan>,
-        spec: BoundWindowSpec,
-        funcs: Vec<BoundWindowFunc>,
-        /// Width of the pre-window row: where the window slots begin.
-        input_width: usize,
-        /// `input_width` + the number of window calls in the whole chain.
-        output_width: usize,
-    },
-    /// INSERT: rows come from a `VALUES` list (full-width, schema order, each
-    /// cell already coerced), from already-formed values (a COPY load), or from
-    /// a query source (`INSERT ... SELECT` / `INSERT ... TABLE t`). See
-    /// [`InsertSource`].
-    Insert {
-        table: Arc<dyn TableAm>,
-        source: InsertSource,
-        /// `RETURNING`: a projection over each inserted row, bound against the
-        /// table schema. `None` when the clause is absent.
-        returning: Option<Returning>,
-        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
-        /// a partitioned parent, holding its leaf partitions. The executor routes
-        /// each row to the leaf whose RANGE bound admits its key (reading the
-        /// bound from each leaf's `partition_of`) and writes there instead of to
-        /// `table`. `None` for an ordinary table (rows go straight to `table`).
-        routing: Option<Vec<Arc<dyn TableAm>>>,
-        /// `COPY … FREEZE`: stamp the rows visible-to-everyone rather than
-        /// visible-once-this-transaction-commits. Carried on the node, not on the
-        /// transaction, so it reaches exactly this target's write and nothing else
-        /// the statement happens to do — see
-        /// [`crabgresql_txn::TxnContext::freeze_inserts`].
-        freeze: bool,
-        /// Whether every row this statement forms carries a trailing `tableoid`
-        /// slot, because a WHERE, SET or RETURNING named it. The executor
-        /// appends the OID of the target the row actually lives in — the
-        /// partition or inheritance child, not the relation the statement
-        /// named.
-        tableoid: bool,
-    },
-    Update {
-        table: Arc<dyn TableAm>,
-        predicate: Option<BoundExpr>,
-        /// (column index, value expression bound against the OLD row).
-        assignments: Vec<(usize, BoundExpr)>,
-        /// `RETURNING`: a projection over each updated (NEW) row.
-        returning: Option<Returning>,
-        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
-        /// a partitioned parent, holding its leaf partitions. The executor scans
-        /// every leaf, and for each updated row re-routes the NEW tuple to the
-        /// leaf whose RANGE bound admits it — moving the row (delete from the old
-        /// leaf, insert into the new) when the key change lands it elsewhere.
-        /// `None` for an ordinary table.
-        routing: Option<Vec<Arc<dyn TableAm>>>,
-        /// Inheritance fan-out: `table`'s descendants, each with the map that
-        /// reads one of its rows as a `table` row. Empty unless `table` has
-        /// inheritance children and the statement did not say `ONLY`.
-        ///
-        /// Deliberately *not* folded into `routing`: routing exists to move a row
-        /// between partitions when its key changes, and inheritance has no such
-        /// notion — every row is updated where it lies, in its own relation, and
-        /// nothing ever moves.
-        inherited: Vec<MappedRelation>,
-        /// Whether every row this statement forms carries a trailing `tableoid`
-        /// slot; see the same field on [`Self::Insert`].
-        tableoid: bool,
-    },
-    Delete {
-        table: Arc<dyn TableAm>,
-        predicate: Option<BoundExpr>,
-        /// `RETURNING`: a projection over each deleted (OLD) row.
-        returning: Option<Returning>,
-        /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
-        /// a partitioned parent. The executor scans every leaf and deletes matching
-        /// rows from whichever leaf holds them. `None` for an ordinary table.
-        routing: Option<Vec<Arc<dyn TableAm>>>,
-        /// Inheritance fan-out, as on [`Self::Update`]: rows are deleted from
-        /// whichever descendant holds them.
-        inherited: Vec<MappedRelation>,
-        /// Whether every row this statement forms carries a trailing `tableoid`
-        /// slot; see the same field on [`Self::Insert`].
-        tableoid: bool,
-    },
+    /// Deliberately *not* folded into `routing`: routing exists to move a row
+    /// between partitions when its key changes, and inheritance has no such
+    /// notion — every row is updated where it lies, in its own relation, and
+    /// nothing ever moves.
+    pub inherited: Vec<MappedRelation>,
+    /// Whether every row this statement forms carries a trailing `tableoid`
+    /// slot; see the same field on [`InsertPlan`].
+    pub tableoid: bool,
+}
+
+/// [`LogicalPlan::Delete`].
+#[derive(Clone)]
+pub struct DeletePlan {
+    pub table: Arc<dyn TableAm>,
+    pub predicate: Option<BoundExpr>,
+    /// `RETURNING`: a projection over each deleted (OLD) row.
+    pub returning: Option<Returning>,
+    /// Tuple routing for a partitioned parent: `Some(leaves)` when `table` is
+    /// a partitioned parent. The executor scans every leaf and deletes matching
+    /// rows from whichever leaf holds them. `None` for an ordinary table.
+    pub routing: Option<Vec<Arc<dyn TableAm>>>,
+    /// Inheritance fan-out, as on [`UpdatePlan`]: rows are deleted from
+    /// whichever descendant holds them.
+    pub inherited: Vec<MappedRelation>,
+    /// Whether every row this statement forms carries a trailing `tableoid`
+    /// slot; see the same field on [`InsertPlan`].
+    pub tableoid: bool,
 }
 
 /// A bound `RETURNING` target list: the output column shape plus one expression
@@ -994,38 +1053,38 @@ pub(crate) type CteEnv = HashMap<String, CteRelation>;
 /// the missing binding), which cannot happen once Bind validates the count.
 pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
     match plan {
-        LogicalPlan::Values {
+        LogicalPlan::Values(ValuesPlan {
             rows, predicate, ..
-        } => {
+        }) => {
             for row in rows {
                 subst_exprs(row, params);
             }
             subst_opt(predicate, params);
         }
-        LogicalPlan::Query {
+        LogicalPlan::Query(QueryPlan {
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             subst_exprs(projections, params);
             subst_opt(predicate, params);
         }
-        LogicalPlan::Subquery {
+        LogicalPlan::Subquery(SubqueryPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             substitute_params(source, params);
             subst_exprs(projections, params);
             subst_opt(predicate, params);
         }
-        LogicalPlan::Window {
+        LogicalPlan::Window(WindowPlan {
             source,
             spec,
             funcs,
             ..
-        } => {
+        }) => {
             substitute_params(source, params);
             for expr in spec.exprs_mut() {
                 subst_expr(expr, params);
@@ -1034,29 +1093,29 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
                 subst_exprs(func.kind.args_mut(), params);
             }
         }
-        LogicalPlan::TableFunction {
+        LogicalPlan::TableFunction(TableFunctionPlan {
             args,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             subst_exprs(args, params);
             subst_exprs(projections, params);
             subst_opt(predicate, params);
         }
-        LogicalPlan::Join {
+        LogicalPlan::Join(JoinPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             subst_join(source, params);
             subst_exprs(projections, params);
             subst_opt(predicate, params);
         }
         // An Append carries only leaf table handles, no parameterizable exprs.
-        LogicalPlan::Append { .. } => {}
-        LogicalPlan::SetOp { arms, .. } => {
+        LogicalPlan::Append(AppendPlan { .. }) => {}
+        LogicalPlan::SetOp(SetOpPlan { arms, .. }) => {
             for arm in arms.iter_mut() {
                 substitute_params(&mut arm.plan, params);
                 if let Some(coercion) = &mut arm.coercion {
@@ -1064,8 +1123,8 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
                 }
             }
         }
-        LogicalPlan::Limit { source, .. } => substitute_params(source, params),
-        LogicalPlan::Aggregate {
+        LogicalPlan::Limit(LimitPlan { source, .. }) => substitute_params(source, params),
+        LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -1073,7 +1132,7 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             having,
             projections,
             ..
-        } => {
+        }) => {
             if let AggInput::Join(join) = input {
                 subst_join(join, params);
             }
@@ -1087,9 +1146,9 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             subst_opt(having, params);
             subst_exprs(projections, params);
         }
-        LogicalPlan::Insert {
+        LogicalPlan::Insert(InsertPlan {
             source, returning, ..
-        } => {
+        }) => {
             match source {
                 InsertSource::Values(rows) => {
                     for row in rows {
@@ -1110,23 +1169,23 @@ pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
             }
             subst_returning(returning, params);
         }
-        LogicalPlan::Update {
+        LogicalPlan::Update(UpdatePlan {
             predicate,
             assignments,
             returning,
             ..
-        } => {
+        }) => {
             subst_opt(predicate, params);
             for (_, expr) in assignments {
                 subst_expr(expr, params);
             }
             subst_returning(returning, params);
         }
-        LogicalPlan::Delete {
+        LogicalPlan::Delete(DeletePlan {
             predicate,
             returning,
             ..
-        } => {
+        }) => {
             subst_opt(predicate, params);
             subst_returning(returning, params);
         }
@@ -1274,9 +1333,9 @@ pub fn substitute_outer(plan: &mut LogicalPlan, outer: &[Value]) {
 
 fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
     match plan {
-        LogicalPlan::Values {
+        LogicalPlan::Values(ValuesPlan {
             rows, predicate, ..
-        } => {
+        }) => {
             for row in rows {
                 for e in row.iter_mut() {
                     subst_outer_expr(e, outer, depth);
@@ -1286,11 +1345,11 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(p, outer, depth);
             }
         }
-        LogicalPlan::Query {
+        LogicalPlan::Query(QueryPlan {
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             for e in projections.iter_mut() {
                 subst_outer_expr(e, outer, depth);
             }
@@ -1298,12 +1357,12 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(p, outer, depth);
             }
         }
-        LogicalPlan::Subquery {
+        LogicalPlan::Subquery(SubqueryPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             // Same depth: a `Subquery` is not necessarily a derived table. The
             // binder also synthesizes one as the projection wrapper over a
             // window chain (`finish_windowed_select`), over a sorted `Limit`
@@ -1323,12 +1382,12 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
         // `source` recurses at the *same* depth — unlike a derived table above.
         // Getting this wrong would shift every correlated reference in a window
         // argument one level out of range.
-        LogicalPlan::Window {
+        LogicalPlan::Window(WindowPlan {
             source,
             spec,
             funcs,
             ..
-        } => {
+        }) => {
             subst_outer_plan(source, outer, depth);
             for expr in spec.exprs_mut() {
                 subst_outer_expr(expr, outer, depth);
@@ -1339,12 +1398,12 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 }
             }
         }
-        LogicalPlan::TableFunction {
+        LogicalPlan::TableFunction(TableFunctionPlan {
             args,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             for e in args.iter_mut().chain(projections.iter_mut()) {
                 subst_outer_expr(e, outer, depth);
             }
@@ -1352,12 +1411,12 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(p, outer, depth);
             }
         }
-        LogicalPlan::Join {
+        LogicalPlan::Join(JoinPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             subst_outer_join(source, outer, depth);
             for e in projections.iter_mut() {
                 subst_outer_expr(e, outer, depth);
@@ -1367,10 +1426,10 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
             }
         }
         // An Append holds only leaf table handles — no correlated exprs.
-        LogicalPlan::Append { .. } => {}
+        LogicalPlan::Append(AppendPlan { .. }) => {}
         // A set operation is not its own query nesting level: its arms bound in
         // the enclosing scope, so they keep this `depth`.
-        LogicalPlan::SetOp { arms, .. } => {
+        LogicalPlan::SetOp(SetOpPlan { arms, .. }) => {
             for arm in arms.iter_mut() {
                 subst_outer_plan(&mut arm.plan, outer, depth);
                 for e in arm.coercion.iter_mut().flatten() {
@@ -1378,8 +1437,8 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 }
             }
         }
-        LogicalPlan::Limit { source, .. } => subst_outer_plan(source, outer, depth),
-        LogicalPlan::Aggregate {
+        LogicalPlan::Limit(LimitPlan { source, .. }) => subst_outer_plan(source, outer, depth),
+        LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -1387,7 +1446,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
             having,
             projections,
             ..
-        } => {
+        }) => {
             if let AggInput::Join(join) = input {
                 subst_outer_join(join, outer, depth);
             }
@@ -1409,9 +1468,9 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(e, outer, depth);
             }
         }
-        LogicalPlan::Insert {
+        LogicalPlan::Insert(InsertPlan {
             source, returning, ..
-        } => {
+        }) => {
             match source {
                 InsertSource::Values(rows) => {
                     for row in rows {
@@ -1441,12 +1500,12 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 }
             }
         }
-        LogicalPlan::Update {
+        LogicalPlan::Update(UpdatePlan {
             predicate,
             assignments,
             returning,
             ..
-        } => {
+        }) => {
             if let Some(p) = predicate {
                 subst_outer_expr(p, outer, depth);
             }
@@ -1459,11 +1518,11 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 }
             }
         }
-        LogicalPlan::Delete {
+        LogicalPlan::Delete(DeletePlan {
             predicate,
             returning,
             ..
-        } => {
+        }) => {
             if let Some(p) = predicate {
                 subst_outer_expr(p, outer, depth);
             }
@@ -1649,42 +1708,42 @@ pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
 /// comment for why none of the structural nodes below is a query nesting level.
 fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match plan {
-        LogicalPlan::Values {
+        LogicalPlan::Values(ValuesPlan {
             rows, predicate, ..
-        } => {
+        }) => {
             rows.iter().flatten().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
                 f(p, depth);
             }
         }
-        LogicalPlan::Query {
+        LogicalPlan::Query(QueryPlan {
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
                 f(p, depth);
             }
         }
-        LogicalPlan::Subquery {
+        LogicalPlan::Subquery(SubqueryPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             for_each_plan_expr(source, depth, &mut *f);
             projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
                 f(p, depth);
             }
         }
-        LogicalPlan::Window {
+        LogicalPlan::Window(WindowPlan {
             source,
             spec,
             funcs,
             ..
-        } => {
+        }) => {
             for_each_plan_expr(source, depth, &mut *f);
             spec.exprs().for_each(|e| f(e, depth));
             funcs
@@ -1692,12 +1751,12 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
                 .flat_map(|w| w.kind.args())
                 .for_each(|e| f(e, depth));
         }
-        LogicalPlan::TableFunction {
+        LogicalPlan::TableFunction(TableFunctionPlan {
             args,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             args.iter()
                 .chain(projections.iter())
                 .for_each(|e| f(e, depth));
@@ -1705,12 +1764,12 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
                 f(p, depth);
             }
         }
-        LogicalPlan::Join {
+        LogicalPlan::Join(JoinPlan {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             for_each_join_expr(source, depth, &mut *f);
             projections.iter().for_each(|e| f(e, depth));
             if let Some(p) = predicate {
@@ -1718,15 +1777,15 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
             }
         }
         // An Append exposes no expressions of its own.
-        LogicalPlan::Append { .. } => {}
-        LogicalPlan::SetOp { arms, .. } => {
+        LogicalPlan::Append(AppendPlan { .. }) => {}
+        LogicalPlan::SetOp(SetOpPlan { arms, .. }) => {
             for arm in arms {
                 for_each_plan_expr(&arm.plan, depth, &mut *f);
                 arm.coercion.iter().flatten().for_each(|e| f(e, depth));
             }
         }
-        LogicalPlan::Limit { source, .. } => for_each_plan_expr(source, depth, &mut *f),
-        LogicalPlan::Aggregate {
+        LogicalPlan::Limit(LimitPlan { source, .. }) => for_each_plan_expr(source, depth, &mut *f),
+        LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -1734,7 +1793,7 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
             having,
             projections,
             ..
-        } => {
+        }) => {
             if let AggInput::Join(join) = input {
                 for_each_join_expr(join, depth, &mut *f);
             }
@@ -1752,9 +1811,9 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
             }
             projections.iter().for_each(|e| f(e, depth));
         }
-        LogicalPlan::Insert {
+        LogicalPlan::Insert(InsertPlan {
             source, returning, ..
-        } => {
+        }) => {
             match source {
                 InsertSource::Values(rows) => rows.iter().flatten().for_each(|e| f(e, depth)),
                 InsertSource::Tuples { defaults, .. } => {
@@ -1769,12 +1828,12 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
                 r.projections.iter().for_each(|e| f(e, depth));
             }
         }
-        LogicalPlan::Update {
+        LogicalPlan::Update(UpdatePlan {
             predicate,
             assignments,
             returning,
             ..
-        } => {
+        }) => {
             if let Some(p) = predicate {
                 f(p, depth);
             }
@@ -1785,11 +1844,11 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
                 r.projections.iter().for_each(|e| f(e, depth));
             }
         }
-        LogicalPlan::Delete {
+        LogicalPlan::Delete(DeletePlan {
             predicate,
             returning,
             ..
-        } => {
+        }) => {
             if let Some(p) = predicate {
                 f(p, depth);
             }
@@ -1989,11 +2048,11 @@ fn bind_query_body(
     match &query.limit_clause {
         Some(clause) => {
             let (limit, offset) = bind_limit_offset(clause, catalog, params)?;
-            Ok(LogicalPlan::Limit {
+            Ok(LogicalPlan::Limit(LimitPlan {
                 source: Box::new(inner),
                 limit,
                 offset,
-            })
+            }))
         }
         None => Ok(inner),
     }
@@ -2041,25 +2100,25 @@ fn attach_sort(plan: LogicalPlan, sort: Vec<SortKey>, columns: Vec<OutputColumn>
         return plan;
     }
     match plan {
-        LogicalPlan::SetOp {
+        LogicalPlan::SetOp(SetOpPlan {
             arms,
             columns,
             distinct,
             sort: _,
-        } => LogicalPlan::SetOp {
+        }) => LogicalPlan::SetOp(SetOpPlan {
             arms,
             columns,
             sort,
             distinct,
-        },
-        plan @ LogicalPlan::Limit { .. } => LogicalPlan::Subquery {
+        }),
+        plan @ LogicalPlan::Limit(LimitPlan { .. }) => LogicalPlan::Subquery(SubqueryPlan {
             projections: identity_projections(&columns),
             source: Box::new(plan),
             columns,
             predicate: None,
             sort,
             distinct: None,
-        },
+        }),
         // Any other body already bound this query's ORDER BY itself.
         plan => plan,
     }
@@ -2123,12 +2182,12 @@ fn bind_set_operation(
     // A top-level ORDER BY over a set operation resolves against the output
     // columns only — ordinals and output-column names, never the arms' inputs.
     let sort = bind_set_order_by(order_by, &columns, catalog, params)?;
-    Ok(LogicalPlan::SetOp {
+    Ok(LogicalPlan::SetOp(SetOpPlan {
         arms,
         columns,
         sort,
         distinct,
-    })
+    }))
 }
 
 /// The pieces of an `ast::SetExpr::SetOperation`, so the binder works with the
@@ -2386,17 +2445,17 @@ fn is_null_literal_column(plan: &LogicalPlan, index: usize) -> bool {
     };
     match plan {
         // `SELECT NULL` / `VALUES (NULL)`: every row must be NULL in this column.
-        LogicalPlan::Values { rows, .. } => rows
+        LogicalPlan::Values(ValuesPlan { rows, .. }) => rows
             .iter()
             .all(|row| row.get(index).is_some_and(is_null_const)),
-        LogicalPlan::Query { projections, .. }
-        | LogicalPlan::Subquery { projections, .. }
-        | LogicalPlan::TableFunction { projections, .. }
-        | LogicalPlan::Join { projections, .. }
-        | LogicalPlan::Aggregate { projections, .. } => {
+        LogicalPlan::Query(QueryPlan { projections, .. })
+        | LogicalPlan::Subquery(SubqueryPlan { projections, .. })
+        | LogicalPlan::TableFunction(TableFunctionPlan { projections, .. })
+        | LogicalPlan::Join(JoinPlan { projections, .. })
+        | LogicalPlan::Aggregate(AggregatePlan { projections, .. }) => {
             projections.get(index).is_some_and(is_null_const)
         }
-        LogicalPlan::Limit { source, .. } => is_null_literal_column(source, index),
+        LogicalPlan::Limit(LimitPlan { source, .. }) => is_null_literal_column(source, index),
         _ => false,
     }
 }
@@ -2763,7 +2822,7 @@ fn build_query_block(
             // multi-relation FROM — an `Input` node is just a single-source tree.
             source => AggInput::Join(source),
         };
-        return LogicalPlan::Aggregate {
+        return LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs: agg.group_exprs,
@@ -2773,20 +2832,20 @@ fn build_query_block(
             projections,
             sort,
             distinct,
-        };
+        });
     }
     match source {
         JoinExpr::Input { input, .. } => {
             finish_single_select(input, columns, projections, predicate, sort, distinct)
         }
-        source @ JoinExpr::Join { .. } => LogicalPlan::Join {
+        source @ JoinExpr::Join { .. } => LogicalPlan::Join(JoinPlan {
             source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        },
+        }),
     }
 }
 
@@ -2857,23 +2916,23 @@ fn finish_single_select(
     distinct: Option<Vec<DistinctKey>>,
 ) -> LogicalPlan {
     match input {
-        JoinInput::Scan(table) => LogicalPlan::Query {
+        JoinInput::Scan(table) => LogicalPlan::Query(QueryPlan {
             table,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        },
-        JoinInput::Subplan(source) => LogicalPlan::Subquery {
+        }),
+        JoinInput::Subplan(source) => LogicalPlan::Subquery(SubqueryPlan {
             source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        },
-        JoinInput::TableFunction { func, args } => LogicalPlan::TableFunction {
+        }),
+        JoinInput::TableFunction { func, args } => LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
             columns,
@@ -2881,7 +2940,7 @@ fn finish_single_select(
             predicate,
             sort,
             distinct,
-        },
+        }),
     }
 }
 
@@ -3313,10 +3372,12 @@ fn bind_from_item(
                         None => None,
                     };
                     let input = match arms {
-                        Some(arms) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
-                            arms,
-                            columns: arm_columns,
-                        })),
+                        Some(arms) => {
+                            JoinInput::Subplan(Box::new(LogicalPlan::Append(AppendPlan {
+                                arms,
+                                columns: arm_columns,
+                            })))
+                        }
                         None => JoinInput::Scan(Arc::clone(&table)),
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
@@ -4112,13 +4173,13 @@ fn bind_values_query(
     // columns to (cells evaluate against an empty row), so only ordinals and
     // `columnN` names resolve; expressions stay `0A000`.
     let sort = bind_order_by(order_by, &columns, &scope, &mut Vec::new(), false)?;
-    Ok(LogicalPlan::Values {
+    Ok(LogicalPlan::Values(ValuesPlan {
         columns,
         rows,
         predicate: None,
         sort,
         distinct: None,
-    })
+    }))
 }
 
 /// The output columns a query plan produces (for CTE/derived-table schemas,
@@ -4128,23 +4189,23 @@ fn bind_values_query(
 /// "NoData".
 pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError> {
     match plan {
-        LogicalPlan::Values { columns, .. }
-        | LogicalPlan::Query { columns, .. }
-        | LogicalPlan::Append { columns, .. }
-        | LogicalPlan::SetOp { columns, .. }
-        | LogicalPlan::Subquery { columns, .. }
-        | LogicalPlan::TableFunction { columns, .. }
-        | LogicalPlan::Aggregate { columns, .. }
-        | LogicalPlan::Join { columns, .. } => Ok(columns.clone()),
+        LogicalPlan::Values(ValuesPlan { columns, .. })
+        | LogicalPlan::Query(QueryPlan { columns, .. })
+        | LogicalPlan::Append(AppendPlan { columns, .. })
+        | LogicalPlan::SetOp(SetOpPlan { columns, .. })
+        | LogicalPlan::Subquery(SubqueryPlan { columns, .. })
+        | LogicalPlan::TableFunction(TableFunctionPlan { columns, .. })
+        | LogicalPlan::Aggregate(AggregatePlan { columns, .. })
+        | LogicalPlan::Join(JoinPlan { columns, .. }) => Ok(columns.clone()),
         // LIMIT/OFFSET is a transparent wrapper: it exposes its source's columns.
-        LogicalPlan::Limit { source, .. } => output_columns_of(source),
+        LogicalPlan::Limit(LimitPlan { source, .. }) => output_columns_of(source),
         // A window step is always wrapped in the `Subquery` that carries the
         // query's real target list, so this is only ever reached through one.
         // Its own row has no user-visible names; report the source's.
-        LogicalPlan::Window { source, .. } => output_columns_of(source),
-        LogicalPlan::Insert { returning, .. }
-        | LogicalPlan::Update { returning, .. }
-        | LogicalPlan::Delete { returning, .. } => match returning {
+        LogicalPlan::Window(WindowPlan { source, .. }) => output_columns_of(source),
+        LogicalPlan::Insert(InsertPlan { returning, .. })
+        | LogicalPlan::Update(UpdatePlan { returning, .. })
+        | LogicalPlan::Delete(DeletePlan { returning, .. }) => match returning {
             Some(returning) => Ok(returning.columns.clone()),
             None => Err(BindError::feature_not_supported(
                 "data-modifying statements in WITH are not supported yet",
@@ -4175,52 +4236,52 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
         projections.iter().any(BoundExpr::contains_srf)
     }
     match plan {
-        LogicalPlan::Query {
+        LogicalPlan::Query(QueryPlan {
             table,
             projections,
             predicate,
             ..
-        } if !has_srf(&projections) => LogicalPlan::Query {
+        }) if !has_srf(&projections) => LogicalPlan::Query(QueryPlan {
             table,
             columns: one_col(),
             projections: one_row(),
             predicate,
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::Subquery {
+        }),
+        LogicalPlan::Subquery(SubqueryPlan {
             source,
             projections,
             predicate,
             ..
-        } if !has_srf(&projections) => LogicalPlan::Subquery {
+        }) if !has_srf(&projections) => LogicalPlan::Subquery(SubqueryPlan {
             source,
             columns: one_col(),
             projections: one_row(),
             predicate,
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::Join {
+        }),
+        LogicalPlan::Join(JoinPlan {
             source,
             projections,
             predicate,
             ..
-        } if !has_srf(&projections) => LogicalPlan::Join {
+        }) if !has_srf(&projections) => LogicalPlan::Join(JoinPlan {
             source,
             columns: one_col(),
             projections: one_row(),
             predicate,
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::TableFunction {
+        }),
+        LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
             projections,
             predicate,
             ..
-        } if !has_srf(&projections) => LogicalPlan::TableFunction {
+        }) if !has_srf(&projections) => LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
             columns: one_col(),
@@ -4228,8 +4289,8 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
             predicate,
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::Aggregate {
+        }),
+        LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -4237,7 +4298,7 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
             having,
             projections,
             ..
-        } if !has_srf(&projections) => LogicalPlan::Aggregate {
+        }) if !has_srf(&projections) => LogicalPlan::Aggregate(AggregatePlan {
             input,
             predicate,
             group_exprs,
@@ -4247,25 +4308,25 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
             projections: one_row(),
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::Values {
+        }),
+        LogicalPlan::Values(ValuesPlan {
             rows, predicate, ..
-        } => LogicalPlan::Values {
+        }) => LogicalPlan::Values(ValuesPlan {
             columns: one_col(),
             rows: rows.into_iter().map(|_| one_row()).collect(),
             predicate,
             sort: Vec::new(),
             distinct: None,
-        },
-        LogicalPlan::Limit {
+        }),
+        LogicalPlan::Limit(LimitPlan {
             source,
             limit,
             offset,
-        } => LogicalPlan::Limit {
+        }) => LogicalPlan::Limit(LimitPlan {
             source: Box::new(strip_to_existence(*source)),
             limit,
             offset,
-        },
+        }),
         // A set-returning projection (guards above fell through) or a DML body in
         // WITH: leave as-is; the executor's first-row check is still correct.
         other => other,
@@ -4774,7 +4835,7 @@ fn bind_values_select(
         // only an identity projection over its `[keys…, aggregates…]` row and
         // the SELECT's own tail rides the wrapping `Subquery`.
         let identity = (!windows.is_empty()).then(|| aggregate_identity_projection(&agg));
-        let block = LogicalPlan::Aggregate {
+        let block = LogicalPlan::Aggregate(AggregatePlan {
             input: AggInput::SingleRow,
             predicate,
             group_exprs: agg.group_exprs,
@@ -4795,7 +4856,7 @@ fn bind_values_select(
             } else {
                 None
             },
-        };
+        });
         return Ok(if windows.is_empty() {
             block
         } else {
@@ -4805,13 +4866,13 @@ fn bind_values_select(
     // A FROM-less window (`SELECT row_number() OVER ()`) runs over the same
     // single virtual row, through an empty-width `Values` the chain widens.
     if !windows.is_empty() {
-        let source = LogicalPlan::Values {
+        let source = LogicalPlan::Values(ValuesPlan {
             columns: Vec::new(),
             rows: vec![vec![]],
             predicate,
             sort: Vec::new(),
             distinct: None,
-        };
+        });
         return Ok(finish_windowed_select(
             source,
             windows,
@@ -4827,29 +4888,29 @@ fn bind_values_select(
     // constant `Values`. Run the projection pipeline over a single dummy input
     // row: `ProjectSet` then expands each SRF. Mirrors PG's Result + ProjectSet.
     if row.iter().any(BoundExpr::is_srf) {
-        let source = LogicalPlan::Values {
+        let source = LogicalPlan::Values(ValuesPlan {
             columns: Vec::new(),
             rows: vec![vec![]],
             predicate: None,
             sort: Vec::new(),
             distinct: None,
-        };
-        return Ok(LogicalPlan::Subquery {
+        });
+        return Ok(LogicalPlan::Subquery(SubqueryPlan {
             source: Box::new(source),
             columns,
             projections: row,
             predicate,
             sort,
             distinct,
-        });
+        }));
     }
-    Ok(LogicalPlan::Values {
+    Ok(LogicalPlan::Values(ValuesPlan {
         columns,
         rows: vec![row],
         predicate,
         sort,
         distinct,
-    })
+    }))
 }
 
 /// The bound pieces of a SELECT over a single in-scope relation.
@@ -5018,15 +5079,15 @@ fn finish_windowed_select(
     let mut node = source;
     for index in order {
         let group = groups[index].take().expect("each group used once");
-        node = LogicalPlan::Window {
+        node = LogicalPlan::Window(WindowPlan {
             source: Box::new(node),
             spec: group.spec,
             funcs: group.funcs,
             input_width,
             output_width,
-        };
+        });
     }
-    LogicalPlan::Subquery {
+    LogicalPlan::Subquery(SubqueryPlan {
         source: Box::new(node),
         columns,
         projections,
@@ -5034,7 +5095,7 @@ fn finish_windowed_select(
         predicate: None,
         sort,
         distinct,
-    }
+    })
 }
 
 /// The synthetic output columns of a plan built only to feed a window chain.
@@ -6136,7 +6197,7 @@ pub fn bind_insert_with_params(
             .with_subqueries(engine, &CteEnv::new()),
     )?;
 
-    Ok(LogicalPlan::Insert {
+    Ok(LogicalPlan::Insert(InsertPlan {
         table,
         source: insert_source,
         returning,
@@ -6144,7 +6205,7 @@ pub fn bind_insert_with_params(
         // Only COPY can freeze; there is no `INSERT … FREEZE` in PostgreSQL.
         freeze: false,
         tableoid,
-    })
+    }))
 }
 
 /// What `COPY … HEADER` does with the first data line, resolved.
@@ -6386,7 +6447,7 @@ impl CopyFromPlan {
             }
             tuples.push(tuple);
         }
-        Ok(LogicalPlan::Insert {
+        Ok(LogicalPlan::Insert(InsertPlan {
             table: self.table.clone(),
             source: InsertSource::Tuples {
                 rows: tuples,
@@ -6401,7 +6462,7 @@ impl CopyFromPlan {
             freeze: self.freeze,
             // COPY has no RETURNING, so nothing can read a system column.
             tableoid: false,
-        })
+        }))
     }
 
     /// A data row must supply exactly the columns the statement named.
@@ -6901,7 +6962,7 @@ pub fn bind_update_with_params(
     // RETURNING references the NEW row (post-update), which the executor feeds
     // in schema order — the same scope the SET/WHERE clauses bound against.
     let returning = bind_returning(&update.returning, &scope)?;
-    Ok(LogicalPlan::Update {
+    Ok(LogicalPlan::Update(UpdatePlan {
         tableoid,
         table,
         predicate,
@@ -6909,7 +6970,7 @@ pub fn bind_update_with_params(
         returning,
         routing,
         inherited,
-    })
+    }))
 }
 
 pub fn bind_delete(
@@ -6981,14 +7042,14 @@ pub fn bind_delete_with_params(
     }
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
-    Ok(LogicalPlan::Delete {
+    Ok(LogicalPlan::Delete(DeletePlan {
         tableoid,
         table,
         predicate,
         returning,
         routing,
         inherited,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -7130,13 +7191,13 @@ mod tests {
         Option<BoundExpr>,
     ) {
         match bound(sql) {
-            LogicalPlan::Aggregate {
+            LogicalPlan::Aggregate(AggregatePlan {
                 group_exprs,
                 aggregates,
                 projections,
                 having,
                 ..
-            } => (group_exprs, aggregates, projections, having),
+            }) => (group_exprs, aggregates, projections, having),
             other => panic!(
                 "expected Aggregate for `{sql}`, got another plan variant: {}",
                 plan_name(&other)
@@ -7146,19 +7207,19 @@ mod tests {
 
     fn plan_name(p: &LogicalPlan) -> &'static str {
         match p {
-            LogicalPlan::Values { .. } => "Values",
-            LogicalPlan::Query { .. } => "Query",
-            LogicalPlan::Append { .. } => "Append",
-            LogicalPlan::SetOp { .. } => "SetOp",
-            LogicalPlan::Subquery { .. } => "Subquery",
-            LogicalPlan::TableFunction { .. } => "TableFunction",
-            LogicalPlan::Join { .. } => "Join",
-            LogicalPlan::Aggregate { .. } => "Aggregate",
-            LogicalPlan::Window { .. } => "Window",
-            LogicalPlan::Limit { .. } => "Limit",
-            LogicalPlan::Insert { .. } => "Insert",
-            LogicalPlan::Update { .. } => "Update",
-            LogicalPlan::Delete { .. } => "Delete",
+            LogicalPlan::Values(ValuesPlan { .. }) => "Values",
+            LogicalPlan::Query(QueryPlan { .. }) => "Query",
+            LogicalPlan::Append(AppendPlan { .. }) => "Append",
+            LogicalPlan::SetOp(SetOpPlan { .. }) => "SetOp",
+            LogicalPlan::Subquery(SubqueryPlan { .. }) => "Subquery",
+            LogicalPlan::TableFunction(TableFunctionPlan { .. }) => "TableFunction",
+            LogicalPlan::Join(JoinPlan { .. }) => "Join",
+            LogicalPlan::Aggregate(AggregatePlan { .. }) => "Aggregate",
+            LogicalPlan::Window(WindowPlan { .. }) => "Window",
+            LogicalPlan::Limit(LimitPlan { .. }) => "Limit",
+            LogicalPlan::Insert(InsertPlan { .. }) => "Insert",
+            LogicalPlan::Update(UpdatePlan { .. }) => "Update",
+            LogicalPlan::Delete(DeletePlan { .. }) => "Delete",
         }
     }
 
@@ -7461,7 +7522,8 @@ mod tests {
 
     #[test]
     fn resolves_columns_to_indices() -> anyhow::Result<()> {
-        let LogicalPlan::Query { projections, .. } = bind_one("SELECT name, id FROM t")? else {
+        let LogicalPlan::Query(QueryPlan { projections, .. }) = bind_one("SELECT name, id FROM t")?
+        else {
             panic!("expected Query");
         };
         assert_eq!(
@@ -7490,7 +7552,7 @@ mod tests {
 
     /// The first projected expression of a bound FROM-less `SELECT`.
     fn one_projection(sql: &str) -> BoundExpr {
-        let LogicalPlan::Values { mut rows, .. } = bound(sql) else {
+        let LogicalPlan::Values(ValuesPlan { mut rows, .. }) = bound(sql) else {
             panic!("expected Values");
         };
         rows.remove(0).remove(0)
@@ -7587,7 +7649,8 @@ mod tests {
 
     #[test]
     fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
-        let LogicalPlan::Query { predicate, .. } = bind_one("SELECT id FROM t WHERE id = big")?
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
+            bind_one("SELECT id FROM t WHERE id = big")?
         else {
             panic!("expected Query");
         };
@@ -7616,7 +7679,8 @@ mod tests {
 
     #[test]
     fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
-        let LogicalPlan::Query { predicate, .. } = bind_one("SELECT id FROM t WHERE big = '5'")?
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
+            bind_one("SELECT id FROM t WHERE big = '5'")?
         else {
             panic!("expected Query");
         };
@@ -7637,7 +7701,7 @@ mod tests {
 
     #[test]
     fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bind_one("SELECT id FROM t WHERE id BETWEEN 1 AND 3")?
         else {
             panic!("expected Query");
@@ -7672,7 +7736,7 @@ mod tests {
 
     #[test]
     fn not_between_desugars_to_lt_or_gt() -> anyhow::Result<()> {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bind_one("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3")?
         else {
             panic!("expected Query");
@@ -7716,7 +7780,7 @@ mod tests {
 
     #[test]
     fn unknown_vs_unknown_comparison_falls_back_to_text() -> anyhow::Result<()> {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'a' = 'b'")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 'a' = 'b'")? else {
             panic!("expected Values");
         };
         assert_eq!(rows.len(), 1);
@@ -7819,7 +7883,8 @@ mod tests {
 
     #[test]
     fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
-        let LogicalPlan::Values { rows, columns, .. } = bind_one("SELECT -2147483648")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, columns, .. }) = bind_one("SELECT -2147483648")?
+        else {
             panic!("expected Values");
         };
         assert_eq!(
@@ -7836,7 +7901,7 @@ mod tests {
 
     #[test]
     fn output_column_names_follow_pg() -> anyhow::Result<()> {
-        let LogicalPlan::Query { columns, .. } =
+        let LogicalPlan::Query(QueryPlan { columns, .. }) =
             bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?
         else {
             panic!("expected Query");
@@ -7849,10 +7914,10 @@ mod tests {
 
     #[test]
     fn insert_coerces_cells_to_column_types() -> anyhow::Result<()> {
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             source: InsertSource::Values(rows),
             ..
-        } = bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
+        }) = bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
         else {
             panic!("expected Insert with a VALUES source");
         };
@@ -7894,11 +7959,11 @@ mod tests {
 
     #[test]
     fn update_binds_assignments_by_index() -> anyhow::Result<()> {
-        let LogicalPlan::Update {
+        let LogicalPlan::Update(UpdatePlan {
             assignments,
             predicate,
             ..
-        } = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?
+        }) = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?
         else {
             panic!("expected Update");
         };
@@ -7929,7 +7994,9 @@ mod tests {
 
     #[test]
     fn update_assignment_coerces_to_column_type() -> anyhow::Result<()> {
-        let LogicalPlan::Update { assignments, .. } = bind_one("UPDATE t SET id = big")? else {
+        let LogicalPlan::Update(UpdatePlan { assignments, .. }) =
+            bind_one("UPDATE t SET id = big")?
+        else {
             panic!("expected Update");
         };
         assert_eq!(
@@ -7948,11 +8015,13 @@ mod tests {
 
     #[test]
     fn delete_binds_predicate() -> anyhow::Result<()> {
-        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t WHERE id = 1")? else {
+        let LogicalPlan::Delete(DeletePlan { predicate, .. }) =
+            bind_one("DELETE FROM t WHERE id = 1")?
+        else {
             panic!("expected Delete");
         };
         assert!(predicate.is_some());
-        let LogicalPlan::Delete { predicate, .. } = bind_one("DELETE FROM t")? else {
+        let LogicalPlan::Delete(DeletePlan { predicate, .. }) = bind_one("DELETE FROM t")? else {
             panic!("expected Delete");
         };
         assert!(predicate.is_none());
@@ -7977,11 +8046,11 @@ mod tests {
     /// into that row.
     #[test]
     fn a_window_call_becomes_a_column_ref_past_the_input_row() {
-        let LogicalPlan::Subquery {
+        let LogicalPlan::Subquery(SubqueryPlan {
             source,
             projections,
             ..
-        } = bound("SELECT id, rank() OVER (ORDER BY name) FROM t")
+        }) = bound("SELECT id, rank() OVER (ORDER BY name) FROM t")
         else {
             panic!("expected a Subquery wrapping the window chain");
         };
@@ -7999,12 +8068,12 @@ mod tests {
                 },
             ]
         );
-        let LogicalPlan::Window {
+        let LogicalPlan::Window(WindowPlan {
             funcs,
             input_width,
             output_width,
             ..
-        } = *source
+        }) = *source
         else {
             panic!("expected a Window");
         };
@@ -8018,18 +8087,18 @@ mod tests {
     /// not produce two.
     #[test]
     fn calls_sharing_a_spec_collapse_into_one_window_step() {
-        let LogicalPlan::Subquery { source, .. } = bound(
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
             "SELECT rank() OVER w1, sum(big) OVER w2 FROM t \
              WINDOW w1 AS (ORDER BY name), w2 AS (ORDER BY name)",
         ) else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let LogicalPlan::Window { source, funcs, .. } = *source else {
+        let LogicalPlan::Window(WindowPlan { source, funcs, .. }) = *source else {
             panic!("expected a Window");
         };
         assert_eq!(funcs.len(), 2, "both calls land on the same step");
         assert!(
-            !matches!(*source, LogicalPlan::Window { .. }),
+            !matches!(*source, LogicalPlan::Window(WindowPlan { .. })),
             "one step, so nothing below it"
         );
     }
@@ -8040,17 +8109,17 @@ mod tests {
     /// ORDER BY of its own returns rows in.
     #[test]
     fn the_widest_window_spec_is_evaluated_first() {
-        let LogicalPlan::Subquery { source, .. } = bound(
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
             "SELECT rank() OVER (ORDER BY name), \
              sum(big) OVER (PARTITION BY id ORDER BY name) FROM t",
         ) else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let LogicalPlan::Window { source, spec, .. } = *source else {
+        let LogicalPlan::Window(WindowPlan { source, spec, .. }) = *source else {
             panic!("expected a Window");
         };
         assert_eq!(spec.partition_by.len(), 0, "the 1-key spec is on top");
-        let LogicalPlan::Window { spec, .. } = *source else {
+        let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
             panic!("expected a second Window below the first");
         };
         assert_eq!(
@@ -8065,34 +8134,37 @@ mod tests {
     /// the window reads that row.
     #[test]
     fn a_window_can_sit_over_a_grouped_aggregate() {
-        let LogicalPlan::Subquery { source, .. } =
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) =
             bound("SELECT sum(sum(big)) OVER (ORDER BY name) FROM t GROUP BY name")
         else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let LogicalPlan::Window {
+        let LogicalPlan::Window(WindowPlan {
             source,
             input_width,
             ..
-        } = *source
+        }) = *source
         else {
             panic!("expected a Window");
         };
         // One group key plus one aggregate.
         assert_eq!(input_width, 2);
-        assert!(matches!(*source, LogicalPlan::Aggregate { .. }));
+        assert!(matches!(
+            *source,
+            LogicalPlan::Aggregate(AggregatePlan { .. })
+        ));
     }
 
     /// A window in an ORDER BY expression rides the hidden ("resjunk") column
     /// `bind_order_by` already appended, so extraction sweeps it up for free.
     #[test]
     fn a_window_in_order_by_lands_in_a_hidden_column() {
-        let LogicalPlan::Subquery {
+        let LogicalPlan::Subquery(SubqueryPlan {
             columns,
             projections,
             sort,
             ..
-        } = bound("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)")
+        }) = bound("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)")
         else {
             panic!("expected a Subquery wrapping the window chain");
         };
@@ -8301,7 +8373,7 @@ mod tests {
              RANGE UNBOUNDED PRECEDING EXCLUDE NO OTHERS) FROM t",
         ] {
             assert!(
-                matches!(bound(sql), LogicalPlan::Subquery { .. }),
+                matches!(bound(sql), LogicalPlan::Subquery(SubqueryPlan { .. })),
                 "for: {sql}"
             );
         }
@@ -8368,17 +8440,17 @@ mod tests {
     /// the plan and fails at evaluation.
     #[test]
     fn a_table_query_order_by_a_window_builds_a_window_chain() {
-        let LogicalPlan::Subquery {
+        let LogicalPlan::Subquery(SubqueryPlan {
             source,
             columns,
             projections,
             sort,
             ..
-        } = bound("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)")
+        }) = bound("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)")
         else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        assert!(matches!(*source, LogicalPlan::Window { .. }));
+        assert!(matches!(*source, LogicalPlan::Window(WindowPlan { .. })));
         assert_eq!(columns.len(), 4, "t's own columns stay visible");
         assert_eq!(projections.len(), 5, "plus the hidden sort column");
         assert_eq!(sort[0].column, 4);
@@ -8393,13 +8465,13 @@ mod tests {
     /// self or forward reference report "does not exist", as PG does.
     #[test]
     fn a_named_window_expands_its_base_at_build_time() {
-        let LogicalPlan::Subquery { source, .. } = bound(
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
             "SELECT rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY name), \
              w2 AS (w1 ORDER BY id)",
         ) else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let LogicalPlan::Window { spec, .. } = *source else {
+        let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
             panic!("expected a Window");
         };
         assert_eq!(spec.partition_by.len(), 1, "w1's PARTITION BY is inherited");
@@ -8533,16 +8605,16 @@ mod tests {
             })
         }
         let plan = bound(sql);
-        let (LogicalPlan::Query {
+        let (LogicalPlan::Query(QueryPlan {
             projections,
             predicate,
             ..
-        }
-        | LogicalPlan::Subquery {
+        })
+        | LogicalPlan::Subquery(SubqueryPlan {
             projections,
             predicate,
             ..
-        }) = &plan
+        })) = &plan
         else {
             panic!("expected a Query or Subquery for `{sql}`");
         };
@@ -8604,10 +8676,10 @@ mod tests {
         };
         let mut plan = bind_query_with_params(&engine, &catalog, query, &params)?;
         substitute_params(&mut plan, &[Value::Int4(7)]);
-        let LogicalPlan::Subquery { source, .. } = plan else {
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = plan else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let LogicalPlan::Window { spec, .. } = *source else {
+        let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
             panic!("expected a Window");
         };
         assert_eq!(
@@ -8624,10 +8696,10 @@ mod tests {
     fn insert_select_binds_as_query_source() -> anyhow::Result<()> {
         // A SELECT source produces a query-source Insert whose projection list is
         // full-width in schema order (unlisted columns take their defaults).
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             source: InsertSource::Query { projections, .. },
             ..
-        } = bind_one("INSERT INTO t (id, name) SELECT id, name FROM t")?
+        }) = bind_one("INSERT INTO t (id, name) SELECT id, name FROM t")?
         else {
             panic!("expected a query-source Insert");
         };
@@ -8668,10 +8740,10 @@ mod tests {
     #[test]
     fn insert_table_source_binds_as_query() -> anyhow::Result<()> {
         // `INSERT ... TABLE t` is `INSERT ... SELECT * FROM t`.
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             source: InsertSource::Query { projections, .. },
             ..
-        } = bind_one("INSERT INTO t TABLE t")?
+        }) = bind_one("INSERT INTO t TABLE t")?
         else {
             panic!("expected a query-source Insert");
         };
@@ -8681,7 +8753,7 @@ mod tests {
 
     #[test]
     fn table_statement_binds_select_star() -> anyhow::Result<()> {
-        let LogicalPlan::Query { columns, .. } = bind_one("TABLE t")? else {
+        let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("TABLE t")? else {
             panic!("expected a Query plan");
         };
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -8731,10 +8803,10 @@ mod tests {
             "INSERT INTO t (id) VALUES (1), (2) LIMIT 1",
             "INSERT INTO t (id) VALUES (1), (2) ORDER BY 1",
         ] {
-            let LogicalPlan::Insert {
+            let LogicalPlan::Insert(InsertPlan {
                 source: InsertSource::Query { .. },
                 ..
-            } = bind_one(sql)?
+            }) = bind_one(sql)?
             else {
                 panic!("expected a query-source Insert for: {sql}");
             };
@@ -8744,10 +8816,10 @@ mod tests {
 
     #[test]
     fn default_keyword_binds_as_typed_null_without_a_declared_default() -> anyhow::Result<()> {
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             source: InsertSource::Values(rows),
             ..
-        } = bind_one("INSERT INTO t (id) VALUES (DEFAULT)")?
+        }) = bind_one("INSERT INTO t (id) VALUES (DEFAULT)")?
         else {
             panic!("expected Insert with a VALUES source");
         };
@@ -8767,9 +8839,9 @@ mod tests {
     fn returning_binds_output_columns_for_each_dml() -> anyhow::Result<()> {
         // INSERT: `*` expands the whole table, a computed column carries an alias.
         let insert = bound("INSERT INTO t (id) VALUES (1) RETURNING *, id + 1 AS next");
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             returning: Some(_), ..
-        } = &insert
+        }) = &insert
         else {
             panic!("expected Insert with RETURNING");
         };
@@ -8787,10 +8859,10 @@ mod tests {
         let update = bound("UPDATE t SET id = 1 RETURNING id, name");
         assert!(matches!(
             update,
-            LogicalPlan::Update {
+            LogicalPlan::Update(UpdatePlan {
                 returning: Some(_),
                 ..
-            }
+            })
         ));
         let names: Vec<String> = output_columns_of(&update)?
             .into_iter()
@@ -8868,7 +8940,7 @@ mod tests {
             ("UPDATE t SET flag = 'ye'", Value::Bool(true)),
             ("UPDATE t SET flag = 'N'", Value::Bool(false)),
         ] {
-            let LogicalPlan::Update { assignments, .. } = bind_one(sql)? else {
+            let LogicalPlan::Update(UpdatePlan { assignments, .. }) = bind_one(sql)? else {
                 panic!("expected Update for: {sql}");
             };
             assert_eq!(
@@ -8899,7 +8971,7 @@ mod tests {
 
     #[test]
     fn decimal_literal_binds_as_numeric() -> anyhow::Result<()> {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 1.5")? else {
             panic!("expected Values");
         };
         let BoundExpr::Const {
@@ -8994,7 +9066,7 @@ mod tests {
 
     #[test]
     fn float_literal_cast_binds() -> anyhow::Result<()> {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 'NaN'::float4")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 'NaN'::float4")? else {
             panic!("expected Values");
         };
         let BoundExpr::Const {
@@ -9048,7 +9120,7 @@ mod tests {
     fn numeric_operators_bind() -> anyhow::Result<()> {
         // Comparison, arithmetic, and modulo all resolve for numeric now.
         assert!(bind_one("SELECT '1'::numeric < '2'::numeric").is_ok());
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT 1.5 + 2.25")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 1.5 + 2.25")? else {
             panic!("expected Values");
         };
         assert_eq!(rows[0][0].ty(), PgType::Numeric);
@@ -9059,7 +9131,9 @@ mod tests {
 
     #[test]
     fn int2_arithmetic_binds() -> anyhow::Result<()> {
-        let LogicalPlan::Values { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2")? else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) =
+            bind_one("SELECT '1'::int2 + '2'::int2")?
+        else {
             panic!("expected Values");
         };
         assert_eq!(rows[0][0].ty(), PgType::Int2);
@@ -9075,12 +9149,15 @@ mod tests {
 
     #[test]
     fn cast_keeps_bare_column_name() -> anyhow::Result<()> {
-        let LogicalPlan::Query { columns, .. } = bind_one("SELECT id::int8 FROM t")? else {
+        let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("SELECT id::int8 FROM t")?
+        else {
             panic!("expected Query");
         };
         assert_eq!(columns[0].name, "id");
         // A constant/nested cast falls back to the target type name.
-        let LogicalPlan::Values { columns, .. } = bind_one("SELECT 'nan'::numeric::float4")? else {
+        let LogicalPlan::Values(ValuesPlan { columns, .. }) =
+            bind_one("SELECT 'nan'::numeric::float4")?
+        else {
             panic!("expected Values");
         };
         assert_eq!(columns[0].name, "float4");
@@ -9090,9 +9167,9 @@ mod tests {
 
     #[test]
     fn select_where_without_table_binds_predicate() -> anyhow::Result<()> {
-        let LogicalPlan::Values {
+        let LogicalPlan::Values(ValuesPlan {
             rows, predicate, ..
-        } = bind_one("SELECT 1 WHERE 1 = 2")?
+        }) = bind_one("SELECT 1 WHERE 1 = 2")?
         else {
             panic!("expected Values");
         };
@@ -9104,7 +9181,7 @@ mod tests {
 
     #[test]
     fn set_returning_function_in_from_binds_columns() -> anyhow::Result<()> {
-        let LogicalPlan::TableFunction { func, columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
             bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')")?
         else {
             panic!("expected TableFunction");
@@ -9120,9 +9197,9 @@ mod tests {
     #[test]
     fn set_returning_function_projects_and_filters() -> anyhow::Result<()> {
         // A subset projection over the SRF's columns resolves like a table.
-        let LogicalPlan::TableFunction {
+        let LogicalPlan::TableFunction(TableFunctionPlan {
             columns, predicate, ..
-        } = bind_one(
+        }) = bind_one(
             "SELECT sql_error_code FROM pg_input_error_info('1e400', 'float4') \
              WHERE message IS NOT NULL",
         )?
@@ -9145,7 +9222,7 @@ mod tests {
 
     #[test]
     fn generate_series_in_from_binds_int4_column() -> anyhow::Result<()> {
-        let LogicalPlan::TableFunction { func, columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
             bind_one("SELECT * FROM generate_series(1, 5)")?
         else {
             panic!("expected TableFunction");
@@ -9161,7 +9238,7 @@ mod tests {
     #[test]
     fn generate_series_widens_to_int8() -> anyhow::Result<()> {
         // A bigint bound widens the whole series to int8.
-        let LogicalPlan::TableFunction { func, columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
             bind_one("SELECT * FROM generate_series(1, 5000000000)")?
         else {
             panic!("expected TableFunction");
@@ -9174,7 +9251,7 @@ mod tests {
 
     #[test]
     fn generate_series_three_arg_step_binds() -> anyhow::Result<()> {
-        let LogicalPlan::TableFunction { func, args, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, args, .. }) =
             bind_one("SELECT * FROM generate_series(1, 10, 3)")?
         else {
             panic!("expected TableFunction");
@@ -9200,7 +9277,8 @@ mod tests {
             "SELECT i FROM generate_series(1, 5) AS i",
             "SELECT i FROM generate_series(1, 5) i",
         ] {
-            let LogicalPlan::TableFunction { columns, .. } = bind_one(sql)? else {
+            let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) = bind_one(sql)?
+            else {
                 panic!("expected TableFunction for `{sql}`");
             };
             assert_eq!(columns.len(), 1);
@@ -9215,7 +9293,7 @@ mod tests {
 
     #[test]
     fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
-        let LogicalPlan::TableFunction { columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
             bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?
         else {
             panic!("expected TableFunction");
@@ -9232,7 +9310,7 @@ mod tests {
     fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
         // `pg_input_error_info` returns a record: the alias names the relation
         // only, and the row type's column names survive.
-        let LogicalPlan::TableFunction { columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
             bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e")?
         else {
             panic!("expected TableFunction");
@@ -9247,7 +9325,8 @@ mod tests {
     fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
         // The rename is specific to scalar function FROM items — a bare alias on
         // a real relation names the relation and nothing else.
-        let LogicalPlan::Query { columns, .. } = bind_one("SELECT * FROM t AS x")? else {
+        let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("SELECT * FROM t AS x")?
+        else {
             panic!("expected Query");
         };
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -9258,7 +9337,7 @@ mod tests {
 
     #[test]
     fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
-        let LogicalPlan::TableFunction { func, columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
             bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?
         else {
             panic!("expected TableFunction");
@@ -9269,7 +9348,7 @@ mod tests {
         assert_eq!(columns[0].ty, PgType::Int4);
 
         // And the alias renames it, like any other scalar SRF.
-        let LogicalPlan::TableFunction { columns, .. } =
+        let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
             bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?
         else {
             panic!("expected TableFunction");
@@ -9342,12 +9421,12 @@ mod tests {
     #[test]
     fn generate_series_in_target_list_is_srf_projection() -> anyhow::Result<()> {
         // A FROM-less SRF in the target list expands over a single dummy row.
-        let LogicalPlan::Subquery {
+        let LogicalPlan::Subquery(SubqueryPlan {
             columns,
             projections,
             source,
             ..
-        } = bind_one("SELECT generate_series(1, 5)")?
+        }) = bind_one("SELECT generate_series(1, 5)")?
         else {
             panic!("expected Subquery over a single-row source");
         };
@@ -9355,7 +9434,7 @@ mod tests {
         assert_eq!(columns[0].name, "generate_series");
         assert_eq!(columns[0].ty, PgType::Int4);
         assert!(matches!(projections[0], BoundExpr::Srf { .. }));
-        assert!(matches!(*source, LogicalPlan::Values { .. }));
+        assert!(matches!(*source, LogicalPlan::Values(ValuesPlan { .. })));
 
         Ok(())
     }
@@ -9363,7 +9442,7 @@ mod tests {
     #[test]
     fn generate_series_in_target_list_over_table() -> anyhow::Result<()> {
         // Mixed scalar + SRF projection over a base table stays a Query.
-        let LogicalPlan::Query { projections, .. } =
+        let LogicalPlan::Query(QueryPlan { projections, .. }) =
             bind_one("SELECT id, generate_series(1, 2) FROM t")?
         else {
             panic!("expected Query");
@@ -9375,7 +9454,7 @@ mod tests {
     }
 
     fn table_fn(sql: &str) -> (crate::TableFn, Vec<OutputColumn>) {
-        let LogicalPlan::TableFunction { func, columns, .. } = bound(sql) else {
+        let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) = bound(sql) else {
             panic!("expected TableFunction");
         };
         (func, columns)
@@ -9420,7 +9499,8 @@ mod tests {
 
     #[test]
     fn standalone_values_binds_to_values_plan() -> anyhow::Result<()> {
-        let LogicalPlan::Values { columns, rows, .. } = bind_one("VALUES (1, 'a'), (2, 'b')")?
+        let LogicalPlan::Values(ValuesPlan { columns, rows, .. }) =
+            bind_one("VALUES (1, 'a'), (2, 'b')")?
         else {
             panic!("expected Values");
         };
@@ -9442,7 +9522,8 @@ mod tests {
     fn values_common_type_keeps_real_over_int() -> anyhow::Result<()> {
         // PG's select_common_type resolves (real, int4) to real, not float8
         // (int4 implicitly casts to real). Contrast with operator resolution.
-        let LogicalPlan::Values { columns, .. } = bind_one("VALUES (CAST(1.5 AS real)), (2)")?
+        let LogicalPlan::Values(ValuesPlan { columns, .. }) =
+            bind_one("VALUES (CAST(1.5 AS real)), (2)")?
         else {
             panic!("expected Values");
         };
@@ -9453,7 +9534,7 @@ mod tests {
 
     #[test]
     fn derived_table_binds_to_subquery_plan() -> anyhow::Result<()> {
-        let LogicalPlan::Subquery { columns, .. } =
+        let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
             bind_one("SELECT x FROM (VALUES (1), (2)) v(x)")?
         else {
             panic!("expected Subquery");
@@ -9472,7 +9553,7 @@ mod tests {
 
     #[test]
     fn cte_reference_resolves_to_subquery() -> anyhow::Result<()> {
-        let LogicalPlan::Subquery { columns, .. } =
+        let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
             bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
         else {
             panic!("expected Subquery");
@@ -9513,10 +9594,10 @@ mod tests {
     fn with_on_insert_source_binds_as_a_query() -> anyhow::Result<()> {
         // The WITH belongs to the source query and is honored via the query
         // binder (the CTE here is unused; the VALUES still supplies the row).
-        let LogicalPlan::Insert {
+        let LogicalPlan::Insert(InsertPlan {
             source: InsertSource::Query { .. },
             ..
-        } = bind_one("INSERT INTO t (id) WITH c AS (SELECT 1) VALUES (10)")?
+        }) = bind_one("INSERT INTO t (id) WITH c AS (SELECT 1) VALUES (10)")?
         else {
             panic!("expected a query-source Insert");
         };
@@ -9533,7 +9614,7 @@ mod tests {
     #[test]
     fn cte_shadows_a_real_table() -> anyhow::Result<()> {
         // `t` here is the CTE, not the base table `t`; its column is `x`.
-        let LogicalPlan::Subquery { columns, .. } =
+        let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
             bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
         else {
             panic!("expected Subquery");
@@ -9547,7 +9628,8 @@ mod tests {
     #[test]
     fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
         // A FROM-less SELECT is a Values plan; its one projection is the marker.
-        let LogicalPlan::Values { rows, .. } = bound("SELECT (SELECT big FROM t)") else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = bound("SELECT (SELECT big FROM t)")
+        else {
             panic!("expected Values");
         };
         assert!(matches!(
@@ -9562,7 +9644,7 @@ mod tests {
 
     #[test]
     fn exists_binds_to_marker() {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bound("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)")
         else {
             panic!("expected Query");
@@ -9575,7 +9657,7 @@ mod tests {
 
     #[test]
     fn not_exists_sets_negated() {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bound("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t)")
         else {
             panic!("expected Query");
@@ -9590,7 +9672,7 @@ mod tests {
     /// with an equality template and no `ALL` flag.
     #[test]
     fn in_subquery_binds_to_marker() {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bound("SELECT id FROM t WHERE id IN (SELECT id FROM t)")
         else {
             panic!("expected Query");
@@ -9607,7 +9689,7 @@ mod tests {
     /// to an inequality template with `all` set rather than a negated equality.
     #[test]
     fn not_in_subquery_binds_to_all_of_inequality() {
-        let LogicalPlan::Query { predicate, .. } =
+        let LogicalPlan::Query(QueryPlan { predicate, .. }) =
             bound("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t)")
         else {
             panic!("expected Query");
@@ -9644,10 +9726,10 @@ mod tests {
         // A qualified reference to an enclosing relation resolves outward rather
         // than erroring: `x.id` becomes an OuterColumnRef at level 1, index 0
         // (the outer row's `id`).
-        let LogicalPlan::Query {
+        let LogicalPlan::Query(QueryPlan {
             predicate: Some(pred),
             ..
-        } = bound("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)")
+        }) = bound("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)")
         else {
             panic!("expected Query with a WHERE predicate");
         };
@@ -9655,10 +9737,10 @@ mod tests {
             panic!("expected EXISTS marker, got {pred:?}");
         };
         assert!(!negated);
-        let LogicalPlan::Query {
+        let LogicalPlan::Query(QueryPlan {
             predicate: Some(inner),
             ..
-        } = &*subplan.0
+        }) = &*subplan.0
         else {
             panic!("expected inner Query with a predicate");
         };
@@ -9683,10 +9765,10 @@ mod tests {
         // An unqualified name absent from the subquery's own relation falls
         // through to the enclosing query. Here `flag` is not selected from in the
         // subquery's FROM-less body, so it resolves to the outer row.
-        let LogicalPlan::Query {
+        let LogicalPlan::Query(QueryPlan {
             predicate: Some(pred),
             ..
-        } = bound("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE flag)")
+        }) = bound("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE flag)")
         else {
             panic!("expected Query with a WHERE predicate");
         };
@@ -9695,10 +9777,10 @@ mod tests {
         };
         // The FROM-less inner body binds as a single-row Values plan; its WHERE
         // is the bare `flag` outer reference (level 1, the outer row's `flag`).
-        let LogicalPlan::Values {
+        let LogicalPlan::Values(ValuesPlan {
             predicate: Some(inner),
             ..
-        } = &*subplan.0
+        }) = &*subplan.0
         else {
             panic!("expected inner Values with a predicate");
         };
@@ -9725,7 +9807,9 @@ mod tests {
 
     #[test]
     fn scalar_subquery_column_named_after_inner_column() {
-        let LogicalPlan::Values { columns, .. } = bound("SELECT (SELECT max(id) FROM t)") else {
+        let LogicalPlan::Values(ValuesPlan { columns, .. }) =
+            bound("SELECT (SELECT max(id) FROM t)")
+        else {
             panic!("expected Values");
         };
         assert_eq!(columns[0].name, "max");
@@ -9733,7 +9817,9 @@ mod tests {
 
     #[test]
     fn exists_column_named_exists() {
-        let LogicalPlan::Values { columns, .. } = bound("SELECT EXISTS (SELECT 1 FROM t)") else {
+        let LogicalPlan::Values(ValuesPlan { columns, .. }) =
+            bound("SELECT EXISTS (SELECT 1 FROM t)")
+        else {
             panic!("expected Values");
         };
         assert_eq!(columns[0].name, "exists");
@@ -9743,13 +9829,15 @@ mod tests {
     fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
         // The EXISTS subplan's projection is replaced with a constant so the
         // original target list (here a division by zero) is never evaluated.
-        let LogicalPlan::Values { rows, .. } = bound("SELECT EXISTS (SELECT id / 0 FROM t)") else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) =
+            bound("SELECT EXISTS (SELECT id / 0 FROM t)")
+        else {
             panic!("expected Values");
         };
         let BoundExpr::Exists { subplan, .. } = &rows[0][0] else {
             panic!("expected Exists");
         };
-        let LogicalPlan::Query { projections, .. } = subplan.0.as_ref() else {
+        let LogicalPlan::Query(QueryPlan { projections, .. }) = subplan.0.as_ref() else {
             panic!("expected Query subplan");
         };
         assert!(matches!(projections.as_slice(), [BoundExpr::Const { .. }]));
@@ -9758,7 +9846,7 @@ mod tests {
 
     #[test]
     fn update_set_accepts_subquery() {
-        let LogicalPlan::Update { assignments, .. } =
+        let LogicalPlan::Update(UpdatePlan { assignments, .. }) =
             bound("UPDATE t SET id = (SELECT max(id) FROM t)")
         else {
             panic!("expected Update");
@@ -9768,7 +9856,7 @@ mod tests {
 
     #[test]
     fn delete_where_accepts_in_subquery() {
-        let LogicalPlan::Delete { predicate, .. } =
+        let LogicalPlan::Delete(DeletePlan { predicate, .. }) =
             bound("DELETE FROM t WHERE id IN (SELECT id FROM t)")
         else {
             panic!("expected Delete");
@@ -9780,11 +9868,11 @@ mod tests {
     }
 
     fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
-        let LogicalPlan::Query {
+        let LogicalPlan::Query(QueryPlan {
             columns,
             projections,
             ..
-        } = bound(sql)
+        }) = bound(sql)
         else {
             panic!("expected Query");
         };
@@ -9858,7 +9946,7 @@ mod tests {
 
     /// The first projected expression of a bound `SELECT`.
     fn first_projection(sql: &str) -> BoundExpr {
-        let LogicalPlan::Query { projections, .. } = bound(sql) else {
+        let LogicalPlan::Query(QueryPlan { projections, .. }) = bound(sql) else {
             panic!("expected Query");
         };
         projections.into_iter().next().expect("no projections")
@@ -9982,12 +10070,12 @@ mod tests {
     #[test]
     fn cross_join_builds_join_plan_with_offsets() -> anyhow::Result<()> {
         // Two derived tables: a(x) at offset 0, b(y) at offset 1.
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             source,
             columns,
             projections,
             ..
-        } = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)")?
+        }) = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -10021,11 +10109,11 @@ mod tests {
 
     #[test]
     fn cross_join_wildcard_expands_every_relation_in_order() -> anyhow::Result<()> {
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             columns,
             projections,
             ..
-        } = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)")?
+        }) = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)")?
         else {
             panic!("expected Join");
         };
@@ -10046,7 +10134,7 @@ mod tests {
     #[test]
     fn cross_join_qualified_refs_use_combined_row_index() -> anyhow::Result<()> {
         // `t` occupies indices 0..4 (id, big, name, flag); b.y follows at 4.
-        let LogicalPlan::Join { projections, .. } =
+        let LogicalPlan::Join(JoinPlan { projections, .. }) =
             bind_one("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
@@ -10085,7 +10173,7 @@ mod tests {
 
     #[test]
     fn explicit_cross_join_flattens_like_a_comma() -> anyhow::Result<()> {
-        let LogicalPlan::Join { source, .. } =
+        let LogicalPlan::Join(JoinPlan { source, .. }) =
             bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
@@ -10119,7 +10207,7 @@ mod tests {
                 JoinKind::Full,
             ),
         ] {
-            let LogicalPlan::Join { source, .. } = bind_one(sql)? else {
+            let LogicalPlan::Join(JoinPlan { source, .. }) = bind_one(sql)? else {
                 panic!("expected Join for {sql}");
             };
             let JoinExpr::Join {
@@ -10144,11 +10232,11 @@ mod tests {
 
     #[test]
     fn chained_join_is_left_associative_and_offsets_keep_growing() -> anyhow::Result<()> {
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             source,
             projections,
             ..
-        } = bind_one(
+        }) = bind_one(
             "SELECT c.z FROM (VALUES (1)) a(x) \
              LEFT JOIN (VALUES (1)) b(y) ON a.x = b.y \
              JOIN (VALUES (1)) c(z) ON b.y = c.z",
@@ -10216,12 +10304,12 @@ mod tests {
     fn using_join_merges_column_and_builds_equality() -> anyhow::Result<()> {
         // `id` is merged (once, first); the other three columns of each side
         // follow — 1 + 3 + 3 = 7 output columns.
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             source,
             columns,
             projections,
             ..
-        } = bind_one("SELECT * FROM t a JOIN t b USING (id)")?
+        }) = bind_one("SELECT * FROM t a JOIN t b USING (id)")?
         else {
             panic!("expected Join");
         };
@@ -10253,7 +10341,7 @@ mod tests {
 
     #[test]
     fn using_merged_column_is_unqualified_while_sides_stay_addressable() -> anyhow::Result<()> {
-        let LogicalPlan::Join { projections, .. } =
+        let LogicalPlan::Join(JoinPlan { projections, .. }) =
             bind_one("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)")?
         else {
             panic!("expected Join");
@@ -10275,7 +10363,7 @@ mod tests {
 
     #[test]
     fn using_full_join_merges_with_coalesce() -> anyhow::Result<()> {
-        let LogicalPlan::Join { projections, .. } =
+        let LogicalPlan::Join(JoinPlan { projections, .. }) =
             bind_one("SELECT id FROM t a FULL JOIN t b USING (id)")?
         else {
             panic!("expected Join");
@@ -10294,9 +10382,9 @@ mod tests {
 
     #[test]
     fn natural_join_equates_every_common_column() -> anyhow::Result<()> {
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             source, columns, ..
-        } = bind_one("SELECT * FROM t a NATURAL JOIN t b")?
+        }) = bind_one("SELECT * FROM t a NATURAL JOIN t b")?
         else {
             panic!("expected Join");
         };
@@ -10319,9 +10407,9 @@ mod tests {
 
     #[test]
     fn natural_join_without_common_columns_is_a_cross_product() -> anyhow::Result<()> {
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             source, columns, ..
-        } = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)")?
+        }) = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)")?
         else {
             panic!("expected Join");
         };
@@ -10358,11 +10446,11 @@ mod tests {
     fn using_join_in_a_later_comma_group_shifts_merged_indices() -> anyhow::Result<()> {
         // `t` (4 columns) is the first comma group, so the merged `id` and the
         // rest of the USING group live at combined-row offsets 4 and up.
-        let LogicalPlan::Join {
+        let LogicalPlan::Join(JoinPlan {
             columns,
             projections,
             ..
-        } = bind_one(
+        }) = bind_one(
             "SELECT * FROM t, \
              (VALUES (5, 50)) a(id, x) JOIN (VALUES (5, 500)) b(id, y) USING (id)",
         )?
@@ -10405,7 +10493,7 @@ mod tests {
     fn using_merged_column_uses_common_type_not_comparison_type() -> anyhow::Result<()> {
         // real + int4: PG's select_common_type resolves the merged column to
         // real, even though the equality comparison promotes to float8.
-        let LogicalPlan::Join { projections, .. } =
+        let LogicalPlan::Join(JoinPlan { projections, .. }) =
             bind_one("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)")?
         else {
             panic!("expected Join");
@@ -10427,11 +10515,11 @@ mod tests {
 
     #[test]
     fn aggregate_accepts_join_input() -> anyhow::Result<()> {
-        let LogicalPlan::Aggregate {
+        let LogicalPlan::Aggregate(AggregatePlan {
             input: AggInput::Join(source),
             aggregates,
             ..
-        } = bind_one("SELECT count(*) FROM t a LEFT JOIN t b ON a.id = b.id")?
+        }) = bind_one("SELECT count(*) FROM t a LEFT JOIN t b ON a.id = b.id")?
         else {
             panic!("expected Aggregate over Join");
         };
@@ -10449,7 +10537,7 @@ mod tests {
 
     #[test]
     fn where_referencing_both_relations_binds() -> anyhow::Result<()> {
-        let LogicalPlan::Join { predicate, .. } =
+        let LogicalPlan::Join(JoinPlan { predicate, .. }) =
             bind_one("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y")?
         else {
             panic!("expected Join");
@@ -10483,20 +10571,20 @@ mod tests {
     /// A single-table SELECT's projections and sort keys.
     fn query_parts(sql: &str) -> (Vec<BoundExpr>, Vec<SortKey>) {
         match bound(sql) {
-            LogicalPlan::Query {
+            LogicalPlan::Query(QueryPlan {
                 projections, sort, ..
-            } => (projections, sort),
+            }) => (projections, sort),
             _ => panic!("expected Query for {sql}, got another plan variant"),
         }
     }
 
     fn distinct_of(sql: &str) -> (Vec<BoundExpr>, Option<Vec<DistinctKey>>) {
         match bound(sql) {
-            LogicalPlan::Query {
+            LogicalPlan::Query(QueryPlan {
                 projections,
                 distinct,
                 ..
-            } => (projections, distinct),
+            }) => (projections, distinct),
             _ => panic!("expected Query for {sql}, got another plan variant"),
         }
     }
@@ -10729,7 +10817,9 @@ mod tests {
 
     #[test]
     fn values_order_by_column_name_resolves() -> anyhow::Result<()> {
-        let LogicalPlan::Values { sort, .. } = bind_one("VALUES (3), (1) ORDER BY column1")? else {
+        let LogicalPlan::Values(ValuesPlan { sort, .. }) =
+            bind_one("VALUES (3), (1) ORDER BY column1")?
+        else {
             panic!("expected Values");
         };
         assert_eq!(sort[0].column, 0);
@@ -10748,17 +10838,17 @@ mod tests {
 
     #[test]
     fn limit_offset_wraps_body() -> anyhow::Result<()> {
-        let LogicalPlan::Limit {
+        let LogicalPlan::Limit(LimitPlan {
             source,
             limit,
             offset,
-        } = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2")?
+        }) = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2")?
         else {
             panic!("expected Limit");
         };
         assert_eq!(limit, Some(5));
         assert_eq!(offset, Some(2));
-        assert!(matches!(*source, LogicalPlan::Query { .. }));
+        assert!(matches!(*source, LogicalPlan::Query(QueryPlan { .. })));
 
         Ok(())
     }
@@ -10766,7 +10856,8 @@ mod tests {
     #[test]
     fn offset_zero_is_a_bare_offset() -> anyhow::Result<()> {
         // The float4/float8 optimization-fence shape: `OFFSET 0`, no LIMIT.
-        let LogicalPlan::Limit { limit, offset, .. } = bind_one("SELECT id FROM t OFFSET 0")?
+        let LogicalPlan::Limit(LimitPlan { limit, offset, .. }) =
+            bind_one("SELECT id FROM t OFFSET 0")?
         else {
             panic!("expected Limit");
         };
@@ -10779,7 +10870,7 @@ mod tests {
     #[test]
     fn limit_all_is_no_bound() -> anyhow::Result<()> {
         // `LIMIT ALL OFFSET 3` carries only the offset; the limit is unbounded.
-        let LogicalPlan::Limit { limit, offset, .. } =
+        let LogicalPlan::Limit(LimitPlan { limit, offset, .. }) =
             bind_one("SELECT id FROM t LIMIT ALL OFFSET 3")?
         else {
             panic!("expected Limit");
@@ -10793,12 +10884,12 @@ mod tests {
     #[test]
     fn offset_in_derived_table_wraps_subplan() -> anyhow::Result<()> {
         // `OFFSET 0` inside a FROM subquery binds as a Limit at that level.
-        let LogicalPlan::Subquery { source, .. } =
+        let LogicalPlan::Subquery(SubqueryPlan { source, .. }) =
             bind_one("SELECT * FROM (SELECT id FROM t OFFSET 0) s")?
         else {
             panic!("expected Subquery");
         };
-        assert!(matches!(*source, LogicalPlan::Limit { .. }));
+        assert!(matches!(*source, LogicalPlan::Limit(LimitPlan { .. })));
 
         Ok(())
     }
@@ -10846,7 +10937,7 @@ mod tests {
         let (plan, ctx) = bind_params("SELECT $1", vec![Some(PgType::Int4)]);
         let plan = plan.expect("declared $1 binds");
         assert_eq!(param_types(&ctx), vec![Some(PgType::Int4)]);
-        let LogicalPlan::Values { rows, .. } = plan else {
+        let LogicalPlan::Values(ValuesPlan { rows, .. }) = plan else {
             panic!("expected Values for a FROM-less SELECT");
         };
         assert_eq!(
@@ -10923,7 +11014,7 @@ mod tests {
         use crate::ScalarFn;
         use crabgresql_types::{RegKind, oid};
         let call_of = |sql: &str| {
-            let LogicalPlan::Values { rows, .. } = bound(sql) else {
+            let LogicalPlan::Values(ValuesPlan { rows, .. }) = bound(sql) else {
                 panic!("expected a FROM-less SELECT for: {sql}");
             };
             let BoundExpr::FuncCall { func, ret, args } = &rows[0][0] else {
@@ -11011,12 +11102,12 @@ mod tests {
         Option<Vec<DistinctKey>>,
     ) {
         match bound(sql) {
-            LogicalPlan::SetOp {
+            LogicalPlan::SetOp(SetOpPlan {
                 arms,
                 columns,
                 sort,
                 distinct,
-            } => (arms, columns, sort, distinct),
+            }) => (arms, columns, sort, distinct),
             other => panic!("expected SetOp for `{sql}`, got {}", plan_name(&other)),
         }
     }
@@ -11435,7 +11526,7 @@ mod tests {
     fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> InsertSource {
         let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         match plan.build_insert(&catalog, &FmtCtx::utc_default(), rows) {
-            Ok(LogicalPlan::Insert { source, .. }) => source,
+            Ok(LogicalPlan::Insert(InsertPlan { source, .. })) => source,
             Ok(_) => panic!("COPY did not build an Insert"),
             Err(error) => panic!("failed to build the COPY rows: {error}"),
         }
