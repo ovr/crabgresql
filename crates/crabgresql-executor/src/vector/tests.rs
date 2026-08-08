@@ -14,8 +14,8 @@ use crabgresql_storage_api::{Column, TableSchema, Tuple};
 use crabgresql_types::collation::{C_COLLATION_OID, DEFAULT_COLLATION_OID};
 use crabgresql_types::{PgType, Value};
 
-use super::{BatchLayout, BatchNode, FilterBatch, Shred, expr};
-use crate::{ExecContext, ExecError, ExecNode, predicate_holds};
+use super::{BatchLayout, BatchNode, FilterBatch, Shred, ShredProject, expr};
+use crate::{ExecContext, ExecError, ExecNode, Filter, Projection, predicate_holds};
 
 /// A batch source over a fixed list of batches.
 struct Batches(std::vec::IntoIter<RecordBatch>);
@@ -866,6 +866,146 @@ fn shred_decodes_only_the_projected_columns() {
     );
     let row = node.next().expect("shred").expect("a row");
     assert_eq!(row, vec![Value::Null, Value::Null, Value::Int8(9)]);
+}
+
+/// `ShredProject` must produce exactly what the three nodes it replaces
+/// produce, for every combination of sparse positions and a row predicate.
+///
+/// That equivalence is the only property that matters: the fused node is chosen
+/// automatically and is invisible in the result. The rows carry a value in
+/// *every* column, so a buffer that leaked between rows would show up as a
+/// stale value where the unprojected slots must read NULL — the failure mode
+/// the whole reuse scheme has to be safe against. Two batches, so the buffer is
+/// live across a `next_batch()` boundary.
+#[test]
+fn a_fused_shred_project_matches_the_separate_nodes() {
+    let schema = schema_of(&[PgType::Int4, PgType::Int4, PgType::Int8]);
+    let rows: Vec<Tuple> = (1..=5)
+        .map(|n| vec![Value::Int4(n), Value::Int4(n * 10), Value::Int8(n as i64)])
+        .collect();
+    let ctx = ExecContext::default();
+
+    let batches = || {
+        vec![
+            build_scan_batch(&schema, &rows[..2]).expect("batch"),
+            build_scan_batch(&schema, &rows[2..]).expect("batch"),
+        ]
+        .into_iter()
+    };
+    let drain = |node: &mut dyn ExecNode| {
+        let mut out = Vec::new();
+        while let Some(row) = node.next().expect("pipeline") {
+            out.push(row);
+        }
+        out
+    };
+
+    // `c0 = 1` reads a column no `positions` list below fills, so it is NULL = 1
+    // — unknown, and every row is rejected. A leaked buffer would let a later
+    // row see an earlier one's value there and wrongly survive.
+    let unfilled = compare(
+        BinOp::Eq,
+        PgType::Int4,
+        column(0, PgType::Int4),
+        constant(Value::Int4(1), PgType::Int4),
+    );
+    let filled = compare(
+        BinOp::Gt,
+        PgType::Int8,
+        column(2, PgType::Int8),
+        constant(Value::Int8(2), PgType::Int8),
+    );
+
+    for positions in [vec![2], vec![1, 2], vec![0, 1, 2]] {
+        for predicate in [None, Some(filled.clone()), Some(unfilled.clone())] {
+            // Every projection reads one filled and one unfilled column, so a
+            // divergence in the padding shows up in the output.
+            let exprs = vec![
+                column(2, PgType::Int8),
+                column(0, PgType::Int4),
+                column(1, PgType::Int4),
+            ];
+
+            let mut fused = ShredProject::new(
+                Box::new(Batches(batches())),
+                layout_of(&schema),
+                positions.clone(),
+                predicate.clone(),
+                exprs.clone(),
+                ctx.clone(),
+            );
+            let shred = Shred::new(
+                Box::new(Batches(batches())),
+                layout_of(&schema),
+                positions.clone(),
+            );
+            let filtered: Box<dyn ExecNode> = match predicate.clone() {
+                Some(predicate) => Box::new(Filter::new(Box::new(shred), predicate, ctx.clone())),
+                None => Box::new(shred),
+            };
+            let mut separate = Projection::new(filtered, exprs, ctx.clone());
+
+            assert_eq!(
+                drain(&mut fused),
+                drain(&mut separate),
+                "positions {positions:?}, predicate {}",
+                predicate.is_some()
+            );
+        }
+    }
+}
+
+/// The padding itself, pinned directly rather than through an equivalence: a
+/// column the scan did not fill reads `Null` in *every* row, including after
+/// rows the predicate rejected have passed through the same buffer.
+#[test]
+fn a_fused_shred_project_never_leaks_a_previous_row() {
+    let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Int8]);
+    let rows: Vec<Tuple> = (1..=4)
+        .map(|n| {
+            vec![
+                Value::Int4(n),
+                Value::Text(format!("row{n}")),
+                Value::Int8(n as i64),
+            ]
+        })
+        .collect();
+    let ctx = ExecContext::default();
+    let batches = vec![
+        build_scan_batch(&schema, &rows[..2]).expect("batch"),
+        build_scan_batch(&schema, &rows[2..]).expect("batch"),
+    ];
+
+    // Keeps rows 3 and 4; rows 1 and 2 are decoded into the buffer and dropped.
+    let mut node = ShredProject::new(
+        Box::new(Batches(batches.into_iter())),
+        layout_of(&schema),
+        vec![2],
+        Some(compare(
+            BinOp::Gt,
+            PgType::Int8,
+            column(2, PgType::Int8),
+            constant(Value::Int8(2), PgType::Int8),
+        )),
+        vec![
+            column(0, PgType::Int4),
+            column(1, PgType::Text),
+            column(2, PgType::Int8),
+        ],
+        ctx,
+    );
+
+    let mut out = Vec::new();
+    while let Some(row) = node.next().expect("shred project") {
+        out.push(row);
+    }
+    assert_eq!(
+        out,
+        vec![
+            vec![Value::Null, Value::Null, Value::Int8(3)],
+            vec![Value::Null, Value::Null, Value::Int8(4)],
+        ]
+    );
 }
 
 /// A filter that rejects everything in a batch yields an empty batch, and the
