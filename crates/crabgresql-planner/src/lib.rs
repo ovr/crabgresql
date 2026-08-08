@@ -14,7 +14,7 @@ use std::time::Duration;
 use crabgresql_binder::{
     AggInput, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey,
     InsertSource, JoinExpr, JoinInput, JoinKind, LogicalPlan, MappedRelation, OutputColumn,
-    Returning, SortKey, TableFn,
+    RelationIdent, Returning, SortKey, TableFn,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema, Tuple,
@@ -153,8 +153,15 @@ pub enum PhysicalPlan {
         /// `COPY … FREEZE` (see [`LogicalPlan::Insert`]): the executor freezes
         /// this target's write and nothing else.
         freeze: bool,
+        /// Whether each inserted row carries a trailing `tableoid` slot for
+        /// RETURNING to read (see [`LogicalPlan::Insert`]). The executor fills
+        /// it with the leaf the row was routed to.
+        tableoid: bool,
     },
     Update {
+        /// Whether each row carries a trailing `tableoid` slot for WHERE, SET or
+        /// RETURNING to read (see [`LogicalPlan::Insert`]).
+        tableoid: bool,
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         assignments: Vec<(usize, BoundExpr)>,
@@ -170,6 +177,9 @@ pub enum PhysicalPlan {
         probe: Option<DmlIndexProbe>,
     },
     Delete {
+        /// Whether each row carries a trailing `tableoid` slot for WHERE or
+        /// RETURNING to read (see [`LogicalPlan::Insert`]).
+        tableoid: bool,
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         returning: Option<Returning>,
@@ -792,7 +802,9 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             returning,
             routing,
             freeze,
+            tableoid,
         } => PhysicalPlan::Insert {
+            tableoid,
             table,
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
@@ -815,6 +827,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             returning,
             routing,
             inherited,
+            tableoid,
         } => {
             // A target whose UNIQUE check needs the whole-relation snapshot has
             // to be scanned: see `update_needs_unique_snapshot`. Row movement is
@@ -830,9 +843,16 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                     None => false,
                 }
             };
-            let (routing, inherited, probe) =
-                dml_targets(&table, routing, inherited, &predicate, Some(&keep));
+            let (routing, inherited, probe) = dml_targets(
+                &table,
+                routing,
+                inherited,
+                &predicate,
+                Some(&keep),
+                tableoid,
+            );
             PhysicalPlan::Update {
+                tableoid,
                 table,
                 predicate,
                 assignments,
@@ -848,11 +868,13 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             returning,
             routing,
             inherited,
+            tableoid,
         } => {
             // A DELETE removes rows outright, so no target needs a snapshot.
             let (routing, inherited, probe) =
-                dml_targets(&table, routing, inherited, &predicate, None);
+                dml_targets(&table, routing, inherited, &predicate, None, tableoid);
             PhysicalPlan::Delete {
+                tableoid,
                 table,
                 predicate,
                 returning,
@@ -997,6 +1019,10 @@ fn dml_targets(
     inherited: Vec<MappedRelation>,
     predicate: &Option<BoundExpr>,
     keep: Option<KeepProbe<'_>>,
+    // `tableoid`: whether each routed leaf must name itself for a `tableoid` the
+    // statement reads. Inherited targets already carry their own name from the
+    // binder.
+    tableoid: bool,
 ) -> (
     Option<Vec<DmlTarget>>,
     Vec<DmlTarget>,
@@ -1045,6 +1071,7 @@ fn dml_targets(
             .map(|leaf| DmlTarget {
                 probe: probe_for(&leaf, &None),
                 relation: MappedRelation {
+                    tableoid: tableoid.then(|| RelationIdent::of(&leaf.schema())),
                     table: leaf,
                     map: None,
                 },
@@ -1845,7 +1872,11 @@ mod tests {
     /// partition or a storage leaf produces.
     pub(super) fn identity_arm(table: Arc<dyn TableAm>) -> PhysicalAppendArm {
         PhysicalAppendArm {
-            relation: MappedRelation { table, map: None },
+            relation: MappedRelation {
+                table,
+                map: None,
+                tableoid: None,
+            },
             projection: ColumnProjection::All,
         }
     }

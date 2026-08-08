@@ -681,6 +681,7 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::TableOid
             | ScalarFn::RegIn(_)
             | ScalarFn::RegFromOid(_)
             | ScalarFn::PgTypeof(_)
@@ -781,6 +782,17 @@ fn eval_catalog_fn(
                 .is_some_and(|name| name.starts_with("pg_temp_"))
                 && ops.my_temp_schema() != Some(oid),
         ),
+        // `tableoid`: the namespace and name the binder recorded, resolved here
+        // so the answer tracks the current catalog rather than the one binding
+        // saw. A relation that has since been dropped reports 0 rather than
+        // raising — the same choice `reg::from_oid` makes for an OID that names
+        // nothing, and the row it would have described is gone anyway.
+        ScalarFn::TableOid => {
+            let (Value::Text(namespace), Value::Text(name)) = (&args[0], &args[1]) else {
+                unreachable!("tableoid arguments were {args:?}");
+            };
+            Value::Oid(ops.rel_oid(Some(namespace), name).unwrap_or(0))
+        }
         // `'name'::reg*` must find the object; `oid::reg*` takes the OID as
         // given and only resolves how it renders, so it cannot fail.
         ScalarFn::RegIn(kind) => match &args[0] {

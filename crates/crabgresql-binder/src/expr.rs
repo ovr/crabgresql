@@ -25,6 +25,7 @@ use crabgresql_types::{
 
 use crate::BindError;
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn, bind_function, bind_srf_projection};
+use crate::plan::TABLEOID;
 
 /// Shared, mutable bind state for one statement. A `$n` occurrence anywhere in
 /// the statement — target list, WHERE, a subquery, a CTE — refers to the same
@@ -1347,15 +1348,51 @@ pub enum Binding {
     },
 }
 
+/// One FROM item as a name-resolution scope is built from it: the qualifier it
+/// is addressed by, the columns it exposes, and where its system column sits.
+#[derive(Clone)]
+pub struct ScopeItem {
+    pub qualifier: String,
+    pub columns: Vec<Column>,
+    /// Local index of the `tableoid` slot within `columns`, when the query asked
+    /// for one. It is a real column of the row — that is what lets an outer
+    /// join null-extend it and an `Append` arm answer for itself — but it sits
+    /// past every declared column, so `*` never reaches it. `None` for a FROM
+    /// item that is not a relation scan.
+    pub system_slot: Option<usize>,
+}
+
+impl ScopeItem {
+    /// The columns `*` expands to: everything but the system slot.
+    pub fn declared(&self) -> &[Column] {
+        match self.system_slot {
+            Some(slot) => &self.columns[..slot],
+            None => &self.columns,
+        }
+    }
+}
+
 /// One relation in a name-resolution scope: its qualifier (alias, else table
-/// name), its columns, and the base index its columns occupy in the combined
+/// name), its columns, the base index its columns occupy in the combined
 /// row (0 for a single relation; the running total across FROM items in a
-/// cross join).
+/// cross join), and where its system column sits among them.
 #[derive(Clone)]
 pub struct ScopeRel {
     qualifier: String,
     columns: Vec<Column>,
     offset: usize,
+    system_slot: Option<usize>,
+}
+
+impl ScopeRel {
+    /// This relation's declared columns — everything `*` expands to, which is
+    /// every column but the system slot.
+    fn declared(&self) -> &[Column] {
+        match self.system_slot {
+            Some(slot) => &self.columns[..slot],
+            None => &self.columns,
+        }
+    }
 }
 
 /// A snapshot of one enclosing query's name-resolution view, kept so a
@@ -1759,17 +1796,31 @@ impl Scope {
         }
     }
 
+    /// A one-relation scope over `schema`.
+    ///
+    /// `tableoid` says whether the row this scope describes carries the system
+    /// slot past its declared columns. The write paths set it when the statement
+    /// names `tableoid`, because there the value is appended per *target* — the
+    /// partition or child a row actually lives in, not the relation the
+    /// statement named.
     pub fn table(
         schema: &TableSchema,
         qualifier: String,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
+        tableoid: bool,
     ) -> Scope {
+        let mut columns = schema.columns.clone();
+        let system_slot = tableoid.then(|| {
+            columns.push(Column::new(TABLEOID, PgType::Oid));
+            columns.len() - 1
+        });
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
-                columns: schema.columns.clone(),
+                columns,
                 offset: 0,
+                system_slot,
             }],
             visible: None,
             catalog: catalog.clone(),
@@ -1781,11 +1832,11 @@ impl Scope {
         }
     }
 
-    /// A multi-relation scope for a cross join. Each `(qualifier, columns)` pair
-    /// becomes a relation; offsets are assigned left-to-right so a column's
-    /// index is its position in the concatenated row.
+    /// A multi-relation scope for a cross join. Each item becomes a relation;
+    /// offsets are assigned left-to-right so a column's index is its position in
+    /// the concatenated row.
     pub fn relations(
-        items: Vec<(String, Vec<Column>)>,
+        items: Vec<ScopeItem>,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
     ) -> Scope {
@@ -1797,19 +1848,20 @@ impl Scope {
     /// built from `items` (so qualified `q.c` resolves each side's own column);
     /// `visible`, when `Some`, drives unqualified resolution and `*` expansion.
     pub fn relations_with_visible(
-        items: Vec<(String, Vec<Column>)>,
+        items: Vec<ScopeItem>,
         visible: Option<Vec<VisibleColumn>>,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
     ) -> Scope {
         let mut offset = 0;
         let mut rels = Vec::with_capacity(items.len());
-        for (qualifier, columns) in items {
-            let width = columns.len();
+        for item in items {
+            let width = item.columns.len();
             rels.push(ScopeRel {
-                qualifier,
-                columns,
+                qualifier: item.qualifier,
+                columns: item.columns,
                 offset,
+                system_slot: item.system_slot,
             });
             offset += width;
         }
@@ -1968,11 +2020,14 @@ impl Scope {
         // columns: the join column appears once (never ambiguous), the merged
         // expression carrying its combined-row value.
         if let Some(visible) = &self.visible {
-            return match lookup_visible(visible, name) {
-                VisibleLookup::Found(expr) => NameLookup::Found(expr.clone()),
-                VisibleLookup::Ambiguous => NameLookup::Ambiguous,
-                VisibleLookup::Missing => NameLookup::Missing,
-            };
+            // A merged join namespace hides the inputs' own columns, but a
+            // system column never takes part in `USING`, so a name it does not
+            // claim still falls through to the relations below.
+            match lookup_visible(visible, name) {
+                VisibleLookup::Found(expr) => return NameLookup::Found(expr.clone()),
+                VisibleLookup::Ambiguous => return NameLookup::Ambiguous,
+                VisibleLookup::Missing => {}
+            }
         }
         match lookup_in_rels(&self.rels, name) {
             Some(Ok(col)) => NameLookup::Found(with_column_collation(
@@ -2167,10 +2222,11 @@ impl Scope {
     }
 }
 
-/// Append every column of `rel` as an `(output column, ColumnRef)` pair at its
-/// combined-row index.
+/// Append every *declared* column of `rel` as an `(output column, ColumnRef)`
+/// pair at its combined-row index. A system column is reachable by name and by
+/// name alone, so `*` and `q.*` skip the slot, as they do upstream.
 fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
-    for (i, col) in rel.columns.iter().enumerate() {
+    for (i, col) in rel.declared().iter().enumerate() {
         out.push((
             crate::OutputColumn {
                 name: col.name.clone(),
@@ -9092,7 +9148,14 @@ fn bind_check_inner(
     let params = param_ctx_none();
     // Deliberately built with no subquery context, which is what makes a
     // subquery in the predicate fail — restated below in PostgreSQL's words.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params);
+    // No system column: a stored CHECK is re-bound against each leaf it runs
+    // for, so a `tableoid` in one would silently mean a different relation per
+    // partition. PostgreSQL records the reference as a negative `conkey` and
+    // evaluates it per row instead.
+    //
+    // TODO: CHECK over a system column, which needs `conkey` to carry negative
+    // attnums and the predicate to be evaluated against the leaf's identity.
+    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false);
     let bound = to_bool_operand(
         bind_expr(expr, &scope).map_err(subquery_in_check)?,
         "CHECK",

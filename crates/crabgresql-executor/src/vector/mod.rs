@@ -119,7 +119,9 @@ impl BatchAppend {
         let children = arms
             .iter()
             .map(|arm| {
-                if arm.relation.map.is_some() {
+                // A remapped arm, or one that must append a `tableoid`, changes
+                // the row shape the batch layout describes.
+                if arm.relation.map.is_some() || arm.relation.tableoid.is_some() {
                     return None;
                 }
                 BatchScan::open(&arm.relation.table, txn, &arm.projection)

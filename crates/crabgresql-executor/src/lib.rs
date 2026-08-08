@@ -28,7 +28,7 @@ use rustc_hash::FxHashMap;
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
     BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, DistinctKey, JoinKind,
-    LogicalPlan, Returning, SortKey, TableFn, WindowFn, WindowKind,
+    LogicalPlan, RelationIdent, Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
     DmlIndexProbe, DmlTarget, HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
@@ -544,7 +544,7 @@ pub fn execute(
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
                 columns,
-                node: append_source(&arms, txn).into_rows(),
+                node: append_source(&arms, ctx, txn)?.into_rows(),
             })
         }
         PhysicalPlan::SetOp {
@@ -735,7 +735,10 @@ pub fn execute(
             returning,
             routing,
             freeze,
-        } => execute_insert(&table, source, returning, routing, freeze, ctx, txn),
+            tableoid,
+        } => execute_insert(
+            &table, source, returning, routing, freeze, tableoid, ctx, txn,
+        ),
         PhysicalPlan::Update {
             table,
             predicate,
@@ -744,6 +747,7 @@ pub fn execute(
             routing,
             inherited,
             probe,
+            tableoid,
         } => execute_update(
             &table,
             &predicate,
@@ -752,6 +756,7 @@ pub fn execute(
             routing,
             inherited,
             probe.as_ref(),
+            tableoid,
             ctx,
             txn,
         ),
@@ -762,6 +767,7 @@ pub fn execute(
             routing,
             inherited,
             probe,
+            tableoid,
         } => execute_delete(
             &table,
             &predicate,
@@ -769,6 +775,7 @@ pub fn execute(
             routing,
             inherited,
             probe.as_ref(),
+            tableoid,
             ctx,
             txn,
         ),
@@ -1670,7 +1677,7 @@ fn subquery_source(
     txn: &TxnContext,
 ) -> Result<Source, ExecError> {
     if let PhysicalPlan::Append { arms, .. } = &source {
-        return Ok(append_source(arms, txn));
+        return append_source(arms, ctx, txn);
     }
     let Execution::Rows { node, .. } = execute(source, ctx, txn)? else {
         return Err(ExecError::new(
@@ -1726,13 +1733,17 @@ fn scan_source(
 /// single row-only arm puts the whole node back on the row path rather than
 /// mixing representations. An arm that remaps disqualifies the batch path
 /// outright — see [`vector::BatchAppend::open`].
-fn append_source(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Source {
+fn append_source(
+    arms: &[PhysicalAppendArm],
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Source, ExecError> {
     // Only identity arms reach the batch path, and they all share the named
     // relation's layout, so any of them describes the batch. `Append` over zero
     // arms is not a shape the planner emits.
     let first = arms.first();
     let layout = first.map(|arm| vector::layout_of(&arm.relation.table.schema()));
-    match (vector::BatchAppend::open(arms, txn), layout) {
+    Ok(match (vector::BatchAppend::open(arms, txn), layout) {
         (Some(append), Some(layout)) => {
             let positions = scan_positions(
                 &first.expect("layout implies an arm").projection,
@@ -1744,8 +1755,8 @@ fn append_source(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Source {
                 positions,
             }
         }
-        _ => Source::Rows(Box::new(Append::new(arms, txn))),
-    }
+        _ => Source::Rows(Box::new(Append::new(arms, ctx, txn)?)),
+    })
 }
 
 fn project_pipeline(
@@ -1864,18 +1875,52 @@ impl ExecNode for MaterializedRows {
 /// write already committed. RETURNING is scalar one-in/one-out (the binder
 /// rejects aggregates and set-returning functions), so this is one output row
 /// per affected row.
+/// `tableoids`, when set, is the OID of the relation each affected row actually
+/// lives in, positionally aligned with `affected`. The binder put a `tableoid`
+/// slot past the target's declared columns, so the projection reads it as an
+/// ordinary column; widening happens here, per row, because *which* relation a
+/// row belongs to is only settled by routing or by the fan-out loop.
 fn project_returning<'a>(
     affected: impl IntoIterator<Item = &'a Tuple>,
     projections: &[BoundExpr],
+    tableoids: Option<&[u32]>,
     ctx: &ExecContext,
 ) -> Result<Vec<Tuple>, ExecError> {
-    affected
-        .into_iter()
-        .map(|row| {
+    let mut out = Vec::new();
+    for (i, row) in affected.into_iter().enumerate() {
+        // Only the statements that read `tableoid` pay for the widened copy.
+        let widened;
+        let row: &Tuple = match tableoids {
+            None => row,
+            Some(oids) => {
+                let mut wide = row.clone();
+                wide.push(Value::Oid(oids[i]));
+                widened = wide;
+                &widened
+            }
+        };
+        out.push(
             projections
                 .iter()
                 .map(|expr| eval(expr, row, ctx))
-                .collect()
+                .collect::<Result<Tuple, _>>()?,
+        );
+    }
+    Ok(out)
+}
+
+/// Each DML target's own OID, resolved once per relation. `None` for a target
+/// whose statement never reads `tableoid`.
+fn target_oids(targets: &[DmlTarget], ctx: &ExecContext) -> Result<Vec<Option<u32>>, ExecError> {
+    targets
+        .iter()
+        .map(|target| {
+            target
+                .relation
+                .tableoid
+                .as_ref()
+                .map(|ident| resolve_tableoid(ident, ctx))
+                .transpose()
         })
         .collect()
 }
@@ -1901,12 +1946,14 @@ fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb)
 /// keeps it off a column `DEFAULT` that calls a routine: the routine reads the
 /// context out of `ctx` (see `eval`), writes to relations nobody checked, and
 /// freezing those rows would leave them visible after a rollback.
+#[allow(clippy::too_many_arguments)]
 fn execute_insert(
     table: &Arc<dyn TableAm>,
     source: PhysicalInsertSource,
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
     freeze: bool,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -1918,9 +1965,11 @@ fn execute_insert(
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
         // its key and write there.
-        Some(leaves) => insert_routed(table, tuples, returning, &leaves, freeze, ctx, txn),
+        Some(leaves) => insert_routed(
+            table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
+        ),
         // Ordinary table: rows go straight to `table`.
-        None => insert_direct(table, tuples, returning, freeze, ctx, txn),
+        None => insert_direct(table, tuples, returning, freeze, tableoid, ctx, txn),
     }
 }
 
@@ -2016,6 +2065,7 @@ fn insert_direct(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     freeze: bool,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2036,8 +2086,21 @@ fn insert_direct(
     // RETURNING sees the fully-formed row (defaults filled in), in schema order.
     // Project before inserting so a faulting RETURNING expression aborts the
     // statement (nothing written); the tuples then move into `insert` uncloned.
+    // One relation, so every row reports the same OID.
+    let oids = match tableoid {
+        true => Some(vec![
+            resolve_tableoid(&RelationIdent::of(&schema), ctx)?;
+            tuples.len()
+        ]),
+        false => None,
+    };
     let output = match &returning {
-        Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
+        Some(returning) => Some(project_returning(
+            &tuples,
+            &returning.projections,
+            oids.as_deref(),
+            ctx,
+        )?),
         None => None,
     };
     let frozen = write_context(freeze, txn);
@@ -2055,12 +2118,14 @@ fn insert_direct(
 /// pre-existing rows plus earlier same-statement rows routed to it, exactly as
 /// [`insert_direct`] does for a plain table. All checks run before any write, so
 /// the statement stays all-or-nothing.
+#[allow(clippy::too_many_arguments)]
 fn insert_routed(
     parent: &Arc<dyn TableAm>,
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     leaves: &[Arc<dyn TableAm>],
     freeze: bool,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2108,8 +2173,25 @@ fn insert_routed(
         routes.push(leaf);
     }
     let inserted = tuples.len() as u64;
+    // Each row reports the leaf it routed to, which is the whole point of
+    // `tableoid` on a partitioned target: `routes` is index-aligned with
+    // `tuples`, so the answer is already in hand here.
+    let oids = match tableoid {
+        true => Some(
+            routes
+                .iter()
+                .map(|&leaf| resolve_tableoid(&RelationIdent::of(&leaves[leaf].schema()), ctx))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        false => None,
+    };
     let output = match &returning {
-        Some(returning) => Some(project_returning(&tuples, &returning.projections, ctx)?),
+        Some(returning) => Some(project_returning(
+            &tuples,
+            &returning.projections,
+            oids.as_deref(),
+            ctx,
+        )?),
         None => None,
     };
     let mut batches: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
@@ -2186,6 +2268,7 @@ fn execute_update(
     routing: Option<Vec<DmlTarget>>,
     inherited: Vec<DmlTarget>,
     probe: Option<&DmlIndexProbe>,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2194,7 +2277,16 @@ fn execute_update(
         None if !inherited.is_empty() => {
             update_inherited(&inherited, predicate, assignments, returning, ctx, txn)
         }
-        None => update_direct(table, predicate, assignments, returning, probe, ctx, txn),
+        None => update_direct(
+            table,
+            predicate,
+            assignments,
+            returning,
+            probe,
+            tableoid,
+            ctx,
+            txn,
+        ),
     }
 }
 
@@ -2282,19 +2374,35 @@ fn update_inherited(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
+    // Each target's own OID, resolved once per relation rather than per row.
+    let target_oids = target_oids(&targets, ctx)?;
     let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
     let mut new_rows: Vec<Tuple> = Vec::new();
+    let mut returned_oids: Vec<u32> = Vec::new();
     for (i, rows) in scans.iter().enumerate() {
         let target = &targets[i];
         for (tid, old) in rows {
             let old_view = target.relation.view(old);
-            if !predicate_holds(predicate, &old_view, ctx)? {
+            // WHERE and SET may read `tableoid`, and it answers for the child
+            // this row actually lives in. The slot is kept out of `new_view`,
+            // which `rebuild` turns back into a stored tuple.
+            let probe;
+            let old_probe: &[Value] = match target_oids[i] {
+                None => &old_view,
+                Some(oid) => {
+                    let mut wide = old_view.to_vec();
+                    wide.push(Value::Oid(oid));
+                    probe = wide;
+                    &probe
+                }
+            };
+            if !predicate_holds(predicate, old_probe, ctx)? {
                 continue;
             }
             // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
             let mut new_view = old_view.to_vec();
             for (index, expr) in assignments {
-                new_view[*index] = eval(expr, &old_view, ctx)?;
+                new_view[*index] = eval(expr, old_probe, ctx)?;
             }
             // RETURNING is bound against the named relation, so it sees the NEW
             // row in that shape, not the child's wider one — kept aside because
@@ -2327,6 +2435,9 @@ fn update_inherited(
             }
             if let Some(view) = returned {
                 new_rows.push(view);
+                if let Some(oid) = target_oids[i] {
+                    returned_oids.push(oid);
+                }
             }
             pending[i].push((*tid, new));
         }
@@ -2338,6 +2449,7 @@ fn update_inherited(
         Some(returning) => Some(project_returning(
             new_rows.iter(),
             &returning.projections,
+            (!returned_oids.is_empty()).then_some(returned_oids.as_slice()),
             ctx,
         )?),
         None => None,
@@ -2363,12 +2475,14 @@ fn update_inherited(
 /// counted. Cross-transaction write-write conflicts still resolve last-writer-
 /// wins here — EvalPlanQual (READ COMMITTED) and the 40001 abort (REPEATABLE
 /// READ) that make this correct arrive with the isolation work (P6).
+#[allow(clippy::too_many_arguments)]
 fn update_direct(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
     probe: Option<&DmlIndexProbe>,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2397,15 +2511,31 @@ fn update_direct(
     // statement assigns: PostgreSQL re-evaluates *every* check against the new
     // row, not only those reading an updated column.
     let checks = CheckSet::for_schema(&schema, ctx)?;
+    // One relation, so every row reports the same OID.
+    let oid = tableoid
+        .then(|| resolve_tableoid(&RelationIdent::of(&schema), ctx))
+        .transpose()?;
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
     for (tid, old) in original {
-        if !predicate_holds(predicate, &old, ctx)? {
+        // WHERE and SET may read `tableoid`; the slot stays out of `new`, which
+        // is the tuple that gets stored.
+        let probe_row;
+        let old_probe: &[Value] = match oid {
+            None => &old,
+            Some(oid) => {
+                let mut wide = old.clone();
+                wide.push(Value::Oid(oid));
+                probe_row = wide;
+                &probe_row
+            }
+        };
+        if !predicate_holds(predicate, old_probe, ctx)? {
             continue;
         }
         // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
         let mut new = old.clone();
         for (index, expr) in assignments {
-            new[*index] = eval(expr, &old, ctx)?;
+            new[*index] = eval(expr, old_probe, ctx)?;
         }
         if has_unique {
             // The row's own OLD key must not conflict with its NEW one, so it
@@ -2431,9 +2561,11 @@ fn update_direct(
     // statement before any row is written.
     match returning {
         Some(returning) => {
+            let oids = oid.map(|oid| vec![oid; pending.len()]);
             let output = project_returning(
                 pending.iter().map(|(_, new)| new),
                 &returning.projections,
+                oids.as_deref(),
                 ctx,
             )?;
             table.update_many(pending, txn)?;
@@ -2539,17 +2671,33 @@ fn update_routed(
     let mut pending_delete: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
     let mut pending_insert: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
     let mut new_rows: Vec<Tuple> = Vec::new();
+    // Each leaf's own OID, resolved once per leaf.
+    let leaf_oids = target_oids(leaves, ctx)?;
+    let mut returned_oids: Vec<u32> = Vec::new();
 
     for (src, rows) in scans.iter().enumerate() {
         for (tid, old) in rows {
             let tid = *tid;
-            if !predicate_holds(predicate, old, ctx)? {
+            // WHERE and SET read `tableoid` as the leaf the row is *currently*
+            // in — the row has not moved yet, and PostgreSQL matches on where it
+            // is, not where the update would put it.
+            let probe_row;
+            let old_probe: &[Value] = match leaf_oids[src] {
+                None => old,
+                Some(oid) => {
+                    let mut wide = old.clone();
+                    wide.push(Value::Oid(oid));
+                    probe_row = wide;
+                    &probe_row
+                }
+            };
+            if !predicate_holds(predicate, old_probe, ctx)? {
                 continue;
             }
             // Every SET expression sees the OLD row: `SET a = b, b = a` swaps.
             let mut new = old.clone();
             for (index, expr) in assignments {
-                new[*index] = eval(expr, old, ctx)?;
+                new[*index] = eval(expr, old_probe, ctx)?;
             }
             let dst = route_tuple(&parent_schema, &leaf_tables, &new, ctx)?;
 
@@ -2607,6 +2755,11 @@ fn update_routed(
             // when there's no RETURNING clause to project.
             if returning.is_some() {
                 new_rows.push(new.clone());
+                // RETURNING reports the NEW row, so it names the leaf the row
+                // ends up in.
+                if let Some(oid) = leaf_oids[dst] {
+                    returned_oids.push(oid);
+                }
             }
             if src == dst {
                 pending_update[src].push((tid, new));
@@ -2623,6 +2776,7 @@ fn update_routed(
         Some(returning) => Some(project_returning(
             new_rows.iter(),
             &returning.projections,
+            (!returned_oids.is_empty()).then_some(returned_oids.as_slice()),
             ctx,
         )?),
         None => None,
@@ -2822,6 +2976,7 @@ fn execute_delete(
     routing: Option<Vec<DmlTarget>>,
     inherited: Vec<DmlTarget>,
     probe: Option<&DmlIndexProbe>,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2830,7 +2985,7 @@ fn execute_delete(
         None if !inherited.is_empty() => {
             delete_inherited(&inherited, predicate, returning, ctx, txn)
         }
-        None => delete_direct(table, predicate, returning, probe, ctx, txn),
+        None => delete_direct(table, predicate, returning, probe, tableoid, ctx, txn),
     }
 }
 
@@ -2850,14 +3005,30 @@ fn delete_inherited(
     // RETURNING sees the deleted (OLD) rows as rows of the named relation, in
     // scan (target) order.
     let mut deleted: Vec<Tuple> = Vec::new();
+    // Each target's own OID, resolved once per relation.
+    let target_oids = target_oids(targets, ctx)?;
+    let mut deleted_oids: Vec<u32> = Vec::new();
     for (i, target) in targets.iter().enumerate() {
         for row in dml_rows(&target.relation.table, target.probe.as_ref(), ctx, txn)? {
             let (tid, tuple) = row?;
-            let view = target.relation.view(&tuple);
+            let mut view = target.relation.view(&tuple);
+            // WHERE reads `tableoid` as the child this row lives in, so
+            // `DELETE FROM parent WHERE tableoid = 'child'::regclass` removes
+            // exactly that child's rows.
+            if let Some(oid) = target_oids[i] {
+                view.to_mut().push(Value::Oid(oid));
+            }
             if predicate_holds(predicate, &view, ctx)? {
                 pending[i].push(tid);
                 if returning.is_some() {
-                    deleted.push(view.into_owned());
+                    let mut row = view.into_owned();
+                    // The slot is re-appended by `project_returning`, so drop
+                    // the copy carried through the predicate.
+                    if let Some(oid) = target_oids[i] {
+                        row.pop();
+                        deleted_oids.push(oid);
+                    }
+                    deleted.push(row);
                 }
             }
         }
@@ -2866,6 +3037,7 @@ fn delete_inherited(
         Some(returning) => Some(project_returning(
             deleted.iter(),
             &returning.projections,
+            (!deleted_oids.is_empty()).then_some(deleted_oids.as_slice()),
             ctx,
         )?),
         None => None,
@@ -2885,20 +3057,36 @@ fn delete_inherited(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delete_direct(
     table: &Arc<dyn TableAm>,
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
     probe: Option<&DmlIndexProbe>,
+    tableoid: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
+    // One relation, so every row reports the same OID.
+    let oid = tableoid
+        .then(|| resolve_tableoid(&RelationIdent::of(&table.schema()), ctx))
+        .transpose()?;
     for row in dml_rows(table, probe, ctx, txn)? {
         let (tid, tuple) = row?;
-        if predicate_holds(predicate, &tuple, ctx)? {
+        let probe_row;
+        let row_probe: &[Value] = match oid {
+            None => &tuple,
+            Some(oid) => {
+                let mut wide = tuple.clone();
+                wide.push(Value::Oid(oid));
+                probe_row = wide;
+                &probe_row
+            }
+        };
+        if predicate_holds(predicate, row_probe, ctx)? {
             pending.push(tid);
             if returning.is_some() {
                 deleted.push(tuple);
@@ -2909,7 +3097,9 @@ fn delete_direct(
     // expression aborts the statement before any row is removed.
     match returning {
         Some(returning) => {
-            let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
+            let oids = oid.map(|oid| vec![oid; deleted.len()]);
+            let output =
+                project_returning(deleted.iter(), &returning.projections, oids.as_deref(), ctx)?;
             table.delete_many(pending, txn)?;
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
@@ -2931,20 +3121,42 @@ fn delete_routed(
     let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();
+    // Each leaf's own OID, resolved once per leaf: `DELETE FROM p WHERE
+    // tableoid = 'p1'::regclass` must remove exactly that partition's rows.
+    let leaf_oids = target_oids(leaves, ctx)?;
+    let mut deleted_oids: Vec<u32> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
         for row in dml_rows(&leaf.relation.table, leaf.probe.as_ref(), ctx, txn)? {
             let (tid, tuple) = row?;
-            if predicate_holds(predicate, &tuple, ctx)? {
+            let probe_row;
+            let row_probe: &[Value] = match leaf_oids[i] {
+                None => &tuple,
+                Some(oid) => {
+                    let mut wide = tuple.clone();
+                    wide.push(Value::Oid(oid));
+                    probe_row = wide;
+                    &probe_row
+                }
+            };
+            if predicate_holds(predicate, row_probe, ctx)? {
                 pending[i].push(tid);
                 if returning.is_some() {
                     deleted.push(tuple);
+                    if let Some(oid) = leaf_oids[i] {
+                        deleted_oids.push(oid);
+                    }
                 }
             }
         }
     }
     match returning {
         Some(returning) => {
-            let output = project_returning(deleted.iter(), &returning.projections, ctx)?;
+            let output = project_returning(
+                deleted.iter(),
+                &returning.projections,
+                (!deleted_oids.is_empty()).then_some(deleted_oids.as_slice()),
+                ctx,
+            )?;
             for (i, leaf) in leaves.iter().enumerate() {
                 leaf.relation
                     .table
@@ -4173,37 +4385,87 @@ pub struct Append {
 }
 
 impl Append {
-    pub fn new(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Self {
-        let scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> =
-            arms.iter()
-                .map(|arm| {
-                    let scan = arm
-                        .relation
-                        .table
-                        .scan(txn, &arm.projection)
-                        .map(|row| row.map(|(_, tuple)| tuple));
-                    match &arm.relation.map {
-                        // The arm already carries the named relation's layout, so
-                        // its tuples pass through untouched.
-                        None => Box::new(scan)
-                            as Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-                        // A wider arm reads through the same `view` the write paths
-                        // use. The scan's projection was translated through this
-                        // same map, so a slot the projection skipped is a
-                        // placeholder in both spaces and stays one here.
-                        Some(_) => {
-                            let relation = arm.relation.clone();
-                            Box::new(scan.map(move |row| {
-                                row.map(|tuple| relation.view(&tuple).into_owned())
-                            }))
-                        }
-                    }
-                })
-                .collect();
-        Self {
-            iter: Box::new(scans.into_iter().flatten()),
+    pub fn new(
+        arms: &[PhysicalAppendArm],
+        ctx: &ExecContext,
+        txn: &TxnContext,
+    ) -> Result<Self, ExecError> {
+        let mut scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> =
+            Vec::with_capacity(arms.len());
+        for arm in arms {
+            let scan = arm
+                .relation
+                .table
+                .scan(txn, &arm.projection)
+                .map(|row| row.map(|(_, tuple)| tuple));
+            let scan: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send> = match &arm
+                .relation
+                .map
+            {
+                // The arm already carries the named relation's layout, so
+                // its tuples pass through untouched.
+                None => Box::new(scan),
+                // A wider arm reads through the same `view` the write paths
+                // use. The scan's projection was translated through this
+                // same map, so a slot the projection skipped is a
+                // placeholder in both spaces and stays one here.
+                Some(_) => {
+                    let relation = arm.relation.clone();
+                    Box::new(
+                        scan.map(move |row| row.map(|tuple| relation.view(&tuple).into_owned())),
+                    )
+                }
+            };
+            scans.push(match &arm.relation.tableoid {
+                None => scan,
+                // Resolved once here rather than per row: within one statement
+                // the catalog snapshot is fixed, so the OID cannot change under
+                // the scan — and leaving it to execution rather than to binding
+                // is what keeps a prepared statement honest when a relation is
+                // created or dropped ahead of this one.
+                //
+                // Appended *after* `view`, so `map` stays a pure gather and the
+                // write-back paths never meet a column with nowhere to write.
+                Some(ident) => {
+                    let oid = resolve_tableoid(ident, ctx)?;
+                    Box::new(scan.map(move |row| {
+                        row.map(|mut tuple| {
+                            tuple.push(Value::Oid(oid));
+                            tuple
+                        })
+                    }))
+                }
+            });
         }
+        Ok(Self {
+            iter: Box::new(scans.into_iter().flatten()),
+        })
     }
+}
+
+/// The OID a `tableoid` slot reports for `ident`.
+///
+/// A relation the catalog cannot name is an internal inconsistency, not a user
+/// error: the binder resolved this very relation moments ago, so the two views
+/// disagreeing means the plan and the catalog have drifted. Saying so beats
+/// reporting OID 0 as though it were data.
+pub(crate) fn resolve_tableoid(ident: &RelationIdent, ctx: &ExecContext) -> Result<u32, ExecError> {
+    let ops = ctx.catalog.as_deref().ok_or_else(|| {
+        ExecError::new(
+            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+            "tableoid evaluated without a catalog context",
+        )
+    })?;
+    ops.rel_oid(Some(&ident.namespace), &ident.name)
+        .ok_or_else(|| {
+            ExecError::new(
+                crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+                format!(
+                    "no OID for relation \"{}.{}\" the plan scans",
+                    ident.namespace, ident.name
+                ),
+            )
+        })
 }
 
 impl ExecNode for Append {
@@ -5301,6 +5563,7 @@ mod tests {
                 None,
                 Vec::new(),
                 probe.as_ref(),
+                false,
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -5337,6 +5600,7 @@ mod tests {
                 None,
                 Vec::new(),
                 probe.as_ref(),
+                false,
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -5372,6 +5636,7 @@ mod tests {
             None,
             Vec::new(),
             probe_on_id("missing_index", 2).as_ref(),
+            false,
             &ExecContext::default(),
             &wtxn(),
         )) else {
@@ -5671,6 +5936,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
             &ExecContext::default(),
             &wtxn(),
         )?
@@ -5719,6 +5985,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
             &ExecContext::default(),
             &wtxn(),
         ) else {
@@ -5751,6 +6018,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
             &ExecContext::default(),
             &wtxn(),
         )?

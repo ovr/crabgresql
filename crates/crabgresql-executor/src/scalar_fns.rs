@@ -187,6 +187,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // it is not STRICT, so the NULL short-circuit above would be wrong for it.
         ScalarFn::PgGetUserById
         | ScalarFn::PgTableIsVisible
+        | ScalarFn::TableOid
         | ScalarFn::PgTypeof(_)
         | ScalarFn::CurrentDatabase
         | ScalarFn::CurrentSchema

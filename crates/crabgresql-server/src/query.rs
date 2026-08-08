@@ -5513,6 +5513,8 @@ fn execute_create_table_as(
         // `CREATE TABLE … AS` has no FREEZE spelling, and this table's DDL is not
         // transactional, so there would be no storage for a rollback to discard.
         freeze: false,
+        // No RETURNING, so nothing reads a system column.
+        tableoid: false,
     };
 
     // Run the populate INSERT through the standard write tail. The DDL catalog
