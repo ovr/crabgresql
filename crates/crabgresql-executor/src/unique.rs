@@ -20,8 +20,10 @@
 //! here: they are not written until every row has been checked, so no engine can
 //! answer for them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, StorageError, TableAm, TableSchema, Tid, Tuple,
@@ -64,7 +66,7 @@ struct KeySet<'a> {
     source: Source<'a>,
     /// Keys of the rows this set answers for itself: the statement's own rows
     /// always, plus the relation's rows under [`Source::Scan`].
-    buckets: HashMap<u64, Vec<Entry>>,
+    buckets: FxHashMap<u64, Vec<Entry>>,
 }
 
 /// Where the *pre-existing* rows' keys for one index come from. The relation to
@@ -337,7 +339,7 @@ fn key_sets<'a>(
                 .collect(),
             nulls_distinct: index.nulls_distinct,
             source: source(index),
-            buckets: HashMap::new(),
+            buckets: FxHashMap::default(),
         })
         .collect()
 }
