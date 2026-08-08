@@ -5,6 +5,7 @@ use crabgresql_storage_api::Column;
 use crabgresql_types::{PgType, Reg, RegKind, Value, VectorKind};
 
 use crate::ProcRef;
+use crate::SystemCatalog;
 use crate::oids::OWN_AM_HANDLERS;
 
 /// A `"char"` column: PostgreSQL's one-byte ad-hoc type, which is what the
@@ -58,6 +59,46 @@ pub(crate) fn regproc_by_name(name: &str) -> Value {
             name: name.to_string(),
         }),
         None => Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+    }
+}
+
+/// A `reg*[]` column of the given kind — `regtype[]` for the type-OID arrays
+/// `pg_prepared_statements` reports.
+pub(crate) fn reg_array_type(kind: RegKind) -> PgType {
+    PgType::Array(kind.oid())
+}
+
+/// A `regtype[]` datum from type OIDs, naming each the way `regtype`'s output
+/// function does.
+///
+/// The three tiers match [`crabgresql_executor::reg`]: a built-in prints under
+/// its SQL spelling (23 is `integer`), a pseudo-type names itself from the
+/// shared table, and a user-defined type comes from the catalog. Only an OID
+/// that names nothing left falls back to its digits, which is what PostgreSQL
+/// renders for a type it genuinely cannot name.
+pub(crate) fn regtype_array(cat: &SystemCatalog, oids: &[u32]) -> Value {
+    Value::Array {
+        elem: PgType::Reg(RegKind::Type),
+        elems: oids
+            .iter()
+            .map(|&oid| {
+                let name = PgType::from_oid(oid)
+                    .map(|ty| ty.name().to_string())
+                    .or_else(|| crabgresql_types::pseudo_type_name(oid).map(str::to_string))
+                    .or_else(|| {
+                        cat.user_type_ref(oid)
+                            .map(|(_, name)| crabgresql_types::text::quote_ident(name))
+                    });
+                Value::Reg(match name {
+                    Some(name) => Reg {
+                        kind: RegKind::Type,
+                        oid,
+                        name,
+                    },
+                    None => Reg::unresolved(RegKind::Type, oid),
+                })
+            })
+            .collect(),
     }
 }
 

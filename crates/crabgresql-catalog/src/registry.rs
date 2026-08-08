@@ -20,7 +20,7 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     am, attribute, auth, class, collation, constraint, cursors, database, index, inherits,
-    language, namespace, proc, sequence, settings, timezone, types,
+    language, namespace, prepared, proc, sequence, settings, timezone, types,
 };
 use crate::views::information_schema;
 
@@ -219,6 +219,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         inherits::pg_partitioned_table_schema,
         inherits::pg_partitioned_table_rows,
+    ),
+    rel(
+        "pg_prepared_statements",
+        12095,
+        PgCatalog,
+        prepared::pg_prepared_statements_schema,
+        prepared::pg_prepared_statements_rows,
     ),
     rel(
         "pg_proc",

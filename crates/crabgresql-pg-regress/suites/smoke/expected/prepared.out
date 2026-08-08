@@ -1,0 +1,226 @@
+--
+-- PREPARED
+-- SQL-level PREPARE / EXECUTE / DEALLOCATE: parameter typing and coercion, the
+-- command tags each form reports, name folding, and pg_prepared_statements.
+--
+CREATE TABLE pt (a integer, b text);
+-- A declared type list seeds the parameter types; an omitted one leaves them to
+-- be deduced from how the statement uses them.
+PREPARE p1 (INT, TEXT) AS SELECT $1, $2;
+PREPARE p2 AS SELECT 1;
+PREPARE p3 AS SELECT a, b FROM pt WHERE a = $1;
+EXECUTE p2;
+ ?column? 
+----------
+        1
+(1 row)
+
+-- Arguments are ordinary expressions, evaluated before the statement runs.
+EXECUTE p1 (1 + 1, 'a' || 'b');
+ ?column? | ?column? 
+----------+----------
+        2 | ab
+(1 row)
+
+-- A name may not be prepared twice while it exists.
+PREPARE p1 AS SELECT 2;
+ERROR:  prepared statement "p1" already exists
+-- Wrong argument counts are refused, with the counts in the DETAIL.
+EXECUTE p1 (1);
+ERROR:  wrong number of parameters for prepared statement "p1"
+DETAIL:  Expected 2 parameters but got 1.
+EXECUTE p1;
+ERROR:  wrong number of parameters for prepared statement "p1"
+DETAIL:  Expected 2 parameters but got 0.
+-- ... but a statement that declared no parameters ignores whatever it is given,
+-- without even evaluating it.
+EXECUTE p2 (1 / 0);
+ ?column? 
+----------
+        1
+(1 row)
+
+-- An unknown name is 26000 from either statement.
+EXECUTE nosuch (1);
+ERROR:  prepared statement "nosuch" does not exist
+DEALLOCATE nosuch;
+ERROR:  prepared statement "nosuch" does not exist
+-- Only an optimizable statement can be prepared; a utility statement is a
+-- syntax error at its leading keyword. The refusal is covered by the e2e tests
+-- rather than here, because PostgreSQL also points a caret at that keyword.
+-- TODO: move those cases here once the parser records a span for PREPARE.
+-- VALUES and a leading WITH are SELECTs, so both prepare.
+PREPARE v1 AS VALUES (1), (2);
+PREPARE w1 AS WITH c AS (SELECT 1 AS x) SELECT * FROM c;
+EXECUTE v1;
+ column1 
+---------
+       1
+       2
+(2 rows)
+
+EXECUTE w1;
+ x 
+---
+ 1
+(1 row)
+
+-- Arguments are assignment-coerced to the declared type: numeric rounds into an
+-- int, an unknown literal goes through the type's input function, and a type
+-- that only an explicit cast could convert is refused.
+PREPARE q (INT) AS SELECT $1;
+EXECUTE q (1.7);
+ ?column? 
+----------
+        2
+(1 row)
+
+EXECUTE q (1.4);
+ ?column? 
+----------
+        1
+(1 row)
+
+EXECUTE q ('7');
+ ?column? 
+----------
+        7
+(1 row)
+
+EXECUTE q (NULL);
+ ?column? 
+----------
+         
+(1 row)
+
+EXECUTE q ('abc');
+ERROR:  invalid input syntax for type integer: "abc"
+LINE 1: EXECUTE q ('abc');
+                   ^
+EXECUTE q (true);
+ERROR:  parameter $1 of type boolean cannot be coerced to the expected type integer
+LINE 1: EXECUTE q (true);
+                   ^
+HINT:  You will need to rewrite or cast the expression.
+-- EXECUTE reports the tag of the statement it names.
+PREPARE ins (INT, TEXT) AS INSERT INTO pt VALUES ($1, $2);
+PREPARE upd AS UPDATE pt SET b = 'y';
+PREPARE del AS DELETE FROM pt RETURNING *;
+EXECUTE ins (1, 'x');
+EXECUTE upd;
+EXECUTE del;
+ a | b 
+---+---
+ 1 | y
+(1 row)
+
+-- Names fold like every other identifier.
+PREPARE Foo AS SELECT 1;
+EXECUTE FOO;
+ ?column? 
+----------
+        1
+(1 row)
+
+PREPARE "Bar" AS SELECT 1;
+-- A user-defined type names itself in the regtype arrays, as any other does.
+CREATE TYPE mood AS ENUM ('ok', 'bad');
+PREPARE m (mood) AS SELECT $1;
+SELECT parameter_types, result_types FROM pg_prepared_statements WHERE name = 'm';
+ parameter_types | result_types 
+-----------------+--------------
+ {mood}          | {mood}
+(1 row)
+
+-- EXPLAIN EXECUTE plans the statement the name refers to, with its own arguments.
+INSERT INTO pt VALUES (1, 'x'), (2, 'y');
+PREPARE pa (int) AS SELECT a, b FROM pt WHERE a = $1;
+EXPLAIN (COSTS OFF) EXECUTE pa (2);
+    QUERY PLAN     
+-------------------
+ Seq Scan on pt
+   Filter: (a = 2)
+(2 rows)
+
+DELETE FROM pt;
+-- A statement with no result set reports NULL result_types, not an empty array.
+SELECT name, statement, parameter_types, result_types, from_sql
+  FROM pg_prepared_statements WHERE name NOT IN ('m', 'pa') ORDER BY name;
+ name |                         statement                          | parameter_types |  result_types  | from_sql 
+------+------------------------------------------------------------+-----------------+----------------+----------
+ Bar  | PREPARE "Bar" AS SELECT 1;                                 | {}              | {integer}      | t
+ del  | PREPARE del AS DELETE FROM pt RETURNING *;                 | {}              | {integer,text} | t
+ foo  | PREPARE Foo AS SELECT 1;                                   | {}              | {integer}      | t
+ ins  | PREPARE ins (INT, TEXT) AS INSERT INTO pt VALUES ($1, $2); | {integer,text}  |                | t
+ p1   | PREPARE p1 (INT, TEXT) AS SELECT $1, $2;                   | {integer,text}  | {integer,text} | t
+ p2   | PREPARE p2 AS SELECT 1;                                    | {}              | {integer}      | t
+ p3   | PREPARE p3 AS SELECT a, b FROM pt WHERE a = $1;            | {integer}       | {integer,text} | t
+ q    | PREPARE q (INT) AS SELECT $1;                              | {integer}       | {integer}      | t
+ upd  | PREPARE upd AS UPDATE pt SET b = 'y';                      | {}              |                | t
+ v1   | PREPARE v1 AS VALUES (1), (2);                             | {}              | {integer}      | t
+ w1   | PREPARE w1 AS WITH c AS (SELECT 1 AS x) SELECT * FROM c;   | {}              | {integer}      | t
+(11 rows)
+
+SELECT prepare_time > now() - interval '1 hour' AS recent
+  FROM pg_prepared_statements WHERE name = 'p2';
+ recent 
+--------
+ t
+(1 row)
+
+-- Executions are counted per plan kind: a statement with no parameters has
+-- nothing to specialize on, so it is planned generically from the first run.
+EXECUTE pa (1);
+ a | b 
+---+---
+(0 rows)
+
+EXECUTE pa (2);
+ a | b 
+---+---
+(0 rows)
+
+EXECUTE p2;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements
+  WHERE name IN ('pa', 'p2') ORDER BY name;
+ name | generic_plans | custom_plans 
+------+---------------+--------------
+ p2   |             3 |            0
+ pa   |             0 |            3
+(2 rows)
+
+-- PREPARE is not transactional: a rolled-back block leaves its statement behind.
+BEGIN;
+PREPARE t1 AS SELECT 1;
+ROLLBACK;
+EXECUTE t1;
+ ?column? 
+----------
+        1
+(1 row)
+
+-- DEALLOCATE takes one name, or ALL — which is a keyword only unquoted.
+DEALLOCATE "ALL";
+ERROR:  prepared statement "ALL" does not exist
+DEALLOCATE PREPARE p2;
+DEALLOCATE p1;
+SELECT count(*) > 0 AS some_left FROM pg_prepared_statements;
+ some_left 
+-----------
+ t
+(1 row)
+
+DEALLOCATE ALL;
+SELECT count(*) FROM pg_prepared_statements;
+ count 
+-------
+     0
+(1 row)
+
+DROP TYPE mood;
+DROP TABLE pt;

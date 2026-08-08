@@ -10859,6 +10859,231 @@ async fn cursor_names_fold_to_lowercase() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SQL `PREPARE` and the extended protocol's `Parse` share one namespace, as in
+/// PostgreSQL: both show up in `pg_prepared_statements` — told apart by
+/// `from_sql` — and SQL `DEALLOCATE` drops either.
+#[tokio::test]
+async fn sql_and_protocol_prepared_statements_share_a_namespace() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("PREPARE viasql AS SELECT 1").await?;
+    // `prepare` is the protocol path: Parse under a client-chosen name.
+    let stmt = client.prepare("SELECT $1::int + 1").await?;
+
+    // Read over the *simple* protocol throughout: an extended-protocol query
+    // prepares itself first and would count in its own result.
+    let listed = client
+        .simple_query(
+            "SELECT name, from_sql FROM pg_prepared_statements \
+             WHERE from_sql OR statement = 'SELECT $1::int + 1' ORDER BY from_sql",
+        )
+        .await?;
+    let listed = rows(&listed);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].get("from_sql"), Some("f"));
+    assert_eq!(listed[1].get("from_sql"), Some("t"));
+    assert_eq!(listed[1].get("name"), Some("viasql"));
+    let protocol_name = listed[0].get("name").expect("a name").to_string();
+
+    // The protocol-prepared statement still works, and SQL DEALLOCATE drops it.
+    assert_eq!(client.query_one(&stmt, &[&1i32]).await?.get::<_, i32>(0), 2);
+    client
+        .batch_execute(&format!("DEALLOCATE \"{protocol_name}\""))
+        .await?;
+    let left = client
+        .simple_query(
+            "SELECT count(*) AS n FROM pg_prepared_statements \
+             WHERE statement = 'SELECT $1::int + 1'",
+        )
+        .await?;
+    assert_eq!(rows(&left)[0].get("n"), Some("0"));
+
+    // DEALLOCATE ALL takes what is left, including the SQL-prepared one.
+    client.batch_execute("DEALLOCATE ALL").await?;
+    let none = client
+        .simple_query("SELECT count(*) AS n FROM pg_prepared_statements")
+        .await?;
+    assert_eq!(rows(&none)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// `PREPARE` takes only an optimizable statement; PostgreSQL's grammar reports a
+/// utility statement as a syntax error at its leading keyword. Covered here
+/// rather than in the smoke suite because PostgreSQL also points a caret at that
+/// keyword, and the parser reports no span for `PREPARE` to point one at.
+#[tokio::test]
+async fn prepare_refuses_utility_statements() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    for (sql, keyword) in [
+        ("PREPARE u AS CREATE TABLE t (a int)", "CREATE"),
+        ("PREPARE u AS SET work_mem = '1MB'", "SET"),
+        ("PREPARE u AS DEALLOCATE ALL", "DEALLOCATE"),
+    ] {
+        let err = client.batch_execute(sql).await.expect_err("not preparable");
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(err.code().code(), "42601");
+        assert_eq!(
+            err.message(),
+            format!("syntax error at or near \"{keyword}\"")
+        );
+    }
+    // Nothing was recorded by a refused PREPARE. Asked over the simple protocol,
+    // which does not prepare the question it is asking.
+    let none = client
+        .simple_query("SELECT count(*) AS n FROM pg_prepared_statements")
+        .await?;
+    assert_eq!(rows(&none)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// An `EXECUTE` argument is a constant expression: it binds in an empty scope,
+/// so a column reference or a subquery is refused in PostgreSQL's own words.
+#[tokio::test]
+async fn execute_arguments_are_constant_expressions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("PREPARE q (int) AS SELECT $1").await?;
+
+    let err = client
+        .batch_execute("EXECUTE q (a)")
+        .await
+        .expect_err("no column in scope");
+    assert_eq!(err.code().map(|c| c.code()), Some("42703"));
+
+    let err = client
+        .batch_execute("EXECUTE q ((SELECT 1))")
+        .await
+        .expect_err("no subquery here");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code().code(), "0A000");
+    assert_eq!(err.message(), "cannot use subquery in EXECUTE parameter");
+    Ok(())
+}
+
+/// `EXECUTE` over the extended protocol describes the shape of the statement it
+/// names, so a client that reads its columns before executing gets the right
+/// ones — a `Describe` answering NoData would leave it unprepared for the rows.
+#[tokio::test]
+async fn execute_describes_the_statement_it_names() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("PREPARE shape AS SELECT 1 AS n, 'x' AS s")
+        .await?;
+    // `query` goes through Parse/Describe/Bind/Execute, so the column names come
+    // from the RowDescription the Describe produced.
+    let rows = client.query("EXECUTE shape", &[]).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("n"), 1);
+    assert_eq!(rows[0].get::<_, &str>("s"), "x");
+    Ok(())
+}
+
+/// Every execution re-plans, so `pg_prepared_statements` reports each as a
+/// custom plan and never a generic one — and counts a failed execution too,
+/// because the planning happened.
+#[tokio::test]
+async fn prepared_statement_counts_its_executions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("PREPARE c (int) AS SELECT 1 / $1")
+        .await?;
+    client.batch_execute("EXECUTE c (1)").await?;
+    client.batch_execute("EXECUTE c (2)").await?;
+    client
+        .batch_execute("EXECUTE c (0)")
+        .await
+        .expect_err("division by zero");
+    let row = client
+        .query_one(
+            "SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'c'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>("generic_plans"), 0);
+    assert_eq!(row.get::<_, i64>("custom_plans"), 3);
+    Ok(())
+}
+
+/// A prepared statement may name another one, and nothing stops a `Parse` from
+/// preparing one that names *itself* — SQL `PREPARE` refuses an `EXECUTE` body,
+/// but the protocol has no such filter. That recursion used to run until the
+/// thread's stack was gone, killing the whole process and every other session
+/// with it; it must be a plain error instead, as PostgreSQL's 54001 is.
+#[tokio::test]
+async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    // The driver names its Parse messages sequentially, so preparing one
+    // statement reveals what the *next* one will be called — which is how a
+    // statement gets to name itself. Asserted below rather than assumed.
+    let probe = client.prepare("SELECT 1").await?;
+    let taken = client
+        .simple_query("SELECT name FROM pg_prepared_statements WHERE NOT from_sql")
+        .await?;
+    let taken = rows(&taken)[0].get("name").expect("a name").to_string();
+    let n: u32 = taken
+        .trim_start_matches('s')
+        .parse()
+        .expect("driver names statements sN");
+    let self_name = format!("s{}", n + 1);
+    drop(probe);
+
+    let stmt = client.prepare(&format!("EXECUTE {self_name}")).await?;
+    let named = client
+        .simple_query(&format!(
+            "SELECT count(*) AS n FROM pg_prepared_statements WHERE name = '{self_name}'"
+        ))
+        .await?;
+    assert_eq!(
+        rows(&named)[0].get("n"),
+        Some("1"),
+        "the statement must name itself for this to test anything"
+    );
+
+    let err = client
+        .query(&stmt, &[])
+        .await
+        .expect_err("recursion must be refused");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code().code(), "54001");
+    assert_eq!(err.message(), "stack depth limit exceeded");
+
+    // The point of the test: the connection — and the server behind it — is
+    // still there afterwards, and the depth counter unwound.
+    assert_eq!(
+        client
+            .query_one("SELECT 1 AS n", &[])
+            .await?
+            .get::<_, i32>("n"),
+        1
+    );
+    Ok(())
+}
+
+/// An `EXECUTE` argument is parse-analyzed like any other expression in a clause
+/// that allows neither aggregates nor window functions, so it is refused with the
+/// SQLSTATE naming that clause rather than the evaluator's generic 0A000.
+#[tokio::test]
+async fn execute_arguments_reject_aggregates_and_window_functions() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("PREPARE q (int) AS SELECT $1").await?;
+    for (sql, code, message) in [
+        (
+            "EXECUTE q (sum(1))",
+            "42803",
+            "aggregate functions are not allowed in EXECUTE parameters",
+        ),
+        (
+            "EXECUTE q (row_number() OVER ())",
+            "42P20",
+            "window functions are not allowed in EXECUTE parameters",
+        ),
+    ] {
+        let err = client.batch_execute(sql).await.expect_err("not allowed");
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(err.code().code(), code, "{sql}");
+        assert_eq!(err.message(), message);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_large_value_round_trips_in_binary_over_the_extended_protocol() {
     // The smoke suite drives the simple protocol in text; this covers the other
