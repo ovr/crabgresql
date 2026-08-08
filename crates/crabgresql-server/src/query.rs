@@ -5901,6 +5901,11 @@ fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
 /// false. Rejecting the column is the honest boundary until relation OIDs are
 /// persistent — using `reg*` in expressions (casts, comparisons, the catalog
 /// queries psql sends) is unaffected, since those resolve within one snapshot.
+///
+/// TODO: COPY has no `reg*` input path. It reads each field with
+/// `parse_unknown`, whose `PgType::Reg` arm is an internal error, because
+/// turning a name into an OID needs the relation catalog the binder does not
+/// hold. Lifting this rejection means giving COPY that lookup first.
 fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
     let kind = match ty {
         PgType::Reg(kind) => Some(kind),

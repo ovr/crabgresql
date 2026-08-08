@@ -5927,16 +5927,18 @@ pub enum CopyFromSource {
 /// columns absent from the column list, and the text/CSV format. The row bytes
 /// arrive later, so binding is split: this resolves everything the server needs
 /// before sending `CopyInResponse` (or opening the file), and
-/// [`build_insert`](Self::build_insert) turns the decoded field rows into a
-/// [`LogicalPlan::Insert`].
+/// [`build_insert`](Self::build_insert) parses the decoded field rows straight
+/// into their columns' [`Value`]s, yielding a [`LogicalPlan::Insert`] over
+/// [`InsertSource::Tuples`].
 ///
-/// It does that one of two ways, decided here once rather than per row.
-/// [`build_tuples`](Self::build_tuples) parses each field straight into its
-/// column's [`Value`]; [`build_values`](Self::build_values) goes through the
-/// binder's ordinary assignment coercion, for the columns the direct route
-/// cannot read without the executor (see [`copy_fast_path_admits`]). Both must
-/// produce the same rows and the same errors — that is what the fallback is
-/// for, and what the COPY-vs-INSERT cases in the smoke suite check.
+/// There is deliberately only one route. An earlier version kept the binder's
+/// ordinary assignment coercion as a fallback for columns the direct route
+/// could not read, but the two disagreed on which error a bad row reported —
+/// the direct route folds a field where the expression route deferred it past
+/// the column defaults — and nothing could reach the fallback to notice: the
+/// only type needing it was `interval[]`, since `CREATE TABLE` refuses every
+/// `reg*` column. With the `interval[]` gap closed in `resolve_unknown`, the
+/// second route had no reason left to exist.
 pub struct CopyFromPlan {
     table: Arc<dyn TableAm>,
     table_name: String,
@@ -5944,8 +5946,6 @@ pub struct CopyFromPlan {
     schema: Arc<TableSchema>,
     /// One schema-column index per data column, in wire order.
     target_indices: Vec<usize>,
-    /// Default expression per schema column (used for columns not in the list).
-    defaults: Vec<BoundExpr>,
     pub format: CopyFormat,
     /// `FREEZE`: stamp the loaded rows visible-to-everyone rather than
     /// visible-once-this-transaction-commits. Binding only records the request
@@ -5959,23 +5959,28 @@ pub struct CopyFromPlan {
     /// routes to the leaf whose RANGE bound admits it (reusing the executor's
     /// INSERT routing); `None` for an ordinary table.
     routing: Option<Vec<Arc<dyn TableAm>>>,
-    /// The direct text → [`Value`] route, when every target column admits it.
-    /// `None` puts the load on the expression path.
-    fast: Option<CopyFastPath>,
+    /// The row shape, worked out once at bind time so a load pays for it once
+    /// rather than once per row.
+    rows: CopyRowPlan,
 }
 
-/// What [`CopyFromPlan::build_tuples`] needs, worked out once at bind time so a
-/// load pays for it once rather than once per row.
-struct CopyFastPath {
+/// How to build one row: what every row starts from, and what the executor still
+/// owes it.
+struct CopyRowPlan {
     /// Full-width row template in schema order: a column whose `DEFAULT` folded
     /// to a constant holds it, everything else holds NULL. Target columns are
-    /// overwritten by the decoded field, and defaults listed below by the
-    /// executor, so leaving those slots NULL avoids cloning a value that is
-    /// about to be replaced — which is the whole cost of the old
-    /// `self.defaults.clone()`.
+    /// overwritten by the decoded field, and the columns below by the executor,
+    /// so leaving those slots NULL avoids cloning a value that is about to be
+    /// replaced.
     template: Vec<Value>,
     /// Columns whose `DEFAULT` did not fold, ascending. Handed to the executor,
     /// which evaluates them once per row.
+    ///
+    /// TODO: a `timestamptz`/`timetz` column whose `DEFAULT` is a literal binds
+    /// to `Coerce{Const(Text)}` rather than a constant, so it lands here and is
+    /// re-parsed for every row. `build_insert` holds the `FmtCtx` that could
+    /// fold it once per batch, the way `session_literal_default` does at DDL
+    /// time. `DEFAULT now()` is a `FuncCall` and must stay per-row regardless.
     defaults: Vec<(usize, BoundExpr)>,
 }
 
@@ -5997,44 +6002,29 @@ impl CopyFromPlan {
     }
 
     /// Turn decoded field rows (`None` = the NULL marker matched) into a
-    /// fully-formed `INSERT ... VALUES` plan: each field parses through its
-    /// column's input function with the column typmod (so `char(n)` blank-pads,
-    /// an over-long `varchar(n)` errors), exactly as a SQL literal would; columns
-    /// absent from the COPY column list take their default. Arity mismatches
-    /// surface as PG's `extra data` / `missing data` errors.
+    /// [`LogicalPlan::Insert`]: each field parses through its column's input
+    /// function with the column typmod (so `char(n)` blank-pads, an over-long
+    /// `varchar(n)` errors), exactly as a SQL literal would; columns absent from
+    /// the COPY column list take their default. Arity mismatches surface as PG's
+    /// `extra data` / `missing data` errors.
+    ///
+    /// Values are built directly, with no expression tree in between: the rows
+    /// are already parsed, so wrapping each cell in a [`BoundExpr::Const`] only
+    /// for the executor to clone it back out doubles the work of the statement.
+    /// What makes that possible is the `FmtCtx` — a load holds the session the
+    /// binder normally lacks, so a `timestamptz` field, a `'now'`, or a
+    /// style-sensitive `interval` folds here against exactly the zone and
+    /// transaction clock a deferred runtime coercion would have used.
     pub fn build_insert(
         &self,
         catalog: &Arc<dyn TypeCatalog>,
         fmt: &FmtCtx,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<LogicalPlan, BindError> {
-        match &self.fast {
-            Some(fast) => self.build_tuples(catalog, fmt, fast, rows),
-            None => self.build_values(catalog, rows),
-        }
-    }
-
-    /// The direct route: parse each field straight into its column's [`Value`].
-    ///
-    /// This does what [`Self::build_values`] does, minus the round trip through
-    /// an expression tree — the same input functions, the same typmod cores, the
-    /// same errors in the same order. The one thing it does that the expression
-    /// path cannot is fold a value whose meaning depends on the session: the
-    /// executor's `FmtCtx` is right here, so a `timestamptz` field, a `'now'`,
-    /// or a style-sensitive `interval` resolves now against exactly the zone and
-    /// transaction clock the deferred runtime coercion would have used.
-    fn build_tuples(
-        &self,
-        catalog: &Arc<dyn TypeCatalog>,
-        fmt: &FmtCtx,
-        fast: &CopyFastPath,
-        rows: Vec<Vec<Option<String>>>,
-    ) -> Result<LogicalPlan, BindError> {
-        let ncols = self.target_indices.len();
         let mut tuples = Vec::with_capacity(rows.len());
         for fields in rows {
-            self.check_arity(fields.len(), ncols)?;
-            let mut tuple = fast.template.clone();
+            self.check_arity(fields.len())?;
+            let mut tuple = self.rows.template.clone();
             for (field, &idx) in fields.into_iter().zip(&self.target_indices) {
                 let column = &self.schema.columns[idx];
                 tuple[idx] = match field {
@@ -6065,16 +6055,23 @@ impl CopyFromPlan {
             table: self.table.clone(),
             source: InsertSource::Tuples {
                 rows: tuples,
-                defaults: fast.defaults.clone(),
+                defaults: self.rows.defaults.clone(),
             },
             returning: None,
+            // A partitioned parent routes each decoded row to a leaf, reusing the
+            // executor's INSERT tuple routing; `None` targets an ordinary table.
             routing: self.routing.clone(),
+            // The server has already verified the precondition against this very
+            // target (it needs a transaction, which binding has no access to).
             freeze: self.freeze,
         })
     }
 
     /// A data row must supply exactly the columns the statement named.
-    fn check_arity(&self, got: usize, want: usize) -> Result<(), BindError> {
+    fn check_arity(&self, got: usize) -> Result<(), BindError> {
+        // Indexing `target_indices` below is in bounds only because `want` is
+        // its length, so it is read here rather than passed in.
+        let want = self.target_indices.len();
         if got > want {
             return Err(BindError::new(
                 sqlstate::BAD_COPY_FILE_FORMAT,
@@ -6092,57 +6089,6 @@ impl CopyFromPlan {
             ));
         }
         Ok(())
-    }
-
-    /// The expression path, for the relations [`copy_fast_path_admits`] turns
-    /// away. Each field becomes the equivalent unknown-typed SQL literal and the
-    /// binder's ordinary assignment coercion takes it from there.
-    fn build_values(
-        &self,
-        catalog: &Arc<dyn TypeCatalog>,
-        rows: Vec<Vec<Option<String>>>,
-    ) -> Result<LogicalPlan, BindError> {
-        let params = param_ctx_none();
-        let scope = Scope::empty(catalog, &params);
-        let ncols = self.target_indices.len();
-        let mut value_rows = Vec::with_capacity(rows.len());
-        for fields in rows {
-            self.check_arity(fields.len(), ncols)?;
-            let mut row = self.defaults.clone();
-            for (field, &idx) in fields.into_iter().zip(&self.target_indices) {
-                let column = &self.schema.columns[idx];
-                row[idx] = match field {
-                    // The NULL marker: a genuine SQL NULL, not the column default.
-                    None => BoundExpr::Const {
-                        value: Value::Null,
-                        ty: column.ty,
-                    },
-                    // A data field parses like the equivalent unknown-typed SQL
-                    // literal against the column type, then takes its length typmod.
-                    Some(text) => coerce_to_column(
-                        Binding::Unknown {
-                            lit: Some(text),
-                            span: Span::empty(),
-                            param: None,
-                        },
-                        column,
-                        &scope,
-                    )?,
-                };
-            }
-            value_rows.push(row);
-        }
-        Ok(LogicalPlan::Insert {
-            table: self.table.clone(),
-            source: InsertSource::Values(value_rows),
-            returning: None,
-            // A partitioned parent routes each decoded row to a leaf, reusing the
-            // executor's INSERT tuple routing; `None` targets an ordinary table.
-            routing: self.routing.clone(),
-            // The server has already verified the precondition against this very
-            // target (it needs a transaction, which binding has no access to).
-            freeze: self.freeze,
-        })
     }
 }
 
@@ -6251,80 +6197,56 @@ pub fn bind_copy_from(
         }
     }
 
-    let fast = build_fast_path(&schema, &target_indices, &defaults);
+    let rows = build_row_plan(&schema, &target_indices, defaults);
 
     Ok(CopyFromPlan {
         table,
         table_name: name,
         schema,
         target_indices,
-        defaults,
         format,
         freeze,
         source: copy_source,
         routing,
-        fast,
+        rows,
     })
 }
 
-/// Whether a column's type can be read straight into a [`Value`] at load time.
-///
-/// Everything the binder defers to runtime it defers for want of a session, and
-/// COPY has one — except for these two.
-fn copy_fast_path_admits(ty: PgType) -> bool {
-    use crabgresql_types::oid;
-    match ty {
-        // A `reg*` literal names an object, and only the relation catalog can
-        // turn a name into an OID. `resolve_unknown` emits a runtime `RegIn`
-        // call for it; there is no value to fold here.
-        PgType::Reg(_) => false,
-        // An array whose element is session-dependent is a gap in the expression
-        // path, not in this one: `resolve_unknown` defers only the *scalar*
-        // `interval`/`timestamptz`/`timetz` forms, so an array of them is parsed
-        // under `FmtCtx::utc_default()` and silently ignores `IntervalStyle` and
-        // the session zone. Folding it here under the real session would be more
-        // correct but would disagree with the expression path for the same
-        // column, making the stored value depend on which path a table happens
-        // to take. Left on the slow path until that asymmetry is fixed.
-        PgType::Array(elem) => !matches!(elem, oid::INTERVAL | oid::TIMESTAMPTZ | oid::TIMETZ),
-        _ => true,
-    }
-}
-
-/// Work out the row template and the deferred defaults, or `None` if any target
-/// column has to go through the expression path.
-fn build_fast_path(
+/// Split the column defaults into what every row starts from and what the
+/// executor must still evaluate for each one.
+fn build_row_plan(
     schema: &TableSchema,
     target_indices: &[usize],
-    defaults: &[BoundExpr],
-) -> Option<CopyFastPath> {
-    if !target_indices
-        .iter()
-        .all(|&i| copy_fast_path_admits(schema.columns[i].ty))
-    {
-        return None;
+    defaults: Vec<BoundExpr>,
+) -> CopyRowPlan {
+    // Which slots the decoded fields will overwrite. A membership mask rather
+    // than a scan of `target_indices` per column, so a wide relation does not
+    // pay O(columns x targets) to answer a question with one bit in it.
+    let mut targeted = vec![false; schema.columns.len()];
+    for &index in target_indices {
+        targeted[index] = true;
     }
     let mut template = Vec::with_capacity(schema.columns.len());
     let mut deferred = Vec::new();
-    for (index, default) in defaults.iter().enumerate() {
+    for (index, default) in defaults.into_iter().enumerate() {
         // A target column's default is dead: the decoded field overwrites it.
-        if target_indices.contains(&index) {
+        if targeted[index] {
             template.push(Value::Null);
             continue;
         }
         match default {
-            BoundExpr::Const { value, .. } => template.push(value.clone()),
+            BoundExpr::Const { value, .. } => template.push(value),
             // `nextval` on a `serial`, `now()`, a routine — must run per row.
             other => {
                 template.push(Value::Null);
-                deferred.push((index, other.clone()));
+                deferred.push((index, other));
             }
         }
     }
-    Some(CopyFastPath {
+    CopyRowPlan {
         template,
         defaults: deferred,
-    })
+    }
 }
 
 /// Whether `FREEZE` is on. The pre-9.0 bare keyword (`COPY … CSV FREEZE`) means
@@ -11121,48 +11043,97 @@ mod tests {
         );
     }
 
-    /// A column COPY cannot read without the executor puts the whole load back
-    /// on the expression path, which is what keeps the two in agreement.
+    /// Every `parse_unknown` arm must return exactly the `Value` variant its
+    /// `PgType` pairs with, because `apply_column_typmod` destructures on that
+    /// pairing and raises an internal error when it does not hold.
+    ///
+    /// There is no second path to absorb a mismatch any more, so the invariant
+    /// is pinned here rather than assumed: a future arm that widened a
+    /// representation (say `money` carried as `Value::Numeric`) would turn every
+    /// COPY into that column into an `XX000` while the equivalent INSERT kept
+    /// working, and nothing else in the suite would notice.
     #[test]
-    fn copy_falls_back_to_expressions_for_a_reg_column() {
-        let engine = crabgresql_pg_engine::ephemeral_engine();
-        if let Err(error) = engine.create_table(TableSchema::new(
-            "r",
-            vec![
-                Column::new("id", PgType::Int4),
-                Column::new("cls", PgType::Reg(crabgresql_types::RegKind::Class)),
-            ],
-        )) {
-            panic!("failed to create the reg* test table: {error}");
-        }
-        let engine: Arc<dyn TableEngine> = engine;
-        let plan = copy_plan(&engine, "COPY r FROM stdin");
-        assert!(
-            matches!(
-                copy_rows(&plan, vec![vec![field("1"), field("pg_class")]]),
-                InsertSource::Values(_)
-            ),
-            "a reg* column needs the relation catalog, so it cannot fold at load time"
-        );
-    }
+    fn every_column_type_parses_into_the_shape_its_typmod_expects() {
+        use crabgresql_types::{Numeric, oid};
 
-    /// An array of a session-dependent element is read under UTC on the
-    /// expression path, so folding it here would disagree with the fallback.
-    #[test]
-    fn copy_falls_back_for_an_array_of_a_session_dependent_type() {
-        use crabgresql_types::oid;
-        for elem in [oid::INTERVAL, oid::TIMESTAMPTZ, oid::TIMETZ] {
-            assert!(
-                !copy_fast_path_admits(PgType::Array(elem)),
-                "an array of oid {elem} must stay on the expression path"
-            );
-        }
-        // The scalar forms do fold: the load holds the session those need.
-        for ty in [PgType::Interval, PgType::TimestampTz, PgType::TimeTz] {
-            assert!(
-                copy_fast_path_admits(ty),
-                "{ty:?} folds against the session"
-            );
+        // (type, typmod, a literal that type accepts)
+        let cases: Vec<(PgType, i32, &str)> = vec![
+            (PgType::Bool, -1, "t"),
+            (PgType::Char, -1, "a"),
+            (PgType::Int2, -1, "1"),
+            (PgType::Int4, -1, "1"),
+            (PgType::Int8, -1, "1"),
+            (PgType::Oid, -1, "1"),
+            (PgType::Float4, -1, "1.5"),
+            (PgType::Float8, -1, "1.5"),
+            (PgType::Numeric, -1, "1.5"),
+            (PgType::Numeric, Numeric::pack_typmod(5, 2), "1.5"),
+            (PgType::Text, -1, "abc"),
+            (PgType::Varchar, -1, "abc"),
+            (PgType::Varchar, 5, "abc"),
+            (PgType::Bpchar, -1, "abc"),
+            (PgType::Bpchar, 5, "abc"),
+            (PgType::Name, -1, "abc"),
+            (PgType::Bytea, -1, r"\x4142"),
+            (PgType::Uuid, -1, "00000000-0000-0000-0000-000000000001"),
+            (PgType::Date, -1, "2020-01-01"),
+            (PgType::Time, -1, "01:02:03"),
+            (PgType::Time, 2, "01:02:03.456"),
+            (PgType::TimeTz, -1, "01:02:03+00"),
+            (PgType::TimeTz, 2, "01:02:03.456+00"),
+            (PgType::Timestamp, -1, "2020-01-01 01:02:03"),
+            (PgType::Timestamp, 2, "2020-01-01 01:02:03.456"),
+            (PgType::TimestampTz, -1, "2020-01-01 01:02:03+00"),
+            (PgType::TimestampTz, 2, "2020-01-01 01:02:03.456+00"),
+            (PgType::Interval, -1, "1 day"),
+            (PgType::Interval, 2, "1.456 seconds"),
+            (PgType::Bit, -1, "1010"),
+            (PgType::Bit, 4, "1010"),
+            (PgType::Varbit, -1, "1010"),
+            (PgType::Varbit, 4, "1010"),
+            (PgType::Inet, -1, "10.0.0.1"),
+            (PgType::Cidr, -1, "10.0.0.0/8"),
+            (PgType::Macaddr, -1, "08:00:2b:01:02:03"),
+            (PgType::Macaddr8, -1, "08:00:2b:01:02:03:04:05"),
+            (PgType::Money, -1, "$1.00"),
+            (PgType::Json, -1, r#"{"a":1}"#),
+            (PgType::Jsonb, -1, r#"{"a":1}"#),
+            (PgType::Jsonpath, -1, "$.a"),
+            (PgType::Tsvector, -1, "a b"),
+            (PgType::Tsquery, -1, "a & b"),
+            (PgType::Xid, -1, "1"),
+            (PgType::Xid8, -1, "1"),
+            (PgType::Tid, -1, "(0,1)"),
+            (PgType::PgLsn, -1, "0/0"),
+            (PgType::Point, -1, "(1,2)"),
+            (PgType::Lseg, -1, "[(1,2),(3,4)]"),
+            (PgType::Box, -1, "(1,2),(3,4)"),
+            (PgType::Path, -1, "[(1,2),(3,4)]"),
+            (PgType::Line, -1, "{1,2,3}"),
+            (PgType::Circle, -1, "<(1,2),3>"),
+            (PgType::Polygon, -1, "((1,2),(3,4),(5,6))"),
+            (PgType::Array(oid::INT4), -1, "{1,2}"),
+            (PgType::Array(oid::TEXT), -1, "{a,b}"),
+            (
+                PgType::Array(oid::TIMESTAMPTZ),
+                -1,
+                "{2020-01-01 00:00:00+00}",
+            ),
+        ];
+
+        let fmt = FmtCtx::utc_default();
+        for (ty, typmod, literal) in cases {
+            let column = Column::with_typmod("c", ty, typmod);
+            let value = match parse_unknown(literal, ty, &fmt) {
+                Ok(value) => value,
+                Err(e) => panic!("{ty:?} typmod {typmod} rejected {literal:?}: {e}"),
+            };
+            if let Err(e) = apply_column_typmod(value, &column) {
+                panic!(
+                    "{ty:?} typmod {typmod}: parse_unknown and apply_column_typmod \
+                     disagree on the value shape for {literal:?}: {e}"
+                );
+            }
         }
     }
 
