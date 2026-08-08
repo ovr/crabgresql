@@ -560,10 +560,10 @@ impl PgType {
     /// Whether the executor's `agg::hash_key` gives distinct values of this type
     /// distinct-enough hashes — i.e. equality is a raw-representation compare, so
     /// hashing that representation agrees with `keys_equal`. Types that fail this
-    /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `point`, `lseg`,
-    /// and user types) all hash into one shared bucket, so a hash join keyed on
-    /// them would collapse to a full scan; the join planner keeps such equalities
-    /// as nested-loop predicates instead.
+    /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `point`, `lseg`)
+    /// all hash into one shared bucket, so a hash join keyed on them would
+    /// collapse to a full scan; the join planner keeps such equalities as
+    /// nested-loop predicates instead.
     ///
     /// Must stay in sync with `hash_key` — and that function's own doc explains
     /// why the sync is load-bearing for correctness rather than for speed: the
@@ -616,6 +616,12 @@ impl PgType {
                 // distinctly, and its equality is element-wise — so hashing the
                 // element sequence agrees with `keys_equal`.
                 | PgType::Vector(_)
+                // An enum compares by ordinal within its own type, and
+                // `hash_key` hashes `(type oid, ordinal)` — the label is the
+                // spelling, never the identity. A value carrying some other
+                // enum's type oid contributes nothing to either side, so the
+                // two still agree.
+                | PgType::User(_)
         )
     }
 

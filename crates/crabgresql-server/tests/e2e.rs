@@ -99,6 +99,70 @@ async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Cl
     client
 }
 
+/// An enum key travels the same hash paths every other type does — the join's
+/// hash table, `GROUP BY`, and `count(DISTINCT)`. All three identify a value by
+/// `(type, ordinal)`, never by the label it prints as.
+#[tokio::test]
+async fn enum_keys_hash_join_group_and_deduplicate() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        .await?;
+    client
+        .simple_query("CREATE TABLE reports (who text, m mood)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE weights (m mood, w int)")
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO reports VALUES ('a', 'sad'), ('b', 'happy'), \
+             ('c', 'happy'), ('d', 'ok')",
+        )
+        .await?;
+    client
+        .simple_query("INSERT INTO weights VALUES ('happy', 3), ('sad', 1)")
+        .await?;
+
+    // The equality is a hash key now that an enum hashes distinctly; the answer
+    // must be the one a nested loop would give.
+    let joined = client
+        .simple_query("SELECT r.who, w.w FROM reports r JOIN weights w ON r.m = w.m ORDER BY r.who")
+        .await?;
+    let joined = rows(&joined);
+    assert_eq!(joined.len(), 3, "'ok' has no weight row");
+    assert_eq!((joined[0].get(0), joined[0].get(1)), (Some("a"), Some("1")));
+    assert_eq!((joined[1].get(0), joined[1].get(1)), (Some("b"), Some("3")));
+    assert_eq!((joined[2].get(0), joined[2].get(1)), (Some("c"), Some("3")));
+
+    // Grouping follows the definition order, not the alphabet.
+    let grouped = client
+        .simple_query("SELECT m, count(*) FROM reports GROUP BY m ORDER BY m")
+        .await?;
+    let grouped = rows(&grouped);
+    assert_eq!(grouped.len(), 3);
+    assert_eq!(
+        (grouped[0].get(0), grouped[0].get(1)),
+        (Some("sad"), Some("1"))
+    );
+    assert_eq!(
+        (grouped[1].get(0), grouped[1].get(1)),
+        (Some("ok"), Some("1"))
+    );
+    assert_eq!(
+        (grouped[2].get(0), grouped[2].get(1)),
+        (Some("happy"), Some("2"))
+    );
+
+    let distinct = client
+        .simple_query("SELECT count(DISTINCT m) FROM reports")
+        .await?;
+    assert_eq!(rows(&distinct)[0].get(0), Some("3"));
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn enum_catalog_and_type_boundaries_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
