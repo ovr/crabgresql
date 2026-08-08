@@ -152,6 +152,72 @@ SELECT 'a%b' LIKE 'a\%b' AS esc1, 'axb' LIKE 'a\%b' AS esc2,
  t    | f    | t
 (1 row)
 
+-- the shapes a pattern can take: anchored both ends, prefix, suffix, contains,
+-- doubled and interior wildcards, and a pattern that is nothing but wildcards
+SELECT 'abc' LIKE 'abc' AS exact, 'abc' LIKE 'abc%' AS prefix,
+       'abc' LIKE '%abc' AS suffix, 'xabcx' LIKE '%abc%' AS contains,
+       'xabcx' LIKE '%%abc%%' AS doubled, 'abcde' LIKE 'a%c%e' AS interior,
+       'abc' LIKE '%' AS anything, '' LIKE '%%' AS empty_anything;
+ exact | prefix | suffix | contains | doubled | interior | anything | empty_anything 
+-------+--------+--------+----------+---------+----------+----------+----------------
+ t     | t      | t      | t        | t       | t        | t        | t
+(1 row)
+
+-- `_` is a character, not a byte, and `%` may match nothing at all
+SELECT 'é' LIKE '_' AS one_char, 'é' LIKE '__' AS two_chars,
+       'aéb' LIKE 'a_b' AS mid_char, 'ab' LIKE 'a%b' AS star_matches_empty,
+       'abab' LIKE '%ab' AS greedy_still_finds_the_end;
+ one_char | two_chars | mid_char | star_matches_empty | greedy_still_finds_the_end 
+----------+-----------+----------+--------------------+----------------------------
+ t        | f         | t        | t                  | t
+(1 row)
+
+-- the escape character may itself be a wildcard, which then loses its meaning
+SELECT 'maca' LIKE 'm%aca' ESCAPE '%' AS pct_escape,
+       'be_r' LIKE 'b_e__r' ESCAPE '_' AS underscore_escape,
+       'h%awkeye' LIKE 'h#%a%k%e' ESCAPE '#' AS escaped_then_wild;
+ pct_escape | underscore_escape | escaped_then_wild 
+------------+-------------------+-------------------
+ t          | t                 | t
+(1 row)
+
+-- ESCAPE '' disables escaping; a trailing bare escape is an error
+SELECT 'a\b' LIKE 'a\b' ESCAPE '' AS no_escape;
+ no_escape 
+-----------
+ t
+(1 row)
+
+SELECT 'ab' LIKE 'a\';
+ERROR:  LIKE pattern must not end with escape character
+-- ILIKE folds both sides; a NULL operand makes the whole predicate NULL
+SELECT 'FooBar' ILIKE '%oob%' AS i1, 'FooBar' NOT ILIKE '%oob%' AS i2,
+       NULL LIKE 'a%' AS n1, 'abc' LIKE NULL AS n2;
+ i1 | i2 | n1 | n2 
+----+----+----+----
+ t  | f  |    | 
+(1 row)
+
+-- the ESCAPE is validated as part of the pattern, so a malformed one is an
+-- error even when the subject is NULL -- but a NULL pattern suppresses it
+SELECT NULL::text LIKE 'y' ESCAPE '\' AS null_subject;
+ null_subject 
+--------------
+ 
+(1 row)
+
+SELECT 'x' LIKE NULL ESCAPE 'ab' AS null_pattern;
+ null_pattern 
+--------------
+ 
+(1 row)
+
+SELECT NULL::text LIKE 'y' ESCAPE 'ab';
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
+SELECT NULL::text ILIKE 'y' ESCAPE 'ab';
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
 -- POSIX regex operators: ~ / ~* / !~, with anchors and case-insensitivity
 SELECT 'abc' ~ 'b' AS r1, 'abc' ~ '^a' AS r2, 'abc' ~ '^b' AS r3,
        'ABC' ~* 'abc' AS r4, 'abc' !~ 'z' AS r5;

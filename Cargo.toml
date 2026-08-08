@@ -41,6 +41,10 @@ deepsize = "0.2"
 icu_collator = "2"
 icu_locale_core = "2"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# The case-insensitive substring prefilter for `ILIKE`. `str::find` carries its
+# own prefilter for the case-sensitive side, but there is no `str` API that
+# scans for two candidate bytes at once.
+memchr = "2"
 regex = "1"
 # `regex::Error` is opaque, so classifying a compile failure (an unsupported
 # construct versus a malformed pattern) needs the parser's own error enum.

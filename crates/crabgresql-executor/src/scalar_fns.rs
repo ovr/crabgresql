@@ -97,6 +97,12 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Text)
                 .map_err(text_err);
         }
+        // LIKE validates its ESCAPE even when the subject is NULL, so it cannot
+        // sit behind the blanket check either (see `eval_like`).
+        ScalarFn::Like | ScalarFn::ILike => {
+            let ci = matches!(func, ScalarFn::ILike);
+            return eval_like(ci, &args[0], &args[1], args.get(2));
+        }
         // quote_nullable is non-strict: a NULL argument becomes the text `NULL`.
         ScalarFn::QuoteNullable => {
             return Ok(Value::Text(text::quote_nullable(
@@ -369,13 +375,6 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::ToHex => return Ok(Value::Text(text::to_hex_i32(i4(&args[0])))),
         ScalarFn::ToHexInt8 => return Ok(Value::Text(text::to_hex_i64(i8(&args[0])))),
-        ScalarFn::Like | ScalarFn::ILike => {
-            let ci = matches!(func, ScalarFn::ILike);
-            let escape = escape_char(args.get(2))?;
-            return text::like(text(&args[0]), text(&args[1]), escape, ci)
-                .map(Value::Bool)
-                .map_err(text_err);
-        }
         ScalarFn::RegexMatch | ScalarFn::RegexIMatch => {
             let ci = matches!(func, ScalarFn::RegexIMatch);
             return text::regex_match(text(&args[0]), text(&args[1]), ci)
@@ -1467,6 +1466,34 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
 
 fn text_err(e: text::TextError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+/// `LIKE` / `ILIKE`, taking its arguments by reference so the row path can call
+/// it without materializing a `Vec<Value>` (see `eval.rs`). `eval_scalar`'s own
+/// arm routes here too, so there is one copy of the semantics and two dispatch
+/// sites rather than two implementations.
+///
+/// Not uniformly STRICT, which is why `eval_scalar` dispatches it ahead of the
+/// blanket NULL check: PG evaluates `like_escape(pattern, escape)` first, so a
+/// NULL pattern or escape yields NULL with no validation, but a malformed
+/// escape is an error even when the *subject* is NULL —
+/// `NULL::text LIKE 'y' ESCAPE 'ab'` raises `22025` rather than returning NULL.
+pub(crate) fn eval_like(
+    case_insensitive: bool,
+    subject: &Value,
+    pattern: &Value,
+    escape: Option<&Value>,
+) -> Result<Value, ExecError> {
+    if matches!(pattern, Value::Null) || matches!(escape, Some(Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let escape = escape_char(escape)?;
+    if matches!(subject, Value::Null) {
+        return Ok(Value::Null);
+    }
+    text::like(text(subject), text(pattern), escape, case_insensitive)
+        .map(Value::Bool)
+        .map_err(text_err)
 }
 
 /// The `ESCAPE` argument shared by `SIMILAR TO` and the SQL-regex `substring`
