@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786209642145,
+  "lastUpdate": 1786209643757,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -5152,6 +5152,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 22377.844687,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee035e10d7ab422944d4e5523a038d9061bd7197",
+          "message": "feat: Support PREPARE/EXECUTE/DEALLOCATE and pg_prepared_statements (#188)",
+          "timestamp": "2026-08-08T18:27:36+02:00",
+          "tree_id": "fd9b2fca088fa427bffe031c436c3ccb940dd737",
+          "url": "https://github.com/ovr/crabgresql/commit/ee035e10d7ab422944d4e5523a038d9061bd7197"
+        },
+        "date": 1786209643680,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 500.114618,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 22560.662061,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
