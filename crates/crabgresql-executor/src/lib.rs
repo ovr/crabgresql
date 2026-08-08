@@ -9,6 +9,7 @@ mod agg;
 mod checks;
 pub mod eval;
 mod generate_series;
+mod keyindex;
 mod md5;
 pub mod reg;
 pub mod scalar_fns;
@@ -19,8 +20,10 @@ pub mod vector;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
@@ -3331,7 +3334,7 @@ pub struct HashJoin {
     /// Key hash → the `(right-row index, key values)` of every inner row carrying
     /// that hash. Only rows with fully non-NULL keys appear here; the stored key
     /// values are the collision guard checked by `keys_equal` at probe time.
-    buckets: HashMap<u64, Vec<(usize, Vec<Value>)>>,
+    buckets: FxHashMap<u64, Vec<(usize, Vec<Value>)>>,
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
@@ -3392,7 +3395,7 @@ impl HashJoin {
         // whose left half is NULL padding and whose right half is the inner row.
         // One scratch buffer is reused across rows: its left half stays NULL and
         // only the right half is overwritten per row.
-        let mut buckets: HashMap<u64, Vec<(usize, Vec<Value>)>> = HashMap::new();
+        let mut buckets: FxHashMap<u64, Vec<(usize, Vec<Value>)>> = FxHashMap::default();
         let mut scratch = vec![Value::Null; left_width + right_width];
         for (index, row) in right_rows.iter().enumerate() {
             scratch.truncate(left_width);
@@ -3687,19 +3690,22 @@ impl Distinct {
     ) -> Result<Self, ExecError> {
         let key_tys: Vec<PgType> = keys.iter().map(|k| k.ty).collect();
         let mut out: Vec<Tuple> = Vec::new();
-        // Hash of a row's distinct key → indices into `out` of surviving rows
-        // sharing that hash; `keys_equal` resolves collisions. Mirrors the
-        // grouping in `Aggregate::build`.
-        let mut lookup: HashMap<u64, Vec<usize>> = HashMap::new();
+        // A row's distinct key → the index into `out` of the row that already
+        // represents it. Mirrors the grouping in `Aggregate::build`.
+        let mut lookup = keyindex::GroupIndex::new(&key_tys);
         while let Some(row) = child.next()? {
             let key: Vec<Value> = keys.iter().map(|k| row[k.column].clone()).collect();
-            let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
-            let seen = bucket.iter().copied().any(|i| {
-                let existing: Vec<Value> = keys.iter().map(|k| out[i][k.column].clone()).collect();
-                agg::keys_equal(&key_tys, &existing, &key)
+            // A surviving row's key is read column by column out of `out[i]`
+            // rather than gathered into a `Vec`: a probe compares against every
+            // candidate, and materializing each one would allocate per
+            // comparison (a `String` per text key column at that).
+            let seen = lookup.find(&key, |i| {
+                keys.iter()
+                    .zip(&key)
+                    .all(|(k, probe)| agg::value_eq(k.ty, &out[i][k.column], probe))
             });
-            if !seen {
-                bucket.push(out.len());
+            if seen.is_none() {
+                lookup.record(&key, out.len());
                 out.push(row);
             }
         }
@@ -3764,10 +3770,10 @@ impl Aggregate {
     fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
         let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
         let mut groups: Vec<AggGroup> = Vec::new();
-        // Hash of each group's key → the indices of groups sharing that hash, so
-        // a row finds its group in ~O(1); `keys_equal` resolves hash collisions.
-        // Groups stay in first-seen order (accumulation follows scan order).
-        let mut lookup: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Each group's key → its index in `groups`, so a row finds its group in
+        // ~O(1). Groups stay in first-seen order (accumulation follows scan
+        // order).
+        let mut lookup = keyindex::GroupIndex::new(&key_tys);
         // The implicit single group needs one seeded group so an empty input
         // still produces a row.
         if self.group_exprs.is_empty() {
@@ -3790,15 +3796,11 @@ impl Aggregate {
                     .iter()
                     .map(|e| eval(e, &row, &self.ctx))
                     .collect::<Result<Vec<_>, _>>()?;
-                let bucket = lookup.entry(agg::hash_key(&key_tys, &key)).or_default();
-                match bucket
-                    .iter()
-                    .copied()
-                    .find(|&i| agg::keys_equal(&key_tys, &groups[i].key, &key))
-                {
+                match lookup.find(&key, |i| agg::keys_equal(&key_tys, &groups[i].key, &key)) {
                     Some(i) => i,
                     None => {
                         let i = groups.len();
+                        lookup.record(&key, i);
                         groups.push(AggGroup {
                             key,
                             accumulators: self
@@ -3814,7 +3816,6 @@ impl Aggregate {
                                 })
                                 .collect(),
                         });
-                        bucket.push(i);
                         i
                     }
                 }
@@ -6235,6 +6236,38 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// `count(DISTINCT x)`, `SELECT DISTINCT x` and `GROUP BY x` are three
+    /// separate lookups over the same notion of key equality, each with its own
+    /// specialized storage. They may not disagree on how many values there are.
+    #[test]
+    fn distinct_paths_agree_on_key_equality() {
+        // Text: case and *trailing* blanks each make a new value, and the two
+        // NULLs are one group for GROUP BY but no value at all for the
+        // aggregate.
+        let rows = "(VALUES ('a'), ('a'), ('A'), ('a '), (' a'), (NULL), (NULL)) t(x)";
+        let (_c, agg) = run_rows(&format!("SELECT count(DISTINCT x) FROM {rows}"));
+        assert_eq!(agg, vec![vec![Value::Int8(4)]]);
+        let (_c, distinct) = run_rows(&format!("SELECT DISTINCT x FROM {rows}"));
+        assert_eq!(
+            distinct.len(),
+            5,
+            "DISTINCT keeps the NULL group: {distinct:?}"
+        );
+        let (_c, grouped) = run_rows(&format!("SELECT x FROM {rows} GROUP BY x"));
+        assert_eq!(
+            grouped.len(),
+            5,
+            "GROUP BY keeps the NULL group: {grouped:?}"
+        );
+
+        // Numeric stays on the general path: display scale is not identity.
+        let rows = "(VALUES (1), (1.0), (1.00), (2), (NULL)) t(x)";
+        let (_c, agg) = run_rows(&format!("SELECT count(DISTINCT x) FROM {rows}"));
+        assert_eq!(agg, vec![vec![Value::Int8(2)]]);
+        let (_c, grouped) = run_rows(&format!("SELECT x FROM {rows} GROUP BY x"));
+        assert_eq!(grouped.len(), 3, "two numerics and the NULL: {grouped:?}");
     }
 
     #[test]

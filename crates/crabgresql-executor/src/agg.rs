@@ -9,9 +9,9 @@
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crabgresql_binder::{AggFn, BoundAggregate};
 use crabgresql_types::{Numeric, PgType, Value, float};
@@ -24,33 +24,192 @@ use crate::eval::{compare_values, compare_values_for_aggregate};
 /// grouping, so duplicate elimination matches PostgreSQL's value semantics.
 pub struct DistinctValues {
     ty: PgType,
-    buckets: HashMap<u64, Vec<Value>>,
+    kind: Kind,
+}
+
+/// How one `DISTINCT` aggregate remembers what it has seen. The variant is
+/// picked once from the input type, so the per-row path holds no type dispatch
+/// beyond one `match` over three arms.
+enum Kind {
+    /// Types whose [`keys_equal`] is the comparison of a single raw field that
+    /// fits in a `u64` losslessly (see [`scalar_code`]). Storing the code
+    /// instead of the value costs no `Value` clone and no per-bucket `Vec`.
+    Scalar {
+        seen: FxHashSet<u64>,
+        odd: Vec<Value>,
+    },
+    /// `text`/`varchar`/`name`/`bpchar`: equality is bytewise, since every
+    /// collation this engine supports is deterministic (see
+    /// `crabgresql_types::collation`). A hit allocates nothing — the lookup
+    /// borrows `&str` — and a miss allocates one `Box<str>` per distinct value.
+    /// `bpchar` is stored with trailing blanks trimmed, as its equality ignores
+    /// them.
+    Text {
+        seen: FxHashSet<Box<str>>,
+        odd: Vec<Value>,
+    },
+    /// Everything else — `numeric` (equal across display scales), `uuid`,
+    /// `bytea`, `jsonb`, and the types that hash to nothing at all. Buckets of
+    /// values narrowed by [`hash_key`] and decided by [`keys_equal`].
+    Generic(FxHashMap<u64, Vec<Value>>),
 }
 
 impl DistinctValues {
     pub fn new(ty: PgType) -> Self {
-        Self {
-            ty,
-            buckets: HashMap::new(),
-        }
+        let kind = match ty {
+            PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar => Kind::Text {
+                seen: FxHashSet::default(),
+                odd: Vec::new(),
+            },
+            _ if scalar_coded(ty) => Kind::Scalar {
+                seen: FxHashSet::default(),
+                odd: Vec::new(),
+            },
+            _ => Kind::Generic(FxHashMap::default()),
+        };
+        Self { ty, kind }
     }
 
     /// Record `value` if it has not appeared before, returning whether the
     /// caller should pass it to the aggregate accumulator.
+    ///
+    /// `value` is never NULL: [`feed`] drops NULL inputs before any aggregate
+    /// sees them, so no variant here has to encode one.
     pub fn insert(&mut self, value: &Value) -> bool {
-        let tys = [self.ty];
-        let values = std::slice::from_ref(value);
-        let bucket = self.buckets.entry(hash_key(&tys, values)).or_default();
-        if bucket
-            .iter()
-            .any(|seen| keys_equal(&tys, std::slice::from_ref(seen), values))
-        {
-            false
-        } else {
-            bucket.push(value.clone());
-            true
+        debug_assert!(!matches!(value, Value::Null), "DISTINCT saw a NULL input");
+        match &mut self.kind {
+            Kind::Scalar { seen, odd } => match scalar_code(self.ty, value) {
+                Some(code) => seen.insert(code),
+                None => insert_odd(self.ty, odd, value),
+            },
+            Kind::Text { seen, odd } => match text_key(self.ty, value) {
+                Some(key) => {
+                    if seen.contains(key) {
+                        false
+                    } else {
+                        seen.insert(key.into());
+                        true
+                    }
+                }
+                None => insert_odd(self.ty, odd, value),
+            },
+            Kind::Generic(buckets) => {
+                let tys = [self.ty];
+                let values = std::slice::from_ref(value);
+                let bucket = buckets.entry(hash_key(&tys, values)).or_default();
+                if bucket
+                    .iter()
+                    .any(|seen| keys_equal(&tys, std::slice::from_ref(seen), values))
+                {
+                    false
+                } else {
+                    bucket.push(value.clone());
+                    true
+                }
+            }
         }
     }
+}
+
+/// The escape hatch for a value whose variant does not match the type the
+/// binder promised. It cannot be dropped (that would undercount) and it cannot
+/// be admitted blindly (that would overcount), so it goes to a list compared
+/// with the general equality. In practice the list stays empty.
+fn insert_odd(ty: PgType, odd: &mut Vec<Value>, value: &Value) -> bool {
+    debug_assert!(false, "DISTINCT over {ty:?} got {value:?}");
+    if odd.iter().any(|seen| value_eq(ty, seen, value)) {
+        false
+    } else {
+        odd.push(value.clone());
+        true
+    }
+}
+
+/// Whether [`scalar_code`] has an encoding for `ty`. Kept beside it so the two
+/// cannot drift: a type listed here without an arm there sends every value to
+/// the `odd` list.
+pub(crate) fn scalar_coded(ty: PgType) -> bool {
+    matches!(
+        ty,
+        PgType::Bool
+            | PgType::Char
+            | PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float4
+            | PgType::Float8
+            | PgType::Oid
+            | PgType::Xid
+            | PgType::Xid8
+            | PgType::PgLsn
+            | PgType::Money
+            | PgType::Date
+            | PgType::Time
+            | PgType::Timestamp
+            | PgType::TimestampTz
+            | PgType::Tid
+            | PgType::Reg(_)
+            | PgType::User(_)
+    )
+}
+
+/// Pack a value into a `u64` that is equal for exactly the values [`keys_equal`]
+/// calls equal — an *injective* encoding, unlike [`hash_key`], which may collide.
+/// That is why only types whose equality is one raw-field comparison appear
+/// here: `numeric` (`1.0` = `1.00`) and `interval` do not, and never can.
+///
+/// `None` means the value is not of the variant `ty` promises; the caller falls
+/// back to the general equality rather than guessing.
+pub(crate) fn scalar_code(ty: PgType, v: &Value) -> Option<u64> {
+    Some(match (ty, v) {
+        (PgType::Bool, Value::Bool(b)) => *b as u64,
+        // `"char"` orders unsigned, and equality is the same either way.
+        (PgType::Char, Value::Char(c)) => *c as u64,
+        (PgType::Int2, Value::Int2(n)) => *n as i64 as u64,
+        (PgType::Int4, Value::Int4(n)) => *n as i64 as u64,
+        (PgType::Int8, Value::Int8(n)) => *n as u64,
+        // Canonicalize in the value's own width before taking the bits, so
+        // every NaN and both zeros land on one code (`-0.0f32 as f64` is
+        // still `-0.0`, so widening first would not do it).
+        (PgType::Float4, Value::Float4(x)) => canonical_f32(*x).to_bits() as u64,
+        (PgType::Float8, Value::Float8(x)) => canonical_f64(*x).to_bits(),
+        (PgType::Oid, Value::Oid(o)) => *o as u64,
+        (PgType::Xid, Value::Xid(x)) => *x as u64,
+        (PgType::Xid8, Value::Xid8(x)) => *x,
+        (PgType::PgLsn, Value::PgLsn(x)) => *x,
+        (PgType::Money, Value::Money(m)) => *m as u64,
+        // ±infinity are the plain `i32`/`i64` sentinels, so they encode as
+        // themselves.
+        (PgType::Date, Value::Date(d)) => *d as i64 as u64,
+        (PgType::Time, Value::Time(t)) => *t as u64,
+        (PgType::Timestamp, Value::Timestamp(t)) => *t as u64,
+        (PgType::TimestampTz, Value::TimestampTz(t)) => *t as u64,
+        (PgType::Tid, Value::Tid { block, offset }) => (*block as u64) << 16 | *offset as u64,
+        // A `reg*` compares by OID alone: the rendered name is display only.
+        (PgType::Reg(_), Value::Reg(r)) => r.oid as u64,
+        // An enum compares by ordinal within its own type; the label is the
+        // spelling, not the identity. A value of some other enum type is not
+        // this type's value at all, so it takes the `odd` path.
+        (
+            PgType::User(type_oid),
+            Value::Enum {
+                type_oid: value_oid,
+                ordinal,
+                ..
+            },
+        ) if *value_oid == type_oid => (type_oid as u64) << 32 | *ordinal as u64,
+        _ => return None,
+    })
+}
+
+/// The bytes that decide a string value's identity: the string itself, minus
+/// the trailing blanks `bpchar` equality ignores.
+pub(crate) fn text_key(ty: PgType, v: &Value) -> Option<&str> {
+    let Value::Text(s) = v else { return None };
+    Some(match ty {
+        PgType::Bpchar => s.trim_end_matches(' '),
+        _ => s,
+    })
 }
 
 /// The running state of one aggregate over one group.
@@ -366,8 +525,13 @@ pub fn feed(
 /// second definition of key equality). It is not one here only because the
 /// buckets never decide: they narrow the candidates, and `keys_equal` answers.
 /// Widening this function is safe; making it finer than `keys_equal` is not.
+///
+/// The hash value itself is never persisted — it only keys in-process maps, and
+/// no two runs have to agree on it — so the *function* is free to change (a
+/// faster hasher, a new arm for a type that used to contribute nothing). What
+/// cannot change is the consistency above.
 pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     for (ty, v) in tys.iter().zip(values) {
         let v = v.borrow();
         if matches!(v, Value::Null) {
@@ -537,6 +701,18 @@ fn canonical_f64(x: f64) -> f64 {
     }
 }
 
+/// [`canonical_f64`] at `float4` width, for the encoding that takes the bits of
+/// the value as stored.
+fn canonical_f32(x: f32) -> f32 {
+    if x.is_nan() {
+        f32::NAN
+    } else if x == 0.0 {
+        0.0
+    } else {
+        x
+    }
+}
+
 fn text_of(v: &Value) -> &str {
     match v {
         Value::Text(s) => s,
@@ -552,11 +728,18 @@ pub fn keys_equal<A: Borrow<Value>, B: Borrow<Value>>(tys: &[PgType], a: &[A], b
     a.iter()
         .zip(b)
         .zip(tys)
-        .all(|((x, y), ty)| match (x.borrow(), y.borrow()) {
-            (Value::Null, Value::Null) => true,
-            (Value::Null, _) | (_, Value::Null) => false,
-            (x, y) => compare_values(*ty, x, y) == Ordering::Equal,
-        })
+        .all(|((x, y), ty)| value_eq(*ty, x.borrow(), y.borrow()))
+}
+
+/// Whether two values of type `ty` are the same key: the one definition of key
+/// equality behind [`keys_equal`], exposed for callers that compare a key held
+/// column by column and so cannot hand over a slice.
+pub fn value_eq(ty: PgType, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (a, b) => compare_values(ty, a, b) == Ordering::Equal,
+    }
 }
 
 /// `avg`'s one division, shared so the two exact states cannot drift on the
@@ -619,9 +802,9 @@ fn bigint_out_of_range() -> ExecError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accumulator, hash_key};
+    use super::{Accumulator, DistinctValues, hash_key, value_eq};
     use crabgresql_binder::{AggFn, BoundAggregate};
-    use crabgresql_types::{PgType, Value};
+    use crabgresql_types::{Numeric, PgType, Value};
 
     /// Fold `values` through a real accumulator for `func` over `input_ty`, and
     /// render what it finalizes to — so the dispatch in `Accumulator::new` is
@@ -716,6 +899,190 @@ mod tests {
         assert_eq!(
             hash_key(&ty, &value(0, "red")),
             hash_key(&ty, &value(0, "red"))
+        );
+    }
+
+    /// How many of `values` a `DISTINCT` aggregate would accept, and how many
+    /// `keys_equal` says are distinct when compared pairwise. The specialized
+    /// storage in [`DistinctValues`] is an optimization only if these agree for
+    /// every type, so every case below asserts on both.
+    fn distinct_counts(ty: PgType, values: &[Value]) -> (usize, usize) {
+        let mut seen = DistinctValues::new(ty);
+        let accepted = values.iter().filter(|v| seen.insert(v)).count();
+        let mut pairwise: Vec<&Value> = Vec::new();
+        for v in values {
+            if !pairwise.iter().any(|seen| value_eq(ty, seen, v)) {
+                pairwise.push(v);
+            }
+        }
+        (accepted, pairwise.len())
+    }
+
+    #[track_caller]
+    fn assert_distinct_agrees(ty: PgType, values: &[Value], expected: usize) {
+        let (accepted, pairwise) = distinct_counts(ty, values);
+        assert_eq!(pairwise, expected, "pairwise equality over {ty:?}");
+        assert_eq!(accepted, expected, "DISTINCT storage over {ty:?}");
+    }
+
+    /// The encoded types have to be *injective*, not merely collision-free like
+    /// `hash_key`: two values sharing a code are silently the same value.
+    #[test]
+    fn distinct_over_encoded_types_matches_pairwise_equality() {
+        let text = |s: &str| Value::Text(s.to_string());
+
+        assert_distinct_agrees(
+            PgType::Int8,
+            &[
+                Value::Int8(0),
+                Value::Int8(0),
+                Value::Int8(-1),
+                Value::Int8(i64::MIN),
+                Value::Int8(i64::MAX),
+            ],
+            4,
+        );
+        // A `date`'s ±infinity are the plain sentinels, and so are a
+        // timestamp's — nothing about them needs a code of its own.
+        assert_distinct_agrees(
+            PgType::Date,
+            &[
+                Value::Date(0),
+                Value::Date(i32::MIN),
+                Value::Date(i32::MAX),
+                Value::Date(i32::MIN),
+            ],
+            3,
+        );
+        // `"char"` compares unsigned, but equality is blind to the sign either
+        // way; what matters is that all 256 bytes stay apart.
+        assert_distinct_agrees(
+            PgType::Char,
+            &[Value::Char(b'a'), Value::Char(0xff), Value::Char(b'a')],
+            2,
+        );
+        // Both zeros are one value and all NaNs are one value, at either width.
+        assert_distinct_agrees(
+            PgType::Float8,
+            &[
+                Value::Float8(0.0),
+                Value::Float8(-0.0),
+                Value::Float8(f64::NAN),
+                Value::Float8(-f64::NAN),
+                Value::Float8(1.0),
+            ],
+            3,
+        );
+        assert_distinct_agrees(
+            PgType::Float4,
+            &[
+                Value::Float4(0.0),
+                Value::Float4(-0.0),
+                Value::Float4(f32::NAN),
+                Value::Float4(-f32::NAN),
+                Value::Float4(1.0),
+            ],
+            3,
+        );
+        assert_distinct_agrees(
+            PgType::Tid,
+            &[
+                Value::Tid {
+                    block: 1,
+                    offset: 2,
+                },
+                Value::Tid {
+                    block: 1,
+                    offset: 2,
+                },
+                // Not the same address, and a shift-and-or that dropped a bit
+                // would say it was.
+                Value::Tid {
+                    block: 0,
+                    offset: 0x0001,
+                },
+                Value::Tid {
+                    block: 0x0001,
+                    offset: 0,
+                },
+            ],
+            3,
+        );
+        // Text is bytewise: case and trailing blanks each make a new value.
+        assert_distinct_agrees(
+            PgType::Text,
+            &[text("a"), text("A"), text("a "), text("a")],
+            3,
+        );
+        // bpchar equality ignores trailing blanks — but only trailing ones.
+        assert_distinct_agrees(
+            PgType::Bpchar,
+            &[text("a"), text("a  "), text("A"), text(" a")],
+            3,
+        );
+    }
+
+    /// The types deliberately left on the general path. If one of them ever
+    /// grows an encoding, this is what catches the loss.
+    #[test]
+    fn distinct_over_unencoded_types_matches_pairwise_equality() {
+        let numeric = |s: &str| Value::Numeric(Numeric::parse(s).expect("numeric literal"));
+
+        // Display scale is not identity: `1.0` and `1.00` are one value.
+        assert_distinct_agrees(
+            PgType::Numeric,
+            &[
+                numeric("1"),
+                numeric("1.0"),
+                numeric("1.00"),
+                numeric("NaN"),
+                numeric("NaN"),
+                numeric("2"),
+            ],
+            3,
+        );
+        assert_distinct_agrees(
+            PgType::Uuid,
+            &[
+                Value::Uuid([0; 16]),
+                Value::Uuid([1; 16]),
+                Value::Uuid([0; 16]),
+            ],
+            2,
+        );
+        // `interval` contributes nothing to the hash, so every value shares one
+        // bucket and `keys_equal` alone separates them — including the
+        // canonical-span equality that makes 24 hours and 1 day the same.
+        let interval =
+            |months, days, usec| Value::Interval(crabgresql_types::Interval { months, days, usec });
+        assert_distinct_agrees(
+            PgType::Interval,
+            &[
+                interval(0, 1, 0),
+                interval(0, 0, 24 * 3_600_000_000),
+                interval(1, 0, 0),
+            ],
+            2,
+        );
+    }
+
+    /// An enum is its `(type, ordinal)`: the label is the spelling, and a value
+    /// of a different enum type is not this type's value at all.
+    #[test]
+    fn distinct_over_enums_ignores_the_label() {
+        let value = |type_oid, ordinal, label: &str| Value::Enum {
+            type_oid,
+            ordinal,
+            label: label.to_string(),
+        };
+        assert_distinct_agrees(
+            PgType::User(16384),
+            &[
+                value(16384, 0, "red"),
+                value(16384, 0, "red"),
+                value(16384, 1, "green"),
+            ],
+            2,
         );
     }
 }
