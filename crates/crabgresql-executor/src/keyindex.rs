@@ -4,9 +4,18 @@
 //! Both nodes hold their groups themselves — one as accumulators, the other as
 //! surviving rows — and want the same thing from a key: "which group is this,
 //! if any". The index answers that, specializing its storage on the key type
-//! exactly as `agg::DistinctValues` does, so a single `int8` or `text` key
-//! costs one hash of the key itself instead of a hash, a bucket vector, and a
-//! type-dispatched comparison per candidate.
+//! through `agg::key_encoding`, the same classifier `agg::DistinctValues` asks,
+//! so a single `int8` or `text` key costs one hash of the key itself instead of
+//! a hash, a bucket vector, and a type-dispatched comparison per candidate.
+//!
+//! That shared classifier is as far as the sharing goes: this type and
+//! `DistinctValues` stay separate because they differ on *who owns the values
+//! equality is decided against*. `DistinctValues` owns them and answers for
+//! itself; this index owns only group numbers and delegates to a closure over
+//! storage it cannot see. Merging the two would force one of them to change
+//! sides — either a set that keeps a side arena and an indirection on the
+//! DISTINCT hot path, or an index that clones every group key, which is the
+//! per-key `String` clone `Distinct::new` exists to avoid.
 //!
 //! The API is two-phase — [`GroupIndex::find`] then [`GroupIndex::record`] —
 //! because the caller assigns the group's index only after deciding it is new,
@@ -55,22 +64,24 @@ enum Kind {
 
 impl GroupIndex {
     pub fn new(tys: &[PgType]) -> Self {
+        // Only a single-column key can be identified by an encoding of itself;
+        // a wide key needs the hash and the caller's equality either way.
         let kind = match tys {
-            [ty] if matches!(
-                ty,
-                PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar
-            ) =>
-            {
-                Kind::Text {
+            [ty] => match agg::key_encoding(*ty) {
+                agg::KeyEncoding::Scalar => Kind::Scalar {
                     ty: *ty,
                     groups: FxHashMap::default(),
                     null: None,
-                }
-            }
-            [ty] if agg::scalar_coded(*ty) => Kind::Scalar {
-                ty: *ty,
-                groups: FxHashMap::default(),
-                null: None,
+                },
+                agg::KeyEncoding::Text => Kind::Text {
+                    ty: *ty,
+                    groups: FxHashMap::default(),
+                    null: None,
+                },
+                agg::KeyEncoding::Generic => Kind::Generic {
+                    tys: tys.to_vec(),
+                    buckets: FxHashMap::default(),
+                },
             },
             _ => Kind::Generic {
                 tys: tys.to_vec(),
