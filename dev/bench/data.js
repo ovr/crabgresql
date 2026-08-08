@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786206270367,
+  "lastUpdate": 1786206272126,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -4504,6 +4504,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 22976.692073,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "zaets28rus@gmail.com",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "d16ae74b34d777387dd3b55c9222515729ec8b6f",
+          "message": "test(copy): pin COPY and INSERT agreeing across the typmod families\n\nThe suite's only COPY-vs-INSERT case ran on `interval[]`, which the load path\nused to reject — so it compared the fallback against INSERT, which are the same\ncode. Nothing checked the property the two paths exist to preserve.\n\n`cpsame` now loads one row each way across sixteen columns covering every typmod\nfamily and the types whose input reads the session, and asserts every column\nagrees; `cprej` does the same for the values that must be rejected, DETAIL\nincluded. `jsonb` is left out of the rejection set because PostgreSQL names that\nerror after `json`, a divergence of its own and not this suite's subject.\n\nThe tables take the file's own `cp*` prefix: all 79 smoke tests share one\ndatabase, and `num`, `en`, `bad` and `ord` are names a future numeric or enum\ntest would reach for.\n\nAlso drops a `WHERE n IS NOT NULL` that hid the invariant it depended on — the\nCOPY before it is expected to fail, so the table holds exactly one row — and\ncorrects a fixture that set `typmod` to 9 while calling itself `bpchar(5)`;\n`Column::typmod` is the bare length, and `atttypmod()` is what adds the header.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-08-08T17:30:56+02:00",
+          "tree_id": "0ceb7dd22841d3cebccb98c5ee35dfa937b43b72",
+          "url": "https://github.com/ovr/crabgresql/commit/d16ae74b34d777387dd3b55c9222515729ec8b6f"
+        },
+        "date": 1786206272082,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 500.364704,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 22377.844687,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
