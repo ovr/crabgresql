@@ -197,10 +197,10 @@ pub(crate) fn scalar_code(ty: PgType, v: &Value) -> u64 {
         (PgType::Int2, Value::Int2(n)) => *n as i64 as u64,
         (PgType::Int4, Value::Int4(n)) => *n as i64 as u64,
         (PgType::Int8, Value::Int8(n)) => *n as u64,
-        // Canonicalize in the value's own width before taking the bits, so
-        // every NaN and both zeros land on one code (`-0.0f32 as f64` is
-        // still `-0.0`, so widening first would not do it).
-        (PgType::Float4, Value::Float4(x)) => canonical_f32(*x).to_bits() as u64,
+        // `float4` widens first, as `hash_key` does: `f32 -> f64` is exact, so
+        // the code stays injective, and `canonical_f64` still collapses the two
+        // zeros (it tests `x == 0.0`, which `-0.0` satisfies) and every NaN.
+        (PgType::Float4, Value::Float4(x)) => canonical_f64(*x as f64).to_bits(),
         (PgType::Float8, Value::Float8(x)) => canonical_f64(*x).to_bits(),
         (PgType::Oid, Value::Oid(o)) => *o as u64,
         (PgType::Xid, Value::Xid(x)) => *x as u64,
@@ -715,18 +715,6 @@ pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
 fn canonical_f64(x: f64) -> f64 {
     if x.is_nan() {
         f64::NAN
-    } else if x == 0.0 {
-        0.0
-    } else {
-        x
-    }
-}
-
-/// [`canonical_f64`] at `float4` width, for the encoding that takes the bits of
-/// the value as stored.
-fn canonical_f32(x: f32) -> f32 {
-    if x.is_nan() {
-        f32::NAN
     } else if x == 0.0 {
         0.0
     } else {

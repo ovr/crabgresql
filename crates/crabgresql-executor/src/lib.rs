@@ -6248,6 +6248,23 @@ mod tests {
         Ok(())
     }
 
+    /// Both zeros are one value and every NaN is one value, at either float
+    /// width. `float4` reaches this through a widening cast, so it needs its own
+    /// case: the cast alone preserves `-0.0`, and only the canonicalization
+    /// after it folds the two zeros together.
+    #[test]
+    fn distinct_floats_fold_both_zeros_and_every_nan() {
+        for ty in ["float4", "float8"] {
+            let rows = format!(
+                "(VALUES (0.0::{ty}), (-0.0::{ty}), ('NaN'::{ty}), ('NaN'::{ty}), (1.0::{ty})) t(x)"
+            );
+            let (_c, got) = run_rows(&format!("SELECT count(DISTINCT x) FROM {rows}"));
+            assert_eq!(got, vec![vec![Value::Int8(3)]], "count(DISTINCT) over {ty}");
+            let (_c, got) = run_rows(&format!("SELECT x FROM {rows} GROUP BY x"));
+            assert_eq!(got.len(), 3, "GROUP BY over {ty}: {got:?}");
+        }
+    }
+
     /// A group carries DISTINCT state only when some aggregate asks for it, so
     /// the three shapes — none DISTINCT, some DISTINCT, all DISTINCT — have to
     /// agree on which accumulator gets which state. Reading that state by
