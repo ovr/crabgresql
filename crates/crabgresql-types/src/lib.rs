@@ -291,7 +291,7 @@ pub enum PgType {
     /// need not be valid UTF-8, so it does not share the `text` representation.
     /// See [`crate::char`].
     Char,
-    /// `name`: a 63-character identifier type backed by `text`.
+    /// `name`: a 63-byte identifier type backed by `text`.
     Name,
     /// `oid`: an unsigned 32-bit object identifier. Fixed 4-byte type; values
     /// print as unsigned decimals. Backs `pg_catalog` OID/`reg*` columns.

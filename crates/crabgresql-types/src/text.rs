@@ -2700,8 +2700,10 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
 
 // --- character-type length coercion (varchar / char / name) ----------------
 
-/// Truncate a value to `n` characters for an *explicit* cast to
-/// `varchar(n)`/`char(n)` — no length error, just truncation.
+/// Truncate a value to `n` characters for an *explicit* cast to `varchar(n)`
+/// — no length error, just truncation. Characters, not bytes: that is what a
+/// character-type modifier counts (`name` is the byte-counted one, see
+/// [`name_input`]). `bpchar` has its own padding rule in [`bpchar_input`].
 pub fn truncate_chars(s: &str, n: i32) -> String {
     if n <= 0 {
         return String::new();
@@ -2761,9 +2763,30 @@ pub fn bpchar_rtrim(s: &str) -> String {
     s.trim_end_matches(' ').to_string()
 }
 
-/// `name` input: truncate to 63 characters (`NAMEDATALEN - 1`).
+/// `NAMEDATALEN - 1`: the widest `name` value, in bytes.
+pub const NAME_MAX_BYTES: usize = 63;
+
+/// `name` input: clip to [`NAME_MAX_BYTES`] **bytes**, on a character boundary.
+///
+/// Bytes, not characters — `name` is a fixed 64-byte slot, so PostgreSQL's
+/// `namein` clips with `pg_mbcliplen` rather than counting characters the way
+/// `varchar(n)` does. The two agree on ASCII and diverge on everything else:
+/// 70 `é` gives 62 bytes / 31 characters here and in PG, where counting
+/// characters would give 126 bytes.
 pub fn name_input(s: &str) -> String {
-    truncate_chars(s, 63)
+    truncate_bytes(s, NAME_MAX_BYTES)
+}
+
+/// Truncate to at most `n` bytes without splitting a character.
+pub fn truncate_bytes(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 #[cfg(test)]
@@ -3897,5 +3920,39 @@ mod tests {
         assert_eq!(bpchar_rtrim("ab   "), "ab");
 
         Ok(())
+    }
+
+    /// `name` counts bytes; `varchar(n)` counts characters. The distinction is
+    /// invisible on ASCII, which is why both rules survived here for so long.
+    #[test]
+    fn name_clips_bytes_where_varchar_counts_characters() {
+        // 70 'é' = 140 bytes. PG 18.4 stores 62 bytes / 31 characters: the 63rd
+        // byte would split a character, so the clip backs up to the boundary.
+        let multibyte = name_input(&"é".repeat(70));
+        assert_eq!(multibyte.len(), 62);
+        assert_eq!(multibyte.chars().count(), 31);
+
+        // The same input under the character rule keeps 63 characters.
+        assert_eq!(truncate_chars(&"é".repeat(70), 63).chars().count(), 63);
+
+        // ASCII cannot tell them apart, which is the trap.
+        assert_eq!(name_input(&"x".repeat(100)).len(), 63);
+        assert_eq!(truncate_chars(&"x".repeat(100), 63).len(), 63);
+
+        // A value that fits is returned whole.
+        assert_eq!(name_input("é"), "é");
+        assert_eq!(name_input(""), "");
+    }
+
+    /// The clip never splits a character, wherever the limit lands inside one.
+    #[test]
+    fn truncate_bytes_backs_up_to_a_character_boundary() {
+        // "€" is 3 bytes, so limits 3..5 all yield the same one-character prefix.
+        for limit in 3..=5 {
+            assert_eq!(truncate_bytes("€€", limit), "€", "limit {limit}");
+        }
+        assert_eq!(truncate_bytes("€€", 6), "€€");
+        assert_eq!(truncate_bytes("€", 2), "");
+        assert_eq!(truncate_bytes("€", 0), "");
     }
 }
