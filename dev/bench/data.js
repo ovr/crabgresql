@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786192278369,
+  "lastUpdate": 1786192279923,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -3856,6 +3856,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 33394.014309,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e197ceef1959c898ecb0bfe3085260f60fc6ff9d",
+          "message": "perf(text): compile LIKE patterns once, match over &str without cloning (#186)",
+          "timestamp": "2026-08-08T13:35:07+02:00",
+          "tree_id": "9bc059f2e086d4e5ed660d61e85eaf7f7c22694c",
+          "url": "https://github.com/ovr/crabgresql/commit/e197ceef1959c898ecb0bfe3085260f60fc6ff9d"
+        },
+        "date": 1786192279886,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 500.687902,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 22976.692073,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
