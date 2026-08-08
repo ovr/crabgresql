@@ -3746,6 +3746,11 @@ struct AggGroup {
     accumulators: Vec<agg::Accumulator>,
     /// One optional seen-value set per aggregate. Non-DISTINCT aggregates have
     /// no set and therefore retain their streaming accumulation behavior.
+    ///
+    /// Empty when *no* aggregate is `DISTINCT`, which is the overwhelmingly
+    /// common case — a query grouping to millions of groups would otherwise
+    /// allocate a vector of `None` per group. Readers index it rather than
+    /// zipping it, so the short and full-length forms behave alike.
     distinct_values: Vec<Option<agg::DistinctValues>>,
 }
 
@@ -3765,9 +3770,28 @@ impl Aggregate {
         }
     }
 
+    /// A fresh group for `key`, with one accumulator per aggregate. Both the
+    /// implicit single group and every keyed group come through here, so the
+    /// two cannot disagree on what a new group holds.
+    fn new_group(&self, key: Vec<Value>, any_distinct: bool) -> AggGroup {
+        AggGroup {
+            key,
+            accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
+            distinct_values: if any_distinct {
+                self.aggregates
+                    .iter()
+                    .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
     /// Drain the child, accumulate per group, and materialize the output rows.
     fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
         let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
+        let any_distinct = self.aggregates.iter().any(|agg| agg.distinct);
         let mut groups: Vec<AggGroup> = Vec::new();
         // Each group's key → its index in `groups`, so a row finds its group in
         // ~O(1). Groups stay in first-seen order (accumulation follows scan
@@ -3776,15 +3800,7 @@ impl Aggregate {
         // The implicit single group needs one seeded group so an empty input
         // still produces a row.
         if self.group_exprs.is_empty() {
-            groups.push(AggGroup {
-                key: Vec::new(),
-                accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
-                distinct_values: self
-                    .aggregates
-                    .iter()
-                    .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
-                    .collect(),
-            });
+            groups.push(self.new_group(Vec::new(), any_distinct));
         }
         while let Some(row) = self.child.next()? {
             let idx = if self.group_exprs.is_empty() {
@@ -3801,32 +3817,26 @@ impl Aggregate {
                 }) {
                     keyindex::Slot::Existing(i) => i,
                     keyindex::Slot::Vacant => {
-                        groups.push(AggGroup {
-                            key,
-                            accumulators: self
-                                .aggregates
-                                .iter()
-                                .map(agg::Accumulator::new)
-                                .collect(),
-                            distinct_values: self
-                                .aggregates
-                                .iter()
-                                .map(|agg| {
-                                    agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty))
-                                })
-                                .collect(),
-                        });
+                        groups.push(self.new_group(key, any_distinct));
                         next
                     }
                 }
             };
-            let group = &mut groups[idx];
-            for ((agg, acc), distinct_values) in self
+            let AggGroup {
+                accumulators,
+                distinct_values,
+                ..
+            } = &mut groups[idx];
+            // `distinct_values` is indexed rather than zipped: it is empty when
+            // no aggregate is DISTINCT, and a third `zip` would then yield
+            // nothing at all — feeding no aggregate and counting no row.
+            for (i, (agg, acc)) in self
                 .aggregates
                 .iter()
-                .zip(group.accumulators.iter_mut())
-                .zip(group.distinct_values.iter_mut())
+                .zip(accumulators.iter_mut())
+                .enumerate()
             {
+                let seen = distinct_values.get_mut(i).and_then(Option::as_mut);
                 // Evaluated into a small stack buffer, sized to the largest
                 // aggregate arity (2, for `string_agg`), so the common
                 // single-argument aggregates (sum/avg/min/max/count(expr))
@@ -3836,7 +3846,7 @@ impl Aggregate {
                 for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
                     *slot = eval(arg, &row, &self.ctx)?;
                 }
-                agg::feed(acc, agg, &buf[..agg.args.len()], distinct_values.as_mut())?;
+                agg::feed(acc, agg, &buf[..agg.args.len()], seen)?;
             }
         }
         let mut out = Vec::with_capacity(groups.len());
@@ -6236,6 +6246,61 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A group carries DISTINCT state only when some aggregate asks for it, so
+    /// the three shapes — none DISTINCT, some DISTINCT, all DISTINCT — have to
+    /// agree on which accumulator gets which state. Reading that state by
+    /// zipping it would feed *no* aggregate in the first shape.
+    #[test]
+    fn aggregates_are_fed_whether_or_not_any_is_distinct() {
+        let rows = "(VALUES (1, 10), (1, 10), (1, 20), (2, 30)) t(g, x)";
+
+        // No DISTINCT: the state vector is empty, and every aggregate must
+        // still see every row.
+        let (_c, got) = run_rows(&format!(
+            "SELECT g, count(*), sum(x) FROM {rows} GROUP BY g ORDER BY g"
+        ));
+        assert_eq!(
+            got,
+            vec![
+                vec![Value::Int4(1), Value::Int8(3), Value::Int8(40)],
+                vec![Value::Int4(2), Value::Int8(1), Value::Int8(30)],
+            ]
+        );
+
+        // Mixed: the DISTINCT state belongs to the second and fourth
+        // aggregates, and the plain ones must not pick it up.
+        let (_c, got) = run_rows(&format!(
+            "SELECT g, count(*), count(DISTINCT x), sum(x), sum(DISTINCT x) \
+             FROM {rows} GROUP BY g ORDER BY g"
+        ));
+        assert_eq!(
+            got,
+            vec![
+                vec![
+                    Value::Int4(1),
+                    Value::Int8(3),
+                    Value::Int8(2),
+                    Value::Int8(40),
+                    Value::Int8(30),
+                ],
+                vec![
+                    Value::Int4(2),
+                    Value::Int8(1),
+                    Value::Int8(1),
+                    Value::Int8(30),
+                    Value::Int8(30),
+                ],
+            ]
+        );
+
+        // The implicit single group is built at its own call site, so it needs
+        // its own case.
+        let (_c, got) = run_rows(&format!("SELECT count(*), count(DISTINCT x) FROM {rows}"));
+        assert_eq!(got, vec![vec![Value::Int8(4), Value::Int8(3)]]);
+        let (_c, got) = run_rows(&format!("SELECT count(*), sum(x) FROM {rows}"));
+        assert_eq!(got, vec![vec![Value::Int8(4), Value::Int8(70)]]);
     }
 
     /// `count(DISTINCT x)`, `SELECT DISTINCT x` and `GROUP BY x` are three
