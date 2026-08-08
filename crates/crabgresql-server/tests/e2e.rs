@@ -1428,6 +1428,32 @@ async fn extended_query_infers_params_and_returns_binary() -> anyhow::Result<()>
     Ok(())
 }
 
+/// `uuid` over the binary wire format, in both directions: `tokio-postgres`
+/// sends a `uuid` parameter as the 16 raw bytes and asks for every result
+/// column in binary, so this is what exercises `wire::decode_binary` /
+/// `Value::encode_binary` for the type end to end.
+#[tokio::test]
+async fn uuid_round_trips_in_binary_over_the_extended_protocol() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let sent = uuid::uuid!("5b35380a-7143-4912-9b55-f322699c6770");
+
+    // Parameter in, value back out — neither side goes through the text form.
+    let row = client.query_one("SELECT $1::uuid AS g", &[&sent]).await?;
+    assert_eq!(row.get::<_, uuid::Uuid>("g"), sent);
+
+    // A generated value decodes too, and carries the version it claims.
+    let row = client
+        .query_one(
+            "SELECT uuidv7() AS g, uuid_extract_version(uuidv7()) AS v",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, uuid::Uuid>("g").get_version_num(), 7);
+    assert_eq!(row.get::<_, i16>("v"), 7);
+
+    Ok(())
+}
+
 /// A parameter typed only by its use against a table column: the server infers
 /// `$1` from the compared column, with no cast in the SQL.
 #[tokio::test]

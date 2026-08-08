@@ -630,7 +630,11 @@ fn emit_notices(
 
 /// Map a value-layer cast/decode failure to a client `ErrorResponse`.
 fn cast_error(e: CastError) -> PgError {
-    PgError::new(e.sqlstate, e.message)
+    let err = PgError::new(e.sqlstate, e.message);
+    match e.detail {
+        Some(detail) => err.with_detail(detail),
+        None => err,
+    }
 }
 
 /// The transfer format for column/parameter `i` from a Bind format list: 0

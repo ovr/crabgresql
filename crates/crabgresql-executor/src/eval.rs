@@ -84,7 +84,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         BoundExpr::Coerce { expr, ty } => coerce_value(eval(expr, row, ctx)?, *ty, ctx),
         BoundExpr::Reinterpret { expr, rep, .. } => {
             cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
-                .map_err(|e| ExecError::new(e.sqlstate, e.message))
+                .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
         }
         BoundExpr::FuncCall { func, ret, args } => {
             let arg_values = args
@@ -123,6 +123,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             // (or, for `clock_timestamp`, from real time) rather than from
             // their arguments — there are none.
             if let Some(result) = eval_clock_fn(*func, ctx) {
+                return result;
+            }
+            // The uuid generators read the wall clock and fresh randomness, so
+            // they sit beside the clock family rather than in `eval_scalar`.
+            if let Some(result) = eval_uuid_gen_fn(*func, &arg_values, ctx) {
                 return result;
             }
             // `age(xid)` reads the live transaction counter, which lives on the
@@ -294,7 +299,8 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
-    cast::cast_value(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value(value, ty, &ctx.fmt)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
 /// Assignment-context sibling of [`coerce_value`], for PL/pgSQL's `:=`,
@@ -306,7 +312,8 @@ pub fn coerce_value_assign(
     ty: PgType,
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    cast::cast_value_assign(value, ty, &ctx.fmt).map_err(|e| ExecError::new(e.sqlstate, e.message))
+    cast::cast_value_assign(value, ty, &ctx.fmt)
+        .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
 /// Dispatch the non-strict array constructor functions (`array_cat`,
@@ -491,6 +498,87 @@ fn eval_clock_fn(func: ScalarFn, ctx: &ExecContext) -> Option<Result<Value, Exec
             .map(Value::TimestampTz)
             .map_err(|e| ExecError::new(e.sqlstate, e.message)),
     )
+}
+
+/// Dispatch the UUID generators. Returns `None` for any other function.
+///
+/// They read the wall clock and fresh randomness, so — like `clock_timestamp`
+/// above — a pure `eval_scalar` could not hold them. The extract functions are
+/// immutable and do live there.
+fn eval_uuid_gen_fn(
+    func: ScalarFn,
+    args: &[Value],
+    ctx: &ExecContext,
+) -> Option<Result<Value, ExecError>> {
+    let bytes = match func {
+        ScalarFn::GenRandomUuid => crate::uuid_gen::gen_v4(),
+        ScalarFn::UuidV7 => crate::uuid_gen::gen_v7(crabgresql_types::tz::now_unix_nanos()),
+        ScalarFn::UuidV7Shift => {
+            let Value::Interval(span) = args[0] else {
+                return Some(Ok(Value::Null));
+            };
+            // One clock reading, used for both the displacement and the stamp,
+            // so the two cannot name different instants.
+            let now = crabgresql_types::tz::now_unix_nanos();
+            let shift_ms = match v7_shift_millis(span, now, ctx) {
+                Ok(ms) => ms,
+                Err(e) => return Some(Err(e)),
+            };
+            match crate::uuid_gen::gen_v7_shifted(now, shift_ms) {
+                Some(bytes) => bytes,
+                None => return Some(Err(v7_timestamp_out_of_range())),
+            }
+        }
+        _ => return None,
+    };
+    Some(Ok(Value::Uuid(bytes)))
+}
+
+/// How far `uuidv7(shift)` moves the stamp, in whole milliseconds.
+///
+/// The displacement is *measured*, not applied: `now + span` goes through the
+/// same `timestamptz + interval` helper an explicit `now() + shift` would, so a
+/// month or year component moves the calendar rather than a fixed count of
+/// microseconds — but only the distance is kept, and the generator adds it to
+/// the latched key. That is what keeps a shifted value ordered against the
+/// others while leaving the guard's state a function of the clock alone.
+///
+/// Whole milliseconds because `rand_a` is a precision field, not a time field:
+/// folding a sub-millisecond remainder into it could carry into the stamp
+/// depending on what the latch happened to hold, so `uuidv7(interval '1.0005
+/// seconds')` would land on either of two milliseconds at random. PostgreSQL's
+/// shifted values sit at exactly the named offset, so the remainder is dropped
+/// — by `div_euclid`, which floors, keeping the mapping monotone across zero.
+fn v7_shift_millis(
+    span: Interval,
+    now_unix_nanos: i128,
+    ctx: &ExecContext,
+) -> Result<i64, ExecError> {
+    if !span.is_finite() {
+        return Err(ExecError::new(
+            sqlstate::DATETIME_FIELD_OVERFLOW,
+            "interval out of range for UUID version 7",
+        )
+        .with_detail(Some(
+            "UUID version 7 does not support infinite intervals.".into(),
+        )));
+    }
+    let base = crabgresql_types::tz::from_unix_micros(now_unix_nanos.div_euclid(1_000) as i64);
+    // Any failure inside the shift is a range failure, and reporting it as a
+    // bare "timestamp out of range" would name a type the caller never wrote.
+    let shifted = crabgresql_types::timestamptz::pl_interval(base, span, ctx.fmt.zone.zone())
+        .map_err(|_| v7_timestamp_out_of_range())?;
+    Ok(shifted.saturating_sub(base).div_euclid(1_000))
+}
+
+fn v7_timestamp_out_of_range() -> ExecError {
+    ExecError::new(
+        sqlstate::DATETIME_FIELD_OVERFLOW,
+        "timestamp out of range for UUID version 7",
+    )
+    .with_detail(Some(
+        "UUID version 7 supports timestamps from 1970-01-01 to approximately year 10889.".into(),
+    ))
 }
 
 /// Dispatch `current_setting`, which reads the session GUC table through the
@@ -1406,7 +1494,7 @@ fn char_of(v: &Value) -> u8 {
     }
 }
 
-fn uuid_of(v: &Value) -> &[u8; 16] {
+pub(crate) fn uuid_of(v: &Value) -> &[u8; 16] {
     match v {
         Value::Uuid(b) => b,
         other => unreachable!("expected uuid, got {other:?}"),

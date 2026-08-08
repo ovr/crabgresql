@@ -20,6 +20,7 @@ crabgresql-pg-wire.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

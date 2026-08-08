@@ -46,6 +46,9 @@ regex = "1"
 # construct versus a malformed pattern) needs the parser's own error enum.
 regex-syntax = "0.8"
 parquet = { version = "59.1", default-features = false, features = ["arrow", "snap"] }
+# UUID generation needs a strong RNG, as PG's `pg_strong_random` is. `thread_rng`
+# gives a per-thread buffered ChaCha12 reseeded from the OS, which is both.
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 similar = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
@@ -56,7 +59,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tempfile = "3"
-tokio-postgres = "0.7"
+# `with-uuid-1` is what lets the e2e suite exercise the binary wire format for
+# `uuid`; without it the driver has no Rust type to decode those bytes into.
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+uuid = "1"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

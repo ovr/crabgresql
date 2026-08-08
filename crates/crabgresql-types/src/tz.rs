@@ -572,15 +572,27 @@ pub fn offset_for_instant(zone: &Zone, micros: i64) -> i32 {
     }
 }
 
-/// The wall clock, as our microseconds since the 2000 epoch.
+/// The wall clock, as nanoseconds since the **Unix** epoch.
 ///
-/// The one place in the engine that reads real time. Everything time-dependent
-/// above this layer takes its instant from the session's clock
-/// ([`crate::fmt::Clock`]) so that a value is stable for as long as PostgreSQL
-/// says it is; only `clock_timestamp()`, which is volatile by definition, and
-/// the session stamping that fills that clock in call this.
+/// The one place in the engine that reads real time; [`now_micros`] below is
+/// this value, shifted and truncated. Everything time-dependent above this
+/// layer takes its instant from the session's clock ([`crate::fmt::Clock`]) so
+/// that a value is stable for as long as PostgreSQL says it is; only
+/// `clock_timestamp()`, which is volatile by definition, the session stamping
+/// that fills that clock in, and version 7 UUID generation read from here.
+///
+/// Nanoseconds rather than microseconds because a version 7 UUID quantizes the
+/// sub-millisecond remainder to 4096 steps of ~244ns each: a microsecond
+/// reading can only ever land on 1000 of them, where PostgreSQL's are spread
+/// over all 4096. The Unix epoch rather than ours because that is the era
+/// version 7 counts in, and it is the only caller that wants this resolution.
+pub fn now_unix_nanos() -> i128 {
+    Timestamp::now().as_nanosecond()
+}
+
+/// The wall clock, as our microseconds since the 2000 epoch.
 pub fn now_micros() -> i64 {
-    Timestamp::now().as_microsecond() - PG_EPOCH_UNIX_MICROS
+    from_unix_micros(now_unix_nanos().div_euclid(1_000) as i64)
 }
 
 /// When this server process started, as our microseconds since the 2000 epoch —
@@ -594,6 +606,21 @@ pub fn now_micros() -> i64 {
 pub fn postmaster_start_micros() -> i64 {
     static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *START.get_or_init(now_micros)
+}
+
+/// Our microseconds since the 2000 epoch, as microseconds since the Unix epoch.
+///
+/// Values that speak Unix time rather than PG time — a UUID version 7
+/// timestamp, for one — cross this boundary in both directions. Saturating,
+/// like [`instant`]: the timestamp range reaches years `jiff` cannot hold, and
+/// no caller wants a panic out of an epoch shift.
+pub fn to_unix_micros(micros: i64) -> i64 {
+    micros.saturating_add(PG_EPOCH_UNIX_MICROS)
+}
+
+/// The inverse of [`to_unix_micros`].
+pub fn from_unix_micros(unix: i64) -> i64 {
+    unix.saturating_sub(PG_EPOCH_UNIX_MICROS)
 }
 
 /// Build a `jiff` civil datetime, clamping a year beyond `jiff`'s `±9999` range
@@ -624,7 +651,7 @@ fn civil_datetime(tm: TmLite) -> DateTime {
 /// Build a `jiff` UTC timestamp from our micros-since-2000, clamping beyond
 /// `jiff`'s range (see [`civil_datetime`]).
 fn instant(micros: i64) -> Timestamp {
-    let unix = micros.saturating_add(PG_EPOCH_UNIX_MICROS);
+    let unix = to_unix_micros(micros);
     Timestamp::from_microsecond(unix).unwrap_or(if unix >= 0 {
         Timestamp::MAX
     } else {

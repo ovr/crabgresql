@@ -14,6 +14,7 @@ pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
 mod unique;
+mod uuid_gen;
 pub mod vector;
 
 use std::borrow::Cow;

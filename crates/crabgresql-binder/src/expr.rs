@@ -962,12 +962,16 @@ impl BoundExpr {
 
     /// Whether this expression contains a volatile function call. The volatile
     /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
-    /// side effects, `currval`/`lastval` read mutable session state) and
-    /// `clock_timestamp`, which reads the wall clock afresh at every call — all
-    /// marked `VOLATILE` by PostgreSQL. Any future volatile scalar function
-    /// (e.g. `random()`) must be added to the match here. Used to refuse
-    /// duplicating a volatile argument when inlining a SQL function body, and
-    /// to keep such a call from being pushed down into a scan.
+    /// side effects, `currval`/`lastval` read mutable session state),
+    /// `clock_timestamp`, which reads the wall clock afresh at every call, and
+    /// the UUID generators, which draw fresh randomness — all marked `VOLATILE`
+    /// by PostgreSQL. Any future volatile scalar function (e.g. `random()`)
+    /// must be added to the match here. Used to refuse duplicating a volatile
+    /// argument when inlining a SQL function body, and to keep such a call from
+    /// being pushed down into a scan.
+    ///
+    /// `uuid_extract_version`/`uuid_extract_timestamp` are deliberately absent:
+    /// they read only their argument, and PG marks them `IMMUTABLE`.
     ///
     /// `now()` and `statement_timestamp()` are deliberately *not* here: PG
     /// marks them `STABLE`, and they are. Calling them volatile would cost a
@@ -983,6 +987,9 @@ impl BoundExpr {
                         | ScalarFn::Setval
                         | ScalarFn::Lastval
                         | ScalarFn::ClockTimestamp
+                        | ScalarFn::GenRandomUuid
+                        | ScalarFn::UuidV7
+                        | ScalarFn::UuidV7Shift
                 ) || args.iter().any(BoundExpr::contains_volatile_fn)
             }
             // A routine's body is opaque here and PostgreSQL defaults a
@@ -8376,7 +8383,7 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
                     }),
                     ty,
                 }),
-                Err(e) => Err(BindError::new(e.sqlstate, e.message)),
+                Err(e) => Err(BindError::new(e.sqlstate, e.message).with_detail(e.detail)),
             }
         }
         expr => Ok(BoundExpr::Coerce {
@@ -8806,9 +8813,7 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
             // transaction clock a scalar of that type would get.
             crabgresql_types::array::array_in(s, elem, fmt)
                 .map(|elems| Value::Array { elem, elems })
-                .map_err(|e| {
-                    BindError::new(e.sqlstate, e.message).with_detail(e.detail.map(String::from))
-                })
+                .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail))
         }
         // Both vector errors name the *element* type (`oid`/`smallint`), so the
         // message comes from `vector_in` rather than the `invalid` helper above.
