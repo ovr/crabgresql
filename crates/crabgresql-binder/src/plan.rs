@@ -12,8 +12,8 @@ use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    Column, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema, Tuple, TypeCatalog,
-    ViewDefinition,
+    Column, EnumInfo, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema, Tuple,
+    TypeCatalog, ViewDefinition,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{FmtCtx, PgType, Value};
@@ -6021,32 +6021,48 @@ impl CopyFromPlan {
         fmt: &FmtCtx,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<LogicalPlan, BindError> {
+        // An enum label is resolved against the catalog, which `parse_unknown`
+        // has no access to — same order as `resolve_unknown_ctx`, whose
+        // `PgType::User` arm would otherwise reject every label. Looked up once
+        // per batch rather than once per cell: `enum_info` takes a read lock,
+        // scans the type catalog for the OID and clones every label, which is
+        // not a thing to do a million times. Per batch and not once per load, so
+        // a concurrent `ALTER TYPE ... ADD VALUE` still becomes visible.
+        let enums: Vec<Option<EnumInfo>> = self
+            .target_indices
+            .iter()
+            .map(|&idx| match self.schema.columns[idx].ty {
+                PgType::User(oid) => catalog.enum_info(oid),
+                _ => None,
+            })
+            .collect();
+
         let mut tuples = Vec::with_capacity(rows.len());
         for fields in rows {
             self.check_arity(fields.len())?;
             let mut tuple = self.rows.template.clone();
-            for (field, &idx) in fields.into_iter().zip(&self.target_indices) {
+            for ((field, &idx), enum_info) in
+                fields.into_iter().zip(&self.target_indices).zip(&enums)
+            {
                 let column = &self.schema.columns[idx];
                 tuple[idx] = match field {
                     // The NULL marker: a genuine SQL NULL, not the column
                     // default, and it takes no typmod.
                     None => Value::Null,
                     Some(text) => {
-                        // An enum label is resolved against the catalog, which
-                        // `parse_unknown` has no access to — same order as
-                        // `resolve_unknown_ctx`, whose `PgType::User` arm would
-                        // otherwise reject every label.
-                        let value = match column.ty {
-                            PgType::User(oid) => match catalog.enum_info(oid) {
-                                Some(info) => enum_value(oid, &info, text)?,
-                                // A user type that is not an enum: the input
-                                // dispatch rejects it, naming the type
-                                // `user-defined` the way the expression path
-                                // does. Reachable, because dropping a type a
-                                // column still uses is allowed here.
-                                None => parse_unknown_owned(text, column.ty, fmt)?,
-                            },
-                            ty => parse_unknown_owned(text, ty, fmt)?,
+                        let value = match enum_info {
+                            Some(info) => {
+                                let PgType::User(oid) = column.ty else {
+                                    unreachable!("only a user type resolves an enum")
+                                };
+                                enum_value(oid, info, text)?
+                            }
+                            // Anything else, including a user type that is not
+                            // an enum: the input dispatch handles it, naming the
+                            // type `user-defined` the way the expression path
+                            // does. Reachable, because dropping a type a column
+                            // still uses is allowed here.
+                            None => parse_unknown_owned(text, column.ty, fmt)?,
                         };
                         apply_column_typmod(value, column)?
                     }
