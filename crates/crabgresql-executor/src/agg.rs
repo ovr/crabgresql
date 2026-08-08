@@ -49,8 +49,8 @@ enum Kind {
         odd: Vec<Value>,
     },
     /// Everything else — `numeric` (equal across display scales), `uuid`,
-    /// `bytea`, `jsonb`, and the types that hash to nothing at all. Buckets of
-    /// values narrowed by [`hash_key`] and decided by [`keys_equal`].
+    /// `bytea`, `jsonb`, enums, and the types that hash to nothing at all.
+    /// Buckets of values narrowed by [`hash_key`] and decided by [`keys_equal`].
     Generic(FxHashMap<u64, Vec<Value>>),
 }
 
@@ -128,6 +128,11 @@ fn insert_odd(ty: PgType, odd: &mut Vec<Value>, value: &Value) -> bool {
 /// Whether [`scalar_code`] has an encoding for `ty`. Kept beside it so the two
 /// cannot drift: a type listed here without an arm there sends every value to
 /// the `odd` list.
+///
+/// Enums are deliberately absent even though their equality *is* a raw-field
+/// compare. A type here promises an encoding for every value that can arrive
+/// under it, and a `PgType::User(oid)` cannot make that promise: nothing in the
+/// type itself says the value is the `Value::Enum` its equality expects.
 pub(crate) fn scalar_coded(ty: PgType) -> bool {
     matches!(
         ty,
@@ -149,7 +154,6 @@ pub(crate) fn scalar_coded(ty: PgType) -> bool {
             | PgType::TimestampTz
             | PgType::Tid
             | PgType::Reg(_)
-            | PgType::User(_)
     )
 }
 
@@ -187,17 +191,6 @@ pub(crate) fn scalar_code(ty: PgType, v: &Value) -> Option<u64> {
         (PgType::Tid, Value::Tid { block, offset }) => (*block as u64) << 16 | *offset as u64,
         // A `reg*` compares by OID alone: the rendered name is display only.
         (PgType::Reg(_), Value::Reg(r)) => r.oid as u64,
-        // An enum compares by ordinal within its own type; the label is the
-        // spelling, not the identity. A value of some other enum type is not
-        // this type's value at all, so it takes the `odd` path.
-        (
-            PgType::User(type_oid),
-            Value::Enum {
-                type_oid: value_oid,
-                ordinal,
-                ..
-            },
-        ) if *value_oid == type_oid => (type_oid as u64) << 32 | *ordinal as u64,
         _ => return None,
     })
 }
@@ -1083,6 +1076,31 @@ mod tests {
                 value(16384, 1, "green"),
             ],
             2,
+        );
+    }
+
+    /// A user type promises nothing about the *variant* a value arrives in, so
+    /// an enum key stays on the general path where `compare_values` decides.
+    /// This is the shape a binary-coercible cast used to produce before the
+    /// catalog started rejecting one (see `enum_binary_coercible_cast_is_rejected`
+    /// in the server's e2e suite); the storage must not assume it away.
+    #[test]
+    fn distinct_over_a_user_type_tolerates_a_foreign_variant() {
+        let enum_value = |ordinal| Value::Enum {
+            type_oid: 16384,
+            ordinal,
+            label: "red".to_string(),
+        };
+        assert_distinct_agrees(
+            PgType::User(16384),
+            &[
+                Value::Int4(1),
+                Value::Int4(1),
+                Value::Int4(2),
+                enum_value(0),
+                enum_value(0),
+            ],
+            3,
         );
     }
 }

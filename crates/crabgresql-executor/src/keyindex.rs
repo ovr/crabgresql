@@ -48,8 +48,9 @@ enum Kind {
         null: Option<usize>,
         odd: Vec<(Value, usize)>,
     },
-    /// Any multi-column key, and any type without an injective encoding: the
-    /// hash narrows the candidates and the caller's equality decides.
+    /// Any multi-column key, and any type without an injective encoding
+    /// (`numeric`, `uuid`, enums, and the types that hash to nothing at all):
+    /// the hash narrows the candidates and the caller's equality decides.
     Generic {
         tys: Vec<PgType>,
         buckets: FxHashMap<u64, Vec<usize>>,
@@ -184,4 +185,71 @@ fn find_odd(ty: PgType, odd: &[(Value, usize)], v: &Value) -> Option<usize> {
     odd.iter()
         .find(|(seen, _)| agg::value_eq(ty, seen, v))
         .map(|(_, i)| *i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GroupIndex;
+    use crabgresql_types::{Numeric, PgType, Value};
+
+    /// Drive `keys` through an index the way `Aggregate::build` does, returning
+    /// the group each key landed in. The caller's storage is `groups`, so the
+    /// general path's equality closure has something to read.
+    fn assign(tys: &[PgType], keys: &[Vec<Value>]) -> Vec<usize> {
+        let mut index = GroupIndex::new(tys);
+        let mut groups: Vec<Vec<Value>> = Vec::new();
+        let mut out = Vec::new();
+        for key in keys {
+            let i = match index.find(key, |i| crate::agg::keys_equal(tys, &groups[i], key)) {
+                Some(i) => i,
+                None => {
+                    let i = groups.len();
+                    index.record(key, i);
+                    groups.push(key.clone());
+                    i
+                }
+            };
+            out.push(i);
+        }
+        out
+    }
+
+    /// A user type promises nothing about the *variant* a value arrives in, so
+    /// an enum key stays on the general path. Mirrors
+    /// `agg::tests::distinct_over_a_user_type_tolerates_a_foreign_variant` for
+    /// the grouping side.
+    #[test]
+    fn a_user_type_key_tolerates_a_foreign_variant() {
+        let ty = PgType::User(16384);
+        let red = Value::Enum {
+            type_oid: 16384,
+            ordinal: 0,
+            label: "red".to_string(),
+        };
+        let keys: Vec<Vec<Value>> = [Value::Int4(1), Value::Int4(1), red.clone(), red]
+            .into_iter()
+            .map(|v| vec![v])
+            .collect();
+        assert_eq!(assign(&[ty], &keys), vec![0, 0, 1, 1]);
+    }
+
+    /// Two NULL keys group together and share a group with nothing else, on
+    /// both specialized paths — the slot NULL is held in rather than encoded.
+    #[test]
+    fn null_keys_group_together_on_every_path() {
+        for (ty, present) in [
+            (PgType::Int8, Value::Int8(7)),
+            (PgType::Text, Value::Text("a".to_string())),
+            (
+                PgType::Numeric,
+                Value::Numeric(Numeric::parse("7").expect("numeric literal")),
+            ),
+        ] {
+            let keys: Vec<Vec<Value>> = [Value::Null, present.clone(), Value::Null, present]
+                .into_iter()
+                .map(|v| vec![v])
+                .collect();
+            assert_eq!(assign(&[ty], &keys), vec![0, 1, 0, 1], "{ty:?}");
+        }
+    }
 }
