@@ -565,6 +565,19 @@ impl PgType {
     /// collapse to a full scan; the join planner keeps such equalities as
     /// nested-loop predicates instead.
     ///
+    /// Three clauses, in the order they matter:
+    ///
+    /// 1. This is a **planner hint**, never a correctness input. Whatever it
+    ///    answers, `keys_equal` decides which values are the same one — a `false`
+    ///    here costs a plan, not an answer.
+    /// 2. What a `true` promises is only that *well-formed* values spread across
+    ///    buckets, so a hash join over them does not degenerate into a scan.
+    /// 3. For `User(_)`, "well-formed" means a `Value::Enum` carrying this type's
+    ///    own OID — which is what the binder admits, since `has_equality` accepts
+    ///    a user type only when the catalog calls it an enum. A value of any other
+    ///    shape contributes nothing to `hash_key`, shares one bucket with every
+    ///    other such value, and is still compared correctly: quadratic, not wrong.
+    ///
     /// Must stay in sync with `hash_key` — and that function's own doc explains
     /// why the sync is load-bearing for correctness rather than for speed: the
     /// same buckets enforce `UNIQUE`. Moving a type into this list means
