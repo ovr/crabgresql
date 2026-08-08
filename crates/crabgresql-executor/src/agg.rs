@@ -55,12 +55,10 @@ const _: () = assert!(std::mem::size_of::<DistinctValues>() <= 48);
 
 impl DistinctValues {
     pub fn new(ty: PgType) -> Self {
-        let kind = match ty {
-            PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar => {
-                Kind::Text(FxHashSet::default())
-            }
-            _ if scalar_coded(ty) => Kind::Scalar(FxHashSet::default()),
-            _ => Kind::Generic(FxHashMap::default()),
+        let kind = match key_encoding(ty) {
+            KeyEncoding::Scalar => Kind::Scalar(FxHashSet::default()),
+            KeyEncoding::Text => Kind::Text(FxHashSet::default()),
+            KeyEncoding::Generic => Kind::Generic(FxHashMap::default()),
         };
         Self { ty, kind }
     }
@@ -101,36 +99,84 @@ impl DistinctValues {
     }
 }
 
-/// Whether [`scalar_code`] has an encoding for `ty`. Kept beside it so the two
-/// cannot drift: a type listed here without an arm there panics on its first
-/// value.
+/// How a key of one type is stored by the structures that de-duplicate keys —
+/// [`DistinctValues`] and `crate::keyindex::GroupIndex`. Both ask this rather
+/// than testing the type themselves, so neither can drift from [`scalar_code`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeyEncoding {
+    /// The key packs into a `u64` losslessly — see [`scalar_code`].
+    Scalar,
+    /// The key is a string compared bytewise — see [`text_key`].
+    Text,
+    /// No encoding: [`hash_key`] narrows and [`keys_equal`] decides.
+    Generic,
+}
+
+/// The storage [`KeyEncoding`] for `ty`.
 ///
-/// Enums are deliberately absent even though their equality *is* a raw-field
-/// compare. A type here promises an encoding for every value that can arrive
-/// under it, and a `PgType::User(oid)` cannot make that promise: nothing in the
-/// type itself says the value is the `Value::Enum` its equality expects.
-pub(crate) fn scalar_coded(ty: PgType) -> bool {
-    matches!(
-        ty,
+/// Deliberately a `match` with **no** `_` arm: an encoding is a promise that
+/// every value arriving under the type has one, and a new `PgType` cannot make
+/// that promise by default. Adding a variant should fail the build here, not
+/// land silently in whichever arm the wildcard happened to cover.
+///
+/// Enums are `Generic` even though an enum's equality *is* a raw-field compare,
+/// because the promise is about values, not types: nothing in a
+/// `PgType::User(oid)` says the value under it is the `Value::Enum` its equality
+/// expects.
+pub(crate) fn key_encoding(ty: PgType) -> KeyEncoding {
+    match ty {
         PgType::Bool
-            | PgType::Char
-            | PgType::Int2
-            | PgType::Int4
-            | PgType::Int8
-            | PgType::Float4
-            | PgType::Float8
-            | PgType::Oid
-            | PgType::Xid
-            | PgType::Xid8
-            | PgType::PgLsn
-            | PgType::Money
-            | PgType::Date
-            | PgType::Time
-            | PgType::Timestamp
-            | PgType::TimestampTz
-            | PgType::Tid
-            | PgType::Reg(_)
-    )
+        | PgType::Char
+        | PgType::Int2
+        | PgType::Int4
+        | PgType::Int8
+        | PgType::Float4
+        | PgType::Float8
+        | PgType::Oid
+        | PgType::Xid
+        | PgType::Xid8
+        | PgType::PgLsn
+        | PgType::Money
+        | PgType::Date
+        | PgType::Time
+        | PgType::Timestamp
+        | PgType::TimestampTz
+        | PgType::Tid
+        | PgType::Reg(_) => KeyEncoding::Scalar,
+
+        PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar => KeyEncoding::Text,
+
+        // `numeric` equates across display scales and the geometric types
+        // equate by area, so neither has an injective code. The rest either
+        // exceed a `u64` (`uuid`, `bytea`, `jsonb`, the vectors) or have no
+        // equality at all (`json`, `jsonpath`) and never reach a key path.
+        PgType::Numeric
+        | PgType::Bytea
+        | PgType::Bit
+        | PgType::Varbit
+        | PgType::TimeTz
+        | PgType::Interval
+        | PgType::Uuid
+        | PgType::Inet
+        | PgType::Cidr
+        | PgType::Macaddr
+        | PgType::Macaddr8
+        | PgType::Point
+        | PgType::Lseg
+        | PgType::Path
+        | PgType::Box
+        | PgType::Polygon
+        | PgType::Line
+        | PgType::Circle
+        | PgType::Json
+        | PgType::Jsonb
+        | PgType::Jsonpath
+        | PgType::Tsvector
+        | PgType::Tsquery
+        | PgType::Vector(_)
+        | PgType::User(_)
+        | PgType::Array(_) => KeyEncoding::Generic,
+    }
 }
 
 /// Pack a value into a `u64` that is equal for exactly the values [`keys_equal`]
@@ -777,7 +823,10 @@ fn bigint_out_of_range() -> ExecError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accumulator, DistinctValues, hash_key, value_eq};
+    use super::{
+        Accumulator, DistinctValues, KeyEncoding, hash_key, key_encoding, scalar_code, text_key,
+        value_eq,
+    };
     use crabgresql_binder::{AggFn, BoundAggregate};
     use crabgresql_types::{Numeric, PgType, Value};
 
@@ -1058,6 +1107,72 @@ mod tests {
                 value(16384, 1, "green"),
             ],
             2,
+        );
+    }
+
+    /// Every type `key_encoding` calls `Scalar` or `Text` must actually have an
+    /// encoding, since there is no longer a fallback: a type classified without
+    /// an arm in `scalar_code`/`text_key` panics on its first value.
+    ///
+    /// This would **not** have caught the bug that removed the fallback — that
+    /// one was a value lying about its type, not a type missing an arm. The net
+    /// for that is `enum_binary_coercible_cast_is_rejected` in the server's e2e
+    /// suite, plus the two foreign-variant tests here and in `keyindex`.
+    #[test]
+    fn every_classified_type_has_an_encoding() {
+        let cases = [
+            (PgType::Bool, Value::Bool(true)),
+            (PgType::Char, Value::Char(b'a')),
+            (PgType::Int2, Value::Int2(1)),
+            (PgType::Int4, Value::Int4(1)),
+            (PgType::Int8, Value::Int8(1)),
+            (PgType::Float4, Value::Float4(1.0)),
+            (PgType::Float8, Value::Float8(1.0)),
+            (PgType::Oid, Value::Oid(1)),
+            (PgType::Xid, Value::Xid(1)),
+            (PgType::Xid8, Value::Xid8(1)),
+            (PgType::PgLsn, Value::PgLsn(1)),
+            (PgType::Money, Value::Money(1)),
+            (PgType::Date, Value::Date(1)),
+            (PgType::Time, Value::Time(1)),
+            (PgType::Timestamp, Value::Timestamp(1)),
+            (PgType::TimestampTz, Value::TimestampTz(1)),
+            (
+                PgType::Tid,
+                Value::Tid {
+                    block: 1,
+                    offset: 1,
+                },
+            ),
+            (
+                PgType::Reg(crabgresql_types::RegKind::Type),
+                Value::Reg(crabgresql_types::Reg::unresolved(
+                    crabgresql_types::RegKind::Type,
+                    1,
+                )),
+            ),
+            (PgType::Text, Value::Text("a".to_string())),
+            (PgType::Varchar, Value::Text("a".to_string())),
+            (PgType::Name, Value::Text("a".to_string())),
+            (PgType::Bpchar, Value::Text("a".to_string())),
+        ];
+        for (ty, v) in &cases {
+            // Both calls panic rather than return on a classification the
+            // encoding cannot honor, so reaching the assert is the assertion.
+            match key_encoding(*ty) {
+                KeyEncoding::Scalar => {
+                    scalar_code(*ty, v);
+                }
+                KeyEncoding::Text => {
+                    text_key(*ty, v);
+                }
+                KeyEncoding::Generic => panic!("{ty:?} is listed here but classified Generic"),
+            }
+        }
+        assert_eq!(
+            cases.len(),
+            22,
+            "a type gained an encoding without gaining a case here"
         );
     }
 
