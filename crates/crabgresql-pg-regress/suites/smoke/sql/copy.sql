@@ -142,22 +142,22 @@ COPY vistest FROM '/dev/null' (FREEZE OFF) CSV FREEZE;
 -- at, so unlike the same literal in an INSERT there is no `LINE n: ... ^`.
 -- (PostgreSQL adds a `CONTEXT: COPY <table>, line n, column c: "..."` line here
 -- that this server does not yet emit.)
-CREATE TABLE bad (a integer, b text);
-COPY bad FROM stdin;
+CREATE TABLE cpbad (a integer, b text);
+COPY cpbad FROM stdin;
 1	one
 zzz	two
 \.
-SELECT count(*) AS loaded FROM bad;
+SELECT count(*) AS loaded FROM cpbad;
 -- Wrong arity, both directions.
-COPY bad FROM stdin;
+COPY cpbad FROM stdin;
 1	one	extra
 \.
-COPY bad FROM stdin;
+COPY cpbad FROM stdin;
 1
 \.
 -- Rows are read in order, so the first bad row wins even when a later row is
 -- bad in a different way.
-COPY bad FROM stdin;
+COPY cpbad FROM stdin;
 1	one
 nope	two
 1	one	extra
@@ -165,76 +165,126 @@ nope	two
 -- Same, for a column whose value the binder cannot fold without a session: the
 -- literal is still checked where it is read, so a bad `timestamptz` in row 1
 -- beats an arity error in row 2 rather than the load reporting them backwards.
-CREATE TABLE ord (z timestamptz, b text);
-COPY ord FROM stdin;
+CREATE TABLE cpord (z timestamptz, b text);
+COPY cpord FROM stdin;
 not-a-time	one
 2020-01-01	two	extra
 \.
 -- The column's length typmod applies in assignment context: an over-long
 -- varchar errors rather than truncating, while `name` always truncates.
-CREATE TABLE lens (v varchar(3), n name);
-COPY lens (v) FROM stdin;
+CREATE TABLE cplens (v varchar(3), n name);
+COPY cplens (v) FROM stdin;
 abcd
 \.
-COPY lens (n) FROM stdin;
+COPY cplens (n) FROM stdin;
 0123456789012345678901234567890123456789012345678901234567890123456789
 \.
-SELECT octet_length(n) AS name_len FROM lens WHERE n IS NOT NULL;
+SELECT octet_length(n) AS name_len FROM cplens;
 -- numeric(p,s) rounds to the scale, and overflows once the integer part no
 -- longer fits.
-CREATE TABLE num (v numeric(5,2));
-COPY num FROM stdin;
+CREATE TABLE cpnum (v numeric(5,2));
+COPY cpnum FROM stdin;
 1.005
 -1.005
 \.
-SELECT v FROM num ORDER BY v;
-COPY num FROM stdin;
+SELECT v FROM cpnum ORDER BY v;
+COPY cpnum FROM stdin;
 12345.6
 \.
 -- An enum column takes its labels by name, through the type catalog.
 CREATE TYPE cpmood AS ENUM ('sad', 'ok', 'happy');
-CREATE TABLE en (m cpmood);
-COPY en FROM stdin;
+CREATE TABLE cpen (m cpmood);
+COPY cpen FROM stdin;
 ok
 \.
-SELECT m FROM en;
-COPY en FROM stdin;
+SELECT m FROM cpen;
+COPY cpen FROM stdin;
 elated
 \.
 -- A NULL marker in a length-modified column is a NULL, not a padded blank: it
 -- never reaches the typmod.
-CREATE TABLE nul (c char(5));
-COPY nul FROM stdin;
+CREATE TABLE cpnul (c char(5));
+COPY cpnul FROM stdin;
 \N
 \.
-SELECT c IS NULL AS is_null, octet_length(c) AS len FROM nul;
+SELECT c IS NULL AS is_null, octet_length(c) AS len FROM cpnul;
 -- `now` reads the transaction clock, which only the executing session holds.
-CREATE TABLE clk (t timestamp, z timestamptz);
+CREATE TABLE cpclk (t timestamp, z timestamptz);
 BEGIN;
-COPY clk FROM stdin;
+COPY cpclk FROM stdin;
 now	now
 \.
 SELECT t = transaction_timestamp()::timestamp AS t_is_xact,
-       z = transaction_timestamp() AS z_is_xact FROM clk;
+       z = transaction_timestamp() AS z_is_xact FROM cpclk;
 COMMIT;
 -- An interval literal whose meaning IntervalStyle changes is read under the
 -- session's style.
-CREATE TABLE iv (v interval);
+CREATE TABLE cpiv (v interval);
 SET IntervalStyle = 'sql_standard';
-COPY iv FROM stdin;
+COPY cpiv FROM stdin;
 -1 2:03:04
 \.
-SELECT v FROM iv;
+SELECT v FROM cpiv;
 -- COPY and INSERT must read the same text into the same value. Asserted on
 -- interval[] because array elements take a different route through the input
 -- functions than the scalar above.
-CREATE TABLE ivd (a interval[]);
-COPY ivd FROM stdin;
+CREATE TABLE cpivd (a interval[]);
+COPY cpivd FROM stdin;
 {-1 2:03:04}
 \.
-INSERT INTO ivd VALUES ('{-1 2:03:04}');
-SELECT count(*) AS rows, count(DISTINCT a) AS distinct_values FROM ivd;
+INSERT INTO cpivd VALUES ('{-1 2:03:04}');
+SELECT count(*) AS rows, count(DISTINCT a) AS distinct_values FROM cpivd;
 RESET IntervalStyle;
+
+-- COPY reads a field with its column's input function and then its typmod, and
+-- so does INSERT. They are separate code paths — COPY parses straight into a
+-- value, INSERT goes through the binder's assignment coercion — so the two
+-- agreeing is the property worth pinning, across every typmod family and the
+-- types whose input reads the session. One row loaded each way per column:
+-- `distinct_values = 1` means both routes produced the same value, and the
+-- rendered value is shown so a change to *both* still has to be looked at.
+SET TimeZone = 'Asia/Tokyo';
+CREATE TABLE cpsame (
+    v varchar(3), c char(5), n name, m numeric(5,2),
+    b bit(4), vb varbit(4), t time(2), s timestamp(2), z timestamptz(2),
+    iv interval(2), j json, jb jsonb, a text[], u uuid, ip inet, mn money
+);
+COPY cpsame FROM stdin;
+ab	ab	abc	1.005	1010	101	01:02:03.456	2020-01-01 01:02:03.456	2020-01-01 01:02:03.456	1.456 seconds	{"a":1}	{"b":1.0}	{x,y}	00000000-0000-0000-0000-000000000001	10.0.0.1	$1.005
+\.
+INSERT INTO cpsame VALUES (
+    'ab', 'ab', 'abc', 1.005, B'1010', B'101', '01:02:03.456',
+    '2020-01-01 01:02:03.456', '2020-01-01 01:02:03.456', '1.456 seconds',
+    '{"a":1}', '{"b":1.0}', '{x,y}', '00000000-0000-0000-0000-000000000001',
+    '10.0.0.1', '$1.005'
+);
+SELECT count(DISTINCT v) + count(DISTINCT c) + count(DISTINCT n)
+     + count(DISTINCT m) + count(DISTINCT b) + count(DISTINCT vb)
+     + count(DISTINCT t) + count(DISTINCT s) + count(DISTINCT z)
+     + count(DISTINCT iv) + count(DISTINCT j::text) + count(DISTINCT jb)
+     + count(DISTINCT a) + count(DISTINCT u) + count(DISTINCT ip)
+     + count(DISTINCT mn) AS columns_that_agree, count(*) AS rows
+FROM cpsame;
+SELECT '['||v||']' AS v, '['||c||']' AS c, m, b, vb, t, s, z, iv, mn
+FROM cpsame LIMIT 1;
+RESET TimeZone;
+-- The same for the values that must be rejected: an over-long varchar, an
+-- out-of-range integer and a malformed array say the same thing whichever way
+-- they arrive, DETAIL included.
+CREATE TABLE cprej (v varchar(3), i integer, a text[]);
+COPY cprej (v) FROM stdin;
+abcd
+\.
+INSERT INTO cprej (v) VALUES ('abcd');
+COPY cprej (i) FROM stdin;
+99999999999999999999
+\.
+INSERT INTO cprej (i) VALUES ('99999999999999999999');
+COPY cprej (a) FROM stdin;
+{bad
+\.
+INSERT INTO cprej (a) VALUES ('{bad');
+SELECT count(*) AS loaded FROM cprej;
 
 -- Server-side COPY FROM a file, addressed the way the upstream corpus does:
 -- the harness exports PG_ABS_SRCDIR, `\set` concatenates it with the relative
