@@ -36,9 +36,6 @@ enum Kind {
         /// no code can be reserved: every `u64` is some value's. Two NULL keys
         /// group together, as PG's `GROUP BY` and `DISTINCT` have them.
         null: Option<usize>,
-        /// Keys whose value did not match the promised type — see
-        /// `agg::scalar_code`. Always empty in practice.
-        odd: Vec<(Value, usize)>,
     },
     /// A one-column `text`/`varchar`/`name`/`bpchar` key, compared bytewise
     /// (`agg::text_key`).
@@ -46,7 +43,6 @@ enum Kind {
         ty: PgType,
         groups: FxHashMap<Box<str>, usize>,
         null: Option<usize>,
-        odd: Vec<(Value, usize)>,
     },
     /// Any multi-column key, and any type without an injective encoding
     /// (`numeric`, `uuid`, enums, and the types that hash to nothing at all):
@@ -69,14 +65,12 @@ impl GroupIndex {
                     ty: *ty,
                     groups: FxHashMap::default(),
                     null: None,
-                    odd: Vec::new(),
                 }
             }
             [ty] if agg::scalar_coded(*ty) => Kind::Scalar {
                 ty: *ty,
                 groups: FxHashMap::default(),
                 null: None,
-                odd: Vec::new(),
             },
             _ => Kind::Generic {
                 tys: tys.to_vec(),
@@ -93,29 +87,13 @@ impl GroupIndex {
     /// itself, which identifies the group outright.
     pub fn find(&self, key: &[Value], eq: impl Fn(usize) -> bool) -> Option<usize> {
         match &self.kind {
-            Kind::Scalar {
-                ty,
-                groups,
-                null,
-                odd,
-            } => match one(key)? {
+            Kind::Scalar { ty, groups, null } => match one(key) {
                 Value::Null => *null,
-                v => match agg::scalar_code(*ty, v) {
-                    Some(code) => groups.get(&code).copied(),
-                    None => find_odd(*ty, odd, v),
-                },
+                v => groups.get(&agg::scalar_code(*ty, v)).copied(),
             },
-            Kind::Text {
-                ty,
-                groups,
-                null,
-                odd,
-            } => match one(key)? {
+            Kind::Text { ty, groups, null } => match one(key) {
                 Value::Null => *null,
-                v => match agg::text_key(*ty, v) {
-                    Some(s) => groups.get(s).copied(),
-                    None => find_odd(*ty, odd, v),
-                },
+                v => groups.get(agg::text_key(*ty, v)).copied(),
             },
             Kind::Generic { tys, buckets } => buckets
                 .get(&agg::hash_key(tys, key))
@@ -127,40 +105,18 @@ impl GroupIndex {
     /// after [`GroupIndex::find`] returned `None` for the same key.
     pub fn record(&mut self, key: &[Value], index: usize) {
         match &mut self.kind {
-            Kind::Scalar {
-                ty,
-                groups,
-                null,
-                odd,
-            } => {
-                let Some(v) = one(key) else { return };
-                match v {
-                    Value::Null => *null = Some(index),
-                    v => match agg::scalar_code(*ty, v) {
-                        Some(code) => {
-                            groups.insert(code, index);
-                        }
-                        None => odd.push((v.clone(), index)),
-                    },
+            Kind::Scalar { ty, groups, null } => match one(key) {
+                Value::Null => *null = Some(index),
+                v => {
+                    groups.insert(agg::scalar_code(*ty, v), index);
                 }
-            }
-            Kind::Text {
-                ty,
-                groups,
-                null,
-                odd,
-            } => {
-                let Some(v) = one(key) else { return };
-                match v {
-                    Value::Null => *null = Some(index),
-                    v => match agg::text_key(*ty, v) {
-                        Some(s) => {
-                            groups.insert(s.into(), index);
-                        }
-                        None => odd.push((v.clone(), index)),
-                    },
+            },
+            Kind::Text { ty, groups, null } => match one(key) {
+                Value::Null => *null = Some(index),
+                v => {
+                    groups.insert(agg::text_key(*ty, v).into(), index);
                 }
-            }
+            },
             Kind::Generic { tys, buckets } => {
                 buckets
                     .entry(agg::hash_key(tys, key))
@@ -172,19 +128,13 @@ impl GroupIndex {
 }
 
 /// The single key column a specialized variant indexes. A key of any other
-/// width means the index was built from types the caller then didn't use.
-fn one(key: &[Value]) -> Option<&Value> {
-    debug_assert_eq!(key.len(), 1, "specialized group index got a wide key");
-    key.first()
-}
-
-/// The group of a value whose variant did not match the promised type, found
-/// through the general equality rather than an encoding.
-fn find_odd(ty: PgType, odd: &[(Value, usize)], v: &Value) -> Option<usize> {
-    debug_assert!(false, "group index over {ty:?} got {v:?}");
-    odd.iter()
-        .find(|(seen, _)| agg::value_eq(ty, seen, v))
-        .map(|(_, i)| *i)
+/// width means the index was built from types the caller then didn't use, which
+/// no lookup could answer correctly.
+fn one(key: &[Value]) -> &Value {
+    match key {
+        [v] => v,
+        _ => unreachable!("specialized group index got a {}-column key", key.len()),
+    }
 }
 
 #[cfg(test)]

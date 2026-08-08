@@ -34,37 +34,32 @@ enum Kind {
     /// Types whose [`keys_equal`] is the comparison of a single raw field that
     /// fits in a `u64` losslessly (see [`scalar_code`]). Storing the code
     /// instead of the value costs no `Value` clone and no per-bucket `Vec`.
-    Scalar {
-        seen: FxHashSet<u64>,
-        odd: Vec<Value>,
-    },
+    Scalar(FxHashSet<u64>),
     /// `text`/`varchar`/`name`/`bpchar`: equality is bytewise, since every
     /// collation this engine supports is deterministic (see
     /// `crabgresql_types::collation`). A hit allocates nothing — the lookup
     /// borrows `&str` — and a miss allocates one `Box<str>` per distinct value.
     /// `bpchar` is stored with trailing blanks trimmed, as its equality ignores
     /// them.
-    Text {
-        seen: FxHashSet<Box<str>>,
-        odd: Vec<Value>,
-    },
+    Text(FxHashSet<Box<str>>),
     /// Everything else — `numeric` (equal across display scales), `uuid`,
     /// `bytea`, `jsonb`, enums, and the types that hash to nothing at all.
     /// Buckets of values narrowed by [`hash_key`] and decided by [`keys_equal`].
     Generic(FxHashMap<u64, Vec<Value>>),
 }
 
+// A `GROUP BY` holds one of these per DISTINCT aggregate per group, so a query
+// with as many groups as rows multiplies it by tens of millions. Every variant
+// is one 32-byte table and nothing else, which is what keeps it here.
+const _: () = assert!(std::mem::size_of::<DistinctValues>() <= 48);
+
 impl DistinctValues {
     pub fn new(ty: PgType) -> Self {
         let kind = match ty {
-            PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar => Kind::Text {
-                seen: FxHashSet::default(),
-                odd: Vec::new(),
-            },
-            _ if scalar_coded(ty) => Kind::Scalar {
-                seen: FxHashSet::default(),
-                odd: Vec::new(),
-            },
+            PgType::Text | PgType::Varchar | PgType::Name | PgType::Bpchar => {
+                Kind::Text(FxHashSet::default())
+            }
+            _ if scalar_coded(ty) => Kind::Scalar(FxHashSet::default()),
             _ => Kind::Generic(FxHashMap::default()),
         };
         Self { ty, kind }
@@ -78,21 +73,16 @@ impl DistinctValues {
     pub fn insert(&mut self, value: &Value) -> bool {
         debug_assert!(!matches!(value, Value::Null), "DISTINCT saw a NULL input");
         match &mut self.kind {
-            Kind::Scalar { seen, odd } => match scalar_code(self.ty, value) {
-                Some(code) => seen.insert(code),
-                None => insert_odd(self.ty, odd, value),
-            },
-            Kind::Text { seen, odd } => match text_key(self.ty, value) {
-                Some(key) => {
-                    if seen.contains(key) {
-                        false
-                    } else {
-                        seen.insert(key.into());
-                        true
-                    }
+            Kind::Scalar(seen) => seen.insert(scalar_code(self.ty, value)),
+            Kind::Text(seen) => {
+                let key = text_key(self.ty, value);
+                if seen.contains(key) {
+                    false
+                } else {
+                    seen.insert(key.into());
+                    true
                 }
-                None => insert_odd(self.ty, odd, value),
-            },
+            }
             Kind::Generic(buckets) => {
                 let tys = [self.ty];
                 let values = std::slice::from_ref(value);
@@ -111,23 +101,9 @@ impl DistinctValues {
     }
 }
 
-/// The escape hatch for a value whose variant does not match the type the
-/// binder promised. It cannot be dropped (that would undercount) and it cannot
-/// be admitted blindly (that would overcount), so it goes to a list compared
-/// with the general equality. In practice the list stays empty.
-fn insert_odd(ty: PgType, odd: &mut Vec<Value>, value: &Value) -> bool {
-    debug_assert!(false, "DISTINCT over {ty:?} got {value:?}");
-    if odd.iter().any(|seen| value_eq(ty, seen, value)) {
-        false
-    } else {
-        odd.push(value.clone());
-        true
-    }
-}
-
 /// Whether [`scalar_code`] has an encoding for `ty`. Kept beside it so the two
-/// cannot drift: a type listed here without an arm there sends every value to
-/// the `odd` list.
+/// cannot drift: a type listed here without an arm there panics on its first
+/// value.
 ///
 /// Enums are deliberately absent even though their equality *is* a raw-field
 /// compare. A type here promises an encoding for every value that can arrive
@@ -162,10 +138,13 @@ pub(crate) fn scalar_coded(ty: PgType) -> bool {
 /// That is why only types whose equality is one raw-field comparison appear
 /// here: `numeric` (`1.0` = `1.00`) and `interval` do not, and never can.
 ///
-/// `None` means the value is not of the variant `ty` promises; the caller falls
-/// back to the general equality rather than guessing.
-pub(crate) fn scalar_code(ty: PgType, v: &Value) -> Option<u64> {
-    Some(match (ty, v) {
+/// A value of another variant is a bug in whatever produced it, and panics here
+/// exactly as it would three frames later: the equality this encoding stands in
+/// for is `compare_values`, whose extractors (`int8`, `text`, `date_of`, …) are
+/// `unreachable!` on the same mismatch. There is no fallback worth writing,
+/// because any fallback would have to call that.
+pub(crate) fn scalar_code(ty: PgType, v: &Value) -> u64 {
+    match (ty, v) {
         (PgType::Bool, Value::Bool(b)) => *b as u64,
         // `"char"` orders unsigned, and equality is the same either way.
         (PgType::Char, Value::Char(c)) => *c as u64,
@@ -191,18 +170,21 @@ pub(crate) fn scalar_code(ty: PgType, v: &Value) -> Option<u64> {
         (PgType::Tid, Value::Tid { block, offset }) => (*block as u64) << 16 | *offset as u64,
         // A `reg*` compares by OID alone: the rendered name is display only.
         (PgType::Reg(_), Value::Reg(r)) => r.oid as u64,
-        _ => return None,
-    })
+        (ty, v) => unreachable!("expected a {ty:?} key, got {v:?}"),
+    }
 }
 
 /// The bytes that decide a string value's identity: the string itself, minus
-/// the trailing blanks `bpchar` equality ignores.
-pub(crate) fn text_key(ty: PgType, v: &Value) -> Option<&str> {
-    let Value::Text(s) = v else { return None };
-    Some(match ty {
+/// the trailing blanks `bpchar` equality ignores. Panics on another variant for
+/// the reason [`scalar_code`] does.
+pub(crate) fn text_key(ty: PgType, v: &Value) -> &str {
+    let Value::Text(s) = v else {
+        unreachable!("expected a {ty:?} key, got {v:?}")
+    };
+    match ty {
         PgType::Bpchar => s.trim_end_matches(' '),
         _ => s,
-    })
+    }
 }
 
 /// The running state of one aggregate over one group.
