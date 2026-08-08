@@ -7594,7 +7594,17 @@ async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<(
         "WHERE id > 3 OR false ORDER BY id",
         // A predicate the columnar filter declines, combined with a sort it
         // accepts: the row Filter must still run, and run first.
+        "WHERE lower(label) = 'a' ORDER BY id",
+        // LIKE against a constant pattern runs columnar, with the same matcher
+        // the row path runs. The NULL label is the one that matters: a subject
+        // that is NULL makes the predicate NULL, which the filter drops.
         "WHERE label LIKE 'a%' ORDER BY id",
+        "WHERE label NOT LIKE 'a%' ORDER BY id",
+        "WHERE label ILIKE '%B%' ORDER BY id",
+        "WHERE label LIKE 'a!%' ESCAPE '!' ORDER BY id",
+        // Declines: a computed pattern, and an escape clause the row path owes
+        // the client as an error.
+        "WHERE label LIKE label ORDER BY id",
     ] {
         let columnar = client
             .simple_query(&format!("SELECT id FROM p {tail}"))
@@ -7687,10 +7697,11 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
         ],
         "a WHERE on a split relation must still be rendered, and by column name"
     );
-    // The annotation must be earned, not assumed. A `LIKE` has no Arrow kernel
-    // here and `id + 1` is a computed sort key, so each declines its own step
-    // while the scan stays columnar — if either over-claimed, EXPLAIN would be
-    // reporting work that never happens.
+    // The annotation must be earned, not assumed. A `LIKE` against a constant
+    // pattern compiles, but one against a column does not (it would compile per
+    // row), and `id + 1` is a computed sort key — so each declines its own step
+    // while the scan stays columnar. If any of them over-claimed, EXPLAIN would
+    // be reporting work that never happens.
     for (query, expected) in [
         (
             "EXPLAIN SELECT id FROM p ORDER BY id",
@@ -7698,6 +7709,19 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
         ),
         (
             "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label NOT ILIKE 'a%'",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label LIKE label",
+            "Append (columnar: scan)",
+        ),
+        (
+            // A malformed escape is an error the row evaluator raises per row.
+            "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%' ESCAPE 'xy'",
             "Append (columnar: scan)",
         ),
         (

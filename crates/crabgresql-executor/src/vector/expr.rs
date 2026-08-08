@@ -26,6 +26,17 @@
 //!   `=`/`<>` are allowed under any of them, because every supported collation
 //!   is deterministic, so equality is bytewise regardless.
 //!
+//! # `LIKE` is not an Arrow kernel
+//!
+//! Arrow ships `like_utf8`/`ilike_utf8`, and neither is used. They have no user
+//! `ESCAPE` clause and their own idea of case folding, so either would be a
+//! second implementation of `LIKE` that has to be kept in step with the real
+//! one. Instead the pattern compiles — once, at plan time, via
+//! [`vectorize::like_call`] — to the *same* [`crabgresql_types::text`] matcher
+//! the row path runs, and the loop over the column is the only new code. What
+//! vectorizing buys here is not a faster match but the compile hoisted out of
+//! the row loop and the batch never shredded into tuples.
+//!
 //! # Three-valued logic
 //!
 //! `AND`/`OR` compile to Arrow's **Kleene** kernels. The plain `and`/`or` return
@@ -39,14 +50,15 @@
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch, Scalar};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch, Scalar, StringArray};
 use arrow_ord::cmp;
 use arrow_schema::ArrowError;
-use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_planner::vectorize;
 use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::build_array;
 use crabgresql_types::PgType;
+use crabgresql_types::text::LikeMatcher;
 
 use super::BatchLayout;
 use crate::ExecError;
@@ -81,6 +93,13 @@ enum Node {
         op: BinOp,
         left: Box<Node>,
         right: Box<Node>,
+    },
+    /// `LIKE`/`ILIKE` against a pattern compiled once, at plan time. The
+    /// matcher is boxed because a compiled program owns its literals and its
+    /// searchers, and every other variant is pointer-sized.
+    Like {
+        subject: Box<Node>,
+        matcher: Box<LikeMatcher>,
     },
 }
 
@@ -150,6 +169,25 @@ impl Node {
                     _ => Err(ArrowError::NotYetImplemented("not a comparison".into())),
                 };
                 mask.map(boxed).map_err(kernel_error)
+            }
+            Node::Like { subject, matcher } => {
+                let subject = subject.evaluate(batch)?;
+                let array = subject
+                    .array()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    // Unreachable: the gate admits only text-family subjects,
+                    // which this mapping stores as `Utf8`. An error rather than
+                    // a panic, so a compiler bug fails the query, not the
+                    // backend.
+                    .ok_or_else(|| internal("vectorized LIKE expected a text operand"))?;
+                // A NULL subject stays NULL, as `eval_like` returns NULL for
+                // one; the top-level filter drops NULL and `false` alike.
+                let mask: BooleanArray = array
+                    .iter()
+                    .map(|value| value.map(|s| matcher.matches(s)))
+                    .collect();
+                Ok(Operand::Array(Arc::new(mask)))
             }
         }
     }
@@ -275,6 +313,18 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
                 op: *op,
                 left: Box::new(compile_operand(left, layout)?),
                 right: Box::new(compile_operand(right, layout)?),
+            })
+        }
+        // `NOT LIKE` binds as `NOT` over this call, so the `Not` arm covers it.
+        BoundExpr::FuncCall {
+            func: func @ (ScalarFn::Like | ScalarFn::ILike),
+            args,
+            ..
+        } => {
+            let call = vectorize::like_call(*func, args, layout.len())?;
+            Some(Node::Like {
+                subject: Box::new(compile_operand(call.subject, layout)?),
+                matcher: Box::new(call.matcher),
             })
         }
         // A bare boolean column or constant is a legal `WHERE` on its own.

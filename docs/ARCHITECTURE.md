@@ -91,6 +91,16 @@ PG's — ordering is repairable where equality is not. `AND`/`OR` use Arrow's
 Kleene kernels; the plain ones return NULL for `false AND NULL` and would
 silently drop rows.
 
+`LIKE`/`ILIKE` against a **constant** pattern is the one function call the
+filter compiles, and it uses no Arrow kernel: Arrow's `like_utf8` has no user
+`ESCAPE` and its own case folding, so it would be a second implementation of
+`LIKE` to keep in step with the real one. The pattern compiles once, at plan
+time, into the same `crabgresql_types::text` matcher the row path runs. The win
+is the compile hoisted out of the row loop and the batch never shredded into
+tuples, not a faster match. A computed pattern is declined (it would compile per
+row), as is one whose pattern or `ESCAPE` is malformed — that error belongs to
+the row evaluator, which raises it per row.
+
 Arrow batches carry **`Value` semantics, not Arrow's** — a `Date32` holds
 PostgreSQL epoch days. A format whose file layout is defined in Arrow's epoch
 converts at its own boundary and nowhere else, so a relation's storage leaves

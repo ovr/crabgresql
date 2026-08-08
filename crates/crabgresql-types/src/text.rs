@@ -889,40 +889,86 @@ pub fn like(s: &str, pattern: &str, escape: Option<char>, case_insensitive: bool
         case_insensitive,
     };
     with_cached(&LIKE_CACHE, pattern, kind, compile_like, |prog| {
-        if !case_insensitive {
-            return prog.matches::<Exact>(s);
-        }
-        // Scanning the whole subject to classify it costs more than a `Prefix`
-        // or `Suffix` match does, so those shapes only classify the window they
-        // compare; everything else has to look at all of it.
-        let ascii = match prog.ascii_window(s) {
-            Some(window) => window.is_ascii(),
-            None => s.is_ascii(),
-        };
-        if ascii {
-            // The pattern was lowercased at compile time, so an ASCII subject
-            // only needs per-byte folding — no allocation. This is exactly
-            // equal to lowering it: over ASCII, `to_lowercase` maps `A-Z` to
-            // `a-z`, touches nothing else, and preserves length (its one
-            // contextual rule, final sigma, needs a non-ASCII `Σ`).
-            prog.matches::<AsciiFold>(s)
-        } else {
-            // Rust lowers with *full* contextual mapping where PostgreSQL maps
-            // each character independently, so this branch is wrong in both
-            // directions: `İ` lowers to two characters here (changing what `_`
-            // counts) against PG's one, and `'ΑΣ' ILIKE 'ασ'` is true in PG but
-            // false here because of the final-sigma rule.
-            //
-            // TODO: PostgreSQL's simple (per-character, 1:1) case mapping, and
-            // the collation tailoring on top of it — `lower('İ' COLLATE
-            // "tr-x-icu")` differs from `"en-x-icu"`, and neither is reachable
-            // while `like` takes no collation. Fixing it means a simple-mapping
-            // table (`icu_casemap`) shared with `lower`/`upper`/`initcap`, plus
-            // a collation OID threaded through `ScalarFn::{Lower,Upper,Initcap}`
-            // and `text::like`.
-            prog.matches::<Exact>(&s.to_lowercase())
-        }
+        match_program(prog, s, case_insensitive)
     })
+}
+
+/// Run a compiled program against one subject.
+///
+/// The one place the case policy is chosen, shared by the cached [`like`] and
+/// by [`LikeMatcher`], so a caller that compiles its own program cannot answer
+/// differently from one that goes through the cache.
+fn match_program(prog: &LikeProgram, s: &str, case_insensitive: bool) -> bool {
+    if !case_insensitive {
+        return prog.matches::<Exact>(s);
+    }
+    // Scanning the whole subject to classify it costs more than a `Prefix`
+    // or `Suffix` match does, so those shapes only classify the window they
+    // compare; everything else has to look at all of it.
+    let ascii = match prog.ascii_window(s) {
+        Some(window) => window.is_ascii(),
+        None => s.is_ascii(),
+    };
+    if ascii {
+        // The pattern was lowercased at compile time, so an ASCII subject
+        // only needs per-byte folding — no allocation. This is exactly
+        // equal to lowering it: over ASCII, `to_lowercase` maps `A-Z` to
+        // `a-z`, touches nothing else, and preserves length (its one
+        // contextual rule, final sigma, needs a non-ASCII `Σ`).
+        prog.matches::<AsciiFold>(s)
+    } else {
+        // Rust lowers with *full* contextual mapping where PostgreSQL maps
+        // each character independently, so this branch is wrong in both
+        // directions: `İ` lowers to two characters here (changing what `_`
+        // counts) against PG's one, and `'ΑΣ' ILIKE 'ασ'` is true in PG but
+        // false here because of the final-sigma rule.
+        //
+        // TODO: PostgreSQL's simple (per-character, 1:1) case mapping, and
+        // the collation tailoring on top of it — `lower('İ' COLLATE
+        // "tr-x-icu")` differs from `"en-x-icu"`, and neither is reachable
+        // while `like` takes no collation. Fixing it means a simple-mapping
+        // table (`icu_casemap`) shared with `lower`/`upper`/`initcap`, plus
+        // a collation OID threaded through `ScalarFn::{Lower,Upper,Initcap}`
+        // and `text::like`.
+        prog.matches::<Exact>(&s.to_lowercase())
+    }
+}
+
+/// A `LIKE` pattern compiled once and owned by the caller.
+///
+/// [`like`] compiles through a thread-local cache because the row path meets a
+/// pattern one subject at a time and cannot know it is the same pattern as last
+/// row. A caller that *does* know — the vectorized filter, which holds one
+/// constant pattern for the life of a plan — compiles here instead and pays no
+/// cache lookup per value at all.
+///
+/// It is the same program run by the same matcher, so the two paths agree by
+/// construction rather than by test.
+pub struct LikeMatcher {
+    program: LikeProgram,
+    case_insensitive: bool,
+}
+
+impl LikeMatcher {
+    /// Compile `pattern`. `escape` follows [`like`]: `Some('\\')` for the
+    /// default clause, `None` to disable escaping (`ESCAPE ''`). Fails exactly
+    /// where `like` fails — on a pattern ending in a bare escape character.
+    pub fn compile(pattern: &str, escape: Option<char>, case_insensitive: bool) -> Result<Self> {
+        let kind = LikeKind {
+            escape,
+            case_insensitive,
+        };
+        Ok(LikeMatcher {
+            program: compile_like(pattern, kind)?,
+            case_insensitive,
+        })
+    }
+
+    /// Whether `s` matches. Never fails: everything that can go wrong went
+    /// wrong at [`compile`](Self::compile).
+    pub fn matches(&self, s: &str) -> bool {
+        match_program(&self.program, s, self.case_insensitive)
+    }
 }
 
 /// How many compiled LIKE patterns this thread is holding.
@@ -3232,6 +3278,36 @@ mod tests {
                                 assert_eq!(a.message, b.message);
                             }
                             _ => panic!("{pattern:?} ESCAPE {escape:?}: {got:?} vs {want:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A caller that owns its compiled program must get the cached matcher's
+    /// answer, error for error. Both go through `match_program`, so this pins
+    /// that they keep doing so — a `LikeMatcher` that drifted would silently
+    /// give the vectorized filter a different answer than the row path.
+    #[test]
+    fn the_owned_matcher_agrees_with_the_cached_one() {
+        let patterns = words_upto(&['a', 'b', '%', '_', '\\'], 4);
+        let subjects = words_upto(&['a', 'b', '\\'], 3);
+        for pattern in &patterns {
+            for escape in ESCAPES {
+                for ci in [false, true] {
+                    let matcher = LikeMatcher::compile(pattern, escape, ci);
+                    for s in &subjects {
+                        match (like(s, pattern, escape, ci), &matcher) {
+                            (Ok(want), Ok(matcher)) => assert_eq!(
+                                matcher.matches(s),
+                                want,
+                                "{s:?} LIKE {pattern:?} ESCAPE {escape:?} ci={ci}"
+                            ),
+                            (Err(want), Err(got)) => assert_eq!(got, &want),
+                            _ => panic!(
+                                "{pattern:?} ESCAPE {escape:?}: one path compiled and the other did not"
+                            ),
                         }
                     }
                 }
