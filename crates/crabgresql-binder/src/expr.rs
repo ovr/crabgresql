@@ -8432,8 +8432,30 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 /// the text can say, and for almost every literal the answer is no — see
 /// [`interval::style_sensitive`].
 fn interval_input_needs_style(value: &Value, to: PgType) -> bool {
-    to == PgType::Interval
-        && matches!(value, Value::Text(s) if crabgresql_types::interval::style_sensitive(s))
+    matches!(value, Value::Text(s) if reads_interval_style(s, to))
+}
+
+/// Whether reading `text` as `ty` consults `IntervalStyle`, and so cannot be
+/// folded by a binder that holds no session.
+///
+/// For a scalar the answer is per-literal: only one whose leading minus would
+/// propagate under `sql_standard` reads differently, which is what
+/// [`interval::style_sensitive`] decides.
+///
+/// For an interval **array** the answer is always yes. `style_sensitive` cannot
+/// be pointed at the raw `{…}` text instead: `interval`'s field scanner treats
+/// `{`, `}` and `,` as ordinary separators, so `{1 day, -1 year 2 months}` reads
+/// as the fields `1 day -1 year 2 months`, whose leading field is positive — it
+/// would answer "not sensitive" while the *second element* is. Splitting the
+/// array first would need `array_in`'s own scanner exposed. Deferring the whole
+/// type costs a bind-time fold for literals that did not need it and never a
+/// wrong value, which is the trade `style_sensitive` itself already makes.
+fn reads_interval_style(text: &str, ty: PgType) -> bool {
+    match ty {
+        PgType::Interval => crabgresql_types::interval::style_sensitive(text),
+        PgType::Array(elem) => elem == crabgresql_types::oid::INTERVAL,
+        _ => false,
+    }
 }
 
 fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
@@ -8590,11 +8612,8 @@ pub(crate) fn resolve_unknown(
     // An interval literal whose meaning `sql_standard` would change cannot be
     // folded either, for the same reason and with the same shape — validated
     // here for the diagnostic, evaluated under the executing session's style.
-    if ty == PgType::Interval
-        && lit
-            .as_deref()
-            .is_some_and(crabgresql_types::interval::style_sensitive)
-    {
+    // Covers `interval[]` as a whole, per `reads_interval_style`.
+    if lit.as_deref().is_some_and(|s| reads_interval_style(s, ty)) {
         let s = lit.unwrap_or_else(|| unreachable!("checked as Some above"));
         parse_unknown(&s, ty, &FmtCtx::utc_default()).map_err(|e| e.at(span))?;
         return Ok(BoundExpr::Coerce {
@@ -10013,5 +10032,36 @@ mod collect_column_refs_tests {
             cmp: Box::new(col(1)),
         };
         assert_eq!(refs(&expr), Some(vec![1, 5]));
+    }
+
+    /// An interval array always reads `IntervalStyle`, because the raw `{…}`
+    /// text cannot be asked the per-literal question: the interval field scanner
+    /// steps over `{`, `}` and `,`, so an array whose *second* element carries
+    /// the propagating minus looks positive from the outside. Folding it at bind
+    /// time would read it under the wrong style.
+    #[test]
+    fn an_interval_array_always_reads_the_session_style() {
+        // The scalar answer stays per-literal.
+        assert!(reads_interval_style("-1 2:03:04", PgType::Interval));
+        assert!(!reads_interval_style("1 day -2 hours", PgType::Interval));
+
+        let interval_array = PgType::Array(crabgresql_types::oid::INTERVAL);
+        // Sensitive in the first element, and in the second — where a check
+        // against the raw text answers "no".
+        assert!(reads_interval_style("{-1 2:03:04}", interval_array));
+        assert!(reads_interval_style("{1 day, -1 2:03:04}", interval_array));
+        assert!(
+            !crabgresql_types::interval::style_sensitive("{1 day, -1 2:03:04}"),
+            "the raw-text shortcut this arm exists to avoid must still look positive"
+        );
+        // Insensitive literals defer too: the cost is a lost fold, not a value.
+        assert!(reads_interval_style("{1 day}", interval_array));
+
+        // Every other array is unaffected.
+        assert!(!reads_interval_style(
+            "{1}",
+            PgType::Array(crabgresql_types::oid::INT4)
+        ));
+        assert!(!reads_interval_style("-1 2:03:04", PgType::Text));
     }
 }
