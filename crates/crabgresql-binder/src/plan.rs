@@ -23,7 +23,7 @@ use crate::expr::{
     ParamCtx, Scope, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey,
     apply_column_typmod, bind_binary_op, bind_column_default, bind_expr, bind_projection,
     bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible, merge_types,
-    normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
+    normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown_owned,
     reject_agg_or_window, reject_window, to_bool_operand, unify_value_column, view_expansion,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
@@ -6039,11 +6039,14 @@ impl CopyFromPlan {
                         let value = match column.ty {
                             PgType::User(oid) => match catalog.enum_info(oid) {
                                 Some(info) => enum_value(oid, &info, text)?,
-                                // Not an enum: let the input-function dispatch
-                                // reject it, so the message stays PG's.
-                                None => parse_unknown(&text, column.ty, fmt)?,
+                                // A user type that is not an enum: the input
+                                // dispatch rejects it, naming the type
+                                // `user-defined` the way the expression path
+                                // does. Reachable, because dropping a type a
+                                // column still uses is allowed here.
+                                None => parse_unknown_owned(text, column.ty, fmt)?,
                             },
-                            ty => parse_unknown(&text, ty, fmt)?,
+                            ty => parse_unknown_owned(text, ty, fmt)?,
                         };
                         apply_column_typmod(value, column)?
                     }
@@ -11124,7 +11127,7 @@ mod tests {
         let fmt = FmtCtx::utc_default();
         for (ty, typmod, literal) in cases {
             let column = Column::with_typmod("c", ty, typmod);
-            let value = match parse_unknown(literal, ty, &fmt) {
+            let value = match crate::expr::parse_unknown(literal, ty, &fmt) {
                 Ok(value) => value,
                 Err(e) => panic!("{ty:?} typmod {typmod} rejected {literal:?}: {e}"),
             };

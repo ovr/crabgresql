@@ -2708,11 +2708,12 @@ pub fn truncate_chars(s: &str, n: i32) -> String {
     if n <= 0 {
         return String::new();
     }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n as usize {
+    // Counted rather than collected: a value that fits is the common case, and
+    // it does not need the characters, only how many there are.
+    if s.chars().count() <= n as usize {
         s.to_string()
     } else {
-        chars[..n as usize].iter().collect()
+        s.chars().take(n as usize).collect()
     }
 }
 
@@ -2720,15 +2721,16 @@ pub fn truncate_chars(s: &str, n: i32) -> String {
 /// is silently truncated; in *assignment/implicit* context it errors unless the
 /// excess characters are all spaces (then it is truncated).
 pub fn varchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= n.max(0) as usize {
+    let n = n.max(0) as usize;
+    if s.chars().count() <= n {
         return Ok(s.to_string());
     }
+    let chars: Vec<char> = s.chars().collect();
     if explicit {
-        return Ok(chars[..n.max(0) as usize].iter().collect());
+        return Ok(chars[..n].iter().collect());
     }
-    if chars[n.max(0) as usize..].iter().all(|&c| c == ' ') {
-        Ok(chars[..n.max(0) as usize].iter().collect())
+    if chars[n..].iter().all(|&c| c == ' ') {
+        Ok(chars[..n].iter().collect())
     } else {
         Err(TextError::new(
             sqlstate::STRING_DATA_RIGHT_TRUNCATION,
@@ -2742,8 +2744,9 @@ pub fn varchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
 /// spaces.
 pub fn bpchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
     let n = n.max(0) as usize;
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() > n {
+    let len = s.chars().count();
+    if len > n {
+        let chars: Vec<char> = s.chars().collect();
         if !explicit && !chars[n..].iter().all(|&c| c == ' ') {
             return Err(TextError::new(
                 sqlstate::STRING_DATA_RIGHT_TRUNCATION,
@@ -2753,7 +2756,7 @@ pub fn bpchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
         return Ok(chars[..n].iter().collect());
     }
     let mut out: String = s.to_string();
-    out.extend(std::iter::repeat(' ').take(n - chars.len()));
+    out.extend(std::iter::repeat_n(' ', n - len));
     Ok(out)
 }
 
