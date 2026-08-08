@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786206267618,
+  "lastUpdate": 1786206268950,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -2988,6 +2988,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q22",
             "value": 0.578,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "zaets28rus@gmail.com",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "d16ae74b34d777387dd3b55c9222515729ec8b6f",
+          "message": "test(copy): pin COPY and INSERT agreeing across the typmod families\n\nThe suite's only COPY-vs-INSERT case ran on `interval[]`, which the load path\nused to reject — so it compared the fallback against INSERT, which are the same\ncode. Nothing checked the property the two paths exist to preserve.\n\n`cpsame` now loads one row each way across sixteen columns covering every typmod\nfamily and the types whose input reads the session, and asserts every column\nagrees; `cprej` does the same for the values that must be rejected, DETAIL\nincluded. `jsonb` is left out of the rejection set because PostgreSQL names that\nerror after `json`, a divergence of its own and not this suite's subject.\n\nThe tables take the file's own `cp*` prefix: all 79 smoke tests share one\ndatabase, and `num`, `en`, `bad` and `ord` are names a future numeric or enum\ntest would reach for.\n\nAlso drops a `WHERE n IS NOT NULL` that hid the invariant it depended on — the\nCOPY before it is expected to fail, so the table holds exactly one row — and\ncorrects a fixture that set `typmod` to 9 while calling itself `bpchar(5)`;\n`Column::typmod` is the bare length, and `atttypmod()` is what adds the header.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-08-08T17:30:56+02:00",
+          "tree_id": "0ceb7dd22841d3cebccb98c5ee35dfa937b43b72",
+          "url": "https://github.com/ovr/crabgresql/commit/d16ae74b34d777387dd3b55c9222515729ec8b6f"
+        },
+        "date": 1786206268897,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.678,
+            "unit": "s",
+            "extra": "dataset load — heap, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.216,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.023,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.102,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 19.181,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.131,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.083,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.261,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.126,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.172,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.096,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.015,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.086,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.027,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.071,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.145,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.008,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.062,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.283,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 134.619,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 4.025,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 10.924,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.725,
             "unit": "s",
             "extra": "best of the timed runs — heap, 86805 rows"
           }
