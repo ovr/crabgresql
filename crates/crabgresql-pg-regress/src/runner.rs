@@ -492,6 +492,12 @@ fn render_events(
                 rows.clear();
             }
             QueryEvent::Row(row) => rows.push(row.clone()),
+            // psql writes a copy-out straight to its output: no column header,
+            // no table framing, no `(n rows)` footer, and the `COPY n` tag is
+            // suppressed like every other tag. The payload already ends in a
+            // newline. It carries no RowDescription, so `fields`/`rows` — which
+            // belong to a result set that may still be in flight — are untouched.
+            QueryEvent::CopyOut(bytes) => out.push_str(&String::from_utf8_lossy(bytes)),
             QueryEvent::CommandComplete(_tag) => {
                 if let Some(fields) = fields.take() {
                     out.push_str(&format::format_table(printing, &fields, &rows));

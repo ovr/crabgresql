@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
-    BoundExpr, CopyFromPlan, CopyFromSource, InsertSource, LogicalPlan, bind_copy_from,
+    BoundExpr, CopyFormat, CopyFromPlan, CopyFromSource, InsertSource, LogicalPlan, bind_copy_from,
     bind_delete_with_params, bind_insert_with_params, bind_query, bind_query_with_params,
     bind_update_with_params, output_columns_of, param_ctx_extended, param_ctx_none, param_types,
     require_all_resolved, substitute_params,
@@ -141,6 +141,21 @@ pub enum QueryResult {
         /// is what the session-owned buffer they come from is shaped for.
         notices: Vec<Notice>,
     },
+    /// `COPY … TO STDOUT`: the same streamed node as [`Self::Rows`], but written
+    /// to the wire's copy-out sub-protocol instead of as DataRows.
+    ///
+    /// This is a result rather than a connection-layer driver (the shape
+    /// copy-*in* needs) because copy-out only ever writes: it never reads a
+    /// frontend message, so it has no reason to bypass the ordinary execute
+    /// path, and going through it is what gives `COPY (SELECT f(x)) TO STDOUT`
+    /// the same materialization a plain `SELECT f(x)` gets.
+    CopyOut {
+        /// Output column names in emission order, for `HEADER`.
+        columns: Vec<String>,
+        node: Box<dyn ExecNode>,
+        format: CopyFormat,
+        notices: Vec<Notice>,
+    },
     Command {
         tag: String,
         /// Warnings to emit before the CommandComplete, in order.
@@ -212,7 +227,9 @@ impl QueryResult {
             return;
         }
         let own = match self {
-            QueryResult::Rows { notices, .. } | QueryResult::Command { notices, .. } => notices,
+            QueryResult::Rows { notices, .. }
+            | QueryResult::CopyOut { notices, .. }
+            | QueryResult::Command { notices, .. } => notices,
         };
         notices.append(own);
         *own = notices;
@@ -763,6 +780,12 @@ pub(crate) fn execute_statement_with(
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
     let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    // Set by the `COPY … TO STDOUT` arm below, which binds to an ordinary
+    // row-producing plan and then rejoins the common path: the XID decision,
+    // execution, the materialize-if-a-routine-is-called rule and
+    // `finalize_statement` are all the same as for the equivalent SELECT. Only
+    // the final result wrapping differs, at the bottom of this function.
+    let mut copy_out: Option<CopyFormat> = None;
     let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
         Some(logical) => logical,
         // EXPLAIN of a utility statement: report the gap rather than falling
@@ -1019,6 +1042,28 @@ pub(crate) fn execute_statement_with(
             ast::Statement::CreateIndex(create) => {
                 return execute_create_index(&catalog, txnmgr, session, create);
             }
+            // `COPY … TO STDOUT` binds to a plain row-producing plan and rejoins
+            // the common path below; `copy_out` carries the format so the result
+            // is wrapped as a copy-out stream rather than as DataRows.
+            ast::Statement::Copy {
+                source,
+                to: true,
+                target,
+                options,
+                legacy_options,
+                ..
+            } => {
+                let plan = crabgresql_binder::bind_copy_to(
+                    &catalog,
+                    &type_catalog,
+                    source,
+                    target,
+                    options,
+                    legacy_options,
+                )?;
+                copy_out = Some(plan.format);
+                plan.plan
+            }
             // `COPY … FROM '<file>'` needs no wire sub-protocol: the server reads
             // the file itself, so it runs on the ordinary execute path. The STDIN
             // form never reaches here — the connection intercepts it before
@@ -1229,6 +1274,25 @@ pub(crate) fn execute_statement_with(
     // Anything a routine body raised is buffered on the session; hand it to the
     // caller alongside the result so it goes out ahead of the rows.
     let notices = session.notices.drain();
+    // A copy-out plan must have executed into rows. Nothing else can reach here
+    // today (the binder only ever produces a query plan for `COPY … TO`), but
+    // the mismatch would be invisible otherwise: the statement would answer with
+    // DataRows after Describe already said NoData, which breaks the extended
+    // protocol outright. Say so instead.
+    if let Some(format) = copy_out {
+        let Execution::Rows { columns, node } = exec else {
+            return Err(PgError::new(
+                sqlstate::INTERNAL_ERROR,
+                "COPY TO did not execute into rows",
+            ));
+        };
+        return Ok(QueryResult::CopyOut {
+            columns: columns.into_iter().map(|c| c.name).collect(),
+            node,
+            format,
+            notices,
+        });
+    }
     let result = match exec {
         Execution::Rows { columns, node } => QueryResult::Rows {
             columns,

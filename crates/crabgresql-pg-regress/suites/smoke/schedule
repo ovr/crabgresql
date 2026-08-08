@@ -58,6 +58,7 @@ test: subquery
 test: subquery_correlated
 test: sequence
 test: copy
+test: copy_to
 test: partition
 test: collate
 test: psql_describe

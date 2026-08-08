@@ -8356,6 +8356,355 @@ async fn copy_in_fills_serial_default_from_sequence() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// COPY ... TO STDOUT
+// ---------------------------------------------------------------------------
+
+/// Run a `COPY … TO STDOUT` and return the concatenated payload. `tokio_postgres`
+/// drives copy-out over the *extended* protocol, so every test here also covers
+/// the Parse/Bind/Describe/Execute path.
+async fn copy_out_bytes(
+    client: &tokio_postgres::Client,
+    statement: &str,
+) -> Result<Vec<u8>, tokio_postgres::Error> {
+    use futures_util::TryStreamExt;
+
+    let stream = client.copy_out(statement).await?;
+    futures_util::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.try_next().await? {
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+async fn copy_out_text(client: &tokio_postgres::Client, statement: &str) -> anyhow::Result<String> {
+    Ok(String::from_utf8(copy_out_bytes(client, statement).await?)?)
+}
+
+/// Text format: TAB-delimited, `\N` for NULL, and the named backslash escapes.
+#[tokio::test]
+async fn copy_out_text_escapes_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, E'a\\tb'), (2, NULL), (3, E'c\\\\d')")
+        .await?;
+
+    assert_eq!(
+        copy_out_text(&client, "COPY t TO STDOUT").await?,
+        "1\ta\\tb\n2\t\\N\n3\tc\\\\d\n"
+    );
+    Ok(())
+}
+
+/// CSV quotes only what it must, and HEADER writes the column names first.
+#[tokio::test]
+async fn copy_out_csv_with_header() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'has,comma'), (2, 'has\"quote'), (3, NULL)")
+        .await?;
+
+    assert_eq!(
+        copy_out_text(&client, "COPY t TO STDOUT (FORMAT csv, HEADER)").await?,
+        "a,b\n1,\"has,comma\"\n2,\"has\"\"quote\"\n3,\n"
+    );
+    Ok(())
+}
+
+/// A written column list emits those columns in that order, not the schema's —
+/// and the HEADER follows it.
+#[tokio::test]
+async fn copy_out_honors_the_written_column_order() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text, c int4)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, 'x', 9)")
+        .await?;
+
+    assert_eq!(
+        copy_out_text(&client, "COPY t (c, a) TO STDOUT (HEADER)").await?,
+        "c\ta\n9\t1\n"
+    );
+    Ok(())
+}
+
+/// The query form takes its column names from the query, and an empty result
+/// still writes the header.
+#[tokio::test]
+async fn copy_out_query_form_and_empty_header() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    assert_eq!(
+        copy_out_text(
+            &client,
+            "COPY (SELECT 1 AS n, 'x'::text AS s) TO STDOUT (FORMAT csv, HEADER)",
+        )
+        .await?,
+        "n,s\n1,x\n"
+    );
+    assert_eq!(
+        copy_out_text(&client, "COPY (SELECT 1 WHERE false) TO STDOUT (HEADER)").await?,
+        "?column?\n"
+    );
+    Ok(())
+}
+
+/// FORCE_QUOTE quotes data fields regardless of content, but never the NULL
+/// marker and never the header.
+#[tokio::test]
+async fn copy_out_force_quote_leaves_null_and_header_bare() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4, b text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO t VALUES (1, NULL)")
+        .await?;
+
+    assert_eq!(
+        copy_out_text(
+            &client,
+            "COPY t TO STDOUT (FORMAT csv, HEADER, FORCE_QUOTE *)"
+        )
+        .await?,
+        "a,b\n\"1\",\n"
+    );
+    Ok(())
+}
+
+/// The `PGCOPY` file header, one row, and the `-1` trailer, byte for byte as
+/// PostgreSQL 18.4 emits them.
+#[tokio::test]
+async fn copy_out_binary_frames_match_pg() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    let bytes = copy_out_bytes(
+        &client,
+        "COPY (SELECT 1::int4, 'ab'::text, NULL::int8) TO STDOUT (FORMAT binary)",
+    )
+    .await?;
+    assert_eq!(
+        bytes,
+        b"PGCOPY\n\xff\r\n\0\
+          \x00\x00\x00\x00\x00\x00\x00\x00\
+          \x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x02ab\xff\xff\xff\xff\
+          \xff\xff"
+    );
+    Ok(())
+}
+
+/// A type with no binary output routine is an honest `0A000` rather than wrong
+/// bytes. A deliberate divergence: PostgreSQL has a `send` function for every
+/// type, so this errors where PG would succeed.
+#[tokio::test]
+async fn copy_out_binary_rejects_a_type_without_a_send_routine() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    let err = match copy_out_bytes(
+        &client,
+        "COPY (SELECT '2020-01-01'::date) TO STDOUT (FORMAT binary)",
+    )
+    .await
+    {
+        Ok(_) => panic!("date has no binary output routine yet"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED
+    );
+    Ok(())
+}
+
+/// The strongest end-to-end check available: what COPY TO writes, COPY FROM
+/// reads back into an identical table — over the real wire, in both formats.
+#[tokio::test]
+async fn copy_out_round_trips_through_copy_in() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE src (a int4, b text)")
+        .await?;
+    client
+        .simple_query(
+            "INSERT INTO src VALUES \
+             (1, 'plain'), (2, 'has,comma'), (3, E'tab\\there'), (4, NULL), \
+             (5, 'has\"quote'), (6, E'nl\\nhere'), (7, E'back\\\\slash'), (8, ' pad ')",
+        )
+        .await?;
+
+    for (index, options) in ["", " (FORMAT csv)"].iter().enumerate() {
+        let table = format!("dst{index}");
+        client
+            .simple_query(&format!("CREATE TABLE {table} (a int4, b text)"))
+            .await?;
+        let dumped = copy_out_bytes(&client, &format!("COPY src TO STDOUT{options}")).await?;
+
+        let sink = client
+            .copy_in(&format!("COPY {table} FROM STDIN{options}"))
+            .await?;
+        futures_util::pin_mut!(sink);
+        sink.send(Bytes::from(dumped.clone())).await?;
+        assert_eq!(sink.finish().await?, 8);
+
+        let reloaded = copy_out_bytes(&client, &format!("COPY {table} TO STDOUT{options}")).await?;
+        assert_eq!(reloaded, dumped, "round trip for `COPY …{options}`");
+    }
+    Ok(())
+}
+
+/// A `COPY … TO` in an aborted block is refused like any other statement, and a
+/// read-only block runs it (it writes nothing).
+#[tokio::test]
+async fn copy_out_in_aborted_and_read_only_transactions() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+
+    client.simple_query("BEGIN").await?;
+    let _ = client.simple_query("SELECT 1/0").await;
+    let err = match copy_out_bytes(&client, "COPY (SELECT 1) TO STDOUT").await {
+        Ok(_) => panic!("an aborted block must refuse the copy"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.as_db_error().expect("db error").code(),
+        &SqlState::IN_FAILED_SQL_TRANSACTION
+    );
+    client.simple_query("ROLLBACK").await?;
+
+    client.simple_query("BEGIN READ ONLY").await?;
+    assert_eq!(
+        copy_out_text(&client, "COPY (SELECT 42) TO STDOUT").await?,
+        "42\n"
+    );
+    client.simple_query("COMMIT").await?;
+    Ok(())
+}
+
+/// A view is refused by name — with PG's hint pointing at the query form, which
+/// then works.
+#[tokio::test]
+async fn copy_out_from_a_view_is_refused_with_pg_s_hint() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int4)").await?;
+    client.simple_query("INSERT INTO t VALUES (1)").await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT a FROM t")
+        .await?;
+
+    let err = match copy_out_bytes(&client, "COPY v TO STDOUT").await {
+        Ok(_) => panic!("a view cannot be copied by name"),
+        Err(err) => err,
+    };
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "cannot copy from view \"v\"");
+    assert_eq!(db.hint(), Some("Try the COPY (SELECT ...) TO variant."));
+
+    assert_eq!(
+        copy_out_text(&client, "COPY (SELECT a FROM v) TO STDOUT").await?,
+        "1\n"
+    );
+    Ok(())
+}
+
+/// `COPY t TO` copies the rows of `SELECT * FROM ONLY t`: an inheritance child's
+/// rows are not included, because the child dumps them itself and a dump that did
+/// both would reload every inherited row twice.
+#[tokio::test]
+async fn copy_out_from_an_inheritance_parent_is_only() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE par (a int4)").await?;
+    client
+        .simple_query("CREATE TABLE ch () INHERITS (par)")
+        .await?;
+    client.simple_query("INSERT INTO par VALUES (1)").await?;
+    client.simple_query("INSERT INTO ch VALUES (2)").await?;
+
+    assert_eq!(copy_out_text(&client, "COPY par TO STDOUT").await?, "1\n");
+    // The query form is the spelling that includes the children, as in PG.
+    assert_eq!(
+        copy_out_text(&client, "COPY (SELECT a FROM par ORDER BY a) TO STDOUT").await?,
+        "1\n2\n"
+    );
+    Ok(())
+}
+
+/// A partitioned parent holds no rows of its own; PG refuses to copy it by name
+/// rather than dumping the leaves, which each dump themselves.
+#[tokio::test]
+async fn copy_out_from_a_partitioned_table_is_refused() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE pt (a int4) PARTITION BY RANGE (a)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (10)")
+        .await?;
+    client.simple_query("INSERT INTO pt VALUES (5)").await?;
+
+    let err = match copy_out_bytes(&client, "COPY pt TO STDOUT").await {
+        Ok(_) => panic!("a partitioned table cannot be copied by name"),
+        Err(err) => err,
+    };
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(db.message(), "cannot copy from partitioned table \"pt\"");
+    assert_eq!(db.hint(), Some("Try the COPY (SELECT ...) TO variant."));
+
+    // The leaf copies itself, and the query form covers the whole hierarchy.
+    assert_eq!(copy_out_text(&client, "COPY pt1 TO STDOUT").await?, "5\n");
+    assert_eq!(
+        copy_out_text(&client, "COPY (SELECT a FROM pt) TO STDOUT").await?,
+        "5\n"
+    );
+    Ok(())
+}
+
+/// A COPY portal describes as `NoData`, as PostgreSQL's utility portals do —
+/// the copy-out columns are announced by CopyOutResponse, not RowDescription.
+/// Driven over the raw protocol because `tokio_postgres` hides Describe.
+#[tokio::test]
+async fn copy_out_describes_as_no_data() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(
+        b'P',
+        b"cp\0COPY (SELECT 1) TO STDOUT\0\x00\x00",
+    ));
+    batch.extend(frontend_message(b'D', b"Scp\0")); // Describe statement "cp"
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await?;
+
+    let tags: Vec<u8> = read_until_ready(&mut socket)
+        .await
+        .iter()
+        .map(|(t, _)| *t)
+        .collect();
+    // ParseComplete, ParameterDescription (none), NoData, ReadyForQuery — never
+    // a RowDescription.
+    assert_eq!(tags, [b'1', b't', b'n', b'Z']);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // COPY ... FREEZE
 // ---------------------------------------------------------------------------
 

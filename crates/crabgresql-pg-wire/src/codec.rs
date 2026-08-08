@@ -11,10 +11,10 @@
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::message::{put_data_row, put_row_description};
+use crate::message::{put_copy_data, put_data_row, put_row_description};
 use crate::{
-    AuthRequest, BackendMessage, ErrorFields, FieldDescription, FrontendMessage, ProtocolError,
-    StartupRequest, TransactionStatus,
+    AuthRequest, BackendMessage, CopyResponse, ErrorFields, FieldDescription, Format,
+    FrontendMessage, ProtocolError, StartupRequest, TransactionStatus,
 };
 
 /// Upper bound on any message body; a startup packet or message longer than
@@ -188,6 +188,26 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
             &mut self.buf,
             columns.iter().map(|c| c.as_deref().map(str::as_bytes)),
         );
+    }
+
+    /// CopyOutResponse: `format` is the overall encoding, and every column takes
+    /// that same format (COPY has no per-column choice — the whole stream is
+    /// text-family or binary).
+    pub fn copy_out_response(&mut self, columns: usize, format: Format) {
+        self.write(&BackendMessage::CopyOutResponse(CopyResponse {
+            format,
+            column_formats: vec![format; columns],
+        }));
+    }
+
+    /// One CopyData frame. Takes borrowed bytes so the caller keeps one scratch
+    /// buffer for the whole stream.
+    pub fn copy_data(&mut self, data: &[u8]) {
+        put_copy_data(&mut self.buf, data);
+    }
+
+    pub fn copy_done(&mut self) {
+        self.write(&BackendMessage::CopyDone);
     }
 
     pub fn command_complete(&mut self, tag: &str) {

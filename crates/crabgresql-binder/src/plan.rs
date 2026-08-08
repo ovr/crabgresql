@@ -5856,18 +5856,67 @@ impl CopyHeader {
     }
 }
 
-/// The COPY text/CSV format, resolved from the statement's `WITH (…)` (and
-/// legacy) options. Consumed by the server's row decoder, which splits the raw
-/// stdin bytes into fields per these rules before [`CopyFromPlan::build_insert`]
-/// turns them into typed rows.
+/// Which of COPY's three on-the-wire encodings a statement asked for. Replaces
+/// what used to be a `csv: bool`, because `binary` is a third alternative rather
+/// than a modifier of the other two: it has no delimiter, no NULL marker and no
+/// header, and rejects every option that shapes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CopyWireFormat {
+    /// The default: one line per row, fields separated by the delimiter,
+    /// backslash escapes.
+    #[default]
+    Text,
+    /// `FORMAT csv` (or the pre-9.0 bare `CSV` keyword).
+    Csv,
+    /// `FORMAT binary`: length-prefixed per-type binary representations behind a
+    /// `PGCOPY` file header. Output-only in crabgresql — `COPY … FROM` still
+    /// rejects it.
+    Binary,
+}
+
+/// Which CSV fields `COPY … TO` quotes regardless of their contents
+/// (`FORCE_QUOTE`). Output-only: PostgreSQL rejects the option on `COPY FROM`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ForceQuote {
+    /// No `FORCE_QUOTE`: quoting is decided per field by its contents.
+    #[default]
+    None,
+    /// `FORCE_QUOTE *`.
+    All,
+    /// `FORCE_QUOTE (a, b)`, as positions into the *output* column list.
+    Columns(Vec<usize>),
+}
+
+impl ForceQuote {
+    /// Whether the field at output position `pos` must be quoted outright.
+    pub fn applies_at(&self, pos: usize) -> bool {
+        match self {
+            ForceQuote::None => false,
+            ForceQuote::All => true,
+            ForceQuote::Columns(cols) => cols.contains(&pos),
+        }
+    }
+}
+
+/// The COPY wire format, resolved from the statement's `WITH (…)` (and legacy)
+/// options. Consumed by the server's row decoder, which splits the raw stdin
+/// bytes into fields per these rules before [`CopyFromPlan::build_insert`] turns
+/// them into typed rows, and by the row encoder, which runs the same rules
+/// backwards for `COPY … TO`.
 ///
 /// The delimiter, quote, and escape are single bytes — PostgreSQL requires each
-/// to be "a single one-byte character" — so the decoder can operate on the raw
-/// byte stream (COPY is byte-oriented; multi-byte data flows through untouched).
+/// to be "a single one-byte character" — so both directions can operate on the
+/// raw byte stream (COPY is byte-oriented; multi-byte data flows through
+/// untouched).
+///
+/// One struct serves both directions, so some fields are direction-specific:
+/// `force_not_null` is only ever set by `COPY FROM` and `force_quote` only by
+/// `COPY TO` — PostgreSQL rejects each option on the other direction, so the two
+/// can never both be populated.
 #[derive(Clone, Debug)]
 pub struct CopyFormat {
-    /// `true` for `FORMAT csv`, `false` for the default text format.
-    pub csv: bool,
+    /// text / CSV / binary.
+    pub format: CopyWireFormat,
     /// Field separator (TAB for text, `,` for CSV, unless overridden).
     pub delimiter: u8,
     /// The unquoted token that means SQL NULL (`\N` for text, empty for CSV).
@@ -5879,36 +5928,61 @@ pub struct CopyFormat {
     /// CSV escape byte (default = the quote byte); unused in text.
     pub escape: u8,
     /// Field positions (into the target column list) that CSV must read as a
-    /// non-NULL empty string rather than NULL (`FORCE_NOT_NULL`).
+    /// non-NULL empty string rather than NULL (`FORCE_NOT_NULL`). COPY FROM only.
     pub force_not_null: Vec<usize>,
+    /// Which fields CSV output quotes unconditionally. COPY TO only.
+    pub force_quote: ForceQuote,
 }
 
 impl CopyFormat {
-    /// Text-format defaults. Public so the server-side decoder and its tests
+    /// Text-format defaults. Public so the server-side codec and its tests
     /// share one source of truth instead of reconstructing the fields.
     pub fn text() -> Self {
         CopyFormat {
-            csv: false,
+            format: CopyWireFormat::Text,
             delimiter: b'\t',
             null: "\\N".to_string(),
             header: CopyHeader::Off,
             quote: b'"',
             escape: b'"',
             force_not_null: Vec::new(),
+            force_quote: ForceQuote::None,
         }
     }
 
     /// CSV-format defaults.
     pub fn csv() -> Self {
         CopyFormat {
-            csv: true,
+            format: CopyWireFormat::Csv,
             delimiter: b',',
             null: String::new(),
             header: CopyHeader::Off,
             quote: b'"',
             escape: b'"',
             force_not_null: Vec::new(),
+            force_quote: ForceQuote::None,
         }
+    }
+
+    /// Binary-format defaults. The delimiter/NULL/quote fields are inert here
+    /// (PostgreSQL rejects every option that would set them), and are left at
+    /// the text defaults rather than at meaningless sentinels.
+    pub fn binary() -> Self {
+        CopyFormat {
+            format: CopyWireFormat::Binary,
+            ..CopyFormat::text()
+        }
+    }
+
+    /// Whether this is the CSV format. Reads better than the enum comparison at
+    /// the decoder's branch points, which only ever ask text-or-CSV.
+    pub fn is_csv(&self) -> bool {
+        self.format == CopyWireFormat::Csv
+    }
+
+    /// Whether this is the binary format.
+    pub fn is_binary(&self) -> bool {
+        self.format == CopyWireFormat::Binary
     }
 }
 
@@ -6117,10 +6191,12 @@ impl CopyFromPlan {
 }
 
 /// Bind `COPY <table> [(cols)] FROM {STDIN | '<file>'} [WITH (…)]`. Rejects the
-/// forms not yet supported (`COPY TO`, a query source, `FROM PROGRAM`, binary
-/// format) with the matching error, resolves the write target and column list
-/// the same way INSERT does, and resolves the text/CSV options into a
-/// [`CopyFormat`].
+/// forms not yet supported (a query source, `FROM PROGRAM`, binary format) with
+/// the matching error, resolves the write target and column list the same way
+/// INSERT does, and resolves the text/CSV options into a [`CopyFormat`].
+///
+/// `COPY … TO` never reaches here — the server dispatches it to
+/// [`bind_copy_to`] — so the `to` gate below is a defensive internal check.
 pub fn bind_copy_from(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -6177,31 +6253,18 @@ pub fn bind_copy_from(
         .map(|column| default_for_column(column, catalog))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Map the optional column list (empty = every column, in schema order).
-    let target_indices: Vec<usize> = if columns.is_empty() {
-        (0..schema.columns.len()).collect()
-    } else {
-        let mut indices = Vec::with_capacity(columns.len());
-        for ident in columns {
-            let col = normalize_ident(ident);
-            let idx = schema.column_index(&col).ok_or_else(|| {
-                BindError::new(
-                    sqlstate::UNDEFINED_COLUMN,
-                    format!("column \"{col}\" of relation \"{name}\" does not exist"),
-                )
-            })?;
-            if indices.contains(&idx) {
-                return Err(BindError::new(
-                    sqlstate::DUPLICATE_COLUMN,
-                    format!("column \"{col}\" specified more than once"),
-                ));
-            }
-            indices.push(idx);
-        }
-        indices
-    };
+    let target_indices = copy_target_indices(&schema, columns, &name)?;
 
-    let format = resolve_copy_format(options, legacy_options, &schema, &target_indices, &name)?;
+    let format = resolve_copy_format(
+        options,
+        legacy_options,
+        CopyDir::From,
+        CopyColumns::Table {
+            schema: &schema,
+            target_indices: &target_indices,
+            relname: &name,
+        },
+    )?;
     let freeze = resolve_copy_freeze(options, legacy_options);
     if freeze {
         // A partitioned parent has no storage of its own, so there is no
@@ -6234,6 +6297,235 @@ pub fn bind_copy_from(
         routing,
         rows,
     })
+}
+
+/// Map a COPY column list onto schema positions. An empty list means every
+/// column in schema order; a written list keeps *its* order, which is what both
+/// directions observe (`COPY t (c, a) TO STDOUT` emits `c` first).
+fn copy_target_indices(
+    schema: &TableSchema,
+    columns: &[ast::Ident],
+    relname: &str,
+) -> Result<Vec<usize>, BindError> {
+    if columns.is_empty() {
+        return Ok((0..schema.columns.len()).collect());
+    }
+    let mut indices = Vec::with_capacity(columns.len());
+    for ident in columns {
+        let col = normalize_ident(ident);
+        let idx = schema.column_index(&col).ok_or_else(|| {
+            BindError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column \"{col}\" of relation \"{relname}\" does not exist"),
+            )
+        })?;
+        if indices.contains(&idx) {
+            return Err(BindError::new(
+                sqlstate::DUPLICATE_COLUMN,
+                format!("column \"{col}\" specified more than once"),
+            ));
+        }
+        indices.push(idx);
+    }
+    Ok(indices)
+}
+
+/// A bound `COPY {<table> [(cols)] | (query)} TO STDOUT [WITH (…)]`.
+///
+/// Both surface forms reduce to one [`LogicalPlan`], so nothing downstream has
+/// to tell them apart — unlike [`CopyFromSource`], which survives binding only
+/// because the server routes STDIN and a server-side file to different drivers.
+/// `TO STDOUT` is the single supported destination, so no target field is
+/// carried either.
+pub struct CopyToPlan {
+    /// The rows to emit, in output order. The column names the `HEADER` line
+    /// carries are read back off the executed plan rather than duplicated here,
+    /// so there is one source of truth for what the copy actually emits.
+    pub plan: LogicalPlan,
+    pub format: CopyFormat,
+}
+
+/// Bind `COPY {<table> [(cols)] | (query)} TO STDOUT [WITH (…)]`.
+///
+/// The relation form resolves for *reading* rather than through
+/// [`resolve_write_table`]: PostgreSQL happily copies a system catalog out
+/// (`COPY pg_am TO STDOUT` works), which the write resolver refuses with 42501.
+/// A view or partitioned table is refused with PG's own message and hint instead
+/// of being expanded, because `COPY (SELECT …)` is the supported spelling.
+pub fn bind_copy_to(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    source: &ast::CopySource,
+    target: &ast::CopyTarget,
+    options: &[ast::CopyOption],
+    legacy_options: &[ast::CopyLegacyOption],
+) -> Result<CopyToPlan, BindError> {
+    match target {
+        ast::CopyTarget::Stdout => {}
+        ast::CopyTarget::File { .. } => {
+            return Err(BindError::feature_not_supported(
+                "COPY TO a file is not supported yet",
+            ));
+        }
+        ast::CopyTarget::Program { .. } => {
+            return Err(BindError::feature_not_supported(
+                "COPY to a program is not supported yet",
+            ));
+        }
+        // `COPY … TO STDIN` is not accepted by the parser's TO branch.
+        ast::CopyTarget::Stdin => {
+            return Err(BindError::feature_not_supported(
+                "COPY to STDIN is not supported",
+            ));
+        }
+    }
+    if resolve_copy_freeze(options, legacy_options) {
+        return Err(BindError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY FREEZE cannot be used with COPY TO",
+        ));
+    }
+
+    match source {
+        ast::CopySource::Query(query) => {
+            let plan = bind_query(engine, catalog, query)?;
+            let columns = output_columns_of(&plan)?;
+            let format = resolve_copy_format(
+                options,
+                legacy_options,
+                CopyDir::To,
+                CopyColumns::Query { columns: &columns },
+            )?;
+            Ok(CopyToPlan { plan, format })
+        }
+        ast::CopySource::Table {
+            table_name,
+            columns,
+        } => {
+            let (table, name) = resolve_copy_read_table(engine, table_name)?;
+            let schema = table.schema();
+            let target_indices = copy_target_indices(&schema, columns, &name)?;
+            let format = resolve_copy_format(
+                options,
+                legacy_options,
+                CopyDir::To,
+                CopyColumns::Table {
+                    schema: &schema,
+                    target_indices: &target_indices,
+                    relname: &name,
+                },
+            )?;
+
+            // The output columns are the named ones, in the order written.
+            let out: Vec<OutputColumn> = target_indices
+                .iter()
+                .map(|&i| relation_output_column(&schema.columns[i]))
+                .collect();
+            let projections: Vec<BoundExpr> = target_indices
+                .iter()
+                .map(|&i| BoundExpr::ColumnRef {
+                    index: i,
+                    ty: schema.columns[i].ty,
+                })
+                .collect();
+
+            // `COPY t TO` copies the rows of `SELECT * FROM ONLY t`: an
+            // inheritance child is *not* included (PG's COPY docs say so, and
+            // including it would make a dump reload every inherited row twice —
+            // once from the parent, once from the child's own COPY). `ONLY` here
+            // is therefore not a divergence from the FROM-item path, which
+            // threads the statement's own flag; it is the flag COPY implies.
+            //
+            // The multi-arm case that remains is an access method with
+            // engine-internal storage leaves, which `ONLY` does not suppress —
+            // and which would otherwise emit nothing. A partitioned parent, the
+            // other multi-arm shape, never reaches here (it is refused above).
+            let plan = match scan_arms(engine, &table, true)? {
+                Some(arms) => {
+                    let relation: Vec<OutputColumn> =
+                        schema.columns.iter().map(relation_output_column).collect();
+                    LogicalPlan::Subquery {
+                        source: Box::new(LogicalPlan::Append {
+                            arms,
+                            columns: relation,
+                        }),
+                        columns: out,
+                        projections,
+                        predicate: None,
+                        sort: Vec::new(),
+                        distinct: None,
+                    }
+                }
+                None => LogicalPlan::Query {
+                    table,
+                    columns: out,
+                    projections,
+                    predicate: None,
+                    sort: Vec::new(),
+                    distinct: None,
+                },
+            };
+            Ok(CopyToPlan { plan, format })
+        }
+    }
+}
+
+/// A stored relation's column as it appears in a rowset. A real table column is
+/// always implicit collation strength, whether or not its collation equals the
+/// type default.
+fn relation_output_column(column: &Column) -> OutputColumn {
+    OutputColumn {
+        name: column.name.clone(),
+        ty: column.ty,
+        collation: column.collation,
+        strength: crate::collation::Strength::Implicit,
+        typmod: column.typmod,
+    }
+}
+
+/// PostgreSQL's refusal for a relation kind `COPY … TO` cannot read, all of
+/// which point at the query form.
+fn cannot_copy_from(kind: &str, name: &str) -> BindError {
+    BindError::new(
+        sqlstate::WRONG_OBJECT_TYPE,
+        format!("cannot copy from {kind} \"{name}\""),
+    )
+    .with_hint(Some("Try the COPY (SELECT ...) TO variant.".into()))
+}
+
+/// Resolve `COPY <name> TO`'s relation for reading, with PostgreSQL's refusals
+/// for the relation kinds it will not read by name. Read resolution honors the
+/// search path, so a system catalog and a temp table both resolve, matching PG.
+fn resolve_copy_read_table(
+    engine: &Arc<dyn TableEngine>,
+    name: &ast::ObjectName,
+) -> Result<(Arc<dyn TableAm>, String), BindError> {
+    let (schema, table_name) = split_relation_name(name)?;
+    match engine.resolve(schema.as_deref(), &table_name) {
+        Ok(table) => {
+            // A partitioned parent has no storage of its own. PG refuses it
+            // rather than dumping the leaves, because the leaves each dump
+            // themselves and a dump that did both would reload every row twice.
+            if table.schema().partition_scheme.is_some() {
+                return Err(cannot_copy_from("partitioned table", &table_name));
+            }
+            Ok((table, table_name))
+        }
+        Err(e) => {
+            if matches!(e, StorageError::TableNotFound(_))
+                && engine
+                    .resolve_view(schema.as_deref(), &table_name)
+                    .is_some()
+            {
+                return Err(cannot_copy_from("view", &table_name));
+            }
+            // A sequence is PG's third refusal here (`cannot copy from sequence`),
+            // but crabgresql's sequences are not relations the engine resolves at
+            // all — `SELECT * FROM <sequence>` does not work either — so the name
+            // lands on "does not exist" like any other non-relation.
+            Err(not_found_as_written(e, schema.as_deref(), &table_name))
+        }
+    }
 }
 
 /// Split the column defaults into what every row starts from and what the
@@ -6292,111 +6584,236 @@ fn resolve_copy_freeze(
         || legacy_options.contains(&ast::CopyLegacyOption::Freeze)
 }
 
+/// Which direction the options are being resolved for. A handful of COPY's
+/// options are legal in exactly one direction, and PostgreSQL names the
+/// direction in the refusal, so the rules cannot be stated without it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyDir {
+    From,
+    To,
+}
+
+impl CopyDir {
+    /// PostgreSQL's spelling of this direction inside an option refusal.
+    fn label(self) -> &'static str {
+        match self {
+            CopyDir::From => "COPY FROM",
+            CopyDir::To => "COPY TO",
+        }
+    }
+}
+
+/// Where a column-name option (`FORCE_NOT_NULL`, `FORCE_QUOTE`) resolves its
+/// names, and what the resulting *field position* means.
+///
+/// The relation form must go through the schema and then through the COPY column
+/// list, because a name may exist on the table yet not be copied. The query form
+/// has no schema: its output columns are the only names there are.
+enum CopyColumns<'a> {
+    Table {
+        schema: &'a TableSchema,
+        target_indices: &'a [usize],
+        relname: &'a str,
+    },
+    Query {
+        columns: &'a [OutputColumn],
+    },
+}
+
+impl CopyColumns<'_> {
+    /// The field position `col` occupies in the copied row, or the error
+    /// PostgreSQL raises: 42703 when the relation has no such column, and
+    /// `not referenced by COPY` when it has one that this statement omits.
+    fn position(&self, col: &str, option: &str) -> Result<usize, BindError> {
+        match self {
+            CopyColumns::Table {
+                schema,
+                target_indices,
+                relname,
+            } => {
+                let sidx = schema.column_index(col).ok_or_else(|| {
+                    BindError::new(
+                        sqlstate::UNDEFINED_COLUMN,
+                        format!("column \"{col}\" of relation \"{relname}\" does not exist"),
+                    )
+                })?;
+                target_indices
+                    .iter()
+                    .position(|&i| i == sidx)
+                    .ok_or_else(|| {
+                        BindError::new(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            format!("{option} column \"{col}\" not referenced by COPY"),
+                        )
+                    })
+            }
+            CopyColumns::Query { columns } => {
+                columns.iter().position(|c| c.name == col).ok_or_else(|| {
+                    BindError::new(
+                        sqlstate::UNDEFINED_COLUMN,
+                        format!("column \"{col}\" does not exist"),
+                    )
+                })
+            }
+        }
+    }
+
+    /// The names of the copied fields, in wire order — what `HEADER MATCH`
+    /// compares the incoming header line against.
+    fn names(&self) -> Vec<String> {
+        match self {
+            CopyColumns::Table {
+                schema,
+                target_indices,
+                ..
+            } => target_indices
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect(),
+            CopyColumns::Query { columns } => columns.iter().map(|c| c.name.clone()).collect(),
+        }
+    }
+}
+
 /// Resolve the modern `WITH (…)` options plus the pre-9.0 legacy option list
 /// into a [`CopyFormat`]. The format keyword is decided first (so `csv`
 /// defaults apply before per-option overrides), then delimiter/NULL/header and
-/// the CSV-only quote/escape/`FORCE_NOT_NULL` settings.
+/// the CSV-only quote/escape/`FORCE_NOT_NULL`/`FORCE_QUOTE` settings.
+///
+/// The check order matters and mirrors PostgreSQL's: the CSV-only refusals are
+/// raised while walking the options, and the binary-mode refusals only
+/// afterwards — so `FORMAT binary, QUOTE '"'` reports `requires CSV mode`, not
+/// `cannot specify QUOTE in BINARY mode`.
 fn resolve_copy_format(
     options: &[ast::CopyOption],
     legacy_options: &[ast::CopyLegacyOption],
-    schema: &TableSchema,
-    target_indices: &[usize],
-    relname: &str,
+    dir: CopyDir,
+    cols: CopyColumns<'_>,
 ) -> Result<CopyFormat, BindError> {
     // Pass 1: the format keyword.
-    let mut csv = false;
+    let mut wire = CopyWireFormat::Text;
+    // `COPY FROM` cannot read the binary format yet. Rejecting it here rather
+    // than at the first refusal site keeps the message about the direction's
+    // real limitation instead of about an option.
+    let reject_binary_input = || -> Result<CopyWireFormat, BindError> {
+        match dir {
+            CopyDir::To => Ok(CopyWireFormat::Binary),
+            CopyDir::From => Err(BindError::feature_not_supported(
+                "COPY FROM with binary format is not supported yet",
+            )),
+        }
+    };
     for opt in options {
         if let ast::CopyOption::Format(name) = opt {
-            match normalize_ident(name).as_str() {
-                "text" => csv = false,
-                "csv" => csv = true,
-                "binary" => {
-                    return Err(BindError::feature_not_supported(
-                        "COPY with binary format is not supported yet",
-                    ));
-                }
+            wire = match normalize_ident(name).as_str() {
+                "text" => CopyWireFormat::Text,
+                "csv" => CopyWireFormat::Csv,
+                "binary" => reject_binary_input()?,
                 other => {
                     return Err(BindError::new(
                         sqlstate::INVALID_PARAMETER_VALUE,
                         format!("COPY format \"{other}\" not recognized"),
                     ));
                 }
-            }
+            };
         }
     }
+    // The pre-9.0 spellings are bare keywords, so at most one format word can be
+    // present: `COPY … CSV BINARY` is a parse-time `conflicting or redundant
+    // options`, which is why nothing here has to decide which of the two wins.
     for opt in legacy_options {
         match opt {
-            ast::CopyLegacyOption::Csv(_) => csv = true,
-            ast::CopyLegacyOption::Binary => {
-                return Err(BindError::feature_not_supported(
-                    "COPY with binary format is not supported yet",
-                ));
-            }
+            ast::CopyLegacyOption::Csv(_) => wire = CopyWireFormat::Csv,
+            ast::CopyLegacyOption::Binary => wire = reject_binary_input()?,
             _ => {}
         }
     }
 
-    let mut fmt = if csv {
-        CopyFormat::csv()
-    } else {
-        CopyFormat::text()
+    let csv = wire == CopyWireFormat::Csv;
+    let mut fmt = match wire {
+        CopyWireFormat::Text => CopyFormat::text(),
+        CopyWireFormat::Csv => CopyFormat::csv(),
+        CopyWireFormat::Binary => CopyFormat::binary(),
     };
+    // Which of the delimiter/NULL/header settings were written out. Binary mode
+    // rejects each one *as written*, which the resolved fields cannot show: they
+    // always hold a default.
+    let (mut set_delimiter, mut set_null, mut set_header) = (false, false, false);
 
-    // Resolve a FORCE_NOT_NULL column name to its position in the data-column
-    // list (the decoder indexes fields by that position).
-    let force_not_null = |cols: &[ast::Ident]| -> Result<Vec<usize>, BindError> {
-        let mut out = Vec::with_capacity(cols.len());
-        for ident in cols {
-            let col = normalize_ident(ident);
-            let sidx = schema.column_index(&col).ok_or_else(|| {
-                BindError::new(
-                    sqlstate::UNDEFINED_COLUMN,
-                    format!("column \"{col}\" of relation \"{relname}\" does not exist"),
-                )
-            })?;
-            let pos = target_indices
-                .iter()
-                .position(|&i| i == sidx)
-                .ok_or_else(|| {
-                    BindError::new(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        format!("FORCE_NOT_NULL column \"{col}\" not referenced by COPY"),
-                    )
-                })?;
-            out.push(pos);
+    // Resolve a column-name list (FORCE_NOT_NULL / FORCE_QUOTE) to field
+    // positions; both directions index fields by position.
+    let positions = |names: &[ast::Ident], option: &str| -> Result<Vec<usize>, BindError> {
+        let mut out = Vec::with_capacity(names.len());
+        for ident in names {
+            out.push(cols.position(&normalize_ident(ident), option)?);
         }
         Ok(out)
     };
+    let force_quote = |names: &ast::CopyForceQuote| -> Result<ForceQuote, BindError> {
+        Ok(match names {
+            ast::CopyForceQuote::All => ForceQuote::All,
+            ast::CopyForceQuote::Columns(names) => {
+                ForceQuote::Columns(positions(names, "FORCE_QUOTE")?)
+            }
+        })
+    };
 
     // Pass 2: modern per-option overrides.
+    // 0A000, not 22023: PostgreSQL classes a CSV-only option outside CSV mode as
+    // an unsupported feature.
     let require_csv = |what: &str| -> Result<(), BindError> {
         if csv {
             Ok(())
         } else {
+            Err(BindError::feature_not_supported(format!(
+                "COPY {what} requires CSV mode"
+            )))
+        }
+    };
+    // An option legal in only one direction.
+    let only_in = |what: &str, allowed: CopyDir| -> Result<(), BindError> {
+        if dir == allowed {
+            Ok(())
+        } else {
             Err(BindError::new(
                 sqlstate::INVALID_PARAMETER_VALUE,
-                format!("COPY {what} available only in CSV mode"),
+                format!("COPY {what} cannot be used with {}", dir.label()),
             ))
         }
     };
     for opt in options {
         match opt {
             ast::CopyOption::Format(_) | ast::CopyOption::Freeze(_) => {}
-            ast::CopyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
-            ast::CopyOption::Null(s) => fmt.null = s.clone(),
+            ast::CopyOption::Delimiter(c) => {
+                set_delimiter = true;
+                fmt.delimiter = single_byte(*c, "delimiter")?;
+            }
+            ast::CopyOption::Null(s) => {
+                set_null = true;
+                fmt.null = s.clone();
+            }
             // `MATCH` needs the columns the statement named, in its order — the
             // decoder sees only the header line, and PostgreSQL compares against
-            // the COPY column list rather than the table's own order.
+            // the COPY column list rather than the table's own order. There is
+            // nothing to match on the way out, and PG says so by name.
             ast::CopyOption::Header(mode) => {
+                // Binary mode rejects a header that was actually *asked for*;
+                // `HEADER false` says the same thing the format already implies,
+                // so PG accepts it (its `header_line` is a tri-state, not a
+                // written/not-written flag).
+                set_header |= *mode != ast::CopyHeaderMode::Off;
                 fmt.header = match mode {
                     ast::CopyHeaderMode::Off => CopyHeader::Off,
                     ast::CopyHeaderMode::On => CopyHeader::On,
-                    ast::CopyHeaderMode::Match => CopyHeader::Match(
-                        target_indices
-                            .iter()
-                            .map(|&i| schema.columns[i].name.clone())
-                            .collect(),
-                    ),
+                    ast::CopyHeaderMode::Match => {
+                        if dir == CopyDir::To {
+                            return Err(BindError::new(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "cannot use \"match\" with HEADER in COPY TO",
+                            ));
+                        }
+                        CopyHeader::Match(cols.names())
+                    }
                 }
             }
             ast::CopyOption::Quote(c) => {
@@ -6407,13 +6824,24 @@ fn resolve_copy_format(
                 require_csv("ESCAPE")?;
                 fmt.escape = single_byte(*c, "escape")?;
             }
-            ast::CopyOption::ForceNotNull(cols) => {
+            // The CSV gate comes first in all three: PostgreSQL reports
+            // `COPY FORCE_NOT_NULL requires CSV mode` for a text-format COPY TO,
+            // not the direction refusal.
+            ast::CopyOption::ForceNotNull(names) => {
                 require_csv("FORCE_NOT_NULL")?;
-                fmt.force_not_null = force_not_null(cols)?;
+                only_in("FORCE_NOT_NULL", CopyDir::From)?;
+                fmt.force_not_null = positions(names, "FORCE_NOT_NULL")?;
             }
-            ast::CopyOption::ForceNull(_) | ast::CopyOption::ForceQuote(_) => {
+            ast::CopyOption::ForceQuote(names) => {
+                require_csv("FORCE_QUOTE")?;
+                only_in("FORCE_QUOTE", CopyDir::To)?;
+                fmt.force_quote = force_quote(names)?;
+            }
+            ast::CopyOption::ForceNull(_) => {
+                require_csv("FORCE_NULL")?;
+                only_in("FORCE_NULL", CopyDir::From)?;
                 return Err(BindError::feature_not_supported(
-                    "COPY FORCE_NULL/FORCE_QUOTE is not supported yet",
+                    "COPY FORCE_NULL is not supported yet",
                 ));
             }
             ast::CopyOption::Encoding(enc) => require_utf8(enc)?,
@@ -6423,9 +6851,18 @@ fn resolve_copy_format(
     // Pass 2b: legacy per-option overrides (`COPY … CSV HEADER DELIMITER ','`).
     for opt in legacy_options {
         match opt {
-            ast::CopyLegacyOption::Delimiter(c) => fmt.delimiter = single_byte(*c, "delimiter")?,
-            ast::CopyLegacyOption::Null(s) => fmt.null = s.clone(),
-            ast::CopyLegacyOption::Header => fmt.header = CopyHeader::On,
+            ast::CopyLegacyOption::Delimiter(c) => {
+                set_delimiter = true;
+                fmt.delimiter = single_byte(*c, "delimiter")?;
+            }
+            ast::CopyLegacyOption::Null(s) => {
+                set_null = true;
+                fmt.null = s.clone();
+            }
+            ast::CopyLegacyOption::Header => {
+                set_header = true;
+                fmt.header = CopyHeader::On;
+            }
             // Freeze is not a decoding rule; `resolve_copy_freeze` reads it.
             ast::CopyLegacyOption::Binary
             | ast::CopyLegacyOption::Csv(_)
@@ -6439,27 +6876,71 @@ fn resolve_copy_format(
         if let ast::CopyLegacyOption::Csv(sub) = opt {
             for s in sub {
                 match s {
-                    ast::CopyLegacyCsvOption::Header => fmt.header = CopyHeader::On,
+                    ast::CopyLegacyCsvOption::Header => {
+                        set_header = true;
+                        fmt.header = CopyHeader::On;
+                    }
                     ast::CopyLegacyCsvOption::Quote(c) => fmt.quote = single_byte(*c, "quote")?,
                     ast::CopyLegacyCsvOption::Escape(c) => fmt.escape = single_byte(*c, "escape")?,
-                    ast::CopyLegacyCsvOption::ForceNotNull(cols) => {
-                        fmt.force_not_null = force_not_null(cols)?;
+                    ast::CopyLegacyCsvOption::ForceNotNull(names) => {
+                        only_in("FORCE_NOT_NULL", CopyDir::From)?;
+                        fmt.force_not_null = positions(names, "FORCE_NOT_NULL")?;
                     }
-                    ast::CopyLegacyCsvOption::ForceQuote(_) => {
-                        return Err(BindError::feature_not_supported(
-                            "COPY FORCE_QUOTE is not supported yet",
-                        ));
+                    ast::CopyLegacyCsvOption::ForceQuote(names) => {
+                        only_in("FORCE_QUOTE", CopyDir::To)?;
+                        fmt.force_quote = force_quote(names)?;
                     }
                 }
             }
         }
     }
 
+    // Binary mode has no delimiter, NULL marker or header to configure. Checked
+    // after the CSV-only refusals above, matching PG's order.
+    if fmt.is_binary() {
+        for (written, what) in [
+            (set_delimiter, "DELIMITER"),
+            (set_null, "NULL"),
+            (set_header, "HEADER"),
+        ] {
+            if written {
+                // 42601: PostgreSQL raises these three as syntax errors, unlike
+                // the CSV-mode refusals above (0A000) or the direction refusals
+                // (22023).
+                return Err(BindError::new(
+                    sqlstate::SYNTAX_ERROR,
+                    format!("cannot specify {what} in BINARY mode"),
+                ));
+            }
+        }
+        return Ok(fmt);
+    }
+
     // PG rejects a delimiter that collides with the CSV quote.
-    if fmt.csv && fmt.delimiter == fmt.quote {
+    if csv && fmt.delimiter == fmt.quote {
         return Err(BindError::new(
             sqlstate::INVALID_PARAMETER_VALUE,
             "COPY delimiter and quote must be different",
+        ));
+    }
+    // A NULL marker that contains the delimiter (or, in CSV, the quote) could
+    // never be told apart from data; a newline in it could never be read back.
+    if fmt.null.as_bytes().contains(&fmt.delimiter) {
+        return Err(BindError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY delimiter character must not appear in the NULL specification",
+        ));
+    }
+    if csv && fmt.null.as_bytes().contains(&fmt.quote) {
+        return Err(BindError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "CSV quote character must not appear in the NULL specification",
+        ));
+    }
+    if fmt.null.contains(['\n', '\r']) {
+        return Err(BindError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "COPY null representation cannot use newline or carriage return",
         ));
     }
 
@@ -11026,6 +11507,243 @@ mod tests {
             Ok(plan) => plan,
             Err(error) => panic!("failed to bind `{sql}`: {error}"),
         }
+    }
+
+    /// Bind a `COPY … TO` the way the server does, keeping the error so a test
+    /// can pin PostgreSQL's refusal text.
+    fn copy_to_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> Result<CopyToPlan, BindError> {
+        let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let stmts = match crabgresql_parser::parse(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+        };
+        let ast::Statement::Copy {
+            source,
+            to: true,
+            target,
+            options,
+            legacy_options,
+            ..
+        } = &stmts[0]
+        else {
+            panic!("expected a COPY … TO statement: {sql}");
+        };
+        bind_copy_to(engine, &catalog, source, target, options, legacy_options)
+    }
+
+    fn copy_to_ok(sql: &str) -> CopyToPlan {
+        let engine = engine_with_table();
+        match copy_to_plan(&engine, sql) {
+            Ok(plan) => plan,
+            Err(error) => panic!("failed to bind `{sql}`: {error}"),
+        }
+    }
+
+    fn copy_to_err(sql: &str) -> BindError {
+        let engine = engine_with_table();
+        match copy_to_plan(&engine, sql) {
+            Ok(_) => panic!("expected `{sql}` to be rejected"),
+            Err(error) => error,
+        }
+    }
+
+    /// The names the copy's HEADER line would carry — read off the bound plan,
+    /// which is where the server reads them from too.
+    fn column_names(plan: &CopyToPlan) -> Vec<String> {
+        match output_columns_of(&plan.plan) {
+            Ok(columns) => columns.into_iter().map(|c| c.name).collect(),
+            Err(error) => panic!("a COPY TO plan must have output columns: {error}"),
+        }
+    }
+
+    /// No column list copies every column in schema order; a written list keeps
+    /// *its* order, which is what `COPY t (c, a) TO STDOUT` observably emits.
+    #[test]
+    fn copy_to_columns_follow_the_statement_not_the_schema() {
+        assert_eq!(
+            column_names(&copy_to_ok("COPY t TO stdout")),
+            vec!["id", "big", "name", "flag"]
+        );
+        assert_eq!(
+            column_names(&copy_to_ok("COPY t (name, id) TO stdout")),
+            vec!["name", "id"]
+        );
+    }
+
+    #[test]
+    fn copy_to_query_takes_its_columns_from_the_query() {
+        let plan = copy_to_ok("COPY (SELECT id AS a, name AS b FROM t) TO stdout");
+        assert_eq!(column_names(&plan), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn copy_to_rejects_an_unknown_column() {
+        let error = copy_to_err("COPY t (nosuch) TO stdout");
+        assert_eq!(error.code, sqlstate::UNDEFINED_COLUMN);
+        assert_eq!(
+            error.message,
+            "column \"nosuch\" of relation \"t\" does not exist"
+        );
+    }
+
+    /// `FORCE_QUOTE` resolves to positions in the *output* list, so a column the
+    /// COPY omits cannot be named even though the table has it.
+    #[test]
+    fn copy_to_force_quote_resolves_against_the_output_columns() {
+        let plan = copy_to_ok("COPY t TO stdout (FORMAT csv, FORCE_QUOTE *)");
+        assert_eq!(plan.format.force_quote, ForceQuote::All);
+
+        let plan = copy_to_ok("COPY t (id, name) TO stdout (FORMAT csv, FORCE_QUOTE (name))");
+        assert_eq!(plan.format.force_quote, ForceQuote::Columns(vec![1]));
+
+        let error = copy_to_err("COPY t (id) TO stdout (FORMAT csv, FORCE_QUOTE (name))");
+        assert_eq!(error.code, sqlstate::INVALID_PARAMETER_VALUE);
+        assert_eq!(
+            error.message,
+            "FORCE_QUOTE column \"name\" not referenced by COPY"
+        );
+    }
+
+    /// The option gates, each with PostgreSQL 18.4's own SQLSTATE and wording.
+    /// The three codes are not interchangeable: PG raises a CSV-only option
+    /// outside CSV mode as 0A000, a wrong-direction option as 22023, and a
+    /// binary-mode conflict as 42601. The CSV gate is also checked *before* the
+    /// direction gate, which is why the FORCE_* cases below all say `FORMAT csv`.
+    #[test]
+    fn copy_to_option_gates_match_pg() {
+        let cases = [
+            (
+                "COPY t TO stdout (HEADER MATCH)",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use \"match\" with HEADER in COPY TO",
+            ),
+            (
+                "COPY t TO stdout (FORMAT csv, FORCE_NOT_NULL (id))",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY FORCE_NOT_NULL cannot be used with COPY TO",
+            ),
+            (
+                "COPY t TO stdout (FORMAT csv, FORCE_NULL (id))",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY FORCE_NULL cannot be used with COPY TO",
+            ),
+            (
+                "COPY t TO stdout (QUOTE '~')",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY QUOTE requires CSV mode",
+            ),
+            (
+                "COPY t TO stdout (FORMAT binary, DELIMITER '|')",
+                sqlstate::SYNTAX_ERROR,
+                "cannot specify DELIMITER in BINARY mode",
+            ),
+            (
+                "COPY t TO stdout (FORMAT binary, NULL 'x')",
+                sqlstate::SYNTAX_ERROR,
+                "cannot specify NULL in BINARY mode",
+            ),
+            (
+                "COPY t TO stdout (FORMAT binary, HEADER)",
+                sqlstate::SYNTAX_ERROR,
+                "cannot specify HEADER in BINARY mode",
+            ),
+            // The CSV refusal wins over the binary one, as in PG.
+            (
+                "COPY t TO stdout (FORMAT binary, QUOTE '~')",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY QUOTE requires CSV mode",
+            ),
+            (
+                "COPY t TO stdout (FREEZE)",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY FREEZE cannot be used with COPY TO",
+            ),
+            (
+                "COPY t TO stdout (FORMAT csv, DELIMITER '\"')",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY delimiter and quote must be different",
+            ),
+            (
+                "COPY t TO stdout (DELIMITER '|', NULL 'a|b')",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY delimiter character must not appear in the NULL specification",
+            ),
+            (
+                "COPY t TO stdout (FORMAT csv, NULL 'a\"b')",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "CSV quote character must not appear in the NULL specification",
+            ),
+            (
+                "COPY t TO stdout (NULL E'a\nb')",
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "COPY null representation cannot use newline or carriage return",
+            ),
+            (
+                "COPY t TO '/tmp/x'",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY TO a file is not supported yet",
+            ),
+            (
+                "COPY t TO PROGRAM 'cat'",
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "COPY to a program is not supported yet",
+            ),
+        ];
+        for (sql, code, message) in cases {
+            let error = copy_to_err(sql);
+            assert_eq!((error.code, error.message.as_str()), (code, message));
+        }
+    }
+
+    /// `HEADER false` says what binary format already implies, so PG accepts it —
+    /// only a header actually asked for is a conflict.
+    #[test]
+    fn copy_to_binary_accepts_header_false() {
+        let plan = copy_to_ok("COPY t TO stdout (FORMAT binary, HEADER false)");
+        assert_eq!(plan.format.format, CopyWireFormat::Binary);
+        assert_eq!(plan.format.header, CopyHeader::Off);
+    }
+
+    /// `FORCE_QUOTE` is the mirror image: legal on the way out, refused on the
+    /// way in — and `FORMAT binary` stays unreadable.
+    #[test]
+    fn copy_from_keeps_its_own_gates() {
+        let engine = engine_with_table();
+        let bind_from = |sql: &str| -> BindError {
+            let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+            let stmts = crabgresql_parser::parse(sql).expect("valid fixture");
+            let ast::Statement::Copy {
+                source,
+                to,
+                target,
+                options,
+                legacy_options,
+                ..
+            } = &stmts[0]
+            else {
+                panic!("expected a COPY statement: {sql}");
+            };
+            match bind_copy_from(
+                &engine,
+                &catalog,
+                source,
+                *to,
+                target,
+                options,
+                legacy_options,
+            ) {
+                Ok(_) => panic!("expected `{sql}` to be rejected"),
+                Err(error) => error,
+            }
+        };
+        assert_eq!(
+            bind_from("COPY t FROM stdin (FORMAT csv, FORCE_QUOTE (id))").message,
+            "COPY FORCE_QUOTE cannot be used with COPY FROM"
+        );
+        assert_eq!(
+            bind_from("COPY t FROM stdin (FORMAT binary)").message,
+            "COPY FROM with binary format is not supported yet"
+        );
     }
 
     fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> InsertSource {

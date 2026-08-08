@@ -194,7 +194,7 @@ impl CopyDecoder {
         if self.end_of_data {
             return Ok(());
         }
-        if self.format.csv {
+        if self.format.is_csv() {
             self.push_csv(bytes, rows)
         } else {
             self.push_text(bytes, rows)
@@ -207,7 +207,7 @@ impl CopyDecoder {
         if self.end_of_data {
             return Ok(());
         }
-        if !self.format.csv {
+        if !self.format.is_csv() {
             if !self.line.is_empty() {
                 self.complete_text_line(rows)?;
             }
@@ -585,6 +585,220 @@ fn finish_csv_field(
 
 fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
     format.force_not_null.contains(&field_index)
+}
+
+/// The `PGCOPY` binary-format file signature, followed by a flags word and a
+/// header-extension length (both zero here — crabgresql emits no extension and
+/// sets no flags, as PostgreSQL does).
+const BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+/// `COPY … TO` row encoding: the inverse of [`CopyDecoder`].
+///
+/// Encoding is byte-oriented for the same reason decoding is — the delimiter,
+/// quote and escape are single bytes and multi-byte data flows through untouched.
+/// Every method appends to a caller-owned buffer so a copy-out stream reuses one
+/// scratch allocation across all its rows.
+///
+/// The text writer is deliberately a *narrower* inverse than [`unescape_text`]:
+/// the decoder additionally accepts `\xHH`, `\NNN` and `\<anything>`, none of
+/// which this ever produces. PostgreSQL's writer is the same shape — it emits
+/// only the seven named escapes plus the delimiter, and passes every other
+/// control byte through raw.
+pub struct CopyEncoder {
+    format: CopyFormat,
+}
+
+impl CopyEncoder {
+    pub fn new(format: &CopyFormat) -> Self {
+        CopyEncoder {
+            format: format.clone(),
+        }
+    }
+
+    /// Whether values must be handed to [`Self::row_binary`] rather than
+    /// [`Self::row_text`].
+    pub fn is_binary(&self) -> bool {
+        self.format.is_binary()
+    }
+
+    /// Whether a `HEADER` record precedes the data. Always false in binary mode,
+    /// which rejects the option outright.
+    pub fn has_header(&self) -> bool {
+        !self.format.is_binary() && self.format.header.present()
+    }
+
+    /// The bytes that open the stream: the `PGCOPY` file header in binary mode,
+    /// nothing in the text family.
+    pub fn preamble(&self, out: &mut Vec<u8>) {
+        if self.format.is_binary() {
+            out.extend_from_slice(BINARY_SIGNATURE);
+            out.extend_from_slice(&0i32.to_be_bytes()); // flags
+            out.extend_from_slice(&0i32.to_be_bytes()); // header extension length
+        }
+    }
+
+    /// The bytes that close the stream: binary's `-1` field-count trailer.
+    pub fn trailer(&self, out: &mut Vec<u8>) {
+        if self.format.is_binary() {
+            out.extend_from_slice(&(-1i16).to_be_bytes());
+        }
+    }
+
+    /// The `HEADER` record. Column names go through the same attribute writer as
+    /// data — so a name containing the delimiter is escaped or quoted — but never
+    /// through `FORCE_QUOTE`, which PostgreSQL applies to data only.
+    pub fn header(&self, names: &[String], out: &mut Vec<u8>) {
+        let single = names.len() == 1;
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                out.push(self.format.delimiter);
+            }
+            if self.format.is_csv() {
+                self.csv_attribute(name.as_bytes(), false, single, out);
+            } else {
+                self.text_attribute(name.as_bytes(), out);
+            }
+        }
+        out.push(b'\n');
+    }
+
+    /// One text/CSV data record. `None` is SQL NULL.
+    pub fn row_text(&self, fields: &[Option<String>], out: &mut Vec<u8>) {
+        let single = fields.len() == 1;
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(self.format.delimiter);
+            }
+            match field {
+                // The NULL marker is written verbatim in both formats: never
+                // escaped, never quoted, and never subject to FORCE_QUOTE.
+                // PostgreSQL makes no attempt to keep it distinct from a data
+                // value that happens to equal it.
+                None => out.extend_from_slice(self.format.null.as_bytes()),
+                Some(text) if self.format.is_csv() => {
+                    let force = self.format.force_quote.applies_at(i);
+                    self.csv_attribute(text.as_bytes(), force, single, out);
+                }
+                Some(text) => self.text_attribute(text.as_bytes(), out),
+            }
+        }
+        out.push(b'\n');
+    }
+
+    /// One binary data record: the field count, then each field's length and
+    /// bytes (`-1` for NULL).
+    ///
+    /// Both widths are signed on the wire, and a value that overflows one would
+    /// frame the *rest of the stream* wrongly rather than corrupt one field —
+    /// a length that wrapped to `-1` reads back as NULL, a field count that
+    /// wrapped to `-1` reads back as the file trailer. So they are checked, and
+    /// a copy that cannot be represented fails instead.
+    pub fn row_binary(&self, fields: &[Option<Vec<u8>>], out: &mut Vec<u8>) -> Result<(), PgError> {
+        let count = i16::try_from(fields.len()).map_err(|_| {
+            PgError::new(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                format!(
+                    "cannot COPY a row of {} columns in binary format",
+                    fields.len()
+                ),
+            )
+        })?;
+        out.extend_from_slice(&count.to_be_bytes());
+        for field in fields {
+            match field {
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    let len = i32::try_from(bytes.len()).map_err(|_| {
+                        PgError::new(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            format!(
+                                "cannot COPY a field of {} bytes in binary format",
+                                bytes.len()
+                            ),
+                        )
+                    })?;
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Text format: the seven named escapes, then the delimiter, then the raw
+    /// byte. Other control bytes and multi-byte UTF-8 pass through untouched, as
+    /// PostgreSQL's writer leaves them.
+    fn text_attribute(&self, bytes: &[u8], out: &mut Vec<u8>) {
+        for &b in bytes {
+            // The named escapes are checked first so that `DELIMITER E'\t'` — the
+            // default — has one unambiguous answer rather than two rules that
+            // happen to agree.
+            let named = match b {
+                b'\\' => Some(b'\\'),
+                0x08 => Some(b'b'),
+                0x0C => Some(b'f'),
+                b'\n' => Some(b'n'),
+                b'\r' => Some(b'r'),
+                b'\t' => Some(b't'),
+                0x0B => Some(b'v'),
+                _ => None,
+            };
+            match named {
+                Some(esc) => {
+                    out.push(b'\\');
+                    out.push(esc);
+                }
+                None if b == self.format.delimiter => {
+                    out.push(b'\\');
+                    out.push(b);
+                }
+                None => out.push(b),
+            }
+        }
+    }
+
+    /// CSV format. An unquoted field is written raw — CSV has no escaping
+    /// outside quotes — so the whole decision is whether to quote.
+    fn csv_attribute(&self, bytes: &[u8], force: bool, single: bool, out: &mut Vec<u8>) {
+        if !force && !self.csv_needs_quotes(bytes, single) {
+            out.extend_from_slice(bytes);
+            return;
+        }
+        let (quote, escape) = (self.format.quote, self.format.escape);
+        out.push(quote);
+        for &b in bytes {
+            // Both the quote and the escape byte are escaped. With the default
+            // `escape == quote` that is the familiar `""` doubling; under
+            // `ESCAPE '\'` it is `\"` and `\\`.
+            if b == quote || b == escape {
+                out.push(escape);
+            }
+            out.push(b);
+        }
+        out.push(quote);
+    }
+
+    /// PostgreSQL's quoting rules for a CSV data or header field, in its order.
+    /// `single` is whether the record has exactly one field, which is taken from
+    /// the record being written rather than stored, so it can never disagree
+    /// with it.
+    fn csv_needs_quotes(&self, bytes: &[u8], single: bool) -> bool {
+        // A value equal to the NULL marker must be quoted, or reading it back
+        // would turn it into NULL. This — not "the field is empty" — is the real
+        // rule: it is only because the CSV default NULL marker *is* the empty
+        // string that the two look alike.
+        if bytes == self.format.null.as_bytes() {
+            return true;
+        }
+        if bytes.iter().any(|&b| {
+            b == self.format.delimiter || b == self.format.quote || b == b'\n' || b == b'\r'
+        }) {
+            return true;
+        }
+        // A lone `\.` in single-column output would read back as text format's
+        // end-of-data marker.
+        single && bytes == b"\\."
+    }
 }
 
 /// Stream an already-opened COPY source file, handing the decoded rows to `sink`
@@ -1318,6 +1532,234 @@ mod tests {
             decoder.push(b"short\n", &mut rows)?;
         }
         assert_eq!(rows.len(), 100);
+        Ok(())
+    }
+
+    // ---- COPY TO encoding -------------------------------------------------
+    //
+    // Every expectation below was read off PostgreSQL 18.4 (`COPY … TO STDOUT`
+    // piped through `od -c`), not derived from the writer.
+
+    /// Encode one row and return the bytes, so a case reads as input → output.
+    fn encode_text(format: &CopyFormat, fields: &[Option<&str>]) -> String {
+        let enc = CopyEncoder::new(format);
+        let owned: Vec<Option<String>> = fields.iter().map(|f| f.map(str::to_string)).collect();
+        let mut out = Vec::new();
+        enc.row_text(&owned, &mut out);
+        String::from_utf8(out).expect("the encoder emits the input bytes unchanged")
+    }
+
+    #[test]
+    fn text_escapes_exactly_the_seven_pg_names() {
+        let f = text_format();
+        assert_eq!(encode_text(&f, &[Some("a\\b")]), "a\\\\b\n");
+        assert_eq!(encode_text(&f, &[Some("a\u{8}b")]), "a\\bb\n");
+        assert_eq!(encode_text(&f, &[Some("a\u{c}b")]), "a\\fb\n");
+        assert_eq!(encode_text(&f, &[Some("a\nb")]), "a\\nb\n");
+        assert_eq!(encode_text(&f, &[Some("a\rb")]), "a\\rb\n");
+        assert_eq!(encode_text(&f, &[Some("a\tb")]), "a\\tb\n");
+        assert_eq!(encode_text(&f, &[Some("a\u{b}b")]), "a\\vb\n");
+    }
+
+    /// Other control bytes and multi-byte UTF-8 go out raw — PG escapes neither.
+    #[test]
+    fn text_passes_other_control_bytes_and_utf8_through() {
+        let f = text_format();
+        assert_eq!(
+            encode_text(&f, &[Some("\u{1}\u{2}\u{1f}\u{7f}")]),
+            "\u{1}\u{2}\u{1f}\u{7f}\n"
+        );
+        assert_eq!(encode_text(&f, &[Some("привет")]), "привет\n");
+    }
+
+    /// The delimiter is escaped too, whatever it is.
+    #[test]
+    fn text_escapes_the_delimiter() {
+        let mut f = text_format();
+        f.delimiter = b'|';
+        assert_eq!(encode_text(&f, &[Some("a|b"), Some("c")]), "a\\|b|c\n");
+    }
+
+    /// The NULL marker goes out verbatim: unescaped, and with no attempt to keep
+    /// it distinct from a value that happens to equal it (PG makes none either).
+    #[test]
+    fn text_writes_the_null_marker_verbatim() {
+        let f = text_format();
+        assert_eq!(encode_text(&f, &[None]), "\\N\n");
+        let mut custom = text_format();
+        custom.null = "NUL".to_string();
+        assert_eq!(encode_text(&custom, &[None]), "NUL\n");
+        assert_eq!(encode_text(&custom, &[Some("NUL")]), "NUL\n");
+    }
+
+    #[test]
+    fn csv_quotes_only_on_the_pg_triggers() {
+        let f = csv_format();
+        // Quoted: the delimiter, the quote, a newline, a carriage return.
+        assert_eq!(encode_text(&f, &[Some("has,comma")]), "\"has,comma\"\n");
+        assert_eq!(encode_text(&f, &[Some("has\"quote")]), "\"has\"\"quote\"\n");
+        assert_eq!(encode_text(&f, &[Some("nl\nhere")]), "\"nl\nhere\"\n");
+        assert_eq!(encode_text(&f, &[Some("cr\rhere")]), "\"cr\rhere\"\n");
+        // Not quoted: leading/trailing space, a backslash, a TAB.
+        assert_eq!(encode_text(&f, &[Some(" lead")]), " lead\n");
+        assert_eq!(encode_text(&f, &[Some("trail ")]), "trail \n");
+        assert_eq!(encode_text(&f, &[Some("back\\slash")]), "back\\slash\n");
+        assert_eq!(encode_text(&f, &[Some("has\ttab")]), "has\ttab\n");
+    }
+
+    /// The rule is "the value equals the NULL marker", not "the value is empty".
+    /// Only the CSV default marker being `''` makes the two look alike.
+    #[test]
+    fn csv_quotes_a_value_that_collides_with_the_null_marker() {
+        let f = csv_format();
+        assert_eq!(encode_text(&f, &[Some("")]), "\"\"\n");
+        assert_eq!(encode_text(&f, &[None]), "\n");
+
+        let mut nul = csv_format();
+        nul.null = "NUL".to_string();
+        assert_eq!(encode_text(&nul, &[Some("NUL")]), "\"NUL\"\n");
+        // …and an empty value is now bare, because it collides with nothing.
+        assert_eq!(encode_text(&nul, &[Some("")]), "\n");
+        assert_eq!(encode_text(&nul, &[None]), "NUL\n");
+    }
+
+    /// Inside quotes, both the quote byte and the escape byte are prefixed with
+    /// the escape byte. With the default `escape == quote` that is `""`.
+    #[test]
+    fn csv_escapes_the_quote_and_the_escape_byte() {
+        let mut f = csv_format();
+        f.escape = b'\\';
+        assert_eq!(encode_text(&f, &[Some("has\"q,d")]), "\"has\\\"q,d\"\n");
+        assert_eq!(encode_text(&f, &[Some("a\\b,c")]), "\"a\\\\b,c\"\n");
+        // The escape byte alone does not trigger quoting.
+        assert_eq!(encode_text(&f, &[Some("a\\b")]), "a\\b\n");
+    }
+
+    /// A lone `\.` would read back as text format's end-of-data marker, but only
+    /// when it is the whole line — so PG quotes it for single-column output only.
+    #[test]
+    fn csv_quotes_a_lone_end_of_data_marker_only_when_single_column() {
+        let f = csv_format();
+        assert_eq!(encode_text(&f, &[Some("\\.")]), "\"\\.\"\n");
+        assert_eq!(encode_text(&f, &[Some("\\."), Some("x")]), "\\.,x\n");
+    }
+
+    /// FORCE_QUOTE quotes data fields, never the NULL marker.
+    #[test]
+    fn csv_force_quote_leaves_null_bare() {
+        let mut f = csv_format();
+        f.force_quote = crabgresql_binder::ForceQuote::All;
+        assert_eq!(encode_text(&f, &[Some("1"), None]), "\"1\",\n");
+
+        let mut one = csv_format();
+        one.force_quote = crabgresql_binder::ForceQuote::Columns(vec![1]);
+        assert_eq!(encode_text(&one, &[Some("a"), Some("b")]), "a,\"b\"\n");
+    }
+
+    /// Header names go through the same attribute writer as data, but never
+    /// through FORCE_QUOTE.
+    #[test]
+    fn header_uses_the_attribute_rules_but_not_force_quote() -> Result<(), PgError> {
+        let render = |format: &CopyFormat, names: &[&str]| -> Result<String, PgError> {
+            let owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut out = Vec::new();
+            CopyEncoder::new(format).header(&owned, &mut out);
+            field_string(out)
+        };
+
+        let mut csv = csv_format();
+        csv.force_quote = crabgresql_binder::ForceQuote::All;
+        assert_eq!(
+            render(&csv, &["col,one", "b\"q"])?,
+            "\"col,one\",\"b\"\"q\"\n"
+        );
+        assert_eq!(
+            render(&text_format(), &["col\ttab", "b"])?,
+            "col\\ttab\tb\n"
+        );
+        // A single-column header still quotes a bare `\.` — the marker rule
+        // applies to the header record too (verified against PG 18.4).
+        assert_eq!(render(&csv_format(), &["\\."])?, "\"\\.\"\n");
+        Ok(())
+    }
+
+    /// The `PGCOPY` file header, a row with a NULL, and the `-1` trailer — the
+    /// exact bytes PostgreSQL 18.4 emits for
+    /// `COPY (SELECT 1::int4, 'ab'::text, NULL::int8) TO STDOUT (FORMAT binary)`.
+    #[test]
+    fn binary_frames_match_pg_byte_for_byte() -> Result<(), PgError> {
+        let enc = CopyEncoder::new(&CopyFormat::binary());
+        let mut out = Vec::new();
+        enc.preamble(&mut out);
+        enc.row_binary(
+            &[
+                Some(1i32.to_be_bytes().to_vec()),
+                Some(b"ab".to_vec()),
+                None,
+            ],
+            &mut out,
+        )?;
+        enc.trailer(&mut out);
+        assert_eq!(
+            out,
+            b"PGCOPY\n\xff\r\n\0\
+              \x00\x00\x00\x00\x00\x00\x00\x00\
+              \x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x02ab\xff\xff\xff\xff\
+              \xff\xff"
+        );
+        Ok(())
+    }
+
+    /// A field count that does not fit the wire's signed 16-bit width would
+    /// re-frame the whole stream — worst case it wraps to `-1`, the file
+    /// trailer, and a reader stops early reporting success. Refuse instead.
+    #[test]
+    fn binary_refuses_a_row_wider_than_the_wire_can_frame() {
+        let enc = CopyEncoder::new(&CopyFormat::binary());
+        let fields: Vec<Option<Vec<u8>>> = vec![None; i16::MAX as usize + 1];
+        let mut out = Vec::new();
+        match enc.row_binary(&fields, &mut out) {
+            Ok(()) => panic!("a 32768-column binary row cannot be framed"),
+            Err(e) => assert_eq!(e.code, sqlstate::PROGRAM_LIMIT_EXCEEDED),
+        }
+    }
+
+    /// The strongest available check that the writer is the reader's inverse:
+    /// nasty values survive a round trip through the existing decoder, in both
+    /// text-family formats and under non-default option bytes.
+    #[test]
+    fn encoding_then_decoding_round_trips() -> Result<(), PgError> {
+        let rows: Vec<Vec<Field>> = vec![
+            vec![Some("plain".into()), Some("has,comma".into())],
+            vec![Some("tab\there".into()), None],
+            vec![Some("has\"quote".into()), Some("nl\nhere".into())],
+            vec![Some("".into()), Some("back\\slash".into())],
+            vec![Some("\\.".into()), Some(" lead trail ".into())],
+            vec![Some("cr\rhere".into()), Some("привет".into())],
+            vec![
+                Some("\u{1}\u{1f}\u{7f}".into()),
+                Some("\u{8}\u{b}\u{c}".into()),
+            ],
+        ];
+
+        let mut formats = vec![CopyFormat::text(), CopyFormat::csv()];
+        let mut pipe = CopyFormat::text();
+        pipe.delimiter = b'|';
+        pipe.null = "NUL".to_string();
+        formats.push(pipe);
+        let mut backslash = CopyFormat::csv();
+        backslash.escape = b'\\';
+        backslash.null = "NUL".to_string();
+        formats.push(backslash);
+
+        for format in formats {
+            let enc = CopyEncoder::new(&format);
+            let mut bytes = Vec::new();
+            for row in &rows {
+                enc.row_text(row, &mut bytes);
+            }
+            assert_eq!(decode(&format, &bytes)?, rows, "round trip for {format:?}");
+        }
         Ok(())
     }
 }
