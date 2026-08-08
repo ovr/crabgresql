@@ -40,7 +40,7 @@ fn fixed<const N: usize>(b: &[u8], ty: PgType) -> Result<[u8; N], CastError> {
 /// literal fail and succeed identically.
 pub fn decode_text(ty: PgType, s: &str, fmt: &FmtCtx) -> Result<Value, CastError> {
     match ty {
-        // `name` truncates to 63 characters (`namein`), as PG does.
+        // `name` clips to 63 bytes (`namein`), as PG does.
         PgType::Name => Ok(Value::Text(crate::text::name_input(s))),
         // The other string types share text's representation; a bind parameter
         // carries no typmod, so there is no length to enforce here (as in PG,
@@ -88,7 +88,7 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         PgType::Float8 => Value::Float8(f64::from_bits(u64::from_be_bytes(fixed(b, ty)?))),
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
             let s = String::from_utf8(b.to_vec()).map_err(|_| invalid_binary(ty))?;
-            // `name` truncates to 63 characters (`namerecv`); the rest keep their
+            // `name` clips to 63 bytes (`namerecv`); the rest keep their
             // full length.
             match ty {
                 PgType::Name => Value::Text(crate::text::name_input(&s)),
@@ -354,14 +354,29 @@ mod tests {
         Ok(())
     }
 
+    /// `name` is a fixed 64-byte slot, so the limit is bytes. ASCII cannot tell
+    /// the two rules apart, so the multibyte case is the one that matters: 70
+    /// `é` is 140 bytes, and PG 18.4 stores 62 of them (31 characters) because
+    /// the 63rd byte would split one.
     #[test]
-    fn name_param_truncates_to_63_chars() -> anyhow::Result<()> {
-        let long = "x".repeat(100);
-        let Value::Text(t) = decode_text(PgType::Name, &long, &FmtCtx::utc_default())? else {
-            panic!("name decodes to text");
+    fn name_param_clips_to_63_bytes() -> anyhow::Result<()> {
+        let name = |s: &str| -> anyhow::Result<String> {
+            let Value::Text(t) = decode_text(PgType::Name, s, &FmtCtx::utc_default())? else {
+                panic!("name decodes to text");
+            };
+            Ok(t)
         };
-        assert_eq!(t.chars().count(), 63);
 
+        let ascii = name(&"x".repeat(100))?;
+        assert_eq!(ascii.len(), 63);
+        assert_eq!(ascii.chars().count(), 63);
+
+        let multibyte = name(&"é".repeat(70))?;
+        assert_eq!(multibyte.len(), 62, "clipped on a character boundary");
+        assert_eq!(multibyte.chars().count(), 31);
+
+        // A value that already fits is returned whole, boundary or not.
+        assert_eq!(name("é")?, "é");
         Ok(())
     }
 

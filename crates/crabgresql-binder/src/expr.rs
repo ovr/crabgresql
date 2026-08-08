@@ -4047,7 +4047,7 @@ pub(crate) fn apply_length_typmod_if_any(
             Some(n) => (ScalarFn::VarbitTypmod, Some(n)),
             None => return Ok(expr),
         },
-        // `name` always truncates to 63 characters, independent of any modifier.
+        // `name` always clips to 63 bytes, independent of any modifier.
         PgType::Name => (ScalarFn::NameInput, None),
         PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
             match datetime_precision(data_type) {

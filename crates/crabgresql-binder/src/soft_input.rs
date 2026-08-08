@@ -277,7 +277,7 @@ fn apply_input_typmod(
                 apply_input_typmod(elem, elem_ty, elem_dt)?;
             }
         }
-        // `name` truncates to 63 characters and never fails; no other type
+        // `name` clips to 63 bytes and never fails; no other type
         // carries a modifier that can reject a value.
         _ => {}
     }

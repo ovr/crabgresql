@@ -469,7 +469,7 @@ pub enum ScalarFn {
     VarcharTypmod,
     /// Apply a `char(n)`/`bpchar(n)` blank-padding coercion (`text`, `int4 n`).
     BpcharTypmod,
-    /// `name` input: truncate to 63 characters (`text`).
+    /// `name` input: clip to 63 bytes (`text`).
     NameInput,
     /// `bpchar -> text` coercion: strip trailing blanks.
     BpcharToText,

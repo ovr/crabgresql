@@ -11205,15 +11205,22 @@ mod tests {
     /// `name` truncates whatever its typmod says, and a `name` column's is
     /// always -1 — so a value-level typmod keyed on `typmod >= 0` would silently
     /// store the untruncated string, and disagree with an ordinary INSERT.
+    ///
+    /// Asserted in bytes, and with a multibyte value, because that is the only
+    /// input that can tell `name`'s byte limit from `varchar(n)`'s character
+    /// one — an ASCII string satisfies both.
     #[test]
     fn copy_truncates_a_name_column_despite_its_absent_typmod() {
         let column = Column::new("n", PgType::Name);
         assert_eq!(column.typmod, -1);
-        let long = "x".repeat(100);
-        let Ok(Value::Text(stored)) = apply_column_typmod(Value::Text(long), &column) else {
-            panic!("a name column must accept text");
+        let stored = |s: String| match apply_column_typmod(Value::Text(s), &column) {
+            Ok(Value::Text(stored)) => stored,
+            other => panic!("a name column must accept text, got {other:?}"),
         };
-        assert_eq!(stored.chars().count(), 63);
+        assert_eq!(stored("x".repeat(100)).len(), 63);
+        let multibyte = stored("é".repeat(70));
+        assert_eq!(multibyte.len(), 62, "clipped on a character boundary");
+        assert_eq!(multibyte.chars().count(), 31);
     }
 
     /// A NULL never reaches a length rule: it is a NULL in a `char(5)` column,
