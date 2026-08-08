@@ -12048,6 +12048,146 @@ async fn pg_dump_preamble_parameters_are_accepted() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tableoid` on a catalog relation, which is how `pg_dump` opens almost every
+/// query it makes: 34 of the 66 in the captured census select it.
+#[tokio::test]
+async fn tableoid_resolves_on_catalog_relations() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    // Verbatim from the census, `pg_am` being the one query that needs nothing
+    // but `tableoid` and a catalog that already exists.
+    let am = client
+        .simple_query(
+            "SELECT tableoid, oid, amname, amtype, amhandler::pg_catalog.regproc AS amhandler \
+             FROM pg_am",
+        )
+        .await?;
+    let am = rows(&am);
+    assert!(!am.is_empty(), "pg_am must report the access methods");
+    let pg_am_oid = scalar(&client, "SELECT 'pg_am'::regclass::oid").await;
+    for row in &am {
+        assert_eq!(
+            row.get(0),
+            Some(pg_am_oid.as_str()),
+            "every pg_am row is a row of pg_am"
+        );
+    }
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT tableoid FROM pg_collation WHERE collname = 'C'",
+        )
+        .await,
+        scalar(&client, "SELECT 'pg_collation'::regclass::oid").await,
+    );
+    Ok(())
+}
+
+/// On a user relation `tableoid` is the relation's own OID, it stays out of
+/// `*`, and — being resolved at execution rather than bind time — it survives a
+/// catalog change under a prepared statement.
+#[tokio::test]
+async fn tableoid_on_a_user_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int, b text); INSERT INTO t VALUES (1, 'x')")
+        .await?;
+
+    assert_eq!(
+        scalar(&client, "SELECT tableoid FROM t").await,
+        scalar(&client, "SELECT 't'::regclass::oid").await,
+    );
+    assert_eq!(
+        scalar(&client, "SELECT t.tableoid FROM t").await,
+        scalar(&client, "SELECT 't'::regclass::oid").await,
+    );
+
+    // `*` expands to the declared columns only, as in PG: a system column is
+    // reachable by name and by name alone.
+    let star = client.query("SELECT * FROM t", &[]).await?;
+    let columns: Vec<&str> = star[0].columns().iter().map(|c| c.name()).collect();
+    assert_eq!(columns, vec!["a", "b"]);
+
+    // Relation OIDs are positional over the catalog snapshot, so creating a
+    // relation that sorts ahead of `t` moves it. A plan holding a folded OID
+    // would answer with the stale one here.
+    client
+        .simple_query("PREPARE q AS SELECT tableoid FROM t")
+        .await?;
+    client
+        .simple_query("CREATE TABLE aaa_sorts_first (x int)")
+        .await?;
+    assert_eq!(
+        scalar(&client, "EXECUTE q").await,
+        scalar(&client, "SELECT 't'::regclass::oid").await,
+        "a prepared `tableoid` must track the current catalog, not the one it bound against",
+    );
+    Ok(())
+}
+
+/// Where `tableoid` does *not* resolve. The first three match PostgreSQL
+/// exactly (it exposes no system columns on a row source that is not a
+/// relation); the partitioned parent is this build's own gap, reported as such
+/// rather than as a missing column.
+#[tokio::test]
+async fn tableoid_is_refused_off_a_plain_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE t (a int); CREATE TABLE u (a int); CREATE VIEW v AS SELECT a FROM t; \
+             CREATE TABLE p (a int) PARTITION BY RANGE (a); \
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10); \
+             INSERT INTO p VALUES (1)",
+        )
+        .await?;
+    for sql in [
+        "SELECT tableoid FROM v",
+        "WITH c AS (SELECT 1 AS a) SELECT tableoid FROM c",
+        "SELECT tableoid FROM (SELECT 1 AS a) s",
+        "SELECT tableoid FROM generate_series(1, 2)",
+    ] {
+        assert_eq!(sqlstate(&client, sql).await?, "42703", "for `{sql}`");
+    }
+    // Two relations in scope, neither qualified: ambiguous, as any duplicated
+    // column name would be.
+    assert_eq!(
+        sqlstate(&client, "SELECT tableoid FROM t, u").await?,
+        "42702"
+    );
+    // A leaf partition is an ordinary relation and answers for itself.
+    assert_eq!(
+        scalar(&client, "SELECT tableoid FROM p1").await,
+        scalar(&client, "SELECT 'p1'::regclass::oid").await,
+    );
+    // The parent would have to report the child each row came from.
+    assert_eq!(sqlstate(&client, "SELECT tableoid FROM p").await?, "0A000");
+    Ok(())
+}
+
+/// `pg_attribute.attacl` exists and is uniformly NULL — which is the truth, not
+/// a placeholder: there is no `GRANT` in this build, so no column carries an
+/// ACL. `pg_dump` asks exactly this question to decide whether to emit any
+/// column-level grants at all.
+#[tokio::test]
+async fn pg_attribute_reports_no_column_acls() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int, b text)")
+        .await?;
+    let acls = client
+        .simple_query("SELECT DISTINCT attrelid FROM pg_attribute WHERE attacl IS NOT NULL")
+        .await?;
+    assert!(rows(&acls).is_empty(), "no column can carry an ACL");
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM pg_attribute WHERE attrelid = 't'::regclass AND attacl IS NULL",
+        )
+        .await,
+        "2",
+    );
+    Ok(())
+}
+
 /// PG's `boolin` takes any unambiguous prefix, not just the full words.
 #[tokio::test]
 async fn boolean_parameters_accept_pg_prefixes() -> anyhow::Result<()> {

@@ -630,6 +630,14 @@ pub enum ScalarFn {
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
+    /// The `tableoid` system column: the OID of the relation a row came from.
+    /// Its two arguments are the relation's namespace and name as text literals,
+    /// resolved through the catalog at *execution* time rather than folded here
+    /// — relation OIDs are positional over the catalog snapshot, so a prepared
+    /// statement holding a frozen one would go stale the moment another relation
+    /// is created or dropped ahead of it. Emitted only by name resolution
+    /// ([`crate::expr::Scope`]), never callable by name, as in PostgreSQL.
+    TableOid,
     /// `'name'::reg*`: resolve an object name to the OID it identifies, erroring
     /// if nothing has that name. Emitted by a cast, not callable by name — PG
     /// spells these `regclassin` and friends, which are not SQL-visible either.

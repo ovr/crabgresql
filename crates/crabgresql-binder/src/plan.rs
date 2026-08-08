@@ -20,11 +20,12 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind, WindowSortKey,
-    apply_column_typmod, bind_binary_op, bind_column_default, bind_expr, bind_projection,
-    bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible, merge_types,
-    normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown_owned,
-    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column, view_expansion,
+    ParamCtx, Scope, ScopeItem, SysSource, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
+    WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
+    bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
+    merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body,
+    parse_unknown_owned, reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
+    view_expansion,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
@@ -613,7 +614,7 @@ fn scan_arms(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
     only: bool,
-) -> Result<Option<Vec<MappedRelation>>, BindError> {
+) -> Result<Option<ScanFanout>, BindError> {
     let schema = table.schema();
     if schema.partition_scheme.is_some() {
         let mut arms = Vec::new();
@@ -621,7 +622,7 @@ fn scan_arms(
             // A leaf is a verbatim clone of the parent's layout, so identity.
             push_storage_leaves(&mut arms, leaf, None);
         }
-        return Ok(Some(arms));
+        return Ok(Some(ScanFanout::relations(arms)));
     }
     if !only {
         let descendants = inheritance_descendants(engine, &schema)?;
@@ -633,12 +634,41 @@ fn scan_arms(
                 let map = inherit_map(&schema, &child.schema())?;
                 push_storage_leaves(&mut arms, child, map);
             }
-            return Ok(Some(arms));
+            return Ok(Some(ScanFanout::relations(arms)));
         }
     }
     Ok(table
         .storage_leaves()
-        .map(|leaves| leaves.into_iter().map(|t| arm(t, None)).collect()))
+        .map(|leaves| ScanFanout::one_relation(leaves.into_iter().map(|t| arm(t, None)).collect())))
+}
+
+/// The arms a fanned-out read produces, and whether they are *other relations*.
+///
+/// The distinction is invisible to the executor — every arm is scanned alike —
+/// but it decides what a row's `tableoid` is: an access method's own physical
+/// pieces all belong to the relation that was named, whereas a partition or an
+/// inheritance child is a relation in its own right and reports itself.
+struct ScanFanout {
+    arms: Vec<MappedRelation>,
+    multi_relation: bool,
+}
+
+impl ScanFanout {
+    /// Partitions or inheritance children: each arm is its own relation.
+    fn relations(arms: Vec<MappedRelation>) -> Self {
+        Self {
+            arms,
+            multi_relation: true,
+        }
+    }
+
+    /// One relation split across several physical sources by its access method.
+    fn one_relation(arms: Vec<MappedRelation>) -> Self {
+        Self {
+            arms,
+            multi_relation: false,
+        }
+    }
 }
 
 fn arm(table: Arc<dyn TableAm>, map: Option<Arc<[usize]>>) -> MappedRelation {
@@ -2907,6 +2937,9 @@ struct BoundFromItem {
     qualifier: String,
     columns: Vec<OutputColumn>,
     input: JoinInput,
+    /// The relation this item's system columns (`tableoid`) answer for.
+    /// [`SysSource::None`] for everything that is not a bare relation scan.
+    sys: SysSource,
 }
 
 /// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
@@ -2914,7 +2947,7 @@ struct BoundFromItem {
 /// projection/WHERE/GROUP BY binding.
 struct BoundFrom {
     source: JoinExpr,
-    relations: Vec<(String, Vec<Column>)>,
+    relations: Vec<ScopeItem>,
     /// The merged-column view when a `USING`/`NATURAL` join is present; `None`
     /// keeps the plain "every relation's columns in order" behavior. Exprs index
     /// into this FROM's own combined row (base 0); [`bind_from_clause`] shifts
@@ -2930,7 +2963,11 @@ impl BoundFromItem {
                 input: self.input,
                 width,
             },
-            relations: vec![(self.qualifier, to_columns(&self.columns))],
+            relations: vec![ScopeItem {
+                qualifier: self.qualifier,
+                columns: to_columns(&self.columns),
+                sys: self.sys,
+            }],
             visible: None,
         }
     }
@@ -3081,7 +3118,7 @@ fn bind_from_item(
     params: &ParamCtx,
     relation: &ast::TableFactor,
     ctes: &CteEnv,
-    siblings: &[(String, Vec<Column>)],
+    siblings: &[ScopeItem],
 ) -> Result<BoundFromItem, BindError> {
     match relation {
         // A `Table` factor carrying call arguments is a set-returning function.
@@ -3161,6 +3198,7 @@ fn bind_from_item(
                     qualifier,
                     columns,
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
+                    sys: SysSource::None,
                 });
             }
             // Read resolution honors the search path: temp → pg_catalog →
@@ -3193,18 +3231,36 @@ fn bind_from_item(
                     // relation columns), so the surrounding SELECT's
                     // projection/WHERE/ORDER BY — and any join or aggregate —
                     // apply through the existing subplan machinery.
-                    let input = match scan_arms(engine, &table, *only)? {
-                        Some(arms) => JoinInput::Subplan(Box::new(LogicalPlan::Append {
-                            arms,
-                            columns: columns.clone(),
-                        })),
-                        None => JoinInput::Scan(table),
+                    // `tableoid` names the relation unless the arms *are* other
+                    // relations, in which case PostgreSQL reports the child each
+                    // row came from — which the arms do not carry.
+                    let self_oid = || {
+                        let schema = table.schema();
+                        SysSource::Relation {
+                            namespace: schema.namespace.clone(),
+                            name: schema.name.clone(),
+                        }
+                    };
+                    let (input, sys) = match scan_arms(engine, &table, *only)? {
+                        Some(fanout) => (
+                            JoinInput::Subplan(Box::new(LogicalPlan::Append {
+                                arms: fanout.arms,
+                                columns: columns.clone(),
+                            })),
+                            if fanout.multi_relation {
+                                SysSource::Inherited
+                            } else {
+                                self_oid()
+                            },
+                        ),
+                        None => (JoinInput::Scan(Arc::clone(&table)), self_oid()),
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
                     Ok(BoundFromItem {
                         qualifier,
                         columns,
                         input,
+                        sys,
                     })
                 }
                 Err(e) => {
@@ -3232,6 +3288,9 @@ fn bind_from_item(
                             qualifier,
                             columns,
                             input: JoinInput::Subplan(Box::new(inner)),
+                            // A view is expanded into its body, and PostgreSQL
+                            // exposes no system columns on one either.
+                            sys: SysSource::None,
                         });
                     }
                     Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
@@ -3285,6 +3344,7 @@ fn bind_from_item(
                 qualifier,
                 columns,
                 input: JoinInput::Subplan(Box::new(inner)),
+                sys: SysSource::None,
             })
         }
         other => Err(BindError::feature_not_supported(format!(
@@ -3327,7 +3387,7 @@ fn bind_from_clause(
     windows: &NamedWindows,
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
-    let mut relations: Vec<(String, Vec<Column>)> = Vec::new();
+    let mut relations: Vec<ScopeItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     // Accumulated merged-column view across comma groups. Stays `None` while no
     // group merges columns; once one does, it is materialized (plain views fill
@@ -3349,8 +3409,8 @@ fn bind_from_clause(
             windows,
             &relations,
         )?;
-        for (qualifier, _) in &group_relations {
-            ensure_unique_qualifier(&mut seen, qualifier)?;
+        for rel in &group_relations {
+            ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
         }
         let group_width = group_source.width();
         // Fold this group's view into the running one, shifting its base-0
@@ -3406,14 +3466,14 @@ fn bind_table_with_joins(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
-    siblings: &[(String, Vec<Column>)],
+    siblings: &[ScopeItem],
 ) -> Result<BoundFrom, BindError> {
     let mut bound =
         bind_from_item(engine, catalog, params, &table.relation, ctes, siblings)?.into_bound_from();
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
-        .map(|(qualifier, _)| qualifier.clone())
+        .map(|rel| rel.qualifier.clone())
         .collect();
     // Width of the accumulated left side in the group's combined row, tracked
     // incrementally (each Input is O(1), so no repeated tree walks).
@@ -3426,7 +3486,7 @@ fn bind_table_with_joins(
     // table-function argument could legally reference. Grown in place as the
     // chain is bound, so an N-way join does not re-clone the accumulated columns
     // N times.
-    let mut left_relations: Vec<(String, Vec<Column>)> = Vec::new();
+    let mut left_relations: Vec<ScopeItem> = Vec::new();
     if !table.joins.is_empty() {
         left_relations.extend(siblings.iter().cloned());
         left_relations.extend(bound.relations.iter().cloned());
@@ -3448,7 +3508,7 @@ fn bind_table_with_joins(
         )?
         .into_bound_from();
         left_relations.extend(right.relations.iter().cloned());
-        let right_qualifier = &right.relations[0].0;
+        let right_qualifier = &right.relations[0].qualifier;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
         let right_width = right.source.width();
 
@@ -3519,11 +3579,11 @@ fn bind_table_with_joins(
 /// The plain visible view for a run of relations laid out from `base` in the
 /// combined row: every column as a `ColumnRef`, in order — exactly what
 /// unqualified resolution and `*` produce without any merged join columns.
-fn default_visible(relations: &[(String, Vec<Column>)], base: usize) -> Vec<VisibleColumn> {
+fn default_visible(relations: &[ScopeItem], base: usize) -> Vec<VisibleColumn> {
     let mut out = Vec::new();
     let mut index = base;
-    for (_qualifier, columns) in relations {
-        for col in columns {
+    for rel in relations {
+        for col in &rel.columns {
             out.push(VisibleColumn {
                 name: col.name.clone(),
                 // Carry the column's declared collation, as unqualified
@@ -3546,7 +3606,7 @@ fn natural_join_names(left: &[VisibleColumn], right: &BoundFrom) -> Vec<String> 
     let right_names: HashSet<&str> = right
         .relations
         .iter()
-        .flat_map(|(_, cols)| cols.iter())
+        .flat_map(|rel| rel.columns.iter())
         .map(|c| c.name.as_str())
         .collect();
     let mut names: Vec<String> = Vec::new();
@@ -3999,7 +4059,7 @@ fn bind_table_fn_args(
     arg_exprs: &[ast::Expr],
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
-    siblings: &[(String, Vec<Column>)],
+    siblings: &[ScopeItem],
 ) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
     let error = match bind_table_fn_call(name, arg_exprs, &Scope::empty(catalog, params)) {
         Ok(bound) => return Ok(bound),
@@ -4054,6 +4114,7 @@ fn bound_table_fn_item(
         qualifier,
         columns,
         input: JoinInput::TableFunction { func, args },
+        sys: SysSource::None,
     })
 }
 
@@ -10958,15 +11019,23 @@ mod tests {
                 SplitTable::new("split_buffer", Vec::new()),
             ],
         );
-        let arms = scan_arms(&engine, &table, false)
+        let fanout = scan_arms(&engine, &table, false)
             .expect("scan_arms must not fail")
             .expect("a relation reporting storage leaves must fan out");
         // Order is the access method's, not sorted: a leaf order carries meaning
         // (durable storage before the write buffer, say) that must survive.
-        assert_eq!(arm_names(&arms), vec!["split_chunks", "split_buffer"]);
+        assert_eq!(
+            arm_names(&fanout.arms),
+            vec!["split_chunks", "split_buffer"]
+        );
         assert!(
-            arms.iter().all(|a| a.map.is_none()),
+            fanout.arms.iter().all(|a| a.map.is_none()),
             "one relation's storage leaves all carry its layout, so none remaps"
+        );
+        assert!(
+            !fanout.multi_relation,
+            "storage leaves are one relation's own pieces, so `tableoid` still \
+             names that relation"
         );
     }
 

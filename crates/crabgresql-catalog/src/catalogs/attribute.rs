@@ -33,6 +33,11 @@ pub(crate) fn pg_attribute_schema() -> TableSchema {
             col("attgenerated", CHARLIKE),
             col("attisdropped", PgType::Bool),
             col("attcollation", PgType::Oid),
+            // aclitem[]; represented as text and always NULL (default ACL) here.
+            // NULL is the whole truth rather than a placeholder: there is no
+            // `GRANT` in this build, so no column ever carries an ACL. Same
+            // treatment as `pg_namespace.nspacl`.
+            col("attacl", PgType::Text),
         ],
     )
 }
@@ -88,6 +93,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('\0'),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(c)),
+                Value::Null,
             ]);
         }
     }
@@ -111,6 +117,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('\0'),
                 Value::Bool(false),
                 Value::Oid(attcollation_of(column)),
+                Value::Null,
             ]);
         }
     }
@@ -135,6 +142,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('\0'),
                 Value::Bool(false),
                 Value::Oid(0),
+                Value::Null,
             ]);
         }
     }
