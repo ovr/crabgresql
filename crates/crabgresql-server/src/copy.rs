@@ -12,8 +12,9 @@
 //! [`crabgresql_binder::CopyFromPlan::build_insert`]'s job. `None` marks a field
 //! that matched the NULL representation.
 //!
-//! Fields come out as owned `String`s because the load consumes them: they are
-//! moved into the values the rows are built from, not copied out of a buffer.
+//! Fields come out as owned `String`s because the load consumes them: for the
+//! text family the string *is* the stored value, so `parse_unknown_owned` takes
+//! it by move rather than copying it out of a buffer that is then dropped.
 //!
 //! Decoding is resumable: [`CopyDecoder`] takes bytes in arbitrary slabs and
 //! keeps the quoting state itself, so a record may straddle any number of reads.
