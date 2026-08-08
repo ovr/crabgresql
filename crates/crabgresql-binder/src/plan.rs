@@ -391,8 +391,13 @@ pub enum InsertSource {
     /// wrapping the results in [`BoundExpr::Const`] only to have the executor
     /// clone them back out doubles the work of the whole statement.
     Tuples {
-        /// Full-width in schema order. Slots named in `defaults` hold a
-        /// placeholder that the executor overwrites.
+        /// Full-width in schema order.
+        ///
+        /// A slot named in `defaults` holds `Value::Null` as a placeholder,
+        /// which is indistinguishable from a genuine NULL — the `defaults` list
+        /// is the only thing that says which is which. So a reader must run that
+        /// list before treating a row as complete; `collect_insert_tuples` is
+        /// the one place that does, and the only consumer.
         rows: Vec<Tuple>,
         /// Columns whose `DEFAULT` does not fold to a constant — `nextval` on a
         /// `serial`, `now()`, a routine call — paired with the expression that
@@ -11217,11 +11222,12 @@ mod tests {
     /// not five blanks.
     #[test]
     fn copy_leaves_a_null_untouched_by_a_typmod() {
-        let mut column = Column::new("c", PgType::Bpchar);
-        column.typmod = 5 + 4; // varlena header, as `bpchar(5)` packs it
-        assert_eq!(
-            apply_column_typmod(Value::Null, &column).ok(),
-            Some(Value::Null)
-        );
+        // `Column::typmod` is the bare declared length; it is `atttypmod()` that
+        // adds the varlena header PostgreSQL's catalog reports.
+        let column = Column::with_typmod("c", PgType::Bpchar, 5);
+        match apply_column_typmod(Value::Null, &column) {
+            Ok(Value::Null) => {}
+            other => panic!("a NULL must pass through a char(5) typmod: {other:?}"),
+        }
     }
 }
