@@ -146,7 +146,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.push.outputs.digest }}"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v7
         if: matrix.platform != ''
@@ -192,7 +193,7 @@ jobs:
           done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           sources=()
           for digest in *; do
-            sources+=("${IMAGE}@${digest}")
+            sources+=("${IMAGE}@sha256:${digest}")
           done
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
 
