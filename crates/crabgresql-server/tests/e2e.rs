@@ -7563,15 +7563,21 @@ async fn the_sort_key_rule_does_not_reach_past_its_own_statements() -> anyhow::R
 async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
+        .simple_query(
+            "CREATE TABLE p (id int4, label text, vc varchar(20)) USING parquet ORDER BY (id)",
+        )
         .await?;
     client
-        .simple_query("CREATE TABLE h (id int4, label text)")
+        .simple_query("CREATE TABLE h (id int4, label text, vc varchar(20))")
         .await?;
     for table in ["p", "h"] {
         client
             .simple_query(&format!(
-                "INSERT INTO {table} VALUES (1,'a'),(2,'b'),(3,'c'),(4,NULL),(5,'e')"
+                // Row 6 carries a literal `%`, which is the only row an escaped
+                // `LIKE 'a!%' ESCAPE '!'` can match — without it that case
+                // returns nothing on both sides and asserts nothing.
+                "INSERT INTO {table} VALUES \
+                 (1,'a','a'),(2,'b','b'),(3,'c','c'),(4,NULL,NULL),(5,'e','e'),(6,'a%','a%')"
             ))
             .await?;
     }
@@ -7592,9 +7598,32 @@ async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<(
         // Arrow's Kleene kernels reject that outright.
         "WHERE id = 1 AND true ORDER BY id",
         "WHERE id > 3 OR false ORDER BY id",
-        // A predicate the columnar filter declines, combined with a sort it
-        // accepts: the row Filter must still run, and run first.
+        // A predicate the columnar filter declines. It takes the sort down with
+        // it — `tail_vectorization` only vectorizes a sort once the predicate is
+        // gone — so this is the whole tail running on rows below a batch scan.
+        "WHERE lower(label) = 'a' ORDER BY id",
+        // LIKE against a constant pattern runs columnar, with the same matcher
+        // the row path runs. The NULL label is the one that matters: a subject
+        // that is NULL makes the predicate NULL, which the filter drops.
         "WHERE label LIKE 'a%' ORDER BY id",
+        "WHERE label NOT LIKE 'a%' ORDER BY id",
+        "WHERE label ILIKE '%B%' ORDER BY id",
+        "WHERE label LIKE 'a!%' ESCAPE '!' ORDER BY id",
+        // A matcher narrowed by a sibling conjunct, in both orders and under a
+        // NOT — where a wrong narrowing turns a dropped row into a kept one.
+        "WHERE id = 1 AND label LIKE 'a%' ORDER BY id",
+        "WHERE label LIKE 'a%' AND id = 1 ORDER BY id",
+        "WHERE NOT (id = 1 AND label LIKE 'a%') ORDER BY id",
+        "WHERE id = 1 OR label LIKE 'a%' ORDER BY id",
+        // A varchar column reaches the operator through the binder's relabel to
+        // text. Every one of these declined until the peel moved out of LIKE
+        // and into the shared operand rule.
+        "WHERE vc LIKE 'a%' ORDER BY id",
+        "WHERE vc = label ORDER BY id",
+        "WHERE vc = 'a'::text ORDER BY id",
+        "WHERE vc IS NULL ORDER BY id",
+        // Declined: a computed pattern.
+        "WHERE label LIKE label ORDER BY id",
     ] {
         let columnar = client
             .simple_query(&format!("SELECT id FROM p {tail}"))
@@ -7603,6 +7632,24 @@ async fn a_columnar_plan_answers_what_the_row_plan_answers() -> anyhow::Result<(
             .simple_query(&format!("SELECT id FROM h {tail}"))
             .await?;
         assert_eq!(ids(&columnar), ids(&row), "disagreement on: {tail}");
+    }
+
+    // A malformed `ESCAPE` is an error the row evaluator owes the client, so
+    // the columnar filter must refuse the whole predicate rather than answer
+    // it. That refusal is invisible in a result set — both sides would just
+    // return rows — so it has to be asserted as the error itself.
+    for table in ["p", "h"] {
+        let error = client
+            .simple_query(&format!(
+                "SELECT id FROM {table} WHERE label LIKE 'a%' ESCAPE 'xy'"
+            ))
+            .await
+            .expect_err("a two-character escape is 22025");
+        assert_eq!(
+            error.code().map(|c| c.code()),
+            Some("22025"),
+            "on {table}: {error}"
+        );
     }
 
     // A constant whose type has no Arrow encoding is legal in a target list
@@ -7649,10 +7696,12 @@ async fn a_buffer_relation_vectorizes() -> anyhow::Result<()> {
 async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE p (id int4, label text) USING parquet ORDER BY (id)")
+        .simple_query(
+            "CREATE TABLE p (id int4, label text, vc varchar(20)) USING parquet ORDER BY (id)",
+        )
         .await?;
     client
-        .simple_query("INSERT INTO p VALUES (1, 'one')")
+        .simple_query("INSERT INTO p VALUES (1, 'one', 'one')")
         .await?;
 
     let lines = explain_lines(&client, "EXPLAIN SELECT * FROM p").await?;
@@ -7687,10 +7736,11 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
         ],
         "a WHERE on a split relation must still be rendered, and by column name"
     );
-    // The annotation must be earned, not assumed. A `LIKE` has no Arrow kernel
-    // here and `id + 1` is a computed sort key, so each declines its own step
-    // while the scan stays columnar — if either over-claimed, EXPLAIN would be
-    // reporting work that never happens.
+    // The annotation must be earned, not assumed. A `LIKE` against a constant
+    // pattern compiles, but one against a column does not (it would compile per
+    // row), and `id + 1` is a computed sort key — so each declines its own step
+    // while the scan stays columnar. If any of them over-claimed, EXPLAIN would
+    // be reporting work that never happens.
     for (query, expected) in [
         (
             "EXPLAIN SELECT id FROM p ORDER BY id",
@@ -7698,11 +7748,40 @@ async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyh
         ),
         (
             "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%'",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label NOT ILIKE 'a%'",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE label LIKE label",
+            "Append (columnar: scan)",
+        ),
+        (
+            // A malformed escape is an error the row evaluator raises per row.
+            "EXPLAIN SELECT id FROM p WHERE label LIKE 'a%' ESCAPE 'xy'",
             "Append (columnar: scan)",
         ),
         (
             "EXPLAIN SELECT id FROM p ORDER BY id + 1",
             "Append (columnar: scan)",
+        ),
+        // The binder relabels a `varchar` operand to `text` the moment the other
+        // side is `text`. Peeling that relabel is what makes these three agree
+        // with each other; while only LIKE peeled it, the middle one declined
+        // and the outer two did not, over the very same column.
+        (
+            "EXPLAIN SELECT id FROM p WHERE vc LIKE 'a%'",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE vc = 'a'::text",
+            "Append (columnar: scan, filter)",
+        ),
+        (
+            "EXPLAIN SELECT id FROM p WHERE vc = 'a'",
+            "Append (columnar: scan, filter)",
         ),
     ] {
         let lines = explain_lines(&client, query).await?;

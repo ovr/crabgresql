@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_storage_api::arrow::build_scan_batch;
 use crabgresql_storage_api::{Column, TableSchema, Tuple};
 use crabgresql_types::collation::{C_COLLATION_OID, DEFAULT_COLLATION_OID};
@@ -342,6 +342,272 @@ fn text_ordering_respects_the_collation() {
     assert!(
         expr::compile_predicate(&text_compare(BinOp::Lt, icu), &layout).is_none(),
         "an ICU ordering is not byte order and must not vectorize"
+    );
+}
+
+fn like(case_insensitive: bool, subject: BoundExpr, pattern: BoundExpr) -> BoundExpr {
+    BoundExpr::FuncCall {
+        func: if case_insensitive {
+            ScalarFn::ILike
+        } else {
+            ScalarFn::Like
+        },
+        ret: PgType::Bool,
+        args: vec![subject, pattern],
+    }
+}
+
+fn like_escape(subject: BoundExpr, pattern: &str, escape: &str) -> BoundExpr {
+    BoundExpr::FuncCall {
+        func: ScalarFn::Like,
+        ret: PgType::Bool,
+        args: vec![
+            subject,
+            constant(Value::Text(pattern.into()), PgType::Text),
+            constant(Value::Text(escape.into()), PgType::Text),
+        ],
+    }
+}
+
+/// Subjects chosen to reach every branch of the matcher: NULL, empty, a subject
+/// shorter than the pattern's literal, repeated characters (where a naive
+/// segment walk would backtrack), and non-ASCII in and out of the compared
+/// window.
+fn text_rows() -> Vec<Tuple> {
+    [
+        None,
+        Some(""),
+        Some("a"),
+        Some("abc"),
+        Some("ABC"),
+        Some("abcde"),
+        Some("aaaab"),
+        Some("xabcx"),
+        Some("a%c"),
+        Some("a_c"),
+        Some("Ünïcödé"),
+        Some("ÄBC"),
+        Some("straße"),
+    ]
+    .into_iter()
+    .map(|v| vec![v.map_or(Value::Null, |s| Value::Text(s.into()))])
+    .collect()
+}
+
+/// Every shape `LikeProgram` narrows to, against both paths.
+#[test]
+fn every_like_pattern_agrees_with_the_row_filter() {
+    let schema = schema_of(&[PgType::Text]);
+    let rows = text_rows();
+    let patterns = [
+        "abc",   // Exact
+        "",      // Exact, empty
+        "a%",    // Prefix
+        "%c",    // Suffix
+        "%b%",   // Contains
+        "%%",    // Contains, empty
+        "a_c",   // Whole
+        "_",     // Whole, one wildcard
+        "a%c%e", // Segments
+        "%a%b%", "a%_%c", "%",
+    ];
+    for pattern in patterns {
+        for case_insensitive in [false, true] {
+            let call = like(
+                case_insensitive,
+                column(0, PgType::Text),
+                constant(Value::Text(pattern.into()), PgType::Text),
+            );
+            assert_same(&schema, &rows, &call);
+            // `NOT LIKE` binds as `NOT` over the call; it must ride the same
+            // path rather than fall back.
+            assert_same(
+                &schema,
+                &rows,
+                &BoundExpr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(call),
+                },
+            );
+        }
+    }
+}
+
+/// `ESCAPE` changes what a pattern compiles to, so the two paths have to read
+/// the clause identically — including the empty one, which disables escaping.
+#[test]
+fn like_honors_the_escape_clause() {
+    let schema = schema_of(&[PgType::Text]);
+    let rows = text_rows();
+    let subject = || column(0, PgType::Text);
+
+    assert_same(&schema, &rows, &like_escape(subject(), "a!%c", "!"));
+    assert_same(&schema, &rows, &like_escape(subject(), "a!_c", "!"));
+    assert_same(&schema, &rows, &like_escape(subject(), "a\\%c", "\\"));
+    // Escaping off: `\` is an ordinary character and `%` is still a wildcard.
+    assert_same(&schema, &rows, &like_escape(subject(), "a%c", ""));
+    assert_same(&schema, &rows, &like_escape(subject(), "%\\%", ""));
+}
+
+/// A `varchar`/`name` column reaches an operator wrapped in the binder's
+/// coercion to `text`. The three share one value representation, so that
+/// coercion is a relabel — peeling it is what lets such a column vectorize at
+/// all, under `LIKE` and equally under a comparison or `IS NULL`.
+#[test]
+fn operators_see_through_the_text_relabel() {
+    for ty in [PgType::Varchar, PgType::Name] {
+        let schema = schema_of(&[ty]);
+        let rows = text_rows();
+        let coerced = || BoundExpr::Coerce {
+            expr: Box::new(column(0, ty)),
+            ty: PgType::Text,
+        };
+        assert_same(
+            &schema,
+            &rows,
+            &like(
+                false,
+                coerced(),
+                constant(Value::Text("a%".into()), PgType::Text),
+            ),
+        );
+        // The case the LIKE-only peel used to miss: `vc = 'x'::text` binds to
+        // exactly the node above, and declining it dropped the whole filter.
+        for op in [BinOp::Eq, BinOp::NotEq] {
+            assert_same(
+                &schema,
+                &rows,
+                &compare(
+                    op,
+                    PgType::Text,
+                    coerced(),
+                    constant(Value::Text("abc".into()), PgType::Text),
+                ),
+            );
+        }
+        assert_same(
+            &schema,
+            &rows,
+            &BoundExpr::IsNull {
+                expr: Box::new(coerced()),
+                negated: false,
+            },
+        );
+    }
+}
+
+/// A matcher is the one node whose per-row cost is unbounded, so `AND`/`OR`
+/// narrow it to the rows the other side left undecided. The narrowing must not
+/// change a single answer.
+///
+/// The load-bearing case is a NULL left operand under `NOT`. `NULL AND x` is
+/// `false` when `x` is `false` and NULL when `x` is `true`; both drop at the top
+/// level, so a selection that wrongly excluded NULL rows would look correct
+/// there — and `NOT` turns the first into a kept row and the second into a
+/// dropped one.
+#[test]
+fn a_narrowed_matcher_agrees_with_the_row_filter() {
+    let schema = schema_of(&[PgType::Text, PgType::Bool]);
+    let rows: Vec<Tuple> = text_rows()
+        .into_iter()
+        .zip([Some(true), Some(false), None].into_iter().cycle())
+        .map(|(mut row, flag)| {
+            row.push(flag.map_or(Value::Null, Value::Bool));
+            row
+        })
+        .collect();
+
+    let flag = || column(1, PgType::Bool);
+    let matches = |pattern: &str| {
+        like(
+            false,
+            column(0, PgType::Text),
+            constant(Value::Text(pattern.into()), PgType::Text),
+        )
+    };
+    for pattern in ["a%", "%c", "%", "zzz"] {
+        for op in [BinOp::And, BinOp::Or] {
+            // Both orders: only the right operand is ever narrowed, and the
+            // left one must keep answering for every row.
+            for predicate in [
+                logic(op, flag(), matches(pattern)),
+                logic(op, matches(pattern), flag()),
+                logic(op, matches(pattern), matches("%b%")),
+            ] {
+                assert_same(&schema, &rows, &predicate);
+                assert_same(
+                    &schema,
+                    &rows,
+                    &BoundExpr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(predicate),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// A constant subject yields a one-row mask that has to be broadcast, the same
+/// way a constant comparison does.
+#[test]
+fn a_constant_like_subject_broadcasts() {
+    let schema = schema_of(&[PgType::Text]);
+    let rows = text_rows();
+    assert_same(
+        &schema,
+        &rows,
+        &like(
+            false,
+            constant(Value::Text("abc".into()), PgType::Text),
+            constant(Value::Text("a%".into()), PgType::Text),
+        ),
+    );
+}
+
+/// `LIKE` shapes the columnar filter must leave to the row path — either
+/// because it cannot compile them once, or because the row path owes the client
+/// an error it must raise per row.
+#[test]
+fn unvectorizable_like_shapes_decline() {
+    let schema = schema_of(&[PgType::Text, PgType::Text, PgType::Bpchar]);
+    let layout = layout_of(&schema);
+    let subject = || column(0, PgType::Text);
+    let decline = |predicate: &BoundExpr, why: &str| {
+        assert!(
+            expr::compile_predicate(predicate, &layout).is_none(),
+            "should have declined: {why}"
+        );
+    };
+
+    // A computed pattern would compile per row — the row path with extra steps.
+    decline(
+        &like(false, subject(), column(1, PgType::Text)),
+        "pattern is a column",
+    );
+    // NULL pattern: the predicate is NULL everywhere. Correct to vectorize, but
+    // a shape of its own with no payoff.
+    decline(
+        &like(false, subject(), constant(Value::Null, PgType::Text)),
+        "NULL pattern",
+    );
+    // Errors the row evaluator owes the client, raised per row.
+    decline(
+        &like_escape(subject(), "abc", "ab"),
+        "escape longer than one character is 22025",
+    );
+    decline(
+        &like_escape(subject(), "abc\\", "\\"),
+        "a pattern ending in a bare escape is 22025",
+    );
+    // `char(n)` matches with its trailing blanks stripped.
+    decline(
+        &like(
+            false,
+            column(2, PgType::Bpchar),
+            constant(Value::Text("a%".into()), PgType::Text),
+        ),
+        "bpchar subject",
     );
 }
 
@@ -803,7 +1069,66 @@ fn the_planner_and_the_executor_agree_on_every_shape() {
             column(1, PgType::Text),
             constant(Value::Text("x".into()), PgType::Text),
         ),
+        like(
+            false,
+            column(1, PgType::Text),
+            constant(Value::Text("%x%".into()), PgType::Text),
+        ),
+        like(
+            true,
+            column(1, PgType::Text),
+            constant(Value::Text("%x%".into()), PgType::Text),
+        ),
+        BoundExpr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(like(
+                false,
+                column(1, PgType::Text),
+                constant(Value::Text("%x%".into()), PgType::Text),
+            )),
+        },
+        like_escape(column(1, PgType::Text), "a!%c", "!"),
+        // The binder's relabel to `text`, which both sides must peel or neither.
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            BoundExpr::Coerce {
+                expr: Box::new(column(1, PgType::Text)),
+                ty: PgType::Text,
+            },
+            constant(Value::Text("x".into()), PgType::Text),
+        ),
+        BoundExpr::IsNull {
+            expr: Box::new(BoundExpr::Coerce {
+                expr: Box::new(column(1, PgType::Text)),
+                ty: PgType::Text,
+            }),
+            negated: false,
+        },
+        // …but only over a text-family input: `numeric::text` really computes.
+        compare(
+            BinOp::Eq,
+            PgType::Text,
+            BoundExpr::Coerce {
+                expr: Box::new(column(2, PgType::Numeric)),
+                ty: PgType::Text,
+            },
+            constant(Value::Text("x".into()), PgType::Text),
+        ),
         // Declined, each for its own reason.
+        like(false, column(1, PgType::Text), column(1, PgType::Text)),
+        like(
+            false,
+            column(1, PgType::Text),
+            constant(Value::Null, PgType::Text),
+        ),
+        like_escape(column(1, PgType::Text), "abc", "ab"),
+        like_escape(column(1, PgType::Text), "abc\\", "\\"),
+        like(
+            false,
+            column(2, PgType::Numeric),
+            constant(Value::Text("1%".into()), PgType::Text),
+        ),
         compare(
             BinOp::Eq,
             PgType::Numeric,

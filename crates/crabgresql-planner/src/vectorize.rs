@@ -14,8 +14,9 @@
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.
 
-use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, UnaryOp};
-use crabgresql_types::{PgType, collation};
+use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, ScalarFn, SortKey, UnaryOp};
+use crabgresql_types::text::LikeMatcher;
+use crabgresql_types::{PgType, Value, collation};
 
 use crate::{PhysicalAppendArm, PhysicalPlan};
 
@@ -97,6 +98,132 @@ pub fn comparable(ty: PgType, op: BinOp, collation: u32) -> bool {
     }
 }
 
+/// A `LIKE`/`ILIKE` call that can run as a columnar filter: the subject to
+/// evaluate per row, and the pattern already compiled.
+pub struct LikeCall<'a> {
+    /// The operand the matcher runs against, with value-transparent wrappers
+    /// already peeled — a column or a constant, as [`vectorizable_operand`]
+    /// requires.
+    pub subject: &'a BoundExpr,
+    pub matcher: LikeMatcher,
+}
+
+/// Whether this `LIKE`/`ILIKE` call can run as a columnar filter, and with what
+/// compiled pattern.
+///
+/// Unlike every other rule here this one returns the *artifact* rather than a
+/// verdict, and deliberately: the executor must not be able to decide
+/// differently from `EXPLAIN`, and handing back the compiled matcher makes that
+/// structural rather than a convention two functions have to keep.
+///
+/// Both callers really do call this — the gate
+/// ([`vectorizable_predicate`]) throws the matcher away and keeps the `is_some`,
+/// then the executor's compiler calls it again for the matcher it holds. That
+/// is the price of the gate, not an oversight, and it is not a second compile:
+/// [`LikeMatcher::compile`] goes through the thread's pattern cache, so the
+/// pattern is compiled once per thread and every later call is a lookup.
+///
+/// There is no Arrow `like` kernel involved. Arrow's has no user `ESCAPE` and
+/// its own idea of case folding; PostgreSQL's semantics live in
+/// [`crabgresql_types::text`], and running exactly that matcher over the batch
+/// is what makes the columnar answer provably the row answer.
+///
+/// The pattern and the `ESCAPE` clause must be non-NULL constants:
+///
+/// - a computed pattern would have to compile per row, which is the row path
+///   with extra steps;
+/// - a NULL pattern or escape makes the predicate NULL for every row. Correct
+///   to vectorize, but a distinct shape with no distinct payoff.
+///
+/// A pattern that fails to compile — the one error `LIKE` raises, a pattern
+/// ending in a bare escape character — is refused here so the row evaluator
+/// raises it, per row, exactly as it always has.
+pub fn like_call(func: ScalarFn, args: &[BoundExpr], width: usize) -> Option<LikeCall<'_>> {
+    let case_insensitive = match func {
+        ScalarFn::Like => false,
+        ScalarFn::ILike => true,
+        _ => return None,
+    };
+    let ([subject, pattern], escape) = match args {
+        [subject, pattern] => ([subject, pattern], None),
+        [subject, pattern, escape] => ([subject, pattern], Some(escape)),
+        _ => return None,
+    };
+    let subject = like_subject(subject, width)?;
+    let pattern = text_const(pattern)?;
+    // The row path's rule (`scalar_fns::escape_char`): an absent clause is `\`,
+    // an empty one disables escaping, and more than one character is an error —
+    // which, like a bad pattern, is left for the row evaluator to raise.
+    let escape = match escape {
+        None => Some('\\'),
+        Some(escape) => {
+            let mut chars = text_const(escape)?.chars();
+            let first = chars.next();
+            chars.next().is_none().then_some(first)?
+        }
+    };
+    let matcher = LikeMatcher::compile(pattern, escape, case_insensitive).ok()?;
+    Some(LikeCall { subject, matcher })
+}
+
+/// The operand a `LIKE` matcher runs against, or `None` if this subject cannot
+/// be one.
+///
+/// `bpchar` is absent for the same reason [`comparable`] excludes it: PostgreSQL
+/// matches a `char(n)` with its trailing blanks stripped. It cannot reach here
+/// anyway — the binder coerces `bpchar` to `text` through a
+/// `ScalarFn::BpcharToText` call, which is computed and so refused — but naming
+/// it keeps the exclusion from looking accidental.
+fn like_subject(expr: &BoundExpr, width: usize) -> Option<&BoundExpr> {
+    let expr = strip_relabel(expr);
+    let text = matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name);
+    (text && vectorizable_operand(expr, width)).then_some(expr)
+}
+
+/// Peel the wrappers that change how a value is *labelled* without changing the
+/// value, so an operand is judged by the column or constant underneath.
+///
+/// Two of them:
+///
+/// - `Collate` — a collation decides how a *comparison* orders, and a
+///   comparison reads that from its own node, never from its operand.
+/// - `Coerce` to `text` over `text`/`varchar`/`name` — all three are backed by
+///   `Value::Text`, whose `pg_type()` is `text`, so `cast_value` returns on
+///   `from == to` and the node evaluates to its input unchanged.
+///
+/// The second one is load-bearing rather than cosmetic: the binder wraps a
+/// `varchar`/`name` operand the moment the other side is `text`
+/// (`to_text_operand`, `unify_types`), so without this peel `vc = t` and
+/// `vc = 'x'::text` decline while the same column under `vc = 'x'` does not.
+///
+/// `bpchar` is deliberately not here. It reaches `text` through a
+/// `ScalarFn::BpcharToText` call — a computed node, refused anyway — which is
+/// the binder's way of saying the conversion is *not* a relabel: it strips
+/// trailing blanks.
+pub fn strip_relabel(expr: &BoundExpr) -> &BoundExpr {
+    match expr {
+        BoundExpr::Collate { expr, .. } => strip_relabel(expr),
+        BoundExpr::Coerce {
+            expr,
+            ty: PgType::Text,
+        } if matches!(expr.ty(), PgType::Text | PgType::Varchar | PgType::Name) => {
+            strip_relabel(expr)
+        }
+        _ => expr,
+    }
+}
+
+/// A non-NULL text constant, whatever text type it is labelled with.
+fn text_const(expr: &BoundExpr) -> Option<&str> {
+    match strip_relabel(expr) {
+        BoundExpr::Const {
+            value: Value::Text(s),
+            ..
+        } => Some(s),
+        _ => None,
+    }
+}
+
 /// Whether Arrow's total order over a sort key is PostgreSQL's order.
 ///
 /// The float types qualify although [`comparable`] excludes them: the sort
@@ -117,9 +244,13 @@ pub fn sortable_key(key: &SortKey) -> bool {
 /// wide.
 ///
 /// Operands are columns and constants only. Anything computed — arithmetic, a
-/// function call, a cast, a bind parameter, a correlated reference — stays on
-/// the row path, which is where PostgreSQL's evaluation semantics and side
-/// effects live.
+/// cast, a bind parameter, a correlated reference — stays on the row path,
+/// which is where PostgreSQL's evaluation semantics and side effects live.
+///
+/// The one function call admitted is `LIKE`/`ILIKE` against a constant pattern
+/// ([`like_call`]), because its pattern compiles once for the whole scan rather
+/// than once per row, and the compiled matcher is the same one the row path
+/// runs.
 pub fn vectorizable_predicate(predicate: &BoundExpr, width: usize) -> bool {
     match predicate {
         // Value-transparent; a comparison reads its collation from its own node.
@@ -146,6 +277,12 @@ pub fn vectorizable_predicate(predicate: &BoundExpr, width: usize) -> bool {
                 && vectorizable_operand(left, width)
                 && vectorizable_operand(right, width)
         }
+        // `NOT LIKE` is `NOT` over this call, so the arm above covers it.
+        BoundExpr::FuncCall {
+            func: func @ (ScalarFn::Like | ScalarFn::ILike),
+            args,
+            ..
+        } => like_call(*func, args, width).is_some(),
         // A bare boolean column or constant is a legal WHERE on its own.
         BoundExpr::ColumnRef {
             ty: PgType::Bool, ..
@@ -165,8 +302,7 @@ fn is_comparison(op: BinOp) -> bool {
 }
 
 fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
-    match expr {
-        BoundExpr::Collate { expr, .. } => vectorizable_operand(expr, width),
+    match strip_relabel(expr) {
         // Batches are full width in schema order, so a schema ordinal is a batch
         // ordinal — but only if it is actually in range.
         BoundExpr::ColumnRef { index, .. } => *index < width,
