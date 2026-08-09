@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crabgresql_binder::LogicalPlan;
+use crabgresql_binder::{DeletePlan, InsertPlan, LogicalPlan, UpdatePlan};
 use crabgresql_executor::{ExecContext, ExecError, Execution, RuntimeNotice, Severity, execute};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
@@ -852,12 +852,14 @@ impl Interpreter {
 
         let is_write = matches!(
             logical,
-            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
+            LogicalPlan::Insert(InsertPlan { .. })
+                | LogicalPlan::Update(UpdatePlan { .. })
+                | LogicalPlan::Delete(DeletePlan { .. })
         );
         if is_write && ctx.read_only {
             let verb = match logical {
-                LogicalPlan::Insert { .. } => "INSERT",
-                LogicalPlan::Update { .. } => "UPDATE",
+                LogicalPlan::Insert(InsertPlan { .. }) => "INSERT",
+                LogicalPlan::Update(UpdatePlan { .. }) => "UPDATE",
                 _ => "DELETE",
             };
             return Err(ExecError::new(

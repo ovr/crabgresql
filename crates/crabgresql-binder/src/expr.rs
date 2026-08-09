@@ -10066,13 +10066,15 @@ mod collect_column_refs_tests {
 
     /// A trivially empty subplan, enough to build the marker variants.
     fn subplan() -> Subplan {
-        Subplan(Box::new(crate::plan::LogicalPlan::Values {
-            columns: Vec::new(),
-            rows: Vec::new(),
-            predicate: None,
-            sort: Vec::new(),
-            distinct: None,
-        }))
+        Subplan(Box::new(crate::plan::LogicalPlan::Values(
+            crate::plan::ValuesPlan {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                predicate: None,
+                sort: Vec::new(),
+                distinct: None,
+            },
+        )))
     }
 
     #[test]
