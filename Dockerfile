@@ -7,7 +7,7 @@ ARG BIN_SOURCE=build
 
 # The channel in rust-toolchain.toml; anything else makes rustup download a
 # second toolchain inside the build.
-FROM rust:1.93.0-slim-trixie AS build
+FROM rust:1.97.1-slim-trixie AS build
 
 WORKDIR /src
 COPY . .
