@@ -44,9 +44,7 @@ ENV PGDATA=/var/lib/crabgresql \
 
 VOLUME /var/lib/crabgresql
 EXPOSE 5433
-# Numeric so an orchestrator enforcing `runAsNonRoot` can tell this is not root
-# without resolving a name out of the image.
-USER 999:999
+USER crabgresql
 WORKDIR /var/lib/crabgresql
 
 # Exec form: under a shell the server would never see SIGTERM, and `docker
