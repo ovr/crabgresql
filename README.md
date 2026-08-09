@@ -115,8 +115,7 @@ $ psql -h 127.0.0.1 -p 5433
 Images are published to [Docker Hub](https://hub.docker.com/r/ovr/crabgresql)
 for `linux/amd64` and `linux/arm64` on every `v*` tag, alongside tarballs of
 the binary attached to the GitHub Release (glibc builds from the CI runners —
-for an older distribution, use the image). See
-[docs/RELEASING.md](docs/RELEASING.md) for how a release is cut.
+for an older distribution, use the image).
 
 **The image listens on `0.0.0.0`, authenticates with trust, and speaks
 cleartext.** Anything that can reach the published port is a superuser, so keep
