@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786313456391,
+  "lastUpdate": 1786313457944,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -8392,6 +8392,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 40841.996125,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a6dfe50dcdfa0916be5ee3a1b4f345311d021c44",
+          "message": "refactor(binder): give every LogicalPlan variant a named struct (#197)",
+          "timestamp": "2026-08-09T23:34:17+02:00",
+          "tree_id": "4a6a61619d1b149730a918adcdd72b01705bae18",
+          "url": "https://github.com/ovr/crabgresql/commit/a6dfe50dcdfa0916be5ee3a1b4f345311d021c44"
+        },
+        "date": 1786313457891,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 482.426931,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 24406.166423,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
