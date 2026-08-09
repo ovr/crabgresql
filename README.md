@@ -108,11 +108,11 @@ them to real storage settings is a follow-up.
 ## Docker
 
 ```console
-$ docker run --rm -p 5433:5433 -v crabgresql-data:/var/lib/crabgresql ovr/crabgresql:latest
+$ docker run --rm -p 5433:5433 -v crabgresql-data:/var/lib/crabgresql ovrweb/crabgresql:latest
 $ psql -h 127.0.0.1 -p 5433
 ```
 
-Images are published to [Docker Hub](https://hub.docker.com/r/ovr/crabgresql)
+Images are published to [Docker Hub](https://hub.docker.com/r/ovrweb/crabgresql)
 for `linux/amd64` and `linux/arm64` on every `v*` tag, alongside tarballs of
 the binary attached to the GitHub Release (glibc builds from the CI runners —
 for an older distribution, use the image).
