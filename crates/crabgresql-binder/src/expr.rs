@@ -226,7 +226,7 @@ pub fn require_all_resolved(ctx: &ParamCtx) -> Result<(), BindError> {
 /// equality is needed nowhere, and treating them as distinct keeps optimizations
 /// that dedup expressions (e.g. ORDER BY target reuse) conservatively correct.
 #[derive(Clone)]
-pub struct Subplan(pub Box<crate::plan::LogicalPlan>);
+pub struct Subplan(pub Box<crate::logical_plan::LogicalPlan>);
 
 impl std::fmt::Debug for Subplan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2682,7 +2682,7 @@ pub(crate) const NO_SUBQUERY_CONTEXT: &str = "subqueries are not supported in th
 fn bind_subquery_plan(
     query: &ast::Query,
     scope: &Scope,
-) -> Result<(crate::plan::LogicalPlan, Vec<crate::OutputColumn>), BindError> {
+) -> Result<(crate::logical_plan::LogicalPlan, Vec<crate::OutputColumn>), BindError> {
     let ctx = scope
         .subquery
         .as_ref()
@@ -10066,8 +10066,8 @@ mod collect_column_refs_tests {
 
     /// A trivially empty subplan, enough to build the marker variants.
     fn subplan() -> Subplan {
-        Subplan(Box::new(crate::plan::LogicalPlan::Values(
-            crate::plan::ValuesPlan {
+        Subplan(Box::new(crate::logical_plan::LogicalPlan::Values(
+            crate::logical_plan::ValuesPlan {
                 columns: Vec::new(),
                 rows: Vec::new(),
                 predicate: None,

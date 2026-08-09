@@ -6,6 +6,7 @@
 mod collation;
 mod expr;
 mod functions;
+mod logical_plan;
 mod plan;
 pub mod ruleutils;
 mod soft_input;
@@ -29,15 +30,18 @@ pub use expr::{
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
 };
+pub use logical_plan::{
+    AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, InsertPlan, InsertSource,
+    JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, QueryPlan,
+    RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan, TableFunctionPlan,
+    UpdatePlan, ValuesPlan, WindowPlan,
+};
 pub use plan::{
-    AggInput, AggregatePlan, AppendPlan, CopyFormat, CopyFromPlan, CopyFromSource, CopyHeader,
-    DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan,
-    LimitPlan, LogicalPlan, MappedRelation, QueryPlan, RelationIdent, Returning, SetOpArm,
-    SetOpPlan, SortKey, SubqueryPlan, TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan,
-    bind_copy_from, bind_delete, bind_delete_with_params, bind_insert, bind_insert_with_params,
-    bind_query, bind_query_with_params, bind_update, bind_update_with_params,
-    inheritance_descendants, output_columns_of, plan_calls_routine, plan_has_outer_refs,
-    substitute_outer, substitute_params,
+    CopyFormat, CopyFromPlan, CopyFromSource, CopyHeader, bind_copy_from, bind_delete,
+    bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
+    bind_query_with_params, bind_update, bind_update_with_params, inheritance_descendants,
+    output_columns_of, plan_calls_routine, plan_has_outer_refs, substitute_outer,
+    substitute_params,
 };
 pub use soft_input::{SoftError, TypeSpec, soft_input};
 
