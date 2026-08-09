@@ -84,16 +84,19 @@ pub(super) fn agg_of(
     }
 }
 
-/// Every [`LogicalPlan`] variant, as `method => Variant -> Payload`.
+/// Every [`LogicalPlan`] variant, as `Variant -> Payload { extractor, binder }`.
 ///
 /// A test that has just bound a statement knows which variant it built, so the
-/// only thing a mismatch can mean is that the expectation is wrong. The
-/// generated extractors say that outright: they consume the plan, hand back the
-/// payload, and panic naming the variant that actually turned up — which the
-/// `let LogicalPlan::Query(QueryPlan { .. }) = … else { panic!("expected
-/// Query") }` blocks they replace could not do.
+/// only thing a mismatch can mean is that the expectation is wrong. Both
+/// generated forms say that outright, panicking with the variant that actually
+/// turned up — which the `let LogicalPlan::Query(QueryPlan { .. }) = … else {
+/// panic!("expected Query") }` blocks they replace could not do.
+///
+/// The extractor takes a plan already in hand (a window chain's source, a
+/// subquery's body); the binder is the whole trip from SQL, which is what a
+/// test opens with.
 macro_rules! plan_variants {
-    ($($method:ident => $variant:ident -> $payload:ident),+ $(,)?) => {
+    ($($variant:ident -> $payload:ident { $expect:ident, $bind:ident })+) => {
         /// The variant of `plan`, for assertions and panic messages.
         pub(super) fn plan_name(plan: &LogicalPlan) -> &'static str {
             match plan {
@@ -113,13 +116,13 @@ macro_rules! plan_variants {
                     "The [`", stringify!($payload), "`] of a [`LogicalPlan::",
                     stringify!($variant), "`]. Panics on any other variant.",
                 )]
-                fn $method(self) -> $payload;
+                fn $expect(self) -> $payload;
             )+
         }
 
         impl PlanExt for LogicalPlan {
             $(
-                fn $method(self) -> $payload {
+                fn $expect(self) -> $payload {
                     match self {
                         LogicalPlan::$variant(plan) => plan,
                         other => panic!(
@@ -131,23 +134,34 @@ macro_rules! plan_variants {
                 }
             )+
         }
+
+        $(
+            #[doc = concat!(
+                "Bind `sql` to the [`", stringify!($payload), "`] it is expected ",
+                "to produce. Panics if it fails to bind, or binds to another variant.",
+            )]
+            #[allow(dead_code)]
+            pub(super) fn $bind(sql: &str) -> $payload {
+                bound(sql).$expect()
+            }
+        )+
     };
 }
 
 plan_variants! {
-    expect_values => Values -> ValuesPlan,
-    expect_query => Query -> QueryPlan,
-    expect_append => Append -> AppendPlan,
-    expect_set_op => SetOp -> SetOpPlan,
-    expect_subquery => Subquery -> SubqueryPlan,
-    expect_table_function => TableFunction -> TableFunctionPlan,
-    expect_join => Join -> JoinPlan,
-    expect_aggregate => Aggregate -> AggregatePlan,
-    expect_window => Window -> WindowPlan,
-    expect_limit => Limit -> LimitPlan,
-    expect_insert => Insert -> InsertPlan,
-    expect_update => Update -> UpdatePlan,
-    expect_delete => Delete -> DeletePlan,
+    Values -> ValuesPlan { expect_values, bound_values }
+    Query -> QueryPlan { expect_query, bound_query }
+    Append -> AppendPlan { expect_append, bound_append }
+    SetOp -> SetOpPlan { expect_set_op, bound_set_op }
+    Subquery -> SubqueryPlan { expect_subquery, bound_subquery }
+    TableFunction -> TableFunctionPlan { expect_table_function, bound_table_function }
+    Join -> JoinPlan { expect_join, bound_join }
+    Aggregate -> AggregatePlan { expect_aggregate, bound_aggregate }
+    Window -> WindowPlan { expect_window, bound_window }
+    Limit -> LimitPlan { expect_limit, bound_limit }
+    Insert -> InsertPlan { expect_insert, bound_insert }
+    Update -> UpdatePlan { expect_update, bound_update }
+    Delete -> DeletePlan { expect_delete, bound_delete }
 }
 
 /// The extractors are the only report a test gets when a plan is not the shape
@@ -160,6 +174,6 @@ fn a_mismatched_extractor_names_the_variant_it_got() {
 
 /// The first projected expression of a bound FROM-less `SELECT`.
 pub(super) fn one_projection(sql: &str) -> BoundExpr {
-    let ValuesPlan { mut rows, .. } = bound(sql).expect_values();
+    let ValuesPlan { mut rows, .. } = bound_values(sql);
     rows.remove(0).remove(0)
 }

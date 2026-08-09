@@ -3,14 +3,14 @@
 use super::common::*;
 
 #[test]
-fn cross_join_builds_join_plan_with_offsets() -> anyhow::Result<()> {
+fn cross_join_builds_join_plan_with_offsets() {
     // Two derived tables: a(x) at offset 0, b(y) at offset 1.
     let JoinPlan {
         source,
         columns,
         projections,
         ..
-    } = bind_one("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)")?.expect_join();
+    } = bound_join("SELECT a.x, b.y FROM (VALUES (1)) a(x), (VALUES (2)) b(y)");
     assert!(matches!(
         source,
         JoinExpr::Join {
@@ -35,17 +35,15 @@ fn cross_join_builds_join_plan_with_offsets() -> anyhow::Result<()> {
     );
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["x", "y"]);
-
-    Ok(())
 }
 
 #[test]
-fn cross_join_wildcard_expands_every_relation_in_order() -> anyhow::Result<()> {
+fn cross_join_wildcard_expands_every_relation_in_order() {
     let JoinPlan {
         columns,
         projections,
         ..
-    } = bind_one("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)")?.expect_join();
+    } = bound_join("SELECT * FROM (VALUES (1, 2)) a(x, y), (VALUES (3)) b(z)");
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["x", "y", "z"]);
     // b.z sits after a's two columns.
@@ -56,15 +54,12 @@ fn cross_join_wildcard_expands_every_relation_in_order() -> anyhow::Result<()> {
             ty: PgType::Int4
         }
     );
-
-    Ok(())
 }
 
 #[test]
-fn cross_join_qualified_refs_use_combined_row_index() -> anyhow::Result<()> {
+fn cross_join_qualified_refs_use_combined_row_index() {
     // `t` occupies indices 0..4 (id, big, name, flag); b.y follows at 4.
-    let JoinPlan { projections, .. } =
-        bind_one("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)")?.expect_join();
+    let JoinPlan { projections, .. } = bound_join("SELECT t.id, b.y FROM t, (VALUES (2)) b(y)");
     assert_eq!(
         projections[0],
         BoundExpr::ColumnRef {
@@ -79,8 +74,6 @@ fn cross_join_qualified_refs_use_combined_row_index() -> anyhow::Result<()> {
             ty: PgType::Int4
         }
     );
-
-    Ok(())
 }
 
 #[test]
@@ -98,9 +91,9 @@ fn duplicate_from_qualifier_is_42712() {
 }
 
 #[test]
-fn explicit_cross_join_flattens_like_a_comma() -> anyhow::Result<()> {
+fn explicit_cross_join_flattens_like_a_comma() {
     let JoinPlan { source, .. } =
-        bind_one("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)")?.expect_join();
+        bound_join("SELECT * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y)");
     assert!(matches!(
         source,
         JoinExpr::Join {
@@ -109,8 +102,6 @@ fn explicit_cross_join_flattens_like_a_comma() -> anyhow::Result<()> {
             ..
         }
     ));
-
-    Ok(())
 }
 
 #[test]
@@ -154,17 +145,16 @@ fn on_join_kinds_bind_boolean_predicates() -> anyhow::Result<()> {
 }
 
 #[test]
-fn chained_join_is_left_associative_and_offsets_keep_growing() -> anyhow::Result<()> {
+fn chained_join_is_left_associative_and_offsets_keep_growing() {
     let JoinPlan {
         source,
         projections,
         ..
-    } = bind_one(
+    } = bound_join(
         "SELECT c.z FROM (VALUES (1)) a(x) \
          LEFT JOIN (VALUES (1)) b(y) ON a.x = b.y \
          JOIN (VALUES (1)) c(z) ON b.y = c.z",
-    )?
-    .expect_join();
+    );
     let JoinExpr::Join {
         left,
         kind: JoinKind::Inner,
@@ -187,8 +177,6 @@ fn chained_join_is_left_associative_and_offsets_keep_growing() -> anyhow::Result
             ty: PgType::Int4
         }
     );
-
-    Ok(())
 }
 
 #[test]
@@ -222,7 +210,7 @@ fn aggregate_in_join_on_is_rejected() {
 }
 
 #[test]
-fn using_join_merges_column_and_builds_equality() -> anyhow::Result<()> {
+fn using_join_merges_column_and_builds_equality() {
     // `id` is merged (once, first); the other three columns of each side
     // follow — 1 + 3 + 3 = 7 output columns.
     let JoinPlan {
@@ -230,7 +218,7 @@ fn using_join_merges_column_and_builds_equality() -> anyhow::Result<()> {
         columns,
         projections,
         ..
-    } = bind_one("SELECT * FROM t a JOIN t b USING (id)")?.expect_join();
+    } = bound_join("SELECT * FROM t a JOIN t b USING (id)");
     assert!(matches!(
         source,
         JoinExpr::Join {
@@ -253,14 +241,12 @@ fn using_join_merges_column_and_builds_equality() -> anyhow::Result<()> {
             ty: PgType::Int4
         }
     );
-
-    Ok(())
 }
 
 #[test]
-fn using_merged_column_is_unqualified_while_sides_stay_addressable() -> anyhow::Result<()> {
+fn using_merged_column_is_unqualified_while_sides_stay_addressable() {
     let JoinPlan { projections, .. } =
-        bind_one("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)")?.expect_join();
+        bound_join("SELECT id, a.id, b.id FROM t a JOIN t b USING (id)");
     // Unqualified `id` and `a.id` are the left copy (index 0); `b.id` the
     // right copy (index 4).
     let left = BoundExpr::ColumnRef {
@@ -272,14 +258,11 @@ fn using_merged_column_is_unqualified_while_sides_stay_addressable() -> anyhow::
         ty: PgType::Int4,
     };
     assert_eq!(projections, vec![left.clone(), left, right]);
-
-    Ok(())
 }
 
 #[test]
-fn using_full_join_merges_with_coalesce() -> anyhow::Result<()> {
-    let JoinPlan { projections, .. } =
-        bind_one("SELECT id FROM t a FULL JOIN t b USING (id)")?.expect_join();
+fn using_full_join_merges_with_coalesce() {
+    let JoinPlan { projections, .. } = bound_join("SELECT id FROM t a FULL JOIN t b USING (id)");
     // A full join's merged column is COALESCE(left, right), lowered to CASE.
     assert!(matches!(
         projections[0],
@@ -288,15 +271,13 @@ fn using_full_join_merges_with_coalesce() -> anyhow::Result<()> {
             ..
         }
     ));
-
-    Ok(())
 }
 
 #[test]
-fn natural_join_equates_every_common_column() -> anyhow::Result<()> {
+fn natural_join_equates_every_common_column() {
     let JoinPlan {
         source, columns, ..
-    } = bind_one("SELECT * FROM t a NATURAL JOIN t b")?.expect_join();
+    } = bound_join("SELECT * FROM t a NATURAL JOIN t b");
     // All four columns are shared, so all four merge and the predicate ANDs
     // four equalities; no columns remain.
     assert_eq!(columns.len(), 4);
@@ -310,15 +291,13 @@ fn natural_join_equates_every_common_column() -> anyhow::Result<()> {
             ..
         }
     ));
-
-    Ok(())
 }
 
 #[test]
-fn natural_join_without_common_columns_is_a_cross_product() -> anyhow::Result<()> {
+fn natural_join_without_common_columns_is_a_cross_product() {
     let JoinPlan {
         source, columns, ..
-    } = bind_one("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)")?.expect_join();
+    } = bound_join("SELECT * FROM (VALUES (1)) a(x) NATURAL JOIN (VALUES (2)) b(y)");
     assert_eq!(columns.len(), 2);
     assert!(matches!(
         source,
@@ -328,8 +307,6 @@ fn natural_join_without_common_columns_is_a_cross_product() -> anyhow::Result<()
             ..
         }
     ));
-
-    Ok(())
 }
 
 #[test]
@@ -349,18 +326,17 @@ fn using_column_missing_on_a_side_is_42703() {
 }
 
 #[test]
-fn using_join_in_a_later_comma_group_shifts_merged_indices() -> anyhow::Result<()> {
+fn using_join_in_a_later_comma_group_shifts_merged_indices() {
     // `t` (4 columns) is the first comma group, so the merged `id` and the
     // rest of the USING group live at combined-row offsets 4 and up.
     let JoinPlan {
         columns,
         projections,
         ..
-    } = bind_one(
+    } = bound_join(
         "SELECT * FROM t, \
          (VALUES (5, 50)) a(id, x) JOIN (VALUES (5, 500)) b(id, y) USING (id)",
-    )?
-    .expect_join();
+    );
     // t's 4 columns, then merged id, a.x, b.y — 7 in all.
     assert_eq!(columns.len(), 7);
     // The merged `id` carries a.id, shifted past t to index 4.
@@ -379,8 +355,6 @@ fn using_join_in_a_later_comma_group_shifts_merged_indices() -> anyhow::Result<(
             ty: PgType::Int4
         }
     );
-
-    Ok(())
 }
 
 #[test]
@@ -394,15 +368,12 @@ fn duplicate_using_column_is_42701() {
 }
 
 #[test]
-fn using_merged_column_uses_common_type_not_comparison_type() -> anyhow::Result<()> {
+fn using_merged_column_uses_common_type_not_comparison_type() {
     // real + int4: PG's select_common_type resolves the merged column to
     // real, even though the equality comparison promotes to float8.
     let JoinPlan { projections, .. } =
-        bind_one("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)")?
-            .expect_join();
+        bound_join("SELECT x FROM (VALUES (1.0::real)) a(x) JOIN (VALUES (1)) b(x) USING (x)");
     assert_eq!(projections[0].ty(), PgType::Float4);
-
-    Ok(())
 }
 
 #[test]
@@ -438,13 +409,10 @@ fn aggregate_accepts_join_input() -> anyhow::Result<()> {
 }
 
 #[test]
-fn where_referencing_both_relations_binds() -> anyhow::Result<()> {
+fn where_referencing_both_relations_binds() {
     let JoinPlan { predicate, .. } =
-        bind_one("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y")?
-            .expect_join();
+        bound_join("SELECT a.x FROM (VALUES (1)) a(x), (VALUES (1)) b(y) WHERE a.x = b.y");
     assert!(predicate.is_some());
-
-    Ok(())
 }
 
 #[test]

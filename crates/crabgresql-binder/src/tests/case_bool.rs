@@ -7,7 +7,7 @@ fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
         columns,
         projections,
         ..
-    } = bound(sql).expect_query();
+    } = bound_query(sql);
     (columns[0].clone(), projections[0].clone())
 }
 
@@ -78,7 +78,7 @@ fn non_boolean_when_condition_is_42804() {
 
 /// The first projected expression of a bound `SELECT`.
 fn first_projection(sql: &str) -> BoundExpr {
-    let QueryPlan { projections, .. } = bound(sql).expect_query();
+    let QueryPlan { projections, .. } = bound_query(sql);
     projections.into_iter().next().expect("no projections")
 }
 

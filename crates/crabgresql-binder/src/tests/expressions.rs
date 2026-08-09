@@ -3,8 +3,8 @@
 use super::common::*;
 
 #[test]
-fn resolves_columns_to_indices() -> anyhow::Result<()> {
-    let QueryPlan { projections, .. } = bind_one("SELECT name, id FROM t")?.expect_query();
+fn resolves_columns_to_indices() {
+    let QueryPlan { projections, .. } = bound_query("SELECT name, id FROM t");
     assert_eq!(
         projections,
         vec![
@@ -18,8 +18,6 @@ fn resolves_columns_to_indices() -> anyhow::Result<()> {
             },
         ]
     );
-
-    Ok(())
 }
 
 #[test]
@@ -119,8 +117,8 @@ fn where_must_be_boolean() {
 }
 
 #[test]
-fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
-    let QueryPlan { predicate, .. } = bind_one("SELECT id FROM t WHERE id = big")?.expect_query();
+fn int4_int8_comparison_promotes_via_coerce() {
+    let QueryPlan { predicate, .. } = bound_query("SELECT id FROM t WHERE id = big");
     let Some(BoundExpr::Binary {
         op: BinOp::Eq,
         arg_ty: PgType::Int8,
@@ -140,13 +138,11 @@ fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
             ty: PgType::Int8,
         }
     );
-
-    Ok(())
 }
 
 #[test]
-fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
-    let QueryPlan { predicate, .. } = bind_one("SELECT id FROM t WHERE big = '5'")?.expect_query();
+fn unknown_literal_takes_type_from_other_side() {
+    let QueryPlan { predicate, .. } = bound_query("SELECT id FROM t WHERE big = '5'");
     let Some(BoundExpr::Binary { arg_ty, right, .. }) = predicate else {
         panic!("expected comparison");
     };
@@ -158,14 +154,11 @@ fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
             ty: PgType::Int8
         }
     );
-
-    Ok(())
 }
 
 #[test]
-fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
-    let QueryPlan { predicate, .. } =
-        bind_one("SELECT id FROM t WHERE id BETWEEN 1 AND 3")?.expect_query();
+fn between_desugars_to_gte_and_lte() {
+    let QueryPlan { predicate, .. } = bound_query("SELECT id FROM t WHERE id BETWEEN 1 AND 3");
     // `x BETWEEN low AND high` -> `(x >= low) AND (x <= high)`.
     let Some(BoundExpr::Binary {
         op: BinOp::And,
@@ -190,14 +183,11 @@ fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
             ..
         }
     ));
-
-    Ok(())
 }
 
 #[test]
-fn not_between_desugars_to_lt_or_gt() -> anyhow::Result<()> {
-    let QueryPlan { predicate, .. } =
-        bind_one("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3")?.expect_query();
+fn not_between_desugars_to_lt_or_gt() {
+    let QueryPlan { predicate, .. } = bound_query("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3");
     // `x NOT BETWEEN low AND high` -> `(x < low) OR (x > high)`.
     let Some(BoundExpr::Binary {
         op: BinOp::Or,
@@ -210,8 +200,6 @@ fn not_between_desugars_to_lt_or_gt() -> anyhow::Result<()> {
     };
     assert!(matches!(*left, BoundExpr::Binary { op: BinOp::Lt, .. }));
     assert!(matches!(*right, BoundExpr::Binary { op: BinOp::Gt, .. }));
-
-    Ok(())
 }
 
 #[test]
@@ -236,15 +224,13 @@ fn unparsable_unknown_literal_is_22p02() {
 }
 
 #[test]
-fn unknown_vs_unknown_comparison_falls_back_to_text() -> anyhow::Result<()> {
-    let ValuesPlan { rows, .. } = bind_one("SELECT 'a' = 'b'")?.expect_values();
+fn unknown_vs_unknown_comparison_falls_back_to_text() {
+    let ValuesPlan { rows, .. } = bound_values("SELECT 'a' = 'b'");
     assert_eq!(rows.len(), 1);
     let BoundExpr::Binary { arg_ty, .. } = &rows[0][0] else {
         panic!("expected comparison");
     };
     assert_eq!(*arg_ty, PgType::Text);
-
-    Ok(())
 }
 
 #[test]
@@ -337,8 +323,8 @@ fn logic_operands_must_be_boolean() {
 }
 
 #[test]
-fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
-    let ValuesPlan { rows, columns, .. } = bind_one("SELECT -2147483648")?.expect_values();
+fn min_int4_literal_binds_as_int4() {
+    let ValuesPlan { rows, columns, .. } = bound_values("SELECT -2147483648");
     assert_eq!(
         rows[0][0],
         BoundExpr::Const {
@@ -347,16 +333,12 @@ fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
         }
     );
     assert_eq!(columns[0].ty, PgType::Int4);
-
-    Ok(())
 }
 
 #[test]
-fn output_column_names_follow_pg() -> anyhow::Result<()> {
+fn output_column_names_follow_pg() {
     let QueryPlan { columns, .. } =
-        bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?.expect_query();
+        bound_query("SELECT id, (name), id + 1 AS next, id + 1, true FROM t");
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "name", "next", "?column?", "bool"]);
-
-    Ok(())
 }

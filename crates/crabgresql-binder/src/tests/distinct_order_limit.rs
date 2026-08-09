@@ -248,12 +248,10 @@ fn order_by_upper_of_column_binds() {
 }
 
 #[test]
-fn values_order_by_column_name_resolves() -> anyhow::Result<()> {
-    let ValuesPlan { sort, .. } = bind_one("VALUES (3), (1) ORDER BY column1")?.expect_values();
+fn values_order_by_column_name_resolves() {
+    let ValuesPlan { sort, .. } = bound_values("VALUES (3), (1) ORDER BY column1");
     assert_eq!(sort[0].column, 0);
     assert_eq!(sort[0].ty, PgType::Int4);
-
-    Ok(())
 }
 
 #[test]
@@ -265,48 +263,38 @@ fn values_order_by_expression_stays_0a000() {
 }
 
 #[test]
-fn limit_offset_wraps_body() -> anyhow::Result<()> {
+fn limit_offset_wraps_body() {
     let LimitPlan {
         source,
         limit,
         offset,
-    } = bind_one("SELECT id FROM t LIMIT 5 OFFSET 2")?.expect_limit();
+    } = bound_limit("SELECT id FROM t LIMIT 5 OFFSET 2");
     assert_eq!(limit, Some(5));
     assert_eq!(offset, Some(2));
     assert!(matches!(*source, LogicalPlan::Query(QueryPlan { .. })));
-
-    Ok(())
 }
 
 #[test]
-fn offset_zero_is_a_bare_offset() -> anyhow::Result<()> {
+fn offset_zero_is_a_bare_offset() {
     // The float4/float8 optimization-fence shape: `OFFSET 0`, no LIMIT.
-    let LimitPlan { limit, offset, .. } = bind_one("SELECT id FROM t OFFSET 0")?.expect_limit();
+    let LimitPlan { limit, offset, .. } = bound_limit("SELECT id FROM t OFFSET 0");
     assert_eq!(limit, None);
     assert_eq!(offset, Some(0));
-
-    Ok(())
 }
 
 #[test]
-fn limit_all_is_no_bound() -> anyhow::Result<()> {
+fn limit_all_is_no_bound() {
     // `LIMIT ALL OFFSET 3` carries only the offset; the limit is unbounded.
-    let LimitPlan { limit, offset, .. } =
-        bind_one("SELECT id FROM t LIMIT ALL OFFSET 3")?.expect_limit();
+    let LimitPlan { limit, offset, .. } = bound_limit("SELECT id FROM t LIMIT ALL OFFSET 3");
     assert_eq!(limit, None);
     assert_eq!(offset, Some(3));
-
-    Ok(())
 }
 
 #[test]
-fn offset_in_derived_table_wraps_subplan() -> anyhow::Result<()> {
+fn offset_in_derived_table_wraps_subplan() {
     // `OFFSET 0` inside a FROM subquery binds as a Limit at that level.
-    let SubqueryPlan { source, .. } =
-        bind_one("SELECT * FROM (SELECT id FROM t OFFSET 0) s")?.expect_subquery();
+    let SubqueryPlan { source, .. } = bound_subquery("SELECT * FROM (SELECT id FROM t OFFSET 0) s");
     assert!(matches!(*source, LogicalPlan::Limit(LimitPlan { .. })));
-
-    Ok(())
 }
 
 #[test]

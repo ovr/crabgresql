@@ -3,43 +3,36 @@
 use super::common::*;
 
 #[test]
-fn select_where_without_table_binds_predicate() -> anyhow::Result<()> {
+fn select_where_without_table_binds_predicate() {
     let ValuesPlan {
         rows, predicate, ..
-    } = bind_one("SELECT 1 WHERE 1 = 2")?.expect_values();
+    } = bound_values("SELECT 1 WHERE 1 = 2");
     assert_eq!(rows.len(), 1);
     assert!(predicate.is_some());
-
-    Ok(())
 }
 
 #[test]
-fn set_returning_function_in_from_binds_columns() -> anyhow::Result<()> {
+fn set_returning_function_in_from_binds_columns() {
     let TableFunctionPlan { func, columns, .. } =
-        bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')")?.expect_table_function();
+        bound_table_function("SELECT * FROM pg_input_error_info('1e400', 'float4')");
     assert_eq!(func, crate::TableFn::PgInputErrorInfo);
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
     assert!(columns.iter().all(|c| c.ty == PgType::Text));
-
-    Ok(())
 }
 
 #[test]
-fn set_returning_function_projects_and_filters() -> anyhow::Result<()> {
+fn set_returning_function_projects_and_filters() {
     // A subset projection over the SRF's columns resolves like a table.
     let TableFunctionPlan {
         columns, predicate, ..
-    } = bind_one(
+    } = bound_table_function(
         "SELECT sql_error_code FROM pg_input_error_info('1e400', 'float4') \
          WHERE message IS NOT NULL",
-    )?
-    .expect_table_function();
+    );
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "sql_error_code");
     assert!(predicate.is_some());
-
-    Ok(())
 }
 
 #[test]
@@ -50,36 +43,30 @@ fn unknown_set_returning_function_is_42883() {
 }
 
 #[test]
-fn generate_series_in_from_binds_int4_column() -> anyhow::Result<()> {
+fn generate_series_in_from_binds_int4_column() {
     let TableFunctionPlan { func, columns, .. } =
-        bind_one("SELECT * FROM generate_series(1, 5)")?.expect_table_function();
+        bound_table_function("SELECT * FROM generate_series(1, 5)");
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "generate_series");
     assert_eq!(columns[0].ty, PgType::Int4);
-
-    Ok(())
 }
 
 #[test]
-fn generate_series_widens_to_int8() -> anyhow::Result<()> {
+fn generate_series_widens_to_int8() {
     // A bigint bound widens the whole series to int8.
     let TableFunctionPlan { func, columns, .. } =
-        bind_one("SELECT * FROM generate_series(1, 5000000000)")?.expect_table_function();
+        bound_table_function("SELECT * FROM generate_series(1, 5000000000)");
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int8));
     assert_eq!(columns[0].ty, PgType::Int8);
-
-    Ok(())
 }
 
 #[test]
-fn generate_series_three_arg_step_binds() -> anyhow::Result<()> {
+fn generate_series_three_arg_step_binds() {
     let TableFunctionPlan { func, args, .. } =
-        bind_one("SELECT * FROM generate_series(1, 10, 3)")?.expect_table_function();
+        bound_table_function("SELECT * FROM generate_series(1, 10, 3)");
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
     assert_eq!(args.len(), 3);
-
-    Ok(())
 }
 
 #[test]
@@ -111,45 +98,38 @@ fn table_fn_bare_alias_names_the_output_column() -> anyhow::Result<()> {
 }
 
 #[test]
-fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
+fn table_fn_alias_column_list_wins_over_bare_alias() {
     let TableFunctionPlan { columns, .. } =
-        bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?.expect_table_function();
+        bound_table_function("SELECT g FROM generate_series(1, 3) AS s(g)");
     assert_eq!(columns[0].name, "g");
     // A list longer than the rowset is still 42P10.
     let e = bind_err("SELECT * FROM generate_series(1, 3) AS s(a, b)");
     assert_eq!(e.code, "42P10");
-
-    Ok(())
 }
 
 #[test]
-fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
+fn composite_table_fn_bare_alias_does_not_rename() {
     // `pg_input_error_info` returns a record: the alias names the relation
     // only, and the row type's column names survive.
     let TableFunctionPlan { columns, .. } =
-        bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e")?
-            .expect_table_function();
+        bound_table_function("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e");
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
-
-    Ok(())
 }
 
 #[test]
-fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
+fn base_table_bare_alias_does_not_rename_columns() {
     // The rename is specific to scalar function FROM items — a bare alias on
     // a real relation names the relation and nothing else.
-    let QueryPlan { columns, .. } = bind_one("SELECT * FROM t AS x")?.expect_query();
+    let QueryPlan { columns, .. } = bound_query("SELECT * FROM t AS x");
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["id", "big", "name", "flag"]);
-
-    Ok(())
 }
 
 #[test]
-fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
+fn unnest_in_from_binds_element_column() {
     let TableFunctionPlan { func, columns, .. } =
-        bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?.expect_table_function();
+        bound_table_function("SELECT * FROM unnest(ARRAY[1, 2, 3])");
     assert_eq!(func, crate::TableFn::Unnest(PgType::Int4));
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "unnest");
@@ -157,10 +137,8 @@ fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
 
     // And the alias renames it, like any other scalar SRF.
     let TableFunctionPlan { columns, .. } =
-        bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?.expect_table_function();
+        bound_table_function("SELECT u FROM unnest(ARRAY['a', 'b']) AS u");
     assert_eq!(columns[0].name, "u");
-
-    Ok(())
 }
 
 #[test]
@@ -224,36 +202,31 @@ fn unnest_in_from_rejects_unsupported_forms() {
 }
 
 #[test]
-fn generate_series_in_target_list_is_srf_projection() -> anyhow::Result<()> {
+fn generate_series_in_target_list_is_srf_projection() {
     // A FROM-less SRF in the target list expands over a single dummy row.
     let SubqueryPlan {
         columns,
         projections,
         source,
         ..
-    } = bind_one("SELECT generate_series(1, 5)")?.expect_subquery();
+    } = bound_subquery("SELECT generate_series(1, 5)");
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "generate_series");
     assert_eq!(columns[0].ty, PgType::Int4);
     assert!(matches!(projections[0], BoundExpr::Srf { .. }));
     assert!(matches!(*source, LogicalPlan::Values(ValuesPlan { .. })));
-
-    Ok(())
 }
 
 #[test]
-fn generate_series_in_target_list_over_table() -> anyhow::Result<()> {
+fn generate_series_in_target_list_over_table() {
     // Mixed scalar + SRF projection over a base table stays a Query.
-    let QueryPlan { projections, .. } =
-        bind_one("SELECT id, generate_series(1, 2) FROM t")?.expect_query();
+    let QueryPlan { projections, .. } = bound_query("SELECT id, generate_series(1, 2) FROM t");
     assert!(matches!(projections[0], BoundExpr::ColumnRef { .. }));
     assert!(matches!(projections[1], BoundExpr::Srf { .. }));
-
-    Ok(())
 }
 
 fn table_fn(sql: &str) -> (crate::TableFn, Vec<OutputColumn>) {
-    let TableFunctionPlan { func, columns, .. } = bound(sql).expect_table_function();
+    let TableFunctionPlan { func, columns, .. } = bound_table_function(sql);
     (func, columns)
 }
 

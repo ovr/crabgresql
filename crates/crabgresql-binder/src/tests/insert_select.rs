@@ -62,15 +62,14 @@ fn insert_table_source_binds_as_query() -> anyhow::Result<()> {
 }
 
 #[test]
-fn table_statement_binds_select_star() -> anyhow::Result<()> {
-    let QueryPlan { columns, .. } = bind_one("TABLE t")?.expect_query();
+fn table_statement_binds_select_star() {
+    let QueryPlan { columns, .. } = bound_query("TABLE t");
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "big", "name", "flag"]);
-    Ok(())
 }
 
 #[test]
-fn table_preserves_quoted_identifier_case() -> anyhow::Result<()> {
+fn table_preserves_quoted_identifier_case() {
     // A case-sensitive relation reached via `TABLE "MixedCase"` must keep its
     // quoting, exactly as `SELECT * FROM "MixedCase"` does; an unquoted name
     // folds to lower case and does not resolve (matching PostgreSQL).
@@ -100,7 +99,6 @@ fn table_preserves_quoted_identifier_case() -> anyhow::Result<()> {
         Err(e) => assert_eq!(e.code, sqlstate::UNDEFINED_TABLE),
         Ok(_) => panic!("unquoted MixedCase must not resolve to \"MixedCase\""),
     }
-    Ok(())
 }
 
 #[test]

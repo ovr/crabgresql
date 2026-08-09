@@ -3,14 +3,12 @@
 use super::common::*;
 
 #[test]
-fn standalone_values_binds_to_values_plan() -> anyhow::Result<()> {
-    let ValuesPlan { columns, rows, .. } = bind_one("VALUES (1, 'a'), (2, 'b')")?.expect_values();
+fn standalone_values_binds_to_values_plan() {
+    let ValuesPlan { columns, rows, .. } = bound_values("VALUES (1, 'a'), (2, 'b')");
     assert_eq!(columns.len(), 2);
     assert_eq!(columns[0].name, "column1");
     assert_eq!(columns[1].name, "column2");
     assert_eq!(rows.len(), 2);
-
-    Ok(())
 }
 
 #[test]
@@ -20,22 +18,17 @@ fn values_uneven_row_lengths_error() {
 }
 
 #[test]
-fn values_common_type_keeps_real_over_int() -> anyhow::Result<()> {
+fn values_common_type_keeps_real_over_int() {
     // PG's select_common_type resolves (real, int4) to real, not float8
     // (int4 implicitly casts to real). Contrast with operator resolution.
-    let ValuesPlan { columns, .. } = bind_one("VALUES (CAST(1.5 AS real)), (2)")?.expect_values();
+    let ValuesPlan { columns, .. } = bound_values("VALUES (CAST(1.5 AS real)), (2)");
     assert_eq!(columns[0].ty, PgType::Float4);
-
-    Ok(())
 }
 
 #[test]
-fn derived_table_binds_to_subquery_plan() -> anyhow::Result<()> {
-    let SubqueryPlan { columns, .. } =
-        bind_one("SELECT x FROM (VALUES (1), (2)) v(x)")?.expect_subquery();
+fn derived_table_binds_to_subquery_plan() {
+    let SubqueryPlan { columns, .. } = bound_subquery("SELECT x FROM (VALUES (1), (2)) v(x)");
     assert_eq!(columns[0].name, "x");
-
-    Ok(())
 }
 
 #[test]
@@ -46,12 +39,9 @@ fn derived_table_requires_alias() {
 }
 
 #[test]
-fn cte_reference_resolves_to_subquery() -> anyhow::Result<()> {
-    let SubqueryPlan { columns, .. } =
-        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?.expect_subquery();
+fn cte_reference_resolves_to_subquery() {
+    let SubqueryPlan { columns, .. } = bound_subquery("WITH t(x) AS (VALUES (1)) SELECT x FROM t");
     assert_eq!(columns[0].name, "x");
-
-    Ok(())
 }
 
 #[test]
@@ -103,12 +93,9 @@ fn with_recursive_is_rejected() {
 }
 
 #[test]
-fn cte_shadows_a_real_table() -> anyhow::Result<()> {
+fn cte_shadows_a_real_table() {
     // `t` here is the CTE, not the base table `t`; its column is `x`.
-    let SubqueryPlan { columns, .. } =
-        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?.expect_subquery();
+    let SubqueryPlan { columns, .. } = bound_subquery("WITH t(x) AS (VALUES (1)) SELECT x FROM t");
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "x");
-
-    Ok(())
 }

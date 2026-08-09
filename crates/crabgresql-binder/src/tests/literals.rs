@@ -62,8 +62,8 @@ fn arithmetic_on_non_numeric_with_unknown_is_42883() {
 }
 
 #[test]
-fn decimal_literal_binds_as_numeric() -> anyhow::Result<()> {
-    let ValuesPlan { rows, .. } = bind_one("SELECT 1.5")?.expect_values();
+fn decimal_literal_binds_as_numeric() {
+    let ValuesPlan { rows, .. } = bound_values("SELECT 1.5");
     let BoundExpr::Const {
         value: Value::Numeric(n),
         ty: PgType::Numeric,
@@ -72,8 +72,6 @@ fn decimal_literal_binds_as_numeric() -> anyhow::Result<()> {
         panic!("expected numeric const, got {:?}", rows[0][0]);
     };
     assert_eq!(n.to_display(), "1.5");
-
-    Ok(())
 }
 
 #[test]
@@ -155,8 +153,8 @@ fn order_by_on_bit_binds() {
 }
 
 #[test]
-fn float_literal_cast_binds() -> anyhow::Result<()> {
-    let ValuesPlan { rows, .. } = bind_one("SELECT 'NaN'::float4")?.expect_values();
+fn float_literal_cast_binds() {
+    let ValuesPlan { rows, .. } = bound_values("SELECT 'NaN'::float4");
     let BoundExpr::Const {
         value: Value::Float4(v),
         ty: PgType::Float4,
@@ -165,8 +163,6 @@ fn float_literal_cast_binds() -> anyhow::Result<()> {
         panic!("expected float4 const, got {:?}", rows[0][0]);
     };
     assert!(v.is_nan());
-
-    Ok(())
 }
 
 #[test]
@@ -205,22 +201,18 @@ fn float_modulo_is_rejected() {
 }
 
 #[test]
-fn numeric_operators_bind() -> anyhow::Result<()> {
+fn numeric_operators_bind() {
     // Comparison, arithmetic, and modulo all resolve for numeric now.
     assert!(bind_one("SELECT '1'::numeric < '2'::numeric").is_ok());
-    let ValuesPlan { rows, .. } = bind_one("SELECT 1.5 + 2.25")?.expect_values();
+    let ValuesPlan { rows, .. } = bound_values("SELECT 1.5 + 2.25");
     assert_eq!(rows[0][0].ty(), PgType::Numeric);
     assert!(bind_one("SELECT 5.5 % 2.0").is_ok());
-
-    Ok(())
 }
 
 #[test]
-fn int2_arithmetic_binds() -> anyhow::Result<()> {
-    let ValuesPlan { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2")?.expect_values();
+fn int2_arithmetic_binds() {
+    let ValuesPlan { rows, .. } = bound_values("SELECT '1'::int2 + '2'::int2");
     assert_eq!(rows[0][0].ty(), PgType::Int2);
-
-    Ok(())
 }
 
 #[test]
@@ -230,12 +222,10 @@ fn implicit_int_to_float4_function_arg_resolves() {
 }
 
 #[test]
-fn cast_keeps_bare_column_name() -> anyhow::Result<()> {
-    let QueryPlan { columns, .. } = bind_one("SELECT id::int8 FROM t")?.expect_query();
+fn cast_keeps_bare_column_name() {
+    let QueryPlan { columns, .. } = bound_query("SELECT id::int8 FROM t");
     assert_eq!(columns[0].name, "id");
     // A constant/nested cast falls back to the target type name.
-    let ValuesPlan { columns, .. } = bind_one("SELECT 'nan'::numeric::float4")?.expect_values();
+    let ValuesPlan { columns, .. } = bound_values("SELECT 'nan'::numeric::float4");
     assert_eq!(columns[0].name, "float4");
-
-    Ok(())
 }

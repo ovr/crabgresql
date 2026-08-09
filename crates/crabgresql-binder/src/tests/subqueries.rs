@@ -3,9 +3,9 @@
 use super::common::*;
 
 #[test]
-fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
+fn scalar_subquery_binds_with_column_type() {
     // A FROM-less SELECT is a Values plan; its one projection is the marker.
-    let ValuesPlan { rows, .. } = bound("SELECT (SELECT big FROM t)").expect_values();
+    let ValuesPlan { rows, .. } = bound_values("SELECT (SELECT big FROM t)");
     assert!(matches!(
         rows[0][0],
         BoundExpr::ScalarSubquery {
@@ -13,13 +13,12 @@ fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
             ..
         }
     ));
-    Ok(())
 }
 
 #[test]
 fn exists_binds_to_marker() {
     let QueryPlan { predicate, .. } =
-        bound("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)").expect_query();
+        bound_query("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t)");
     assert!(matches!(
         predicate,
         Some(BoundExpr::Exists { negated: false, .. })
@@ -29,7 +28,7 @@ fn exists_binds_to_marker() {
 #[test]
 fn not_exists_sets_negated() {
     let QueryPlan { predicate, .. } =
-        bound("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t)").expect_query();
+        bound_query("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t)");
     assert!(matches!(
         predicate,
         Some(BoundExpr::Exists { negated: true, .. })
@@ -41,7 +40,7 @@ fn not_exists_sets_negated() {
 #[test]
 fn in_subquery_binds_to_marker() {
     let QueryPlan { predicate, .. } =
-        bound("SELECT id FROM t WHERE id IN (SELECT id FROM t)").expect_query();
+        bound_query("SELECT id FROM t WHERE id IN (SELECT id FROM t)");
     let Some(BoundExpr::QuantifiedSubquery { all, cmp, .. }) = predicate else {
         panic!("expected QuantifiedSubquery predicate");
     };
@@ -55,7 +54,7 @@ fn in_subquery_binds_to_marker() {
 #[test]
 fn not_in_subquery_binds_to_all_of_inequality() {
     let QueryPlan { predicate, .. } =
-        bound("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t)").expect_query();
+        bound_query("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t)");
     let Some(BoundExpr::QuantifiedSubquery { all, cmp, .. }) = predicate else {
         panic!("expected QuantifiedSubquery predicate");
     };
@@ -88,8 +87,7 @@ fn correlated_qualified_reference_binds_to_outer_column() {
     // A qualified reference to an enclosing relation resolves outward rather
     // than erroring: `x.id` becomes an OuterColumnRef at level 1, index 0
     // (the outer row's `id`).
-    let pred = bound("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)")
-        .expect_query()
+    let pred = bound_query("SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t WHERE id = x.id)")
         .predicate
         .expect("a WHERE predicate");
     let BoundExpr::Exists { subplan, negated } = pred else {
@@ -124,8 +122,7 @@ fn correlated_unqualified_reference_binds_to_outer_column() {
     // An unqualified name absent from the subquery's own relation falls
     // through to the enclosing query. Here `flag` is not selected from in the
     // subquery's FROM-less body, so it resolves to the outer row.
-    let pred = bound("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE flag)")
-        .expect_query()
+    let pred = bound_query("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE flag)")
         .predicate
         .expect("a WHERE predicate");
     let BoundExpr::Exists { subplan, .. } = pred else {
@@ -163,21 +160,21 @@ fn uncorrelated_missing_column_still_errors_42703() {
 
 #[test]
 fn scalar_subquery_column_named_after_inner_column() {
-    let ValuesPlan { columns, .. } = bound("SELECT (SELECT max(id) FROM t)").expect_values();
+    let ValuesPlan { columns, .. } = bound_values("SELECT (SELECT max(id) FROM t)");
     assert_eq!(columns[0].name, "max");
 }
 
 #[test]
 fn exists_column_named_exists() {
-    let ValuesPlan { columns, .. } = bound("SELECT EXISTS (SELECT 1 FROM t)").expect_values();
+    let ValuesPlan { columns, .. } = bound_values("SELECT EXISTS (SELECT 1 FROM t)");
     assert_eq!(columns[0].name, "exists");
 }
 
 #[test]
-fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
+fn exists_strips_target_list_to_a_constant() {
     // The EXISTS subplan's projection is replaced with a constant so the
     // original target list (here a division by zero) is never evaluated.
-    let ValuesPlan { rows, .. } = bound("SELECT EXISTS (SELECT id / 0 FROM t)").expect_values();
+    let ValuesPlan { rows, .. } = bound_values("SELECT EXISTS (SELECT id / 0 FROM t)");
     let BoundExpr::Exists { subplan, .. } = &rows[0][0] else {
         panic!("expected Exists");
     };
@@ -186,20 +183,17 @@ fn exists_strips_target_list_to_a_constant() -> anyhow::Result<()> {
         panic!("expected Query subplan");
     };
     assert!(matches!(projections.as_slice(), [BoundExpr::Const { .. }]));
-    Ok(())
 }
 
 #[test]
 fn update_set_accepts_subquery() {
-    let UpdatePlan { assignments, .. } =
-        bound("UPDATE t SET id = (SELECT max(id) FROM t)").expect_update();
+    let UpdatePlan { assignments, .. } = bound_update("UPDATE t SET id = (SELECT max(id) FROM t)");
     assert!(matches!(assignments[0].1, BoundExpr::ScalarSubquery { .. }));
 }
 
 #[test]
 fn delete_where_accepts_in_subquery() {
-    let DeletePlan { predicate, .. } =
-        bound("DELETE FROM t WHERE id IN (SELECT id FROM t)").expect_delete();
+    let DeletePlan { predicate, .. } = bound_delete("DELETE FROM t WHERE id IN (SELECT id FROM t)");
     assert!(matches!(
         predicate,
         Some(BoundExpr::QuantifiedSubquery { .. })
