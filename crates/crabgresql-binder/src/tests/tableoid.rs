@@ -1,0 +1,79 @@
+//! Which relations a query demands `tableoid` for.
+
+use super::common::*;
+
+/// The `tableoid` demand of a SELECT, as `(bare, sorted qualifiers)`.
+fn demand_of(sql: &str) -> (bool, Vec<String>) {
+    let stmts = match crabgresql_parser::parse(sql) {
+        Ok(stmts) => stmts,
+        Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
+    };
+    let ast::Statement::Query(query) = &stmts[0] else {
+        panic!("expected a query: {sql}");
+    };
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected a plain SELECT: {sql}");
+    };
+    let demand = TableoidDemand::of_select(select, &query.order_by);
+    let mut qualified: Vec<String> = demand.qualified.into_iter().collect();
+    qualified.sort();
+    (demand.bare, qualified)
+}
+
+#[test]
+fn tableoid_demand_finds_every_expression_position() {
+    // Nothing names it: the common case must widen nothing at all.
+    assert_eq!(demand_of("SELECT id FROM t").0, false);
+    assert!(demand_of("SELECT id FROM t").1.is_empty());
+
+    // Every clause an expression can sit in, including a correlated
+    // subquery, which is the position a structural walk is likeliest to
+    // miss.
+    for sql in [
+        "SELECT tableoid FROM t",
+        "SELECT id FROM t WHERE tableoid > 0",
+        "SELECT id FROM t GROUP BY tableoid",
+        "SELECT count(*) FROM t GROUP BY id HAVING max(tableoid) > 0",
+        "SELECT id FROM t ORDER BY tableoid",
+        "SELECT id FROM t JOIN t u ON u.id = tableoid",
+        "SELECT (SELECT tableoid) FROM t",
+        "SELECT CASE WHEN true THEN tableoid ELSE 0 END FROM t",
+    ] {
+        assert!(demand_of(sql).0, "unqualified reference missed in `{sql}`");
+    }
+
+    // Qualified references name the relation they belong to, and only it.
+    assert_eq!(
+        demand_of("SELECT t.tableoid FROM t, u"),
+        (false, vec!["t".to_string()])
+    );
+    assert_eq!(
+        demand_of("SELECT id FROM t WHERE (SELECT x.tableoid FROM u x) = 1"),
+        (false, vec!["x".to_string()])
+    );
+    // A quoted qualifier keeps its case, exactly as `normalize_ident` would
+    // leave it, so the two spellings match the same relation.
+    assert_eq!(
+        demand_of("SELECT \"T\".tableoid FROM t \"T\""),
+        (false, vec!["T".to_string()])
+    );
+    // Schema-qualified: the relation is addressed by its own name.
+    assert_eq!(
+        demand_of("SELECT public.t.tableoid FROM public.t"),
+        (false, vec!["t".to_string()])
+    );
+
+    // A longer identifier merely containing the word is not a reference.
+    for sql in [
+        "SELECT mytableoid FROM t",
+        "SELECT tableoid_x FROM t",
+        "SELECT t.tableoids FROM t",
+    ] {
+        let (bare, qualified) = demand_of(sql);
+        assert!(!bare && qualified.is_empty(), "false positive in `{sql}`");
+    }
+
+    // Documented over-approximation: a literal spelling the word costs an
+    // unreferenced slot, never a wrong answer.
+    assert!(demand_of("SELECT 'tableoid' FROM t").0);
+}

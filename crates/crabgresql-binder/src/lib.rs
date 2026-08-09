@@ -9,6 +9,8 @@ mod functions;
 mod plan;
 pub mod ruleutils;
 mod soft_input;
+#[cfg(test)]
+mod tests;
 
 pub use collation::{
     Derived, Strength, check_explicit_conflict, collation_name, column_collation, expr_collation,
