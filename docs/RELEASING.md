@@ -39,11 +39,11 @@ Linux tarballs are glibc builds from the GitHub runners, not static musl ones:
 musl's allocator costs real throughput under a database workload, and the
 portable answer is the image. macOS ships arm64 only.
 
-Each architecture's image is smoke-tested (`scripts/docker-smoke.sh`) before it
-is pushed, and pushed by digest without a tag; the tags are created once, on
-the merged manifest, so `latest` is never briefly single-architecture. The
-`image` job then asserts that both platforms are actually in the manifest —
-`imagetools create` is happy to build a manifest with one.
+Each architecture's image is smoke-tested before it is pushed, and pushed by
+digest without a tag; the tags are created once, on the merged manifest, so
+`latest` is never briefly single-architecture. The `image` job then asserts
+that both platforms are actually in the manifest — `imagetools create` is happy
+to build a manifest with one.
 
 ## Repository secrets
 

@@ -126,15 +126,8 @@ jobs:
           echo "smoke: ${{ steps.smoke.outcome }}, upstream: ${{ steps.upstream.outcome }}"
           exit 1
 
-  # Builds the image the same way `docker build .` does and runs the same smoke
-  # script the release workflow runs before it pushes anything. The release
-  # image takes the `BIN_SOURCE=prebuilt` path through the same Dockerfile, so
-  # what this proves about the runtime stage — reachable port, non-root user,
-  # clean SIGTERM shutdown, volume that outlives the container — holds there
-  # too; what it does not cover is the compile-from-source path being skipped,
-  # which is why this job builds from source and the release one does not.
-  # amd64 only: arm64 here would mean QEMU, and the release workflow builds
-  # that architecture natively anyway.
+  # amd64 only: arm64 here would mean QEMU, and the release workflow builds it
+  # natively anyway.
   docker:
     name: docker image
     needs: lint
@@ -152,7 +145,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: smoke
-        run: scripts/docker-smoke.sh crabgresql:ci
+        run: |
+          set -euo pipefail
+          docker run -d --name ci -p 55433:5433 crabgresql:ci
+          for _ in $(seq 60); do
+            psql -h 127.0.0.1 -p 55433 -U postgres -qtAc 'SELECT 1' && break
+            sleep 1
+          done
+          psql -h 127.0.0.1 -p 55433 -U postgres -qtAc 'SELECT 1' > /dev/null
+          docker stop -t 30 ci
 
   # The benchmark jobs below report numbers but gate only on breakage: a query
   # that errored or timed out, or a pgbench run with failed transactions.

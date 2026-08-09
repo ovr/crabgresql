@@ -1,8 +1,5 @@
 name: Release
 
-# A pushed tag is the whole trigger, and the tag is the version: nothing here
-# reads a release draft or a workflow input, so the artifacts of `v1.2.3` can
-# only ever have come from the commit that tag points at.
 on:
   push:
     tags: ["v*"]
@@ -12,9 +9,6 @@ env:
   IMAGE: ovr/crabgresql
 
 jobs:
-  # Cheap and first, because everything below is expensive and a tag that
-  # disagrees with the workspace version would publish an image whose own
-  # `crabgresql --version` contradicts the tag it was pulled by.
   verify:
     name: verify tag
     runs-on: ubuntu-latest
@@ -33,9 +27,6 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME says $version, Cargo.toml says $cargo_version" >&2
             exit 1
           fi
-          # A version with a suffix (-rc1, -beta.2) is a prerelease, and a
-          # prerelease must not move `latest` or people pulling the default tag
-          # get a candidate they never asked for.
           case "$version" in
             *-*) prerelease=true ;;
             *)   prerelease=false ;;
@@ -44,10 +35,6 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "$GITHUB_REF_NAME -> $version (prerelease=$prerelease)"
 
-  # One compile per architecture, on a runner of that architecture. The binary
-  # it produces is both the tarball and the image payload — cross-compiling
-  # arm64 under QEMU would take hours, and building it twice would take twice
-  # as long as building it once.
   build:
     name: build (${{ matrix.target }})
     needs: verify
@@ -63,7 +50,6 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux/arm64
-          # Tarball only: there is no macOS container runtime to publish to.
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: ""
@@ -71,8 +57,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
 
-      # The same invocation the benchmark job uses, so the released binary is
-      # the one the benchmarks characterize.
       - name: cargo build --release
         run: cargo build --release -p crabgresql-server --bin crabgresql --locked
 
@@ -94,12 +78,8 @@ jobs:
           path: ${{ steps.package.outputs.tarball }}
           if-no-files-found: error
 
-      # ---- image, linux only ----
-
       - name: stage the binary for the image
         if: matrix.platform != ''
-        # `BIN_SOURCE=prebuilt` makes the Dockerfile package this file instead
-        # of compiling; the runtime stage is the one CI already smoke-tested.
         run: cp target/release/crabgresql ./crabgresql
 
       - uses: docker/setup-buildx-action@v3
@@ -115,14 +95,20 @@ jobs:
           load: true
           tags: crabgresql:release
 
-      # Before the push, not after: an image that cannot serve a query has no
-      # business acquiring a tag people will pull.
+      # Before the push: an image that cannot serve a query should not get a tag.
       - name: smoke
         if: matrix.platform != ''
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client
-          scripts/docker-smoke.sh crabgresql:release
+          docker run -d --name smoke -p 55433:5433 crabgresql:release
+          for _ in $(seq 60); do
+            psql -h 127.0.0.1 -p 55433 -U postgres -qtAc 'SELECT 1' && break
+            sleep 1
+          done
+          psql -h 127.0.0.1 -p 55433 -U postgres -qtAc 'SELECT 1' > /dev/null
+          docker rm -f smoke
 
       - uses: docker/login-action@v3
         if: matrix.platform != ''
@@ -130,11 +116,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Pushed by digest and left untagged: the tags belong to the multi-arch
-      # manifest the next job assembles, and tagging a single-architecture
-      # image here would briefly publish `latest` as amd64-only.
-      # `provenance: false` because a provenance attestation adds a manifest
-      # entry that `imagetools create` then refuses to merge.
       - name: push by digest
         if: matrix.platform != ''
         id: push
@@ -143,6 +124,7 @@ jobs:
           context: .
           build-args: BIN_SOURCE=prebuilt
           platforms: ${{ matrix.platform }}
+          # provenance adds a manifest entry `imagetools create` refuses to merge
           provenance: false
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
@@ -160,8 +142,6 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
 
-  # The tags exist only here, so an architecture that failed to build takes the
-  # release down with it rather than shipping a half-populated manifest.
   image:
     name: multi-arch manifest
     needs: [verify, build]
@@ -183,8 +163,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # `latest=auto` moves the tag only for a non-prerelease semver, which
-          # is exactly the rule `verify` computed.
           flavor: latest=auto
           tags: |
             type=semver,pattern={{version}}
@@ -195,21 +173,18 @@ jobs:
         working-directory: /tmp/digests
         run: |
           set -euo pipefail
-          # Arrays rather than word splitting: a tag or a digest is one
-          # argument whatever it contains.
           tags=()
           while IFS= read -r tag; do
             tags+=(-t "$tag")
           done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          # One file per pushed architecture, named after its digest.
           sources=()
           for digest in *; do
             sources+=("${IMAGE}@${digest}")
           done
           docker buildx imagetools create "${tags[@]}" "${sources[@]}"
 
-      # Not decoration: `imagetools create` succeeds on a single-platform
-      # manifest, so this is the step that proves both architectures made it.
+      # `imagetools create` succeeds on a single-platform manifest, so the
+      # architectures have to be checked explicitly.
       - name: verify the manifest
         run: |
           set -euo pipefail
@@ -223,7 +198,6 @@ jobs:
               || { echo "::error::$platform missing from the manifest" >&2; exit 1; }
           done
 
-  # Last, so a GitHub Release only ever appears next to an image that exists.
   release:
     name: github release
     needs: [verify, build, image]

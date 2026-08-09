@@ -27,8 +27,7 @@ use std::time::Duration;
 /// TCP port the server listens on.
 pub const PORT: &str = "CRABGRESQL_PORT";
 /// Address the server accepts connections on. Loopback by default: the only
-/// authentication method is trust and there is no TLS, so reaching the port at
-/// all is enough to be a superuser.
+/// authentication method is trust and there is no TLS.
 pub const LISTEN_ADDRESS: &str = "CRABGRESQL_LISTEN_ADDRESS";
 /// Data directory the durable heap engine is opened in. Spelled `PGDATA` to
 /// match PostgreSQL, since the same directory serves the same purpose.
@@ -45,7 +44,6 @@ pub const LOG_FILTER: &str = "RUST_LOG";
 /// One above PostgreSQL's 5432, so a local PostgreSQL can keep running.
 pub const DEFAULT_PORT: u16 = 5433;
 /// Used when neither `--listen-address` nor [`LISTEN_ADDRESS`] is given.
-/// Listening anywhere else is opt-in, because it is a security decision.
 pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1";
 /// Used when neither `--data-dir` nor [`DATA_DIR`] is given.
 pub const DEFAULT_DATA_DIR: &str = "./pgdata";

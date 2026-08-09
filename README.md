@@ -130,12 +130,7 @@ SIGTERM and flushes, which is what keeps unlogged tables across a restart.
 There is no `HEALTHCHECK` — the image ships no client — so probe the port from
 outside if you need one.
 
-Building it yourself:
-
-```console
-$ docker build -t crabgresql .
-$ scripts/docker-smoke.sh crabgresql          # serves SQL, keeps a volume, stops cleanly
-```
+Building it yourself: `docker build -t crabgresql .`
 
 ## PostgreSQL regression tests
 

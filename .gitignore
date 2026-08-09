@@ -1,4 +1,3 @@
 /target
 .idea
-# Where the release workflow stages the binary for `BIN_SOURCE=prebuilt`.
 /crabgresql

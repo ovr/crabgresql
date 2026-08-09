@@ -9,9 +9,8 @@ use tokio::net::TcpListener;
 #[derive(Parser)]
 #[command(name = "crabgresql", version)]
 struct Cli {
-    /// Address to accept connections on. `0.0.0.0` (or `::`) exposes the server
-    /// to the network, which is opt-in because the only authentication method
-    /// is trust and there is no TLS.
+    /// Address to accept connections on. Loopback by default: authentication is
+    /// trust and there is no TLS, so exposing the port is opt-in.
     #[arg(
         long = "listen-address",
         short = 'l',
@@ -82,9 +81,7 @@ async fn main() -> std::io::Result<()> {
     // control file dirty and reset them).
     let engine_for_shutdown = engine.clone();
 
-    // Anything but loopback hands every reachable client a superuser session:
-    // the handshake authenticates with trust and the connection is cleartext.
-    // Say so once, loudly, rather than leaving it to be discovered.
+    // Anything but loopback hands every reachable client a superuser session.
     if !cli.listen_address.is_loopback() {
         tracing::warn!(
             "listening on {} — connections are unauthenticated (trust) and \
