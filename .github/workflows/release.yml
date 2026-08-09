@@ -40,6 +40,8 @@ jobs:
     needs: verify
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -70,13 +72,24 @@ jobs:
           cp target/release/crabgresql "dist/$name/"
           cp LICENSE NOTICE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          echo "tarball=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          # macOS has shasum, Linux has both.
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: tarball-${{ matrix.target }}
-          path: ${{ steps.package.outputs.tarball }}
-          if-no-files-found: error
+      # Uploaded here rather than collected at the end, so an architecture is
+      # downloadable as soon as it is built. The Release itself is created
+      # elsewhere when the tag goes up; this step fails if it is not there yet.
+      # `--clobber` so a re-run replaces its own asset instead of failing on
+      # the name.
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256" --clobber
 
       - name: stage the binary for the image
         if: matrix.platform != ''
@@ -197,48 +210,3 @@ jobs:
               /tmp/manifest.json > /dev/null \
               || { echo "::error::$platform missing from the manifest" >&2; exit 1; }
           done
-
-  release:
-    name: github release
-    needs: [verify, build, image]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          path: dist
-          pattern: tarball-*
-          merge-multiple: true
-
-      - name: checksums
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          sha256sum -- *.tar.gz | tee SHA256SUMS
-
-      - name: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          notes=$(mktemp)
-          {
-            echo "### Docker"
-            echo
-            echo '```console'
-            echo "\$ docker run --rm -p 5433:5433 -v crabgresql-data:/var/lib/crabgresql ${IMAGE}:${{ needs.verify.outputs.version }}"
-            echo '```'
-            echo
-            echo "The image listens on \`0.0.0.0\`, authenticates with trust and speaks cleartext — trusted networks only."
-            echo
-            echo "Linux tarballs are glibc builds from the GitHub runners; for an older distribution, use the image."
-          } > "$notes"
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes-file "$notes" \
-            ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
-            dist/*.tar.gz dist/SHA256SUMS
