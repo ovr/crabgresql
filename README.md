@@ -124,11 +124,13 @@ it on a trusted network — or set `CRABGRESQL_LISTEN_ADDRESS` back to
 `127.0.0.1` and reach it another way. Everything in the Configuration table
 above works as a `-e` flag.
 
-The data directory is `/var/lib/crabgresql`, owned by uid 5433, which the
-server also runs as. `docker stop` is a clean shutdown: the server handles
-SIGTERM and flushes, which is what keeps unlogged tables across a restart.
-There is no `HEALTHCHECK` — the image ships no client — so probe the port from
-outside if you need one.
+The data directory is `/var/lib/crabgresql`, owned by uid 999, which the server
+also runs as — unlike the official postgres image, the container never starts
+as root, so a *bind*-mounted data directory has to be `chown 999` on the host
+first (a named volume inherits the ownership and needs nothing). `docker stop`
+is a clean shutdown: the server handles SIGTERM and flushes, which is what
+keeps unlogged tables across a restart. There is no `HEALTHCHECK` — the image
+ships no client — so probe the port from outside if you need one.
 
 Building it yourself: `docker build -t crabgresql .`
 

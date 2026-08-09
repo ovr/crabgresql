@@ -25,8 +25,10 @@ FROM ${BIN_SOURCE} AS binary
 
 FROM debian:trixie-slim
 
-RUN groupadd --system --gid 5433 crabgresql \
-    && useradd --system --uid 5433 --gid 5433 --home-dir /var/lib/crabgresql \
+# 999 is where Debian starts allocating system uids downward, and what the
+# official postgres image pins for the same reason.
+RUN groupadd --system --gid 999 crabgresql \
+    && useradd --system --uid 999 --gid 999 --home-dir /var/lib/crabgresql \
        --shell /usr/sbin/nologin crabgresql \
     && mkdir -p /var/lib/crabgresql \
     && chown crabgresql:crabgresql /var/lib/crabgresql
@@ -42,10 +44,13 @@ ENV PGDATA=/var/lib/crabgresql \
 
 VOLUME /var/lib/crabgresql
 EXPOSE 5433
-USER 5433:5433
+# Numeric so an orchestrator enforcing `runAsNonRoot` can tell this is not root
+# without resolving a name out of the image.
+USER 999:999
 WORKDIR /var/lib/crabgresql
 
 # Exec form: under a shell the server would never see SIGTERM, and `docker
-# stop` would end in SIGKILL, which leaves the control file dirty.
-STOPSIGNAL SIGTERM
+# stop` would end in SIGKILL, which leaves the control file dirty. SIGTERM
+# rather than the postgres image's SIGINT, because this server treats the two
+# the same and has no smart-shutdown mode to avoid.
 ENTRYPOINT ["crabgresql"]
