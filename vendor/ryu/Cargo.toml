@@ -6,6 +6,12 @@ license = "Apache-2.0 OR BSL-1.0"
 description = "Vendored fork of the ryu crate with PostgreSQL's STRICTLY_SHORTEST-disabled rounding (accept_bounds = false), producing float output that matches PG float4out/float8out byte-for-byte."
 publish = false
 
+# The version above tracks the upstream ryu release this fork is taken from,
+# which is what `NOTICE` attributes. It is not the workspace's version, so
+# `cargo release` must leave it alone.
+[package.metadata.release]
+release = false
+
 [lints]
 workspace = true
 

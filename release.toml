@@ -1,0 +1,28 @@
+# `cargo release <level> --workspace --execute` is the whole release: it bumps
+# the version, regenerates the changelog, commits once, tags, and pushes. The
+# tag is what `.github/workflows/release.yml` waits for — it builds the
+# binaries and the images from there. Without `--execute` the command is a
+# dry run, which is worth doing first.
+#
+# `vendor/ryu` opts out in its own manifest; it carries upstream ryu's version.
+
+# Every crate inherits `version.workspace`, so the bump is one line in the root
+# Cargo.toml and all 18 crates move together.
+shared-version = true
+
+# Nothing here is published to crates.io. The artifacts are binaries and a
+# Docker image, both built by CI from the tag.
+publish = false
+
+# One commit and one tag for the whole workspace, rather than one per crate.
+consolidate-commits = true
+tag = true
+tag-prefix = ""
+tag-name = "v{{version}}"
+tag-message = "crabgresql {{version}}"
+pre-release-commit-message = "chore(release): v{{version}}"
+
+# git-cliff reads cliff.toml and rewrites CHANGELOG.md in place, so the release
+# commit carries the notes. `--tag` tells it which version the pending commits
+# belong to, since the tag does not exist yet at this point.
+pre-release-hook = ["git-cliff", "--tag", "v{{version}}", "-o", "CHANGELOG.md"]
