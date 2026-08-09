@@ -49,14 +49,11 @@ fn insert_column_refs_in_values_are_undefined() {
 
 #[test]
 fn update_binds_assignments_by_index() -> anyhow::Result<()> {
-    let LogicalPlan::Update(UpdatePlan {
+    let UpdatePlan {
         assignments,
         predicate,
         ..
-    }) = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?
-    else {
-        panic!("expected Update");
-    };
+    } = bind_one("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?.expect_update();
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0].0, 2);
     assert_eq!(assignments[1].0, 0);
@@ -84,10 +81,7 @@ fn update_unknown_column_names_the_relation() {
 
 #[test]
 fn update_assignment_coerces_to_column_type() -> anyhow::Result<()> {
-    let LogicalPlan::Update(UpdatePlan { assignments, .. }) = bind_one("UPDATE t SET id = big")?
-    else {
-        panic!("expected Update");
-    };
+    let UpdatePlan { assignments, .. } = bind_one("UPDATE t SET id = big")?.expect_update();
     assert_eq!(
         assignments[0].1,
         BoundExpr::Coerce {
@@ -104,14 +98,9 @@ fn update_assignment_coerces_to_column_type() -> anyhow::Result<()> {
 
 #[test]
 fn delete_binds_predicate() -> anyhow::Result<()> {
-    let LogicalPlan::Delete(DeletePlan { predicate, .. }) = bind_one("DELETE FROM t WHERE id = 1")?
-    else {
-        panic!("expected Delete");
-    };
+    let DeletePlan { predicate, .. } = bind_one("DELETE FROM t WHERE id = 1")?.expect_delete();
     assert!(predicate.is_some());
-    let LogicalPlan::Delete(DeletePlan { predicate, .. }) = bind_one("DELETE FROM t")? else {
-        panic!("expected Delete");
-    };
+    let DeletePlan { predicate, .. } = bind_one("DELETE FROM t")?.expect_delete();
     assert!(predicate.is_none());
 
     Ok(())

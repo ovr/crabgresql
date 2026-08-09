@@ -3,14 +3,11 @@
 use super::common::*;
 
 fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
-    let LogicalPlan::Query(QueryPlan {
+    let QueryPlan {
         columns,
         projections,
         ..
-    }) = bound(sql)
-    else {
-        panic!("expected Query");
-    };
+    } = bound(sql).expect_query();
     (columns[0].clone(), projections[0].clone())
 }
 
@@ -81,9 +78,7 @@ fn non_boolean_when_condition_is_42804() {
 
 /// The first projected expression of a bound `SELECT`.
 fn first_projection(sql: &str) -> BoundExpr {
-    let LogicalPlan::Query(QueryPlan { projections, .. }) = bound(sql) else {
-        panic!("expected Query");
-    };
+    let QueryPlan { projections, .. } = bound(sql).expect_query();
     projections.into_iter().next().expect("no projections")
 }
 

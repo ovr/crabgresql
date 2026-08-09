@@ -63,9 +63,7 @@ fn insert_table_source_binds_as_query() -> anyhow::Result<()> {
 
 #[test]
 fn table_statement_binds_select_star() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("TABLE t")? else {
-        panic!("expected a Query plan");
-    };
+    let QueryPlan { columns, .. } = bind_one("TABLE t")?.expect_query();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "big", "name", "flag"]);
     Ok(())

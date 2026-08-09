@@ -4,11 +4,7 @@ use super::common::*;
 
 #[test]
 fn standalone_values_binds_to_values_plan() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { columns, rows, .. }) =
-        bind_one("VALUES (1, 'a'), (2, 'b')")?
-    else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { columns, rows, .. } = bind_one("VALUES (1, 'a'), (2, 'b')")?.expect_values();
     assert_eq!(columns.len(), 2);
     assert_eq!(columns[0].name, "column1");
     assert_eq!(columns[1].name, "column2");
@@ -27,11 +23,7 @@ fn values_uneven_row_lengths_error() {
 fn values_common_type_keeps_real_over_int() -> anyhow::Result<()> {
     // PG's select_common_type resolves (real, int4) to real, not float8
     // (int4 implicitly casts to real). Contrast with operator resolution.
-    let LogicalPlan::Values(ValuesPlan { columns, .. }) =
-        bind_one("VALUES (CAST(1.5 AS real)), (2)")?
-    else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { columns, .. } = bind_one("VALUES (CAST(1.5 AS real)), (2)")?.expect_values();
     assert_eq!(columns[0].ty, PgType::Float4);
 
     Ok(())
@@ -39,11 +31,8 @@ fn values_common_type_keeps_real_over_int() -> anyhow::Result<()> {
 
 #[test]
 fn derived_table_binds_to_subquery_plan() -> anyhow::Result<()> {
-    let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
-        bind_one("SELECT x FROM (VALUES (1), (2)) v(x)")?
-    else {
-        panic!("expected Subquery");
-    };
+    let SubqueryPlan { columns, .. } =
+        bind_one("SELECT x FROM (VALUES (1), (2)) v(x)")?.expect_subquery();
     assert_eq!(columns[0].name, "x");
 
     Ok(())
@@ -58,11 +47,8 @@ fn derived_table_requires_alias() {
 
 #[test]
 fn cte_reference_resolves_to_subquery() -> anyhow::Result<()> {
-    let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
-        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
-    else {
-        panic!("expected Subquery");
-    };
+    let SubqueryPlan { columns, .. } =
+        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?.expect_subquery();
     assert_eq!(columns[0].name, "x");
 
     Ok(())
@@ -119,11 +105,8 @@ fn with_recursive_is_rejected() {
 #[test]
 fn cte_shadows_a_real_table() -> anyhow::Result<()> {
     // `t` here is the CTE, not the base table `t`; its column is `x`.
-    let LogicalPlan::Subquery(SubqueryPlan { columns, .. }) =
-        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?
-    else {
-        panic!("expected Subquery");
-    };
+    let SubqueryPlan { columns, .. } =
+        bind_one("WITH t(x) AS (VALUES (1)) SELECT x FROM t")?.expect_subquery();
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "x");
 

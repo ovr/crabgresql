@@ -84,28 +84,82 @@ pub(super) fn agg_of(
     }
 }
 
-pub(super) fn plan_name(p: &LogicalPlan) -> &'static str {
-    match p {
-        LogicalPlan::Values(ValuesPlan { .. }) => "Values",
-        LogicalPlan::Query(QueryPlan { .. }) => "Query",
-        LogicalPlan::Append(AppendPlan { .. }) => "Append",
-        LogicalPlan::SetOp(SetOpPlan { .. }) => "SetOp",
-        LogicalPlan::Subquery(SubqueryPlan { .. }) => "Subquery",
-        LogicalPlan::TableFunction(TableFunctionPlan { .. }) => "TableFunction",
-        LogicalPlan::Join(JoinPlan { .. }) => "Join",
-        LogicalPlan::Aggregate(AggregatePlan { .. }) => "Aggregate",
-        LogicalPlan::Window(WindowPlan { .. }) => "Window",
-        LogicalPlan::Limit(LimitPlan { .. }) => "Limit",
-        LogicalPlan::Insert(InsertPlan { .. }) => "Insert",
-        LogicalPlan::Update(UpdatePlan { .. }) => "Update",
-        LogicalPlan::Delete(DeletePlan { .. }) => "Delete",
-    }
+/// Every [`LogicalPlan`] variant, as `method => Variant -> Payload`.
+///
+/// A test that has just bound a statement knows which variant it built, so the
+/// only thing a mismatch can mean is that the expectation is wrong. The
+/// generated extractors say that outright: they consume the plan, hand back the
+/// payload, and panic naming the variant that actually turned up — which the
+/// `let LogicalPlan::Query(QueryPlan { .. }) = … else { panic!("expected
+/// Query") }` blocks they replace could not do.
+macro_rules! plan_variants {
+    ($($method:ident => $variant:ident -> $payload:ident),+ $(,)?) => {
+        /// The variant of `plan`, for assertions and panic messages.
+        pub(super) fn plan_name(plan: &LogicalPlan) -> &'static str {
+            match plan {
+                $(LogicalPlan::$variant(_) => stringify!($variant),)+
+            }
+        }
+
+        /// Consuming, panicking extractors: one per [`LogicalPlan`] variant.
+        ///
+        /// The set is complete on purpose — a test for a variant nothing
+        /// covers yet should find its extractor already here — so some of
+        /// them have no caller at any given time.
+        #[allow(dead_code)]
+        pub(super) trait PlanExt {
+            $(
+                #[doc = concat!(
+                    "The [`", stringify!($payload), "`] of a [`LogicalPlan::",
+                    stringify!($variant), "`]. Panics on any other variant.",
+                )]
+                fn $method(self) -> $payload;
+            )+
+        }
+
+        impl PlanExt for LogicalPlan {
+            $(
+                fn $method(self) -> $payload {
+                    match self {
+                        LogicalPlan::$variant(plan) => plan,
+                        other => panic!(
+                            "expected a {} plan, got {}",
+                            stringify!($variant),
+                            plan_name(&other),
+                        ),
+                    }
+                }
+            )+
+        }
+    };
+}
+
+plan_variants! {
+    expect_values => Values -> ValuesPlan,
+    expect_query => Query -> QueryPlan,
+    expect_append => Append -> AppendPlan,
+    expect_set_op => SetOp -> SetOpPlan,
+    expect_subquery => Subquery -> SubqueryPlan,
+    expect_table_function => TableFunction -> TableFunctionPlan,
+    expect_join => Join -> JoinPlan,
+    expect_aggregate => Aggregate -> AggregatePlan,
+    expect_window => Window -> WindowPlan,
+    expect_limit => Limit -> LimitPlan,
+    expect_insert => Insert -> InsertPlan,
+    expect_update => Update -> UpdatePlan,
+    expect_delete => Delete -> DeletePlan,
+}
+
+/// The extractors are the only report a test gets when a plan is not the shape
+/// it was written for, so the message has to name both sides of the mismatch.
+#[test]
+#[should_panic(expected = "expected a Query plan, got Values")]
+fn a_mismatched_extractor_names_the_variant_it_got() {
+    bound("SELECT 1").expect_query();
 }
 
 /// The first projected expression of a bound FROM-less `SELECT`.
 pub(super) fn one_projection(sql: &str) -> BoundExpr {
-    let LogicalPlan::Values(ValuesPlan { mut rows, .. }) = bound(sql) else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { mut rows, .. } = bound(sql).expect_values();
     rows.remove(0).remove(0)
 }

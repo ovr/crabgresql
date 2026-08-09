@@ -151,12 +151,8 @@ fn substitute_params_reaches_into_a_window_spec() -> anyhow::Result<()> {
     };
     let mut plan = bind_query_with_params(&engine, &catalog, query, &params)?;
     substitute_params(&mut plan, &[Value::Int4(7)]);
-    let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = plan else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
-    let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
-        panic!("expected a Window");
-    };
+    let SubqueryPlan { source, .. } = plan.expect_subquery();
+    let WindowPlan { spec, .. } = source.expect_window();
     assert_eq!(
         spec.partition_by,
         vec![BoundExpr::Const {

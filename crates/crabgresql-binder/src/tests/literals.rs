@@ -63,9 +63,7 @@ fn arithmetic_on_non_numeric_with_unknown_is_42883() {
 
 #[test]
 fn decimal_literal_binds_as_numeric() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 1.5")? else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, .. } = bind_one("SELECT 1.5")?.expect_values();
     let BoundExpr::Const {
         value: Value::Numeric(n),
         ty: PgType::Numeric,
@@ -158,9 +156,7 @@ fn order_by_on_bit_binds() {
 
 #[test]
 fn float_literal_cast_binds() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 'NaN'::float4")? else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, .. } = bind_one("SELECT 'NaN'::float4")?.expect_values();
     let BoundExpr::Const {
         value: Value::Float4(v),
         ty: PgType::Float4,
@@ -212,9 +208,7 @@ fn float_modulo_is_rejected() {
 fn numeric_operators_bind() -> anyhow::Result<()> {
     // Comparison, arithmetic, and modulo all resolve for numeric now.
     assert!(bind_one("SELECT '1'::numeric < '2'::numeric").is_ok());
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 1.5 + 2.25")? else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, .. } = bind_one("SELECT 1.5 + 2.25")?.expect_values();
     assert_eq!(rows[0][0].ty(), PgType::Numeric);
     assert!(bind_one("SELECT 5.5 % 2.0").is_ok());
 
@@ -223,10 +217,7 @@ fn numeric_operators_bind() -> anyhow::Result<()> {
 
 #[test]
 fn int2_arithmetic_binds() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT '1'::int2 + '2'::int2")?
-    else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, .. } = bind_one("SELECT '1'::int2 + '2'::int2")?.expect_values();
     assert_eq!(rows[0][0].ty(), PgType::Int2);
 
     Ok(())
@@ -240,16 +231,10 @@ fn implicit_int_to_float4_function_arg_resolves() {
 
 #[test]
 fn cast_keeps_bare_column_name() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("SELECT id::int8 FROM t")? else {
-        panic!("expected Query");
-    };
+    let QueryPlan { columns, .. } = bind_one("SELECT id::int8 FROM t")?.expect_query();
     assert_eq!(columns[0].name, "id");
     // A constant/nested cast falls back to the target type name.
-    let LogicalPlan::Values(ValuesPlan { columns, .. }) =
-        bind_one("SELECT 'nan'::numeric::float4")?
-    else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { columns, .. } = bind_one("SELECT 'nan'::numeric::float4")?.expect_values();
     assert_eq!(columns[0].name, "float4");
 
     Ok(())

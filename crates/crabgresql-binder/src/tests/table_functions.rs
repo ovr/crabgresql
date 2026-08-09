@@ -4,12 +4,9 @@ use super::common::*;
 
 #[test]
 fn select_where_without_table_binds_predicate() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan {
+    let ValuesPlan {
         rows, predicate, ..
-    }) = bind_one("SELECT 1 WHERE 1 = 2")?
-    else {
-        panic!("expected Values");
-    };
+    } = bind_one("SELECT 1 WHERE 1 = 2")?.expect_values();
     assert_eq!(rows.len(), 1);
     assert!(predicate.is_some());
 
@@ -18,11 +15,8 @@ fn select_where_without_table_binds_predicate() -> anyhow::Result<()> {
 
 #[test]
 fn set_returning_function_in_from_binds_columns() -> anyhow::Result<()> {
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
-        bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, columns, .. } =
+        bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4')")?.expect_table_function();
     assert_eq!(func, crate::TableFn::PgInputErrorInfo);
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
@@ -34,15 +28,13 @@ fn set_returning_function_in_from_binds_columns() -> anyhow::Result<()> {
 #[test]
 fn set_returning_function_projects_and_filters() -> anyhow::Result<()> {
     // A subset projection over the SRF's columns resolves like a table.
-    let LogicalPlan::TableFunction(TableFunctionPlan {
+    let TableFunctionPlan {
         columns, predicate, ..
-    }) = bind_one(
+    } = bind_one(
         "SELECT sql_error_code FROM pg_input_error_info('1e400', 'float4') \
          WHERE message IS NOT NULL",
     )?
-    else {
-        panic!("expected TableFunction");
-    };
+    .expect_table_function();
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "sql_error_code");
     assert!(predicate.is_some());
@@ -59,11 +51,8 @@ fn unknown_set_returning_function_is_42883() {
 
 #[test]
 fn generate_series_in_from_binds_int4_column() -> anyhow::Result<()> {
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
-        bind_one("SELECT * FROM generate_series(1, 5)")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, columns, .. } =
+        bind_one("SELECT * FROM generate_series(1, 5)")?.expect_table_function();
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "generate_series");
@@ -75,11 +64,8 @@ fn generate_series_in_from_binds_int4_column() -> anyhow::Result<()> {
 #[test]
 fn generate_series_widens_to_int8() -> anyhow::Result<()> {
     // A bigint bound widens the whole series to int8.
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
-        bind_one("SELECT * FROM generate_series(1, 5000000000)")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, columns, .. } =
+        bind_one("SELECT * FROM generate_series(1, 5000000000)")?.expect_table_function();
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int8));
     assert_eq!(columns[0].ty, PgType::Int8);
 
@@ -88,11 +74,8 @@ fn generate_series_widens_to_int8() -> anyhow::Result<()> {
 
 #[test]
 fn generate_series_three_arg_step_binds() -> anyhow::Result<()> {
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, args, .. }) =
-        bind_one("SELECT * FROM generate_series(1, 10, 3)")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, args, .. } =
+        bind_one("SELECT * FROM generate_series(1, 10, 3)")?.expect_table_function();
     assert_eq!(func, crate::TableFn::GenerateSeries(PgType::Int4));
     assert_eq!(args.len(), 3);
 
@@ -129,11 +112,8 @@ fn table_fn_bare_alias_names_the_output_column() -> anyhow::Result<()> {
 
 #[test]
 fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
-    let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
-        bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { columns, .. } =
+        bind_one("SELECT g FROM generate_series(1, 3) AS s(g)")?.expect_table_function();
     assert_eq!(columns[0].name, "g");
     // A list longer than the rowset is still 42P10.
     let e = bind_err("SELECT * FROM generate_series(1, 3) AS s(a, b)");
@@ -146,11 +126,9 @@ fn table_fn_alias_column_list_wins_over_bare_alias() -> anyhow::Result<()> {
 fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
     // `pg_input_error_info` returns a record: the alias names the relation
     // only, and the row type's column names survive.
-    let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
+    let TableFunctionPlan { columns, .. } =
         bind_one("SELECT * FROM pg_input_error_info('1e400', 'float4') AS e")?
-    else {
-        panic!("expected TableFunction");
-    };
+            .expect_table_function();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["message", "detail", "hint", "sql_error_code"]);
 
@@ -161,9 +139,7 @@ fn composite_table_fn_bare_alias_does_not_rename() -> anyhow::Result<()> {
 fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
     // The rename is specific to scalar function FROM items — a bare alias on
     // a real relation names the relation and nothing else.
-    let LogicalPlan::Query(QueryPlan { columns, .. }) = bind_one("SELECT * FROM t AS x")? else {
-        panic!("expected Query");
-    };
+    let QueryPlan { columns, .. } = bind_one("SELECT * FROM t AS x")?.expect_query();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["id", "big", "name", "flag"]);
 
@@ -172,22 +148,16 @@ fn base_table_bare_alias_does_not_rename_columns() -> anyhow::Result<()> {
 
 #[test]
 fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) =
-        bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, columns, .. } =
+        bind_one("SELECT * FROM unnest(ARRAY[1, 2, 3])")?.expect_table_function();
     assert_eq!(func, crate::TableFn::Unnest(PgType::Int4));
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "unnest");
     assert_eq!(columns[0].ty, PgType::Int4);
 
     // And the alias renames it, like any other scalar SRF.
-    let LogicalPlan::TableFunction(TableFunctionPlan { columns, .. }) =
-        bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?
-    else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { columns, .. } =
+        bind_one("SELECT u FROM unnest(ARRAY['a', 'b']) AS u")?.expect_table_function();
     assert_eq!(columns[0].name, "u");
 
     Ok(())
@@ -256,15 +226,12 @@ fn unnest_in_from_rejects_unsupported_forms() {
 #[test]
 fn generate_series_in_target_list_is_srf_projection() -> anyhow::Result<()> {
     // A FROM-less SRF in the target list expands over a single dummy row.
-    let LogicalPlan::Subquery(SubqueryPlan {
+    let SubqueryPlan {
         columns,
         projections,
         source,
         ..
-    }) = bind_one("SELECT generate_series(1, 5)")?
-    else {
-        panic!("expected Subquery over a single-row source");
-    };
+    } = bind_one("SELECT generate_series(1, 5)")?.expect_subquery();
     assert_eq!(columns.len(), 1);
     assert_eq!(columns[0].name, "generate_series");
     assert_eq!(columns[0].ty, PgType::Int4);
@@ -277,11 +244,8 @@ fn generate_series_in_target_list_is_srf_projection() -> anyhow::Result<()> {
 #[test]
 fn generate_series_in_target_list_over_table() -> anyhow::Result<()> {
     // Mixed scalar + SRF projection over a base table stays a Query.
-    let LogicalPlan::Query(QueryPlan { projections, .. }) =
-        bind_one("SELECT id, generate_series(1, 2) FROM t")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { projections, .. } =
+        bind_one("SELECT id, generate_series(1, 2) FROM t")?.expect_query();
     assert!(matches!(projections[0], BoundExpr::ColumnRef { .. }));
     assert!(matches!(projections[1], BoundExpr::Srf { .. }));
 
@@ -289,9 +253,7 @@ fn generate_series_in_target_list_over_table() -> anyhow::Result<()> {
 }
 
 fn table_fn(sql: &str) -> (crate::TableFn, Vec<OutputColumn>) {
-    let LogicalPlan::TableFunction(TableFunctionPlan { func, columns, .. }) = bound(sql) else {
-        panic!("expected TableFunction");
-    };
+    let TableFunctionPlan { func, columns, .. } = bound(sql).expect_table_function();
     (func, columns)
 }
 

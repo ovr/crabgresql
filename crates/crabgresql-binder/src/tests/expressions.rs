@@ -4,10 +4,7 @@ use super::common::*;
 
 #[test]
 fn resolves_columns_to_indices() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { projections, .. }) = bind_one("SELECT name, id FROM t")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { projections, .. } = bind_one("SELECT name, id FROM t")?.expect_query();
     assert_eq!(
         projections,
         vec![
@@ -123,11 +120,7 @@ fn where_must_be_boolean() {
 
 #[test]
 fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { predicate, .. }) =
-        bind_one("SELECT id FROM t WHERE id = big")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { predicate, .. } = bind_one("SELECT id FROM t WHERE id = big")?.expect_query();
     let Some(BoundExpr::Binary {
         op: BinOp::Eq,
         arg_ty: PgType::Int8,
@@ -153,11 +146,7 @@ fn int4_int8_comparison_promotes_via_coerce() -> anyhow::Result<()> {
 
 #[test]
 fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { predicate, .. }) =
-        bind_one("SELECT id FROM t WHERE big = '5'")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { predicate, .. } = bind_one("SELECT id FROM t WHERE big = '5'")?.expect_query();
     let Some(BoundExpr::Binary { arg_ty, right, .. }) = predicate else {
         panic!("expected comparison");
     };
@@ -175,11 +164,8 @@ fn unknown_literal_takes_type_from_other_side() -> anyhow::Result<()> {
 
 #[test]
 fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { predicate, .. }) =
-        bind_one("SELECT id FROM t WHERE id BETWEEN 1 AND 3")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { predicate, .. } =
+        bind_one("SELECT id FROM t WHERE id BETWEEN 1 AND 3")?.expect_query();
     // `x BETWEEN low AND high` -> `(x >= low) AND (x <= high)`.
     let Some(BoundExpr::Binary {
         op: BinOp::And,
@@ -210,11 +196,8 @@ fn between_desugars_to_gte_and_lte() -> anyhow::Result<()> {
 
 #[test]
 fn not_between_desugars_to_lt_or_gt() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { predicate, .. }) =
-        bind_one("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { predicate, .. } =
+        bind_one("SELECT id FROM t WHERE id NOT BETWEEN 1 AND 3")?.expect_query();
     // `x NOT BETWEEN low AND high` -> `(x < low) OR (x > high)`.
     let Some(BoundExpr::Binary {
         op: BinOp::Or,
@@ -254,9 +237,7 @@ fn unparsable_unknown_literal_is_22p02() {
 
 #[test]
 fn unknown_vs_unknown_comparison_falls_back_to_text() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = bind_one("SELECT 'a' = 'b'")? else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, .. } = bind_one("SELECT 'a' = 'b'")?.expect_values();
     assert_eq!(rows.len(), 1);
     let BoundExpr::Binary { arg_ty, .. } = &rows[0][0] else {
         panic!("expected comparison");
@@ -357,10 +338,7 @@ fn logic_operands_must_be_boolean() {
 
 #[test]
 fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
-    let LogicalPlan::Values(ValuesPlan { rows, columns, .. }) = bind_one("SELECT -2147483648")?
-    else {
-        panic!("expected Values");
-    };
+    let ValuesPlan { rows, columns, .. } = bind_one("SELECT -2147483648")?.expect_values();
     assert_eq!(
         rows[0][0],
         BoundExpr::Const {
@@ -375,11 +353,8 @@ fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
 
 #[test]
 fn output_column_names_follow_pg() -> anyhow::Result<()> {
-    let LogicalPlan::Query(QueryPlan { columns, .. }) =
-        bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?
-    else {
-        panic!("expected Query");
-    };
+    let QueryPlan { columns, .. } =
+        bind_one("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?.expect_query();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["id", "name", "next", "?column?", "bool"]);
 

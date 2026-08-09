@@ -8,14 +8,11 @@ use super::common::*;
 /// into that row.
 #[test]
 fn a_window_call_becomes_a_column_ref_past_the_input_row() {
-    let LogicalPlan::Subquery(SubqueryPlan {
+    let SubqueryPlan {
         source,
         projections,
         ..
-    }) = bound("SELECT id, rank() OVER (ORDER BY name) FROM t")
-    else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
+    } = bound("SELECT id, rank() OVER (ORDER BY name) FROM t").expect_subquery();
     // `t` is four columns wide, so the single window slot is index 4.
     assert_eq!(
         projections,
@@ -30,15 +27,12 @@ fn a_window_call_becomes_a_column_ref_past_the_input_row() {
             },
         ]
     );
-    let LogicalPlan::Window(WindowPlan {
+    let WindowPlan {
         funcs,
         input_width,
         output_width,
         ..
-    }) = *source
-    else {
-        panic!("expected a Window");
-    };
+    } = source.expect_window();
     assert_eq!((input_width, output_width), (4, 5));
     assert_eq!(funcs.len(), 1);
     assert_eq!(funcs[0].slot, 4);
@@ -49,15 +43,12 @@ fn a_window_call_becomes_a_column_ref_past_the_input_row() {
 /// not produce two.
 #[test]
 fn calls_sharing_a_spec_collapse_into_one_window_step() {
-    let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
+    let SubqueryPlan { source, .. } = bound(
         "SELECT rank() OVER w1, sum(big) OVER w2 FROM t \
          WINDOW w1 AS (ORDER BY name), w2 AS (ORDER BY name)",
-    ) else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
-    let LogicalPlan::Window(WindowPlan { source, funcs, .. }) = *source else {
-        panic!("expected a Window");
-    };
+    )
+    .expect_subquery();
+    let WindowPlan { source, funcs, .. } = source.expect_window();
     assert_eq!(funcs.len(), 2, "both calls land on the same step");
     assert!(
         !matches!(*source, LogicalPlan::Window(WindowPlan { .. })),
@@ -71,19 +62,14 @@ fn calls_sharing_a_spec_collapse_into_one_window_step() {
 /// ORDER BY of its own returns rows in.
 #[test]
 fn the_widest_window_spec_is_evaluated_first() {
-    let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
+    let SubqueryPlan { source, .. } = bound(
         "SELECT rank() OVER (ORDER BY name), \
          sum(big) OVER (PARTITION BY id ORDER BY name) FROM t",
-    ) else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
-    let LogicalPlan::Window(WindowPlan { source, spec, .. }) = *source else {
-        panic!("expected a Window");
-    };
+    )
+    .expect_subquery();
+    let WindowPlan { source, spec, .. } = source.expect_window();
     assert_eq!(spec.partition_by.len(), 0, "the 1-key spec is on top");
-    let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
-        panic!("expected a second Window below the first");
-    };
+    let WindowPlan { spec, .. } = source.expect_window();
     assert_eq!(
         spec.partition_by.len(),
         1,
@@ -96,19 +82,13 @@ fn the_widest_window_spec_is_evaluated_first() {
 /// the window reads that row.
 #[test]
 fn a_window_can_sit_over_a_grouped_aggregate() {
-    let LogicalPlan::Subquery(SubqueryPlan { source, .. }) =
-        bound("SELECT sum(sum(big)) OVER (ORDER BY name) FROM t GROUP BY name")
-    else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
-    let LogicalPlan::Window(WindowPlan {
+    let SubqueryPlan { source, .. } =
+        bound("SELECT sum(sum(big)) OVER (ORDER BY name) FROM t GROUP BY name").expect_subquery();
+    let WindowPlan {
         source,
         input_width,
         ..
-    }) = *source
-    else {
-        panic!("expected a Window");
-    };
+    } = source.expect_window();
     // One group key plus one aggregate.
     assert_eq!(input_width, 2);
     assert!(matches!(
@@ -121,15 +101,12 @@ fn a_window_can_sit_over_a_grouped_aggregate() {
 /// `bind_order_by` already appended, so extraction sweeps it up for free.
 #[test]
 fn a_window_in_order_by_lands_in_a_hidden_column() {
-    let LogicalPlan::Subquery(SubqueryPlan {
+    let SubqueryPlan {
         columns,
         projections,
         sort,
         ..
-    }) = bound("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)")
-    else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
+    } = bound("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)").expect_subquery();
     assert_eq!(columns.len(), 1, "one visible output column");
     assert_eq!(projections.len(), 2, "plus one hidden sort column");
     assert_eq!(sort.len(), 1);
@@ -402,16 +379,13 @@ fn the_leftmost_offender_is_the_one_reported() {
 /// the plan and fails at evaluation.
 #[test]
 fn a_table_query_order_by_a_window_builds_a_window_chain() {
-    let LogicalPlan::Subquery(SubqueryPlan {
+    let SubqueryPlan {
         source,
         columns,
         projections,
         sort,
         ..
-    }) = bound("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)")
-    else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
+    } = bound("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)").expect_subquery();
     assert!(matches!(*source, LogicalPlan::Window(WindowPlan { .. })));
     assert_eq!(columns.len(), 4, "t's own columns stay visible");
     assert_eq!(projections.len(), 5, "plus the hidden sort column");
@@ -427,15 +401,12 @@ fn a_table_query_order_by_a_window_builds_a_window_chain() {
 /// self or forward reference report "does not exist", as PG does.
 #[test]
 fn a_named_window_expands_its_base_at_build_time() {
-    let LogicalPlan::Subquery(SubqueryPlan { source, .. }) = bound(
+    let SubqueryPlan { source, .. } = bound(
         "SELECT rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY name), \
          w2 AS (w1 ORDER BY id)",
-    ) else {
-        panic!("expected a Subquery wrapping the window chain");
-    };
-    let LogicalPlan::Window(WindowPlan { spec, .. }) = *source else {
-        panic!("expected a Window");
-    };
+    )
+    .expect_subquery();
+    let WindowPlan { spec, .. } = source.expect_window();
     assert_eq!(spec.partition_by.len(), 1, "w1's PARTITION BY is inherited");
     assert_eq!(spec.order_by.len(), 1);
 

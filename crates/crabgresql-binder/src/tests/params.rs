@@ -31,9 +31,7 @@ fn declared_param_binds_and_reports_its_type() {
     let (plan, ctx) = bind_params("SELECT $1", vec![Some(PgType::Int4)]);
     let plan = plan.expect("declared $1 binds");
     assert_eq!(param_types(&ctx), vec![Some(PgType::Int4)]);
-    let LogicalPlan::Values(ValuesPlan { rows, .. }) = plan else {
-        panic!("expected Values for a FROM-less SELECT");
-    };
+    let ValuesPlan { rows, .. } = plan.expect_values();
     assert_eq!(
         rows[0][0],
         BoundExpr::Param {
