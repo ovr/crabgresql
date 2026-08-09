@@ -25,8 +25,7 @@ FROM ${BIN_SOURCE} AS binary
 
 FROM debian:trixie-slim
 
-# 999 is where Debian starts allocating system uids downward, and what the
-# official postgres image pins for the same reason.
+# 999 is where Debian starts allocating system uids downward.
 RUN groupadd --system --gid 999 crabgresql \
     && useradd --system --uid 999 --gid 999 --home-dir /var/lib/crabgresql \
        --shell /usr/sbin/nologin crabgresql \
@@ -48,7 +47,5 @@ USER crabgresql
 WORKDIR /var/lib/crabgresql
 
 # Exec form: under a shell the server would never see SIGTERM, and `docker
-# stop` would end in SIGKILL, which leaves the control file dirty. SIGTERM
-# rather than the postgres image's SIGINT, because this server treats the two
-# the same and has no smart-shutdown mode to avoid.
+# stop` would end in SIGKILL, which leaves the control file dirty.
 ENTRYPOINT ["crabgresql"]

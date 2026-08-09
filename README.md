@@ -125,10 +125,10 @@ it on a trusted network — or set `CRABGRESQL_LISTEN_ADDRESS` back to
 above works as a `-e` flag.
 
 The data directory is `/var/lib/crabgresql`, owned by the `crabgresql` user
-(uid 999), which the server also runs as — unlike the official postgres image,
-the container never starts as root, so a *bind*-mounted data directory has to
-be `chown 999` on the host first (a named volume inherits the ownership and
-needs nothing). Under Kubernetes, spell that uid out as `runAsUser: 999`:
+(uid 999), which the server also runs as. The container never starts as root,
+so a *bind*-mounted data directory has to be `chown 999` on the host first (a
+named volume inherits the ownership and needs nothing). Under Kubernetes,
+spell that uid out as `runAsUser: 999`:
 `runAsNonRoot` alone rejects an image whose user is a name it cannot resolve.
 `docker stop`
 is a clean shutdown: the server handles SIGTERM and flushes, which is what
