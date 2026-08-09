@@ -126,6 +126,34 @@ jobs:
           echo "smoke: ${{ steps.smoke.outcome }}, upstream: ${{ steps.upstream.outcome }}"
           exit 1
 
+  # Builds the image the same way `docker build .` does and runs the same smoke
+  # script the release workflow runs before it pushes anything. The release
+  # image takes the `BIN_SOURCE=prebuilt` path through the same Dockerfile, so
+  # what this proves about the runtime stage — reachable port, non-root user,
+  # clean SIGTERM shutdown, volume that outlives the container — holds there
+  # too; what it does not cover is the compile-from-source path being skipped,
+  # which is why this job builds from source and the release one does not.
+  # amd64 only: arm64 here would mean QEMU, and the release workflow builds
+  # that architecture natively anyway.
+  docker:
+    name: docker image
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: crabgresql:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: smoke
+        run: scripts/docker-smoke.sh crabgresql:ci
+
   # The benchmark jobs below report numbers but gate only on breakage: a query
   # that errored or timed out, or a pgbench run with failed transactions.
   # Timing thresholds are deliberately absent — a shared runner's variance is

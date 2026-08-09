@@ -1,0 +1,31 @@
+# What the image build needs is the workspace as cargo sees it: every member
+# manifest (including `vendor/ryu`, or `cargo metadata` fails on a missing
+# member) and `vendor/postgres/catalog`, which `crabgresql-catalog/build.rs`
+# reads through a path relative to its own manifest. Excluding either breaks
+# the build rather than slowing it down.
+
+# Build output — the host's `target/` is for the host's triple and is the
+# single largest thing in the tree.
+/target
+
+# Repository plumbing that no compilation reads.
+.git
+.github
+.claude
+.context
+.idea
+.gitkeep
+
+# The PostgreSQL regression corpus: ~19 MB, used by `crabgresql-pg-regress`,
+# which the image does not build. The catalog `.dat` files next to it stay.
+vendor/postgres/regress
+
+# Benchmark harness data and scripts — CI territory, not the server image.
+scripts/bench
+
+# Prose. `README.md` stays: `crabgresql-config` reads it to check that its
+# Configuration table still matches the knobs.
+AGENTS.md
+CLAUDE.md
+ROADMAP.md
+docs
