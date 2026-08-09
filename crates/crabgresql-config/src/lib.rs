@@ -8,10 +8,10 @@
 //! their prose copy.
 //!
 //! Only the knobs this crate reads itself go through [`RangedVar`]. The
-//! server's port and data directory are clap arguments that happen to take an
-//! environment fallback, and `RUST_LOG` belongs to `tracing_subscriber`; those
-//! three are here as names and defaults only, and they keep their own
-//! (stricter, exit-on-bad-input) behavior.
+//! server's listen address, port and data directory are clap arguments that
+//! happen to take an environment fallback, and `RUST_LOG` belongs to
+//! `tracing_subscriber`; those are here as names and defaults only, and they
+//! keep their own (stricter, exit-on-bad-input) behavior.
 //!
 //! Cargo's own build-time variables (`OUT_DIR`, `CARGO_MANIFEST_DIR`,
 //! `CARGO_TARGET_TMPDIR`) are deliberately absent — they are an interface with
@@ -26,6 +26,9 @@ use std::time::Duration;
 
 /// TCP port the server listens on.
 pub const PORT: &str = "CRABGRESQL_PORT";
+/// Address the server accepts connections on. Loopback by default: the only
+/// authentication method is trust and there is no TLS.
+pub const LISTEN_ADDRESS: &str = "CRABGRESQL_LISTEN_ADDRESS";
 /// Data directory the durable heap engine is opened in. Spelled `PGDATA` to
 /// match PostgreSQL, since the same directory serves the same purpose.
 pub const DATA_DIR: &str = "PGDATA";
@@ -40,6 +43,8 @@ pub const LOG_FILTER: &str = "RUST_LOG";
 
 /// One above PostgreSQL's 5432, so a local PostgreSQL can keep running.
 pub const DEFAULT_PORT: u16 = 5433;
+/// Used when neither `--listen-address` nor [`LISTEN_ADDRESS`] is given.
+pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1";
 /// Used when neither `--data-dir` nor [`DATA_DIR`] is given.
 pub const DEFAULT_DATA_DIR: &str = "./pgdata";
 /// Used when [`LOG_FILTER`] is unset or unparseable.

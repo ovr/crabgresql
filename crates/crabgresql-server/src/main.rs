@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -8,6 +9,16 @@ use tokio::net::TcpListener;
 #[derive(Parser)]
 #[command(name = "crabgresql", version)]
 struct Cli {
+    /// Address to accept connections on. Loopback by default: authentication is
+    /// trust and there is no TLS, so exposing the port is opt-in.
+    #[arg(
+        long = "listen-address",
+        short = 'l',
+        env = config::LISTEN_ADDRESS,
+        default_value = config::DEFAULT_LISTEN_ADDRESS
+    )]
+    listen_address: IpAddr,
+
     /// Port to listen on. Defaults one above PG's 5432 so a local PostgreSQL can
     /// keep running.
     #[arg(long, short = 'p', env = config::PORT, default_value_t = config::DEFAULT_PORT)]
@@ -70,10 +81,21 @@ async fn main() -> std::io::Result<()> {
     // control file dirty and reset them).
     let engine_for_shutdown = engine.clone();
 
-    let listener = TcpListener::bind(("127.0.0.1", cli.port)).await?;
+    // Anything but loopback hands every reachable client a superuser session.
+    if !cli.listen_address.is_loopback() {
+        tracing::warn!(
+            "listening on {} — connections are unauthenticated (trust) and \
+             unencrypted; expose this only on a trusted network",
+            cli.listen_address
+        );
+    }
+
+    let listener = TcpListener::bind((cli.listen_address, cli.port)).await?;
     tracing::info!(
-        "crabgresql listening on 127.0.0.1:{} (try: psql -h 127.0.0.1 -p {})",
+        "crabgresql listening on {}:{} (try: psql -h {} -p {})",
+        cli.listen_address,
         cli.port,
+        cli.listen_address,
         cli.port
     );
 

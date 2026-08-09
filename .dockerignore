@@ -1,0 +1,15 @@
+# `vendor/postgres/catalog` and `vendor/ryu` must stay: build.rs reads the
+# former, and cargo fails on the latter as a missing workspace member.
+/target
+.git
+.github
+.claude
+.context
+.idea
+.gitkeep
+vendor/postgres/regress
+scripts/bench
+AGENTS.md
+CLAUDE.md
+ROADMAP.md
+docs

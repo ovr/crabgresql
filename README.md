@@ -70,6 +70,7 @@ not parse falls back to its default rather than failing startup.
 | Variable | Default | Range | Controls |
 | --- | --- | --- | --- |
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
+| `CRABGRESQL_LISTEN_ADDRESS` | `127.0.0.1` | | address to accept connections on (also `--listen-address`). Loopback by default: authentication is trust and there is no TLS, so anything reachable on this port is a superuser |
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
 | `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |
@@ -103,6 +104,37 @@ ID that bounds what a flush is allowed to reclaim.
 The `CRABGRESQL_BUFFER_*` knobs are environment variables rather than GUCs
 because a `SET` is session-scoped and the flush worker is process-wide; moving
 them to real storage settings is a follow-up.
+
+## Docker
+
+```console
+$ docker run --rm -p 5433:5433 -v crabgresql-data:/var/lib/crabgresql ovr/crabgresql:latest
+$ psql -h 127.0.0.1 -p 5433
+```
+
+Images are published to [Docker Hub](https://hub.docker.com/r/ovr/crabgresql)
+for `linux/amd64` and `linux/arm64` on every `v*` tag, alongside tarballs of
+the binary attached to the GitHub Release (glibc builds from the CI runners —
+for an older distribution, use the image).
+
+**The image listens on `0.0.0.0`, authenticates with trust, and speaks
+cleartext.** Anything that can reach the published port is a superuser, so keep
+it on a trusted network — or set `CRABGRESQL_LISTEN_ADDRESS` back to
+`127.0.0.1` and reach it another way. Everything in the Configuration table
+above works as a `-e` flag.
+
+The data directory is `/var/lib/crabgresql`, owned by the `crabgresql` user
+(uid 999), which the server also runs as. The container never starts as root,
+so a *bind*-mounted data directory has to be `chown 999` on the host first (a
+named volume inherits the ownership and needs nothing). Under Kubernetes,
+spell that uid out as `runAsUser: 999`:
+`runAsNonRoot` alone rejects an image whose user is a name it cannot resolve.
+`docker stop`
+is a clean shutdown: the server handles SIGTERM and flushes, which is what
+keeps unlogged tables across a restart. There is no `HEALTHCHECK` — the image
+ships no client — so probe the port from outside if you need one.
+
+Building it yourself: `docker build -t crabgresql .`
 
 ## PostgreSQL regression tests
 
