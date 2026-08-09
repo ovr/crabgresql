@@ -7,9 +7,9 @@ fn insert_coerces_cells_to_column_types() -> anyhow::Result<()> {
     let LogicalPlan::Insert(InsertPlan {
         source: InsertSource::Values(rows),
         ..
-    }) = bind_one("INSERT INTO t (id, name) VALUES ('7', 'x')")?
+    }) = bound("INSERT INTO t (id, name) VALUES ('7', 'x')")?
     else {
-        panic!("expected Insert with a VALUES source");
+        bail!("expected Insert with a VALUES source");
     };
     // Full-width row in schema order, missing columns padded with NULL.
     assert_eq!(rows[0].len(), 4);
@@ -32,54 +32,59 @@ fn insert_coerces_cells_to_column_types() -> anyhow::Result<()> {
 }
 
 #[test]
-fn insert_type_mismatch_is_42804_with_column_context() {
-    let e = bind_err("INSERT INTO t (flag) VALUES (1)");
+fn insert_type_mismatch_is_42804_with_column_context() -> anyhow::Result<()> {
+    let e = bind_err("INSERT INTO t (flag) VALUES (1)")?;
     assert_eq!(e.code, "42804");
     assert_eq!(
         e.message,
         "column \"flag\" is of type boolean but expression is of type integer"
     );
+    Ok(())
 }
 
 #[test]
-fn insert_column_refs_in_values_are_undefined() {
-    let e = bind_err("INSERT INTO t (id) VALUES (id)");
+fn insert_column_refs_in_values_are_undefined() -> anyhow::Result<()> {
+    let e = bind_err("INSERT INTO t (id) VALUES (id)")?;
     assert_eq!(e.code, "42703");
+    Ok(())
 }
 
 #[test]
-fn update_binds_assignments_by_index() {
+fn update_binds_assignments_by_index() -> anyhow::Result<()> {
     let UpdatePlan {
         assignments,
         predicate,
         ..
-    } = bound_update("UPDATE t SET name = 'x', id = id + 1 WHERE flag");
+    } = bound_update("UPDATE t SET name = 'x', id = id + 1 WHERE flag")?;
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0].0, 2);
     assert_eq!(assignments[1].0, 0);
     assert!(predicate.is_some());
+    Ok(())
 }
 
 #[test]
-fn update_duplicate_assignment_is_42601() {
-    let e = bind_err("UPDATE t SET id = 1, id = 2");
+fn update_duplicate_assignment_is_42601() -> anyhow::Result<()> {
+    let e = bind_err("UPDATE t SET id = 1, id = 2")?;
     assert_eq!(e.code, "42601");
     assert_eq!(e.message, "multiple assignments to same column \"id\"");
+    Ok(())
 }
 
 #[test]
-fn update_unknown_column_names_the_relation() {
-    let e = bind_err("UPDATE t SET nope = 1");
+fn update_unknown_column_names_the_relation() -> anyhow::Result<()> {
+    let e = bind_err("UPDATE t SET nope = 1")?;
     assert_eq!(e.code, "42703");
     assert_eq!(
         e.message,
         "column \"nope\" of relation \"t\" does not exist"
     );
+    Ok(())
 }
 
 #[test]
-fn update_assignment_coerces_to_column_type() {
-    let UpdatePlan { assignments, .. } = bound_update("UPDATE t SET id = big");
+fn update_assignment_coerces_to_column_type() -> anyhow::Result<()> {
+    let UpdatePlan { assignments, .. } = bound_update("UPDATE t SET id = big")?;
     assert_eq!(
         assignments[0].1,
         BoundExpr::Coerce {
@@ -90,23 +95,26 @@ fn update_assignment_coerces_to_column_type() {
             ty: PgType::Int4,
         }
     );
+    Ok(())
 }
 
 #[test]
-fn delete_binds_predicate() {
-    let DeletePlan { predicate, .. } = bound_delete("DELETE FROM t WHERE id = 1");
+fn delete_binds_predicate() -> anyhow::Result<()> {
+    let DeletePlan { predicate, .. } = bound_delete("DELETE FROM t WHERE id = 1")?;
     assert!(predicate.is_some());
-    let DeletePlan { predicate, .. } = bound_delete("DELETE FROM t");
+    let DeletePlan { predicate, .. } = bound_delete("DELETE FROM t")?;
     assert!(predicate.is_none());
+    Ok(())
 }
 
 #[test]
-fn unsupported_forms_stay_0a000() {
+fn unsupported_forms_stay_0a000() -> anyhow::Result<()> {
     for sql in [
         "UPDATE t SET (id, name) = (1, 'x')",
         "DELETE FROM t USING t AS u",
     ] {
-        let e = bind_err(sql);
+        let e = bind_err(sql)?;
         assert_eq!(e.code, "0A000", "for: {sql}");
     }
+    Ok(())
 }

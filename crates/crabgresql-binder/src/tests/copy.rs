@@ -4,12 +4,10 @@ use super::common::*;
 
 /// Bind a `COPY … FROM stdin` the way the server does, so the fast-path gate
 /// can be inspected from a test.
-fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> CopyFromPlan {
+fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> anyhow::Result<CopyFromPlan> {
     let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
-    let stmts = match crabgresql_parser::parse(sql) {
-        Ok(stmts) => stmts,
-        Err(error) => panic!("invalid SQL test fixture `{sql}`: {error}"),
-    };
+    let stmts = crabgresql_parser::parse(sql)
+        .map_err(|error| anyhow!("invalid SQL test fixture `{sql}`: {error}"))?;
     let ast::Statement::Copy {
         source,
         to,
@@ -19,9 +17,9 @@ fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> CopyFromPlan {
         ..
     } = &stmts[0]
     else {
-        panic!("expected a COPY statement: {sql}");
+        bail!("expected a COPY statement: {sql}");
     };
-    match bind_copy_from(
+    bind_copy_from(
         engine,
         &catalog,
         source,
@@ -29,19 +27,17 @@ fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> CopyFromPlan {
         target,
         options,
         legacy_options,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => panic!("failed to bind `{sql}`: {error}"),
-    }
+    )
+    .with_context(|| format!("binding `{sql}`"))
 }
 
-fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> InsertSource {
+fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> anyhow::Result<InsertSource> {
     let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
-    match plan.build_insert(&catalog, &FmtCtx::utc_default(), rows) {
-        Ok(LogicalPlan::Insert(InsertPlan { source, .. })) => source,
-        Ok(_) => panic!("COPY did not build an Insert"),
-        Err(error) => panic!("failed to build the COPY rows: {error}"),
-    }
+    let InsertPlan { source, .. } = plan
+        .build_insert(&catalog, &FmtCtx::utc_default(), rows)
+        .context("building the COPY rows")?
+        .into_insert()?;
+    Ok(source)
 }
 
 fn field(text: &str) -> Option<String> {
@@ -52,15 +48,15 @@ fn field(text: &str) -> Option<String> {
 /// built only to be torn down again by the executor. This is the whole point
 /// of the fast path, so it is asserted rather than left to the benchmark.
 #[test]
-fn copy_parses_fields_straight_into_values() {
-    let engine = engine_with_table();
-    let plan = copy_plan(&engine, "COPY t FROM stdin");
+fn copy_parses_fields_straight_into_values() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
+    let plan = copy_plan(&engine, "COPY t FROM stdin")?;
     let source = copy_rows(
         &plan,
         vec![vec![field("7"), field("8"), field("hi"), field("t")]],
-    );
+    )?;
     let InsertSource::Tuples { rows, defaults } = source else {
-        panic!("expected a Tuples source");
+        bail!("expected a Tuples source");
     };
     assert!(defaults.is_empty(), "no column here has a default to defer");
     assert_eq!(
@@ -72,6 +68,7 @@ fn copy_parses_fields_straight_into_values() {
             Value::Bool(true),
         ]]
     );
+    Ok(())
 }
 
 /// Every `parse_unknown` arm must return exactly the `Value` variant its
@@ -84,7 +81,7 @@ fn copy_parses_fields_straight_into_values() {
 /// COPY into that column into an `XX000` while the equivalent INSERT kept
 /// working, and nothing else in the suite would notice.
 #[test]
-fn every_column_type_parses_into_the_shape_its_typmod_expects() {
+fn every_column_type_parses_into_the_shape_its_typmod_expects() -> anyhow::Result<()> {
     use crabgresql_types::{Numeric, oid};
 
     // (type, typmod, a literal that type accepts)
@@ -157,15 +154,16 @@ fn every_column_type_parses_into_the_shape_its_typmod_expects() {
         let column = Column::with_typmod("c", ty, typmod);
         let value = match crate::expr::parse_unknown(literal, ty, &fmt) {
             Ok(value) => value,
-            Err(e) => panic!("{ty:?} typmod {typmod} rejected {literal:?}: {e}"),
+            Err(e) => bail!("{ty:?} typmod {typmod} rejected {literal:?}: {e}"),
         };
         if let Err(e) = apply_column_typmod(value, &column) {
-            panic!(
+            bail!(
                 "{ty:?} typmod {typmod}: parse_unknown and apply_column_typmod \
                  disagree on the value shape for {literal:?}: {e}"
             );
         }
     }
+    Ok(())
 }
 
 /// A default that cannot fold — `nextval` on a `serial`, `now()`, a routine
@@ -173,7 +171,7 @@ fn every_column_type_parses_into_the_shape_its_typmod_expects() {
 /// template. Getting this wrong would give every row the same sequence
 /// value.
 #[test]
-fn copy_defers_a_default_that_does_not_fold() {
+fn copy_defers_a_default_that_does_not_fold() -> anyhow::Result<()> {
     let engine = crabgresql_pg_engine::ephemeral_engine();
     let mut stamped = Column::new("stamped", PgType::Timestamp);
     stamped.default = Some("now()".into());
@@ -183,12 +181,12 @@ fn copy_defers_a_default_that_does_not_fold() {
         "d",
         vec![Column::new("id", PgType::Int4), stamped, literal],
     )) {
-        panic!("failed to create the default test table: {error}");
+        bail!("failed to create the default test table: {error}");
     }
     let engine: Arc<dyn TableEngine> = engine;
-    let plan = copy_plan(&engine, "COPY d (id) FROM stdin");
-    let InsertSource::Tuples { rows, defaults } = copy_rows(&plan, vec![vec![field("1")]]) else {
-        panic!("expected a Tuples source");
+    let plan = copy_plan(&engine, "COPY d (id) FROM stdin")?;
+    let InsertSource::Tuples { rows, defaults } = copy_rows(&plan, vec![vec![field("1")]])? else {
+        bail!("expected a Tuples source");
     };
     assert_eq!(
         defaults.len(),
@@ -201,6 +199,7 @@ fn copy_defers_a_default_that_does_not_fold() {
     assert_eq!(rows[0][0], Value::Int4(1));
     assert_eq!(rows[0][1], Value::Null);
     assert_eq!(rows[0][2], Value::Int4(7));
+    Ok(())
 }
 
 /// `name` truncates whatever its typmod says, and a `name` column's is
@@ -211,28 +210,32 @@ fn copy_defers_a_default_that_does_not_fold() {
 /// input that can tell `name`'s byte limit from `varchar(n)`'s character
 /// one — an ASCII string satisfies both.
 #[test]
-fn copy_truncates_a_name_column_despite_its_absent_typmod() {
+fn copy_truncates_a_name_column_despite_its_absent_typmod() -> anyhow::Result<()> {
     let column = Column::new("n", PgType::Name);
     assert_eq!(column.typmod, -1);
-    let stored = |s: String| match apply_column_typmod(Value::Text(s), &column) {
-        Ok(Value::Text(stored)) => stored,
-        other => panic!("a name column must accept text, got {other:?}"),
+    let stored = |s: String| -> anyhow::Result<String> {
+        match apply_column_typmod(Value::Text(s), &column) {
+            Ok(Value::Text(stored)) => Ok(stored),
+            other => bail!("a name column must accept text, got {other:?}"),
+        }
     };
-    assert_eq!(stored("x".repeat(100)).len(), 63);
-    let multibyte = stored("é".repeat(70));
+    assert_eq!(stored("x".repeat(100))?.len(), 63);
+    let multibyte = stored("é".repeat(70))?;
     assert_eq!(multibyte.len(), 62, "clipped on a character boundary");
     assert_eq!(multibyte.chars().count(), 31);
+    Ok(())
 }
 
 /// A NULL never reaches a length rule: it is a NULL in a `char(5)` column,
 /// not five blanks.
 #[test]
-fn copy_leaves_a_null_untouched_by_a_typmod() {
+fn copy_leaves_a_null_untouched_by_a_typmod() -> anyhow::Result<()> {
     // `Column::typmod` is the bare declared length; it is `atttypmod()` that
     // adds the varlena header PostgreSQL's catalog reports.
     let column = Column::with_typmod("c", PgType::Bpchar, 5);
     match apply_column_typmod(Value::Null, &column) {
         Ok(Value::Null) => {}
-        other => panic!("a NULL must pass through a char(5) typmod: {other:?}"),
+        other => bail!("a NULL must pass through a char(5) typmod: {other:?}"),
     }
+    Ok(())
 }

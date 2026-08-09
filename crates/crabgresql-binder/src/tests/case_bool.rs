@@ -2,29 +2,30 @@
 
 use super::common::*;
 
-fn case_column(sql: &str) -> (OutputColumn, BoundExpr) {
+fn case_column(sql: &str) -> anyhow::Result<(OutputColumn, BoundExpr)> {
     let QueryPlan {
         columns,
         projections,
         ..
-    } = bound_query(sql);
-    (columns[0].clone(), projections[0].clone())
+    } = bound_query(sql)?;
+    Ok((columns[0].clone(), projections[0].clone()))
 }
 
 #[test]
-fn case_default_column_name_is_case() {
-    let (col, expr) = case_column("SELECT CASE WHEN flag THEN id END FROM t");
+fn case_default_column_name_is_case() -> anyhow::Result<()> {
+    let (col, expr) = case_column("SELECT CASE WHEN flag THEN id END FROM t")?;
     assert_eq!(col.name, "case");
     assert!(matches!(expr, BoundExpr::Case { .. }));
+    Ok(())
 }
 
 #[test]
-fn case_result_branches_promote_to_common_type() {
+fn case_result_branches_promote_to_common_type() -> anyhow::Result<()> {
     // int4 THEN, int8 ELSE -> int8, with a Coerce inserted on the int4 arm.
-    let (col, expr) = case_column("SELECT CASE WHEN flag THEN id ELSE big END FROM t");
+    let (col, expr) = case_column("SELECT CASE WHEN flag THEN id ELSE big END FROM t")?;
     assert_eq!(col.ty, PgType::Int8);
     let BoundExpr::Case { whens, else_, ty } = expr else {
-        panic!("expected Case");
+        bail!("expected Case");
     };
     assert_eq!(ty, PgType::Int8);
     assert!(matches!(
@@ -41,20 +42,22 @@ fn case_result_branches_promote_to_common_type() {
             ..
         })
     ));
+    Ok(())
 }
 
 #[test]
-fn all_untyped_case_branches_resolve_to_text() {
-    let (col, _) = case_column("SELECT CASE WHEN flag THEN NULL ELSE NULL END FROM t");
+fn all_untyped_case_branches_resolve_to_text() -> anyhow::Result<()> {
+    let (col, _) = case_column("SELECT CASE WHEN flag THEN NULL ELSE NULL END FROM t")?;
     assert_eq!(col.ty, PgType::Text);
+    Ok(())
 }
 
 #[test]
-fn simple_case_desugars_operand_to_equality() {
+fn simple_case_desugars_operand_to_equality() -> anyhow::Result<()> {
     // CASE id WHEN 1 THEN ... becomes a boolean `id = 1` condition.
-    let (_, expr) = case_column("SELECT CASE id WHEN 1 THEN 'a' END FROM t");
+    let (_, expr) = case_column("SELECT CASE id WHEN 1 THEN 'a' END FROM t")?;
     let BoundExpr::Case { whens, .. } = expr else {
-        panic!("expected Case");
+        bail!("expected Case");
     };
     assert!(matches!(
         &whens[0].0,
@@ -64,26 +67,31 @@ fn simple_case_desugars_operand_to_equality() {
             ..
         }
     ));
+    Ok(())
 }
 
 #[test]
-fn non_boolean_when_condition_is_42804() {
-    let e = bind_err("SELECT CASE WHEN id THEN 1 END FROM t");
+fn non_boolean_when_condition_is_42804() -> anyhow::Result<()> {
+    let e = bind_err("SELECT CASE WHEN id THEN 1 END FROM t")?;
     assert_eq!(e.code, "42804");
     assert_eq!(
         e.message,
         "argument of CASE/WHEN must be type boolean, not type integer"
     );
+    Ok(())
 }
 
 /// The first projected expression of a bound `SELECT`.
-fn first_projection(sql: &str) -> BoundExpr {
-    let QueryPlan { projections, .. } = bound_query(sql);
-    projections.into_iter().next().expect("no projections")
+fn first_projection(sql: &str) -> anyhow::Result<BoundExpr> {
+    let QueryPlan { projections, .. } = bound_query(sql)?;
+    projections
+        .into_iter()
+        .next()
+        .with_context(|| format!("`{sql}` projects nothing"))
 }
 
 #[test]
-fn boolean_test_operand_must_be_boolean() {
+fn boolean_test_operand_must_be_boolean() -> anyhow::Result<()> {
     // PG names the clause after the spelling that was used, so each form
     // reports itself.
     for (sql, context) in [
@@ -94,7 +102,7 @@ fn boolean_test_operand_must_be_boolean() {
         ("SELECT id IS UNKNOWN FROM t", "IS UNKNOWN"),
         ("SELECT id IS NOT UNKNOWN FROM t", "IS NOT UNKNOWN"),
     ] {
-        let e = bind_err(sql);
+        let e = bind_err(sql)?;
         assert_eq!(e.code, "42804", "{sql}");
         assert_eq!(
             e.message,
@@ -102,10 +110,11 @@ fn boolean_test_operand_must_be_boolean() {
             "{sql}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn every_boolean_context_points_its_cursor_at_the_operand() {
+fn every_boolean_context_points_its_cursor_at_the_operand() -> anyhow::Result<()> {
     // PG prints `LINE n: ... ^` under the non-boolean operand for all of
     // these, so `to_bool_operand` takes the operand span rather than each
     // caller remembering to stamp one. `operand` is the token the cursor
@@ -121,8 +130,8 @@ fn every_boolean_context_points_its_cursor_at_the_operand() {
         ("SELECT id IS TRUE FROM t", "IS TRUE", "id"),
     ] {
         // The offending operand is the last such token in every fixture.
-        let col = sql.rfind(operand).expect("operand not in fixture") + 1;
-        let e = bind_err(sql);
+        let col = sql.rfind(operand).context("operand not in fixture")? + 1;
+        let e = bind_err(sql)?;
         assert_eq!(e.code, "42804", "{sql}");
         assert_eq!(
             e.message,
@@ -131,27 +140,29 @@ fn every_boolean_context_points_its_cursor_at_the_operand() {
         );
         assert_eq!(e.location, Some((1, col as u64)), "{sql}");
     }
+    Ok(())
 }
 
 #[test]
-fn boolean_test_takes_an_untyped_literal_as_boolean() {
+fn boolean_test_takes_an_untyped_literal_as_boolean() -> anyhow::Result<()> {
     // Unlike IS NULL, which defaults an unknown to text, the boolean tests
     // give it boolean from context — so 'true' parses rather than failing.
     assert!(matches!(
-        first_projection("SELECT 'true' IS TRUE FROM t"),
+        first_projection("SELECT 'true' IS TRUE FROM t")?,
         BoundExpr::BoolTest { .. }
     ));
-    let e = bind_err("SELECT 'a' IS TRUE FROM t");
+    let e = bind_err("SELECT 'a' IS TRUE FROM t")?;
     assert_eq!(e.message, "invalid input syntax for type boolean: \"a\"");
+    Ok(())
 }
 
 #[test]
-fn is_unknown_is_a_bool_test_against_null() {
+fn is_unknown_is_a_bool_test_against_null() -> anyhow::Result<()> {
     // UNKNOWN is the third boolean value, so it rides the same node rather
     // than collapsing into IsNull — which would lose the spelling EXPLAIN
     // has to print back.
     assert!(matches!(
-        first_projection("SELECT flag IS UNKNOWN FROM t"),
+        first_projection("SELECT flag IS UNKNOWN FROM t")?,
         BoundExpr::BoolTest {
             value: None,
             negated: false,
@@ -159,25 +170,27 @@ fn is_unknown_is_a_bool_test_against_null() {
         }
     ));
     assert!(matches!(
-        first_projection("SELECT flag IS NOT UNKNOWN FROM t"),
+        first_projection("SELECT flag IS NOT UNKNOWN FROM t")?,
         BoundExpr::BoolTest {
             value: None,
             negated: true,
             ..
         }
     ));
+    Ok(())
 }
 
 #[test]
-fn incompatible_case_results_are_42804() {
+fn incompatible_case_results_are_42804() -> anyhow::Result<()> {
     // ELSE participates first in unification, matching PG's type order.
-    let e = bind_err("SELECT CASE WHEN flag THEN id ELSE name END FROM t");
+    let e = bind_err("SELECT CASE WHEN flag THEN id ELSE name END FROM t")?;
     assert_eq!(e.code, "42804");
     assert_eq!(e.message, "CASE types text and integer cannot be matched");
+    Ok(())
 }
 
 #[test]
-fn simple_case_untyped_operand_resolves_to_text() {
+fn simple_case_untyped_operand_resolves_to_text() -> anyhow::Result<()> {
     // PG gives an untyped-literal operand its own type (text) before
     // comparing, so a NULL or string operand against an integer WHEN value
     // is `text = integer` (operator does not exist), not a read of the
@@ -186,7 +199,7 @@ fn simple_case_untyped_operand_resolves_to_text() {
         "SELECT CASE NULL WHEN 1 THEN 'a' ELSE 'b' END",
         "SELECT CASE 'x' WHEN 1 THEN 'a' END",
     ] {
-        let e = bind_err(sql);
+        let e = bind_err(sql)?;
         assert_eq!(e.code, "42883", "{sql}");
         assert_eq!(
             e.message, "operator does not exist: text = integer",
@@ -194,5 +207,6 @@ fn simple_case_untyped_operand_resolves_to_text() {
         );
     }
     // Two untyped literals still compare as text (unchanged).
-    assert!(bind_one("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
+    assert!(bound("SELECT CASE 'x' WHEN 'y' THEN 1 ELSE 2 END").is_ok());
+    Ok(())
 }

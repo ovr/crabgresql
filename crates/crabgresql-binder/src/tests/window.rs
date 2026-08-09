@@ -7,12 +7,12 @@ use super::common::*;
 /// `[input row…, window slots…]` and every marker has become a `ColumnRef`
 /// into that row.
 #[test]
-fn a_window_call_becomes_a_column_ref_past_the_input_row() {
+fn a_window_call_becomes_a_column_ref_past_the_input_row() -> anyhow::Result<()> {
     let SubqueryPlan {
         source,
         projections,
         ..
-    } = bound_subquery("SELECT id, rank() OVER (ORDER BY name) FROM t");
+    } = bound_subquery("SELECT id, rank() OVER (ORDER BY name) FROM t")?;
     // `t` is four columns wide, so the single window slot is index 4.
     assert_eq!(
         projections,
@@ -32,27 +32,29 @@ fn a_window_call_becomes_a_column_ref_past_the_input_row() {
         input_width,
         output_width,
         ..
-    } = source.expect_window();
+    } = source.into_window()?;
     assert_eq!((input_width, output_width), (4, 5));
     assert_eq!(funcs.len(), 1);
     assert_eq!(funcs[0].slot, 4);
+    Ok(())
 }
 
 /// Calls that share an `OVER` clause are computed by one step, over one sort
 /// of the input — `WINDOW w1 AS (…), w2 AS (…)` with identical bodies must
 /// not produce two.
 #[test]
-fn calls_sharing_a_spec_collapse_into_one_window_step() {
+fn calls_sharing_a_spec_collapse_into_one_window_step() -> anyhow::Result<()> {
     let SubqueryPlan { source, .. } = bound_subquery(
         "SELECT rank() OVER w1, sum(big) OVER w2 FROM t \
          WINDOW w1 AS (ORDER BY name), w2 AS (ORDER BY name)",
-    );
-    let WindowPlan { source, funcs, .. } = source.expect_window();
+    )?;
+    let WindowPlan { source, funcs, .. } = source.into_window()?;
     assert_eq!(funcs.len(), 2, "both calls land on the same step");
     assert!(
         !matches!(*source, LogicalPlan::Window(WindowPlan { .. })),
         "one step, so nothing below it"
     );
+    Ok(())
 }
 
 /// PG evaluates the spec with the most keys first, so the chain's *bottom*
@@ -60,51 +62,53 @@ fn calls_sharing_a_spec_collapse_into_one_window_step() {
 /// leaves its sort in place, and that is the order a window query with no
 /// ORDER BY of its own returns rows in.
 #[test]
-fn the_widest_window_spec_is_evaluated_first() {
+fn the_widest_window_spec_is_evaluated_first() -> anyhow::Result<()> {
     let SubqueryPlan { source, .. } = bound_subquery(
         "SELECT rank() OVER (ORDER BY name), \
          sum(big) OVER (PARTITION BY id ORDER BY name) FROM t",
-    );
-    let WindowPlan { source, spec, .. } = source.expect_window();
+    )?;
+    let WindowPlan { source, spec, .. } = source.into_window()?;
     assert_eq!(spec.partition_by.len(), 0, "the 1-key spec is on top");
-    let WindowPlan { spec, .. } = source.expect_window();
+    let WindowPlan { spec, .. } = source.into_window()?;
     assert_eq!(
         spec.partition_by.len(),
         1,
         "the 2-key spec is at the bottom"
     );
+    Ok(())
 }
 
 /// Windows are extracted after aggregation, so by then the inner `sum(x)` is
 /// already a `ColumnRef` into the aggregate's `[keys…, aggregates…]` row and
 /// the window reads that row.
 #[test]
-fn a_window_can_sit_over_a_grouped_aggregate() {
+fn a_window_can_sit_over_a_grouped_aggregate() -> anyhow::Result<()> {
     let SubqueryPlan { source, .. } =
-        bound_subquery("SELECT sum(sum(big)) OVER (ORDER BY name) FROM t GROUP BY name");
+        bound_subquery("SELECT sum(sum(big)) OVER (ORDER BY name) FROM t GROUP BY name")?;
     let WindowPlan {
         source,
         input_width,
         ..
-    } = source.expect_window();
+    } = source.into_window()?;
     // One group key plus one aggregate.
     assert_eq!(input_width, 2);
     assert!(matches!(
         *source,
         LogicalPlan::Aggregate(AggregatePlan { .. })
     ));
+    Ok(())
 }
 
 /// A window in an ORDER BY expression rides the hidden ("resjunk") column
 /// `bind_order_by` already appended, so extraction sweeps it up for free.
 #[test]
-fn a_window_in_order_by_lands_in_a_hidden_column() {
+fn a_window_in_order_by_lands_in_a_hidden_column() -> anyhow::Result<()> {
     let SubqueryPlan {
         columns,
         projections,
         sort,
         ..
-    } = bound_subquery("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)");
+    } = bound_subquery("SELECT id FROM t ORDER BY rank() OVER (ORDER BY name)")?;
     assert_eq!(columns.len(), 1, "one visible output column");
     assert_eq!(projections.len(), 2, "plus one hidden sort column");
     assert_eq!(sort.len(), 1);
@@ -116,12 +120,13 @@ fn a_window_in_order_by_lands_in_a_hidden_column() {
             ty: PgType::Int8
         }
     );
+    Ok(())
 }
 
 /// Every clause evaluated before windows are, plus the forms PG rejects
 /// outright. Text and SQLSTATE are PG 18.4's, observed through psql.
 #[test]
-fn window_misuse_reports_pg_text_and_sqlstate() {
+fn window_misuse_reports_pg_text_and_sqlstate() -> anyhow::Result<()> {
     for (sql, code, message) in [
         (
             "SELECT 1 FROM t WHERE rank() OVER () > 1",
@@ -246,10 +251,11 @@ fn window_misuse_reports_pg_text_and_sqlstate() {
             "OVER specified, but abs is not a window function nor an aggregate function",
         ),
     ] {
-        let error = bind_err(sql);
+        let error = bind_err(sql)?;
         assert_eq!(error.code, code, "for: {sql}");
         assert_eq!(error.message, message, "for: {sql}");
     }
+    Ok(())
 }
 
 /// `OVER w` *is* the named window, frame and all; `OVER (w)` **copies** it,
@@ -257,9 +263,9 @@ fn window_misuse_reports_pg_text_and_sqlstate() {
 /// Conflating the two would reject `OVER w` on a framed window, which PG
 /// accepts — its hint on the copy error points at exactly this difference.
 #[test]
-fn a_named_window_reference_inherits_a_frame_that_a_copy_may_not() {
+fn a_named_window_reference_inherits_a_frame_that_a_copy_may_not() -> anyhow::Result<()> {
     let framed = "FROM t WINDOW w AS (ORDER BY name ROWS UNBOUNDED PRECEDING)";
-    let copy = bind_err(&format!("SELECT rank() OVER (w) {framed}"));
+    let copy = bind_err(&format!("SELECT rank() OVER (w) {framed}"))?;
     assert_eq!(copy.code, "42P20");
     assert_eq!(
         copy.message,
@@ -271,37 +277,39 @@ fn a_named_window_reference_inherits_a_frame_that_a_copy_may_not() {
     );
     // The reference form gets past the copy rules and inherits the frame,
     // which is then refused only because explicit frames are unimplemented.
-    let reference = bind_err(&format!("SELECT rank() OVER w {framed}"));
+    let reference = bind_err(&format!("SELECT rank() OVER w {framed}"))?;
     assert_eq!(reference.code, "0A000");
     assert_eq!(
         reference.message,
         "explicit window frames are not supported yet"
     );
+    Ok(())
 }
 
 /// Only the default frame is implemented; an explicit one — including the
 /// `EXCLUDE` clause the parser now accepts — is refused loudly rather than
 /// silently computed as the default.
 #[test]
-fn an_explicit_window_frame_stays_0a000() {
+fn an_explicit_window_frame_stays_0a000() -> anyhow::Result<()> {
     for sql in [
         "SELECT sum(big) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         "SELECT sum(big) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         "SELECT sum(big) OVER (ORDER BY id RANGE UNBOUNDED PRECEDING EXCLUDE TIES) FROM t",
     ] {
-        let error = bind_err(sql);
+        let error = bind_err(sql)?;
         assert_eq!(error.code, "0A000", "for: {sql}");
         assert_eq!(
             error.message,
             "explicit window frames are not supported yet"
         );
     }
+    Ok(())
 }
 
 /// Writing the default frame out longhand is common and means exactly the
 /// frame a spec gets anyway, so it binds.
 #[test]
-fn the_default_frame_written_longhand_is_accepted() {
+fn the_default_frame_written_longhand_is_accepted() -> anyhow::Result<()> {
     for sql in [
         "SELECT sum(big) OVER (ORDER BY id RANGE UNBOUNDED PRECEDING) FROM t",
         "SELECT sum(big) OVER (ORDER BY id \
@@ -310,16 +318,17 @@ fn the_default_frame_written_longhand_is_accepted() {
          RANGE UNBOUNDED PRECEDING EXCLUDE NO OTHERS) FROM t",
     ] {
         assert!(
-            matches!(bound(sql), LogicalPlan::Subquery(SubqueryPlan { .. })),
+            matches!(bound(sql)?, LogicalPlan::Subquery(SubqueryPlan { .. })),
             "for: {sql}"
         );
     }
+    Ok(())
 }
 
 /// The clauses that reject a window also reject an aggregate, and had no
 /// guard for either before the window work — these are the aggregate half.
 #[test]
-fn aggregate_misuse_in_dml_reports_pg_text_and_sqlstate() {
+fn aggregate_misuse_in_dml_reports_pg_text_and_sqlstate() -> anyhow::Result<()> {
     for (sql, clause) in [
         ("UPDATE t SET id = count(*)", "UPDATE"),
         ("UPDATE t SET id = 1 WHERE count(*) > 0", "WHERE"),
@@ -329,7 +338,7 @@ fn aggregate_misuse_in_dml_reports_pg_text_and_sqlstate() {
         ("SELECT id FROM t LIMIT count(*)", "LIMIT"),
         ("SELECT id FROM t OFFSET count(*)", "OFFSET"),
     ] {
-        let error = bind_err(sql);
+        let error = bind_err(sql)?;
         assert_eq!(error.code, "42803", "for: {sql}");
         assert_eq!(
             error.message,
@@ -337,13 +346,14 @@ fn aggregate_misuse_in_dml_reports_pg_text_and_sqlstate() {
             "for: {sql}"
         );
     }
+    Ok(())
 }
 
 /// PG analyzes an expression in source order and blames the first misplaced
 /// node it meets, so which of an aggregate and a window is reported depends
 /// on which is written first.
 #[test]
-fn the_leftmost_offender_is_the_one_reported() {
+fn the_leftmost_offender_is_the_one_reported() -> anyhow::Result<()> {
     for (sql, code, message) in [
         (
             "SELECT 1 FROM t WHERE count(*) > 0 AND rank() OVER () > 0",
@@ -366,24 +376,25 @@ fn the_leftmost_offender_is_the_one_reported() {
             "window functions are not allowed in RETURNING",
         ),
     ] {
-        let error = bind_err(sql);
+        let error = bind_err(sql)?;
         assert_eq!(error.code, code, "for: {sql}");
         assert_eq!(error.message, message, "for: {sql}");
     }
+    Ok(())
 }
 
 /// `TABLE t` is `SELECT * FROM t`, so its ORDER BY can hold a window call and
 /// must go through the same extraction — otherwise the marker survives into
 /// the plan and fails at evaluation.
 #[test]
-fn a_table_query_order_by_a_window_builds_a_window_chain() {
+fn a_table_query_order_by_a_window_builds_a_window_chain() -> anyhow::Result<()> {
     let SubqueryPlan {
         source,
         columns,
         projections,
         sort,
         ..
-    } = bound_subquery("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)");
+    } = bound_subquery("TABLE t ORDER BY rank() OVER (ORDER BY id DESC)")?;
     assert!(matches!(*source, LogicalPlan::Window(WindowPlan { .. })));
     assert_eq!(columns.len(), 4, "t's own columns stay visible");
     assert_eq!(projections.len(), 5, "plus the hidden sort column");
@@ -392,18 +403,19 @@ fn a_table_query_order_by_a_window_builds_a_window_chain() {
         !projections.iter().any(BoundExpr::contains_window),
         "no marker survives extraction"
     );
+    Ok(())
 }
 
 /// A `WINDOW` definition may name an *earlier* one, and the copy inherits
 /// what the base contributes. Expanding at build time is also what makes a
 /// self or forward reference report "does not exist", as PG does.
 #[test]
-fn a_named_window_expands_its_base_at_build_time() {
+fn a_named_window_expands_its_base_at_build_time() -> anyhow::Result<()> {
     let SubqueryPlan { source, .. } = bound_subquery(
         "SELECT rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY name), \
          w2 AS (w1 ORDER BY id)",
-    );
-    let WindowPlan { spec, .. } = source.expect_window();
+    )?;
+    let WindowPlan { spec, .. } = source.into_window()?;
     assert_eq!(spec.partition_by.len(), 1, "w1's PARTITION BY is inherited");
     assert_eq!(spec.order_by.len(), 1);
 
@@ -436,22 +448,24 @@ fn a_named_window_expands_its_base_at_build_time() {
             "cannot override ORDER BY clause of window \"w1\"",
         ),
     ] {
-        let error = bind_err(sql);
+        let error = bind_err(sql)?;
         assert_eq!(error.code, code, "for: {sql}");
         assert_eq!(error.message, message, "for: {sql}");
     }
+    Ok(())
 }
 
 /// The name alone does not make a call a window call — PG resolves by name
 /// *and* argument types, so only the zero-argument form is the builtin. The
 /// user-function half needs a catalog and is covered end to end.
 #[test]
-fn only_a_zero_argument_call_resolves_to_a_window_function() {
-    let bare = bind_err("SELECT rank() FROM t");
+fn only_a_zero_argument_call_resolves_to_a_window_function() -> anyhow::Result<()> {
+    let bare = bind_err("SELECT rank() FROM t")?;
     assert_eq!(bare.code, "42809");
     assert_eq!(bare.message, "window function rank requires an OVER clause");
 
-    let with_arg = bind_err("SELECT rank(1) FROM t");
+    let with_arg = bind_err("SELECT rank(1) FROM t")?;
     assert_eq!(with_arg.code, "42883");
     assert_eq!(with_arg.message, "function rank(integer) does not exist");
+    Ok(())
 }

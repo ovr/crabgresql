@@ -9,7 +9,7 @@ use super::common::*;
 /// first. Anything that assumed inherited columns stay contiguous, or stay
 /// at the front, would read `salary` where `gpa` belongs.
 #[test]
-fn inherit_map_is_by_name_and_none_when_it_is_the_identity() {
+fn inherit_map_is_by_name_and_none_when_it_is_the_identity() -> anyhow::Result<()> {
     let cols = |names: &[&str]| -> Vec<Column> {
         names
             .iter()
@@ -28,19 +28,19 @@ fn inherit_map_is_by_name_and_none_when_it_is_the_identity() {
     let clone = TableSchema::new("clone", cols(&["name", "age"]));
     assert!(
         inherit_map(&person, &clone)
-            .expect("map must resolve")
+            .context("map must resolve")?
             .is_none()
     );
     // A child that merely *appends* still needs a map, because the map is
     // also what narrows its wider tuple to the parent's width.
     let map = inherit_map(&person, &student)
-        .expect("map must resolve")
-        .expect("a wider child needs a map");
+        .context("map must resolve")?
+        .context("a wider child needs a map")?;
     assert_eq!(map.as_ref(), [0, 1]);
     // Reading `stud_emp` as a `student` needs a real permutation on top.
     let map = inherit_map(&student, &stud_emp)
-        .expect("map must resolve")
-        .expect("a non-prefix layout needs a map");
+        .context("map must resolve")?
+        .context("a non-prefix layout needs a map")?;
     assert_eq!(map.as_ref(), [0, 1, 4]);
 
     // A missing column is an invariant break, not a user error.
@@ -51,6 +51,7 @@ fn inherit_map_is_by_name_and_none_when_it_is_the_identity() {
             .code,
         sqlstate::INTERNAL_ERROR
     );
+    Ok(())
 }
 
 /// A relation whose storage is split into engine-internal leaves. Only
@@ -127,20 +128,21 @@ fn arm_names(arms: &[MappedRelation]) -> Vec<String> {
 }
 
 #[test]
-fn a_relation_without_storage_leaves_is_scanned_directly() {
-    let engine = engine_with_table();
+fn a_relation_without_storage_leaves_is_scanned_directly() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
     let table = SplitTable::new("solo", Vec::new());
     assert!(
         scan_arms(&engine, &table, false, false)
-            .expect("scan_arms must not fail on a plain relation")
+            .context("scan_arms must not fail on a plain relation")?
             .is_none(),
         "a monolithic relation must bind to a plain Scan, not a one-armed Append"
     );
+    Ok(())
 }
 
 #[test]
-fn storage_leaves_become_the_append_arms() {
-    let engine = engine_with_table();
+fn storage_leaves_become_the_append_arms() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
     let table = SplitTable::new(
         "split",
         vec![
@@ -149,8 +151,8 @@ fn storage_leaves_become_the_append_arms() {
         ],
     );
     let arms = scan_arms(&engine, &table, false, true)
-        .expect("scan_arms must not fail")
-        .expect("a relation reporting storage leaves must fan out");
+        .context("scan_arms must not fail")?
+        .context("a relation reporting storage leaves must fan out")?;
     // Order is the access method's, not sorted: a leaf order carries meaning
     // (durable storage before the write buffer, say) that must survive.
     assert_eq!(arm_names(&arms), vec!["split_chunks", "split_buffer"]);
@@ -165,10 +167,11 @@ fn storage_leaves_become_the_append_arms() {
             .all(|a| a.tableoid.as_ref().is_some_and(|id| id.name == "split")),
         "a storage leaf must answer `tableoid` with its owning relation"
     );
+    Ok(())
 }
 
 #[test]
-fn a_sql_partitions_storage_leaves_flatten_into_one_append() {
+fn a_sql_partitions_storage_leaves_flatten_into_one_append() -> anyhow::Result<()> {
     // A partitioned parent is identified by its schema, so build one whose
     // single leaf itself splits, and confirm the result is one flat list
     // rather than an Append of an Append.
@@ -190,4 +193,5 @@ fn a_sql_partitions_storage_leaves_flatten_into_one_append() {
         vec!["part_2024_chunks", "part_2024_buffer"],
         "a SQL partition that splits its storage must contribute its leaves, not itself"
     );
+    Ok(())
 }
