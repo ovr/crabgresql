@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786311306323,
+  "lastUpdate": 1786311307775,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -7744,6 +7744,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 42416.228104,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "278864699641b4abf6d6cb1312d32284c43b508e",
+          "message": "feat: Upgrade rust to 1.97.1",
+          "timestamp": "2026-08-09T22:26:55+02:00",
+          "tree_id": "6de985f670a4522e4e1b214cb5418e17c6a2be11",
+          "url": "https://github.com/ovr/crabgresql/commit/278864699641b4abf6d6cb1312d32284c43b508e"
+        },
+        "date": 1786311307723,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 558.539784,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 40841.996125,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
