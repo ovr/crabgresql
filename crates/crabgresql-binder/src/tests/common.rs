@@ -18,6 +18,7 @@ pub(super) use crabgresql_types::{FmtCtx, PgType, Value};
 pub(super) use crate::expr::{
     BinOp, BoundExpr, ParamCtx, apply_column_typmod, param_ctx_extended, param_types,
 };
+pub(super) use crate::logical_plan::*;
 pub(super) use crate::plan::*;
 pub(super) use crate::{BindError, OutputColumn};
 
