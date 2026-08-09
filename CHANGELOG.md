@@ -1,0 +1,254 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the entries are
+generated from [Conventional Commits](https://www.conventionalcommits.org).
+
+## [0.0.1] - 2026-08-09
+
+### Features
+- Docker + release process ([#198](https://github.com/ovr/crabgresql-new/pull/198))
+- **catalog**: tableoid system column, and pg_attribute.attacl ([#193](https://github.com/ovr/crabgresql-new/pull/193))
+- **planner**: let an enum equality drive a hash join
+- Support PREPARE/EXECUTE/DEALLOCATE and pg_prepared_statements ([#188](https://github.com/ovr/crabgresql-new/pull/188))
+- **uuid**: generation/extraction functions, uuid<->bytea casts, binary wire I/O ([#189](https://github.com/ovr/crabgresql-new/pull/189))
+- **catalog**: the pg_type and pg_attribute columns type_sanity reads
+- **catalog**: regproc is an OID, and pg_proc has rows to point at
+- **catalog**: give every array type its own pg_type row
+- **catalog**: pg_database, the role catalogs, pg_settings and the timezone views
+- **datetime**: timestamptz arithmetic, age() overloads, and IntervalStyle ([#171](https://github.com/ovr/crabgresql-new/pull/171))
+- **functions**: support version() and pg_postmaster_start_time() ([#174](https://github.com/ovr/crabgresql-new/pull/174))
+- **constraints**: implement CHECK constraints ([#173](https://github.com/ovr/crabgresql-new/pull/173))
+- implement psql's query-buffer model, \if blocks and output formats ([#170](https://github.com/ovr/crabgresql-new/pull/170))
+- **copy**: implement HEADER match
+- **copy**: accept the Boolean spellings defGetBoolean does, and only those
+- **copy**: accept every Boolean spelling PostgreSQL does for COPY options
+- **copy**: COPY ... FREEZE stamps rows frozen instead of ignoring the option
+- Integer shifts, non-decimal literals and `_` digit separators ([#158](https://github.com/ovr/crabgresql-new/pull/158))
+- **planner**: Probe the index for UPDATE and DELETE ([#156](https://github.com/ovr/crabgresql-new/pull/156))
+- **types**: A zone argument may be a full POSIX specification
+- **types**: date_trunc truncates in the zone its third argument names
+- **ddl**: ALTER TABLE ... ADD PRIMARY KEY / ADD UNIQUE ([#154](https://github.com/ovr/crabgresql-new/pull/154))
+- A transaction clock — now(), CURRENT_TIMESTAMP, and the relative literals
+- **binder**: Report a value's type with pg_typeof
+- **types**: Bucket timestamps with date_bin, as in PostgreSQL
+- CREATE TABLE ... INHERITS — table inheritance ([#142](https://github.com/ovr/crabgresql-new/pull/142))
+- **types**: interval(p) type modifiers, and view columns that keep theirs ([#150](https://github.com/ovr/crabgresql-new/pull/150))
+- **binder**: Deparse every column default the way pg_get_expr prints it
+- **binder**: nextval/currval/setval take regclass, as in PostgreSQL
+- **types**: Honour timestamp(p)/time(p) precision on columns and casts
+- **types**: Store numeric(p,s) on a column and enforce it on assignment
+- **pg-regress**: Minimal psql \d <relation>, promoting bit (18->19)
+- **types**: Finish timetz — abbreviations, named zones, AT TIME ZONE/AT LOCAL ([#145](https://github.com/ovr/crabgresql-new/pull/145))
+- **parquet**: sort rows on the layout sort key before writing fragments ([#146](https://github.com/ovr/crabgresql-new/pull/146))
+- **types**: timestamptz casts to time/timetz, and to_char TZH/TZM ([#144](https://github.com/ovr/crabgresql-new/pull/144))
+- **binder**: Table-function FROM aliases name the output column ([#143](https://github.com/ovr/crabgresql-new/pull/143))
+- **types**: Support char type (OID 18) ([#141](https://github.com/ovr/crabgresql-new/pull/141))
+- **types**: Support oidvector and int2vector ([#140](https://github.com/ovr/crabgresql-new/pull/140))
+- **server**: session TimeZone GUC, and SET/RESET/SHOW over a GUC table ([#139](https://github.com/ovr/crabgresql-new/pull/139))
+- **executor**: Vectorized Filter and Sort ([#119](https://github.com/ovr/crabgresql-new/pull/119))
+- **server**: COPY <table> FROM '<file>' ([#137](https://github.com/ovr/crabgresql-new/pull/137))
+- **pg-regress**: psql \set, \unset, \getenv and :var substitution ([#136](https://github.com/ovr/crabgresql-new/pull/136))
+- **pg-engine**: TOAST — out-of-line storage for oversized attributes ([#130](https://github.com/ovr/crabgresql-new/pull/130))
+- **types**: to_char / to_date / to_timestamp / to_number ([#131](https://github.com/ovr/crabgresql-new/pull/131))
+- Complete PostgreSQL boolean compatibility ([#134](https://github.com/ovr/crabgresql-new/pull/134))
+- **types**: Support box, line, circle and polygon types ([#133](https://github.com/ovr/crabgresql-new/pull/133))
+- SQL cursors — DECLARE/FETCH/MOVE/CLOSE and pg_cursors ([#132](https://github.com/ovr/crabgresql-new/pull/132))
+- **types**: Support tid, xid, xid8 and pg_lsn ([#129](https://github.com/ovr/crabgresql-new/pull/129))
+- **types**: JSON extraction operators -> ->> #> #>> for json and jsonb ([#127](https://github.com/ovr/crabgresql-new/pull/127))
+- **parser**: E'...' escape string literal ([#126](https://github.com/ovr/crabgresql-new/pull/126))
+- Support IS TRUE/FALSE/UNKNOWN ([#124](https://github.com/ovr/crabgresql-new/pull/124))
+- **types**: Support path type, its operators and functions ([#125](https://github.com/ovr/crabgresql-new/pull/125))
+- **types**: Real pg_input_is_valid / pg_input_error_info ([#122](https://github.com/ovr/crabgresql-new/pull/122))
+- **window**: Window functions over the default frame ([#120](https://github.com/ovr/crabgresql-new/pull/120))
+- **server**: CREATE INDEX without a name derives one from the table ([#123](https://github.com/ovr/crabgresql-new/pull/123))
+- **binder**: Named parameters in LANGUAGE SQL function bodies ([#121](https://github.com/ovr/crabgresql-new/pull/121))
+- **parquet-engine**: Buffer table -  account buffered rows by RAM ([#118](https://github.com/ovr/crabgresql-new/pull/118))
+- **wal**: V2 ([#117](https://github.com/ovr/crabgresql-new/pull/117))
+- **parquet**: Engine-managed tables require a sort key, defaulting to the PK ([#116](https://github.com/ovr/crabgresql-new/pull/116))
+- **txn**: Serve commit-status lookups without taking a lock ([#115](https://github.com/ovr/crabgresql-new/pull/115))
+- **txn**: Durable CLOG under pg_xact, written back at checkpoint ([#114](https://github.com/ovr/crabgresql-new/pull/114))
+- **wal**: Checkpoint-delay barrier and start-bounded recovery ([#111](https://github.com/ovr/crabgresql-new/pull/111))
+- **bench**: Add a TPC-H suite ([#109](https://github.com/ovr/crabgresql-new/pull/109))
+- Support substring(str from pattern) and substring(str similar pat escape e) ([#110](https://github.com/ovr/crabgresql-new/pull/110))
+- **parquet-engine**: Push column projections down to a ProjectionMask ([#108](https://github.com/ovr/crabgresql-new/pull/108))
+- Support regexp_replace, regexp_like, regexp_count, regexp_substr ([#107](https://github.com/ovr/crabgresql-new/pull/107))
+- **bench**: Add benchmark harness crate with ClickBench suite ([#106](https://github.com/ovr/crabgresql-new/pull/106))
+- Buffer tables for Parquet relations ([#104](https://github.com/ovr/crabgresql-new/pull/104))
+- **parquet-engine**: Support TRUNCATE ([#102](https://github.com/ovr/crabgresql-new/pull/102))
+- Support Parquet table engine ([#101](https://github.com/ovr/crabgresql-new/pull/101))
+- extract join conditions from WHERE and push filters to scan leaves ([#100](https://github.com/ovr/crabgresql-new/pull/100))
+- Initial PL/pgSQL support ([#99](https://github.com/ovr/crabgresql-new/pull/99))
+- EXPLAIN ANALYZE runs the statement and times it ([#97](https://github.com/ovr/crabgresql-new/pull/97))
+- ANALYZE and the planner statistics substrate ([#98](https://github.com/ovr/crabgresql-new/pull/98))
+- tsvector and tsquery types with @@ matching and phrase search ([#96](https://github.com/ovr/crabgresql-new/pull/96))
+- psql \d <view> renders in full; \d <table> reaches the index query ([#94](https://github.com/ovr/crabgresql-new/pull/94))
+- pg_am + pg_get_userbyid/pg_table_is_visible so psql \d works ([#93](https://github.com/ovr/crabgresql-new/pull/93))
+- COLLATE with ICU locale ordering and pg_collation catalog ([#92](https://github.com/ovr/crabgresql-new/pull/92))
+- string_agg + array_upper/array_to_string ([#90](https://github.com/ovr/crabgresql-new/pull/90))
+- UNION and UNION ALL set operations ([#91](https://github.com/ovr/crabgresql-new/pull/91))
+- Support ANY/SOME/ALL quantified comparisons ([#89](https://github.com/ovr/crabgresql-new/pull/89))
+- bind OPERATOR(pg_catalog.<op>) explicit-schema operator spelling ([#88](https://github.com/ovr/crabgresql-new/pull/88))
+- route UPDATE/DELETE/COPY through partitionions ([#87](https://github.com/ovr/crabgresql-new/pull/87))
+- Support one-dimensional Array type ([#86](https://github.com/ovr/crabgresql-new/pull/86))
+- partition tuple routing on INSERT and union-scan on SELECT ([#85](https://github.com/ovr/crabgresql-new/pull/85))
+- Improve memory tables ([#83](https://github.com/ovr/crabgresql-new/pull/83))
+- **pg-engine**: Вurable heap B-tree index ([#81](https://github.com/ovr/crabgresql-new/pull/81))
+- Enforce RANGE partition bounds on leaf INSERT; store typed bounds ([#80](https://github.com/ovr/crabgresql-new/pull/80))
+- initial declarative RANGE partitioning (DDL + catalog reflection) ([#79](https://github.com/ovr/crabgresql-new/pull/79))
+- Correlated subqueries ([#77](https://github.com/ovr/crabgresql-new/pull/77))
+- Aggregate over derived table (subquery/VALUES/CTE in FROM) ([#76](https://github.com/ovr/crabgresql-new/pull/76))
+- CREATE FUNCTION ... LANGUAGE SQL (scalar, inlined) ([#75](https://github.com/ovr/crabgresql-new/pull/75))
+- DROP INDEX and DROP FUNCTION ([#74](https://github.com/ovr/crabgresql-new/pull/74))
+- support BETWEEN / NOT BETWEEN ([#73](https://github.com/ovr/crabgresql-new/pull/73))
+- CREATE/DROP SCHEMA and schema-qualified relations ([#71](https://github.com/ovr/crabgresql-new/pull/71))
+- CREATE TABLE AS SELECT ([#70](https://github.com/ovr/crabgresql-new/pull/70))
+- COPY <table> FROM STDIN (text and CSV) ([#69](https://github.com/ovr/crabgresql-new/pull/69))
+- jsonpath queries (jsonb_path_* functions and @?/@@ operators) ([#68](https://github.com/ovr/crabgresql-new/pull/68))
+- sequences and serial (CREATE/DROP SEQUENCE, nextval/currval/setval/lastval) ([#67](https://github.com/ovr/crabgresql-new/pull/67))
+- Non-correlated subqueries in expressions (scalar, EXISTS, IN) ([#66](https://github.com/ovr/crabgresql-new/pull/66))
+- INSERT ... SELECT / TABLE t source with ORDER BY and LIMIT ([#65](https://github.com/ovr/crabgresql-new/pull/65))
+- CREATE VIEW and DROP VIEW ([#64](https://github.com/ovr/crabgresql-new/pull/64))
+- RETURNING for INSERT/UPDATE/DELETE ([#61](https://github.com/ovr/crabgresql-new/pull/61))
+- distinguish ambiguous vs undefined operator; promote float8/lseg/time ([#63](https://github.com/ovr/crabgresql-new/pull/63))
+- Support json and jsonb types ([#62](https://github.com/ovr/crabgresql-new/pull/62))
+- SELECT DISTINCT and DISTINCT ON ([#60](https://github.com/ovr/crabgresql-new/pull/60))
+- Assignment coercion of any type into varchar/char columns ([#59](https://github.com/ovr/crabgresql-new/pull/59))
+- Transactional TRUNCATE ([#58](https://github.com/ovr/crabgresql-new/pull/58))
+- IndexScan node and equality index selection in the planner ([#56](https://github.com/ovr/crabgresql-new/pull/56))
+- Support ALTER TYPE (RENAME TO / ADD VALUE / RENAME VALUE) ([#57](https://github.com/ovr/crabgresql-new/pull/57))
+- Hash join for equi-joins ([#55](https://github.com/ovr/crabgresql-new/pull/55))
+- Support enum types (CREATE TYPE AS ENUM) ([#53](https://github.com/ovr/crabgresql-new/pull/53))
+- Implement the extended query protocol (Parse/Bind/Describe/Execute/Sync) ([#51](https://github.com/ovr/crabgresql-new/pull/51))
+- Support POSIX regex operators and SIMILAR TO ([#52](https://github.com/ovr/crabgresql-new/pull/52))
+- Wire transaction isolation levels & access modes ([#50](https://github.com/ovr/crabgresql-new/pull/50))
+- Support JOIN … USING and NATURAL JOIN with merged columns ([#48](https://github.com/ovr/crabgresql-new/pull/48))
+- Initial support for geometric types (point + lseg) ([#49](https://github.com/ovr/crabgresql-new/pull/49))
+- PG-accurate IN / NOT IN common-type resolution ([#47](https://github.com/ovr/crabgresql-new/pull/47))
+- Implement constraints, defaults, and semantic indexes ([#46](https://github.com/ovr/crabgresql-new/pull/46))
+- Initial support for JOINs (loop for now) ([#45](https://github.com/ovr/crabgresql-new/pull/45))
+- Support DISTINCT modifier for aggregates ([#44](https://github.com/ovr/crabgresql-new/pull/44))
+- Initial support for information_schema catalog ([#43](https://github.com/ovr/crabgresql-new/pull/43))
+- Support aggregates (min/max/count/sum/avg) with GROUP BY and HAVING ([#42](https://github.com/ovr/crabgresql-new/pull/42))
+- Support macaddr + macaddr8 types ([#40](https://github.com/ovr/crabgresql-new/pull/40))
+- Support bit, varbit types ([#38](https://github.com/ovr/crabgresql-new/pull/38))
+- Support pg_catalog (pg_type, pg_namespace, pg_class, pg_attribute, pg_cast) ([#41](https://github.com/ovr/crabgresql-new/pull/41))
+- Add the money (cash) type ([#39](https://github.com/ovr/crabgresql-new/pull/39))
+- Support DROP TABLE ([#36](https://github.com/ovr/crabgresql-new/pull/36))
+- **binder**: Support column-list aliases in FROM for base tables and SRFs ([#35](https://github.com/ovr/crabgresql-new/pull/35))
+- Introduce pg-engine + WAL core service ([#32](https://github.com/ovr/crabgresql-new/pull/32))
+- Support LIMIT and OFFSET ([#33](https://github.com/ovr/crabgresql-new/pull/33))
+- User defined types ([#31](https://github.com/ovr/crabgresql-new/pull/31))
+- render LINE/caret for the "argument type … is only a shell" NOTICE ([#30](https://github.com/ovr/crabgresql-new/pull/30))
+- **binder**: Support hex string literals X'...' ([#29](https://github.com/ovr/crabgresql-new/pull/29))
+- MVCC transaction core ([#26](https://github.com/ovr/crabgresql-new/pull/26))
+- User shell types, internal I/O functions, CREATE CAST, DROP TYPE CASCADE ([#28](https://github.com/ovr/crabgresql-new/pull/28))
+- Support ORDER BY with expressions (names, aliases, arbitrary exprs) ([#27](https://github.com/ovr/crabgresql-new/pull/27))
+- Support uuid, inet and cidr types ([#25](https://github.com/ovr/crabgresql-new/pull/25))
+- bind <expr> IN (list) / NOT IN (list) ([#23](https://github.com/ovr/crabgresql-new/pull/23))
+- CREATE TEMP TABLE with per-session name shadowing ([#22](https://github.com/ovr/crabgresql-new/pull/22))
+- Support text/varchar/char/bpchar/name types ([#21](https://github.com/ovr/crabgresql-new/pull/21))
+- Support date/time/timetz types with functions and operators ([#19](https://github.com/ovr/crabgresql-new/pull/19))
+- Support generate_series #12)
+- multiple FROM items / cross joins (comma and CROSS JOIN) ([#17](https://github.com/ovr/crabgresql-new/pull/17))
+- **parser**: Hard-fork sqlparser-rs v0.62.0 in-tree ([#18](https://github.com/ovr/crabgresql-new/pull/18))
+- **types**: Support arbitrary-precision numeric type ([#16](https://github.com/ovr/crabgresql-new/pull/16))
+- interval type with full arithmetic, functions, and to_char ([#13](https://github.com/ovr/crabgresql-new/pull/13))
+- BEGIN/COMMIT/ROLLBACK + TRUNCATE (control-flow) ([#15](https://github.com/ovr/crabgresql-new/pull/15))
+- timestamptz type + AT TIME ZONE / make_timestamptz (IANA zones via jiff) ([#14](https://github.com/ovr/crabgresql-new/pull/14))
+- CASE WHEN expressions (searched and simple forms) ([#11](https://github.com/ovr/crabgresql-new/pull/11))
+- **pg-protocol**: Improve protocol support ([#10](https://github.com/ovr/crabgresql-new/pull/10))
+- timestamp type + date_part/extract/date_trunc/isfinite/make_timestamp ([#9](https://github.com/ovr/crabgresql-new/pull/9))
+- pg_input_error_info SRF, WITH/CTE, VALUES, derived tables ([#8](https://github.com/ovr/crabgresql-new/pull/8))
+- md5() function with text/bytea overloads and byteain ([#7](https://github.com/ovr/crabgresql-new/pull/7))
+- broaden CAST value conversions (text/int/float/numeric/bit) ([#6](https://github.com/ovr/crabgresql-new/pull/6))
+- float4/float8 types, math functions, and query-engine groundwork ([#5](https://github.com/ovr/crabgresql-new/pull/5))
+- binder/planner pipeline, expression engine, WHERE, UPDATE, DELETE ([#4](https://github.com/ovr/crabgresql-new/pull/4))
+- pg_regress-style runner + vendored PostgreSQL regression corpus ([#3](https://github.com/ovr/crabgresql-new/pull/3))
+- Cargo workspace, pgwire v3 handshake, SELECT 1 on the memory engine ([#2](https://github.com/ovr/crabgresql-new/pull/2))
+
+### Bug Fixes
+- **agg**: restore the defensive path for an enum key
+- **catalog**: reject a binary-coercible cast to or from an enum
+- **name**: clip to 63 bytes, not 63 characters
+- **interval**: read an interval array under the session's IntervalStyle
+- **numeric**: make ln converge for tiny and infinite arguments
+- **catalog**: the flag columns are "char", not text
+- **server**: a user type may take a built-in's name
+- **types**: resolve an array type by its _elem catalog name
+- **catalog**: read typcollation from the vendored data
+- **catalog**: substitute typalign's symbol, and guard derived names
+- **partition**: fold a session-identity function in a partition bound
+- **catalog**: three values that diverge from PostgreSQL
+- **guc**: give SET LOCAL and SET the two levels PostgreSQL keeps
+- **interval**: raise "interval out of range" instead of panicking on typmod rounding ([#169](https://github.com/ovr/crabgresql-new/pull/169))
+- **heap**: refuse a frozen write into storage a rollback would not discard
+- **heap**: log a block the chain sweep could not read
+- **heap**: free TOAST chains on every path that discards a heap file
+- **copy**: apply the redundant-option rule to every option spelling
+- **copy**: reject a repeated COPY option the way PostgreSQL does
+- **copy**: the legacy bare FREEZE takes no argument
+- **parquet**: refuse a frozen write the relation has not staged a truncate for
+- **heap**: free the TOAST chains a discarded staged file leaves behind
+- **heap**: stop freezing TOAST chunks, which never mattered and misled
+- **copy**: confine FREEZE to the relation its precondition was checked for
+- **pg-engine**: An eviction that fails leaves the mapping intact
+- **pg-engine**: An oversized index key is 54000, not a panic
+- **truncate**: A TRUNCATE must swap the table's indexes too ([#159](https://github.com/ovr/crabgresql-new/pull/159))
+- **types**: Read a POSIX displacement's fields the way PG does
+- **types**: A zone argument is matched as given, not trimmed
+- **types**: A zone argument means the same thing for timetz
+- **parser**: A type name before a literal is a constant, not a column ([#155](https://github.com/ovr/crabgresql-new/pull/155))
+- **parser**: A reserved keyword is not a bare column name
+- **server**: An extended-query batch is one implicit transaction, for the clock
+- **types**: A relative date token conflicts with a month name too
+- **binder**: Read array elements with the session, not a fresh UTC context
+- **types**: A reserved date/time word in company is a syntax error
+- **server**: Freeze a literal default by its bound shape, not its syntax
+- **binder**: Only the keyword spelling binds to the clock
+- **binder**: Defer a relative literal reached through an explicit cast
+- **binder**: Mask interval literals through main's typmod encoding
+- **types**: Read `N HH:MM:SS` as days, and finish the pg_typeof deparse
+- **binder**: Let pg_typeof keep its argument, and mask qualified intervals
+- **binder**: Detect view recursion by expansion, and bound its depth and work ([#138](https://github.com/ovr/crabgresql-new/pull/138))
+- **binder**: outer-ref check must ask if a reference escapes, not if one exists ([#135](https://github.com/ovr/crabgresql-new/pull/135))
+- **numeric**: Terminate extreme integer powers instead of looping ([#128](https://github.com/ovr/crabgresql-new/pull/128))
+- **txn**: Unify VACUUM on the horizon that counts read-only readers ([#113](https://github.com/ovr/crabgresql-new/pull/113))
+- correct the reg*/format_type defects ([#95](https://github.com/ovr/crabgresql-new/pull/95))
+- resolve namespace in CREATE TABLE AS ([#72](https://github.com/ovr/crabgresql-new/pull/72))
+- avoid i64 overflow in time/timetz interval add and epoch extract ([#34](https://github.com/ovr/crabgresql-new/pull/34))
+
+### Performance
+- **agg**: allocate DISTINCT state only for DISTINCT aggregates
+- **agg**: hash a group key once per row
+- **agg**: store DISTINCT and grouping keys by type, not as hashed values
+- **copy**: resolve enum labels once per batch
+- **copy**: stop copying every text cell
+- **copy**: build tuples directly instead of an INSERT ... VALUES plan
+- **text**: compile LIKE patterns once, match over &str without cloning ([#186](https://github.com/ovr/crabgresql-new/pull/186))
+- **heap**: hand scan rows out by moving them, not by cloning ([#190](https://github.com/ovr/crabgresql-new/pull/190))
+- **numeric**: divide by a register-sized divisor, and fix a unit logarithm base ([#183](https://github.com/ovr/crabgresql-new/pull/183))
+- **agg**: accumulate integer sum and avg in registers, not Numeric ([#182](https://github.com/ovr/crabgresql-new/pull/182))
+- **catalog**: stop rebuilding catalogs to answer a lookup
+- **copy**: let the write target choose the bulk-load batch size
+- **executor**: stop cloning the transaction context on every insert
+- **heap**: skip the chain sweep when the relation owns no chunk store
+- **copy**: fill whole fragments on a frozen file load
+- **pg-engine**: Descend the btree with one pin per level
+- **pg-engine**: Size the buffer pool for the working set
+- **executor**: Compare a unique key without copying it
+- **executor**: Demote a declined probe to a scan, not a scan per row
+- **executor**: Check UNIQUE against a keyed multiset, and probe the index
+- **server**: Fail fast on a duplicate, and buffer only the key
+- **server**: Find a build-time duplicate by sorting, not by rescanning
+- **types**: Resolve a constant zone argument once, not per row
+
+### Documentation
+- **catalog**: fix three comments the regproc change made untrue
+- **catalog**: attribute the transcribed tables, and drop two stale comments
+- **executor**: The hash-vs-equality agreement is now a correctness rule
+- **storage-api**: Say what a probe's three answers mean
+- **test**: Say which PostgreSQL the unit wording is pinned to
+- Design buffered Parquet and chunk architecture ([#103](https://github.com/ovr/crabgresql-new/pull/103))
+
+<!-- generated by git-cliff -->
