@@ -12021,6 +12021,86 @@ async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `bytea_output` reaches every rendering that goes through `byteaout`, not
+/// just the top-level column: the `::text` cast and array elements too. The
+/// escape spellings themselves are pinned by unit tests in the types crate;
+/// what is proved here is that the session state arrives.
+///
+/// Unlike `IntervalStyle`, this parameter is *not* `GUC_REPORT` in PostgreSQL,
+/// so no `ParameterStatus` is expected — see the table entry in `guc.rs`.
+#[tokio::test]
+async fn bytea_output_selects_the_output_form() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+    let bytes = "decode('00615c', 'hex')";
+
+    assert_eq!(
+        scalar(&client, &format!("SELECT {bytes}")).await,
+        "\\x00615c"
+    );
+
+    client.simple_query("SET bytea_output TO escape").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "escape");
+    assert_eq!(
+        scalar(&client, &format!("SELECT {bytes}")).await,
+        "\\000a\\\\"
+    );
+    // The cast to text is the same output function.
+    assert_eq!(
+        scalar(&client, &format!("SELECT ({bytes})::text")).await,
+        "\\000a\\\\"
+    );
+    // ...and so is array element rendering, which then quotes and doubles the
+    // backslashes on top. Verified against PostgreSQL 18.4.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT array[decode('0061','hex'), decode('5c','hex')]"
+        )
+        .await,
+        "{\"\\\\000a\",\"\\\\\\\\\"}"
+    );
+    // Input is unaffected: both forms still read, whatever the setting is.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT '\\x00615c'::bytea = decode('00615c','hex')"
+        )
+        .await,
+        "t"
+    );
+
+    // The name and the value are both matched case-insensitively.
+    client.simple_query("SET BYTEA_OUTPUT TO 'HEX'").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+
+    // A change is transactional, like every other GUC.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET bytea_output TO escape").await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+
+    // Case-insensitively and nothing more: padding is part of the value.
+    for value in ["bogus", "' hex '"] {
+        let err = client
+            .simple_query(&format!("SET bytea_output TO {value}"))
+            .await
+            .expect_err("an unrecognized bytea_output must be rejected");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "22023", "{value}");
+        assert_eq!(
+            db.message(),
+            format!(
+                "invalid value for parameter \"bytea_output\": \"{}\"",
+                value.trim_matches('\'')
+            ),
+            "{value}"
+        );
+        assert_eq!(db.hint(), Some("Available values: escape, hex."), "{value}");
+    }
+    Ok(())
+}
+
 /// PostgreSQL's one-argument `age` spans two type categories — the two datetime
 /// forms and `age(xid)` — so an untyped argument has no best candidate and the
 /// call is ambiguous rather than quietly resolving to a datetime overload.

@@ -2369,7 +2369,13 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
-fn encode_escape(bytes: &[u8]) -> String {
+/// PostgreSQL's escape rendering of a byte string: a doubled backslash,
+/// printable ASCII verbatim, everything else three-digit octal.
+///
+/// Shared with `byteaout` under `bytea_output = escape` — `encode(b, 'escape')`
+/// and the output function produce the same string, so there is one copy of the
+/// rule rather than two that could drift.
+pub(crate) fn encode_escape(bytes: &[u8]) -> String {
     let mut out = String::new();
     for &b in bytes {
         match b {

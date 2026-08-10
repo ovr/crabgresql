@@ -24,6 +24,7 @@
 //! rejecting it would break restores that worked before this table existed.
 
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_types::bytea::{BYTEA_OUTPUT_VALUES, ByteaOutput};
 use crabgresql_types::interval::{INTERVAL_STYLE_VALUES, IntervalStyle};
 use crabgresql_types::tz::SessionZone;
 
@@ -55,6 +56,7 @@ pub enum SavedValue {
     TimeZone(std::sync::Arc<SessionZone>),
     ExtraFloatDigits(i32),
     IntervalStyle(IntervalStyle),
+    ByteaOutput(ByteaOutput),
     DefaultIsolation(IsolationLevel),
     DefaultReadOnly(bool),
 }
@@ -181,6 +183,36 @@ const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL V
 /// in PG, which is what drivers rely on to parse the version and pick their
 /// quoting rules.
 pub static GUCS: &[GucDef] = &[
+    GucDef {
+        key: "bytea_output",
+        name: "bytea_output",
+        description: "Sets the output format for bytea.",
+        extra_desc: None,
+        // Not GUC_REPORT in PG, unlike its neighbours here: a change is not
+        // echoed as ParameterStatus (verified on the wire against 18.4).
+        report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "enum",
+        min_val: None,
+        max_val: None,
+        // PostgreSQL's declaration order, which is what `enumvals` prints — and
+        // which is alphabetical here only by coincidence, `hex` being the
+        // default.
+        enumvals: Some(&["escape", "hex"]),
+        boot_val: "hex",
+        show: |s| s.bytea_output.name().to_string(),
+        kind: GucKind::Settable {
+            set: set_bytea_output,
+            capture: |s| SavedValue::ByteaOutput(s.bytea_output),
+            restore: |s, v| {
+                if let SavedValue::ByteaOutput(x) = v {
+                    s.bytea_output = x;
+                }
+            },
+        },
+    },
     GucDef {
         key: "client_encoding",
         name: "client_encoding",
@@ -662,6 +694,21 @@ fn set_interval_style(session: &mut Session, value: GucValue) -> Result<(), PgEr
         GucValue::Default => IntervalStyle::default(),
         GucValue::OffsetSecondsEast(secs) => return Err(rejected(secs.to_string())),
         GucValue::Str(s) => IntervalStyle::from_name(&s).ok_or_else(|| rejected(s.clone()))?,
+    };
+    Ok(())
+}
+
+/// `SET bytea_output`. Like [`set_interval_style`], the rejection carries PG's
+/// HINT listing the accepted names.
+fn set_bytea_output(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let rejected = |written: String| {
+        invalid_value("bytea_output", &written)
+            .with_hint(format!("Available values: {BYTEA_OUTPUT_VALUES}."))
+    };
+    session.bytea_output = match value {
+        GucValue::Default => ByteaOutput::default(),
+        GucValue::OffsetSecondsEast(secs) => return Err(rejected(secs.to_string())),
+        GucValue::Str(s) => ByteaOutput::from_name(&s).ok_or_else(|| rejected(s.clone()))?,
     };
     Ok(())
 }

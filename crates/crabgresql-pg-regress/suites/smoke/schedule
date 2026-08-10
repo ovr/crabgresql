@@ -78,3 +78,4 @@ test: pg_database
 test: pg_settings
 test: timezone_views
 test: session_identity
+test: bytea_output
