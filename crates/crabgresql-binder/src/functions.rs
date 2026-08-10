@@ -2237,8 +2237,11 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: &[TEXT],
                 ret: I4,
             },
-            // `length(bytea)` counts bytes, not characters. Text is listed
-            // first so a bare `length('abc')` unknown literal stays text.
+            // `length(bytea)` counts bytes, not characters. A bare
+            // `length('abc')` still answers 3: bytea's category is
+            // `UserDefined`, and an unknown literal prefers a `String`
+            // candidate (`narrow_by_unknown_category`), so the order these
+            // two signatures appear in is not what decides it.
             Signature {
                 func: ScalarFn::Length,
                 args: &[BYTEA],

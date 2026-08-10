@@ -54,6 +54,29 @@ fn out_of_range_input() -> ExecError {
     )
 }
 
+/// The bytes behind a text or a bytea argument. The two are interchangeable to
+/// the byte-counting length functions, which is why they share one signature.
+fn byte_len(v: &Value) -> usize {
+    match v {
+        Value::Bytea(b) => b.len(),
+        v => text(v).len(),
+    }
+}
+
+/// The length family answers in `int4`, so a value wider than that is an error
+/// rather than a wrapped count.
+fn byte_count(len: usize) -> Result<i32, ExecError> {
+    i32::try_from(len).map_err(|_| crate::eval::out_of_range(PgType::Int4))
+}
+
+/// `bit_length` is `octet_length * 8`, and PostgreSQL computes that product in
+/// `int4` — a value above 256MB overflows it and raises rather than wrapping.
+fn bit_count(len: usize) -> Result<i32, ExecError> {
+    byte_count(len)?
+        .checked_mul(8)
+        .ok_or_else(|| crate::eval::out_of_range(PgType::Int4))
+}
+
 /// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
 /// NULL without invoking the function.
 ///
@@ -303,26 +326,19 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
         }
         // The length family spans text and bytea. A bytea argument answers in
-        // bytes under all three names (PG routes them all to `byteaoctetlen`),
-        // so only `bit_length` scales it; the cast to i32 cannot overflow
-        // because a bytea value is capped at 1GB.
+        // bytes under all three names, so only `length` differs between the two
+        // input types: over text it counts characters, over bytea bytes.
         ScalarFn::Length => {
             return Ok(Value::Int4(match &args[0] {
-                Value::Bytea(b) => b.len() as i32,
+                Value::Bytea(b) => byte_count(b.len())?,
                 v => text::char_length(text(v)),
             }));
         }
         ScalarFn::OctetLength => {
-            return Ok(Value::Int4(match &args[0] {
-                Value::Bytea(b) => b.len() as i32,
-                v => text::octet_length(text(v)),
-            }));
+            return Ok(Value::Int4(byte_count(byte_len(&args[0]))?));
         }
         ScalarFn::BitLength => {
-            return Ok(Value::Int4(match &args[0] {
-                Value::Bytea(b) => (b.len() as i32).wrapping_mul(8),
-                v => text::bit_length(text(v)),
-            }));
+            return Ok(Value::Int4(bit_count(byte_len(&args[0]))?));
         }
         ScalarFn::Upper => return Ok(Value::Text(text::upper(text(&args[0])))),
         ScalarFn::Lower => return Ok(Value::Text(text::lower(text(&args[0])))),
@@ -2810,6 +2826,23 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    /// `bit_length` multiplies in `int4`, the way PostgreSQL's
+    /// `octet_length($1) * 8` does, so a value above 256MB is out of range
+    /// rather than a wrapped (and possibly negative) count. Driving this
+    /// through a real 256MB datum would cost more than it proves, so the
+    /// boundary is pinned on the helper.
+    #[test]
+    fn bit_count_raises_past_int4() {
+        let max_bytes = (i32::MAX / 8) as usize;
+        assert_eq!(bit_count(max_bytes).expect("in range"), i32::MAX - 7);
+        let e = bit_count(max_bytes + 1).expect_err("out of range");
+        assert_eq!(e.code, sqlstate::NUMERIC_VALUE_OUT_OF_RANGE);
+        assert_eq!(e.message, "integer out of range");
+        // The byte count has the same ceiling one multiplication later.
+        let e = byte_count(i32::MAX as usize + 1).expect_err("out of range");
+        assert_eq!(e.code, sqlstate::NUMERIC_VALUE_OUT_OF_RANGE);
     }
 
     #[test]

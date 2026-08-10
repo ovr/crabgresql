@@ -1649,7 +1649,7 @@ fn timetz_of(v: &Value) -> TimeTz {
     }
 }
 
-fn out_of_range(ty: PgType) -> ExecError {
+pub(crate) fn out_of_range(ty: PgType) -> ExecError {
     let message = match ty {
         PgType::Int2 => "smallint out of range",
         PgType::Int4 => "integer out of range",
