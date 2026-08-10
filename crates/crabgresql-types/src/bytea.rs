@@ -5,6 +5,8 @@
 //! setting is — see `cast::byteain` — which is what makes `escape` output still
 //! round-trip through a `hex` session.
 
+use crate::hex;
+
 /// The `bytea_output` GUC.
 ///
 /// Input is unaffected: this picks between `\x4142` and `AB` on the way out,
@@ -42,20 +44,13 @@ impl ByteaOutput {
     }
 }
 
-/// The lower-case hex digits `byteaout` emits, indexed by nibble. A table
-/// rather than `format!("{b:02x}")`: this runs per byte of every `bytea` on the
-/// default output path, where the per-byte `String` that `format!` allocates
-/// measured 33x slower than two `push`es (37.2 vs 1.1 ms per MB).
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
 /// `byteaout` under `bytea_output = hex`: `\x` and two lower-case hex digits
 /// per byte. PostgreSQL's default since 9.0.
 pub(crate) fn hex_out(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("\\x");
     for &b in bytes {
-        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
-        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
+        hex::push(&mut out, b);
     }
     out
 }

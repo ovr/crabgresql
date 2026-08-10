@@ -6,8 +6,8 @@
 use crate::fmt::FmtCtx;
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, jsonpath, money,
-    parse_bool, text, time, timestamp, timestamptz, timetz,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, hex, interval, json, jsonpath, money,
+    parse_bool, time, timestamp, timestamptz, timetz,
 };
 
 /// SQLSTATE + message for a failed cast.
@@ -942,10 +942,10 @@ fn money_to_numeric(cents: i64) -> Numeric {
 /// while a bad escape is a bare `22P02` that — unlike almost every other
 /// `invalid input syntax` — does not echo the offending value.
 pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
-    if let Some(hex) = s.strip_prefix("\\x") {
-        return text::hex_decode(hex).map_err(|e| CastError {
-            sqlstate: text::HexError::SQLSTATE,
-            message: e.message(),
+    if let Some(digits) = s.strip_prefix("\\x") {
+        return hex::decode(digits).map_err(|e| CastError {
+            sqlstate: e.sqlstate,
+            message: e.message,
             detail: None,
         });
     }
@@ -1210,6 +1210,8 @@ mod tests {
         assert_eq!(byteain("\\xdead")?, vec![0xde, 0xad]);
         assert_eq!(byteain("\\xDE AD")?, vec![0xde, 0xad]);
         assert_eq!(byteain("\\x")?, b"");
+        // All four of the characters PG's decoder skips, and only those.
+        assert_eq!(byteain("\\x41\n42\t43\r44 45")?, b"ABCDE");
 
         // The two formats fail differently. Hex goes through the same decoder
         // as `decode(…, 'hex')` and names the offending digit (`22023`);
@@ -1222,6 +1224,12 @@ mod tests {
         hex_err("\\xabc", "invalid hexadecimal data: odd number of digits");
         hex_err("\\xzz", "invalid hexadecimal digit: \"z\"");
         hex_err("\\x a b", "invalid hexadecimal digit: \" \"");
+        // Form feed and vertical tab look like whitespace to Rust but not to
+        // PG's decoder, which skips only space/newline/tab/CR.
+        hex_err("\\x41\x0c42", "invalid hexadecimal digit: \"\x0c\"");
+        hex_err("\\x41\x0b42", "invalid hexadecimal digit: \"\x0b\"");
+        // A multi-byte character is echoed whole, not as its leading byte.
+        hex_err("\\xé", "invalid hexadecimal digit: \"é\"");
 
         // A bad escape is a bare `22P02` that does not echo the value, unlike
         // almost every other `invalid input syntax`.

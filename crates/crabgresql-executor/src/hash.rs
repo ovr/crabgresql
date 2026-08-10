@@ -41,14 +41,7 @@ mod tests {
     /// The vectors PG's own `strings` regression test pins.
     const FOX: &[u8] = b"The quick brown fox jumps over the lazy dog.";
 
-    fn hex(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            out.push(crabgresql_types::hex::lo(byte >> 4));
-            out.push(crabgresql_types::hex::lo(byte & 0x0f));
-        }
-        out
-    }
+    use crabgresql_types::hex::encode as hex;
 
     #[test]
     fn sha2_matches_pg() {
