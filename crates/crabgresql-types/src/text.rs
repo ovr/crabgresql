@@ -55,19 +55,11 @@ fn too_large() -> TextError {
 
 // --- length ----------------------------------------------------------------
 
-/// `length` / `char_length` / `character_length`: number of characters.
+/// `length` / `char_length` / `character_length`: number of characters. The
+/// byte-counting members of the family (`octet_length`, `bit_length`) live in
+/// the executor, which counts the bytes of a text or a bytea argument alike.
 pub fn char_length(s: &str) -> i32 {
     s.chars().count() as i32
-}
-
-/// `octet_length`: number of bytes.
-pub fn octet_length(s: &str) -> i32 {
-    s.len() as i32
-}
-
-/// `bit_length`: number of bits (`octet_length * 8`).
-pub fn bit_length(s: &str) -> i32 {
-    (s.len() as i32).wrapping_mul(8)
 }
 
 // --- case ------------------------------------------------------------------
@@ -2792,8 +2784,6 @@ mod tests {
     #[test]
     fn lengths() {
         assert_eq!(char_length("café"), 4);
-        assert_eq!(octet_length("é"), 2);
-        assert_eq!(bit_length("abc"), 24);
     }
 
     #[test]

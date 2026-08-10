@@ -104,6 +104,33 @@ fn substring_and_position_desugar_to_functions() -> anyhow::Result<()> {
 }
 
 #[test]
+fn length_family_resolves_a_bytea_argument_to_the_bytea_overload() -> anyhow::Result<()> {
+    // The argument type is what separates the two overloads at runtime: text
+    // counts characters, bytea counts bytes. A bare literal must stay text.
+    let arg_ty = |sql: &str| -> anyhow::Result<PgType> {
+        let BoundExpr::FuncCall { args, .. } = one_projection(sql)? else {
+            bail!("expected a function call");
+        };
+        Ok(args[0].ty())
+    };
+    assert_eq!(arg_ty("SELECT length('привет')")?, PgType::Text);
+    assert_eq!(arg_ty("SELECT length('привет'::bytea)")?, PgType::Bytea);
+    assert_eq!(
+        arg_ty("SELECT octet_length('\\x001000'::bytea)")?,
+        PgType::Bytea
+    );
+    assert_eq!(arg_ty("SELECT bit_length('abc'::bytea)")?, PgType::Bytea);
+    for sql in [
+        "SELECT length('a'::bytea)",
+        "SELECT octet_length('a'::bytea)",
+        "SELECT bit_length('a'::bytea)",
+    ] {
+        assert_eq!(one_projection(sql)?.ty(), PgType::Int4);
+    }
+    Ok(())
+}
+
+#[test]
 fn qualified_column_uses_table_name_or_alias() -> anyhow::Result<()> {
     assert!(bound("SELECT t.id FROM t").is_ok());
     assert!(bound("SELECT x.id FROM t AS x").is_ok());
