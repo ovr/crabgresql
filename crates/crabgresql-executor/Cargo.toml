@@ -20,9 +20,12 @@ crabgresql-pg-wire.workspace = true
 crabgresql-storage-api.workspace = true
 crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
+crc32c.workspace = true
+crc32fast.workspace = true
 md-5.workspace = true
 rand.workspace = true
 rustc-hash.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

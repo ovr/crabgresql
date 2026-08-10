@@ -60,6 +60,18 @@ pub enum ScalarFn {
     Float8Send,
     PgInputIsValid,
     Md5,
+    /// `sha224(bytea) -> bytea`.
+    Sha224,
+    /// `sha256(bytea) -> bytea`.
+    Sha256,
+    /// `sha384(bytea) -> bytea`.
+    Sha384,
+    /// `sha512(bytea) -> bytea`.
+    Sha512,
+    /// `crc32(bytea) -> int8`.
+    Crc32,
+    /// `crc32c(bytea) -> int8`.
+    Crc32c,
     /// `date_part(text, timestamp) -> float8`.
     DatePart,
     /// `EXTRACT(field FROM timestamp) -> numeric`; the field is a text arg.
@@ -2215,6 +2227,42 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: PgType::Text,
             },
         ],
+        // The SHA-2 and CRC families take bytea only — there is no text
+        // overload, so `sha256('abc'::text)` is a 42883 while the unknown
+        // literal in `sha256('abc')` resolves through byteain. Their result is
+        // bytea (rendered `\x…`), not md5's hex text.
+        "sha224" => &[Signature {
+            func: ScalarFn::Sha224,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha256" => &[Signature {
+            func: ScalarFn::Sha256,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha384" => &[Signature {
+            func: ScalarFn::Sha384,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha512" => &[Signature {
+            func: ScalarFn::Sha512,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        // int8, not int4: the checksum is unsigned 32-bit, so 4213642571 has
+        // to stay positive.
+        "crc32" => &[Signature {
+            func: ScalarFn::Crc32,
+            args: &[BYTEA],
+            ret: I8,
+        }],
+        "crc32c" => &[Signature {
+            func: ScalarFn::Crc32c,
+            args: &[BYTEA],
+            ret: I8,
+        }],
         // The uuid readers. Unlike the generators above these are pure — they
         // answer from their argument alone — so `eval_scalar` holds them.
         "uuid_extract_version" => &[Signature {

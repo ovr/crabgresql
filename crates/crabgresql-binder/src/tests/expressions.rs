@@ -385,6 +385,44 @@ fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The digest functions take bytea only. A bare literal reaches them through
+/// byteain, but a typed text argument must not coerce — otherwise `sha256`
+/// would silently hash a value PG refuses to hash.
+#[test]
+fn digest_functions_reject_a_typed_text_argument() -> anyhow::Result<()> {
+    for (sql, message) in [
+        (
+            "SELECT sha224('abc'::text)",
+            "function sha224(text) does not exist",
+        ),
+        (
+            "SELECT sha256('abc'::text)",
+            "function sha256(text) does not exist",
+        ),
+        (
+            "SELECT sha384('abc'::text)",
+            "function sha384(text) does not exist",
+        ),
+        (
+            "SELECT sha512('abc'::text)",
+            "function sha512(text) does not exist",
+        ),
+        (
+            "SELECT crc32('abc'::text)",
+            "function crc32(text) does not exist",
+        ),
+        (
+            "SELECT crc32c('abc'::text)",
+            "function crc32c(text) does not exist",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION, "{sql}");
+        assert_eq!(e.message, message);
+    }
+    Ok(())
+}
+
 #[test]
 fn output_column_names_follow_pg() -> anyhow::Result<()> {
     let QueryPlan { columns, .. } =

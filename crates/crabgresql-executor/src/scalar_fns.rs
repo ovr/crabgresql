@@ -26,6 +26,7 @@ use crabgresql_types::{
 
 use crate::ExecError;
 use crate::eval::{array_elems, uuid_of};
+use crate::hash;
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
 
@@ -952,6 +953,12 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             };
             return Ok(Value::Text(crate::md5::md5_hex(bytes)));
         }
+        ScalarFn::Sha224 => return Ok(Value::Bytea(hash::sha224(bytea(&args[0])))),
+        ScalarFn::Sha256 => return Ok(Value::Bytea(hash::sha256(bytea(&args[0])))),
+        ScalarFn::Sha384 => return Ok(Value::Bytea(hash::sha384(bytea(&args[0])))),
+        ScalarFn::Sha512 => return Ok(Value::Bytea(hash::sha512(bytea(&args[0])))),
+        ScalarFn::Crc32 => return Ok(Value::Int8(hash::crc32(bytea(&args[0])))),
+        ScalarFn::Crc32c => return Ok(Value::Int8(hash::crc32c(bytea(&args[0])))),
         // The uuid readers. Both answer NULL rather than erroring when the
         // value carries no such field — a version 4 value has no timestamp, and
         // a non-RFC-9562 variant has no version — so they are total.

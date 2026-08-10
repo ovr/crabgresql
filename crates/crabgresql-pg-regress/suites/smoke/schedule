@@ -34,6 +34,7 @@ test: join
 test: join_pushdown
 test: generate_series
 test: string
+test: hash
 test: uuid
 test: tid
 test: xid
