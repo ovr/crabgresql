@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786381532492,
+  "lastUpdate": 1786381533965,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -14872,6 +14872,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20894.789,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "295c51c2a4a87557fc74e4460efbc4725ae7949c",
+          "message": "perf(executor): hash and memoize correlated subqueries (#211)\n\n```\nselect max(unique1) from tenk1 a where exists (select 1 from tenk1 b where b.thousand = a.unique2);\n                                                          43190 ms -> 9 ms\nnested EXISTS/NOT EXISTS over a 10M-row join               504156 ms -> 3160 ms\nunique1 IN (select hundred from tenk1 b)                      982 ms -> 16 ms\ncross-type correlation (int4 outer / int8 inner)             1554 ms -> 2 ms\n```",
+          "timestamp": "2026-08-10T17:30:31+02:00",
+          "tree_id": "b6545a8fcd031cc64168af56f5a9ee5a470a6fcd",
+          "url": "https://github.com/ovr/crabgresql/commit/295c51c2a4a87557fc74e4460efbc4725ae7949c"
+        },
+        "date": 1786381533905,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 516.251601,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 37855.277343,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
