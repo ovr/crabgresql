@@ -93,8 +93,9 @@ Zone Database (public domain, github.com/eggert/tz) via the
 `tzdb-bundle-always` feature.
 
 This product depends on the `crc32c` crate (used by crabgresql-wal for WAL
-record integrity and by crabgresql-pg-engine for 8 KB page checksums, both using
-the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL):
+record integrity, by crabgresql-pg-engine for 8 KB page checksums — both using
+the CRC-32C / Castagnoli polynomial that PostgreSQL documents for its WAL — and
+by crabgresql-executor for the SQL `crc32c()` function):
 
   Copyright (c) The crc32c authors (github.com/zowens/crc32c)
 
@@ -111,6 +112,17 @@ implement the SQL `md5()` function):
   (github.com/RustCrypto/hashes)
 
 licensed under MIT OR Apache-2.0. It is an ordinary Cargo dependency, not
+vendored; no PostgreSQL source is involved.
+
+This product depends on the `sha2` and `crc32fast` crates (used by
+crabgresql-executor for the SQL sha224/sha256/sha384/sha512 and crc32
+functions):
+
+  Copyright (c) The RustCrypto authors (github.com/RustCrypto/hashes)
+  Copyright (c) Sam Rijs, Alex Crichton and contributors
+  (github.com/srijs/rust-crc32fast)
+
+licensed under MIT OR Apache-2.0. They are ordinary Cargo dependencies, not
 vendored; no PostgreSQL source is involved.
 
 This product depends on the `deepsize` crate and its `deepsize_derive` proc

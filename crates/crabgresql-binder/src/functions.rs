@@ -16,7 +16,7 @@ use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
-    Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
+    ArgFail, Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
     bind_sql_function_body, coerce_for_arg, inline_params,
 };
 use crate::{BindError, BoundAggregate, OutputColumn};
@@ -60,6 +60,18 @@ pub enum ScalarFn {
     Float8Send,
     PgInputIsValid,
     Md5,
+    /// `sha224(bytea) -> bytea`.
+    Sha224,
+    /// `sha256(bytea) -> bytea`.
+    Sha256,
+    /// `sha384(bytea) -> bytea`.
+    Sha384,
+    /// `sha512(bytea) -> bytea`.
+    Sha512,
+    /// `crc32(bytea) -> int8`.
+    Crc32,
+    /// `crc32c(bytea) -> int8`.
+    Crc32c,
     /// `date_part(text, timestamp) -> float8`.
     DatePart,
     /// `EXTRACT(field FROM timestamp) -> numeric`; the field is a text arg.
@@ -1440,12 +1452,11 @@ pub(crate) fn bind_table_fn_call(
         return Err(undefined_function(name, &bindings));
     }
     // Exact-type first, then a coercing pass — same policy as scalar overloads.
-    for exact_only in [true, false] {
-        if let Some(args) = try_coerce_args(&bindings, params, exact_only) {
-            return Ok((func, args));
-        }
+    match single_candidate_args(&bindings, params) {
+        Ok(args) => Ok((func, args)),
+        Err(None) => Err(undefined_function(name, &bindings)),
+        Err(Some(e)) => Err(e),
     }
-    Err(undefined_function(name, &bindings))
 }
 
 /// Resolve `unnest(array)` to its element type and single (array) argument. Only
@@ -1490,7 +1501,7 @@ pub(crate) fn resolve_generate_series(
     for elem in [PgType::Int4, PgType::Int8, PgType::Numeric] {
         let params = vec![elem; arity];
         for exact_only in [true, false] {
-            if let Some(args) = try_coerce_args(bindings, &params, exact_only) {
+            if let Ok(args) = try_coerce_args(bindings, &params, exact_only) {
                 return Ok((elem, args));
             }
         }
@@ -1502,7 +1513,7 @@ pub(crate) fn resolve_generate_series(
         for elem in [TS, TSTZ] {
             let params = [elem, elem, IV];
             for exact_only in [true, false] {
-                if let Some(args) = try_coerce_args(bindings, &params, exact_only) {
+                if let Ok(args) = try_coerce_args(bindings, &params, exact_only) {
                     return Ok((elem, args));
                 }
             }
@@ -2215,6 +2226,42 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: PgType::Text,
             },
         ],
+        // The SHA-2 and CRC families take bytea only — there is no text
+        // overload, so `sha256('abc'::text)` is a 42883 while the unknown
+        // literal in `sha256('abc')` resolves through byteain. Their result is
+        // bytea (rendered `\x…`), not md5's hex text.
+        "sha224" => &[Signature {
+            func: ScalarFn::Sha224,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha256" => &[Signature {
+            func: ScalarFn::Sha256,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha384" => &[Signature {
+            func: ScalarFn::Sha384,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        "sha512" => &[Signature {
+            func: ScalarFn::Sha512,
+            args: &[BYTEA],
+            ret: BYTEA,
+        }],
+        // int8, not int4: the checksum is unsigned 32-bit, so 4213642571 has
+        // to stay positive.
+        "crc32" => &[Signature {
+            func: ScalarFn::Crc32,
+            args: &[BYTEA],
+            ret: I8,
+        }],
+        "crc32c" => &[Signature {
+            func: ScalarFn::Crc32c,
+            args: &[BYTEA],
+            ret: I8,
+        }],
         // The uuid readers. Unlike the generators above these are pure — they
         // answer from their argument alone — so `eval_scalar` holds them.
         "uuid_extract_version" => &[Signature {
@@ -3898,7 +3945,7 @@ pub(crate) fn resolve_call(
     if sigs.is_empty() {
         // No built-in of this name: a user-defined `LANGUAGE SQL` function may
         // still match. Only when that also fails is the call undefined.
-        return resolve_user_routine_call(name, bindings, catalog);
+        return resolve_user_routine_call(name, bindings, catalog.routines(name), catalog);
     }
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
@@ -3934,28 +3981,49 @@ pub(crate) fn resolve_call(
         arity
     };
     for sig in &candidates {
-        if let Some(args) = try_coerce_args(&bindings, sig.args, true) {
+        if let Ok(args) = try_coerce_args(&bindings, sig.args, true) {
             return finish_func_call(sig.func, sig.ret, args);
         }
     }
     let mut best: Option<(usize, &Signature, Vec<BoundExpr>)> = None;
+    // The rejected literal of a lone candidate, kept from the pass that found
+    // it so the reporting path below need not parse it a second time.
+    let mut literal_fail: Option<BindError> = None;
     for sig in &candidates {
-        if let Some(args) = try_coerce_args(&bindings, sig.args, false) {
-            let exact = bindings
-                .iter()
-                .zip(sig.args)
-                .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
-                .count();
-            if best.as_ref().is_none_or(|(b, _, _)| exact > *b) {
-                best = Some((exact, sig, args));
+        match try_coerce_args(&bindings, sig.args, false) {
+            Ok(args) => {
+                let exact = bindings
+                    .iter()
+                    .zip(sig.args)
+                    .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
+                    .count();
+                if best.as_ref().is_none_or(|(b, _, _)| exact > *b) {
+                    best = Some((exact, sig, args));
+                }
             }
+            Err(ArgFail::LiteralInput(e)) if candidates.len() == 1 => literal_fail = Some(e),
+            Err(_) => {}
         }
     }
     match best {
         Some((_, sig, args)) => finish_func_call(sig.func, sig.ret, args),
-        // No built-in overload fit the argument types; a user `LANGUAGE SQL`
-        // function of the same name but different signature may still match.
-        None => resolve_user_routine_call(name, bindings, catalog),
+        None => {
+            // No built-in overload fit the argument types; a user `LANGUAGE SQL`
+            // function of the same name may still match.
+            let routines = catalog.routines(name);
+            // PG picks the overload from the argument types alone and runs the
+            // input functions only afterwards, so once one candidate is the
+            // only one left, its literal's failure is the answer: `crc32('\x4')`
+            // is the odd-digit error, not "function crc32(unknown) does not
+            // exist". Same-arity user routines are still candidates by type, so
+            // they have to be ruled out first; other arities never were.
+            if let Some(e) = literal_fail
+                && !routines.iter().any(|r| r.arg_types.len() == bindings.len())
+            {
+                return Err(e);
+            }
+            resolve_user_routine_call(name, bindings, routines, catalog)
+        }
     }
 }
 
@@ -4006,12 +4074,15 @@ impl Drop for InlineGuard {
 /// executor dispatches at run time. Returns PG's `42883` "function name(types)
 /// does not exist" when nothing matches, or `42725` "function name(types) is not
 /// unique" when two overloads coerce equally well.
+/// `sigs` is passed in rather than fetched: [`TypeCatalog::routines`] takes the
+/// catalog lock and deep-clones every overload, body text included, so the one
+/// caller that already needed the list must not make this fetch it again.
 fn resolve_user_routine_call(
     name: &str,
     bindings: Vec<Binding>,
+    sigs: Vec<RoutineSig>,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<Binding, BindError> {
-    let sigs = catalog.routines(name);
     let Some((sig, args)) = choose_routine_overload(name, &bindings, &sigs)? else {
         return Err(undefined_function(name, &bindings));
     };
@@ -4090,7 +4161,7 @@ fn choose_routine_overload<'a>(
     // rejects that), so at most one all-exact match exists.
     for sig in sigs {
         if sig.arg_types.len() == bindings.len()
-            && let Some(args) = try_coerce_args(bindings, &sig.arg_types, true)
+            && let Ok(args) = try_coerce_args(bindings, &sig.arg_types, true)
         {
             return Ok(Some((sig, args)));
         }
@@ -4099,12 +4170,24 @@ fn choose_routine_overload<'a>(
     // already at their exact type, as the built-in resolver does.
     let mut best: Option<(usize, &RoutineSig, Vec<BoundExpr>)> = None;
     let mut tied = false;
+    // As for built-ins: the rejected literal of a lone arity-matching overload
+    // is the error PG reports, since the overload was already chosen by then.
+    let arity_matches = sigs
+        .iter()
+        .filter(|s| s.arg_types.len() == bindings.len())
+        .count();
+    let mut literal_fail: Option<BindError> = None;
     for sig in sigs {
         if sig.arg_types.len() != bindings.len() {
             continue;
         }
-        let Some(args) = try_coerce_args(bindings, &sig.arg_types, false) else {
-            continue;
+        let args = match try_coerce_args(bindings, &sig.arg_types, false) {
+            Ok(args) => args,
+            Err(ArgFail::LiteralInput(e)) if arity_matches == 1 => {
+                literal_fail = Some(e);
+                continue;
+            }
+            Err(_) => continue,
         };
         let score = bindings
             .iter()
@@ -4123,6 +4206,11 @@ fn choose_routine_overload<'a>(
     }
     if tied {
         return Err(ambiguous_function(name, bindings));
+    }
+    if best.is_none()
+        && let Some(e) = literal_fail
+    {
+        return Err(e);
     }
     Ok(best.map(|(_, sig, args)| (sig, args)))
 }
@@ -4210,26 +4298,74 @@ pub(crate) fn resolve_jsonb_path_query(bindings: &[Binding]) -> Result<Vec<Bound
         4 => &[JSONB, JSONPATH, JSONB, BOOL],
         _ => return Err(undefined_function("jsonb_path_query", bindings)),
     };
+    match single_candidate_args(bindings, params) {
+        Ok(args) => Ok(args),
+        Err(None) => Err(undefined_function("jsonb_path_query", bindings)),
+        Err(Some(e)) => Err(e),
+    }
+}
+
+/// Coerce a call against the one signature that could possibly match, exact
+/// pass first. `Err(Some(e))` is a literal its input function rejected, which
+/// PG reports because the overload was never in doubt; `Err(None)` leaves the
+/// caller to raise its own `42883`.
+fn single_candidate_args(
+    bindings: &[Binding],
+    params: &[PgType],
+) -> Result<Vec<BoundExpr>, Option<BindError>> {
+    let mut literal_fail = None;
     for exact_only in [true, false] {
-        if let Some(args) = try_coerce_args(bindings, params, exact_only) {
-            return Ok(args);
+        match try_coerce_args(bindings, params, exact_only) {
+            Ok(args) => return Ok(args),
+            Err(ArgFail::LiteralInput(e)) => literal_fail = Some(e),
+            Err(_) => {}
         }
     }
-    Err(undefined_function("jsonb_path_query", bindings))
+    Err(literal_fail)
 }
 
 /// Try to coerce every binding to the signature's parameter types. When
 /// `exact_only`, reject anything that would need a numeric promotion.
+///
+/// A rejected literal is only reported as such when no *typed* argument also
+/// fails, since PG would then have dropped the candidate on types alone and
+/// never reached the literal. Scanning that tail is deliberately limited to
+/// typed arguments: continuing the normal loop past a failure would resolve
+/// later `$n` placeholders and record type deductions for a signature that is
+/// not going to win.
 fn try_coerce_args(
     bindings: &[Binding],
     params: &[PgType],
     exact_only: bool,
-) -> Option<Vec<BoundExpr>> {
+) -> Result<Vec<BoundExpr>, ArgFail> {
     let mut out = Vec::with_capacity(params.len());
-    for (binding, &target) in bindings.iter().zip(params) {
-        out.push(coerce_for_arg(binding.clone(), target, exact_only)?);
+    for (i, (binding, &target)) in bindings.iter().zip(params).enumerate() {
+        match coerce_for_arg(binding.clone(), target, exact_only) {
+            Ok(arg) => out.push(arg),
+            Err(ArgFail::LiteralInput(e)) => {
+                let rest = i + 1;
+                return Err(
+                    if typed_mismatch(&bindings[rest..], &params[rest..], exact_only) {
+                        ArgFail::Mismatch
+                    } else {
+                        ArgFail::LiteralInput(e)
+                    },
+                );
+            }
+            Err(other) => return Err(other),
+        }
     }
-    Some(out)
+    Ok(out)
+}
+
+/// Whether any *typed* argument fails to reach its parameter type. Unknown
+/// bindings are skipped, so this is free of the `ParamCtx` side effect that
+/// makes [`coerce_for_arg`] unsafe to call speculatively.
+fn typed_mismatch(bindings: &[Binding], params: &[PgType], exact_only: bool) -> bool {
+    bindings.iter().zip(params).any(|(binding, &target)| {
+        matches!(binding, Binding::Typed(_))
+            && coerce_for_arg(binding.clone(), target, exact_only).is_err()
+    })
 }
 
 fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {

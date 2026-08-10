@@ -385,6 +385,113 @@ fn min_int4_literal_binds_as_int4() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The digest functions take bytea only. A bare literal reaches them through
+/// byteain, but a typed text argument must not coerce — otherwise `sha256`
+/// would silently hash a value PG refuses to hash.
+#[test]
+fn digest_functions_reject_a_typed_text_argument() -> anyhow::Result<()> {
+    for (sql, message) in [
+        (
+            "SELECT sha224('abc'::text)",
+            "function sha224(text) does not exist",
+        ),
+        (
+            "SELECT sha256('abc'::text)",
+            "function sha256(text) does not exist",
+        ),
+        (
+            "SELECT sha384('abc'::text)",
+            "function sha384(text) does not exist",
+        ),
+        (
+            "SELECT sha512('abc'::text)",
+            "function sha512(text) does not exist",
+        ),
+        (
+            "SELECT crc32('abc'::text)",
+            "function crc32(text) does not exist",
+        ),
+        (
+            "SELECT crc32c('abc'::text)",
+            "function crc32c(text) does not exist",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION, "{sql}");
+        assert_eq!(e.message, message);
+    }
+    Ok(())
+}
+
+/// A literal that its input function rejects is that error, not "the function
+/// does not exist" — PG resolves the overload from types, so once one candidate
+/// is the only reachable one, its coercion failure is the answer. Without the
+/// single-candidate rule in `resolve_call` these all report 42883, which sends
+/// the reader hunting for a missing overload instead of a bad literal.
+#[test]
+fn bad_literal_to_a_single_overload_reports_the_input_error() -> anyhow::Result<()> {
+    for (sql, code, message) in [
+        (
+            "SELECT crc32('\\x4')",
+            "22023",
+            "invalid hexadecimal data: odd number of digits",
+        ),
+        (
+            "SELECT sha256('\\xzz')",
+            "22023",
+            "invalid hexadecimal digit: \"z\"",
+        ),
+        (
+            "SELECT sha512('\\9')",
+            "22P02",
+            "invalid input syntax for type bytea",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, code, "{sql}");
+        assert_eq!(e.message, message, "{sql}");
+    }
+    // An ambiguous name keeps the overload-resolution error: with more than one
+    // candidate PG has not yet committed to an input function.
+    let e = bind_err("SELECT to_char('2024-01-01', 'YYYY')")?;
+    assert_eq!(e.code, sqlstate::AMBIGUOUS_FUNCTION);
+    Ok(())
+}
+
+/// The other half of the rule, and the one that is easy to break: when a
+/// *typed* argument is why no candidate survived, the call is undefined and the
+/// literals are never parsed at all. Reporting a literal's error here would
+/// point at an argument PG considers blameless.
+#[test]
+fn typed_argument_mismatch_outranks_a_bad_literal() -> anyhow::Result<()> {
+    for (sql, message) in [
+        // `repeat`/`lpad` take text, so the bytea argument alone sinks the
+        // signature -- 'x' is never offered to int4's input function.
+        (
+            "SELECT repeat('a'::bytea, 'x')",
+            "function repeat(bytea, unknown) does not exist",
+        ),
+        (
+            "SELECT lpad('a'::bytea, 'x')",
+            "function lpad(bytea, unknown) does not exist",
+        ),
+        // The mismatch can also sit to the right of the bad literal.
+        (
+            "SELECT encode('\\xzz', 42)",
+            "function encode(unknown, integer) does not exist",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION, "{sql}");
+        assert_eq!(e.message, message, "{sql}");
+    }
+    // With every typed argument fitting, the literal is back in scope.
+    let e = bind_err("SELECT repeat('a', 'x')")?;
+    assert_eq!(e.code, "22P02");
+    assert_eq!(e.message, "invalid input syntax for type integer: \"x\"");
+    Ok(())
+}
+
 #[test]
 fn output_column_names_follow_pg() -> anyhow::Result<()> {
     let QueryPlan { columns, .. } =

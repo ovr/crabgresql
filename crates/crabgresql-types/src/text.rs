@@ -2312,7 +2312,7 @@ const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 /// `escape`.
 pub fn encode(bytes: &[u8], format: &str) -> Result<String> {
     match format {
-        "hex" => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+        "hex" => Ok(hex::encode(bytes)),
         "base64" => Ok(encode_base64(bytes)),
         "escape" => Ok(encode_escape(bytes)),
         other => Err(TextError::new(
@@ -2415,30 +2415,7 @@ pub fn decode(s: &str, format: &str) -> Result<Vec<u8>> {
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut hi: Option<u8> = None;
-    for c in s.bytes() {
-        if c.is_ascii_whitespace() {
-            continue;
-        }
-        let v = hex::val(c).ok_or_else(|| {
-            TextError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                format!("invalid hexadecimal digit: \"{}\"", c as char),
-            )
-        })?;
-        match hi.take() {
-            None => hi = Some(v),
-            Some(h) => out.push((h << 4) | v),
-        }
-    }
-    if hi.is_some() {
-        return Err(TextError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "invalid hexadecimal data: odd number of digits",
-        ));
-    }
-    Ok(out)
+    hex::decode(s).map_err(|e| TextError::new(e.sqlstate, e.message))
 }
 
 fn base64_val(c: u8) -> Option<u8> {
