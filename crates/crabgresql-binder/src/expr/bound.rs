@@ -751,6 +751,30 @@ impl BoundExpr {
         }
     }
 
+    /// Whether **this node alone** is a volatile call, ignoring its arguments.
+    ///
+    /// The list of volatile scalar functions lives here and only here, so a walk
+    /// that visits every node (see [`crate::plan_contains_volatile_fn`]) and the
+    /// subtree predicate below cannot drift apart. A routine's body is opaque
+    /// and PostgreSQL defaults a routine to VOLATILE, so every call counts.
+    pub fn is_volatile_call(&self) -> bool {
+        match self {
+            BoundExpr::FuncCall { func, .. } => matches!(
+                func,
+                ScalarFn::Nextval
+                    | ScalarFn::Currval
+                    | ScalarFn::Setval
+                    | ScalarFn::Lastval
+                    | ScalarFn::ClockTimestamp
+                    | ScalarFn::GenRandomUuid
+                    | ScalarFn::UuidV7
+                    | ScalarFn::UuidV7Shift
+            ),
+            BoundExpr::Routine { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Whether this expression contains a volatile function call. The volatile
     /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
     /// side effects, `currval`/`lastval` read mutable session state),
@@ -768,23 +792,15 @@ impl BoundExpr {
     /// marks them `STABLE`, and they are. Calling them volatile would cost a
     /// real optimization — `WHERE ts > now() - interval '1 day'` could no
     /// longer be pushed to a leaf — for no change in the answer.
+    ///
+    /// Note this stops at a subquery marker: a subquery's body is a plan of its
+    /// own. A caller that needs to see inside one wants
+    /// [`crate::expr_contains_volatile_fn`].
     pub fn contains_volatile_fn(&self) -> bool {
         match self {
-            BoundExpr::FuncCall { func, args, .. } => {
-                matches!(
-                    func,
-                    ScalarFn::Nextval
-                        | ScalarFn::Currval
-                        | ScalarFn::Setval
-                        | ScalarFn::Lastval
-                        | ScalarFn::ClockTimestamp
-                        | ScalarFn::GenRandomUuid
-                        | ScalarFn::UuidV7
-                        | ScalarFn::UuidV7Shift
-                ) || args.iter().any(BoundExpr::contains_volatile_fn)
+            BoundExpr::FuncCall { args, .. } => {
+                self.is_volatile_call() || args.iter().any(BoundExpr::contains_volatile_fn)
             }
-            // A routine's body is opaque here and PostgreSQL defaults a
-            // routine to VOLATILE, so treat every call as volatile.
             BoundExpr::Routine { .. } => true,
             BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
             BoundExpr::WindowFunc { kind, spec, .. } => {
@@ -823,6 +839,56 @@ impl BoundExpr {
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
+        }
+    }
+
+    /// Whether this expression tree contains a subquery marker anywhere — a
+    /// scalar subquery, an `EXISTS`, or a quantified `op ANY/ALL (SELECT …)`.
+    ///
+    /// Evaluating one runs a whole plan. A *correlated* one runs that plan again
+    /// for every row the expression is applied to, so a conjunct containing one
+    /// is by far the most expensive thing a filter can hold — orders of magnitude
+    /// past any ordinary comparison. Used by the planner to evaluate such a
+    /// conjunct last.
+    pub fn contains_subquery(&self) -> bool {
+        match self {
+            BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. }
+            | BoundExpr::QuantifiedSubquery { .. } => true,
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::IsNull { expr, .. }
+            | BoundExpr::BoolTest { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Collate { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. } => expr.contains_subquery(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_subquery() || right.contains_subquery()
+            }
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::WindowFunc { kind, spec, .. } => {
+                kind.args().iter().any(BoundExpr::contains_subquery)
+                    || spec.exprs().any(BoundExpr::contains_subquery)
+            }
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::Subscript { base, index, .. } => {
+                base.contains_subquery() || index.contains_subquery()
+            }
+            BoundExpr::Case { whens, else_, .. } => {
+                whens
+                    .iter()
+                    .any(|(c, r)| c.contains_subquery() || r.contains_subquery())
+                    || else_.as_ref().is_some_and(|e| e.contains_subquery())
+            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => {
+                array.contains_subquery() || cmp.contains_subquery()
+            }
+            BoundExpr::Const { .. }
+            | BoundExpr::ColumnRef { .. }
+            | BoundExpr::Param { .. }
+            | BoundExpr::OuterColumnRef { .. } => false,
         }
     }
 
@@ -1152,6 +1218,44 @@ mod collect_column_refs_tests {
                 distinct: None,
             },
         )))
+    }
+
+    #[test]
+    fn only_the_deep_volatility_test_sees_inside_a_subquery_body() {
+        // `EXISTS (SELECT nextval('s'))`. The shallow predicate stops at the
+        // marker because a subquery body is a plan of its own; the deep one has
+        // to cross it, or a caller reasoning about the *marker* — how many rows
+        // reach it, how many times it is built — draws the wrong conclusion.
+        let nextval = BoundExpr::FuncCall {
+            func: ScalarFn::Nextval,
+            ret: PgType::Int8,
+            args: vec![BoundExpr::Const {
+                value: Value::Text("s".into()),
+                ty: PgType::Text,
+            }],
+        };
+        let marker = BoundExpr::Exists {
+            subplan: Subplan(Box::new(crate::logical_plan::LogicalPlan::Values(
+                crate::logical_plan::ValuesPlan {
+                    columns: Vec::new(),
+                    rows: vec![vec![nextval.clone()]],
+                    predicate: None,
+                    sort: Vec::new(),
+                    distinct: None,
+                },
+            ))),
+            negated: false,
+        };
+        assert!(nextval.is_volatile_call());
+        assert!(
+            !marker.is_volatile_call(),
+            "the marker itself is not a call"
+        );
+        assert!(
+            !marker.contains_volatile_fn(),
+            "shallow stops at the marker"
+        );
+        assert!(crate::plan::expr_contains_volatile_fn(&marker));
     }
 
     #[test]
