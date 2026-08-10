@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786355873289,
+  "lastUpdate": 1786355874696,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -10336,6 +10336,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 24679.87151,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "65f44d62df3ecb36bed4ee441ed70afdf1ede99a",
+          "message": "refactor(executor): Use `md-5` crate for md5 function (#203)",
+          "timestamp": "2026-08-10T11:10:53+02:00",
+          "tree_id": "7500b60906829208c1898ece75e948900d67f691",
+          "url": "https://github.com/ovr/crabgresql/commit/65f44d62df3ecb36bed4ee441ed70afdf1ede99a"
+        },
+        "date": 1786355874641,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 484.88728,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 24292.940766,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
