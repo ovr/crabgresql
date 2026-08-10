@@ -20,7 +20,7 @@ pub mod vector;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -675,13 +675,24 @@ pub fn execute(
             source,
             limit,
             offset,
+            sort,
         } => {
-            let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
+            let Execution::Rows { columns, mut node } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "LIMIT source did not produce a row set",
                 ));
             };
+            // ORDER BY keys the planner lifted out of the source so the sort can
+            // run bounded (see `crabgresql_planner::topn`). The source left its
+            // rows unsorted and full width — including the hidden ORDER BY
+            // columns — so this node does the ordering *and* the trim the `Sort`
+            // it replaced would have done.
+            if !sort.is_empty() {
+                let fetch = crabgresql_planner::topn::fetch(limit, offset)
+                    .expect("lifted sort keys imply a bounded fetch");
+                node = Box::new(TopN::new(node, sort, fetch as usize, columns.len())?);
+            }
             Ok(Execution::Rows {
                 columns,
                 node: Box::new(Limit::new(node, limit, offset)),
@@ -3845,9 +3856,119 @@ impl ExecNode for Sort {
     }
 }
 
+/// Bounded sort (`ORDER BY … LIMIT n`): keeps only the `fetch` smallest rows.
+///
+/// Same output as [`Sort`] followed by the matching [`Limit`], for `O(n log k)`
+/// time and `k` rows of memory instead of `O(n log n)` and all of them. The
+/// planner decides when this applies (see `crabgresql_planner::topn`) and hands
+/// the keys to the `Limit` node, which builds this.
+///
+/// A max-heap of the rows kept so far makes its worst member — `peek` — the
+/// threshold: any row that loses to it cannot reach the answer and is dropped
+/// without touching the heap, which is the path almost every input row takes.
+///
+/// **Ties keep input order**, as [`Sort`]'s stable `sort_by` does, because a heap
+/// on its own does not: `seq` is the arrival number and the final tiebreak of
+/// the comparison. Without it `LIMIT 50` and `LIMIT 100` could disagree about
+/// which of two equal rows they returned.
+pub struct TopN {
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+/// One row in [`TopN`]'s heap, ordered *worst-first* so `peek` is the row the
+/// next better candidate evicts.
+struct Candidate<'a> {
+    seq: u64,
+    row: Tuple,
+    keys: &'a [SortKey],
+}
+
+impl Candidate<'_> {
+    /// Sort order: by the keys, then by arrival. Total, and equal only to
+    /// itself, so the `Ord`/`Eq` pair below is consistent.
+    fn order(&self, other: &Self) -> Ordering {
+        compare_rows(&self.row, &other.row, self.keys).then(self.seq.cmp(&other.seq))
+    }
+}
+
+impl Ord for Candidate<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order(other)
+    }
+}
+
+impl PartialOrd for Candidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.order(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Candidate<'_> {}
+
+impl TopN {
+    /// `fetch` is `LIMIT + OFFSET` — every row the `Limit` above may still need.
+    /// It is non-zero and bounded by the planner.
+    pub fn new(
+        mut child: Box<dyn ExecNode>,
+        keys: Vec<SortKey>,
+        fetch: usize,
+        visible_width: usize,
+    ) -> Result<Self, ExecError> {
+        let mut heap: BinaryHeap<Candidate<'_>> = BinaryHeap::with_capacity(fetch);
+        let mut seq = 0u64;
+        while let Some(row) = child.next()? {
+            let candidate = Candidate {
+                seq,
+                row,
+                keys: &keys,
+            };
+            seq += 1;
+            if heap.len() < fetch {
+                heap.push(candidate);
+                continue;
+            }
+            // The threshold check. `peek` is the worst row kept, so a candidate
+            // that is not better than it cannot be in the answer.
+            match heap.peek() {
+                Some(worst) if candidate < *worst => {
+                    heap.pop();
+                    heap.push(candidate);
+                }
+                _ => {}
+            }
+        }
+        // Worst-first heap → `into_sorted_vec` gives best-first, the order the
+        // rows leave in.
+        let mut rows: Vec<Tuple> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| candidate.row)
+            .collect();
+        // Drop the hidden sort-only columns, exactly as `Sort` does.
+        for row in &mut rows {
+            row.truncate(visible_width);
+        }
+        Ok(Self {
+            rows: rows.into_iter(),
+        })
+    }
+}
+
+impl ExecNode for TopN {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        Ok(self.rows.next())
+    }
+}
+
 /// Order two rows by `keys`, the comparison behind every `ORDER BY` in the
-/// engine. Shared by [`Sort`] and [`WindowAgg`] so the window sort and the
-/// query's own can never disagree about where NULLs go.
+/// engine. Shared by [`Sort`], [`TopN`] and [`WindowAgg`] so the window sort and
+/// the query's own can never disagree about where NULLs go.
 fn compare_rows(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> Ordering {
     for key in keys {
         let (va, vb) = (&a[key.column], &b[key.column]);
@@ -5909,6 +6030,110 @@ mod tests {
         let mut node = Limit::new(Box::new(sort), Some(1), None);
         assert_eq!(ids(&mut node), vec![3]);
 
+        Ok(())
+    }
+
+    /// Rows whose sort key repeats heavily and includes NULLs — the input a
+    /// Top-N can only get right if it breaks ties the way a stable sort does.
+    /// Column 0 is the key, column 1 the arrival number, so a row that moved
+    /// relative to an equal one is visible in the output.
+    fn tied_rows(count: i32) -> Vec<Tuple> {
+        // A tiny LCG: reproducible, and unrelated to the order the keys imply.
+        let mut state = 12345u64;
+        (0..count)
+            .map(|seq| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let key = (state >> 33) % 7;
+                let key = match key {
+                    // Roughly one row in seven is NULL, so both NULL branches of
+                    // the comparison are exercised at every limit.
+                    6 => Value::Null,
+                    other => Value::Int4(other as i32),
+                };
+                vec![key, Value::Int4(seq)]
+            })
+            .collect()
+    }
+
+    /// The contract of [`TopN`]: for every direction, NULL placement and window,
+    /// it returns exactly what the full [`Sort`] plus [`Limit`] returns —
+    /// including *which* of several equal rows, which is what the arrival-number
+    /// tiebreak in `Candidate::order` exists for. Dropping that tiebreak makes
+    /// this test fail on the very first limit.
+    #[test]
+    fn topn_matches_a_full_sort_under_the_same_limit() -> anyhow::Result<()> {
+        let rows = tied_rows(200);
+        for asc in [true, false] {
+            for nulls_first in [true, false] {
+                let keys = vec![SortKey {
+                    column: 0,
+                    ty: PgType::Int4,
+                    collation: DEFAULT_COLLATION_OID,
+                    asc,
+                    nulls_first,
+                }];
+                for (limit, offset) in [
+                    (1i64, None),
+                    (1, Some(0)),
+                    (10, None),
+                    (10, Some(5)),
+                    (50, None),
+                    (100, Some(90)),
+                    // Past the input: the bound never binds.
+                    (500, None),
+                    (200, Some(199)),
+                ] {
+                    let fetch = crabgresql_planner::topn::fetch(Some(limit), offset)
+                        .expect("a positive limit is bounded");
+                    let expected = {
+                        let sort = Sort::new(VecSource::boxed(rows.clone()), keys.clone(), 2)?;
+                        collect(&mut Limit::new(Box::new(sort), Some(limit), offset))
+                    };
+                    let topn = TopN::new(
+                        VecSource::boxed(rows.clone()),
+                        keys.clone(),
+                        fetch as usize,
+                        2,
+                    )?;
+                    let actual = collect(&mut Limit::new(Box::new(topn), Some(limit), offset));
+                    assert_eq!(
+                        actual, expected,
+                        "asc={asc} nulls_first={nulls_first} limit={limit} offset={offset:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A Top-N inherits the hidden-column trim from the `Sort` it replaces: the
+    /// planner lifts the keys off a node that then emits full-width rows, so
+    /// nothing else is left to drop the resjunk columns.
+    #[test]
+    fn topn_trims_hidden_sort_columns() -> anyhow::Result<()> {
+        // `SELECT id FROM t ORDER BY -id LIMIT 2`: the key is a second, hidden
+        // column the client never sees.
+        let rows = vec![
+            vec![Value::Int4(1), Value::Int4(-1)],
+            vec![Value::Int4(2), Value::Int4(-2)],
+            vec![Value::Int4(3), Value::Int4(-3)],
+        ];
+        let mut node = TopN::new(
+            VecSource::boxed(rows),
+            vec![SortKey {
+                column: 1,
+                ty: PgType::Int4,
+                collation: DEFAULT_COLLATION_OID,
+                asc: true,
+                nulls_first: false,
+            }],
+            2,
+            1,
+        )?;
+        assert_eq!(
+            collect(&mut node),
+            vec![vec![Value::Int4(3)], vec![Value::Int4(2)]]
+        );
         Ok(())
     }
 
