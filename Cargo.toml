@@ -41,6 +41,7 @@ deepsize = "0.2"
 icu_collator = "2"
 icu_locale_core = "2"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+md-5 = "0.11"
 # The case-insensitive substring prefilter for `ILIKE`. `str::find` carries its
 # own prefilter for the case-sensitive side, but there is no `str` API that
 # scans for two candidate bytes at once.
