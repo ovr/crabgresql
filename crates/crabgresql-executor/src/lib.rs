@@ -1088,7 +1088,8 @@ fn resolve_expr(
         }
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
-        | BoundExpr::Srf { args, .. } => {
+        | BoundExpr::Srf { args, .. }
+        | BoundExpr::Coalesce { args, .. } => {
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,

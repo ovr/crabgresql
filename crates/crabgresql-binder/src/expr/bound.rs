@@ -235,6 +235,20 @@ pub enum BoundExpr {
         else_: Option<Box<BoundExpr>>,
         ty: PgType,
     },
+    /// `COALESCE(a, b, …)`: the first argument that is not NULL, or NULL when
+    /// every one is. Arguments are evaluated left to right and only until one
+    /// answers non-NULL, so `coalesce(1, 1/0)` is `1` — which is why this is its
+    /// own node rather than sugar for `CASE WHEN a IS NOT NULL THEN a …`: that
+    /// shape would place each argument in the tree twice and evaluate it twice.
+    ///
+    /// Every argument is already coerced to `ty`, the type
+    /// [`crate::expr::coerce::unify_value_column`] resolved for the whole list —
+    /// the same rule `CASE`/`UNION`/`VALUES` use. Never empty: the grammar
+    /// requires at least one argument.
+    Coalesce {
+        args: Vec<BoundExpr>,
+        ty: PgType,
+    },
     /// A set-returning function in the SELECT target list; `ret` is the element
     /// (per-row output) type. This is a marker that is only legal at the top
     /// level of a projection: the `ProjectSet` executor node expands it into
@@ -541,6 +555,7 @@ impl BoundExpr {
             BoundExpr::ArrayCtor { ty, .. } => *ty,
             BoundExpr::Subscript { ty, .. } => *ty,
             BoundExpr::Case { ty, .. } => *ty,
+            BoundExpr::Coalesce { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
             BoundExpr::WindowFunc { ret, .. } => *ret,
@@ -569,7 +584,8 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
-            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_srf),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_srf)
                     || spec.exprs().any(BoundExpr::contains_srf)
@@ -615,7 +631,9 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
                 args.iter().any(BoundExpr::contains_routine)
             }
-            BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_routine),
+            BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
+                args.iter().any(BoundExpr::contains_routine)
+            }
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_routine)
                     || spec.exprs().any(BoundExpr::contains_routine)
@@ -670,7 +688,8 @@ impl BoundExpr {
             BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
-            | BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_aggregate() || index.contains_aggregate()
@@ -732,7 +751,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_window),
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_window),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_window() || index.contains_window()
@@ -785,7 +805,8 @@ impl BoundExpr {
                 .or_else(|| right.first_agg_or_window()),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
-            | BoundExpr::Srf { args, .. } => first(args),
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Coalesce { args, .. } => first(args),
             BoundExpr::ArrayCtor { elems, .. } => first(elems),
             BoundExpr::Subscript { base, index, .. } => base
                 .first_agg_or_window()
@@ -859,7 +880,9 @@ impl BoundExpr {
                 self.is_volatile_call() || args.iter().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::Routine { .. } => true,
-            BoundExpr::Srf { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
+            BoundExpr::Srf { args, .. } | BoundExpr::Coalesce { args, .. } => {
+                args.iter().any(BoundExpr::contains_volatile_fn)
+            }
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_volatile_fn)
                     || spec.exprs().any(BoundExpr::contains_volatile_fn)
@@ -924,7 +947,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. } => args.iter().any(BoundExpr::contains_subquery),
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_subquery),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_subquery)
                     || spec.exprs().any(BoundExpr::contains_subquery)
@@ -983,7 +1007,7 @@ impl BoundExpr {
                     .sum::<usize>()
                     + else_.as_ref().map_or(0, |e| e.count_param_refs(index))
             }
-            BoundExpr::Aggregate { args, .. } => {
+            BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
             }
             BoundExpr::WindowFunc { kind, spec, .. } => kind
@@ -1051,7 +1075,7 @@ impl BoundExpr {
                         fold(e, acc);
                     }
                 }
-                BoundExpr::Aggregate { args, .. } => {
+                BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
                 }
                 // The arguments and the OVER clause both read this row, so both
@@ -1126,7 +1150,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. } => Self::collect_all(args, out),
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => Self::collect_all(args, out),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
             BoundExpr::Subscript { base, index, .. } => {
                 base.collect_column_refs(out) && index.collect_column_refs(out)
@@ -1208,7 +1233,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. } => {
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => {
                 args.iter_mut().for_each(|a| a.shift_column_refs(delta));
             }
             // Mirrors `column_ref_bounds`: the arguments and the OVER clause

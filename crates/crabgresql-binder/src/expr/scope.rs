@@ -366,6 +366,10 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             else_: else_.as_ref().map(|e| Box::new(outerize_columns(e, level))),
             ty: *ty,
         },
+        BoundExpr::Coalesce { args, ty } => BoundExpr::Coalesce {
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            ty: *ty,
+        },
         // A merged-join visible column expression is only ever a ColumnRef or a
         // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
         BoundExpr::Srf { .. }
@@ -994,15 +998,20 @@ pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
                 _ => -1,
             }
         }
-        // `CASE` (which is also how `COALESCE` is lowered) keeps a modifier only
-        // when every arm agrees on it, as PostgreSQL's `select_common_typmod`
-        // does.
+        // `CASE` keeps a modifier only when every arm agrees on it, as
+        // PostgreSQL's `select_common_typmod` does.
         BoundExpr::Case { whens, else_, .. } => {
             let arms = whens
                 .iter()
                 .map(|(_, result)| result)
                 .chain(else_.as_deref());
             common_typmod(arms.map(|arm| expr_typmod(arm, scope)))
+        }
+        // `COALESCE` resolves its modifier by the same rule over its arguments:
+        // `coalesce(varchar(3), varchar(3))` is `varchar(3)`, while
+        // `coalesce(varchar(3), varchar(5))` is bare `varchar`.
+        BoundExpr::Coalesce { args, .. } => {
+            common_typmod(args.iter().map(|arg| expr_typmod(arg, scope)))
         }
         // A scalar subquery reports its single output column's modifier.
         BoundExpr::ScalarSubquery { subplan, .. } => crate::plan::output_columns_of(&subplan.plan)

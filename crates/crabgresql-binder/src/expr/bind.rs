@@ -842,6 +842,124 @@ fn bind_case(
     Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
 }
 
+/// `COALESCE(a, b, …)`: the first argument that is not NULL.
+///
+/// PostgreSQL resolves the result type with the same `select_common_type` rule as
+/// `CASE`/`UNION`/`VALUES` — so `unify_value_column` does the whole job here,
+/// including adapting untyped literals per argument (`coalesce(1, 'x')` is
+/// `invalid input syntax for type integer`, not a text comparison) and settling an
+/// all-untyped list on `text`.
+///
+/// The result is a [`BoundExpr::Coalesce`] rather than the equivalent `CASE WHEN a
+/// IS NOT NULL THEN a …`, because that shape would place — and evaluate — every
+/// argument twice. Laziness lives in the executor: `coalesce(1, 1/0)` is `1`.
+pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError> {
+    // `COALESCE()` is a syntax error in PG's grammar (`expr_list` is not
+    // optional). This parser accepts an empty argument list for any call, so the
+    // refusal has to happen here; the message is PG's, without its cursor.
+    if bindings.is_empty() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "syntax error at or near \")\"",
+        ));
+    }
+    let (ty, args) = unify_value_column(bindings, "COALESCE")?;
+    if ty.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            args.iter().map(crate::collation::expr_collation),
+        )?;
+    }
+    Ok(Binding::Typed(BoundExpr::Coalesce { args, ty }))
+}
+
+/// `NULLIF(a, b)`: NULL when the two are equal, `a` otherwise — the standard's
+/// shorthand for `CASE WHEN a = b THEN NULL ELSE a END`, which is exactly what it
+/// binds to.
+///
+/// The comparison goes through `bind_binary_op`, so operator resolution decides
+/// everything observable: which types can be compared at all
+/// (`nullif(1, true)` is `operator does not exist: integer = boolean`), how an
+/// untyped literal is read, and — through the operand type the operator resolved
+/// — the result type. That last point is why `nullif('a'::varchar(3), 'b')` is
+/// `text` and not `varchar(3)`: `=` compares varchar as text, and PG reports the
+/// *coerced* left argument's type.
+///
+/// `a` therefore appears twice in the tree (inside the comparison and as the ELSE)
+/// and is evaluated twice, the same trade-off a simple `CASE` operand already
+/// makes. A volatile `a` would make that observable, so it is refused instead.
+pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Binding, BindError> {
+    // PG's grammar fixes the arity at two, so a wrong count is a syntax error
+    // there. Reproduce the message (without its cursor) rather than reporting a
+    // missing two-argument function.
+    let [left, right] = <[Binding; 2]>::try_from(bindings).map_err(|bindings| {
+        BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            if bindings.len() < 2 {
+                "syntax error at or near \")\""
+            } else {
+                "syntax error at or near \",\""
+            },
+        )
+    })?;
+    let eq = bind_binary_op(
+        BinOp::Eq,
+        left.clone(),
+        right,
+        Span::empty(),
+        (Span::empty(), Span::empty()),
+        scope.catalog().as_ref(),
+    )?;
+    let eq = match eq {
+        Binding::Typed(e) => e,
+        // `=` always resolves to a typed boolean expression.
+        Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
+    };
+    // The type the operator settled its operands on — and so the type of the
+    // value NULLIF returns. Comparisons bind either to a `Binary` (which records
+    // it directly) or, for the types whose `=` lowers to a function, to that
+    // call, whose first argument already carries it.
+    let arg_ty = match &eq {
+        BoundExpr::Binary { arg_ty, .. } => *arg_ty,
+        BoundExpr::FuncCall { args, .. } if !args.is_empty() => args[0].ty(),
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "NULLIF over this comparison is not supported yet",
+            ));
+        }
+    };
+    // PostgreSQL has no `varchar = varchar` operator: `varchar` comparisons run
+    // through `text`, so the argument PG hands back is a `text` one and
+    // `nullif(v, v)` reports `text`, not `character varying`. This binder compares
+    // varchar natively — invisible while the result is a boolean, but NULLIF
+    // returns the operand, so the type has to be corrected here. (`bpchar` and
+    // `name` keep their own equality operators, and so their own type.)
+    let arg_ty = if arg_ty == PgType::Varchar {
+        PgType::Text
+    } else {
+        arg_ty
+    };
+    let value = resolve_operand(&left, arg_ty)?;
+    // Evaluating `a` twice is invisible for a pure expression but not for a
+    // volatile one — `nullif(nextval('s'), 1)` would advance the sequence twice.
+    // Refuse rather than answer wrongly, as the SQL-function inliner does.
+    if value.contains_volatile_fn() {
+        return Err(BindError::feature_not_supported(
+            "NULLIF over a volatile expression is not supported yet",
+        ));
+    }
+    Ok(Binding::Typed(BoundExpr::Case {
+        whens: vec![(
+            eq,
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: arg_ty,
+            },
+        )],
+        else_: Some(Box::new(value)),
+        ty: arg_ty,
+    }))
+}
+
 /// `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c`; `x NOT IN (...)` to
 /// `x <> a AND x <> b AND x <> c`. Both reproduce PG's three-valued logic (a
 /// NULL element yields NULL, not false — the executor's Kleene `OR`/`AND`) and

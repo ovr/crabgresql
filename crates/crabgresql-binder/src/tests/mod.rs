@@ -3,6 +3,7 @@
 
 mod aggregates;
 mod case_bool;
+mod coalesce;
 mod common;
 mod copy;
 mod distinct_order_limit;

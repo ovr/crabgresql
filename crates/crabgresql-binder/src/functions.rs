@@ -3281,6 +3281,20 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // `COALESCE` and `NULLIF` are grammar constructs in PostgreSQL, not entries in
+    // `pg_proc`: they are polymorphic, resolve their type the way `CASE` does, and
+    // `COALESCE` is variadic and lazy. This parser hands them over as ordinary
+    // function calls, so they are intercepted here — but only unqualified, because
+    // no schema actually contains them (`pg_catalog.coalesce(1,2)` is `42883` in
+    // PG, and falling through to `resolve_call` is how that stays true).
+    if func.name.0.len() == 1 {
+        match name.as_str() {
+            "coalesce" => return crate::expr::bind_coalesce(bindings),
+            "nullif" => return crate::expr::bind_nullif(bindings, scope),
+            _ => {}
+        }
+    }
+
     // `concat`/`concat_ws`/`format` are variadic and non-strict; they don't fit
     // the fixed-arity overload table, so every argument is coerced to text and a
     // single variadic `FuncCall` is built directly.

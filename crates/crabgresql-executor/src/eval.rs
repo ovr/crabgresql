@@ -295,6 +295,18 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 None => Ok(Value::Null),
             }
         }
+        // COALESCE evaluates its arguments left to right and stops at the first
+        // one that is not NULL — the rest are never evaluated, so
+        // `coalesce(1, 1/0)` is 1 rather than a division-by-zero error, as in PG.
+        BoundExpr::Coalesce { args, .. } => {
+            for arg in args {
+                let value = eval(arg, row, ctx)?;
+                if !matches!(value, Value::Null) {
+                    return Ok(value);
+                }
+            }
+            Ok(Value::Null)
+        }
         // An SRF marker only expands via the `ProjectSet` node; reaching scalar
         // evaluation means it appeared where a set is not allowed (WHERE, an
         // operator argument, ORDER BY, ...). PG reports this as 0A000.
