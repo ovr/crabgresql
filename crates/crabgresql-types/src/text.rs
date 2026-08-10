@@ -6,6 +6,8 @@
 //! source. Indexing is 1-based and character-based (not byte-based), matching
 //! `text`'s behavior in a UTF-8 database.
 
+use crate::hex;
+
 /// SQLSTATE codes emitted by string functions. Kept local (like `interval.rs`)
 /// so `crabgresql-types` needs no dependency on the wire-protocol crate; the
 /// executor maps these onto `crabgresql_pg_wire::sqlstate::*`.
@@ -2394,15 +2396,6 @@ pub fn decode(s: &str, format: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut hi: Option<u8> = None;
@@ -2410,7 +2403,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
         if c.is_ascii_whitespace() {
             continue;
         }
-        let v = hex_val(c).ok_or_else(|| {
+        let v = hex::val(c).ok_or_else(|| {
             TextError::new(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 format!("invalid hexadecimal digit: \"{}\"", c as char),

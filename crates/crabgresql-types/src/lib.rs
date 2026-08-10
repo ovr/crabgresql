@@ -18,6 +18,7 @@ pub mod fmt;
 pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
+pub mod hex;
 pub mod interval;
 pub mod intlit;
 pub mod json;

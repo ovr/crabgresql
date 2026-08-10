@@ -5,22 +5,20 @@
 //! the 32-character lowercase digest — as pinned by the `md5` regression test.
 //! No PG C source is consulted.
 
+use crabgresql_types::hex;
 use md5::{Digest, Md5};
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// The lowercase 32-character hex MD5 digest of `data`.
 pub fn md5_hex(data: &[u8]) -> String {
     // `digest` 0.11 returns a `hybrid_array::Array`, which — unlike the
     // `generic-array` of 0.10 — has no `LowerHex`, so the nibbles are spelled
     // out by hand.
-    let mut out = Vec::with_capacity(32);
+    let mut out = String::with_capacity(32);
     for byte in Md5::digest(data) {
-        out.push(HEX[(byte >> 4) as usize]);
-        out.push(HEX[(byte & 0x0f) as usize]);
+        out.push(hex::lo(byte >> 4));
+        out.push(hex::lo(byte & 0x0f));
     }
-    // Only ASCII hex digits were pushed, so this is valid UTF-8.
-    String::from_utf8(out).expect("hex digest is ASCII")
+    out
 }
 
 #[cfg(test)]

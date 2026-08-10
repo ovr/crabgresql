@@ -104,9 +104,13 @@ vendored; no PostgreSQL source is involved.
 This product depends on the `md-5` crate (used by crabgresql-executor to
 implement the SQL `md5()` function):
 
-  Copyright (c) RustCrypto Developers (github.com/RustCrypto/hashes)
+  Copyright (c) 2016-2026 The RustCrypto Project Developers
+  Copyright (c) 2016 Artyom Pavlov
+  Copyright (c) 2009-2013 Mozilla Foundation
+  Copyright (c) 2006-2009 Graydon Hoare
+  (github.com/RustCrypto/hashes)
 
-licensed under Apache-2.0 OR MIT. It is an ordinary Cargo dependency, not
+licensed under MIT OR Apache-2.0. It is an ordinary Cargo dependency, not
 vendored; no PostgreSQL source is involved.
 
 This product depends on the `deepsize` crate and its `deepsize_derive` proc

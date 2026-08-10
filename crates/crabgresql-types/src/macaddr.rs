@@ -11,6 +11,8 @@
 //! `Value::Macaddr8([u8; 8])`). The natural byte order already gives PG's
 //! `macaddr_cmp`, so ordering is a plain slice comparison and needs no helper.
 
+use crate::hex;
+
 // SQLSTATEs (kept as literals; the types crate does not depend on the protocol
 // crate — the binder/executor map these to `sqlstate::*`).
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -35,22 +37,6 @@ fn invalid8(input: &str) -> MacaddrError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
         message: format!("invalid input syntax for type macaddr8: \"{input}\""),
     }
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_lo(nibble: u8) -> char {
-    char::from(match nibble {
-        0..=9 => b'0' + nibble,
-        _ => b'a' + (nibble - 10),
-    })
 }
 
 fn is_delim(c: u8) -> bool {
@@ -89,7 +75,7 @@ pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
         let mut i = 0usize;
         for g in groups {
             for pair in g.chunks(2) {
-                let (Some(hi), Some(lo)) = (hex_val(pair[0]), hex_val(pair[1])) else {
+                let (Some(hi), Some(lo)) = (hex::val(pair[0]), hex::val(pair[1])) else {
                     return Err(err());
                 };
                 out[i] = (hi << 4) | lo;
@@ -104,7 +90,7 @@ pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
         }
         let mut out = [0u8; 6];
         for i in 0..6 {
-            let (Some(hi), Some(lo)) = (hex_val(s[2 * i]), hex_val(s[2 * i + 1])) else {
+            let (Some(hi), Some(lo)) = (hex::val(s[2 * i]), hex::val(s[2 * i + 1])) else {
                 return Err(err());
             };
             out[i] = (hi << 4) | lo;
@@ -127,7 +113,7 @@ pub fn parse_macaddr8(input: &str) -> Result<[u8; 8], MacaddrError> {
     let mut delim: Option<u8> = None;
     let mut group_len = 0usize;
     for &c in trimmed.as_bytes() {
-        if let Some(n) = hex_val(c) {
+        if let Some(n) = hex::val(c) {
             nibbles.push(n);
             group_len += 1;
         } else if is_delim(c) {
@@ -185,8 +171,8 @@ fn format_bytes(bytes: &[u8]) -> String {
         if i != 0 {
             out.push(':');
         }
-        out.push(hex_lo(byte >> 4));
-        out.push(hex_lo(byte & 0x0f));
+        out.push(hex::lo(byte >> 4));
+        out.push(hex::lo(byte & 0x0f));
     }
     out
 }

@@ -6,7 +6,7 @@
 use crate::fmt::FmtCtx;
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, jsonpath, money,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, hex, interval, json, jsonpath, money,
     parse_bool, time, timestamp, timestamptz, timetz,
 };
 
@@ -952,7 +952,7 @@ pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
                 }
                 continue;
             }
-            let nibble = hex_val(c).ok_or_else(|| invalid_input(PgType::Bytea, s))?;
+            let nibble = hex::val(c).ok_or_else(|| invalid_input(PgType::Bytea, s))?;
             match hi.take() {
                 None => hi = Some(nibble),
                 Some(h) => out.push((h << 4) | nibble),
@@ -994,15 +994,6 @@ pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
         }
     }
     Ok(out)
-}
-
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn octal_val(c: u8) -> Option<u8> {
