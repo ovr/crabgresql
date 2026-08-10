@@ -10,9 +10,21 @@ SELECT NULLIF('a', 'b');
 -- NULL is never "equal", so a NULL first argument stays NULL and a NULL second
 -- argument returns the first
 SELECT NULLIF(NULL::int, 1) AS left_null, NULLIF(1, NULL) AS right_null;
--- the result type is the type the `=` operator resolved its operands to, which
--- is why a mixed comparison reports the promoted type
-SELECT pg_typeof(NULLIF(1::int, 2.5)) AS ty, pg_typeof(NULLIF('a', 'b')) AS ty;
+-- the result is the left argument as the `=` operator takes it. PG compares these
+-- pairs cross-type, so the left argument is not coerced and keeps its own type --
+-- which is what keeps a real from being printed at double precision and a
+-- timestamp from picking up a zone
+SELECT pg_typeof(NULLIF(1::int2, 1::int8)) AS int2_int8,
+       pg_typeof(NULLIF(1::float4, 1::float8)) AS float4_float8,
+       NULLIF(0.1::float4, 1::float8) AS float4_value;
+SELECT pg_typeof(NULLIF('2020-01-01'::date, '2020-01-01'::timestamp)) AS date_ts,
+       NULLIF('2020-01-01 05:00'::timestamp, '2020-06-01'::timestamptz) AS ts_tstz,
+       pg_typeof(NULLIF('a'::name, 'a'::text)) AS name_text;
+-- where PG has no cross-type operator it coerces both sides first, and then the
+-- comparison's own operand type is the result: int against numeric compares in
+-- numeric, and varchar compares as text (PG has no varchar `=`)
+SELECT pg_typeof(NULLIF(1::int, 2.5)) AS int_numeric, pg_typeof(NULLIF('a', 'b')) AS unknowns,
+       pg_typeof(NULLIF('a'::varchar, 'b'::varchar)) AS varchars;
 -- the classic use: turn a sentinel into NULL, here to divide safely
 CREATE TABLE quotas (team text, allowed integer);
 INSERT INTO quotas VALUES ('a', 4), ('b', 0), ('c', 2);
@@ -29,4 +41,9 @@ SELECT NULLIF(1, true);
 -- prints the same message, with a cursor under the offending token
 SELECT NULLIF(1);
 SELECT NULLIF(1, 2, 3);
+-- error: like COALESCE, NULLIF is a keyword and takes no function decorations, and
+-- is not reachable under quotes (see coalesce.sql for the cursor/token-case and
+-- HINT gaps these share)
+SELECT NULLIF(1, 2) OVER ();
+SELECT "nullif"(1, 2);
 DROP TABLE quotas;

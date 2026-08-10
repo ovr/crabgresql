@@ -19,7 +19,7 @@ use super::datatype::{custom_type_name, map_data_type};
 use super::literal::{bind_at_local, bind_at_time_zone, bind_extract, bind_interval, bind_value};
 use super::operators::{
     bind_binary, bind_binary_op, bind_bool_test, bind_compound, bind_is_null, bind_like,
-    bind_similar_to, bind_unary, binding_typed_ty, is_geo_ty, resolve_operand,
+    bind_similar_to, bind_unary, binding_typed_ty, is_geo_ty, is_text_family, resolve_operand,
 };
 use super::scope::{Binding, Scope, normalize_ident};
 
@@ -878,11 +878,15 @@ pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError
 ///
 /// The comparison goes through `bind_binary_op`, so operator resolution decides
 /// everything observable: which types can be compared at all
-/// (`nullif(1, true)` is `operator does not exist: integer = boolean`), how an
-/// untyped literal is read, and — through the operand type the operator resolved
-/// — the result type. That last point is why `nullif('a'::varchar(3), 'b')` is
-/// `text` and not `varchar(3)`: `=` compares varchar as text, and PG reports the
-/// *coerced* left argument's type.
+/// (`nullif(1, true)` is `operator does not exist: integer = boolean`) and how an
+/// untyped literal is read.
+///
+/// The result is the *left* argument as the chosen operator takes it, which is
+/// where [`equality_keeps_left`] comes in: PG reports `nullif(int2, int4)` as
+/// `smallint` and `nullif(timestamp, timestamptz)` as an untouched `timestamp`,
+/// because a cross-type `=` operator leaves the operand alone. Only when PG has to
+/// coerce the left argument to compare at all (`nullif(int, numeric)` → `numeric`)
+/// does the comparison's operand type become the result type.
 ///
 /// `a` therefore appears twice in the tree (inside the comparison and as the ELSE)
 /// and is evaluated twice, the same trade-off a simple `CASE` operand already
@@ -901,6 +905,7 @@ pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Bindi
             },
         )
     })?;
+    let (left_ty, right_ty) = (binding_typed_ty(&left), binding_typed_ty(&right));
     let eq = bind_binary_op(
         BinOp::Eq,
         left.clone(),
@@ -938,7 +943,14 @@ pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Bindi
     } else {
         arg_ty
     };
-    let value = resolve_operand(&left, arg_ty)?;
+    // Where PG compares the two types as they are, the left argument is never
+    // coerced and keeps its own type. An untyped left has no type of its own, and
+    // took the comparison's anyway.
+    let result_ty = match (left_ty, right_ty) {
+        (Some(left_ty), Some(right_ty)) if equality_keeps_left(left_ty, right_ty) => left_ty,
+        _ => arg_ty,
+    };
+    let value = resolve_operand(&left, result_ty)?;
     // Evaluating `a` twice is invisible for a pure expression but not for a
     // volatile one — `nullif(nextval('s'), 1)` would advance the sequence twice.
     // Refuse rather than answer wrongly, as the SQL-function inliner does.
@@ -952,12 +964,40 @@ pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Bindi
             eq,
             BoundExpr::Const {
                 value: Value::Null,
-                ty: arg_ty,
+                ty: result_ty,
             },
         )],
         else_: Some(Box::new(value)),
-        ty: arg_ty,
+        ty: result_ty,
     }))
+}
+
+/// Whether PostgreSQL compares `left` against `right` with a **cross-type** `=`
+/// operator, which leaves both operands at their own types — so `NULLIF` hands the
+/// left one back unchanged, and reports its type.
+///
+/// The families are the ones PG ships those operators for, read off its observable
+/// behavior: `nullif(int2, int4)` is `smallint`, `nullif(float4, float8)` is `real`
+/// (so `0.1::float4` comes back as `0.1`, not widened), `nullif(timestamp,
+/// timestamptz)` is an untouched `timestamp`, `nullif(date, timestamp)` is a `date`,
+/// and `nullif(name, text)` is `name`. Everything else has a single-type operator
+/// only, so PG coerces both sides to it first — `nullif(int, numeric)` is `numeric`,
+/// `nullif(time, timetz)` is `time with time zone` — and the caller falls back to
+/// the comparison's own operand type.
+///
+/// Known gap: `nullif(varchar, bpchar)` is `character` in PG, which resolves it to
+/// the blank-insensitive `bpchar` `=`; this binder compares those two as text.
+fn equality_keeps_left(left: PgType, right: PgType) -> bool {
+    let exact_int = |ty| matches!(ty, PgType::Int2 | PgType::Int4 | PgType::Int8);
+    let float = |ty| matches!(ty, PgType::Float4 | PgType::Float8);
+    let datetime = |ty| matches!(ty, PgType::Date | PgType::Timestamp | PgType::TimestampTz);
+    (exact_int(left) && exact_int(right))
+        || (float(left) && float(right))
+        || (datetime(left) && datetime(right))
+        // `nameeqtext` compares a `name` against the text family as it stands; the
+        // mirrored `texteqname` is why the reverse (`nullif(text, name)`) is `text`,
+        // which the fallback already produces.
+        || (left == PgType::Name && is_text_family(right))
 }
 
 /// `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c`; `x NOT IN (...)` to

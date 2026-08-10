@@ -3237,7 +3237,129 @@ fn function_name(name: &ast::ObjectName) -> Option<String> {
         .map(crate::expr::normalize_ident)
 }
 
+/// The two shorthands PostgreSQL implements in its grammar rather than in
+/// `pg_proc`. Neither is polymorphic enough for the overload table: `COALESCE` is
+/// variadic and lazy, and both take their type from `select_common_type`.
+#[derive(Clone, Copy)]
+enum SpecialForm {
+    Coalesce,
+    NullIf,
+}
+
+/// `COALESCE`/`NULLIF` written the one way PG's grammar admits them: as an
+/// **unqualified, unquoted** keyword.
+///
+/// Both other spellings are ordinary function-name lookups in PG, and no schema
+/// holds a function by either name — so `pg_catalog.coalesce(1, 2)` and
+/// `"coalesce"(1, 2)` are both `42883`, which is what returning `None` here (and
+/// falling through to `resolve_call`) produces.
+fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
+    let [part] = name.0.as_slice() else {
+        return None;
+    };
+    let ident = part.as_ident().filter(|id| id.quote_style.is_none())?;
+    match crate::expr::normalize_ident(ident).as_str() {
+        "coalesce" => Some(SpecialForm::Coalesce),
+        "nullif" => Some(SpecialForm::NullIf),
+        _ => None,
+    }
+}
+
+/// Bind `COALESCE(…)` / `NULLIF(…)`.
+///
+/// PG's grammar gives these a bare expression list and nothing else, so every
+/// decoration an aggregate or window call may carry is a *syntax* error there. This
+/// parser accepts them all on any call, so each is rejected here — naming the token
+/// PG's cursor would sit under, and in the order its parser meets them: inside the
+/// argument list first, then `FILTER`, `WITHIN GROUP`, and `OVER`.
+fn bind_special_form(
+    form: SpecialForm,
+    func: &ast::Function,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let syntax_error = |token: &str| {
+        Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            format!("syntax error at or near \"{token}\""),
+        ))
+    };
+    if let ast::FunctionArguments::List(list) = &func.args {
+        if let Some(treatment) = list.duplicate_treatment {
+            return syntax_error(match treatment {
+                ast::DuplicateTreatment::Distinct => "distinct",
+                ast::DuplicateTreatment::All => "all",
+            });
+        }
+        if let Some(clause) = list.clauses.first() {
+            return syntax_error(argument_clause_token(clause));
+        }
+        // A named argument (`coalesce(x => 1)`) is reported at its operator, which
+        // is where PG's cursor sits.
+        for arg in &list.args {
+            match arg {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(_)) => {}
+                ast::FunctionArg::Named { operator, .. }
+                | ast::FunctionArg::ExprNamed { operator, .. } => {
+                    return syntax_error(&operator.to_string());
+                }
+                // `coalesce(*)` / `coalesce(t.*)`: PG's grammar has no wildcard in
+                // an expression list either, and reports the star.
+                ast::FunctionArg::Unnamed(_) => return syntax_error("*"),
+            }
+        }
+    }
+    if func.filter.is_some() {
+        return syntax_error("filter");
+    }
+    if !func.within_group.is_empty() {
+        return syntax_error("within");
+    }
+    if func.over.is_some() {
+        return syntax_error("over");
+    }
+    if let Some(treatment) = func.null_treatment {
+        return syntax_error(null_treatment_token(treatment));
+    }
+    let bindings = positional_args(&func.args)?
+        .iter()
+        .map(|e| bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    match form {
+        SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings),
+        SpecialForm::NullIf => crate::expr::bind_nullif(bindings, scope),
+    }
+}
+
+/// The keyword PG's parser stops at for a clause written inside an argument list.
+fn argument_clause_token(clause: &ast::FunctionArgumentClause) -> &'static str {
+    match clause {
+        ast::FunctionArgumentClause::IgnoreOrRespectNulls(treatment) => {
+            null_treatment_token(*treatment)
+        }
+        ast::FunctionArgumentClause::OrderBy(_) => "order",
+        ast::FunctionArgumentClause::Limit(_) => "limit",
+        ast::FunctionArgumentClause::OnOverflow(_) => "on",
+        ast::FunctionArgumentClause::Having(_) => "having",
+        ast::FunctionArgumentClause::Separator(_) => "separator",
+        ast::FunctionArgumentClause::JsonNullClause(_) => "null",
+        ast::FunctionArgumentClause::JsonReturningClause(_) => "returning",
+    }
+}
+
+fn null_treatment_token(treatment: ast::NullTreatment) -> &'static str {
+    match treatment {
+        ast::NullTreatment::IgnoreNulls => "ignore",
+        ast::NullTreatment::RespectNulls => "respect",
+    }
+}
+
 pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Binding, BindError> {
+    // `COALESCE`/`NULLIF` are grammar constructs, so they are recognized before
+    // anything else a *function* call can carry: every decoration below is a syntax
+    // error in PG's grammar, not an unsupported function form.
+    if let Some(form) = special_form(&func.name) {
+        return bind_special_form(form, func, scope);
+    }
     if func.filter.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some() {
         return Err(BindError::feature_not_supported(
             "this function form is not supported yet",
@@ -3280,20 +3402,6 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-
-    // `COALESCE` and `NULLIF` are grammar constructs in PostgreSQL, not entries in
-    // `pg_proc`: they are polymorphic, resolve their type the way `CASE` does, and
-    // `COALESCE` is variadic and lazy. This parser hands them over as ordinary
-    // function calls, so they are intercepted here — but only unqualified, because
-    // no schema actually contains them (`pg_catalog.coalesce(1,2)` is `42883` in
-    // PG, and falling through to `resolve_call` is how that stays true).
-    if func.name.0.len() == 1 {
-        match name.as_str() {
-            "coalesce" => return crate::expr::bind_coalesce(bindings),
-            "nullif" => return crate::expr::bind_nullif(bindings, scope),
-            _ => {}
-        }
-    }
 
     // `concat`/`concat_ws`/`format` are variadic and non-strict; they don't fit
     // the fixed-arity overload table, so every argument is coerced to text and a

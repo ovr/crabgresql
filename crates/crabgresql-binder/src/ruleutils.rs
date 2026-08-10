@@ -624,9 +624,14 @@ fn literal_of(e: &ast::Expr) -> Option<&ast::Value> {
 
 /// A literal rendered at the type its context gives it, rather than at the
 /// `text` a bare string defaults to.
+///
+/// A bare `NULL` takes a label for the same reason a string does: it carries no type
+/// of its own, so PostgreSQL writes the one the analyser gave it —
+/// `COALESCE(NULL::integer, 5)`, `upper(NULL::text)`. Numbers and booleans spell
+/// their own type and are left alone.
 fn typed_value(v: &ast::Value, ty: PgType) -> String {
     match v {
-        ast::Value::SingleQuotedString(_) => {
+        ast::Value::SingleQuotedString(_) | ast::Value::Null => {
             let label = ty
                 .format_type(Some(-1))
                 .unwrap_or_else(|| ty.name().to_string());

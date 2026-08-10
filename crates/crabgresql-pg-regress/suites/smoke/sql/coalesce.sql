@@ -43,8 +43,28 @@ SELECT COALESCE(1, 'x');
 SELECT COALESCE();
 -- error: two explicit collations that disagree (PG prints a cursor here too)
 SELECT COALESCE('a' COLLATE "C", 'b' COLLATE "POSIX");
--- error: COALESCE is a grammar construct, not a function in a schema, so a
--- schema-qualified call finds nothing. Known gap: PG names the missing function
--- `pg_catalog.coalesce(integer, integer)`, and adds a cursor and a HINT.
+-- COALESCE is a keyword, so it is spelled in any case ...
+SELECT CoAlEsCe(NULL, 1) AS keyword_case;
+-- ... but only bare: a quoted or schema-qualified name is an ordinary function
+-- lookup, and no schema holds a function by that name. Known gap: for the
+-- qualified form PG names the missing function `pg_catalog.coalesce(integer,
+-- integer)`, and both add a cursor and a HINT.
+SELECT "coalesce"(1, 2);
 SELECT pg_catalog.coalesce(1, 2);
+-- error: PG's grammar gives COALESCE a bare expression list, so every decoration a
+-- function call may carry is a syntax error, reported at its own keyword. Known
+-- gap: PG echoes the token as it was written and adds a cursor; the parsed tree
+-- keeps no source text for these keywords, so they are always spelled lower case
+-- here.
+SELECT COALESCE(1, 2) OVER ();
+SELECT COALESCE(1, 2) FILTER (WHERE true);
+SELECT COALESCE(1, 2) WITHIN GROUP (ORDER BY 1);
+SELECT COALESCE(DISTINCT 1, 2);
+SELECT COALESCE(1 ORDER BY 1);
+SELECT COALESCE(x => 1);
+-- a deparsed COALESCE is upper case, and its untyped arguments carry the type the
+-- list resolved to
+CREATE TABLE dflt (a integer DEFAULT COALESCE(NULL, 5));
+SELECT pg_get_expr(adbin, adrelid) AS deparsed FROM pg_attrdef WHERE adrelid = 'dflt'::regclass;
+DROP TABLE dflt;
 DROP TABLE readings;

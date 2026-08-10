@@ -114,11 +114,52 @@ fn an_empty_coalesce_is_a_syntax_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `COALESCE` is not reachable through a schema, because no schema holds it.
+/// Neither form is reachable through a schema, or under quotes: PG spells them as
+/// keywords, so any other spelling is an ordinary function lookup that finds
+/// nothing.
 #[test]
-fn a_qualified_coalesce_does_not_exist() -> anyhow::Result<()> {
-    let e = bind_err("SELECT pg_catalog.coalesce(id, 0) FROM t")?;
-    assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION);
+fn only_a_bare_keyword_reaches_the_special_form() -> anyhow::Result<()> {
+    for sql in [
+        "SELECT pg_catalog.coalesce(id, 0) FROM t",
+        "SELECT \"coalesce\"(id, 0) FROM t",
+        "SELECT \"nullif\"(id, 0) FROM t",
+        "SELECT \"NULLIF\"(id, 0) FROM t",
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::UNDEFINED_FUNCTION, "{sql}");
+    }
+    // The keyword itself is case-insensitive, as any keyword is.
+    assert_eq!(
+        first_column("SELECT CoAlEsCe(id, 0) FROM t")?.0.name,
+        "coalesce"
+    );
+    Ok(())
+}
+
+/// PG's grammar gives these a bare expression list, so every decoration a function
+/// call may carry is a syntax error — reported at the token PG stops on.
+#[test]
+fn a_decorated_special_form_is_a_syntax_error() -> anyhow::Result<()> {
+    for (sql, token) in [
+        ("SELECT coalesce(id, 0) OVER () FROM t", "over"),
+        ("SELECT nullif(id, 0) OVER () FROM t", "over"),
+        (
+            "SELECT coalesce(id, 0) FILTER (WHERE true) FROM t",
+            "filter",
+        ),
+        (
+            "SELECT coalesce(id, 0) WITHIN GROUP (ORDER BY id) FROM t",
+            "within",
+        ),
+        ("SELECT coalesce(DISTINCT id, 0) FROM t", "distinct"),
+        ("SELECT coalesce(ALL id, 0) FROM t", "all"),
+        ("SELECT coalesce(id ORDER BY id) FROM t", "order"),
+        ("SELECT coalesce(x => id) FROM t", "=>"),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::SYNTAX_ERROR, "{sql}");
+        assert_eq!(e.message, format!("syntax error at or near \"{token}\""));
+    }
     Ok(())
 }
 
@@ -167,12 +208,50 @@ fn nullif_lowers_to_a_case_over_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The result type is the one the comparison resolved, not the first argument's
-/// own: `int = numeric` compares in `numeric`, so that is what comes back.
+/// The result is the left argument as the chosen `=` operator takes it. PG compares
+/// these pairs cross-type, so the left argument is never coerced and keeps its own
+/// type — which is also what keeps `float4` from being widened (and printed at
+/// `float8` precision) and a `timestamp` from picking up a zone.
 #[test]
-fn nullif_reports_the_compared_type() -> anyhow::Result<()> {
-    let (col, _) = first_column("SELECT NULLIF(id, 2.5) FROM t")?;
-    assert_eq!(col.ty, PgType::Numeric);
+fn nullif_keeps_a_left_argument_the_operator_does_not_coerce() -> anyhow::Result<()> {
+    for (sql, ty) in [
+        ("SELECT NULLIF(id::int2, big) FROM t", PgType::Int2),
+        ("SELECT NULLIF(id, big) FROM t", PgType::Int4),
+        (
+            "SELECT NULLIF(id::float4, id::float8) FROM t",
+            PgType::Float4,
+        ),
+        (
+            "SELECT NULLIF(name::timestamp, name::timestamptz) FROM t",
+            PgType::Timestamp,
+        ),
+        (
+            "SELECT NULLIF(name::date, name::timestamp) FROM t",
+            PgType::Date,
+        ),
+        ("SELECT NULLIF(name::name, name) FROM t", PgType::Name),
+    ] {
+        assert_eq!(first_column(sql)?.0.ty, ty, "{sql}");
+    }
+    Ok(())
+}
+
+/// Where PG has no cross-type operator it coerces both sides first, and the
+/// comparison's own operand type is the result: `int = numeric` compares in
+/// `numeric`, and `varchar = varchar` compares as `text`.
+#[test]
+fn nullif_reports_the_compared_type_when_the_operand_is_coerced() -> anyhow::Result<()> {
+    for (sql, ty) in [
+        ("SELECT NULLIF(id, 2.5) FROM t", PgType::Numeric),
+        ("SELECT NULLIF(id, id::float8) FROM t", PgType::Float8),
+        (
+            "SELECT NULLIF(name::varchar, name::varchar) FROM t",
+            PgType::Text,
+        ),
+        ("SELECT NULLIF(name, name::name) FROM t", PgType::Text),
+    ] {
+        assert_eq!(first_column(sql)?.0.ty, ty, "{sql}");
+    }
     Ok(())
 }
 
