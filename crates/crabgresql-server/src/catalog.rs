@@ -15,6 +15,7 @@ use crabgresql_storage_api::{
     StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
 };
 use crabgresql_txn::{TxnContext, Xid};
+use crabgresql_types::ByteaOutput;
 
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{catalog_routine, partition_session_relations};
@@ -53,6 +54,9 @@ pub struct SessionCatalogSource {
     /// for every statement after the first in a block — visibly so for a
     /// transaction that spans a DST transition.
     now: i64,
+    /// The reading session's `bytea_output`, for `pg_class.relpartbound` — the
+    /// one catalog column whose text can hold a rendered `bytea`.
+    bytea_output: ByteaOutput,
 }
 
 impl SessionCatalogSource {
@@ -126,6 +130,7 @@ impl SessionCatalogSource {
             prepared_statements,
             settings: crate::guc::catalog_settings(session),
             now: session.xact_start(),
+            bytea_output: session.bytea_output,
         }
     }
 }
@@ -235,6 +240,10 @@ impl CatalogSource for SessionCatalogSource {
 
     fn now(&self) -> i64 {
         self.now
+    }
+
+    fn bytea_output(&self) -> ByteaOutput {
+        self.bytea_output
     }
 }
 

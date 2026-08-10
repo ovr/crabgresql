@@ -12021,6 +12021,140 @@ async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `bytea_output` reaches every rendering that goes through `byteaout`, not
+/// just the top-level column: the `::text` cast and array elements too. The
+/// escape spellings themselves are pinned by unit tests in the types crate;
+/// what is proved here is that the session state arrives.
+///
+/// Unlike `IntervalStyle`, this parameter is *not* `GUC_REPORT` in PostgreSQL
+/// — `bytea_output_changes_emit_no_parameter_status` below is the guard on that.
+#[tokio::test]
+async fn bytea_output_selects_the_output_form() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+    let bytes = "decode('00615c', 'hex')";
+
+    assert_eq!(
+        scalar(&client, &format!("SELECT {bytes}")).await,
+        "\\x00615c"
+    );
+
+    client.simple_query("SET bytea_output TO escape").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "escape");
+    assert_eq!(
+        scalar(&client, &format!("SELECT {bytes}")).await,
+        "\\000a\\\\"
+    );
+    // The cast to text is the same output function.
+    assert_eq!(
+        scalar(&client, &format!("SELECT ({bytes})::text")).await,
+        "\\000a\\\\"
+    );
+    // ...and so is array element rendering, which then quotes and doubles the
+    // backslashes on top. Verified against PostgreSQL 18.4.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT array[decode('0061','hex'), decode('5c','hex')]"
+        )
+        .await,
+        "{\"\\\\000a\",\"\\\\\\\\\"}"
+    );
+    // Input is unaffected: both forms still read, whatever the setting is.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT '\\x00615c'::bytea = decode('00615c','hex')"
+        )
+        .await,
+        "t"
+    );
+
+    // The name and the value are both matched case-insensitively.
+    client.simple_query("SET BYTEA_OUTPUT TO 'HEX'").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+
+    // A change is transactional, like every other GUC.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SET bytea_output TO escape").await?;
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, "SHOW bytea_output").await, "hex");
+
+    // Case-insensitively and nothing more: padding is part of the value.
+    for value in ["bogus", "' hex '"] {
+        let err = client
+            .simple_query(&format!("SET bytea_output TO {value}"))
+            .await
+            .expect_err("an unrecognized bytea_output must be rejected");
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.code().code(), "22023", "{value}");
+        assert_eq!(
+            db.message(),
+            format!(
+                "invalid value for parameter \"bytea_output\": \"{}\"",
+                value.trim_matches('\'')
+            ),
+            "{value}"
+        );
+        assert_eq!(db.hint(), Some("Available values: escape, hex."), "{value}");
+    }
+    Ok(())
+}
+
+/// `bytea_output` is **not** `GUC_REPORT` in PostgreSQL: it rides in no startup
+/// burst and a `SET` echoes nothing. Confirmed against 18.4 with a raw protocol
+/// script — its burst lists `DateStyle`, `IntervalStyle`, `TimeZone`,
+/// `client_encoding` and the rest, and `bytea_output` is absent from it.
+///
+/// This is the negative twin of `interval_style_changes_emit_parameter_status`,
+/// and it earns its keep: `report` is read in exactly one place and surfaces in
+/// neither `SHOW ALL` nor `pg_settings`, so before this test flipping the table
+/// entry to `report: true` broke nothing at all.
+#[tokio::test]
+async fn bytea_output_changes_emit_no_parameter_status() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    /// Run one simple query, returning the `ParameterStatus` pairs it emitted.
+    async fn query(
+        socket: &mut tokio::net::TcpStream,
+        sql: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        socket.write_all(&frontend_message(b'Q', &body)).await?;
+        Ok(read_until_ready(socket)
+            .await
+            .into_iter()
+            .filter(|(tag, _)| *tag == b'S')
+            .map(|(_, body)| {
+                let mut parts = body.split(|b| *b == 0);
+                let name = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                let value = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                (name, value)
+            })
+            .collect())
+    }
+
+    // A real change, a no-op re-set, and the way back — none of them reported.
+    assert_eq!(
+        query(&mut socket, "SET bytea_output TO escape").await?,
+        vec![]
+    );
+    assert_eq!(
+        query(&mut socket, "SET bytea_output TO escape").await?,
+        vec![]
+    );
+    assert_eq!(query(&mut socket, "RESET bytea_output").await?, vec![]);
+
+    // Nor the transactional revert, which is where the diffing design would
+    // announce a change if the parameter were reported at all.
+    query(&mut socket, "BEGIN").await?;
+    query(&mut socket, "SET LOCAL bytea_output TO escape").await?;
+    assert_eq!(query(&mut socket, "COMMIT").await?, vec![]);
+    Ok(())
+}
+
 /// PostgreSQL's one-argument `age` spans two type categories — the two datetime
 /// forms and `age(xid)` — so an untyped argument has no best candidate and the
 /// call is ambiguous rather than quietly resolving to a datetime overload.

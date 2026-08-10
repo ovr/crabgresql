@@ -24,7 +24,8 @@
 //! rejecting it would break restores that worked before this table existed.
 
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::interval::{INTERVAL_STYLE_VALUES, IntervalStyle};
+use crabgresql_types::bytea::ByteaOutput;
+use crabgresql_types::interval::IntervalStyle;
 use crabgresql_types::tz::SessionZone;
 
 use crate::error::PgError;
@@ -55,6 +56,7 @@ pub enum SavedValue {
     TimeZone(std::sync::Arc<SessionZone>),
     ExtraFloatDigits(i32),
     IntervalStyle(IntervalStyle),
+    ByteaOutput(ByteaOutput),
     DefaultIsolation(IsolationLevel),
     DefaultReadOnly(bool),
 }
@@ -181,6 +183,37 @@ const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL V
 /// in PG, which is what drivers rely on to parse the version and pick their
 /// quoting rules.
 pub static GUCS: &[GucDef] = &[
+    GucDef {
+        key: "bytea_output",
+        name: "bytea_output",
+        description: "Sets the output format for bytea.",
+        extra_desc: None,
+        // Not GUC_REPORT in PG, unlike its neighbours here: a change is not
+        // echoed as ParameterStatus (verified on the wire against 18.4, and
+        // guarded by `bytea_output_changes_emit_no_parameter_status`).
+        report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "enum",
+        min_val: None,
+        max_val: None,
+        // PostgreSQL's declaration order, which is what `enumvals` prints — and
+        // which is alphabetical here only by coincidence, `hex` being the
+        // default.
+        enumvals: Some(&["escape", "hex"]),
+        boot_val: "hex",
+        show: |s| s.bytea_output.name().to_string(),
+        kind: GucKind::Settable {
+            set: set_bytea_output,
+            capture: |s| SavedValue::ByteaOutput(s.bytea_output),
+            restore: |s, v| {
+                if let SavedValue::ByteaOutput(x) = v {
+                    s.bytea_output = x;
+                }
+            },
+        },
+    },
     GucDef {
         key: "client_encoding",
         name: "client_encoding",
@@ -336,10 +369,9 @@ pub static GUCS: &[GucDef] = &[
         vartype: "enum",
         min_val: None,
         max_val: None,
-        // PostgreSQL's declaration order, which is what `enumvals` prints. The
-        // same four names `INTERVAL_STYLE_VALUES` lists for the rejection HINT,
-        // in the same order — spelled out here because `enumvals` is an array
-        // and that one is a rendered sentence.
+        // PostgreSQL's declaration order, which is what `enumvals` prints — and
+        // also, joined with ", ", the rejection HINT `invalid_enum_value`
+        // builds, so the published list and the error text are one declaration.
         enumvals: Some(&["postgres", "postgres_verbose", "sql_standard", "iso_8601"]),
         boot_val: "postgres",
         show: |s| s.interval_style.name().to_string(),
@@ -586,6 +618,29 @@ fn invalid_value(name: &str, value: &str) -> PgError {
     )
 }
 
+/// PG's `22023` for an enum parameter given a name outside its `enumvals`,
+/// carrying the HINT that lists the accepted spellings.
+///
+/// The HINT is built from the very `enumvals` `pg_settings` publishes rather
+/// than from a hand-written sentence per parameter, so the two cannot disagree:
+/// PG's own HINT is exactly that list joined with `", "`, verified against 18.4
+/// for both parameters that use this.
+///
+/// A `key` missing from `GUCS` is a wiring bug, not a runtime condition — it
+/// degrades to a HINT-less `22023` rather than panicking, and
+/// `every_enum_guc_resolves_its_own_key` below fails at the definition site
+/// instead.
+fn invalid_enum_value(key: &str, written: &str) -> PgError {
+    let Some(def) = lookup(key) else {
+        return invalid_value(key, written);
+    };
+    let error = invalid_value(def.name, written);
+    match def.enumvals {
+        Some(values) => error.with_hint(format!("Available values: {}.", values.join(", "))),
+        None => error,
+    }
+}
+
 /// The spelling `SHOW default_transaction_isolation` prints.
 fn isolation_name(level: IsolationLevel) -> &'static str {
     match level {
@@ -654,14 +709,23 @@ fn set_extra_float_digits(session: &mut Session, value: GucValue) -> Result<(), 
 /// accepted names — without it the message says what is wrong but not what
 /// would be right.
 fn set_interval_style(session: &mut Session, value: GucValue) -> Result<(), PgError> {
-    let rejected = |written: String| {
-        invalid_value("IntervalStyle", &written)
-            .with_hint(format!("Available values: {INTERVAL_STYLE_VALUES}."))
-    };
+    let rejected = |written: String| invalid_enum_value("intervalstyle", &written);
     session.interval_style = match value {
         GucValue::Default => IntervalStyle::default(),
         GucValue::OffsetSecondsEast(secs) => return Err(rejected(secs.to_string())),
         GucValue::Str(s) => IntervalStyle::from_name(&s).ok_or_else(|| rejected(s.clone()))?,
+    };
+    Ok(())
+}
+
+/// `SET bytea_output`. Like [`set_interval_style`], the rejection carries PG's
+/// HINT listing the accepted names.
+fn set_bytea_output(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let rejected = |written: String| invalid_enum_value("bytea_output", &written);
+    session.bytea_output = match value {
+        GucValue::Default => ByteaOutput::default(),
+        GucValue::OffsetSecondsEast(secs) => return Err(rejected(secs.to_string())),
+        GucValue::Str(s) => ByteaOutput::from_name(&s).ok_or_else(|| rejected(s.clone()))?,
     };
     Ok(())
 }
@@ -730,6 +794,23 @@ mod tests {
     fn every_key_is_its_name_lowercased() {
         for def in GUCS {
             assert_eq!(def.key, def.name.to_ascii_lowercase(), "{}", def.name);
+        }
+    }
+
+    /// `invalid_enum_value` looks its parameter up by key to build the HINT
+    /// from `enumvals`, and degrades to a HINT-less error if the key is not in
+    /// `GUCS`. That degradation must never fire in practice, so pin the two
+    /// setters that rely on it: a typo'd key would otherwise drop the HINT from
+    /// a live error message and nothing else would notice.
+    #[test]
+    fn every_enum_guc_resolves_its_own_key() {
+        for key in ["bytea_output", "intervalstyle"] {
+            let def = lookup(key).unwrap_or_else(|| panic!("{key} is in GUCS"));
+            assert_eq!(def.vartype, "enum", "{key}");
+            assert!(
+                def.enumvals.is_some_and(|v| !v.is_empty()),
+                "{key} needs enumvals for its HINT"
+            );
         }
     }
 

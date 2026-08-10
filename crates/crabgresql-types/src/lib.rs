@@ -7,6 +7,7 @@
 
 pub mod array;
 pub mod bit;
+pub mod bytea;
 pub mod cast;
 pub mod char;
 pub mod collation;
@@ -43,6 +44,7 @@ pub mod version;
 pub mod wire;
 pub mod xid;
 
+pub use bytea::ByteaOutput;
 pub use fmt::FmtCtx;
 pub use interval::Interval;
 pub use net::Inet;
@@ -1499,7 +1501,8 @@ impl Value {
 
     /// Text-format encoding as sent in `DataRow`; `None` encodes SQL NULL.
     /// `fmt` carries `extra_float_digits` (float output), the session display
-    /// zone (`timestamptz` output) and `IntervalStyle` (`interval` output).
+    /// zone (`timestamptz` output), `IntervalStyle` (`interval` output) and
+    /// `bytea_output` (`bytea` output).
     pub fn encode_text_with(&self, fmt: &FmtCtx) -> Option<String> {
         let efd = fmt.efd;
         match self {
@@ -1526,14 +1529,10 @@ impl Value {
             // of the reg* output function.
             Value::Reg(r) => Some(r.name.clone()),
             Value::Text(s) => Some(s.clone()),
-            Value::Bytea(bytes) => {
-                let mut out = String::with_capacity(2 + bytes.len() * 2);
-                out.push_str("\\x");
-                for b in bytes {
-                    out.push_str(&format!("{b:02x}"));
-                }
-                Some(out)
-            }
+            Value::Bytea(bytes) => Some(match fmt.bytea_output {
+                ByteaOutput::Hex => bytea::hex_out(bytes),
+                ByteaOutput::Escape => bytea::escape_out(bytes),
+            }),
             Value::Bit { len, data } => Some(bit::format(*len, data)),
             Value::Date(d) => Some(date::format(*d)),
             Value::Time(usec) => Some(time::format(*usec)),
@@ -1950,5 +1949,54 @@ mod tests {
                 .as_deref(),
             Some("\\x001000")
         );
+        // The session-less context is `hex`, PG's boot value.
+        assert_eq!(
+            Value::Bytea(Vec::new()).encode_text_utc().as_deref(),
+            Some("\\x")
+        );
+    }
+
+    /// `bytea_output = escape`, pinned against PostgreSQL 18.4:
+    ///
+    /// ```text
+    /// set bytea_output=escape;
+    /// select decode('0001027f807e5c2027225a','hex');
+    ///  --> \000\001\002\177\200~\\ '"Z
+    /// ```
+    ///
+    /// The interesting bytes are the boundaries: `0x7e` is the last printable
+    /// one and `0x7f` the first that is not, which an `is_ascii_graphic`-style
+    /// test would get wrong at both ends.
+    #[test]
+    fn bytea_escape_encoding() {
+        let escape = FmtCtx::utc_default().with_bytea_output(ByteaOutput::Escape);
+        let bytes = vec![
+            0x00, 0x01, 0x02, 0x7f, 0x80, 0x7e, 0x5c, 0x20, 0x27, 0x22, 0x5a,
+        ];
+        assert_eq!(
+            Value::Bytea(bytes).encode_text_with(&escape).as_deref(),
+            Some("\\000\\001\\002\\177\\200~\\\\ '\"Z")
+        );
+        assert_eq!(
+            Value::Bytea(Vec::new())
+                .encode_text_with(&escape)
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    /// Whichever form was printed, `byteain` reads it back — which is what
+    /// makes the GUC an output-only choice.
+    #[test]
+    fn both_bytea_forms_read_back() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let value = Value::Bytea(bytes.clone());
+        for fmt in [
+            FmtCtx::utc_default(),
+            FmtCtx::utc_default().with_bytea_output(ByteaOutput::Escape),
+        ] {
+            let rendered = value.encode_text_with(&fmt).expect("not null");
+            assert_eq!(cast::byteain(&rendered).expect("re-reads"), bytes);
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! new wave adds to them without touching the snapshot machinery.
 
 use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
-use crabgresql_types::PgType;
+use crabgresql_types::{ByteaOutput, PgType};
 
 /// The relation kind reflected into `pg_class.relkind` / `information_schema`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +273,18 @@ pub trait CatalogSource: Send + Sync {
     /// with `now()` for every statement in the block.
     fn now(&self) -> i64 {
         crabgresql_types::tz::now_micros()
+    }
+
+    /// The reading session's `bytea_output`, for the one catalog column that
+    /// renders a `bytea` datum: `pg_class.relpartbound`.
+    ///
+    /// A partition bound is stored already deparsed and `pg_get_expr` only
+    /// echoes it (see `deparse_partbound`), so unlike a column default it has no
+    /// read-time re-render hook to hang the GUC on — the reader's setting has to
+    /// reach the row builder itself. Defaults to PG's boot value, which is the
+    /// answer for a catalog with no session behind it.
+    fn bytea_output(&self) -> ByteaOutput {
+        ByteaOutput::Hex
     }
 }
 

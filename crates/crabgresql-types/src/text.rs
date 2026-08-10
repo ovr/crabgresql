@@ -2363,16 +2363,42 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
+/// `encode(bytea, 'escape')`: NUL and every high-bit byte as three-digit octal,
+/// a doubled backslash, and **everything else verbatim** — including the C0
+/// controls and `0x7f`.
+///
+/// Deliberately *not* the rendering [`crate::bytea::escape_out`] produces for
+/// `bytea_output = escape`, which escapes every byte outside `0x20..=0x7e`.
+/// PostgreSQL really does spell the same bytes two different ways depending on
+/// which of the two you ask, so these are two rules and not one duplicated by
+/// oversight. Read off 18.4 for the bytes `00 01 0a 1f 20 7e 7f 80 5c ff 41`:
+///
+/// ```text
+/// encode(…, 'escape') -> \000 <01> <0a> <1f> <20> ~ <7f> \200 \\ \377 A
+/// bytea_output=escape -> \000\001\012\037 ~ \177\200\\\377A
+/// ```
+///
+/// The pass-through bytes are all below `0x80`, so the result stays valid UTF-8.
 fn encode_escape(bytes: &[u8]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         match b {
             b'\\' => out.push_str("\\\\"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\{b:03o}")),
+            0x00 | 0x80..=0xff => push_octal_escape(&mut out, b),
+            _ => out.push(b as char),
         }
     }
     out
+}
+
+/// `\ooo` — a backslash and exactly three octal digits, written without going
+/// through `format!` (which allocates a `String` per byte; this runs per byte of
+/// every escaped `bytea` on the output path).
+pub(crate) fn push_octal_escape(out: &mut String, b: u8) {
+    out.push('\\');
+    out.push((b'0' + (b >> 6)) as char);
+    out.push((b'0' + ((b >> 3) & 7)) as char);
+    out.push((b'0' + (b & 7)) as char);
 }
 
 /// `decode(text, format)`: inverse of [`encode`].
@@ -3832,6 +3858,32 @@ mod tests {
         assert_eq!(encode(&[0x00, 0x10, 0x00], "hex")?, "001000");
         assert_eq!(encode(b"abc", "base64")?, "YWJj");
         assert_eq!(encode(b"a\x00b", "escape")?, "a\\000b");
+        // NUL alone cannot tell the two escape rules apart — it is escaped by
+        // both — which is why this line used to be the whole of the coverage
+        // while `encode` was quietly using `byteaout`'s rule. Pinned against
+        // PostgreSQL 18.4 read with `od -c`:
+        //   select encode(decode('00011f7f80ff5c41','hex'),'escape')
+        //     -> \000 <01> <1f> <7f> \200 \377 \\ A
+        // The C0 controls and 0x7f pass through; only NUL, `\` and the high-bit
+        // bytes are escaped. `bytea_output = escape` spells the same input
+        // \000\001\037\177\200\377\\A instead.
+        assert_eq!(
+            encode(&[0x00, 0x01, 0x1f, 0x7f, 0x80, 0xff, 0x5c, 0x41], "escape")?,
+            "\\000\u{1}\u{1f}\u{7f}\\200\\377\\\\A"
+        );
+        assert_eq!(
+            crate::bytea::escape_out(&[0x00, 0x01, 0x1f, 0x7f, 0x80, 0xff, 0x5c, 0x41]),
+            "\\000\\001\\037\\177\\200\\377\\\\A"
+        );
+        // Whichever rule wrote it, `decode` reads it back (verified on 18.4).
+        assert_eq!(
+            decode("\\000\u{1}\u{1f}\u{7f}\\200\\377\\\\A", "escape")?,
+            vec![0x00, 0x01, 0x1f, 0x7f, 0x80, 0xff, 0x5c, 0x41]
+        );
+        assert_eq!(
+            decode("\\000\\001\\037\\177\\200\\377\\\\A", "escape")?,
+            vec![0x00, 0x01, 0x1f, 0x7f, 0x80, 0xff, 0x5c, 0x41]
+        );
         assert_eq!(decode("YWJj", "base64")?, b"abc");
         assert_eq!(decode("001000", "hex")?, vec![0x00, 0x10, 0x00]);
         // Malformed base64 (missing padding / lone trailing symbol) is rejected.

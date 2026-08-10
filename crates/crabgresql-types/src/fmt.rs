@@ -1,14 +1,15 @@
 //! The session state that value formatting, casting and date/time input depend
 //! on.
 //!
-//! Four things reach down this far. Three GUCs: `extra_float_digits`, which
+//! Five things reach down this far. Four GUCs: `extra_float_digits`, which
 //! sets float output precision, `TimeZone`, the display zone `timestamptz`
-//! input and output are relative to, and `IntervalStyle`, which picks among
-//! `interval_out`'s four renderings. And the transaction clock, which is what
-//! the relative input specials (`'now'`, `'today'`, `'tomorrow'`,
-//! `'yesterday'`) read. They travel together in [`FmtCtx`] rather than as
-//! separate parameters so that adding the next one (`DateStyle`) does not mean
-//! touching every call site again.
+//! input and output are relative to, `IntervalStyle`, which picks among
+//! `interval_out`'s four renderings, and `bytea_output`, which picks between
+//! `byteaout`'s two. And the transaction clock, which is what the relative
+//! input specials (`'now'`, `'today'`, `'tomorrow'`, `'yesterday'`) read. They
+//! travel together in [`FmtCtx`] rather than as separate parameters so that
+//! adding the next one (`DateStyle`) does not mean touching every call site
+//! again.
 //!
 //! There is deliberately **no `Default` impl**. A missing zone renders as UTC,
 //! which is silently wrong rather than loudly wrong, so each context that has no
@@ -19,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::bytea::ByteaOutput;
 use crate::interval::IntervalStyle;
 use crate::tz::SessionZone;
 
@@ -48,8 +50,8 @@ pub struct ClockError {
     pub message: String,
 }
 
-/// `extra_float_digits`, the display `TimeZone`, `IntervalStyle` and the
-/// transaction clock, as one bag.
+/// `extra_float_digits`, the display `TimeZone`, `IntervalStyle`,
+/// `bytea_output` and the transaction clock, as one bag.
 ///
 /// Cheap to clone: the zone is shared behind an `Arc` because the executor's
 /// context is cloned into every plan node, and [`Clock`] is two words.
@@ -61,6 +63,8 @@ pub struct FmtCtx {
     pub zone: Arc<SessionZone>,
     /// `IntervalStyle` — which rendering `interval_out` produces.
     pub interval_style: IntervalStyle,
+    /// `bytea_output` — which rendering `byteaout` produces.
+    pub bytea_output: ByteaOutput,
     /// The statement's instants, absent in contexts with no session.
     clock: Option<Clock>,
 }
@@ -70,12 +74,14 @@ impl FmtCtx {
         efd: i32,
         zone: Arc<SessionZone>,
         interval_style: IntervalStyle,
+        bytea_output: ByteaOutput,
         clock: Clock,
     ) -> FmtCtx {
         FmtCtx {
             efd,
             zone,
             interval_style,
+            bytea_output,
             clock: Some(clock),
         }
     }
@@ -86,14 +92,15 @@ impl FmtCtx {
     /// faithful — and a place where a `'now'` literal cannot appear, which the
     /// missing clock enforces rather than assumes.
     ///
-    /// The interval style is PG's default `postgres`, for the same reason the
-    /// zone is UTC: it is the answer a session that never issued a `SET` would
-    /// give.
+    /// The interval style is PG's default `postgres` and the bytea output its
+    /// default `hex`, for the same reason the zone is UTC: they are the answers
+    /// a session that never issued a `SET` would give.
     pub fn utc(efd: i32) -> FmtCtx {
         FmtCtx {
             efd,
             zone: Arc::new(SessionZone::utc()),
             interval_style: IntervalStyle::Postgres,
+            bytea_output: ByteaOutput::Hex,
             clock: None,
         }
     }
@@ -110,6 +117,7 @@ impl FmtCtx {
             efd,
             zone: Arc::new(SessionZone::utc()),
             interval_style: IntervalStyle::Postgres,
+            bytea_output: ByteaOutput::Hex,
             clock: Some(Clock {
                 xact_start,
                 stmt_start,
@@ -132,6 +140,15 @@ impl FmtCtx {
     pub fn with_interval_style(&self, interval_style: IntervalStyle) -> FmtCtx {
         FmtCtx {
             interval_style,
+            ..self.clone()
+        }
+    }
+
+    /// The same context under a different `bytea_output`. See
+    /// [`FmtCtx::with_interval_style`].
+    pub fn with_bytea_output(&self, bytea_output: ByteaOutput) -> FmtCtx {
+        FmtCtx {
+            bytea_output,
             ..self.clone()
         }
     }

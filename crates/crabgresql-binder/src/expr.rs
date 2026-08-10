@@ -8455,16 +8455,19 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
 /// answer into the plan — visibly wrong for a prepared statement re-executed
 /// after a `SET`.
 ///
-/// Two GUCs reach this far:
+/// Three GUCs reach this far:
 ///
 /// * `extra_float_digits`, for any conversion to a string type. (The old guard
 ///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
 ///   precision and silently ignored the session's setting.)
+/// * `bytea_output`, which rides on the same string-type arm: `'\x00'::bytea`
+///   renders as `\x00` or `\000` depending on the session, so `::text` on one
+///   cannot be folded either.
 /// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
 ///   an instant to a wall clock, in both directions — and for every conversion
 ///   to `timetz`, which attaches the zone's offset when the value carries none.
 ///
-/// The transaction clock is the third such input, and [`resolve_unknown`]
+/// The transaction clock is the fourth such input, and [`resolve_unknown`]
 /// defers on it the same way — but it is detected by probing rather than listed
 /// here, since `'today 10:00'` is as relative as `'today'` and only the scanner
 /// knows that.
@@ -9241,8 +9244,8 @@ pub fn subquery_in_execute_param(e: BindError) -> BindError {
 ///   (`'1001'::bit(4)`), which is the opposite of the rule above.
 ///
 /// A `timestamptz` value is baked here in whatever zone the DDL session had, and
-/// [`crate::ruleutils::rerender_in_zone`] puts it back into the reader's on the
-/// way out.
+/// a `bytea` in whatever `bytea_output` it had; [`crate::ruleutils::stored_expr`]
+/// puts both back into the reader's on the way out.
 pub fn deparse_literal_default(
     expr: &ast::Expr,
     column: &Column,

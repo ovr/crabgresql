@@ -1,7 +1,7 @@
 //! `pg_class`: every live relation, index, TOAST relation and sequence.
 
 use crabgresql_storage_api::TableSchema;
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{ByteaOutput, FmtCtx, PgType, Value};
 
 use crate::SystemCatalog;
 use crate::cols::*;
@@ -81,7 +81,13 @@ pub(crate) fn pg_class_schema() -> TableSchema {
 /// type and does not record whether a coercion happened, so it cannot make that
 /// distinction; the rule above matches PostgreSQL for the `int4`, boolean, and
 /// text keys in practice and quotes (the safe, re-parseable form) otherwise.
-fn deparse_partbound(part: &PartitionOf) -> String {
+/// A `bytea` bound takes the *reader's* `bytea_output`, as it does in
+/// PostgreSQL: the bound is a datum there and `pg_get_expr` runs it through
+/// `byteaout`. Since we store the rendered text instead, the setting has to
+/// arrive here rather than at read time. Everything else stays UTC/default —
+/// a zone-dependent bound is frozen at DDL time, which was already true.
+fn deparse_partbound(part: &PartitionOf, bytea_output: ByteaOutput) -> String {
+    let fmt = FmtCtx::utc_default().with_bytea_output(bytea_output);
     let datum = |d: &PartitionBoundDatum| match d {
         PartitionBoundDatum::MinValue => "MINVALUE".to_string(),
         PartitionBoundDatum::MaxValue => "MAXVALUE".to_string(),
@@ -92,7 +98,7 @@ fn deparse_partbound(part: &PartitionOf) -> String {
             if let Value::Bool(b) = v {
                 return if *b { "true" } else { "false" }.to_string();
             }
-            let text = v.encode_text_utc().unwrap_or_default();
+            let text = v.encode_text_with(&fmt).unwrap_or_default();
             let bare = match v {
                 Value::Int2(_) | Value::Int4(_) | Value::Int8(_) => !text.starts_with('-'),
                 _ => false,
@@ -185,7 +191,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 RelKind::View | RelKind::Sequence => 'n',
             };
             let relpartbound = match &schema.partition_of {
-                Some(part) => Value::Text(deparse_partbound(part)),
+                Some(part) => Value::Text(deparse_partbound(part, cat.bytea_output())),
                 None => Value::Null,
             };
             // A sequence is one page holding its single row, and PostgreSQL

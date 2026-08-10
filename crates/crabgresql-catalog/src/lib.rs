@@ -849,6 +849,11 @@ impl SystemCatalog {
     pub(crate) fn now(&self) -> i64 {
         self.source.now()
     }
+
+    /// The reading session's `bytea_output`; see [`CatalogSource::bytea_output`].
+    pub(crate) fn bytea_output(&self) -> crabgresql_types::ByteaOutput {
+        self.source.bytea_output()
+    }
 }
 
 impl TableEngine for SystemCatalog {

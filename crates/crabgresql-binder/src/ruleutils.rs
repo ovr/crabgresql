@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crabgresql_parser::{ast, keywords};
 use crabgresql_storage_api::TypeCatalog;
-use crabgresql_types::{FmtCtx, Numeric, PgType, interval, text, timestamptz};
+use crabgresql_types::{FmtCtx, Numeric, PgType, Value, cast, interval, text, timestamptz};
 
 /// `pretty`-printed `pg_get_viewdef`. Returns `None` if `sql` does not re-parse
 /// as a single `SELECT`, in which case the caller reports the view as
@@ -217,6 +217,46 @@ fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Optio
     Some(format!(
         "'{}'::timestamp with time zone",
         timestamptz::format(micros, &fmt.zone)
+    ))
+}
+
+/// A `'…'::bytea` constant, re-rendered under this session's `bytea_output`.
+/// `None` for every other cast.
+///
+/// The stored spelling is whichever the DDL session produced — `deparse_const`
+/// writes hex, but a value that reached the catalog through a session-rendered
+/// path can be escape — so the *input* side deliberately accepts both, which
+/// `byteain` already does. That is also why this cannot be a string rewrite:
+/// the two spellings have to go through the bytes to meet.
+///
+/// Verified against PostgreSQL 18.4, including the quoting: a `0x27` byte prints
+/// verbatim in escape form and is then doubled inside the SQL literal, so
+/// `'\x27615c'::bytea` re-renders as `'''a\\'::bytea`.
+///
+/// **Reaches column defaults, not CHECK predicates.** A CHECK is deparsed into
+/// the catalog by [`deparse_check_expr`], which labels a bare literal `::text`
+/// instead of resolving its type from the comparison — so `CHECK (b <>
+/// '\x0061')` is stored as `'\x0061'::text` and arrives here typed `text`. That
+/// mislabelling is type-general (a `date` constant in a CHECK prints `::text`
+/// too, where PG prints `::date`) and predates this function; fixing it means
+/// resolving operand types during the deparse walk, not widening the match here.
+fn bytea_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Option<String> {
+    let fmt = cx.zone?;
+    if PgType::from_name(&type_name(data_type))? != PgType::Bytea {
+        return None;
+    }
+    let ast::Expr::Value(v) = inner else {
+        return None;
+    };
+    let ast::Value::SingleQuotedString(text) = &v.value else {
+        return None;
+    };
+    let bytes = cast::byteain(text).ok()?;
+    let rendered = Value::Bytea(bytes).encode_text_with(fmt)?;
+    Some(format!(
+        "{}::{}",
+        value_body(&ast::Value::SingleQuotedString(rendered)),
+        type_name(data_type)
     ))
 }
 
@@ -447,16 +487,18 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
             expr: inner,
             data_type,
             ..
-        } => zoned_constant(inner, data_type, cx).unwrap_or_else(|| {
-            // A constant carries exactly one type label. Rendering the operand
-            // through `value` would add the `text` it assumes for a bare string
-            // and produce `'x'::text::text`, which also makes re-rendering an
-            // already-deparsed expression non-idempotent.
-            match literal_of(inner) {
-                Some(v) => format!("{}::{}", value_body(v), type_name(data_type)),
-                None => format!("{}::{}", expr(inner, cx, u8::MAX), type_name(data_type)),
-            }
-        }),
+        } => zoned_constant(inner, data_type, cx)
+            .or_else(|| bytea_constant(inner, data_type, cx))
+            .unwrap_or_else(|| {
+                // A constant carries exactly one type label. Rendering the operand
+                // through `value` would add the `text` it assumes for a bare string
+                // and produce `'x'::text::text`, which also makes re-rendering an
+                // already-deparsed expression non-idempotent.
+                match literal_of(inner) {
+                    Some(v) => format!("{}::{}", value_body(v), type_name(data_type)),
+                    None => format!("{}::{}", expr(inner, cx, u8::MAX), type_name(data_type)),
+                }
+            }),
         // A bare string literal in an analysed tree is never untyped: it carries
         // the cast the analyser resolved it to. `current_setting('TimeZone')`
         // deparses as `current_setting('TimeZone'::text)`.
