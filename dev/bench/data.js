@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786366981551,
+  "lastUpdate": 1786366982992,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -12280,6 +12280,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 31485.506984,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1bfd702a3bc5fa2a21bc642eff3b60269c86f82d",
+          "message": "feat: Support sha224/sha256/sha384/sha512 and crc32/crc32c functions (#206)",
+          "timestamp": "2026-08-10T14:10:22+02:00",
+          "tree_id": "ae12b52e60bc1b1e05d3bd040c5bb2d5d65ec792",
+          "url": "https://github.com/ovr/crabgresql/commit/1bfd702a3bc5fa2a21bc642eff3b60269c86f82d"
+        },
+        "date": 1786366982932,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 501.491544,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 22224.23372,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
