@@ -190,6 +190,22 @@ SELECT encode('\x001000'::bytea, 'hex') AS e_hex, encode('abc'::bytea, 'base64')
        encode('a\000b'::bytea, 'escape') AS e_esc;
 SELECT decode('001000', 'hex') AS d_hex, decode('YWJj', 'base64') AS d_b64;
 
+-- the length family over bytea answers in bytes under all three names, so only
+-- bit_length scales; over text length still counts characters
+SELECT length('\x'::bytea) AS z_len, octet_length('\x'::bytea) AS z_oct,
+       bit_length('\x'::bytea) AS z_bits;
+SELECT length('\x001000'::bytea) AS b_len, octet_length(decode('YWJj', 'base64')) AS b_oct,
+       bit_length('abc'::bytea) AS b_bits;
+SELECT length('привет') AS t_chars, length('привет'::bytea) AS b_bytes,
+       octet_length('привет') AS t_octets;
+SELECT length(NULL::bytea) AS n_len, octet_length(NULL::bytea) AS n_oct,
+       bit_length(NULL::bytea) AS n_bits;
+-- over a stored column, not just a constant the binder could fold
+CREATE TEMP TABLE bytea_len_t (b bytea);
+INSERT INTO bytea_len_t VALUES ('\x'), ('\x001000'), (NULL);
+SELECT length(b) AS len, octet_length(b) AS oct, bit_length(b) AS bits
+  FROM bytea_len_t ORDER BY len;
+
 -- quoting
 SELECT quote_ident('foo') AS qi1, quote_ident('foo bar') AS qi2,
        quote_literal('a''b') AS ql, quote_nullable(NULL) AS qn;

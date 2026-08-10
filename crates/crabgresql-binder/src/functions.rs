@@ -2237,6 +2237,13 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: &[TEXT],
                 ret: I4,
             },
+            // `length(bytea)` counts bytes, not characters. Text is listed
+            // first so a bare `length('abc')` unknown literal stays text.
+            Signature {
+                func: ScalarFn::Length,
+                args: &[BYTEA],
+                ret: I4,
+            },
             Signature {
                 func: ScalarFn::BitLen,
                 args: &[BIT],
@@ -2278,12 +2285,23 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: &[PgType::Bpchar],
                 ret: I4,
             },
+            Signature {
+                func: ScalarFn::OctetLength,
+                args: &[BYTEA],
+                ret: I4,
+            },
         ],
         // `bit_length(bit)` is the number of bits, like `length(bit)`.
         "bit_length" => &[
             Signature {
                 func: ScalarFn::BitLength,
                 args: &[TEXT],
+                ret: I4,
+            },
+            // `bit_length(bytea)` is eight times the byte count.
+            Signature {
+                func: ScalarFn::BitLength,
+                args: &[BYTEA],
                 ret: I4,
             },
             Signature {

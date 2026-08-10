@@ -302,9 +302,28 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         ScalarFn::TextConcat => {
             return Ok(Value::Text(format!("{}{}", text(&args[0]), text(&args[1]))));
         }
-        ScalarFn::Length => return Ok(Value::Int4(text::char_length(text(&args[0])))),
-        ScalarFn::OctetLength => return Ok(Value::Int4(text::octet_length(text(&args[0])))),
-        ScalarFn::BitLength => return Ok(Value::Int4(text::bit_length(text(&args[0])))),
+        // The length family spans text and bytea. A bytea argument answers in
+        // bytes under all three names (PG routes them all to `byteaoctetlen`),
+        // so only `bit_length` scales it; the cast to i32 cannot overflow
+        // because a bytea value is capped at 1GB.
+        ScalarFn::Length => {
+            return Ok(Value::Int4(match &args[0] {
+                Value::Bytea(b) => b.len() as i32,
+                v => text::char_length(text(v)),
+            }));
+        }
+        ScalarFn::OctetLength => {
+            return Ok(Value::Int4(match &args[0] {
+                Value::Bytea(b) => b.len() as i32,
+                v => text::octet_length(text(v)),
+            }));
+        }
+        ScalarFn::BitLength => {
+            return Ok(Value::Int4(match &args[0] {
+                Value::Bytea(b) => (b.len() as i32).wrapping_mul(8),
+                v => text::bit_length(text(v)),
+            }));
+        }
         ScalarFn::Upper => return Ok(Value::Text(text::upper(text(&args[0])))),
         ScalarFn::Lower => return Ok(Value::Text(text::lower(text(&args[0])))),
         ScalarFn::Initcap => return Ok(Value::Text(text::initcap(text(&args[0])))),
