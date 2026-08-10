@@ -6,8 +6,8 @@
 use crate::fmt::FmtCtx;
 use crate::numeric::ParseError;
 use crate::{
-    Interval, Numeric, PgType, TimeTz, Value, date, float, hex, interval, json, jsonpath, money,
-    parse_bool, time, timestamp, timestamptz, timetz,
+    Interval, Numeric, PgType, TimeTz, Value, date, float, interval, json, jsonpath, money,
+    parse_bool, text, time, timestamp, timestamptz, timetz,
 };
 
 /// SQLSTATE + message for a failed cast.
@@ -935,36 +935,22 @@ fn money_to_numeric(cents: i64) -> Numeric {
 /// `byteain`: parse PG's bytea input syntax into raw bytes. A leading `\x`
 /// selects hex format (an even run of hex digits); otherwise the traditional
 /// escape format applies (`\\` → `\`, `\ooo` octal → that byte, any other byte
-/// literal). Malformed input is `22P02`. Shared with the binder's
-/// `parse_unknown` so the two never drift.
+/// literal). Shared with the binder's `parse_unknown` so the two never drift.
+///
+/// The two formats fail differently: PG runs the hex form through the same
+/// decoder as `decode(…, 'hex')`, so it reports which digit was bad (`22023`),
+/// while a bad escape is a bare `22P02` that — unlike almost every other
+/// `invalid input syntax` — does not echo the offending value.
 pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
-    let bytes = s.as_bytes();
-    if let Some(hex) = bytes.strip_prefix(b"\\x") {
-        // Hex format: pairs of hex digits, with whitespace between pairs
-        // ignored (matching PG's hex_decode).
-        let mut out = Vec::with_capacity(hex.len() / 2);
-        let mut hi: Option<u8> = None;
-        for &c in hex {
-            if c.is_ascii_whitespace() {
-                // Whitespace is only allowed between pairs, not mid-byte.
-                if hi.is_some() {
-                    return Err(invalid_input(PgType::Bytea, s));
-                }
-                continue;
-            }
-            let nibble = hex::val(c).ok_or_else(|| invalid_input(PgType::Bytea, s))?;
-            match hi.take() {
-                None => hi = Some(nibble),
-                Some(h) => out.push((h << 4) | nibble),
-            }
-        }
-        // A dangling half-byte (odd number of hex digits) is invalid.
-        if hi.is_some() {
-            return Err(invalid_input(PgType::Bytea, s));
-        }
-        return Ok(out);
+    if let Some(hex) = s.strip_prefix("\\x") {
+        return text::hex_decode(hex).map_err(|e| CastError {
+            sqlstate: text::HexError::SQLSTATE,
+            message: e.message(),
+            detail: None,
+        });
     }
     // Escape format.
+    let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -981,19 +967,30 @@ pub fn byteain(s: &str) -> Result<Vec<u8>, CastError> {
             }
             Some(&c) if (b'0'..=b'3').contains(&c) => {
                 let (Some(&d1), Some(&d2)) = (bytes.get(i + 2), bytes.get(i + 3)) else {
-                    return Err(invalid_input(PgType::Bytea, s));
+                    return Err(bad_bytea_escape());
                 };
                 let (Some(o0), Some(o1), Some(o2)) = (octal_val(c), octal_val(d1), octal_val(d2))
                 else {
-                    return Err(invalid_input(PgType::Bytea, s));
+                    return Err(bad_bytea_escape());
                 };
                 out.push((o0 << 6) | (o1 << 3) | o2);
                 i += 4;
             }
-            _ => return Err(invalid_input(PgType::Bytea, s)),
+            _ => return Err(bad_bytea_escape()),
         }
     }
     Ok(out)
+}
+
+/// `22P02` for a malformed backslash escape. Unlike [`invalid_input`], this one
+/// prints no `: "<value>"` suffix — PG's escape-format branch raises the bare
+/// message.
+fn bad_bytea_escape() -> CastError {
+    CastError {
+        sqlstate: INVALID_TEXT_REPRESENTATION,
+        message: format!("invalid input syntax for type {}", PgType::Bytea.name()),
+        detail: None,
+    }
 }
 
 fn octal_val(c: u8) -> Option<u8> {
@@ -1213,37 +1210,32 @@ mod tests {
         assert_eq!(byteain("\\xdead")?, vec![0xde, 0xad]);
         assert_eq!(byteain("\\xDE AD")?, vec![0xde, 0xad]);
         assert_eq!(byteain("\\x")?, b"");
-        // Malformed input is 22P02.
-        assert_eq!(
-            byteain("\\xabc")
-                .expect_err("hex bytea with an odd number of nibbles has no whole last byte")
-                .sqlstate,
-            "22P02"
-        ); // odd nibbles
-        assert_eq!(
-            byteain("\\xzz")
-                .expect_err("'z' is not a hex digit")
-                .sqlstate,
-            "22P02"
-        ); // non-hex
-        assert_eq!(
-            byteain("\\x a b")
-                .expect_err("whitespace inside a hex pair splits a byte")
-                .sqlstate,
-            "22P02"
-        ); // mid-byte space
-        assert_eq!(
-            byteain("\\9")
-                .expect_err("\\9 is neither \\\\ nor a three-digit octal escape")
-                .sqlstate,
-            "22P02"
-        ); // bad escape
-        assert_eq!(
-            byteain("\\")
-                .expect_err("a trailing backslash has no escape body")
-                .sqlstate,
-            "22P02"
-        ); // dangling backslash
+
+        // The two formats fail differently. Hex goes through the same decoder
+        // as `decode(…, 'hex')` and names the offending digit (`22023`);
+        // whitespace *inside* a pair is one of those digits, not a separate
+        // "odd number" error.
+        let hex_err = |s: &str, want: &str| {
+            let e = byteain(s).expect_err("malformed hex bytea");
+            assert_eq!((e.sqlstate, e.message.as_str()), ("22023", want), "{s}");
+        };
+        hex_err("\\xabc", "invalid hexadecimal data: odd number of digits");
+        hex_err("\\xzz", "invalid hexadecimal digit: \"z\"");
+        hex_err("\\x a b", "invalid hexadecimal digit: \" \"");
+
+        // A bad escape is a bare `22P02` that does not echo the value, unlike
+        // almost every other `invalid input syntax`.
+        let esc_err = |s: &str| {
+            let e = byteain(s).expect_err("malformed escape bytea");
+            assert_eq!(
+                (e.sqlstate, e.message.as_str()),
+                ("22P02", "invalid input syntax for type bytea"),
+                "{s}"
+            );
+        };
+        esc_err("\\9"); // neither `\\` nor a three-digit octal escape
+        esc_err("\\"); // dangling backslash
+        esc_err("\\800"); // octal escape out of the 0-3 lead range
 
         Ok(())
     }

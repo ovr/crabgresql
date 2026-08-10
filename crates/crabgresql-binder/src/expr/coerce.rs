@@ -233,6 +233,23 @@ pub(crate) fn binding_type_label(b: &Binding) -> String {
     }
 }
 
+/// Why an argument did not fit a parameter type.
+///
+/// Overload resolution needs these apart. PG chooses the overload from the
+/// argument *types* and only then runs the chosen parameter's input function,
+/// so a rejected literal is the answer when one candidate is left, while a type
+/// that cannot reach the parameter drops the candidate and — if none survives —
+/// is `42883` no matter what the literals say.
+pub(crate) enum ArgFail {
+    /// The argument's type does not reach the parameter's.
+    Mismatch,
+    /// A `$n` placeholder not yet pinned to this type during the exact-only
+    /// pass. Not a real failure: the coercing pass retries it.
+    ParamDeferred,
+    /// An untyped literal its input function rejected, cursor already attached.
+    LiteralInput(BindError),
+}
+
 /// Coerce a function argument binding to `target`. Unknown literals resolve to
 /// `target`; a typed argument matches exactly, or (when `exact_only` is false)
 /// is promoted if `target` is its common type with `target` — reproducing PG's
@@ -241,7 +258,7 @@ pub(crate) fn coerce_for_arg(
     binding: Binding,
     target: PgType,
     exact_only: bool,
-) -> Option<BoundExpr> {
+) -> Result<BoundExpr, ArgFail> {
     match binding {
         // A parameter's type is deduced by the *side effect* of `resolve_unknown`
         // (it records the type in the shared context). Overload resolution tries
@@ -261,23 +278,32 @@ pub(crate) fn coerce_for_arg(
             // takes it mutably.
             let already = param.1.borrow().slot_type(param.0);
             if already == Some(target) {
-                resolve_unknown(lit, span, Some(param), target).ok()
+                // A conflicting deduction here is 42P18 invented by the search
+                // itself, so it stays unreportable.
+                resolve_unknown(lit, span, Some(param), target).map_err(|_| ArgFail::Mismatch)
             } else {
-                None
+                Err(ArgFail::ParamDeferred)
             }
         }
-        Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, target).ok(),
+        Binding::Unknown {
+            lit,
+            span,
+            param: None,
+        } => resolve_unknown(lit, span, None, target).map_err(ArgFail::LiteralInput),
+        Binding::Unknown { lit, span, param } => {
+            resolve_unknown(lit, span, param, target).map_err(|_| ArgFail::Mismatch)
+        }
         Binding::Typed(e) => {
             if e.ty() == target {
-                return Some(e);
+                return Ok(e);
             }
             if exact_only {
-                return None;
+                return Err(ArgFail::Mismatch);
             }
             if implicit_castable(e.ty(), target) {
-                return coerce_expr(e, target).ok();
+                return coerce_expr(e, target).map_err(|_| ArgFail::Mismatch);
             }
-            None
+            Err(ArgFail::Mismatch)
         }
     }
 }

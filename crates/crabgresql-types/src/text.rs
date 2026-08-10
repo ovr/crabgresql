@@ -2414,31 +2414,52 @@ pub fn decode(s: &str, format: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+/// The two ways hex input can be malformed, both `22023`.
+///
+/// Split out because PG decodes `decode(…, 'hex')` and `byteain`'s `\x` form
+/// with the same routine, so the messages *and* the whitespace rule have to
+/// agree; [`cast::byteain`](crate::cast::byteain) maps these onto its own
+/// error type.
+pub(crate) enum HexError {
+    InvalidDigit(char),
+    OddDigits,
+}
+
+impl HexError {
+    pub(crate) const SQLSTATE: &'static str = sqlstate::INVALID_PARAMETER_VALUE;
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            HexError::InvalidDigit(c) => format!("invalid hexadecimal digit: \"{c}\""),
+            HexError::OddDigits => "invalid hexadecimal data: odd number of digits".into(),
+        }
+    }
+}
+
+/// Decode a run of hex digit pairs. Whitespace separates pairs and is skipped,
+/// but *within* a pair it is an invalid digit like any other byte — `4 1` is an
+/// error while ` 41` is `0x41`.
+pub(crate) fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, HexError> {
+    let mut out = Vec::with_capacity(s.len() / 2);
     let mut hi: Option<u8> = None;
     for c in s.bytes() {
-        if c.is_ascii_whitespace() {
+        if c.is_ascii_whitespace() && hi.is_none() {
             continue;
         }
-        let v = hex::val(c).ok_or_else(|| {
-            TextError::new(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                format!("invalid hexadecimal digit: \"{}\"", c as char),
-            )
-        })?;
+        let v = hex::val(c).ok_or(HexError::InvalidDigit(c as char))?;
         match hi.take() {
             None => hi = Some(v),
             Some(h) => out.push((h << 4) | v),
         }
     }
     if hi.is_some() {
-        return Err(TextError::new(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "invalid hexadecimal data: odd number of digits",
-        ));
+        return Err(HexError::OddDigits);
     }
     Ok(out)
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    hex_decode(s).map_err(|e| TextError::new(HexError::SQLSTATE, e.message()))
 }
 
 fn base64_val(c: u8) -> Option<u8> {
