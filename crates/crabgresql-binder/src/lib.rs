@@ -4,7 +4,7 @@
 //! rejection (`0A000`) of everything parsed but not yet executable.
 
 mod collation;
-mod expr;
+pub mod expr;
 mod functions;
 mod logical_plan;
 mod plan;
