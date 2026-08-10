@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786378415917,
+  "lastUpdate": 1786378417672,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -9738,6 +9738,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q22",
             "value": 0.725,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "83662a01592045a0c92fa35e277e142854cdd263",
+          "message": "perf(planner): order a filter's conjuncts so a subquery is checked last (#210)\n\n* refactor(binder): one walk for the expression tree, and a node-level volatility test\n\nThree consumers are about to want the same two things, so introduce them\nonce rather than three times.\n\n`for_each_subexpr` visits every node of a bound expression with the\ncorrelation depth that node sits at, crossing the one boundary that pushes\na level — a nested subquery's body. `expr_has_outer_ref` is rewritten on\ntop of it (same answer; it loses only its early return, and its callers\nwere already walking whole plans).\n\n`BoundExpr::is_volatile_call` answers the question for a single node. The\nlist of volatile scalar functions now lives there and only there, so a\nwalk that visits every node and the subtree predicate that stops at a\nsubquery marker cannot drift apart — `contains_volatile_fn` delegates to\nit. And `expr_contains_volatile_fn` is the walk-based sibling that *does*\ncross a marker: a conjunct holding `EXISTS (SELECT … nextval('s') …)` is\nvolatile in every sense that counts, but the subtree predicate reports\n`false` because a subquery's body is a plan of its own.\n\nNo behaviour change; the new test pins the shallow/deep distinction so a\nlater caller cannot pick the wrong one by accident.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n* perf(planner): evaluate subquery conjuncts after the cheap ones\n\n`AND` short-circuits left to right, so the order a `WHERE` was typed in\ndecides how many rows a correlated subquery is executed for. On the\nupstream `subselect` corpus that is not a micro-optimization but a\ncomplexity class:\n\n  where thousand = 1 and exists (select 1 from tenk1 k where k.unique1 = t.unique2)\n  where exists (select 1 from tenk1 k where k.unique1 = t.unique2) and thousand = 1\n\nmeasure 20.7 ms and 14802 ms — the same answer, 716x apart, decided purely\nby which conjunct the user typed first.\n\nAdd a `qualorder` pass, run after the sinking passes so each conjunct is\nordered against the ones it shares a node with. It makes exactly one\ndistinction: a conjunct containing a subquery marker sinks to the end,\nevery other conjunct keeps its written order. Narrower is safer —\nreordering two ordinary conjuncts could only change which of two errors a\nrow raises, for a gain too small to measure. A filter holding a volatile\nconjunct is left alone entirely, since reordering changes how many rows\nit runs on and so how many times a sequence advances.\n\n  select count(*) from tenk1 t\n  where exists(select 1 from tenk1 k where k.unique1 = t.unique2)\n    and thousand = 1;\n  14802 ms -> 20 ms\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n* fix(planner): only sink a conjunct whose subquery is correlated\n\n`reorder` sank every subquery-bearing conjunct, but an *uncorrelated*\nmarker is folded to a `Const` by `resolve_subqueries` before the scan\nstarts, and evaluating a `Const` is a clone. Sinking one therefore buys\nnothing and costs whatever it was gating:\n\n  CREATE TABLE cfg(enabled bool); INSERT INTO cfg VALUES (false);\n  SELECT * FROM t WHERE EXISTS (SELECT 1 FROM cfg WHERE enabled)\n                    AND 100 / t.divisor > 1;\n\nreturns 0 rows on the previous commit's parent and on PostgreSQL 18.4,\nbut raises `division by zero` with the pass in place — the guard is a\ncompile-time `false` that no longer guards.\n\nSort on \"contains a correlated marker\" instead, asking the binder the\nsame question the executor asks when it decides whether to fold:\n`plan_has_outer_refs`. The new `expr_contains_correlated_subquery` is\nbuilt on the `for_each_subexpr` walker this branch already added, and\nlooks only at the expression's own markers — a marker nested inside\nanother's subplan is covered by the enclosing one either way.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n* fix(planner): look inside a subquery body for volatility\n\nThe module promises that a filter holding a volatile conjunct is left\nentirely alone, because reordering changes how many rows a conjunct is\nevaluated on and so how many times a sequence advances. It asked\n`BoundExpr::contains_volatile_fn`, which by design stops at a subquery\nmarker — the exact kind of conjunct this pass moves. So\n\n  SELECT * FROM t\n  WHERE (SELECT nextval('s') FROM u WHERE u.k = t.k) > 0 AND t.x = 1;\n\nreported no volatility, the subquery sank behind the equality, and\n`nextval` fired once per row *matching* `t.x = 1` rather than once per\nscanned row.",
+          "timestamp": "2026-08-10T16:32:06+02:00",
+          "tree_id": "eb9d929e641794da7683231061b802063dc71d1d",
+          "url": "https://github.com/ovr/crabgresql/commit/83662a01592045a0c92fa35e277e142854cdd263"
+        },
+        "date": 1786378417625,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.737,
+            "unit": "s",
+            "extra": "dataset load — heap, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.208,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.024,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.107,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 18.864,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.141,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.078,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.264,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.137,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.181,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.096,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.013,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.08,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.027,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.069,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.141,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.007,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.062,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.297,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 59.19,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 3.765,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 10.762,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.699,
             "unit": "s",
             "extra": "best of the timed runs — heap, 86805 rows"
           }
