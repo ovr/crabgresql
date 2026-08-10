@@ -19,7 +19,7 @@ pub use collation::{
 };
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ColumnDefault,
-    ParamCtx, ParamState, Scope, Subplan, UnaryOp, WindowKind, WindowSortKey,
+    ParamCtx, ParamState, Scope, Subplan, SubplanId, UnaryOp, WindowKind, WindowSortKey,
     bind_check_constraint, bind_column_default, bind_expr, bind_scalar, bind_sql_function_body,
     bool_test_clause, builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod,
     coerce_to_column, coerce_to_param, const_type_label, datetime_precision, declared_typmod,
@@ -41,8 +41,8 @@ pub use plan::{
     bind_delete_with_params, bind_insert, bind_insert_with_params, bind_query,
     bind_query_with_params, bind_update, bind_update_with_params,
     expr_contains_correlated_subquery, expr_contains_volatile_fn, inheritance_descendants,
-    output_columns_of, plan_calls_routine, plan_has_outer_refs, substitute_outer,
-    substitute_params,
+    output_columns_of, plan_calls_routine, plan_contains_volatile_fn, plan_has_outer_refs,
+    plan_outer_ref_slots, substitute_outer, substitute_params,
 };
 pub use soft_input::{SoftError, TypeSpec, soft_input};
 

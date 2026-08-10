@@ -15,6 +15,7 @@ mod md5;
 pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
+mod subplan;
 mod unique;
 mod uuid_gen;
 pub mod vector;
@@ -307,6 +308,11 @@ pub struct ExecContext {
     /// statement would reuse a command id the body already stamped rows with,
     /// and those rows would be invisible to it.
     pub command_counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// What the executor has learned about this statement's subplans (see
+    /// [`subplan`]). Created by the outermost [`execute`] and inherited, not
+    /// replaced, by the nested executions a correlated subquery drives — a cache
+    /// scoped to a single outer row would never be hit.
+    pub subplans: Option<Arc<subplan::SubplanCache>>,
 }
 
 impl Default for ExecContext {
@@ -324,6 +330,7 @@ impl Default for ExecContext {
             read_only: false,
             call_depth: 0,
             command_counter: None,
+            subplans: None,
         }
     }
 }
@@ -481,15 +488,17 @@ pub fn execute(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    // Fold every *non-correlated* subquery to a constant/comparison before any
-    // node evaluates an expression. Correlated subqueries are left in place and
-    // folded per outer row by `eval`, which needs the transaction to re-run their
-    // subplans — so thread it through the context every node is built with (and
-    // nested `run_subplan` → `execute` re-injects it, so deeper levels see it too).
-    resolve_subqueries(&mut plan, ctx, txn)?;
     // Build the enriched context by copying only the fields we keep — not
     // `..ctx.clone()`, which would clone the old `txn` Snapshot (a `Vec<Xid>`)
     // only to overwrite it. One `txn.clone()` per execute, none wasted.
+    //
+    // Correlated subqueries are left in place by the fold below and evaluated per
+    // outer row by `eval`, which needs the transaction to re-run their subplans —
+    // so thread it through the context every node is built with (and nested
+    // `run_subplan` → `execute` re-injects it, so deeper levels see it too). The
+    // subplan cache is threaded the same way, but *inherited* where one already
+    // exists: a cache that started over at each nested execution would be built
+    // per outer row and hit never.
     let ctx = &ExecContext {
         fmt: ctx.fmt.clone(),
         sequences: ctx.sequences.clone(),
@@ -502,7 +511,11 @@ pub fn execute(
         read_only: ctx.read_only,
         call_depth: ctx.call_depth,
         command_counter: ctx.command_counter.clone(),
+        subplans: Some(ctx.subplans.clone().unwrap_or_default()),
     };
+    // Fold every *non-correlated* subquery to a constant/comparison before any
+    // node evaluates an expression.
+    resolve_subqueries(&mut plan, ctx, txn)?;
     match plan {
         PhysicalPlan::Values {
             columns,
@@ -1146,7 +1159,7 @@ fn is_foldable_subquery(expr: &BoundExpr) -> bool {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => {
-            !crabgresql_binder::plan_has_outer_refs(&subplan.0)
+            !crabgresql_binder::plan_has_outer_refs(&subplan.plan)
         }
         _ => false,
     }
@@ -1160,7 +1173,7 @@ fn fold_subquery(
 ) -> Result<BoundExpr, ExecError> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, ty } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            let rows = run_subplan(*subplan.plan, ctx, txn)?;
             Ok(BoundExpr::Const {
                 value: scalar_subquery_value(rows, ty, ctx)?,
                 ty,
@@ -1171,7 +1184,7 @@ fn fold_subquery(
             // one rather than draining the whole subplan; the binder already
             // stripped the target list to a constant so no per-row projection
             // (or its errors) is evaluated. NOT EXISTS inverts the test.
-            let exists = subplan_has_rows(*subplan.0, ctx, txn)?;
+            let exists = subplan_has_rows(*subplan.plan, ctx, txn)?;
             Ok(BoundExpr::Const {
                 value: Value::Bool(exists != negated),
                 ty: PgType::Bool,
@@ -1181,13 +1194,13 @@ fn fold_subquery(
         // array so the per-row work reuses the single `QuantifiedArray`
         // evaluation path (which evaluates the needle exactly once per row).
         BoundExpr::QuantifiedSubquery { subplan, all, cmp } => {
-            let rows = run_subplan(*subplan.0, ctx, txn)?;
+            let rows = run_subplan(*subplan.plan, ctx, txn)?;
             let elem = hole_ty(&cmp).unwrap_or(PgType::Text);
             Ok(BoundExpr::QuantifiedArray {
                 array: Box::new(BoundExpr::Const {
                     value: Value::Array {
                         elem,
-                        elems: subquery_column(rows),
+                        elems: dedup_candidates(subquery_column(rows)),
                     },
                     ty: PgType::Array(elem.oid()),
                 }),
@@ -1198,6 +1211,53 @@ fn fold_subquery(
         // Not a subquery marker (unreachable — the caller matched one).
         other => Ok(other),
     }
+}
+
+/// Drop candidates a quantified comparison would ask the same question of twice.
+///
+/// `x op ANY/ALL (SELECT …)` compares the needle against every candidate for
+/// every outer row, so a subquery returning 10 000 rows over 100 distinct values
+/// does a hundred times the work it needs to. Two equal candidates give the same
+/// answer under any of the six comparison operators — they compare identically
+/// against everything, being equal — and duplicate NULLs are equally redundant,
+/// since the evaluator only records *that* it saw one.
+///
+/// The type is read off the values themselves rather than from the comparison's
+/// hole: the candidates arrive as the subquery produced them and are coerced
+/// only later, per row, so `float_col IN (SELECT num_col …)` hands numerics to a
+/// float8 comparison. Values of mixed types, or of a type whose hash does not
+/// separate them the way its comparison does (interval, inet, …), are left as
+/// they came — the same refusal the hash join makes.
+///
+/// Deduplicating on the *source* type is conservative in the right direction:
+/// coercion is a function, so values equal before it are equal after it, while
+/// values it would map together are simply kept apart.
+fn dedup_candidates(values: Vec<Value>) -> Vec<Value> {
+    let Some(elem) = values.iter().find_map(Value::pg_type) else {
+        return values;
+    };
+    let uniform = values
+        .iter()
+        .all(|value| value.pg_type().is_none_or(|ty| ty == elem));
+    if values.len() < 2 || !uniform || !elem.hashes_distinctly() {
+        return values;
+    }
+    let tys = [elem];
+    let mut seen: FxHashMap<u64, Vec<Value>> = FxHashMap::default();
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let bucket = seen.entry(agg::hash_key(&tys, &[&value])).or_default();
+        // A bucket hit can be a hash collision, so confirm on the values.
+        if bucket
+            .iter()
+            .any(|other| agg::keys_equal(&tys, &[other], &[&value]))
+        {
+            continue;
+        }
+        bucket.push(value.clone());
+        out.push(value);
+    }
+    out
 }
 
 /// The value a scalar subquery folds to from its materialized `rows`: no row →
@@ -1258,30 +1318,56 @@ pub(crate) fn eval_correlated_subquery(
             ));
         }
     };
-    let mut logical = (*subplan.0).clone();
+    // An `EXISTS` whose correlation is plain equality is answered from a hash
+    // table built once for the whole statement — no clone, no plan, no scan.
+    if let BoundExpr::Exists { negated, .. } = marker
+        && let Some(hashed) = subplan::hashed_exists(subplan, ctx, txn)?
+    {
+        return Ok(Value::Bool(hashed.probe(row, ctx)? != *negated));
+    }
+    // Otherwise the subplan really is re-run — but only for an outer row that
+    // does not agree with an earlier one on every slot the subplan reads. A
+    // quantified marker is excluded: its needle is evaluated against the outer
+    // row *outside* the subplan, so the subplan's own slots do not determine the
+    // answer.
+    let memo = match marker {
+        BoundExpr::QuantifiedSubquery { .. } => None,
+        _ => subplan::memo_key(subplan, row, ctx),
+    };
+    if let Some(key) = &memo
+        && let Some(hit) = subplan::memo_get(key, ctx)
+    {
+        return Ok(hit);
+    }
+
+    let mut logical = (*subplan.plan).clone();
     crabgresql_binder::substitute_outer(&mut logical, row);
-    match marker {
+    let value = match marker {
         BoundExpr::ScalarSubquery { ty, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
-            scalar_subquery_value(rows, *ty, ctx)
+            scalar_subquery_value(rows, *ty, ctx)?
         }
         BoundExpr::Exists { negated, .. } => {
             let exists = subplan_has_rows(logical, ctx, txn)?;
-            Ok(Value::Bool(exists != *negated))
+            Value::Bool(exists != *negated)
         }
         BoundExpr::QuantifiedSubquery { all, cmp, .. } => {
             let rows = run_subplan(logical, ctx, txn)?;
             // The template's needle reads the current row, so the quantifier is
             // evaluated against `row` (needle once, then each candidate).
-            eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)
+            eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)?
         }
         // Unreachable: `subplan` above already matched these three variants.
-        _ => Ok(Value::Null),
+        _ => Value::Null,
+    };
+    if let Some(key) = memo {
+        subplan::memo_put(key, &value, ctx);
     }
+    Ok(value)
 }
 
 /// Plan and execute a subplan, draining its result set into materialized rows.
-fn run_subplan(
+pub(crate) fn run_subplan(
     logical: LogicalPlan,
     ctx: &ExecContext,
     txn: &TxnContext,
@@ -7397,6 +7483,240 @@ mod tests {
              JOIN (VALUES (1, 9), (1, 3), (2, 1)) b(x, v) ON a.x = b.x AND a.v < b.v",
         );
         assert_eq!(rows, vec![vec![Value::Int4(5), Value::Int4(9)]]);
+    }
+
+    /// Two tables of `(k, v)` int4 rows, for the hashed-`EXISTS` tests.
+    fn exists_engine(
+        outer: &[(i32, i32)],
+        inner: &[(Option<i32>, i32)],
+    ) -> anyhow::Result<Arc<dyn TableEngine>> {
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let o = engine.create_table(TableSchema::in_namespace(
+            "o",
+            "public",
+            vec![
+                Column::new("k", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        ))?;
+        let i = engine.create_table(TableSchema::in_namespace(
+            "i",
+            "public",
+            vec![
+                Column::new("k", PgType::Int4),
+                Column::new("v", PgType::Int4),
+            ],
+        ))?;
+        let txn = wtxn();
+        for (k, v) in outer {
+            o.insert(vec![Value::Int4(*k), Value::Int4(*v)], &txn)?;
+        }
+        for (k, v) in inner {
+            let k = k.map_or(Value::Null, Value::Int4);
+            i.insert(vec![k, Value::Int4(*v)], &txn)?;
+        }
+        Ok(engine as Arc<dyn TableEngine>)
+    }
+
+    #[test]
+    fn a_cross_type_correlation_still_hashes() -> anyhow::Result<()> {
+        // `unify_types` wraps the *narrower* operand, so an int4 outer column
+        // against an int8 inner one arrives as `Coerce{OuterColumnRef}` and used
+        // to fall off the hashed path entirely. Both orientations must answer
+        // the same, and the same as the per-row path.
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let narrow = engine.create_table(TableSchema::in_namespace(
+            "narrow",
+            "public",
+            vec![Column::new("k", PgType::Int4)],
+        ))?;
+        let wide = engine.create_table(TableSchema::in_namespace(
+            "wide",
+            "public",
+            vec![Column::new("k", PgType::Int8)],
+        ))?;
+        let txn = wtxn();
+        for k in [1_i32, 2, 3] {
+            narrow.insert(vec![Value::Int4(k)], &txn)?;
+        }
+        for k in [2_i64, 3, 9] {
+            wide.insert(vec![Value::Int8(k)], &txn)?;
+        }
+        let engine: Arc<dyn TableEngine> = engine;
+        for sql in [
+            "SELECT k FROM narrow o WHERE EXISTS (SELECT 1 FROM wide i WHERE i.k = o.k) ORDER BY k",
+            "SELECT k FROM narrow o WHERE EXISTS (SELECT 1 FROM wide i WHERE o.k = i.k) ORDER BY k",
+        ] {
+            let (_c, rows) = run_rows_on(&engine, sql);
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int4(2)], vec![Value::Int4(3)]],
+                "{sql}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hashed_exists_matches_the_per_row_answer() -> anyhow::Result<()> {
+        // The correlation `i.k = o.k` is stripped and hashed; the residual
+        // `i.v > 0` still applies. o.k = 3 has an inner row but it fails the
+        // residual, and o.k = 4 has none at all.
+        let engine = exists_engine(
+            &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            &[(Some(1), 1), (Some(2), 5), (Some(3), -1)],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 0) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]);
+
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v > 0) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(3)], vec![Value::Int4(4)]]);
+        Ok(())
+    }
+
+    #[test]
+    fn hashed_exists_never_matches_a_null_key() -> anyhow::Result<()> {
+        // `i.k = o.k` is never true when either side is NULL, so a NULL inner key
+        // must stay out of the hash table and a NULL outer key must match nothing
+        // — the same rule the hash join follows. Without it, NULL would collide
+        // with NULL in one bucket and `EXISTS` would wrongly report a row.
+        let engine = exists_engine(&[(1, 10)], &[(None, 1), (Some(1), 1)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.v)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int8(0)]],
+            "o.v = 10 matches no inner key, and the NULL key is not one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn in_subquery_candidates_of_a_foreign_type_are_left_alone() {
+        // The candidates are numerics while the comparison is on float8, since
+        // they are coerced per row and not at fold time. Hashing them as float8
+        // would reach the wrong accumulator; the dedup has to read the type off
+        // the values. `1.000000000000000000001` is a distinct numeric that still
+        // rounds to 1.0, so it must not be dropped either.
+        let (_c, rows) = run_rows(
+            "SELECT f FROM (VALUES (1::float8), (2::float8)) t(f) \
+             WHERE f IN (SELECT n FROM (VALUES (1::numeric), \
+                                               (1.000000000000000000001::numeric)) u(n)) \
+             ORDER BY f",
+        );
+        assert_eq!(rows, vec![vec![Value::Float8(1.0)]]);
+    }
+
+    #[test]
+    fn in_subquery_candidates_are_deduplicated() -> anyhow::Result<()> {
+        // Six candidate rows over two distinct values, plus NULLs. Dropping the
+        // duplicates must not change either answer: `IN` still matches, and
+        // `NOT IN` is still NULL rather than false because a NULL candidate
+        // survives the dedup.
+        let engine = exists_engine(
+            &[(1, 0), (3, 0)],
+            &[
+                (Some(1), 0),
+                (Some(1), 0),
+                (Some(2), 0),
+                (Some(2), 0),
+                (None, 0),
+                (None, 0),
+            ],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT o.k, o.k IN (SELECT i.k FROM i) FROM o ORDER BY o.k",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Bool(true)],
+                // 3 matches nothing, but a NULL candidate makes the answer NULL.
+                vec![Value::Int4(3), Value::Null],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_type_the_hash_cannot_separate_is_not_memoized() {
+        // `point` is outside `hashes_distinctly`, so `hash_key` puts every key
+        // in one bucket and `compare_values` — which has no `Point` arm — is
+        // asked to resolve it. Without the guard the *second* outer row lands in
+        // the first one's bucket and hits `unreachable!`.
+        let (_c, rows) = run_rows(
+            "SELECT (SELECT count(*) FROM (VALUES (1)) c(x) WHERE c.x = 1 AND o.p IS NOT NULL) \
+             FROM (VALUES ('(1,2)'::point), ('(3,4)'::point)) o(p)",
+        );
+        assert_eq!(rows, vec![vec![Value::Int8(1)], vec![Value::Int8(1)]]);
+    }
+
+    #[test]
+    fn memoized_scalar_subquery_answers_each_distinct_key_once() -> anyhow::Result<()> {
+        // Four outer rows over two distinct correlation keys: the second row of
+        // each key is answered from the memo, and must get its own key's answer
+        // rather than the previously computed one.
+        let engine = exists_engine(
+            &[(1, 0), (2, 0), (1, 0), (2, 0)],
+            &[(Some(1), 7), (Some(2), 9)],
+        )?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT (SELECT i.v FROM i WHERE i.k = o.k) FROM o ORDER BY 1",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(7)],
+                vec![Value::Int4(7)],
+                vec![Value::Int4(9)],
+                vec![Value::Int4(9)],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memo_key_covers_every_outer_column_the_subplan_reads() -> anyhow::Result<()> {
+        // Two outer rows share `k` but differ in `v`, and the subplan reads
+        // both. Keying on only one of them would serve the first row's answer
+        // to the second.
+        let engine = exists_engine(&[(1, 7), (1, 9)], &[(Some(1), 7), (Some(1), 9)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT o.v, (SELECT count(*) FROM i WHERE i.k = o.k AND i.v = o.v) FROM o ORDER BY o.v",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(7), Value::Int8(1)],
+                vec![Value::Int4(9), Value::Int8(1)],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn correlated_exists_on_an_inequality_still_answers_per_row() -> anyhow::Result<()> {
+        // `i.k < o.k` is not an equality, so nothing is hashable and the marker
+        // falls back to the per-outer-row path. The answer has to be the same.
+        let engine = exists_engine(&[(1, 10), (5, 50)], &[(Some(3), 1)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k < o.k) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(5)]]);
+        Ok(())
     }
 
     #[test]

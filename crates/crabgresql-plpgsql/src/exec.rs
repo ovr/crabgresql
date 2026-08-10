@@ -199,8 +199,16 @@ impl Interpreter {
     /// The depth lives on the context rather than in a thread-local because a
     /// suspended portal carries a cloned context across `Execute` round-trips,
     /// and tokio may resume it on a different worker thread.
+    /// The caller's subplan cache is deliberately *not* inherited: `run_statement`
+    /// re-parses and re-binds every body statement on every invocation, so each
+    /// one mints fresh `SubplanId`s. An inherited cache could therefore only
+    /// accumulate entries that can never be looked up again — one hashed inner
+    /// relation per call, retained until the top-level statement ends. Each body
+    /// statement's own `execute` creates a cache scoped to itself, which is where
+    /// the hits actually are.
     fn deeper(&self, ctx: &ExecContext) -> Result<ExecContext, ExecError> {
         let mut inner = ctx.clone();
+        inner.subplans = None;
         inner.call_depth = ctx.call_depth + 1;
         if inner.call_depth > MAX_CALL_DEPTH {
             return Err(ExecError::new(
