@@ -6,6 +6,7 @@
 
 mod projection;
 mod pushdown;
+pub mod topn;
 pub mod vectorize;
 
 use std::sync::Arc;
@@ -144,6 +145,11 @@ pub enum PhysicalPlan {
         source: Box<PhysicalPlan>,
         limit: Option<i64>,
         offset: Option<i64>,
+        /// ORDER BY keys lifted out of `source` by the [`topn`] pass: the
+        /// executor runs a bounded Top-N here instead of the full sort that
+        /// would otherwise have happened below. Empty when nothing was fused,
+        /// which is the shape [`lower`] always produces.
+        sort: Vec<SortKey>,
     },
     Insert {
         table: Arc<dyn TableAm>,
@@ -601,9 +607,14 @@ fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
 
 pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
     let mut physical = lower(logical);
-    // Last, so every predicate has already been sunk to the leaf that will
-    // evaluate it and each scan's demand is analyzed where it actually applies.
+    // Before the projection pass, so every predicate has already been sunk to
+    // the leaf that will evaluate it and each scan's demand is analyzed where it
+    // actually applies.
     projection::push_column_projections(&mut physical);
+    // Last: the pass above reads each node's `sort` to keep the columns the keys
+    // address alive (`through_tail`), and this one moves those keys out of the
+    // node. Running it first would let a scan prune a column the Top-N needs.
+    topn::fuse_limit_into_sort(&mut physical);
     physical
 }
 
@@ -797,6 +808,8 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             source: Box::new(lower(*source)),
             limit,
             offset,
+            // Filled in later by `topn::fuse_limit_into_sort`, if it applies.
+            sort: Vec::new(),
         },
         LogicalPlan::Insert(InsertPlan {
             table,
@@ -1390,9 +1403,19 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             );
             lines
         }
-        PhysicalPlan::Limit { source, .. } => {
+        PhysicalPlan::Limit { source, sort, .. } => {
+            let mut child = explain(source);
+            // A lifted Top-N (see `topn`) is the same sort, executed bounded —
+            // the plan the user sees must not change because of it. `SetOp` is
+            // the one variant that renders a `Sort` line of its own for the keys
+            // this pass takes away, so it is the one that has to get it back.
+            // PG draws no distinction either: plain `EXPLAIN` says `Sort`
+            // whether or not the executor picks a top-N heapsort.
+            if !sort.is_empty() && matches!(**source, PhysicalPlan::SetOp { .. }) {
+                child = nest_under("Sort", child);
+            }
             let mut lines = vec!["Limit".to_string()];
-            lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
+            lines.extend(child.into_iter().map(|l| format!("  {l}")));
             lines
         }
         PhysicalPlan::Insert { table, source, .. } => {
