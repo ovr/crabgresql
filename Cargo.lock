@@ -522,6 +522,7 @@ dependencies = [
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",
+ "md-5",
  "rand",
  "rustc-hash",
 ]

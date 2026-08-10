@@ -13,6 +13,8 @@
 //! The natural byte order already gives PG's `uuid_cmp`, so ordering is a plain
 //! `[u8; 16]` comparison and needs no helper here.
 
+use crate::hex;
+
 // SQLSTATE (kept as a literal; the types crate does not depend on the protocol
 // crate — the binder/executor map these to `sqlstate::*`).
 const INVALID_TEXT_REPRESENTATION: &str = "22P02";
@@ -31,22 +33,6 @@ fn invalid_syntax(input: &str) -> UuidError {
     }
 }
 
-fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_lo(nibble: u8) -> char {
-    char::from(match nibble {
-        0..=9 => b'0' + nibble,
-        _ => b'a' + (nibble - 10),
-    })
-}
-
 /// `uuid_in`: accept the 16 bytes as 32 hex digits, optionally wrapped in
 /// `{ }` and optionally punctuated with `-` after any even count of hex digits
 /// (so the canonical `8-4-4-4-12` form, an unpunctuated run, and PG's lenient
@@ -63,8 +49,8 @@ pub fn parse(input: &str) -> Result<[u8; 16], UuidError> {
     }
     let mut out = [0u8; 16];
     for i in 0..16 {
-        let hi = s.get(pos).copied().and_then(hex_val);
-        let lo = s.get(pos + 1).copied().and_then(hex_val);
+        let hi = s.get(pos).copied().and_then(hex::val);
+        let lo = s.get(pos + 1).copied().and_then(hex::val);
         let (Some(hi), Some(lo)) = (hi, lo) else {
             return Err(invalid_syntax(input));
         };
@@ -93,8 +79,8 @@ pub fn format(b: &[u8; 16]) -> String {
         if matches!(i, 4 | 6 | 8 | 10) {
             out.push('-');
         }
-        out.push(hex_lo(byte >> 4));
-        out.push(hex_lo(byte & 0x0f));
+        out.push(hex::lo(byte >> 4));
+        out.push(hex::lo(byte & 0x0f));
     }
     out
 }
