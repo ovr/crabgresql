@@ -161,10 +161,6 @@ pub enum IntervalStyle {
     Iso8601,
 }
 
-/// The values `SET IntervalStyle` accepts, in the order and spelling PG's HINT
-/// lists them.
-pub const INTERVAL_STYLE_VALUES: &str = "postgres, postgres_verbose, sql_standard, iso_8601";
-
 impl IntervalStyle {
     /// Parse a `SET IntervalStyle` value. Names are case-insensitive in PG, and
     /// nothing more: `SET IntervalStyle TO ' postgres '` is

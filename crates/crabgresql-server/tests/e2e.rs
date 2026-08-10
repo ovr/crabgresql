@@ -12026,8 +12026,8 @@ async fn interval_style_selects_the_output_form() -> anyhow::Result<()> {
 /// escape spellings themselves are pinned by unit tests in the types crate;
 /// what is proved here is that the session state arrives.
 ///
-/// Unlike `IntervalStyle`, this parameter is *not* `GUC_REPORT` in PostgreSQL,
-/// so no `ParameterStatus` is expected — see the table entry in `guc.rs`.
+/// Unlike `IntervalStyle`, this parameter is *not* `GUC_REPORT` in PostgreSQL
+/// — `bytea_output_changes_emit_no_parameter_status` below is the guard on that.
 #[tokio::test]
 async fn bytea_output_selects_the_output_form() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -12098,6 +12098,60 @@ async fn bytea_output_selects_the_output_form() -> anyhow::Result<()> {
         );
         assert_eq!(db.hint(), Some("Available values: escape, hex."), "{value}");
     }
+    Ok(())
+}
+
+/// `bytea_output` is **not** `GUC_REPORT` in PostgreSQL: it rides in no startup
+/// burst and a `SET` echoes nothing. Confirmed against 18.4 with a raw protocol
+/// script — its burst lists `DateStyle`, `IntervalStyle`, `TimeZone`,
+/// `client_encoding` and the rest, and `bytea_output` is absent from it.
+///
+/// This is the negative twin of `interval_style_changes_emit_parameter_status`,
+/// and it earns its keep: `report` is read in exactly one place and surfaces in
+/// neither `SHOW ALL` nor `pg_settings`, so before this test flipping the table
+/// entry to `report: true` broke nothing at all.
+#[tokio::test]
+async fn bytea_output_changes_emit_no_parameter_status() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+
+    /// Run one simple query, returning the `ParameterStatus` pairs it emitted.
+    async fn query(
+        socket: &mut tokio::net::TcpStream,
+        sql: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        socket.write_all(&frontend_message(b'Q', &body)).await?;
+        Ok(read_until_ready(socket)
+            .await
+            .into_iter()
+            .filter(|(tag, _)| *tag == b'S')
+            .map(|(_, body)| {
+                let mut parts = body.split(|b| *b == 0);
+                let name = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                let value = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                (name, value)
+            })
+            .collect())
+    }
+
+    // A real change, a no-op re-set, and the way back — none of them reported.
+    assert_eq!(
+        query(&mut socket, "SET bytea_output TO escape").await?,
+        vec![]
+    );
+    assert_eq!(
+        query(&mut socket, "SET bytea_output TO escape").await?,
+        vec![]
+    );
+    assert_eq!(query(&mut socket, "RESET bytea_output").await?, vec![]);
+
+    // Nor the transactional revert, which is where the diffing design would
+    // announce a change if the parameter were reported at all.
+    query(&mut socket, "BEGIN").await?;
+    query(&mut socket, "SET LOCAL bytea_output TO escape").await?;
+    assert_eq!(query(&mut socket, "COMMIT").await?, vec![]);
     Ok(())
 }
 

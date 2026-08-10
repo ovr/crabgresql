@@ -1598,9 +1598,12 @@ fn push_root_property(lines: &mut Vec<String>, property: String) {
 /// references render by name against `schema`.
 fn explain_expr(expr: &BoundExpr, names: &[Option<String>]) -> String {
     match expr {
-        // Divergence: rendered in UTC at the default `extra_float_digits`,
-        // because `EXPLAIN` output is built without a session context, so a
-        // `float8` constant ignores the session's precision setting.
+        // Divergence: rendered in UTC at the default `extra_float_digits` and
+        // the default `bytea_output`, because `EXPLAIN` output is built without
+        // a session context — so a `float8` constant ignores the session's
+        // precision setting, and a `bytea` one prints hex however the session is
+        // set. PG 18.4 under `SET bytea_output=escape` prints
+        // `Filter: (b = '\000a'::bytea)` where this prints `'\x0061'::bytea`.
         //
         // A `timestamptz` literal is further off: it is still an unevaluated
         // `Coerce` of its source text at this point (see the binder's

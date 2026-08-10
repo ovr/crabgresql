@@ -144,3 +144,66 @@ SELECT current_setting('bytea_output') AS via_current_setting;
 (1 row)
 
 RESET bytea_output;
+--
+-- encode(bytea, 'escape') is a DIFFERENT rule and does not follow the GUC
+--
+-- PostgreSQL escapes only NUL, the backslash and the high-bit bytes there,
+-- passing the C0 controls and 0x7f through untouched, where byteaout escapes
+-- everything outside 0x20..0x7e. The two spell the same input differently, and
+-- the setting moves only the second.
+SELECT encode(decode('00011f7f80ff5c41', 'hex'), 'escape') = decode('00011f7f80ff5c41', 'hex')::text
+       AS encode_differs_from_byteaout;
+ encode_differs_from_byteaout 
+------------------------------
+ f
+(1 row)
+
+SET bytea_output TO escape;
+SELECT encode(decode('00011f7f80ff5c41', 'hex'), 'escape') = decode('00011f7f80ff5c41', 'hex')::text
+       AS still_differs_under_escape;
+ still_differs_under_escape 
+----------------------------
+ f
+(1 row)
+
+-- both spellings decode back to the same bytes, which is what makes the choice
+-- an output-only one
+SELECT decode(encode(decode('00011f7f80ff5c41', 'hex'), 'escape'), 'escape')
+         = decode('00011f7f80ff5c41', 'hex') AS encode_roundtrips;
+ encode_roundtrips 
+-------------------
+ t
+(1 row)
+
+RESET bytea_output;
+--
+-- the deparse paths run the datum through byteaout, so they follow the reader
+--
+CREATE TABLE bo_default (b bytea DEFAULT '\x27615c');
+SELECT pg_get_expr(d.adbin, d.adrelid) AS hex_reader
+  FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+ WHERE c.relname = 'bo_default';
+    hex_reader     
+-------------------
+ '\x27615c'::bytea
+(1 row)
+
+SET bytea_output TO escape;
+-- the 0x27 byte prints verbatim in escape form and is then doubled inside the
+-- SQL literal, so this is also the quoting test
+SELECT pg_get_expr(d.adbin, d.adrelid) AS escape_reader
+  FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+ WHERE c.relname = 'bo_default';
+ escape_reader  
+----------------
+ '''a\\'::bytea
+(1 row)
+
+RESET bytea_output;
+DROP TABLE bo_default;
+-- `pg_get_constraintdef` shares the re-render, but a CHECK cannot reach it for
+-- a bytea today: the write-time deparse labels a bare literal `::text` rather
+-- than resolving its type from the comparison, so `CHECK (b <> '\x0061')` is
+-- stored as `'\x0061'::text` and never matches the bytea arm. That gap is
+-- type-general — a `date` constant in a CHECK is mislabelled the same way — so
+-- it is not pinned here; see the note on `bytea_constant` in ruleutils.rs.

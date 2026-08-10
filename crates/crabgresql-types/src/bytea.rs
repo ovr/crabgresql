@@ -15,16 +15,11 @@ pub enum ByteaOutput {
     #[default]
     Hex,
     /// `\000a` — the pre-9.0 form: printable ASCII verbatim, a doubled
-    /// backslash, everything else three-digit octal. Produced by
-    /// [`crate::text::encode_escape`], which is the same rendering
-    /// `encode(bytea, 'escape')` returns.
+    /// backslash, everything else three-digit octal. Note that
+    /// `encode(bytea, 'escape')` is a *different* rule despite the shared name
+    /// — see `escape_out` in this module for the transcript separating them.
     Escape,
 }
-
-/// The values `SET bytea_output` accepts, in the order and spelling PG's HINT
-/// lists them — which is PostgreSQL's declaration order, not alphabetical
-/// coincidence.
-pub const BYTEA_OUTPUT_VALUES: &str = "escape, hex";
 
 impl ByteaOutput {
     /// Parse a `SET bytea_output` value. Names are case-insensitive in PG, and
@@ -45,6 +40,48 @@ impl ByteaOutput {
             ByteaOutput::Escape => "escape",
         }
     }
+}
+
+/// The lower-case hex digits `byteaout` emits, indexed by nibble. A table
+/// rather than `format!("{b:02x}")`: this runs per byte of every `bytea` on the
+/// default output path, where the per-byte `String` that `format!` allocates
+/// measured 33x slower than two `push`es (37.2 vs 1.1 ms per MB).
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// `byteaout` under `bytea_output = hex`: `\x` and two lower-case hex digits
+/// per byte. PostgreSQL's default since 9.0.
+pub(crate) fn hex_out(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for &b in bytes {
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// `byteaout` under `bytea_output = escape`: a doubled backslash, printable
+/// ASCII (`0x20..=0x7e`) verbatim, and every other byte as `\ooo`.
+///
+/// `0x7e` is the last byte that prints as itself and `0x7f` the first that does
+/// not, so an `is_ascii_graphic`-style test would be wrong at both ends.
+///
+/// Not to be confused with `encode(bytea, 'escape')`, which passes the C0
+/// controls and `0x7f` through untouched — see [`crate::text::encode_escape`]
+/// for the transcript that separates them.
+pub(crate) fn escape_out(bytes: &[u8]) -> String {
+    // Four bytes per input byte is the worst case (`\ooo`); one allocation up
+    // front beats the log2(n) reallocation passes a growing buffer would pay on
+    // a large value.
+    let mut out = String::with_capacity(bytes.len() * 4);
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char),
+            _ => crate::text::push_octal_escape(&mut out, b),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

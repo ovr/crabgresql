@@ -1529,15 +1529,8 @@ impl Value {
             Value::Reg(r) => Some(r.name.clone()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(bytes) => Some(match fmt.bytea_output {
-                ByteaOutput::Hex => {
-                    let mut out = String::with_capacity(2 + bytes.len() * 2);
-                    out.push_str("\\x");
-                    for b in bytes {
-                        out.push_str(&format!("{b:02x}"));
-                    }
-                    out
-                }
-                ByteaOutput::Escape => text::encode_escape(bytes),
+                ByteaOutput::Hex => bytea::hex_out(bytes),
+                ByteaOutput::Escape => bytea::escape_out(bytes),
             }),
             Value::Bit { len, data } => Some(bit::format(*len, data)),
             Value::Date(d) => Some(date::format(*d)),
