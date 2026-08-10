@@ -67,6 +67,64 @@ fn coalesce_arguments_promote_to_common_type() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The string types convert to each other in both directions, so PG's
+/// `select_common_type` never leaves its candidate and the **first** argument's type
+/// wins — not the category's preferred `text`. `name` is the exception in one
+/// direction: only the other types reach it implicitly, so it wins either way.
+#[test]
+fn the_string_family_resolves_to_the_first_argument() -> anyhow::Result<()> {
+    for (sql, ty) in [
+        (
+            "SELECT COALESCE(name::varchar, name) FROM t",
+            PgType::Varchar,
+        ),
+        ("SELECT COALESCE(name, name::varchar) FROM t", PgType::Text),
+        (
+            "SELECT COALESCE(name::bpchar, name::varchar) FROM t",
+            PgType::Bpchar,
+        ),
+        (
+            "SELECT COALESCE(name::varchar, name::bpchar) FROM t",
+            PgType::Varchar,
+        ),
+        ("SELECT COALESCE(name::name, name) FROM t", PgType::Name),
+        (
+            "SELECT COALESCE(name::varchar, name::name) FROM t",
+            PgType::Name,
+        ),
+        // Same rule outside the string family: `bit` and `bit varying` convert both
+        // ways, so `bit varying` does not win by being preferred.
+        (
+            "SELECT COALESCE('1'::bit(1), '10'::varbit) FROM t",
+            PgType::Bit,
+        ),
+        (
+            "SELECT COALESCE('10'::varbit, '1'::bit(1)) FROM t",
+            PgType::Varbit,
+        ),
+    ] {
+        assert_eq!(first_column(sql)?.0.ty, ty, "{sql}");
+    }
+    Ok(())
+}
+
+/// Leaving `bpchar` runs through PG's blank-stripping cast, whichever string type it
+/// lands on — so the padding survives only while the common type *is* `bpchar`.
+#[test]
+fn a_bpchar_argument_loses_its_padding_when_the_result_is_not_bpchar() -> anyhow::Result<()> {
+    let (_, expr) = first_column("SELECT COALESCE(name::varchar, 'a  '::char(3)) FROM t")?;
+    let BoundExpr::Coalesce { args, ty } = expr else {
+        bail!("expected Coalesce");
+    };
+    assert_eq!(ty, PgType::Varchar);
+    assert!(
+        matches!(&args[1], BoundExpr::Const { value: Value::Text(s), .. } if s == "a"),
+        "padded bpchar constant should fold to its stripped form, got {:?}",
+        args[1]
+    );
+    Ok(())
+}
+
 #[test]
 fn an_all_untyped_coalesce_resolves_to_text() -> anyhow::Result<()> {
     let (col, _) = first_column("SELECT COALESCE(NULL, NULL) FROM t")?;

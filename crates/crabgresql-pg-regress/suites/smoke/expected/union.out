@@ -103,11 +103,20 @@ SELECT NULL UNION ALL SELECT NULL;
  
 (2 rows)
 
--- char and varchar arms meet at text
+-- the string types are mutually convertible, so the column takes the *first* arm's
+-- type rather than the category's preferred `text`: char and varchar arms meet at
+-- char, and the padding of the char arm survives
 CREATE TABLE un2 (v varchar(5), c char(5));
 INSERT INTO un2 VALUES ('ab', 'cd');
 SELECT c FROM un2 UNION ALL SELECT v FROM un2 ORDER BY 1;
- c  
+   c   
+-------
+ ab
+ cd   
+(2 rows)
+
+SELECT v FROM un2 UNION ALL SELECT c FROM un2 ORDER BY 1;
+ v  
 ----
  ab
  cd

@@ -383,11 +383,17 @@ pub(crate) fn type_label(ty: PgType, catalog: &dyn TypeCatalog) -> String {
 }
 
 /// The common type of two column entries (`VALUES` rows / `UNION` arms),
-/// approximating PG's `select_common_type`: when exactly one side implicitly
-/// casts to the other, the column takes that target (so `real` + `int4` -> `real`,
-/// not `float8`). When neither or both cast implicitly, fall back to numeric
-/// preferred-type promotion (`float8` dominates). This deliberately differs from
-/// `unify_types` (operator resolution), where `real` + `int4` resolves to `float8`.
+/// approximating PG's `select_common_type`: `a` is the candidate and `b` the type
+/// considered next, and the candidate is replaced only when it casts implicitly to
+/// `b` and `b` does not cast back (so `real` + `int4` -> `real`, not `float8`; and
+/// `varchar` + `text` -> `varchar`, because PG lists that pair in both directions).
+/// When neither casts, fall back to numeric preferred-type promotion (`float8`
+/// dominates). This deliberately differs from `unify_types` (operator resolution),
+/// where `real` + `int4` resolves to `float8`.
+///
+/// **Order matters**, exactly as it does in PG: the caller must fold left to right
+/// over the inputs in source order, which is why a `CASE`'s ELSE result — the
+/// candidate PG starts from — is unified first.
 pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     if a == b {
         return Some(a);
@@ -398,28 +404,42 @@ pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
         let (le, re) = (PgType::from_oid(la)?, PgType::from_oid(rb)?);
         return merge_types(le, re).map(|e| PgType::Array(e.oid()));
     }
-    match (implicit_castable(a, b), implicit_castable(b, a)) {
+    match (common_type_castable(a, b), common_type_castable(b, a)) {
         (true, false) => Some(b),
         (false, true) => Some(a),
-        // Mutually castable: today only `bit` <-> `bit varying`, whose common
-        // type is `bit varying` (the preferred type of the bit-string category),
-        // as PG's `select_common_type` resolves it.
-        (true, true) => Some(PgType::Varbit),
-        (false, false) => common_string(a, b).or_else(|| common_numeric(a, b)),
+        // Mutually castable — the string family, and `bit` <-> `bit varying`. PG's
+        // "unless the reverse conversion also exists" clause never fires, so the
+        // candidate stands: `coalesce(varchar, text)` is `character varying`,
+        // `coalesce(bit, varbit)` is `bit`, and swapping the arguments swaps the
+        // answer.
+        (true, true) => Some(a),
+        (false, false) => common_numeric(a, b),
     }
 }
 
-/// The common type of two string types. `char(n)` and `varchar(n)` are not
-/// castable to each other, so they only meet at `text` — the preferred type of
-/// PG's string category, which `select_common_type` picks for them.
-fn common_string(a: PgType, b: PgType) -> Option<PgType> {
-    let is_string = |ty| {
-        matches!(
-            ty,
-            PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name
+/// Implicit castability as `select_common_type` needs to see it: PG's `pg_cast`
+/// lists text/varchar/bpchar in **both** directions and text/varchar/bpchar -> name
+/// implicitly, which is what makes the string family resolve to whichever type comes
+/// first.
+///
+/// Those edges are deliberately *not* in [`implicit_castable`], which answers a
+/// different question — may an argument be handed to a parameter of this type. There
+/// a `text` argument satisfying a `varchar` parameter would reshuffle overload
+/// resolution for no gain, since the built-in signatures are written in `text`.
+fn common_type_castable(from: PgType, to: PgType) -> bool {
+    use PgType::*;
+    implicit_castable(from, to)
+        || matches!(
+            (from, to),
+            // text <-> varchar <-> bpchar, all six directions (`implicit_castable`
+            // holds the two that end at `text`).
+            (Text, Varchar) | (Text, Bpchar) | (Varchar, Bpchar) | (Bpchar, Varchar)
+            | (Text, Name) | (Varchar, Name)
+            // `bpchar -> name` is implicit, so `coalesce(bpchar, name)` is `name`,
+            // while `name -> bpchar` is assignment-only, which is why the reverse
+            // order answers `name` too.
+            | (Bpchar, Name)
         )
-    };
-    (is_string(a) && is_string(b)).then_some(PgType::Text)
 }
 
 /// Resolve a set of expressions (one `VALUES`/`UNION` column, or a `CASE`'s
@@ -493,11 +513,13 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
     if expr.ty() == ty {
         return Ok(expr);
     }
-    // `bpchar -> text` strips trailing blanks (PG's bpchar->text cast), which is
-    // how a padded `char(n)` value loses its padding under `||`, `::text`, and
-    // most text functions. It cannot be done in `cast_value` because a padded
-    // `bpchar` value is indistinguishable from `text` there.
-    if expr.ty() == PgType::Bpchar && ty == PgType::Text {
+    // Leaving `bpchar` strips its trailing blanks: PG runs every one of those casts
+    // through the same blank-stripping function (`text(bpchar)` for `text` and
+    // `varchar`, `name(bpchar)` for `name`), which is how a padded `char(n)` value
+    // loses its padding under `||`, `::text`, and most text functions. It cannot be
+    // done in `cast_value` because a padded `bpchar` value is indistinguishable from
+    // `text` there.
+    if expr.ty() == PgType::Bpchar && matches!(ty, PgType::Text | PgType::Varchar | PgType::Name) {
         if let BoundExpr::Const {
             value: Value::Text(s),
             ..
@@ -505,12 +527,12 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
         {
             return Ok(BoundExpr::Const {
                 value: Value::Text(s.trim_end_matches(' ').to_string()),
-                ty: PgType::Text,
+                ty,
             });
         }
         return Ok(BoundExpr::FuncCall {
             func: ScalarFn::BpcharToText,
-            ret: PgType::Text,
+            ret: ty,
             args: vec![expr],
         });
     }

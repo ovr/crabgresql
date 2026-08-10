@@ -17,6 +17,15 @@ SELECT COALESCE(1, 2.5) AS promoted, pg_typeof(COALESCE(1, 2.5)) AS ty;
 SELECT pg_typeof(COALESCE(1::int, 2::bigint)) AS ty;
 -- an untyped literal adapts to the resolved type per argument
 SELECT COALESCE(NULL::int, '42') + 1 AS added;
+-- the string types convert to each other both ways, so the *first* argument's type
+-- wins rather than the category's preferred text -- and a char(n) first keeps its
+-- blank padding, while a char(n) anywhere else loses it to the conversion
+SELECT pg_typeof(COALESCE('a'::char(3), 'b'::varchar)) AS bpchar_first,
+       pg_typeof(COALESCE('a'::varchar, 'b'::char(3))) AS varchar_first,
+       pg_typeof(COALESCE('a'::name, 'b'::text)) AS name_first,
+       pg_typeof(COALESCE('a'::varchar, 'b'::name)) AS name_wins;
+SELECT octet_length(COALESCE('a  '::char(3), 'b'::varchar)) AS padded,
+       octet_length(COALESCE(NULL::varchar, 'b  '::char(3))) AS stripped;
 -- arguments after the first non-NULL one are never evaluated, so a division by
 -- zero that can never be reached is not an error
 SELECT COALESCE(1, 1/0) AS lazy;
