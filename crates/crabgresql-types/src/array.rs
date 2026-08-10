@@ -3,8 +3,10 @@
 //!
 //! Clean-room (see AGENTS.md): this reproduces PostgreSQL's *observable* array
 //! text format — the `{...}` syntax, its quoting/escaping rules, and the
-//! case-insensitive unquoted `NULL` element — implemented independently. Only
-//! 1-D arrays are handled; a nested `{` is rejected as unsupported.
+//! case-insensitive unquoted `NULL` element — implemented independently.
+//!
+//! TODO: support multi-dimensional arrays; only 1-D is handled, and a nested
+//! `{` is rejected as a malformed literal.
 
 use crate::{FmtCtx, PgType, Value, cast, oid};
 

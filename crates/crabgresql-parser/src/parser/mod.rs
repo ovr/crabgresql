@@ -822,7 +822,7 @@ impl<'a> Parser<'a> {
         &mut self,
         terminal_keywords: &[Keyword],
     ) -> Result<ConditionalStatementBlock, ParserError> {
-        let start_token = self.get_current_token().clone(); // self.expect_keyword(keyword)?;
+        let start_token = self.get_current_token().clone();
         let mut then_token = None;
 
         let condition = match &start_token.token {
@@ -1191,7 +1191,7 @@ impl<'a> Parser<'a> {
 
         // Parse an optional collation cast operator following `expr`.
         //
-        // For example (MSSQL): t1.a COLLATE Latin1_General_CI_AS
+        // For example: t1.a COLLATE "C"
         if !self.in_column_definition_state() && self.parse_keyword(Keyword::COLLATE) {
             expr = Expr::Collate {
                 expr: Box::new(expr),
@@ -1756,8 +1756,9 @@ impl<'a> Parser<'a> {
                         return Ok(lambda);
                     } else {
                         // Parentheses in expressions switch to "normal" parsing state.
-                        // This matters for dialects (SQLite, DuckDB) where `NOT NULL` can
-                        // be an alias for `IS NOT NULL`. In column definitions like:
+                        // This matters because outside a column definition `NOT NULL`
+                        // is parsed as an alias for `IS NOT NULL`. In column definitions
+                        // like:
                         //
                         //   CREATE TABLE t (c INT DEFAULT (42 NOT NULL) NOT NULL)
                         //
@@ -2154,11 +2155,8 @@ impl<'a> Parser<'a> {
     ///
     /// See <https://duckdb.org/docs/stable/sql/functions/lambda>
     fn parse_lambda_expr(&mut self) -> Result<Expr, ParserError> {
-        // Parse the parameters: either a single identifier or comma-separated identifiers
         let params = self.parse_lambda_function_parameters()?;
-        // Expect the colon separator
         self.expect_token(&Token::Colon)?;
-        // Parse the body expression
         let body = self.parse_expr()?;
         Ok(Expr::Lambda(LambdaFunction {
             params,
@@ -2171,7 +2169,6 @@ impl<'a> Parser<'a> {
     fn parse_lambda_function_parameters(
         &mut self,
     ) -> Result<OneOrManyWithParens<LambdaFunctionParameter>, ParserError> {
-        // Parse the parameters: either a single identifier or comma-separated identifiers
         let params = if self.consume_token(&Token::LParen) {
             // Parenthesized parameters: (x, y)
             let params = self.parse_comma_separated(|p| p.parse_lambda_function_parameter())?;
@@ -2206,7 +2203,7 @@ impl<'a> Parser<'a> {
 
     /// Tries to parse the body of an [ODBC escaping sequence]
     /// i.e. without the enclosing braces
-    /// Currently implemented:
+    /// Recognized escape sequences:
     /// Scalar Function Calls
     /// Date, Time, and Timestamp Literals
     /// See <https://learn.microsoft.com/en-us/sql/odbc/reference/develop-app/escape-sequences-in-odbc?view=sql-server-2017>
@@ -2536,7 +2533,10 @@ impl<'a> Parser<'a> {
                 self.parse_expr()
             }
         } else {
-            // TODO parse rollup for other dialects
+            // Unreachable in this fork: both dialects it ships, PostgreSqlDialect
+            // and GenericDialect, return true above. The arm is what the trait's
+            // `false` default gives an out-of-tree Dialect — a plain expression,
+            // with no GROUPING SETS / CUBE / ROLLUP.
             self.parse_expr()
         }
     }
@@ -3013,8 +3013,9 @@ impl<'a> Parser<'a> {
 
     /// Parse a date/time field for `EXTRACT`, interval qualifiers, and ceil/floor operations.
     ///
-    /// `EXTRACT` supports a wider set of date/time fields than interval qualifiers,
-    /// so this function may need to be split in two.
+    /// TODO: split into separate `EXTRACT` and interval-qualifier field
+    /// parsers — `EXTRACT` takes a wider set of date/time fields than an
+    /// interval qualifier does, and this one parser accepts the union.
     ///
     /// See [`DateTimeField`]
     pub fn parse_date_time_field(&mut self) -> Result<DateTimeField, ParserError> {
@@ -3203,7 +3204,9 @@ impl<'a> Parser<'a> {
     ///   7. (MySql & BigQuery only): INTERVAL 1 DAY
     /// ```
     ///
-    /// Note that we do not currently attempt to parse the quoted value.
+    /// The quoted value is kept verbatim: interpreting the interval string is
+    /// the binder's job, since the field qualifier only supplies the default
+    /// unit the string is read with.
     pub fn parse_interval(&mut self) -> Result<Expr, ParserError> {
         // The SQL standard allows an optional sign before the value string, but
         // it is not clear if any implementations support that syntax, so we
@@ -4418,8 +4421,6 @@ impl<'a> Parser<'a> {
     ///
     /// Must be called after `next_token()`, otherwise might panic. OK to call
     /// after `next_token()` indicates an EOF.
-    ///
-    // TODO rename to backup_token and deprecate prev_token?
     pub fn prev_token(&mut self) {
         loop {
             assert!(self.index > 0);
@@ -4592,8 +4593,6 @@ impl<'a> Parser<'a> {
 
     /// If the current token is the `expected` keyword, consume the token.
     /// Otherwise, return an error.
-    ///
-    // todo deprecate in favor of expected_keyword_is
     pub fn expect_keyword(&mut self, expected: Keyword) -> Result<TokenWithSpan, ParserError> {
         if self.parse_keyword(expected) {
             Ok(self.get_current_token().clone())
@@ -4949,7 +4948,6 @@ impl<'a> Parser<'a> {
         match f(self) {
             Ok(t) => Ok(t),
             Err(e) => {
-                // Unwind stack if limit exceeded
                 self.index = index;
                 Err(e)
             }
@@ -5012,9 +5010,10 @@ impl<'a> Parser<'a> {
         let temporary = self
             .parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY])
             .is_some();
-        // PostgreSQL `UNLOGGED`: a table that is not WAL-logged (a memory table in
-        // this engine). Mutually exclusive with TEMP in PG, but the AST carries the
-        // flag and downstream binding decides.
+        // PostgreSQL `UNLOGGED`: a table whose changes are not WAL-logged, so it is
+        // still file-backed but its contents are reset after a crash. Mutually
+        // exclusive with TEMP in PG's grammar, but the AST carries the flag and
+        // downstream binding decides.
         let unlogged = self.parse_one_of_keywords(&[Keyword::UNLOGGED]).is_some();
         let create_view_params = self.parse_create_view_params()?;
         if self.peek_keywords(&[Keyword::SNAPSHOT, Keyword::TABLE]) {
@@ -5072,7 +5071,6 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::TYPE) {
             self.parse_create_type()
         } else if self.parse_keyword(Keyword::OPERATOR) {
-            // Check if this is CREATE OPERATOR FAMILY or CREATE OPERATOR CLASS
             if self.parse_keyword(Keyword::FAMILY) {
                 self.parse_create_operator_family().map(Into::into)
             } else if self.parse_keyword(Keyword::CLASS) {
@@ -5174,7 +5172,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse 'AS' before as query,such as `WITH XXX AS SELECT XXX` oer `CACHE TABLE AS SELECT XXX`
+    /// Parse an optional `AS` before a query, such as `WITH XXX AS SELECT XXX`.
     pub fn parse_as_query(&mut self) -> Result<(bool, Box<Query>), ParserError> {
         match &self.peek_token_ref().token {
             Token::Word(word) => match word.keyword {
@@ -6055,8 +6053,8 @@ impl<'a> Parser<'a> {
             && self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
         let if_not_exists = if_not_exists_first || name_before_not_exists;
         let copy_grants = self.parse_keywords(&[Keyword::COPY, Keyword::GRANTS]);
-        // Many dialects support `OR ALTER` right after `CREATE`, but we don't (yet).
-        // ANSI SQL and Postgres support RECURSIVE here, but we don't support it either.
+        // TODO: parse `CREATE RECURSIVE VIEW`, which ANSI SQL and PostgreSQL
+        // accept with `RECURSIVE` between `CREATE` and `VIEW`.
         let columns = self.parse_view_columns()?;
         let mut options = CreateTableOptions::None;
         let with_options = self.parse_options(Keyword::WITH)?;
@@ -6096,7 +6094,8 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword_is(Keyword::AS)?;
         let query = self.parse_query()?;
-        // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
+        // TODO: parse the optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` clause
+        // that PostgreSQL accepts after the view query.
 
         let with_no_schema_binding = dialect_of!(self is GenericDialect)
             && self.parse_keywords(&[
@@ -6665,10 +6664,8 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Expect closing parenthesis
         self.expect_token(&Token::RParen)?;
 
-        // FUNCTION is required
         let function = function.ok_or_else(|| {
             ParserError::ParserError("CREATE OPERATOR requires FUNCTION parameter".to_string())
         })?;
@@ -6807,7 +6804,6 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Check for comma separator
             if !self.consume_token(&Token::Comma) {
                 break;
             }
@@ -6825,7 +6821,8 @@ impl<'a> Parser<'a> {
 
     /// Parse a `DROP` statement.
     pub fn parse_drop(&mut self) -> Result<Statement, ParserError> {
-        // MySQL dialect supports `TEMPORARY`
+        // `DROP TEMPORARY TABLE` is a MySQL extension: only the generic dialect
+        // takes the keyword, so PostgreSQL input rejects it as a syntax error.
         let temporary =
             dialect_of!(self is GenericDialect) && self.parse_keyword(Keyword::TEMPORARY);
 
@@ -7527,9 +7524,12 @@ impl<'a> Parser<'a> {
     ///
     /// Deliberately scoped to a column *definition* — so `ALTER TABLE … ADD
     /// COLUMN` and `RETURNS TABLE (…)` inherit it, both funnelling through
-    /// `parse_column_def`. The `CREATE VIEW` column list and the parenthesized
-    /// column lists (INSERT targets, index keys, FK references) have their own
-    /// identifier paths and are left alone for now.
+    /// `parse_column_def`.
+    ///
+    /// TODO: reject unquoted reserved words in the `CREATE VIEW` column list
+    /// and in the parenthesized column lists (INSERT targets, index keys, FK
+    /// references) as well — they have their own identifier paths and never
+    /// reach this check.
     fn reject_reserved_column_name(&self) -> Result<(), ParserError> {
         if let Token::Word(w) = &self.peek_token_ref().token {
             if w.quote_style.is_none() && keywords::RESERVED_FOR_COLUMN_NAME.contains(&w.keyword) {
@@ -8020,16 +8020,13 @@ impl<'a> Parser<'a> {
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
         let table_name = self.parse_object_name(allow_unquoted_hyphen)?;
 
-        // PostgreSQL PARTITION OF for child partition tables
-        // Note: This is a PostgreSQL-specific feature, but the dialect check was intentionally
-        // removed to allow GenericDialect and other dialects to parse this syntax. This enables
-        // multi-dialect SQL tools to work with PostgreSQL-specific DDL statements.
+        // PARTITION OF is intentionally not gated behind PostgreSqlDialect, so
+        // GenericDialect parses PostgreSQL partition DDL as well.
         //
-        // PARTITION OF can be combined with other table definition clauses in the AST,
-        // though PostgreSQL itself prohibits PARTITION OF with AS SELECT or LIKE clauses.
-        // The parser accepts these combinations for flexibility; semantic validation
-        // is left to downstream tools.
-        // Child partitions can have their own constraints and indexes.
+        // The grammar also accepts PARTITION OF next to AS SELECT or LIKE,
+        // which PostgreSQL rejects; refusing those combinations is a semantic
+        // check made above the parser. A child partition can carry its own
+        // constraints, so the column list below is parsed either way.
         let partition_of = if self.parse_keywords(&[Keyword::PARTITION, Keyword::OF]) {
             Some(self.parse_object_name(allow_unquoted_hyphen)?)
         } else {
@@ -8814,7 +8811,7 @@ impl<'a> Parser<'a> {
 
             Ok(Some(
                 ForeignKeyConstraint {
-                    name: None,       // Column-level constraints don't have names
+                    name: None,       // a `CONSTRAINT <name>` prefix lands in ColumnOptionDef
                     index_name: None, // Not applicable for column-level constraints
                     columns: vec![],  // Not applicable for column-level constraints
                     foreign_table,
@@ -8842,7 +8839,7 @@ impl<'a> Parser<'a> {
 
             Ok(Some(
                 CheckConstraint {
-                    name: None, // Column-level check constraints don't have names
+                    name: None, // a `CONSTRAINT <name>` prefix lands in ColumnOptionDef
                     expr: Box::new(expr),
                     enforced,
                 }
@@ -9022,7 +9019,8 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// Parse optional `CLUSTERED BY` clause for Hive/Generic dialects.
+    /// Parse an optional `CLUSTERED BY` clause (Hive syntax, accepted only by
+    /// the generic dialect).
     pub fn parse_optional_clustered_by(&mut self) -> Result<Option<ClusteredBy>, ParserError> {
         let clustered_by = if dialect_of!(self is GenericDialect)
             && self.parse_keywords(&[Keyword::CLUSTERED, Keyword::BY])
@@ -9184,7 +9182,6 @@ impl<'a> Parser<'a> {
 
                 let nulls_distinct = self.parse_optional_nulls_distinct()?;
 
-                // optional index name
                 let index_name = self.parse_optional_ident()?;
                 let index_type = self.parse_optional_using_then_index_type()?;
 
@@ -9206,7 +9203,6 @@ impl<'a> Parser<'a> {
                 ))
             }
             Token::Word(w) if w.keyword == Keyword::PRIMARY => {
-                // after `PRIMARY` always stay `KEY`
                 self.expect_keyword_is(Keyword::KEY)?;
 
                 // PostgreSQL: PRIMARY KEY USING INDEX index_name
@@ -9217,7 +9213,6 @@ impl<'a> Parser<'a> {
                     )));
                 }
 
-                // optional index name
                 let index_name = self.parse_optional_ident()?;
                 let index_type = self.parse_optional_using_then_index_type()?;
 
@@ -9451,7 +9446,6 @@ impl<'a> Parser<'a> {
     /// ```sql
     //// USING BTREE (name, age DESC)
     /// ```
-    /// Optionally parse `USING <index_type>` and return the parsed `IndexType` if present.
     pub fn parse_optional_using_then_index_type(
         &mut self,
     ) -> Result<Option<IndexType>, ParserError> {
@@ -9464,7 +9458,6 @@ impl<'a> Parser<'a> {
 
     /// Parse `[ident]`, mostly `ident` is name, like:
     /// `window_name`, `index_name`, ...
-    /// Parse an optional identifier, returning `Some(Ident)` if present.
     pub fn parse_optional_ident(&mut self) -> Result<Option<Ident>, ParserError> {
         self.maybe_parse(|parser| parser.parse_identifier())
     }
@@ -10570,9 +10563,9 @@ impl<'a> Parser<'a> {
     pub fn parse_alter_operator(&mut self) -> Result<AlterOperator, ParserError> {
         let name = self.parse_operator_name()?;
 
-        // Parse (left_type, right_type)
         self.expect_token(&Token::LParen)?;
 
+        // `NONE` in the left slot is how PostgreSQL spells a prefix operator.
         let left_type = if self.parse_keyword(Keyword::NONE) {
             None
         } else {
@@ -10583,7 +10576,6 @@ impl<'a> Parser<'a> {
         let right_type = self.parse_data_type()?;
         self.expect_token(&Token::RParen)?;
 
-        // Parse the operation
         let operation = if self.parse_keywords(&[Keyword::OWNER, Keyword::TO]) {
             let owner = if self.parse_keyword(Keyword::CURRENT_ROLE) {
                 Owner::CurrentRole
@@ -10684,7 +10676,6 @@ impl<'a> Parser<'a> {
         let op_types = self.parse_comma_separated(Parser::parse_data_type)?;
         self.expect_token(&Token::RParen)?;
 
-        // Optional purpose
         let purpose = if self.parse_keyword(Keyword::FOR) {
             if self.parse_keyword(Keyword::SEARCH) {
                 Some(OperatorPurpose::ForSearch)
@@ -10710,7 +10701,6 @@ impl<'a> Parser<'a> {
     fn parse_operator_family_add_function(&mut self) -> Result<OperatorFamilyItem, ParserError> {
         let support_number = self.parse_literal_uint()?;
 
-        // Optional operator types
         let op_types =
             if self.consume_token(&Token::LParen) && self.peek_token_ref().token != Token::RParen {
                 let types = self.parse_comma_separated(Parser::parse_data_type)?;
@@ -10725,7 +10715,6 @@ impl<'a> Parser<'a> {
 
         let function_name = self.parse_object_name(false)?;
 
-        // Function argument types
         let argument_types = if self.consume_token(&Token::LParen) {
             if self.peek_token_ref().token == Token::RParen {
                 self.expect_token(&Token::RParen)?;
@@ -11191,9 +11180,6 @@ impl<'a> Parser<'a> {
             }
             Some(Keyword::DELIMITER) => CopyOption::Delimiter(self.parse_literal_char()?),
             Some(Keyword::NULL) => CopyOption::Null(self.parse_literal_string()?),
-            // PostgreSQL's HEADER also takes `match`, which this parser does not
-            // implement; its message names that option all the same, because the
-            // message is what a client sees for a bad value either way.
             // `MATCH` is a third value, not a Boolean, so it is taken before the
             // Boolean parse — which is also why this option's error names it.
             Some(Keyword::HEADER) => CopyOption::Header(if self.parse_keyword(Keyword::MATCH) {
@@ -11838,7 +11824,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a boolean string
     /// Parse a literal unicode normalization clause
     pub fn parse_unicode_is_normalized(&mut self, expr: Expr) -> Result<Expr, ParserError> {
         let neg = self.parse_keyword(Keyword::NOT);
@@ -12457,9 +12442,9 @@ impl<'a> Parser<'a> {
     /// Parse a possibly qualified, possibly quoted identifier, e.g.
     /// `foo` or `myschema."table"
     ///
-    /// The `in_table_clause` parameter indicates whether the object name is a table in a FROM, JOIN,
-    /// or similar table clause. Currently, this is used only to support unquoted hyphenated identifiers
-    /// in this context on BigQuery.
+    /// The `in_table_clause` parameter says whether the object name is a table in a FROM, JOIN
+    /// or similar table clause; it is accepted but ignored, since it only ever toggled the
+    /// BigQuery unquoted-hyphenated-identifier form that this fork does not parse.
     pub fn parse_object_name(&mut self, in_table_clause: bool) -> Result<ObjectName, ParserError> {
         self.parse_object_name_inner(in_table_clause, false)
     }
@@ -12642,16 +12627,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// On BigQuery, hyphens are permitted in unquoted identifiers inside of a FROM or
-    /// TABLE clause.
-    ///
-    /// The first segment must be an ordinary unquoted identifier, e.g. it must not start
-    /// with a digit. Subsequent segments are either must either be valid identifiers or
-    /// integers, e.g. foo-123 is allowed, but foo-123a is not.
-    ///
-    /// [BigQuery-lexical](https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical)
-    ///
-    /// Return a tuple of the identifier and a boolean indicating it ends with a period.
     /// Parses a parenthesized, comma-separated list of column definitions within a view.
     fn parse_view_columns(&mut self) -> Result<Vec<ViewColumnDef>, ParserError> {
         if self.consume_token(&Token::LParen) {
@@ -13117,8 +13092,6 @@ impl<'a> Parser<'a> {
         let mut format = None;
         let mut options = None;
 
-        // Note: DuckDB is compatible with PostgreSQL syntax for this statement,
-        // although not all features may be implemented.
         if describe_alias == DescribeAlias::Explain
             && self.dialect.supports_explain_with_utility_options()
             && self.peek_token_ref().token == Token::LParen
@@ -13372,7 +13345,10 @@ impl<'a> Parser<'a> {
         {
             SetExpr::Select(self.parse_select().map(Box::new)?)
         } else if self.consume_token(&Token::LParen) {
-            // CTEs are not allowed here, but the parser currently accepts them
+            // PG admits a WITH clause in the parenthesized arm of a set
+            // operation — `(WITH t AS (SELECT 1 AS a) SELECT a FROM t) UNION
+            // ALL SELECT 2` returns 1 and 2 — so this recurses through the
+            // full `parse_query`, not back into `parse_query_body`.
             let subquery = self.parse_query()?;
             self.expect_token(&Token::RParen)?;
             SetExpr::Query(subquery)
@@ -14718,8 +14694,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    ///
-    /// See: <https://docs.snowflake.com/en/user-guide/querying-stage>
     fn maybe_parse_table_sample(&mut self) -> Result<Option<Box<TableSample>>, ParserError> {
         let modifier = if self.parse_keyword(Keyword::TABLESAMPLE) {
             TableSampleModifier::TableSample
@@ -15075,7 +15049,6 @@ impl<'a> Parser<'a> {
             Ok(JoinConstraint::Using(columns))
         } else {
             Ok(JoinConstraint::None)
-            //self.expected_ref("ON, or USING after JOIN", self.peek_token_ref())
         }
     }
 
@@ -16663,8 +16636,6 @@ impl<'a> Parser<'a> {
         Ok(OrderByOptions { asc, nulls_first })
     }
 
-    // Parse a WITH FILL clause (ClickHouse dialect)
-    // that follow the WITH FILL keywords in a ORDER BY clause
     /// Parse a `WITH FILL` clause used in ORDER BY (ClickHouse dialect).
     pub fn parse_with_fill(&mut self) -> Result<WithFill, ParserError> {
         let from = if self.parse_keyword(Keyword::FROM) {
@@ -17220,7 +17191,6 @@ impl<'a> Parser<'a> {
     pub fn parse_create_sequence(&mut self, temporary: bool) -> Result<Statement, ParserError> {
         //[ IF NOT EXISTS ]
         let if_not_exists = self.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-        //name
         let name = self.parse_object_name(false)?;
         //[ AS data_type ]
         let mut data_type: Option<DataType> = None;
@@ -17396,7 +17366,6 @@ impl<'a> Parser<'a> {
     pub fn parse_create_type(&mut self) -> Result<Statement, ParserError> {
         let name = self.parse_object_name(false)?;
 
-        // Check if we have AS keyword
         let has_as = self.parse_keyword(Keyword::AS);
 
         if !has_as {
@@ -17789,7 +17758,9 @@ impl<'a> Parser<'a> {
                     }
                 }
                 // PG allows a boolean argument per option; consume it so the shape
-                // parses, and let the executor decide what it can honor.
+                // parses.
+                // TODO: record each option's boolean argument instead of dropping
+                // it — `VACUUM (ANALYZE false)` parses as a plain `ANALYZE`.
                 let _ = self.parse_one_of_keywords(&[Keyword::TRUE, Keyword::FALSE]);
                 if !self.consume_token(&Token::Comma) {
                     break;
@@ -17845,7 +17816,8 @@ impl<'a> Parser<'a> {
         self.tokens
     }
 
-    /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
+    /// Returns true if the next keyword indicates a sub query, i.e. SELECT,
+    /// WITH or TABLE
     fn peek_sub_query(&mut self) -> bool {
         // `TABLE t` is a query body too (PostgreSQL's `SELECT * FROM t`
         // shorthand), so an INSERT source starting with it is a subquery, not a
@@ -18147,9 +18119,10 @@ mod tests {
         }
     }
 
-    /// `defGetBoolean`'s full accepted set, which is wider than the four bare
-    /// keywords: quoted spellings and the integers 1 and 0. A value outside it is
-    /// PostgreSQL's own "requires a Boolean value", not a bare syntax error.
+    /// The Boolean spellings PostgreSQL accepts for an option value are wider
+    /// than the four bare keywords: quoted spellings and the integers 1 and 0
+    /// count too. A value outside that set is PostgreSQL's own "requires a
+    /// Boolean value", not a bare syntax error.
     #[test]
     fn parse_copy_option_boolean_literals_match_pg() {
         let freeze = |sql: &str| match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
@@ -18167,7 +18140,7 @@ mod tests {
             ("COPY t FROM stdin (FREEZE 'false')", false),
             ("COPY t FROM stdin (FREEZE 'on')", true),
             ("COPY t FROM stdin (FREEZE 'OFF')", false),
-            // Double-quoted too: upstream's grammar hands `defGetBoolean` a
+            // Double-quoted too: PostgreSQL takes the option's argument as a
             // string either way, so this is a value and not an identifier.
             ("COPY t FROM stdin (FREEZE \"on\")", true),
             ("COPY t FROM stdin (FREEZE \"OFF\")", false),
@@ -18748,9 +18721,7 @@ mod tests {
                         parser.parse_optional_table_constraint()?.ok_or_else(|| {
                             ParserError::ParserError("expected a table constraint".to_string())
                         })?;
-                    // Validate that the structure is the same as expected
                     assert_eq!(constraint, $expected);
-                    // Validate that the input and the expected structure serialization are the same
                     assert_eq!(constraint.to_string(), $input.to_string());
                     Ok(())
                 })?;

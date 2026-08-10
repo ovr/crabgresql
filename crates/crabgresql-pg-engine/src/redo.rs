@@ -12,8 +12,6 @@ use crate::rec;
 use crate::smgr::RelFileNode;
 use crate::tuple;
 
-// `RelFileNode` names the type of `apply`'s `rel` parameter below.
-
 pub struct HeapRedo {
     pub engine: Arc<EngineInner>,
 }

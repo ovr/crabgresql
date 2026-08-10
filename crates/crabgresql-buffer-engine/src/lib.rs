@@ -895,9 +895,13 @@ impl TableAm for BufferTable {
                 tuple
             })
             .collect();
-        // Chunked rather than one unbounded batch: a buffer at its soft
-        // threshold would otherwise be live twice over, as tuples and as one
-        // giant Arrow copy, before a single row reached the operator above.
+        // Cut at `BATCH_ROWS` so this leaf hands batches up at the same
+        // granularity as the Parquet leaf beside it.
+        //
+        // TODO(perf): build the batches lazily. `chunks` borrows a slice that
+        // has to outlive the iterator, so every batch is built before the first
+        // one reaches the operator above, and a buffer at its soft threshold is
+        // resident twice over meanwhile — as tuples and as Arrow arrays.
         let schema = self.schema.clone();
         Some(Box::new(
             rows.into_iter()
@@ -1542,7 +1546,7 @@ mod tests {
             .map(|row| row.expect("scan must not fail").1)
             .collect();
         assert_eq!(got.len(), expected.len());
-        // NaN != NaN, so compare it by bit pattern rather than by value.
+        // NaN != NaN, so assert NaN-ness rather than equality.
         for (index, want) in expected.iter().enumerate() {
             for (col, value) in want.iter().enumerate() {
                 match (value, &got[index][col]) {

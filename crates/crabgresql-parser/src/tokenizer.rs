@@ -447,8 +447,13 @@ fn keyword_lookup(word: &str, quote_style: Option<char>) -> Keyword {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub struct Word {
-    /// The value of the token, without the enclosing quotes, and with the
-    /// escape sequences (if any) processed (TODO: escapes are not handled)
+    /// The value of the token, without the enclosing quotes. A doubled quote
+    /// inside a quoted identifier is collapsed to one, unless the tokenizer
+    /// was built with `unescape` off.
+    ///
+    /// TODO: decode the unicode escapes of a `U&"…"` identifier — `U&` is
+    /// recognized only before a single quote, so `U&"d\0061ta"` tokenizes as
+    /// the word `U`, an `&`, and the quoted identifier `d\0061ta`.
     pub value: String,
     /// An identifier can be "quoted" (&lt;delimited identifier> in ANSI parlance).
     /// The standard and most implementations allow using double quotes for this,
@@ -493,12 +498,14 @@ pub enum Whitespace {
     Newline,
     /// A tab character.
     Tab,
-    /// A single-line comment (e.g. `-- comment` or `# comment`).
+    /// A single-line comment (`-- comment`).
     /// The `comment` field contains the text, and `prefix` contains the comment prefix.
     SingleLineComment {
         /// The content of the comment (without the prefix).
         comment: String,
-        /// The prefix used for the comment (for example `--` or `#`).
+        /// The prefix used for the comment. Always `--`: PostgreSQL introduces
+        /// single-line comments only that way, and the dialects that spell them
+        /// `#` or `//` are not part of this fork.
         prefix: String,
     },
 
@@ -580,7 +587,6 @@ impl Location {
     /// Create a new location for a given line and column
     ///
     /// Alias for [`Self::new`]
-    // TODO: remove / deprecate in favor of` `new` for consistency?
     pub fn of(line: u64, column: u64) -> Self {
         Self::new(line, column)
     }
@@ -2800,7 +2806,8 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
 
     /// `\uXXXX` (16-bit) or `\UXXXXXXXX` (32-bit) code point. A UTF-16 high
     /// surrogate must be followed by a `\u` low surrogate; the pair combines
-    /// into one scalar, which is how `E'😄'` yields an emoji.
+    /// into one scalar, so a high `\ud83d` beside a low `\ude04` decodes to
+    /// the single character 😄.
     fn unescape_unicode(&mut self, wide: bool, esc_loc: Location) -> Result<char, TokenizerError> {
         const DIAG: UnicodeEscapeDiag = UnicodeEscapeDiag::ESCAPE_STRING;
         let (value, text) = self.hex_escape(wide, esc_loc)?;
@@ -4234,7 +4241,8 @@ mod tests {
         check_unescape("é", Some("é"));
         check_unescape("😄", Some("😄"));
 
-        // UTF-16 surrogate pairs combine; `\U` reaches the same code point.
+        // TODO: assert the UTF-16 pair spelling `\ud83d\ude04` decodes here to
+        // the same emoji; only its rejections are covered below.
         check_unescape(r"😄", Some("😄"));
         check_unescape(r"\U0001F604", Some("😄"));
 

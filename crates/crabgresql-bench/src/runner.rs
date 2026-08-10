@@ -31,8 +31,11 @@ pub struct RunConfig {
     pub runs: u32,
     /// Query numbers to run; all of them when empty.
     pub only: Vec<usize>,
-    /// Per-run wall-clock limit. Exceeding it abandons the connection, since
-    /// the server has no query cancellation yet.
+    /// Per-run wall-clock limit. Exceeding it abandons the connection, leaving
+    /// the query running server-side.
+    ///
+    /// TODO: cancel a timed-out query instead of abandoning it — the server
+    /// hands out BackendKeyData but does not act on a protocol cancel request.
     pub timeout: Duration,
     /// `USING <am>` for the created tables (`parquet`, `buffer`, …).
     pub access_method: Option<String>,

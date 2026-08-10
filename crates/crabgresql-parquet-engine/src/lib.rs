@@ -18,8 +18,10 @@
 //! [`crabgresql_txn::TableLock`]'s scope: a reader's/writer's shared hold covers one
 //! *operation*, not its whole transaction (PostgreSQL holds `RowExclusiveLock` to
 //! end-of-transaction). So a TRUNCATE can commit between two statements of another
-//! open transaction and discard fragments that transaction had already staged. The
-//! fix is transaction-scoped table locks in the engine, not per-AM bookkeeping.
+//! open transaction and discard fragments that transaction had already staged.
+//!
+//! TODO: scope the table lock to the whole transaction instead of to one operation
+//! (in the engine, not as per-AM bookkeeping), which is what closes this hole.
 
 mod buffered;
 
@@ -97,10 +99,12 @@ fn schema_identity(schema: &TableSchema) -> String {
 /// fragment keeps of how its rows are ordered.
 ///
 /// Written only when the sort actually ran, so its presence means "this file is
-/// clustered" rather than "this table declares a key". Nothing in this engine
-/// reads it back yet; it is the standard field an outside reader and the
-/// eventual pruning/compaction pass will look at, which is why the claim is
-/// made in Parquet's own vocabulary rather than in a private footer key.
+/// clustered" rather than "this table declares a key". The claim is made in
+/// Parquet's own vocabulary rather than in a private footer key because that is
+/// the field an outside reader already looks at.
+///
+/// TODO: read this metadata back, to skip row groups whose key range cannot
+/// match and to drive a compaction pass; nothing in this engine consumes it.
 ///
 /// `SortingColumn::column_idx` is a **leaf** index, not the ordinal of a
 /// top-level field. [`crabgresql_storage_api::arrow::arrow_type`] maps `timetz`
@@ -444,13 +448,13 @@ fn metadata_map(metadata: Option<&Vec<KeyValue>>) -> HashMap<&str, &str> {
 /// created and removed, never renamed, so no footer has to be rewritten; the price
 /// is that passing the wrong generation's id reports perfectly good bytes as
 /// [`StorageError::CorruptData`].
-/// Opens `fragment` for reading, restricted to `projection`.
 ///
-/// Returns the reader together with its **position map**: entry `i` is the
-/// schema ordinal that batch column `i` decodes into. For an unprojected read
-/// that is the identity; for a projected one it is the selected ordinals. The
-/// map is derived from the reader's own schema by field *name* rather than by
-/// assuming the mask preserves the requested order.
+/// The read is restricted to `projection`, and the reader comes back with its
+/// **position map**: entry `i` is the schema ordinal that batch column `i`
+/// decodes into. For an unprojected read that is the identity; for a projected
+/// one it is the selected ordinals. The map is derived from the reader's own
+/// schema by field *name* rather than by assuming the mask preserves the
+/// requested order.
 fn open_reader(
     schema: &TableSchema,
     rel: u32,
@@ -1301,8 +1305,8 @@ impl ParquetTable {
     /// post-TRUNCATE insert has to carry the *staged* directory's id.
     ///
     /// `sorting` is `Some` exactly when `batch`'s rows are in the relation's
-    /// layout sort key order, and is what puts that on the record — both in
-    /// Parquet's own row-group metadata — see [`sorting_columns`].
+    /// layout sort key order, and is what puts that on the record, in Parquet's
+    /// own row-group metadata — see [`sorting_columns`].
     fn write_fragment(
         &self,
         rel: u32,
@@ -3282,9 +3286,6 @@ mod tests {
         Ok(())
     }
 
-    /// A mask prunes columns, never rows — so the tid sequence, and `fetch`'s
-    /// ability to find a row by it, must be identical to an unprojected scan.
-    /// Spans several fragments, since the ordinal restarts within each.
     /// The bytes in a fragment are in **Arrow's** epoch, not PostgreSQL's.
     ///
     /// A fragment is a persisted format, so this is a compatibility boundary
@@ -3483,6 +3484,9 @@ mod tests {
         Ok(())
     }
 
+    /// A mask prunes columns, never rows — so the tid sequence, and `fetch`'s
+    /// ability to find a row by it, must be identical to an unprojected scan.
+    /// Spans several fragments, since the ordinal restarts within each.
     #[test]
     fn a_projected_scan_yields_the_same_tids_as_a_full_one() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3522,7 +3526,7 @@ mod tests {
     }
 
     /// [`schema`] plus a layout sort key over `key`, ascending / NULLS LAST —
-    /// the only shape DDL can spell today.
+    /// the shape a bare `ORDER BY (columns)` produces.
     fn sorted_schema(name: &str, types: &[PgType], key: &[usize]) -> TableSchema {
         let mut schema = schema(name, types);
         schema.sort_key = key
@@ -3774,9 +3778,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        // Built by hand: the clause parses bare expressions, so DDL cannot spell
-        // a direction yet, but the key is persisted with both flags and the
-        // write path has to honor whatever it finds.
+        // Built by hand: the layout `ORDER BY` clause parses bare expressions,
+        // so DDL cannot spell a direction, but the key is persisted with both
+        // flags and the write path has to honor whatever it finds.
+        // TODO: accept ASC/DESC and NULLS FIRST/LAST in the layout ORDER BY
+        // clause, so a descending key is reachable through DDL.
         let mut schema = schema("descending", &[PgType::Int4]);
         schema.sort_key = vec![IndexKey {
             column: 0,

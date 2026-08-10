@@ -2,8 +2,8 @@
 //! session implements to supply it.
 //!
 //! Kept apart from [`crate::SystemCatalog`] because the direction of dependency
-//! is one-way — these types know nothing about how a relation is rendered, and a
-//! new wave adds to them without touching the snapshot machinery.
+//! is one-way — these types know nothing about how a relation is rendered, so
+//! new live state is added here without touching the snapshot machinery.
 
 use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
 use crabgresql_types::{ByteaOutput, PgType};
@@ -171,7 +171,11 @@ pub struct CatalogUserType {
     pub oid: u32,
     pub name: String,
     /// The enum labels in definition (= sort) order, or `None` for a non-enum
-    /// user type (which is not reflected into `pg_type`/`pg_enum` yet).
+    /// user type.
+    ///
+    /// TODO: reflect non-enum `CREATE TYPE` shapes into `pg_type` — only rows
+    /// with labels here are emitted (`typtype = 'e'`), so any other user type
+    /// is invisible to a client reading the catalog.
     pub enum_labels: Option<Vec<String>>,
 }
 
@@ -209,10 +213,14 @@ pub struct CatalogRoutine {
 
 /// The live server state one [`crate::SystemCatalog`] snapshot reflects.
 ///
-/// Every method is called **at most once** per snapshot, and only when a query
-/// actually opens the relation it feeds — `SystemCatalog` owns that
-/// memoization, so an implementation is free to be expensive: `relations()`
-/// enumerates the whole database, and a `SELECT 1` must never pay for it.
+/// Every method that enumerates state is called **at most once** per snapshot,
+/// and only when a query actually opens the relation it feeds —
+/// `SystemCatalog` owns that memoization, so an implementation is free to be
+/// expensive: `relations()` enumerates the whole database, and a `SELECT 1`
+/// must never pay for it. The cheap answers — `database`, `owner`, `now` and
+/// `bytea_output` — are read straight through with no memoization, and
+/// `bytea_output` is asked once per row that renders a partition bound, so
+/// they must stay trivial.
 ///
 /// `relations`, `database` and `owner` have no default on purpose. A silent
 /// `Vec::new()` for the first would empty `pg_class`, `pg_attribute` and the

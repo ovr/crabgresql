@@ -165,8 +165,9 @@ pub fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBa
 ///
 /// Two divergences, both real and both silent:
 ///
-/// - PostgreSQL treats `-0.0` and `0.0` as **equal** (`float8_cmp`), while
-///   Arrow's total order ranks `-0.0` below `0.0`.
+/// - PostgreSQL treats `-0.0` and `0.0` as **equal**
+///   (`'-0'::float8 = '0'::float8` is true), while Arrow's total order ranks
+///   `-0.0` below `0.0`.
 /// - PostgreSQL treats all NaNs as one value, greater than everything. Arrow's
 ///   total order also puts NaN last, but orders distinct NaN *bit patterns*
 ///   against each other, so two NaNs that PostgreSQL calls equal would get a

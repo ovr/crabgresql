@@ -529,8 +529,9 @@ fn every_regproc_reference_resolves_to_an_emitted_row() -> anyhow::Result<()> {
     let am_schema = catalogs::am::pg_am_schema();
     let amhandler = required(am_schema.column_index("amhandler"), "amhandler missing")?;
     for row in catalogs::am::pg_am_rows(&SystemCatalog::new()) {
-        // Unlike the other two, an access method always has a handler —
-        // including crabgresql's own, which get rows of their own.
+        // Unlike a `pg_type` regproc or a cast function, an access method
+        // always has a handler — including crabgresql's own, which get rows
+        // of their own.
         assert_ne!(
             row[amhandler],
             Value::Reg(crabgresql_types::Reg::unresolved(
@@ -583,7 +584,8 @@ fn pg_am_lists_the_builtin_access_methods() -> anyhow::Result<()> {
     assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
 
     let by_oid = |n: u32| rows.iter().find(|r| r[oid] == Value::Oid(n));
-    // heap is the only table access method; the rest are index methods.
+    // PostgreSQL ships one table access method, heap, and six index ones;
+    // crabgresql's parquet and buffer methods are the other two `t` rows.
     let heap = required(by_oid(2), "heap row is missing")?;
     assert_eq!(heap[amname], Value::Text("heap".to_string()));
     assert_eq!(heap[amtype], Value::Char(b't'));
@@ -623,12 +625,13 @@ fn pg_am_lists_the_builtin_access_methods() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `pg_class` columns psql's `\d` reads but crabgresql has no state for
-/// carry their true PostgreSQL constant, not a placeholder — `relchecks = 0`
-/// is what gates psql's CHECK-constraint query *off*, and `relhasrules`
-/// distinguishes a view (which owns a `_RETURN` rule) from a table.
-/// `relpartbound` carries the deparsed bound a leaf partition was created
-/// with, since `pg_get_expr` only echoes it.
+/// The `pg_class` columns psql's `\d` reads carry their true PostgreSQL
+/// value, never a placeholder — `relchecks` counts the relation's CHECK
+/// constraints, so the `0` a table without any reports is what gates psql's
+/// CHECK-constraint query *off*, and `relhasrules` distinguishes a view
+/// (which owns a `_RETURN` rule) from a table. `relpartbound` carries the
+/// deparsed bound a leaf partition was created with, since `pg_get_expr` only
+/// echoes it.
 #[test]
 fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()> {
     use crabgresql_storage_api::{
@@ -804,9 +807,10 @@ fn pg_attribute_encodes_postgres_atttypmod() -> anyhow::Result<()> {
     assert_eq!(cell("n", "atttypmod")?, Value::Int4(327686));
     assert_eq!(cell("nn", "atttypmod")?, Value::Int4(264194));
     assert_eq!(cell("i", "atttypmod")?, Value::Int4(-1));
-    // Identity and generated columns do not exist, and PG spells "neither"
-    // as `\0` rather than NULL — a `"char"` that prints as the empty
-    // string, which psql projects directly.
+    // TODO: report attidentity/attgenerated once identity and generated
+    // columns can be declared. Until then both carry PG's "neither" spelling:
+    // `\0` rather than NULL — a `"char"` that prints as the empty string,
+    // which psql projects directly.
     assert_eq!(cell("i", "attidentity")?, Value::Char(0));
     assert_eq!(cell("i", "attgenerated")?, Value::Char(0));
 
@@ -890,9 +894,10 @@ fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
             "{} sits in the enum-label band",
             def.name
         );
-        // The band codegen numbers `pg_cast` rows from starts at 10000 and
-        // runs into the 12000s where the initdb-created views live, so this
-        // asks the generated rows themselves rather than a band bound.
+        // Codegen numbers `pg_cast` rows from 10000 upward with no reserved
+        // ceiling, and the initdb-created views this registry lists sit above
+        // that start, in the 12000s — no numeric bound separates the two, so
+        // this asks the generated rows themselves.
         assert!(
             !PG_CAST_ROWS.iter().any(|row| row.oid == def.oid),
             "{} shares its OID with a generated pg_cast row",
@@ -1344,8 +1349,8 @@ fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<
         nulls_distinct: true,
         constraint: None,
     };
-    // `analyzed_stats` stands in for a relation ANALYZE has measured; the
-    // others have not been analyzed and must report the sentinel.
+    // `analyzed` stands in for a relation ANALYZE has measured; the others
+    // have not been analyzed and must report the sentinel.
     let analyzed = RelStats::exact(1234, &table);
     let cat = SystemCatalog::with_catalog_relations("db", "owner", {
         let mut measured = CatalogRelation::permanent(TableSchema::new(

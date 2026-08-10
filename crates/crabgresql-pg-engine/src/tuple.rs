@@ -47,9 +47,13 @@ fn bytes<const N: usize>(buf: &[u8], off: usize) -> [u8; N] {
 /// The header portion decoded from an on-page tuple.
 pub struct OnPageHeader {
     pub hdr: TupleHeader,
-    /// Forward link to the newest version (self when this is the newest). Read
-    /// by update-chain following; retained on every decode. On a toast chunk
-    /// this field is the chain link instead — see [`crate::toast`].
+    /// Forward link to the newest version. Every heap version is placed
+    /// self-linked and an UPDATE leaves the old one that way, so no reader
+    /// consumes this link. On a toast chunk the field is the chain link
+    /// instead — see [`crate::toast`].
+    ///
+    /// TODO: point this at the successor version on UPDATE and follow the chain
+    /// for the READ COMMITTED re-check (EvalPlanQual).
     #[allow(dead_code)]
     pub ctid: Tid,
     pub natts: u16,

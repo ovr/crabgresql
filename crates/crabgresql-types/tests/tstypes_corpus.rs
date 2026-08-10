@@ -8,8 +8,9 @@
 //! * `SELECT <lit>::tsvector @@ <lit>;` — the match operator, including phrase
 //!   search, prefixes, weights and negation
 //!
-//! Statements needing a text-search configuration (`to_tsvector`) or ranking
-//! (`ts_rank`) are skipped; those belong to a later rung.
+//! TODO: replay the statements that need a text-search configuration
+//! (`to_tsvector`) or ranking (`ts_rank`); neither exists yet, so they are
+//! skipped here.
 
 use crabgresql_types::tsquery::{self, TsQuery};
 use crabgresql_types::tsvector::{self, TsVector};
@@ -108,8 +109,10 @@ fn collect_cases() -> Vec<Case> {
         if !line.ends_with(';') {
             continue;
         }
-        // Anything needing a text-search configuration or ranking is a later
-        // rung; `tsvectorin(tsvectorout(...))` nests a call we do not parse.
+        // TODO: replay the `to_tsvector`/`ts_rank` statements too; they need a
+        // text-search configuration and ranking, which are not implemented.
+        // `tsvectorin(tsvectorout(...))` nests a call this extractor does not
+        // parse.
         if rest.contains("to_tsvector")
             || rest.contains("ts_rank")
             || rest.contains("tsvectorin")
@@ -229,7 +232,7 @@ fn tstypes_match_operator_agrees_with_upstream() -> anyhow::Result<()> {
     }
     // Guards against the extractor silently going blind (e.g. an upstream
     // formatting change); the rest of the file's `@@` assertions wrap the
-    // vector in `to_tsvector`, which is a later rung.
+    // vector in `to_tsvector`, which `collect_cases` filters out.
     assert!(
         checked >= 37,
         "expected a large match corpus, got {checked}"

@@ -65,9 +65,11 @@ impl RoutineDef {
 /// Compiled routine bodies, keyed by catalog OID.
 ///
 /// No invalidation, because none is needed: OIDs are never reused, and a
-/// routine's body and signature are fixed once created — there is no
-/// `CREATE OR REPLACE FUNCTION` yet. Adding one means adding a generation
-/// stamp here.
+/// routine's body and signature are fixed once created — redefining one is
+/// rejected with `42723 duplicate_function`.
+///
+/// TODO: stamp each entry with a generation and drop it on redefinition, once
+/// `CREATE OR REPLACE FUNCTION` can replace a routine's body in place.
 #[derive(Default)]
 pub struct RoutineCache {
     entries: Mutex<HashMap<u32, Arc<Routine>>>,
@@ -729,8 +731,10 @@ impl Interpreter {
             RaiseLevel::Warning => Severity::Warning,
             RaiseLevel::Exception => Severity::Warning,
         };
-        // DEBUG and LOG go to the server log, not the client, under
-        // PostgreSQL's default client_min_messages.
+        // DEBUG and LOG rank below the default client_min_messages (NOTICE),
+        // so PostgreSQL never sends them to the client.
+        // TODO: write RAISE DEBUG/LOG to the server log instead of discarding
+        // them.
         if matches!(severity, Severity::Debug | Severity::Log) {
             return Ok(());
         }
@@ -741,8 +745,10 @@ impl Interpreter {
                 message,
                 detail,
                 hint,
-                // PostgreSQL prints no CONTEXT for a message below ERROR
-                // under the default `client_min_messages`.
+                // TODO: fill in this invocation's `CONTEXT:` traceback frame.
+                // PostgreSQL sends one for a RAISE below ERROR as well; psql
+                // hides it only because SHOW_CONTEXT defaults to `errors`, and
+                // prints it under `\set SHOW_CONTEXT always`.
                 context: Vec::new(),
             });
         }

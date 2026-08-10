@@ -37,7 +37,6 @@ pub enum DataType {
     /// Table type in [PostgreSQL], e.g. CREATE FUNCTION RETURNS TABLE(...).
     ///
     /// [PostgreSQL]: https://www.postgresql.org/docs/15/sql-createfunction.html
-    /// [MsSQL]: https://learn.microsoft.com/en-us/sql/t-sql/statements/create-function-transact-sql?view=sql-server-ver16#c-create-a-multi-statement-table-valued-function
     Table(Option<Vec<ColumnDef>>),
     /// Fixed-length character type, e.g. CHARACTER(10).
     Character(Option<CharacterLength>),
@@ -326,7 +325,6 @@ impl fmt::Display for DataType {
                     write!(f, "{}({})", ty, modifiers.join(", "))
                 }
             }
-            // ClickHouse
             DataType::Unspecified => Ok(()),
             DataType::Trigger => write!(f, "TRIGGER"),
             DataType::Table(fields) => match fields {

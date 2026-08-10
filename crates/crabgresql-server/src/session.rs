@@ -63,9 +63,11 @@ pub struct PreparedStatement {
     /// The preparing statement's timestamp, for
     /// `pg_prepared_statements.prepare_time`.
     pub prepare_time: i64,
-    /// How many times this statement has been executed, which is what
-    /// `pg_prepared_statements.custom_plans` reports — every execution re-plans
-    /// here, so no execution is ever a generic one.
+    /// How many times this statement has been executed. Every execution
+    /// re-plans, so `pg_prepared_statements` reports this whole count under
+    /// `generic_plans` for a parameterless statement and under `custom_plans`
+    /// for a parameterized one (see [`crate::prepare`] for why the split is by
+    /// parameter count).
     pub executions: i64,
 }
 
@@ -380,8 +382,7 @@ impl ActiveTxn {
 /// PostgreSQL keeps two, and so must this: a plain `SET` inside a block survives
 /// `COMMIT`, a `SET LOCAL` does not, and the two can be issued on the same
 /// parameter in either order. One slot cannot express that — it can only ever
-/// restore the pre-block value, which is wrong for both orders. These fields are
-/// `guc.c`'s `GucStack.prior` and `GucStack.masked` under different names.
+/// restore the pre-block value, which is wrong for both orders.
 ///
 /// A `None` value never means "not captured yet": `session` is initialised from
 /// `outer` on first touch, so `None` only ever means this parameter has no value
@@ -408,9 +409,10 @@ struct SavedGuc {
 }
 
 pub struct Session {
-    /// Database and role accepted during startup. The server currently has one
-    /// physical database, but these are still the current connection identity
-    /// reported by information-schema metadata.
+    /// Database and role accepted during startup. A crabgresql server serves
+    /// exactly one physical database, so `database` selects nothing, but these
+    /// are still the current connection identity reported by information-schema
+    /// metadata.
     pub database: String,
     pub user: String,
     /// Concrete namespace assigned to this connection's temporary relations.
@@ -447,7 +449,10 @@ pub struct Session {
     /// **Clock only.** This does not make the batch atomic: each autocommit
     /// statement is still committed at its own boundary (see
     /// `finalize_statement`), where PostgreSQL would roll the whole batch back
-    /// on an error. Giving the batch one XID is a separate piece of work.
+    /// on an error.
+    ///
+    /// TODO: run an extended-query batch under a single XID, so an error
+    /// anywhere in it rolls back every statement of the batch.
     implicit_xact_start: Option<i64>,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
@@ -552,7 +557,10 @@ impl SessionSequences {
     }
 
     /// Resolve the reference's schema: the written qualifier, or `public` when
-    /// unqualified (a real search_path is a follow-up).
+    /// unqualified.
+    ///
+    /// TODO: resolve an unqualified sequence name through `search_path` instead
+    /// of assuming `public`.
     fn resolve_ns(namespace: Option<&str>) -> &str {
         namespace.unwrap_or("public")
     }
@@ -710,8 +718,10 @@ impl SequenceOps for SessionSequences {
                     .lock()
                     .unwrap_or_else(|_| panic!("mutex poisoned"));
                 state.currval.insert(Self::state_key(namespace, name), v);
-                // setval does NOT define lastval: PG's lastval reflects only the
-                // most recent nextval in the session.
+                // TODO: have setval define lastval as well — in PG,
+                // `setval('seq', 99)` followed by `lastval()` returns 99
+                // (vendored `regress/expected/sequence.out`, reconfirmed
+                // against 18.4); here lastval still reports the last nextval.
                 Ok(v)
             }
             // Concurrently dropped between the existence check and the write.
@@ -742,13 +752,13 @@ impl Session {
         temp_schema: impl Into<String>,
         temp_namespace_oid: u32,
     ) -> Self {
-        // PG's default since v12.
         let lock_owner = txnmgr.new_lock_owner();
         Self {
             database: database.into(),
             user: user.into(),
             temp_schema: temp_schema.into(),
             temp_namespace_oid,
+            // PG's default since v12.
             extra_float_digits: 1,
             // PG's boot value is the host zone; ours is UTC, which keeps every
             // expected output in the test suites stable.
@@ -778,8 +788,6 @@ impl Session {
         }
     }
 
-    /// The execution context with no sequence or catalog handle — for utility
-    /// paths (e.g. `EXPLAIN`'s `Values` node) that never call either family.
     /// Capture a parameter's block-entry state so the transaction can put it
     /// back.
     ///

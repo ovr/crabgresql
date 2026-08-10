@@ -367,7 +367,8 @@ fn raise_reports_a_wrong_argument_count() {
         let oid = h.define("f", &[], None, body);
         let e = err(h.call(oid, vec![]));
         // PostgreSQL reports a RAISE placeholder/argument mismatch as a syntax
-        // error (`check_raise_parameters`), not as an invalid parameter value.
+        // error, not as an invalid parameter value — the upstream `plpgsql`
+        // regression test expects "too few parameters specified for RAISE".
         assert_eq!(e.code, "42601");
         assert!(e.message.contains(want), "{body}: {}", e.message);
     }

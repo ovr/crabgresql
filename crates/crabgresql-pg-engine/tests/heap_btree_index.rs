@@ -173,8 +173,7 @@ fn duplicate_keys_return_every_matching_row_across_split_leaves() -> anyhow::Res
     engine.create_index("public", "t", idx_on_id())?;
 
     // Many rows with the SAME key (7): the run spills across leaf pages, so the
-    // probe must follow right-links to gather them all. Distinguish them by name
-    // length via distinct payloads and count them.
+    // probe must follow right-links to gather them all.
     let x = tm.allocate_xid();
     let ctx = tm.context(x, CommandId::FIRST);
     const DUPES: usize = 2000;
@@ -280,8 +279,9 @@ fn null_key_is_not_indexed_and_probing_null_is_empty() -> anyhow::Result<()> {
 fn un_indexable_key_type_falls_back_to_scan() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (engine, tm) = open(dir.path())?;
-    // float8 has no order-preserving equality-canonical encoding in this cut, so
-    // an index on it is metadata-only: no physical scan, probe falls back.
+    // An index on float8 is metadata-only: no physical scan, probe falls back.
+    // TODO: an order-preserving, equality-canonical key encoding for float8, so
+    // an index on it can be physical.
     let s = TableSchema::new("t", vec![Column::new("f", PgType::Float8)]);
     let table = engine.create_table(s)?;
     let x = tm.allocate_xid();
@@ -540,11 +540,10 @@ fn truncate_then_create_index_indexes_only_the_new_rows() -> anyhow::Result<()> 
 /// (verified: forcing `recover` back to offset 0 fails it).
 ///
 /// Everything is inserted by ONE transaction that commits *above* the redo
-/// point, deliberately. The CLOG is still a RAM `HashMap` rebuilt from replay,
-/// so a transaction whose commit record sat below redo would come back
-/// `InProgress` and all its rows would be invisible — nothing to do with
-/// splits. Making commit status survive a bounded replay is the durable-CLOG
-/// work; this test isolates the page-level behaviour from it.
+/// point, deliberately. A commit record below redo is never replayed, so such a
+/// transaction's fate would rest entirely on the durable CLOG under `pg_xact`;
+/// committing above redo keeps commit-status durability out of the picture, so
+/// a row that goes missing here means a lost page, not a lost fate.
 ///
 /// The *timing* hazard in `split_page` is guarded separately, by
 /// `nbtree::tests::no_page_stays_dirty_at_or_below_a_sampled_redo_point` and by
@@ -605,7 +604,7 @@ fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::
         })?;
 
         // Commit only after the last redo sample, so the commit record is above
-        // redo and the rebuilt CLOG still learns this transaction's fate.
+        // redo and replay still learns this transaction's fate.
         tm.commit(x)?;
         wal.flush(wal.current_lsn())?;
     }

@@ -35,10 +35,12 @@ pub type Tuple = Vec<Value>;
 
 /// Row identity — PostgreSQL's `ctid`: the physical `(block, offset)` address of
 /// a tuple version. Stable for a version's lifetime and never reused while the
-/// version lives. The heap engine fills both fields from the page it lands on;
-/// the in-memory engine synthesizes them from a monotonic counter (`block` the
-/// high bits, `offset` the low), so its tids are just as opaque but share the
-/// type the heap engine needs.
+/// version lives. The heap engine fills both fields from the page it lands on —
+/// including a RAM-backed UNLOGGED/TEMP relation, whose pages are ordinary heap
+/// pages that simply never reach a file. An access method with no pages at all
+/// (the read-only system catalogs) synthesizes the pair from a row counter
+/// (`block` the high bits, `offset` the low), so its tids are just as opaque but
+/// share the type the heap engine needs.
 ///
 /// The top bit of `block` is reserved: see [`TID_LOGICAL_FLAG`]. Clear, the tid
 /// is a physical address as above; set, it is a logical row id
@@ -87,7 +89,8 @@ impl Tid {
     }
 
     /// Inverse of [`Tid::packed`]: pack a monotonic counter into a `(block,
-    /// offset)` pair (used by the in-memory engine).
+    /// offset)` pair — how a pageless access method numbers its rows, and how
+    /// the heap's B-tree decodes a tid back out of an index key.
     pub const fn from_packed(n: u64) -> Self {
         Tid {
             block: (n >> 16) as u32,
@@ -225,8 +228,11 @@ pub struct CheckConstraint {
     /// ascending and deduplicated. Derived from the bound expression at DDL
     /// time, so it follows the relation's *final* column layout.
     pub columns: Vec<usize>,
-    /// `pg_constraint.convalidated`. Always `true` for now — `NOT VALID` is
-    /// rejected at DDL, so no unvalidated constraint can be created.
+    /// `pg_constraint.convalidated`. Always `true`: DDL rejects `NOT VALID`, so
+    /// no unvalidated constraint can be created.
+    ///
+    /// TODO: accept `NOT VALID` on a CHECK constraint — record it unvalidated
+    /// (skipping the existing-row scan) until `VALIDATE CONSTRAINT` clears it.
     pub validated: bool,
     /// `pg_constraint.conislocal`: declared on this relation itself, rather than
     /// only inherited. A child that redeclares a parent's constraint has both
@@ -237,8 +243,10 @@ pub struct CheckConstraint {
     pub inhcount: i16,
 }
 
-/// Access method recorded for a semantic index. Physical index access arrives
-/// later; this metadata already reproduces DDL, catalogs, and uniqueness.
+/// Access method recorded for a semantic index: the `pg_am` name DDL declared,
+/// which the catalogs reflect and DDL validates against (`hash` rejects
+/// UNIQUE). Whether a probe can actually be served physically is a separate
+/// question, answered per index by [`TableAm::supports_index_scan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexMethod {
     BTree,
@@ -260,8 +268,10 @@ pub enum IndexConstraint {
     Unique,
 }
 
-/// Metadata for an index relation. Only simple column indexes are represented;
-/// unsupported expression/partial/include forms are rejected by DDL.
+/// Metadata for an index relation. Only simple column indexes are represented.
+///
+/// TODO: represent expression keys, a partial index's `WHERE` predicate and
+/// `INCLUDE` columns — DDL rejects all three rather than lose them here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexMetadata {
     pub name: String,
@@ -273,8 +283,9 @@ pub struct IndexMetadata {
     pub constraint: Option<IndexConstraint>,
 }
 
-/// The partitioning strategy of a partitioned (parent) table. Only `Range` is
-/// supported so far; `List`/`Hash` are rejected at DDL time.
+/// The partitioning strategy of a partitioned (parent) table.
+///
+/// TODO: add LIST and HASH partitioning — `PARTITION BY` accepts only RANGE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartitionStrategy {
     Range,
@@ -556,12 +567,15 @@ pub struct TableSchema {
     /// before it is cut into fragments, so the fragments *of one write* have
     /// disjoint key ranges. The relation as a whole is **not** clustered — two
     /// writes produce two sorted runs that overlap freely — so a reader may
-    /// prune within a write's fragments and nothing more until compaction lands
-    /// (`ROADMAP.md` step 4). Step 3 still owes the 64 MiB target chunk size,
-    /// which needs the V2 fragment footer. A method that does not
-    /// [`honor a key`](TableAccessMethod::honors_sort_key) — a standalone
+    /// prune within a write's fragments and nothing more. A method that does
+    /// not [`honor a key`](TableAccessMethod::honors_sort_key) — a standalone
     /// `USING buffer` relation — carries one only so both engine-managed
     /// methods answer the same DDL alike.
+    ///
+    /// TODO: merge the per-write sorted runs by compaction, so pruning can
+    /// exclude fragments across the whole relation and not only within a write.
+    /// TODO: cut fragments at the 64 MiB target chunk size; a fragment is capped
+    /// at 65,535 rows by the `Tid` offset until the V2 fragment footer lands.
     ///
     /// Only a key [`sort::sortable_layout`] accepts is honored. DDL rejects the
     /// rest, but a relation created before that check is stored in insertion
@@ -784,8 +798,13 @@ impl StorageError {
 /// meant to update was updated or deleted by another transaction that committed
 /// after the caller's snapshot. `updater` is that transaction (whom to wait on
 /// or abort against); `latest` is the newest live version's tid to re-read
-/// under READ COMMITTED. The in-memory engine does not yet raise it — conflict
-/// handling arrives with the isolation work (P6) — but the shape is fixed here.
+/// under READ COMMITTED. The variant's shape is fixed, but no engine
+/// constructs it.
+///
+/// TODO: return `Conflict` from the engines when the target version was
+/// updated or deleted by a transaction that committed after the caller's
+/// snapshot, so READ COMMITTED can re-read the latest version and the stricter
+/// isolation levels can raise a serialization failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateResult {
     Updated,
@@ -1206,8 +1225,12 @@ pub trait TableAm: Send + Sync {
     /// Reclaim versions dead to every transaction at or before `oldest`. A
     /// version is reclaimable only if its deleter **committed** — `clog` decides
     /// that; a version stamped by an aborted or in-flight deleter is still live.
-    /// The default is a no-op: the in-memory engine keeps dead versions until it
-    /// is asked to vacuum, and there is no background vacuum before M5.
+    /// The default is a no-op, for an access method with nothing to reclaim: a
+    /// read-only catalog, or an append-only Parquet relation whose fragments are
+    /// immutable.
+    ///
+    /// TODO: reclaim dead versions on a schedule (autovacuum) — a heap relation
+    /// is vacuumed only when a `VACUUM` statement asks for it.
     fn vacuum(&self, _oldest: Xid, _clog: &Clog) {}
 }
 

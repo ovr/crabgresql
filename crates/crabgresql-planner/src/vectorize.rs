@@ -8,8 +8,8 @@
 //!
 //! So this module is the single source of truth for *whether*, and
 //! `crabgresql_executor::vector` only decides *how*. The executor gates its
-//! compilers on these functions and may decline further (an operand shape it has
-//! not implemented yet), but it must never vectorize something rejected here.
+//! compilers on these functions and may decline further (an operand shape it
+//! does not handle), but it must never vectorize something rejected here.
 //!
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.

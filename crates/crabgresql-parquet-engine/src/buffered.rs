@@ -214,9 +214,10 @@ impl BufferedParquetTable {
         // discarded here anyway — the tombstones below are keyed by *buffer*
         // tid — so the permutation is invisible to this side.
         //
-        // What remains of ROADMAP's Parquet step 3 is the other half: the
-        // `Tid` offset caps a fragment at 65,535 rows, so a flush still cannot
-        // reach the 64 MiB target chunk size without the V2 fragment footer.
+        // TODO: let one flushed fragment reach the 64 MiB target chunk size —
+        // the physical `Tid`'s `u16` offset caps a fragment at 65,535 rows
+        // (`MAX_FRAGMENT_ROWS`), so the row locator has to move to the V2
+        // fragment metadata first.
         let staged = self
             .chunks
             .insert_many(values, &txn)

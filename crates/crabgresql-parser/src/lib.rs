@@ -61,9 +61,10 @@ pub mod parser;
 pub mod tokenizer;
 
 #[doc(hidden)]
-// This is required to make utilities accessible by both the crate-internal
-// unit-tests and by the integration tests <https://stackoverflow.com/a/44541071/1026>
-// External users are not supposed to rely on this module.
+// Public because upstream shared these helpers with its integration tests
+// <https://stackoverflow.com/a/44541071/1026>; this fork vendored no `tests/`
+// directory, so only the crate's own unit tests use them. External users are
+// not supposed to rely on this module.
 pub mod test_utils;
 
 // ---------------------------------------------------------------------------
@@ -81,11 +82,14 @@ pub const SYNTAX_ERROR: &str = tokenizer::DEFAULT_TOKENIZER_SQLSTATE;
 /// Error returned when a SQL string cannot be parsed.
 ///
 /// Almost every parse failure is a plain `42601` syntax error whose message
-/// already carries its own position text. The exceptions are the escape
-/// sequences inside `E'…'` and `U&'…'`, which reproduce a specific PostgreSQL
-/// diagnostic: those set a different [`ParseError::sqlstate`], may add a
-/// [`ParseError::hint`], and report [`ParseError::location`] separately so the
-/// protocol layer can turn it into a `LINE n:` cursor.
+/// already carries its own position text. The exceptions are the failures that
+/// reproduce a specific PostgreSQL diagnostic — a bad escape inside `E'…'` or
+/// `U&'…'`, a malformed numeric literal, a redundant `COPY` option, a reserved
+/// word used as a column name, and others: their message is PG's own wording,
+/// to be shown verbatim, and they report [`ParseError::location`] separately so
+/// the protocol layer can turn it into a `LINE n:` cursor. Only the
+/// escape-string ones ever carry a different [`ParseError::sqlstate`] or a
+/// [`ParseError::hint`]; every other exception is still `42601` with no hint.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct ParseError {

@@ -1,9 +1,11 @@
 //! A minimal on-disk relation catalog: relation name -> (`RelFileNode`, schema).
 //!
 //! It exists so the engine can rediscover its tables and their column types
-//! after a restart. It is intentionally simple — the whole catalog is rewritten
-//! and fsynced on each DDL — and is not itself MVCC/crash-transactional yet; a
-//! real `pg_class`/`pg_attribute`-backed catalog is future work.
+//! after a restart. It is intentionally simple: the whole catalog is rewritten
+//! and fsynced on each DDL.
+//!
+//! TODO: make catalog changes MVCC/crash-transactional by storing relation
+//! metadata in real `pg_class`/`pg_attribute` relations instead of this file.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,8 +21,6 @@ use crabgresql_types::PgType;
 
 use crate::smgr::RelFileNode;
 
-/// One relation as reflected at startup: its name, heap relfilenode, schema, and
-/// each index paired with the relfilenode of its physical B-tree.
 /// A relation as the engine reopens it: its name, heap relfilenode, out-of-line
 /// chunk relfilenode (`RelFileNode(0)` for none), schema, and physical indexes.
 type ReflectedRelation = (
@@ -60,7 +60,8 @@ const PART_MAGIC: &[u8; 4] = b"PART";
 /// a sixth backward-compatible tail carrying the physical B-tree relfilenode of
 /// each index (zipped by position onto the metadata decoded from the `CRM1`
 /// block). A reader that predates physical indexes stops above, so every index
-/// decodes with `rel = 0` (metadata-only) — exactly today's behavior.
+/// decodes with `rel = 0` (metadata-only), which is what every index written
+/// before this tail had: no B-tree file of its own.
 const IDXR_MAGIC: &[u8; 4] = b"IXR1";
 /// Marks the persistence section, appended after the [`IDXR_MAGIC`] block — a
 /// seventh backward-compatible tail carrying each relation's `relpersistence`
@@ -145,9 +146,10 @@ struct PersistRel {
     rel: u32,
     cols: Vec<PersistCol>,
     indexes: Vec<PersistIndex>,
-    /// How the relation is stored. A memory table (`Unlogged`/`Temporary`) is held
-    /// in the in-memory `State` for name resolution during this run but is
-    /// **excluded from [`encode`]** — it never persists and so is gone on restart.
+    /// How the relation is stored. A `Temporary` table is held in the in-memory
+    /// `State` for name resolution during this run but is **excluded from
+    /// [`encode`]** — it never persists and so is gone on restart. `Permanent`
+    /// and `Unlogged` both persist their definition here.
     persistence: RelPersistence,
     access_method: TableAccessMethod,
     /// `Some` on a partitioned (parent) table: its partition key.
@@ -175,9 +177,12 @@ struct PersistRel {
     toast_rel: u32,
 }
 
-/// A persisted `ANALYZE` result. Relation-level only for now; `ncols` is written
-/// even when zero so per-column statistics can be added to the same tail without
-/// a format break.
+/// A persisted `ANALYZE` result. Relation-level: `ncols` is written even when
+/// zero so per-column statistics can be added to the same tail without a format
+/// break.
+///
+/// TODO: persist per-column `ANALYZE` results (null fraction, distinct count,
+/// most-common values, histogram) beside `relpages`/`reltuples`.
 #[derive(Clone, Debug, PartialEq)]
 struct PersistStats {
     relpages: u32,
@@ -255,9 +260,9 @@ impl RelCatalog {
         })
     }
 
-    /// Every relation's `(name, relfilenode, schema, indexes)` for rebuilding the
-    /// table map at startup. Each index carries its physical B-tree relfilenode
-    /// (`RelFileNode(0)` when metadata-only).
+    /// Every relation's `(name, relfilenode, toast relfilenode, schema, indexes)`
+    /// for rebuilding the table map at startup. Each index carries its physical
+    /// B-tree relfilenode (`RelFileNode(0)` when metadata-only).
     pub fn schemas(&self) -> Vec<ReflectedRelation> {
         let state = self
             .state
@@ -1331,9 +1336,9 @@ fn encode(state: &State) -> Vec<u8> {
     // Statistics: a ninth backward-compatible tail. For each relation (in `rels`
     // order) a presence byte, and when set, what ANALYZE measured. `decode`
     // leaves every relation never-analyzed when this tail is absent. The
-    // per-relation column count is written even though it is always zero today,
-    // so per-column statistics can be appended inside this same tail later
-    // without minting a tenth magic.
+    // per-relation column count is written even though only relation-level
+    // statistics exist, so per-column ones can be appended inside this same tail
+    // without minting another magic (see `PersistStats`).
     out.extend_from_slice(STAT_MAGIC);
     out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
     for r in &rels {
@@ -1581,7 +1586,7 @@ fn decode(bytes: &[u8]) -> State {
             // Anything on disk is a durable heap: memory tables are never persisted.
             persistence: RelPersistence::Permanent,
             access_method: TableAccessMethod::Heap,
-            // Default to unpartitioned; overridden below from the PART1 tail.
+            // Default to unpartitioned; overridden below from the PART tail.
             partition_scheme: None,
             partition_of: None,
             // Default to no parents; overridden below from the INH1 tail.
@@ -1752,7 +1757,9 @@ fn decode(bytes: &[u8]) -> State {
         let nrels = d.u32();
         for r in rels.iter_mut().take(nrels as usize) {
             if d.byte() != 0 {
-                // Only RANGE exists so far; the tag is reserved for LIST/HASH.
+                // TODO: decode LIST and HASH partition strategies — the tag
+                // byte is read and discarded because RANGE is the only
+                // strategy the DDL can create.
                 let _strategy_tag = d.byte();
                 let strategy = PartitionStrategy::Range;
                 let nkeys = d.u32();
@@ -1831,7 +1838,7 @@ fn decode(bytes: &[u8]) -> State {
     // Statistics tail: what ANALYZE last measured, zipped by position. Absent in
     // a pre-statistics file — every relation keeps the never-analyzed `None`
     // decoded above. The trailing column count is read and skipped; it is always
-    // zero today (see `encode`).
+    // zero while only relation-level statistics are written (see `encode`).
     if d.remaining().starts_with(STAT_MAGIC) {
         d.p += STAT_MAGIC.len();
         let nrels = d.u32();

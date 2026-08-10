@@ -27,18 +27,19 @@
 //!
 //! The `TableAm` methods are infallible, so a conflicting acquisition **blocks**
 //! (faithful to `AccessShare` waiting for `AccessExclusive`) rather than erroring.
-//! Surfacing `55P03 lock_not_available` with a bounded timeout would require
-//! widening the `TableAm` trait to return `Result`; that is a deliberate
-//! follow-up (see the plan and `query.rs`'s `TODO(perf)` about moving statement
-//! execution off the reactor).
 //!
-//! Performance note (review finding #9): the shared acquire takes this per-table
-//! `Mutex` on every DML operation, but it is required for cross-session
-//! correctness, is uncontended in the common (no-TRUNCATE) case, and is taken
-//! once per scan (not per row) — one more short critical section among the
-//! per-page `bufpool` locks each operation already takes. A lock-free fast path
-//! is incompatible with the per-owner upgrade bookkeeping this fix needs, so the
-//! mutex stays.
+//! TODO: honour a bounded lock timeout and report `55P03 lock_not_available`
+//! instead of waiting forever. That needs the `TableAm` trait widened to return
+//! `Result`; related is the `TODO(perf)` on the commit fsync in the server's
+//! `query.rs` about moving statement execution off the tokio reactor, since a
+//! wait here blocks a reactor worker.
+//!
+//! Performance note: the shared acquire takes this per-table `Mutex` on every
+//! DML operation, but it is required for cross-session correctness, is
+//! uncontended in the common (no-TRUNCATE) case, and is taken once per scan
+//! (not per row) — one more short critical section among the per-page
+//! `bufpool` locks each operation already takes. A lock-free fast path is
+//! incompatible with the per-owner upgrade bookkeeping, so the mutex stays.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -47,8 +48,9 @@ use crate::LockOwner;
 
 #[derive(Default)]
 struct LockInner {
-    /// The owner holding the table exclusively (a pending TRUNCATE), or `None`.
-    /// Held until that transaction commits or aborts.
+    /// The owner holding the table exclusively, or `None`: a pending TRUNCATE
+    /// (held until that transaction commits or aborts), or an engine-internal
+    /// index build/drop (held only for the duration of that call).
     exclusive: Option<LockOwner>,
     /// Per-owner count of in-flight shared holders (readers and writers). Keyed
     /// by owner so an exclusive acquire can tell its own holds apart from others'.
@@ -282,8 +284,8 @@ mod tests {
 
     #[test]
     fn exclusive_upgrades_over_own_shared_hold() {
-        // The realistic #3 case: a session holds a shared hold (an open cursor)
-        // and then TRUNCATEs the same table. It must not self-deadlock.
+        // A session holds a shared hold (an open cursor) and then TRUNCATEs the
+        // same table. It must not self-deadlock.
         let lock = Arc::new(TableLock::new());
         let _cursor = lock.acquire_shared(owner(7));
         lock.acquire_exclusive(owner(7)); // same owner: granted despite the shared hold

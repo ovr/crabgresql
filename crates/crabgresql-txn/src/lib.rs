@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A transaction identifier. Unlike PostgreSQL's 32-bit XIDs this is 64-bit, a
-/// deliberate deviation (see `docs/ARCHITECTURE.md §5`): no wraparound, no
+/// deliberate deviation (see `docs/ARCHITECTURE.md §6`): no wraparound, no
 /// freeze, no anti-wraparound VACUUM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Xid(pub u64);
@@ -34,8 +34,11 @@ impl Xid {
     /// never been deleted carries this in `xmax`.
     pub const INVALID: Xid = Xid(0);
     /// A frozen inserter: always treated as committed and visible to every
-    /// snapshot. Reserved for a future VACUUM FREEZE; unused by the in-memory
-    /// engine, but the visibility rule honours it.
+    /// snapshot, without a commit-log lookup. Stamped by `COPY … FREEZE` through
+    /// [`TxnContext::freeze_inserts`].
+    ///
+    /// TODO: stamp it from a VACUUM FREEZE sweep over old committed versions,
+    /// the other producer of frozen tuples.
     pub const FROZEN: Xid = Xid(2);
     /// The first XID handed out to a real transaction. Values below this are
     /// reserved (`INVALID`, `FROZEN`), mirroring PG's `FirstNormalTransactionId`.
@@ -65,7 +68,10 @@ pub enum XactStatus {
     Committed,
     Aborted,
     /// A subtransaction that committed to its parent but whose top-level
-    /// transaction has not yet committed. Reserved for savepoints (P6).
+    /// transaction has not yet committed.
+    ///
+    /// TODO: stamp this for subtransactions; nothing records it, because
+    /// `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` are not implemented.
     SubCommitted,
 }
 
@@ -99,8 +105,12 @@ impl XactStatus {
 
 /// Hint bits cached on a version so visibility need not re-consult the CLOG once
 /// a transaction's fate is known. Correctness never depends on them — they are a
-/// cache the engine may set lazily — so the in-memory engine leaves them clear
-/// and [`satisfies_mvcc`] falls back to the CLOG.
+/// cache the engine may set lazily — and no engine sets them, so
+/// [`satisfies_mvcc`] answers from the CLOG alone. The heap engine still
+/// round-trips the field through its on-page tuple header.
+///
+/// TODO: set these bits once a transaction's fate is resolved and consult them in
+/// [`satisfies_mvcc`], so a settled XID costs no commit-log lookup per version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Infomask(pub u16);
 
@@ -178,11 +188,13 @@ const INDEX_CHUNKS: usize = 2048;
 /// This is not comfortable headroom, and the numbers are worth stating plainly:
 /// 2^23 pages of 8 KiB is 64 GiB of resident pages, which is reachable on a large
 /// machine, and 2^38 XIDs is about a month at a sustained 100k commits/s. Resident
-/// page memory binds first, and bounding it is the eviction follow-up named in this
-/// design's notes — but a cluster that outruns either ceiling needs the truncation
-/// work (Rung D), not a bigger constant. Crossing it is at least not silent: a
+/// page memory binds first, but a cluster that outruns either ceiling needs
+/// truncation, not a bigger constant. Crossing it is at least not silent: a
 /// *stamp* above the ceiling latches an error that fails the next checkpoint (see
 /// [`Clog::set_status`]), rather than being dropped.
+///
+/// TODO: truncate the commit log below the freeze floor, so resident page memory
+/// stays bounded and a long-running cluster reaches neither ceiling.
 const MAX_PAGENO: u64 = (INDEX_CHUNKS * PAGES_PER_CHUNK) as u64;
 
 /// Where an XID sits relative to the addressable range of the commit log.
@@ -226,14 +238,20 @@ enum Reach {
 /// Nothing is ever evicted or moved, which is what makes that sound. A page is
 /// 8 KiB per 32768 transactions — 256 KiB per million — and evicting would mean
 /// writing a page outside a checkpoint, precisely what the write-back model exists
-/// to avoid. Truncation is the only thing that will ever drop pages, and it has to
-/// take the spine apart deliberately (Rung D).
+/// to avoid. Truncation is the only thing that may ever drop pages, and it has to
+/// take the spine apart deliberately.
+///
+/// TODO: truncate pages below the freeze floor; nothing drops a page, so a
+/// long-running cluster keeps every page it has ever touched resident.
 pub struct Clog {
     /// `None` for an in-memory-only commit log — the memory engine and tests,
     /// where nothing is ever written and the cache is simply the whole log.
     dir: Option<std::path::PathBuf>,
     /// Every XID below this has been frozen out of every relation; its segment
-    /// may be gone. Zero until a freeze sweep advances it.
+    /// may be gone.
+    ///
+    /// TODO: advance it from a freeze sweep — nothing does, so it stays zero and
+    /// no XID is ever below the floor.
     floor: AtomicU64,
     /// The next XID the allocator would hand out, as last observed.
     ///
@@ -349,9 +367,11 @@ impl Clog {
     fn reach(&self, xid: Xid) -> Reach {
         // Relaxed: nothing is ever stored to `floor` after construction, so there is
         // no release for an acquire to pair with, and this runs once or twice per
-        // tuple per scan. When a freeze sweep starts advancing it (Rung D) the
-        // ordering it needs is against dropping pages, not against this word, so
-        // this line will have to be revisited there rather than merely strengthened.
+        // tuple per scan.
+        //
+        // TODO: revisit this load when a freeze sweep starts advancing `floor`; the
+        // ordering needed then is against dropping pages, not against this word, so
+        // merely strengthening it here is not the fix.
         if xid.0 < self.floor.load(Ordering::Relaxed) {
             return Reach::BelowFloor;
         }
@@ -718,8 +738,10 @@ impl Snapshot {
 }
 
 /// SQL transaction isolation. `READ UNCOMMITTED` is an alias for `READ COMMITTED`
-/// (PG never permits dirty reads); `SERIALIZABLE` reuses `RepeatableRead`
-/// visibility until SSI lands in M3.
+/// (PG never permits dirty reads).
+///
+/// TODO: implement SSI; `SERIALIZABLE` is accepted but judged with
+/// `RepeatableRead` visibility, so read/write dependency anomalies go undetected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
     #[default]

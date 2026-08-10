@@ -28,7 +28,9 @@
 //!
 //! - Reads are strictly sequential: there is no way to fetch chunk *n* without
 //!   walking chunks `0..n`, so a slice read (`substr` over a toasted value)
-//!   cannot skip ahead. Nothing pushes slicing down to storage yet.
+//!   cannot skip ahead — every read reassembles the whole value.
+//!   TODO(perf): serve a slice read by fetching only the chunks it covers,
+//!   which needs a position-addressable chunk layout.
 //! - The toast relation cannot be vacuumed on its own. A chunk carries no
 //!   back-pointer, so nothing can decide from the chunk alone whether it is
 //!   live; reclamation is driven from the heap side by
@@ -85,9 +87,8 @@ pub const POINTER_LEN: usize = 1 + 1 + 4 + 4 + 2 + 4;
 /// Locates one attribute's bytes in a toast relation.
 ///
 /// The relfilenode rides on the pointer rather than being inferred from the
-/// table so a tuple is self-describing: during a TRUNCATE the table names a new
-/// toast relation while tuples in the old file still point at the old one, and
-/// inferring would read the wrong generation.
+/// table so a tuple is self-describing: reassembling a value takes the pointer
+/// and the buffer pool alone, never a handle on the table the tuple came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToastPointer {
     pub rel: RelFileNode,

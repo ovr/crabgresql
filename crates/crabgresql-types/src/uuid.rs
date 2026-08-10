@@ -38,8 +38,9 @@ fn invalid_syntax(input: &str) -> UuidError {
 /// (so the canonical `8-4-4-4-12` form, an unpunctuated run, and PG's lenient
 /// intermediate forms all parse). Anything else is `22P02`, echoing the input.
 ///
-/// This mirrors PG's `string_to_uuid`, which consumes an optional `-` after
-/// byte `i` when `i` is odd and not the last byte.
+/// The hyphen rule is per byte, not per group: a `-` may follow byte `i` only
+/// when `i` is odd and not the last byte, so `a0-eebc99…` — a hyphen after
+/// byte 0 — is rejected. Pinned by `rejects_malformed` below.
 pub fn parse(input: &str) -> Result<[u8; 16], UuidError> {
     let s = input.as_bytes();
     let mut pos = 0usize;
@@ -113,8 +114,9 @@ pub fn build_v4(random: [u8; 16]) -> [u8; 16] {
 /// PostgreSQL fills `rand_a` with the sub-millisecond part of the clock rather
 /// than with randomness — RFC 9562 §6.2 "Replace Leftmost Random Bits with
 /// Increased Clock Precision" — so two values from the same millisecond still
-/// sort in generation order. See [`sub_ms_fraction`]. Bits of `unix_ms` above
-/// the 48th are dropped; callers range-check first (see [`V7_MAX_UNIX_MS`]).
+/// sort in generation order. See [`sub_ms_fraction_nanos`]. Bits of `unix_ms`
+/// above the 48th are dropped; callers range-check first (see
+/// [`V7_MAX_UNIX_MS`]).
 pub fn build_v7(unix_ms: u64, rand_a: u16, rand_b: [u8; 8]) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..6].copy_from_slice(&unix_ms.to_be_bytes()[2..]);

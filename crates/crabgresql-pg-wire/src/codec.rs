@@ -152,6 +152,8 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
 
     /// Single-byte reply to SSLRequest / GSSENCRequest: we do not speak TLS.
     /// This is a bare `N`, not a framed message, so it is written directly.
+    ///
+    /// TODO: support TLS — answer SSLRequest with `S` and upgrade the stream.
     pub async fn refuse_encryption(&mut self) -> Result<(), ProtocolError> {
         self.buf.put_u8(b'N');
         self.flush().await

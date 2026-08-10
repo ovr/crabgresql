@@ -396,7 +396,7 @@ pub trait VisitorMut {
         ControlFlow::Continue(())
     }
 
-    /// Invoked for any statements that appear in the AST after visiting children
+    /// Invoked for any value that appear in the AST after visiting children
     fn post_visit_value(&mut self, _value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
         ControlFlow::Continue(())
     }
@@ -559,7 +559,8 @@ where
 /// Invokes the provided closure iteratively with a mutable reference to all expressions
 /// present in `v`.
 ///
-/// This performs a depth-first search, so if the closure mutates the expression
+/// This performs a depth-first search and invokes the closure after a node's children
+/// have been visited, so an expression the closure substitutes in is not visited again.
 ///
 /// # Example
 ///
@@ -744,13 +745,11 @@ mod tests {
     impl Visitor for TestVisitor {
         type Break = ();
 
-        /// Invoked for any queries that appear in the AST before visiting children
         fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
             self.visited.push(format!("PRE: QUERY: {query}"));
             ControlFlow::Continue(())
         }
 
-        /// Invoked for any queries that appear in the AST after visiting children
         fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
             self.visited.push(format!("POST: QUERY: {query}"));
             ControlFlow::Continue(())

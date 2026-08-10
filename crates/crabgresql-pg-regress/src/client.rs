@@ -136,7 +136,8 @@ impl Client {
                 b'I' => events.push(QueryEvent::EmptyQuery),
                 b'E' => events.push(QueryEvent::Error(parse_error_fields(&body))),
                 b'N' => events.push(QueryEvent::Notice(parse_error_fields(&body))),
-                // ParameterStatus, e.g. after SET once GUCs are reported.
+                // ParameterStatus, e.g. the echo of a reported GUC after SET,
+                // which psql prints nothing for.
                 b'S' => {}
                 b'Z' => return Ok(events),
                 other => {

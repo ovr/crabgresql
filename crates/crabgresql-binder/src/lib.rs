@@ -1,7 +1,8 @@
 //! Binder: semantic analysis turning the sqlparser AST into a typed logical
 //! plan — name resolution against table schemas, operator type inference with
 //! PG semantics (int4/int8 promotion, untyped-literal coercion), and honest
-//! rejection (`0A000`) of everything parsed but not yet executable.
+//! rejection (`0A000`) of everything the parser accepts but this engine does
+//! not implement.
 
 mod collation;
 pub mod expr;
@@ -58,7 +59,7 @@ pub struct OutputColumn {
     pub ty: PgType,
     /// The column's collation when it differs from the type default — carried
     /// so a rowset's collation survives into an enclosing query's scope, the
-    /// way PostgreSQL tracks `varcollid` on every column of every rowset.
+    /// way PostgreSQL tracks a collation on every column of every rowset.
     /// `None` means the type default (and is always `None` for a
     /// non-collatable type).
     pub collation: Option<u32>,
@@ -74,9 +75,9 @@ pub struct OutputColumn {
     /// [`crabgresql_storage_api::Column::typmod`] (`-1` for none). Only a
     /// reference to a modifier-bearing column, or an explicit coercion to one,
     /// produces a non-`-1` value; everything computed loses it, exactly as
-    /// PostgreSQL's `exprTypmod` does. `CREATE VIEW` reads it so a view's
-    /// columns describe themselves as `character varying(20)` rather than as a
-    /// bare `character varying`.
+    /// PostgreSQL does. `CREATE VIEW` reads it so a view's columns describe
+    /// themselves as `character varying(20)` rather than as a bare
+    /// `character varying`.
     pub typmod: i32,
 }
 
@@ -110,8 +111,11 @@ pub struct BindError {
     /// Optional HINT line (e.g. "You might need to add explicit type casts.").
     pub hint: Option<String>,
     /// 1-based (line, column) of the offending token, when PG reports a
-    /// cursor position (`LINE n: ... ^`). Only set for literal input-function
-    /// failures and ambiguous operators, mirroring PG.
+    /// cursor position (`LINE n: ... ^`). Only the call sites that know which
+    /// token the caret belongs under stamp one — a literal's input function,
+    /// the operator token of a resolution failure, an operand a clause needs
+    /// as boolean, an `EXECUTE` parameter, a `CHECK` predicate — so most bind
+    /// errors carry no position at all.
     pub location: Option<(u64, u64)>,
     /// The `CONTEXT:` traceback: the call frames this error unwound through,
     /// innermost first. Non-empty only when binding happened inside a routine

@@ -11,9 +11,11 @@ use crabgresql_txn::{CommitSink, Xid};
 use crate::record::{Lsn, LsnRange, WalError, WalRecord};
 use crate::rmgr::{RmgrId, XACT_ABORT, XACT_COMMIT};
 
-/// The single WAL file lives at `<dir>/pg_wal/wal`. Segment rotation is a
-/// follow-up (`docs/ARCHITECTURE.md §3`); a single growing file is enough for a
-/// correct first cut and keeps LSN==byte-offset trivially true.
+/// The single WAL file lives at `<dir>/pg_wal/wal`. One growing file keeps
+/// LSN==byte-offset trivially true.
+///
+/// TODO: rotate the WAL into segments so finished ones can be recycled
+/// (`docs/ARCHITECTURE.md §1.3`).
 const WAL_SUBDIR: &str = "pg_wal";
 const WAL_FILE: &str = "wal";
 
@@ -75,7 +77,7 @@ pub struct Wal {
 /// Most writers need nothing: the heap `INSERT`/`DELETE` path appends the record
 /// and stamps the page inside one buffer-pool `modify` closure, so both become
 /// visible under a single frame lock and no window exists. This guard is for the
-/// writers that genuinely cannot do that. There are three:
+/// writers that genuinely cannot do that. There are four:
 ///
 /// * a B-tree split — one record over three separately locked pages;
 /// * a transaction commit or abort, where the record is appended and only then is

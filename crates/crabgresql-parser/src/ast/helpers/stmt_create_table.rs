@@ -73,7 +73,8 @@ pub struct CreateTableBuilder {
     pub unlogged: bool,
     /// Whether the table is `EXTERNAL`.
     pub external: bool,
-    /// Optional `GLOBAL` flag for dialects that support it.
+    /// `Some(true)` for `GLOBAL`, `Some(false)` for `LOCAL`, `None` when
+    /// neither keyword was written.
     pub global: Option<bool>,
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
@@ -131,7 +132,8 @@ pub struct CreateTableBuilder {
     pub inherits: Option<Vec<ObjectName>>,
     /// Optional partitioned table (`PARTITION OF`)
     pub partition_of: Option<ObjectName>,
-    /// Range of values associated with the partition (`FOR VALUES`)
+    /// Partition bound specification (`FOR VALUES IN`, `FROM ... TO`, `WITH`)
+    /// or a bare `DEFAULT`
     pub for_values: Option<ForValues>,
     /// `STRICT` table flag.
     pub strict: bool,
@@ -273,7 +275,7 @@ impl CreateTableBuilder {
         self.external = external;
         self
     }
-    /// Set optional `GLOBAL` flag (dialect-specific).
+    /// Set `GLOBAL` (`Some(true)`) or `LOCAL` (`Some(false)`) table scope.
     pub fn global(mut self, global: Option<bool>) -> Self {
         self.global = global;
         self
@@ -364,7 +366,8 @@ impl CreateTableBuilder {
         self.version = version;
         self
     }
-    /// Set a comment for the table or following column definitions.
+    /// Set the table comment that is rendered after the column definitions,
+    /// as Hive writes it, rather than in the table option list.
     pub fn comment_after_column_def(mut self, comment: Option<CommentDef>) -> Self {
         self.comment = comment;
         self
@@ -416,7 +419,7 @@ impl CreateTableBuilder {
         self
     }
 
-    /// Sets the range of values associated with the partition.
+    /// Sets the partition bound spec (`FOR VALUES ...` or `DEFAULT`).
     pub fn for_values(mut self, for_values: Option<ForValues>) -> Self {
         self.for_values = for_values;
         self

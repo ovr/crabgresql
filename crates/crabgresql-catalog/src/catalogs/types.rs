@@ -101,9 +101,11 @@ pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
 }
 
 /// The `pg_type` rows for user-defined enum types, appended after
-/// [`pg_type_builtin_rows`]. Only enums are reflected (`typtype = 'e'`); other
-/// `CREATE TYPE` shapes are not surfaced here yet. Column order matches
-/// [`pg_type_schema`].
+/// [`pg_type_builtin_rows`]. Column order matches [`pg_type_schema`].
+///
+/// TODO: reflect non-enum `CREATE TYPE` shapes into `pg_type` — only types
+/// carrying enum labels are emitted (`typtype = 'e'`), so any other user type
+/// is invisible to a client reading the catalog.
 pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
     user_types
         .iter()

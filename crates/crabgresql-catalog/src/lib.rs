@@ -336,10 +336,10 @@ impl SystemCatalog {
     }
 
     /// The accessors below are the only places `self.source` is read, apart
-    /// from the three cheap answers (`database`, `owner`, `now`) that need no
-    /// memoization. Keeping it that way is what makes the source's cost a
-    /// per-snapshot one: a call site outside a `OnceLock` would re-enumerate
-    /// the database on every row that reached it.
+    /// from the four cheap answers (`database`, `owner`, `now`,
+    /// `bytea_output`) that need no memoization. Keeping it that way is what
+    /// makes the source's cost a per-snapshot one: a call site outside a
+    /// `OnceLock` would re-enumerate the database on every row that reached it.
     pub(crate) fn live_relations(&self) -> &[CatalogRelation] {
         self.live_relations.get_or_init(|| self.source.relations())
     }
@@ -546,8 +546,14 @@ impl SystemCatalog {
             let mut out = Vec::new();
             for (table_oid, schema) in self.relation_oids() {
                 for (position, column) in schema.columns.iter().enumerate() {
-                    // A PRIMARY KEY implies non-nullability without a catalog
-                    // entry of its own, so only an explicitly named one is a row.
+                    // Only a column with an explicit NOT NULL declaration
+                    // carries a constraint name and becomes a row here; a
+                    // PRIMARY KEY sets `Column::nullable` to false without
+                    // recording one.
+                    // TODO: emit the `<table>_<column>_not_null` rows
+                    // PostgreSQL creates for every PRIMARY KEY column
+                    // (upstream `constraints` regression test: "Primary keys
+                    // cause not-null constraints to be created").
                     let Some(name) = &column.not_null_constraint else {
                         continue;
                     };
@@ -814,7 +820,6 @@ impl SystemCatalog {
             .map(|t| t.oid)
     }
 
-    /// Build the requested relation's rows + schema, or `None` if unknown.
     /// The schema and rows of the `pg_catalog` relation `name`, or `None` if
     /// this build serves no such relation.
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
@@ -829,7 +834,7 @@ impl SystemCatalog {
     /// Materialize `namespace.name` from the registry.
     ///
     /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
-    /// relation twice and every scan of `pg_proc` rebuilds 503 rows. The cache
+    /// relation twice and every scan of `pg_proc` rebuilds ~500 rows. The cache
     /// belongs one level up, in `open_table`/`resolve`: both wrap this in a
     /// [`StaticTable`], which already holds its schema and rows behind `Arc`s,
     /// so caching the `Arc<dyn TableAm>` is a refcount bump where caching the

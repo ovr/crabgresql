@@ -1,8 +1,8 @@
 //! Simple-query execution: AST → bind → plan → Volcano executor.
 //!
 //! DQL/DML statements run through the binder/planner pipeline. DDL
-//! (CREATE TABLE) and session commands (SET) execute directly here until the
-//! catalog and GUC store exist.
+//! (CREATE TABLE) and session commands (SET) go to the utility dispatch in this
+//! module, which drives the engine and the GUC table directly.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -361,7 +361,10 @@ pub(crate) fn catalog_routine(info: &FuncInfo) -> crabgresql_catalog::CatalogRou
             Vec::new()
         },
         ret_type: oid_of(&info.ret),
-        // SETOF is rejected at CREATE, so nothing here returns a set yet.
+        // A SETOF return type is rejected at CREATE, so no routine in the
+        // catalog returns a set.
+        // TODO: set-returning routines (SETOF); `retset` must then follow the
+        // routine's declared return type.
         retset: false,
         volatile: info.volatility.provolatile(),
         strict: info.strict,
@@ -765,8 +768,10 @@ pub(crate) fn execute_statement_with(
     let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
     let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
         Some(logical) => logical,
-        // EXPLAIN of a utility statement: report the gap rather than falling
-        // through to the handler, which would run the utility for real.
+        // EXPLAIN of a utility statement: error rather than falling through to
+        // the handler, which would run the utility for real.
+        // TODO: plan the utility statements PostgreSQL's EXPLAIN accepts —
+        // CREATE TABLE AS and DECLARE … CURSOR.
         None if explain_options.is_some() => {
             return Err(PgError::feature_not_supported(format!(
                 "EXPLAIN of {} is not supported yet",
@@ -1186,10 +1191,10 @@ pub(crate) fn execute_statement_with(
     // would run its body after its own transaction had already committed or
     // aborted. Drain the rows here instead when a routine is in the plan.
     //
-    // A deliberate, temporary deviation: PostgreSQL streams and holds the
-    // transaction open until the portal closes. Undoing it needs per-portal
-    // transaction lifetimes; until then the cost is the result set's memory,
-    // paid only by statements that call a routine.
+    // TODO: give portals their own transaction lifetimes, so a plan that calls a
+    // routine can stream instead of being buffered. PostgreSQL streams and holds
+    // the transaction open until the portal closes; the cost of buffering here is
+    // the result set's memory, paid only by statements that call a routine.
     //
     // `force_materialize` is the same need from the other direction: `DECLARE …
     // CURSOR` keeps its rows past the end of this statement, so they have to be
@@ -1313,12 +1318,6 @@ fn materialize(exec: Execution) -> Result<Execution, PgError> {
     })
 }
 
-/// Build the [`TxnContext`] a statement executes under. Under autocommit each
-/// statement is its own implicit transaction (a write allocates a throwaway XID,
-/// a read uses none); inside an explicit block the XID is allocated lazily on
-/// the first write and reused, and the snapshot policy follows the isolation
-/// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
-/// READ and above).
 /// Let the engine hold this statement back if its write buffers are full.
 ///
 /// Must run before [`build_txn`], which is where a write allocates its XID: the
@@ -1336,6 +1335,12 @@ fn await_write_capacity(engine: &Arc<dyn TableEngine>, session: &Session) {
     }
 }
 
+/// Build the [`TxnContext`] a statement executes under. Under autocommit each
+/// statement is its own implicit transaction (a write allocates a throwaway XID,
+/// a read uses none); inside an explicit block the XID is allocated lazily on
+/// the first write and reused, and the snapshot policy follows the isolation
+/// level (fresh per statement for READ COMMITTED, frozen once for REPEATABLE
+/// READ and above).
 fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool) -> TxnContext {
     // The connection's session-stable table-lock owner, stamped onto every
     // context so a transaction can upgrade its own AccessShare hold (an open
@@ -1671,17 +1676,22 @@ fn commit_io_error(e: std::io::Error) -> PgError {
     )
 }
 
-/// `AND CHAIN` (commit/rollback then immediately open an identical block) is not
-/// implemented yet; shared by the BEGIN/COMMIT/ROLLBACK handlers.
+/// The rejection shared by the BEGIN/COMMIT/ROLLBACK handlers.
+///
+/// TODO: implement `AND CHAIN` — commit or roll back, then immediately reopen a
+/// block with the same isolation level and access mode.
 fn and_chain_unsupported() -> PgError {
     PgError::feature_not_supported("AND CHAIN is not supported yet")
 }
 
 /// Map the parser's SQL isolation level to the core [`IsolationLevel`]. `READ
 /// UNCOMMITTED` aliases READ COMMITTED (PG never permits dirty reads);
-/// `SERIALIZABLE` maps to REPEATABLE READ-strength visibility for now (true SSI
-/// is M3, per the `IsolationLevel::Serializable` note in `crabgresql-txn`).
-/// `SNAPSHOT` (a non-standard extension) is not supported.
+/// `SNAPSHOT` (a non-standard extension PG's grammar has no spelling for) is
+/// rejected.
+///
+/// TODO: serializable isolation — `SERIALIZABLE` gets only REPEATABLE
+/// READ-strength visibility, so write skew between concurrent transactions is
+/// not detected.
 fn map_isolation_level(level: ast::TransactionIsolationLevel) -> Result<IsolationLevel, PgError> {
     use ast::TransactionIsolationLevel as Sql;
     Ok(match level {
@@ -1728,15 +1738,14 @@ pub(crate) fn read_only_active(session: &Session) -> bool {
     }
 }
 
-/// Whether executing `stmt` acquires a snapshot (PG's `FirstSnapshotSet`).
-/// Transaction control and `SET`/`RESET` take none; every other statement —
-/// queries, DML, and DDL — does. Used to enforce the "SET TRANSACTION ISOLATION
-/// LEVEL before any query" rule uniformly across statement kinds.
+/// Whether executing `stmt` acquires a snapshot. Transaction control and
+/// `SET`/`RESET` take none; every other statement — queries, DML, and DDL —
+/// does. Used to enforce the "SET TRANSACTION ISOLATION LEVEL before any query"
+/// rule uniformly across statement kinds.
 ///
 /// `FETCH`/`MOVE` read no table: they walk a cursor whose snapshot was taken
 /// back at its `DECLARE`. `DECLARE` is where that snapshot is taken, and `CLOSE`
-/// counts as a query in PostgreSQL — `PlannedStmtRequiresSnapshot` exempts
-/// `FetchStmt` but not `ClosePortalStmt`, so `BEGIN; CLOSE ALL; SET TRANSACTION
+/// counts as a query in PostgreSQL — `BEGIN; CLOSE ALL; SET TRANSACTION
 /// ISOLATION LEVEL …` raises 25001 there. Both therefore keep the default.
 fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
     !matches!(
@@ -2081,8 +2090,9 @@ fn execute_analyze(
         None => engine
             .relations()
             .into_iter()
-            // A partitioned parent holds no rows of its own; PostgreSQL derives
-            // its statistics from its children, which is not implemented here.
+            // A partitioned parent holds no rows of its own.
+            // TODO: derive a partitioned parent's statistics from its children,
+            // as PostgreSQL does, instead of skipping it.
             .filter(|schema| schema.partition_scheme.is_none())
             .map(|schema| (schema.namespace, schema.name))
             .collect(),
@@ -2133,9 +2143,12 @@ fn execute_vacuum(
     }
     // Modifiers the grammar accepts but this implementation does not honor. A
     // `VACUUM FULL` that silently ran a plain vacuum would report success for work
-    // it never did, so each is a stated gap instead. `ANALYZE` is honored below;
+    // it never did, so each is rejected instead. `ANALYZE` is honored below;
     // `VERBOSE` only adds progress messages, so accepting it silently is faithful
-    // enough — the work it describes still happens.
+    // enough — the work it describes still happens. Everything below except FULL
+    // and FREEZE is another dialect's spelling that PG's grammar has no option
+    // for, so refusing those is a settled decision, not a gap.
+    // TODO: honor `VACUUM FULL` (rewrite the relation) and `VACUUM FREEZE`.
     for (present, name) in [
         (vacuum.full, "FULL"),
         (vacuum.freeze, "FREEZE"),
@@ -2214,9 +2227,11 @@ fn execute_vacuum(
     Ok(QueryResult::command("VACUUM"))
 }
 
-/// Register a semantic index. It is reflected through the catalogs and UNIQUE
-/// indexes validate existing and future rows; physical lookup/IndexScan waits
-/// for the B-tree access-method milestone.
+/// Register an index. It is reflected through the catalogs and UNIQUE indexes
+/// validate existing and future rows. Whether it also gets a physical B-tree an
+/// `IndexScan` can probe is the engine's call: a durable heap builds one, while
+/// a RAM-backed or engine-managed relation keeps the index metadata-only and
+/// lookups there fall back to a scan.
 fn execute_create_index(
     engine: &Arc<dyn TableEngine>,
     txnmgr: &TransactionManager,
@@ -2354,8 +2369,14 @@ struct CheckTarget {
     bound: crabgresql_binder::BoundExpr,
 }
 
-/// `ALTER TABLE ... ADD [CONSTRAINT n] {PRIMARY KEY|UNIQUE} (cols)`. Every other
-/// `ALTER TABLE` action is rejected as unsupported.
+/// `ALTER TABLE ... ADD [CONSTRAINT n] {PRIMARY KEY|UNIQUE} (cols)` and
+/// `ALTER TABLE ... ADD [CONSTRAINT n] CHECK (expr)`.
+///
+/// TODO: the other `ALTER TABLE` actions PostgreSQL has — `ADD COLUMN`,
+/// `DROP COLUMN`, `ALTER COLUMN` (its type, `SET`/`DROP DEFAULT`,
+/// `SET`/`DROP NOT NULL`), `RENAME` of the table, a column or a constraint,
+/// `ADD FOREIGN KEY`, `DROP CONSTRAINT`. Every action but the two above is
+/// rejected as unsupported.
 ///
 /// Runs in passes — classify, resolve, plan, validate, apply — because PostgreSQL
 /// applies a multi-action `ALTER TABLE` atomically. Our DDL is not transactional
@@ -2381,6 +2402,10 @@ struct CheckTarget {
 /// `TableAm` nor `TableEngine` exposes locking), and a transactional-DDL hook
 /// general enough to stage a schema change — `TxnFinalize` today serves one
 /// bespoke TRUNCATE registry.
+///
+/// TODO: make `ADD CONSTRAINT` transactional so `ROLLBACK` undoes it, and hold
+/// one table lock across validation and application.
+///
 /// `engine` is the session's resolution overlay (temp shadows global); every
 /// catalog read and write below routes through it. `raw_engine` is the
 /// underlying engine, which is what [`Session::exec_context_for_statement`] takes
@@ -2464,9 +2489,11 @@ fn execute_alter_table(
             }
             ast::TableConstraint::Check(check) => {
                 // PostgreSQL supports `NOT VALID` here — the constraint lands
-                // unvalidated and a later `VALIDATE CONSTRAINT` scans. Neither
-                // half exists yet, and accepting the suffix while validating
-                // anyway would reject rows the user asked us to tolerate.
+                // unvalidated and a later `VALIDATE CONSTRAINT` scans. Accepting
+                // the suffix while validating anyway would reject rows the user
+                // asked us to tolerate.
+                // TODO: land a CHECK unvalidated for `NOT VALID`, and add
+                // `ALTER TABLE ... VALIDATE CONSTRAINT` to scan it afterwards.
                 if *not_valid {
                     return Err(PgError::feature_not_supported(
                         "CHECK constraints cannot be marked NOT VALID yet",
@@ -2556,6 +2583,9 @@ fn execute_alter_table(
     // and transitive: matching a bare relation name would let an unrelated
     // `public.par` with children veto a key on a temp or schema-qualified `par`
     // that has none.
+    //
+    // TODO: fan a PRIMARY KEY's NOT NULL out to the inheritance descendants
+    // (flip each matching column, scan it for NULLs) so a parent can take one.
     if wants_primary_key && !crabgresql_binder::inheritance_descendants(engine, &schema)?.is_empty()
     {
         return Err(PgError::feature_not_supported(format!(
@@ -2706,6 +2736,8 @@ fn execute_alter_table(
                     // `coninhcount` bumped instead of a second row, and nothing
                     // here can express that — so it is refused rather than
                     // silently left with whichever predicate it already had.
+                    // TODO: merge into a descendant's existing constraint of the
+                    // same name by bumping its `coninhcount`.
                     if child_schema.checks.iter().any(|c| c.name == name) {
                         return Err(PgError::feature_not_supported(format!(
                             "ADD CHECK would collide with constraint \"{name}\" already on \
@@ -3701,8 +3733,9 @@ pub(crate) fn normalize_ident(ident: &ast::Ident) -> String {
 }
 
 /// A single-part object name, lowercased. `noun` names the object class for the
-/// error text ("relation", "type", "function"). Qualified names are not yet
-/// supported.
+/// error text ("relation", "type", "function").
+///
+/// TODO: resolve schema-qualified names here; a qualified name is rejected.
 pub(crate) fn single_object_name(name: &ast::ObjectName, noun: &str) -> Result<String, PgError> {
     if name.0.len() != 1 {
         return Err(PgError::feature_not_supported(format!(
@@ -3888,8 +3921,9 @@ fn execute_create_table(
             )],
         });
     }
-    // Temp and UNLOGGED tables are memory tables (RAM-backed, WAL-skipping); a
-    // plain table is a durable heap. All of them live in the one shared engine now.
+    // A TEMP table is RAM-backed; an UNLOGGED one is on-disk but WAL-skipped, so
+    // its data is reset to empty after an unclean shutdown; a plain table is a
+    // durable heap. All three live in the one shared engine.
     let persistence = if create.temporary {
         RelPersistence::Temporary
     } else if create.unlogged {
@@ -3918,9 +3952,11 @@ fn execute_create_table(
     let target = engine;
     // CTAS (`create.query.is_some()`) is dispatched to `execute_create_table_as`
     // before reaching here, so this path only builds an empty table. Clauses we
-    // can't honor must be rejected, not silently dropped: ON COMMIT DROP/DELETE
-    // ROWS needs the M2 transaction engine — accepting it would leave a plain
-    // session-lifetime table that diverges from PG.
+    // can't honor must be rejected, not silently dropped: accepting ON COMMIT
+    // DROP/DELETE ROWS would leave a plain session-lifetime table that diverges
+    // from PG.
+    // TODO: honor `ON COMMIT DELETE ROWS` and `ON COMMIT DROP` — truncate or
+    // drop the temp table when the transaction commits.
     if create.on_commit.is_some() {
         return Err(PgError::feature_not_supported(
             "CREATE TABLE ... ON COMMIT is not supported yet",
@@ -3929,7 +3965,9 @@ fn execute_create_table(
     // Table inheritance is a distinct feature from declarative partitioning, and
     // the two do not compose here: a partitioned relation anywhere in a hierarchy
     // would make the read fan-out have to expand a leaf set inside a descendant
-    // set. PG allows the combination; we reject it rather than half-honor it.
+    // set. PostgreSQL does not compose them either — `INHERITS (...) PARTITION BY
+    // ...` answers "cannot create partitioned table as inheritance child" in the
+    // create_table regression test — so refusing matches it rather than defers.
     let inherits = create.inherits.as_deref().unwrap_or(&[]);
     if !inherits.is_empty() {
         // Both `PARTITION BY` (this table is a partitioned parent) and
@@ -3958,11 +3996,10 @@ fn execute_create_table(
             "CREATE TABLE ... SORTKEY is not supported; use ORDER BY (columns)",
         ));
     }
-    // Declarative partitioning (initial slice: RANGE, DDL + catalog reflection).
-    // A partitioned parent or a leaf partition may not be a memory table (TEMP or
-    // UNLOGGED) in this slice: leaf partitions are always created Permanent, so a
-    // memory-table parent would leave durable partitions dangling off a parent
-    // that vanishes on restart.
+    // A partitioned parent or a leaf partition may not be TEMP or UNLOGGED: leaf
+    // partitions are always created Permanent, so a parent that does not survive
+    // a restart intact would leave durable partitions dangling off it.
+    // TODO: support temporary and unlogged partitioned tables.
     if (create.partition_by.is_some() || create.partition_of.is_some())
         && (create.temporary || create.unlogged)
     {
@@ -4278,7 +4315,9 @@ fn execute_create_table(
     }
 
     // A partitioned parent (`PARTITION BY ...`) carries a partition key and holds
-    // no rows of its own. This slice supports RANGE only, without keys/serial.
+    // no rows of its own.
+    // TODO: support PRIMARY KEY/UNIQUE constraints and serial columns on a
+    // partitioned table.
     let partition_scheme = match create.partition_by.as_deref() {
         Some(expr) => {
             if !pending.is_empty() {
@@ -4296,6 +4335,8 @@ fn execute_create_table(
             // create leaves from the parent's columns alone, so accepting one
             // here would declare a constraint and then never enforce it — the one
             // failure worse than refusing the DDL.
+            // TODO: copy a partitioned parent's CHECK constraints into every
+            // leaf partition.
             if !pending_checks.is_empty() {
                 return Err(PgError::feature_not_supported(
                     "CHECK constraints on partitioned tables are not supported yet",
@@ -4313,6 +4354,8 @@ fn execute_create_table(
     // the executor, keyed off `TableAm::schema()`), so this is a narrower refusal
     // than it looks: it keeps CREATE and ALTER agreeing about the same relation
     // rather than accepting a constraint that only half the DDL surface can add.
+    // TODO: republish an engine-managed relation's cached `TableSchema` so
+    // `ALTER TABLE ... ADD CHECK` can reach one.
     if access_method.is_engine_managed() && !pending_checks.is_empty() {
         return Err(PgError::feature_not_supported(format!(
             "CHECK constraints on a table using access method \"{}\" are not supported yet",
@@ -4383,8 +4426,6 @@ fn execute_create_table(
             constraint: Some(p.constraint),
         });
     }
-    // TEMP tables go in the session-local catalog, which shadows a same-named
-    // permanent table; its separate keyspace means shadowing never raises 42P07.
     let mut schema = schema;
     for index in &indexes {
         if index.constraint == Some(IndexConstraint::PrimaryKey) {
@@ -4403,9 +4444,9 @@ fn execute_create_table(
     )?;
     // The parents are resolved *before* the table's own checks are named, so a
     // generated name can step around one the merge is about to inherit —
-    // PostgreSQL's `ChooseConstraintName` consults the inherited set too, and
-    // without this a child declaring `CHECK (x < 100)` under a parent already
-    // holding `c_x_check` collided instead of becoming `c_x_check1`.
+    // PostgreSQL generates around the inherited names too, and without this a
+    // child declaring `CHECK (x < 100)` under a parent already holding
+    // `c_x_check` collided instead of becoming `c_x_check1`.
     //
     // Re-resolving rather than threading handles down from the column merge: it
     // has already accepted every one of them, so this cannot fail differently,
@@ -4497,11 +4538,12 @@ fn execute_create_table(
 }
 
 /// Reject a direct physical DDL operation (TRUNCATE, CREATE INDEX) on a
-/// partitioned parent. The parent owns no storage of its own — the operation
-/// would have to fan out to its partitions, which is not implemented yet — so it
+/// partitioned parent. The parent owns no storage of its own, so the operation
 /// is rejected rather than silently applied to the empty parent relation. (DML
-/// and queries against the parent are supported: they route/union across the
-/// leaves; only these physical DDL operations remain unsupported.)
+/// and queries against the parent do work: they route/union across the leaves.)
+///
+/// TODO: fan TRUNCATE and CREATE INDEX on a partitioned parent out to its
+/// partitions, the way PostgreSQL applies them to every leaf.
 fn reject_partitioned_parent(table: &Arc<dyn TableAm>, name: &str) -> Result<(), PgError> {
     if table.schema().partition_scheme.is_some() {
         return Err(PgError::feature_not_supported(format!(
@@ -4512,8 +4554,10 @@ fn reject_partitioned_parent(table: &Arc<dyn TableAm>, name: &str) -> Result<(),
 }
 
 /// Decode a `PARTITION BY <strategy> (<cols>)` clause into a [`PartitionScheme`].
-/// The parser stores the clause as a function-call expression (`RANGE(d)`); this
-/// slice supports RANGE with a single simple-column key.
+/// The parser stores the clause as a function-call expression (`RANGE(d)`).
+///
+/// TODO: decode LIST and HASH strategies, multi-column keys, and expression
+/// keys — only RANGE over a single simple column is accepted here.
 fn build_partition_scheme(
     expr: &ast::Expr,
     columns: &[Column],
@@ -4576,25 +4620,6 @@ fn build_partition_scheme(
     })
 }
 
-/// Resolve a relation's layout sort key: the order an engine-managed access
-/// method stores its rows in.
-///
-/// PostgreSQL has no such clause, so the rule is ClickHouse MergeTree's — an
-/// explicit `ORDER BY (...)` wins, a `PRIMARY KEY` supplies the default, and a
-/// table declaring neither is refused. Refusing is the point: an unordered
-/// column store gives up range pruning, compression locality, and
-/// merge-friendly compaction, and handing one back silently would hide all
-/// three. Nor is it ever forced — every type these methods accept is
-/// btree-orderable, so a table can always name a key.
-///
-/// A heap relation has no layout order to declare, so `ORDER BY` on one is an
-/// error rather than a clause quietly dropped.
-///
-/// A standalone `USING buffer` relation is the awkward case: it is RAM plus WAL
-/// with nowhere to flush, so its key is recorded and nothing will ever apply it.
-/// It is required all the same, so that the two engine-managed methods answer
-/// the same DDL identically — a `buffer` table that silently accepted what
-/// `parquet` refuses would be a worse surprise than a key that costs nothing.
 /// Resolve a column named in an *ordered* key — an index key, a layout sort key,
 /// or a RANGE partition key — and reject a type that has no B-tree ordering.
 ///
@@ -4719,6 +4744,25 @@ fn reject_unsortable_key(
     }))
 }
 
+/// Resolve a relation's layout sort key: the order an engine-managed access
+/// method stores its rows in.
+///
+/// PostgreSQL has no such clause, so the rule is ClickHouse MergeTree's — an
+/// explicit `ORDER BY (...)` wins, a `PRIMARY KEY` supplies the default, and a
+/// table declaring neither is refused. Refusing is the point: an unordered
+/// column store gives up range pruning, compression locality, and
+/// merge-friendly compaction, and handing one back silently would hide all
+/// three. Nor is it ever forced — every type these methods accept is
+/// btree-orderable, so a table can always name a key.
+///
+/// A heap relation has no layout order to declare, so `ORDER BY` on one is an
+/// error rather than a clause quietly dropped.
+///
+/// A standalone `USING buffer` relation is the awkward case: it is RAM plus WAL
+/// with nowhere to flush, so its key is recorded and nothing will ever apply it.
+/// It is required all the same, so that the two engine-managed methods answer
+/// the same DDL identically — a `buffer` table that silently accepted what
+/// `parquet` refuses would be a worse surprise than a key that costs nothing.
 fn build_sort_key(
     order_by: Option<&ast::OneOrManyWithParens<ast::Expr>>,
     access_method: TableAccessMethod,
@@ -4790,8 +4834,9 @@ fn build_sort_key(
             ));
         }
         // The clause parses its elements as bare expressions, so `a DESC` does
-        // not parse and there is no direction or NULL ordering to carry yet.
+        // not parse and there is no direction or NULL ordering to carry.
         // Ascending / NULLS LAST is PG's default for an unqualified key.
+        // TODO: let a layout sort key spell a direction and a NULLS ordering.
         keys.push(IndexKey {
             column,
             descending: false,
@@ -4982,9 +5027,10 @@ fn merge_inherited_columns(
                 format!("relation \"{parent_name}\" would be inherited from more than once"),
             ));
         }
-        // A partitioned parent holds no rows and a partition enforces a bound;
-        // an inheritance child of either would need routing rules this slice
-        // does not have, so both are refused at DDL rather than half-honored.
+        // Not a gap: PostgreSQL refuses an inheritance child of a partitioned
+        // table and of a partition too — `cannot inherit from partitioned
+        // table` / `cannot inherit from partition`, 42809 in the create_table
+        // and alter_table regression tests. The two hierarchies do not mix.
         if parent_schema.partition_scheme.is_some() {
             return Err(PgError::new(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -5003,6 +5049,9 @@ fn merge_inherited_columns(
         // which is not filtered by session, so another session reading a
         // permanent parent would find a temp child it cannot resolve and fail
         // the SELECT outright. Refusing at CREATE keeps that from being built.
+        //
+        // TODO: filter inheritance-descendant discovery by session, so a
+        // temporary table can join a hierarchy as it does in PostgreSQL.
         //
         // Tested before the parent's persistence so a temp/temp hierarchy — the
         // combination this gap is actually about — gets *this* message. The
@@ -5174,8 +5223,11 @@ fn merge_column_into(
 
 /// `CREATE TABLE <child> PARTITION OF <parent> FOR VALUES FROM (...) TO (...)`:
 /// create a leaf partition as an ordinary heap table that inherits the parent's
-/// columns and records its bound. RANGE only; the bound is validated non-empty
-/// and non-overlapping with existing siblings.
+/// columns and records its bound. The bound is validated non-empty and
+/// non-overlapping with existing siblings.
+///
+/// TODO: accept LIST and HASH bounds (`FOR VALUES IN` / `FOR VALUES WITH`) and
+/// `DEFAULT` partitions — only a RANGE `FOR VALUES FROM ... TO` lands here.
 fn execute_create_partition(
     engine: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
@@ -5186,8 +5238,9 @@ fn execute_create_partition(
     temp_schema: &str,
     ctx: &ExecContext,
 ) -> Result<QueryResult, PgError> {
-    // A partition inherits its shape from the parent: no redeclared columns,
-    // constraints, or sub-partitioning in this slice.
+    // A partition inherits its shape from the parent.
+    // TODO: accept a partition's own column and constraint definitions, and
+    // sub-partitioning (`PARTITION BY` on a leaf).
     if !create.columns.is_empty() || !create.constraints.is_empty() {
         return Err(PgError::feature_not_supported(
             "column and constraint definitions on a partition are not supported yet",
@@ -5206,7 +5259,8 @@ fn execute_create_partition(
             format!("\"{parent_name}\" is not partitioned"),
         ));
     };
-    // Only single-column RANGE keys exist so far.
+    // TODO: match a multi-column RANGE bound here; `build_partition_scheme`
+    // accepts a single-column key only, so today this cannot be reached.
     if scheme.key_columns.len() != 1 {
         return Err(PgError::feature_not_supported(
             "multi-column partition keys are not supported yet",
@@ -5350,11 +5404,12 @@ fn execute_create_table_as(
         resolve_create_namespace(engine, schema_qual.as_deref(), &name)?
     };
     // Reject CTAS forms we don't implement rather than silently dropping them.
-    // A table cannot be `OR REPLACE`d; ON COMMIT needs the M2 txn engine; table
-    // constraints / LIKE / CLONE / storage options are not derived from a query.
-    // `PARTITION BY` and `INHERITS` are unimplemented on the plain path too, and
-    // the Redshift trio parses ungated — every one of them would otherwise be
-    // accepted here and thrown away, which is what the plain path refuses to do.
+    // A table cannot be `OR REPLACE`d; table constraints / LIKE / CLONE /
+    // storage options are not derived from a query; `ON COMMIT` is refused on
+    // the plain path too; and `PARTITION BY`, `INHERITS` and the Redshift trio
+    // parse ungated here although PostgreSQL's `CREATE TABLE ... AS` synopsis has
+    // no place for them — every one of them would otherwise be accepted here and
+    // thrown away, which is what the plain path refuses to do.
     if create.or_replace
         || create.on_commit.is_some()
         || !create.constraints.is_empty()
@@ -5556,6 +5611,9 @@ fn execute_create_table_as(
 /// applies. Nothing here models that, and silently enforcing one anyway would be
 /// the opposite of what was asked for, so it is refused. `ENFORCED` is the
 /// default and is accepted as a no-op.
+///
+/// TODO: record a `CHECK ... NOT ENFORCED` constraint and skip applying it, as
+/// PostgreSQL does.
 fn reject_not_enforced(enforced: Option<bool>) -> Result<(), PgError> {
     match enforced {
         Some(false) => Err(PgError::feature_not_supported(
@@ -5984,10 +6042,6 @@ fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
     crabgresql_binder::map_data_type(dt).map_err(PgError::from)
 }
 
-/// Resolve a column's declared type: a built-in, or — when the name is a bare
-/// custom identifier — a `CREATE TYPE` name from the catalog (e.g. an enum),
-/// yielding `PgType::User(oid)`. A bare name that is neither is an
-/// undefined-object error (42704), matching PG (and `resolve_type_ref`).
 /// Refuse to give a stored column a `reg*` type.
 ///
 /// A `reg*` value is an OID, and its whole contract is that the OID keeps
@@ -6022,6 +6076,10 @@ fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
     }
 }
 
+/// Resolve a column's declared type: a built-in, or — when the name is a bare
+/// custom identifier — a `CREATE TYPE` name from the catalog (e.g. an enum),
+/// yielding `PgType::User(oid)`. A bare name that is neither is an
+/// undefined-object error (42704), matching PG (and `resolve_type_ref`).
 pub(crate) fn resolve_column_type(
     type_catalog: &Arc<dyn TypeCatalog>,
     dt: &ast::DataType,
@@ -6122,10 +6180,10 @@ fn type_shape_from_options(
             Opt::Like(name) => {
                 // `LIKE builtin` copies its width and representation; `LIKE
                 // usertype` inherits the user type's width and backing. Only an
-                // unqualified name can resolve — crabgresql has no schema
-                // namespaces, so a schema-qualified target never names a
-                // builtin/user type (cf. `single_object_name`, which likewise
-                // rejects qualified names for the type being created).
+                // unqualified name can resolve — a user type is keyed by bare
+                // name, so a schema-qualified target never names a builtin/user
+                // type (cf. `single_object_name`, which likewise rejects
+                // qualified names for the type being created).
                 let ident = match name.0.as_slice() {
                     [part] => part.as_ident(),
                     _ => None,
@@ -6234,8 +6292,8 @@ fn execute_create_type(
 /// Reject an enum-only `ALTER TYPE` operation targeting a builtin type. Builtins
 /// exist but are never enums, so PG reports `<type> is not an enum`
 /// (WRONG_OBJECT_TYPE) rather than the catalog's "type does not exist" (builtins
-/// are absent from the user-type map). The name is rendered as PG's `format_type_be`
-/// spelling (e.g. `integer`, not `int4`) when known.
+/// are absent from the user-type map). The name is rendered as PG's
+/// `format_type` spelling (e.g. `integer`, not `int4`) when known.
 fn reject_non_enum_builtin(name: &str) -> Result<(), PgError> {
     if crabgresql_catalog::is_builtin_type_name(name) {
         let display =
@@ -6297,8 +6355,10 @@ fn function_internal_name(create: &ast::CreateFunction) -> Result<String, PgErro
 /// The normalized `SELECT <expr>` body text of a `LANGUAGE SQL` function. A
 /// `RETURN expr` / `AS RETURN expr` form becomes `SELECT expr`; an `AS '<body>'`
 /// string is taken verbatim (it is already a `SELECT`); an `AS RETURN (select)`
-/// is rendered from its query. Multi-statement `BEGIN ATOMIC` bodies are not
-/// supported yet. The binder re-parses this text to validate and inline the body.
+/// is rendered from its query. The binder re-parses this text to validate and
+/// inline the body.
+///
+/// TODO: accept a multi-statement `BEGIN ATOMIC ... END` body.
 fn sql_function_body_text(create: &ast::CreateFunction) -> Result<String, PgError> {
     match &create.function_body {
         Some(ast::CreateFunctionBody::Return(expr))
@@ -6572,9 +6632,10 @@ fn execute_create_procedure(
         name,
         kind: RoutineKind::Procedure,
         args,
-        // A procedure declares no return type. There is no `void` here yet, so
-        // a placeholder is stored; nothing reads it, because `RoutineKind`
-        // already tells the interpreter a procedure returns nothing.
+        // A procedure declares no return type, and `RoutineKind` is what tells
+        // the interpreter that, so no call path consults this field.
+        // TODO: store `void` — `PgType` has no such variant, so a procedure's
+        // `pg_proc.prorettype` reads `text` instead.
         ret: TypeRef::Builtin(PgType::Text),
         body: FuncBody::PlPgSql(body_sql),
         volatility: Volatility::Volatile,
@@ -6809,11 +6870,6 @@ fn execute_create_cast(
     })
 }
 
-/// `DROP TABLE name [, ...] [IF EXISTS] [CASCADE|RESTRICT]`. Resolves against the
-/// temp-first overlay so a session temp table is dropped ahead of a same-named
-/// permanent one. All targets are validated before any is dropped, so a multi-name
-/// DROP is atomic like PG. `CASCADE`/`RESTRICT` are accepted and ignored: no object
-/// depends on a table in this engine, so both simply drop the named tables.
 /// `CREATE [OR REPLACE] VIEW name [(cols)] AS <query>`. Binds the defining query
 /// to validate it and derive the output columns, stores the view (as its SELECT
 /// text plus derived columns and surface dependencies), and handles name
@@ -6825,7 +6881,8 @@ fn execute_create_view(
 ) -> Result<QueryResult, PgError> {
     let (schema_qual, name) = split_object_name(&create.name, "relation")?;
     let namespace = resolve_create_namespace(catalog, schema_qual.as_deref(), &name)?;
-    // Reject forms we do not implement rather than silently ignoring them.
+    // TODO: support materialized views and temporary views. Until then the
+    // modifier is refused, never silently ignored.
     if create.materialized {
         return Err(PgError::feature_not_supported(
             "materialized views are not supported yet",
@@ -6976,9 +7033,9 @@ fn check_view_replace_compatible(old: &ViewDefinition, new: &[Column]) -> Result
 /// The surface relation names a query references in FROM position (including
 /// joins, derived tables, nested joins, set operations, and CTE bodies), minus
 /// the names bound by the query's own `WITH` clauses. A view over another view
-/// records the *view* name — the dependency edge `DROP ... CASCADE` walks. NB:
-/// subqueries embedded in expressions (e.g. a scalar subquery in the SELECT
-/// list) are not traced yet.
+/// records the *view* name — the dependency edge `DROP ... CASCADE` walks.
+/// TODO: also trace subqueries embedded in expressions (e.g. a scalar subquery
+/// in the SELECT list); only FROM-position references are collected.
 fn referenced_relations(query: &ast::Query) -> Vec<String> {
     let mut names = Vec::new();
     // The CTE names currently in scope, as a stack: a query's `WITH` names shadow
@@ -7079,6 +7136,12 @@ fn collect_factor_relations(
     }
 }
 
+/// `DROP TABLE name [, ...] [IF EXISTS] [CASCADE|RESTRICT]`. Resolves against
+/// the temp-first overlay so a session temp table is dropped ahead of a
+/// same-named permanent one. All targets are validated before any is dropped,
+/// so a multi-name DROP is atomic like PG. `CASCADE`/`RESTRICT` go through
+/// [`plan_drop_cascade`]: a dependent view or inheritance child blocks the drop
+/// under RESTRICT and is dropped along with the target under CASCADE.
 fn execute_drop_table(
     catalog: &Arc<dyn TableEngine>,
     names: &[ast::ObjectName],
@@ -7519,9 +7582,11 @@ fn build_sequence_definition(
     })
 }
 
-/// `CREATE SEQUENCE [IF NOT EXISTS] name [AS type] [options]`. `OWNED BY` is
-/// accepted and ignored (dependency tracking beyond serial's own sequences is a
-/// v1 gap); temporary sequences are not supported.
+/// `CREATE SEQUENCE [IF NOT EXISTS] name [AS type] [options]`.
+///
+/// TODO: record the `OWNED BY` dependency — it is parsed and ignored, so only
+/// the sequences a `serial` column creates are tracked.
+/// TODO: support `CREATE TEMPORARY SEQUENCE`.
 #[allow(clippy::too_many_arguments)]
 fn execute_create_sequence(
     catalog: &Arc<dyn TableEngine>,
@@ -7572,8 +7637,8 @@ fn execute_create_sequence(
 /// `DROP SEQUENCE name [, ...] [CASCADE|RESTRICT]`. Mirrors [`execute_drop_view`]'s
 /// two-phase validate/drop and wrong-object-type detection. Under RESTRICT a
 /// sequence still owned by a live table's `serial` column is blocked (2BP01);
-/// CASCADE drops it anyway. (Reverse dependencies on *manually* written
-/// `nextval(...)` defaults, which have no OWNED BY link, remain untracked.)
+/// CASCADE drops it anyway. TODO: block a RESTRICT drop on a *manually* written
+/// `nextval(...)` default too — those have no OWNED BY link and are untracked.
 fn execute_drop_sequence(
     catalog: &Arc<dyn TableEngine>,
     names: &[ast::ObjectName],
@@ -7796,9 +7861,11 @@ fn execute_drop_index(
 
 /// `CREATE SCHEMA [IF NOT EXISTS] name`. Registers a user namespace with an
 /// engine-allocated OID. Rejects a `pg_`-prefixed name (reserved for system
-/// schemas, 42939), reports a collision as 42P06 (or a skip NOTICE under
-/// `IF NOT EXISTS`), and does not yet support `AUTHORIZATION` or schema-element
-/// forms.
+/// schemas, 42939), and reports a collision as 42P06 (or a skip NOTICE under
+/// `IF NOT EXISTS`).
+///
+/// TODO: support `CREATE SCHEMA ... AUTHORIZATION` and the schema-element form
+/// (`CREATE SCHEMA s CREATE TABLE ...`).
 fn execute_create_schema(
     engine: &Arc<dyn TableEngine>,
     schema_name: &ast::SchemaName,
@@ -8315,11 +8382,10 @@ fn execute_drop_type(
 }
 
 /// `DROP FUNCTION name [ ( argtypes ) ] [, ...] [IF EXISTS] [CASCADE|RESTRICT]`.
-/// Only `LANGUAGE internal` functions exist in this catalog, but the drop path
-/// is general: each target is resolved by (name, argument types), with the
-/// argument list optional when the name is unambiguous, as in PG. `OUT`
-/// parameters do not contribute to a function's identity, so they are left out
-/// of the lookup signature.
+/// Each target is resolved by (name, argument types), with the argument list
+/// optional when the name is unambiguous, as in PG. `OUT` parameters do not
+/// contribute to a function's identity, so they are left out of the lookup
+/// signature.
 fn execute_drop_function(
     catalog: &GlobalCatalog,
     engine: &Arc<dyn TableEngine>,
@@ -8382,12 +8448,13 @@ fn execute_drop_routine(
         RoutineKind::Procedure => Vec::new(),
     };
     if !dependents.is_empty() {
-        // PostgreSQL's CASCADE drops the dependent constraint / clears the
-        // default. Nothing here can do either — there is no
-        // `ALTER TABLE DROP CONSTRAINT`, no `ALTER COLUMN DROP DEFAULT`, and no
-        // engine method behind them — so CASCADE is refused rather than
-        // reported as done. The alternative is the silent success this guard
-        // exists to remove. CASCADE with no dependents is unaffected.
+        // TODO: implement DROP FUNCTION ... CASCADE — dropping the dependent
+        // constraint / clearing the default, as PostgreSQL does. Nothing here
+        // can do either: there is no `ALTER TABLE DROP CONSTRAINT`, no
+        // `ALTER COLUMN DROP DEFAULT`, and no engine method behind them — so
+        // CASCADE is refused rather than reported as done. The alternative is
+        // the silent success this guard exists to remove. CASCADE with no
+        // dependents is unaffected.
         if cascade {
             return Err(PgError::feature_not_supported(
                 "DROP FUNCTION ... CASCADE is not supported yet",
@@ -8623,7 +8690,7 @@ mod tests {
     #[test]
     fn qualified_like_target_does_not_resolve_and_echoes_full_name() {
         let catalog = GlobalCatalog::new();
-        // `int8` is a builtin, but crabgresql has no schema namespaces, so a
+        // `int8` is a builtin, but a type is keyed by its bare name here, so a
         // schema-qualified target must not resolve to it (PG rejects
         // `public.int8`), and the error echoes the full qualified name.
         let options =

@@ -467,8 +467,11 @@ fn raise_rejects_a_repeated_or_unknown_using_option() {
     );
 }
 
-/// Constructs PostgreSQL has and this rung does not are named rather than
-/// reported as a syntax error — the body is valid PL/pgSQL, just not yet run.
+/// An unimplemented construct is named in a `0A000` error rather than reported
+/// as a syntax error, because the body is valid PL/pgSQL.
+///
+/// TODO: implement EXCEPTION handlers, RETURN NEXT / RETURN QUERY, EXECUTE,
+/// FOREACH, GET DIAGNOSTICS, and FOR over a query.
 #[test]
 fn unsupported_constructs_say_so() {
     for (body, needle) in [

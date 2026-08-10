@@ -1,5 +1,5 @@
-//! `interval`: parsing, output, arithmetic, the justify/age/make constructors,
-//! and the field functions (`date_part`/`extract`/`date_trunc`).
+//! `interval`: parsing, output, arithmetic, the justify/make constructors, and
+//! the field functions (`date_part`/`extract`/`date_trunc`).
 //!
 //! Clean-room (see AGENTS.md): this reproduces PostgreSQL's *observable*
 //! behavior — the `postgres`-style output, the field values, and the
@@ -553,8 +553,8 @@ pub fn range_name(range: u16) -> Option<&'static str> {
 /// `1 year`, to `interval hour` is `1 year 2 mons 3 days 04:00:00`, and to
 /// `interval minute to second(0)` is `1 year 2 mons 3 days 04:05:07`.
 ///
-/// A negative modifier, an unnamed bit combination, or a non-finite value all
-/// leave the interval unchanged.
+/// A negative modifier, a range mask with none of the six field bits set, or a
+/// non-finite value all leave the interval unchanged.
 ///
 /// Rounding is the one step that can fail: a `usec` near the `i64` extreme has
 /// no room for the half-unit the rounding adds, and PG reports that as `interval
@@ -1085,7 +1085,7 @@ fn canonical_unit(unit: &str) -> String {
     .to_string()
 }
 
-// --- input (interval_in, a practical subset) -------------------------------
+// --- input (interval_in) ---------------------------------------------------
 
 /// A time unit a bare number can attach to. `Second` is the default unit for a
 /// number with no field of its own (`interval '1'` is one second).
@@ -1886,6 +1886,11 @@ fn is_iso8601(s: &str) -> bool {
 
 /// Parse an ISO-8601 duration `P[nY][nM][nW][nD][T[nH][nM][nS]]`. The `M`
 /// designator is months before the `T`, minutes after it.
+///
+/// TODO: accept the ISO-8601 alternative format too — `P0002-10-15T10:30:20`,
+/// its basic spelling `P00021015T103020`, and the truncations PG allows
+/// (`P0002`, `PT10`, `PT10:30`) are all `22007` here, where PG reads them as
+/// `2 years 10 mons 15 days 10:30:20` and so on.
 fn parse_iso8601(s: &str, input: &str, acc: &mut Acc) -> Result<(), IntervalError> {
     let mut chars = s[1..].chars().peekable(); // skip leading 'P'
     let mut in_time = false;
@@ -2481,7 +2486,8 @@ mod tests {
             ("0.000001 sec", "@ 0.000001 secs"),
             ("1 year", "@ 1 year"),
             ("-1 year -2 mons", "@ 1 year 2 mons ago"),
-            // A mixed-sign span keeps its per-field signs, and `-1` pluralizes.
+            // A mixed-sign span keeps its per-field signs, and `-1` pluralizes
+            // every unit but seconds, which PG makes singular on the magnitude.
             ("1 mon -1 day", "@ 1 mon -1 days"),
             ("1 day -1 hour", "@ 1 day -1 hours"),
             ("1 day -1 sec", "@ 1 day -1 sec"),

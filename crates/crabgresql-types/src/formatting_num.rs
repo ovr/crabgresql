@@ -7,9 +7,17 @@
 //! Supported codes: `9 0 . D , G S MI PL SG PR L V RN EEEE TH/th FM`, plus
 //! `"quoted"` text and passthrough of anything else. `B` (blank-when-zero) and
 //! `C` (ISO currency) are recognized so they do not print as literal letters,
-//! but they always render as nothing — a divergence for `B` over a zero value.
+//! but they always render as nothing. For `B` that is PG's behavior too: it
+//! prints a zero value identically with and without it, `to_char(0, 'B0999')`
+//! is ` 0000` either way.
 //!
-//! Locale is fixed to PG's `C` locale: `L` is `$`, `D` is `.` and `G` is `,`.
+//! `L`, `D` and `G` are fixed to `$`, `.` and `,`, the glyphs PG prints under a
+//! `$`-currency locale.
+//!
+//! TODO: resolve `L` from `lc_monetary` and `D`/`G` from `lc_numeric`. PG
+//! prints a blank, not `$`, for `L` under `lc_monetary = C` — `to_char(123,
+//! 'L999')` is `  123` there against `$ 123` under a `$` locale — and swaps
+//! `D`/`G` to `,`/`.` under `lc_numeric = de_DE.UTF-8`.
 //!
 //! The layout is two-phase, because zero suppression and the *floating* sign
 //! both depend on the whole field: [`parse_format`] measures the picture, then

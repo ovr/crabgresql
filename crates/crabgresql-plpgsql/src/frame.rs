@@ -97,8 +97,8 @@ impl Frame {
             slot.constant = false;
             slot.not_null = false;
         }
-        // The first slot initialized as a bool named nothing is FOUND; the
-        // interpreter tells us explicitly instead of guessing.
+        // Nothing here infers which slot holds FOUND from its type or its
+        // empty name: the interpreter names that slot with `track_found`.
     }
 
     /// Record a declaration's modifiers after its initializer has run, so the

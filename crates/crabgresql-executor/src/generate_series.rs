@@ -52,8 +52,9 @@ pub enum Series {
         tz: bool,
         done: bool,
     },
-    /// A NULL bound/step produces no rows. Carries the element type only so the
-    /// (empty) column shape is irrelevant — nothing is yielded.
+    /// No rows at all: a NULL bound/step, and the empty cases of the other
+    /// set-returning functions that reuse [`Series`]. Carries nothing, since
+    /// nothing is yielded and the column type comes from the plan.
     Empty,
     /// A pre-computed sequence of values (e.g. `jsonb_path_query`'s matches),
     /// yielded one per row. Lets a set-returning function that isn't a lazy range
@@ -130,7 +131,6 @@ impl Series {
                 if *done {
                     return Ok(None);
                 }
-                // forward → cur <= stop; backward → cur >= stop.
                 let in_range = if *forward {
                     cur.cmp(stop) != Ordering::Greater
                 } else {
@@ -172,8 +172,8 @@ impl Series {
                     Value::Timestamp(*cur)
                 };
                 // Advance eagerly: PG computes the successor before yielding, so
-                // an overflow aborts this call (the row is not emitted) — matching
-                // `generate_series_timestamp`'s `22008 "timestamp out of range"`.
+                // an overflow aborts this call (the row is not emitted) and the
+                // series reports `22008 "timestamp out of range"`.
                 match timestamp::pl_interval(*cur, *step) {
                     Ok(next) => {
                         *cur = next;

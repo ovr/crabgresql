@@ -1,9 +1,10 @@
 //! Volcano (iterator) executor.
 //!
-//! Nodes: `Values`, `SeqScan`, `Filter`, `Projection`; expression evaluation
-//! lives in [`eval`]. DML (INSERT/UPDATE/DELETE) runs as plain functions
-//! rather than plan nodes: it yields a row count, and — with `RETURNING` — a
-//! row stream projected over the affected tuples the function already owns.
+//! Scan, filter, projection, join, aggregate, window, sort/distinct and limit
+//! nodes; expression evaluation lives in [`eval`]. DML (INSERT/UPDATE/DELETE)
+//! runs as plain functions rather than plan nodes: it yields a row count, and
+//! — with `RETURNING` — a row stream projected over the affected tuples the
+//! function already owns.
 
 mod agg;
 mod checks;
@@ -60,7 +61,10 @@ use unique::UniqueKeySet;
 /// The sequence functions take a possibly schema-qualified name. `namespace` is
 /// the schema written by the caller (e.g. `nextval('app.s')`), or `None` when the
 /// reference was unqualified — the implementation resolves `None` to its default
-/// schema (`public` until a real search_path lands).
+/// schema.
+///
+/// TODO: resolve an unqualified sequence name through `search_path`; the
+/// implementation always answers `public`.
 pub trait SequenceOps: Send + Sync {
     /// Advance the sequence and return its new value. Errors: 42P01 (no such
     /// sequence), 2200H (reached min/max with `NO CYCLE`).
@@ -464,9 +468,11 @@ pub enum Execution {
     /// than `SELECT n`. RETURNING is scalar one-in/one-out (the binder rejects
     /// aggregates and set-returning functions), so the streamed row count is one
     /// per affected row. It can still exceed the count `update_many`/`delete_many`
-    /// actually applied when a matched row is skipped as non-live at write time;
-    /// that cross-transaction reconciliation arrives with the isolation work
-    /// (see [`execute_update`]).
+    /// actually applied when a matched row is skipped as non-live at write time.
+    ///
+    /// TODO: reconcile the RETURNING row count with the rows actually written,
+    /// which needs cross-transaction write-conflict resolution (see
+    /// [`update_direct`]).
     ReturningRows {
         columns: Vec<OutputColumn>,
         node: Box<dyn ExecNode>,
@@ -623,8 +629,9 @@ pub fn execute(
             distinct,
         } => {
             // Stream the source's rows straight into this level's pipeline. A
-            // single FROM reference needs no materialization; buffering waits
-            // for multi-reference CTEs and joins.
+            // single FROM reference needs no materialization.
+            // TODO: materialize a CTE referenced more than once, instead of
+            // re-running its body at every reference.
             let source = subquery_source(*source, ctx, txn)?;
             project_pipeline(source, projections, predicate, sort, distinct, columns, ctx)
         }
@@ -1288,12 +1295,16 @@ fn scalar_subquery_value(
 }
 
 /// Evaluate a *correlated* subquery marker for one outer `row`: the per-row
-/// counterpart of `fold_subquery`. The subplan is cloned, its outer references
-/// filled from `row` (via `crabgresql_binder::substitute_outer`), then run and
-/// folded to a value — a scalar to its single value, `EXISTS` to a bool, and
-/// `IN (…)` to the outer needle's membership (evaluated against `row`). Called
-/// from `eval` when it reaches a marker `resolve_subqueries` left in place, which
-/// only happens under a real `execute`, so `ctx.txn` is present.
+/// counterpart of `fold_subquery`. The value is a scalar subquery's single
+/// value, `EXISTS` as a bool, or a quantified `IN`/`op ANY`/`op ALL` as the
+/// comparison's answer for the outer needle (evaluated against `row`). Getting
+/// it need not run the subplan for this row: a hashed `EXISTS` probes a table
+/// built once for the whole statement, and a memo hit reuses the answer an
+/// earlier row with the same correlation key produced. Only when neither
+/// applies is the subplan cloned, its outer references filled from `row` (via
+/// `crabgresql_binder::substitute_outer`), and re-executed. Called from `eval`
+/// when it reaches a marker `resolve_subqueries` left in place, which only
+/// happens under a real `execute`, so `ctx.txn` is present.
 pub(crate) fn eval_correlated_subquery(
     marker: &BoundExpr,
     row: &[Value],
@@ -1305,8 +1316,8 @@ pub(crate) fn eval_correlated_subquery(
             "correlated subquery evaluated without a transaction context",
         )
     })?;
-    // Every correlated marker carries a subplan; clone it and fill its outer
-    // references from the current `row` once, then interpret per marker kind.
+    // Every correlated marker carries a subplan; read it out once, since each
+    // of the three paths below — hashed, memoized, re-run — starts from it.
     let subplan = match marker {
         BoundExpr::ScalarSubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
@@ -1613,10 +1624,6 @@ fn substitute_hole(
     }
 }
 
-/// Wrap a source node in the standard `Filter -> Projection -> Sort` tail and
-/// package it as a streamable result set. Shared by table scans, subquery
-/// sources, and set-returning functions (every SELECT-shaped plan with a
-/// projection list).
 #[allow(clippy::too_many_arguments)]
 /// A pipeline's row source, before it is decided how far up the columnar
 /// segment reaches.
@@ -1847,6 +1854,10 @@ fn append_source(
     })
 }
 
+/// Wrap a source node in the standard `Filter -> Projection -> Sort` tail and
+/// package it as a streamable result set. Shared by table scans, subquery
+/// sources, and set-returning functions (every SELECT-shaped plan with a
+/// projection list).
 fn project_pipeline(
     source: Source,
     projections: Vec<BoundExpr>,
@@ -2560,9 +2571,11 @@ fn update_inherited(
 /// The scan sees `txn`'s snapshot, and the new versions it writes carry `txn`'s
 /// command id, so the statement never re-visits rows it wrote itself (no
 /// Halloween problem). A row that vanished under us (`NotFound`) is skipped, not
-/// counted. Cross-transaction write-write conflicts still resolve last-writer-
-/// wins here — EvalPlanQual (READ COMMITTED) and the 40001 abort (REPEATABLE
-/// READ) that make this correct arrive with the isolation work (P6).
+/// counted. Cross-transaction write-write conflicts resolve last-writer-wins.
+///
+/// TODO: re-check a concurrently updated row against the new version under READ
+/// COMMITTED (EvalPlanQual) and raise the 40001 serialization failure under
+/// REPEATABLE READ, instead of letting the last writer win.
 #[allow(clippy::too_many_arguments)]
 fn update_direct(
     table: &Arc<dyn TableAm>,
@@ -3052,7 +3065,7 @@ fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
         .join(", ")
 }
 
-/// See the concurrency note on [`execute_update`].
+/// See the concurrency note on [`update_direct`].
 /// DELETE dispatch: an ordinary table deletes from its own storage
 /// ([`delete_direct`]); a partitioned parent scans every leaf and deletes matching
 /// rows from whichever leaf holds them ([`delete_routed`]).
@@ -4245,12 +4258,15 @@ impl ExecNode for Aggregate {
 /// order of the last spec evaluated. The query's own `ORDER BY`, when it has one,
 /// runs above this node and re-sorts.
 ///
-/// Only the default frame (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`)
-/// is supported, which needs just two evaluation strategies, both O(n) per
-/// partition: with no `ORDER BY` every row is a peer of every other, so an
-/// aggregate is the whole-partition total; with one, the frame runs through the
-/// current row's last *peer*, so it is a running total that only advances at a
-/// peer-group boundary. Explicit frames are refused at bind time.
+/// The default frame (`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`)
+/// needs just two evaluation strategies, both O(n) per partition: with no
+/// `ORDER BY` every row is a peer of every other, so an aggregate is the
+/// whole-partition total; with one, the frame runs through the current row's
+/// last *peer*, so it is a running total that only advances at a peer-group
+/// boundary.
+///
+/// TODO: evaluate explicit window frames (ROWS/RANGE/GROUPS bounds and
+/// EXCLUDE); anything but the default frame is rejected at bind time.
 pub struct WindowAgg {
     rows: std::vec::IntoIter<Tuple>,
 }
@@ -4626,7 +4642,8 @@ impl ExecNode for Append {
 /// each child fully, in order, before advancing to the next. Unlike [`Append`],
 /// the children are already-projected `ExecNode` arms, so rows are pulled through
 /// the Volcano `next()` rather than by flattening iterators. `UNION`
-/// deduplication and ORDER BY are applied by the wrapping Subquery pipeline.
+/// deduplication and ORDER BY belong to the `SetOp` node itself and are layered
+/// on top of this one.
 pub struct Concat {
     children: Vec<Box<dyn ExecNode>>,
     cursor: usize,
@@ -4654,7 +4671,7 @@ impl ExecNode for Concat {
 }
 
 /// Equality index scan: probes the engine's physical index for the key. When
-/// the engine cannot serve it (durable heap engine, an index whose key type it
+/// the engine cannot serve it (a columnar engine, an index whose key type it
 /// cannot physically index, a system catalog) it falls back to a full scan and
 /// re-checks key equality per row, which is what makes that fallback correct.
 /// The physical-index path is already exact (the engine returns only rows whose
@@ -4927,8 +4944,8 @@ impl ExecNode for ProjectSet {
     }
 }
 
-/// Build the range iterator for a target-list SRF (`generate_series` or
-/// `jsonb_path_query`).
+/// Build the [`Series`] a target-list SRF (`generate_series`, `unnest` or
+/// `jsonb_path_query`) yields.
 fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
     match func {
         TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
@@ -6998,8 +7015,9 @@ mod tests {
 
     #[test]
     fn generate_series_numeric_infinite_bounds_error_22023() {
-        // Infinite bounds/step are rejected (bounds "cannot be infinity", the
-        // step "cannot be infinite") rather than looping forever.
+        // Infinite numeric bounds and step are rejected rather than looping
+        // forever, all three with "cannot be infinity" (only the interval-step
+        // overload says "cannot be infinite").
         for (sql, msg) in [
             (
                 "SELECT generate_series('infinity'::numeric, 3)",
@@ -7233,7 +7251,6 @@ mod tests {
 
     #[test]
     fn aggregate_over_values_in_from() {
-        // count/sum over an inline VALUES relation in FROM.
         let (_c, rows) = run_rows("SELECT count(*), sum(x) FROM (VALUES (1), (2), (3)) v(x)");
         assert_eq!(rows, vec![vec![Value::Int8(3), Value::Int8(6)]]);
     }
@@ -7250,7 +7267,6 @@ mod tests {
 
     #[test]
     fn aggregate_over_set_returning_function() {
-        // count/sum over generate_series() as a FROM set-returning function.
         let (_c, rows) =
             run_rows("SELECT count(*), sum(generate_series) FROM generate_series(1, 3)");
         assert_eq!(rows, vec![vec![Value::Int8(3), Value::Int8(6)]]);

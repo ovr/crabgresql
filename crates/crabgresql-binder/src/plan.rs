@@ -37,7 +37,11 @@ use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
 
 /// Split a relation name into an optional schema qualifier and the relation
 /// name. `t` → `(None, "t")`; `pg_catalog.pg_type` → `(Some("pg_catalog"),
-/// "pg_type")`. A three-or-more-part name (cross-database) is still unsupported.
+/// "pg_type")`.
+///
+/// TODO: accept a three-part `db.schema.rel` name whose first part names the
+/// database the session is connected to — PG resolves that spelling and rejects
+/// only a reference to a *different* database.
 fn split_relation_name(name: &ast::ObjectName) -> Result<(Option<String>, String), BindError> {
     let idents: Vec<&ast::Ident> = name.0.iter().filter_map(|p| p.as_ident()).collect();
     if idents.len() != name.0.len() {
@@ -112,8 +116,9 @@ fn resolve_write_table(
     };
     let table = table.map_err(|e| {
         // A write whose target is a view is rejected as non-updatable rather than
-        // "relation does not exist": crabgresql has no auto-updatable-view or
-        // INSTEAD OF trigger support yet.
+        // "relation does not exist".
+        // TODO: auto-updatable views and INSTEAD OF triggers, which are what
+        // would let a write to a view reach a base relation instead.
         if matches!(e, StorageError::TableNotFound(_))
             && engine
                 .resolve_view(schema.as_deref(), &table_name)
@@ -470,9 +475,9 @@ fn open_write_relation(
             "target is not supported yet: {relation}"
         )));
     };
-    // A partitioned parent is a valid UPDATE/DELETE target: the executor routes
-    // through its leaves (each binder captures them via `partition_leaves`), so —
-    // unlike before — the parent is not rejected here.
+    // A partitioned parent is a valid UPDATE/DELETE target, so it is not
+    // rejected here: the executor routes through its leaves, which each binder
+    // captures via `partition_leaves`.
     let (table, table_name) = resolve_write_table(engine, name, verb)?;
     let qualifier = aliased_qualifier(alias, table_name)?;
     Ok((table, qualifier, *only))
@@ -1002,9 +1007,9 @@ fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
             // hold references of its own, correlating one of its nested
             // subqueries to its own relations; those sit below a marker, so
             // they are visited at a deeper `depth` than their `level` and left
-            // alone.) LATERAL is the one future feature that would bind a FROM
-            // subquery against the enclosing scope and so need the `depth + 1`
-            // back here.
+            // alone.)
+            // TODO: LATERAL — it binds a FROM subquery against the enclosing
+            // scope, so it needs the `depth + 1` back here.
             JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth),
             JoinInput::TableFunction { args, .. } => {
                 for e in args.iter_mut() {
@@ -1736,8 +1741,9 @@ fn attach_sort(plan: LogicalPlan, sort: Vec<SortKey>, columns: Vec<OutputColumn>
     }
 }
 
-/// Bind a `UNION` / `UNION ALL` set operation. `INTERSECT` / `EXCEPT` are not
-/// supported yet.
+/// Bind a `UNION` / `UNION ALL` set operation.
+///
+/// TODO: bind `INTERSECT` and `EXCEPT`; both are rejected as unsupported.
 ///
 /// A chain of equivalent operations is flattened into one N-ary
 /// [`LogicalPlan::SetOp`] rather than nested pairs. The parser builds set
@@ -2016,9 +2022,9 @@ fn unify_set_columns(
             None => (None, crate::collation::Strength::None),
         };
         // A modifier survives a set operation only when every contributing arm
-        // declares the same one on the same type, as PG's `select_common_typmod`
-        // requires: `varchar(20) UNION varchar(20)` stays `character
-        // varying(20)`, `varchar(20) UNION char(5)` goes bare.
+        // declares the same one on the same type, which is how PG resolves a
+        // set operation's common modifier: `varchar(20) UNION varchar(20)`
+        // stays `character varying(20)`, `varchar(20) UNION char(5)` goes bare.
         let merged_typmod = crate::expr::common_typmod(
             arms.iter()
                 .filter(|(plan, _)| !is_null_literal_column(plan, i))
@@ -2198,10 +2204,12 @@ fn all_column_distinct_keys(columns: &[OutputColumn]) -> Vec<DistinctKey> {
         .collect()
 }
 
-/// Fold a `LIMIT`/`OFFSET` clause into constant row counts. PG evaluates these as
-/// `bigint` expressions; we support constant integers (the only form the tests
-/// and typical queries need). `LIMIT ALL`, a `NULL` count, or an absent clause
-/// all mean "no bound" (`None`). Negative counts are rejected with PG's wording.
+/// Fold a `LIMIT`/`OFFSET` clause into constant row counts. `LIMIT ALL`, a
+/// `NULL` count, or an absent clause all mean "no bound" (`None`). Negative
+/// counts are rejected with PG's wording.
+///
+/// TODO: evaluate a non-constant count; PG binds `LIMIT`/`OFFSET` as an
+/// ordinary `bigint` expression, while only a constant integer folds here.
 fn bind_limit_offset(
     clause: &ast::LimitClause,
     catalog: &Arc<dyn TypeCatalog>,
@@ -2300,8 +2308,11 @@ fn const_i64(expr: &ast::Expr) -> Option<Option<i64>> {
 }
 
 /// Bind a `WITH` clause into a fresh environment layered on `outer`. CTEs bind in
-/// order, each seeing earlier siblings; recursion and `WITH` on data-modifying
-/// bodies are not yet supported. Duplicate names within one clause are rejected.
+/// order, each seeing earlier siblings. Duplicate names within one clause are
+/// rejected.
+///
+/// TODO: `WITH RECURSIVE`, and a data-modifying CTE body (`INSERT`/`UPDATE`/
+/// `DELETE` inside `WITH`).
 fn bind_ctes(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -2483,8 +2494,13 @@ fn aggregate_identity_projection(agg: &Aggregation) -> Vec<BoundExpr> {
 /// fire whether or not the definition is ever referenced, as in PG.
 ///
 /// The bodies are still bound lazily, so an *unreferenced* definition's
-/// expressions are not column-checked — a deliberate gap, since eagerly binding
-/// one would reject frames PG accepts. See the window notes in the smoke suite.
+/// expressions are not column-checked, where PG raises `42703` for one naming a
+/// missing column. Binding eagerly instead would reject the explicit frames PG
+/// accepts and this build does not implement — the worse error. See the window
+/// notes in the smoke suite.
+///
+/// TODO: column-check an unreferenced `WINDOW` definition, which needs explicit
+/// frames to bind rather than error first.
 fn named_windows(select: &ast::Select) -> Result<NamedWindows, BindError> {
     let mut map = std::collections::HashMap::new();
     for ast::NamedWindowDefinition(name, definition) in &select.named_window {
@@ -2887,9 +2903,10 @@ fn bind_from_item(
                     "WITH OFFSET is not supported yet",
                 ));
             }
-            // Multiple arrays unnest side by side (padded to the longest); only
-            // the single-array form is supported, matching `resolve_unnest`. The
-            // parser requires at least one argument, so this is the `> 1` case.
+            // TODO: unnest several arrays side by side, padding the short ones
+            // to the longest as PG does — `resolve_unnest` binds only the
+            // single-array form. The parser requires at least one argument, so
+            // this is the `> 1` case.
             if array_exprs.len() > 1 {
                 return Err(BindError::feature_not_supported(
                     "unnest with multiple arrays is not supported yet",
@@ -3781,9 +3798,11 @@ fn bind_values_query(
         })
         .collect();
 
-    // A standalone VALUES list has no projection tuple to append hidden sort
-    // columns to (cells evaluate against an empty row), so only ordinals and
-    // `columnN` names resolve; expressions stay `0A000`.
+    // TODO: ORDER BY expressions over a standalone VALUES list, which PG answers
+    // (`VALUES (1),(2) ORDER BY column1 * 2`). There is no projection tuple to
+    // append hidden sort columns to here — the cells evaluate against an empty
+    // row — so only ordinals and `columnN` names resolve and an expression is
+    // `0A000`.
     let sort = bind_order_by(order_by, &columns, &scope, &mut Vec::new(), false)?;
     Ok(LogicalPlan::Values(ValuesPlan {
         columns,
@@ -3796,9 +3815,9 @@ fn bind_values_query(
 
 /// The output columns a query plan produces (for CTE/derived-table schemas,
 /// and the extended protocol's `Describe`, which needs a statement's
-/// `RowDescription` without executing it). A data-modifying plan has no result
-/// row shape (no `RETURNING` yet) and returns an error the caller treats as
-/// "NoData".
+/// `RowDescription` without executing it). A data-modifying plan without a
+/// `RETURNING` clause has no result row shape and returns an error the caller
+/// treats as "NoData".
 pub fn output_columns_of(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, BindError> {
     match plan {
         LogicalPlan::Values(ValuesPlan { columns, .. })
@@ -3945,10 +3964,11 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
-/// `WITH ORDINALITY` adds a trailing bigint column; unsupported for now — reject
-/// rather than silently drop it (which would return the wrong number of columns,
-/// and would quietly defeat the single-column rename in [`bound_table_fn_item`]).
-/// Shared so every function-in-FROM spelling rejects it identically.
+/// TODO: `WITH ORDINALITY`, which adds a trailing bigint column numbering the
+/// function's rows. It is rejected rather than silently dropped: dropping it
+/// would return the wrong number of columns, and would quietly defeat the
+/// single-column rename in [`bound_table_fn_item`]. Shared so every
+/// function-in-FROM spelling rejects it identically.
 fn reject_with_ordinality(with_ordinality: bool) -> Result<(), BindError> {
     if with_ordinality {
         return Err(BindError::feature_not_supported(
@@ -4068,9 +4088,12 @@ fn apply_relation_alias_columns(
 
 /// Rename a rowset's columns from an alias column list (`t(a, b, c)`). As in PG,
 /// the list may be shorter than the rowset — the leading columns are renamed and
-/// the rest keep their names — but a longer list is an error. Per-column type
-/// annotations are not supported. `subject` is the relation phrasing PG uses in
-/// the column-count error (see [`table_subject`] / [`with_query_subject`]).
+/// the rest keep their names — but a longer list is an error. `subject` is the
+/// relation phrasing PG uses in the column-count error (see [`table_subject`] /
+/// [`with_query_subject`]).
+///
+/// TODO: an alias column-definition list carrying types (`f(a int, b text)`),
+/// which PG requires to give a record-returning function its row shape.
 fn apply_alias_columns(
     columns: &mut [OutputColumn],
     alias_columns: &[ast::TableAliasColumnDef],
@@ -4360,9 +4383,11 @@ fn reject_unsupported_query_clauses(query: &ast::Query) -> Result<(), BindError>
 }
 
 fn reject_unsupported_select_clauses(select: &ast::Select) -> Result<(), BindError> {
-    // GROUP BY and HAVING are handled by the aggregation binder; only the
+    // GROUP BY and HAVING are handled by the aggregation binder, so only the
     // grouping-set extensions (ROLLUP / CUBE / GROUPING SETS / GROUP BY ALL)
-    // remain unsupported.
+    // reach this check.
+    //
+    // TODO: GROUP BY ROLLUP, CUBE and GROUPING SETS.
     let grouping_sets_unsupported = match &select.group_by {
         ast::GroupByExpr::Expressions(_, modifiers) => !modifiers.is_empty(),
         ast::GroupByExpr::All(_) => true,
@@ -4556,10 +4581,6 @@ struct Aggregation {
     having: Option<BoundExpr>,
 }
 
-/// Bind a SELECT's projection list, WHERE and ORDER BY against the in-scope
-/// relation(s). One relation for a single-table SELECT / subquery / SRF, more
-/// for a cross join — `scope` handles wildcard expansion and column resolution
-/// uniformly across however many relations it holds.
 /// Bind a target list (a SELECT projection or a `RETURNING` list) against
 /// `scope`, expanding `*`/`t.*` and naming each output column by its alias or
 /// derived name. Shared by SELECT and RETURNING, which have identical shape.
@@ -4627,6 +4648,10 @@ fn bind_returning(
     Ok(Some(bound))
 }
 
+/// Bind a SELECT's projection list, WHERE and ORDER BY against the in-scope
+/// relation(s). One relation for a single-table SELECT / subquery / SRF, more
+/// for a cross join — `scope` handles wildcard expansion and column resolution
+/// uniformly across however many relations it holds.
 fn bind_select_body(
     select: &ast::Select,
     order_by: &Option<ast::OrderBy>,
@@ -5488,8 +5513,10 @@ fn rewrite_over_aggregate(
                 .transpose()?;
             Ok(BoundExpr::Case { whens, else_, ty })
         }
-        // A set-returning function combined with aggregation is not meaningful
-        // (PG: "set-returning functions are not allowed in ..."); reject cleanly.
+        // TODO: expand a set-returning function in the target list of a grouped
+        // query. PG computes SRFs *after* aggregation, so
+        // `SELECT a, count(*), unnest('{1,1,3}'::int[]) ... GROUP BY a` returns
+        // one row per generated element (upstream regression test `tsrf`).
         BoundExpr::Srf { .. } => Err(BindError::feature_not_supported(
             "set-returning functions with aggregation are not supported yet",
         )),
@@ -5500,6 +5527,10 @@ fn rewrite_over_aggregate(
         // node's output row (`[group keys, aggregates]`), so the indices would not
         // line up. (A correlated subquery in WHERE is unaffected — that predicate
         // runs before aggregation, over the base row, and never reaches here.)
+        //
+        // TODO: rebase an `OuterColumnRef` onto the aggregate's output row so a
+        // correlated subquery can appear in the target list or HAVING of a
+        // grouped query, which PG answers.
         c @ (BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. }) => {
             reject_correlated_over_aggregate(&c)?;
             Ok(c)
@@ -5787,7 +5818,7 @@ pub fn bind_insert_with_params(
                 ));
             }
             // With an explicit column list PG requires an exact match; without
-            // one, missing trailing columns default to NULL.
+            // one, missing trailing columns take their column defaults.
             if !default_values_form && explicit_columns && value_row.len() < target_indices.len() {
                 return Err(BindError::syntax(
                     "INSERT has more target columns than expressions",
@@ -5911,10 +5942,10 @@ impl CopyFormat {
 
 /// Where a bound COPY reads its row bytes from.
 ///
-/// PostgreSQL restricts the file form to superusers (or `pg_read_server_files`);
-/// this project has no role system yet, so the read is unconditional — a
-/// deliberate, documented divergence. Relative paths, which PG resolves against
-/// the data directory, are rejected instead (see the server's file reader).
+/// TODO: restrict the file form to superusers (or `pg_read_server_files`) the
+/// way PostgreSQL does — there is no role system to check against, so the read
+/// is unconditional. Relative paths, which PG resolves against the data
+/// directory, are rejected rather than resolved (see the server's file reader).
 #[derive(Clone, Debug)]
 pub enum CopyFromSource {
     /// `FROM STDIN`: the bytes stream in over the wire's copy-in sub-protocol.
@@ -6115,11 +6146,12 @@ impl CopyFromPlan {
     }
 }
 
-/// Bind `COPY <table> [(cols)] FROM {STDIN | '<file>'} [WITH (…)]`. Rejects the
-/// forms not yet supported (`COPY TO`, a query source, `FROM PROGRAM`, binary
-/// format) with the matching error, resolves the write target and column list
-/// the same way INSERT does, and resolves the text/CSV options into a
-/// [`CopyFormat`].
+/// Bind `COPY <table> [(cols)] FROM {STDIN | '<file>'} [WITH (…)]`. Resolves the
+/// write target and column list the same way INSERT does, and resolves the
+/// text/CSV options into a [`CopyFormat`].
+///
+/// TODO: `COPY TO`, a query source (`COPY (SELECT …)`), `FROM PROGRAM` and the
+/// binary format; each is rejected here with its own error.
 pub fn bind_copy_from(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -6477,7 +6509,8 @@ fn single_byte(c: char, what: &str) -> Result<u8, BindError> {
     }
 }
 
-/// COPY only speaks UTF-8; any other `ENCODING` is an honest not-supported.
+/// TODO: decode COPY input in an `ENCODING` other than UTF8, which needs
+/// server-side encoding conversion. Rejected rather than mis-decoded silently.
 fn require_utf8(enc: &str) -> Result<(), BindError> {
     let e = enc.to_ascii_uppercase().replace(['-', '_'], "");
     if e == "UTF8" {

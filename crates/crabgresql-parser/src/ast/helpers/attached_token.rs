@@ -76,7 +76,6 @@ use sqlparser_derive::{Visit, VisitMut};
 /// assert_ne!(tok1, tok2); // token with locations are *not* equal
 /// assert_eq!(AttachedToken(tok1), AttachedToken(tok2)); // attached tokens are
 /// ```
-/// // period @ line 2, column 20
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -89,14 +88,12 @@ impl AttachedToken {
     }
 }
 
-// Conditional Implementations
 impl Debug for AttachedToken {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-// Blanket Implementations
 impl PartialEq for AttachedToken {
     fn eq(&self, _: &Self) -> bool {
         true
@@ -119,7 +116,8 @@ impl Ord for AttachedToken {
 
 impl Hash for AttachedToken {
     fn hash<H: Hasher>(&self, _state: &mut H) {
-        // Do nothing
+        // `eq` is unconditionally true, so hashing the wrapped token would
+        // give equal values different hashes and break the Hash/Eq contract.
     }
 }
 

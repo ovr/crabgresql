@@ -145,8 +145,8 @@ fn pg_typeof_reports_the_type_and_keeps_the_argument() -> anyhow::Result<()> {
     );
 
     // An aggregate inside the argument is still visible to the extraction
-    // pass, so the query groups instead of scanning. `agg_of` panics if the
-    // plan is not an Aggregate, which is exactly the regression to catch.
+    // pass, so the query groups instead of scanning. `agg_of` errors out if
+    // the plan is not an Aggregate, which is exactly the regression to catch.
     let (_, aggregates, _, _) = agg_of("SELECT pg_typeof(count(*)) FROM t")?;
     assert_eq!(aggregates.len(), 1);
     // ... and a bare column beside a grouped one is still the GROUP BY error.

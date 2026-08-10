@@ -8,18 +8,25 @@
 //! identifier, a dollar-quoted body or a comment, and `::` is a cast rather
 //! than a variable because `:` is not a valid variable character.
 //!
-//! Two divergences from psql are deliberate:
+//! Two divergences from psql:
 //!
-//! 1. **Substitution runs after statement splitting.** psql pushes a
-//!    plain-`:var` expansion back onto its input and rescans it, so a value
-//!    containing `;` splits into two statements; here it stays one. The
-//!    vendored corpus never puts a `;` in a plain-`:var` value —
-//!    `largeobject.sql`'s `\set dobody 'DECLARE loid oid; BEGIN '` is only ever
-//!    consumed through the quoted `:'dobody'` form, which psql does not rescan
-//!    either. [`substitute_is_not_rescanned`] pins the current behavior.
-//! 2. **Single-quoted metacommand arguments decode only `\'` and `\\`.** psql
-//!    also decodes `\n`, `\t`, `\xNN` and octal escapes there. No argument in
-//!    the corpus uses those.
+//! 1. **Substitution runs after statement splitting.** This one is deliberate:
+//!    psql pushes a plain-`:var` expansion back onto its input and rescans it,
+//!    so a value containing `;` splits into two statements; here it stays one.
+//!    `update.sql`'s `:init_range_parted;` is the corpus case — it expands to
+//!    `truncate …; insert …`, which the server accepts as a multi-statement
+//!    simple query, and the printed output is the same either way because
+//!    command tags are suppressed. (`largeobject.sql`'s `dobody` also holds a
+//!    `;`, but reaches statement text only through the quoted `:'dobody'`
+//!    form, which psql does not rescan either.)
+//!    [`substitute_is_not_rescanned`] pins the current behavior.
+//! 2. **Single-quoted metacommand arguments decode only `\'` and `\\`.**
+//!    TODO: decode `\n`, `\t`, `\xNN` and octal escapes in single-quoted
+//!    metacommand arguments, as psql does. The only corpus arguments that
+//!    need them are `psql.sql`'s CSV field separators (`\pset csv_fieldsep
+//!    '\0' / '\n' / '\r'` and `\g (format=csv csv_fieldsep='\t')`), and this
+//!    runner renders no CSV output at all, so no expected file depends on the
+//!    decoding.
 
 use std::collections::BTreeMap;
 
@@ -49,8 +56,9 @@ impl Variables {
     }
 }
 
-/// psql's `VALID_VARIABLE_CHARS`. Notably excludes `:`, which is what keeps
-/// `a::int` a cast rather than a reference to a variable named `:int`.
+/// The characters psql accepts in a variable name. Notably excludes `:`, which
+/// is what keeps `a::int` a cast rather than a reference to a variable named
+/// `:int`.
 fn is_variable_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }

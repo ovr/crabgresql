@@ -235,8 +235,12 @@ impl Suite {
                 }
                 continue;
             }
-            // Sections of one query may be written in any order, so find it by
-            // number rather than assuming it is the one most recently pushed.
+            // A section lands in the most recently pushed query, not in the
+            // one its marker names, so a query's sections have to stay
+            // together in the file: `-- Q15 teardown` written after `-- Q22`
+            // would land in Q22's.
+            // TODO: attach a `-- Qn setup`/`teardown` to the query numbered n
+            // wherever it sits in the file, not to the last one pushed.
             let Some(current) = queries.last_mut() else {
                 continue;
             };
@@ -315,7 +319,7 @@ fn is_all_comments(sql: &str) -> bool {
         .all(|line| line.is_empty() || line.starts_with("--"))
 }
 
-/// A statement's text with any leading comment lines removed.
+/// A statement's text with any leading `--` comment lines removed.
 fn strip_leading_comments(statement: &str) -> &str {
     let mut rest = statement.trim_start();
     while rest.starts_with("--") {

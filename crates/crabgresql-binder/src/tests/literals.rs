@@ -156,7 +156,7 @@ fn empty_hex_literal_binds_as_zero_width_bit() -> anyhow::Result<()> {
 
 #[test]
 fn order_by_on_bit_binds() -> anyhow::Result<()> {
-    // `bit` now has an executor comparison, so ORDER BY on it binds.
+    // `bit` has an executor comparison, so ORDER BY on it binds.
     assert!(bound("SELECT X'FF' ORDER BY 1").is_ok());
     Ok(())
 }
@@ -216,7 +216,6 @@ fn float_modulo_is_rejected() -> anyhow::Result<()> {
 
 #[test]
 fn numeric_operators_bind() -> anyhow::Result<()> {
-    // Comparison, arithmetic, and modulo all resolve for numeric now.
     assert!(bound("SELECT '1'::numeric < '2'::numeric").is_ok());
     let ValuesPlan { rows, .. } = bound_values("SELECT 1.5 + 2.25")?;
     assert_eq!(rows[0][0].ty(), PgType::Numeric);

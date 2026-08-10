@@ -241,8 +241,9 @@ fn bind_collate(
 
 /// Bind an `ARRAY[...]` constructor. Elements are bound and unified to a common
 /// element type (untyped literals adapt to it), then coerced; the result type is
-/// `PgType::Array(elem)`. An empty `ARRAY[]` settles on `text[]` and typically
-/// takes its real type from a surrounding cast (`ARRAY[]::int[]`).
+/// `PgType::Array(elem)`. An empty `ARRAY[]` only binds under a cast that
+/// supplies its element type (`ARRAY[]::int[]`, intercepted in `bind_cast`); a
+/// bare one is `42P18`.
 fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindError> {
     // A bare, uncast `ARRAY[]` has no determinable element type. PG requires an
     // explicit cast; `ARRAY[]::t[]` is intercepted in `bind_cast` and never
@@ -261,6 +262,8 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
     let (elem, exprs) = unify_value_column(bindings, "ARRAY")?;
     // Reject an element type this build has no array type for — this also
     // rejects a multi-dimensional constructor (an array-typed element).
+    // TODO: support multi-dimensional array constructors (`ARRAY[[1,2],[3,4]]`,
+    // `ARRAY[ARRAY[…]]`).
     if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
         return Err(BindError::feature_not_supported(format!(
             "could not find array type for data type {}",
@@ -279,9 +282,11 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
     }))
 }
 
-/// Bind an `a[i]` subscript. Only a single integer index on an array is
-/// supported (slices and chained/multi-dim subscripts are `0A000`). The result
+/// Bind an `a[i]` subscript: a single integer index on an array, whose result
 /// type is the array's element type.
+///
+/// TODO: support array slices (`a[1:3]`) and chained/multi-dimensional
+/// subscripts, both rejected here with `0A000`.
 fn bind_subscript(
     root: &ast::Expr,
     access_chain: &[ast::AccessExpr],
@@ -402,7 +407,7 @@ fn bind_in_subquery(
 ) -> Result<Binding, BindError> {
     let op = if negated { BinOp::NotEq } else { BinOp::Eq };
     // `IN` has no operator token of its own to point a cursor at, so the
-    // comparison resolves with an empty span, as it did before.
+    // comparison resolves with an empty span.
     bind_quantified_subquery(expr, op, query, negated, Span::empty(), scope)
 }
 
@@ -410,11 +415,14 @@ fn bind_in_subquery(
 /// The right-hand operand is either a subquery (`ANY(SELECT …)`, →
 /// [`BoundExpr::QuantifiedSubquery`]) or an array-valued expression
 /// (`ANY(ARRAY[…])`, `ANY('{…}')`, → [`BoundExpr::QuantifiedArray`]; a `$n`
-/// array parameter binds here too, but only reaches execution over the simple
-/// protocol until `types::wire` gains a binary array decoder).
+/// array parameter binds here too, but a Bind message can only supply its value
+/// in text format).
 /// In both cases a NULL `Const` "hole" of the element type stands in for a
 /// candidate and `bind_binary_op` resolves the operator/coercions exactly as a
 /// written `left op v` would (the same trick as [`bind_in_subquery`]).
+///
+/// TODO: decode array values in binary-format Bind parameters, which
+/// `types::wire::decode_binary` refuses with `0A000`.
 fn bind_quantified(
     left: &ast::Expr,
     compare_op: &ast::BinaryOperator,
@@ -426,7 +434,9 @@ fn bind_quantified(
     let Some(op) = binop_from_comparison(compare_op) else {
         // The parser also accepts the LIKE/regex operator spellings after
         // ANY/ALL. Those lower to `ScalarFn` calls, not a `Binary` comparison
-        // template, so the quantified path can't build a hole for them yet.
+        // template, so the quantified path has no hole to substitute into.
+        // TODO: build a quantified template for the LIKE/regex operator
+        // spellings after ANY/ALL.
         return Err(BindError::feature_not_supported(format!(
             "{compare_op} {} (…) is not supported yet",
             if all { "ALL" } else { "ANY" }
@@ -522,10 +532,11 @@ fn bind_quantified_array(
     // Coerce the right side to `elem_ty[]` (identity for an already-typed array;
     // parses `'{…}'` / types a `$n` param via `resolve_unknown`'s array arm).
     let array_expr = resolve_operand(&array, PgType::Array(elem_ty.oid()))?;
-    // `PgType::Array` is never itself collatable (only the element is), and
-    // nothing in this build tracks a per-element collation on an array value
-    // yet, so the hole falls back to the element type's default collation —
-    // unlike the subquery form, which does know its one column's collation.
+    // `PgType::Array` is never itself collatable here (only the element is), so
+    // the hole falls back to the element type's default collation — unlike the
+    // subquery form, which does know its one column's collation.
+    // TODO: track an array value's element collation so `op ANY (array)`
+    // compares under it instead of the element type's default.
     let cmp = bind_hole_template(op, needle, elem_ty, None, op_span, scope)?;
     Ok(Binding::Typed(BoundExpr::QuantifiedArray {
         array: Box::new(array_expr),
@@ -551,7 +562,9 @@ fn bind_hole_template(
     // Geometric comparisons exist in PG but lower to `ScalarFn::Geo` calls here,
     // not to a `Binary` with a substitutable RHS hole. `bind_binary_op` would
     // report "operator does not exist", which is untrue — the operator exists,
-    // the quantified form just can't build a template for it yet.
+    // the quantified form just has no template shape for it.
+    // TODO: build a quantified template for geometric comparisons, rejected
+    // here with `0A000`.
     if is_geo_ty(Some(elem_ty)) || is_geo_ty(binding_typed_ty(&needle)) {
         return Err(BindError::feature_not_supported(format!(
             "{} ANY/ALL (…) on geometric types is not supported yet",
@@ -730,10 +743,10 @@ pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindErr
     })
 }
 
-/// Bind a SELECT-list item. A top-level call to a set-returning function
-/// (currently `generate_series`) binds to a [`BoundExpr::Srf`] marker that the
-/// executor's `ProjectSet` node expands into rows; everything else binds as an
-/// ordinary scalar via [`bind_scalar`].
+/// Bind a SELECT-list item. A top-level call to one of the set-returning
+/// functions `bind_srf_projection` recognizes binds to a [`BoundExpr::Srf`]
+/// marker that the executor's `ProjectSet` node expands into rows; everything
+/// else binds as an ordinary scalar via [`bind_scalar`].
 pub fn bind_projection(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindError> {
     if let ast::Expr::Function(func) = expr
         && let Some(srf) = bind_srf_projection(func, scope)?
@@ -758,8 +771,11 @@ fn bind_case(
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     // Simple CASE evaluates the operand once at run time; we re-bind a clone of
-    // it per WHEN to build `operand = value`. That is equivalent because our
-    // scalar expressions are pure (no volatile functions reach here yet).
+    // it per WHEN to build `operand = value`, which is equivalent for a pure
+    // operand.
+    // TODO: evaluate a simple-CASE operand once instead of per WHEN — an impure
+    // one (`nextval`, `clock_timestamp`) is re-run by every comparison the
+    // executor tests.
     //
     // PG gives an untyped-literal operand its own type before comparing — an
     // unknown resolves to text (its default), independent of the WHEN values —
@@ -985,8 +1001,9 @@ pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Bindi
 /// `nullif(time, timetz)` is `time with time zone` — and the caller falls back to
 /// the comparison's own operand type.
 ///
-/// Known gap: `nullif(varchar, bpchar)` is `character` in PG, which resolves it to
-/// the blank-insensitive `bpchar` `=`; this binder compares those two as text.
+/// TODO: resolve `nullif(varchar, bpchar)` to `character`, the type PG gives it,
+/// so the pair compares under the blank-insensitive `bpchar` `=`; this binder
+/// compares those two as text.
 fn equality_keeps_left(left: PgType, right: PgType) -> bool {
     let exact_int = |ty| matches!(ty, PgType::Int2 | PgType::Int4 | PgType::Int8);
     let float = |ty| matches!(ty, PgType::Float4 | PgType::Float8);

@@ -1,8 +1,13 @@
 //! Planner: logical plan → physical plan.
 //!
-//! With one access path (a full scan) the mapping is 1:1 — this crate exists
-//! to hold the layer boundary where index selection, join ordering and
-//! cost-based choices land later (docs/ARCHITECTURE.md §2).
+//! Every choice made here is structural rather than cost-based: an equality
+//! index probe when one index's key columns are all pinned by the `WHERE`, a
+//! hash join when a cross-side equality can be extracted, predicate and
+//! column-projection pushdown, and sinking a filter's correlated-subquery
+//! conjunct behind the cheap conjuncts it may legally cross.
+//!
+//! TODO: join ordering and cost-based path selection, both of which need the
+//! table statistics this layer has no source for (docs/ARCHITECTURE.md §3).
 
 mod projection;
 mod pushdown;
@@ -908,9 +913,13 @@ enum AccessPath {
 
 /// Choose an access path for a `WHERE` predicate: an equality index probe when
 /// some index's every key column is pinned by an `col = <constant>` conjunct,
-/// else a full scan. PostgreSQL makes this choice by cost; with one real access
-/// path here the rule is structural — an equality-covered PK/UNIQUE (or plain)
+/// else a full scan. PostgreSQL makes this choice by cost; with no cost model
+/// here the rule is structural — an equality-covered PK/UNIQUE (or plain)
 /// index always beats a sequential scan for a point lookup.
+///
+/// TODO: serve range predicates (`<`, `>`, `BETWEEN`) from an index too; only
+/// equality conjuncts are considered here, and the storage API offers only an
+/// equality probe ([`TableAm::index_lookup`]).
 fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> AccessPath {
     let Some(predicate) = predicate else {
         return AccessPath::Scan { predicate: None };
@@ -1254,17 +1263,20 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
 }
 
 /// Render a physical plan as PostgreSQL-style `EXPLAIN` text — one string per
-/// output line. This is a **reduced** form: it reproduces PG's node headers
-/// (`Seq Scan on t`, `Index Scan using t_pkey on t`, `Index Cond`, `Filter`) so
-/// the chosen access path is observable, but omits the cost/row/width estimates
-/// PG prints (crabgresql has no cost model). Only the scan paths are rendered in
-/// detail; other plan shapes get a single summary line.
+/// output line. It reproduces PG's node headers (`Seq Scan on t`, `Index Scan
+/// using t_pkey on t`, `Index Cond`, `Filter`) so the chosen access path is
+/// observable. Shapes with no access path worth showing collapse to one
+/// summary line (`Values Scan`, `Function Scan`, an aggregate over a non-join
+/// input); every other node renders its children and properties.
 ///
-/// `EXPLAIN ANALYZE` renders the same lines and appends [`explain_summary`]. It
-/// adds no per-node `(actual time=… rows=… loops=…)` suffix and no `Buffers:`
-/// block, so a node line is a *prefix* of PG's, not a copy of it: a consumer that
-/// parses `actual rows=` out of ANALYZE output will not find it here. Only the two
-/// footers are byte-identical to PG's.
+/// TODO: print the `(cost=… rows=… width=…)` estimate PG puts on every node,
+/// which needs the cost model this planner does not have.
+///
+/// `EXPLAIN ANALYZE` renders the same lines and appends [`explain_summary`].
+/// TODO: print the per-node `(actual time=… rows=… loops=…)` suffix and the
+/// `Buffers:` block; without them a node line is a *prefix* of PG's, not a copy
+/// of it, so a consumer that parses `actual rows=` out of ANALYZE output will
+/// not find it here. Only the two footers are byte-identical to PG's.
 pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
         PhysicalPlan::Select {
@@ -1599,8 +1611,12 @@ fn push_root_property(lines: &mut Vec<String>, property: String) {
 }
 
 /// Minimal expression rendering for `EXPLAIN` conditions: enough to show a
-/// constant key or a residual comparison, not a faithful SQL deparser. Column
-/// references render by name against `schema`.
+/// constant key or a residual comparison. Column references render by name
+/// through `names`.
+///
+/// TODO: deparse the expression kinds that fall through to the `…` placeholder
+/// (function calls, `CASE`, subqueries, array constructors); PG prints the
+/// whole condition.
 fn explain_expr(expr: &BoundExpr, names: &[Option<String>]) -> String {
     match expr {
         // Divergence: rendered in UTC at the default `extra_float_digits` and
@@ -1653,8 +1669,9 @@ fn explain_expr(expr: &BoundExpr, names: &[Option<String>]) -> String {
 }
 
 /// Render `expr` where a larger expression uses it as an operand. PG's
-/// ruleutils parenthesizes anything that is not a bare column, constant, or
-/// parameter, so `x IS NULL` under an `IS TRUE` prints as `(x IS NULL) IS TRUE`.
+/// `EXPLAIN` output parenthesizes anything that is not a bare column, constant,
+/// or parameter, so `x IS NULL` under an `IS TRUE` prints as
+/// `(x IS NULL) IS TRUE`.
 fn explain_operand(expr: &BoundExpr, names: &[Option<String>]) -> String {
     // A cast is invisible in this output, so its operand decides.
     let bare = match expr {
@@ -1694,8 +1711,11 @@ fn window_number(plan: &PhysicalPlan) -> usize {
 }
 
 /// Render an `OVER (…)` clause the way PG's `Window:` property does, omitting a
-/// clause that is absent. The frame is never printed: only the default frame is
-/// supported, and PG omits that one too.
+/// clause that is absent. The frame is never printed: the binder accepts only
+/// the default frame, and PG omits that one too.
+///
+/// TODO: print the `ROWS`/`RANGE` frame clause for an explicit (non-default)
+/// window frame.
 fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<String>]) -> String {
     let mut parts = Vec::new();
     if !spec.partition_by.is_empty() {
@@ -2826,7 +2846,9 @@ mod tests {
 
     #[test]
     fn range_on_pk_stays_seq_scan() {
-        // Equality only: a range predicate cannot be served by the hash index.
+        // Equality only: `choose_access` classifies equality conjuncts alone, so
+        // a range falls back to a sequential scan even on this B-tree index —
+        // see its TODO on serving ranges from an index.
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id > 1", Some(pk_on_id()));
         assert!(matches!(plan, PhysicalPlan::Select { .. }));
     }
@@ -3049,8 +3071,9 @@ mod tests {
 
     #[test]
     fn explain_parenthesizes_a_composite_operand() {
-        // PG's ruleutils wraps anything that is not a bare column, constant or
-        // parameter, so a test over a test nests rather than running together.
+        // PG's `EXPLAIN` output wraps anything that is not a bare column,
+        // constant or parameter, so a test over a test nests rather than
+        // running together.
         // `big IS NULL IS TRUE` would be a different (and unreadable) tree.
         assert_eq!(
             filter_line("SELECT * FROM t WHERE (big IS NULL) IS TRUE"),

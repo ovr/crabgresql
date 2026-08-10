@@ -8,11 +8,11 @@
 //! Everything else in the crate speaks only in our own broken-down [`TmLite`]
 //! and microsecond values.
 //!
-//! PG's `DetermineTimeZoneOffset` rule for an ambiguous local time: a **gap**
-//! (a nonexistent wall-clock time, spring-forward) uses the offset in effect
-//! *before* the transition; a **fold** (an ambiguous wall-clock time,
-//! fall-back) uses the offset *after* the transition. `jiff` hands us both
-//! bracketing offsets, so this is a direct match.
+//! PG's rule for an ambiguous local time: a **gap** (a nonexistent wall-clock
+//! time, spring-forward) uses the offset in effect *before* the transition; a
+//! **fold** (an ambiguous wall-clock time, fall-back) uses the offset *after*
+//! the transition. `jiff` hands us both bracketing offsets, so this is a
+//! direct match.
 
 use std::cell::RefCell;
 
@@ -232,9 +232,9 @@ pub fn format_offset(secs: i32) -> String {
 }
 
 /// Render a UTC offset the way `to_char`'s `OF` code does, which — unlike
-/// [`format_offset`] — never emits a seconds field: PG's `DCH_OF` prints the
-/// hours and, only when the offset is not a whole hour, the minutes. So an
-/// LMT-era offset that `timestamptz_out` shows as `-04:56:02` is `-04:56` here.
+/// [`format_offset`] — never emits a seconds field: PG prints the hours and,
+/// only when the offset is not a whole hour, the minutes. So an LMT-era offset
+/// that `timestamptz_out` shows as `-04:56:02` is `-04:56` here.
 pub fn format_offset_hours_minutes(secs: i32) -> String {
     let sign = if secs < 0 { '-' } else { '+' };
     let abs = secs.unsigned_abs();
@@ -261,8 +261,9 @@ pub enum ZoneError {
 ///
 /// Numeric offsets (`±HH`, `±HHMM`, `±HH:MM[:SS]`), `Z`/`zulu`, and `UTC`/`GMT`
 /// resolve to [`Zone::Fixed`] via our own parser. Named IANA zones
-/// (`America/New_York`) and the zone-backed abbreviations in [`ABBREVS`]
-/// resolve through `jiff`. Unknown tokens are [`ZoneError::NotRecognized`].
+/// (`America/New_York`) and the zone-backed abbreviations in
+/// [`DATETIME_ABBREVS`] resolve through `jiff`. Unknown tokens are
+/// [`ZoneError::NotRecognized`].
 ///
 /// **Not** the resolver for `AT TIME ZONE` or the three-argument `date_trunc` —
 /// see [`resolve_zone_arg`], which reads a bare numeric offset with the opposite
@@ -297,8 +298,8 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 
 /// Classify and resolve a zone token that arrives as a *function argument* —
 /// `AT TIME ZONE`, `timezone(zone, …)`, and the three-argument `date_trunc`.
-/// PG funnels all three through one reader (`parse_sane_timezone`), and its
-/// grammar is neither [`resolve_zone`]'s nor [`SessionZone::resolve`]'s.
+/// PG funnels all three through one reader, whose grammar is neither
+/// [`resolve_zone`]'s nor [`SessionZone::resolve`]'s.
 ///
 /// The difference that matters is the **sign of a bare numeric offset**, and it
 /// is the reverse of the same spelling inside a value. Verified against PG 18
@@ -314,8 +315,8 @@ pub fn resolve_zone(name: &str) -> Result<Zone, ZoneError> {
 /// So the colon-less `±HHMM` form is a value-only spelling, the wide
 /// [`MAX_GUC_OFFSET_SECS`] band applies here rather than the in-value
 /// [`MAX_TZ_DISPLACEMENT_SECS`] one, and an unsigned offset is legal. Named
-/// zones, the [`ABBREVS`] table, `Z`/`zulu` and `UTC`/`GMT` mean the same in
-/// both readers.
+/// zones, the [`DATETIME_ABBREVS`] table, `Z`/`zulu` and `UTC`/`GMT` mean the
+/// same in both readers.
 ///
 /// What PG is really doing with a token that is none of the above is handing it
 /// to a POSIX TZ reader, so a full specification works — `EST5EDT,M3.2.0/2,`
@@ -914,9 +915,9 @@ pub fn timezone_abbrevs(at_micros: i64) -> Vec<AbbrevListing> {
         .filter_map(|(abbrev, kind)| {
             let (utc_offset_secs, is_dst) = match kind {
                 Abbrev::Fixed { secs, is_dst } => (*secs, *is_dst),
-                // PG's `DYNTZ`: resolve through the reference zone at the
-                // instant, so `MSK` follows Moscow's history rather than a
-                // frozen offset.
+                // A zone-backed abbreviation resolves through its reference
+                // zone at the instant, as PG does, so `MSK` follows Moscow's
+                // history rather than a frozen offset.
                 Abbrev::Zone(zone) => {
                     let tz = TimeZone::get(zone).ok()?;
                     let info = tz.to_offset_info(ts);
@@ -942,8 +943,8 @@ pub(crate) fn lookup_abbrev(token: &str) -> Option<&'static Abbrev> {
         .map(|(_, k)| k)
 }
 
-/// The zone *names* the value and argument readers share: the [`ABBREVS`] table
-/// first, then a full IANA name.
+/// The zone *names* the value and argument readers share: the
+/// [`DATETIME_ABBREVS`] table first, then a full IANA name.
 ///
 /// `None` means "not a name, try a displacement"; `Some(None)` means the token
 /// named something the tz database could not produce, which is the caller's
@@ -1269,8 +1270,10 @@ mod tests {
     ///
     /// The last is the sharp one: with a colon the GUC string counts *west*
     /// (`'+05:30'` is UTC−5:30, which we match), without one it counts *east*.
-    /// Fixing that means giving the GUC the same POSIX reader the argument path
-    /// now has, plus PG's `<+NN>-NN` renaming — a separate change.
+    /// TODO: accept the unsigned POSIX form (`XYZ5`) and the wide
+    /// `±167:59:59` band in the `TimeZone` GUC, read a colon-less numeric
+    /// value *east* rather than west, and name a bare numeric zone
+    /// `<+NN>-NN` as PG does.
     #[test]
     fn the_guc_numeric_grammar_still_diverges() {
         assert!(SessionZone::resolve("XYZ5").is_err());

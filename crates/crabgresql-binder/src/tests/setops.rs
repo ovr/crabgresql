@@ -2,7 +2,7 @@
 
 use super::common::*;
 
-/// The arms of a bound set operation.
+/// The pieces of a bound set operation.
 fn setop_of(
     sql: &str,
 ) -> anyhow::Result<(

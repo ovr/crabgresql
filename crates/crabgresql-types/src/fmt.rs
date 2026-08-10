@@ -8,8 +8,10 @@
 //! `byteaout`'s two. And the transaction clock, which is what the relative
 //! input specials (`'now'`, `'today'`, `'tomorrow'`, `'yesterday'`) read. They
 //! travel together in [`FmtCtx`] rather than as separate parameters so that
-//! adding the next one (`DateStyle`) does not mean touching every call site
-//! again.
+//! adding the next one does not mean touching every call site again.
+//!
+//! TODO: carry `DateStyle` here — `SET DateStyle` is accepted and ignored, and
+//! date/timestamp output is fixed at ISO.
 //!
 //! There is deliberately **no `Default` impl**. A missing zone renders as UTC,
 //! which is silently wrong rather than loudly wrong, so each context that has no

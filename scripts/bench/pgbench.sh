@@ -74,12 +74,12 @@ psql -qtAc 'SELECT 1' > /dev/null
 
 echo "$($pgbench --version), shared_buffers=$CRABGRESQL_SHARED_BUFFERS"
 
-# -I dtGvp rather than the default dtgvp: step `g` generates the rows
-# client-side through `COPY … FREEZE`, which this server refuses outside a
-# table created in the same transaction. `G` generates them server-side with
-# INSERT … SELECT FROM generate_series instead. Step `f` (foreign keys) is
-# left out because ALTER TABLE ADD CONSTRAINT … FOREIGN KEY is not supported.
+# -I dtGvp rather than the default dtgvp: step `G` generates the rows
+# server-side with INSERT … SELECT FROM generate_series instead of streaming
+# them from the client (step `g`, a libpq `COPY … FREEZE`).
 # `-I` is only honored alongside `-i`, hence both.
+# TODO: support ALTER TABLE ADD CONSTRAINT … FOREIGN KEY, so pgbench's `f`
+# step (the TPC-B foreign keys) can be added to the step list.
 echo "== init (-i -I dtGvp -s $SCALE)"
 "$pgbench" -i -I dtGvp -s "$SCALE" 2>&1 | tee "$outdir/init.log"
 

@@ -1,9 +1,8 @@
 //! Type system: values and their wire encodings.
 //!
-//! Scope: bool / int2 / int4 / int8 / float4 / float8 / text with text-format
-//! encoding, plus the minimal `numeric` / `bytea` / `bit` and user-type support
-//! the float regression tests need. `float` and `cast` hold the PG-exact I/O
-//! and cast machinery.
+//! [`PgType`] is the static type and [`Value`] the runtime one; each built-in
+//! type's input, output, comparison and arithmetic live in the module named
+//! after it. `float` and `cast` hold the PG-exact I/O and cast machinery.
 
 pub mod array;
 pub mod bit;
@@ -370,7 +369,7 @@ pub enum PgType {
     /// Varlena; no default equality/ordering. See [`crate::jsonpath`].
     Jsonpath,
     /// A `reg*` type: an OID that renders as the name of the object it
-    /// identifies ([`Value::Reg`]). Fixed 4-byte type. The three PG types
+    /// identifies ([`Value::Reg`]). Fixed 4-byte type. The four PG types
     /// share one variant because they differ only in *what* the OID names —
     /// see [`RegKind`].
     Reg(RegKind),
@@ -407,8 +406,9 @@ pub enum PgType {
 /// PostgreSQL type that stores an OID and renders as that object's name, so
 /// `'pg_class'::regclass` and `1259::regclass` are the same value.
 ///
-/// PG has more of these (`regoper`, `regconfig`, `regrole`, `regprocedure`, …);
-/// only the four crabgresql can actually resolve are modeled.
+/// TODO: model PG's remaining `reg*` types (`regoper`, `regconfig`, `regrole`,
+/// `regprocedure`, …); each needs a lookup that resolves its own kind of object
+/// by name, which only these four have.
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
     /// `regproc`: names a function by its bare name. Distinct from
@@ -563,10 +563,10 @@ impl PgType {
     /// Whether the executor's `agg::hash_key` gives distinct values of this type
     /// distinct-enough hashes — i.e. equality is a raw-representation compare, so
     /// hashing that representation agrees with `keys_equal`. Types that fail this
-    /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `point`, `lseg`)
-    /// all hash into one shared bucket, so a hash join keyed on them would
-    /// collapse to a full scan; the join planner keeps such equalities as
-    /// nested-loop predicates instead.
+    /// (`interval`, `timetz`, `inet`, `cidr`, `bit`, `varbit`, `tsquery`, the
+    /// geometric types and arrays) all hash into one shared bucket, so a hash
+    /// join keyed on them would collapse to a full scan; the join planner keeps
+    /// such equalities as nested-loop predicates instead.
     ///
     /// Three clauses, in the order they matter:
     ///
@@ -873,7 +873,6 @@ impl PgType {
             // whose length is the element count.
             | PgType::Vector(_) => -1,
             PgType::User(_) => -1,
-            // Arrays are varlena.
             PgType::Array(_) => -1,
         }
     }
@@ -888,8 +887,8 @@ impl PgType {
     /// Below the threshold PostgreSQL prints the bare type name rather than a
     /// nonsensical `character varying(-2)`.
     ///
-    /// `interval` is a deliberate gap: its modifier packs range bits and is
-    /// printed bare rather than decoded. Arrays and non-built-in types are the
+    /// `interval` prints bare here; decoding its packed range bits and precision
+    /// is [`Self::format_type`]'s job. Arrays and non-built-in types are the
     /// caller's problem — they need a catalog this crate does not have.
     pub fn name_with_typmod(self, typmod: i32) -> String {
         // VARHDRSZ: character types encode `length + 4`; the storage layer's
@@ -1007,8 +1006,8 @@ impl PgType {
     /// type with no `typmodout` (`format_type(25, 5)` → `text(5)`) is not
     /// reproduced.
     pub fn format_type(self, typmod: Option<i32>) -> Option<String> {
-        // VARHDRSZ: character types encode `length + 4` (see the catalog's
-        // `atttypmod_of`, which is the encoder this decodes).
+        // VARHDRSZ: character types encode `length + 4` (see the storage layer's
+        // `Column::atttypmod`, which is the encoder this decodes).
         const VARHDRSZ: i32 = 4;
         if matches!(self, PgType::Array(_) | PgType::User(_)) {
             return None;
@@ -1136,11 +1135,13 @@ impl PgType {
     }
 
     /// Whether this type has a default B-tree operator class — i.e. it can be
-    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`
-    /// and the geometric types have no default ordering in PostgreSQL (and the
-    /// executor's `compare_values` has no arm for them); everything else,
-    /// including user types (enums order by ordinal), does. Must stay in sync
-    /// with `crabgresql_executor::is_orderable`.
+    /// ordered, so it may key a B-tree / UNIQUE index or a PRIMARY KEY. `json`,
+    /// `jsonpath` and the geometric types have no default ordering in PostgreSQL
+    /// (and the executor's `compare_values` has no arm for them); everything
+    /// else, including user types (enums order by ordinal), does.
+    /// `crabgresql_executor::is_orderable` delegates here rather than restating
+    /// the list, so the two cannot drift — but `compare_values` ends in an
+    /// `unreachable!`, so admitting a type here without an arm there panics.
     ///
     /// `xid` is the one type whose `compare_values` arm exists even though this
     /// returns `false`: the executor needs an ordering internally to make

@@ -25,7 +25,12 @@ use crate::query::{
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
-/// one, but there are no processes to kill yet (cancel lands with M1+).
+/// one, but nothing registers them, so a CancelRequest has no connection to
+/// look up.
+///
+/// TODO: act on CancelRequest — register connections by backend id and
+/// interrupt the query running on the one named, instead of dropping the
+/// request during startup.
 static NEXT_BACKEND_ID: AtomicI32 = AtomicI32::new(1);
 
 pub async fn handle_connection(
@@ -61,7 +66,8 @@ pub async fn handle_connection(
         }
     };
 
-    // Trust auth for M0; SCRAM-SHA-256 is on the roadmap.
+    // TODO: authenticate the client (SCRAM-SHA-256) instead of accepting
+    // every connection as trusted, whatever it sent in `user`.
     writer.authentication_ok();
 
     // Per-connection session state (GUCs). A fresh connection resets them,
@@ -253,8 +259,10 @@ pub async fn handle_connection(
             // Flush forces buffered replies onto the wire without ending the
             // batch — no ReadyForQuery, no state change.
             Some(FrontendMessage::Flush) => writer.flush().await?,
-            // COPY, function-call and password messages have no place in this
-            // flow; answer like any unsupported message and recover at Sync.
+            // COPY and password messages have no place in this flow; answer
+            // like any unsupported message and recover at Sync.
+            // TODO: serve the legacy fast-path FunctionCall message ('F'),
+            // which lands here only because nothing executes it.
             Some(other) => {
                 report(
                     &mut writer,
@@ -665,8 +673,12 @@ fn check_format_count(len: usize, count: usize, kind: &str) -> Result<(), PgErro
 }
 
 /// Build a `RowDescription`'s fields from a statement's output columns, applying
-/// the requested per-column result `formats`. Query results carry no catalog
-/// origin or typmod, matching the simple-query path.
+/// the requested per-column result `formats`.
+///
+/// TODO: report the source table OID and attribute number for result columns
+/// that are plain table column references, and the type modifier of any type
+/// that carries one; these fields are held at 0/0/-1 here, as they are by
+/// `FieldDescription::new` on the simple-query path.
 fn field_descriptions(cols: &[OutputColumn], formats: &[Format]) -> Vec<FieldDescription> {
     cols.iter()
         .enumerate()

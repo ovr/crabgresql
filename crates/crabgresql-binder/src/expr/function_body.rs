@@ -24,8 +24,10 @@ use super::scope::{Binding, Scope};
 /// positionally aligned with `arg_types`. `body_sql` is the normalized `SELECT <expr>` the
 /// catalog stores; it must be a single FROM-less, single-column `SELECT` — any
 /// other shape (FROM, WHERE, GROUP BY, set-op, multiple columns, …) is rejected,
-/// since a scalar function is expanded inline and the engine has no per-row query
-/// execution for function bodies.
+/// since a scalar function is expanded inline into the caller's expression tree.
+///
+/// TODO: run a SQL function body as its own query, so the shapes PG accepts
+/// (FROM, WHERE, GROUP BY, set-ops, multiple columns) work here too.
 ///
 /// Used both to validate the body at `CREATE FUNCTION` and to produce the
 /// expression a call site inlines: the returned tree still carries `Param` leaves
@@ -124,14 +126,17 @@ pub fn bind_sql_function_body(
     // body into the caller's expression tree, where the marker would join the
     // caller's window chain and number the caller's rows instead — so the body
     // must be refused. A limitation, not an illegal construct, hence 0A000.
+    // TODO: allow a window function in a SQL function body, which needs the body
+    // to have a query level of its own instead of being inlined.
     if bound.contains_window() {
         return Err(BindError::feature_not_supported(
             "window functions in a SQL function body are not supported yet",
         ));
     }
     // PG accepts a FROM-less aggregate (e.g. `SELECT sum(1)`) as a function body;
-    // this engine cannot yet inline one as a scalar, so it is a limitation, not
-    // an illegal construct — report it as unsupported rather than a grouping error.
+    // there is no way to inline one as a scalar — a limitation, not an illegal
+    // construct, so report it as unsupported rather than a grouping error.
+    // TODO: allow a FROM-less aggregate in a SQL function body.
     if bound.contains_aggregate() {
         return Err(BindError::feature_not_supported(
             "aggregate functions in a SQL function body are not supported yet",

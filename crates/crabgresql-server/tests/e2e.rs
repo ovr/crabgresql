@@ -1362,9 +1362,11 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
     // A correlated subquery in the target list of a GROUP BY (aggregating) query
     // is rejected cleanly: its OuterColumnRef indices address the pre-aggregation
     // row, which would not line up with the aggregate node's output row. We
-    // return 0A000 rather than silently returning a wrong value (PG evaluates it;
-    // this is a documented not-yet-supported position). WHERE-clause correlation
-    // over an aggregating query (the join-outer case above) is unaffected.
+    // return 0A000 rather than silently returning a wrong value. WHERE-clause
+    // correlation over an aggregating query (the join-outer case above) is
+    // unaffected.
+    // TODO: evaluate a correlated subquery in the target list or HAVING of a
+    // grouped query, which PG answers per outer row, instead of raising 0A000.
     let err = client
         .simple_query("SELECT a, (SELECT max(c) FROM t2 WHERE t2.a = t1.a) FROM t1 GROUP BY a")
         .await
@@ -1381,8 +1383,10 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
 /// subquery, checked against PostgreSQL: the six comparison operators, empty/NULL
 /// three-valued semantics, `= ANY` ≡ `IN` / `<> ALL` ≡ `NOT IN`, a correlated
 /// subquery form, single evaluation of a side-effecting needle, and the
-/// non-array right-side error. (`= ANY($1)` with an array parameter is not
-/// covered: binary array parameters are still undecodable — see `types::wire`.)
+/// non-array right-side error.
+///
+/// TODO: decode array values in the binary wire format (`types::wire` has no
+/// array case), so `= ANY($1)` with an array parameter can be covered here.
 #[tokio::test]
 async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -1924,8 +1928,10 @@ async fn explicit_schema_operator_spelling() -> anyhow::Result<()> {
     );
 
     // A non-`pg_catalog` schema qualification never names a built-in operator, so
-    // it is reported as 42883. (Real PG additionally reports 3F000 when the schema
-    // itself does not exist; the schema catalog is not reachable at bind time.)
+    // it is reported as 42883.
+    // TODO: report 3F000 `schema "x" does not exist` when the qualifier names no
+    // schema, as PG does; the schema catalog is not reachable at bind time, so
+    // that case collapses into the 42883 asserted here.
     let err = client
         .simple_query("SELECT 1 OPERATOR(myschema.=) 2")
         .await
@@ -2201,7 +2207,9 @@ async fn integer_out_of_range_on_insert() -> anyhow::Result<()> {
 async fn unsupported_clauses_error_instead_of_silently_dropping() {
     let client = connect(spawn_server().await).await;
     // GROUP BY / HAVING and DISTINCT are supported now (see the aggregate and
-    // distinct tests); the rest still error rather than being silently dropped.
+    // distinct tests); the rest error rather than being silently dropped.
+    //
+    // TODO: support FETCH FIRST, GROUP BY ROLLUP and GROUP BY GROUPING SETS.
     for sql in [
         "SELECT 1 FETCH FIRST 1 ROW ONLY",
         "SELECT 1 GROUP BY ROLLUP (1)",
@@ -2370,7 +2378,10 @@ async fn a_user_function_may_shadow_a_window_function_name() -> anyhow::Result<(
 /// A window call in a `LANGUAGE SQL` body is refused. PG accepts it and runs the
 /// body as its own query (every call returns 1); this engine *inlines* bodies, so
 /// the marker would join the caller's chain and number the caller's rows instead.
-/// Refusing is the honest answer until bodies stop being inlined.
+/// Refusing is the honest answer.
+///
+/// TODO: run a `LANGUAGE SQL` body as its own query instead of inlining it, so a
+/// window call inside one can be accepted.
 #[tokio::test]
 async fn a_window_call_in_a_sql_function_body_is_rejected() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -2745,7 +2756,10 @@ async fn unenforceable_ddl_is_rejected() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     for sql in [
         // Clauses we can't honor must be rejected, not silently dropped:
-        // ON COMMIT DROP/DELETE ROWS needs the M2 txn engine.
+        // accepting these would leave a plain session-lifetime table.
+        //
+        // TODO: drop / empty a temp table at commit for ON COMMIT DROP and
+        // ON COMMIT DELETE ROWS.
         "CREATE TEMP TABLE c (x int) ON COMMIT DROP",
         "CREATE TEMP TABLE c (x int) ON COMMIT DELETE ROWS",
     ] {
@@ -3075,7 +3089,7 @@ async fn full_crud_cycle_with_where() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The count of visible rows in `t`.
+/// The count of rows in `table` visible to `client`'s snapshot.
 async fn row_count(client: &tokio_postgres::Client, table: &str) -> usize {
     let messages = match client.simple_query(&format!("SELECT * FROM {table}")).await {
         Ok(messages) => messages,
@@ -4512,8 +4526,10 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.simple_query("CREATE TABLE t (id integer)").await?;
     for sql in [
-        // ISOLATION LEVEL / READ ONLY are now honored; SNAPSHOT isolation and
-        // SET TRANSACTION SNAPSHOT remain unsupported modes.
+        // ISOLATION LEVEL / READ ONLY are honored. `SNAPSHOT` isolation is
+        // refused on purpose: PG's grammar has no spelling for it.
+        // TODO: support savepoints, TRUNCATE's CASCADE and RESTART IDENTITY
+        // options, and SET TRANSACTION SNAPSHOT.
         "BEGIN ISOLATION LEVEL SNAPSHOT",
         "SAVEPOINT s",
         "ROLLBACK TO SAVEPOINT s",
@@ -4654,12 +4670,13 @@ async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
 
 /// A probe must never hand the same row to DML twice.
 ///
-/// `TRUNCATE` swaps the heap's relfilenode without resetting the index, so a
-/// stale `key -> tid` entry survives and the next insert reuses the very slot it
-/// names. The probe then reports that tid twice — once for the stale entry, once
-/// for the new one — and an unguarded UPDATE would write the row twice and report
-/// `UPDATE 2` for a one-row table. The engine-side repair is tracked separately;
-/// this pins the executor's guard.
+/// The probe answers with tids, so an UPDATE handed one tid twice would write
+/// the row twice and report `UPDATE 2` for a one-row table. This sequence
+/// produced exactly that while `TRUNCATE` swapped the heap's relfilenode alone:
+/// the stale `key -> tid` entry survived and the next insert reused the very
+/// slot it named. TRUNCATE swaps the indexes too now (see
+/// `truncate_resets_the_index_so_stale_keys_find_nothing`), and this pins the
+/// executor's guard independently of that.
 #[tokio::test]
 async fn a_probe_never_reports_the_same_row_twice() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -4899,12 +4916,15 @@ async fn explain_of_a_utility_statement_never_runs_it() -> anyhow::Result<()> {
     // Wrapping a utility in EXPLAIN must report the gap, not fall through to the
     // handler and create the table for real — with or without ANALYZE.
     //
-    // The invariant under test is "never runs it". The SQLSTATE is a known
-    // divergence, not a contract: PG's grammar accepts only explainable
-    // statements, so `EXPLAIN CREATE TABLE …` is a 42601 syntax error there, and
-    // `EXPLAIN <other utility>` prints one `Utility Statement` row. Closing that
-    // gap belongs with the statements themselves (`EXPLAIN CREATE TABLE … AS
-    // SELECT` is fully explainable in PG), and may change this assertion.
+    // The invariant under test is "never runs it". The SQLSTATE is not a
+    // contract: PG's grammar accepts only explainable statements, so
+    // `EXPLAIN CREATE TABLE …` is a 42601 syntax error there, and
+    // `EXPLAIN <other utility>` prints one `Utility Statement` row.
+    //
+    // TODO: reproduce that — 42601 where PG's grammar refuses the statement, a
+    // `Utility Statement` row otherwise, and a real plan for the utilities PG
+    // does explain (`EXPLAIN CREATE TABLE … AS SELECT`). It will change the
+    // SQLSTATE asserted here.
     for sql in [
         "EXPLAIN CREATE TABLE untouched (x int)",
         "EXPLAIN ANALYZE CREATE TABLE untouched (x int)",
@@ -4928,7 +4948,8 @@ async fn explain_options_report_pgs_sqlstates() -> anyhow::Result<()> {
         ("EXPLAIN (BOGUS) SELECT 1", "42601"),
         ("EXPLAIN (FORMAT bogus) SELECT 1", "22023"),
         ("EXPLAIN (TIMING ON) SELECT 1", "22023"),
-        // Options PG supports and crabgresql cannot yet produce.
+        // TODO: produce EXPLAIN's FORMAT JSON, VERBOSE and SETTINGS output; PG
+        // supports all three, and they are rejected with 0A000 until then.
         ("EXPLAIN (FORMAT JSON) SELECT 1", "0A000"),
         ("EXPLAIN VERBOSE SELECT 1", "0A000"),
         ("EXPLAIN (SETTINGS) SELECT 1", "0A000"),
@@ -5463,7 +5484,12 @@ async fn drop_view_object_type_and_dependencies() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A view is not automatically updatable: writes through it are rejected.
+/// Writes through a view are rejected with PG's non-updatable-view error.
+///
+/// TODO: support automatically updatable views — PG rewrites INSERT/UPDATE/
+/// DELETE on a view over a single table onto that table, and refuses only the
+/// forms listed in vendor/postgres/regress/sql/updatable_views.sql (DISTINCT,
+/// GROUP BY, aggregates, set operations, …).
 #[tokio::test]
 async fn views_are_not_updatable() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -5895,9 +5921,9 @@ async fn serial_column_and_sequence_reflection() -> anyhow::Result<()> {
 
 /// Regression coverage for the sequence-semantics fixes: setval/lastval,
 /// setval bounds + NULL strictness, CREATE SEQUENCE type-range validation,
-/// read-only rejection, wrong-object-type, currval-after-drop, namespace
-/// collisions, and DROP SEQUENCE dependency blocking. Asserts SQLSTATEs so it is
-/// stable across PostgreSQL versions.
+/// wrong-object-type, currval-after-drop, namespace collisions, and DROP
+/// SEQUENCE dependency blocking. Asserts SQLSTATEs so it is stable across
+/// PostgreSQL versions.
 #[tokio::test]
 async fn sequence_semantics_edge_cases() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -6096,8 +6122,8 @@ async fn drop_function_semantics() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
     let client = connect(spawn_server().await).await;
 
-    // Two overloads of the same name (LANGUAGE internal is the only supported
-    // form; the declared signature need not match the builtin it wraps).
+    // Two overloads of the same name. A LANGUAGE internal body names a builtin,
+    // and the declared signature need not match the one that builtin has.
     client
         .batch_execute(
             "CREATE FUNCTION f_in(cstring) RETURNS int8 AS 'int8in' LANGUAGE internal; \
@@ -6612,7 +6638,8 @@ async fn alter_table_rejected_forms() -> anyhow::Result<()> {
         "ALTER TABLE t RENAME TO t2",
         "ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES t (a)",
         "ALTER TABLE t ADD PRIMARY KEY (a) NOT VALID",
-        // A CHECK *is* supported now; only these two spellings of it are not.
+        // A plain ADD CHECK is supported; only these two spellings are not.
+        // TODO: support ADD CHECK ... NOT VALID and ADD CHECK ... NOT ENFORCED.
         "ALTER TABLE t ADD CHECK (a > 0) NOT VALID",
         "ALTER TABLE t ADD CHECK (a > 0) NOT ENFORCED",
         "ALTER TABLE t ADD UNIQUE (b) DEFERRABLE",
@@ -6872,8 +6899,11 @@ async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
 }
 
 /// A PRIMARY KEY makes its key columns NOT NULL, and PostgreSQL pushes that down
-/// the inheritance tree. We have no fan-out for it, so a parent is refused —
-/// while UNIQUE, which PostgreSQL never inherits, is allowed on one.
+/// the inheritance tree. This build refuses it on a parent instead — while
+/// UNIQUE, which PostgreSQL never inherits, is allowed on one.
+///
+/// TODO: fan a PRIMARY KEY's NOT NULL out to the inheritance descendants so a
+/// parent can take one, instead of raising 0A000.
 #[tokio::test]
 async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -6968,6 +6998,9 @@ async fn alter_table_add_constraint_and_inheritance() -> anyhow::Result<()> {
 
 /// Only the heap can record a column as NOT NULL, so ADD PRIMARY KEY on another
 /// access method is refused — as *unsupported*, and before anything is written.
+///
+/// TODO: record a column as NOT NULL on the non-heap access methods, so ADD
+/// PRIMARY KEY works there too.
 ///
 /// Both halves are the regression. The refusal used to come from the engine in
 /// the apply pass as a `TableNotFound`, so the client was told `relation "p"
@@ -7219,8 +7252,8 @@ async fn parquet_tables_support_append_workflows_and_reject_mutation() -> anyhow
         .expect_err("unknown table access method must fail");
     let unknown = unknown.as_db_error().expect("database error");
     assert_eq!(unknown.code().code(), "42704");
-    // Wording matches PostgreSQL's `get_am_type_oid`, which says "access method",
-    // not "table access method".
+    // PostgreSQL words an unknown method "access method", not "table access
+    // method", even when the name came from a table's `USING` clause.
     assert_eq!(
         unknown.message(),
         "access method \"imaginary\" does not exist"
@@ -7550,7 +7583,6 @@ async fn the_sort_key_rule_does_not_reach_past_its_own_statements() -> anyhow::R
     Ok(())
 }
 
-/// A Parquet relation is physically two stores — the immutable chunks and its RAM
 /// A columnar plan must answer exactly what the row plan answers.
 ///
 /// Each case here is a bug the columnar path shipped with: a predicate with no
@@ -7643,7 +7675,8 @@ async fn a_buffer_relation_vectorizes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// write buffer — so it plans as an `Append` over both. The leaves are not
+/// A Parquet relation is physically two stores — the immutable chunks and its
+/// RAM write buffer — so it plans as an `Append` over both. The leaves are not
 /// catalog relations, so each labels itself and neither appears in `pg_class`.
 #[tokio::test]
 async fn a_parquet_relation_plans_as_an_append_over_its_storage_leaves() -> anyhow::Result<()> {
@@ -8225,7 +8258,8 @@ async fn parquet_truncate_is_transactional_and_resets_statistics() -> anyhow::Re
     assert_eq!(rows(&doubled).len(), 1);
     assert_eq!(rows(&doubled)[0].get(0), Some("5"));
 
-    // The unsupported spellings stay unsupported.
+    // TODO: support TRUNCATE ... CASCADE and TRUNCATE ... RESTART IDENTITY;
+    // both are refused with 0A000 until then.
     for sql in ["TRUNCATE p CASCADE", "TRUNCATE p RESTART IDENTITY"] {
         let error = client
             .simple_query(sql)
@@ -8792,8 +8826,9 @@ async fn copy_freeze_into_parquet_writes_a_discardable_fragment() -> anyhow::Res
 // COPY ... FROM '<file>' — the server reads the file itself
 // ---------------------------------------------------------------------------
 
-/// Write `contents` to a file inside `dir` and hand back its absolute path,
-/// which is the only form `COPY … FROM` accepts.
+/// Write `contents` to a file inside `dir` and hand back its absolute path: a
+/// relative path in `COPY … FROM` resolves against the data directory, not
+/// against `dir`.
 fn fixture_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> anyhow::Result<String> {
     let path = dir.path().join(name);
     std::fs::write(&path, contents)?;
@@ -9181,7 +9216,8 @@ async fn copy_from_missing_file_carries_pgs_hint() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `COPY … FROM PROGRAM` is still unimplemented, and keeps its own 0A000.
+/// TODO: implement `COPY … FROM PROGRAM`; it is rejected with a 0A000 of its
+/// own, distinct from the file and stdin paths.
 #[tokio::test]
 async fn copy_from_program_is_unsupported() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;
@@ -9421,7 +9457,8 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
         &SqlState::UNDEFINED_FUNCTION
     );
 
-    // Only scalar, FROM-less bodies are supported for now.
+    // TODO: support a SQL function body that reads from a table; only scalar,
+    // FROM-less bodies are accepted.
     client.simple_query("CREATE TABLE t (a int)").await?;
     let err = client
         .simple_query("CREATE FUNCTION scan() RETURNS int LANGUAGE SQL AS $$ SELECT a FROM t $$")
@@ -9519,8 +9556,9 @@ async fn create_function_language_sql_resolution_and_volatility_match_pg() -> an
         )
     );
 
-    // An aggregate body is a scalar-inlining limitation, reported as unsupported
-    // (PostgreSQL accepts `SELECT sum(1)`), not a grouping error.
+    // TODO: support an aggregate in a SQL function body — PostgreSQL accepts
+    // `SELECT sum(1)`. Bodies are inlined as scalar expressions, so it is
+    // reported as unsupported rather than as a grouping error.
     let err = client
         .simple_query("CREATE FUNCTION agg() RETURNS bigint LANGUAGE SQL AS $$ SELECT sum(1) $$")
         .await
@@ -10275,8 +10313,8 @@ async fn analyze_measures_relations_and_reports_its_limits() -> anyhow::Result<(
         &SqlState::UNDEFINED_TABLE
     );
 
-    // Column statistics are not collected yet, so a column list is refused
-    // rather than silently ignored.
+    // TODO: collect per-column statistics for ANALYZE; until then a column list
+    // is refused rather than silently ignored.
     let err = client
         .simple_query("ANALYZE a1 (id)")
         .await
@@ -10463,9 +10501,9 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
     let db = e.as_db_error().expect("database error");
     assert_eq!(db.code(), &SqlState::SYNTAX_ERROR);
     assert_eq!(db.message(), "\"x\" is not a known variable");
-    // PostgreSQL also prints a `LINE n:` excerpt with a caret into the body,
-    // which needs a mapping from a body offset back into the statement text;
-    // the CONTEXT line names the line instead.
+    // TODO: emit the `LINE n:` excerpt with a caret into the body that
+    // PostgreSQL prints for a compile error — it needs a mapping from a body
+    // offset back into the statement text. Only the CONTEXT line names the line.
     assert_eq!(
         db.where_(),
         Some("compilation of PL/pgSQL function \"bad\" near line 3")
@@ -10481,7 +10519,8 @@ async fn plpgsql_bodies_are_syntax_checked_at_create_time() -> anyhow::Result<()
         .await
         .expect_err("a RAISE with fewer arguments than format placeholders must be rejected");
     let db = e.as_db_error().expect("database error");
-    // PostgreSQL reports this from `check_raise_parameters` as a syntax error.
+    // PostgreSQL classifies a format-string/argument mismatch as a syntax
+    // error, not as an invalid function definition.
     assert_eq!(db.code().code(), "42601");
     assert_eq!(db.message(), "too few parameters specified for RAISE");
 
@@ -10665,7 +10704,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     // vector end to end. See `OidVectorBinary`.
     assert_eq!(row.get::<_, OidVectorBinary>("proargtypes").0, vec![23, 25]);
     assert_eq!(row.get::<_, u32>("argtype0"), 23);
-    // Read through array_to_string: arrays have no binary wire format yet.
+    // TODO: add a binary wire encoding for arrays — `Value::encode_binary`
+    // rejects them with 0A000, so this reads through array_to_string.
     assert_eq!(row.get::<_, &str>("argnames"), "a,b");
     assert!(row.get::<_, &str>("prosrc").contains("RETURN 1;"));
     assert_eq!(row.get::<_, &str>("nspname"), "public");
@@ -11082,9 +11122,9 @@ async fn execute_describes_the_statement_it_names() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every execution re-plans, so `pg_prepared_statements` reports each as a
-/// custom plan and never a generic one — and counts a failed execution too,
-/// because the planning happened.
+/// Every execution re-plans, so `pg_prepared_statements` reports a
+/// parameterized statement's executions as custom plans and never as generic
+/// ones — and counts a failed execution too, because the planning happened.
 #[tokio::test]
 async fn prepared_statement_counts_its_executions() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -11547,8 +11587,9 @@ async fn prepared_statement_diverges_from_pg_on_a_later_set_timezone() -> anyhow
     let client = connect(spawn_server().await).await;
     client.simple_query("SET TIME ZONE 'UTC'").await?;
     // `prepare` uses the extended protocol, so the statement is parsed once.
-    // Rendered as text because `timestamptz` has no binary output routine yet,
-    // which tokio-postgres would otherwise request.
+    // TODO: add a binary wire encoding for timestamptz — `Value::encode_binary`
+    // rejects it with 0A000, so this reads through `::text` instead of the
+    // binary form tokio-postgres would otherwise request.
     let stmt = client
         .prepare("SELECT ('2024-06-01 12:00:00'::timestamptz)::text")
         .await?;
@@ -12282,7 +12323,8 @@ async fn pg_dump_preamble_parameters_are_accepted() -> anyhow::Result<()> {
             .await
             .unwrap_or_else(|e| panic!("`{sql}` must be accepted: {e}"));
     }
-    // Accepted, but a no-op: we implement exactly one value for each.
+    // TODO: honor DateStyle and client_encoding — every value is accepted but
+    // ignored, and `SHOW` reports the single form each is implemented for.
     assert_eq!(scalar(&client, "SHOW client_encoding").await, "UTF8");
     assert_eq!(scalar(&client, "SHOW DateStyle").await, "ISO, MDY");
     Ok(())
@@ -12370,10 +12412,10 @@ async fn tableoid_on_a_user_relation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where `tableoid` does *not* resolve. The first three match PostgreSQL
-/// exactly (it exposes no system columns on a row source that is not a
-/// relation); the partitioned parent is this build's own gap, reported as such
-/// rather than as a missing column.
+/// Where `tableoid` does *not* resolve. Every case below matches PostgreSQL
+/// exactly: it exposes no system columns on a row source that is not a
+/// relation. A partitioned parent is not such a source — the tail of the test
+/// pins it resolving, to the leaf each row came from.
 #[tokio::test]
 async fn tableoid_is_refused_off_a_plain_relation() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -13204,7 +13246,7 @@ async fn table_inheritance_reads_and_writes_fan_out_to_descendants() -> anyhow::
     // An INSERT aimed at the parent stays in the parent — the difference from a
     // partitioned parent, which would route the row away.
     assert_eq!(names("SELECT name FROM ONLY person").await?, ["pp"]);
-    // Reading `stud_emp` as a `student` must find `gpa` at ordinal 5, not 3.
+    // Reading `stud_emp` as a `student` must find `gpa` at ordinal 4, not 3.
     let msgs = client
         .simple_query("SELECT name, gpa FROM student ORDER BY name")
         .await?;
@@ -13506,7 +13548,8 @@ async fn a_multi_statement_query_shares_one_stamp() -> anyhow::Result<()> {
 async fn the_extended_protocol_restamps_each_execute() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client.simple_query("SET TIME ZONE 'UTC'").await?;
-    // `timestamptz` has no binary output routine yet, so ask for text.
+    // TODO: a binary output routine for `timestamptz`; until it exists a binary
+    // request is `0A000`, so this asks for text.
     let stmt = client
         .prepare("SELECT now()::text, statement_timestamp()::text")
         .await?;
@@ -13740,8 +13783,8 @@ async fn relative_column_defaults_freeze_but_function_defaults_do_not() -> anyho
 #[tokio::test]
 async fn the_session_zone_decides_which_day_today_is() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    // Two zones 18.5 hours apart: at some instant every day they disagree about
-    // the date, and at every instant they agree with their own `now()`.
+    // Two zones 25 hours apart: their local dates never coincide, and at every
+    // instant each still agrees with its own `now()`.
     for zone in ["Pacific/Midway", "Pacific/Kiritimati"] {
         client
             .simple_query(&format!("SET TIME ZONE '{zone}'"))
@@ -13763,8 +13806,11 @@ async fn the_session_zone_decides_which_day_today_is() -> anyhow::Result<()> {
 /// it and every `EXECUTE` — in whatever later transaction — returns the same
 /// instant. Probed against PG 18.4: two executes 0.3 s apart gave one frozen
 /// `'now'` and two different `now()`s. Here both move, because the plan is
-/// re-bound per Execute. See `fold_needs_session` for why closing this needs a
-/// plan cache rather than a session-aware binder.
+/// re-bound per Execute.
+///
+/// TODO: freeze a prepared statement's `'now'` at parse analysis the way PG
+/// does; it needs a plan cache rather than a session-aware binder, for the
+/// reason `fold_needs_session` gives.
 #[tokio::test]
 async fn a_prepared_now_literal_is_not_frozen_as_pg_freezes_it() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -13989,9 +14035,10 @@ fn data_row_values(msgs: &[(u8, Vec<u8>)]) -> Vec<String> {
 /// parent row and its children in one round trip saw two different instants.
 /// Reachable only over a raw socket: tokio-postgres Syncs once per call.
 ///
-/// This is the *clock* half of an implicit block. The batch is still not atomic
-/// — each autocommit statement commits at its own boundary — which is separate
-/// work.
+/// This is the *clock* half of an implicit block.
+///
+/// TODO: make an extended-query batch atomic; each autocommit statement still
+/// commits at its own boundary.
 #[tokio::test]
 async fn an_extended_query_batch_shares_one_transaction_timestamp() -> anyhow::Result<()> {
     let port = spawn_server().await;

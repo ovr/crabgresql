@@ -62,7 +62,6 @@ fn tsquery_codec_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         n += 1;
     }
     assert!(n > 3000, "only {n} usable cases");
-    // empty query
     // The empty query is storable too.
     let e = TsQuery::default();
     assert_eq!(
@@ -80,10 +79,10 @@ fn tsquery_decode_rejects_garbage_without_panicking() -> Result<(), Box<dyn std:
         let mut b = good.clone();
         if !b.is_empty() {
             let i = r.next(b.len());
-            b[i] = (r.next(256)) as u8; // corrupt a byte
+            b[i] = (r.next(256)) as u8;
         }
         let cut = r.next(b.len() + 1);
-        b.truncate(cut); // and/or truncate
+        b.truncate(cut);
         let _ = tsquery::decode(&b); // must not panic
     }
     for len in 0..40usize {

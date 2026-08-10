@@ -12,7 +12,7 @@
 //! catalog's partition bounds, and the Parquet buffer table's WAL records. One
 //! codec means one place to get a type's byte layout right, and it means an
 //! access method outside `crabgresql-pg-engine` can persist a `Value` without
-//! reimplementing 33 encodings.
+//! reimplementing every value kind's encoding.
 //!
 //! The tag bytes below are an on-disk format shared by all of those. Adding a
 //! kind appends a tag; renumbering one silently misreads every existing file.
@@ -304,8 +304,8 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_JSONPATH_TREE);
             put_var(out, &crate::jsonpath::encode(p));
         }
-        // Both text-search types store their canonical text for the same reason:
-        // the output form round-trips exactly through the input parser.
+        // `tsvector` stores its canonical text: the output form round-trips
+        // exactly through the input parser.
         Value::Tsvector(v) => {
             out.push(T_TSVECTOR);
             put_var(out, crate::tsvector::format(v).as_bytes());
@@ -824,15 +824,15 @@ mod tests {
                 .map(Value::Jsonb)
                 .expect("valid jsonb"),
         );
-        // `jsonpath` stores its canonical text form.
+        // `jsonpath` stores its parsed tree, not its canonical text form.
         roundtrip(
             crate::jsonpath::jsonpath_in("$.a[*] ? (@ > 3)")
                 .map(Value::Jsonpath)
                 .expect("valid jsonpath"),
         );
-        // Both text-search types store their canonical text form. The escaped
-        // lexeme and the phrase query exercise the parts of that form most
-        // likely to lose information on a round trip.
+        // `tsvector` stores its canonical text form. The escaped lexeme and the
+        // weighted positions exercise the parts of that form most likely to
+        // lose information on a round trip.
         for tv in ["'a':1A,3B 'b' 'c':16383", r"'ab\\c' 'x''y'", ""] {
             roundtrip(
                 crate::tsvector::tsvector_in(tv)

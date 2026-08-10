@@ -265,10 +265,14 @@ jobs:
       - name: generate the dataset
         run: scripts/bench/gen-tpch.sh 0.01 "$RUNNER_TEMP/tpch"
 
-      # Q19's whole WHERE is one top-level OR, so it degenerates into a cross
-      # product and takes ~85s on a developer machine — the per-query timeout
-      # is sized for a shared runner being several times slower, not for the
-      # other 21 queries, which finish in well under a second.
+      # Q19's whole WHERE is one top-level OR, so there is no conjunct for the
+      # pushdown pass to turn into a join condition and it degenerates into a
+      # cross product: ~85s on a developer machine, and the per-query timeout
+      # is sized for a shared runner being several times slower than that. The
+      # next slowest — Q4, Q20 and Q21, correlated subqueries re-planned once
+      # per outer row — take 10-18s; the rest finish in well under a second.
+      # TODO(perf): extract a join condition from a top-level OR WHERE so Q19
+      # stops running as a cross product.
       - name: tpch on ${{ matrix.am }}
         id: run
         continue-on-error: true

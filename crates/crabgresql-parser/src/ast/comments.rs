@@ -173,10 +173,6 @@ impl Deref for CommentWithSpan {
 /// A unified type of the different source code comment formats.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Comment {
-    /// A single line comment, typically introduced with a prefix and spanning
-    /// until end-of-line or end-of-file in the source code.
-    ///
-    /// Note: `content` will include the terminating new-line character, if any.
     /// A single-line comment, typically introduced with a prefix and spanning
     /// until end-of-line or end-of-file in the source code.
     ///

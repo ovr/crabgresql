@@ -78,8 +78,9 @@ fn bit_count(len: usize) -> Result<i32, ExecError> {
         .ok_or_else(|| crate::eval::out_of_range(PgType::Int4))
 }
 
-/// Evaluate a scalar function. All functions are STRICT: a NULL argument yields
-/// NULL without invoking the function.
+/// Evaluate a scalar function. Most are STRICT — a NULL argument yields NULL
+/// without invoking the function — and the handful that are not are dispatched
+/// ahead of that blanket check below.
 ///
 /// Still a pure function — `fmt` is session *state*, not a handle to anything
 /// side-effecting. It is threaded in because rendering a value to text
@@ -175,7 +176,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 !equal
             }));
         }
-        // --- geometric (point / lseg) ---
+        // --- geometric operators/functions ---
         ScalarFn::Geo(g) => return eval_geo(g, args),
         // The server's build identity: a compile-time constant, so unlike the
         // rest of the version/session surface it needs no handle at all.
@@ -300,9 +301,11 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         }
         ScalarFn::ArrayOverlap => return Ok(Value::Bool(array_overlap(&args[0], &args[1]))),
         ScalarFn::ArrayLength | ScalarFn::ArrayUpper => {
-            // `array_length(arr, dim)` / `array_upper(arr, dim)`: only dimension
-            // 1 exists here, where the 1-based upper bound equals the length. An
-            // empty array or any other dimension yields NULL.
+            // `array_length(arr, dim)` / `array_upper(arr, dim)`: for a
+            // one-dimensional value the 1-based upper bound of dimension 1 is
+            // its length. An empty array or any other dimension yields NULL.
+            // TODO: answer for dimensions above 1 once multi-dimensional arrays
+            // are modeled.
             let elems = array_elems(&args[0]);
             return Ok(if i4(&args[1]) == 1 && !elems.is_empty() {
                 Value::Int4(elems.len() as i32)
@@ -1024,8 +1027,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map_err(ts_err);
         }
         // Not a missing zone argument: the difference of two instants is the
-        // same span from every zone, which is why PG's `timestamptz_mi` is
-        // literally the `timestamp_mi` C function under a second name.
+        // same span in every zone, so unlike `timestamptz ± interval` above the
+        // result never depends on the session zone.
         ScalarFn::TimestampTzMi => {
             return timestamp::mi(tstz(&args[0]), tstz(&args[1]))
                 .map(Value::Interval)
@@ -1608,7 +1611,6 @@ fn dln(x: f64) -> Result<f64, ExecError> {
     Ok(x.ln())
 }
 
-/// `dlog10`: base-10 logarithm with PG's domain errors.
 fn dlog10(x: f64) -> Result<f64, ExecError> {
     if x.is_nan() {
         return Ok(f64::NAN);
@@ -2728,10 +2730,11 @@ fn money_of(v: &Value) -> i64 {
     }
 }
 
-/// Element equality for array containment/overlap. PG's `array_contain_compare`
-/// treats a NULL element as matching nothing (a NULL is never "contained", even
-/// by another NULL), so any NULL operand is unequal; two non-NULLs use the
-/// element type's total order.
+/// Element equality for array containment/overlap. PG treats a NULL element as
+/// matching nothing (a NULL is never "contained", even by another NULL), so any
+/// NULL operand is unequal; two non-NULLs use the element type's total order.
+/// The upstream `arrays` regression test pins this: `i @> '{NULL}'` and
+/// `i && '{NULL}'` both return zero rows.
 fn elem_eq(elem: PgType, x: &Value, y: &Value) -> bool {
     !matches!(x, Value::Null)
         && !matches!(y, Value::Null)

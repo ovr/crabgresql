@@ -135,8 +135,9 @@ fn parse_ipv4(s: &str) -> Option<([u8; 4], usize)> {
 /// PG's default masklen for a bare `cidr` (no `/bits`): the historical class of
 /// the first octet, widened to cover the octets actually written. Reproduces
 /// PG's observable output for `cidr '128'` (/16), `cidr '192'` (/24), etc.
-/// (The lone multicast-base literal `cidr '224'` is PG's one `/4` special case,
-/// not modeled here.)
+/// TODO: return `/4` for the bare one-octet literal `cidr '224'`, PG's single
+/// exception to the widening: every other class D spelling widens to the octets
+/// written, so `225` is `/8` and `224.0` is `/16` exactly as here.
 fn cidr_default_bits(first: u8, octets: usize) -> u8 {
     let classful: u8 = match first {
         0..=127 => 8,    // class A
@@ -226,7 +227,13 @@ pub fn cidr_in(input: &str) -> Result<Inet, NetError> {
 }
 
 /// The bare address (no `/bits`) in canonical form: dotted quad or the RFC 5952
-/// compressed IPv6 form (`std`'s `Ipv6Addr` display matches PG's).
+/// compressed IPv6 form (`std`'s `Ipv6Addr` display matches PG's, including the
+/// IPv4-mapped `::ffff:1.2.3.4` spelling).
+/// TODO: print the low 32 bits as a dotted quad when the first six groups are
+/// zero and the seventh is not — PG renders `::4.3.2.1`, the form the upstream
+/// `inet` regression test expects, where `std` renders `::403:201`. A zero run
+/// reaching the seventh group stays compressed in PG too (`::2`, not
+/// `::0.0.0.2`).
 fn addr_str(v: &Inet) -> String {
     if v.is_ipv6 {
         let mut o = [0u8; 16];
@@ -474,7 +481,7 @@ pub fn abbrev_cidr(v: &Inet) -> String {
     format!("{}/{}", addr, net.bits)
 }
 
-/// PG's `inet_cidr_ntop` IPv6 rendering: show only the `ceil(bits/16)` groups
+/// PG's `abbrev(cidr)` IPv6 rendering: show only the `ceil(bits/16)` groups
 /// covered by the mask. A zero-length prefix is `::`; a single group appends
 /// `::`; two or more groups use the standard `::` zero-run compression.
 fn abbrev_ipv6(addr: &[u8; 16], bits: u8) -> String {

@@ -79,7 +79,7 @@ fn row_filter(rows: &[Tuple], predicate: &BoundExpr) -> Result<Vec<Tuple>, ExecE
     Ok(out)
 }
 
-/// The assertion every test here makes: both paths, same answer.
+/// The assertion the filter tests make: both paths, same answer.
 fn assert_same(schema: &TableSchema, rows: &[Tuple], predicate: &BoundExpr) {
     let columnar = columnar_filter(schema, rows, predicate).expect("columnar filter");
     let row = row_filter(rows, predicate).expect("row filter");
@@ -351,7 +351,8 @@ fn uncompilable_expressions_decline() {
     let schema = schema_of(&[PgType::Int4]);
     let layout = layout_of(&schema);
 
-    // Arithmetic: no vectorized operand evaluation yet.
+    // TODO(perf): vectorize computed operands (arithmetic) so a predicate over
+    // `c0 + 1` stops falling back to the row filter.
     let arithmetic = compare(
         BinOp::Eq,
         PgType::Int4,

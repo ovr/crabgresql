@@ -29,7 +29,12 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 /// One column in a `RowDescription` message. Carries every field on the wire so
 /// a client decoding a real server's RowDescription round-trips losslessly; the
 /// server builds query-result columns with [`FieldDescription::new`], which
-/// zeroes the catalog origin and reports text format (no catalog yet).
+/// zeroes the catalog origin and reports text format.
+///
+/// TODO: report the source table OID and attribute number for result columns
+/// that are plain table column references, and the type modifier of any type
+/// that carries one — PG describes a `varchar(5)` result as typmod 9, where
+/// [`FieldDescription::new`] reports -1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDescription {
     pub name: String,
@@ -47,7 +52,7 @@ pub struct FieldDescription {
 
 impl FieldDescription {
     /// A column with no catalog origin: no table/attnum, no type modifier, text
-    /// format. Used for query results before a catalog exists.
+    /// format.
     pub fn new(name: String, type_oid: u32, type_len: i16) -> Self {
         Self {
             name,

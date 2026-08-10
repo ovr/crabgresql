@@ -1,6 +1,8 @@
 //! Storage manager: maps a relation to its on-disk file and does checksummed,
-//! block-granular I/O. One file per relation under `<data_dir>/base/<relfilenode>`
-//! (single segment; PG's 1 GB segmentation is a follow-up).
+//! block-granular I/O. One file per relation under `<data_dir>/base/<relfilenode>`.
+//!
+//! TODO: split a relation across 1 GB segment files as PG does; one unbounded
+//! file per relation caps a relation at the filesystem's file-size limit.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -33,8 +35,8 @@ pub struct StorageManager {
     /// record of what it held — so a checkpoint that fsynced only "the relations I
     /// just wrote" would miss every relation whose pages were all evicted before
     /// it ran. Whole-stream replay used to repair those lost writes; a replay
-    /// bounded at a redo point cannot. PostgreSQL keeps the same queue in `md.c`
-    /// for the same reason.
+    /// bounded at a redo point cannot. PostgreSQL keeps an equivalent queue of
+    /// pending fsync requests, drained at checkpoint, for the same reason.
     ///
     /// It lives here rather than in the buffer pool so that memory relations fall
     /// out for free (the callers below register only past the RAM early-return),
@@ -395,9 +397,11 @@ impl StorageManager {
         self.file(rel).map(|_| ())
     }
 
-    /// Truncate a relation to zero blocks. Not on the transactional TRUNCATE path
-    /// (which swaps to a fresh relfilenode); used by the startup crash-reset of
-    /// unlogged relations ([`crate::PgEngine::reset_unlogged_relations`]).
+    /// Truncate a relation to zero blocks. A transactional TRUNCATE does not
+    /// empty the table's heap file this way — it swaps to a fresh relfilenode —
+    /// so the callers are the startup crash-reset of unlogged relations
+    /// ([`crate::PgEngine::reset_unlogged_relations`]) and the post-commit
+    /// reclaim of a truncated table's chunk store, which keeps its relfilenode.
     pub fn truncate(&self, rel: RelFileNode) -> std::io::Result<()> {
         if self.with_mem(rel, |pages| pages.clear()).is_some() {
             return Ok(());

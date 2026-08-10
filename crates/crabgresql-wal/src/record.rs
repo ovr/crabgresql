@@ -104,8 +104,8 @@ impl<'a> WalRecord<'a> {
     }
 
     /// Parse one record at the front of `bytes`. Returns:
-    /// - `Ok(Some((record, len)))` on a complete, CRC-valid record;
-    /// - `Ok(None)` when `bytes` is too short, `total_len` is nonsensical, or the
+    /// - `Some((record, len))` on a complete, CRC-valid record;
+    /// - `None` when `bytes` is too short, `total_len` is nonsensical, or the
     ///   CRC does not match — all of which mean "the log validly ends here"
     ///   (a crash tore the tail); recovery stops cleanly at that point.
     pub fn decode(bytes: &'a [u8]) -> Option<(WalRecord<'a>, usize)> {

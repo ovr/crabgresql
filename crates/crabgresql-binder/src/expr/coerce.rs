@@ -48,8 +48,9 @@ pub(super) fn bind_cast(
     }
     // `ARRAY[…]::reg*[]`: cast each element, for the same reason. A value-level
     // array cast cannot do this — coercing an element needs a catalog lookup,
-    // not a pure conversion — so casting an existing `text[]` *expression* to
-    // `reg*[]` is still unsupported; only the constructor spelling resolves.
+    // not a pure conversion — so only the constructor spelling resolves.
+    // TODO: cast an array-typed *expression* (e.g. a `text[]` column) to
+    // `reg*[]`, which needs element-wise name resolution at run time.
     if let ast::Expr::Array(arr) = inner
         && let PgType::Array(elem_oid) = target
         && let Some(PgType::Reg(kind)) = PgType::from_oid(elem_oid)
@@ -77,9 +78,6 @@ pub(super) fn bind_cast(
     )?))
 }
 
-/// The (normalized) name of a bare `DataType::Custom` type reference — e.g. the
-/// `xfloat4` in `x::xfloat4` — used to look a `CREATE TYPE` name up in the
-/// catalog. `None` for anything that is not a plain custom name.
 /// Lower `expr::regclass` (and the other `reg*` targets) to the catalog-backed
 /// function that resolves it at run time.
 ///
@@ -154,7 +152,9 @@ fn coerce_user_cast(
     }
     // Text family → enum maps the label to its ordinal. Only a constant text
     // value can resolve at bind time; a runtime `textcol::myenum` cast has no
-    // catalog to consult in the executor and is not supported yet.
+    // catalog to consult in the executor.
+    // TODO: resolve enum labels at run time, so a non-constant text expression
+    // can be cast to an enum.
     if is_text_family(source)
         && let PgType::User(oid) = target
         && let Some(info) = catalog.enum_info(oid)
@@ -252,8 +252,8 @@ pub(crate) enum ArgFail {
 
 /// Coerce a function argument binding to `target`. Unknown literals resolve to
 /// `target`; a typed argument matches exactly, or (when `exact_only` is false)
-/// is promoted if `target` is its common type with `target` — reproducing PG's
-/// implicit numeric widening for function arguments.
+/// is promoted when it implicitly casts to `target` — reproducing PG's implicit
+/// numeric widening for function arguments.
 pub(crate) fn coerce_for_arg(
     binding: Binding,
     target: PgType,
@@ -569,45 +569,6 @@ pub(crate) fn coerce_expr(expr: BoundExpr, ty: PgType) -> Result<BoundExpr, Bind
     }
 }
 
-/// Whether converting `from` to `to` reads session state, and so must be left
-/// to a runtime `Coerce` instead of folded at bind time. The binder holds no
-/// session, and folding one of these would freeze the *binding* session's
-/// answer into the plan — visibly wrong for a prepared statement re-executed
-/// after a `SET`.
-///
-/// Three GUCs reach this far:
-///
-/// * `extra_float_digits`, for any conversion to a string type. (The old guard
-///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
-///   precision and silently ignored the session's setting.)
-/// * `bytea_output`, which rides on the same string-type arm: `'\x00'::bytea`
-///   renders as `\x00` or `\000` depending on the session, so `::text` on one
-///   cannot be folded either.
-/// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
-///   an instant to a wall clock, in both directions — and for every conversion
-///   to `timetz`, which attaches the zone's offset when the value carries none.
-///
-/// The transaction clock is the fourth such input, and [`resolve_unknown`]
-/// defers on it the same way — but it is detected by probing rather than listed
-/// here, since `'today 10:00'` is as relative as `'today'` and only the scanner
-/// knows that.
-///
-/// **Known divergence.** PostgreSQL folds these literals during parse analysis,
-/// freezing the instant with the parsing session's zone and clock; we defer and
-/// recompute per execution. Visible for a prepared statement re-executed after
-/// a `SET TimeZone` (pinned by
-/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and for
-/// `PREPARE p AS SELECT 'now'::timestamptz`, which PG answers identically on
-/// every `EXECUTE`.
-///
-/// Handing the binder a session `FmtCtx` would *not* close it: the extended
-/// protocol re-binds the statement on every `Execute` (`analyze_statement`
-/// binds for Describe and throws the plan away; `bind_dml_with_params` runs
-/// again from Execute), so a bind-time fold would be re-done with each
-/// execution's own session state and land back where it started. Closing it
-/// needs a plan cache. What the deferral *does* still cost is nothing at DDL
-/// time: a column default resolves through `zoned_literal_default`, where the
-/// session is in hand, so `DEFAULT 'now'` freezes exactly as PG's does.
 /// Whether folding this string-to-`interval` conversion at bind time would
 /// read the literal under the wrong `IntervalStyle`.
 ///
@@ -644,6 +605,48 @@ fn reads_interval_style(text: &str, ty: PgType) -> bool {
     }
 }
 
+/// Whether converting `from` to `to` reads session state, and so must be left
+/// to a runtime `Coerce` instead of folded at bind time. The binder holds no
+/// session, and folding one of these would freeze the *binding* session's
+/// answer into the plan — visibly wrong for a prepared statement re-executed
+/// after a `SET`.
+///
+/// Three GUCs reach this far:
+///
+/// * `extra_float_digits`, for any conversion to a string type. (The old guard
+///   here tested only `Text`, so `1.5::float8::varchar` folded at the default
+///   precision and silently ignored the session's setting.)
+/// * `bytea_output`, which rides on the same string-type arm: `'\x00'::bytea`
+///   renders as `\x00` or `\000` depending on the session, so `::text` on one
+///   cannot be folded either.
+/// * `TimeZone`, for every `timestamptz` conversion — the zone is what relates
+///   an instant to a wall clock, in both directions — and for every conversion
+///   to `timetz`, which attaches the zone's offset when the value carries none.
+///
+/// The transaction clock is the fourth such input, and [`resolve_unknown`]
+/// defers on it the same way — but it is detected by probing rather than listed
+/// here, since `'today 10:00'` is as relative as `'today'` and only the scanner
+/// knows that.
+///
+/// **Known divergence.** PostgreSQL folds these literals during parse analysis,
+/// freezing the instant with the parsing session's zone and clock; we defer and
+/// recompute per execution. Visible for a prepared statement re-executed after
+/// a `SET TimeZone` (pinned by
+/// `prepared_statement_diverges_from_pg_on_a_later_set_timezone`), and for
+/// `PREPARE p AS SELECT 'now'::timestamptz`, which PG answers identically on
+/// every `EXECUTE`.
+///
+/// Handing the binder a session `FmtCtx` would *not* close it: the extended
+/// protocol re-binds the statement on every `Execute` (`analyze_statement`
+/// binds for Describe and throws the plan away; `bind_dml_with_params` runs
+/// again from Execute), so a bind-time fold would be re-done with each
+/// execution's own session state and land back where it started.
+/// TODO: fold a zone- or clock-dependent literal once at parse analysis, as PG
+/// does — which needs a plan cache to keep the folded plan across `EXECUTE`s.
+///
+/// What the deferral *does* still cost is nothing at DDL time: a column default
+/// resolves through `zoned_literal_default`, where the session is in hand, so
+/// `DEFAULT 'now'` freezes exactly as PG's does.
 fn fold_needs_session(from: Option<PgType>, to: PgType) -> bool {
     if matches!(
         to,

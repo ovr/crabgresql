@@ -30,19 +30,20 @@ pub enum ScriptItem {
     Metacommand { name: String, args: String },
     /// The inline data body of a preceding `COPY … FROM STDIN` statement: every
     /// physical line up to (but not including) the terminating `\.`, joined with
-    /// newlines. The data lines are still echoed individually as `Line`s, as
-    /// psql does under `-a`; this carries the payload to feed over the wire.
+    /// newlines. The data lines are not echoed as `Line`s — psql under `-a`
+    /// leaves copy-in data out of its output (`copy2.out:393`) — so this item
+    /// is the only carrier of the payload to feed over the wire.
     CopyData(String),
 }
 
 /// What ended a query buffer.
 #[derive(Debug, PartialEq)]
 pub enum QueryEnd {
-    /// A top-level `;`, which is part of `text`.
+    /// A top-level `;`, which is part of the `Sql` fragments preceding it.
     Semicolon,
     /// End of file with a non-empty buffer, which psql also executes.
     Eof,
-    /// One of psql's query-buffer terminators — `\g`, `\gset`, `\gexec`,
+    /// One of psql's query-buffer terminators — `\g`, `\gx`, `\gset`, `\gexec`,
     /// `\gdesc`, `\crosstabview` — with its raw argument text.
     Backslash { name: String, args: String },
 }
@@ -122,7 +123,7 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
     let mut state = State::Normal;
     let mut dollar_tag = String::new();
     // `Some` while collecting the inline data of a `COPY … FROM STDIN`: each
-    // line is echoed and accumulated until a lone `\.` closes the payload.
+    // line is accumulated until a lone `\.` closes the payload.
     let mut copy_data: Option<String> = None;
 
     for line in input.lines() {

@@ -10,8 +10,9 @@
 //! grammar and the authority on it. This crate is a fork of sqlparser-rs and
 //! carries no dependency on the rest of the workspace; that autonomy is worth
 //! more than sharing 40 lines, so the rule is: change `intlit` first, then
-//! mirror it here. The two are kept honest by `mirrors_the_types_crate_grammar`
-//! in `crates/crabgresql-types/src/intlit.rs`, which asserts the same table of
+//! mirror it here. The two are kept honest by the
+//! `mirrors_the_parser_crate_grammar` test in
+//! `crates/crabgresql-types/src/intlit.rs`, which asserts the same table of
 //! spellings both must accept.
 
 /// The value of an integer literal token, or `None` if the text is not one.

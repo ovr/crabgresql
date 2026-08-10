@@ -95,9 +95,10 @@ fn coerce_assign(
             } else if is_bit_family(Some(ty)) && is_bit_family(Some(target)) {
                 coerce_expr(e, target)?
             // Assignment context also permits the implicit `timestamp ->
-            // timestamptz` cast and its assignment-only reverse (both are plain
-            // microsecond reinterprets under the UTC session zone), so inserting
-            // a `timestamp` expression into a `timestamptz` column works, as in PG.
+            // timestamptz` cast and its assignment-only reverse (both convert
+            // through the session zone, exactly as `AT TIME ZONE` does, so
+            // neither folds at bind time), so inserting a `timestamp`
+            // expression into a `timestamptz` column works, as in PG.
             // ... and the pairs `pg_cast` marks assignment-only. `"char"` needs
             // them spelled out because it is category `Z`, not `S`: PG's
             // I/O-coercion shortcut for string-category targets does not apply,
@@ -281,9 +282,11 @@ pub fn subquery_in_execute_param(e: BindError) -> BindError {
 ///   explicit cast goes there too: PG keeps the modifier on one
 ///   (`'1001'::bit(4)`), which is the opposite of the rule above.
 ///
-/// A `timestamptz` value is baked here in whatever zone the DDL session had, and
-/// a `bytea` in whatever `bytea_output` it had; [`crate::ruleutils::stored_expr`]
-/// puts both back into the reader's on the way out.
+/// A `bytea` value is baked here in `hex` no matter what the DDL session's
+/// `bytea_output` was, and a `timestamptz` in that session's zone — the latter
+/// by the DDL path, since a zone-dependent literal never folds to a `Const`
+/// here and leaves as `Source`. [`crate::ruleutils::stored_expr`] puts both
+/// back into the reader's `bytea_output` and zone on the way out.
 pub fn deparse_literal_default(
     expr: &ast::Expr,
     column: &Column,

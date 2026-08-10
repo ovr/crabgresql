@@ -1293,8 +1293,8 @@ pub const RESERVED_FOR_COLUMN_ALIAS: &[Keyword] = &[
 ];
 
 /// Global list of reserved keywords allowed after FROM.
-/// Parser should call Dialect::get_reserved_keyword_after_from
-/// to allow for each dialect to customize the list.
+/// Parser should call `Dialect::is_table_factor` to allow for each dialect to
+/// customize the list.
 pub const RESERVED_FOR_TABLE_FACTOR: &[Keyword] = &[
     Keyword::INTO,
     Keyword::LIMIT,
@@ -1327,8 +1327,10 @@ pub const RESERVED_FOR_IDENTIFIER: &[Keyword] = &[
 /// (`col_name_keyword`) — are accepted, and `C` is where the type names live
 /// (`name`, `text`, `time`, `timestamp`), so nothing ordinary is caught here.
 ///
-/// Two of PG's 101 have no `Keyword` in this fork and are simply absent:
-/// `ANALYSE` (the British spelling of `ANALYZE`) and `ISNULL`.
+/// TODO: add `Keyword::ANALYSE` (the British spelling of `ANALYZE`) and
+/// `Keyword::ISNULL` and list them here — neither has a `Keyword` in this fork,
+/// so only 99 of PG's 101 are covered and both are still accepted as bare
+/// column names where PG raises `syntax error at or near "isnull"`.
 pub const RESERVED_FOR_COLUMN_NAME: &[Keyword] = &[
     Keyword::ALL,
     Keyword::ANALYZE,

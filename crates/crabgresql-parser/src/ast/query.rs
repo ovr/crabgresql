@@ -122,7 +122,6 @@ pub enum SetExpr {
     /// in its body and an optional ORDER BY / LIMIT.
     Query(Box<Query>),
     /// UNION/EXCEPT/INTERSECT of two queries
-    /// A set operation combining two query expressions.
     SetOperation {
         /// Left operand of the set operation.
         left: Box<SetExpr>,
@@ -228,8 +227,9 @@ impl fmt::Display for SetOperator {
 }
 
 /// A quantifier for [SetOperator].
-// TODO: Restrict parsing specific SetQuantifier in some specific dialects.
-// For example, BigQuery does not support `DISTINCT` for `EXCEPT` and `INTERSECT`
+// TODO: reject the `BY NAME` quantifiers under the PostgreSQL dialect —
+// PostgreSQL has no `UNION/EXCEPT/INTERSECT ... BY NAME` form, but
+// `parse_set_quantifier` accepts one regardless of the dialect in use.
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -265,7 +265,6 @@ impl fmt::Display for SetQuantifier {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 /// A [`TABLE` command]( https://www.postgresql.org/docs/current/sql-select.html#SQL-TABLE)
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// A (possibly schema-qualified) table reference used in `FROM` clauses.
 pub struct Table {
     /// The relation name, as a (possibly schema-qualified) object name.
     /// Identifier quoting is preserved so case-sensitive relations resolve
@@ -733,7 +732,8 @@ impl fmt::Display for CteAsMaterialized {
 /// A single CTE (used after `WITH`): `<alias> [(col1, col2, ...)] AS <materialized> ( <query> )`
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
-/// number of columns in the query matches the number of columns in the query.
+/// number of names in the column list matches the number of columns returned
+/// by the query.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -742,7 +742,7 @@ pub struct Cte {
     pub alias: TableAlias,
     /// The query that defines the CTE body.
     pub query: Box<Query>,
-    /// Optional `FROM` identifier for materialized CTEs.
+    /// Identifier of a trailing `FROM <name>` clause after the CTE body.
     pub from: Option<Ident>,
     /// Optional `AS MATERIALIZED` / `AS NOT MATERIALIZED` hint.
     pub materialized: Option<CteAsMaterialized>,
@@ -1617,7 +1617,6 @@ impl fmt::Display for TableSampleQuantity {
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Sampling method used by `TABLESAMPLE`.
 pub enum TableSampleMethod {
     /// `ROW` sampling method.
     Row,
@@ -1748,7 +1747,6 @@ impl fmt::Display for TableSample {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// An item in the `MEASURES` clause of `MATCH_RECOGNIZE`.
 pub struct Measure {
     /// Expression producing the measure value.
     pub expr: Expr,
@@ -1848,7 +1846,6 @@ impl fmt::Display for EmptyMatchesMode {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// A symbol defined in a `MATCH_RECOGNIZE` operation.
 pub struct SymbolDefinition {
     /// The symbol identifier.
     pub symbol: Ident,
@@ -2488,7 +2485,8 @@ pub enum JoinConstraint {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// The kind of `ORDER BY` clause: either `ALL` with modifiers or a list of expressions.
 pub enum OrderByKind {
-    /// `GROUP BY ALL`/`ORDER BY ALL` syntax with optional modifiers.
+    /// `ORDER BY ALL` syntax of [DuckDB] and [ClickHouse], carrying the
+    /// `ASC`/`DESC` and `NULLS` options written after `ALL`.
     ///
     /// [DuckDB]:  <https://duckdb.org/docs/sql/query_syntax/orderby>
     /// [ClickHouse]: <https://clickhouse.com/docs/en/sql-reference/statements/select/order-by>
@@ -2573,7 +2571,6 @@ impl fmt::Display for OrderByExpr {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// `WITH FILL` options for ClickHouse `ORDER BY` expressions.
 pub struct WithFill {
     /// Optional lower bound expression for the fill range (`FROM <expr>`).
     pub from: Option<Expr>,
@@ -2734,7 +2731,8 @@ impl fmt::Display for Offset {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum OffsetRows {
-    /// Omitting `ROW`/`ROWS` entirely (non-standard MySQL quirk).
+    /// No `ROW`/`ROWS` keyword. PostgreSQL accepts this bare `OFFSET start`
+    /// spelling, unlike the standard offset clause, which requires the keyword.
     None,
     /// `ROW` keyword present.
     Row,
@@ -2941,7 +2939,6 @@ impl fmt::Display for SelectInto {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Modifiers used with `GROUP BY` such as `WITH ROLLUP` or `WITH CUBE`.
 pub enum GroupByWithModifier {
     /// `WITH ROLLUP` modifier.
     Rollup,
@@ -3110,7 +3107,6 @@ impl fmt::Display for JsonTableColumn {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-/// A nested column in a `JSON_TABLE` column list.
 pub struct JsonTableNestedColumn {
     /// JSON path expression (must be a literal `Value`).
     pub path: ValueWithSpan,
@@ -3179,7 +3175,6 @@ impl fmt::Display for JsonTableNamedColumn {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-/// Error/empty-value handling for `JSON_TABLE` columns.
 pub enum JsonTableColumnErrorHandling {
     /// `NULL` — return NULL when the path does not match.
     Null,
@@ -3323,7 +3318,6 @@ impl fmt::Display for XmlTableColumn {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-/// Argument passed in the `XMLTABLE PASSING` clause.
 pub struct XmlPassingArgument {
     /// Expression to pass to the XML table.
     pub expr: Expr,
@@ -3350,7 +3344,6 @@ impl fmt::Display for XmlPassingArgument {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-/// The PASSING clause for `XMLTABLE`.
 pub struct XmlPassingClause {
     /// The list of passed arguments.
     pub arguments: Vec<XmlPassingArgument>,

@@ -297,8 +297,9 @@ pub struct RoutineDefinition {
 struct FuncEntry {
     oid: u32,
     name: String,
-    /// The schema the routine lives in. Always `public` today —
-    /// `CREATE FUNCTION app.f` is still unsupported.
+    /// The schema the routine lives in.
+    /// TODO: record the schema a qualified `CREATE FUNCTION app.f` names; every
+    /// routine is registered in `public`.
     namespace: String,
     kind: RoutineKind,
     /// Input-argument types: the routine's identity.
@@ -326,9 +327,9 @@ impl FuncEntry {
         format!("{} {}({})", self.kind.noun(), self.name, args.join(", "))
     }
 
-    /// The same object, spelled the way a *dependency* error spells it —
-    /// `format_procedure`'s form, whose argument list has **no space** after the
-    /// comma: `function h(integer,text)`, against [`Self::describe`]'s
+    /// The same object, spelled the way a *dependency* error spells it: its
+    /// argument list has **no space** after the comma —
+    /// `function h(integer,text)`, against [`Self::describe`]'s
     /// `function h(integer, text)`. Probed against PostgreSQL 18.4; the two
     /// spellings really do differ, so they stay two methods.
     fn object_description(&self) -> String {
@@ -481,7 +482,8 @@ fn enum_labels_mut<'a>(
             sqlstate::UNDEFINED_OBJECT,
             format!("type \"{ty}\" does not exist"),
         )),
-        // PG's `%s is not an enum` renders the type name unquoted (format_type_be).
+        // PG's `%s is not an enum` renders the type name unquoted, unlike the
+        // quoted spelling of the "does not exist" message above.
         Some(entry) => entry.enum_labels.as_mut().ok_or_else(|| {
             PgError::new(sqlstate::WRONG_OBJECT_TYPE, format!("{ty} is not an enum"))
         }),
@@ -631,7 +633,8 @@ impl GlobalCatalog {
     /// `CREATE TYPE name AS ENUM ('a', 'b', ...)`. Labels are stored verbatim
     /// (case-sensitive) in definition order, which is also their sort order.
     /// Re-declaring an existing type is a duplicate-object error; a label that
-    /// repeats within the list is rejected as PG's `enum_in` bootstrap does.
+    /// repeats within the list draws PG's `enum label "x" used more than once`
+    /// (`vendor/postgres/regress/expected/enum.out`).
     pub fn create_enum_type(
         &self,
         name: &str,
@@ -715,12 +718,12 @@ impl GlobalCatalog {
     /// AFTER; `None` appends. Labels are stored verbatim (case-sensitive), like
     /// [`Self::create_enum_type`].
     ///
-    /// Known limitation: an enum value's ordinal is baked into every stored
-    /// `Value::Enum` at bind time, so inserting BEFORE/AFTER an existing label
-    /// renumbers later labels for *new* values only — rows already materialized
-    /// keep their old ordinal until re-read. PG avoids this with a fractional
-    /// `enumsortorder`; matching that is out of scope. Appending (no position) is
-    /// always safe.
+    /// TODO: give each label a fractional sort order (PG's
+    /// `pg_enum.enumsortorder`) so inserting BEFORE/AFTER an existing label
+    /// does not renumber the labels after it. An enum value's ordinal is baked
+    /// into every stored `Value::Enum` at bind time, so the renumbering reaches
+    /// *new* values only — rows already materialized keep their old ordinal
+    /// until re-read. Appending (no position) is always safe.
     pub fn add_enum_value(
         &self,
         ty: &str,
@@ -876,8 +879,8 @@ impl GlobalCatalog {
         cat.funcs.push(FuncEntry {
             oid,
             name: def.name,
-            // CREATE FUNCTION does not accept a qualified name yet, so every
-            // routine lands in `public`.
+            // TODO: parse a schema-qualified routine name in CREATE FUNCTION
+            // and register the routine there instead of always in `public`.
             namespace: "public".to_string(),
             kind: def.kind,
             args: arg_types,
@@ -920,8 +923,11 @@ impl GlobalCatalog {
         out
     }
 
-    /// `CREATE CAST (source AS target) ...`. Only binary-coercible
-    /// (`WITHOUT FUNCTION`) casts are supported for now.
+    /// `CREATE CAST (source AS target) ...`, restricted to binary-coercible
+    /// (`WITHOUT FUNCTION`) casts.
+    ///
+    /// TODO: register `WITH FUNCTION` / `WITH INOUT` casts; both are refused
+    /// with `0A000`.
     pub fn create_cast(
         &self,
         source: TypeRef,
@@ -1058,15 +1064,11 @@ impl GlobalCatalog {
         }
     }
 
-    /// `DROP FUNCTION spec [, ...] [CASCADE|RESTRICT]`. Every target is resolved
-    /// before any is removed, so a failure on one leaves the whole statement's
-    /// targets intact (PG evaluates a multi-target DROP atomically). Nothing in
-    /// this catalog depends on a function — functions are only ever dependents of
-    /// user types — so `CASCADE`/`RESTRICT` have no dependents to walk and are
-    /// accepted without producing cascade notices.
     /// Resolve each `DROP FUNCTION`/`DROP PROCEDURE` target to the OID it names,
     /// without removing anything. `None` marks an absent target `if_exists`
-    /// allows skipping.
+    /// allows skipping. Every target is resolved before any is removed, so a
+    /// failure on one leaves the whole statement's targets intact — PG evaluates
+    /// a multi-target DROP atomically.
     ///
     /// Separate from [`Self::drop_resolved_routines`] so the caller can look for
     /// dependents in between — and that scan **re-enters this catalog** through
@@ -1462,10 +1464,16 @@ impl CatalogInner {
 }
 
 /// The `LANGUAGE internal` built-in functions crabgresql recognises: the text
-/// I/O functions of every scalar type crabgresql supports, so a user type can be
-/// bootstrapped over any of them (as PG allows). PG has hundreds more; an
-/// unrecognised name draws PG's "there is no built-in function named" error, as
-/// it would in PG. Keep this in step with the supported `PgType` set.
+/// I/O functions of the numeric, boolean, `bytea`, character, `bit` and
+/// date/time built-ins, so a user type can be bootstrapped over any of them (as
+/// PG allows). PG has hundreds more; an unrecognised name draws PG's "there is
+/// no built-in function named" error, as it would in PG. Keep this list in step
+/// with the `PgType` set as new types land.
+///
+/// TODO: recognise the I/O functions of the supported `PgType`s missing here —
+/// `oid`, `money`, `uuid`, `varbit`, `tid`/`xid`/`xid8`/`pg_lsn`, the network,
+/// `json`/`jsonb`, text-search, `reg*` and geometric types among them; their
+/// names are rejected, so no user type can be bootstrapped over any of those.
 fn is_known_internal(name: &str) -> bool {
     matches!(
         name,

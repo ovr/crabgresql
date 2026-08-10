@@ -36,7 +36,8 @@ const SINGLETON_JSON_ITEM_REQUIRED: &str = "22038";
 
 /// Guard against a pathologically deep path chain overflowing the stack while
 /// parsing or evaluating (worker threads get ~2 MB stacks). Far exceeds any real
-/// path; PG relies on `check_stack_depth()` for the same protection.
+/// path; PG bounds the same recursion with the `max_stack_depth` GUC instead of
+/// a fixed node count, and both report `stack depth limit exceeded` (54001).
 const MAX_DEPTH: usize = 200;
 
 /// A parsed `jsonpath` program: a mode flag plus the root expression.
@@ -581,7 +582,7 @@ fn is_utf8_start(c: u8) -> bool {
 }
 
 // ===========================================================================
-// Parser (Pratt over the token stream)
+// Parser (recursive descent over the token stream)
 // ===========================================================================
 
 struct Parser {
@@ -1481,8 +1482,8 @@ pub fn decode(bytes: &[u8]) -> Option<JsonPath> {
     (i == bytes.len()).then_some(JsonPath { strict, expr })
 }
 
-/// Operator priority (PG's `operationPriority`): a child is parenthesized when
-/// its priority is `<=` its parent's, so lower-priority (looser-binding) or
+/// Operator priority driving `jsonpath_out`: a child is parenthesized when its
+/// priority is `<=` its parent's, so lower-priority (looser-binding) or
 /// equal-priority sub-expressions print with explicit grouping.
 fn prio(node: &Node) -> u8 {
     match node {
@@ -2538,7 +2539,7 @@ mod tests {
             Some("Unrecognized flag character \"h\" in LIKE_REGEX predicate.")
         );
 
-        // `x` is unimplemented, but only rejected when `q` is absent.
+        // PG does not implement `x`, and rejects it only when `q` is absent.
         let e = jsonpath_in("$ like_regex \"a\" flag \"ismx\"").expect_err("x needs q");
         assert_eq!(e.sqlstate, "0A000");
         assert_eq!(

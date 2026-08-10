@@ -144,8 +144,9 @@ pub fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()
 }
 
 /// Corrupt a data page by flipping a byte well inside its written region (past
-/// the page header, before the checksum field), deterministically breaking its
-/// CRC so `StorageManager::read` must reject it.
+/// the 24-byte page header, so the flip lands in payload the CRC covers rather
+/// than in the checksum field itself), deterministically breaking its CRC so
+/// `StorageManager::read` must reject it.
 pub fn corrupt_page_byte(dir: &Path, rel: RelFileNode, block: u32) -> std::io::Result<()> {
     const BLCKSZ: u64 = 8192;
     flip_byte(&relfile_path(dir, rel), block as u64 * BLCKSZ + 100)

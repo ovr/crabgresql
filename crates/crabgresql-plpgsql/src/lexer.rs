@@ -246,7 +246,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// PostgreSQL's `syntax error at or near "<token>"`, at the cursor's line.
+    /// PostgreSQL's `syntax error at or near "<token>"`, at the cursor's line,
+    /// followed by an `expected <what>` clause PostgreSQL does not print.
     pub fn unexpected(&self, expected: &str) -> CompileError {
         let found = match self.peek() {
             Token::EOF => "end of function definition".to_string(),

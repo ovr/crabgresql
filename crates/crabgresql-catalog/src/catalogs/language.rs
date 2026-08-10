@@ -7,7 +7,6 @@ use crate::SystemCatalog;
 use crate::cols::*;
 use crate::oids::*;
 
-/// `pg_catalog.pg_language`.
 pub(crate) fn pg_language_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_language",

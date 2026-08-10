@@ -128,9 +128,10 @@ pub enum BoundExpr {
     /// with the expression.
     ///
     /// Value-transparent — evaluating it evaluates `expr` unchanged. It exists
-    /// only so [`expr_collation`] can derive which collation a comparison or
-    /// sort should use, and `explicit` records the two strengths PostgreSQL
-    /// distinguishes when combining them (a clause overrides a column's own).
+    /// only so `crate::collation::expr_collation` can derive which collation a
+    /// comparison or sort should use, and `explicit` records the two strengths
+    /// PostgreSQL distinguishes when combining them (a clause overrides a
+    /// column's own).
     Collate {
         expr: Box<BoundExpr>,
         collation: u32,
@@ -431,11 +432,14 @@ pub struct BoundWindowFunc {
 /// A bound `OVER (…)` clause: how the input is divided and ordered before the
 /// window calls under it are evaluated.
 ///
-/// Rung 1 supports only the default frame (`RANGE BETWEEN UNBOUNDED PRECEDING
-/// AND CURRENT ROW`), so no frame is carried: with an `ORDER BY` the frame runs
-/// from the partition start through the current row's last peer, and without
-/// one it is the whole partition. An explicit non-default frame is refused at
-/// bind time.
+/// No frame is carried, because only the default frame (`RANGE BETWEEN
+/// UNBOUNDED PRECEDING AND CURRENT ROW`) is supported: with an `ORDER BY` the
+/// frame runs from the partition start through the current row's last peer, and
+/// without one it is the whole partition. An explicit non-default frame is
+/// refused at bind time.
+///
+/// TODO: carry an explicit window frame (`ROWS`/`RANGE`/`GROUPS` bounds and
+/// `EXCLUDE`) instead of rejecting every non-default one at bind time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundWindowSpec {
     /// Evaluated against the pre-window row. Rows sharing these values form one
@@ -859,9 +863,11 @@ impl BoundExpr {
     /// `clock_timestamp`, which reads the wall clock afresh at every call, and
     /// the UUID generators, which draw fresh randomness — all marked `VOLATILE`
     /// by PostgreSQL. Any future volatile scalar function (e.g. `random()`)
-    /// must be added to the match here. Used to refuse duplicating a volatile
-    /// argument when inlining a SQL function body, and to keep such a call from
-    /// being pushed down into a scan.
+    /// belongs in [`is_volatile_call`](Self::is_volatile_call), which this
+    /// delegates to. Used to refuse duplicating a volatile argument — when
+    /// inlining a SQL function body, and when `NULLIF` places its left operand
+    /// in the tree twice — and to keep such a call from being pushed down into
+    /// a scan.
     ///
     /// `uuid_extract_version`/`uuid_extract_timestamp` are deliberately absent:
     /// they read only their argument, and PG marks them `IMMUTABLE`.

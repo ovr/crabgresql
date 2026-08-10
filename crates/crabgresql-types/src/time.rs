@@ -10,11 +10,13 @@
 //! range `[0, 86_400_000_000]` (the upper bound is `24:00:00`, which PG allows).
 //! There are no infinity values.
 //!
-//! Deviations from PG, acceptable while no passing test needs them: a precision
-//! modifier above 6 is clamped silently where PG also warns; a trailing numeric
-//! offset or fixed abbreviation is
-//! accepted and ignored, but a bare IANA zone name without a date is rejected
-//! (as PG does).
+//! A trailing numeric offset or fixed zone abbreviation is accepted and
+//! ignored — a bare `time` carries no zone — while a bare IANA zone name with
+//! no date is rejected, since its offset is not determinable; both match PG
+//! (`vendor/postgres/regress/expected/time.out`).
+//!
+//! TODO: raise PG's `TIME(7) precision reduced to maximum allowed, 6` WARNING;
+//! a `time(p)` modifier above 6 is clamped to 6 silently.
 
 use crate::Numeric;
 use crate::fmt::FmtCtx;

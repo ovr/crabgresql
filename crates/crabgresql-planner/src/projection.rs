@@ -88,10 +88,12 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             ..
         } => {
             let mut demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
-            // The executor's index-scan fallback (`IndexScan::new`) re-checks
-            // every key column per row whenever the engine has no physical index
-            // to probe — which is every engine but the in-memory one. Pruning a
-            // key column would make that re-check read NULL and drop every row.
+            // The executor's index-scan fallback (`index_probe_rows`) re-checks
+            // every key column per row whenever the engine declines the probe —
+            // which it may do even though `pick_index` only plans an `IndexScan`
+            // over an index the engine advertised, since a concurrent
+            // `DROP INDEX` can remove it mid-statement. Pruning a key column
+            // would make that re-check read NULL and drop every row.
             if let Some(demand) = &mut demand {
                 demand.extend(key.iter().map(|(column, _)| *column));
             }
