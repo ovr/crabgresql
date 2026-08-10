@@ -13,7 +13,6 @@ use crate::BindError;
 use crate::functions::ScalarFn;
 
 use super::bound::BoundExpr;
-use super::coerce::custom_type_name;
 use super::literal::literal_int;
 use super::scope::normalize_ident;
 
@@ -251,6 +250,15 @@ fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
         ast::ExactNumberInfo::None => None,
         ast::ExactNumberInfo::Precision(p) => Some(*p),
         ast::ExactNumberInfo::PrecisionAndScale(p, _) => Some(*p),
+    }
+}
+
+pub(super) fn custom_type_name(dt: &ast::DataType) -> Option<String> {
+    match dt {
+        ast::DataType::Custom(obj, mods) if mods.is_empty() => {
+            obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
+        }
+        _ => None,
     }
 }
 

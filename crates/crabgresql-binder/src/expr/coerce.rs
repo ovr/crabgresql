@@ -15,11 +15,11 @@ use crate::BindError;
 use crate::functions::ScalarFn;
 
 use super::bind::bind_expr;
-use super::bound::{BinOp, BoundExpr};
+use super::bound::BoundExpr;
 use super::datatype::{apply_length_typmod_if_any, apply_numeric_typmod_if_any, resolve_data_type};
 use super::operators::is_text_family;
 use super::params::ParamCtx;
-use super::scope::{Binding, Scope, normalize_ident};
+use super::scope::{Binding, Scope};
 
 pub(super) fn bind_cast(
     inner: &ast::Expr,
@@ -116,15 +116,6 @@ fn bind_reg_cast(inner: &ast::Expr, kind: RegKind, scope: &Scope) -> Result<Boun
         ret: PgType::Reg(kind),
         args: vec![coerce_expr(expr, arg_ty)?],
     })
-}
-
-pub(super) fn custom_type_name(dt: &ast::DataType) -> Option<String> {
-    match dt {
-        ast::DataType::Custom(obj, mods) if mods.is_empty() => {
-            obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
-        }
-        _ => None,
-    }
 }
 
 /// Coerce `expr` to an explicit-cast `target`. When a user-defined type is on
@@ -352,110 +343,6 @@ pub(crate) fn implicit_castable(from: PgType, to: PgType) -> bool {
                 // stays an explicit cast lowering to `RegFromOid`.
                 | (Reg(_), Oid)
         )
-}
-
-/// The DETAIL/HINT pair PG attaches to an `operator does not exist` (42883)
-/// raised because the operator *name* is known but no candidate accepts these
-/// operand types — which is every site below, since an unrecognized symbol never
-/// reaches them. Shared so the constructors cannot drift apart.
-///
-/// PG words this case as a DETAIL plus a short HINT; the older single-HINT
-/// phrasing ("No operator matches the given name and argument types…") belongs
-/// to a form PG no longer emits here.
-const NO_OPERATOR_DETAIL: &str = "No operator of that name accepts the given argument types.";
-const NO_OPERATOR_HINT: &str = "You might need to add explicit type casts.";
-
-/// Build the 42883 with PG's DETAIL/HINT pair. The caret is attached by the
-/// caller — [`bind_binary`] stamps the operator token onto any 42883 leaving it
-/// that has no position of its own, so the many construction sites do not each
-/// have to thread a span.
-pub(super) fn undefined_operator_error(message: String) -> BindError {
-    let mut e = BindError::new(sqlstate::UNDEFINED_FUNCTION, message)
-        .with_detail(Some(NO_OPERATOR_DETAIL.to_string()))
-        .with_hint(Some(NO_OPERATOR_HINT.to_string()));
-    // Lets `bind_binary` recognise its own error on the way out; see there.
-    e.blames_operator = true;
-    e
-}
-
-pub(super) fn no_operator(left: &str, op: BinOp, right: &str) -> BindError {
-    undefined_operator_error(format!(
-        "operator does not exist: {left} {} {right}",
-        op.sql_symbol()
-    ))
-}
-
-/// PG reports 42725 (with DETAIL/HINT) when more than one candidate operator
-/// matches and none is clearly best — as opposed to `no_operator`'s 42883 when
-/// no candidate exists at all. Every 42725 site shares the same DETAIL/HINT.
-pub(super) fn ambiguous_operator_msg(message: String) -> BindError {
-    BindError::new(sqlstate::AMBIGUOUS_FUNCTION, message)
-        .with_detail(Some(
-            "Could not choose a best candidate operator.".to_string(),
-        ))
-        .with_hint(Some(
-            "You might need to add explicit type casts.".to_string(),
-        ))
-}
-
-pub(super) fn ambiguous_operator(left: &str, sym: &str, right: &str) -> BindError {
-    ambiguous_operator_msg(format!("operator is not unique: {left} {sym} {right}"))
-}
-
-/// Settle two typed operands on a common type: exact match, or numeric
-/// promotion via a `Coerce` on the narrower side.
-pub(super) fn unify_types(
-    left: BoundExpr,
-    right: BoundExpr,
-    op: BinOp,
-    catalog: &dyn TypeCatalog,
-) -> Result<(BoundExpr, BoundExpr, PgType), BindError> {
-    let (lty, rty) = (left.ty(), right.ty());
-    if lty == rty {
-        return Ok((left, right, lty));
-    }
-    if let Some(common) = common_numeric(lty, rty) {
-        let left = coerce_expr(left, common)?;
-        let right = coerce_expr(right, common)?;
-        return Ok((left, right, common));
-    }
-    // Non-numeric implicit cast (e.g. `timestamp` -> `timestamptz`): when one
-    // side implicitly casts to the other, compare in that common type, as PG
-    // does (`tstz = timestamp`). Numeric pairs are already handled above, so
-    // this only fires for the datetime cast and never changes numeric results.
-    if implicit_castable(lty, rty) {
-        return Ok((coerce_expr(left, rty)?, right, rty));
-    }
-    if implicit_castable(rty, lty) {
-        return Ok((left, coerce_expr(right, lty)?, lty));
-    }
-    // Neither side casts to the other, but both may still reach a common third
-    // type. PG resolves an operator by picking a candidate and implicitly
-    // coercing both operands to its argument type, so `varchar = bpchar` binds
-    // via `texteq` even though neither casts to the other directly. This is
-    // deliberately *not* `select_common_type` (see `merge_types`): that one
-    // requires a shared type category, which is why `"char"` unifies with
-    // `varchar` for an operator but a UNION over the two still fails — exactly
-    // as in PG, where `"char"` is category `Z` and `varchar` is `S`.
-    //
-    // `oid` is tried before `text`: it is how PG resolves `oideq` for a `reg*`
-    // against an integer literal (`pg_type.typinput = 0`, `relnamespace = 11`).
-    // `reg* -> text` is not an implicit cast, so the two can never both apply.
-    if implicit_castable(lty, PgType::Oid) && implicit_castable(rty, PgType::Oid) {
-        let left = coerce_expr(left, PgType::Oid)?;
-        let right = coerce_expr(right, PgType::Oid)?;
-        return Ok((left, right, PgType::Oid));
-    }
-    if implicit_castable(lty, PgType::Text) && implicit_castable(rty, PgType::Text) {
-        let left = coerce_expr(left, PgType::Text)?;
-        let right = coerce_expr(right, PgType::Text)?;
-        return Ok((left, right, PgType::Text));
-    }
-    Err(no_operator(
-        &type_label(lty, catalog),
-        op,
-        &type_label(rty, catalog),
-    ))
 }
 
 /// Display a user type by its catalog name instead of the generic

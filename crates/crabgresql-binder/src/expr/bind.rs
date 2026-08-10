@@ -12,10 +12,10 @@ use crate::functions::{bind_function, bind_srf_projection};
 
 use super::bound::{BinOp, BoundExpr, Subplan};
 use super::coerce::{
-    bind_cast, bind_typed_string, coerce_expr, custom_type_name, merge_types, resolve_unknown,
-    to_bool_operand, unify_value_column,
+    bind_cast, bind_typed_string, coerce_expr, merge_types, resolve_unknown, to_bool_operand,
+    unify_value_column,
 };
-use super::datatype::map_data_type;
+use super::datatype::{custom_type_name, map_data_type};
 use super::literal::{bind_at_local, bind_at_time_zone, bind_extract, bind_interval, bind_value};
 use super::operators::{
     bind_binary, bind_binary_op, bind_bool_test, bind_compound, bind_is_null, bind_like,
