@@ -477,6 +477,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabgresql-bki"
+version = "0.0.1"
+
+[[package]]
 name = "crabgresql-buffer-engine"
 version = "0.0.1"
 dependencies = [
@@ -495,6 +499,7 @@ name = "crabgresql-catalog"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "crabgresql-bki",
  "crabgresql-storage-api",
  "crabgresql-txn",
  "crabgresql-types",

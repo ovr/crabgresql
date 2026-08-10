@@ -9,8 +9,8 @@ attribution in the repo-root `NOTICE` file. The upstream license is in
 
 It also holds `catalog/` — PostgreSQL's system-catalog **data** files
 (`src/include/catalog/*.dat`: `pg_type`, `pg_proc`, `pg_cast`, `pg_namespace`).
-These seed `pg_catalog`'s built-in rows: `crates/crabgresql-catalog` codegens
-from them at build time. Only the `.dat` DATA is vendored — never the C headers
+These seed `pg_catalog`'s built-in rows: `crates/crabgresql-bki` codegens from
+them at build time, and `crates/crabgresql-catalog` includes what it emits. Only the `.dat` DATA is vendored — never the C headers
 or the Perl `Catalog.pm` parser. The pin is recorded in `CATALOG_COMMIT`
 (kept equal to `REGRESS_COMMIT`).
 

@@ -9,6 +9,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 crabgresql-binder = { path = "crates/crabgresql-binder" }
+crabgresql-bki = { path = "crates/crabgresql-bki" }
 crabgresql-buffer-engine = { path = "crates/crabgresql-buffer-engine" }
 crabgresql-catalog = { path = "crates/crabgresql-catalog" }
 crabgresql-config = { path = "crates/crabgresql-config" }

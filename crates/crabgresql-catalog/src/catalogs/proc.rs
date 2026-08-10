@@ -48,7 +48,8 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
 }
 
 /// The built-in `pg_proc` rows generated from `pg_proc.dat` — the functions the
-/// other catalogs reference, and only those (see `gen_pg_proc` in `build.rs`).
+/// other catalogs reference, and only those (see `crabgresql-bki`'s `pg_proc`
+/// module).
 /// Callers append the session's `CREATE FUNCTION` routines after these.
 ///
 /// `proallargtypes`/`proargmodes`/`proargnames` are NULL for every one: none of
