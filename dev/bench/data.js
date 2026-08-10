@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786375220940,
+  "lastUpdate": 1786375222980,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -13576,6 +13576,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 21735.553587,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "311503ae2938c5ef07bc3308c28ca74d256c408c",
+          "message": "perf(executor): test a nested-loop pair without building the row (#209)\n\nThe nested loop built the joined row *before* checking the filter and\nthrew it away on a mismatch: an allocation plus a deep clone of every\ncolumn of both sides — `Value::Text` is an owned `String` — for every\ncandidate pair. Over `tenk1 × tenk1` that is 100 million allocations and\n600 million string clones to answer a three-way OR.\n\nKeep one full-width probe buffer and copy in only the slots the filter\nreads (`collect_column_refs`, with the projection pass's fail-safe for an\nexpression whose reads cannot be pinned down). The real row is built only\nonce a pair matches. The hash join's build side already reuses a scratch\nbuffer the same way.\n\n  SELECT COUNT(*) FROM tenk1 t1, tenk1 t2\n  WHERE t2.thousand = t1.tenthous OR t2.thousand = t1.unique1\n     OR t2.thousand = t1.unique2;\n  40833 ms -> 20348 ms\n\n  SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2\n      ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);\n  3881 ms -> 1012 ms",
+          "timestamp": "2026-08-10T16:25:05+02:00",
+          "tree_id": "38aadf290cf36cbbead9318b1e9a48d37d7a8d68",
+          "url": "https://github.com/ovr/crabgresql/commit/311503ae2938c5ef07bc3308c28ca74d256c408c"
+        },
+        "date": 1786375222921,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 493.301329,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21878.10626,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
