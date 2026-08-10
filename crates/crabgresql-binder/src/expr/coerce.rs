@@ -268,7 +268,7 @@ pub(crate) fn coerce_for_arg(
             // genuine exact match and must not be dropped. Read the slot into a
             // local so the shared borrow is released before `resolve_unknown`
             // takes it mutably.
-            let already = param.1.borrow().types.get(param.0).copied().flatten();
+            let already = param.1.borrow().slot_type(param.0);
             if already == Some(target) {
                 resolve_unknown(lit, span, Some(param), target).ok()
             } else {
@@ -701,7 +701,7 @@ fn interval_input_needs_style(value: &Value, to: PgType) -> bool {
 /// array first would need `array_in`'s own scanner exposed. Deferring the whole
 /// type costs a bind-time fold for literals that did not need it and never a
 /// wrong value, which is the trade `style_sensitive` itself already makes.
-pub(super) fn reads_interval_style(text: &str, ty: PgType) -> bool {
+fn reads_interval_style(text: &str, ty: PgType) -> bool {
     match ty {
         PgType::Interval => crabgresql_types::interval::style_sensitive(text),
         PgType::Array(elem) => elem == crabgresql_types::oid::INTERVAL,
@@ -785,7 +785,7 @@ pub(crate) fn to_bool_operand(
 /// Give an untyped literal its type from context, parsing its text the way the
 /// type's input function would. A parse failure carries the literal's position
 /// (PG's cursor), matching the `LINE n: ... ^` output.
-pub(crate) fn resolve_unknown(
+pub(super) fn resolve_unknown(
     lit: Option<String>,
     span: Span,
     param: Option<(usize, ParamCtx)>,

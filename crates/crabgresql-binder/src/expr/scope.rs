@@ -392,11 +392,11 @@ pub struct Scope {
     visible: Option<Vec<VisibleColumn>>,
     /// User-defined type/cast view, so an expression cast to/from a `CREATE TYPE`
     /// name resolves and a `WITHOUT FUNCTION` cast can be applied.
-    pub(super) catalog: Arc<dyn TypeCatalog>,
+    catalog: Arc<dyn TypeCatalog>,
     /// The statement's shared bind-parameter context. The same handle flows into
     /// every nested scope (subqueries, CTEs, derived tables) so a `$n` unifies
     /// its type across the whole statement.
-    pub(super) params: ParamCtx,
+    params: ParamCtx,
     /// What an expression subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`)
     /// needs to bind its body: the table engine (to resolve scans) and the CTEs
     /// visible at this query level. `None` in contexts where a subquery cannot
@@ -419,7 +419,7 @@ pub struct Scope {
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
 /// (`Rc`) so cheaply threaded into the transient scopes built per clause.
-pub(crate) struct SubqueryContext {
+pub(super) struct SubqueryContext {
     pub(super) engine: Arc<dyn TableEngine>,
     pub(super) ctes: crate::plan::CteEnv,
 }
@@ -428,7 +428,7 @@ pub(crate) struct SubqueryContext {
 /// name (which qualifies a parameter, as in `f.value`) and each *named*
 /// parameter's 0-based `$n` slot. Arguments declared without a name are absent
 /// and stay reachable only as `$n`.
-pub(crate) struct FuncParams {
+pub(super) struct FuncParams {
     func_name: String,
     params: Vec<(String, usize)>,
 }
@@ -693,7 +693,10 @@ impl Scope {
             return Ok(None);
         };
         let index = self.params.borrow_mut().reference(index + 1)?;
-        let ty = self.params.borrow().types[index]
+        let ty = self
+            .params
+            .borrow()
+            .slot_type(index)
             .expect("SQL function body parameter types are seeded at bind");
         Ok(Some(BoundExpr::Param { index, ty }))
     }
@@ -961,7 +964,7 @@ fn typmod_at(rels: &[ScopeRel], index: usize) -> i32 {
 /// constant, where the wrapper is gone by the time we get here; the projection
 /// sites handle that by consulting the AST first (see
 /// [`crate::declared_typmod`]).
-pub(crate) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
+pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
     match expr {
         BoundExpr::ColumnRef { index, .. } => scope.column_typmod(*index),
         BoundExpr::OuterColumnRef { level, index, .. } => scope.outer_column_typmod(*level, *index),

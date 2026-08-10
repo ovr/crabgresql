@@ -3047,7 +3047,7 @@ fn pow_operand(b: Binding, target: PgType) -> Result<BoundExpr, BindError> {
 
 /// Coerce a binding to `text` for a string function/operator argument. An
 /// untyped literal (or NULL) becomes text; a typed value casts to text.
-pub(crate) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> {
+pub(super) fn to_text_operand(binding: Binding) -> Result<BoundExpr, BindError> {
     match binding {
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text),
         Binding::Typed(e) if e.ty() == PgType::Text => Ok(e),

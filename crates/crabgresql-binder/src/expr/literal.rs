@@ -69,7 +69,7 @@ fn bind_placeholder(s: &str, span: Span, scope: &Scope) -> Result<Binding, BindE
         .filter(|&n| n > 0)
         .ok_or_else(|| BindError::syntax(format!("invalid parameter number: {s}")))?;
     let index = scope.params().borrow_mut().reference(n1)?;
-    let known = scope.params().borrow().types.get(index).copied().flatten();
+    let known = scope.params().borrow().slot_type(index);
     if let Some(ty) = known {
         return Ok(Binding::Typed(BoundExpr::Param { index, ty }));
     }

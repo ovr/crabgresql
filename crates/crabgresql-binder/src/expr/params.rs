@@ -9,7 +9,8 @@ use crate::BindError;
 /// the statement — target list, WHERE, a subquery, a CTE — refers to the same
 /// slot here, so a type deduced at one site is visible at every other. Held
 /// behind `Rc<RefCell<…>>` because the binder threads a single context through
-/// the whole tree (see [`Scope`]) while several sites borrow it. That reach is
+/// the whole tree (see [`crate::Scope`]) while several sites borrow it. That
+/// reach is
 /// also why the view-expansion state rides along: it has to be visible at every
 /// relation reference, including one nested inside an expression subquery.
 pub type ParamCtx = std::rc::Rc<std::cell::RefCell<ParamState>>;
@@ -17,7 +18,7 @@ pub type ParamCtx = std::rc::Rc<std::cell::RefCell<ParamState>>;
 /// A view's identity while it is being expanded: `(namespace, name)`. Both come
 /// from the *resolved* view definition, not from how the reference was spelled,
 /// so the key is unambiguous across schemas.
-pub(crate) type ViewKey = (String, String);
+pub(super) type ViewKey = (String, String);
 
 /// The views whose bodies are currently being bound (outermost first) and how
 /// many expansions this statement has done. Behind its own `Rc` so a nested view
@@ -32,7 +33,7 @@ pub(crate) type ViewExpansion = std::rc::Rc<std::cell::RefCell<(Vec<ViewKey>, us
 #[derive(Debug)]
 pub struct ParamState {
     /// `types[i]` is the type of `$(i+1)`; `None` until inferred/declared.
-    pub(super) types: Vec<Option<PgType>>,
+    types: Vec<Option<PgType>>,
     /// Whether `$n` placeholders are permitted at all. A simple-query bind sets
     /// this false, so any `$n` is PG's `42P02` "there is no parameter $n".
     allow: bool,
@@ -113,6 +114,14 @@ impl ParamState {
                 Ok(())
             }
         }
+    }
+
+    /// The type deduced for `$(index + 1)`, or `None` while the slot is still
+    /// open. Reading goes through here so the slot vector itself stays private:
+    /// its length is only ever grown by [`ParamState::reference`], under the
+    /// `MAX_PARAMS` cap.
+    pub(super) fn slot_type(&self, index: usize) -> Option<PgType> {
+        self.types.get(index).copied().flatten()
     }
 }
 

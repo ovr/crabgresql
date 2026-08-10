@@ -332,7 +332,7 @@ fn bind_subscript(
 /// Named so a caller that *deliberately* builds such a scope — a CHECK
 /// constraint, which PostgreSQL forbids subqueries in — can recognize its own
 /// refusal and restate it in PostgreSQL's words.
-pub(crate) const NO_SUBQUERY_CONTEXT: &str = "subqueries are not supported in this context";
+pub(super) const NO_SUBQUERY_CONTEXT: &str = "subqueries are not supported in this context";
 
 /// Bind a nested query into a [`LogicalPlan`] against the enclosing scope's
 /// subquery context (table engine + visible CTEs). The subquery body is bound
@@ -350,8 +350,8 @@ fn bind_subquery_plan(
         .ok_or_else(|| BindError::feature_not_supported(NO_SUBQUERY_CONTEXT))?;
     let plan = crate::plan::bind_query_scoped(
         &ctx.engine,
-        &scope.catalog,
-        &scope.params,
+        scope.catalog(),
+        scope.params(),
         query,
         &ctx.ctes,
         &scope.as_outer_levels(),

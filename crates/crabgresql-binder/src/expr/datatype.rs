@@ -346,7 +346,7 @@ pub(super) fn apply_numeric_typmod_if_any(
 /// fits — so unlike the character and bit types this needs no
 /// truncate-vs-error flag, and the cast path ([`apply_numeric_typmod_if_any`])
 /// and the column path ([`apply_length_to_column`]) share it.
-pub(crate) fn apply_numeric_typmod(
+pub(super) fn apply_numeric_typmod(
     expr: BoundExpr,
     precision: i32,
     scale: i32,
@@ -632,7 +632,7 @@ pub(crate) fn apply_datetime_precision(
 
 /// Apply a `varchar(n)`/`char(n)` length coercion, or a `name` truncation, when
 /// the target is one of those types. Constant inputs fold at bind time.
-pub(crate) fn apply_length_typmod_if_any(
+pub(super) fn apply_length_typmod_if_any(
     expr: BoundExpr,
     target: PgType,
     data_type: &ast::DataType,

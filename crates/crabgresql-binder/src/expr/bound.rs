@@ -238,7 +238,7 @@ pub enum BoundExpr {
     },
     /// `left op ANY(SELECT …)` / `left op ALL(SELECT …)`, and equally
     /// `x [NOT] IN (SELECT …)`, which PostgreSQL defines as `= ANY` / `<> ALL`
-    /// (see [`bind_in_subquery`]). `cmp` is the bound `left op <hole>`
+    /// (see `bind_in_subquery`). `cmp` is the bound `left op <hole>`
     /// comparison template — a `Binary { op, arg_ty, left, right }` whose `right`
     /// is a NULL `Const` of the subquery column's type, possibly wrapped in the
     /// coercions the binder resolved. At execution the one-column `subplan`
