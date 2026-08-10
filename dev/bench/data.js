@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786321909384,
+  "lastUpdate": 1786321911094,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -9688,6 +9688,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 42495.476929,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3e1c639c8989e17d058dbbdc3f110ee021b52e6",
+          "message": "refactor(binder): Make LogicalPlan nodes into a logical_plan module (#201)",
+          "timestamp": "2026-08-10T01:19:59+02:00",
+          "tree_id": "7ad12ee7b0a78d7ea8107df5a525aae95303b514",
+          "url": "https://github.com/ovr/crabgresql/commit/a3e1c639c8989e17d058dbbdc3f110ee021b52e6"
+        },
+        "date": 1786321911041,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 482.979638,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 24679.87151,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
