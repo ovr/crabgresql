@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786438819604,
+  "lastUpdate": 1786438823950,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -15520,6 +15520,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 37855.277343,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e0eee21af9f8e250481038513df3c4742dfcbd1d",
+          "message": "feat(binder): Support COALESCE and NULLIF (#208)",
+          "timestamp": "2026-08-11T10:07:04+02:00",
+          "tree_id": "bc21451ee28767484b809db226ae878eb0e492c1",
+          "url": "https://github.com/ovr/crabgresql/commit/e0eee21af9f8e250481038513df3c4742dfcbd1d"
+        },
+        "date": 1786438823882,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 476.102761,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 23461.350204,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
