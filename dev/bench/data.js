@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786472069082,
+  "lastUpdate": 1786472071735,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -18760,6 +18760,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 23975.911837,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6ecb08913eabff20a293c19b0b35f5b1453aa960",
+          "message": "test(server): fix a flaky self-referencing prepared statement test (#217)",
+          "timestamp": "2026-08-11T19:23:08+02:00",
+          "tree_id": "2c3636cae928b137064071abd5c7fd953c75af81",
+          "url": "https://github.com/ovr/crabgresql/commit/6ecb08913eabff20a293c19b0b35f5b1453aa960"
+        },
+        "date": 1786472071626,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 496.264981,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21067.610372,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
