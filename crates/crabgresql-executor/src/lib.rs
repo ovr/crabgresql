@@ -43,7 +43,7 @@ use crabgresql_storage_api::{
     TableSchema, Tid, Tuple, TypeCatalog,
 };
 use crabgresql_txn::TxnContext;
-use crabgresql_types::{FmtCtx, PgType, Value};
+use crabgresql_types::{FmtCtx, PgType, Value, cast};
 
 use checks::CheckSet;
 use eval::eval;
@@ -1475,8 +1475,10 @@ fn eval_quantified(
             "ANY/ALL comparison template has no candidate placeholder",
         ));
     }
-    // The one and only evaluation of the needle.
-    let needle = eval::eval(left, row, ctx)?;
+    // The one and only evaluation of the needle. Borrowed when it is a column
+    // or a literal, since every comparison below only reads it.
+    let needle_slot;
+    let needle = eval::eval_ref!(needle_slot, left, row, ctx);
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null;
     // The common case is a bare hole (`Const { Null, ty }`): the candidate only
@@ -1491,10 +1493,21 @@ fn eval_quantified(
     for value in values {
         // Candidates are coerced even once the result can only be NULL, since a
         // coercion failure is observable — as it was when this was an OR/AND
-        // chain that evaluated every element.
+        // chain that evaluated every element. A cast the hole does not actually
+        // need is borrowed past instead, so a large candidate set is not cloned
+        // element by element just to hand each one straight back.
+        let candidate_slot;
         let candidate = match bare_hole {
-            Some(ty) => eval::coerce_value(value.clone(), ty, ctx)?,
-            None => eval::eval(&substitute_hole(right, value.clone(), ctx)?, row, ctx)?,
+            Some(ty) if cast::is_identity_cast(value, ty) => value,
+            Some(ty) => {
+                candidate_slot = eval::coerce_value(value.clone(), ty, ctx)?;
+                &candidate_slot
+            }
+            None => {
+                candidate_slot =
+                    eval::eval(&substitute_hole(right, value.clone(), ctx)?, row, ctx)?;
+                &candidate_slot
+            }
         };
         // Only *this* candidate (or the needle) being NULL skips the comparison;
         // an earlier NULL must not mask a later decisive one, so
@@ -1503,7 +1516,7 @@ fn eval_quantified(
             saw_null = true;
             continue;
         }
-        if eval::apply_comparison(*op, *arg_ty, *collation, &needle, &candidate) != all {
+        if eval::apply_comparison(*op, *arg_ty, *collation, needle, candidate) != all {
             // ANY found a match, or ALL found a counterexample.
             return Ok(Value::Bool(!all));
         }

@@ -33,7 +33,7 @@ use crate::{CatalogOps, ExecContext, ExecError};
 /// to text but holds a `Value::Char`, and unwrapping it would hand `eval_like` a
 /// non-text value; `bpchar` reaches text through a `BpcharToText` call that
 /// trims, and `Reinterpret` rewrites bits. All three must stay on the slow path.
-fn arg_ref<'a>(expr: &'a BoundExpr, row: &'a [Value]) -> Option<&'a Value> {
+pub(crate) fn arg_ref<'a>(expr: &'a BoundExpr, row: &'a [Value]) -> Option<&'a Value> {
     match expr {
         BoundExpr::Const { value, .. } => Some(value),
         BoundExpr::ColumnRef { index, .. } => row.get(*index),
@@ -47,6 +47,34 @@ fn arg_ref<'a>(expr: &'a BoundExpr, row: &'a [Value]) -> Option<&'a Value> {
         _ => None,
     }
 }
+
+/// Bind `&Value` for an operand that is only ever *read*: the value it already
+/// is when [`arg_ref`] can point at it, and a freshly evaluated one otherwise.
+/// The fast path costs a pointer rather than a deep clone of a
+/// `text`/`numeric`/`bytea` column.
+///
+/// `$slot` is a bare `let slot;` in the caller's frame: the slow path's value
+/// has to outlive the expression, and only the caller's frame does. Two tidier
+/// spellings both cost more than the clone they remove, because `Value` is a
+/// wide enum and each adds a discriminant to it — a returned `Cow<Value>` lost
+/// 4% on TPC-H Q19's comparison loop, and a `fn` taking `&mut Option<Value>`
+/// lost the same (worse with `#[inline]`). Hence a macro: it is the only form
+/// that leaves the slow-path value a plain `Value` in the caller's frame.
+///
+/// [`arg_ref`] neither evaluates anything nor fails, so operands are still
+/// evaluated in the order, and with the errors, a plain [`eval`] pair gives.
+macro_rules! eval_ref {
+    ($slot:ident, $expr:expr, $row:expr, $ctx:expr) => {
+        match $crate::eval::arg_ref($expr, $row) {
+            Some(value) => value,
+            None => {
+                $slot = $crate::eval::eval($expr, $row, $ctx)?;
+                &$slot
+            }
+        }
+    };
+}
+pub(crate) use eval_ref;
 
 pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     match expr {
@@ -1165,23 +1193,27 @@ fn eval_binary(
     if let BinOp::And | BinOp::Or = op {
         return eval_logic(op, left, right, row, ctx);
     }
-    let l = eval(left, row, ctx)?;
-    let r = eval(right, row, ctx)?;
+    // Both the arithmetic accessors below and `apply_comparison` read through a
+    // `&Value`, so neither side has to be owned: for `text_col = 'lit'` that
+    // saves two `String` copies per row, for `numeric` two heap allocations.
+    let (l_slot, r_slot);
+    let l = eval_ref!(l_slot, left, row, ctx);
+    let r = eval_ref!(r_slot, right, row, ctx);
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
     if op.is_arithmetic() {
         return match arg_ty {
-            PgType::Int2 => eval_arith_int2(op, int2(&l), int2(&r)),
-            PgType::Int4 => eval_arith_int4(op, int4(&l), int4(&r)),
-            PgType::Int8 => eval_arith_int8(op, int8(&l), int8(&r)),
-            PgType::Float4 => eval_arith_f4(op, float4(&l), float4(&r)),
-            PgType::Float8 => eval_arith_f8(op, float8(&l), float8(&r)),
-            PgType::Numeric => eval_arith_numeric(op, numeric(&l), numeric(&r)),
+            PgType::Int2 => eval_arith_int2(op, int2(l), int2(r)),
+            PgType::Int4 => eval_arith_int4(op, int4(l), int4(r)),
+            PgType::Int8 => eval_arith_int8(op, int8(l), int8(r)),
+            PgType::Float4 => eval_arith_f4(op, float4(l), float4(r)),
+            PgType::Float8 => eval_arith_f8(op, float8(l), float8(r)),
+            PgType::Numeric => eval_arith_numeric(op, numeric(l), numeric(r)),
             other => unreachable!("binder let arithmetic through on {other:?}"),
         };
     }
-    Ok(Value::Bool(apply_comparison(op, arg_ty, collation, &l, &r)))
+    Ok(Value::Bool(apply_comparison(op, arg_ty, collation, l, r)))
 }
 
 /// Apply a comparison operator to two already-evaluated, non-NULL operands of
