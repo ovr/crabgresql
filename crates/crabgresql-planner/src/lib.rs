@@ -533,6 +533,38 @@ pub(crate) fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
     Some(acc)
 }
 
+/// Recursively split a top-level `OR` tree into its arms, preserving order.
+/// The `AND` mirror of this is [`flatten_and`].
+pub(crate) fn flatten_or(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            flatten_or(*left, out);
+            flatten_or(*right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Re-combine arms with `OR`, yielding `None` for an empty list.
+pub(crate) fn rebuild_or(mut arms: Vec<BoundExpr>) -> Option<BoundExpr> {
+    let mut acc = arms.pop()?;
+    while let Some(next) = arms.pop() {
+        acc = BoundExpr::Binary {
+            op: BinOp::Or,
+            arg_ty: PgType::Bool,
+            collation: DEFAULT_COLLATION_OID,
+            left: Box::new(next),
+            right: Box::new(acc),
+        };
+    }
+    Some(acc)
+}
+
 /// If `conjunct` is a cross-side equality, return its [`HashKey`] (oriented so
 /// `left` addresses the left input); otherwise hand the expression back as a
 /// residual conjunct.
@@ -633,6 +665,11 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
+        // The predicate is factored before the access path is chosen, so a
+        // `WHERE` written as one OR still offers `choose_access` the conjuncts
+        // every arm repeats — without it, `(k = 5 AND a = 1) OR (k = 5 AND a =
+        // 2)` probes an index on `k` when the query joins a second relation but
+        // scans the whole table when it does not.
         LogicalPlan::Query(QueryPlan {
             table,
             columns,
@@ -640,7 +677,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => match choose_access(&table, predicate) {
+        }) => match choose_access(&table, predicate.map(pushdown::factor_common_or_conjuncts)) {
             AccessPath::Index {
                 index_name,
                 key,
@@ -2378,6 +2415,57 @@ mod tests {
     }
 
     #[test]
+    fn or_of_arms_sharing_an_equality_still_hashes() {
+        // The TPC-H Q19 shape: the whole WHERE is one OR, but every arm repeats
+        // the join equality and one single-relation restriction. Factoring those
+        // out is what keeps this from planning as a Cartesian product.
+        let PhysicalPlan::Aggregate {
+            input: PhysicalAggInput::Join(source),
+            predicate,
+            ..
+        } = plan_sql(
+            "SELECT count(*) FROM t a, t b \
+             WHERE (a.id = b.id AND a.name = 'x' AND b.big = 1) \
+                OR (a.id = b.id AND a.name = 'x' AND b.big = 2)",
+        )
+        else {
+            panic!("expected Aggregate over Join");
+        };
+        let PhysicalJoinExpr::Join {
+            left,
+            kind,
+            right,
+            predicate: residual,
+            hash_keys,
+        } = source
+        else {
+            panic!("expected a Join node");
+        };
+        assert_eq!(kind, JoinKind::Inner, "Cross must flip once conditioned");
+        assert_eq!(hash_keys.len(), 1, "the factored equality is the hash key");
+        // `a.name = 'x'` is common to both arms too, so it reaches the left leaf.
+        let PhysicalJoinExpr::Input {
+            predicate: Some(_), ..
+        } = *left
+        else {
+            panic!("the common single-relation conjunct must sink to the leaf");
+        };
+        // What is left of the OR (`b.big = 1 OR b.big = 2`) touches only `b`, so
+        // it sinks to the right leaf rather than filtering joined rows.
+        let PhysicalJoinExpr::Input {
+            predicate: Some(_), ..
+        } = *right
+        else {
+            panic!("the residual OR must sink to the right leaf");
+        };
+        assert!(
+            residual.is_none(),
+            "nothing is left to re-check at the join"
+        );
+        assert!(predicate.is_none(), "nothing is left above the join");
+    }
+
+    #[test]
     fn three_way_comma_join_hashes_at_every_level() {
         // The TPC-H Q3 shape. The binder builds Cross(Cross(a, b), c); `a.id = b.id`
         // sinks to the inner node and `b.id = c.id` straddles the root, so both
@@ -2833,6 +2921,38 @@ mod tests {
         else {
             panic!("expected a residual text-equality filter");
         };
+    }
+
+    #[test]
+    fn or_arms_sharing_an_equality_still_probe_the_index() {
+        // The single-table counterpart of the Q19 shape: the key equality is
+        // written once per arm, so it only becomes a probe once the common
+        // conjunct has been factored out of the OR.
+        let plan = plan_sql_indexed(
+            "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR (id = 1 AND name = 'y')",
+            Some(pk_on_id()),
+        );
+        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+            panic!("expected IndexScan");
+        };
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].0, 0);
+        // What is left of the OR is not an index key, so it filters at runtime.
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Or, .. })),
+            "the residual OR must survive as a filter"
+        );
+    }
+
+    #[test]
+    fn an_equality_in_only_one_or_arm_does_not_probe() {
+        // Nothing is common to both arms, so the OR stays whole and a row with
+        // `id <> 1` is still reachable — an index probe would drop it.
+        let plan = plan_sql_indexed(
+            "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR name = 'y'",
+            Some(pk_on_id()),
+        );
+        assert!(matches!(plan, PhysicalPlan::Select { .. }));
     }
 
     #[test]
