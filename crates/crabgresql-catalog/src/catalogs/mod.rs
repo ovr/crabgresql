@@ -18,5 +18,6 @@ pub(crate) mod prepared;
 pub(crate) mod proc;
 pub(crate) mod sequence;
 pub(crate) mod settings;
+pub(crate) mod statistic;
 pub(crate) mod timezone;
 pub(crate) mod types;

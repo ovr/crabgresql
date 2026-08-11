@@ -1515,3 +1515,119 @@ fn a_toast_relation_is_published_and_its_parent_points_at_it() -> anyhow::Result
     );
     Ok(())
 }
+
+/// `pg_stats` and `pg_statistic` describe the same measurement two ways: the
+/// view names the columns a reader knows, the catalog packs them into the
+/// generic slots PostgreSQL defines. A relation nothing measured appears in
+/// neither.
+#[test]
+fn statistics_relations_report_what_analyze_measured() -> anyhow::Result<()> {
+    use crabgresql_storage_api::{ColStats, Column, RelStats, TableSchema};
+    use crabgresql_types::PgType;
+
+    let schema = TableSchema::new(
+        "measured",
+        vec![
+            Column::new("g", PgType::Int4),
+            Column::new("t", PgType::Text),
+        ],
+    );
+    let cat = SystemCatalog::with_catalog_relations("db", "owner", {
+        let mut measured = CatalogRelation::permanent(schema.clone());
+        measured.stats = RelStats {
+            relpages: 4,
+            reltuples: 1000.0,
+            analyzed: true,
+            curpages: Some(4),
+            columns: std::sync::Arc::from([
+                // A skewed integer column: two common values and a histogram of
+                // what is left.
+                ColStats {
+                    null_frac: 0.1,
+                    avg_width: 4,
+                    n_distinct: 5.0,
+                    mcv: vec![(Value::Int4(1), 0.5), (Value::Int4(2), 0.25)],
+                    histogram: vec![Value::Int4(10), Value::Int4(20)],
+                    correlation: 0.5,
+                },
+                // A column with nothing common enough to list.
+                ColStats {
+                    null_frac: 0.0,
+                    avg_width: 12,
+                    n_distinct: -1.0,
+                    mcv: Vec::new(),
+                    histogram: vec![Value::Text("a".into()), Value::Text("b".into())],
+                    correlation: -1.0,
+                },
+            ]),
+        };
+        vec![
+            measured,
+            CatalogRelation::permanent(TableSchema::new(
+                "unmeasured",
+                vec![Column::new("a", PgType::Int4)],
+            )),
+        ]
+    });
+
+    let (vschema, vrows) = required(cat.build_pg_catalog("pg_stats"), "pg_stats is missing")?;
+    let at = |row: &[Value], col: &str| -> Value {
+        row[vschema.column_index(col).expect("column exists")].clone()
+    };
+    // Only the analyzed relation's columns, in attnum order.
+    let described: Vec<Value> = vrows.iter().map(|r| at(r, "attname")).collect();
+    assert_eq!(
+        described,
+        vec![Value::Text("g".into()), Value::Text("t".into())]
+    );
+    assert_eq!(at(&vrows[0], "tablename"), Value::Text("measured".into()));
+    assert_eq!(at(&vrows[0], "null_frac"), Value::Float4(0.1));
+    assert_eq!(at(&vrows[0], "n_distinct"), Value::Float4(5.0));
+    assert_eq!(
+        at(&vrows[0], "most_common_vals"),
+        Value::Text("{1,2}".into())
+    );
+    assert_eq!(
+        at(&vrows[0], "most_common_freqs"),
+        Value::Text("{0.5,0.25}".into())
+    );
+    assert_eq!(
+        at(&vrows[0], "histogram_bounds"),
+        Value::Text("{10,20}".into())
+    );
+    assert_eq!(at(&vrows[0], "correlation"), Value::Float4(0.5));
+    // No MCV list is NULL, not an empty array — the distinction PostgreSQL draws.
+    assert_eq!(at(&vrows[1], "most_common_vals"), Value::Null);
+    assert_eq!(
+        at(&vrows[1], "histogram_bounds"),
+        Value::Text("{a,b}".into())
+    );
+    // Never collected here, and NULL is what PostgreSQL shows for them.
+    assert_eq!(at(&vrows[0], "most_common_elems"), Value::Null);
+
+    let (cschema, crows) = required(
+        cat.build_pg_catalog("pg_statistic"),
+        "pg_statistic is missing",
+    )?;
+    let raw = |row: &[Value], col: &str| -> Value {
+        row[cschema.column_index(col).expect("column exists")].clone()
+    };
+    assert_eq!(crows.len(), 2);
+    assert_eq!(raw(&crows[0], "staattnum"), Value::Int2(1));
+    // Slots fill in order: MCV, then histogram, then correlation.
+    assert_eq!(raw(&crows[0], "stakind1"), Value::Int2(1));
+    assert_eq!(raw(&crows[0], "stakind2"), Value::Int2(2));
+    assert_eq!(raw(&crows[0], "stakind3"), Value::Int2(3));
+    assert_eq!(raw(&crows[0], "stakind4"), Value::Int2(0));
+    assert_eq!(raw(&crows[0], "stavalues1"), Value::Text("{1,2}".into()));
+    assert_eq!(
+        raw(&crows[0], "stanumbers1"),
+        Value::Text("{0.5,0.25}".into())
+    );
+    assert_eq!(raw(&crows[0], "stavalues2"), Value::Text("{10,20}".into()));
+    assert_eq!(raw(&crows[0], "stanumbers3"), Value::Text("{0.5}".into()));
+    // The second column has no MCV list, so the histogram takes slot 1.
+    assert_eq!(raw(&crows[1], "stakind1"), Value::Int2(2));
+    assert_eq!(raw(&crows[1], "stavalues1"), Value::Text("{a,b}".into()));
+    Ok(())
+}
