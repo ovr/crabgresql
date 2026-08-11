@@ -2,6 +2,7 @@
 //! server on an ephemeral port, plus raw-socket checks of the startup phase.
 
 use anyhow::Context as _;
+use crabgresql_pg_wire::FrontendMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -3869,6 +3870,18 @@ fn frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     msg.extend_from_slice(body);
     msg
+}
+
+/// Frame a batch from the wire crate's own message structs. The hand-written
+/// bodies above are deliberate where the *encoding* is what's under test; this
+/// is for the tests that only need to say what a client sent, and would rather
+/// name the fields than count NUL bytes.
+fn frontend_batch(messages: &[FrontendMessage]) -> bytes::BytesMut {
+    let mut buf = bytes::BytesMut::new();
+    for message in messages {
+        message.encode(&mut buf);
+    }
+    buf
 }
 
 /// Collect every backend `(tag, body)` up to and including the terminating
@@ -11161,11 +11174,25 @@ async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow
     // the next number, which is a race against every other session.)
     let mut socket = raw_session(spawn_server().await).await;
 
-    let mut batch = Vec::new();
-    batch.extend(frontend_message(b'P', b"self\0EXECUTE self\0\x00\x00")); // Parse "self"
-    batch.extend(frontend_message(b'B', b"\0self\0\x00\x00\x00\x00\x00\x00")); // Bind
-    batch.extend(frontend_message(b'E', b"\0\x00\x00\x00\x00")); // Execute (unlimited)
-    batch.extend(frontend_message(b'S', b""));
+    let batch = frontend_batch(&[
+        FrontendMessage::Parse {
+            name: "self".to_string(),
+            query: "EXECUTE self".to_string(),
+            param_types: Vec::new(),
+        },
+        FrontendMessage::Bind {
+            portal: String::new(),
+            statement: "self".to_string(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        },
+        FrontendMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+        FrontendMessage::Sync,
+    ]);
     socket.write_all(&batch).await?;
 
     let msgs = read_until_ready(&mut socket).await;
