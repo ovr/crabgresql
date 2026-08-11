@@ -36,6 +36,7 @@ mod nbtree;
 mod page;
 mod rec;
 mod redo;
+mod relstats;
 mod smgr;
 mod toast;
 mod tuple;
@@ -465,6 +466,9 @@ pub struct PgEngine {
     inner: Arc<EngineInner>,
     data_dir: PathBuf,
     catalog: Arc<RelCatalog>,
+    /// Where each relation's column distributions live — out of the catalog
+    /// file, which is rewritten whole on every DDL (see [`crate::relstats`]).
+    stats_store: Arc<relstats::StatsStore>,
     /// The catalog's relfilenode counter, handed to every Parquet table so its
     /// TRUNCATE can stage a fresh directory (see [`CatalogAllocator`]).
     relfilenodes: Arc<dyn RelfilenodeAllocator>,
@@ -581,10 +585,29 @@ impl PgEngine {
         let relfilenodes: Arc<dyn RelfilenodeAllocator> =
             Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
+        let stats_store = Arc::new(relstats::StatsStore::open(data_dir)?);
+
         let mut tables = HashMap::new();
         for (name, rel, toast_rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
-            let analyzed = catalog.stats_in(&namespace, &name);
+            // One measurement, stored in two places: the relation-level numbers
+            // in the catalog (tiny, and already there), the column distributions
+            // in their own file (large, and keyed by relfilenode). A relation
+            // whose catalog record says it was never analyzed is never analyzed,
+            // whatever file happens to be lying around — that is what makes a
+            // TRUNCATE's clear of the record enough.
+            let analyzed = catalog.stats_in(&namespace, &name).map(|(pages, rows)| {
+                let mut stats = stats_store.read(rel).unwrap_or(RelStats {
+                    relpages: pages,
+                    reltuples: rows,
+                    analyzed: true,
+                    curpages: None,
+                    columns: Arc::from([]),
+                });
+                stats.relpages = pages;
+                stats.reltuples = rows;
+                stats
+            });
             let table = match schema.access_method {
                 TableAccessMethod::Heap => {
                     let table = Arc::new(HeapTable::new(
@@ -666,6 +689,7 @@ impl PgEngine {
             inner,
             data_dir: data_dir.to_path_buf(),
             catalog,
+            stats_store,
             relfilenodes,
             parquet_redo,
             buffer_redo,
@@ -1435,6 +1459,14 @@ impl PgEngine {
     pub fn gc_orphan_relfiles(&self) -> std::io::Result<()> {
         let live: std::collections::HashSet<u32> =
             self.catalog.live_relfilenodes().into_iter().collect();
+        // A measurement is named after the relfilenode it described, so a
+        // TRUNCATE's swap and a DROP that did not get to unlink both leave one
+        // behind — reclaimed here, against the same live set as the data files.
+        for rel in self.stats_store.stored_relfilenodes() {
+            if !live.contains(&rel) {
+                self.stats_store.unlink(RelFileNode(rel));
+            }
+        }
         let base = self.data_dir.join("base");
         let entries = match std::fs::read_dir(&base) {
             Ok(e) => e,
@@ -1859,6 +1891,24 @@ impl TableEngine for PgEngine {
                 }
             }
         };
+        // The two halves of one measurement go to their two homes: the
+        // relation-level numbers to the catalog, the column distributions to
+        // this relation's own file. Only the first is worth failing over —
+        // losing a distribution costs plan quality, and the catalog write is
+        // what makes the relation count as analyzed at all.
+        if let Some(rel) = self.catalog.current_relfilenode(namespace, name) {
+            if stats.columns.is_empty() {
+                // An engine that reports none: drop whatever a previous ANALYZE
+                // left, or the stale file would outlive the measurement.
+                self.stats_store.unlink(rel);
+            } else if let Err(error) = self.stats_store.write(rel, &stats) {
+                tracing::warn!(
+                    relation = %name,
+                    %error,
+                    "column statistics could not be stored; the relation keeps its row counts"
+                );
+            }
+        }
         self.catalog
             .set_stats(namespace, name, &stats)
             .expect("relation catalog write failed");
@@ -2012,6 +2062,10 @@ impl TableEngine for PgEngine {
         if let Some(toast) = toast {
             self.inner.discard_relfile(toast);
         }
+        // The measurement goes with the relation it described. The startup sweep
+        // would reclaim it anyway (it is named after a relfilenode nothing
+        // references now); unlinking here just makes it immediate.
+        self.stats_store.unlink(rel);
         Ok(())
     }
 
