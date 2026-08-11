@@ -10,7 +10,7 @@
 use crabgresql_storage_api::{StorageError, Tid, Tuple};
 use crabgresql_txn::{CommandId, Infomask, TupleHeader, Xid};
 
-use crabgresql_types::datum::{T_EXTERNAL, decode_datum, encode_datum};
+use crabgresql_types::datum::{T_EXTERNAL, decode_datum, encode_datum, skip_datum};
 
 use crate::toast::{self, ToastPointer};
 
@@ -184,6 +184,10 @@ pub struct RawTuple {
     /// `(attribute number, pointer)` for each out-of-line attribute, in
     /// attribute order. Empty for the overwhelming majority of tuples.
     external: Vec<(usize, ToastPointer)>,
+    /// Set by [`decode_raw_projected`]: attributes outside the projection hold
+    /// placeholders and their pointers were never collected. Only
+    /// [`RawTuple::external`] cares, and only to refuse being called.
+    projected: bool,
 }
 
 /// Decode the header and every inline datum, leaving out-of-line attributes as
@@ -228,13 +232,97 @@ pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
             vals.push(decode_datum(buf, &mut pos));
         }
     }
-    Ok(RawTuple { vals, external })
+    Ok(RawTuple {
+        vals,
+        external,
+        projected: false,
+    })
+}
+
+/// Decode only the attributes `wanted` names, walking past the rest.
+///
+/// `wanted` is sorted, deduplicated schema ordinals — a `ColumnProjection::Some`
+/// exactly as `ColumnProjection::of` normalizes it. Everything else lands as
+/// `Value::Null`, which the scan contract makes legal: the row keeps its full
+/// width, only the work of filling it shrinks.
+///
+/// Three savings, in increasing order of what they are worth:
+///
+/// * no `String`/`Vec` allocation and no re-parse for a skipped `text`,
+///   `numeric`, `jsonb`, `tsvector` … (see [`skip_datum`]);
+/// * nothing at all past the last wanted ordinal — a `SELECT c0` on a wide
+///   relation stops walking after the first attribute;
+/// * a skipped out-of-line attribute is **not** collected, so [`RawTuple::resolve`]
+///   never detoasts it. That one pins pages of the toast relation through the
+///   buffer pool, so it is the expensive thing this avoids, not the allocation.
+///
+/// The pointer of a skipped external attribute is still *parsed*, because that
+/// is what gives its length; only the chunk walk is dropped.
+pub fn decode_raw_projected(buf: &[u8], wanted: &[usize]) -> Result<RawTuple, StorageError> {
+    let head = decode_header(buf);
+    let natts = head.natts as usize;
+    let bmlen = if head.has_null { bitmap_len(natts) } else { 0 };
+    let bitmap = &buf[TUPLE_HEADER_LEN..TUPLE_HEADER_LEN + bmlen];
+    let mut pos = TUPLE_HEADER_LEN + bmlen;
+    let mut vals = Vec::with_capacity(natts);
+    let mut external = Vec::new();
+    // A cursor into `wanted` rather than a set lookup: both walks are in
+    // ascending attribute order, so membership is one comparison per attribute.
+    let mut next = 0;
+    for i in 0..natts {
+        // Past the last wanted attribute nothing behind `pos` is ever read
+        // again, so the remaining slots are filled without touching the bytes.
+        if next == wanted.len() {
+            vals.resize(natts, Value::Null);
+            break;
+        }
+        let is_null = head.has_null && (bitmap[i / 8] & (1 << (i % 8))) == 0;
+        let is_wanted = wanted[next] == i;
+        if is_wanted {
+            next += 1;
+        }
+        if is_null {
+            vals.push(Value::Null);
+        } else if head.has_external && buf.get(pos) == Some(&T_EXTERNAL) {
+            let Some(p) = toast::decode_pointer(buf, &mut pos) else {
+                return Err(StorageError::CorruptData(format!(
+                    "unreadable out-of-line pointer in attribute {i}"
+                )));
+            };
+            if is_wanted {
+                external.push((i, p));
+            }
+            // Either a placeholder `resolve` will fill in, or — for a skipped
+            // attribute, whose pointer was deliberately not collected — the
+            // unspecified value the projection contract allows.
+            vals.push(Value::Null);
+        } else if is_wanted {
+            vals.push(decode_datum(buf, &mut pos));
+        } else {
+            skip_datum(buf, &mut pos);
+            vals.push(Value::Null);
+        }
+    }
+    Ok(RawTuple {
+        vals,
+        external,
+        projected: true,
+    })
 }
 
 impl RawTuple {
     /// The out-of-line attributes this tuple owns — what VACUUM reclaims once the
     /// tuple itself is dead.
+    ///
+    /// Only meaningful for a full decode. A projected one collects no pointer for
+    /// an attribute it skipped, so reclaiming from that list would orphan the
+    /// chunks of every unread column — hence the assertion rather than a caveat
+    /// in prose.
     pub fn external(&self) -> &[(usize, ToastPointer)] {
+        debug_assert!(
+            !self.projected,
+            "a projected tuple's external list is incomplete; never reclaim from it"
+        );
         &self.external
     }
 
@@ -464,6 +552,92 @@ mod tests {
         assert_eq!(head.hdr.xmax, Xid(8));
         assert!(head.has_external);
         assert_eq!(raw.external(), &[(0, p)]);
+    }
+
+    /// Every projection of one mixed tuple — every subset of its attributes —
+    /// must agree with the full decode on the attributes it asked for. Exhaustive
+    /// over the subsets rather than a hand-picked few: an off-by-one skip shows up
+    /// only for the *particular* pairing that straddles it.
+    #[test]
+    fn every_projection_agrees_with_the_full_decode() {
+        let hdr = TupleHeader::inserted(Xid(3), CommandId(1));
+        let ctid = Tid {
+            block: 0,
+            offset: 1,
+        };
+        // Fixed-width, variable-width, a NULL and a nested kind, so a skip that
+        // mis-measures any of those shifts everything behind it.
+        let vals = vec![
+            Value::Int4(11),
+            Value::Text("a longer string".into()),
+            Value::Null,
+            Value::Bool(true),
+            Value::Array {
+                elem: crabgresql_types::PgType::Int4,
+                elems: vec![Value::Int4(1), Value::Null, Value::Int4(3)],
+            },
+            Value::Bytea(vec![7; 9]),
+        ];
+        let buf = encode_inline(&vals, &hdr, ctid);
+        for mask in 0..(1u32 << vals.len()) {
+            let wanted: Vec<usize> = (0..vals.len()).filter(|i| mask >> i & 1 == 1).collect();
+            let got = decode_raw_projected(&buf, &wanted)
+                .unwrap_or_else(|e| panic!("projected decode failed: {e}"))
+                .resolve(|_| unreachable!("nothing is out of line"))
+                .unwrap_or_else(|e| panic!("resolve failed: {e}"));
+            assert_eq!(got.len(), vals.len(), "rows stay full width");
+            for (i, want) in vals.iter().enumerate() {
+                if wanted.contains(&i) {
+                    assert_eq!(&got[i], want, "attribute {i} of projection {wanted:?}");
+                } else {
+                    assert_eq!(got[i], Value::Null, "attribute {i} was not asked for");
+                }
+            }
+        }
+    }
+
+    /// The saving that matters: a skipped out-of-line attribute is never
+    /// detoasted. `resolve`'s closure is the buffer-pool walk, so a call to it is
+    /// the failure.
+    #[test]
+    fn a_skipped_external_attribute_is_never_detoasted() {
+        let hdr = TupleHeader::inserted(Xid(1), CommandId(0));
+        let ctid = Tid {
+            block: 0,
+            offset: 1,
+        };
+        let (first, second) = (pointer(4), pointer(5));
+        let buf = encode_tuple(
+            &[
+                Attr::External(first),
+                Attr::Inline(&Value::Int4(2)),
+                Attr::External(second),
+            ],
+            &hdr,
+            ctid,
+        );
+        // Ask for the middle attribute only: both pointers are walked past, and
+        // neither is collected, so nothing reaches the chunk store.
+        let raw = decode_raw_projected(&buf, &[1]).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        let vals = raw
+            .resolve(|p| unreachable!("detoasted {p:?} for an unprojected attribute"))
+            .unwrap_or_else(|e| panic!("resolve failed: {e}"));
+        assert_eq!(vals, vec![Value::Null, Value::Int4(2), Value::Null]);
+
+        // Asking for the second one still resolves it — and only it.
+        let raw = decode_raw_projected(&buf, &[2]).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        let mut encoded = Vec::new();
+        encode_datum(&Value::Text("second".into()), &mut encoded);
+        let vals = raw
+            .resolve(|p| {
+                assert_eq!(*p, second, "only the projected pointer is followed");
+                Ok(encoded.clone())
+            })
+            .unwrap_or_else(|e| panic!("resolve failed: {e}"));
+        assert_eq!(
+            vals,
+            vec![Value::Null, Value::Null, Value::Text("second".into())]
+        );
     }
 
     #[test]

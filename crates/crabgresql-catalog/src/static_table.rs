@@ -15,6 +15,7 @@ use crabgresql_storage_api::{
     TupleStream, UpdateResult, txn::TxnContext,
 };
 use crabgresql_txn::Xid;
+use crabgresql_types::Value;
 
 /// One materialized `pg_catalog` relation: its schema plus a fixed set of rows.
 pub struct StaticTable {
@@ -55,12 +56,38 @@ impl TableAm for StaticTable {
         RelStats::exact(self.rows.len(), &self.schema)
     }
 
-    /// Rows are already materialized in RAM, so there is no read to prune: the
-    /// projection is ignored, which the scan contract permits.
-    fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
+    /// Rows are already materialized in RAM, so a projection prunes no read —
+    /// but the rows are shared behind an `Arc` and handed out by value, so every
+    /// scan clones them, and *that* is what it prunes. A `pg_proc` row is a
+    /// `text` body, a `name`, an `oidvector` and a `regproc` per column; psql and
+    /// `pg_dump` scan these relations several times per statement, almost always
+    /// for a handful of columns.
+    ///
+    /// Unprojected slots hold `Value::Null` and the row keeps its full width,
+    /// exactly as the heap's projected scan leaves them.
+    fn scan(&self, _txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
         let rows = self.rows.clone();
-        Box::new((0..rows.len()).map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))))
+        let ColumnProjection::Some(wanted) = projection else {
+            return Box::new(
+                (0..rows.len()).map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))),
+            );
+        };
+        let wanted = Arc::clone(wanted);
+        Box::new((0..rows.len()).map(move |i| {
+            let row = &rows[i];
+            let mut out = vec![Value::Null; row.len()];
+            // `ColumnProjection::of` keeps every ordinal inside the schema, and a
+            // catalog row is built to the schema's width — but this is handed a
+            // projection built elsewhere, so a stray ordinal drops rather than
+            // panicking a session mid-scan.
+            for &column in wanted.iter() {
+                if let Some(value) = row.get(column) {
+                    out[column] = value.clone();
+                }
+            }
+            Ok((Tid::from_packed(i as u64), out))
+        }))
     }
 
     fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
@@ -109,6 +136,52 @@ mod tests {
             "a materialized row count is exact, not an estimate"
         );
         assert!(stats.relpages > 0);
+    }
+
+    /// A projected scan keeps the row's width and its tids, carries the columns
+    /// it was asked for, and leaves the rest as the placeholder the contract
+    /// allows.
+    #[test]
+    fn a_projected_scan_keeps_the_row_width() {
+        let table = StaticTable::new(
+            TableSchema::new(
+                "t",
+                vec![
+                    Column::new("a", PgType::Int4),
+                    Column::new("b", PgType::Text),
+                    Column::new("c", PgType::Int4),
+                ],
+            ),
+            vec![
+                vec![Value::Int4(1), Value::Text("x".into()), Value::Int4(3)],
+                vec![Value::Int4(4), Value::Text("y".into()), Value::Int4(6)],
+            ],
+        );
+        let schema = table.schema();
+        // A catalog row is visible to every snapshot, so any context serves.
+        let tm = crabgresql_txn::TransactionManager::new();
+        let txn = tm.context(Xid::INVALID, crabgresql_txn::CommandId::FIRST);
+        let rows: Vec<_> = table
+            .scan(&txn, &ColumnProjection::of([1], &schema))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("catalog scan failed: {error}"));
+        assert_eq!(
+            rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>(),
+            vec![
+                vec![Value::Null, Value::Text("x".into()), Value::Null],
+                vec![Value::Null, Value::Text("y".into()), Value::Null],
+            ]
+        );
+        // The tids must be the same synthetic row indices the full scan hands
+        // out — `fetch` resolves them back through the same mapping.
+        let full: Vec<_> = table
+            .scan(&txn, &ColumnProjection::All)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("catalog scan failed: {error}"));
+        assert_eq!(
+            rows.iter().map(|(tid, _)| *tid).collect::<Vec<_>>(),
+            full.iter().map(|(tid, _)| *tid).collect::<Vec<_>>()
+        );
     }
 
     #[test]

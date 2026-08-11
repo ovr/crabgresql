@@ -617,6 +617,131 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
     v
 }
 
+/// Advance `*pos` past one datum without building its [`Value`].
+///
+/// The point is what it does *not* do: no `String`, no `Vec`, no re-parse of a
+/// `numeric`/`jsonb`/`tsvector` payload. A scan that was told it needs two of
+/// forty columns walks the other thirty-eight through here instead of decoding
+/// them (see `TableAm::scan`'s column-projection contract).
+///
+/// Reads through the same `Reader` as [`decode_datum`], so a truncated or
+/// corrupt datum fails identically: the same slice bounds panic, the same
+/// `corrupt datum tag` message. That matters because both run under a heap
+/// page's frame lock, where the two must not diverge in *how* they fail.
+pub fn skip_datum(buf: &[u8], pos: &mut usize) {
+    let start = *pos;
+    let mut r = Reader { buf, pos: start };
+    let tag = r.take(1)[0];
+    match tag {
+        // Fixed-width payloads, grouped by their byte count. This table is the
+        // one place that knows a kind's width without decoding it, so a kind
+        // added to `encode_datum` and forgotten here would walk the tuple off
+        // by its own length — which is what the debug cross-check at the bottom
+        // exists to catch, on every kind the test suite ever stores.
+        T_BOOL | T_CHAR => {
+            r.take(1);
+        }
+        T_INT2 => {
+            r.take(2);
+        }
+        T_INT4 | T_OID | T_FLOAT4 | T_DATE | T_XID => {
+            r.take(4);
+        }
+        T_TID | T_MACADDR => {
+            r.take(6);
+        }
+        T_INT8 | T_FLOAT8 | T_TIME | T_TIMESTAMP | T_TIMESTAMPTZ | T_MONEY | T_XID8 | T_PG_LSN
+        | T_MACADDR8 => {
+            r.take(8);
+        }
+        T_TIMETZ => {
+            r.take(12);
+        }
+        T_UUID | T_INTERVAL | T_POINT => {
+            r.take(16);
+        }
+        T_INET | T_CIDR => {
+            r.take(18);
+        }
+        T_LINE | T_CIRCLE => {
+            r.take(24);
+        }
+        T_LSEG | T_BOX => {
+            r.take(32);
+        }
+        // A `u32` length prefix and its payload: `var` reads the length and
+        // slices past the bytes without copying them.
+        T_NUMERIC | T_TEXT | T_BYTEA | T_JSON | T_JSONB | T_JSONPATH_TREE | T_JSONPATH
+        | T_TSVECTOR | T_TSQUERY => {
+            r.var();
+        }
+        // A bit length, then the packed bytes.
+        T_BIT => {
+            r.take(4);
+            r.var();
+        }
+        // Two OIDs (kind + value, or type + ordinal), then the rendered name.
+        T_REG | T_ENUM => {
+            r.take(8);
+            r.var();
+        }
+        // The open/closed flag, then the vertex count and its coordinate pairs.
+        T_PATH => {
+            r.take(1);
+            skip_points(&mut r);
+        }
+        T_POLYGON => skip_points(&mut r),
+        T_VECTOR => {
+            let width = match r.take(1)[0] {
+                0 => VectorKind::Oid,
+                1 => VectorKind::Int2,
+                other => panic!("corrupt vector kind {other}"),
+            }
+            .element()
+            .typlen() as usize;
+            let count = r.u32() as usize;
+            r.take(count.saturating_mul(width));
+        }
+        // Elements are self-describing, so skipping one is this same walk a
+        // level down — the recursion mirrors `encode_datum`'s.
+        T_ARRAY => {
+            r.take(4);
+            let count = r.u32();
+            for _ in 0..count {
+                if r.take(1)[0] != 0 {
+                    skip_datum(buf, &mut r.pos);
+                }
+            }
+        }
+        other => panic!("corrupt datum tag {other}"),
+    }
+
+    // Debug builds pay for a full decode and check the walk against it. Every
+    // kind the test suite and the regression corpus ever store is therefore
+    // checked against the codec itself, rather than against a hand-written list
+    // of expected widths that would need its own maintenance.
+    #[cfg(debug_assertions)]
+    {
+        let mut decoded = start;
+        decode_datum(buf, &mut decoded);
+        debug_assert_eq!(
+            decoded, r.pos,
+            "skip_datum disagrees with decode_datum on tag {tag}"
+        );
+    }
+
+    *pos = r.pos;
+}
+
+/// Skip a vertex count and the `count * 16` bytes of coordinates behind it.
+///
+/// `saturating_mul` and a single `take` keep a corrupt count to the ordinary
+/// bounds panic, exactly as the decoding side's explicit guard does.
+fn skip_points(r: &mut Reader<'_>) {
+    let npts = r.u32() as usize;
+    r.take(npts.saturating_mul(16));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +793,86 @@ mod tests {
         let got = decode_datum(&buf, &mut pos);
         assert_eq!(pos, buf.len(), "consumed exactly the datum");
         assert_eq!(got, v);
+
+        // Skipping must land where decoding did. Asserted here rather than in a
+        // test of its own so that every kind listed below — and every kind
+        // anyone adds to that list later — checks its own width for free.
+        let mut skipped = 0;
+        skip_datum(&buf, &mut skipped);
+        assert_eq!(skipped, buf.len(), "skipped exactly the datum: {v:?}");
+    }
+
+    /// A skipped datum must leave the position the *next* one starts at. Landing
+    /// one byte off is invisible to a single-datum check — the length still
+    /// matches the buffer — and corrupts every attribute after it in a tuple.
+    #[test]
+    fn skipping_lands_on_the_next_datum() {
+        let values = [
+            Value::Text("skip me".into()),
+            Value::Int4(-7),
+            Value::Bit {
+                len: 12,
+                data: vec![0xAB, 0xC0],
+            },
+            Value::Array {
+                elem: PgType::Text,
+                elems: vec![Value::Text("x".into()), Value::Null],
+            },
+            Value::Path(crate::geo::PathVal {
+                closed: true,
+                pts: vec![[1.0, 2.0], [3.0, 4.0]],
+            }),
+            Value::Vector {
+                kind: VectorKind::Int2,
+                elems: vec![Value::Int2(3), Value::Int2(4)],
+            },
+            Value::Numeric(Numeric::parse("1.2300").expect("valid numeric")),
+        ];
+        let mut buf = Vec::new();
+        for v in &values {
+            encode_datum(v, &mut buf);
+        }
+        // Skip the first `n`, then decode the rest and require them to be the
+        // values that were written.
+        for n in 0..values.len() {
+            let mut pos = 0;
+            for _ in 0..n {
+                skip_datum(&buf, &mut pos);
+            }
+            for want in &values[n..] {
+                assert_eq!(&decode_datum(&buf, &mut pos), want, "after skipping {n}");
+            }
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    /// `jsonpath` written before the tree encoding existed is stored under its
+    /// own tag, which `encode_datum` no longer produces — so `roundtrip` cannot
+    /// reach it and the skip table would go unchecked for that tag.
+    #[test]
+    fn a_legacy_jsonpath_datum_skips() {
+        let mut buf = vec![T_JSONPATH];
+        put_var(&mut buf, b"$.a[*]");
+        let mut pos = 0;
+        skip_datum(&buf, &mut pos);
+        assert_eq!(pos, buf.len());
+    }
+
+    /// A corrupt vertex count is a bounds panic when skipping too, not a
+    /// `npts * 16` allocation — the guard the decoding side spells out.
+    #[test]
+    #[should_panic(expected = "range end index")]
+    fn skipping_a_polygon_rejects_a_bogus_vertex_count() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::Polygon(crate::geo::PolygonVal {
+                pts: vec![[1.0, 2.0]],
+            }),
+            &mut buf,
+        );
+        buf[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut pos = 0;
+        skip_datum(&buf, &mut pos);
     }
 
     /// `Reg`'s `PartialEq` compares only `(kind, oid)`, so `roundtrip`'s

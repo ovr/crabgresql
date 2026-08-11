@@ -1020,6 +1020,84 @@ fn a_large_value_round_trips_through_scan_and_fetch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A projected scan must agree with a full scan on every column it was asked
+/// for, for **every** subset of the columns — including one that skips a toasted
+/// value, which is the case the heap's decoder walks past rather than
+/// reassembles.
+///
+/// Exhaustive over the subsets on purpose. A skip that mis-measures one kind
+/// shifts every attribute behind it, so it shows up only for the particular
+/// pairing that straddles the mistake; a handful of hand-picked projections
+/// would miss it.
+#[test]
+fn every_projection_agrees_with_a_full_scan() -> anyhow::Result<()> {
+    let h = setup();
+    let columns = vec![
+        Column::new("i", PgType::Int4),
+        Column::new("t", PgType::Text),
+        Column::new("big", PgType::Text),
+        Column::new("b", PgType::Bool),
+        Column::new("n", PgType::Numeric),
+        Column::new("y", PgType::Bytea),
+    ];
+    let width = columns.len();
+    let table = h
+        .engine
+        .create_table(TableSchema::new("t", columns.clone()))?;
+    let schema = table.schema();
+    let rows = vec![
+        vec![
+            Value::Int4(1),
+            Value::Text("short".into()),
+            // Comfortably over the inline limit, so it is stored out of line and
+            // an unprojected scan must not walk its chunks.
+            big_text(60_000),
+            Value::Bool(true),
+            Value::Numeric(crabgresql_types::Numeric::parse("12.3400")?),
+            Value::Bytea(vec![1, 2, 3]),
+        ],
+        // A row of NULLs beside the values, so the bitmap and the skip walk are
+        // exercised together.
+        vec![
+            Value::Int4(2),
+            Value::Null,
+            big_text(3_000),
+            Value::Null,
+            Value::Numeric(crabgresql_types::Numeric::parse("-0.5")?),
+            Value::Null,
+        ],
+    ];
+    for row in &rows {
+        insert_committed(&h.tm, &*table, row.clone());
+    }
+
+    let full = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(full.len(), rows.len());
+    for mask in 0..(1u32 << width) {
+        let wanted: Vec<usize> = (0..width).filter(|i| mask >> i & 1 == 1).collect();
+        let projection = ColumnProjection::of(wanted.iter().copied(), &schema);
+        let got: Vec<(Tid, Tuple)> = table
+            .scan(&read(&h.tm), &projection)
+            .collect::<Result<_, StorageError>>()?;
+        assert_eq!(got.len(), full.len(), "projection {wanted:?} lost rows");
+        for (want, have) in full.iter().zip(&got) {
+            assert_eq!(want.0, have.0, "projection {wanted:?} moved a tid");
+            assert_eq!(
+                have.1.len(),
+                width,
+                "projection {wanted:?} narrowed the row"
+            );
+            for &column in &wanted {
+                assert_eq!(
+                    have.1[column], want.1[column],
+                    "column {column} under projection {wanted:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn values_spanning_one_two_and_many_chunks_round_trip() -> anyhow::Result<()> {
     // The chunk payload is ~2 KB, so these straddle every boundary that matters:

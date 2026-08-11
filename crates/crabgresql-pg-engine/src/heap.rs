@@ -1366,9 +1366,15 @@ impl TableAm for HeapTable {
         Some(Box::new(out.into_iter()))
     }
 
-    /// The heap stores whole tuples per page, so reading fewer columns saves no
-    /// I/O: the projection is ignored, which the scan contract permits.
-    fn scan(&self, txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
+    /// The heap stores whole tuples per page, so a projection saves no I/O — the
+    /// page is read either way. What it does save is everything after the read:
+    /// a skipped attribute is not decoded, allocates nothing, and — the part
+    /// worth the most — is not detoasted, so an unread wide column stops pulling
+    /// the toast relation's pages through the buffer pool.
+    ///
+    /// Skipped attributes come back as `Value::Null` in a full-width row, which
+    /// is what the scan contract asks for.
+    fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
         // cannot unlink the file this scan is reading.
         let guard = self.lock.acquire_shared(txn.lock_owner);
@@ -1380,6 +1386,10 @@ impl TableAm for HeapTable {
             txn: txn.clone(),
             nblocks,
             cur_block: 0,
+            projection: match projection {
+                ColumnProjection::All => None,
+                ColumnProjection::Some(wanted) => Some(Arc::clone(wanted)),
+            },
             buffer: Vec::new(),
             buf_idx: 0,
             _guard: guard,
@@ -1811,6 +1821,9 @@ struct HeapScan {
     txn: TxnContext,
     nblocks: u32,
     cur_block: u32,
+    /// The projected attributes, or `None` for the whole row. Sorted ordinals,
+    /// straight out of [`ColumnProjection::Some`].
+    projection: Option<Arc<[usize]>>,
     buffer: Vec<(Tid, Tuple)>,
     buf_idx: usize,
     /// Shared table-lock hold kept for the iterator's whole life, so a concurrent
@@ -1860,7 +1873,11 @@ impl Iterator for HeapScan {
                             self.txn.xid,
                             self.txn.cid,
                         ) {
-                            out.push((Tid { block, offset: off }, tuple::decode_raw(bytes)));
+                            let raw = match &self.projection {
+                                Some(wanted) => tuple::decode_raw_projected(bytes, wanted),
+                                None => tuple::decode_raw(bytes),
+                            };
+                            out.push((Tid { block, offset: off }, raw));
                         }
                     }
                 }
