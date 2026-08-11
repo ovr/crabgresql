@@ -528,6 +528,38 @@ pub(crate) fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
     Some(acc)
 }
 
+/// Recursively split a top-level `OR` tree into its arms, preserving order.
+/// The `AND` mirror of this is [`flatten_and`].
+pub(crate) fn flatten_or(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            flatten_or(*left, out);
+            flatten_or(*right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Re-combine arms with `OR`, yielding `None` for an empty list.
+pub(crate) fn rebuild_or(mut arms: Vec<BoundExpr>) -> Option<BoundExpr> {
+    let mut acc = arms.pop()?;
+    while let Some(next) = arms.pop() {
+        acc = BoundExpr::Binary {
+            op: BinOp::Or,
+            arg_ty: PgType::Bool,
+            collation: DEFAULT_COLLATION_OID,
+            left: Box::new(next),
+            right: Box::new(acc),
+        };
+    }
+    Some(acc)
+}
+
 /// If `conjunct` is a cross-side equality, return its [`HashKey`] (oriented so
 /// `left` addresses the left input); otherwise hand the expression back as a
 /// residual conjunct.
@@ -2354,6 +2386,57 @@ mod tests {
         assert_eq!(hash_keys.len(), 1);
         assert!(residual.is_none());
         assert!(predicate.is_none());
+    }
+
+    #[test]
+    fn or_of_arms_sharing_an_equality_still_hashes() {
+        // The TPC-H Q19 shape: the whole WHERE is one OR, but every arm repeats
+        // the join equality and one single-relation restriction. Factoring those
+        // out is what keeps this from planning as a Cartesian product.
+        let PhysicalPlan::Aggregate {
+            input: PhysicalAggInput::Join(source),
+            predicate,
+            ..
+        } = plan_sql(
+            "SELECT count(*) FROM t a, t b \
+             WHERE (a.id = b.id AND a.name = 'x' AND b.big = 1) \
+                OR (a.id = b.id AND a.name = 'x' AND b.big = 2)",
+        )
+        else {
+            panic!("expected Aggregate over Join");
+        };
+        let PhysicalJoinExpr::Join {
+            left,
+            kind,
+            right,
+            predicate: residual,
+            hash_keys,
+        } = source
+        else {
+            panic!("expected a Join node");
+        };
+        assert_eq!(kind, JoinKind::Inner, "Cross must flip once conditioned");
+        assert_eq!(hash_keys.len(), 1, "the factored equality is the hash key");
+        // `a.name = 'x'` is common to both arms too, so it reaches the left leaf.
+        let PhysicalJoinExpr::Input {
+            predicate: Some(_), ..
+        } = *left
+        else {
+            panic!("the common single-relation conjunct must sink to the leaf");
+        };
+        // What is left of the OR (`b.big = 1 OR b.big = 2`) touches only `b`, so
+        // it sinks to the right leaf rather than filtering joined rows.
+        let PhysicalJoinExpr::Input {
+            predicate: Some(_), ..
+        } = *right
+        else {
+            panic!("the residual OR must sink to the right leaf");
+        };
+        assert!(
+            residual.is_none(),
+            "nothing is left to re-check at the join"
+        );
+        assert!(predicate.is_none(), "nothing is left above the join");
     }
 
     #[test]
