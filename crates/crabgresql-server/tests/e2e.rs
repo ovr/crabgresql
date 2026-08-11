@@ -2,6 +2,7 @@
 //! server on an ephemeral port, plus raw-socket checks of the startup phase.
 
 use anyhow::Context as _;
+use crabgresql_pg_wire::FrontendMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -3869,6 +3870,14 @@ fn frontend_message(tag: u8, body: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     msg.extend_from_slice(body);
     msg
+}
+
+fn frontend_batch(messages: &[FrontendMessage]) -> bytes::BytesMut {
+    let mut buf = bytes::BytesMut::new();
+    for message in messages {
+        message.encode(&mut buf);
+    }
+    buf
 }
 
 /// Collect every backend `(tag, body)` up to and including the terminating
@@ -11155,51 +11164,45 @@ async fn prepared_statement_counts_its_executions() -> anyhow::Result<()> {
 /// with it; it must be a plain error instead, as PostgreSQL's 54001 is.
 #[tokio::test]
 async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow::Result<()> {
-    let client = connect(spawn_server().await).await;
-    // The driver names its Parse messages sequentially, so preparing one
-    // statement reveals what the *next* one will be called — which is how a
-    // statement gets to name itself. Asserted below rather than assumed.
-    let probe = client.prepare("SELECT 1").await?;
-    let taken = client
-        .simple_query("SELECT name FROM pg_prepared_statements WHERE NOT from_sql")
-        .await?;
-    let taken = rows(&taken)[0].get("name").expect("a name").to_string();
-    let n: u32 = taken
-        .trim_start_matches('s')
-        .parse()
-        .expect("driver names statements sN");
-    let self_name = format!("s{}", n + 1);
-    drop(probe);
+    // Raw protocol, because on the wire the statement name is the client's to
+    // choose: `self` names itself outright, with no driver-assigned counter to
+    // guess and race against.
+    let mut socket = raw_session(spawn_server().await).await;
 
-    let stmt = client.prepare(&format!("EXECUTE {self_name}")).await?;
-    let named = client
-        .simple_query(&format!(
-            "SELECT count(*) AS n FROM pg_prepared_statements WHERE name = '{self_name}'"
-        ))
-        .await?;
-    assert_eq!(
-        rows(&named)[0].get("n"),
-        Some("1"),
-        "the statement must name itself for this to test anything"
+    let batch = frontend_batch(&[
+        FrontendMessage::Parse {
+            name: "self".to_string(),
+            query: "EXECUTE self".to_string(),
+            param_types: Vec::new(),
+        },
+        FrontendMessage::Bind {
+            portal: String::new(),
+            statement: "self".to_string(),
+            param_formats: Vec::new(),
+            params: Vec::new(),
+            result_formats: Vec::new(),
+        },
+        FrontendMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        },
+        FrontendMessage::Sync,
+    ]);
+    socket.write_all(&batch).await?;
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, [b'1', b'2', b'E', b'Z'], "recursion must be refused");
+    let err = fields(
+        msgs.iter()
+            .find(|(t, _)| *t == b'E')
+            .context("ErrorResponse is missing")?,
     );
-
-    let err = client
-        .query(&stmt, &[])
-        .await
-        .expect_err("recursion must be refused");
-    let err = err.as_db_error().expect("database error");
-    assert_eq!(err.code().code(), "54001");
+    assert_eq!(err.code(), "54001");
     assert_eq!(err.message(), "stack depth limit exceeded");
 
-    // The point of the test: the connection — and the server behind it — is
-    // still there afterwards, and the depth counter unwound.
-    assert_eq!(
-        client
-            .query_one("SELECT 1 AS n", &[])
-            .await?
-            .get::<_, i32>("n"),
-        1
-    );
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert_eq!(command_tags(&msgs), ["SELECT 1"]);
     Ok(())
 }
 

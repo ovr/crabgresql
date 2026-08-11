@@ -70,6 +70,17 @@ for the entire codebase:
   which observable PG behavior it reproduces, what breaks if it is changed, or
   which non-obvious alternative was rejected and why.
 - If nothing of that kind is true of a line, leave it uncommented.
+- **Do not narrate the assertions.** `// the connection is still alive`,
+  `// the point of the test: …`, `// check that it errors` above an assertion
+  that already says exactly that is noise. Name the test well and let the
+  assertion — with its own failure message — speak.
+- **The commit message is not a comment.** Why a patch was written, what it
+  replaced, what CI failure it fixes, which approach the author weighed — that
+  belongs in the commit message or the PR description. A comment describes the
+  code as it stands now, for a reader who never saw the diff.
+- Keep it to what a reader needs: one or two lines. A four-line paragraph
+  justifying a five-line helper is a sign the explanation belongs elsewhere, or
+  nowhere.
 - **Missing functionality is a `TODO`, not prose.** When a comment says that
   something is not built yet — a column held at a constant until a subsystem
   lands, a relation served in reduced form, a slow path kept until an index
