@@ -169,7 +169,12 @@ pub fn fmt_f32(v: f32, efd: i32) -> String {
 }
 
 /// C `%.*g` formatting with `prec` significant digits (efd <= 0 path).
-fn fmt_g(v: f64, prec: usize) -> String {
+///
+/// Public because `SHOW`ing a `real` configuration parameter needs the same
+/// rendering: PostgreSQL's `guc.c` prints those with a plain `%g`, so
+/// `random_page_cost = 1e10` reads back as `1e+10` rather than as the digits
+/// `float8out` would give.
+pub fn fmt_g(v: f64, prec: usize) -> String {
     if v == 0.0 {
         return if v.is_sign_negative() { "-0" } else { "0" }.into();
     }

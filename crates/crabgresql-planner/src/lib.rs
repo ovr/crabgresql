@@ -374,21 +374,21 @@ pub enum PhysicalAggInput {
     SingleRow,
 }
 
-fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
+fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinInput {
     match input {
         JoinInput::Scan(table) => PhysicalJoinInput::Scan {
             table,
             projection: ColumnProjection::All,
         },
-        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source))),
+        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source, costs))),
         JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
     }
 }
 
-fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
+fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinExpr {
     match source {
         JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
-            input: plan_join_input(input),
+            input: plan_join_input(input, costs),
             width,
             predicate: None,
         },
@@ -405,8 +405,8 @@ fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
                 "a cross join carries no condition; pushdown flips the kind to Inner \
                  when it attaches one"
             );
-            let mut left = Box::new(plan_join_expr(*left));
-            let mut right = Box::new(plan_join_expr(*right));
+            let mut left = Box::new(plan_join_expr(*left, costs));
+            let mut right = Box::new(plan_join_expr(*right, costs));
             let predicate = sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
             PhysicalJoinExpr::Join {
                 left,
@@ -638,8 +638,8 @@ fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
     }
 }
 
-pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
-    let mut physical = lower(logical);
+pub fn plan(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
+    let mut physical = lower(logical, costs);
     // After the sinking passes, so each conjunct is ordered against the ones it
     // shares a node with rather than the ones it was written next to.
     qualorder::reorder_quals(&mut physical);
@@ -651,7 +651,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
 
 /// Lower one logical node, recursing into subplans. Split from [`plan`] so the
 /// projection pass runs exactly once, over the finished tree.
-fn lower(logical: LogicalPlan) -> PhysicalPlan {
+fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
     match logical {
         LogicalPlan::Values(ValuesPlan {
             columns,
@@ -678,7 +678,11 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => match choose_access(&table, predicate.map(pushdown::factor_common_or_conjuncts)) {
+        }) => match choose_access(
+            &table,
+            predicate.map(pushdown::factor_common_or_conjuncts),
+            costs,
+        ) {
             AccessPath::Index {
                 index_name,
                 key,
@@ -725,7 +729,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             arms: arms
                 .into_iter()
                 .map(|arm| PhysicalSetOpArm {
-                    plan: lower(arm.plan),
+                    plan: lower(arm.plan, costs),
                     coercion: arm.coercion,
                 })
                 .collect(),
@@ -741,7 +745,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         }) => PhysicalPlan::Subquery {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             columns,
             projections,
             predicate,
@@ -755,7 +759,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             input_width,
             output_width,
         }) => PhysicalPlan::Window {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             spec,
             funcs,
             input_width,
@@ -788,7 +792,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
         }) => {
             let predicate = pushdown::push_where_into_joins(&mut source, predicate);
             PhysicalPlan::Join {
-                source: plan_join_expr(source),
+                source: plan_join_expr(source, costs),
                 columns,
                 projections,
                 predicate,
@@ -820,7 +824,10 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 ),
                 AggInput::Join(mut source) => {
                     let predicate = pushdown::push_where_into_joins(&mut source, predicate);
-                    (PhysicalAggInput::Join(plan_join_expr(source)), predicate)
+                    (
+                        PhysicalAggInput::Join(plan_join_expr(source, costs)),
+                        predicate,
+                    )
                 }
                 AggInput::SingleRow => (PhysicalAggInput::SingleRow, predicate),
             };
@@ -841,7 +848,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             limit,
             offset,
         }) => PhysicalPlan::Limit {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             limit,
             offset,
         },
@@ -861,7 +868,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                     PhysicalInsertSource::Tuples { rows, defaults }
                 }
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
-                    input: Box::new(lower(*input)),
+                    input: Box::new(lower(*input, costs)),
                     projections,
                 },
             },
@@ -899,6 +906,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 &predicate,
                 Some(&keep),
                 tableoid,
+                costs,
             );
             PhysicalPlan::Update {
                 tableoid,
@@ -920,8 +928,9 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             tableoid,
         }) => {
             // A DELETE removes rows outright, so no target needs a snapshot.
-            let (routing, inherited, probe) =
-                dml_targets(&table, routing, inherited, &predicate, None, tableoid);
+            let (routing, inherited, probe) = dml_targets(
+                &table, routing, inherited, &predicate, None, tableoid, costs,
+            );
             PhysicalPlan::Delete {
                 tableoid,
                 table,
@@ -958,7 +967,11 @@ enum AccessPath {
 /// equality conjuncts are considered here, and the storage API offers only an
 /// equality probe ([`TableAm::index_lookup`]). The estimate a range path needs
 /// is already written and tested — [`cost::range_selectivity`].
-fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> AccessPath {
+fn choose_access(
+    table: &Arc<dyn TableAm>,
+    predicate: Option<BoundExpr>,
+    costs: cost::CostSettings,
+) -> AccessPath {
     let Some(predicate) = predicate else {
         return AccessPath::Scan { predicate: None };
     };
@@ -974,7 +987,7 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
     flatten_and(predicate, &mut conjuncts);
     let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
 
-    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs) else {
+    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs, costs) else {
         return AccessPath::Scan {
             predicate: rebuild_and(conjuncts),
         };
@@ -1016,6 +1029,7 @@ fn pick_index(
     table: &Arc<dyn TableAm>,
     indexes: &[IndexMetadata],
     eqs: &[Option<(usize, BoundExpr)>],
+    costs: cost::CostSettings,
 ) -> Option<(DmlIndexProbe, Vec<bool>)> {
     // Which indexes are even in the running, in tie-break order. Settled before
     // anything is measured: asking for statistics reads the relation's file
@@ -1062,6 +1076,7 @@ fn pick_index(
             }
         }
         let total = cost::index_scan_cost(
+            costs,
             size,
             index_pages(table, &index.name, size),
             selectivity,
@@ -1084,7 +1099,7 @@ fn pick_index(
         }
     }
     let (total, probe, consumed) = best?;
-    (total < cost::seq_scan_cost(size, nquals)).then_some((probe, consumed))
+    (total < cost::seq_scan_cost(costs, size, nquals)).then_some((probe, consumed))
 }
 
 /// The fraction of the relation one `col = <value>` key column keeps.
@@ -1177,6 +1192,7 @@ fn dml_targets(
     // statement reads. Inherited targets already carry their own name from the
     // binder.
     tableoid: bool,
+    costs: cost::CostSettings,
 ) -> (
     Option<Vec<DmlTarget>>,
     Vec<DmlTarget>,
@@ -1207,7 +1223,7 @@ fn dml_targets(
                 })
                 .collect(),
         };
-        let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated)?;
+        let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated, costs)?;
         probe.residual = rebuild_and(
             conjuncts
                 .iter()
@@ -2180,7 +2196,7 @@ mod tests {
             Ok(plan) => plan,
             Err(error) => panic!("failed to bind planner test SQL `{sql}`: {error}"),
         };
-        plan(logical)
+        plan(logical, cost::CostSettings::default())
     }
 
     #[test]

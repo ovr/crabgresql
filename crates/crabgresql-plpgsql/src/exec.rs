@@ -892,7 +892,7 @@ impl Interpreter {
             None => txn.clone(),
         };
 
-        match execute(crabgresql_planner::plan(logical), ctx, &txn)? {
+        match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, &txn)? {
             Execution::Rows { node, .. } | Execution::ReturningRows { node, .. } => {
                 Ok(Rows::Set(drain(node)?))
             }

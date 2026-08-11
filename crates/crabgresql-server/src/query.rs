@@ -1091,7 +1091,7 @@ pub(crate) fn execute_statement_with(
     // binder) is outside it there too. crabgresql's planner does far less than
     // PG's, so this number is legitimately small; it is not comparable to PG's.
     let planning_started = explain.is_some().then(Instant::now);
-    let plan = crabgresql_planner::plan(logical);
+    let plan = crabgresql_planner::plan(logical, session.costs);
     let planning = planning_started.map_or(Duration::ZERO, |started| started.elapsed());
     // Rendered here, while the plan is still borrowable — `execute` consumes it.
     let explaining = explain.map(|opts| (opts, crabgresql_planner::explain(&plan)));
@@ -1600,7 +1600,11 @@ pub fn run_copy_rows(
         let batch_txn = txn.with_cid(CommandId(
             command_counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1,
         ));
-        match execute(crabgresql_planner::plan(logical), &exec_ctx, &batch_txn)? {
+        match execute(
+            crabgresql_planner::plan(logical, exec_ctx.costs),
+            &exec_ctx,
+            &batch_txn,
+        )? {
             Execution::Inserted(n) => {
                 loaded += n;
                 Ok(n)
@@ -5587,7 +5591,11 @@ fn execute_create_table_as(
         Arc::clone(&command_counter),
         read_only,
     );
-    let exec = match execute(crabgresql_planner::plan(logical), &exec_ctx, &txn) {
+    let exec = match execute(
+        crabgresql_planner::plan(logical, exec_ctx.costs),
+        &exec_ctx,
+        &txn,
+    ) {
         Ok(exec) => exec,
         Err(e) => {
             let _ = finalize_statement(txnmgr, session, &txn, true, false, Some(&command_counter));

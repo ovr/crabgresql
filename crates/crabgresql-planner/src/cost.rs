@@ -23,11 +23,35 @@ use crabgresql_storage_api::{ColStats, RelStats, TableSchema};
 use crabgresql_types::compare::compare_values_collated;
 use crabgresql_types::{PgType, Value};
 
-/// Cost of a sequentially fetched page.
-const SEQ_PAGE_COST: f64 = 1.0;
-/// Cost of a randomly fetched page — PostgreSQL's default ratio of 4:1 against
-/// [`SEQ_PAGE_COST`], which is what makes an index scan lose on a wide range.
-const RANDOM_PAGE_COST: f64 = 4.0;
+/// The two page costs, as the session has them set.
+///
+/// Settable because the right ratio is a property of the storage, not of the
+/// query: PostgreSQL's 4:1 default describes a spinning disk, and a relation
+/// served from a warm buffer pool is nearer 1:1 — measured here, a mid-
+/// selectivity scan the 4:1 ratio talks the planner out of runs 1.7x faster
+/// through the index. PG exposes exactly these as `seq_page_cost` and
+/// `random_page_cost`, so the tuning knob a user already knows is the one that
+/// works.
+///
+/// TODO: expose `cpu_tuple_cost`, `cpu_index_tuple_cost` and
+/// `cpu_operator_cost` too — PostgreSQL has all five, and they are still
+/// constants below.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CostSettings {
+    pub seq_page_cost: f64,
+    pub random_page_cost: f64,
+}
+
+impl Default for CostSettings {
+    /// PostgreSQL's defaults.
+    fn default() -> Self {
+        CostSettings {
+            seq_page_cost: 1.0,
+            random_page_cost: 4.0,
+        }
+    }
+}
+
 /// Cost of processing one heap tuple.
 const CPU_TUPLE_COST: f64 = 0.01;
 /// Cost of processing one index entry.
@@ -103,8 +127,8 @@ pub fn estimate_rel_size(stats: &RelStats, schema: &TableSchema) -> RelSize {
 
 /// The cost of reading the whole relation and applying `nquals` qualifications
 /// to every row.
-pub fn seq_scan_cost(size: RelSize, nquals: usize) -> f64 {
-    size.pages * SEQ_PAGE_COST + size.rows * (CPU_TUPLE_COST + qual_cost(nquals))
+pub fn seq_scan_cost(costs: CostSettings, size: RelSize, nquals: usize) -> f64 {
+    size.pages * costs.seq_page_cost + size.rows * (CPU_TUPLE_COST + qual_cost(nquals))
 }
 
 /// The cost of visiting `selectivity` of the relation through an index:
@@ -115,6 +139,7 @@ pub fn seq_scan_cost(size: RelSize, nquals: usize) -> f64 {
 /// `index_pages` is the index's own size; `nquals` counts the qualifications
 /// re-checked per fetched row.
 pub fn index_scan_cost(
+    costs: CostSettings,
     size: RelSize,
     index_pages: f64,
     selectivity: f64,
@@ -127,18 +152,18 @@ pub fn index_scan_cost(
     // Descent: the fraction of the index the scan reads, never less than the one
     // page every probe touches.
     let index_pages_read = (selectivity * index_pages).max(1.0);
-    let index_cost = index_pages_read * RANDOM_PAGE_COST
+    let index_cost = index_pages_read * costs.random_page_cost
         + tuples_fetched * (CPU_INDEX_TUPLE_COST + qual_cost(nquals));
 
     // Heap: the same rows may share pages, so the page count is sublinear in the
     // row count (Mackert–Lohman, with this scan run once).
     let random_pages = mackert_lohman(tuples_fetched, size.pages);
-    let max_io = random_pages * RANDOM_PAGE_COST;
+    let max_io = random_pages * costs.random_page_cost;
     // Perfectly correlated: the fetches walk the relation in physical order, so
     // only the first page is a random one.
     let ordered_pages = (selectivity * size.pages).ceil();
     let min_io = if ordered_pages > 0.0 {
-        RANDOM_PAGE_COST + (ordered_pages - 1.0) * SEQ_PAGE_COST
+        costs.random_page_cost + (ordered_pages - 1.0) * costs.seq_page_cost
     } else {
         0.0
     };
@@ -639,7 +664,7 @@ mod tests {
         let size = estimate_rel_size(&RelStats::unknown(&schema), &schema);
         assert_eq!(size.pages, f64::from(DEFAULT_RELPAGES));
         assert!(size.rows > 0.0);
-        assert!(seq_scan_cost(size, 1) > 0.0);
+        assert!(seq_scan_cost(CostSettings::default(), size, 1) > 0.0);
     }
 
     /// The decision this model exists to make: a selective probe beats a scan of
@@ -651,13 +676,19 @@ mod tests {
             pages: 5_000.0,
             rows: 500_000.0,
         };
-        assert!(index_scan_cost(big, 200.0, 1.0 / 500_000.0, 0.0, 1) < seq_scan_cost(big, 1));
+        assert!(
+            index_scan_cost(CostSettings::default(), big, 200.0, 1.0 / 500_000.0, 0.0, 1)
+                < seq_scan_cost(CostSettings::default(), big, 1)
+        );
 
         let small = RelSize {
             pages: 1.0,
             rows: 5.0,
         };
-        assert!(index_scan_cost(small, 1.0, 0.2, 0.0, 1) > seq_scan_cost(small, 1));
+        assert!(
+            index_scan_cost(CostSettings::default(), small, 1.0, 0.2, 0.0, 1)
+                > seq_scan_cost(CostSettings::default(), small, 1)
+        );
     }
 
     /// A wide range through an index is worse than reading the relation, because
@@ -669,7 +700,10 @@ mod tests {
             pages: 5_000.0,
             rows: 500_000.0,
         };
-        assert!(index_scan_cost(size, 200.0, 0.5, 0.0, 1) > seq_scan_cost(size, 1));
+        assert!(
+            index_scan_cost(CostSettings::default(), size, 200.0, 0.5, 0.0, 1)
+                > seq_scan_cost(CostSettings::default(), size, 1)
+        );
     }
 
     /// Physical order is worth real money: the same fetch is cheaper when the
@@ -680,8 +714,8 @@ mod tests {
             pages: 5_000.0,
             rows: 500_000.0,
         };
-        let random = index_scan_cost(size, 200.0, 0.05, 0.0, 1);
-        let ordered = index_scan_cost(size, 200.0, 0.05, 1.0, 1);
+        let random = index_scan_cost(CostSettings::default(), size, 200.0, 0.05, 0.0, 1);
+        let ordered = index_scan_cost(CostSettings::default(), size, 200.0, 0.05, 1.0, 1);
         assert!(ordered < random, "ordered {ordered} vs random {random}");
     }
 }
