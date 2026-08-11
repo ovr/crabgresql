@@ -476,6 +476,44 @@ mod tests {
     }
 
     #[test]
+    fn a_common_conjunct_is_hoisted_across_three_arms() {
+        // Q19's arity. With two arms the cross-arm bookkeeping cannot be wrong —
+        // every claim is against arm 1 — so the third arm is what exercises it.
+        let join_key = eq(col(0), col(1));
+        let arm = |n| all(BinOp::And, vec![join_key.clone(), eq(col(0), lit(n))]);
+        let input = all(BinOp::Or, vec![arm(1), arm(2), arm(3)]);
+
+        let expected = all(
+            BinOp::And,
+            vec![
+                join_key,
+                all(
+                    BinOp::Or,
+                    vec![eq(col(0), lit(1)), eq(col(0), lit(2)), eq(col(0), lit(3))],
+                ),
+            ],
+        );
+        assert_eq!(factor_common_or_conjuncts(input), expected);
+    }
+
+    #[test]
+    fn a_conjunct_missing_from_one_arm_is_not_hoisted() {
+        // Present in arms 0 and 1, absent from arm 2: a majority is not enough,
+        // since the third arm can be satisfied without it.
+        let join_key = eq(col(0), col(1));
+        let input = all(
+            BinOp::Or,
+            vec![
+                all(BinOp::And, vec![join_key.clone(), eq(col(0), lit(1))]),
+                all(BinOp::And, vec![join_key, eq(col(0), lit(2))]),
+                all(BinOp::And, vec![eq(col(1), lit(3)), eq(col(0), lit(4))]),
+            ],
+        );
+
+        assert_eq!(factor_common_or_conjuncts(input.clone()), input);
+    }
+
+    #[test]
     fn a_volatile_common_conjunct_stays_in_every_arm() {
         // Hoisting `nextval(...) = 1` would advance the sequence once per row
         // instead of once per arm evaluated, so only the stable conjunct moves.
