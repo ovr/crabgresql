@@ -11155,51 +11155,34 @@ async fn prepared_statement_counts_its_executions() -> anyhow::Result<()> {
 /// with it; it must be a plain error instead, as PostgreSQL's 54001 is.
 #[tokio::test]
 async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow::Result<()> {
-    let client = connect(spawn_server().await).await;
-    // The driver names its Parse messages sequentially, so preparing one
-    // statement reveals what the *next* one will be called — which is how a
-    // statement gets to name itself. Asserted below rather than assumed.
-    let probe = client.prepare("SELECT 1").await?;
-    let taken = client
-        .simple_query("SELECT name FROM pg_prepared_statements WHERE NOT from_sql")
-        .await?;
-    let taken = rows(&taken)[0].get("name").expect("a name").to_string();
-    let n: u32 = taken
-        .trim_start_matches('s')
-        .parse()
-        .expect("driver names statements sN");
-    let self_name = format!("s{}", n + 1);
-    drop(probe);
+    // Parse is written by hand: the name of a statement is the client's to
+    // choose on the wire, so `self` can name itself outright. (A driver that
+    // numbers its own Parse messages could only be made to do this by guessing
+    // the next number, which is a race against every other session.)
+    let mut socket = raw_session(spawn_server().await).await;
 
-    let stmt = client.prepare(&format!("EXECUTE {self_name}")).await?;
-    let named = client
-        .simple_query(&format!(
-            "SELECT count(*) AS n FROM pg_prepared_statements WHERE name = '{self_name}'"
-        ))
-        .await?;
-    assert_eq!(
-        rows(&named)[0].get("n"),
-        Some("1"),
-        "the statement must name itself for this to test anything"
+    let mut batch = Vec::new();
+    batch.extend(frontend_message(b'P', b"self\0EXECUTE self\0\x00\x00")); // Parse "self"
+    batch.extend(frontend_message(b'B', b"\0self\0\x00\x00\x00\x00\x00\x00")); // Bind
+    batch.extend(frontend_message(b'E', b"\0\x00\x00\x00\x00")); // Execute (unlimited)
+    batch.extend(frontend_message(b'S', b""));
+    socket.write_all(&batch).await?;
+
+    let msgs = read_until_ready(&mut socket).await;
+    let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, [b'1', b'2', b'E', b'Z'], "recursion must be refused");
+    let err = fields(
+        msgs.iter()
+            .find(|(t, _)| *t == b'E')
+            .context("ErrorResponse is missing")?,
     );
-
-    let err = client
-        .query(&stmt, &[])
-        .await
-        .expect_err("recursion must be refused");
-    let err = err.as_db_error().expect("database error");
-    assert_eq!(err.code().code(), "54001");
+    assert_eq!(err.code(), "54001");
     assert_eq!(err.message(), "stack depth limit exceeded");
 
     // The point of the test: the connection — and the server behind it — is
     // still there afterwards, and the depth counter unwound.
-    assert_eq!(
-        client
-            .query_one("SELECT 1 AS n", &[])
-            .await?
-            .get::<_, i32>("n"),
-        1
-    );
+    let msgs = simple_query_raw(&mut socket, "SELECT 1").await;
+    assert_eq!(command_tags(&msgs), ["SELECT 1"]);
     Ok(())
 }
 
