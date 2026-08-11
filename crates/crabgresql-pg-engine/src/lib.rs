@@ -36,6 +36,7 @@ mod nbtree;
 mod page;
 mod rec;
 mod redo;
+mod relstats;
 mod smgr;
 mod toast;
 mod tuple;
@@ -203,6 +204,10 @@ impl TableAm for ManagedTable {
 
     fn toast_statistics(&self) -> Option<RelStats> {
         self.as_am().toast_statistics()
+    }
+
+    fn index_statistics(&self, index_name: &str) -> Option<RelStats> {
+        self.as_am().index_statistics(index_name)
     }
 
     fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
@@ -461,6 +466,9 @@ pub struct PgEngine {
     inner: Arc<EngineInner>,
     data_dir: PathBuf,
     catalog: Arc<RelCatalog>,
+    /// Where each relation's column distributions live — out of the catalog
+    /// file, which is rewritten whole on every DDL (see [`crate::relstats`]).
+    stats_store: Arc<relstats::StatsStore>,
     /// The catalog's relfilenode counter, handed to every Parquet table so its
     /// TRUNCATE can stage a fresh directory (see [`CatalogAllocator`]).
     relfilenodes: Arc<dyn RelfilenodeAllocator>,
@@ -577,10 +585,29 @@ impl PgEngine {
         let relfilenodes: Arc<dyn RelfilenodeAllocator> =
             Arc::new(CatalogAllocator(Arc::clone(&catalog)));
 
+        let stats_store = Arc::new(relstats::StatsStore::open(data_dir)?);
+
         let mut tables = HashMap::new();
         for (name, rel, toast_rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
-            let analyzed = catalog.stats_in(&namespace, &name);
+            // One measurement, stored in two places: the relation-level numbers
+            // in the catalog (tiny, and already there), the column distributions
+            // in their own file (large, and keyed by relfilenode). A relation
+            // whose catalog record says it was never analyzed is never analyzed,
+            // whatever file happens to be lying around — that is what makes a
+            // TRUNCATE's clear of the record enough.
+            let analyzed = catalog.stats_in(&namespace, &name).map(|(pages, rows)| {
+                let mut stats = stats_store.read(rel).unwrap_or(RelStats {
+                    relpages: pages,
+                    reltuples: rows,
+                    analyzed: true,
+                    curpages: None,
+                    columns: Arc::from([]),
+                });
+                stats.relpages = pages;
+                stats.reltuples = rows;
+                stats
+            });
             let table = match schema.access_method {
                 TableAccessMethod::Heap => {
                     let table = Arc::new(HeapTable::new(
@@ -590,8 +617,8 @@ impl PgEngine {
                         schema,
                         indexes,
                     ));
-                    if let Some((relpages, reltuples)) = analyzed {
-                        table.set_analyzed(relpages, reltuples);
+                    if let Some(stats) = analyzed {
+                        table.set_analyzed(stats);
                     }
                     ManagedTable::Heap(table)
                 }
@@ -636,8 +663,11 @@ impl PgEngine {
                             .as_write_buffer_of(&schema.name);
                             let table =
                                 Arc::new(BufferedParquetTable::open(chunks, buffer, indexes));
-                            if let Some((relpages, reltuples)) = analyzed {
-                                table.set_analyzed(relpages, reltuples);
+                            // The Parquet engine reports no column
+                            // distributions, so only the two relation-level
+                            // numbers cross over.
+                            if let Some(stats) = &analyzed {
+                                table.set_analyzed(stats.relpages, stats.reltuples);
                             }
                             ManagedTable::Parquet(table)
                         }
@@ -659,6 +689,7 @@ impl PgEngine {
             inner,
             data_dir: data_dir.to_path_buf(),
             catalog,
+            stats_store,
             relfilenodes,
             parquet_redo,
             buffer_redo,
@@ -1428,6 +1459,14 @@ impl PgEngine {
     pub fn gc_orphan_relfiles(&self) -> std::io::Result<()> {
         let live: std::collections::HashSet<u32> =
             self.catalog.live_relfilenodes().into_iter().collect();
+        // A measurement is named after the relfilenode it described, so a
+        // TRUNCATE's swap and a DROP that did not get to unlink both leave one
+        // behind — reclaimed here, against the same live set as the data files.
+        for rel in self.stats_store.stored_relfilenodes() {
+            if !live.contains(&rel) {
+                self.stats_store.unlink(RelFileNode(rel));
+            }
+        }
         let base = self.data_dir.join("base");
         let entries = match std::fs::read_dir(&base) {
             Ok(e) => e,
@@ -1816,12 +1855,14 @@ impl TableEngine for PgEngine {
             ManagedTable::Heap(heap) => {
                 let stats =
                     crate::analyze::analyze_heap(heap, txn, analyze::SampleTarget::default());
-                heap.set_analyzed(stats.relpages, stats.reltuples);
+                heap.set_analyzed(stats.clone());
                 stats
             }
             ManagedTable::Buffer(buffer) => {
                 // Rows are in memory, so the "estimate" is an exact count and
-                // there is nothing to measure or cache.
+                // there is nothing to measure or cache. No column distributions:
+                // the heap is the only engine that computes them, so a plan over
+                // a buffer or Parquet relation estimates from PG's defaults.
                 buffer.statistics()
             }
             ManagedTable::Parquet(parquet) => {
@@ -1844,12 +1885,32 @@ impl TableEngine for PgEngine {
                     relpages,
                     reltuples,
                     analyzed: true,
-                    columns: Vec::new(),
+                    // Just measured, so the live count is the measured one.
+                    curpages: Some(relpages),
+                    columns: std::sync::Arc::from([]),
                 }
             }
         };
+        // The two halves of one measurement go to their two homes: the
+        // relation-level numbers to the catalog, the column distributions to
+        // this relation's own file. Only the first is worth failing over —
+        // losing a distribution costs plan quality, and the catalog write is
+        // what makes the relation count as analyzed at all.
+        if let Some(rel) = self.catalog.current_relfilenode(namespace, name) {
+            if stats.columns.is_empty() {
+                // An engine that reports none: drop whatever a previous ANALYZE
+                // left, or the stale file would outlive the measurement.
+                self.stats_store.unlink(rel);
+            } else if let Err(error) = self.stats_store.write(rel, &stats) {
+                tracing::warn!(
+                    relation = %name,
+                    %error,
+                    "column statistics could not be stored; the relation keeps its row counts"
+                );
+            }
+        }
         self.catalog
-            .set_stats(namespace, name, stats.relpages, stats.reltuples)
+            .set_stats(namespace, name, &stats)
             .expect("relation catalog write failed");
         Ok(())
     }
@@ -2001,6 +2062,10 @@ impl TableEngine for PgEngine {
         if let Some(toast) = toast {
             self.inner.discard_relfile(toast);
         }
+        // The measurement goes with the relation it described. The startup sweep
+        // would reclaim it anyway (it is named after a relfilenode nothing
+        // references now); unlinking here just makes it immediate.
+        self.stats_store.unlink(rel);
         Ok(())
     }
 

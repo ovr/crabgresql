@@ -1506,7 +1506,12 @@ impl TableAm for ParquetTable {
                 relpages,
                 reltuples,
                 analyzed: true,
-                columns: Vec::new(),
+                // No live page count: sizing this relation means walking its
+                // fragment directory, which is more than the planner's
+                // per-statement budget. The measured figure stands alone, so a
+                // plan here does not rescale by growth the way a heap's does.
+                curpages: None,
+                columns: Arc::from([]),
             };
         }
         let Ok(relpages) = self.measure_relpages() else {

@@ -1035,6 +1035,25 @@ pub trait TableAm: Send + Sync {
         None
     }
 
+    /// The size of one index's physical storage, or `None` for an engine that
+    /// keeps the index as metadata only. Same cost contract as
+    /// [`TableAm::statistics`]: cheap enough for the planner to ask per plan, so
+    /// never a scan.
+    ///
+    /// Only `relpages` is meaningful. An index entry is not a row, so reporting a
+    /// tuple count here would invite it to be read as one — the planner derives
+    /// the entries it expects to visit from the table's `reltuples` and the
+    /// estimated selectivity instead, exactly as PostgreSQL's
+    /// `genericcostestimate` does.
+    ///
+    /// `None` is not "the index is empty": it means the size is unknown, and the
+    /// planner falls back to estimating it from the table. An engine whose index
+    /// is metadata-only also declines [`TableAm::supports_index_scan`], so the
+    /// path is never costed at all.
+    fn index_statistics(&self, _index_name: &str) -> Option<RelStats> {
+        None
+    }
+
     /// Full scan yielding only the versions visible to `txn`'s snapshot. The
     /// iterator captures the snapshot up front, so a DML statement never
     /// re-visits rows it modified itself (the reader's own new versions carry

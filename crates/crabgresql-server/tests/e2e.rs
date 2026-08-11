@@ -4449,12 +4449,7 @@ async fn unsupported_transaction_forms_are_rejected() -> anyhow::Result<()> {
 #[tokio::test]
 async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    client
-        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
-        .await?;
-    client
-        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
-        .await?;
+    analyzed_indexed_table(&client).await?;
 
     // An equality on the PRIMARY KEY chooses an index scan (the durable heap engine
     // builds a physical B-tree for the PK).
@@ -4469,17 +4464,20 @@ async fn explain_shows_index_scan_for_pk_equality() -> anyhow::Result<()> {
     let result = client
         .simple_query("SELECT label FROM t WHERE id = 2")
         .await?;
-    assert_eq!(rows(&result)[0].get(0), Some("two"));
+    assert_eq!(rows(&result)[0].get(0), Some("r2"));
 
     // A filter on a non-indexed column stays a sequential scan.
-    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE label = 'two'").await?;
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE label = 'r2'").await?;
     assert_eq!(lines[0], "Seq Scan on t");
 
     Ok(())
 }
 
+/// The other half of the same choice: on a table of a few rows a probe costs
+/// more than reading everything, so the index goes unused even for an equality
+/// on its own key — which is what PostgreSQL plans for such a table.
 #[tokio::test]
-async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
+async fn explain_prefers_a_sequential_scan_on_a_tiny_table() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
         .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
@@ -4487,6 +4485,25 @@ async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
     client
         .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         .await?;
+    client.simple_query("ANALYZE t").await?;
+
+    let lines = explain_lines(&client, "EXPLAIN SELECT * FROM t WHERE id = 2").await?;
+    assert_eq!(lines[0], "Seq Scan on t", "plan was {lines:?}");
+    assert_eq!(lines[1], "  Filter: (id = 2)");
+
+    // The plan the planner declined is still the right answer, of course.
+    let result = client
+        .simple_query("SELECT label FROM t WHERE id = 2")
+        .await?;
+    assert_eq!(rows(&result)[0].get(0), Some("two"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    analyzed_indexed_table(&client).await?;
 
     // The modify node now reports the child scan it reads through.
     let lines = explain_lines(&client, "EXPLAIN UPDATE t SET label = 'x' WHERE id = 2").await?;
@@ -4551,7 +4568,7 @@ async fn dml_on_pk_equality_probes_the_index() -> anyhow::Result<()> {
 
     client.simple_query("DELETE FROM t WHERE id = 1").await?;
     let result = client
-        .simple_query("SELECT id, label FROM t ORDER BY id")
+        .simple_query("SELECT id, label FROM t WHERE id <= 3 ORDER BY id")
         .await?;
     let left = rows(&result);
     assert_eq!(left.len(), 2);
@@ -4604,6 +4621,30 @@ async fn a_probe_never_reports_the_same_row_twice() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `t (id int PRIMARY KEY, label text)` holding enough analyzed rows for an
+/// equality probe on `id` to be the cheaper access path.
+///
+/// Both halves are load-bearing. The planner costs an index scan against a
+/// sequential one, and on a table of a few rows the scan wins — four random
+/// pages cost more than reading the whole thing, which is why PostgreSQL plans a
+/// `Seq Scan` there too. And without `ANALYZE` the planner has to assume PG's
+/// default 0.5% selectivity rather than knowing the key is unique. A test about
+/// what an index scan *prints* therefore has to earn one first.
+async fn analyzed_indexed_table(client: &tokio_postgres::Client) -> anyhow::Result<()> {
+    client
+        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
+        .await?;
+    let values: String = (1..=1000)
+        .map(|i| format!("({i},'r{i}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    client
+        .simple_query(&format!("INSERT INTO t VALUES {values}"))
+        .await?;
+    client.simple_query("ANALYZE t").await?;
+    Ok(())
+}
+
 /// The `QUERY PLAN` lines of an EXPLAIN, as the client sees them.
 async fn explain_lines(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<Vec<String>> {
     let plan = client.simple_query(sql).await?;
@@ -4630,12 +4671,7 @@ async fn sqlstate(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<
 #[tokio::test]
 async fn explain_analyze_reports_planning_and_execution_time() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    client
-        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
-        .await?;
-    client
-        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
-        .await?;
+    analyzed_indexed_table(&client).await?;
 
     // ANALYZE keeps the plan lines a plain EXPLAIN prints and appends PG's two
     // footers — millisecond times to three decimals.
@@ -5160,12 +5196,7 @@ async fn unlogged_table_crud_reflection_and_cross_session() -> anyhow::Result<()
 #[tokio::test]
 async fn explain_resolves_bind_parameters_in_extended_protocol() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
-    client
-        .simple_query("CREATE TABLE t (id int PRIMARY KEY, label text)")
-        .await?;
-    client
-        .simple_query("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
-        .await?;
+    analyzed_indexed_table(&client).await?;
 
     // The extended-protocol path (a query with $1) must resolve the inner
     // statement's parameter at Describe and not error at Execute.

@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use crabgresql_storage_api::{
     CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
     PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
-    RelPersistence, SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema,
+    RelPersistence, RelStats, SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema,
     ViewDefinition,
 };
 use crabgresql_types::PgType;
@@ -117,7 +117,6 @@ const INHERIT_MAGIC: &[u8; 4] = b"INH1";
 /// what every relation written before this tail had: the DDL that declares one
 /// was rejected outright.
 const CHECK_MAGIC: &[u8; 4] = b"CHK1";
-
 struct PersistCol {
     name: String,
     oid: u32,
@@ -177,12 +176,14 @@ struct PersistRel {
     toast_rel: u32,
 }
 
-/// A persisted `ANALYZE` result. Relation-level: `ncols` is written even when
-/// zero so per-column statistics can be added to the same tail without a format
-/// break.
+/// A persisted `ANALYZE` result: the relation-level numbers only.
 ///
-/// TODO: persist per-column `ANALYZE` results (null fraction, distinct count,
-/// most-common values, histogram) beside `relpages`/`reltuples`.
+/// The per-column distributions deliberately live elsewhere ([`crate::relstats`],
+/// a file per relation). They are the largest thing a measurement produces, and
+/// this catalog is one file that [`RelCatalog::persist`] re-encodes and fsyncs in
+/// full on every DDL — so keeping them here would make every `CREATE TABLE` pay
+/// for every other relation's histogram. `ncols` is written as zero and skipped
+/// on read, a slot from when they were going to be added here.
 #[derive(Clone, Debug, PartialEq)]
 struct PersistStats {
     relpages: u32,
@@ -533,8 +534,7 @@ impl RelCatalog {
         &self,
         namespace: &str,
         table: &str,
-        relpages: u32,
-        reltuples: f64,
+        stats: &RelStats,
     ) -> std::io::Result<bool> {
         let mut state = self
             .state
@@ -548,8 +548,8 @@ impl RelCatalog {
             return Ok(false);
         };
         rel.stats = Some(PersistStats {
-            relpages,
-            reltuples,
+            relpages: stats.relpages,
+            reltuples: stats.reltuples,
         });
         // A `Temporary` relation is excluded from `encode`, so persisting would
         // rewrite and fsync the whole catalog to produce identical bytes. Keep
@@ -561,8 +561,10 @@ impl RelCatalog {
         Ok(true)
     }
 
-    /// What `ANALYZE` last measured for a relation as `(relpages, reltuples)`, or
-    /// `None` if it has never been analyzed (or does not exist here).
+    /// What `ANALYZE` last measured for a relation as `(relpages, reltuples)`,
+    /// or `None` if it has never been analyzed (or does not exist here). The
+    /// per-column distributions of the same measurement live in
+    /// [`crate::relstats`]; the engine composes the two at open.
     pub fn stats_in(&self, namespace: &str, table: &str) -> Option<(u32, f64)> {
         let state = self
             .state
@@ -2831,18 +2833,18 @@ mod tests {
             vec![Column::new("id", PgType::Int4)],
         ))?;
         // A fresh relation has never been analyzed.
-        assert_eq!(catalog.stats_in("public", "t"), None);
+        assert!(catalog.stats_in("public", "t").is_none());
         // A fractional row count exercises the float encoding: a sampled
         // reltuples is not an integer, and must survive verbatim.
-        assert!(catalog.set_stats("public", "t", 17, 1234.5)?);
-        assert!(!catalog.set_stats("public", "nosuch", 1, 1.0)?);
+        assert!(catalog.set_stats("public", "t", &measured(17, 1234.5))?);
+        assert!(!catalog.set_stats("public", "nosuch", &measured(1, 1.0))?);
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
         assert_eq!(loaded.stats_in("public", "t"), Some((17, 1234.5)));
         // Statistics are per relation, not global: analyzing one must not make
         // its neighbour look analyzed.
-        assert_eq!(loaded.stats_in("public", "untouched"), None);
+        assert!(loaded.stats_in("public", "untouched").is_none());
         drop(loaded);
 
         // A catalog written before this tail existed stops at the missing magic
@@ -2856,7 +2858,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("statistics marker is missing"))?;
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
-        assert_eq!(legacy.stats_in("public", "t"), None);
+        assert!(legacy.stats_in("public", "t").is_none());
         // Everything the earlier tails carry still decodes.
         assert_eq!(legacy.schemas().len(), 2);
 
@@ -2877,21 +2879,34 @@ mod tests {
             "other",
             vec![Column::new("id", PgType::Int4)],
         ))?;
-        assert!(catalog.set_stats("public", "t", 17, 1234.0)?);
-        assert!(catalog.set_stats("public", "other", 3, 9.0)?);
+        assert!(catalog.set_stats("public", "t", &measured(17, 1234.0))?);
+        assert!(catalog.set_stats("public", "other", &measured(3, 9.0))?);
 
         let swapped = catalog.alloc_relfilenode();
         catalog.swap_relfilenode("public", "t", swapped, &[])?;
-        assert_eq!(catalog.stats_in("public", "t"), None);
+        assert!(catalog.stats_in("public", "t").is_none());
         // Only the truncated relation is affected.
-        assert_eq!(catalog.stats_in("public", "other"), Some((3, 9.0)));
+        assert!(catalog.stats_in("public", "other").is_some());
         drop(catalog);
 
         // The clear was persisted, so a restart does not resurrect the old count.
         let reopened = RelCatalog::load(dir.path())?;
-        assert_eq!(reopened.stats_in("public", "t"), None);
+        assert!(reopened.stats_in("public", "t").is_none());
         assert_eq!(reopened.stats_in("public", "other"), Some((3, 9.0)));
 
         Ok(())
+    }
+
+    /// An `ANALYZE` result as this catalog stores one: the relation-level
+    /// numbers alone. The column distributions of the same measurement are
+    /// [`crate::relstats`]' business and are round-tripped there.
+    fn measured(relpages: u32, reltuples: f64) -> RelStats {
+        RelStats {
+            relpages,
+            reltuples,
+            analyzed: true,
+            curpages: Some(relpages),
+            columns: std::sync::Arc::from([]),
+        }
     }
 }

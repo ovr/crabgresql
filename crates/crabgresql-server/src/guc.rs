@@ -56,6 +56,10 @@ pub enum GucValue {
 pub enum SavedValue {
     TimeZone(std::sync::Arc<SessionZone>),
     ExtraFloatDigits(i32),
+    /// Both page costs at once. They live in one struct on the session, and a
+    /// pair that saved and restored independently could be reinstated half-way
+    /// if a future parameter ever set both.
+    Costs(crabgresql_planner::cost::CostSettings),
     IntervalStyle(IntervalStyle),
     ByteaOutput(ByteaOutput),
     DefaultIsolation(IsolationLevel),
@@ -171,6 +175,7 @@ impl GucDef {
 const LOCALE: &str = "Client Connection Defaults / Locale and Formatting";
 const STATEMENT: &str = "Client Connection Defaults / Statement Behavior";
 const PRESET: &str = "Preset Options";
+const PLANNER_COST: &str = "Query Tuning / Planner Cost Constants";
 const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL Versions";
 
 /// Every parameter this server models, **sorted by name case-insensitively** —
@@ -406,6 +411,56 @@ pub static GUCS: &[GucDef] = &[
         boot_val: "off",
         show: |_| "on".to_string(),
         kind: GucKind::ReadOnly,
+    },
+    GucDef {
+        key: "random_page_cost",
+        name: "random_page_cost",
+        description: "Sets the planner's estimate of the cost of a nonsequentially fetched disk page.",
+        extra_desc: None,
+        report: false,
+        show_all: true,
+        category: PLANNER_COST,
+        context: "user",
+        vartype: "real",
+        min_val: Some("0"),
+        max_val: Some(REAL_MAX),
+        enumvals: None,
+        boot_val: "4",
+        show: |s| show_real(s.costs.random_page_cost),
+        kind: GucKind::Settable {
+            set: set_random_page_cost,
+            capture: |s| SavedValue::Costs(s.costs),
+            restore: |s, v| {
+                if let SavedValue::Costs(costs) = v {
+                    s.costs = costs;
+                }
+            },
+        },
+    },
+    GucDef {
+        key: "seq_page_cost",
+        name: "seq_page_cost",
+        description: "Sets the planner's estimate of the cost of a sequentially fetched disk page.",
+        extra_desc: None,
+        report: false,
+        show_all: true,
+        category: PLANNER_COST,
+        context: "user",
+        vartype: "real",
+        min_val: Some("0"),
+        max_val: Some(REAL_MAX),
+        enumvals: None,
+        boot_val: "1",
+        show: |s| show_real(s.costs.seq_page_cost),
+        kind: GucKind::Settable {
+            set: set_seq_page_cost,
+            capture: |s| SavedValue::Costs(s.costs),
+            restore: |s, v| {
+                if let SavedValue::Costs(costs) = v {
+                    s.costs = costs;
+                }
+            },
+        },
     },
     GucDef {
         key: "server_encoding",
@@ -706,6 +761,53 @@ fn set_extra_float_digits(session: &mut Session, value: GucValue) -> Result<(), 
     Ok(())
 }
 
+/// `DBL_MAX` as PostgreSQL renders it in `pg_settings.max_val` for a `real`
+/// parameter — the `%g` of `1.7976931348623157e308`.
+const REAL_MAX: &str = "1.79769e+308";
+
+/// How PostgreSQL prints a `real` parameter: `guc.c` formats it with a plain
+/// `%g`, so `4` stays `4`, `1.1` stays `1.1`, and `1e10` reads back as `1e+10`
+/// rather than as the eleven digits `float8out` would give.
+fn show_real(v: f64) -> String {
+    crabgresql_types::float::fmt_g(v, 6)
+}
+
+fn set_random_page_cost(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    session.costs.random_page_cost = parse_page_cost("random_page_cost", value, 4.0)?;
+    Ok(())
+}
+
+fn set_seq_page_cost(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    session.costs.seq_page_cost = parse_page_cost("seq_page_cost", value, 1.0)?;
+    Ok(())
+}
+
+/// Decode one page-cost assignment, with PostgreSQL's two rejections: a value
+/// that is not a number at all, and one outside `[0, DBL_MAX]`. Both messages
+/// are PG's verbatim, including the range it prints back.
+fn parse_page_cost(name: &str, value: GucValue, boot: f64) -> Result<f64, PgError> {
+    let written = match value {
+        GucValue::Default => return Ok(boot),
+        GucValue::OffsetSecondsEast(secs) => secs.to_string(),
+        GucValue::Str(s) => s,
+    };
+    let Ok(v) = written.parse::<f64>() else {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("invalid value for parameter \"{name}\": \"{written}\""),
+        ));
+    };
+    if !(v >= 0.0 && v.is_finite()) {
+        return Err(PgError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!(
+                "{written} is outside the valid range for parameter \"{name}\" (0 .. {REAL_MAX})"
+            ),
+        ));
+    }
+    Ok(v)
+}
+
 /// `SET IntervalStyle`. The rejection carries PG's HINT listing the four
 /// accepted names — without it the message says what is wrong but not what
 /// would be right.
@@ -813,6 +915,50 @@ mod tests {
                 "{key} needs enumvals for its HINT"
             );
         }
+    }
+
+    /// A `real` parameter renders through `%g`, which is not how this system
+    /// prints a float anywhere else: `float8out` would spell the last of these
+    /// `10000000000`. Each pair was read off a stock PostgreSQL 18.4 with
+    /// `SET random_page_cost = <x>; SHOW random_page_cost;`.
+    #[test]
+    fn a_real_parameter_prints_the_way_postgresql_prints_one() {
+        for (set, shown) in [
+            (4.0, "4"),
+            (1.0, "1"),
+            (1.1, "1.1"),
+            (0.125, "0.125"),
+            (1e10, "1e+10"),
+        ] {
+            assert_eq!(show_real(set), shown, "{set}");
+        }
+        // And the boot values the table publishes are what a reset leaves.
+        let boot = crabgresql_planner::cost::CostSettings::default();
+        assert_eq!(show_real(boot.random_page_cost), "4");
+        assert_eq!(show_real(boot.seq_page_cost), "1");
+    }
+
+    /// PostgreSQL rejects a negative page cost and a non-numeric one, with the
+    /// range spelled back in the first message. Both were read off 18.4.
+    #[test]
+    fn a_page_cost_rejects_what_postgresql_rejects() {
+        let err = parse_page_cost("random_page_cost", GucValue::Str("-1".into()), 4.0)
+            .expect_err("a negative cost is out of range");
+        assert_eq!(
+            err.message,
+            "-1 is outside the valid range for parameter \"random_page_cost\" (0 .. 1.79769e+308)"
+        );
+        let err = parse_page_cost("random_page_cost", GucValue::Str("abc".into()), 4.0)
+            .expect_err("a non-number is invalid");
+        assert_eq!(
+            err.message,
+            "invalid value for parameter \"random_page_cost\": \"abc\""
+        );
+        // RESET goes back to the boot value rather than to zero.
+        assert_eq!(
+            parse_page_cost("seq_page_cost", GucValue::Default, 1.0).expect("reset is accepted"),
+            1.0
+        );
     }
 
     /// Metadata that only makes sense for one `vartype` is present exactly

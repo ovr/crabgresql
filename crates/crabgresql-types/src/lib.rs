@@ -10,6 +10,7 @@ pub mod bytea;
 pub mod cast;
 pub mod char;
 pub mod collation;
+pub mod compare;
 pub mod date;
 pub mod datum;
 pub mod encoding;

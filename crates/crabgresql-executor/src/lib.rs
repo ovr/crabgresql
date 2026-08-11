@@ -265,6 +265,13 @@ pub struct ExecContext {
     /// `extra_float_digits` and the session display zone — everything value
     /// rendering, parsing, and casting needs from the session.
     pub fmt: FmtCtx,
+    /// `seq_page_cost` and `random_page_cost`, for the paths that plan a
+    /// statement of their own — a routine body, a correlated subplan re-planned
+    /// per outer row — rather than being handed a finished plan. Carried here
+    /// because those paths have a context and no session: a `SET
+    /// random_page_cost` inside a function must reach the statements the
+    /// function runs, the way every other session setting does.
+    pub costs: crabgresql_planner::cost::CostSettings,
     /// `None` in contexts that never call a sequence function (e.g. `EXPLAIN`'s
     /// `Values` node); a sequence function reaching a `None` context is an
     /// internal wiring error, reported as 5-char `XX000`.
@@ -324,6 +331,7 @@ impl Default for ExecContext {
         // PG's default since v12.
         Self {
             fmt: FmtCtx::utc_default(),
+            costs: crabgresql_planner::cost::CostSettings::default(),
             sequences: None,
             catalog: None,
             gucs: None,
@@ -507,6 +515,7 @@ pub fn execute(
     // per outer row and hit never.
     let ctx = &ExecContext {
         fmt: ctx.fmt.clone(),
+        costs: ctx.costs,
         sequences: ctx.sequences.clone(),
         catalog: ctx.catalog.clone(),
         gucs: ctx.gucs.clone(),
@@ -1384,7 +1393,7 @@ pub(crate) fn run_subplan(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Vec<Tuple>, ExecError> {
-    match execute(crabgresql_planner::plan(logical), ctx, txn)? {
+    match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, txn)? {
         Execution::Rows { node, .. } => drain(node),
         _ => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
@@ -1400,7 +1409,7 @@ fn subplan_has_rows(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<bool, ExecError> {
-    match execute(crabgresql_planner::plan(logical), ctx, txn)? {
+    match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, txn)? {
         Execution::Rows { mut node, .. } => Ok(node.next()?.is_some()),
         _ => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
@@ -6347,7 +6356,7 @@ mod tests {
             }
             other => panic!("expected a DML statement, got {other:?}"),
         };
-        let physical = crabgresql_planner::plan(logical);
+        let physical = crabgresql_planner::plan(logical, Default::default());
         let Execution::ReturningRows {
             columns,
             mut node,
@@ -6411,7 +6420,7 @@ mod tests {
             panic!("expected an INSERT statement");
         };
         let logical = test_ok(crabgresql_binder::bind_insert(engine, &catalog, insert));
-        let physical = crabgresql_planner::plan(logical);
+        let physical = crabgresql_planner::plan(logical, Default::default());
         match test_ok(execute(physical, &ExecContext::default(), &wtxn())) {
             Execution::Inserted(n) => n,
             _ => panic!("expected Inserted"),
@@ -6521,7 +6530,7 @@ mod tests {
         let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let logical = test_ok(crabgresql_binder::bind_query(engine, &catalog, query));
-        let physical = crabgresql_planner::plan(logical);
+        let physical = crabgresql_planner::plan(logical, Default::default());
         let Execution::Rows { columns, mut node } =
             test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {
@@ -6960,7 +6969,7 @@ mod tests {
         let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let logical = test_ok(crabgresql_binder::bind_query(&engine, &catalog, query));
-        let physical = crabgresql_planner::plan(logical);
+        let physical = crabgresql_planner::plan(logical, Default::default());
         let Execution::Rows { mut node, .. } =
             test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {

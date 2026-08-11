@@ -435,6 +435,10 @@ pub struct Session {
     /// `bytea_output` GUC — which of `byteaout`'s two renderings a `bytea`
     /// takes on the wire. Output only: `byteain` reads both forms regardless.
     pub bytea_output: ByteaOutput,
+    /// `seq_page_cost`/`random_page_cost` GUCs — what the planner charges for a
+    /// page, and so how readily it prefers an index scan to reading the whole
+    /// relation.
+    pub costs: crabgresql_planner::cost::CostSettings,
     /// When the protocol message being processed arrived, backing
     /// `statement_timestamp()`. Stamped once per message — not per statement —
     /// so every statement of a multi-statement simple query shares it, as in
@@ -765,6 +769,7 @@ impl Session {
             timezone: Arc::new(SessionZone::utc()),
             interval_style: IntervalStyle::default(),
             bytea_output: ByteaOutput::default(),
+            costs: crabgresql_planner::cost::CostSettings::default(),
             // Restamped by every incoming message; seeded here so the value is
             // never an invented instant even before the first one arrives.
             stmt_start: crabgresql_types::tz::now_micros(),
@@ -970,6 +975,7 @@ impl Session {
     pub fn exec_context(&self) -> ExecContext {
         ExecContext {
             fmt: self.fmt_ctx(),
+            costs: self.costs,
             sequences: None,
             catalog: None,
             gucs: Some(Arc::new(GucSnapshot(crate::guc::snapshot(self)))),
@@ -1000,6 +1006,7 @@ impl Session {
     ) -> ExecContext {
         ExecContext {
             fmt: self.fmt_ctx(),
+            costs: self.costs,
             sequences: Some(Arc::new(SessionSequences::new(
                 Arc::clone(engine),
                 Arc::clone(&self.seq_state),

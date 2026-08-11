@@ -169,7 +169,7 @@ pub struct HeapTable {
     /// What `ANALYZE` last measured, or `None` for a never-analyzed relation.
     /// Loaded from the durable catalog at open and rewritten by `ANALYZE`;
     /// non-transactional, matching PostgreSQL (see `RelCatalog::set_stats`).
-    analyzed: RwLock<Option<(u32, f64)>>,
+    analyzed: RwLock<Option<RelStats>>,
 }
 
 /// One index attached to a heap table: its semantic metadata, its physical
@@ -245,8 +245,8 @@ impl HeapTable {
         self.engine.bufpool.smgr().nblocks(self.relfilenode())
     }
 
-    /// Count the rows visible to `txn` and size the relation, as one consistent
-    /// observation: `(relpages, reltuples)`.
+    /// Count the rows visible to `txn`, size the relation and offer every row to
+    /// `visit`, as one consistent observation: `(relpages, reltuples)`.
     ///
     /// Both halves must describe the *same* file, which needs two things a
     /// naive `scan().count()` then `nblocks()` does not give:
@@ -262,7 +262,15 @@ impl HeapTable {
     ///   between the two reads. Holding a shared hold across both closes that
     ///   window — nested shared holds by the same owner are refcounted, so the
     ///   one `scan` takes underneath is harmless.
-    pub fn measure(&self, txn: &TxnContext) -> (u32, f64) {
+    ///
+    /// Every visible row is handed to `visit` in physical order on the way past,
+    /// for the same reason: `ANALYZE` needs the values *and* the two numbers to
+    /// describe one file, and a second scan to collect them would reopen exactly
+    /// the window this single hold exists to close. `visit` therefore runs on the
+    /// scan's hot path — it must not take the table lock or write to the
+    /// relation, and keeping what it retains bounded is its own job, because every
+    /// row is offered, not a sample.
+    pub fn measure_visiting(&self, txn: &TxnContext, visit: &mut dyn FnMut(&Tuple)) -> (u32, f64) {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let relpages = self
@@ -273,17 +281,26 @@ impl HeapTable {
             // Statistics are advisory: a size that cannot be read pairs a zero
             // with the real count rather than failing the statement.
             .unwrap_or(0);
-        let reltuples = self.scan(txn, &ColumnProjection::All).count() as f64;
+        let mut reltuples = 0.0;
+        for row in self.scan(txn, &ColumnProjection::All) {
+            reltuples += 1.0;
+            // A row that cannot be read is still a row: it counts, and only its
+            // values are lost to the sample. Statistics are advisory, so a
+            // detoast failure here must not fail the statement.
+            if let Ok((_, tuple)) = row {
+                visit(&tuple);
+            }
+        }
         (relpages, reltuples)
     }
 
     /// Install the `ANALYZE` result the durable catalog holds for this relation,
     /// at open, or the one a fresh `ANALYZE` just produced.
-    pub fn set_analyzed(&self, relpages: u32, reltuples: f64) {
+    pub fn set_analyzed(&self, stats: RelStats) {
         *self
             .analyzed
             .write()
-            .unwrap_or_else(|_| panic!("rwlock poisoned")) = Some((relpages, reltuples));
+            .unwrap_or_else(|_| panic!("rwlock poisoned")) = Some(stats);
     }
 
     /// Log a heap change, or skip the WAL entirely for a WAL-skipped table
@@ -1236,17 +1253,24 @@ impl TableAm for HeapTable {
     /// statistics are advisory, and no query result depends on them.
     fn statistics(&self) -> RelStats {
         // An ANALYZE result supersedes the size-derived guess: it counted the
-        // rows rather than inferring them from an assumed row width.
-        if let Some((relpages, reltuples)) = *self
+        // rows rather than inferring them from an assumed row width, and only it
+        // carries the per-column distributions a plan estimate needs.
+        //
+        // It is reported *with* the relation's current size rather than instead
+        // of it. The measured pair is what `pg_class` must show, and the live
+        // page count is what keeps a plan honest as the relation grows away from
+        // the measurement — see [`RelStats::curpages`]. Nothing re-analyzes a
+        // relation here on its own, so without the second number a table
+        // analyzed while small would never take an index again.
+        if let Some(stats) = self
             .analyzed
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .clone()
         {
             return RelStats {
-                relpages,
-                reltuples,
-                analyzed: true,
-                columns: Vec::new(),
+                curpages: self.nblocks().ok(),
+                ..stats
             };
         }
         let schema = self.snap();
@@ -1266,7 +1290,31 @@ impl TableAm for HeapTable {
             relpages,
             reltuples: 0.0,
             analyzed: false,
-            columns: Vec::new(),
+            curpages: Some(relpages),
+            columns: Arc::from([]),
+        })
+    }
+
+    /// The B-tree's size in pages, straight from the storage manager — the same
+    /// O(1) file-length read [`HeapTable::statistics`] uses, so the planner may
+    /// ask per plan. `None` for an index this engine holds as metadata only,
+    /// which is also the index it declines to scan.
+    fn index_statistics(&self, index_name: &str) -> Option<RelStats> {
+        let schema = self.snap();
+        let rel = self
+            .indexes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .find(|e| e.meta.name == index_name && e.is_physical(&schema))
+            .map(|e| e.rel)?;
+        let relpages = self.engine.bufpool.smgr().nblocks(rel).unwrap_or(0);
+        Some(RelStats {
+            relpages,
+            reltuples: 0.0,
+            analyzed: false,
+            curpages: Some(relpages),
+            columns: Arc::from([]),
         })
     }
 

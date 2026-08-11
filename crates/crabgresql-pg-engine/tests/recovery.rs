@@ -666,6 +666,78 @@ fn size_derived_statistics_survive_a_crash() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Column distributions live in their own file per relation, not in the
+/// relation catalog: that catalog is rewritten and fsynced *whole* on every
+/// DDL, so a hundred most-common values per column would be re-paid by every
+/// unrelated `CREATE TABLE` in the database. The file goes when the relation
+/// does.
+#[test]
+fn column_statistics_stay_out_of_the_relation_catalog() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let catalog_file = dir.path().join("global").join("relcatalog");
+    let stats_dir = dir.path().join("stats");
+    let stats_files = || -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&stats_dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.create_table(schema())?;
+    // Wide, high-cardinality text: whatever ANALYZE keeps of this is the bulk
+    // of the measurement, and it is what must not land in the catalog.
+    for i in 0..400 {
+        let xid = tm.allocate_xid();
+        insert(
+            &*table,
+            &tm.context(xid, CommandId::FIRST),
+            i,
+            &format!("{i}{}", "padding".repeat(20)),
+        );
+        tm.commit(xid)?;
+    }
+    assert!(stats_files().is_empty(), "nothing analyzed yet");
+    let catalog_before = std::fs::metadata(&catalog_file)?.len();
+
+    let xid = tm.allocate_xid();
+    engine.analyze("public", "t", &tm.context(xid, CommandId::FIRST))?;
+    tm.commit(xid)?;
+
+    let stats = table.statistics();
+    assert!(
+        !stats.columns[1].histogram.is_empty(),
+        "the wide column should have produced a histogram: {stats:?}"
+    );
+    // The measurement's two halves went to two different places: the catalog
+    // grew by the fixed-width row counts alone, while the distribution — orders
+    // of magnitude larger — went to the relation's own file.
+    assert_eq!(stats_files().len(), 1, "files: {:?}", stats_files());
+    let catalog_growth = std::fs::metadata(&catalog_file)?.len() - catalog_before;
+    let stats_size = std::fs::metadata(stats_dir.join(&stats_files()[0]))?.len();
+    assert!(
+        catalog_growth < 32,
+        "the relation catalog grew by {catalog_growth} bytes, so more than the row counts landed there"
+    );
+    assert!(
+        stats_size > 10 * catalog_growth,
+        "the distribution should dwarf the row counts: {stats_size} vs {catalog_growth}"
+    );
+
+    engine.drop_table("public", "t")?;
+    assert!(
+        stats_files().is_empty(),
+        "dropping the relation must take its measurement with it: {:?}",
+        stats_files()
+    );
+    Ok(())
+}
+
 #[test]
 fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<()> {
     // Statistics live in the relation catalog, which is fsynced directly rather
@@ -686,6 +758,12 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
         let stats = table.statistics();
         assert!(stats.analyzed);
         assert_eq!(stats.reltuples, 40.0);
+        // `id` counted up from 0 into an append-only heap: 40 distinct values
+        // stored in ascending order.
+        assert_eq!(stats.columns[0].n_distinct, -1.0);
+        assert_eq!(stats.columns[0].correlation, 1.0);
+        // ...and `name` is the same string in every row.
+        assert_eq!(stats.columns[1].mcv, vec![(Value::Text("row".into()), 1.0)]);
         // Drop without a checkpoint.
     }
 
@@ -696,6 +774,12 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
         "the reopened relation must still know it was analyzed: {stats:?}"
     );
     assert_eq!(stats.reltuples, 40.0);
+    // The column distributions ride the same tail, so they cross the crash too —
+    // without them the planner would fall back to PostgreSQL's default guesses
+    // after every restart.
+    assert_eq!(stats.columns[0].n_distinct, -1.0);
+    assert_eq!(stats.columns[0].correlation, 1.0);
+    assert_eq!(stats.columns[1].mcv, vec![(Value::Text("row".into()), 1.0)]);
 
     Ok(())
 }

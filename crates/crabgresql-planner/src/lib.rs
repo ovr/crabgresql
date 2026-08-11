@@ -9,6 +9,7 @@
 //! TODO: join ordering and cost-based path selection, both of which need the
 //! table statistics this layer has no source for (docs/ARCHITECTURE.md §3).
 
+pub mod cost;
 mod projection;
 mod pushdown;
 mod qualorder;
@@ -25,10 +26,10 @@ use crabgresql_binder::{
     UpdatePlan, ValuesPlan, WindowPlan,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema, Tuple,
+    ColumnProjection, IndexConstraint, IndexMetadata, RelStats, TableAm, TableSchema, Tuple,
 };
-use crabgresql_types::PgType;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
+use crabgresql_types::{PgType, Value};
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
 /// Sort pipeline the executor builds.
@@ -373,21 +374,21 @@ pub enum PhysicalAggInput {
     SingleRow,
 }
 
-fn plan_join_input(input: JoinInput) -> PhysicalJoinInput {
+fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinInput {
     match input {
         JoinInput::Scan(table) => PhysicalJoinInput::Scan {
             table,
             projection: ColumnProjection::All,
         },
-        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source))),
+        JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source, costs))),
         JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
     }
 }
 
-fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
+fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinExpr {
     match source {
         JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
-            input: plan_join_input(input),
+            input: plan_join_input(input, costs),
             width,
             predicate: None,
         },
@@ -404,8 +405,8 @@ fn plan_join_expr(source: JoinExpr) -> PhysicalJoinExpr {
                 "a cross join carries no condition; pushdown flips the kind to Inner \
                  when it attaches one"
             );
-            let mut left = Box::new(plan_join_expr(*left));
-            let mut right = Box::new(plan_join_expr(*right));
+            let mut left = Box::new(plan_join_expr(*left, costs));
+            let mut right = Box::new(plan_join_expr(*right, costs));
             let predicate = sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
             PhysicalJoinExpr::Join {
                 left,
@@ -637,8 +638,8 @@ fn ref_side(expr: &BoundExpr, left_width: usize) -> Option<Side> {
     }
 }
 
-pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
-    let mut physical = lower(logical);
+pub fn plan(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
+    let mut physical = lower(logical, costs);
     // After the sinking passes, so each conjunct is ordered against the ones it
     // shares a node with rather than the ones it was written next to.
     qualorder::reorder_quals(&mut physical);
@@ -650,7 +651,7 @@ pub fn plan(logical: LogicalPlan) -> PhysicalPlan {
 
 /// Lower one logical node, recursing into subplans. Split from [`plan`] so the
 /// projection pass runs exactly once, over the finished tree.
-fn lower(logical: LogicalPlan) -> PhysicalPlan {
+fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
     match logical {
         LogicalPlan::Values(ValuesPlan {
             columns,
@@ -677,7 +678,11 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => match choose_access(&table, predicate.map(pushdown::factor_common_or_conjuncts)) {
+        }) => match choose_access(
+            &table,
+            predicate.map(pushdown::factor_common_or_conjuncts),
+            costs,
+        ) {
             AccessPath::Index {
                 index_name,
                 key,
@@ -724,7 +729,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             arms: arms
                 .into_iter()
                 .map(|arm| PhysicalSetOpArm {
-                    plan: lower(arm.plan),
+                    plan: lower(arm.plan, costs),
                     coercion: arm.coercion,
                 })
                 .collect(),
@@ -740,7 +745,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         }) => PhysicalPlan::Subquery {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             columns,
             projections,
             predicate,
@@ -754,7 +759,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             input_width,
             output_width,
         }) => PhysicalPlan::Window {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             spec,
             funcs,
             input_width,
@@ -787,7 +792,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
         }) => {
             let predicate = pushdown::push_where_into_joins(&mut source, predicate);
             PhysicalPlan::Join {
-                source: plan_join_expr(source),
+                source: plan_join_expr(source, costs),
                 columns,
                 projections,
                 predicate,
@@ -819,7 +824,10 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 ),
                 AggInput::Join(mut source) => {
                     let predicate = pushdown::push_where_into_joins(&mut source, predicate);
-                    (PhysicalAggInput::Join(plan_join_expr(source)), predicate)
+                    (
+                        PhysicalAggInput::Join(plan_join_expr(source, costs)),
+                        predicate,
+                    )
                 }
                 AggInput::SingleRow => (PhysicalAggInput::SingleRow, predicate),
             };
@@ -840,7 +848,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             limit,
             offset,
         }) => PhysicalPlan::Limit {
-            source: Box::new(lower(*source)),
+            source: Box::new(lower(*source, costs)),
             limit,
             offset,
         },
@@ -860,7 +868,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                     PhysicalInsertSource::Tuples { rows, defaults }
                 }
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
-                    input: Box::new(lower(*input)),
+                    input: Box::new(lower(*input, costs)),
                     projections,
                 },
             },
@@ -898,6 +906,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
                 &predicate,
                 Some(&keep),
                 tableoid,
+                costs,
             );
             PhysicalPlan::Update {
                 tableoid,
@@ -919,8 +928,9 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             tableoid,
         }) => {
             // A DELETE removes rows outright, so no target needs a snapshot.
-            let (routing, inherited, probe) =
-                dml_targets(&table, routing, inherited, &predicate, None, tableoid);
+            let (routing, inherited, probe) = dml_targets(
+                &table, routing, inherited, &predicate, None, tableoid, costs,
+            );
             PhysicalPlan::Delete {
                 tableoid,
                 table,
@@ -949,15 +959,19 @@ enum AccessPath {
 }
 
 /// Choose an access path for a `WHERE` predicate: an equality index probe when
-/// some index's every key column is pinned by an `col = <constant>` conjunct,
-/// else a full scan. PostgreSQL makes this choice by cost; with no cost model
-/// here the rule is structural — an equality-covered PK/UNIQUE (or plain)
-/// index always beats a sequential scan for a point lookup.
+/// some index's every key column is pinned by an `col = <constant>` conjunct and
+/// probing it is estimated to cost less than reading the relation, else a full
+/// scan. See [`pick_index`] for how the two are compared.
 ///
 /// TODO: serve range predicates (`<`, `>`, `BETWEEN`) from an index too; only
 /// equality conjuncts are considered here, and the storage API offers only an
-/// equality probe ([`TableAm::index_lookup`]).
-fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> AccessPath {
+/// equality probe ([`TableAm::index_lookup`]). The estimate a range path needs
+/// is already written and tested — [`cost::range_selectivity`].
+fn choose_access(
+    table: &Arc<dyn TableAm>,
+    predicate: Option<BoundExpr>,
+    costs: cost::CostSettings,
+) -> AccessPath {
     let Some(predicate) = predicate else {
         return AccessPath::Scan { predicate: None };
     };
@@ -973,7 +987,7 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
     flatten_and(predicate, &mut conjuncts);
     let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
 
-    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs) else {
+    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs, costs) else {
         return AccessPath::Scan {
             predicate: rebuild_and(conjuncts),
         };
@@ -994,11 +1008,19 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
 /// Pick the index to probe for a set of already-classified conjuncts, returning
 /// the probe and a per-conjunct flag saying which conjuncts the key consumed.
 ///
-/// Preference is structural rather than by cost: a PRIMARY KEY, then a UNIQUE
-/// index, then any other. Shared by the read path ([`choose_access`], which turns
-/// the unconsumed conjuncts into a residual filter the scan applies) and the DML
-/// path ([`dml_targets`], which keeps the whole predicate and uses the residual
-/// for `EXPLAIN` alone).
+/// Every index whose key columns are fully pinned by equality conjuncts, and
+/// which the engine can physically scan, is costed against a sequential scan of
+/// the relation ([`cost`]); the cheapest wins, and `None` means the scan did.
+/// That is PostgreSQL's rule, and it is what keeps a probe of a two-page table —
+/// where four random pages cost more than reading everything — from being chosen
+/// just because an index exists. Ties break structurally, PRIMARY KEY then
+/// UNIQUE then the rest, so the choice is deterministic when the estimates
+/// cannot separate two indexes.
+///
+/// Shared by the read path ([`choose_access`], which turns the unconsumed
+/// conjuncts into a residual filter the scan applies) and the DML path
+/// ([`dml_targets`], which keeps the whole predicate and uses the residual for
+/// `EXPLAIN` alone).
 ///
 /// `indexes` is passed in rather than fetched because `TableAm::indexes` deep
 /// clones the metadata under a lock, and every caller already needs the list for
@@ -1007,33 +1029,66 @@ fn pick_index(
     table: &Arc<dyn TableAm>,
     indexes: &[IndexMetadata],
     eqs: &[Option<(usize, BoundExpr)>],
+    costs: cost::CostSettings,
 ) -> Option<(DmlIndexProbe, Vec<bool>)> {
-    for pref in [
+    // Which indexes are even in the running, in tie-break order. Settled before
+    // anything is measured: asking for statistics reads the relation's file
+    // length, and every planned statement — including one against a relation
+    // with no index at all — would otherwise pay for it.
+    let candidates: Vec<(&IndexMetadata, Vec<(usize, usize)>)> = [
         Some(IndexConstraint::PrimaryKey),
         Some(IndexConstraint::Unique),
         None,
-    ] {
-        for index in indexes.iter().filter(|i| i.constraint == pref) {
-            let Some(chosen) = cover_index(index, eqs) else {
-                continue;
-            };
-            // Only route to an index scan the engine can physically serve;
-            // otherwise `EXPLAIN` would advertise an index scan that silently
-            // degrades to a sequential scan at execution time.
-            if !table.supports_index_scan(&index.name) {
-                continue;
+    ]
+    .into_iter()
+    .flat_map(|pref| indexes.iter().filter(move |i| i.constraint == pref))
+    .filter_map(|index| Some((index, cover_index(index, eqs)?)))
+    // Only route to an index scan the engine can physically serve; otherwise
+    // `EXPLAIN` would advertise an index scan that silently degrades to a
+    // sequential scan at execution time.
+    .filter(|(index, _)| table.supports_index_scan(&index.name))
+    .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let schema = table.schema();
+    let stats = table.statistics();
+    let size = cost::estimate_rel_size(&stats, &schema);
+    // Conjuncts the scan would have to evaluate per row. The index path's
+    // residual is never larger, and the difference is one CPU term either way;
+    // charging both sides the same keeps the comparison about the I/O.
+    let nquals = eqs.len();
+    let mut best: Option<(f64, DmlIndexProbe, Vec<bool>)> = None;
+    for (index, chosen) in candidates {
+        let mut key = Vec::with_capacity(chosen.len());
+        let mut consumed = vec![false; eqs.len()];
+        // Independent per-column selectivities multiply, as in PG's
+        // `clauselist_selectivity`.
+        let mut selectivity = 1.0;
+        for (column, conjunct) in chosen {
+            // `cover_index` only ever returns conjuncts classified as an
+            // equality key, so `eqs[conjunct]` is always `Some`.
+            if let Some((_, value)) = &eqs[conjunct] {
+                selectivity *= key_selectivity(&schema, &stats, column, value, size.rows);
+                key.push((column, value.clone()));
+                consumed[conjunct] = true;
             }
-            let mut key = Vec::with_capacity(chosen.len());
-            let mut consumed = vec![false; eqs.len()];
-            for (column, conjunct) in chosen {
-                // `cover_index` only ever returns conjuncts classified as an
-                // equality key, so `eqs[conjunct]` is always `Some`.
-                if let Some((_, value)) = &eqs[conjunct] {
-                    key.push((column, value.clone()));
-                    consumed[conjunct] = true;
-                }
-            }
-            return Some((
+        }
+        let total = cost::index_scan_cost(
+            costs,
+            size,
+            index_pages(table, &index.name, size),
+            selectivity,
+            correlation_of(&stats, index.keys.first().map(|k| k.column)),
+            nquals,
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(cheapest, _, _)| total < *cheapest)
+        {
+            best = Some((
+                total,
                 DmlIndexProbe {
                     index_name: index.name.clone(),
                     key,
@@ -1043,8 +1098,70 @@ fn pick_index(
             ));
         }
     }
-    None
+    let (total, probe, consumed) = best?;
+    (total < cost::seq_scan_cost(costs, size, nquals)).then_some((probe, consumed))
 }
+
+/// The fraction of the relation one `col = <value>` key column keeps.
+fn key_selectivity(
+    schema: &TableSchema,
+    stats: &RelStats,
+    column: usize,
+    value: &BoundExpr,
+    rows: f64,
+) -> f64 {
+    let Some(meta) = schema.columns.get(column) else {
+        return 1.0;
+    };
+    cost::eq_selectivity(
+        stats.columns.get(column),
+        meta.ty,
+        meta.collation.unwrap_or(DEFAULT_COLLATION_OID),
+        const_of(value),
+        rows,
+    )
+}
+
+/// The literal a key expression is, when it is one. A key that is not a literal
+/// — a parameter, or an expression left for execution — is estimated without
+/// consulting the distribution, exactly as PostgreSQL's `var_eq_non_const` does:
+/// the planner cannot tell which value it will land on.
+fn const_of(expr: &BoundExpr) -> Option<&Value> {
+    match strip_collate(expr) {
+        BoundExpr::Const { value, .. } => Some(value),
+        _ => None,
+    }
+}
+
+/// How strongly the relation's physical order follows this index's leading key
+/// column — what decides whether its heap fetches are sequential or random.
+fn correlation_of(stats: &RelStats, leading: Option<usize>) -> f32 {
+    leading
+        .and_then(|column| stats.columns.get(column))
+        .map_or(0.0, |column| column.correlation)
+}
+
+/// The index's size in pages, or — for an engine that does not report one — a
+/// flat assumption of [`ASSUMED_INDEX_ENTRIES_PER_PAGE`] entries per page, one
+/// entry per row.
+///
+/// The fallback is deliberately crude: it only has to be the right order of
+/// magnitude against the table's own page count, and the engine that actually
+/// serves index scans reports the real number. Sizing it from the key columns'
+/// `avg_width` would look more precise without being more useful — the estimate
+/// it feeds is multiplied by a selectivity that is itself an approximation.
+fn index_pages(table: &Arc<dyn TableAm>, index_name: &str, size: cost::RelSize) -> f64 {
+    if let Some(stats) = table.index_statistics(index_name)
+        && stats.relpages > 0
+    {
+        return f64::from(stats.relpages);
+    }
+    (size.rows / ASSUMED_INDEX_ENTRIES_PER_PAGE).max(1.0)
+}
+
+/// Index entries assumed to fit on a page when the engine cannot say. Roughly a
+/// 40-byte entry in an 8 KB page.
+const ASSUMED_INDEX_ENTRIES_PER_PAGE: f64 = 200.0;
 
 /// Whether one DML target may keep the probe an index offers it, given the
 /// target and its [`MappedRelation::map`]. `UPDATE` uses this to veto a probe for
@@ -1075,6 +1192,7 @@ fn dml_targets(
     // statement reads. Inherited targets already carry their own name from the
     // binder.
     tableoid: bool,
+    costs: cost::CostSettings,
 ) -> (
     Option<Vec<DmlTarget>>,
     Vec<DmlTarget>,
@@ -1105,7 +1223,7 @@ fn dml_targets(
                 })
                 .collect(),
         };
-        let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated)?;
+        let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated, costs)?;
         probe.residual = rebuild_and(
             conjuncts
                 .iter()
@@ -2078,7 +2196,7 @@ mod tests {
             Ok(plan) => plan,
             Err(error) => panic!("failed to bind planner test SQL `{sql}`: {error}"),
         };
-        plan(logical)
+        plan(logical, cost::CostSettings::default())
     }
 
     #[test]

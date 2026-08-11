@@ -13,6 +13,8 @@
 //! about a table it believes is empty. [`RelStats::unknown`] is the last resort
 //! for engines that cannot report even a page count.
 
+use std::sync::Arc;
+
 use crabgresql_types::Value;
 
 use crate::TableSchema;
@@ -40,15 +42,33 @@ pub struct RelStats {
     /// derived estimate less confidently; `pg_stats` shows nothing for a
     /// relation that was never analyzed.
     pub analyzed: bool,
+    /// The relation's size in pages **now**, where the engine can read it
+    /// cheaply — as distinct from [`Self::relpages`], which is frozen at the
+    /// last `ANALYZE`.
+    ///
+    /// The two exist separately because their consumers want opposite things.
+    /// `pg_class.relpages`/`reltuples` must report the measurement verbatim, so
+    /// that a client checking `reltuples = -1` can tell a table that needs
+    /// analyzing from one that does not. A plan estimate must not: a relation
+    /// analyzed at a hundred rows and since grown to a million would otherwise
+    /// be planned as a hundred rows forever, since nothing re-analyzes it on its
+    /// own. PostgreSQL resolves it the same way — `estimate_rel_size` scales the
+    /// measured tuple density by the *current* block count.
+    ///
+    /// `None` means the engine cannot answer cheaply; the planner then falls
+    /// back to [`Self::relpages`].
+    pub curpages: Option<u32>,
     /// Per-column distribution statistics, one entry per schema column in
     /// `attnum` order, or empty when no column statistics were collected.
-    /// A non-empty vector always has exactly `schema().columns.len()` entries,
+    /// A non-empty slice always has exactly `schema().columns.len()` entries,
     /// so callers may index it by column position.
     ///
-    /// TODO: collect per-column statistics — `ANALYZE` measures only
-    /// `relpages`/`reltuples`, so every construction site leaves this empty and
-    /// no `pg_stats` view is served.
-    pub columns: Vec<ColStats>,
+    /// Shared rather than owned because `TableAm::statistics` returns by value
+    /// and both of its callers copy it per statement: the planner once per
+    /// planned relation, and the `pg_catalog` snapshot once per relation per
+    /// access. Deep-copying every MCV list and histogram there was measurable on
+    /// a wide analyzed table and bought nothing — nobody mutates these.
+    pub columns: Arc<[ColStats]>,
 }
 
 impl RelStats {
@@ -59,7 +79,8 @@ impl RelStats {
             relpages: 0,
             reltuples: 0.0,
             analyzed: false,
-            columns: Vec::new(),
+            curpages: None,
+            columns: no_columns(),
         }
     }
 
@@ -73,7 +94,10 @@ impl RelStats {
             relpages,
             reltuples: f64::from(relpages) * rows_per_page,
             analyzed: false,
-            columns: Vec::new(),
+            // Derived from the size the relation has right now, so the two
+            // page counts are the same number by construction.
+            curpages: Some(relpages),
+            columns: no_columns(),
         }
     }
 
@@ -84,13 +108,21 @@ impl RelStats {
         let width = estimated_row_width(schema);
         let rows_per_page = (USABLE_BYTES_PER_PAGE / width).floor().max(1.0);
         let rows = rows as f64;
+        let relpages = (rows / rows_per_page).ceil() as u32;
         RelStats {
-            relpages: (rows / rows_per_page).ceil() as u32,
+            relpages,
             reltuples: rows,
             analyzed: true,
-            columns: Vec::new(),
+            curpages: Some(relpages),
+            columns: no_columns(),
         }
     }
+}
+
+/// The empty column-statistics slice. A fresh `Arc<[ColStats]>` per call, which
+/// allocates nothing for a zero-length slice.
+fn no_columns() -> Arc<[ColStats]> {
+    Arc::from([])
 }
 
 /// Distribution statistics for one column, mirroring the columns of
