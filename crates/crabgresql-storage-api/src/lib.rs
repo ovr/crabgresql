@@ -869,9 +869,11 @@ pub type BatchStream = Box<dyn Iterator<Item = Result<RecordBatch, StorageError>
 
 /// Which of a relation's columns a scan actually needs.
 ///
-/// A columnar engine reads only the selected columns off disk; a row store
-/// ignores the request entirely. Either is correct — see [`TableAm::scan`] for
-/// the contract that makes ignoring it free.
+/// A columnar engine reads only the selected columns off disk. A row store
+/// reads the whole tuple either way, but still has a decode, an allocation and
+/// (in the heap's case) a detoast to skip per unread column. Ignoring the
+/// request entirely is also correct — see [`TableAm::scan`] for the contract
+/// that makes it free.
 ///
 /// Tuples stay full width regardless: this narrows the *work*, never the row
 /// shape. The whole executor addresses columns by schema position
