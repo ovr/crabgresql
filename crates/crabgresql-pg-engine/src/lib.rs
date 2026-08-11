@@ -205,6 +205,10 @@ impl TableAm for ManagedTable {
         self.as_am().toast_statistics()
     }
 
+    fn index_statistics(&self, index_name: &str) -> Option<RelStats> {
+        self.as_am().index_statistics(index_name)
+    }
+
     fn storage_leaves(&self) -> Option<Vec<Arc<dyn TableAm>>> {
         self.as_am().storage_leaves()
     }
@@ -590,8 +594,8 @@ impl PgEngine {
                         schema,
                         indexes,
                     ));
-                    if let Some((relpages, reltuples)) = analyzed {
-                        table.set_analyzed(relpages, reltuples);
+                    if let Some(stats) = analyzed {
+                        table.set_analyzed(stats);
                     }
                     ManagedTable::Heap(table)
                 }
@@ -636,8 +640,11 @@ impl PgEngine {
                             .as_write_buffer_of(&schema.name);
                             let table =
                                 Arc::new(BufferedParquetTable::open(chunks, buffer, indexes));
-                            if let Some((relpages, reltuples)) = analyzed {
-                                table.set_analyzed(relpages, reltuples);
+                            // The Parquet engine reports no column
+                            // distributions, so only the two relation-level
+                            // numbers cross over.
+                            if let Some(stats) = &analyzed {
+                                table.set_analyzed(stats.relpages, stats.reltuples);
                             }
                             ManagedTable::Parquet(table)
                         }
@@ -1816,12 +1823,14 @@ impl TableEngine for PgEngine {
             ManagedTable::Heap(heap) => {
                 let stats =
                     crate::analyze::analyze_heap(heap, txn, analyze::SampleTarget::default());
-                heap.set_analyzed(stats.relpages, stats.reltuples);
+                heap.set_analyzed(stats.clone());
                 stats
             }
             ManagedTable::Buffer(buffer) => {
                 // Rows are in memory, so the "estimate" is an exact count and
-                // there is nothing to measure or cache.
+                // there is nothing to measure or cache. No column distributions:
+                // the heap is the only engine that computes them, so a plan over
+                // a buffer or Parquet relation estimates from PG's defaults.
                 buffer.statistics()
             }
             ManagedTable::Parquet(parquet) => {
@@ -1849,7 +1858,7 @@ impl TableEngine for PgEngine {
             }
         };
         self.catalog
-            .set_stats(namespace, name, stats.relpages, stats.reltuples)
+            .set_stats(namespace, name, &stats)
             .expect("relation catalog write failed");
         Ok(())
     }

@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
-    PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
-    RelPersistence, SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema,
-    ViewDefinition,
+    CheckConstraint, ColStats, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
+    InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
+    PartitionStrategy, RelPersistence, RelStats, SequenceAdvance, SequenceDefinition,
+    TableAccessMethod, TableSchema, ViewDefinition,
 };
 use crabgresql_types::PgType;
 
@@ -117,6 +117,18 @@ const INHERIT_MAGIC: &[u8; 4] = b"INH1";
 /// what every relation written before this tail had: the DDL that declares one
 /// was rejected outright.
 const CHECK_MAGIC: &[u8; 4] = b"CHK1";
+/// Marks the column-statistics section, appended after the [`CHECK_MAGIC`] block
+/// — a fifteenth backward-compatible tail carrying what `ANALYZE` measured about
+/// each column's distribution. A reader that predates it stops above and decodes
+/// every relation with relation-level statistics only, which costs plan quality
+/// and nothing else.
+///
+/// Deliberately its own tail rather than the `ncols` field [`STAT_MAGIC`]
+/// reserved for it: that field is *read and skipped* by every existing reader,
+/// so filling it in would shift the byte stream under a binary that predates
+/// this change instead of being ignored by it. Every tail is optional to a new
+/// reader, but only an unrecognized magic is safely invisible to an old one.
+const COLSTAT_MAGIC: &[u8; 4] = b"CST1";
 
 struct PersistCol {
     name: String,
@@ -177,16 +189,19 @@ struct PersistRel {
     toast_rel: u32,
 }
 
-/// A persisted `ANALYZE` result. Relation-level: `ncols` is written even when
-/// zero so per-column statistics can be added to the same tail without a format
-/// break.
+/// A persisted `ANALYZE` result: the relation-level numbers from the
+/// [`STAT_MAGIC`] tail, plus the per-column distributions from the
+/// [`COLSTAT_MAGIC`] one.
 ///
-/// TODO: persist per-column `ANALYZE` results (null fraction, distinct count,
-/// most-common values, histogram) beside `relpages`/`reltuples`.
+/// `columns` is either empty or exactly one entry per column, matching
+/// [`RelStats::columns`]' contract, so a reader may index it by column position.
+/// It stays empty when the file predates `CST1` and when the relation's engine
+/// reports no column statistics.
 #[derive(Clone, Debug, PartialEq)]
 struct PersistStats {
     relpages: u32,
     reltuples: f64,
+    columns: Vec<ColStats>,
 }
 
 /// A persisted view: its SELECT text, derived column list, and the relations it
@@ -533,8 +548,7 @@ impl RelCatalog {
         &self,
         namespace: &str,
         table: &str,
-        relpages: u32,
-        reltuples: f64,
+        stats: &RelStats,
     ) -> std::io::Result<bool> {
         let mut state = self
             .state
@@ -548,8 +562,9 @@ impl RelCatalog {
             return Ok(false);
         };
         rel.stats = Some(PersistStats {
-            relpages,
-            reltuples,
+            relpages: stats.relpages,
+            reltuples: stats.reltuples,
+            columns: stats.columns.clone(),
         });
         // A `Temporary` relation is excluded from `encode`, so persisting would
         // rewrite and fsync the whole catalog to produce identical bytes. Keep
@@ -561,9 +576,10 @@ impl RelCatalog {
         Ok(true)
     }
 
-    /// What `ANALYZE` last measured for a relation as `(relpages, reltuples)`, or
-    /// `None` if it has never been analyzed (or does not exist here).
-    pub fn stats_in(&self, namespace: &str, table: &str) -> Option<(u32, f64)> {
+    /// What `ANALYZE` last measured for a relation, or `None` if it has never
+    /// been analyzed (or does not exist here). `analyzed` is always `true` in the
+    /// returned value — the `None` is what says otherwise.
+    pub fn stats_in(&self, namespace: &str, table: &str) -> Option<RelStats> {
         let state = self
             .state
             .lock()
@@ -572,7 +588,12 @@ impl RelCatalog {
             .rels
             .iter()
             .find(|r| r.namespace == namespace && r.name == table)?;
-        rel.stats.as_ref().map(|s| (s.relpages, s.reltuples))
+        rel.stats.as_ref().map(|s| RelStats {
+            relpages: s.relpages,
+            reltuples: s.reltuples,
+            analyzed: true,
+            columns: s.columns.clone(),
+        })
     }
 
     /// Raise `next` above `n` so a freshly allocated relfilenode can never alias a
@@ -1413,6 +1434,19 @@ fn encode(state: &State) -> Vec<u8> {
             out.extend_from_slice(&check.inhcount.to_le_bytes());
         }
     }
+    // Column statistics: a fifteenth backward-compatible tail, a length-prefixed
+    // run per relation (empty for one that was never analyzed, or analyzed by an
+    // engine that reports no distributions). Absent in a pre-`CST1` file, where
+    // every relation decodes with relation-level statistics only.
+    out.extend_from_slice(COLSTAT_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        let columns = r.stats.as_ref().map_or(&[][..], |s| &s.columns);
+        out.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+        for column in columns {
+            put_col_stats(&mut out, column);
+        }
+    }
     out
 }
 
@@ -1428,6 +1462,29 @@ fn put_index_keys(out: &mut Vec<u8>, keys: &[IndexKey]) {
         out.extend_from_slice(&(key.column as u32).to_le_bytes());
         out.push(u8::from(key.descending));
         out.push(u8::from(key.nulls_first));
+    }
+}
+
+/// Write one column's `ANALYZE` distribution (the [`COLSTAT_MAGIC`] tail).
+///
+/// The four scalars first, then the two value lists, each length-prefixed. A
+/// value goes out through the same self-describing datum codec the heap writes
+/// tuples with — deliberately not its SQL text, which renders through session
+/// GUCs (`TimeZone`, `IntervalStyle`) and so would read back as a different
+/// value in a different session.
+fn put_col_stats(out: &mut Vec<u8>, stats: &ColStats) {
+    out.extend_from_slice(&stats.null_frac.to_bits().to_le_bytes());
+    out.extend_from_slice(&stats.avg_width.to_le_bytes());
+    out.extend_from_slice(&stats.n_distinct.to_bits().to_le_bytes());
+    out.extend_from_slice(&stats.correlation.to_bits().to_le_bytes());
+    out.extend_from_slice(&(stats.mcv.len() as u32).to_le_bytes());
+    for (value, freq) in &stats.mcv {
+        crabgresql_types::datum::encode_datum(value, out);
+        out.extend_from_slice(&freq.to_bits().to_le_bytes());
+    }
+    out.extend_from_slice(&(stats.histogram.len() as u32).to_le_bytes());
+    for value in &stats.histogram {
+        crabgresql_types::datum::encode_datum(value, out);
     }
 }
 
@@ -1480,6 +1537,14 @@ impl<'a> Dec<'a> {
         let v = u64::from_le_bytes(self.array());
         self.p += 8;
         f64::from_bits(v)
+    }
+    /// A single-precision statistic, likewise by bit pattern (see
+    /// [`COLSTAT_MAGIC`]). `pg_statistic` stores these as `real`, so widening
+    /// them here would only invent precision the measurement never had.
+    fn f32(&mut self) -> f32 {
+        let v = u32::from_le_bytes(self.array());
+        self.p += 4;
+        f32::from_bits(v)
     }
     fn s(&mut self) -> String {
         let n = self.u32() as usize;
@@ -1549,6 +1614,34 @@ fn get_bound_datums(d: &mut Dec) -> Vec<PartitionBoundDatum> {
         });
     }
     out
+}
+
+/// Read one column's `ANALYZE` distribution back, in the order
+/// [`put_col_stats`] wrote it.
+fn get_col_stats(d: &mut Dec<'_>) -> ColStats {
+    let null_frac = d.f32();
+    let avg_width = d.i32();
+    let n_distinct = d.f32();
+    let correlation = d.f32();
+    let nmcv = d.u32();
+    let mcv = (0..nmcv)
+        .map(|_| {
+            let value = crabgresql_types::datum::decode_datum(d.b, &mut d.p);
+            (value, d.f32())
+        })
+        .collect();
+    let nhist = d.u32();
+    let histogram = (0..nhist)
+        .map(|_| crabgresql_types::datum::decode_datum(d.b, &mut d.p))
+        .collect();
+    ColStats {
+        null_frac,
+        avg_width,
+        n_distinct,
+        mcv,
+        histogram,
+        correlation,
+    }
 }
 
 fn decode(bytes: &[u8]) -> State {
@@ -1852,6 +1945,8 @@ fn decode(bytes: &[u8]) -> State {
             r.stats = Some(PersistStats {
                 relpages,
                 reltuples,
+                // Filled in by the `CST1` tail below, when the file has one.
+                columns: Vec::new(),
             });
         }
     }
@@ -1932,6 +2027,22 @@ fn decode(bytes: &[u8]) -> State {
                     }
                 })
                 .collect();
+        }
+    }
+    // Column-statistics tail: absent means relation-level statistics only, which
+    // is both the legacy state and the state of a relation whose engine reports
+    // no distributions. A run is attached only where the `STA1` tail already
+    // recorded an `ANALYZE` — column statistics without one would describe a
+    // measurement that never happened.
+    if d.remaining().starts_with(COLSTAT_MAGIC) {
+        d.p += COLSTAT_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let ncols = d.u32();
+            let columns: Vec<ColStats> = (0..ncols).map(|_| get_col_stats(&mut d)).collect();
+            if let Some(stats) = r.stats.as_mut() {
+                stats.columns = columns;
+            }
         }
     }
     State {
@@ -2831,18 +2942,20 @@ mod tests {
             vec![Column::new("id", PgType::Int4)],
         ))?;
         // A fresh relation has never been analyzed.
-        assert_eq!(catalog.stats_in("public", "t"), None);
+        assert!(catalog.stats_in("public", "t").is_none());
         // A fractional row count exercises the float encoding: a sampled
         // reltuples is not an integer, and must survive verbatim.
-        assert!(catalog.set_stats("public", "t", 17, 1234.5)?);
-        assert!(!catalog.set_stats("public", "nosuch", 1, 1.0)?);
+        assert!(catalog.set_stats("public", "t", &measured(17, 1234.5))?);
+        assert!(!catalog.set_stats("public", "nosuch", &measured(1, 1.0))?);
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
-        assert_eq!(loaded.stats_in("public", "t"), Some((17, 1234.5)));
+        let stats = loaded.stats_in("public", "t").expect("t was analyzed");
+        assert_eq!((stats.relpages, stats.reltuples), (17, 1234.5));
+        assert_eq!(stats.columns, measured(17, 1234.5).columns);
         // Statistics are per relation, not global: analyzing one must not make
         // its neighbour look analyzed.
-        assert_eq!(loaded.stats_in("public", "untouched"), None);
+        assert!(loaded.stats_in("public", "untouched").is_none());
         drop(loaded);
 
         // A catalog written before this tail existed stops at the missing magic
@@ -2856,9 +2969,59 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("statistics marker is missing"))?;
         std::fs::write(&path, &bytes[..tail])?;
         let legacy = RelCatalog::load(dir.path())?;
-        assert_eq!(legacy.stats_in("public", "t"), None);
+        assert!(legacy.stats_in("public", "t").is_none());
         // Everything the earlier tails carry still decodes.
         assert_eq!(legacy.schemas().len(), 2);
+
+        Ok(())
+    }
+
+    /// The relation-level numbers and the column distributions live in two
+    /// separate tails, so a file that has the first and not the second — every
+    /// catalog written before `CST1` — must still decode as analyzed, just
+    /// without distributions.
+    #[test]
+    fn column_statistics_round_trip_and_a_pre_column_catalog_keeps_the_row_counts()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        assert!(catalog.set_stats("public", "t", &measured(17, 1234.5))?);
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let stats = loaded.stats_in("public", "t").expect("t was analyzed");
+        let column = &stats.columns[0];
+        assert_eq!(column.null_frac, 0.25);
+        assert_eq!(column.avg_width, 4);
+        assert_eq!(column.n_distinct, -1.0);
+        assert_eq!(column.correlation, 0.5);
+        assert_eq!(
+            column.mcv,
+            vec![(Value::Int4(7), 0.5), (Value::Text("x".into()), 0.25)]
+        );
+        assert_eq!(
+            column.histogram,
+            vec![Value::Int4(1), Value::Int4(2), Value::Int4(9)]
+        );
+        drop(loaded);
+
+        // Truncate at the column tail: the relation is still analyzed, and only
+        // the distributions are gone.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(COLSTAT_MAGIC.len())
+            .position(|w| w == COLSTAT_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("column-statistics marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let stats = legacy.stats_in("public", "t").expect("t is still analyzed");
+        assert_eq!((stats.relpages, stats.reltuples), (17, 1234.5));
+        assert!(stats.columns.is_empty());
 
         Ok(())
     }
@@ -2877,21 +3040,44 @@ mod tests {
             "other",
             vec![Column::new("id", PgType::Int4)],
         ))?;
-        assert!(catalog.set_stats("public", "t", 17, 1234.0)?);
-        assert!(catalog.set_stats("public", "other", 3, 9.0)?);
+        assert!(catalog.set_stats("public", "t", &measured(17, 1234.0))?);
+        assert!(catalog.set_stats("public", "other", &measured(3, 9.0))?);
 
         let swapped = catalog.alloc_relfilenode();
         catalog.swap_relfilenode("public", "t", swapped, &[])?;
-        assert_eq!(catalog.stats_in("public", "t"), None);
+        assert!(catalog.stats_in("public", "t").is_none());
         // Only the truncated relation is affected.
-        assert_eq!(catalog.stats_in("public", "other"), Some((3, 9.0)));
+        assert!(catalog.stats_in("public", "other").is_some());
         drop(catalog);
 
         // The clear was persisted, so a restart does not resurrect the old count.
         let reopened = RelCatalog::load(dir.path())?;
-        assert_eq!(reopened.stats_in("public", "t"), None);
-        assert_eq!(reopened.stats_in("public", "other"), Some((3, 9.0)));
+        assert!(reopened.stats_in("public", "t").is_none());
+        let other = reopened
+            .stats_in("public", "other")
+            .expect("the untruncated relation keeps its measurement");
+        assert_eq!((other.relpages, other.reltuples), (3, 9.0));
 
         Ok(())
+    }
+
+    /// An `ANALYZE` result with one column's distribution filled in, exercising
+    /// every field of the `CST1` encoding: both list kinds, a mixed-type MCV
+    /// list (the datum codec is self-describing, so it must not assume one
+    /// type), and fractional statistics.
+    fn measured(relpages: u32, reltuples: f64) -> RelStats {
+        RelStats {
+            relpages,
+            reltuples,
+            analyzed: true,
+            columns: vec![ColStats {
+                null_frac: 0.25,
+                avg_width: 4,
+                n_distinct: -1.0,
+                mcv: vec![(Value::Int4(7), 0.5), (Value::Text("x".into()), 0.25)],
+                histogram: vec![Value::Int4(1), Value::Int4(2), Value::Int4(9)],
+                correlation: 0.5,
+            }],
+        }
     }
 }

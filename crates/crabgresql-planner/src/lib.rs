@@ -9,6 +9,7 @@
 //! TODO: join ordering and cost-based path selection, both of which need the
 //! table statistics this layer has no source for (docs/ARCHITECTURE.md §3).
 
+pub mod cost;
 mod projection;
 mod pushdown;
 mod qualorder;
@@ -25,10 +26,10 @@ use crabgresql_binder::{
     UpdatePlan, ValuesPlan, WindowPlan,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, IndexConstraint, IndexMetadata, TableAm, TableSchema, Tuple,
+    ColumnProjection, IndexConstraint, IndexMetadata, RelStats, TableAm, TableSchema, Tuple,
 };
-use crabgresql_types::PgType;
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
+use crabgresql_types::{PgType, Value};
 
 /// An executable plan. `Select` describes the SeqScan → Filter → Projection →
 /// Sort pipeline the executor builds.
@@ -949,14 +950,14 @@ enum AccessPath {
 }
 
 /// Choose an access path for a `WHERE` predicate: an equality index probe when
-/// some index's every key column is pinned by an `col = <constant>` conjunct,
-/// else a full scan. PostgreSQL makes this choice by cost; with no cost model
-/// here the rule is structural — an equality-covered PK/UNIQUE (or plain)
-/// index always beats a sequential scan for a point lookup.
+/// some index's every key column is pinned by an `col = <constant>` conjunct and
+/// probing it is estimated to cost less than reading the relation, else a full
+/// scan. See [`pick_index`] for how the two are compared.
 ///
 /// TODO: serve range predicates (`<`, `>`, `BETWEEN`) from an index too; only
 /// equality conjuncts are considered here, and the storage API offers only an
-/// equality probe ([`TableAm::index_lookup`]).
+/// equality probe ([`TableAm::index_lookup`]). The estimate a range path needs
+/// is already written and tested — [`cost::range_selectivity`].
 fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> AccessPath {
     let Some(predicate) = predicate else {
         return AccessPath::Scan { predicate: None };
@@ -994,11 +995,19 @@ fn choose_access(table: &Arc<dyn TableAm>, predicate: Option<BoundExpr>) -> Acce
 /// Pick the index to probe for a set of already-classified conjuncts, returning
 /// the probe and a per-conjunct flag saying which conjuncts the key consumed.
 ///
-/// Preference is structural rather than by cost: a PRIMARY KEY, then a UNIQUE
-/// index, then any other. Shared by the read path ([`choose_access`], which turns
-/// the unconsumed conjuncts into a residual filter the scan applies) and the DML
-/// path ([`dml_targets`], which keeps the whole predicate and uses the residual
-/// for `EXPLAIN` alone).
+/// Every index whose key columns are fully pinned by equality conjuncts, and
+/// which the engine can physically scan, is costed against a sequential scan of
+/// the relation ([`cost`]); the cheapest wins, and `None` means the scan did.
+/// That is PostgreSQL's rule, and it is what keeps a probe of a two-page table —
+/// where four random pages cost more than reading everything — from being chosen
+/// just because an index exists. Ties break structurally, PRIMARY KEY then
+/// UNIQUE then the rest, so the choice is deterministic when the estimates
+/// cannot separate two indexes.
+///
+/// Shared by the read path ([`choose_access`], which turns the unconsumed
+/// conjuncts into a residual filter the scan applies) and the DML path
+/// ([`dml_targets`], which keeps the whole predicate and uses the residual for
+/// `EXPLAIN` alone).
 ///
 /// `indexes` is passed in rather than fetched because `TableAm::indexes` deep
 /// clones the metadata under a lock, and every caller already needs the list for
@@ -1008,6 +1017,14 @@ fn pick_index(
     indexes: &[IndexMetadata],
     eqs: &[Option<(usize, BoundExpr)>],
 ) -> Option<(DmlIndexProbe, Vec<bool>)> {
+    let schema = table.schema();
+    let stats = table.statistics();
+    let size = cost::estimate_rel_size(&stats, &schema);
+    // Conjuncts the scan would have to evaluate per row. The index path's
+    // residual is never larger, and the difference is one CPU term either way;
+    // charging both sides the same keeps the comparison about the I/O.
+    let nquals = eqs.len();
+    let mut best: Option<(f64, DmlIndexProbe, Vec<bool>)> = None;
     for pref in [
         Some(IndexConstraint::PrimaryKey),
         Some(IndexConstraint::Unique),
@@ -1025,25 +1042,96 @@ fn pick_index(
             }
             let mut key = Vec::with_capacity(chosen.len());
             let mut consumed = vec![false; eqs.len()];
+            // Independent per-column selectivities multiply, as in PG's
+            // `clauselist_selectivity`.
+            let mut selectivity = 1.0;
             for (column, conjunct) in chosen {
                 // `cover_index` only ever returns conjuncts classified as an
                 // equality key, so `eqs[conjunct]` is always `Some`.
                 if let Some((_, value)) = &eqs[conjunct] {
+                    selectivity *= key_selectivity(&schema, &stats, column, value, size.rows);
                     key.push((column, value.clone()));
                     consumed[conjunct] = true;
                 }
             }
-            return Some((
-                DmlIndexProbe {
-                    index_name: index.name.clone(),
-                    key,
-                    residual: None,
-                },
-                consumed,
-            ));
+            let total = cost::index_scan_cost(
+                size,
+                index_pages(table, &index.name, size),
+                selectivity,
+                correlation_of(&stats, index.keys.first().map(|k| k.column)),
+                nquals,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(cheapest, _, _)| total < *cheapest)
+            {
+                best = Some((
+                    total,
+                    DmlIndexProbe {
+                        index_name: index.name.clone(),
+                        key,
+                        residual: None,
+                    },
+                    consumed,
+                ));
+            }
         }
     }
-    None
+    let (total, probe, consumed) = best?;
+    (total < cost::seq_scan_cost(size, nquals)).then_some((probe, consumed))
+}
+
+/// The fraction of the relation one `col = <value>` key column keeps.
+fn key_selectivity(
+    schema: &TableSchema,
+    stats: &RelStats,
+    column: usize,
+    value: &BoundExpr,
+    rows: f64,
+) -> f64 {
+    let Some(meta) = schema.columns.get(column) else {
+        return 1.0;
+    };
+    cost::eq_selectivity(
+        stats.columns.get(column),
+        meta.ty,
+        meta.collation.unwrap_or(DEFAULT_COLLATION_OID),
+        const_of(value),
+        rows,
+    )
+}
+
+/// The literal a key expression is, when it is one. A key that is not a literal
+/// — a parameter, or an expression left for execution — is estimated without
+/// consulting the distribution, exactly as PostgreSQL's `var_eq_non_const` does:
+/// the planner cannot tell which value it will land on.
+fn const_of(expr: &BoundExpr) -> Option<&Value> {
+    match strip_collate(expr) {
+        BoundExpr::Const { value, .. } => Some(value),
+        _ => None,
+    }
+}
+
+/// How strongly the relation's physical order follows this index's leading key
+/// column — what decides whether its heap fetches are sequential or random.
+fn correlation_of(stats: &RelStats, leading: Option<usize>) -> f32 {
+    leading
+        .and_then(|column| stats.columns.get(column))
+        .map_or(0.0, |column| column.correlation)
+}
+
+/// The index's size in pages, or an estimate for an engine that does not report
+/// one: one entry per row, packed into pages by the average key width.
+fn index_pages(table: &Arc<dyn TableAm>, index_name: &str, size: cost::RelSize) -> f64 {
+    if let Some(stats) = table.index_statistics(index_name)
+        && stats.relpages > 0
+    {
+        return f64::from(stats.relpages);
+    }
+    // Deliberately crude — it only has to be the right order of magnitude
+    // against the table's own page count, and an engine that serves index scans
+    // is expected to report the real number.
+    (size.rows / 200.0).max(1.0)
 }
 
 /// Whether one DML target may keep the probe an index offers it, given the

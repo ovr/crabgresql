@@ -686,6 +686,12 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
         let stats = table.statistics();
         assert!(stats.analyzed);
         assert_eq!(stats.reltuples, 40.0);
+        // `id` counted up from 0 into an append-only heap: 40 distinct values
+        // stored in ascending order.
+        assert_eq!(stats.columns[0].n_distinct, -1.0);
+        assert_eq!(stats.columns[0].correlation, 1.0);
+        // ...and `name` is the same string in every row.
+        assert_eq!(stats.columns[1].mcv, vec![(Value::Text("row".into()), 1.0)]);
         // Drop without a checkpoint.
     }
 
@@ -696,6 +702,12 @@ fn analyze_results_survive_a_crash_without_being_wal_logged() -> anyhow::Result<
         "the reopened relation must still know it was analyzed: {stats:?}"
     );
     assert_eq!(stats.reltuples, 40.0);
+    // The column distributions ride the same tail, so they cross the crash too —
+    // without them the planner would fall back to PostgreSQL's default guesses
+    // after every restart.
+    assert_eq!(stats.columns[0].n_distinct, -1.0);
+    assert_eq!(stats.columns[0].correlation, 1.0);
+    assert_eq!(stats.columns[1].mcv, vec![(Value::Text("row".into()), 1.0)]);
 
     Ok(())
 }

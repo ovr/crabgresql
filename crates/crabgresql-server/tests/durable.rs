@@ -280,6 +280,12 @@ async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {
         client
             .simple_query("CREATE INDEX t_id_idx ON t(id)")
             .await?;
+        // Without statistics the planner has to assume `id = 250` keeps PG's
+        // default 0.5% of the rows, and on a table this small a probe for two or
+        // three rows costs more in random pages than reading all four — so it
+        // would choose a Seq Scan, exactly as PostgreSQL does for an unanalyzed
+        // table. ANALYZE is what tells it the column is unique.
+        client.simple_query("ANALYZE t").await?;
 
         // EXPLAIN now plans an Index Scan on the durable engine (it did a Seq Scan
         // before physical B-trees).
@@ -304,7 +310,9 @@ async fn index_scan_over_the_wire_and_survives_restart() -> anyhow::Result<()> {
         shutdown(client, handle).await;
     }
 
-    // Restart: the index is rebuilt from the WAL and still serves probes.
+    // Restart: the index is rebuilt from the WAL and still serves probes. The
+    // plan is also unchanged, which takes both halves — the index *and* the
+    // statistics that justify choosing it — surviving the restart.
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;
