@@ -408,7 +408,59 @@ impl<'a> Reader<'a> {
 }
 
 /// Decode one datum starting at `*pos`, advancing `*pos` past it.
+///
+/// Every text-bearing kind re-validates its UTF-8, so a corrupt page fails with
+/// a panic rather than producing an ill-formed `String`. Callers that have
+/// already established the bytes' integrity can skip that scan with
+/// [`decode_datum_trusted`].
 pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
+    decode_datum_inner::<false>(buf, pos)
+}
+
+/// [`decode_datum`], minus the UTF-8 re-validation on the two kinds where it
+/// shows up in profiles (`text` and `numeric`).
+///
+/// # Safety
+///
+/// `buf` must hold datums that [`encode_datum`] produced and that nothing has
+/// altered since. That is the whole of the requirement, and it is worth stating
+/// plainly, because the two halves of it are underwritten very differently:
+///
+/// * **That the bytes started out well-formed** is a property of this module.
+///   `encode_datum` writes a `text` payload out of a `String` and a `numeric`
+///   payload out of its own decimal rendering, so both are UTF-8 by
+///   construction. This half holds unconditionally.
+/// * **That nothing altered them in between** is a property of the medium, and
+///   it is only *checked* for some media. A page read off disk has its CRC-32C
+///   verified by `smgr` (`crabgresql-pg-engine/src/smgr.rs`), and a WAL record
+///   has its CRC verified by `Record::decode` (`crabgresql-wal/src/record.rs`).
+///   A page belonging to a RAM-backed relation is **not** checksummed at all —
+///   `smgr::read` returns it straight from the memory store — and neither is a
+///   page already resident in the buffer pool re-verified on later reads.
+///
+/// So do not read the CRC as the source of the guarantee; it is a backstop on
+/// the one path where the bytes leave the process's memory and can come back
+/// changed. Where there is no CRC, the caller is relying on the first half
+/// alone: that the encoder wrote these bytes and no memory-safety bug has
+/// scribbled on them since.
+///
+/// A caller that cannot make even that claim — because the bytes came from a
+/// file this module did not write, or from a format whose framing is not
+/// otherwise validated — must use [`decode_datum`]. The relation catalog's
+/// image is the live example: it is a plain `fs::read` with no checksum and no
+/// framing check, so a truncated or garbled file could hand this function
+/// arbitrary bytes, and it stays on the validating path for exactly that reason.
+///
+/// Both trusted arms carry a `debug_assert!` on the encoding, so a bug in the
+/// encoder fails loudly under test rather than silently in release.
+pub unsafe fn decode_datum_trusted(buf: &[u8], pos: &mut usize) -> Value {
+    decode_datum_inner::<true>(buf, pos)
+}
+
+/// `TRUSTED` selects between the two entry points above; it threads through the
+/// array recursion so a nested `text` element is decoded under the same rule as
+/// its parent.
+fn decode_datum_inner<const TRUSTED: bool>(buf: &[u8], pos: &mut usize) -> Value {
     let mut r = Reader { buf, pos: *pos };
     let tag = r.take(1)[0];
     let v = match tag {
@@ -421,10 +473,29 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_FLOAT4 => Value::Float4(f32::from_bits(r.u32())),
         T_FLOAT8 => Value::Float8(f64::from_bits(r.u64())),
         T_NUMERIC => {
-            let s = std::str::from_utf8(r.var()).expect("numeric text is valid utf-8");
+            let bytes = r.var();
+            let s = if TRUSTED {
+                debug_assert!(std::str::from_utf8(bytes).is_ok(), "numeric text is utf-8");
+                // SAFETY: `decode_datum_trusted`'s contract puts the integrity
+                // of `buf` on its caller, and `encode_datum` only ever writes a
+                // `Numeric`'s decimal rendering here.
+                unsafe { std::str::from_utf8_unchecked(bytes) }
+            } else {
+                std::str::from_utf8(bytes).expect("numeric text is valid utf-8")
+            };
             Value::Numeric(Numeric::parse(s).expect("stored numeric re-parses"))
         }
-        T_TEXT => Value::Text(String::from_utf8(r.var().to_vec()).expect("text is valid utf-8")),
+        T_TEXT => {
+            let bytes = r.var().to_vec();
+            Value::Text(if TRUSTED {
+                debug_assert!(std::str::from_utf8(&bytes).is_ok(), "text is utf-8");
+                // SAFETY: as above — the caller has vouched for `buf`, and these
+                // bytes were written by `encode_datum` out of a `String`.
+                unsafe { String::from_utf8_unchecked(bytes) }
+            } else {
+                String::from_utf8(bytes).expect("text is valid utf-8")
+            })
+        }
         T_BYTEA => Value::Bytea(r.var().to_vec()),
         T_BIT => {
             let len = r.u32();
@@ -585,7 +656,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                 if r.take(1)[0] == 0 {
                     elems.push(Value::Null);
                 } else {
-                    elems.push(decode_datum(buf, &mut r.pos));
+                    elems.push(decode_datum_inner::<TRUSTED>(buf, &mut r.pos));
                 }
             }
             Value::Array { elem, elems }

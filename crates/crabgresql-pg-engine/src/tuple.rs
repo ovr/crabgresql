@@ -10,7 +10,7 @@
 use crabgresql_storage_api::{StorageError, Tid, Tuple};
 use crabgresql_txn::{CommandId, Infomask, TupleHeader, Xid};
 
-use crabgresql_types::datum::{T_EXTERNAL, decode_datum, encode_datum};
+use crabgresql_types::datum::{T_EXTERNAL, decode_datum_trusted, encode_datum};
 
 use crate::toast::{self, ToastPointer};
 
@@ -194,7 +194,22 @@ pub struct RawTuple {
 /// pointer. Panicking here would fire *inside* the buffer pool's frame guard,
 /// poisoning it and taking every later page fault down with it — so one bad page
 /// would stop the process rather than one query.
-pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
+///
+/// # Safety
+///
+/// `buf` must be a tuple [`encode_tuple`] wrote, unaltered since. The datum
+/// codec runs in its trusted mode ([`decode_datum_trusted`]), so ill-formed
+/// UTF-8 in a `text` or `numeric` attribute is undefined behaviour here rather
+/// than the panic [`crabgresql_types::datum::decode_datum`] would raise.
+///
+/// In this engine that means an item off a buffer-pool page. Note what does and
+/// does not back that up: a page read from disk has had its CRC-32C checked by
+/// `smgr`, but a page belonging to a RAM-backed relation is never checksummed,
+/// and a page already resident in the pool is not re-verified. The CRC is a
+/// backstop on the disk round trip, not the source of the guarantee — see
+/// [`decode_datum_trusted`] for the full statement of what is actually being
+/// relied on.
+pub unsafe fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
     let head = decode_header(buf);
     // The header is decoded again here rather than passed in: callers run the
     // visibility check on `decode_header` alone, so an invisible tuple never
@@ -221,7 +236,10 @@ pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
             // `external`.
             vals.push(Value::Null);
         } else {
-            vals.push(decode_datum(buf, &mut pos));
+            // SAFETY: `decode_raw`'s own contract is that `buf` is a tuple
+            // `encode_tuple` wrote, which is exactly what the trusted decode
+            // asks for.
+            vals.push(unsafe { decode_datum_trusted(buf, &mut pos) });
         }
     }
     Ok(RawTuple { vals, external })
@@ -239,7 +257,16 @@ impl RawTuple {
     /// `detoast` is handed a pointer and returns the bytes its chain holds; it is
     /// the caller that owns a buffer pool. Nothing is read when the tuple has no
     /// out-of-line attribute, which is the common case.
-    pub fn resolve(
+    ///
+    /// # Safety
+    ///
+    /// `detoast` must return a datum [`encode_datum`] wrote, unaltered since —
+    /// the same requirement [`decode_raw`] places on its own input, and for the
+    /// same reason: the chunks are reassembled with the trusted datum codec.
+    /// Every caller in this engine concatenates them out of pages of the same
+    /// relation file, so the claim carries through unchanged, with the same
+    /// caveats about where the CRC does and does not reach.
+    pub unsafe fn resolve(
         mut self,
         detoast: impl Fn(&ToastPointer) -> Result<Vec<u8>, StorageError>,
     ) -> Result<Tuple, StorageError> {
@@ -249,7 +276,8 @@ impl RawTuple {
             // inline, so reassembly is an ordinary decode and needs no knowledge
             // of the attribute's type.
             let mut pos = 0;
-            self.vals[*i] = decode_datum(&bytes, &mut pos);
+            // SAFETY: forwarded from this function's own contract on `detoast`.
+            self.vals[*i] = unsafe { decode_datum_trusted(&bytes, &mut pos) };
         }
         Ok(self.vals)
     }
@@ -313,10 +341,11 @@ mod tests {
     /// Decode a tuple that has nothing stored out of line.
     fn decode_inline(buf: &[u8]) -> (OnPageHeader, Tuple) {
         let head = decode_header(buf);
-        let raw = decode_raw(buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        // SAFETY: the buffer was just produced by `encode_tuple`.
+        let raw = unsafe { decode_raw(buf) }.unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(raw.external().is_empty(), "expected no external attributes");
-        let vals = raw
-            .resolve(|_| unreachable!("no external attributes to detoast"))
+        // SAFETY: as above — these bytes never left this test.
+        let vals = unsafe { raw.resolve(|_| unreachable!("no external attributes to detoast")) }
             .unwrap_or_else(|e| panic!("resolve failed: {e}"));
         (head, vals)
     }
@@ -373,7 +402,8 @@ mod tests {
             ctid,
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        // SAFETY: the buffer was just produced by `encode_tuple`.
+        let raw = unsafe { decode_raw(&buf) }.unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_external);
         assert_eq!(head.natts, 3);
         assert_eq!(raw.external(), &[(1, p)]);
@@ -382,12 +412,14 @@ mod tests {
         // the resolved value lands in the right slot.
         let mut encoded = Vec::new();
         encode_datum(&big, &mut encoded);
-        let vals = raw
-            .resolve(|got| {
+        // SAFETY: as above — these bytes never left this test.
+        let vals = unsafe {
+            raw.resolve(|got| {
                 assert_eq!(*got, p);
                 Ok(encoded.clone())
             })
-            .unwrap_or_else(|e| panic!("resolve failed: {e}"));
+        }
+        .unwrap_or_else(|e| panic!("resolve failed: {e}"));
         assert_eq!(vals, vec![Value::Int4(1), big, Value::Bool(true)]);
     }
 
@@ -412,16 +444,19 @@ mod tests {
             ctid,
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        // SAFETY: the buffer was just produced by `encode_tuple`.
+        let raw = unsafe { decode_raw(&buf) }.unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_null && head.has_external);
         assert_eq!(raw.external(), &[(1, p)]);
-        let vals = raw
-            .resolve(|_| {
+        // SAFETY: as above — these bytes never left this test.
+        let vals = unsafe {
+            raw.resolve(|_| {
                 let mut out = Vec::new();
                 encode_datum(&Value::Text("v".into()), &mut out);
                 Ok(out)
             })
-            .unwrap_or_else(|e| panic!("resolve failed: {e}"));
+        }
+        .unwrap_or_else(|e| panic!("resolve failed: {e}"));
         assert_eq!(
             vals,
             vec![
@@ -456,7 +491,8 @@ mod tests {
             },
         );
         let head = decode_header(&buf);
-        let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        // SAFETY: the buffer was just produced by `encode_tuple`.
+        let raw = unsafe { decode_raw(&buf) }.unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert_eq!(head.hdr.xmax, Xid(8));
         assert!(head.has_external);
         assert_eq!(raw.external(), &[(0, p)]);
