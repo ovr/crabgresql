@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786482600362,
+  "lastUpdate": 1786482601966,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -20056,6 +20056,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 24751.716165,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4fbaeb5dee9c320add894192ab4940a7eef274a5",
+          "message": "perf(engine): honor a scan's column projection in the heap and catalog (#219)\n\n`HeapTable::scan` and `StaticTable::scan` ignored the `ColumnProjection` the\nplanner already computes for every scan leaf. The page is read either way, so\nthere is no I/O to prune — but everything after the read is prunable: an unread\n`text`/`numeric`/`jsonb` column was still allocated and re-parsed per row, an\nunread out-of-line column was still detoasted (pinning the toast relation's\npages), and a catalog row was cloned in its entirety for a scan that wanted one column.",
+          "timestamp": "2026-08-11T20:17:35Z",
+          "tree_id": "790e66e2f1b78e9ec0dcff78fd54ea89c7673943",
+          "url": "https://github.com/ovr/crabgresql/commit/4fbaeb5dee9c320add894192ab4940a7eef274a5"
+        },
+        "date": 1786482601858,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 497.611875,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21030.239623,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
