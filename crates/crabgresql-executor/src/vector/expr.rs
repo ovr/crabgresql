@@ -26,6 +26,17 @@
 //!   `=`/`<>` are allowed under any of them, because every supported collation
 //!   is deterministic, so equality is bytewise regardless.
 //!
+//! # The one computed operand
+//!
+//! Operands are columns and constants, with a single exception: a **widening
+//! integer cast**. It is admitted because it is total over its source type —
+//! every `int2` is an `int4` — so there is no failure to reproduce, whereas a
+//! narrowing cast raises `22003` and *which row raises first* is observable. It
+//! is admitted rather than merely admissible because the binder resolves
+//! `smallint_col <> 0` in `int4` and wraps the column, so declining it declines
+//! the filter on most real predicates over an analytic relation. See
+//! [`vectorize::widening_int_cast`].
+//!
 //! # Three-valued logic
 //!
 //! `AND`/`OR` compile to Arrow's **Kleene** kernels. The plain `and`/`or` return
@@ -39,9 +50,11 @@
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch, Scalar};
 use arrow_ord::cmp;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 use crabgresql_planner::vectorize;
 use crabgresql_storage_api::Column;
@@ -82,6 +95,17 @@ enum Node {
         left: Box<Node>,
         right: Box<Node>,
     },
+    /// A widening integer cast, applied to the whole operand at once.
+    ///
+    /// Needed because Arrow's comparison kernels require both sides to share a
+    /// `DataType`, while the binder resolves `smallint_col <> 0` in `int4` and
+    /// wraps only the column. See
+    /// [`vectorize::widening_int_cast`] for why *widening* is the admissible
+    /// direction and nothing else is.
+    Widen {
+        operand: Box<Node>,
+        to: PgType,
+    },
 }
 
 /// An evaluated operand. The distinction is not cosmetic: Arrow broadcasts a
@@ -104,6 +128,50 @@ impl Operand {
     fn array(&self) -> &dyn Array {
         self.datum().get().0
     }
+
+    /// Widen every value to `to`, keeping the operand's broadcasting.
+    ///
+    /// Scalar-ness has to survive: a widened `Scalar` that came back as a plain
+    /// length-1 array would meet a full batch and the kernel would reject the
+    /// length mismatch rather than broadcast.
+    fn widen(self, to: PgType) -> Result<Operand, ExecError> {
+        match self {
+            Operand::Array(array) => widen_array(&array, to).map(Operand::Array),
+            Operand::Scalar(scalar) => {
+                widen_array(scalar.get().0, to).map(|array| Operand::Scalar(Scalar::new(array)))
+            }
+        }
+    }
+}
+
+/// Widen an integer array to `to`, preserving nulls.
+///
+/// `unary` carries the null buffer across unchanged, which is what makes this
+/// safe to apply under an `IS NULL` as well as under a comparison. Only the three
+/// widening pairs appear, because those are the only ones
+/// [`vectorize::widening_int_cast`] admits and the compiler checks it first.
+fn widen_array(array: &dyn Array, to: PgType) -> Result<ArrayRef, ExecError> {
+    let widened: ArrayRef = match (array.data_type(), to) {
+        (DataType::Int16, PgType::Int4) => Arc::new(
+            array
+                .as_primitive::<Int16Type>()
+                .unary::<_, Int32Type>(i32::from),
+        ),
+        (DataType::Int16, PgType::Int8) => Arc::new(
+            array
+                .as_primitive::<Int16Type>()
+                .unary::<_, Int64Type>(i64::from),
+        ),
+        (DataType::Int32, PgType::Int8) => Arc::new(
+            array
+                .as_primitive::<Int32Type>()
+                .unary::<_, Int64Type>(i64::from),
+        ),
+        // Unreachable: the compiler gated on `widening_int_cast`. An error rather
+        // than a panic, so a compiler bug fails the query, not the backend.
+        _ => return Err(internal("vectorized predicate widened an unexpected type")),
+    };
+    Ok(widened)
 }
 
 impl Node {
@@ -151,6 +219,7 @@ impl Node {
                 };
                 mask.map(boxed).map_err(kernel_error)
             }
+            Node::Widen { operand, to } => operand.evaluate(batch)?.widen(*to),
         }
     }
 
@@ -288,15 +357,25 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
     }
 }
 
-/// Compile a comparison operand: a column or a constant, nothing computed.
+/// Compile a comparison operand: a column, a constant, or a widening integer
+/// cast of one — nothing computed.
 ///
-/// Anything else — an arithmetic expression, a function call, a cast, a
-/// parameter, a correlated reference — ends the compile. Those are where the
-/// row evaluator's side effects and PostgreSQL-specific semantics live, and
-/// none of them is worth reproducing before the simple cases are proven.
+/// Anything else — an arithmetic expression, a function call, a narrowing or
+/// lossy cast, a parameter, a correlated reference — ends the compile. Those are
+/// where the row evaluator's side effects and PostgreSQL-specific semantics live,
+/// and none of them is worth reproducing before the simple cases are proven.
 fn compile_operand(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
     match expr {
         BoundExpr::Collate { expr, .. } => compile_operand(expr, layout),
+        // A widening integer cast only: total over its source type, so there is
+        // no overflow behavior to reproduce. See `vectorize::widening_int_cast`.
+        BoundExpr::Coerce { expr, ty } => {
+            vectorize::widening_int_cast(expr.ty(), *ty).then_some(())?;
+            Some(Node::Widen {
+                operand: Box::new(compile_operand(expr, layout)?),
+                to: *ty,
+            })
+        }
         BoundExpr::ColumnRef { index, .. } => {
             // Batches are full width in schema order, so a schema ordinal is a
             // batch ordinal. Checked rather than assumed: an out-of-range index

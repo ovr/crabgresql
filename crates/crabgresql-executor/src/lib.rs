@@ -35,7 +35,7 @@ use crabgresql_binder::{
 use crabgresql_planner::{
     DmlIndexProbe, DmlTarget, HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
     PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, map_assigned_columns,
-    update_needs_unique_snapshot,
+    update_needs_unique_snapshot, vectorize,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
@@ -713,20 +713,34 @@ pub fn execute(
             distinct,
         } => {
             // Source rows: a base table scan or the single virtual row of a
-            // FROM-less aggregate.
-            let source: Box<dyn ExecNode> = match input {
-                PhysicalAggInput::Scan { table, projection } => {
-                    Box::new(SeqScan::new(&table, txn, &projection))
+            // FROM-less aggregate — kept in batch form where the input has one, so
+            // the WHERE and the grouping can be offered to the columnar path.
+            let source = agg_source(input, ctx, txn)?;
+            // The WHERE goes first: filtering on batches removes rows before
+            // anything decodes them, which is where vectorizing an aggregate pays.
+            let (source, predicate) = match predicate {
+                Some(predicate) => source.filter(predicate),
+                None => (source, None),
+            };
+            // Then the grouping, but only if the predicate is gone. One left for
+            // the row `Filter` has to run *before* grouping, and a row filter
+            // cannot be interposed in a batch stream.
+            let columnar = match predicate.is_none() {
+                true => source.aggregate(&group_exprs, &aggregates),
+                false => Err(source),
+            };
+            let mut node: Box<dyn ExecNode> = match columnar {
+                Ok(node) => node,
+                // Declined: the source hands back untouched and this is the
+                // pipeline the executor always built.
+                Err(source) => {
+                    let mut node = source.into_rows();
+                    if let Some(predicate) = predicate {
+                        node = Box::new(Filter::new(node, predicate, ctx.clone()));
+                    }
+                    Box::new(Aggregate::new(node, group_exprs, aggregates, ctx.clone()))
                 }
-                PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
-                PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
             };
-            // WHERE filters rows before aggregation.
-            let mut node: Box<dyn ExecNode> = match predicate {
-                Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
-                None => source,
-            };
-            node = Box::new(Aggregate::new(node, group_exprs, aggregates, ctx.clone()));
             // HAVING filters the per-group rows.
             if let Some(having) = having {
                 node = Box::new(Filter::new(node, having, ctx.clone()));
@@ -1743,6 +1757,97 @@ impl Source {
             true,
         ))
     }
+
+    /// Group and aggregate on batches, or hand the source back untouched.
+    ///
+    /// `Err(self)` is the decline, so the caller still owns everything it needs to
+    /// build the row `Aggregate` instead — the constructor consumes the batch
+    /// node, which is why the compile happens before it.
+    ///
+    /// Unlike the filter and the sort, this ends the columnar segment: the node it
+    /// returns is an [`ExecNode`] handing up one row per group, so `HAVING`, the
+    /// projection list and the `ORDER BY` above it run on rows exactly as they
+    /// always did. That is also why no `Shred` appears here — the aggregate *is*
+    /// the segment's terminator.
+    fn aggregate(
+        self,
+        group_exprs: &[BoundExpr],
+        aggregates: &[BoundAggregate],
+    ) -> Result<Box<dyn ExecNode>, Source> {
+        let Source::Batches {
+            node,
+            layout,
+            positions,
+        } = self
+        else {
+            return Err(self);
+        };
+        match vector::agg::AggregateBatch::compile(
+            node,
+            Arc::clone(&layout),
+            group_exprs,
+            aggregates,
+            &positions,
+        ) {
+            Ok(node) => Ok(Box::new(node)),
+            Err(node) => Err(Source::Batches {
+                node,
+                layout,
+                positions,
+            }),
+        }
+    }
+}
+
+/// The source rows an aggregate groups, in batch form wherever the input has one.
+///
+/// The shape that matters is the `Join` one, not the `Scan` one: a relation with
+/// storage leaves — every `USING parquet` relation — binds as a one-input join
+/// over an `Append`, so `PhysicalAggInput::Scan` is reached only by a monolithic
+/// relation. The planner's `agg_input_width` classifies the same three shapes and
+/// is consulted by `EXPLAIN`, so annotation and pipeline agree.
+fn agg_source(
+    input: PhysicalAggInput,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Source, ExecError> {
+    // Ask the planner first, as every columnar compiler here does: this may
+    // decline further but must never accept an input the annotation rejected.
+    if vectorize::agg_input_width(&input).is_none() {
+        return Ok(Source::Rows(agg_rows(input, ctx, txn)?));
+    }
+    match input {
+        PhysicalAggInput::Scan { table, projection } => Ok(scan_source(&table, txn, &projection)),
+        PhysicalAggInput::Join(PhysicalJoinExpr::Input { input, .. }) => match input {
+            PhysicalJoinInput::Scan { table, projection } => {
+                Ok(scan_source(&table, txn, &projection))
+            }
+            // `subquery_source` already knows to build an `Append` directly rather
+            // than through `execute`, which would shred at the leaves and leave
+            // nothing above to vectorize.
+            PhysicalJoinInput::Subplan(source) => subquery_source(*source, ctx, txn),
+            other => Ok(Source::Rows(build_join_source(other, ctx, txn)?)),
+        },
+        // Unreachable given the check above; rows rather than an error, so a shape
+        // added to the classifier later degrades instead of failing the query.
+        other => Ok(Source::Rows(agg_rows(other, ctx, txn)?)),
+    }
+}
+
+/// The aggregate's input as plain rows — the pipeline for every input with no
+/// batch form, and the fallback when the columnar aggregate declines.
+fn agg_rows(
+    input: PhysicalAggInput,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Box<dyn ExecNode>, ExecError> {
+    Ok(match input {
+        PhysicalAggInput::Scan { table, projection } => {
+            Box::new(SeqScan::new(&table, txn, &projection))
+        }
+        PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
+        PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
+    })
 }
 
 /// A `Subquery`'s child as a pipeline source, keeping the batch form when the
