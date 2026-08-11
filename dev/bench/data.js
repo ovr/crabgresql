@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786461619236,
+  "lastUpdate": 1786461621201,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -17464,6 +17464,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20730.970276,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "096f8cbb0d93b9b42ced870a3a5e2bb21a6a77a7",
+          "message": "perf(executor): borrow a binary operator's operands instead of cloning them (#216)",
+          "timestamp": "2026-08-11T16:37:22+02:00",
+          "tree_id": "a2e115ccfccb93a65a2abac07615778efc01edb0",
+          "url": "https://github.com/ovr/crabgresql/commit/096f8cbb0d93b9b42ced870a3a5e2bb21a6a77a7"
+        },
+        "date": 1786461621096,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 501.873781,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21401.749491,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
