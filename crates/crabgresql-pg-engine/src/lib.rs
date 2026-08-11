@@ -363,7 +363,7 @@ impl EngineInner {
                         if tuple::decode_header(bytes).has_external
                             && let Ok(raw) = tuple::decode_raw(bytes)
                         {
-                            found.extend(raw.external().iter().map(|(_, p)| *p));
+                            found.extend(raw.external().iter().map(|attr| attr.ptr));
                         }
                     }
                 }

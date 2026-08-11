@@ -181,13 +181,27 @@ pub fn decode_header(buf: &[u8]) -> OnPageHeader {
 /// caller can consume by accident.
 pub struct RawTuple {
     vals: Tuple,
-    /// `(attribute number, pointer)` for each out-of-line attribute, in
-    /// attribute order. Empty for the overwhelming majority of tuples.
-    external: Vec<(usize, ToastPointer)>,
-    /// Set by [`decode_raw_projected`]: attributes outside the projection hold
-    /// placeholders and their pointers were never collected. Only
-    /// [`RawTuple::external`] cares, and only to refuse being called.
-    projected: bool,
+    /// Every out-of-line attribute, in attribute order. Empty for the
+    /// overwhelming majority of tuples.
+    external: Vec<ExternalAttr>,
+}
+
+/// One out-of-line attribute of a decoded tuple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalAttr {
+    /// Which attribute the chain belongs to, so [`RawTuple::resolve`] knows the
+    /// slot to fill.
+    pub att: usize,
+    pub ptr: ToastPointer,
+    /// Whether the scan asked for this attribute's value.
+    ///
+    /// A skipped attribute is still listed, because the two readings of this list
+    /// want opposite things: VACUUM reclaims chains and must see every one the
+    /// tuple owns, while `resolve` walks chunks and must touch only what was
+    /// asked for. Listing everything and filtering in `resolve` keeps the
+    /// reclaim side correct by construction — an incomplete list would orphan
+    /// the chunks of every unread column, silently.
+    pub wanted: bool,
 }
 
 /// Decode the header and every inline datum, leaving out-of-line attributes as
@@ -223,7 +237,11 @@ pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
                     "unreadable out-of-line pointer in attribute {i}"
                 )));
             };
-            external.push((i, p));
+            external.push(ExternalAttr {
+                att: i,
+                ptr: p,
+                wanted: true,
+            });
             // A placeholder until `resolve` fills it in. Never observable: the
             // only way out of this type replaces every entry listed in
             // `external`.
@@ -232,11 +250,7 @@ pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
             vals.push(decode_datum(buf, &mut pos));
         }
     }
-    Ok(RawTuple {
-        vals,
-        external,
-        projected: false,
-    })
+    Ok(RawTuple { vals, external })
 }
 
 /// Decode only the attributes `wanted` names, walking past the rest.
@@ -252,12 +266,13 @@ pub fn decode_raw(buf: &[u8]) -> Result<RawTuple, StorageError> {
 ///   `numeric`, `jsonb`, `tsvector` … (see [`skip_datum`]);
 /// * nothing at all past the last wanted ordinal — a `SELECT c0` on a wide
 ///   relation stops walking after the first attribute;
-/// * a skipped out-of-line attribute is **not** collected, so [`RawTuple::resolve`]
-///   never detoasts it. That one pins pages of the toast relation through the
-///   buffer pool, so it is the expensive thing this avoids, not the allocation.
+/// * a skipped out-of-line attribute is never detoasted, and that one pins pages
+///   of the toast relation through the buffer pool — so it, not the allocation,
+///   is the expensive thing this avoids.
 ///
-/// The pointer of a skipped external attribute is still *parsed*, because that
-/// is what gives its length; only the chunk walk is dropped.
+/// The pointer of a skipped external attribute is still parsed (that is what
+/// gives its length) and still listed in [`ExternalAttr`], marked unwanted: only
+/// the chunk walk is dropped, never the record that the chain exists.
 pub fn decode_raw_projected(buf: &[u8], wanted: &[usize]) -> Result<RawTuple, StorageError> {
     let head = decode_header(buf);
     let natts = head.natts as usize;
@@ -289,12 +304,13 @@ pub fn decode_raw_projected(buf: &[u8], wanted: &[usize]) -> Result<RawTuple, St
                     "unreadable out-of-line pointer in attribute {i}"
                 )));
             };
-            if is_wanted {
-                external.push((i, p));
-            }
+            external.push(ExternalAttr {
+                att: i,
+                ptr: p,
+                wanted: is_wanted,
+            });
             // Either a placeholder `resolve` will fill in, or — for a skipped
-            // attribute, whose pointer was deliberately not collected — the
-            // unspecified value the projection contract allows.
+            // attribute — the unspecified value the projection contract allows.
             vals.push(Value::Null);
         } else if is_wanted {
             vals.push(decode_datum(buf, &mut pos));
@@ -303,30 +319,20 @@ pub fn decode_raw_projected(buf: &[u8], wanted: &[usize]) -> Result<RawTuple, St
             vals.push(Value::Null);
         }
     }
-    Ok(RawTuple {
-        vals,
-        external,
-        projected: true,
-    })
+    Ok(RawTuple { vals, external })
 }
 
 impl RawTuple {
-    /// The out-of-line attributes this tuple owns — what VACUUM reclaims once the
-    /// tuple itself is dead.
-    ///
-    /// Only meaningful for a full decode. A projected one collects no pointer for
-    /// an attribute it skipped, so reclaiming from that list would orphan the
-    /// chunks of every unread column — hence the assertion rather than a caveat
-    /// in prose.
-    pub fn external(&self) -> &[(usize, ToastPointer)] {
-        debug_assert!(
-            !self.projected,
-            "a projected tuple's external list is incomplete; never reclaim from it"
-        );
+    /// Every out-of-line attribute this tuple owns — what VACUUM reclaims once
+    /// the tuple itself is dead. Complete regardless of any projection, which is
+    /// why a projected decode is safe to reclaim from.
+    pub fn external(&self) -> &[ExternalAttr] {
         &self.external
     }
 
-    /// The tuple's column values, with every out-of-line attribute reassembled.
+    /// The tuple's column values, with every *wanted* out-of-line attribute
+    /// reassembled. One the projection skipped keeps its placeholder, which is
+    /// the whole saving: its chain is never walked.
     ///
     /// `detoast` is handed a pointer and returns the bytes its chain holds; it is
     /// the caller that owns a buffer pool. Nothing is read when the tuple has no
@@ -335,13 +341,13 @@ impl RawTuple {
         mut self,
         detoast: impl Fn(&ToastPointer) -> Result<Vec<u8>, StorageError>,
     ) -> Result<Tuple, StorageError> {
-        for (i, p) in &self.external {
-            let bytes = detoast(p)?;
+        for attr in self.external.iter().filter(|attr| attr.wanted) {
+            let bytes = detoast(&attr.ptr)?;
             // The chunks hold exactly what `encode_datum` would have written
             // inline, so reassembly is an ordinary decode and needs no knowledge
             // of the attribute's type.
             let mut pos = 0;
-            self.vals[*i] = decode_datum(&bytes, &mut pos);
+            self.vals[attr.att] = decode_datum(&bytes, &mut pos);
         }
         Ok(self.vals)
     }
@@ -435,6 +441,15 @@ mod tests {
         }
     }
 
+    /// The `external()` entry a full decode produces for attribute `att`.
+    fn wanted_chain(att: usize, ptr: ToastPointer) -> ExternalAttr {
+        ExternalAttr {
+            att,
+            ptr,
+            wanted: true,
+        }
+    }
+
     fn pointer(rawsize: u32) -> ToastPointer {
         ToastPointer {
             rel: RelFileNode(42),
@@ -468,7 +483,7 @@ mod tests {
         let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_external);
         assert_eq!(head.natts, 3);
-        assert_eq!(raw.external(), &[(1, p)]);
+        assert_eq!(raw.external(), &[wanted_chain(1, p)]);
 
         // The inline attributes on either side of the pointer are untouched, and
         // the resolved value lands in the right slot.
@@ -506,7 +521,7 @@ mod tests {
         let head = decode_header(&buf);
         let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert!(head.has_null && head.has_external);
-        assert_eq!(raw.external(), &[(1, p)]);
+        assert_eq!(raw.external(), &[wanted_chain(1, p)]);
         let vals = raw
             .resolve(|_| {
                 let mut out = Vec::new();
@@ -551,7 +566,7 @@ mod tests {
         let raw = decode_raw(&buf).unwrap_or_else(|e| panic!("decode failed: {e}"));
         assert_eq!(head.hdr.xmax, Xid(8));
         assert!(head.has_external);
-        assert_eq!(raw.external(), &[(0, p)]);
+        assert_eq!(raw.external(), &[wanted_chain(0, p)]);
     }
 
     /// Every projection of one mixed tuple — every subset of its attributes —
@@ -596,6 +611,40 @@ mod tests {
         }
     }
 
+    /// A projected decode still lists every chain the tuple owns, wanted or not.
+    /// VACUUM reclaims from that list and reaches a chain only through its heap
+    /// tuple, so an entry missing here is a chunk leak nothing else would notice.
+    #[test]
+    fn a_projected_decode_lists_every_chain_the_tuple_owns() {
+        let hdr = TupleHeader::inserted(Xid(1), CommandId(0));
+        let ctid = Tid {
+            block: 0,
+            offset: 1,
+        };
+        let (first, second) = (pointer(4), pointer(5));
+        let buf = encode_tuple(
+            &[
+                Attr::External(first),
+                Attr::Inline(&Value::Int4(2)),
+                Attr::External(second),
+            ],
+            &hdr,
+            ctid,
+        );
+        let raw = decode_raw_projected(&buf, &[2]).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        assert_eq!(
+            raw.external(),
+            &[
+                ExternalAttr {
+                    att: 0,
+                    ptr: first,
+                    wanted: false,
+                },
+                wanted_chain(2, second),
+            ]
+        );
+    }
+
     /// The saving that matters: a skipped out-of-line attribute is never
     /// detoasted. `resolve`'s closure is the buffer-pool walk, so a call to it is
     /// the failure.
@@ -616,8 +665,6 @@ mod tests {
             &hdr,
             ctid,
         );
-        // Ask for the middle attribute only: both pointers are walked past, and
-        // neither is collected, so nothing reaches the chunk store.
         let raw = decode_raw_projected(&buf, &[1]).unwrap_or_else(|e| panic!("decode failed: {e}"));
         let vals = raw
             .resolve(|p| unreachable!("detoasted {p:?} for an unprojected attribute"))

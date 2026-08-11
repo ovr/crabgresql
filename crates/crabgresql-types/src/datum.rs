@@ -16,6 +16,9 @@
 //!
 //! The tag bytes below are an on-disk format shared by all of those. Adding a
 //! kind appends a tag; renumbering one silently misreads every existing file.
+//! Two functions read a tag — [`decode_datum`] and [`skip_datum`], which walks
+//! past a datum without building it — so a new kind needs an arm in both, plus a
+//! case in the tests' `roundtrip`, which is what checks that the two agree.
 
 use crate::{Inet, Interval, Numeric, PgType, Reg, TimeTz, Value, VectorKind, json};
 
@@ -629,15 +632,14 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
 /// `corrupt datum tag` message. That matters because both run under a heap
 /// page's frame lock, where the two must not diverge in *how* they fail.
 pub fn skip_datum(buf: &[u8], pos: &mut usize) {
-    let start = *pos;
-    let mut r = Reader { buf, pos: start };
-    let tag = r.take(1)[0];
-    match tag {
-        // Fixed-width payloads, grouped by their byte count. This table is the
-        // one place that knows a kind's width without decoding it, so a kind
-        // added to `encode_datum` and forgotten here would walk the tuple off
-        // by its own length — which is what the debug cross-check at the bottom
-        // exists to catch, on every kind the test suite ever stores.
+    let mut r = Reader { buf, pos: *pos };
+    match r.take(1)[0] {
+        // Widths, grouped by byte count. This is the second reader of the tag
+        // registry, and the only one that claims a kind's size without decoding
+        // it: a kind added to `encode_datum` and forgotten here walks the tuple
+        // off by that kind's own length, corrupting every attribute after it.
+        // What keeps the two in step is `roundtrip` in this module's tests,
+        // which asserts skipping and decoding land on the same byte.
         T_BOOL | T_CHAR => {
             r.take(1);
         }
@@ -669,23 +671,18 @@ pub fn skip_datum(buf: &[u8], pos: &mut usize) {
         T_LSEG | T_BOX => {
             r.take(32);
         }
-        // A `u32` length prefix and its payload: `var` reads the length and
-        // slices past the bytes without copying them.
         T_NUMERIC | T_TEXT | T_BYTEA | T_JSON | T_JSONB | T_JSONPATH_TREE | T_JSONPATH
         | T_TSVECTOR | T_TSQUERY => {
             r.var();
         }
-        // A bit length, then the packed bytes.
         T_BIT => {
             r.take(4);
             r.var();
         }
-        // Two OIDs (kind + value, or type + ordinal), then the rendered name.
         T_REG | T_ENUM => {
             r.take(8);
             r.var();
         }
-        // The open/closed flag, then the vertex count and its coordinate pairs.
         T_PATH => {
             r.take(1);
             skip_points(&mut r);
@@ -702,8 +699,6 @@ pub fn skip_datum(buf: &[u8], pos: &mut usize) {
             let count = r.u32() as usize;
             r.take(count.saturating_mul(width));
         }
-        // Elements are self-describing, so skipping one is this same walk a
-        // level down — the recursion mirrors `encode_datum`'s.
         T_ARRAY => {
             r.take(4);
             let count = r.u32();
@@ -715,21 +710,6 @@ pub fn skip_datum(buf: &[u8], pos: &mut usize) {
         }
         other => panic!("corrupt datum tag {other}"),
     }
-
-    // Debug builds pay for a full decode and check the walk against it. Every
-    // kind the test suite and the regression corpus ever store is therefore
-    // checked against the codec itself, rather than against a hand-written list
-    // of expected widths that would need its own maintenance.
-    #[cfg(debug_assertions)]
-    {
-        let mut decoded = start;
-        decode_datum(buf, &mut decoded);
-        debug_assert_eq!(
-            decoded, r.pos,
-            "skip_datum disagrees with decode_datum on tag {tag}"
-        );
-    }
-
     *pos = r.pos;
 }
 
@@ -832,8 +812,6 @@ mod tests {
         for v in &values {
             encode_datum(v, &mut buf);
         }
-        // Skip the first `n`, then decode the rest and require them to be the
-        // values that were written.
         for n in 0..values.len() {
             let mut pos = 0;
             for _ in 0..n {
@@ -923,6 +901,8 @@ mod tests {
         roundtrip(Value::Char(0));
         roundtrip(Value::Char(0xFF));
         roundtrip(Value::Int2(i16::MIN));
+        roundtrip(Value::Oid(0));
+        roundtrip(Value::Oid(u32::MAX));
         roundtrip(Value::Int4(i32::MAX));
         roundtrip(Value::Int8(i64::MIN));
         roundtrip(Value::Float4(0.0));

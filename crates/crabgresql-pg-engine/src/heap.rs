@@ -1738,7 +1738,7 @@ impl TableAm for HeapTable {
             let dead_chains: Vec<toast::ToastPointer> = victims
                 .iter()
                 .filter_map(|(_, raw)| raw.as_ref().ok())
-                .flat_map(|raw: &tuple::RawTuple| raw.external().iter().map(|(_, p)| *p))
+                .flat_map(|raw: &tuple::RawTuple| raw.external().iter().map(|attr| attr.ptr))
                 .collect();
             // Reassemble values ONLY to delete index entries. With no physical
             // index there is nothing to delete, so a table of wide rows is
