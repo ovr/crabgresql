@@ -98,6 +98,34 @@ pub fn analyze_heap(table: &HeapTable, txn: &TxnContext, target: SampleTarget) -
     }
 }
 
+/// What `pg_statistic.stawidth` reports for one value: the width PostgreSQL
+/// would store it at, not the width this system's datum codec spends.
+///
+/// The two differ, and the reported one has to be PostgreSQL's — `avg_width` is
+/// a number users read and do capacity arithmetic with, and it says `4` for an
+/// `int4` on every PostgreSQL there has ever been. A fixed-width type is its
+/// `typlen`, exactly. A varlena is its payload plus the one-byte header
+/// PostgreSQL gives a short value (four once it exceeds what that header can
+/// count), where the payload is what is left after this codec's own framing —
+/// a tag byte and a four-byte length.
+///
+/// Approximate for the few types that frame their payload differently
+/// (`bit`/`varbit` carry a bit count of their own), which comes out a few bytes
+/// wide. `stawidth` is an average of estimates to begin with; being wrong about
+/// `int4` would not have been in the same class.
+fn stored_width(ty: PgType, encoded: usize) -> usize {
+    let fixed = ty.typlen();
+    if fixed > 0 {
+        return fixed as usize;
+    }
+    let payload = encoded.saturating_sub(DATUM_FRAMING);
+    payload + if payload < 127 { 1 } else { 4 }
+}
+
+/// The tag byte and length prefix `crabgresql_types::datum` puts in front of a
+/// variable-length payload.
+const DATUM_FRAMING: usize = 5;
+
 /// One sampled cell. `TooWide` is not `Val`: such a value takes part in
 /// `avg_width` and counts as distinct, but never reaches an MCV list or a
 /// histogram, so it must not be retained (see [`WIDTH_THRESHOLD`]).
@@ -128,6 +156,9 @@ struct Decimator {
     /// Width sums and counts feeding `avg_width`, over *every* non-null value
     /// seen, not just the retained ones.
     widths: Vec<(u64, u64)>,
+    /// Each column's type, for [`stored_width`]. Held rather than looked up per
+    /// row: `push` runs on the scan's hot path.
+    types: Vec<PgType>,
     /// Nulls seen per column, over every row (not just retained ones), so
     /// `null_frac` is exact.
     nulls: Vec<u64>,
@@ -143,6 +174,7 @@ impl Decimator {
         Decimator {
             columns: (0..ncols).map(|_| Vec::new()).collect(),
             widths: vec![(0, 0); ncols],
+            types: schema.columns.iter().map(|c| c.ty).collect(),
             nulls: vec![0; ncols],
             rows_seen: 0,
             rows_kept: 0,
@@ -169,7 +201,7 @@ impl Decimator {
             scratch.clear();
             encode_datum(value, &mut scratch);
             let width = scratch.len();
-            self.widths[column].0 += width as u64;
+            self.widths[column].0 += stored_width(self.types[column], width) as u64;
             self.widths[column].1 += 1;
             if retain {
                 cell.push(if width > WIDTH_THRESHOLD {
@@ -455,7 +487,8 @@ mod tests {
         let rows: Vec<Tuple> = (0..1000).map(|i| vec![Value::Int4(i)]).collect();
         let stats = stats_of(&schema, &rows, 10_000);
         assert_eq!(stats[0].null_frac, 0.0);
-        assert_eq!(stats[0].avg_width, 5);
+        // PostgreSQL's width for an int4, not this codec's encoded size.
+        assert_eq!(stats[0].avg_width, 4);
         // Every value distinct: the negated-fraction encoding, -1.
         assert_eq!(stats[0].n_distinct, -1.0);
         assert!(stats[0].mcv.is_empty(), "mcv: {:?}", stats[0].mcv);
@@ -587,7 +620,7 @@ mod tests {
         // null_frac and avg_width are exact — they are counted over every row,
         // not over the retained ones.
         assert_eq!(stats[0].null_frac, 0.0);
-        assert_eq!(stats[0].avg_width, 5);
+        assert_eq!(stats[0].avg_width, 4);
     }
 
     #[test]
