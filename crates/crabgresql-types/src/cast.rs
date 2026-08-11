@@ -173,13 +173,31 @@ pub fn cast_value_assign(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, Ca
     cast_value(v, to, fmt)
 }
 
+/// Whether [`cast_value`] would hand `v` back untouched: NULL passes through any
+/// cast, and a value already of the target type needs no conversion.
+///
+/// Callers that hold a `&Value` use this to skip the clone `cast_value`'s
+/// by-value signature would otherwise force on them — see the ANY/ALL candidate
+/// loop in the executor. It sits next to [`cast_value`]'s own early returns,
+/// which say the same thing in the one shape that also keeps `from` for the
+/// conversion below; calling it from there would cost a second `pg_type` walk on
+/// every cast that is *not* the identity, which is the hot direction.
+#[inline]
+pub fn is_identity_cast(v: &Value, to: PgType) -> bool {
+    match v.pg_type() {
+        None => true, // NULL casts to anything, unchanged.
+        Some(from) => from == to,
+    }
+}
+
 /// Cast `v` to `to`. `fmt` supplies `extra_float_digits` (float→text) and the
 /// session display zone (every `timestamptz` conversion).
 pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError> {
-    if matches!(v, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let from = v.pg_type().expect("non-null value has a type");
+    // The two identity cases [`is_identity_cast`] answers, in the form that also
+    // binds `from` for the conversion table below.
+    let Some(from) = v.pg_type() else {
+        return Ok(v); // NULL passes through any cast.
+    };
     if from == to {
         return Ok(v);
     }
