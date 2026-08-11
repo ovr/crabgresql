@@ -3881,7 +3881,7 @@ fn frontend_batch(messages: &[FrontendMessage]) -> bytes::BytesMut {
 }
 
 /// `Parse` with inferred parameter types, the only kind these tests send.
-fn parse(name: &str, query: &str) -> FrontendMessage {
+fn parse_message(name: &str, query: &str) -> FrontendMessage {
     FrontendMessage::Parse {
         name: name.to_string(),
         query: query.to_string(),
@@ -3890,7 +3890,7 @@ fn parse(name: &str, query: &str) -> FrontendMessage {
 }
 
 /// `Bind` with no formats and no parameters — everything defaults to text.
-fn bind(portal: &str, statement: &str) -> FrontendMessage {
+fn bind_message(portal: &str, statement: &str) -> FrontendMessage {
     FrontendMessage::Bind {
         portal: portal.to_string(),
         statement: statement.to_string(),
@@ -3901,7 +3901,7 @@ fn bind(portal: &str, statement: &str) -> FrontendMessage {
 }
 
 /// `Execute` with no row limit.
-fn execute(portal: &str) -> FrontendMessage {
+fn execute_message(portal: &str) -> FrontendMessage {
     FrontendMessage::Execute {
         portal: portal.to_string(),
         max_rows: 0,
@@ -3931,13 +3931,13 @@ async fn extended_protocol_runs_a_full_batch() -> anyhow::Result<()> {
     let mut socket = raw_session(port).await;
 
     let batch = frontend_batch(&[
-        parse("", "SELECT 1"),
-        bind("", ""),
+        parse_message("", "SELECT 1"),
+        bind_message("", ""),
         FrontendMessage::Describe {
             target: Target::Portal,
             name: String::new(),
         },
-        execute(""),
+        execute_message(""),
         FrontendMessage::Sync,
     ]);
     socket.write_all(&batch).await?;
@@ -3989,15 +3989,15 @@ async fn a_completed_portal_is_not_run_again() -> anyhow::Result<()> {
         read_until_ready(&mut socket).await;
 
         let batch = frontend_batch(&[
-            parse("st", sql),
-            bind("po", "st"),
-            execute("po"),
+            parse_message("st", sql),
+            bind_message("po", "st"),
+            execute_message("po"),
             FrontendMessage::Sync,
         ]);
         socket.write_all(&batch).await?;
         let first = command_tag(&read_until_ready(&mut socket).await)?;
 
-        let again = frontend_batch(&[execute("po"), FrontendMessage::Sync]);
+        let again = frontend_batch(&[execute_message("po"), FrontendMessage::Sync]);
         socket.write_all(&again).await?;
         Ok((first, read_until_ready(&mut socket).await))
     }
@@ -4074,8 +4074,8 @@ async fn reparse_named_statement_errors_42p05() -> anyhow::Result<()> {
     let mut socket = raw_session(port).await;
 
     let batch = frontend_batch(&[
-        parse("s", "SELECT 1"),
-        parse("s", "SELECT 2"), // the same name again
+        parse_message("s", "SELECT 1"),
+        parse_message("s", "SELECT 2"), // the same name again
         FrontendMessage::Sync,
     ]);
     socket.write_all(&batch).await?;
@@ -4119,12 +4119,12 @@ async fn extended_protocol_errors_once_and_recovers_at_sync() -> anyhow::Result<
     let mut socket = raw_session(port).await;
 
     let batch = frontend_batch(&[
-        bind("", "nope"), // no such prepared statement
+        bind_message("", "nope"), // no such prepared statement
         FrontendMessage::Describe {
             target: Target::Portal,
             name: String::new(),
         }, // skipped
-        execute(""),      // skipped
+        execute_message(""),      // skipped
         FrontendMessage::Sync,
     ]);
     socket.write_all(&batch).await?;
@@ -4161,7 +4161,7 @@ async fn describe_statement_reports_params_then_close_drops_it() -> anyhow::Resu
     // Parse `SELECT $1::int4` as statement "s" (no declared types — the `::int4`
     // cast forces inference); Describe the statement; Sync.
     let batch = frontend_batch(&[
-        parse("s", "SELECT $1::int4"),
+        parse_message("s", "SELECT $1::int4"),
         FrontendMessage::Describe {
             target: Target::Statement,
             name: "s".to_string(),
@@ -11213,9 +11213,9 @@ async fn self_referencing_prepared_statement_is_an_error_not_a_crash() -> anyhow
     let mut socket = raw_session(spawn_server().await).await;
 
     let batch = frontend_batch(&[
-        parse("self", "EXECUTE self"),
-        bind("", "self"),
-        execute(""),
+        parse_message("self", "EXECUTE self"),
+        bind_message("", "self"),
+        execute_message(""),
         FrontendMessage::Sync,
     ]);
     socket.write_all(&batch).await?;
@@ -12864,7 +12864,7 @@ async fn show_describes_its_columns_in_the_extended_protocol() -> anyhow::Result
     for (sql, want_columns) in [("SHOW TimeZone", 1u16), ("SHOW ALL", 3)] {
         let name = format!("s_{want_columns}");
         let batch = frontend_batch(&[
-            parse(&name, sql),
+            parse_message(&name, sql),
             FrontendMessage::Describe {
                 target: Target::Statement,
                 name: name.clone(),
@@ -14080,9 +14080,9 @@ async fn an_extended_query_batch_shares_one_transaction_timestamp() -> anyhow::R
         let mut messages = Vec::new();
         for n in 0..2u8 {
             let (stmt, portal) = (format!("s{round}{n}"), format!("p{round}{n}"));
-            messages.push(parse(&stmt, "SELECT now()::text"));
-            messages.push(bind(&portal, &stmt));
-            messages.push(execute(&portal));
+            messages.push(parse_message(&stmt, "SELECT now()::text"));
+            messages.push(bind_message(&portal, &stmt));
+            messages.push(execute_message(&portal));
         }
         messages.push(FrontendMessage::Sync);
         frontend_batch(&messages)
