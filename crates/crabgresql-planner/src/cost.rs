@@ -52,30 +52,52 @@ const DEFAULT_INEQ_SEL: f64 = 0.3333333333333333;
 /// bounds are estimated independently, which can otherwise cancel to zero.
 const DEFAULT_RANGE_INEQ_SEL: f64 = 0.005;
 
-/// A relation's size as the cost model sees it: never zero pages, so no path is
-/// ever free.
+/// A relation's size as the cost model sees it.
+///
+/// Zero pages is a legitimate answer, but only for a relation that was
+/// *measured* empty: an unmeasured one is floored at [`DEFAULT_RELPAGES`], so a
+/// missing statistic can never make a sequential scan look free.
 #[derive(Clone, Copy, Debug)]
 pub struct RelSize {
     pub pages: f64,
     pub rows: f64,
 }
 
-/// PostgreSQL's `estimate_rel_size`: use what was measured, and substitute the
-/// 10-page default for a relation whose size is unknown, deriving its row count
-/// from the schema's assumed row width.
+/// PostgreSQL's `estimate_rel_size`: take the *tuple density* from what was
+/// measured and apply it to the relation's size **now**.
+///
+/// The two are not the same number. `ANALYZE` freezes `relpages`/`reltuples` at
+/// the moment it ran, and that pair is what `pg_class` must keep reporting; a
+/// plan that used it directly would describe a relation as it was, not as it is.
+/// Nothing re-analyzes a relation here on its own, so a table analyzed while
+/// small and since grown would otherwise be planned as small forever — and would
+/// refuse its own primary key. Scaling the measured density by
+/// [`RelStats::curpages`] is how PostgreSQL avoids that, and it degrades
+/// gracefully: an engine that reports no live size keeps exactly the measured
+/// estimate.
+///
+/// The 10-page substitution is PG's too, and applies only to a relation that was
+/// never measured. Without it a never-measured relation would cost nothing to
+/// scan sequentially and no index could ever win.
 pub fn estimate_rel_size(stats: &RelStats, schema: &TableSchema) -> RelSize {
-    if stats.relpages > 0 {
-        return RelSize {
-            pages: f64::from(stats.relpages),
-            // An unanalyzed relation still reports a size-derived row count; a
-            // zero here means the relation really is empty.
-            rows: stats.reltuples.max(0.0),
-        };
+    let measured = f64::from(stats.relpages);
+    let mut curpages = f64::from(stats.curpages.unwrap_or(stats.relpages));
+    if stats.relpages == 0 && curpages < f64::from(DEFAULT_RELPAGES) {
+        curpages = f64::from(DEFAULT_RELPAGES);
     }
-    let derived = RelStats::from_pages(DEFAULT_RELPAGES, schema);
+    // Rows per page: from the measurement where there is one, else from the
+    // schema's assumed row width (which is all `from_pages` has to go on). A
+    // measured *zero* is a real answer — a relation whose rows were all deleted
+    // is empty however many pages it still occupies — so the fallback keys on
+    // the page count alone, as PG's does.
+    let density = if measured > 0.0 {
+        stats.reltuples.max(0.0) / measured
+    } else {
+        RelStats::from_pages(1, schema).reltuples
+    };
     RelSize {
-        pages: f64::from(DEFAULT_RELPAGES),
-        rows: derived.reltuples,
+        pages: curpages,
+        rows: (density * curpages).max(0.0),
     }
 }
 
@@ -552,6 +574,60 @@ mod tests {
             Some((&Value::Int4(100), true)),
         );
         assert_eq!(sel, DEFAULT_RANGE_INEQ_SEL);
+    }
+
+    /// The estimate follows the relation, not the measurement. A table analyzed
+    /// at 10 pages and since grown to 100 is planned as ten times the rows —
+    /// otherwise it would keep the plan it earned while it was small, forever,
+    /// since nothing re-analyzes it.
+    #[test]
+    fn a_grown_relation_is_estimated_from_its_current_size() {
+        let schema = TableSchema::new(
+            "t",
+            vec![crabgresql_storage_api::Column::new("id", PgType::Int4)],
+        );
+        let analyzed = RelStats {
+            relpages: 10,
+            reltuples: 1_000.0,
+            analyzed: true,
+            curpages: Some(100),
+            columns: std::sync::Arc::from([]),
+        };
+        let size = estimate_rel_size(&analyzed, &schema);
+        assert_eq!(size.pages, 100.0);
+        assert_eq!(size.rows, 10_000.0);
+
+        // An engine that cannot report a live size keeps exactly what it
+        // measured — no guessing in either direction.
+        let size = estimate_rel_size(
+            &RelStats {
+                curpages: None,
+                ..analyzed
+            },
+            &schema,
+        );
+        assert_eq!((size.pages, size.rows), (10.0, 1_000.0));
+    }
+
+    /// The other direction: a relation measured empty really is free to scan,
+    /// and must not be inflated back to the unmeasured default.
+    #[test]
+    fn a_relation_measured_empty_stays_empty() {
+        let schema = TableSchema::new(
+            "t",
+            vec![crabgresql_storage_api::Column::new("id", PgType::Int4)],
+        );
+        let size = estimate_rel_size(
+            &RelStats {
+                relpages: 4,
+                reltuples: 0.0,
+                analyzed: true,
+                curpages: Some(4),
+                columns: std::sync::Arc::from([]),
+            },
+            &schema,
+        );
+        assert_eq!(size.rows, 0.0);
     }
 
     #[test]

@@ -1255,13 +1255,23 @@ impl TableAm for HeapTable {
         // An ANALYZE result supersedes the size-derived guess: it counted the
         // rows rather than inferring them from an assumed row width, and only it
         // carries the per-column distributions a plan estimate needs.
+        //
+        // It is reported *with* the relation's current size rather than instead
+        // of it. The measured pair is what `pg_class` must show, and the live
+        // page count is what keeps a plan honest as the relation grows away from
+        // the measurement — see [`RelStats::curpages`]. Nothing re-analyzes a
+        // relation here on its own, so without the second number a table
+        // analyzed while small would never take an index again.
         if let Some(stats) = self
             .analyzed
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .clone()
         {
-            return stats;
+            return RelStats {
+                curpages: self.nblocks().ok(),
+                ..stats
+            };
         }
         let schema = self.snap();
         match self.nblocks() {
@@ -1280,7 +1290,8 @@ impl TableAm for HeapTable {
             relpages,
             reltuples: 0.0,
             analyzed: false,
-            columns: Vec::new(),
+            curpages: Some(relpages),
+            columns: Arc::from([]),
         })
     }
 
@@ -1297,11 +1308,13 @@ impl TableAm for HeapTable {
             .iter()
             .find(|e| e.meta.name == index_name && e.is_physical(&schema))
             .map(|e| e.rel)?;
+        let relpages = self.engine.bufpool.smgr().nblocks(rel).unwrap_or(0);
         Some(RelStats {
-            relpages: self.engine.bufpool.smgr().nblocks(rel).unwrap_or(0),
+            relpages,
             reltuples: 0.0,
             analyzed: false,
-            columns: Vec::new(),
+            curpages: Some(relpages),
+            columns: Arc::from([]),
         })
     }
 

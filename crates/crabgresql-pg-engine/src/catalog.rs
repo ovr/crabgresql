@@ -9,7 +9,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crabgresql_storage_api::{
     CheckConstraint, ColStats, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
@@ -564,7 +564,7 @@ impl RelCatalog {
         rel.stats = Some(PersistStats {
             relpages: stats.relpages,
             reltuples: stats.reltuples,
-            columns: stats.columns.clone(),
+            columns: stats.columns.to_vec(),
         });
         // A `Temporary` relation is excluded from `encode`, so persisting would
         // rewrite and fsync the whole catalog to produce identical bytes. Keep
@@ -592,7 +592,10 @@ impl RelCatalog {
             relpages: s.relpages,
             reltuples: s.reltuples,
             analyzed: true,
-            columns: s.columns.clone(),
+            // What was measured, not what the relation is now: the caller owns
+            // the file and fills the live count in when it reports.
+            curpages: None,
+            columns: Arc::from(s.columns.clone()),
         })
     }
 
@@ -3070,14 +3073,15 @@ mod tests {
             relpages,
             reltuples,
             analyzed: true,
-            columns: vec![ColStats {
+            curpages: Some(relpages),
+            columns: std::sync::Arc::from([ColStats {
                 null_frac: 0.25,
                 avg_width: 4,
                 n_distinct: -1.0,
                 mcv: vec![(Value::Int4(7), 0.5), (Value::Text("x".into()), 0.25)],
                 histogram: vec![Value::Int4(1), Value::Int4(2), Value::Int4(9)],
                 correlation: 0.5,
-            }],
+            }]),
         }
     }
 }

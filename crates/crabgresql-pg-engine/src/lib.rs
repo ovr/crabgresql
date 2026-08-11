@@ -1853,7 +1853,9 @@ impl TableEngine for PgEngine {
                     relpages,
                     reltuples,
                     analyzed: true,
-                    columns: Vec::new(),
+                    // Just measured, so the live count is the measured one.
+                    curpages: Some(relpages),
+                    columns: std::sync::Arc::from([]),
                 }
             }
         };

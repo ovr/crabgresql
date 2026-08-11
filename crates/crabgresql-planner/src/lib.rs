@@ -1017,6 +1017,27 @@ fn pick_index(
     indexes: &[IndexMetadata],
     eqs: &[Option<(usize, BoundExpr)>],
 ) -> Option<(DmlIndexProbe, Vec<bool>)> {
+    // Which indexes are even in the running, in tie-break order. Settled before
+    // anything is measured: asking for statistics reads the relation's file
+    // length, and every planned statement — including one against a relation
+    // with no index at all — would otherwise pay for it.
+    let candidates: Vec<(&IndexMetadata, Vec<(usize, usize)>)> = [
+        Some(IndexConstraint::PrimaryKey),
+        Some(IndexConstraint::Unique),
+        None,
+    ]
+    .into_iter()
+    .flat_map(|pref| indexes.iter().filter(move |i| i.constraint == pref))
+    .filter_map(|index| Some((index, cover_index(index, eqs)?)))
+    // Only route to an index scan the engine can physically serve; otherwise
+    // `EXPLAIN` would advertise an index scan that silently degrades to a
+    // sequential scan at execution time.
+    .filter(|(index, _)| table.supports_index_scan(&index.name))
+    .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
     let schema = table.schema();
     let stats = table.statistics();
     let size = cost::estimate_rel_size(&stats, &schema);
@@ -1025,56 +1046,41 @@ fn pick_index(
     // charging both sides the same keeps the comparison about the I/O.
     let nquals = eqs.len();
     let mut best: Option<(f64, DmlIndexProbe, Vec<bool>)> = None;
-    for pref in [
-        Some(IndexConstraint::PrimaryKey),
-        Some(IndexConstraint::Unique),
-        None,
-    ] {
-        for index in indexes.iter().filter(|i| i.constraint == pref) {
-            let Some(chosen) = cover_index(index, eqs) else {
-                continue;
-            };
-            // Only route to an index scan the engine can physically serve;
-            // otherwise `EXPLAIN` would advertise an index scan that silently
-            // degrades to a sequential scan at execution time.
-            if !table.supports_index_scan(&index.name) {
-                continue;
+    for (index, chosen) in candidates {
+        let mut key = Vec::with_capacity(chosen.len());
+        let mut consumed = vec![false; eqs.len()];
+        // Independent per-column selectivities multiply, as in PG's
+        // `clauselist_selectivity`.
+        let mut selectivity = 1.0;
+        for (column, conjunct) in chosen {
+            // `cover_index` only ever returns conjuncts classified as an
+            // equality key, so `eqs[conjunct]` is always `Some`.
+            if let Some((_, value)) = &eqs[conjunct] {
+                selectivity *= key_selectivity(&schema, &stats, column, value, size.rows);
+                key.push((column, value.clone()));
+                consumed[conjunct] = true;
             }
-            let mut key = Vec::with_capacity(chosen.len());
-            let mut consumed = vec![false; eqs.len()];
-            // Independent per-column selectivities multiply, as in PG's
-            // `clauselist_selectivity`.
-            let mut selectivity = 1.0;
-            for (column, conjunct) in chosen {
-                // `cover_index` only ever returns conjuncts classified as an
-                // equality key, so `eqs[conjunct]` is always `Some`.
-                if let Some((_, value)) = &eqs[conjunct] {
-                    selectivity *= key_selectivity(&schema, &stats, column, value, size.rows);
-                    key.push((column, value.clone()));
-                    consumed[conjunct] = true;
-                }
-            }
-            let total = cost::index_scan_cost(
-                size,
-                index_pages(table, &index.name, size),
-                selectivity,
-                correlation_of(&stats, index.keys.first().map(|k| k.column)),
-                nquals,
-            );
-            if best
-                .as_ref()
-                .is_none_or(|(cheapest, _, _)| total < *cheapest)
-            {
-                best = Some((
-                    total,
-                    DmlIndexProbe {
-                        index_name: index.name.clone(),
-                        key,
-                        residual: None,
-                    },
-                    consumed,
-                ));
-            }
+        }
+        let total = cost::index_scan_cost(
+            size,
+            index_pages(table, &index.name, size),
+            selectivity,
+            correlation_of(&stats, index.keys.first().map(|k| k.column)),
+            nquals,
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(cheapest, _, _)| total < *cheapest)
+        {
+            best = Some((
+                total,
+                DmlIndexProbe {
+                    index_name: index.name.clone(),
+                    key,
+                    residual: None,
+                },
+                consumed,
+            ));
         }
     }
     let (total, probe, consumed) = best?;
@@ -1120,19 +1126,27 @@ fn correlation_of(stats: &RelStats, leading: Option<usize>) -> f32 {
         .map_or(0.0, |column| column.correlation)
 }
 
-/// The index's size in pages, or an estimate for an engine that does not report
-/// one: one entry per row, packed into pages by the average key width.
+/// The index's size in pages, or — for an engine that does not report one — a
+/// flat assumption of [`ASSUMED_INDEX_ENTRIES_PER_PAGE`] entries per page, one
+/// entry per row.
+///
+/// The fallback is deliberately crude: it only has to be the right order of
+/// magnitude against the table's own page count, and the engine that actually
+/// serves index scans reports the real number. Sizing it from the key columns'
+/// `avg_width` would look more precise without being more useful — the estimate
+/// it feeds is multiplied by a selectivity that is itself an approximation.
 fn index_pages(table: &Arc<dyn TableAm>, index_name: &str, size: cost::RelSize) -> f64 {
     if let Some(stats) = table.index_statistics(index_name)
         && stats.relpages > 0
     {
         return f64::from(stats.relpages);
     }
-    // Deliberately crude — it only has to be the right order of magnitude
-    // against the table's own page count, and an engine that serves index scans
-    // is expected to report the real number.
-    (size.rows / 200.0).max(1.0)
+    (size.rows / ASSUMED_INDEX_ENTRIES_PER_PAGE).max(1.0)
 }
+
+/// Index entries assumed to fit on a page when the engine cannot say. Roughly a
+/// 40-byte entry in an 8 KB page.
+const ASSUMED_INDEX_ENTRIES_PER_PAGE: f64 = 200.0;
 
 /// Whether one DML target may keep the probe an index offers it, given the
 /// target and its [`MappedRelation::map`]. `UPDATE` uses this to veto a probe for

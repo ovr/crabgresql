@@ -91,7 +91,10 @@ pub fn analyze_heap(table: &HeapTable, txn: &TxnContext, target: SampleTarget) -
         relpages,
         reltuples,
         analyzed: true,
-        columns: sampler.finish(&schema, reltuples),
+        // Just measured, so the live count is the measured one. It diverges only
+        // later, as the relation grows away from this `ANALYZE`.
+        curpages: Some(relpages),
+        columns: sampler.finish(&schema, reltuples).into(),
     }
 }
 
@@ -106,12 +109,18 @@ enum Cell {
 
 /// A bounded, deterministic decimation of a scan: keeps every `stride`-th row
 /// and doubles `stride` (dropping every second retained row) whenever the buffer
-/// would exceed twice the target.
+/// would exceed the target, so the retained set stays between half the target
+/// and the target — the same ceiling PostgreSQL's sample has.
 ///
 /// Deterministic on purpose — the same table always yields the same statistics,
 /// so a test can assert an MCV list rather than a tolerance. The doubling is
 /// what makes it work without knowing the row count up front: at every moment
 /// the retained rows are an evenly spaced sample of everything seen so far.
+///
+/// The ceiling is in *rows*, so a relation of very wide columns still costs
+/// `target × columns × `[`WIDTH_THRESHOLD`] at the peak. That exposure is
+/// PostgreSQL's too — its sample holds whole tuples — and narrowing it further
+/// would mean sampling fewer rows than the statistics target asks for.
 struct Decimator {
     /// Per column, the retained cells in physical row order. Indexed by schema
     /// position, so a column is analyzed without transposing the sample.
@@ -172,7 +181,7 @@ impl Decimator {
         }
         if retain {
             self.rows_kept += 1;
-            if self.rows_kept > 2 * self.target {
+            if self.rows_kept > self.target {
                 self.halve();
             }
         }
@@ -539,6 +548,24 @@ mod tests {
         );
         assert!(stats[0].histogram.is_empty());
         assert_eq!(stats[0].n_distinct, 2.0);
+    }
+
+    /// The retained sample never exceeds the target — checked at every step, not
+    /// just at the end, because the peak is what costs memory and it is reached
+    /// mid-scan.
+    #[test]
+    fn the_retained_sample_never_exceeds_the_target() {
+        let schema = schema(&[PgType::Int4]);
+        let target = 64;
+        let mut sampler = Decimator::new(&schema, target);
+        for i in 0..10_000 {
+            sampler.push(&vec![Value::Int4(i)]);
+            assert!(
+                sampler.columns[0].len() <= target,
+                "retained {} rows at step {i}, target {target}",
+                sampler.columns[0].len()
+            );
+        }
     }
 
     /// Decimation keeps the sample bounded and evenly spread: the shape of the

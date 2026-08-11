@@ -966,7 +966,8 @@ fn wide_fixture() -> SystemCatalog {
         relpages: 3,
         reltuples: 0.0,
         analyzed: false,
-        columns: Vec::new(),
+        curpages: Some(3),
+        columns: std::sync::Arc::from([]),
     });
 
     let mut parent = TableSchema::new("part", vec![Column::new("k", PgType::Int4)]);
@@ -1430,7 +1431,8 @@ fn a_toast_relation_is_published_and_its_parent_points_at_it() -> anyhow::Result
             relpages: 7,
             reltuples: 0.0,
             analyzed: false,
-            columns: Vec::new(),
+            curpages: Some(7),
+            columns: std::sync::Arc::from([]),
         });
         vec![CatalogRelation::permanent(plain("bare")), toasted]
     });

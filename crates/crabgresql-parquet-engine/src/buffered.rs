@@ -305,6 +305,7 @@ impl TableAm for BufferedParquetTable {
             relpages: chunks.relpages,
             reltuples: chunks.reltuples + buffered.reltuples,
             analyzed: chunks.analyzed,
+            curpages: chunks.curpages,
             columns: chunks.columns,
         }
     }
