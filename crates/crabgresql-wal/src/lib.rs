@@ -6,8 +6,10 @@
 //! registers a **redo** handler that knows how to reapply its records to a page
 //! during crash recovery. This crate owns the stream (append, group-commit
 //! fsync, segment file), the record envelope with a CRC, the rmgr registry, and
-//! the redo-only recovery pass. Engines (`crabgresql-pg-engine`) register their
-//! record types and redo handlers; the memory engine writes no WAL at all.
+//! the redo-only recovery pass. Engines (`crabgresql-pg-engine`,
+//! `crabgresql-parquet-engine`, `crabgresql-buffer-engine`) register their
+//! record types and redo handlers; an `UNLOGGED`/`TEMP` relation's writes
+//! bypass the WAL entirely.
 //!
 //! Clean-room: the durability behavior (write-ahead rule, redo-only recovery, a
 //! per-record CRC) is reproduced from the published ARIES algorithm and the

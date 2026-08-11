@@ -106,15 +106,20 @@ pub struct BatchAppend {
 }
 
 impl BatchAppend {
-    /// `None` — stay on the row path — if any arm cannot hand up batches, or if
-    /// any arm carries a column remap. A batch is in its own relation's column
-    /// order and there is nowhere here to permute one, so a remapped arm would
-    /// concatenate mis-ordered columns rather than fail loudly.
+    /// `None` — stay on the row path — if any arm cannot hand up batches, if
+    /// any arm carries a column remap, or if any arm must append a `tableoid`.
+    /// A batch is in its own relation's column order and there is nowhere here
+    /// to permute one, so a remapped arm would concatenate mis-ordered columns
+    /// rather than fail loudly.
     ///
-    /// Unreachable today: DDL refuses an engine-managed relation on either side
-    /// of an inheritance link, so no remapped arm can be batch-capable. The
-    /// planner's `arms_batch` makes the same call, so `EXPLAIN` agrees with what
-    /// runs.
+    /// The remap branch is unreachable today: DDL refuses an engine-managed
+    /// relation on either side of an inheritance link, so no remapped arm can be
+    /// batch-capable. The planner's `arms_batch` applies that same remap rule,
+    /// so a remapped arm never makes `EXPLAIN` disagree with what runs.
+    ///
+    /// TODO: hand up batches for an arm that must append a `tableoid` slot.
+    /// `arms_batch` does not test for that slot, so until then `EXPLAIN` calls
+    /// such an `Append` columnar while it runs on rows.
     pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<Self> {
         let children = arms
             .iter()

@@ -23,8 +23,9 @@ use crate::session::Session;
 
 /// The live server state one session's [`SystemCatalog`] snapshot reflects.
 ///
-/// Every method but `cursors` reads through the captured engine handles when
-/// called, which is what keeps a `SELECT 1` from enumerating the database:
+/// Every method but the eagerly snapshotted ones below (`cursors`,
+/// `prepared_statements`, `settings`) reads through the captured engine handles
+/// when called, which is what keeps a `SELECT 1` from enumerating the database:
 /// `SystemCatalog` invokes each at most once, and only when the relation it
 /// feeds is opened.
 pub struct SessionCatalogSource {
@@ -37,10 +38,11 @@ pub struct SessionCatalogSource {
     owner: String,
     temp_schema: String,
     temp_namespace_oid: u32,
-    /// The one eager field. This source outlives the `&Session` borrow it is
-    /// built from, so the cursor metadata is snapshotted here rather than read
-    /// on demand. Only names and statement texts are copied — never rows — and
-    /// a session with no open cursor copies nothing.
+    /// Eager, unlike the engine-backed lists: this source outlives the
+    /// `&Session` borrow it is built from, so the cursor metadata is
+    /// snapshotted here rather than read on demand. Only names and statement
+    /// texts are copied — never rows — and a session with no open cursor copies
+    /// nothing.
     cursors: Vec<CatalogCursor>,
     /// Eager for the same reason as `cursors`, and just as cheap: only names,
     /// statement texts and type OIDs are copied — never a plan.
@@ -290,10 +292,11 @@ impl CatalogOps for SessionCatalogOps {
     /// So this walks [`SessionCatalog::resolve`]'s search order for the
     /// relation's own name (temp → system catalog → global, which resolves
     /// unqualified names in `public` only) and reports whether the relation
-    /// found is this one. `search_path` is still a no-op, so the order is
-    /// crabgresql's rather than PostgreSQL's; a relation in a `CREATE SCHEMA`
-    /// namespace is correctly invisible because nothing but a qualified name
-    /// reaches it.
+    /// found is this one. A relation in a `CREATE SCHEMA` namespace is
+    /// correctly invisible because nothing but a qualified name reaches it.
+    ///
+    /// TODO: walk the session's `search_path` instead of this fixed order, so
+    /// visibility follows the configured path as it does in PostgreSQL.
     ///
     /// Kept in step with `resolve` by `visibility_follows_resolution_order`
     /// below, which fails if the two disagree about a shadowed name.
@@ -412,18 +415,23 @@ impl CatalogOps for SessionCatalogOps {
         self.system.owner().to_string()
     }
 
-    /// The same string as [`CatalogOps::current_user`]: there is no `SET ROLE`
-    /// to make the two differ.
+    /// The same string as [`CatalogOps::current_user`]: `SET ROLE` is accepted
+    /// and ignored, so nothing can make the two differ.
+    ///
+    /// TODO: track `SET ROLE` in `current_user`, so it can differ from the
+    /// authenticated role this method reports.
     fn session_user(&self) -> String {
         self.system.owner().to_string()
     }
 
     /// Mirrors the resolution order `table_is_visible` and `rel_oid` above
-    /// already implement — temp, then `pg_catalog`, then `public` — because
-    /// there is no `search_path` GUC yet (`SET search_path` is among the names
-    /// [`crate::guc`] silently accepts and ignores). With PostgreSQL's default
-    /// `"$user", public` and no `$user` schema, the two agree exactly; once
-    /// `search_path` becomes real, this is where it plugs in.
+    /// already implement — temp, then `pg_catalog`, then `public`. With
+    /// PostgreSQL's default `"$user", public` and no `$user` schema, the two
+    /// agree exactly.
+    ///
+    /// TODO: return the session's `search_path` setting — `SET search_path` is
+    /// among the names [`crate::guc`] silently accepts and ignores, so this
+    /// list is fixed.
     fn search_path(&self, include_implicit: bool) -> Vec<String> {
         let mut out = Vec::new();
         if include_implicit {
@@ -717,14 +725,18 @@ impl TableEngine for SessionCatalog {
         }
     }
 
-    /// A view is created in the permanent (global) catalog; temp views are not
-    /// supported yet, so like the CTAS default this routes to `global`.
+    /// Every view is created in the permanent (global) catalog, like the
+    /// non-temp default in `create_table`.
+    ///
+    /// TODO: create temporary views in this session's temp namespace;
+    /// `CREATE TEMP VIEW` is rejected outright today.
     fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
         self.global.create_view(def)
     }
 
     /// Search-path-aware view resolution, mirroring [`SessionCatalog::resolve`].
-    /// Views live only in the permanent catalog for now, so an unqualified or
+    /// Views live only in the permanent catalog (see the temp-view `TODO` on
+    /// [`SessionCatalog::create_view`]), so an unqualified or
     /// `public.`-qualified name reaches `global`; other namespaces (temp,
     /// `pg_catalog`) hold no user views.
     fn resolve_view(&self, schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
@@ -748,8 +760,11 @@ impl TableEngine for SessionCatalog {
         self.global.views()
     }
 
-    /// Sequences live only in the permanent catalog (temp sequences unsupported),
-    /// so every sequence operation routes to `global`, like views.
+    /// Sequences live only in the permanent catalog, so every sequence
+    /// operation routes to `global`, like views.
+    ///
+    /// TODO: support temporary sequences; `CREATE TEMP SEQUENCE` is rejected
+    /// outright today.
     fn create_sequence(&self, def: SequenceDefinition) -> Result<(), StorageError> {
         self.global.create_sequence(def)
     }

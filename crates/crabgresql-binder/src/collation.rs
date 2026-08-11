@@ -7,9 +7,9 @@
 //! a literal or a non-string input contributes **none**. Combining inputs takes
 //! the strongest, and two conflicting explicit collations are an error.
 //!
-//! Where this build simplifies: when two *implicit* collations conflict,
-//! PostgreSQL reports `42P22` at the point of use, while here the expression
-//! falls back to the database collation. Explicit conflicts — the case a query
+//! TODO: raise `42P22` when two *implicit* collations conflict, the way
+//! PostgreSQL does at the point of use; here such an expression falls back to
+//! the database collation instead. Explicit conflicts — the case a query
 //! author can actually see and fix — do raise `42P22`.
 
 use crabgresql_parser::ast;
@@ -128,9 +128,9 @@ pub fn expr_collation(expr: &BoundExpr) -> Derived {
 impl Derived {
     /// Keep the stronger of two derivations. On a tie — both sides carrying
     /// the same non-`None` strength but disagreeing on the collation — fall
-    /// back to the database default, matching this module's documented
-    /// simplification for a conflict PostgreSQL would flag `42P22` at the
-    /// point of use. A genuine *explicit* conflict is caught earlier by
+    /// back to the database default instead of raising the `42P22` PostgreSQL
+    /// reports at the point of use, the gap the module header records as a
+    /// `TODO`. A genuine *explicit* conflict is caught earlier by
     /// [`check_explicit_conflict`] wherever more than one collatable input
     /// combines, so by the time an explicit/explicit tie reaches here it has
     /// already been rejected; this fallback only actually fires for implicit

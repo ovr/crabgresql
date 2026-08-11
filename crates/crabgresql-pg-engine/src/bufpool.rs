@@ -6,10 +6,13 @@
 //! executor calls the heap AM on its own threads — and every field is behind a
 //! lock, so it is `Send + Sync`.
 //!
-//! Simplicity note: eviction I/O runs while the mapping lock is held, which
-//! serializes page faults. That is correct and fine for a first cut given the
-//! pool is far larger than the number of concurrently pinned pages; a
-//! finer-grained scheme is a later optimization.
+//! Eviction I/O runs while the mapping lock is held, which serializes page
+//! faults. That is correct, and tolerable while the pool stays far larger than
+//! the number of concurrently pinned pages.
+//!
+//! TODO(perf): run the eviction write-back and read outside the mapping lock
+//! (or partition the mapping), so one page fault stops serializing every other
+//! pin.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -339,8 +342,11 @@ impl BufferPool {
             .iter()
             .filter_map(|frame| {
                 let fr = frame.lock().unwrap_or_else(|_| panic!("mutex poisoned"));
-                // A frame that never held a page has nothing to be dirty about,
-                // and asking it for one would panic.
+                // An untagged frame is skipped rather than reported: the only
+                // way one is dirty is a `PinnedPage` that outlived
+                // `forget_relation` and wrote through it (see `pin`), and those
+                // bytes belong to no relation — they are discarded, not owed to
+                // disk.
                 let lsn = page::get_lsn(&fr.data);
                 (fr.dirty && fr.tag.is_some() && lsn != 0).then_some(lsn)
             })
@@ -352,8 +358,7 @@ impl BufferPool {
     /// `PinnedPage` still holds keeps `pins > 0`, so it is not chosen as an
     /// eviction victim (no cross-relation aliasing) and its holder's `Drop`
     /// decrements normally (no underflow). Once the holder drops, the frame is
-    /// clean and unmapped, hence reusable. (TRUNCATE remains non-transactional,
-    /// as documented — this only removes the crash/aliasing.)
+    /// clean and unmapped, hence reusable.
     pub fn forget_relation(&self, rel: RelFileNode) {
         // "Do not write these pages back" and "do not fsync on their behalf" are
         // the same intent; every caller here goes on to unlink or truncate the

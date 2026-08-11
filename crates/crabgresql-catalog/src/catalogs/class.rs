@@ -15,9 +15,13 @@ use crate::{RelKind, TOAST_NAMESPACE};
 /// `pg_catalog.pg_class` — a curated subset of columns for user relations, in
 /// PostgreSQL's `attnum` order. Columns crabgresql has no state for are still
 /// emitted with their true constant so a client's `\d` predicates evaluate as on
-/// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*). Storage
-/// bookkeeping columns beyond this set (`relfrozenxid`, `relminmxid`, …) are
-/// omitted.
+/// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*).
+///
+/// TODO: the storage, inheritance and ACL columns (`relfilenode`,
+/// `relallfrozen`, `relisshared`, `relhassubclass`, `relispopulated`,
+/// `relrewrite`, `relfrozenxid`, `relminmxid`, `relacl`, `reloptions`) are
+/// absent, so a query naming one fails with "column does not exist" rather than
+/// reading a value.
 ///
 /// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
 /// measurement — matching PostgreSQL, where a relation that has never been
@@ -64,10 +68,13 @@ pub(crate) fn pg_class_schema() -> TableSchema {
 }
 
 /// Deparse a leaf partition's `relpartbound` to the text PostgreSQL's
-/// `pg_get_expr(relpartbound, oid)` prints — `FOR VALUES FROM (…) TO (…)`. Only
-/// RANGE partitions exist, so only the range form is produced. `MINVALUE`/
-/// `MAXVALUE` print as bare keywords. Storing the final text (not a node tree)
-/// is a deliberate deviation: `pg_get_expr` then just echoes it.
+/// `pg_get_expr(relpartbound, oid)` prints — `FOR VALUES FROM (…) TO (…)`.
+/// `MINVALUE`/`MAXVALUE` print as bare keywords. Storing the final text (not a
+/// node tree) is a deliberate deviation: `pg_get_expr` then just echoes it.
+///
+/// TODO: deparse LIST (`FOR VALUES IN (…)`) and HASH (`FOR VALUES WITH
+/// (modulus …, remainder …)`, lower-case as PostgreSQL 18.4 prints it) bounds;
+/// only RANGE partitions can be created, so only the range form is produced.
 ///
 /// Quoting follows what PostgreSQL 18.4 was observed to print: `true`/`false`
 /// bare, a non-negative integer bare, and everything else single-quoted with
@@ -146,10 +153,10 @@ fn analyzed_size(stats: &RelStats) -> (Value, Value) {
 /// join to `pg_attribute.attrelid` lines up.
 ///
 /// Columns crabgresql does not track are their PostgreSQL constants: rules only
-/// on views (`relhasrules`), no triggers or row security, no `OF type` /
-/// tablespace / TOAST relation. `relchecks` counts the relation's CHECK
-/// constraints, which is what makes psql print a `Check constraints:` footer. A
-/// heap-backed relation defaults its replica identity to the primary key
+/// on views (`relhasrules`), no triggers or row security, no `OF type` and no
+/// tablespace of its own. `relchecks` counts the relation's CHECK constraints,
+/// which is what makes psql print a `Check constraints:` footer. A heap-backed
+/// relation defaults its replica identity to the primary key
 /// (`relreplident = 'd'`); views, sequences, and indexes have none (`'n'`).
 ///
 /// `stats` is parallel to `relations`; see [`analyzed_size`] for how it renders.
@@ -259,8 +266,9 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 IndexMethod::Hash => HASH_AM_OID,
             }),
             Value::Oid(0),
-            // relpages / reltuples: per-index size is not tracked, so an index
-            // reports the never-analyzed sentinel. relallvisible: no map.
+            // TODO: report an index's own relpages/reltuples — per-index size
+            // is not tracked, so an index keeps the never-analyzed sentinel
+            // even after the table is analyzed. relallvisible: no map.
             Value::Int4(0),
             Value::Float4(-1.0),
             Value::Int4(0),

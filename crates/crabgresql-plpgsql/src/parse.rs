@@ -284,8 +284,7 @@ impl<'a> Compiler<'a> {
     // -----------------------------------------------------------------------
 
     /// Statements up to (not including) the `END` / `EXCEPTION` that closes a
-    /// block. PostgreSQL requires at least one, `NULL;` being the way to write
-    /// none.
+    /// block. The list may be empty: PostgreSQL accepts `BEGIN END`.
     fn statements_until_block_end(&mut self) -> Result<Vec<Stmt>, CompileError> {
         let mut stmts = Vec::new();
         loop {
@@ -360,9 +359,9 @@ impl<'a> Compiler<'a> {
                 self.lex.next();
                 Ok(Stmt::Null { line })
             }
-            // Constructs PostgreSQL has and this rung does not. Naming them
-            // beats "syntax error": the body is valid PL/pgSQL, just not yet
-            // supported.
+            // TODO: implement CASE, EXECUTE, FOREACH, OPEN/FETCH/CLOSE, ASSERT
+            // and GET DIAGNOSTICS. Naming the construct beats "syntax error":
+            // the body is valid PL/pgSQL.
             kw @ ("case" | "execute" | "foreach" | "open" | "fetch" | "close" | "assert"
             | "get") => Err(CompileError::unsupported(
                 format!("{} in PL/pgSQL is not supported yet", kw.to_uppercase()),
@@ -602,9 +601,10 @@ impl<'a> Compiler<'a> {
     fn raise_stmt(&mut self, line: u32) -> Result<Stmt, CompileError> {
         self.lex.expect_word("raise")?;
 
-        // The level is optional and defaults to EXCEPTION. It is only a level
-        // if something follows it — `RAISE notice;` with a condition named
-        // `notice` is not a thing anyone writes, and PG reads it as the level.
+        // The level is optional and defaults to EXCEPTION. A level keyword is
+        // consumed as the level even when nothing follows it: PostgreSQL
+        // answers `RAISE notice;` with a syntax error at the `;`, so it read
+        // `notice` as the level and not as a condition name to raise.
         let level = match self.lex.peek_word().unwrap_or("").to_lowercase().as_str() {
             "debug" => Some(RaiseLevel::Debug),
             "log" => Some(RaiseLevel::Log),
@@ -620,8 +620,9 @@ impl<'a> Compiler<'a> {
         let level = level.unwrap_or(RaiseLevel::Exception);
 
         if matches!(self.lex.peek(), Token::SemiColon) {
-            // A bare `RAISE;` re-raises the exception being handled, which
-            // requires an EXCEPTION block — and there are none yet.
+            // TODO: re-raise the exception being handled for a bare `RAISE;`
+            // once EXCEPTION handlers are supported. Outside a handler
+            // PostgreSQL reports this same message.
             return Err(CompileError::syntax(
                 "RAISE without parameters cannot be used outside an exception handler",
                 line,
@@ -699,10 +700,10 @@ impl<'a> Compiler<'a> {
                 "detail" => &mut using.detail,
                 "hint" => &mut using.hint,
                 "errcode" => &mut using.errcode,
-                // PostgreSQL also accepts COLUMN/CONSTRAINT/DATATYPE/TABLE/
-                // SCHEMA, which only populate error fields this engine does not
-                // send. Accepting and ignoring them beats rejecting a body that
-                // would work.
+                // TODO: carry COLUMN/CONSTRAINT/DATATYPE/TABLE/SCHEMA into the
+                // error response; they are parsed and dropped because the
+                // engine's error type has no such fields. Accepting and
+                // ignoring them beats rejecting a body that would work.
                 "column" | "constraint" | "datatype" | "table" | "schema" => {
                     if !self.lex.eat(&Token::Comma) {
                         break;
@@ -894,7 +895,7 @@ impl<'a> Compiler<'a> {
     ///
     /// A bare word is a variable if a declaration of that name is in scope.
     /// PostgreSQL's `plpgsql.variable_conflict` GUC chooses what happens when
-    /// the name is also a column of a table in the query; this rung always
+    /// the name is also a column of a table in the query; this crate always
     /// takes the variable, which is PostgreSQL's historical behavior and what
     /// almost all real code assumes.
     fn fragment_var(&self, inner: &Lexer<'_>, i: usize) -> Option<VarId> {

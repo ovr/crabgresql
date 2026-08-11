@@ -1088,8 +1088,8 @@ async fn out_of_line_values_survive_a_restart() -> anyhow::Result<()> {
             .await?;
         shutdown(client, handle).await;
     }
-    // Second boot: the value is intact, and md5 rather than a length so a chain
-    // reassembled short or out of order would show.
+    // Second boot: the value is intact — an md5 alongside the length, so a
+    // chain reassembled out of order and not just short would show.
     {
         let (port, handle) = spawn_pg(dir.path()).await;
         let client = connect(port).await;

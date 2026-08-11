@@ -1,11 +1,12 @@
 //! Scalar function resolution.
 //!
 //! Clean-room (see AGENTS.md): the function set, argument coercions, and error
-//! text reproduce PG's *observable* behavior for the functions the float
-//! regression tests call, pinned by the corpus. A minimal name+arity+coercion
-//! resolver stands in for PG's full overload machinery — enough for these
-//! tests, where arguments are floats, unknown literals, or ints promoted to
-//! float8.
+//! text reproduce PG's *observable* behavior, pinned by the vendored regression
+//! corpus. Overloads live in a static per-name signature table and are chosen
+//! by `resolve_call` with PG's candidate-narrowing rules: drop the signatures
+//! the typed arguments cannot reach, keep the most exact matches, prefer a
+//! category's preferred type, and only then let the untyped literals decide —
+//! reporting `42725` when nothing separates the survivors.
 
 use std::sync::Arc;
 
@@ -253,8 +254,9 @@ pub enum ScalarFn {
     /// answers it — no session state is involved.
     Version,
 
-    // --- the clock. All three read the session's stamped instants rather than
-    // their arguments, so they dispatch in `eval`, not in `eval_scalar`.
+    // --- the clock. All four answer with an instant the session or the process
+    // carries rather than with anything from their arguments, so they dispatch
+    // in `eval`, not in `eval_scalar`.
     /// `now()` / `transaction_timestamp() -> timestamptz`: when the current
     /// transaction started. Stable — the same value for every row and every
     /// statement of the block. Also what a `'now'` literal resolves to.
@@ -406,11 +408,12 @@ pub enum ScalarFn {
     // --- string functions (see `crabgresql_types::text`) ----
     /// `text || text -> text` (the `||` operator / `textcat`).
     TextConcat,
-    /// `length`/`char_length`/`character_length(text) -> int4`.
+    /// `length`/`char_length`/`character_length(text) -> int4`, and
+    /// `length(bytea) -> int4`, which counts bytes rather than characters.
     Length,
-    /// `octet_length(text) -> int4`.
+    /// `octet_length(text|bpchar|bytea) -> int4`.
     OctetLength,
-    /// `bit_length(text) -> int4`.
+    /// `bit_length(text|bytea) -> int4`.
     BitLength,
     /// `upper(text) -> text`.
     Upper,
@@ -577,7 +580,7 @@ pub enum ScalarFn {
     BitTypmod,
     /// Apply a `bit varying(n)` length coercion (`bit`, `int4 n`[, flag]).
     VarbitTypmod,
-    // --- geometric (point / lseg) ---
+    // --- geometric (point / lseg / path / box / line / circle / polygon) ---
     /// A geometric operator/function; the specific operation is the payload.
     Geo(GeoFn),
     // --- tid ---
@@ -591,7 +594,8 @@ pub enum ScalarFn {
     /// as an ordinary function. `xid` has no counterpart — it has no btree
     /// opclass at all.
     Xid8Cmp,
-    // --- pg_lsn (args are always `[pg_lsn, numeric]`, LSN first) ---
+    // --- pg_lsn (the binder normalizes the commuted spellings, so wherever an
+    // LSN is an operand it is argument 0) ---
     /// `pg_lsn - pg_lsn -> numeric`: the exact signed byte distance.
     PgLsnMi,
     /// `pg_lsn + numeric -> pg_lsn` (and the commuted `numeric + pg_lsn`).
@@ -752,8 +756,12 @@ pub enum JsonPathFn {
 /// both types. The `*Text` forms are the `->>`/`#>>` spellings, which return
 /// `text` (a JSON string unquoted, a JSON `null` as SQL NULL).
 ///
-/// Named after PG's underlying functions so registering the SQL spellings
-/// (`jsonb_extract_path`, ...) later is a lookup-table entry and nothing more.
+/// Named after PG's underlying functions so that registering a SQL spelling is
+/// a lookup-table entry and nothing more.
+///
+/// TODO: register the SQL spellings of these extractions
+/// (`jsonb_extract_path`, `json_object_field`, ...); only the operator forms
+/// resolve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JsonFn {
     /// `json -> text` — an object field.
@@ -775,10 +783,10 @@ pub enum JsonFn {
 /// `resolve_ts_unary` (`!!`); named functions register them in [`lookup`].
 /// Argument order is fixed per variant.
 ///
-/// PG spells the weight arguments as `"char"` and `"char"[]`, which this engine
-/// has no type for; they are modeled as `text`/`text[]`, so a literal like
-/// `setweight(v, 'c')` binds identically. Only the first character is read, as
-/// the `"char"` cast would.
+/// PG spells the weight arguments as `"char"` and `"char"[]`; they are modeled
+/// as `text`/`text[]`, and `"char" -> text` is an implicit cast, so both a
+/// literal like `setweight(v, 'c')` and a `"char"`-typed argument bind. Only
+/// the first character is read, as the `"char"` cast would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TsFn {
     /// `tsvector @@ tsquery` (`-> boolean`). Operand order is normalized, so the
@@ -1201,8 +1209,9 @@ pub enum TableFn {
     /// `pg_input_error_info(value text, type_name text)` — the non-throwing
     /// sibling of `pg_input_is_valid`, reporting why an input would fail.
     PgInputErrorInfo,
-    /// `generate_series(start, stop [, step])` over an integer element type
-    /// (`int4` or `int8`, carried here). Yields one row per value in the range.
+    /// `generate_series(start, stop [, step])`. The element type carried here —
+    /// `int4`, `int8`, `numeric`, or a `timestamp`/`timestamptz` stepped by an
+    /// interval — is the output column's. Yields one row per value in the range.
     GenerateSeries(PgType),
     /// `jsonb_path_query(target jsonb, path jsonpath [, vars jsonb, silent bool])`
     /// — one `jsonb` row per item the path returns.
@@ -1214,8 +1223,9 @@ pub enum TableFn {
 
 impl TableFn {
     /// The function's declared parameter types (for arity/coercion checks).
-    /// `GenerateSeries` is polymorphic (int4/int8, 2- or 3-arg) and resolves via
-    /// [`resolve_generate_series`] instead, so it has no fixed signature here.
+    /// `GenerateSeries` is polymorphic in its element type (2- or 3-arg) and
+    /// resolves via [`resolve_generate_series`] instead, so it has no fixed
+    /// signature here.
     fn arg_types(self) -> &'static [PgType] {
         match self {
             TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
@@ -1235,7 +1245,6 @@ impl TableFn {
                 text("hint"),
                 text("sql_error_code"),
             ],
-            // A single column named after the function, of the element type.
             TableFn::GenerateSeries(elem) => vec![OutputColumn::new("generate_series", elem)],
             TableFn::JsonbPathQuery => {
                 vec![OutputColumn::new("jsonb_path_query", PgType::Jsonb)]
@@ -1459,9 +1468,12 @@ pub(crate) fn bind_table_fn_call(
     }
 }
 
-/// Resolve `unnest(array)` to its element type and single (array) argument. Only
-/// the single-array 1-D form is supported; anything else is `42883`. Shared by
-/// FROM-position and target-list binding.
+/// Resolve `unnest(array)` to its element type and single (array) argument.
+/// Shared by FROM-position and target-list binding.
+///
+/// TODO: resolve `unnest` over more than one array (PG's `unnest(a, b, …)`
+/// FROM-position form); only a single array argument binds here, and anything
+/// else is `42883`.
 pub(crate) fn resolve_unnest(bindings: &[Binding]) -> Result<(PgType, Vec<BoundExpr>), BindError> {
     if let [Binding::Typed(e)] = bindings {
         // `oidvector`/`int2vector` unnest to their element type as well, even
@@ -2211,9 +2223,12 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TIMETZ,
             },
         ],
-        // Two overloads. Text is listed first so a bare `md5('abc')` unknown
-        // literal resolves to text; a typed `bytea` argument never coerces to
-        // text (see `implicit_castable`), so `md5(x::bytea)` binds the bytea one.
+        // Two overloads. A bare `md5('abc')` answers from the text one: an
+        // unknown literal prefers a `String`-category candidate over bytea's
+        // `UserDefined` (`narrow_by_unknown_category`), so the order the two
+        // appear in is not what decides it. A typed `bytea` argument never
+        // coerces to text (see `implicit_castable`), so `md5(x::bytea)` binds
+        // the bytea one.
         "md5" => &[
             Signature {
                 func: ScalarFn::Md5,
@@ -2847,9 +2862,9 @@ fn lookup(name: &str) -> &'static [Signature] {
         // inet/cidr accessors. A `cidr` argument coerces to the `inet` overload
         // via the implicit cidr->inet cast, matching PG (whose inet functions
         // accept cidr). `abbrev` keeps a distinct cidr overload because its
-        // output differs (`10.1/16` vs `10.1.0.0/16`); the inet overload is
-        // listed first so an untyped literal resolves to inet (PG's preferred
-        // type in the inet/cidr category), while a typed cidr still binds cidr.
+        // output differs (`10.1/16` vs `10.1.0.0/16`); an untyped literal still
+        // resolves to inet, the preferred type of the inet/cidr category, while
+        // a typed cidr binds the cidr overload by exact match.
         "host" => &[Signature {
             func: ScalarFn::Host,
             args: &[INET],
@@ -3150,8 +3165,6 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: F8,
             },
         ],
-        // --- jsonpath query functions: each has the 2-arg form plus the
-        // optional `vars jsonb` / `silent bool` arguments PG's DEFAULTs add ---
         // --- text search (tsvector / tsquery) ---
         "strip" => &[Signature {
             func: ScalarFn::Ts(TsFn::Strip),
@@ -3238,8 +3251,11 @@ fn function_name(name: &ast::ObjectName) -> Option<String> {
 }
 
 /// The two shorthands PostgreSQL implements in its grammar rather than in
-/// `pg_proc`. Neither is polymorphic enough for the overload table: `COALESCE` is
-/// variadic and lazy, and both take their type from `select_common_type`.
+/// `pg_proc`. Neither is polymorphic enough for the overload table: `COALESCE`
+/// is variadic and lazy, and takes its result type from the one type its whole
+/// argument list unifies to; `NULLIF` hands back its left argument, so its
+/// result type is that argument's, as the `=` it resolves takes it — neither is
+/// a fixed signature.
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Coalesce,
@@ -3583,8 +3599,6 @@ fn bind_window_call(
     }))
 }
 
-/// Bind the argument list of a dedicated window function. All three supported
-/// today take no arguments, so this only validates the arity.
 /// Whether a call site supplies exactly the arguments a dedicated window
 /// function takes. All three take none, so this is an empty `()`.
 ///
@@ -4359,9 +4373,9 @@ pub(crate) fn bind_ceil_floor(
 }
 
 /// If `func` is a top-level call to a set-returning function usable in the
-/// SELECT target list (currently `generate_series`), bind it to a
-/// [`BoundExpr::Srf`] marker. Returns `Ok(None)` when it is not such a call, so
-/// the caller can bind it as an ordinary scalar instead.
+/// SELECT target list (`generate_series`, `jsonb_path_query`, `unnest`), bind it
+/// to a [`BoundExpr::Srf`] marker. Returns `Ok(None)` when it is not such a
+/// call, so the caller can bind it as an ordinary scalar instead.
 pub(crate) fn bind_srf_projection(
     func: &ast::Function,
     scope: &Scope,

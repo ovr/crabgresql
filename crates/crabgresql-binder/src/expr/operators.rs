@@ -322,8 +322,10 @@ fn bind_binary_inner(
     // the symbol back to its native `BinaryOperator` and recurse so it reaches the
     // exact same path as the bare spelling (e.g. `~` -> `bind_regex`). A non-empty,
     // non-`pg_catalog` qualifier names no built-in operator, so it is reported as
-    // 42883 (PG additionally reports 3F000 when that schema does not exist, but the
-    // schema catalog is not reachable here, so both collapse to 42883).
+    // 42883.
+    // TODO: raise 3F000 `schema "x" does not exist` when the qualifier names no
+    // schema, as PG does; the schema catalog is not reachable from the binder
+    // scope, so that case collapses into the 42883 above.
     if let ast::BinaryOperator::PGCustomBinaryOperator(parts) = op {
         let symbol = match parts.as_slice() {
             [sym] => sym.as_str(),
@@ -440,7 +442,8 @@ fn bind_binary_inner(
 
     // bit/varbit bitwise (`& | #`) and shift (`<< >>`) operators also lower to
     // `ScalarFn` calls. Tried after the network path so an inet operand still
-    // wins; falls through so integer `&`/`|`/`<<` keep their error.
+    // wins; without a bit operand it falls through, so integer `&`/`|`/`<<`
+    // reach `resolve_int_bitwise_op` below.
     if let Some(binding) = resolve_bit_op(op, &lb, &rb)? {
         return Ok(binding);
     }
@@ -488,8 +491,9 @@ fn bind_binary_inner(
 
     // Integer bitwise (`& | #`) and shift (`<< >>`) operators. Deliberately the
     // last resolver: every spelling it claims is shared with the network, bit
-    // and geometric families above, and this one only fires on an integer left
-    // operand, so putting it here means it can never shadow them.
+    // and geometric families above, and this one never claims a typed
+    // non-integer left operand, so putting it here means it can never shadow
+    // them.
     if let Some(binding) = resolve_int_bitwise_op(op, &lb, &rb)? {
         return Ok(binding);
     }
@@ -567,8 +571,8 @@ pub(crate) fn bind_binary_op(
 
     // Mixed-type temporal arithmetic (`ts - ts`, `ts ± interval`, `interval ±
     // interval`, `interval * / number`) doesn't fit the single-`arg_ty` `Binary`
-    // node, so it lowers to a function call. Comparisons and same-type cases fall
-    // through to the generic path below.
+    // node, so it lowers to a function call. Comparisons, and combinations with
+    // no temporal operator at all, fall through to the generic path below.
     if let Some(binding) = resolve_temporal(op, &lb, &rb, op_span)? {
         return Ok(binding);
     }
@@ -758,7 +762,7 @@ fn unify_types(
     // Non-numeric implicit cast (e.g. `timestamp` -> `timestamptz`): when one
     // side implicitly casts to the other, compare in that common type, as PG
     // does (`tstz = timestamp`). Numeric pairs are already handled above, so
-    // this only fires for the datetime cast and never changes numeric results.
+    // this never changes numeric results.
     if implicit_castable(lty, rty) {
         return Ok((coerce_expr(left, rty)?, right, rty));
     }
@@ -1282,8 +1286,10 @@ fn operand_name(b: &Binding) -> &'static str {
 /// `operator does not exist: <left> <op> <right>` (42883) for the operator
 /// spellings that have no [`BinOp`] — the family resolvers' `@@`, `&&`, `<->`,
 /// `>>`, ... Shared so a mis-typed operand reports a missing operator instead of
-/// a cast failure from inside `coerce_expr`. Carries PG's HINT, as
-/// `custom_op_undefined` does for the `OPERATOR(...)` spelling.
+/// a cast failure from inside `coerce_expr`. Carries the DETAIL/HINT pair PG
+/// attaches when the operator name exists but no candidate accepts these
+/// operands; `custom_op_undefined` owns the other case, where the name itself is
+/// unknown.
 fn undefined_binary_operator(lb: &Binding, op: &ast::BinaryOperator, rb: &Binding) -> BindError {
     undefined_operator_error(format!(
         "operator does not exist: {} {op} {}",
@@ -1318,11 +1324,11 @@ fn custom_op_undefined(
         _ => op.to_string(),
     };
     // A different DETAIL from the type-mismatch sites, and no HINT: nothing here
-    // names an operator that exists, so there are no casts to suggest. (PG
-    // splits this further — a symbol that exists in another schema gets "An
-    // operator of that name exists, but it is not in the search_path." — but
-    // that needs an operator catalog we do not have, so both collapse here, as
-    // the SQLSTATE already does.)
+    // names an operator that exists, so there are no casts to suggest.
+    // TODO: emit PG's "An operator of that name exists, but it is not in the
+    // search_path." DETAIL for a symbol defined in another schema — that needs
+    // an operator catalog, so both cases collapse onto the DETAIL below, as the
+    // SQLSTATE already does.
     BindError::new(
         sqlstate::UNDEFINED_FUNCTION,
         format!(
@@ -1388,7 +1394,7 @@ fn resolve_network_op(
 
     // Containment / overlap (`<<` `>>` `&&`) and bitwise (`&` `|`) take two
     // inet-family operands (result bool / inet). Without any net operand, fall
-    // through so integer `&`/`|`/`<<` still error as before.
+    // through so integer `&`/`|`/`<<` reach `resolve_int_bitwise_op`.
     let net_net = match op {
         B::PGBitwiseShiftLeft => Some((ScalarFn::NetworkContainedBy, PgType::Bool)),
         B::PGBitwiseShiftRight => Some((ScalarFn::NetworkContains, PgType::Bool)),
@@ -1529,7 +1535,7 @@ fn resolve_geometric_combo(
     };
     let combo = (left_ty, right_ty);
     match op {
-        // Distance — point↔point, point↔lseg, lseg↔lseg.
+        // Distance (`<->`).
         B::LtDashGt => match combo {
             (Point, Point) => call(
                 geo(GeoFn::PointDist),
@@ -1752,8 +1758,11 @@ fn resolve_geometric_combo(
             PgType::Bool,
             vec![l(Path)?, r(Path)?],
         ),
-        // `##` closest point: the result lies on the 2nd operand, except for
-        // `line ## lseg`, where it lies on the segment.
+        // `##` closest point: the answer sits on the 2nd operand — for
+        // `line ## lseg` that is the segment, not the infinite line. The box
+        // pairs are the exception: when the operands overlap, `lseg ## box`
+        // answers the segment point nearest the box centre and `point ## box`
+        // the point itself, as PG does.
         B::DoubleHash => match combo {
             (Point, Lseg) => call(
                 geo(GeoFn::ClosePointSeg),
@@ -2830,8 +2839,6 @@ fn resolve_macaddr_op(
     })))
 }
 
-/// Materialize an operand at `target`: an untyped literal is parsed as `target`,
-/// a typed operand is coerced (used for the numeric `* /` factor → float8).
 /// Lower `jsonb @? jsonpath` / `jsonb @@ jsonpath` to the silent jsonpath query
 /// functions. Uses the dedicated `ExistsOp`/`MatchOp` variants (a 2-arg,
 /// always-silent form) rather than the STRICT `jsonb_path_exists`/`_match`
@@ -2998,9 +3005,12 @@ fn resolve_ts_op(
             // @@ 'hello'::tsquery` is `to_tsvector('Hello World') @@ …`, which
             // is true. Parsing the literal as a tsvector instead would answer
             // false, and look like a real answer. Both that and an explicit
-            // `text` operand need a text search configuration, a later rung, so
-            // report the honest 0A000 rather than a wrong boolean or a 42883
-            // that would deny an operator PG really has.
+            // `text` operand need a text search configuration, so report the
+            // honest 0A000 rather than a wrong boolean or a 42883 that would
+            // deny an operator PG really has.
+            // TODO: add text search configurations (`to_tsvector`) so a `text`
+            // or untyped operand on the vector side of `@@` binds instead of
+            // raising 0A000.
             if vec_t.is_none() || vec_t.is_some_and(is_text_family) {
                 return Err(BindError::feature_not_supported(
                     "text @@ tsquery is not supported yet: it requires a text search \

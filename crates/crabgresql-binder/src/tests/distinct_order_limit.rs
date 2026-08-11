@@ -272,7 +272,9 @@ fn values_order_by_column_name_resolves() -> anyhow::Result<()> {
 #[test]
 fn values_order_by_expression_stays_0a000() -> anyhow::Result<()> {
     // A standalone VALUES list has no projection tuple to hang a hidden
-    // column on, so expression sort keys are still unsupported.
+    // column on.
+    // TODO: bind expression sort keys over a standalone VALUES list — PG
+    // answers `VALUES (3), (1) ORDER BY column1 + 1` with 1, 3.
     let e = bind_err("VALUES (3), (1) ORDER BY column1 + 1")?;
     assert_eq!(e.code, "0A000");
     Ok(())

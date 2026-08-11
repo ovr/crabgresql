@@ -127,7 +127,9 @@ struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     type_name: &'a str,
-    /// Whether the target is `jsonb` (which rejects ``) vs `json`.
+    /// Whether a decoded `\u0000` escape must be rejected because the result
+    /// becomes a `text` datum: true for `jsonb` input, and also for
+    /// `json_as_text` on a `json` string.
     is_jsonb: bool,
     /// Current container nesting depth, bounded by [`MAX_DEPTH`].
     depth: usize,

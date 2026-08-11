@@ -5,10 +5,11 @@
 //! `ParameterStatus`, and the SQLSTATE of each rejection — pinned by
 //! differential tests against real PG.
 //!
-//! One table drives all four consumers: the startup `ParameterStatus` burst,
-//! `SET`, `RESET`, and `SHOW`. Keeping them in a single list is what stops the
-//! startup report and `SHOW` from drifting apart, which is exactly what happened
-//! while the startup list was a hardcoded `const` disconnected from `Session`.
+//! One table drives every consumer: the startup `ParameterStatus` burst, `SET`,
+//! `RESET`, `SHOW`/`SHOW ALL`, `pg_settings`, and `current_setting()`. Keeping
+//! them in a single list is what stops the startup report and `SHOW` from
+//! drifting apart, which is exactly what happened while the startup list was a
+//! hardcoded `const` disconnected from `Session`.
 //!
 //! Two deliberate divergences from PG, both to avoid regressing working
 //! clients:
@@ -174,8 +175,8 @@ const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL V
 
 /// Every parameter this server models, **sorted by name case-insensitively** —
 /// the order PostgreSQL's `pg_show_all_settings` returns, and therefore the
-/// order both `SHOW ALL` and `pg_settings` inherit for free. `gucs_are_sorted`
-/// below fails if an entry is appended out of place.
+/// order both `SHOW ALL` and `pg_settings` inherit for free.
+/// `gucs_are_sorted_by_name` below fails if an entry is appended out of place.
 ///
 /// The name order is the only grouping: the read-only reported constants
 /// (`server_version`, `server_encoding`, `integer_datetimes`, …) are scattered

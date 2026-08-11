@@ -3,9 +3,12 @@
 //! upstream `expected/*.out` files byte for byte.
 //!
 //! The rules are derived from psql's observable output in the vendored
-//! expected files. Known gaps, acceptable while no passing test needs them:
-//! wide-character display widths, and psql's truncation of long `LINE n:`
-//! excerpts.
+//! expected files.
+//!
+//! TODO: measure widths in display columns instead of characters — both table
+//! column widths and the `LINE n:` excerpt window — so wide characters (CJK,
+//! combining marks) line up the way psql aligns them. Acceptable while no
+//! passing test needs it.
 
 use crate::client::{ErrorFields, Field};
 
@@ -13,7 +16,7 @@ use crate::client::{ErrorFields, Field};
 /// xid, cid, float4, float8, money, numeric, xid8.
 const RIGHT_ALIGNED_OIDS: &[u32] = &[20, 21, 23, 26, 28, 29, 700, 701, 790, 1700, 5069];
 
-/// psql's `printQueryOpt`, as far as the corpus exercises it: what `\pset`,
+/// psql's output settings, as far as the corpus exercises them: what `\pset`,
 /// `\x`, `\a` and `\t` change about a result table.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Printing {
@@ -389,7 +392,7 @@ pub fn format_notice(notice: &ErrorFields, query: &str) -> String {
     out
 }
 
-/// Deterministic stand-in for psql metacommands, which the runner does not
+/// Deterministic stand-in for the psql metacommands the runner does not
 /// implement. `name` is the command name the lexer sliced off, without the
 /// leading backslash.
 pub fn metacommand_stub(name: &str) -> String {
@@ -403,11 +406,12 @@ fn push_field(out: &mut String, label: &str, value: Option<&str>) {
 }
 
 /// `LINE n: <query line>` and a caret under the cursor, where `position` is a
-/// 1-based character offset over the whole query text. Ports libpq's
-/// `reportErrorPosition` (fe-protocol3.c), including its truncation of an
-/// over-long line to a 60-column window with leading/trailing `...`. Screen
-/// columns are taken as character counts — the wide-character display-width gap
-/// noted in the module docs; the regression corpus is single-byte here.
+/// 1-based character offset over the whole query text. Reproduces the excerpt
+/// libpq prints for an error position, including its truncation of an
+/// over-long line to a 60-column window with leading/trailing `...`
+/// (`float4.out:493`). Screen columns are taken as character counts — the
+/// wide-character display-width gap noted in the module docs; the regression
+/// corpus is single-byte here.
 fn position_excerpt(query: &str, position: usize) -> String {
     const DISPLAY_SIZE: usize = 60; // screen width limit, in columns
     const MIN_RIGHT_CUT: usize = 10; // keep at least this far from EOL
@@ -750,8 +754,10 @@ mod tests {
 
     /// `CREATE TABLE t(); INSERT INTO t DEFAULT VALUES; SELECT * FROM t;`
     /// yields a row with no columns, which must not underflow the width index.
-    /// The rule line is still narrower than psql's `--`, but that is a diff
-    /// rather than a panic that takes the whole run down.
+    /// TODO: match psql's zero-column output — a `--` rule and the footer, with
+    /// no blank header or row line (`alter_table.out:1624`). The blank lines
+    /// rendered here are a diff rather than a panic that takes the whole run
+    /// down.
     #[test]
     fn zero_column_result_with_rows() {
         let out = format_table(&Printing::default(), &[], &[vec![]]);

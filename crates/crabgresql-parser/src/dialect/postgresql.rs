@@ -48,7 +48,8 @@ const AT_TZ_PREC: u8 = 110;
 const CARET_PREC: u8 = 100;
 const MUL_DIV_MOD_OP_PREC: u8 = 90;
 const PLUS_MINUS_PREC: u8 = 80;
-// there's no XOR operator in PostgreSQL, but support it here to avoid breaking tests
+// PostgreSQL has no `XOR` operator, but the shared expression parser accepts
+// the keyword under every dialect, so `prec_value` still has to answer for it.
 const XOR_PREC: u8 = 75;
 const PG_OTHER_PREC: u8 = 70;
 const BETWEEN_LIKE_PREC: u8 = 60;

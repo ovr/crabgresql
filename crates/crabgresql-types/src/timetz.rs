@@ -14,13 +14,13 @@
 //! A missing zone takes the offset the session zone is at on the transaction's
 //! date — see [`crate::FmtCtx::zone_offset_today`].
 //!
-//! One further deviation from PG, acceptable while no passing test needs it: a
-//! zone-backed abbreviation (`MSK`, `VET`) needs a date here, because we resolve
-//! it through its reference zone. PG additionally knows *when that zone used
-//! that abbreviation*, so it can answer `'15:36:39 MSK'` with the zone's
-//! standard offset and no date at all — `15:36:39+03`, where we raise `22007`.
-//! The set of affected tokens is whichever abbreviations `crate::tz` maps to a
-//! reference zone, so adding one for another reader's sake widens this too;
+//! TODO: accept a zone-backed abbreviation (`MSK`, `VET`) with no date. We
+//! resolve such an abbreviation through its reference zone, which needs a date;
+//! PG additionally knows *when that zone used that abbreviation*, so it answers
+//! `'15:36:39 MSK'` with the zone's standard offset and no date at all —
+//! `15:36:39+03`, where we raise `22007`. The set of affected tokens is
+//! whichever abbreviations `crate::tz` maps to a reference zone, so adding one
+//! for another reader's sake widens this too;
 //! `zone_tokens_resolve_or_fail_like_pg` pins the current list.
 
 use crate::Numeric;
@@ -101,7 +101,7 @@ pub fn format(v: TimeTz) -> String {
 /// without one. Every token is accounted for: an unrecognized trailing word is
 /// `22007`, never silently ignored.
 ///
-/// A missing offset takes `session`'s, so `'03:30'::timetz` and
+/// A missing offset takes the session zone's, so `'03:30'::timetz` and
 /// `'03:30'::time::timetz` agree — PG resolves both through the session zone
 /// too, and having only one of them do it made the same value compare unequal
 /// to itself.

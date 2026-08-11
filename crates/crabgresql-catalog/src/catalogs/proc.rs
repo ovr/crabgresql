@@ -129,19 +129,26 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
 /// The `pg_proc` rows for the routines this server holds, appended after
 /// [`pg_proc_builtin_rows`].
 ///
-/// Honest for everything the catalog actually knows. The stubs are the columns
-/// nothing here can have an opinion about yet, each set to PostgreSQL's own
-/// default rather than to zero: `procost`/`prorows` (no planner cost model),
-/// `provariadic`/`pronargdefaults` (VARIADIC and argument defaults are
-/// rejected), `prosupport`/`proleakproof`/`proparallel`. `probin` is NULL
-/// honestly — there are no C functions.
+/// Honest for everything the catalog actually knows. `probin` is NULL because
+/// nothing here is a C function, and `prosupport` is 0 because a user routine
+/// has no planner support function — settled, not gaps. `procost`, `prorows`
+/// and `proparallel` carry PostgreSQL's own default rather than a zero stub,
+/// so they read as they would for a `CREATE FUNCTION` that named no such
+/// clause.
+///
+/// TODO: carry `COST`/`ROWS`/`PARALLEL` into [`CatalogRoutine`] so
+/// `procost`/`prorows`/`proparallel` report what the routine declared —
+/// `CREATE FUNCTION` parses no `COST`/`ROWS` clause at all and drops the
+/// `PARALLEL` it does parse, so one created `PARALLEL SAFE` reports `u`.
+/// TODO: fill `provariadic`/`pronargdefaults` once `VARIADIC` parameters and
+/// argument defaults are accepted; `CREATE FUNCTION` rejects both, so 0 is
+/// exact until then.
 pub(crate) fn pg_proc_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let mut rows = pg_proc_builtin_rows();
     rows.extend(user_rows(cat.routines(), cat.namespace_oids()));
     rows
 }
 
-/// The rows for the routines this server holds, appended after the built-ins.
 fn user_rows(
     routines: &[CatalogRoutine],
     namespace_oids: &HashMap<String, u32>,

@@ -22,6 +22,9 @@
 //! does not model keeps its own `0A000` rather than being called nonexistent. A
 //! `reg*` name needs a catalog outright, so [`TypeSpec`] is public for the
 //! executor to finish that one itself.
+//!
+//! TODO: resolve `CREATE TYPE` names through a catalog, so a user enum is
+//! validated instead of raising `42704` as a name that denotes nothing.
 
 use std::rc::Rc;
 
@@ -407,8 +410,8 @@ mod tests {
     /// own 0A000, rather than being relabelled as a type that does not exist —
     /// so the feature-gap signal survives.
     ///
-    /// A bare name the parser hands over as `Custom` (`box`, `xml`) cannot be
-    /// told apart from a typo without a catalog, and stays 42704.
+    /// A bare name the parser hands over as `Custom` (`xml`, `aclitem`) cannot
+    /// be told apart from a typo without a catalog, and stays 42704.
     #[test]
     fn unmodelled_spec_keeps_its_not_supported_error() {
         assert_eq!(

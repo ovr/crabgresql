@@ -35,7 +35,10 @@ pub enum LogicalPlan {
     Query(QueryPlan),
     /// Union scan over the several relations one FROM item names.
     Append(AppendPlan),
-    /// A `UNION` / `UNION ALL` (and, once supported, the other set operations).
+    /// A `UNION` / `UNION ALL`.
+    ///
+    /// TODO: also represent `INTERSECT` and `EXCEPT`, which the binder rejects
+    /// as unsupported.
     SetOp(SetOpPlan),
     /// SELECT over a subquery source in FROM, and the binder's general
     /// same-level projection wrapper.

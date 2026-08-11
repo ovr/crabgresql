@@ -137,7 +137,9 @@ pub(crate) fn pg_roles_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Text(MASKED_PASSWORD.to_string()),
                 Value::Null,
                 Value::Bool(r.bypassrls),
-                // `ALTER ROLE … SET` is unsupported, so no per-role GUCs exist.
+                // TODO: `ALTER ROLE … SET`, which is what would put a per-role
+                // GUC here; with no statement that sets one, `rolconfig` (and
+                // `useconfig` below) can only be NULL.
                 Value::Null,
                 Value::Oid(r.oid),
             ]

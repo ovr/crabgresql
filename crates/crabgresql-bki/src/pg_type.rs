@@ -121,7 +121,7 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
         out.push_str(&array.emit());
     }
     out.push_str("];\n");
-    let _ = writeln!(out); // trailing newline
+    let _ = writeln!(out);
     out
 }
 
@@ -192,9 +192,10 @@ typinput: {typinput}, typoutput: {typoutput}, typreceive: {typreceive}, \
 typsend: {typsend}, typmodin: {typmodin}, typmodout: {typmodout}, \
 typanalyze: {typanalyze}, typalign: {typalign:?}, typstorage: {typstorage:?}, \
 typcollation: {typcollation} }},\n",
-            // typrelid references a catalog relation's pg_class OID, which we do
-            // not codegen yet — 0 until pg_class OIDs are available (only the
-            // handful of catalog composite types carry a nonzero value).
+            // TODO: emit typrelid for the handful of catalog composite types,
+            // which needs the pg_class OID of the relation `pg_type.dat` names
+            // for them; this codegen resolves type and function names, never a
+            // relation. 0 is the right answer for every other type.
             typrelid = 0,
         )
     }

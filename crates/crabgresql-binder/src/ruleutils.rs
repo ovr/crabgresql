@@ -16,12 +16,21 @@
 //!
 //! # Scope
 //!
-//! This is deliberately **partial**. It renders faithfully the constructs the
-//! regression suites exercise — a `SELECT` list with aliases, `FROM`, `WHERE`,
-//! `GROUP BY`/`HAVING`, `ORDER BY`, and the expression forms below — and falls
-//! back to the parser's own `Display` for anything else. The fallback is
-//! syntactically valid SQL but is *not* guaranteed to match PostgreSQL byte for
-//! byte, so extend the match arms rather than relying on it.
+//! It renders faithfully the constructs the regression suites exercise — a
+//! `SELECT` list with aliases, `FROM`, `WHERE`, `GROUP BY`/`HAVING`,
+//! `ORDER BY`, and the expression forms below — and falls back to the parser's
+//! own `Display` for anything else it reaches. The fallback is syntactically
+//! valid SQL but is *not* guaranteed to match PostgreSQL byte for byte, so
+//! extend the match arms rather than relying on it.
+//!
+//! TODO: give the constructs outside that set their own match arms, so nothing
+//! reaches the `Display` fallback and every definition is byte-identical to
+//! `pg_get_viewdef`.
+//!
+//! TODO: render the parts that are dropped rather than fallen back on, since a
+//! definition missing them no longer means what the view does: the `WITH`
+//! list, `DISTINCT`, `LIMIT`/`OFFSET` and the `WINDOW` clause of the query,
+//! and `DISTINCT`, `FILTER` and `OVER` on a function call.
 
 use std::sync::Arc;
 
@@ -72,7 +81,8 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
     }
     if let Some(having) = &select.having {
         // One space, not two: PG right-aligns the clause keyword under `SELECT`,
-        // and `HAVING` is a letter longer than `WHERE`/`GROUP BY`/`ORDER BY`.
+        // and `HAVING` is a letter longer than the `WHERE`, `GROUP` and `ORDER`
+        // that end in the same column.
         out.push_str(&format!("\n HAVING {}", top_expr(having, cx)));
     }
     if let Some(order_by) = &query.order_by
@@ -238,8 +248,11 @@ fn zoned_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Optio
 /// instead of resolving its type from the comparison — so `CHECK (b <>
 /// '\x0061')` is stored as `'\x0061'::text` and arrives here typed `text`. That
 /// mislabelling is type-general (a `date` constant in a CHECK prints `::text`
-/// too, where PG prints `::date`) and predates this function; fixing it means
-/// resolving operand types during the deparse walk, not widening the match here.
+/// too, where PG prints `::date`) and predates this function.
+///
+/// TODO: resolve operand types during the deparse walk so a literal in a CHECK
+/// carries the type its comparison gives it (`::bytea`, `::date`) instead of
+/// `::text`; widening the match here would not reach it.
 fn bytea_constant(inner: &ast::Expr, data_type: &ast::DataType, cx: Cx) -> Option<String> {
     let fmt = cx.zone?;
     if PgType::from_name(&type_name(data_type))? != PgType::Bytea {
@@ -364,10 +377,10 @@ fn from_item(from: &ast::TableWithJoins, _cx: Cx) -> String {
     if from.joins.is_empty() {
         table_factor(&from.relation)
     } else {
-        // A join keeps the parser's rendering: PG's parenthesised, indented
-        // shape is not reproduced here. Note it is emitted *verbatim* — folding
-        // the case of the whole clause would rewrite quoted identifiers and the
-        // contents of string literals inside the `ON`, turning a merely
+        // TODO: render a join in PG's parenthesised, indented shape; it keeps
+        // the parser's rendering instead. Note it is emitted *verbatim* —
+        // folding the case of the whole clause would rewrite quoted identifiers
+        // and the contents of string literals inside the `ON`, turning a merely
         // non-canonical rendering into SQL that no longer means the same thing.
         from.to_string()
     }
@@ -670,8 +683,9 @@ fn interval_literal(iv: &ast::Interval) -> String {
         },
         other => return format!("{other}"),
     };
-    // A qualified form (`INTERVAL '1' DAY`) has field information we do not
-    // re-render; fall back to the parser's shape rather than lose it.
+    // TODO: re-render a qualified form (`INTERVAL '1' DAY`) as an interval
+    // constant; its field information has no rendering here, so fall back to
+    // the parser's shape rather than lose it.
     if iv.leading_field.is_some() || iv.last_field.is_some() {
         return ast::Expr::Interval(iv.clone()).to_string();
     }

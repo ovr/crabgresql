@@ -14,14 +14,14 @@
 //! backing store differ; visibility is identical.
 //!
 //! An attribute too wide to keep on a page is stored out of line in a per-table
-//! chunk relation ([`toast`]); compression is not implemented, so a value goes
-//! out of line where PostgreSQL would first try to compress it inline.
+//! chunk relation ([`toast`]).
 //!
-//! Deliberately deferred to keep this first cut tractable (all documented in
-//! `docs/ARCHITECTURE.md §3`): a durable SLRU CLOG and checkpoint-bounded
-//! recovery (recovery replays the whole WAL), full-page writes / torn-page
-//! protection beyond page checksums, WAL segment recycling, and a transactional
-//! relation catalog.
+//! TODO: compress a wide attribute inline before storing it out of line —
+//! PostgreSQL tries compression first, so a value goes out of line here that it
+//! would keep on the page.
+//!
+//! TODO: full-page writes / torn-page protection beyond page checksums, WAL
+//! segment recycling, and a transactional relation catalog.
 
 mod analyze;
 mod btkey;
@@ -105,10 +105,10 @@ pub(crate) struct EngineInner {
     /// Uncommitted relfilenode-swap TRUNCATEs, keyed by the truncating XID:
     /// which tables it truncated, as `(namespace, name)` so temp tables (in a
     /// `pg_temp_N` namespace) resolve correctly, not just `public` ones. This is an
-    /// O(1) commit-time index (review finding #10) — the alternative, scanning
-    /// every table for a matching pending XID on every commit, is O(tables). The
-    /// commit/abort hook drains an XID's entry to apply or discard its swaps and
-    /// release the table locks.
+    /// O(1) commit-time index — the alternative, scanning every table for a
+    /// matching pending XID on every commit, is O(tables). The commit/abort hook
+    /// drains an XID's entry to apply or discard its swaps and release the table
+    /// locks.
     ///
     /// Emphatically NOT a durability signal, though it looks like one: it is
     /// drained at the *top* of the commit hook, before the swap it describes is
@@ -830,11 +830,6 @@ impl PgEngine {
         self.buffer_redo.discard_unclaimed();
     }
 
-    /// Flush all dirty pages to their relation files (obeying the write-ahead
-    /// rule) and record a **running** (not-cleanly-shut-down) control file, so a
-    /// crash after this leaves `clean_shutdown = false` and the next startup resets
-    /// unlogged relations. A clean exit calls [`TableEngine::shutdown`], which marks
-    /// it clean instead.
     /// Hand the engine the transaction service its storage-maintenance work
     /// needs, once.
     ///
@@ -940,6 +935,11 @@ impl PgEngine {
         self.vacuum_table(namespace, name, txnmgr.reclaim_horizon())
     }
 
+    /// Flush all dirty pages to their relation files (obeying the write-ahead
+    /// rule) and record a **running** (not-cleanly-shut-down) control file, so a
+    /// crash after this leaves `clean_shutdown = false` and the next startup resets
+    /// unlogged relations. A clean exit calls [`TableEngine::shutdown`], which marks
+    /// it clean instead.
     pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
         self.log_pool_stats();
         self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
@@ -972,9 +972,11 @@ impl PgEngine {
     ///
     /// Every reason here is state whose only durable trace is a WAL record, so a
     /// redo point above it would skip the very record that rebuilds it. Each one
-    /// currently costs a whole-stream replay rather than a clamp to the record's
-    /// own LSN: tracking a real per-item LSN is the refinement
-    /// (`docs/ARCHITECTURE.md`, the per-buffer min/max LSN paragraph), and it is a
+    /// costs a whole-stream replay rather than a clamp to the record's own LSN.
+    ///
+    /// TODO: track a per-item LSN, so a reason here clamps the redo point to that
+    /// record's own LSN instead of forcing a whole-stream replay
+    /// (`docs/ARCHITECTURE.md`, the per-buffer min/max LSN paragraph); it is a
     /// change to this function's body and nothing else.
     ///
     /// Must be called only *after* [`Wal::redo_point`] has returned. It takes the
@@ -1040,7 +1042,7 @@ impl PgEngine {
     ///    pass carry an LSN below the redo point, leaving it neither written back
     ///    nor replayed. The sample is also durable on return, which matters because
     ///    recovery hard-errors on a start past end-of-file.
-    /// 2. Clamp it to whatever [`PgEngine::redo_floor`] still needs replayed —
+    /// 2. Clamp it to whatever [`PgEngine::redo_clamp`] still needs replayed —
     ///    after the sample, never while holding the barrier.
     /// 3. and 4. Pages, then the commit log: this is what turns "below the redo
     ///    point" into "on disk".
@@ -1955,11 +1957,12 @@ impl TableEngine for PgEngine {
             };
             // Also reclaim any files staged by an in-flight TRUNCATE on this table
             // — the heap's and every index's (their new relfilenodes live on the
-            // handle, not the catalog) — so dropping the table doesn't leak
-            // them. Concurrent DROP vs another
-            // session's uncommitted TRUNCATE is not otherwise synchronized — full
-            // serialization needs transactional DDL, which is deferred; the losing
-            // side's staged file is caught here or by `gc_orphan_relfiles`.
+            // handle, not the catalog) — so dropping the table doesn't leak them.
+            // A DROP racing another session's uncommitted TRUNCATE is not
+            // otherwise synchronized; the losing side's staged file is caught here
+            // or by `gc_orphan_relfiles`.
+            // TODO: transactional DDL, so a DROP is fully serialized against
+            // another session's uncommitted TRUNCATE of the same table.
             let dropped = tables.get(&key).cloned();
             let staged = dropped
                 .as_deref()
@@ -2083,8 +2086,9 @@ impl TableEngine for PgEngine {
         // it mid-life would leave one relation's fragments disagreeing about
         // whether a field is required. Reads do not care (`scan_schema` forces
         // every field nullable), but the footer is a claim an outside Parquet
-        // reader will act on, so it deserves its own change rather than riding
-        // along with this one.
+        // reader will act on.
+        // TODO: accept SET NOT NULL on a Parquet or Buffer relation, reconciling
+        // the nullability its already-written fragment footers claim.
         let ManagedTable::Heap(heap) = target.as_ref() else {
             let method = target.schema().access_method.as_str();
             return Err(StorageError::UnsupportedOperation(format!(
@@ -2767,8 +2771,7 @@ mod test_support {
 
     /// A fully-wired durable [`PgEngine`] over a throwaway temp directory, plus its
     /// WAL-backed [`TransactionManager`]. The directory is deleted when this is
-    /// dropped, so each test that builds one is isolated. Replaces the old
-    /// in-memory reference engine in downstream tests.
+    /// dropped, so each test that builds one is isolated.
     pub struct Ephemeral {
         engine: Arc<PgEngine>,
         txnmgr: Arc<TransactionManager>,

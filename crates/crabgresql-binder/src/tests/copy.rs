@@ -2,8 +2,8 @@
 
 use super::common::*;
 
-/// Bind a `COPY … FROM stdin` the way the server does, so the fast-path gate
-/// can be inspected from a test.
+/// Bind a `COPY … FROM stdin` the way the server does, so a test starts from
+/// the same `CopyFromPlan` a real load builds its rows against.
 fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> anyhow::Result<CopyFromPlan> {
     let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
     let stmts = crabgresql_parser::parse(sql)

@@ -13,8 +13,10 @@ use crate::cols::*;
 /// indistinguishable to a client reading it.
 ///
 /// `generic_plans` and `custom_plans` count how each execution was planned.
-/// Every execution re-plans here, so the first is always 0 and the second is the
-/// execution count — there is no plan cache to choose between.
+/// Every execution re-plans here, so the session splits the count by the
+/// statement's shape instead of by a plan cache's choice: a parameterless
+/// statement counts as generic (PostgreSQL calls it generic from its first
+/// execution too), a parameterized one as custom.
 pub(crate) fn pg_prepared_statements_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_prepared_statements",

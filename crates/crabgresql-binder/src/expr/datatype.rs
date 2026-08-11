@@ -96,8 +96,6 @@ pub(crate) fn has_equality(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
     matches!(ty, PgType::Xid) || is_orderable(ty, catalog)
 }
 
-/// Map a SQL type name to a `PgType`. Shared by cast/typed-string binding and
-/// server-side CREATE TABLE.
 /// The built-in a type *spelling* denotes under PG's type-name grammar, or
 /// `None` if it names no built-in.
 ///
@@ -112,6 +110,8 @@ pub fn builtin_type_from_syntax(s: &str) -> Option<PgType> {
     map_data_type(&dt).ok()
 }
 
+/// Map a SQL type name to a `PgType`. Shared by cast/typed-string binding and
+/// server-side CREATE TABLE.
 pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
     use ast::DataType;
     Ok(match dt {
@@ -129,22 +129,22 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
         },
         DataType::Numeric(_) | DataType::Decimal(_) => PgType::Numeric,
         DataType::Bytea => PgType::Bytea,
-        // `date`.
         DataType::Date => PgType::Date,
-        // `time` / `time with time zone` (the precision modifier is accepted and
-        // ignored; full microsecond resolution is kept).
+        // `time` / `time with time zone`. The precision modifier is not part of
+        // the type itself; `datetime_precision` reads it back out of the name
+        // and the coercion rounds to it.
         DataType::Time(_, tz) => match tz {
             ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone => PgType::Time,
             ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => PgType::TimeTz,
         },
-        // `timestamp` / `timestamp with time zone` (the precision modifier is
-        // ignored; full microsecond resolution is kept).
+        // `timestamp` / `timestamp with time zone`; the precision modifier is
+        // read separately, as for `time` above.
         DataType::Timestamp(_, tz) => match tz {
             ast::TimezoneInfo::None | ast::TimezoneInfo::WithoutTimeZone => PgType::Timestamp,
             ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => PgType::TimestampTz,
         },
-        // `interval` (any field qualifier / precision is accepted and ignored;
-        // full resolution is kept, as with `timestamp(2)`).
+        // `interval`; the field qualifier and the precision are read back out
+        // of the name by `interval_typmod`, which packs both into one modifier.
         DataType::Interval { .. } => PgType::Interval,
         DataType::Uuid => PgType::Uuid,
         DataType::Inet => PgType::Inet,
@@ -191,8 +191,10 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
             };
             let elem = map_data_type(inner)?;
             // Only element types this build has an array type for are supported;
-            // this also rejects multi-dimensional arrays (an array element type),
-            // which are not modeled yet.
+            // this also rejects an array element type, i.e. a multi-dimensional
+            // array.
+            // TODO: support multi-dimensional array declarations such as
+            // `int4[][][]`, which PG accepts (upstream `arrays` regress test).
             if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
                 return Err(BindError::feature_not_supported(format!(
                     "type \"{dt}\" is not supported yet"
@@ -496,8 +498,11 @@ pub fn checked_length_typmod(dt: &ast::DataType) -> Result<Option<i32>, BindErro
 ///
 /// PostgreSQL warns and clamps rather than rejecting a larger modifier
 /// (`TIMESTAMP(7) precision reduced to maximum allowed, 6`), and since the
-/// clamped value is what it then stores, the only divergence here is the missing
-/// warning. A negative modifier never reaches this: the grammar rejects it.
+/// clamped value is what it then stores, the clamping matches. A negative
+/// modifier never reaches this: the grammar rejects it.
+///
+/// TODO: emit the `precision reduced to maximum allowed` WARNING that PG
+/// raises alongside the clamp.
 pub fn datetime_precision(dt: &ast::DataType) -> Option<i32> {
     use ast::DataType;
     let p = match dt {

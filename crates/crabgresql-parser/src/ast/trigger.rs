@@ -121,9 +121,10 @@ impl fmt::Display for TriggerEvent {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum TriggerPeriod {
-    /// The trigger fires once for each row affected by the triggering event
+    /// A bare `FOR` written where a period is expected, as in
+    /// `CREATE TRIGGER t FOR INSERT ON tbl ...`
     For,
-    /// The trigger fires once for the triggering SQL statement
+    /// The trigger fires after the triggering event
     After,
     /// The trigger fires before the triggering event
     Before,
@@ -161,7 +162,7 @@ impl fmt::Display for TriggerExecBodyType {
         }
     }
 }
-/// This keyword immediately precedes the declaration of one or two relation names that provide access to the transition relations of the triggering statement
+/// The `{ FUNCTION | PROCEDURE } name(args)` body of a trigger's `EXECUTE` clause
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]

@@ -196,7 +196,6 @@ fn is_pg_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
 }
 
-/// The value of `c` as a digit in `radix`, or `None` if it is not one.
 fn digit_val(c: u8, radix: u32) -> Option<u32> {
     let v = match c {
         b'0'..=b'9' => (c - b'0') as u32,
@@ -344,7 +343,8 @@ mod tests {
             dec(&format!("0x{}", "F".repeat(33)))?,
             "5444517870735015415413993718908291383295"
         );
-        // Base 10 takes the digits as written, separators and all.
+        // Base 10 takes the digits as written: separators drop out, but the
+        // run is not renormalized, so leading zeros survive.
         assert_eq!(dec("1_000")?, "1000");
         assert_eq!(dec("007")?, "007");
         assert_eq!(scan_int_literal_decimal("0x"), Err(ScanError::Syntax));

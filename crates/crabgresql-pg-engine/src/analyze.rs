@@ -5,19 +5,20 @@
 //!
 //! PostgreSQL samples: it reads `300 × default_statistics_target` rows drawn
 //! from randomly chosen blocks and extrapolates. This implementation **reads
-//! every row instead**, so [`SampleTarget::target_rows`] is recorded but not yet
-//! honored. The trade is deliberate for now:
+//! every row instead**, so [`SampleTarget::target_rows`] is recorded but not
+//! honored. Reading everything buys two things:
 //!
 //! - the result is exact, so `reltuples` is a count rather than an estimate;
 //! - it is deterministic, which is what makes the statistics testable at all —
 //!   a sampled `n_distinct` cannot be asserted, a counted one can.
 //!
-//! The cost is that `ANALYZE` on a large relation is O(rows) rather than
-//! O(sample). Swapping in the two-stage sampler is a change to
-//! [`analyze_heap`]'s body alone: build it on [`crate::heap::HeapTable`]'s
-//! block-at-a-time scan (which already captures the block count up front and
-//! holds the relation against a concurrent TRUNCATE), not on `TableAm::scan`,
-//! which yields tuples and so loses the block boundary the extrapolation needs.
+//! TODO(perf): draw `target_rows` rows from randomly chosen blocks instead of
+//! reading every row — `ANALYZE` on a large relation is O(rows) rather than
+//! O(sample). The two-stage sampler is a change to [`analyze_heap`]'s body
+//! alone: build it on [`crate::heap::HeapTable`]'s block-at-a-time scan (which
+//! already captures the block count up front and holds the relation against a
+//! concurrent TRUNCATE), not on `TableAm::scan`, which yields tuples and so
+//! loses the block boundary the extrapolation needs.
 
 use crabgresql_storage_api::{RelStats, TableAm};
 use crabgresql_txn::TxnContext;
@@ -31,7 +32,8 @@ pub const DEFAULT_STATISTICS_TARGET: usize = 100;
 /// How large a sample `ANALYZE` should draw.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleTarget {
-    /// Rows to sample. Recorded but not yet honored — see the module docs.
+    /// Rows to sample. TODO: honor this — [`analyze_heap`] reads every row
+    /// instead of sampling (see the module docs).
     pub target_rows: usize,
 }
 

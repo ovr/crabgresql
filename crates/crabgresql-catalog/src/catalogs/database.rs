@@ -13,7 +13,7 @@ use crate::oids::*;
 ///
 /// `datacl` (`aclitem[]`) is omitted: no `GRANT` exists to populate it, and
 /// `aclitem` is not a type this build models. Same reasoning as `pg_type.typacl`
-/// at the top of this file.
+/// in [`crate::catalogs::types`].
 pub(crate) fn pg_database_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_database",
@@ -46,8 +46,9 @@ pub(crate) fn pg_database_schema() -> TableSchema {
 /// advertises (`server_encoding`), and the locale columns report `C`: the
 /// default collation compares bytewise, and `datcollate`/`datctype` must name
 /// the collation a `CREATE TABLE` with no `COLLATE` clause actually gets.
-/// `datfrozenxid`/`datminmxid` report 1, PostgreSQL's `FirstNormalTransactionId`
-/// — this build never advances a per-database freeze horizon.
+/// `datfrozenxid`/`datminmxid` report 1, PostgreSQL's `BootstrapTransactionId`
+/// and below every XID this build hands out — it never advances a per-database
+/// freeze horizon.
 pub(crate) fn pg_database_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let database = cat.database();
     vec![vec![

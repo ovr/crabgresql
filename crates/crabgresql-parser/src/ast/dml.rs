@@ -554,11 +554,11 @@ pub enum MergeClauseKind {
     Matched,
     /// `WHEN NOT MATCHED`
     NotMatched,
-    /// `WHEN MATCHED BY TARGET`
+    /// `WHEN NOT MATCHED BY TARGET`
     ///
     /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax#merge_statement)
     NotMatchedByTarget,
-    /// `WHEN MATCHED BY SOURCE`
+    /// `WHEN NOT MATCHED BY SOURCE`
     ///
     /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/dml-syntax#merge_statement)
     NotMatchedBySource,

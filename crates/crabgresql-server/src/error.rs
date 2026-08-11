@@ -12,9 +12,7 @@ pub struct PgError {
     /// error still passes a `&'static str` from [`sqlstate`].
     pub code: Cow<'static, str>,
     pub message: String,
-    /// Optional DETAIL line.
     pub detail: Option<String>,
-    /// Optional HINT line.
     pub hint: Option<String>,
     /// 1-based (line, column) of the offending token, when PG reports a cursor
     /// position. Converted to a wire character offset when the error is sent.
@@ -52,13 +50,11 @@ impl PgError {
         Self::new(sqlstate::SYNTAX_ERROR, message)
     }
 
-    /// Attach a DETAIL line.
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
     }
 
-    /// Attach a HINT line.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self

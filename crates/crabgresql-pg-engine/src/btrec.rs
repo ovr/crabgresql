@@ -3,10 +3,12 @@
 //! the heap's `rec` module.
 //!
 //! Split and new-root records carry *full page images* (every item + the opaque
-//! fields) rather than PostgreSQL's incremental right-half logging. That is a
-//! deliberate simplification for this first durable cut: replay is a plain page
-//! rebuild, unmistakably idempotent under the LSN gate. Shrinking these records
-//! is a later optimization.
+//! fields) rather than PostgreSQL's incremental right-half logging, which makes
+//! replay a plain page rebuild, unmistakably idempotent under the LSN gate.
+//!
+//! TODO(perf): log only the items that moved to the right half instead of both
+//! full page images — the record carries every item of the page that split,
+//! about twice what replay needs.
 
 use crabgresql_wal::RmgrId;
 

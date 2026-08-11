@@ -94,8 +94,11 @@ fn syntax(input: &str) -> TsError {
 // ---------------------------------------------------------------------------
 
 /// `tsquery_in`. Returns the parsed query; an input with no lexemes yields an
-/// empty query, which the caller reports with PG's
-/// `text-search query doesn't contain lexemes` NOTICE.
+/// empty query.
+///
+/// TODO: raise PG's `text-search query doesn't contain lexemes: ""` NOTICE for
+/// such an input — expression binding has no channel to emit a notice on, so
+/// nothing reports it today.
 pub fn tsquery_in(input: &str) -> Result<TsQuery, TsError> {
     let mut p = Parser {
         chars: input.chars().collect(),
@@ -1018,6 +1021,10 @@ fn complement(set: PosSet) -> PosSet {
         // differential cases against 18.4, end-keying leaves one divergence and
         // start-keying two, both only in phrases nesting three or more
         // negations. See `known_divergence_negated_negation_phrase`.
+        //
+        // TODO: represent the complement of a cofinite set whose members span a
+        // distance exactly, so phrases nesting three or more negations agree
+        // with PG.
         PosSet::Cofinite { except, extra, .. } => PosSet::Exact(norm_spans(
             except
                 .into_iter()
@@ -1621,11 +1628,14 @@ mod tests {
         Ok(())
     }
 
-    /// The one shape where the phrase evaluator still disagrees with PG.
-    /// Negating a phrase whose *operands* are themselves negations produces a
-    /// match set with no exact representation here; both available spellings of
-    /// `complement` get some case wrong. Pinned so the gap is explicit, and so a
-    /// future fix has a failing target to aim at.
+    /// The one shape where the phrase evaluator disagrees with PG, out of the
+    /// 4400 differential cases measured against 18.4.
+    ///
+    /// TODO: match PG when a phrase whose *operands* are themselves negations
+    /// is negated in turn — that match set has no exact representation here,
+    /// and both available spellings of `complement` get some case wrong. The
+    /// shape is pinned below so the gap is explicit rather than silent; a fix
+    /// flips the first assertion.
     #[test]
     fn known_divergence_negated_negation_phrase() -> Result<(), TsError> {
         // PostgreSQL 18.4 answers `true`; we answer `false`. The `&` mixes a

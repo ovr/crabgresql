@@ -13,12 +13,14 @@
 //! `-infinity`/`infinity` sentinels, so the natural integer order already
 //! sorts them correctly (they compare less/greater than every finite value).
 //!
-//! Deviations from PG, acceptable while no passing test needs them: a precision
-//! modifier above 6 is clamped silently where PG also warns. The input grammar
-//! covers ISO 8601, the traditional `Mon DD HH:MM:SS YYYY` form, the
-//! `infinity`/`epoch` specials and the current-relative ones (`now`, `today`,
-//! `tomorrow`, `yesterday`) — a trailing time zone is accepted and ignored
-//! (this type has no zone).
+//! The input grammar covers ISO 8601, the traditional `Mon DD HH:MM:SS YYYY`
+//! form, the `infinity`/`epoch` specials and the current-relative ones (`now`,
+//! `today`, `tomorrow`, `yesterday`) — a trailing time zone is accepted and
+//! ignored (this type has no zone).
+//!
+//! TODO: warn when a precision modifier above 6 is reduced to 6 — PG answers
+//! `::timestamp(7)` with `WARNING:  TIMESTAMP(7) precision reduced to maximum
+//! allowed, 6`, while the clamp here is silent.
 
 use crate::Numeric;
 use crate::fmt::FmtCtx;
@@ -34,7 +36,8 @@ pub(crate) const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
 /// PG raises this (not a 22xxx) for a `date_bin` stride carrying months.
 pub(crate) const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
-/// `-infinity` / `+infinity` sentinels, matching PG's `DT_NOBEGIN`/`DT_NOEND`.
+/// `-infinity` / `+infinity` sentinels: the extreme `i64` values, so integer
+/// order alone sorts them outside every finite timestamp.
 pub const NEG_INFINITY: i64 = i64::MIN;
 pub const POS_INFINITY: i64 = i64::MAX;
 
@@ -286,7 +289,7 @@ pub(crate) fn format_parts(micros: i64) -> (String, bool) {
     (out, bc)
 }
 
-// --- input (timestamp_in, a practical subset) ------------------------------
+// --- input (timestamp_in) --------------------------------------------------
 
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -505,9 +508,9 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
     // contributes one. The `have_date` guard in the loop catches a second date
     // token, and the bare-number pass above rejects a loose number (it refuses
     // to run once `have_date` is set) — but a month name sets `month` without
-    // touching `have_date`, and nothing caught that. PG sets the full
-    // `DTK_DATE_M` mask for these words and detects the overlap the same way,
-    // which is why `'Feb today'` is an error there and was today's date here.
+    // touching `have_date`, and nothing caught that. PG treats these words as
+    // supplying every date field and detects the overlap the same way, which is
+    // why `'Feb today'` is an error there and was today's date here.
     if let Some(shift) = relative {
         if month.is_some() || year.is_some() || day.is_some() {
             return Err(invalid_syntax(input));
@@ -546,12 +549,12 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
 /// Whether `word` (already lowercased) is one of the reserved date/time input
 /// words, whatever type accepts it.
 ///
-/// PostgreSQL's decoder gives each of these a RESERV token, and a RESERV token
-/// in company is a format error — `'now 10:00'` and `'Feb today'` are rejected
-/// even though every part is individually meaningful. Types that do not accept
-/// a given word still need to *recognize* it, or their scanner's catch-all
-/// (`time`'s "decorative zone abbreviation") swallows it and silently answers
-/// with the rest of the input.
+/// PostgreSQL's decoder treats each of these as a reserved word, and a
+/// reserved word in company is a format error — `'now 10:00'` and
+/// `'Feb today'` are rejected even though every part is individually
+/// meaningful. Types that do not accept a given word still need to
+/// *recognize* it, or their scanner's catch-all (`time`'s "decorative zone
+/// abbreviation") swallows it and silently answers with the rest of the input.
 pub(crate) fn is_reserved_word(word: &str) -> bool {
     matches!(
         word,
@@ -665,9 +668,10 @@ fn month_index(name: &str) -> Option<i64> {
 /// attached zone token (`Z`, `-07:00`) if one was present — `timestamp` ignores
 /// it, `timestamptz` resolves it.
 fn parse_time(field: &str) -> Option<(i64, i64, i64, i64, Option<String>)> {
-    // Strip a leading sign-less zone offset attached to the seconds, keeping the
-    // digits/dot/colons; a bare abbreviation was already split off as its own
-    // whitespace field, so here we only handle an am/pm suffix.
+    // The `am`/`pm` suffix has to come off before the zone scan below, which
+    // takes everything from the first non digit/colon/dot character as the
+    // zone and would otherwise swallow it. A bare abbreviation needs no such
+    // care: it arrived as its own whitespace-separated field.
     let mut body = field;
     let mut ampm = 0i64; // 0 none, 1 am, 2 pm
     let lower = field.to_ascii_lowercase();
@@ -792,8 +796,10 @@ fn parse_date_token(field: &str) -> Option<(i64, i64, i64)> {
     if parts.len() != 3 {
         return None;
     }
-    // ISO order Y-M-D: the year is the first component (4 digits or clearly a
-    // year); only this order is accepted (the tested/default DateStyle).
+    // ISO order Y-M-D: the year is the first component.
+    // TODO: accept the `SET DateStyle` MDY/DMY input orders — PG's default
+    // DateStyle reads `'02/16/2001'` as 2001-02-16, whereas taking the leading
+    // field as the year makes that input an out-of-range month here.
     let y = parts[0].parse().ok()?;
     let m = parts[1].parse().ok()?;
     let d = parts[2].parse().ok()?;
@@ -931,8 +937,9 @@ pub fn extract(unit: &str, micros: i64) -> Result<Option<Numeric>, TimestampErro
         "milliseconds" => fixed_point(total_sub_usec, 3),
         "microseconds" => total_sub_usec.to_string(),
         "epoch" => fixed_point(epoch_micros(micros), 6),
-        // PG returns a high-precision numeric here; we render the float8 Julian
-        // date (fractional, but not byte-identical to PG's exotic numeric scale).
+        // TODO: compute the Julian field as a high-precision numeric — PG
+        // answers `2451957.86018518518518518519` where the float8 rendering
+        // used here keeps the fraction but far fewer digits.
         "julian" => match date_part_canon("julian", micros)? {
             Some(value) => format!("{value}"),
             None => panic!("finite Julian timestamp field must have a value"),
@@ -1060,8 +1067,11 @@ const KNOWN_UNITS: &[&str] = &[
 // --- date_trunc ------------------------------------------------------------
 
 /// `date_trunc(unit, timestamp)`. `±infinity` truncates to itself. Errors on an
-/// unrecognized unit. (BC years are not covered by the century/millennium/decade
-/// rounding — no passing test needs them.)
+/// unrecognized unit.
+///
+/// TODO: round BC years for the `century` and `millennium` units — PG truncates
+/// `'0055-06-10 BC'` to `'0100-01-01 BC'` and `'1000-01-01 BC'`, while a BC year
+/// passes through unchanged here. (`decade` already agrees for BC.)
 pub fn date_trunc(unit: &str, micros: i64) -> Result<i64, TimestampError> {
     let unit = canonical_unit(unit);
     // Only the truncatable units are valid here; others error like PG (e.g.
@@ -1201,7 +1211,7 @@ pub fn make_timestamp(
             message: describe(),
         });
     }
-    // PG's time_overflows: hour 0..24, min 0..59, sec 0..60, with 24:00:00
+    // PG's field ranges here: hour 0..24, min 0..59, sec 0..60, with 24:00:00
     // allowed only when min and sec are exactly zero (the end-of-day boundary
     // carries into the next day). sec == 60 is a valid leap-second carry.
     if !(0..=24).contains(&hour)

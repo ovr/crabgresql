@@ -66,9 +66,13 @@ pub(crate) fn schemata_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// `information_schema.tables` for represented user relations. Catalog and
-/// information-schema implementation relations are deliberately not invented:
-/// their complete PostgreSQL metadata is not modeled yet.
+/// `information_schema.tables` for represented user relations.
+///
+/// TODO: report the `pg_catalog` and `information_schema` relations that
+/// PostgreSQL also lists here; they are served as Rust row builders rather than
+/// reflected into `pg_class`, and nothing records which of them PostgreSQL
+/// implements as a table and which as a view, so `table_type` would have to be
+/// invented.
 pub(crate) fn tables_schema() -> TableSchema {
     TableSchema::in_namespace(
         "tables",

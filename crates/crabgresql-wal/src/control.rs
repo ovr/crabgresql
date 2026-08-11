@@ -12,9 +12,11 @@
 //! A control file that is absent, truncated, of an unknown version, or fails its
 //! CRC reads as `None`, which the caller turns into a whole-stream replay. That
 //! is the fail-safe direction: replaying more than necessary is always correct,
-//! because redo is idempotent under the per-page LSN gate. Segment recycling —
-//! the other thing a durable redo point unlocks — is still a follow-up
-//! (`docs/ARCHITECTURE.md §3`).
+//! because redo is idempotent under the per-page LSN gate.
+//!
+//! TODO: recycle WAL segments below the durable redo point — the other thing it
+//! unlocks, and nothing does it, so the stream grows without bound
+//! (`docs/ARCHITECTURE.md §1.3`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -68,7 +70,7 @@ pub struct ControlFile {
     pub next_xid: Xid,
     /// The record boundary replay resumes from. [`Lsn::INVALID`] means "replay
     /// the whole stream" — a fresh cluster, or a checkpoint that could not bound
-    /// itself (see `PgEngine::redo_floor`).
+    /// itself (see `PgEngine::redo_clamp`).
     pub redo_lsn: Lsn,
     pub clean_shutdown: bool,
 }

@@ -298,7 +298,6 @@ impl Ord for Ident {
             span: _,
         } = other;
 
-        // First compare by value, then by quote_style
         value
             .cmp(other_value)
             .then_with(|| quote_style.cmp(other_quote_style))
@@ -1268,7 +1267,8 @@ pub enum Expr {
         /// The prefix identifier (introducer or projection prefix).
         prefix: Ident,
         /// The value expression being prefixed.
-        /// Hint: you can unwrap the string value using `value.into_string()`.
+        /// Hint: for an introducer string this is an `Expr::Value`, whose text
+        /// can be taken with `ValueWithSpan::into_string`.
         value: Box<Expr>,
     },
     /// A constant of form `<data_type> 'value'`.
@@ -1381,7 +1381,6 @@ pub enum Expr {
     /// An unqualified `*` wildcard token (e.g. `*`).
     Wildcard(AttachedToken),
     /// Qualified wildcard, e.g. `alias.*` or `schema.table.*`.
-    /// (Same caveats apply to `QualifiedWildcard` as to `Wildcard`.)
     QualifiedWildcard(ObjectName, AttachedToken),
     /// Some dialects support an older syntax for outer joins where columns are
     /// marked with the `(+)` operator in the WHERE clause, for example:
@@ -2273,10 +2272,6 @@ impl fmt::Display for Expr {
 ///
 /// A window can be either an inline specification (`WindowSpec`) or a
 /// reference to a previously defined named window.
-///
-/// - `WindowSpec(WindowSpec)`: An inline window specification, e.g.
-///   `OVER (PARTITION BY ... ORDER BY ...)`.
-/// - `NamedWindow(Ident)`: A reference to a named window declared elsewhere.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -2464,7 +2459,6 @@ impl fmt::Display for WindowFrameUnits {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// How NULL values are treated in certain window functions.
 pub enum NullTreatment {
     /// Ignore NULL values (e.g. `IGNORE NULLS`).
     IgnoreNulls,
@@ -2867,7 +2861,6 @@ impl fmt::Display for ConditionalStatementBlock {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Statements used inside conditional blocks (`IF`, `WHEN`, `WHILE`).
 pub enum ConditionalStatements {
     /// Simple sequence of statements (no `BEGIN`/`END`).
     Sequence {
@@ -3251,7 +3244,6 @@ impl fmt::Display for Declare {
 #[derive(Debug, Default, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Options allowed within a `CREATE TABLE` statement.
 pub enum CreateTableOptions {
     /// No options specified.
     #[default]
@@ -3322,7 +3314,6 @@ impl Display for FromTable {
 pub enum Set {
     /// SQL Standard-style
     /// SET a = 1;
-    /// `SET var = value` (standard SQL-style assignment).
     SingleAssignment {
         /// Optional scope modifier (`SESSION` / `LOCAL`).
         scope: Option<ContextModifier>,
@@ -3335,7 +3326,6 @@ pub enum Set {
     },
     /// Snowflake-style
     /// SET (a, b, ..) = (1, 2, ..);
-    /// `SET (a, b) = (1, 2)` (tuple assignment syntax).
     ParenthesizedAssignments {
         /// Variables being assigned in tuple form.
         variables: Vec<ObjectName>,
@@ -3344,7 +3334,6 @@ pub enum Set {
     },
     /// MySQL-style
     /// SET a = 1, b = 2, ..;
-    /// `SET a = 1, b = 2` (MySQL-style comma-separated assignments).
     MultipleAssignments {
         /// List of `SET` assignments (MySQL-style comma-separated).
         assignments: Vec<SetAssignment>,
@@ -3385,8 +3374,6 @@ pub enum Set {
     /// Note: this is a PostgreSQL-specific statements
     /// `SET TIME ZONE <value>` is an alias for `SET timezone TO <value>` in PostgreSQL
     /// However, we allow it for all dialects.
-    /// `SET TIME ZONE` statement. `local` indicates the `LOCAL` keyword.
-    /// `SET TIME ZONE <value>` statement.
     SetTimeZone {
         /// Whether the `LOCAL` keyword was specified.
         local: bool,
@@ -3980,7 +3967,9 @@ pub enum Statement {
         begin: bool,
         /// Optional specific keyword used: `TRANSACTION` or `WORK`.
         transaction: Option<BeginTransactionKind>,
-        /// Optional transaction modifier (e.g., `AND NO CHAIN`).
+        /// The keyword written directly after `BEGIN` (`DEFERRED`, `IMMEDIATE`,
+        /// `EXCLUSIVE`, `TRY` or `CATCH`). PostgreSQL has no such keyword, so
+        /// this is always `None` for the PostgreSQL dialect.
         modifier: Option<TransactionModifier>,
         /// List of statements belonging to the `BEGIN` block.
         /// Example:
@@ -4034,18 +4023,20 @@ pub enum Statement {
     /// ```
     /// If `end` is true
     Commit {
-        /// `true` when `AND [ NO ] CHAIN` was present.
+        /// `true` only for `AND CHAIN`; `AND NO CHAIN` and an omitted clause
+        /// are both `false`.
         chain: bool,
         /// `true` when this `COMMIT` was parsed as an `END` block terminator.
         end: bool,
-        /// Optional transaction modifier for commit semantics.
+        /// `TRY` or `CATCH` when the statement was `END TRY` / `END CATCH`.
         modifier: Option<TransactionModifier>,
     },
     /// ```sql
     /// ROLLBACK [ TRANSACTION | WORK ] [ AND [ NO ] CHAIN ] [ TO [ SAVEPOINT ] savepoint_name ]
     /// ```
     Rollback {
-        /// `true` when `AND [ NO ] CHAIN` was present.
+        /// `true` only for `AND CHAIN`; `AND NO CHAIN` and an omitted clause
+        /// are both `false`.
         chain: bool,
         /// Optional savepoint name to roll back to.
         savepoint: Option<Ident>,
@@ -5093,8 +5084,6 @@ impl fmt::Display for Statement {
                 owned_by,
             } => {
                 let as_type: String = if let Some(dt) = data_type.as_ref() {
-                    //Cannot use format!(" AS {}", dt), due to format! is not available in --target thumbv6m-none-eabi
-                    // " AS ".to_owned() + &dt.to_string()
                     [" AS ", &dt.to_string()].concat()
                 } else {
                     "".to_string()
@@ -5276,7 +5265,9 @@ pub struct TruncateTableTarget {
     /// name of the table being truncated
     #[cfg_attr(feature = "visitor", visit(with = "visit_relation"))]
     pub name: ObjectName,
-    /// Postgres-specific option: explicitly exclude descendants (also default without ONLY)
+    /// Postgres-specific option: `ONLY` truncates just this table and leaves
+    /// the rows of its descendant tables alone; without `ONLY` the descendants
+    /// are truncated too (upstream `truncate` regression test).
     /// ```sql
     /// TRUNCATE TABLE ONLY name
     /// ```
@@ -9257,7 +9248,6 @@ impl fmt::Display for HiveSetLocation {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// MySQL `ALTER TABLE` column position specifier: `FIRST` or `AFTER <column>`.
 pub enum MySQLColumnPosition {
     /// Place the column first in the table.
     First,
@@ -9281,7 +9271,6 @@ impl Display for MySQLColumnPosition {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// MySQL `CREATE VIEW` algorithm options.
 pub enum CreateViewAlgorithm {
     /// `UNDEFINED` algorithm.
     Undefined,
@@ -9304,7 +9293,6 @@ impl Display for CreateViewAlgorithm {
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// MySQL `CREATE VIEW` SQL SECURITY options.
 pub enum CreateViewSecurity {
     /// The view runs with the privileges of the definer.
     Definer,
@@ -9482,7 +9470,6 @@ impl Display for ContactEntry {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum CommentDef {
     /// Includes `=` when printing the comment, as `COMMENT = 'comment'`
-    /// Does not include `=` when printing the comment, as `COMMENT 'comment'`
     WithEq(String),
     /// Comment variant that omits the `=` when displayed.
     WithoutEq(String),
@@ -9639,9 +9626,9 @@ impl Display for ShowStatementOptions {
 /// Where a `SHOW` filter appears relative to the main clause.
 pub enum ShowStatementFilterPosition {
     /// Put the filter in an infix position (e.g. `SHOW COLUMNS LIKE '%name%' IN TABLE tbl`).
-    Infix(ShowStatementFilter), // For example: SHOW COLUMNS LIKE '%name%' IN TABLE tbl
+    Infix(ShowStatementFilter),
     /// Put the filter in a suffix position (e.g. `SHOW COLUMNS IN tbl LIKE '%name%'`).
-    Suffix(ShowStatementFilter), // For example: SHOW COLUMNS IN tbl LIKE '%name%'
+    Suffix(ShowStatementFilter),
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -10622,7 +10609,7 @@ pub enum CreateTableLikeKind {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Controls whether defaults are included when creating a table FROM/LILE another.
+/// Controls whether column defaults are copied by a `CREATE TABLE ... LIKE` clause.
 pub enum CreateTableLikeDefaults {
     /// Include default values from the source table.
     Including,
@@ -10790,7 +10777,7 @@ pub struct ResetStatement {
 }
 
 /// Query optimizer hints are optionally supported comments after the
-/// `SELECT`, `INSERT`, `UPDATE`, `REPLACE`, `MERGE`, and `DELETE` keywords in
+/// `SELECT`, `INSERT`, `UPDATE`, `MERGE`, and `DELETE` keywords in
 /// the corresponding statements.
 ///
 /// See [Select::optimizer_hints]

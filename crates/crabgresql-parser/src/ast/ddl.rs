@@ -381,7 +381,7 @@ pub enum AlterTableOperation {
         /// New column name.
         new_column_name: Ident,
     },
-    /// `RENAME TO <table_name>`
+    /// `RENAME { TO | AS } <table_name>`
     RenameTable {
         /// The new table name or renaming kind.
         table_name: RenameTableNameKind,
@@ -591,7 +591,6 @@ impl fmt::Display for AlterPolicyOperation {
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Algorithm option for `ALTER TABLE` operations (MySQL-specific).
 pub enum AlterTableAlgorithm {
     /// Default algorithm selection.
     Default,
@@ -620,7 +619,6 @@ impl fmt::Display for AlterTableAlgorithm {
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
-/// Locking behavior for `ALTER TABLE` (MySQL-specific).
 pub enum AlterTableLock {
     /// `DEFAULT` lock behavior.
     Default,
@@ -2194,7 +2192,8 @@ pub(crate) fn display_option_spaced<T: fmt::Display>(option: &Option<T>) -> impl
 
 /// `<constraint_characteristics> = [ DEFERRABLE | NOT DEFERRABLE ] [ INITIALLY DEFERRED | INITIALLY IMMEDIATE ] [ ENFORCED | NOT ENFORCED ]`
 ///
-/// Used in UNIQUE and foreign key constraints. The individual settings may occur in any order.
+/// Used in UNIQUE, PRIMARY KEY and foreign key constraints. The individual settings may occur in
+/// any order.
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -2395,7 +2394,6 @@ pub enum UserDefinedTypeRepresentation {
     /// Enum type: `CREATE TYPE name AS ENUM (labels)`
     ///
     /// Note: this is PostgreSQL-specific. See <https://www.postgresql.org/docs/current/sql-createtype.html>
-    /// Enum type: `CREATE TYPE name AS ENUM (labels)`
     Enum {
         /// Labels that make up the enum type.
         labels: Vec<Ident>,
@@ -2956,7 +2954,7 @@ pub struct CreateTable {
     pub hive_formats: Option<HiveFormat>,
     /// Table options
     pub table_options: CreateTableOptions,
-    /// General comment for the table
+    /// `STORED AS <format>` of a `CREATE EXTERNAL TABLE`
     pub file_format: Option<FileFormat>,
     /// Location of the table data
     pub location: Option<String>,
@@ -3603,7 +3601,7 @@ pub struct CreateFunction {
     pub or_replace: bool,
     /// True if this is a `CREATE TEMPORARY FUNCTION` statement
     pub temporary: bool,
-    /// True if this is a `CREATE IF NOT EXISTS FUNCTION` statement
+    /// True if this is a `CREATE FUNCTION IF NOT EXISTS` statement
     pub if_not_exists: bool,
     /// Name of the function to be created.
     pub name: ObjectName,
@@ -4780,7 +4778,7 @@ impl Spanned for AlterCollation {
 }
 
 /// Table type for ALTER TABLE statements.
-/// Used to distinguish between regular tables, Iceberg tables, and Dynamic tables.
+/// Used to distinguish regular tables from Iceberg, Dynamic and External tables.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
@@ -4816,7 +4814,8 @@ pub struct AlterTable {
     /// For example: `ALTER TABLE table_name ON CLUSTER cluster_name ADD COLUMN c UInt32`
     /// [ClickHouse](https://clickhouse.com/docs/en/sql-reference/statements/alter/update)
     pub on_cluster: Option<Ident>,
-    /// Table type: None for regular tables, Some(AlterTableType) for Iceberg or Dynamic tables
+    /// Table type: None for regular tables, Some(AlterTableType) for Iceberg,
+    /// Dynamic or External tables
     pub table_type: Option<AlterTableType>,
     /// Token that represents the end of the statement (semicolon or EOF)
     pub end_token: AttachedToken,
@@ -5023,7 +5022,8 @@ pub enum OperatorClassItem {
     Function {
         /// Support function number for this entry.
         support_number: u64,
-        /// Optional function argument types for the operator class.
+        /// Optional `op_type` list: the operand data types the support
+        /// function applies to, which need not be its own argument types.
         op_types: Option<Vec<DataType>>,
         /// The function name implementing the support function.
         function_name: ObjectName,
@@ -5454,7 +5454,6 @@ pub struct AlterOperatorClass {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterOperatorClassOperation {
     /// `RENAME TO new_name`
-    /// Rename the operator class to a new name.
     RenameTo {
         /// The new name for the operator class.
         new_name: ObjectName,
@@ -5462,7 +5461,6 @@ pub enum AlterOperatorClassOperation {
     /// `OWNER TO { new_owner | CURRENT_ROLE | CURRENT_USER | SESSION_USER }`
     OwnerTo(Owner),
     /// `SET SCHEMA new_schema`
-    /// Set the schema for the operator class.
     SetSchema {
         /// The target schema name.
         schema_name: ObjectName,
@@ -5766,9 +5764,11 @@ impl fmt::Display for CreatePolicy {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum CreatePolicyType {
-    /// Policy allows operations unless explicitly denied.
+    /// Grants access to the rows it matches; permissive policies for the same
+    /// command are combined with `OR`.
     Permissive,
-    /// Policy denies operations unless explicitly allowed.
+    /// Further restricts the rows other policies allow; restrictive policies
+    /// are combined with `AND`.
     Restrictive,
 }
 

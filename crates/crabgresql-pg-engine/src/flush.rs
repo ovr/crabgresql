@@ -56,11 +56,13 @@ impl Default for BufferFlushPolicy {
 impl BufferFlushPolicy {
     /// Read the policy from the environment, falling back to the defaults.
     ///
-    /// Environment variables rather than GUCs because `SET` is session-scoped and
-    /// there is no storage-settings plumbing yet; a per-session knob for a
-    /// process-wide background thread would be misleading. Moving these to real
-    /// GUCs is a follow-up. The names, defaults and accepted ranges live in
+    /// Environment variables rather than GUCs because `SET` is session-scoped
+    /// and a per-session knob for a process-wide background thread would be
+    /// misleading. The names, defaults and accepted ranges live in
     /// `crabgresql-config` with every other environment variable.
+    ///
+    /// TODO: expose the flush policy as GUCs, once a setting can be changed for
+    /// the whole process instead of one session.
     ///
     /// A value we cannot use as written is corrected — clamped into range, or
     /// replaced by the default when it does not parse — and the correction is
@@ -212,7 +214,7 @@ impl FlushWorker {
     /// "Rebuilt at the next startup" costs something now that replay is bounded:
     /// those rows are reachable only by replaying their records, so a checkpoint
     /// with rows still resident cannot bound replay at all (see
-    /// `PgEngine::redo_floor`). Leaving them is still the right call here — the
+    /// `PgEngine::redo_clamp`). Leaving them is still the right call here — the
     /// alternative is a flush transaction during teardown — but that is why this
     /// runs *before* the shutdown checkpoint samples anything.
     pub fn stop_and_join(mut self) {

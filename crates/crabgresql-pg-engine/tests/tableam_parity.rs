@@ -727,7 +727,6 @@ fn drop_table_unlinks_file_and_frees_name() -> anyhow::Result<()> {
         h.engine.open_table("t"),
         Err(crabgresql_storage_api::StorageError::TableNotFound(_))
     ));
-    // Dropping again reports the missing table.
     assert!(matches!(
         h.engine.drop_table("public", "t"),
         Err(crabgresql_storage_api::StorageError::TableNotFound(_))
@@ -818,8 +817,8 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
 
 #[test]
 fn truncate_upgrades_over_the_same_owners_open_scan() -> anyhow::Result<()> {
-    // Review finding #3: a session that holds an open cursor (a live scan guard)
-    // and then TRUNCATEs the same table must not self-deadlock. Run it on a worker
+    // Regression: a session that holds an open cursor (a live scan guard) and
+    // then TRUNCATEs the same table must not self-deadlock. Run it on a worker
     // thread and fail fast via a timeout if the lock upgrade regresses to a hang.
     use std::sync::mpsc;
     use std::time::Duration;
@@ -859,7 +858,7 @@ fn truncate_upgrades_over_the_same_owners_open_scan() -> anyhow::Result<()> {
 
 #[test]
 fn drop_table_reclaims_a_pending_truncate_file() -> anyhow::Result<()> {
-    // Review finding #4: a staged (uncommitted) TRUNCATE's new file lives on the
+    // Regression: a staged (uncommitted) TRUNCATE's new file lives on the
     // handle, not the catalog; dropping the table must reclaim it, not leak it.
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
@@ -918,7 +917,7 @@ fn drop_table_reclaims_a_pending_truncates_index_files_too() -> anyhow::Result<(
 }
 
 /// A row of `plain`-storage columns only: nothing is a candidate for out-of-line
-/// storage, so this is the shape that must still be rejected once TOAST exists.
+/// storage, so this is the shape TOAST cannot rescue — it stays rejected.
 fn untoastable_schema(name: &str, ncols: usize) -> TableSchema {
     TableSchema::new(
         name,

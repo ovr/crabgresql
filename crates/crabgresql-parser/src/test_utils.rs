@@ -18,9 +18,6 @@
 /// This module contains internal utilities used for testing the library.
 /// While technically public, the library's users are not supposed to rely
 /// on this module, as it will change without notice.
-//
-// Integration tests (i.e. everything under `tests/`) import this
-// via `tests/test_utils/helpers`.
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -134,18 +131,13 @@ impl TestedDialects {
                 .with_tokens(tokens)
                 .parse_statements()
         })
-        // To fail the `ensure_multiple_dialects_are_tested` test:
-        // if let Some(dialect) = self.dialects.first() {
-        //     Parser::parse_sql(&***dialect, sql)
-        // }
     }
 
     /// Ensures that `sql` parses as a single [Statement] for all tested
     /// dialects.
     ///
-    /// In general, the canonical SQL should be the same (see crate
-    /// documentation for rationale) and you should prefer the `verified_`
-    /// variants in testing, such as  [`verified_statement`] or
+    /// In general, the canonical SQL should be the same, and you should prefer
+    /// the `verified_` variants in testing, such as [`verified_stmt`] or
     /// [`verified_query`].
     ///
     /// If `canonical` is non empty,this function additionally asserts

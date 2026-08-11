@@ -17,8 +17,8 @@ pub(crate) fn pg_constraint_schema() -> TableSchema {
             col("contype", CHARLIKE),
             col("condeferrable", PgType::Bool),
             col("condeferred", PgType::Bool),
-            // Present in PostgreSQL 18; `NOT ENFORCED` is refused at DDL, so
-            // everything here is enforced.
+            // Present in PostgreSQL 18. TODO: accept `NOT ENFORCED`
+            // constraints; DDL refuses them, so everything here is enforced.
             col("conenforced", PgType::Bool),
             col("convalidated", PgType::Bool),
             col("conrelid", PgType::Oid),
@@ -56,25 +56,32 @@ pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Text(c.name.clone()),
                 Value::Oid(nsp_oid(&c.namespace)),
                 str_char(c.contype),
-                // condeferrable / condeferred: DEFERRABLE is refused at DDL.
+                // condeferrable / condeferred. TODO: accept `DEFERRABLE` /
+                // `INITIALLY DEFERRED` constraints; DDL refuses them, so both
+                // are constant false.
                 Value::Bool(false),
                 Value::Bool(false),
                 // conenforced.
                 Value::Bool(true),
                 Value::Bool(c.validated),
                 Value::Oid(c.table_oid),
-                // contypid: domain constraints are not modelled.
+                // contypid. TODO: publish domain constraints; `CREATE DOMAIN`
+                // is not implemented, so no constraint here belongs to a type.
                 Value::Oid(0),
                 Value::Oid(c.index_oid),
-                // conparentid: a partition's copied constraint would point at
-                // its parent's; partitioned tables carry no checks here.
+                // conparentid. TODO: copy a partitioned parent's `CHECK`
+                // constraints into its leaves, each pointing back at the
+                // parent's row; a `CHECK` on a partitioned parent is refused at
+                // DDL.
                 Value::Oid(0),
-                // confrelid: foreign keys are not supported.
+                // confrelid. TODO: foreign keys; `FOREIGN KEY` is refused at
+                // DDL, so no constraint here references another relation.
                 Value::Oid(0),
                 Value::Bool(c.islocal),
                 Value::Int2(c.inhcount),
-                // connoinherit: `NO INHERIT` has no parser support, so nothing
-                // that exists here can be marked with it.
+                // connoinherit. TODO: `NO INHERIT` constraints; the parser has
+                // no production for the clause, so nothing that exists here can
+                // be marked with it.
                 Value::Bool(false),
                 // NULL, not an empty array, when the constraint reads no column
                 // — PostgreSQL stores NULL for a predicate like `CHECK (1 > 0)`,

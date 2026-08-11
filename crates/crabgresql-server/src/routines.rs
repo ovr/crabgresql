@@ -31,7 +31,7 @@ impl RoutineSource for CatalogRoutines {
 
 /// Translate a catalog entry into the interpreter's [`RoutineDef`], or `None`
 /// if it is not a routine the interpreter can run — a `LANGUAGE internal` I/O
-/// symbol, or one whose signature mentions a type that does not resolve.
+/// symbol, or one whose signature mentions a user type (see [`pg_type_of`]).
 fn routine_def(info: &FuncInfo) -> Option<RoutineDef> {
     Some(RoutineDef {
         name: info.name.clone(),
@@ -57,14 +57,17 @@ fn routine_def(info: &FuncInfo) -> Option<RoutineDef> {
     })
 }
 
-/// A resolved [`TypeRef`] as a `PgType`. A `cstring` or unresolved user type
-/// cannot appear in a callable routine's signature.
+/// A resolved [`TypeRef`] as a `PgType`. `cstring` is refused because no
+/// callable routine's signature can mention it — only the I/O symbols that
+/// bootstrap a type do.
 fn pg_type_of(r: &TypeRef) -> Option<PgType> {
     match r {
         TypeRef::Builtin(t) => Some(*t),
-        // A user type resolves through the catalog's own OID assignment; the
-        // binder has already refused any overload it could not resolve, so a
-        // signature reaching here mentions only resolvable types.
+        // TODO: resolve a user type to `PgType::User(oid)` so a PL/pgSQL
+        // routine declared over one can run. `GlobalCatalog::routines` already
+        // resolves it, so the binder offers the overload and a call like
+        // `f('happy'::mood)` binds, then fails out of here with "function with
+        // OID N does not exist".
         TypeRef::User(_) | TypeRef::Cstring => None,
     }
 }
@@ -164,8 +167,10 @@ fn into_notice(notice: RuntimeNotice) -> Notice {
     Notice {
         severity: match notice.severity {
             Severity::Warning => NoticeSeverity::Warning,
-            // DEBUG and LOG never reach here — the interpreter routes them to
-            // the server log — and INFO renders as a NOTICE on the wire.
+            // DEBUG and LOG never reach here: they rank below the default
+            // client_min_messages, so the interpreter drops them.
+            // TODO: carry INFO through as its own severity — PostgreSQL sends
+            // `INFO:  ...` for `RAISE INFO`, this collapses it to `NOTICE:`.
             _ => NoticeSeverity::Notice,
         },
         code: notice.code.into(),

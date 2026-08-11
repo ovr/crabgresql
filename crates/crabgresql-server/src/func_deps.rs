@@ -16,11 +16,13 @@
 //! not survive a restart and a stored expression naming one dangles again
 //! afterwards regardless. Nothing here should be read as a durability guarantee.
 //!
-//! Out of scope, deliberately: view bodies (PostgreSQL blocks those too, and the
-//! same recorder would find them, but binding a whole query at DROP time drags
-//! in view expansion and inheritance fan-out), and `DROP TYPE`/`DROP CAST`
-//! reached from a stored expression, which needs its own hooks and its own
-//! decision about what a column *of* a user type contributes.
+//! TODO: block a `DROP FUNCTION` whose routine a view body calls. PostgreSQL
+//! blocks it and the same recorder would find it, but binding a whole query at
+//! DROP time drags in view expansion and inheritance fan-out.
+//!
+//! TODO: block a `DROP TYPE`/`DROP CAST` reached from a stored expression.
+//! That needs its own hooks and its own decision about what a column *of* a
+//! user type contributes.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};

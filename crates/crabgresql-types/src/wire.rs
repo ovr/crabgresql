@@ -7,6 +7,11 @@
 //! types; a binary request for any other type is an honest `0A000`, matching a
 //! server that lacks that type's `send`/`recv` function. Layouts follow the
 //! documented binary formats (network byte order), not PG's C source.
+//!
+//! TODO: binary encode/decode for the types that fall through to `no_binary`
+//! here — `numeric`, `money`, the date/time types, `bit`/`varbit`, the network
+//! and geometric types, `json`/`jsonb`/`jsonpath`, `tsvector`/`tsquery` and
+//! arrays — all of which PG has a `send`/`recv` pair for.
 
 use crate::cast::{self, CastError};
 use crate::{FmtCtx, PgType, Value, VectorKind};
@@ -14,7 +19,7 @@ use crate::{FmtCtx, PgType, Value, VectorKind};
 /// `22P03` invalid_binary_representation — a binary value the type's `recv`
 /// function would reject (wrong length, out-of-domain byte).
 const INVALID_BINARY: &str = "22P03";
-/// `0A000` feature_not_supported — no binary I/O for this type yet.
+/// `0A000` feature_not_supported — no binary I/O for this type.
 const FEATURE_NOT_SUPPORTED: &str = "0A000";
 
 fn invalid_binary(ty: PgType) -> CastError {

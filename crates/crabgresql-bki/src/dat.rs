@@ -31,7 +31,6 @@ pub fn parse_dat(src: &str) -> Vec<Entry> {
     while i < n {
         match bytes[i] {
             b'#' => {
-                // Comment to end of line.
                 while i < n && bytes[i] != b'\n' {
                     i += 1;
                 }
@@ -64,7 +63,6 @@ fn parse_entry(bytes: &[u8], start: usize) -> (Entry, usize) {
             i += 1;
         }
         let key = String::from_utf8_lossy(&bytes[key_start..i]).into_owned();
-        // '=>'
         i = skip_ws_and_commas(bytes, i);
         if i + 1 < n && bytes[i] == b'=' && bytes[i + 1] == b'>' {
             i += 2;

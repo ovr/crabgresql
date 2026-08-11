@@ -1,15 +1,20 @@
 //! The durable B-tree access method: a page-backed, WAL-logged index over an
-//! index relfilenode. This milestone serves **equality** probes; the on-disk
+//! index relfilenode. Only **equality** probes are served; the on-disk
 //! structure is fully ordered (right-links, high keys, order-preserving keys via
-//! [`crate::btkey`]) so range scans can be added later with no format change.
+//! [`crate::btkey`]) so range scans need no format change.
+//!
+//! TODO: serve range and ordered scans, not only equality probes.
 //!
 //! Concurrency is a single coarse per-index latch: writers take it exclusively,
 //! readers share it, so the tree is quiescent during any one operation. The
 //! right-links are still maintained — they are what keeps the tree navigable
 //! after a crash interrupts a split (a page that migrated right stays reachable
 //! from its left sibling even if the parent downlink record never reached durable
-//! WAL), and they let a later milestone drop the coarse latch for Lehman-Yao
-//! latch-coupling without touching the format.
+//! WAL), and they are what a Lehman-Yao latch-coupling descent moves right
+//! through, so dropping the coarse latch needs no format change.
+//!
+//! TODO(perf): drop the coarse latch for Lehman-Yao latch-coupling, so readers
+//! and writers no longer serialize on one lock per index.
 //!
 //! Visibility is *not* the index's concern: it maps `key -> Tid`, and the caller
 //! ([`crate::heap`]) re-fetches each heap tuple and applies the shared MVCC rule,
@@ -108,8 +113,9 @@ enum Step {
     /// Not reached by any test in this crate, and not reachable under the coarse
     /// latch at all: a writer holds it exclusively, so no reader ever observes a
     /// split in progress. It is here for the states the module header describes
-    /// — a crash between a split and its parent downlink, and the latch-coupling
-    /// milestone — which means it is verified by reading, not by running.
+    /// — a crash between a split and its parent downlink, and latch-coupling
+    /// once the coarse latch is dropped — which means it is verified by reading,
+    /// not by running.
     Right(u32),
     /// Follow this downlink.
     Down(u32),
@@ -565,7 +571,10 @@ impl BTree {
     /// Remove the exact leaf entry `(key, tid)` if present (called by vacuum when
     /// a heap version is reclaimed, so a reused heap slot is never reachable by a
     /// stale key). No page merging — the slot is removed and the array stays
-    /// contiguous; empty pages linger until a future milestone reclaims them.
+    /// contiguous.
+    ///
+    /// TODO: reclaim pages emptied by deletes; an empty page stays linked into
+    /// its level, so every search over its range still steps through it.
     pub fn delete(&self, key: &[u8], tid: Tid) {
         let _w = self
             .latch

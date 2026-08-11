@@ -144,8 +144,9 @@ pub fn strpos(haystack: &str, needle: &str) -> i32 {
 pub fn overlay(s: &str, replacement: &str, start: i32, count: Option<i32>) -> Result<String> {
     let count = count.unwrap_or_else(|| char_length(replacement));
     // `substr(s, 1, start-1)` with `start < 1` raises PG's negative-length error,
-    // so `start <= 0` is rejected exactly as PG's `text_overlay` does. A negative
-    // `start` maps to a negative length without risking i32 overflow.
+    // so `start <= 0` fails with SQLSTATE 22011, which is what PG answers for
+    // `overlay(... placing ... from 0)`. A negative `start` maps to a negative
+    // length without risking i32 overflow.
     let left_len = if start < 1 { -1 } else { start - 1 };
     let left = substr(s, 1, Some(left_len))?;
     let right = substr(s, start.saturating_add(count).max(1), None)?;
@@ -1032,6 +1033,10 @@ fn reference_like(
 /// syntax error would be a lie, and silently treating it as "no match" would
 /// return wrong rows, so it is `0A000`.
 ///
+/// TODO: match patterns that use backreferences or look-around, which PG
+/// accepts and this engine rejects — the `regex` crate implements neither, so
+/// it takes a different matcher, not a change to the translation.
+///
 /// `regex::Error` is opaque (`Syntax(String)`), so the pattern is re-parsed
 /// with `regex_syntax` to classify it. That only happens on the error path.
 fn invalid_regex(e: regex::Error, source: &str, opts: ReOpts) -> TextError {
@@ -1133,6 +1138,9 @@ fn parse_re_flags(flags: &str) -> Result<(ReOpts, bool)> {
             // and the `\d`-style shorthands mean something else than they do in
             // the ARE this engine speaks. Accepting either as a no-op would
             // silently return wrong rows, so both are refused outright.
+            //
+            // TODO: translate the BRE (`b`) and ERE (`e`) grammars into the ARE
+            // this engine matches, instead of rejecting both flags.
             'b' => {
                 return Err(TextError::new(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2670,7 +2678,6 @@ pub fn format(fmt: &str, args: &[FormatArg]) -> Result<String> {
                 ));
             }
         };
-        // Pad the formatted piece to the requested field width with spaces.
         let pad = width
             .map(|w| w as usize)
             .unwrap_or(0)
@@ -2759,11 +2766,11 @@ pub const NAME_MAX_BYTES: usize = 63;
 
 /// `name` input: clip to [`NAME_MAX_BYTES`] **bytes**, on a character boundary.
 ///
-/// Bytes, not characters — `name` is a fixed 64-byte slot, so PostgreSQL's
-/// `namein` clips with `pg_mbcliplen` rather than counting characters the way
-/// `varchar(n)` does. The two agree on ASCII and diverge on everything else:
-/// 70 `é` gives 62 bytes / 31 characters here and in PG, where counting
-/// characters would give 126 bytes.
+/// Bytes, not characters — `name` is a fixed 64-byte slot, so PostgreSQL clips
+/// at the byte limit, backing up to a character boundary, rather than counting
+/// characters the way `varchar(n)` does. The two agree on ASCII and diverge on
+/// everything else: 70 `é` gives 62 bytes / 31 characters here and in PG,
+/// where counting characters would give 126 bytes.
 pub fn name_input(s: &str) -> String {
     truncate_bytes(s, NAME_MAX_BYTES)
 }
@@ -3154,7 +3161,7 @@ mod tests {
     /// cache were removed, so they exercise it through repeated lookups.
     #[test]
     fn pattern_cache_returns_the_right_entry() -> anyhow::Result<()> {
-        // Interleave two patterns so each lookup is a hit on a non-zero index.
+        // Interleave three patterns so each lookup is a hit on a non-zero index.
         for _ in 0..4 {
             assert!(regex_match("abc", "a", false)?);
             assert!(!regex_match("abc", "z", false)?);

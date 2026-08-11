@@ -353,8 +353,9 @@ async fn run_test(
                     continue;
                 }
                 // `\gdesc` and `\crosstabview` re-render the result rather than
-                // just sending it; neither is implemented, so they stub and
-                // drop the buffer.
+                // just sending it, so they stub and drop the buffer.
+                // TODO: render `\gdesc`'s column-description table and
+                // `\crosstabview`'s pivoted output.
                 if let QueryEnd::Backslash { name, .. } = &end
                     && !matches!(name.as_str(), "g" | "gx" | "gset" | "gexec")
                 {
@@ -709,9 +710,10 @@ fn describe_pattern<'a>(name: &str, arguments: &'a str) -> Option<&'a str> {
     (!arguments.contains(char::is_whitespace)).then_some(arguments)
 }
 
-/// Run one backslash command, appending whatever psql would print. The four
-/// implemented commands (`\set`, `\unset`, `\getenv`, `\pset null`) print
-/// nothing on success; everything else gets the "not supported" stub.
+/// Run one backslash command, appending whatever psql would print. The
+/// implemented commands (`\set`, `\unset`, `\getenv`, `\pset`, `\x`, `\a`,
+/// `\t`, `\\`) print nothing on success and the `\echo` family prints its
+/// arguments; everything else gets the "not supported" stub.
 ///
 /// Chaining is the lexer's job: `\set x y \\ -- note` (`regproc.sql:108`)
 /// arrives here as a `\set` and then a separate, argument-less `\\`.
@@ -799,8 +801,8 @@ fn set_print_option(option: &str, value: Option<&str>, printing: &mut format::Pr
         "format" => match value {
             "aligned" | "a" => printing.aligned = true,
             "unaligned" | "u" => printing.aligned = false,
-            // wrapped, csv, html, latex, troff-ms: not implemented, and
-            // rendering them as `aligned` would be a silent lie.
+            // TODO: render the wrapped, csv, html, latex and troff-ms output
+            // formats; rendering them as `aligned` would be a silent lie.
             _ => return false,
         },
         _ => return false,

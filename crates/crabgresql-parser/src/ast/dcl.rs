@@ -143,18 +143,23 @@ pub enum ResetConfig {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 pub enum AlterRoleOperation {
-    /// Generic
+    /// PostgreSQL
+    /// <https://www.postgresql.org/docs/current/sql-alterrole.html>
+    ///
+    /// `RENAME TO new_name`
     RenameRole {
         /// Role name to rename.
         role_name: Ident,
     },
-    /// MS SQL Server
+    /// MS SQL Server `ALTER ROLE ... ADD MEMBER`; this parser accepts only
+    /// PostgreSQL's `ALTER ROLE` grammar, so nothing builds this variant.
     /// <https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-role-transact-sql>
     AddMember {
         /// Member name to add to the role.
         member_name: Ident,
     },
-    /// MS SQL Server
+    /// MS SQL Server `ALTER ROLE ... DROP MEMBER`; this parser accepts only
+    /// PostgreSQL's `ALTER ROLE` grammar, so nothing builds this variant.
     ///
     /// <https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-role-transact-sql>
     DropMember {
@@ -279,8 +284,8 @@ pub struct CreateRole {
     pub user: Vec<Ident>,
     /// Admin users listed in `ADMIN` clause.
     pub admin: Vec<Ident>,
-    // MSSQL
-    /// Optional authorization owner.
+    /// MS SQL Server's `CREATE ROLE ... AUTHORIZATION owner`; this parser
+    /// accepts only PostgreSQL's `CREATE ROLE` options, so it is always `None`.
     pub authorization_owner: Option<ObjectName>,
 }
 

@@ -77,8 +77,9 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       # Uploaded here rather than collected at the end, so an architecture is
-      # downloadable as soon as it is built. The Release itself is created
-      # elsewhere when the tag goes up; this step fails if it is not there yet.
+      # downloadable as soon as it is built. Nothing in this repository creates
+      # the Release, so `gh release upload` fails unless the Release for the
+      # tag already exists.
       # `--clobber` so a re-run replaces its own asset instead of failing on
       # the name.
       - name: upload

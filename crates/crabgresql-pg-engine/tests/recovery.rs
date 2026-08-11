@@ -340,8 +340,11 @@ fn truncate_crash_then_truncate_again_commit_is_consistent() -> anyhow::Result<(
 /// redo point has nothing to replay into that page, so it never pins it and
 /// startup succeeds; `StorageManager::read` rejects the page at the first actual
 /// read instead. That later rejection is not asserted here because the heap scan
-/// path surfaces an I/O error as a panic rather than a `Result` (`heap::io`) —
-/// pre-existing, and a separate thing to fix.
+/// path surfaces an I/O error as a panic rather than a `Result`: `HeapTable::io`
+/// unwraps every page pin even though `HeapScan` yields `Result`s.
+///
+/// TODO: report a corrupt page from the heap scan as a `StorageError` instead of
+/// panicking in `HeapTable::io`, and assert that rejection here.
 #[test]
 fn a_corrupt_data_page_is_rejected_by_any_replay_that_reads_it() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1790,8 +1793,8 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
         )?;
         engine.checkpoint(Xid::FIRST_NORMAL)?;
     }
-    // The heap is 1 and the index is 2, so the chunk store — created before the
-    // index — is 2 and the index is 3. Corrupt the chunk store.
+    // The heap is 1 and the chunk store — created by the wide insert, before the
+    // index — is 2, so the index is 3. Corrupt the chunk store.
     corrupt_page_byte(dir.path(), RelFileNode(2), 0)?;
     let (engine, tm) = try_open(dir.path())?;
     let table = engine.open_table("t")?;

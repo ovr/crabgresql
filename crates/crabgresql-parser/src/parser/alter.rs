@@ -115,10 +115,8 @@ impl Parser<'_> {
             } else {
                 return self.expected_ref("TO after RENAME", self.peek_token_ref());
             }
-        // SET
         } else if self.parse_keyword(Keyword::SET) {
             let config_name = self.parse_object_name(false)?;
-            // FROM CURRENT
             if self.parse_keywords(&[Keyword::FROM, Keyword::CURRENT]) {
                 AlterRoleOperation::Set {
                     config_name,
@@ -145,7 +143,6 @@ impl Parser<'_> {
             } else {
                 self.expected_ref("'TO' or '=' or 'FROM CURRENT'", self.peek_token_ref())?
             }
-        // RESET
         } else if self.parse_keyword(Keyword::RESET) {
             if self.parse_keyword(Keyword::ALL) {
                 AlterRoleOperation::Reset {
@@ -159,16 +156,13 @@ impl Parser<'_> {
                     in_database,
                 }
             }
-        // option
         } else {
             // [ WITH ]
             let _ = self.parse_keyword(Keyword::WITH);
-            // option
             let mut options = vec![];
             while let Some(opt) = self.maybe_parse(|parser| parser.parse_pg_role_option())? {
                 options.push(opt);
             }
-            // check option
             if options.is_empty() {
                 return self.expected_ref("option", self.peek_token_ref())?;
             }

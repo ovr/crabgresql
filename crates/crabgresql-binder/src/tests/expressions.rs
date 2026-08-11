@@ -78,7 +78,7 @@ fn char_types_carry_their_type_and_length() -> anyhow::Result<()> {
             ty: PgType::Bpchar
         }
     );
-    // A bare `char` is `char(1)` and blank-pads a short constant.
+    // `char(n)` blank-pads a short constant out to the declared length.
     assert_eq!(
         one_projection("SELECT 'a'::char(3)")?,
         BoundExpr::Const {

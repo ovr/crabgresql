@@ -286,9 +286,11 @@ fn a_named_window_reference_inherits_a_frame_that_a_copy_may_not() -> anyhow::Re
     Ok(())
 }
 
-/// Only the default frame is implemented; an explicit one — including the
-/// `EXCLUDE` clause the parser now accepts — is refused loudly rather than
-/// silently computed as the default.
+/// An explicit frame — including the `EXCLUDE` clause the parser accepts — is
+/// refused loudly rather than silently computed as the default.
+///
+/// TODO: evaluate explicit window frames (`ROWS`/`RANGE`/`GROUPS` bounds and
+/// `EXCLUDE`) instead of rejecting them at bind time.
 #[test]
 fn an_explicit_window_frame_stays_0a000() -> anyhow::Result<()> {
     for sql in [

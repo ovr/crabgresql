@@ -32,18 +32,20 @@ pub struct ExplainOptions {
 
 impl ExplainOptions {
     /// Resolve the modifiers from both spellings the parser produces: the bare
-    /// `EXPLAIN ANALYZE VERBOSE FORMAT TEXT` form fills the `analyze`/`verbose`/
-    /// `format` fields of the AST node, while the parenthesized
-    /// `EXPLAIN (ANALYZE, TIMING OFF)` form lands entirely in `options` as
-    /// generic name/value pairs.
+    /// `EXPLAIN ANALYZE VERBOSE` form fills the `analyze`/`verbose` fields of the
+    /// AST node, while the parenthesized `EXPLAIN (ANALYZE, TIMING OFF)` form
+    /// lands entirely in `options` as generic name/value pairs. The AST's
+    /// `format` field never reaches here: bare `EXPLAIN FORMAT <kind>` is another
+    /// dialect's grammar and is rejected as a syntax error before this runs.
     ///
     /// An option that would change the *shape* of the output we cannot produce
     /// is rejected rather than ignored — EXPLAIN output is part of the
     /// compatibility surface, so answering `FORMAT JSON` with text is worse than
-    /// admitting the gap. `COSTS` and `BUFFERS` are accepted and ignored: our
-    /// output is permanently `COSTS OFF` shaped (there is no cost model), and PG
-    /// turns `BUFFERS` on by default under `ANALYZE`, so rejecting the explicit
-    /// spelling while silently omitting the implicit default would be incoherent.
+    /// admitting the gap. `COSTS` and `BUFFERS` are accepted and ignored: this
+    /// planner has no cost model, so the plan text carries no estimates for
+    /// `COSTS OFF` to suppress, and PG turns `BUFFERS` on by default under
+    /// `ANALYZE`, so rejecting the explicit spelling while silently omitting
+    /// the implicit default would be incoherent.
     pub fn resolve(
         analyze: bool,
         verbose: bool,
@@ -77,8 +79,10 @@ impl ExplainOptions {
                 "analyze" | "analyse" => analyze = option_flag(option, "analyze")?,
                 "summary" => summary = Some(option_flag(option, &name)?),
                 // TIMING needs ANALYZE but asks for nothing we cannot deliver: it
-                // is validated so `EXPLAIN (ANALYZE, TIMING OFF)` is accepted today
-                // and keeps meaning the same thing once per-node times arrive.
+                // is validated so `EXPLAIN (ANALYZE, TIMING OFF)` is accepted and
+                // keeps meaning the same thing when per-node times exist.
+                // TODO: suppress the per-node `actual time=` values under
+                // TIMING OFF once the plan text prints them.
                 "timing" => timing = option_flag(option, &name)?,
                 // Accepted and ignored: neither changes which lines we print.
                 "costs" | "buffers" => {
@@ -149,7 +153,10 @@ impl ExplainOptions {
                 "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together",
             ));
         }
-        // Last, the options PG honors and crabgresql cannot yet produce.
+        // Last, the options PG honors and crabgresql does not produce.
+        // TODO: implement these instead of rejecting them: FORMAT
+        // JSON/XML/YAML, VERBOSE `Output:` lines, SETTINGS, MEMORY, WAL,
+        // SERIALIZE and GENERIC_PLAN's parameter-free plan.
         if let Some(format) = format {
             return Err(unsupported_option(&format!(
                 "FORMAT {}",

@@ -68,8 +68,13 @@ pub(crate) fn pg_inherits_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
 }
 
 /// `pg_catalog.pg_partitioned_table` — one row per partitioned (parent) table,
-/// describing its partition key. A curated subset: `partdefid` (the default
-/// partition) is always 0 and the class/collation/expression vectors are omitted.
+/// describing its partition key.
+///
+/// TODO: `partdefid` is always 0 — DDL rejects `PARTITION OF … DEFAULT` with
+/// "default partitions are not supported yet", so no parent has a default
+/// partition to point at.
+/// TODO: the `partclass`/`partcollation`/`partexprs` columns are absent, so a
+/// query naming one fails with "column does not exist".
 pub(crate) fn pg_partitioned_table_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_partitioned_table",

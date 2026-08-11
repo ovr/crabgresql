@@ -227,8 +227,6 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             let value = routines.call(*oid, arg_values, ctx, txn)?;
             coerce_value(value, *ret, ctx)
         }
-        // An array constructor: evaluate each element and collect into a
-        // `Value::Array` of the declared element type.
         BoundExpr::ArrayCtor { elem, elems, .. } => {
             let values = elems
                 .iter()
@@ -681,9 +679,6 @@ fn eval_guc_fn(
 /// (the caller falls back to the pure `eval_scalar`), `Some(result)` for a
 /// catalog function — including a wiring error if the context supplied no
 /// [`CatalogOps`] handle.
-///
-/// Both functions are STRICT, but this path runs ahead of `eval_scalar`'s NULL
-/// short-circuit, so a NULL argument is handled here.
 fn eval_catalog_fn(
     func: ScalarFn,
     args: &[Value],
@@ -901,14 +896,18 @@ fn eval_deparse_fn(
 /// `CHECK ((x > 3))`, the outer pair from the `CHECK` syntax and the inner from
 /// `pg_get_expr`. `pretty` drops the inner one, giving psql's `CHECK (x > 3)`.
 ///
-/// **Known divergence, in `ruleutils` rather than here:** PostgreSQL's pretty
-/// mode keeps the parentheses around an operator nested in another operator, so
-/// `CHECK (x + y < 100)` renders as `CHECK ((x + y) < 100)`, while
-/// [`crabgresql_binder::ruleutils`] drops them by precedence and renders
-/// `CHECK (x + y < 100)`. The non-pretty form — what `pg_constraint.conbin`
-/// stores and what `information_schema` reads — agrees exactly. This predates
-/// CHECK support (the same deparser renders column defaults) and is left alone
-/// here rather than changed underneath every DEFAULT in the tree.
+/// TODO: parenthesise a comparison's operator operands the way PostgreSQL's
+/// pretty mode does — there `CHECK (x + y < 100)` renders as
+/// `CHECK ((x + y) < 100)`, while [`crabgresql_binder::ruleutils`] drops the
+/// pair by precedence and renders `CHECK (x + y < 100)`. Only a comparison's
+/// operands take the extra pair: under `AND`/`OR`/`NOT`, and between arithmetic
+/// operators, PostgreSQL goes by precedence as well — verified against
+/// PostgreSQL 18.4, where `CHECK (x > 1 AND y > 2 OR z)` agrees exactly and
+/// `CHECK ((x / 2 + 1) > 0)` differs only in that outer pair. The fix belongs
+/// in `ruleutils` rather than here, and moves more than CHECK output: the same
+/// deparser renders every column default in the tree. The non-pretty form —
+/// what `pg_constraint.conbin` stores and what `information_schema` reads —
+/// already agrees exactly.
 fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let Value::Oid(oid) = &args[0] else {
         return Ok(Value::Null);
@@ -1063,8 +1062,11 @@ fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogO
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
 /// the last `.` separates an optional schema qualifier from the sequence name
-/// (`app.s` → `(Some("app"), "s")`, `s` → `(None, "s")`). Full `regclass` name
-/// normalization (quoting, case-folding, search_path) is a v1 gap.
+/// (`app.s` → `(Some("app"), "s")`, `s` → `(None, "s")`).
+///
+/// TODO: normalize this name the way `regclass` input does — quoting,
+/// case-folding and `search_path` resolution — instead of splitting on the
+/// last `.`.
 fn seq_ref(v: &Value) -> (Option<&str>, &str) {
     match v {
         Value::Text(s) => match s.rsplit_once('.') {
@@ -1339,7 +1341,11 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             }
             compare_elementwise(kind.element(), la, lb)
         }
-        // Query-time user-type ordering is currently defined only for enums.
+        // Enums are the only user type with a query-time ordering (by
+        // definition ordinal), which matches PG: a `CREATE TYPE` base type has
+        // no default btree opclass, so ORDER BY on one fails with "could not
+        // identify an ordering operator" — the binder's `is_orderable` admits
+        // `PgType::User` for an enum only.
         // Keep this total for defensive callers: malformed/mixed values use
         // their actual non-user representation or type OID, never an unchecked
         // NULL unwrap or recursive redispatch through `PgType::User`.

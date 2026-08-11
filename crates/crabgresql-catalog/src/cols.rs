@@ -107,7 +107,6 @@ pub(crate) fn regtype_array(cat: &SystemCatalog, oids: &[u32]) -> Value {
 pub(crate) const OIDVECTOR: PgType = PgType::Vector(VectorKind::Oid);
 pub(crate) const INT2VECTOR: PgType = PgType::Vector(VectorKind::Int2);
 
-/// Build an [`OIDVECTOR`] value from a sequence of OIDs.
 pub(crate) fn oidvector(elems: impl IntoIterator<Item = u32>) -> Value {
     Value::Vector {
         kind: VectorKind::Oid,
@@ -115,7 +114,6 @@ pub(crate) fn oidvector(elems: impl IntoIterator<Item = u32>) -> Value {
     }
 }
 
-/// Build an [`INT2VECTOR`] value from a sequence of `int2`s.
 pub(crate) fn int2vector(elems: impl IntoIterator<Item = i16>) -> Value {
     Value::Vector {
         kind: VectorKind::Int2,

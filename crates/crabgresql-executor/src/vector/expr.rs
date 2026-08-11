@@ -13,9 +13,11 @@
 //!
 //! - **`numeric`** is stored as `Utf8` — arbitrary precision has no Arrow type —
 //!   so an Arrow comparison would compare *text*, making `'9' > '10'`. Excluded.
-//! - **`float4`/`float8`** — PostgreSQL defines `NaN = NaN` as true and `NaN` as
-//!   greater than everything (`crabgresql_types::float`); IEEE, and so Arrow's
-//!   `eq`, says `NaN` equals nothing. Excluded from comparisons. Floats are
+//! - **`float4`/`float8`** — Arrow's comparison kernels are bitwise, which is
+//!   IEEE's totalOrder predicate and not IEEE `==`: `-0.0 = 0.0` comes out
+//!   false where PostgreSQL says true, and two NaNs with distinct bit
+//!   patterns come out unequal where PostgreSQL treats every NaN as one
+//!   value (`crabgresql_types::float`). Excluded from comparisons. Floats are
 //!   still usable as *sort* keys, where the divergence is repairable.
 //! - **`bpchar`** compares with trailing blanks trimmed, which no Arrow kernel
 //!   does. Excluded.
@@ -292,8 +294,11 @@ fn compile_bool(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
 ///
 /// Anything else — an arithmetic expression, a function call, a cast, a
 /// parameter, a correlated reference — ends the compile. Those are where the
-/// row evaluator's side effects and PostgreSQL-specific semantics live, and
-/// none of them is worth reproducing before the simple cases are proven.
+/// row evaluator's side effects and PostgreSQL-specific semantics live.
+///
+/// TODO(perf): compile computed operands (arithmetic, casts, function calls);
+/// each needs its PostgreSQL semantics — arithmetic overflow errors, the
+/// evaluation order of a volatile call — reproduced on the Arrow path first.
 fn compile_operand(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
     match expr {
         BoundExpr::Collate { expr, .. } => compile_operand(expr, layout),

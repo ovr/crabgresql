@@ -24,8 +24,9 @@ const MAX_DSCALE: i64 = 16383;
 /// weight `w` maps to base-10000 weight `floor(w/4)`, so this bounds the
 /// integer magnitude at ~131072 digits.
 const MAX_NBASE_WEIGHT: i64 = 0x7FFF;
-/// Division/transcendental "give at least this many significant digits" floor,
-/// matching PG's `NUMERIC_MIN_SIG_DIGITS`.
+/// Division/transcendental "give at least this many significant digits" floor:
+/// PG prints `10::numeric / 3` as `3.3333333333333333` and `ln(2)` as
+/// `0.6931471805599453` (see `division_scale_matches_pg`, `ln_matches_pg`).
 const MIN_SIG_DIGITS: i32 = 16;
 /// Ceiling on the display scale exp/ln/log/power pick for themselves. PG stops
 /// at 1000 fractional digits there, well short of [`MAX_DSCALE`]: `exp(-5000)`
@@ -867,7 +868,8 @@ impl Numeric {
     }
 
     /// Result scale for `sqrt`: ~16 significant digits, honoring the input's
-    /// own scale (reproduced from PG's observable `sqrt_var` rule).
+    /// own scale (reproduced from PG's observable output, see
+    /// `sqrt_matches_pg`).
     fn sqrt_scale(&self) -> i32 {
         let base = (MIN_SIG_DIGITS as i64 - 1) - 2 * self.nbase_weight();
         base.max(self.dscale as i64).max(0).min(MAX_DSCALE) as i32
@@ -881,8 +883,8 @@ impl Numeric {
         let a_low = self.low();
         let shift = a_low + 2 * rscale;
         // Radicand must be an integer: pad or (rarely) drop low digits. shift
-        // is >= 0 here because rscale >= 0 and a_low is small in practice; if
-        // negative, we would lose precision, so guard by extending to even.
+        // is >= 0 here because rscale >= 0 and a_low is small in practice; a
+        // negative one only drops digits below the requested result scale.
         let mut radicand = self.digits.clone();
         if shift >= 0 {
             radicand.extend(std::iter::repeat(0u8).take(shift as usize));
@@ -896,9 +898,6 @@ impl Numeric {
             }
         }
         let (root, rem) = isqrt_be(&radicand);
-        // Round half-up: if remainder past floor pushes over .5, i.e.
-        // value - root^2 = rem, and (root+0.5)^2 = root^2+root+0.25, so round up
-        // when rem > root  ⇔  2*rem > 2*root+... use rem*? Compare rem to root.
         let mut q = root;
         // (root+1)^2 - value = 2*root+1 - rem ; nearest integer root: round up
         // when rem*2 >= 2*root+1  ⇔  rem > root.
@@ -909,7 +908,7 @@ impl Numeric {
     }
 
     /// `ln(numeric)`: natural logarithm. Errors on zero/negative arguments.
-    /// Result scale gives ~16 significant digits (PG's `ln_var` rule).
+    /// Result scale gives ~16 significant digits (see `ln_matches_pg`).
     pub fn ln(&self) -> Result<Numeric, NumErr> {
         if self.is_nan() {
             return Ok(Numeric::nan());
@@ -1023,7 +1022,8 @@ impl Numeric {
     /// through `exp(y * ln x)`.
     pub fn power(&self, y: &Numeric) -> Result<Numeric, NumErr> {
         if self.is_nan() || y.is_nan() {
-            // PG: x^0 = 1 and 1^y = 1 even for NaN; otherwise NaN propagates.
+            // PG: x^0 = 1 even for a NaN base; otherwise NaN propagates.
+            // TODO: return 1 for `1 ^ NaN`; PG answers 1, this returns NaN.
             if y.is_zero() {
                 return Ok(Numeric::from_i128(1));
             }
@@ -1346,8 +1346,12 @@ fn ln10(guard: i32) -> Numeric {
     Numeric::from_i128(10).ln_near_one(guard)
 }
 
-/// Result scale for ln/log: 16 significant digits, i.e. `16 - max(0, weight)`,
-/// never below the value's own scale or zero.
+/// Result scale for ln/log: 16 significant digits, i.e. `16 - max(0, weight)`
+/// of the computed logarithm, clamped to `0..=MAX_DSCALE`.
+///
+/// TODO: floor the result scale at the *input's* display scale, which this
+/// helper never sees — PG's `ln(1.2345678e-28)` prints the input's 35
+/// fractional digits, where this asks for 15.
 fn log_scale(val: &Numeric) -> i32 {
     let w = if val.is_zero() { 0 } else { val.weight.max(0) };
     (MIN_SIG_DIGITS - w).clamp(0, MAX_DSCALE as i32)
@@ -1698,8 +1702,7 @@ fn isqrt_be(n: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Expand Rust scientific notation (`-6.66e-1`) into a plain decimal string,
-/// stripping insignificant trailing zeros. Shared shape with the old cast
-/// helper; used by float→numeric.
+/// stripping insignificant trailing zeros. Used by float→numeric.
 fn sci_to_plain(sci: &str) -> String {
     let (mantissa, exp) = sci.split_once('e').expect("scientific notation");
     let exp: i32 = exp.parse().expect("exponent");

@@ -3,7 +3,7 @@
 //! flag bits. The line-pointer array stays in logical (sorted) key order, so a
 //! binary search walks it directly.
 //!
-//! Slot convention (PostgreSQL's `P_HIKEY`/`P_FIRSTDATAKEY`):
+//! Slot convention, matching PostgreSQL's B-tree page layout:
 //! * a non-rightmost page keeps a **high key** at offset 1 (an upper bound: every
 //!   data key on the page is `<=` it); data items start at offset 2;
 //! * a rightmost page has no high key (its bound is +infinity); data starts at 1;
@@ -16,8 +16,8 @@ use crate::page::{self, Page};
 /// Special-region length reserved by [`page::init_special`] on every B-tree page.
 pub const BT_SPECIAL_LEN: usize = 16;
 
-/// Sentinel for "no sibling / no such block". Block 0 is always the meta page and
-/// is never a sibling, so it is safe as the invalid marker.
+/// Sentinel for "no sibling / no such block". Zero cannot serve as the marker
+/// because it is a real block (the meta page), so the top of the range is used.
 pub const INVALID_BLOCK: u32 = u32::MAX;
 /// The meta page lives at block 0 and holds the root pointer.
 pub const META_BLOCK: u32 = 0;
@@ -25,11 +25,14 @@ pub const META_BLOCK: u32 = 0;
 pub const BTP_LEAF: u16 = 1 << 0;
 pub const BTP_ROOT: u16 = 1 << 1;
 pub const BTP_META: u16 = 1 << 2;
-#[allow(dead_code)] // page deletion/merge is deferred; the flag is reserved
+#[allow(dead_code)] // TODO: delete/merge empty pages and mark them with this
 pub const BTP_DELETED: u16 = 1 << 3;
-/// Set on the left half of a split until its parent downlink is inserted. Equality
-/// search does not depend on it (right-links cover an incomplete split); it is
-/// reserved for a future `_bt_finish_split`.
+/// Reserved to mark the left half of a split whose parent downlink has not been
+/// inserted yet. Equality search does not depend on it (right-links cover an
+/// incomplete split).
+///
+/// TODO: set and clear this flag around a split so a crash between the split and
+/// the parent insert can be repaired by the next descent.
 #[allow(dead_code)]
 pub const BTP_INCOMPLETE_SPLIT: u16 = 1 << 4;
 

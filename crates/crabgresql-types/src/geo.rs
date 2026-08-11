@@ -893,7 +893,7 @@ pub fn path_n_cmp(a: &PathVal, b: &PathVal) -> std::cmp::Ordering {
 //
 // A `box` is stored normalized as `[high.x, high.y, low.x, low.y]` — PG swaps
 // the corners on input so that `high` is componentwise >= `low`, which is why
-// `'(2.0,2.0,0.0,0.0)'::box` prints as `(2,2),(0,0)`.
+// `'(1.0,1.0,3.0,3.0)'::box` prints as `(3,3),(1,1)`.
 
 fn box_high(b: &[f64; 4]) -> [f64; 2] {
     [b[0], b[1]]
@@ -934,7 +934,7 @@ pub fn format_box(b: &[f64; 4], efd: i32) -> String {
     )
 }
 
-/// `box(p1, p2)` / `point::box` when both points are the same.
+/// `box(p1, p2)`.
 pub fn box_from_points(p1: &[f64; 2], p2: &[f64; 2]) -> [f64; 4] {
     box_normalize([p1[0], p1[1], p2[0], p2[1]])
 }
@@ -1214,7 +1214,7 @@ pub fn box_to_circle(b: &[f64; 4]) -> [f64; 3] {
     [c[0], c[1], point_distance(&box_high(b), &c)]
 }
 
-/// `box::polygon`: the four corners, counterclockwise from the low corner.
+/// `box::polygon`: the four corners, clockwise from the low corner.
 pub fn box_to_polygon(b: &[f64; 4]) -> PolygonVal {
     let (hx, hy, lx, ly) = (b[0], b[1], b[2], b[3]);
     PolygonVal {
@@ -2475,7 +2475,8 @@ mod tests {
             parse_box(" ( ( 1 , 2 ) , ( 3 , 4 ) ) ")?,
             [3.0, 4.0, 1.0, 2.0]
         );
-        // Unlike `lseg`, a trailing separator is tolerated but `[...]` is not.
+        // Both types tolerate a trailing separator; unlike `lseg`, the `[...]`
+        // spelling is rejected.
         assert_eq!(parse_box("(1,2),(3,4),")?, [3.0, 4.0, 1.0, 2.0]);
         assert_eq!(format_box(&[3.0, 4.0, 1.0, 2.0], 0), "(3,4),(1,2)");
         Ok(())
@@ -3003,7 +3004,7 @@ mod tests {
         let inner = parse_polygon("((1,1),(2,1),(2,2),(1,2))")?;
         assert!(poly_contain(&outer, &inner) && poly_contained(&inner, &outer));
         assert!(poly_contain(&outer, &outer));
-        // Sharing the bounding box but poking outside it is not containment.
+        // Overlapping is not containment: a vertex outside `outer` fails.
         assert!(!poly_contain(
             &outer,
             &parse_polygon("((-1,-1),(5,0),(4,4))")?

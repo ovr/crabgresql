@@ -12,12 +12,14 @@
 //! fill-mode prefix, the `TH`/`th` ordinal suffix, `"quoted"` literal text, and
 //! passthrough of anything else.
 //!
-//! Divergences, both deliberate:
+//! Gaps, both of which show as output that differs from PG:
 //!
-//! * The codes `Q W WW IW IYYY IDDD DDD J SSSS RM CC BC AD SP TM D` are not
-//!   implemented and pass through as literal text rather than being expanded.
-//! * `to_timestamp`'s `TZ` code resolves a parsed abbreviation's offset at the
-//!   2000 epoch rather than at the instant being parsed, so a DST-varying
+//! * TODO: expand the codes `Q W WW IW IYYY IDDD DDD J SSSS RM CC BC AD SP TM
+//!   D`. Most pass through as literal text; the ones that begin with a
+//!   supported spelling are read as that shorter code instead — `SSSS` as two
+//!   `SS` fields, `DDD` and `IDDD` as `DD` and a literal `D`, `IYYY` as `YYY`.
+//! * TODO: resolve a parsed `TZ` abbreviation's offset at the instant being
+//!   parsed. `to_timestamp` resolves it at the 2000 epoch, so a DST-varying
 //!   abbreviation can come back one hour off for dates far from 2000.
 
 use crate::interval::{self, Interval};
@@ -1718,14 +1720,14 @@ mod tests {
         assert_eq!(e.sqlstate, "22008");
     }
 
-    /// `TZ` and `OF` report the session zone, not a hardcoded UTC.
-    /// Pinned against PostgreSQL 18.4.
     /// `FormatError` is a plain message struct, not a `std::error::Error`, so
     /// `?` needs an explicit mapper.
     fn fe(e: FormatError) -> anyhow::Error {
         anyhow::anyhow!("{}: {}", e.sqlstate, e.message)
     }
 
+    /// `TZ` and `OF` report the session zone, not a hardcoded UTC.
+    /// Pinned against PostgreSQL 18.4.
     #[test]
     fn to_char_renders_the_session_zone() -> anyhow::Result<()> {
         let z = |n: &str| SessionZone::resolve(n).expect("real zone");

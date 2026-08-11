@@ -11,6 +11,9 @@
 //! fractional digits). The value range is exactly `i64`:
 //! `-92233720368547758.08` (`i64::MIN` cents) .. `92233720368547758.07`
 //! (`i64::MAX` cents).
+//!
+//! TODO: honor `lc_monetary`; the `$`/`,`/`.` conventions are hardcoded to the
+//! `C` locale, which is the locale the upstream `money` regression test assumes.
 
 use std::cmp::Ordering;
 
@@ -62,12 +65,17 @@ fn division_by_zero() -> MoneyError {
 /// Accepts an optional `$`, `,` thousands separators, and a single sign
 /// indicator that is either leading (`-`/`+`), trailing (`-`/`+`), or PG's
 /// accounting parentheses where a leading `(` denotes a negative amount and the
-/// closing `)` is optional (`(1)` and `(1` both = -$1.00). Reproduces PG's
-/// `cash_in`: more than one sign, or a sign nested inside the parentheses, is an
+/// closing `)` is optional (`(1)` and `(1` both = -$1.00). As in PG, a sign
+/// ahead of the digits inside the parentheses, or a doubled leading sign, is an
 /// error (`(-1)`, `--1`, `+-1` all reject). Two fractional digits are kept; a
 /// third digit `>= '5'` rounds the magnitude away from zero (matching `cash_in`,
 /// which inspects only the next digit — so `92233720368547758.075` rounds up
 /// into overflow).
+///
+/// TODO: accept the repeated sign indicators PG tolerates — a trailing sign
+/// after a leading one (`-1-` and `(1-)` both = -$1.00) and an unmatched
+/// closing paren (`1)` = $1.00, `(1))` = -$1.00) — which are rejected here as
+/// `22P02`.
 pub fn parse(input: &str) -> Result<i64, MoneyError> {
     let mut s = input.trim();
     let mut neg = false;
@@ -430,8 +438,10 @@ mod tests {
 
     #[test]
     fn rejects_multiple_or_nested_signs() {
-        // A sign nested in parentheses, or more than one sign indicator, is an
-        // error in PG rather than a silently cancelled/duplicated sign.
+        // A sign ahead of the digits inside parentheses, or a doubled leading
+        // sign, is an error in PG rather than a silently cancelled/duplicated
+        // sign. `-1-` and `1)` are stricter than PG, which reads them as -$1.00
+        // and $1.00 (see the TODO on `parse`).
         for bad in ["(-1)", "(+1)", "--1", "+-1", "-$-1", "-1-", "1)"] {
             assert_eq!(
                 parse(bad)

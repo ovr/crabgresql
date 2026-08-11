@@ -159,6 +159,8 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
     // legal there. Bound in an empty scope they would fail with a misleading
     // 42P01/42703 blaming a FROM clause that plainly lists `t`; say what is
     // actually missing instead, exactly as the derived-table arm does.
+    // TODO: bind a function FROM item as implicitly LATERAL, so its arguments
+    // can reference the columns of FROM items to its left.
     for sql in [
         "SELECT * FROM t, generate_series(1, t.id) g",
         "SELECT * FROM t, generate_series(1, id) g",

@@ -21,8 +21,8 @@ const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
 /// The lowest value `xid` accepts once a negative input has wrapped:
-/// `(-2147483648i64) as u64`. See [`xid_in`] for why the accepted set has this
-/// second, disjoint band at the top of the `u64` range.
+/// `(-2147483648i64) as u64`. See [`wraps_into_u32`] for why the accepted set
+/// has this second, disjoint band at the top of the `u64` range.
 const MIN_WRAPPED_XID: u64 = (i32::MIN as i64) as u64;
 
 /// A parse error, carrying the SQLSTATE and message PG reports.
@@ -202,8 +202,10 @@ mod tests {
         Ok(())
     }
 
-    /// Each of these stops the digit run early, leaving a trailing character —
-    /// which PG treats as a syntax error rather than a partial parse.
+    /// None of these converts in full: either nothing converts at all (`""`,
+    /// `"asdf"`, a bare sign) or the digit run stops early and leaves a
+    /// trailing character (`"08"`, `"0x"`). PG reports both as a syntax error
+    /// rather than accepting the partial parse.
     #[test]
     fn rejects_malformed() {
         for bad in ["", "asdf", "1abc", "08", "0b11", "0o17", "0x", "-", "+"] {

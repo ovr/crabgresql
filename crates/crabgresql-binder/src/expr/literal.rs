@@ -204,12 +204,14 @@ fn numeric_const(text: &str, original: &str) -> Result<BoundExpr, BindError> {
 ///   [`crabgresql_types::interval::apply_typmod`] drops everything below its
 ///   lowest field, so `INTERVAL '1 day 2 hours' DAY` is one day.
 ///
-/// Divergence: in PostgreSQL the qualifier also *steers the parse* of a
-/// punctuated literal — `interval '1 2:03' day to second` is `1 day 02:03:00`
-/// while `interval '1 2:03' hour to second` reads the same text as `mm:ss`. Here
-/// the qualifier only picks the default unit and then masks the result, so those
-/// two spellings still agree. That lives inside `interval_in`, not in the type
-/// modifier, and is why `interval` is not yet an upstream must-pass test.
+/// TODO: let the qualifier steer the parse of a punctuated literal, inside
+/// `interval_in` rather than in the type modifier. In PostgreSQL
+/// `interval '1 2:03' day to second` is `1 day 02:03:00` while
+/// `interval '1 2:03' minute to second` reads the same text as `mm:ss` and is
+/// `1 day 00:02:03` (upstream `interval` regression test); here the qualifier
+/// only picks the default unit and then masks the result, so those two
+/// spellings still agree. That gap is why `interval` is not an upstream
+/// must-pass test.
 pub(super) fn bind_interval(node: &ast::Interval) -> Result<Binding, BindError> {
     let (s, span) = match &*node.value {
         ast::Expr::Value(v) => match v.value.as_pg_string() {
@@ -367,18 +369,17 @@ fn datetime_field_to_unit(field: &ast::DateTimeField) -> interval::Unit {
 }
 
 /// `EXTRACT(field FROM ts)`: PG's `date_part`-family sugar that returns
-/// `numeric`. We support it on `timestamp`; the field name is carried as a text
-/// constant argument and validated at run time (unknown units error there,
-/// matching `date_part`).
+/// `numeric`. The field name is carried as a text constant argument and
+/// validated at run time (unknown units error there, matching `date_part`).
 pub(super) fn bind_extract(
     field: &ast::DateTimeField,
     expr: &ast::Expr,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
     let unit = datetime_field_unit(field);
-    // The operand type selects the overload; interval, timestamp, and
-    // timestamptz each have their own extract. An untyped literal defaults to
-    // `timestamp`, matching PG.
+    // The operand type selects the overload; timestamp, interval, timestamptz,
+    // date, time and timetz each have their own extract. An untyped literal
+    // defaults to `timestamp`, matching PG.
     let (func, arg) = match bind_expr(expr, scope)? {
         Binding::Typed(e) if e.ty() == PgType::Timestamp => (ScalarFn::Extract, e),
         Binding::Typed(e) if e.ty() == PgType::Interval => (ScalarFn::ExtractInterval, e),

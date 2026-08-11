@@ -28,7 +28,7 @@ const USECS_PER_SEC: i64 = 1_000_000;
 
 /// PG's `timestamptz` range is `[4714-11-24 00:00:00 UTC BC, 294276-12-31
 /// 23:59:59.999999 UTC]`. We express it as a half-open micro range on the
-/// stored value: `MIN_MICROS <= v < END_MICROS`.
+/// stored value: `min_micros() <= v < end_micros()`.
 fn min_micros() -> i64 {
     // 4714-11-24 00:00:00 BC == astronomical year -4713.
     encode_ymd(-4713, 11, 24)
@@ -334,7 +334,7 @@ fn local_for_field(unit: &str, micros: i64, session: &SessionZone) -> i64 {
 /// argument for the three-argument one — the arithmetic is identical either way,
 /// which is why this takes a bare [`tz::Zone`] rather than a [`SessionZone`].
 ///
-/// Which offset converts back depends on the unit, matching PG's `redotz` flag:
+/// Which offset converts back depends on the unit:
 ///
 /// * `day` and coarser **re-resolve** the offset from the truncated wall clock,
 ///   which is what makes `date_trunc('day', …)` land on real local midnight on
@@ -379,8 +379,8 @@ pub fn date_trunc_in_zone(unit: &str, micros: i64, zone: &str) -> Result<i64, Ti
 }
 
 /// Whether truncating to `unit` re-resolves the zone offset from the truncated
-/// wall clock (PG's `redotz`): true for `day` and coarser, false for the
-/// sub-day units, which keep the input's offset.
+/// wall clock: true for `day` and coarser, false for the sub-day units, which
+/// keep the input's offset.
 fn redo_zone(unit: &str) -> bool {
     !matches!(
         unit.trim().to_ascii_lowercase().as_str(),
@@ -390,10 +390,10 @@ fn redo_zone(unit: &str) -> bool {
 
 // --- arithmetic ------------------------------------------------------------
 //
-// `timestamptz - timestamptz` has no entry here: PostgreSQL's `timestamptz_mi`
-// *is* `timestamp_mi` (one C function under two names), because the difference
-// of two instants is the same span whatever zone you look at them from. The
-// executor calls [`timestamp::mi`] directly.
+// `timestamptz - timestamptz` has no entry here: PG's `timestamptz_mi` answers
+// exactly as `timestamp_mi` does, because the difference of two instants is the
+// same span whatever zone you look at them from. The executor calls
+// [`timestamp::mi`] directly.
 
 /// `timestamptz + interval` (`timestamptz_pl_interval`): the months and days
 /// are calendar quantities and so are added to the **local wall clock**, while
@@ -414,7 +414,7 @@ fn redo_zone(unit: &str) -> bool {
 /// * Months and days take **separate** round trips through the zone, as they do
 ///   in PG. Folding them into one differs whenever the month shift and the day
 ///   shift straddle a transition.
-/// * Infinities are settled before any of it: [`instant_to_wall`] would pass a
+/// * Infinities are settled before any of it: [`to_wall_clock`] would pass a
 ///   sentinel through unharmed, but the microsecond step below would not, and
 ///   an infinite interval has no wall clock at all.
 pub fn pl_interval(
@@ -1600,8 +1600,12 @@ mod tests {
         );
     }
 
-    /// The infinity matrix, settled before any zone rotation: `to_wall_clock`'s
-    /// saturating add would quietly turn a sentinel into a finite instant.
+    /// The infinity matrix, settled before any of the shifts: the rotation and
+    /// the calendar step pass an infinite *timestamp* through untouched, but an
+    /// infinite *interval* does not survive them — its sentinel `i32::MAX`
+    /// months would be shifted as a real month count and raise `timestamp out
+    /// of range` instead of answering `infinity`, and an opposite-signed pair
+    /// would fold into a finite instant rather than raise.
     #[test]
     fn infinities_short_circuit_the_zone() {
         let ny = zone_of("America/New_York");

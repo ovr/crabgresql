@@ -9,8 +9,9 @@
 //! without a clock.
 //!
 //! Randomness comes from `rand`'s thread generator, a buffered ChaCha12
-//! reseeded from the OS. PG draws UUID bytes from `pg_strong_random`, so a
-//! cryptographic generator is the behavior to match, not an upgrade over it.
+//! reseeded from the OS. PG's generated UUIDs draw their bytes from a
+//! cryptographically strong random source, so a cryptographic generator is the
+//! behavior to match, not an upgrade over it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

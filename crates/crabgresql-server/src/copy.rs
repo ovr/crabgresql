@@ -445,9 +445,9 @@ impl CopyDecoder {
     }
 }
 
-/// PostgreSQL has no COPY-specific line limit: `CopyReadLine` accumulates the
-/// logical line into a `StringInfo`, which refuses to grow past `MaxAllocSize`.
-/// We reproduce that limit, its SQLSTATE and its wording; the HINT is ours (PG
+/// PostgreSQL has no COPY-specific line limit: a logical line accumulates in a
+/// string buffer that refuses to grow past `MaxAllocSize` (1 GB − 1). We
+/// reproduce that limit, its SQLSTATE and its wording; the HINT is ours (PG
 /// emits none), because in practice this is almost always an unterminated quote.
 fn record_too_long(have: usize, added: usize, max: usize) -> PgError {
     PgError::new(
@@ -665,7 +665,7 @@ pub fn open_source_file(access: &CopyFileAccess, path: &str) -> Result<File, PgE
     Ok(file)
 }
 
-/// PG's `BeginCopyFrom` rejects a directory before it ever reads, with the
+/// PG rejects a directory before it ever reads a byte, with the
 /// wrong-object-type class rather than an I/O error.
 fn is_a_directory(path: &str) -> PgError {
     PgError::new(

@@ -56,10 +56,10 @@ pub fn open_pg_engine(
 }
 
 /// Accept connections forever with the default, non-durable transaction manager
-/// (no WAL) — the entry point the memory-engine tests and the in-memory default
-/// use. Durable deployments call [`serve_with`] with a WAL-backed manager.
+/// (no WAL) and no server-side COPY file access — the in-memory entry point,
+/// which has no data directory to anchor either on. Durable deployments call
+/// [`serve_with`] with a WAL-backed manager.
 pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::io::Result<()> {
-    // No data directory, so no server-side COPY file read can be anchored.
     serve_with(
         listener,
         engine,

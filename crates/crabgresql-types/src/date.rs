@@ -12,10 +12,9 @@
 //! an `i32`. `i32::MIN`/`i32::MAX` are the `-infinity`/`infinity` sentinels, so
 //! the natural integer order already sorts them correctly.
 //!
-//! Deviations from PG, acceptable while no passing test needs them: only ISO
-//! `Y-M-D` and the verbose `Mon DD, YYYY` input forms are accepted (the
-//! `SET DateStyle` ymd/dmy/mdy matrix, Julian `J…` input, and `.NNN`
-//! day-of-year forms are not).
+//! TODO: accept the remaining `date_in` input forms — the `SET DateStyle`
+//! ymd/dmy/mdy orders, Julian `J…` input, and `.NNN` day-of-year forms. Only
+//! ISO `Y-M-D` and the verbose `Mon DD, YYYY` are parsed.
 
 use crate::Numeric;
 use crate::fmt::FmtCtx;
@@ -40,8 +39,8 @@ pub const POS_INFINITY: i32 = i32::MAX;
 /// `4714-11-24 BC` (Julian day 0) ..= `5874897-12-31`.
 const DATE_MINVAL: i32 = -(POSTGRES_EPOCH_JDATE as i32); // Julian day 0
 /// One past the last Julian day a `date` can hold — `5874897-12-31` is
-/// `JULIAN_MAX - 1`. PG's `IS_VALID_DATE` compares against it exclusively, so
-/// every bound built from it must too.
+/// `JULIAN_MAX - 1`. PG's range check is exclusive at this end (`5874898-01-01`
+/// already errors), so every bound built from it must be too.
 pub(crate) const JULIAN_MAX: i32 = 2_147_483_494;
 const DATE_MAXVAL: i32 = JULIAN_MAX - POSTGRES_EPOCH_JDATE as i32;
 
@@ -190,8 +189,8 @@ fn out_of_range() -> DateError {
     }
 }
 
-/// `date + int4` / `date - int4` (via a negative `n`): shift by whole days. An
-/// infinite date is unchanged.
+/// `date + int4` (`date_pli`): shift by whole days. An infinite date is
+/// unchanged.
 pub fn add_days(d: i32, n: i32) -> Result<i32, DateError> {
     if !is_finite(d) {
         return Ok(d);
@@ -222,8 +221,8 @@ pub fn sub_date(a: i32, b: i32) -> Result<i32, DateError> {
     Ok(a - b)
 }
 
-/// `date field value out of range for timestamp` — a finite date whose midnight
-/// falls outside the `timestamp` microsecond range (PG's `date2timestamp`).
+/// `date out of range for timestamp` — a finite date whose midnight falls
+/// outside the `timestamp` microsecond range.
 fn out_of_range_for_timestamp() -> DateError {
     DateError {
         sqlstate: DATETIME_FIELD_OVERFLOW,
@@ -250,8 +249,8 @@ pub fn to_timestamp_micros(d: i32) -> Result<i64, DateError> {
         .ok_or_else(out_of_range_for_timestamp)
 }
 
-/// The calendar date of a timestamp (`timestamp::to_date` direction): the
-/// `date` cast of a `timestamp`/`timestamptz`, infinities preserved.
+/// The calendar date of a timestamp: the `date` cast of a
+/// `timestamp`/`timestamptz`, infinities preserved.
 pub fn from_timestamp_micros(micros: i64) -> i32 {
     if micros == timestamp::POS_INFINITY {
         return POS_INFINITY;
@@ -284,7 +283,7 @@ pub fn pl_time(d: i32, time_usec: i64) -> Result<i64, DateError> {
 
 /// `date + timetz` → `timestamptz`: the UTC instant of the date's midnight plus
 /// the zoned time-of-day (`local usec + zone-west offset`). Matches PG's
-/// `datetimetz_timestamptz`.
+/// `datetimetz_pl`.
 pub fn pl_timetz(d: i32, t: crate::TimeTz) -> Result<i64, DateError> {
     let micros = to_timestamp_micros(d)?;
     if !is_finite(d) {

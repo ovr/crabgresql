@@ -12,7 +12,10 @@ use crate::catalogs::class::TOAST_COLUMNS;
 use crate::catalogs::collation::typcollation_of;
 
 /// `pg_catalog.pg_attribute` — a curated subset of columns for user relations'
-/// columns. System (negative `attnum`) columns are not emitted yet.
+/// columns.
+///
+/// TODO: emit the system columns PostgreSQL also lists here — `ctid`, `xmin`,
+/// `cmin`, `xmax`, `cmax` and `tableoid`, at negative `attnum`.
 pub(crate) fn pg_attribute_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_attribute",

@@ -57,7 +57,11 @@ pub enum JoinExpr {
         left: Box<JoinExpr>,
         right: Box<JoinExpr>,
         kind: JoinKind,
-        /// `None` only for `CROSS JOIN` / comma joins.
+        /// `None` for `CROSS JOIN` / comma joins, and for a `NATURAL` join
+        /// whose sides share no column name: no equality is derived, so the
+        /// node behaves like `ON TRUE` while keeping the kind it was written
+        /// with — a bare `NATURAL JOIN` stays `Inner`, it does not become
+        /// `Cross`.
         predicate: Option<BoundExpr>,
     },
 }

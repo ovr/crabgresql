@@ -67,7 +67,6 @@ use sqlparser_derive::{Visit, VisitMut};
 /// // convert back to `Value`
 /// let value: Value = value_with_span.into();
 /// ```
-/// A `Value` paired with its source `Span` location.
 #[derive(Debug, Clone, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(
@@ -242,9 +241,13 @@ impl Value {
     }
 
     /// The text of a PostgreSQL *character string constant*, whichever way it
-    /// was quoted: `'…'`, `$$…$$`, `E'…'`, `U&'…'` or `N'…'`. All five are the
-    /// same kind of constant to PG and are interchangeable everywhere one is
+    /// was quoted: `'…'`, `$$…$$`, `E'…'` or `U&'…'`. All four are the same
+    /// kind of constant to PG and are interchangeable everywhere one is
     /// accepted — `ESCAPE E'\\'`, `DATE E'2024-01-01'`, and so on.
+    ///
+    /// `N'…'` is unwrapped here too, which is looser than PG: PG types
+    /// `N'abc'` as `character` rather than an untyped constant, and rejects it
+    /// where a constant is expected (`DATE N'2024-01-01'` is a syntax error).
     ///
     /// Returns `None` for the bit-string forms `B'…'`/`X'…'`, which are not
     /// text, and for the non-PostgreSQL quoting styles the vendored parser
@@ -686,7 +689,7 @@ impl fmt::Display for EscapeUnicodeStringLiteral<'_> {
                 }
                 _ => {
                     let codepoint = c as u32;
-                    // if the character fits in 32 bits, we can use the \XXXX format
+                    // if the character fits in 16 bits, we can use the \XXXX format
                     // otherwise, we need to use the \+XXXXXX format
                     if codepoint <= 0xFFFF {
                         write!(f, "\\{codepoint:04X}")?;

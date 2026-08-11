@@ -8,10 +8,11 @@
 //! their prose copy.
 //!
 //! Only the knobs this crate reads itself go through [`RangedVar`]. The
-//! server's listen address, port and data directory are clap arguments that
-//! happen to take an environment fallback, and `RUST_LOG` belongs to
-//! `tracing_subscriber`; those are here as names and defaults only, and they
-//! keep their own (stricter, exit-on-bad-input) behavior.
+//! server's listen address, port, data directory and `COPY … FROM` path list
+//! are clap arguments that happen to take an environment fallback, and
+//! `RUST_LOG` belongs to `tracing_subscriber`; those are here as names and
+//! defaults only, and they keep their own handling of a value they cannot
+//! use — clap exits, and `RUST_LOG` falls back to the default filter.
 //!
 //! Cargo's own build-time variables (`OUT_DIR`, `CARGO_MANIFEST_DIR`,
 //! `CARGO_TARGET_TMPDIR`) are deliberately absent — they are an interface with
@@ -297,8 +298,9 @@ impl Quantity for usize {
 impl Quantity for Duration {
     const NOUN: &'static str = "duration";
 
-    /// `ms`, `s`, `m` (also `min`) and `h`; a bare count is milliseconds,
-    /// which is what these knobs took before they had units at all.
+    /// `ms`, `s` (also `sec`), `m` (also `min`) and `h`; a bare count is
+    /// milliseconds, which is what these knobs took before they had units at
+    /// all.
     fn parse(raw: &str) -> Option<Duration> {
         const SECOND: u64 = 1_000;
         const MINUTE: u64 = 60 * SECOND;

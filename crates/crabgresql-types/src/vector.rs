@@ -39,6 +39,8 @@
 //!   `array_length`, `@>`, `<@` and `&&` all work on an `oidvector` there.
 //!   Here they are gated on [`crate::PgType::Array`] and raise `42883`.
 //!   `unnest` and subscripting are wired up individually and do work.
+//!   TODO: accept `oidvector`/`int2vector` in the polymorphic `anyarray`
+//!   functions and operators (`cardinality`, `array_length`, `@>`, `<@`, `&&`).
 //!
 //! Note that *subscripting* is 0-based, unlike a real array:
 //! `('11 22 33'::oidvector)[0]` is `11`. That is handled in the executor's

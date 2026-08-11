@@ -4,16 +4,18 @@
 //! psql builds its describe output from a fixed sequence of catalog queries — a
 //! name lookup, the relation's `pg_class` flags, one row per column, and then a
 //! footer query per feature (indexes, constraints, foreign keys, policies,
-//! extended statistics, publications, inheritance children, partitions). The
-//! footer queries need `pg_get_indexdef`, `pg_get_constraintdef`,
-//! `pg_partition_ancestors`, `pg_policy`, `pg_publication` and `pg_roles`, none of
-//! which crabgresql has yet, and psql sends most of them unconditionally.
+//! extended statistics, publications, inheritance children, partitions), and it
+//! sends most of them unconditionally.
 //!
 //! So this runs the first three queries verbatim and refuses — falling back to
 //! the "metacommand not supported" stub — whenever the relation is one a real
 //! psql would print a footer for. A refusal is a visible diff; silently dropping
 //! a footer would be an invisible wrong answer. See [`Flags::footerless`] for the
 //! exact gate.
+//!
+//! TODO: render the footers instead of refusing; their queries need
+//! `pg_get_indexdef`, `pg_partition_ancestors`, `pg_policy` and `pg_publication`,
+//! none of which crabgresql has.
 //!
 //! The queries are the ones psql 18.4 sends, captured with `psql -E` (the
 //! versions of them already pinned as SQL in `suites/smoke/sql/psql_describe.sql`
@@ -37,6 +39,9 @@ pub async fn describe(
     // `?`/`*`/regex wildcards. Only a bare, unquoted, wildcard-free name is
     // accepted here — enough for a `\d <table>` in a script, and everything else
     // is left to the stub rather than half-translated.
+    //
+    // TODO: accept the rest of that pattern grammar — quoted identifiers,
+    // `schema.name`, and the `?`/`*`/regex wildcards.
     if pattern.is_empty()
         || !pattern
             .chars()
@@ -130,9 +135,9 @@ ORDER BY a.attnum;"
     let Some(columns) = query_rows(client, &columns_sql, statement_timeout).await? else {
         return Ok(None);
     };
-    // An identity or generated column adds text to the Default cell that this
-    // does not build; neither exists in crabgresql, so decline instead of
-    // printing the cell empty.
+    // TODO: build the Default cell text psql prints for an identity or a
+    // generated column. Neither column kind exists in crabgresql, so declining
+    // costs nothing today, and printing the cell empty would be a wrong answer.
     if columns
         .iter()
         .any(|row| !cell(row, 5).is_empty() || !cell(row, 6).is_empty())

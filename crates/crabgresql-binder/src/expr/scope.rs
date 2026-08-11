@@ -404,7 +404,8 @@ pub struct Scope {
     /// What an expression subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`)
     /// needs to bind its body: the table engine (to resolve scans) and the CTEs
     /// visible at this query level. `None` in contexts where a subquery cannot
-    /// appear (column defaults, INSERT VALUES rows), which then reject one.
+    /// appear (column defaults, CHECK constraints, EXECUTE parameters), which
+    /// then reject one.
     pub(super) subquery: Option<std::rc::Rc<SubqueryContext>>,
     /// The enclosing queries' resolution views, nearest first (index 0 = the
     /// immediate parent = correlation level 1). Empty for a top-level query;
@@ -957,10 +958,10 @@ fn typmod_at(rels: &[ScopeRel], index: usize) -> i32 {
     -1
 }
 
-/// The type modifier a projected expression carries, mirroring PostgreSQL's
-/// `exprTypmod`: a modifier survives a reference and an explicit coercion, and
-/// nothing else. `CREATE VIEW` stores the result on the view's column, so
-/// `\d v` can print `character varying(20)`.
+/// The type modifier a projected expression carries, as PostgreSQL derives it:
+/// a modifier survives a reference and an explicit coercion, and nothing else.
+/// `CREATE VIEW` stores the result on the view's column, so `\d v` can print
+/// `character varying(20)`.
 ///
 /// The bound tree already records every coercion — `x::varchar(9)` is a
 /// `FuncCall` whose second argument is the modifier — so this reads them back
@@ -998,8 +999,9 @@ pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
                 _ => -1,
             }
         }
-        // `CASE` keeps a modifier only when every arm agrees on it, as
-        // PostgreSQL's `select_common_typmod` does.
+        // `CASE` keeps a modifier only when every arm agrees on it, the same
+        // rule PostgreSQL applies when it resolves a common modifier over a set
+        // of alternative results.
         BoundExpr::Case { whens, else_, .. } => {
             let arms = whens
                 .iter()

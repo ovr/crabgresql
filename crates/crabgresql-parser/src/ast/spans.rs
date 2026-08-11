@@ -60,15 +60,12 @@ fn union_spans<I: Iterator<Item = Span>>(iter: I) -> Span {
 ///
 /// # Notes:
 ///
-/// Source [`Span`] are not yet complete. They may be missing:
+/// TODO: complete the source [`Span`]s. Nodes may still be missing:
 ///
 /// 1. keywords or other tokens
 /// 2. span information entirely, in which case they return [`Span::empty()`].
 ///
-/// Note Some impl blocks (rendered below) are annotated with which nodes are
-/// missing spans. See [this ticket] for additional information and status.
-///
-/// [this ticket]: https://github.com/apache/datafusion-sqlparser-rs/issues/1548
+/// Some impl blocks below are annotated with which nodes are missing spans.
 ///
 /// # Example
 /// ```
@@ -121,7 +118,7 @@ impl Spanned for Query {
             order_by,
             limit_clause,
             fetch,
-            locks: _, // todo
+            locks: _, // TODO: include the FOR UPDATE/SHARE clause in the span
         } = self;
 
         union_spans(
@@ -348,7 +345,7 @@ impl Spanned for Statement {
                     .chain(core::iter::once(query.span()))
                     .chain(with_options.iter().map(|i| i.span())),
             ),
-            // These statements need to be implemented
+            // TODO: compute spans for the Span::empty() statement arms below.
             Statement::AlterFunction { .. } => Span::empty(),
             Statement::AlterType { .. } => Span::empty(),
             Statement::AlterCollation { .. } => Span::empty(),
@@ -431,15 +428,15 @@ impl Spanned for CreateTable {
             without_rowid: _, // bool
             like: _,
             clone,
-            comment: _, // todo, no span
+            comment: _, // hive specific, no span
             on_commit: _,
-            on_cluster: _,   // todo, clickhouse specific
-            primary_key: _,  // todo, clickhouse specific
-            order_by: _,     // todo, clickhouse specific
-            partition_by: _, // todo, BigQuery specific
-            cluster_by: _,   // todo, BigQuery specific
-            clustered_by: _, // todo, Hive specific
-            inherits: _,     // todo, PostgreSQL specific
+            on_cluster: _,   // TODO: span the ON CLUSTER name
+            primary_key: _,  // TODO: span the PRIMARY KEY expression
+            order_by: _,     // TODO: span the ORDER BY expressions
+            partition_by: _, // TODO: span the PARTITION BY expression
+            cluster_by: _,   // TODO: span the CLUSTER BY expressions
+            clustered_by: _, // TODO: span the CLUSTERED BY column list
+            inherits: _,     // TODO: span the INHERITS parent list
             partition_of,
             for_values,
             strict: _,                          // bool
@@ -449,14 +446,14 @@ impl Spanned for CreateTable {
             data_retention_time_in_days: _,     // u64, no span
             max_data_extension_time_in_days: _, // u64, no span
             default_ddl_collation: _,           // string, no span
-            with_aggregation_policy: _,         // todo, Snowflake specific
-            with_row_access_policy: _,          // todo, Snowflake specific
-            with_storage_lifecycle_policy: _,   // todo, Snowflake specific
-            with_tags: _,                       // todo, Snowflake specific
-            external_volume: _,                 // todo, Snowflake specific
-            base_location: _,                   // todo, Snowflake specific
-            catalog: _,                         // todo, Snowflake specific
-            catalog_sync: _,                    // todo, Snowflake specific
+            with_aggregation_policy: _,         // Snowflake specific
+            with_row_access_policy: _,          // Snowflake specific
+            with_storage_lifecycle_policy: _,   // Snowflake specific
+            with_tags: _,                       // Snowflake specific
+            external_volume: _,                 // Snowflake specific
+            base_location: _,                   // Snowflake specific
+            catalog: _,                         // Snowflake specific
+            catalog_sync: _,                    // Snowflake specific
             storage_serialization_policy: _,
             table_options,
             target_lag: _,
@@ -873,7 +870,7 @@ impl Spanned for ViewColumnDef {
     fn span(&self) -> Span {
         let ViewColumnDef {
             name,
-            data_type: _, // todo, DataType
+            data_type: _, // never populated: view columns carry no type
             options,
         } = self;
 
@@ -1186,7 +1183,7 @@ impl Spanned for AlterIndexOperation {
 
 /// # partial span
 ///
-/// Missing spans:ever
+/// Missing spans:
 /// - [Insert::insert_alias]
 impl Spanned for Insert {
     fn span(&self) -> Span {
@@ -1208,11 +1205,11 @@ impl Spanned for Insert {
             returning,
             output,
             replace_into: _, // bool
-            priority: _,     // todo, mysql specific
-            insert_alias: _, // todo, mysql specific
+            priority: _,     // enum, mysql specific
+            insert_alias: _, // TODO: span the AS row alias
             assignments,
-            settings: _,                 // todo, clickhouse specific
-            format_clause: _,            // todo, clickhouse specific
+            settings: _,                 // clickhouse specific
+            format_clause: _,            // clickhouse specific
             multi_table_insert_type: _,  // snowflake multi-table insert
             multi_table_into_clauses: _, // snowflake multi-table insert
             multi_table_when_clauses: _, // snowflake multi-table insert
@@ -1720,7 +1717,7 @@ impl Spanned for FunctionArgumentList {
         } = self;
 
         union_spans(
-            // # todo: duplicate-treatment span
+            // TODO: include the DISTINCT/ALL duplicate treatment in the span
             args.iter()
                 .map(|i| i.span())
                 .chain(clauses.iter().map(|i| i.span())),
@@ -1882,6 +1879,7 @@ impl Spanned for ReplaceSelectElement {
 /// # partial span
 ///
 /// Missing spans:
+/// - [TableFactor::XmlTable]
 impl Spanned for TableFactor {
     fn span(&self) -> Span {
         match self {
@@ -2156,7 +2154,7 @@ impl Spanned for Select {
         let Select {
             select_token,
             optimizer_hints: _,
-            distinct: _, // todo
+            distinct: _, // TODO: include DISTINCT ON expressions in the span
             select_modifiers: _,
             projection,
             exclude: _,
@@ -2468,7 +2466,7 @@ pub mod tests {
         // get the subsection of the source string that corresponds to the span
         // only works on single-line strings
         fn get_source(&self, span: Span) -> &'a str {
-            // lines in spans are 1-indexed
+            // columns in spans are 1-indexed
             &self.1[(span.start.column as usize - 1)..(span.end.column - 1) as usize]
         }
     }
@@ -2491,7 +2489,9 @@ pub mod tests {
 
         let join_span = query.from[0].joins[0].span();
 
-        // 'LEFT JOIN' missing
+        // TODO: cover the 'LEFT JOIN' keywords in Join::span; the join
+        // keywords are not kept as tokens in the AST, so the span starts at
+        // the joined relation.
         assert_eq!(
             test.get_source(join_span),
             "companies ON users.company_id = companies.id"
@@ -2541,7 +2541,9 @@ pub mod tests {
 
         let subquery_span = query.from[0].span();
 
-        // left paren missing
+        // TODO: cover the opening paren of a derived table in
+        // TableFactor::Derived's span, which unions only the subquery and the
+        // alias.
         assert_eq!(
             test.get_source(subquery_span),
             "SELECT a FROM postgres.public.source) AS b"
@@ -2582,7 +2584,7 @@ pub mod tests {
         let cte_query_span = with.cte_tables[0].query.span();
         let body_span = query.body.span();
 
-        // the WITH keyboard is part of the query
+        // the WITH keyword belongs to the query's span, not the CTE's
         assert_eq!(
             test.get_source(cte_span),
             "cte AS (SELECT a FROM postgres.public.source)"

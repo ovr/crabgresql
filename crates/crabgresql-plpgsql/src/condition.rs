@@ -1,13 +1,17 @@
 //! Exception condition names.
 //!
 //! `RAISE division_by_zero` and `RAISE ... USING ERRCODE = 'unique_violation'`
-//! both name an error by condition rather than by SQLSTATE. PostgreSQL keeps
-//! the full mapping in `errcodes.txt`; this is the subset a routine body is
-//! plausibly going to raise deliberately, plus the message PostgreSQL uses when
-//! a condition name is given with no message of its own.
+//! both name an error by condition rather than by SQLSTATE. This table holds
+//! the conditions a routine body is plausibly going to raise deliberately, plus
+//! the message PostgreSQL uses when a condition name is given with no message
+//! of its own.
 //!
 //! An unlisted name is an error rather than a silent fallback: quietly
 //! inventing a SQLSTATE would make a typo look like a working `RAISE`.
+//!
+//! TODO: carry every condition name of PostgreSQL's error-code appendix — a
+//! real but unlisted name such as `lock_not_available` raises `unrecognized
+//! exception condition` here and works in PostgreSQL.
 
 /// `(sqlstate, default message)` for a condition name, or `None` if unknown.
 /// Comparison is case-insensitive, as PostgreSQL's is.

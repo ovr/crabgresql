@@ -99,8 +99,8 @@ enum Planned {
 pub struct HeapTable {
     /// The relation's shape. Behind a lock because `ALTER TABLE` republishes it
     /// while other sessions hold this table — see `TableAm::schema`. Only
-    /// `columns` ever differs between versions; name, namespace and persistence
-    /// are fixed at creation.
+    /// `columns` and `checks` ever differ between versions; name, namespace and
+    /// persistence are fixed at creation.
     schema: RwLock<Arc<TableSchema>>,
     engine: Arc<EngineInner>,
     /// The committed relfilenode — what every transaction sees, except the one
@@ -109,7 +109,7 @@ pub struct HeapTable {
     /// A staged, not-yet-committed TRUNCATE, if any. `pending` and `has_pending`
     /// are the single source of truth for an in-flight swap and are mutated ONLY
     /// together, through this type's methods (`truncate`/`commit_truncate`/
-    /// `abort_truncate`/`rebind`), so they never drift (review finding #10).
+    /// `abort_truncate`/`rebind`), so they never drift.
     pending: RwLock<Option<PendingTruncate>>,
     /// Cheap gate that lets the read/write hot path skip the `pending` RwLock read
     /// entirely while no TRUNCATE is in flight — kept in sync with `pending`.
@@ -156,8 +156,9 @@ pub struct HeapTable {
     /// This relation's storage class, cached from `schema.persistence` at
     /// construction.
     ///
-    /// Not a second source of truth: only `columns` ever differs between schema
-    /// versions (see `schema`), so persistence is fixed for the relation's life.
+    /// Not a second source of truth: only `columns` and `checks` ever differ
+    /// between schema versions (see `schema`), so persistence is fixed for the
+    /// relation's life.
     /// Caching it keeps the WAL and backing-store predicates off the schema lock
     /// on the per-row write path, where they are asked once per index per row.
     ///
@@ -307,8 +308,9 @@ impl HeapTable {
     /// and silently leave a row out of a live index.
     ///
     /// One snapshot is stable for a whole operation by construction, not by
-    /// luck: every caller holds a `TableLock` hold, and the only mutator
-    /// (`set_columns_not_null`) takes that lock exclusively.
+    /// luck: every caller holds a `TableLock` hold, and both republishers
+    /// (`set_columns_not_null`, `add_check_constraint`) take that lock
+    /// exclusively.
     ///
     /// Fields that cannot change are cached on the struct (`persistence`) and
     /// must not be read through here.
@@ -405,13 +407,6 @@ impl HeapTable {
         )
     }
 
-    /// Build the physical B-tree for a new index and publish it. Runs under the
-    /// table's exclusive lock so no concurrent writer slips between the build scan
-    /// and publication; the index becomes probe-visible only once fully built.
-    /// Every physical version is indexed (dead ones included) — probes re-check
-    /// visibility, exactly as the memory engine's build does. An index whose key
-    /// columns are not physically indexable is published metadata-only (no file,
-    /// no build), so `supports_index_scan` stays false and probes fall back.
     /// Whether an index over `index`'s key columns can be served by a physical
     /// B-tree on this table (all key types order-preserving-encodable). When
     /// false, the index is registered metadata-only (relfilenode 0).
@@ -419,6 +414,14 @@ impl HeapTable {
         btkey::keys_indexable(&self.snap(), &index.keys)
     }
 
+    /// Build the physical B-tree for a new index and publish it. Runs under the
+    /// table's exclusive lock so no concurrent writer slips between the build scan
+    /// and publication; the index becomes probe-visible only once fully built.
+    /// Every physical version is indexed (dead ones included) — probes re-check
+    /// visibility. An index whose key columns are not physically indexable is
+    /// published metadata-only (no file, no build), so `supports_index_scan`
+    /// stays false and probes fall back.
+    ///
     /// `Err` when a row's out-of-line value cannot be read: CREATE INDEX is an
     /// ordinary user command, so an unreadable chunk store must fail the statement
     /// rather than the process.
@@ -433,8 +436,8 @@ impl HeapTable {
         // Exclude sessions AND vacuum (which runs as INTERNAL) during the build,
         // via an RAII guard so a panic mid-build cannot leak the exclusive hold.
         let _guard = self.lock.acquire_exclusive_guard(LockOwner::DDL);
-        // Pinned by the hold above: the only republisher takes the same
-        // exclusive lock, so one snapshot covers the whole build.
+        // Pinned by the hold above: every republisher takes the same exclusive
+        // lock, so one snapshot covers the whole build.
         let schema = self.snap();
         let latch = Arc::new(RwLock::new(()));
         let btree = BTree::open(
@@ -521,7 +524,7 @@ impl HeapTable {
 
     /// Add a `key -> tid` entry to every physical index for a newly placed
     /// version. A row whose key column is NULL or an un-indexable value is simply
-    /// not indexed (its key never satisfies equality), matching the memory engine.
+    /// not indexed (its key never satisfies equality).
     ///
     /// Fails the statement for a key too large to page — the row itself may be
     /// far bigger and still storable, since only the indexed columns are capped.
@@ -1475,12 +1478,14 @@ impl TableAm for HeapTable {
             return Ok(UpdateResult::NotFound);
         }
         // The old tuple's forward ctid is left pointing at itself; the
-        // update-chain link is only consumed by EvalPlanQual, which is deferred
-        // (P6).
+        // update-chain link would only be consumed by EvalPlanQual, which is not
+        // implemented.
+        // TODO: point the old version's ctid at the new one, so a READ COMMITTED
+        // re-check (EvalPlanQual) can walk the update chain.
         //
         // Index only the new version's key; the old version's entry stays and is
-        // filtered by MVCC at probe time (reclaimed by vacuum), matching the
-        // memory engine's append-only maintenance.
+        // filtered by MVCC at probe time (reclaimed by vacuum) — index
+        // maintenance here is append-only.
         let new_bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let new_tid = self.place(rel, txn.xid, &new_bytes);
         self.maintain_insert(&tuple, new_tid, txn.xid)?;

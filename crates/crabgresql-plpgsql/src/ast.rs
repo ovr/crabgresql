@@ -59,10 +59,12 @@ pub struct Block {
     pub label: Option<String>,
     pub decls: Vec<Decl>,
     pub stmts: Vec<Stmt>,
-    /// `EXCEPTION WHEN ...` handlers. Always `None` — handlers need a
-    /// subtransaction per block entry, which this engine does not have yet, so
-    /// the parser rejects the clause. The field exists so adding them later is
-    /// a local change rather than a reshaping of every block.
+    /// `EXCEPTION WHEN ...` handlers. The field exists so that adding them is a
+    /// local change rather than a reshaping of every block.
+    ///
+    /// TODO: support `EXCEPTION WHEN` handlers — they need a subtransaction
+    /// per block entry, so until that exists the parser rejects the clause and
+    /// this field stays `None`.
     pub exception: Option<()>,
 }
 
@@ -212,7 +214,7 @@ pub enum Stmt {
     SelectInto {
         query: SqlFragment,
         targets: Vec<VarId>,
-        /// `STRICT`: exactly one row must match, else 02000/P0003.
+        /// `STRICT`: exactly one row must match, else P0002/P0003.
         strict: bool,
         line: u32,
     },

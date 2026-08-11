@@ -1,5 +1,5 @@
 //! Planner-facing relation statistics — the data `ANALYZE` collects and
-//! `pg_class.relpages`/`reltuples` and `pg_stats` render.
+//! `pg_class.relpages`/`reltuples` render.
 //!
 //! Statistics are **estimates, deliberately**. PostgreSQL's contract for these
 //! values is best-effort: they may be stale, they are not transactional, and a
@@ -44,6 +44,10 @@ pub struct RelStats {
     /// `attnum` order, or empty when no column statistics were collected.
     /// A non-empty vector always has exactly `schema().columns.len()` entries,
     /// so callers may index it by column position.
+    ///
+    /// TODO: collect per-column statistics — `ANALYZE` measures only
+    /// `relpages`/`reltuples`, so every construction site leaves this empty and
+    /// no `pg_stats` view is served.
     pub columns: Vec<ColStats>,
 }
 

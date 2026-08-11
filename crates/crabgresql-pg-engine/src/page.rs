@@ -13,13 +13,15 @@ pub const PAGE_HEADER_LEN: usize = 24;
 // Header field byte offsets.
 const OFF_LSN: usize = 0; // u64
 const OFF_CHECKSUM: usize = 8; // u16
-#[allow(dead_code)] // reserved header field (all-visible/prune hints); kept for layout fidelity
+#[allow(dead_code)] // layout-fidelity offset; TODO: maintain the all-visible bit
 const OFF_FLAGS: usize = 10; // u16
 const OFF_LOWER: usize = 12; // u16 — end of line-pointer array
 const OFF_UPPER: usize = 14; // u16 — start of tuple area
 const OFF_SPECIAL: usize = 16; // u16 — start of special space (= BLCKSZ for heap)
 const OFF_PAGESIZE: usize = 18; // u16
-#[allow(dead_code)] // reserved pruning hint; kept for layout fidelity
+// TODO: record the oldest prunable xid here, so a scan can decide whether
+// opportunistic pruning of this page is worth it.
+#[allow(dead_code)] // layout-fidelity offset
 const OFF_PRUNE_XID: usize = 20; // u32
 
 const PAGESIZE_VERSION: u16 = BLCKSZ as u16 | 0x01;
@@ -27,7 +29,7 @@ const PAGESIZE_VERSION: u16 = BLCKSZ as u16 | 0x01;
 // Line-pointer (ItemId) flags, in the 2-bit field.
 pub const LP_UNUSED: u8 = 0;
 pub const LP_NORMAL: u8 = 1;
-#[allow(dead_code)] // vacuum could mark tuples DEAD before reclaiming; not used in this cut
+#[allow(dead_code)] // TODO: mark tuples LP_DEAD in vacuum before reclaiming them
 pub const LP_DEAD: u8 = 3;
 
 pub type Page = [u8; BLCKSZ];
@@ -276,7 +278,8 @@ pub fn get_item_mut(p: &mut Page, off: u16) -> Option<&mut [u8]> {
 }
 
 /// Reclaim the space of UNUSED/DEAD line pointers by repacking live tuples
-/// against the end of the page (PostgreSQL's `PageRepairFragmentation`).
+/// against the end of the page (the defragmentation a vacuum runs once it has
+/// released the dead tuples' line pointers).
 pub fn compact(p: &mut Page) {
     let maxoff = max_offset(p);
     // Collect live tuples (offset -> bytes), preserving line-pointer numbers.
@@ -315,8 +318,8 @@ fn compute_checksum(p: &Page, blockno: u32) -> u16 {
     c ^= blockno;
     let folded = ((c >> 16) as u16) ^ (c as u16);
     // Map into 1..=65535 so an all-zero (never-written) page stays distinguishable,
-    // without masking a whole detection bit the way `| 1` would (PostgreSQL's
-    // pg_checksum_page uses the same `(x % 65535) + 1`).
+    // without masking a whole detection bit the way `| 1` would (PostgreSQL's page
+    // checksum reserves zero the same way, with `(x % 65535) + 1`).
     ((folded as u32 % 65535) + 1) as u16
 }
 

@@ -837,7 +837,8 @@ mod tests {
         // Equal footprint falls to the lexeme count, then to byte order.
         assert_eq!(cmp(&v("a:1")?, &v("a b")?), Ordering::Less);
         assert_eq!(cmp(&v("aa:1")?, &v("b:1")?), Ordering::Less);
-        // Positionless lexemes compare by their bytes alone.
+        // Positionless lexemes make the footprint track word length, and that
+        // tier is decided before byte order: `'b'` sorts before `'aa'`.
         assert_eq!(cmp(&v("b")?, &v("aa")?), Ordering::Less);
         assert_eq!(cmp(&v("a")?, &v("a")?), Ordering::Equal);
         // Positions order descending, matching PG (`'a:2' < 'a:1'`), and still

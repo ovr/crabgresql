@@ -61,10 +61,12 @@ fn a_self_contained_subquery_over_an_aggregate_is_not_rejected() -> anyhow::Resu
     Ok(())
 }
 
-/// LATERAL parses but the binder still binds a FROM subquery with an empty
-/// outer scope, so it cannot mean what it says. Report the missing feature
-/// rather than the `42703` that falls out of binding it as a plain derived
-/// table.
+/// A FROM subquery is bound with an empty outer scope, so a parsed LATERAL
+/// cannot mean what it says. Report the missing feature rather than the
+/// `42703` that falls out of binding it as a plain derived table.
+///
+/// TODO: bind a LATERAL FROM item against the scope of the FROM items to its
+/// left, so the correlation resolves instead of being rejected.
 #[test]
 fn lateral_is_reported_as_unsupported() -> anyhow::Result<()> {
     let error = bind_err("SELECT * FROM t, LATERAL (SELECT t.id) x")?;
@@ -74,7 +76,7 @@ fn lateral_is_reported_as_unsupported() -> anyhow::Result<()> {
 }
 
 /// The subplan of the first expression-subquery marker in `sql`'s target
-/// list, ready for [`substitute_outer`].
+/// list, or failing that in its `WHERE`, ready for [`substitute_outer`].
 fn first_subplan(sql: &str) -> anyhow::Result<LogicalPlan> {
     fn find(exprs: &[BoundExpr]) -> Option<LogicalPlan> {
         exprs.iter().find_map(|e| match e {

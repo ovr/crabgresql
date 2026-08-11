@@ -29,9 +29,10 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
     }
     match kind {
         // A function prints under its bare name. PG schema-qualifies one that
-        // an unqualified name would not reach, but every function this build
-        // publishes lives in `pg_catalog` or on the search path, so there is
-        // nothing here that needs qualifying yet.
+        // an unqualified name would not reach; built-ins live in `pg_catalog`
+        // and every `CREATE FUNCTION` routine lands in `public`.
+        // TODO: schema-qualify a regproc name the session's search path does
+        // not reach.
         RegKind::Proc => ops.proc_name(oid),
         // A relation is printed bare when an unqualified name reaches it, and
         // schema-qualified when it does not — the same reachability rule

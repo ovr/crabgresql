@@ -80,8 +80,8 @@ pub enum TableConstraint {
     ForeignKey(ForeignKeyConstraint),
     /// `[ CONSTRAINT <name> ] CHECK (<expr>) [[NOT] ENFORCED]`
     Check(CheckConstraint),
-    /// MySQLs [index definition][1] for index creation. Not present on ANSI so, for now, the usage
-    /// is restricted to MySQL, as no other dialects that support this syntax were found.
+    /// MySQLs [index definition][1] for index creation. Not present in ANSI or in
+    /// PostgreSQL, so only the generic dialect accepts it.
     ///
     /// `{INDEX | KEY} [index_name] [index_type] (key_part,...) [index_option]...`
     ///
@@ -352,8 +352,8 @@ impl crate::ast::Spanned for FullTextOrSpatialConstraint {
     }
 }
 
-/// MySQLs [index definition][1] for index creation. Not present on ANSI so, for now, the usage
-/// is restricted to MySQL, as no other dialects that support this syntax were found.
+/// MySQLs [index definition][1] for index creation. Not present in ANSI or in
+/// PostgreSQL, so only the generic dialect accepts it.
 ///
 /// `{INDEX | KEY} [index_name] [index_type] (key_part,...) [index_option]...`
 ///
@@ -372,8 +372,8 @@ pub struct IndexConstraint {
     pub index_type: Option<IndexType>,
     /// Referred column identifier list.
     pub columns: Vec<IndexColumn>,
-    /// Optional index options such as `USING`; see [`IndexOption`].
-    /// Options applied to the index (e.g., `COMMENT`, `WITH` options).
+    /// Optional index options: `USING <index_type>` or `COMMENT '<string>'`;
+    /// see [`IndexOption`].
     pub index_options: Vec<IndexOption>,
 }
 

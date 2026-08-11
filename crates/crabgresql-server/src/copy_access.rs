@@ -1,10 +1,13 @@
 //! Which files a server-side `COPY <table> FROM '<file>'` may read.
 //!
 //! PostgreSQL restricts this form to superusers (or `pg_read_server_files`)
-//! because it reads with the server process's privileges, not the client's. This
-//! project has no role system yet, so authorization is by **path** instead: a
-//! read must land inside the data directory or one of the roots the operator
-//! configured, and everything else is refused before the file is touched.
+//! because it reads with the server process's privileges, not the client's.
+//! With no role system, authorization is by **path** instead: a read must land
+//! inside the data directory or one of the roots the operator configured, and
+//! everything else is refused before the file is touched.
+//!
+//! TODO: authorize server-side COPY by role membership (superuser or
+//! `pg_read_server_files`) rather than by path.
 //!
 //! A relative path resolves against the data directory, as it does in PG, where
 //! the backend's working directory *is* PGDATA.
@@ -92,8 +95,9 @@ impl CopyFileAccess {
     }
 }
 
-/// PG's `genfile.c` wording for a path outside what the server will read. The
-/// two spellings mirror how PG distinguishes the two ways to escape.
+/// PG's wording for a path outside what the server will read. The two spellings
+/// mirror how PG distinguishes the two ways to escape: an absolute path outside
+/// every permitted root, and a relative path that does not land inside one.
 fn denied(was_absolute: bool) -> PgError {
     let message = if was_absolute {
         "absolute path not allowed"

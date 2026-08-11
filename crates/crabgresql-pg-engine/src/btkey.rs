@@ -4,12 +4,14 @@
 //! so the tree can order and search entirely by raw bytes with no type
 //! dispatch on the hot path.
 //!
-//! Supported key types match the in-memory reference engine's servable set
-//! (`crabgresql_memory_storage`'s `key_type_indexable`): `bool`, the signed
-//! integers, `oid`, the text family (`text`/`varchar`/`name`), `uuid`, and
-//! `date`. Types whose SQL `=` normalizes a value's representation — `bpchar`
-//! (blank padding), `numeric`/`float` (canonicalization) — are deferred: an
-//! index over one is metadata-only and the planner falls back to a scan.
+//! The servable key types are exactly the arms of [`encode_one`]: `bool`,
+//! `"char"`, the signed integers, `oid`, the text family
+//! (`text`/`varchar`/`name`), `uuid`, `date`, `tid`, `xid8` and `pg_lsn`.
+//!
+//! TODO: encode key types whose SQL `=` normalizes a value's representation —
+//! `bpchar` (blank padding), `numeric`/`float` (canonicalization). An index over
+//! one of those is registered metadata-only and the planner falls back to a
+//! scan.
 //!
 //! Every leaf/internal item carries the heap `Tid` as a low-order tiebreak, so
 //! the ordering `(key, tid)` is total even when a key has many duplicates. That
@@ -60,8 +62,8 @@ pub fn key_columns(keys: &[IndexKey]) -> Vec<usize> {
 
 /// Encode the key columns (`cols`, in key order) of `tuple` into
 /// order-preserving bytes, or `None` when any key column is NULL (a NULL never
-/// satisfies equality, so such a row is simply not indexed — matching the
-/// in-memory engine) or holds a value of an un-indexable form.
+/// satisfies equality, so such a row is simply not indexed) or holds a value of
+/// an un-indexable form.
 pub fn encode_row(schema: &TableSchema, cols: &[usize], tuple: &Tuple) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for &c in cols {
@@ -379,7 +381,6 @@ mod tests {
                 .expect("row 2 encodes");
                 let want = s1.as_bytes().cmp(s2.as_bytes()).then(n1.cmp(n2));
                 let got = e1.cmp(&e2);
-                // Map to the same 3-way outcome, treating equal keys as Equal.
                 let want = match want {
                     Ordering::Equal => Ordering::Equal,
                     o => o,

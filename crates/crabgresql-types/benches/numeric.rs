@@ -57,9 +57,11 @@ fn accumulation(c: &mut Criterion) {
     let mut g = c.benchmark_group("numeric_accumulate");
 
     // The per-row cost an aggregate pays to accumulate in `Numeric` rather than
-    // a register: `avg`/`sum` over an exact type still do this once per input
-    // row, so it is the yardstick for whether a register accumulator is worth
-    // it. Division above is the once-per-group cost; this is the per-row one.
+    // a register: `avg`/`sum` over `numeric` do this once per input row, while
+    // the integer cases already accumulate in an `i64`/`i128` register, so this
+    // is the yardstick for whether a register accumulator is worth it for
+    // `numeric` too. Division above is the once-per-group cost; this is the
+    // per-row one.
     g.bench_function("add_small", |b| {
         let x = Numeric::from_i128(1913);
         b.iter(|| {

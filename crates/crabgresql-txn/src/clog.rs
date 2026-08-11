@@ -200,7 +200,7 @@ impl ClogPage {
     /// aborts, appending an abort record after the commit one. Replay applies both,
     /// and `Committed | Aborted` is the `SubCommitted` encoding — a status that is
     /// neither committed nor aborted, which would make rows deleted by that XID
-    /// look permanently un-live. It is also the shape savepoints need in P6, where
+    /// look permanently un-live. It is also the shape savepoints need, where
     /// `SubCommitted -> Committed` clears a bit on the ordinary path.
     ///
     /// The cost is irrelevant: this runs once per transaction, while
@@ -230,7 +230,8 @@ impl ClogPage {
     /// For the same reason, do **not** add the tempting `if !dirty.load(Relaxed)`
     /// fast path: a writer that skips the RMW contributes nothing to this flag's
     /// modification order at all, so there is nothing to continue the sequence with.
-    /// (A *reader* skipping the RMW is fine — see [`Clog::flush`]'s pre-check.)
+    /// (A *reader* skipping the RMW is fine — see the pre-check in
+    /// [`crate::Clog::flush`].)
     ///
     /// It is not free, and it is the reason stamping does not scale the way reading
     /// does: one flag per page means every transaction committing into the same
@@ -289,8 +290,11 @@ impl ClogPage {
 }
 
 /// `<dir>/<16 hex digits>`. The full u64 segment number is zero-padded so
-/// lexicographic order equals numeric order — which is what lets truncation walk
-/// the directory and stop at the first segment at or above the floor.
+/// lexicographic order equals numeric order — which is what lets a directory walk
+/// stop at the first segment at or above the floor.
+///
+/// TODO: unlink the segment files wholly below [`ClogMeta::floor`]; nothing
+/// removes them, so `pg_xact` grows without bound.
 pub fn segment_path(dir: &Path, segno: u64) -> PathBuf {
     dir.join(format!("{segno:016X}"))
 }
