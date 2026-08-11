@@ -1230,6 +1230,7 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
                 .all(|(when, then)| is_row_constant(when) && is_row_constant(then))
                 && else_.as_ref().map_or(true, |e| is_row_constant(e))
         }
+        BoundExpr::Coalesce { args, .. } => args.iter().all(is_row_constant),
         // ColumnRef/Param reference per-row/per-execution state; FuncCall/Srf and
         // a user routine may be volatile; Aggregate and WindowFunc never appear in a
         // bindable WHERE key. A subquery

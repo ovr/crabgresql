@@ -272,6 +272,18 @@ fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<V
         crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
             Some(args.iter().map(|a| a.ty()).collect())
         }
+        // `COALESCE` coerces every argument to the one type it resolved, so that
+        // is the label each literal argument carries: PG prints
+        // `COALESCE(NULL::text, 'z'::text)`.
+        crate::Binding::Typed(crate::BoundExpr::Coalesce { args, ty }) => {
+            Some(vec![ty; args.len()])
+        }
+        // `NULLIF` binds to the `CASE` it is shorthand for, and both its
+        // arguments were coerced to that expression's type — the one the `=`
+        // operator settled on. PG prints `NULLIF('a'::text, 'b'::text)`.
+        crate::Binding::Typed(crate::BoundExpr::Case { ty, .. }) if is_named(f, "nullif") => {
+            Some(vec![ty; 2])
+        }
         _ => None,
     }
 }
@@ -558,7 +570,20 @@ fn function(f: &ast::Function, cx: Cx) -> String {
         ast::FunctionArguments::None => String::new(),
         other => return format!("{}{other}", object_name(&f.name)),
     };
-    format!("{}({args})", object_name(&f.name))
+    format!("{}({args})", call_name(f))
+}
+
+/// How PG spells a call back. `COALESCE` and `NULLIF` are grammar constructs, not
+/// functions, and PG prints them in upper case (`COALESCE(1, 2)`) — everything
+/// else is a real function name and keeps its own spelling. Keyed on the name so
+/// this holds on the type-blind `pg_get_expr` path too.
+fn call_name(f: &ast::Function) -> String {
+    if (is_named(f, "coalesce") || is_named(f, "nullif"))
+        && let Some(ident) = f.name.0.last().and_then(|p| p.as_ident())
+    {
+        return ident.value.to_ascii_uppercase();
+    }
+    object_name(&f.name)
 }
 
 /// `CURRENT_DATE`, `CURRENT_TIME[(p)]`, `CURRENT_TIMESTAMP[(p)]`,
@@ -599,9 +624,14 @@ fn literal_of(e: &ast::Expr) -> Option<&ast::Value> {
 
 /// A literal rendered at the type its context gives it, rather than at the
 /// `text` a bare string defaults to.
+///
+/// A bare `NULL` takes a label for the same reason a string does: it carries no type
+/// of its own, so PostgreSQL writes the one the analyser gave it —
+/// `COALESCE(NULL::integer, 5)`, `upper(NULL::text)`. Numbers and booleans spell
+/// their own type and are left alone.
 fn typed_value(v: &ast::Value, ty: PgType) -> String {
     match v {
-        ast::Value::SingleQuotedString(_) => {
+        ast::Value::SingleQuotedString(_) | ast::Value::Null => {
             let label = ty
                 .format_type(Some(-1))
                 .unwrap_or_else(|| ty.name().to_string());

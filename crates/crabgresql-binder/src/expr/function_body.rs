@@ -299,6 +299,16 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             else_: else_.map(|e| Box::new(inline_params(*e, args))),
             ty,
         },
+        BoundExpr::Coalesce {
+            args: coalesce_args,
+            ty,
+        } => BoundExpr::Coalesce {
+            args: coalesce_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
+            ty,
+        },
         BoundExpr::Aggregate {
             func,
             distinct,

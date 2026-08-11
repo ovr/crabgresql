@@ -26,10 +26,13 @@ SELECT id FROM un1 UNION ALL SELECT NULL ORDER BY 1;
 SELECT id, name FROM un1 UNION ALL SELECT NULL, NULL ORDER BY 1;
 -- a column that is NULL in every arm falls back to text
 SELECT NULL UNION ALL SELECT NULL;
--- char and varchar arms meet at text
+-- the string types are mutually convertible, so the column takes the *first* arm's
+-- type rather than the category's preferred `text`: char and varchar arms meet at
+-- char, and the padding of the char arm survives
 CREATE TABLE un2 (v varchar(5), c char(5));
 INSERT INTO un2 VALUES ('ab', 'cd');
 SELECT c FROM un2 UNION ALL SELECT v FROM un2 ORDER BY 1;
+SELECT v FROM un2 UNION ALL SELECT c FROM un2 ORDER BY 1;
 -- a correlated reference inside a UNION arm resolves per outer row
 SELECT id, (SELECT o.id UNION SELECT o.id) AS same FROM un1 o ORDER BY 1;
 SELECT id FROM un1 o WHERE EXISTS (SELECT o.id UNION ALL SELECT o.big) ORDER BY 1;

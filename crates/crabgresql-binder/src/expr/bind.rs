@@ -19,7 +19,7 @@ use super::datatype::{custom_type_name, map_data_type};
 use super::literal::{bind_at_local, bind_at_time_zone, bind_extract, bind_interval, bind_value};
 use super::operators::{
     bind_binary, bind_binary_op, bind_bool_test, bind_compound, bind_is_null, bind_like,
-    bind_similar_to, bind_unary, binding_typed_ty, is_geo_ty, resolve_operand,
+    bind_similar_to, bind_unary, binding_typed_ty, is_geo_ty, is_text_family, resolve_operand,
 };
 use super::scope::{Binding, Scope, normalize_ident};
 
@@ -840,6 +840,164 @@ fn bind_case(
     }
 
     Ok(Binding::Typed(BoundExpr::Case { whens, else_, ty }))
+}
+
+/// `COALESCE(a, b, …)`: the first argument that is not NULL.
+///
+/// PostgreSQL resolves the result type with the same `select_common_type` rule as
+/// `CASE`/`UNION`/`VALUES` — so `unify_value_column` does the whole job here,
+/// including adapting untyped literals per argument (`coalesce(1, 'x')` is
+/// `invalid input syntax for type integer`, not a text comparison) and settling an
+/// all-untyped list on `text`.
+///
+/// The result is a [`BoundExpr::Coalesce`] rather than the equivalent `CASE WHEN a
+/// IS NOT NULL THEN a …`, because that shape would place — and evaluate — every
+/// argument twice. Laziness lives in the executor: `coalesce(1, 1/0)` is `1`.
+pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError> {
+    // `COALESCE()` is a syntax error in PG's grammar (`expr_list` is not
+    // optional). This parser accepts an empty argument list for any call, so the
+    // refusal has to happen here; the message is PG's, without its cursor.
+    if bindings.is_empty() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "syntax error at or near \")\"",
+        ));
+    }
+    let (ty, args) = unify_value_column(bindings, "COALESCE")?;
+    if ty.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            args.iter().map(crate::collation::expr_collation),
+        )?;
+    }
+    Ok(Binding::Typed(BoundExpr::Coalesce { args, ty }))
+}
+
+/// `NULLIF(a, b)`: NULL when the two are equal, `a` otherwise — the standard's
+/// shorthand for `CASE WHEN a = b THEN NULL ELSE a END`, which is exactly what it
+/// binds to.
+///
+/// The comparison goes through `bind_binary_op`, so operator resolution decides
+/// everything observable: which types can be compared at all
+/// (`nullif(1, true)` is `operator does not exist: integer = boolean`) and how an
+/// untyped literal is read.
+///
+/// The result is the *left* argument as the chosen operator takes it, which is
+/// where [`equality_keeps_left`] comes in: PG reports `nullif(int2, int4)` as
+/// `smallint` and `nullif(timestamp, timestamptz)` as an untouched `timestamp`,
+/// because a cross-type `=` operator leaves the operand alone. Only when PG has to
+/// coerce the left argument to compare at all (`nullif(int, numeric)` → `numeric`)
+/// does the comparison's operand type become the result type.
+///
+/// `a` therefore appears twice in the tree (inside the comparison and as the ELSE)
+/// and is evaluated twice, the same trade-off a simple `CASE` operand already
+/// makes. A volatile `a` would make that observable, so it is refused instead.
+pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Binding, BindError> {
+    // PG's grammar fixes the arity at two, so a wrong count is a syntax error
+    // there. Reproduce the message (without its cursor) rather than reporting a
+    // missing two-argument function.
+    let [left, right] = <[Binding; 2]>::try_from(bindings).map_err(|bindings| {
+        BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            if bindings.len() < 2 {
+                "syntax error at or near \")\""
+            } else {
+                "syntax error at or near \",\""
+            },
+        )
+    })?;
+    let (left_ty, right_ty) = (binding_typed_ty(&left), binding_typed_ty(&right));
+    let eq = bind_binary_op(
+        BinOp::Eq,
+        left.clone(),
+        right,
+        Span::empty(),
+        (Span::empty(), Span::empty()),
+        scope.catalog().as_ref(),
+    )?;
+    let eq = match eq {
+        Binding::Typed(e) => e,
+        // `=` always resolves to a typed boolean expression.
+        Binding::Unknown { .. } => unreachable!("= yields a typed bool"),
+    };
+    // The type the operator settled its operands on — and so the type of the
+    // value NULLIF returns. Comparisons bind either to a `Binary` (which records
+    // it directly) or, for the types whose `=` lowers to a function, to that
+    // call, whose first argument already carries it.
+    let arg_ty = match &eq {
+        BoundExpr::Binary { arg_ty, .. } => *arg_ty,
+        BoundExpr::FuncCall { args, .. } if !args.is_empty() => args[0].ty(),
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "NULLIF over this comparison is not supported yet",
+            ));
+        }
+    };
+    // PostgreSQL has no `varchar = varchar` operator: `varchar` comparisons run
+    // through `text`, so the argument PG hands back is a `text` one and
+    // `nullif(v, v)` reports `text`, not `character varying`. This binder compares
+    // varchar natively — invisible while the result is a boolean, but NULLIF
+    // returns the operand, so the type has to be corrected here. (`bpchar` and
+    // `name` keep their own equality operators, and so their own type.)
+    let arg_ty = if arg_ty == PgType::Varchar {
+        PgType::Text
+    } else {
+        arg_ty
+    };
+    // Where PG compares the two types as they are, the left argument is never
+    // coerced and keeps its own type. An untyped left has no type of its own, and
+    // took the comparison's anyway.
+    let result_ty = match (left_ty, right_ty) {
+        (Some(left_ty), Some(right_ty)) if equality_keeps_left(left_ty, right_ty) => left_ty,
+        _ => arg_ty,
+    };
+    let value = resolve_operand(&left, result_ty)?;
+    // Evaluating `a` twice is invisible for a pure expression but not for a
+    // volatile one — `nullif(nextval('s'), 1)` would advance the sequence twice.
+    // Refuse rather than answer wrongly, as the SQL-function inliner does.
+    if value.contains_volatile_fn() {
+        return Err(BindError::feature_not_supported(
+            "NULLIF over a volatile expression is not supported yet",
+        ));
+    }
+    Ok(Binding::Typed(BoundExpr::Case {
+        whens: vec![(
+            eq,
+            BoundExpr::Const {
+                value: Value::Null,
+                ty: result_ty,
+            },
+        )],
+        else_: Some(Box::new(value)),
+        ty: result_ty,
+    }))
+}
+
+/// Whether PostgreSQL compares `left` against `right` with a **cross-type** `=`
+/// operator, which leaves both operands at their own types — so `NULLIF` hands the
+/// left one back unchanged, and reports its type.
+///
+/// The families are the ones PG ships those operators for, read off its observable
+/// behavior: `nullif(int2, int4)` is `smallint`, `nullif(float4, float8)` is `real`
+/// (so `0.1::float4` comes back as `0.1`, not widened), `nullif(timestamp,
+/// timestamptz)` is an untouched `timestamp`, `nullif(date, timestamp)` is a `date`,
+/// and `nullif(name, text)` is `name`. Everything else has a single-type operator
+/// only, so PG coerces both sides to it first — `nullif(int, numeric)` is `numeric`,
+/// `nullif(time, timetz)` is `time with time zone` — and the caller falls back to
+/// the comparison's own operand type.
+///
+/// Known gap: `nullif(varchar, bpchar)` is `character` in PG, which resolves it to
+/// the blank-insensitive `bpchar` `=`; this binder compares those two as text.
+fn equality_keeps_left(left: PgType, right: PgType) -> bool {
+    let exact_int = |ty| matches!(ty, PgType::Int2 | PgType::Int4 | PgType::Int8);
+    let float = |ty| matches!(ty, PgType::Float4 | PgType::Float8);
+    let datetime = |ty| matches!(ty, PgType::Date | PgType::Timestamp | PgType::TimestampTz);
+    (exact_int(left) && exact_int(right))
+        || (float(left) && float(right))
+        || (datetime(left) && datetime(right))
+        // `nameeqtext` compares a `name` against the text family as it stands; the
+        // mirrored `texteqname` is why the reverse (`nullif(text, name)`) is `text`,
+        // which the fallback already produces.
+        || (left == PgType::Name && is_text_family(right))
 }
 
 /// `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c`; `x NOT IN (...)` to

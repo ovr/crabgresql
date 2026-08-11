@@ -25,6 +25,8 @@ test: timestamptz
 test: now
 test: interval
 test: case
+test: coalesce
+test: nullif
 test: bool_test
 test: in
 test: between

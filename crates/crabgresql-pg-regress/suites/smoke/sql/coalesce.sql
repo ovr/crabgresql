@@ -1,0 +1,79 @@
+--
+-- COALESCE
+-- The first non-NULL argument: laziness, result-type resolution over any
+-- arity, and the error cases, checked against psql's aligned format.
+--
+-- the default column name is "coalesce"
+SELECT COALESCE(NULL, 'fallback');
+-- the first non-NULL wins, whatever follows it
+SELECT COALESCE(NULL, 1, 2) AS first_non_null;
+-- one argument is legal, and is just that argument
+SELECT COALESCE(7) AS single;
+-- every argument NULL yields NULL (renders empty); an all-untyped list resolves
+-- to text, as it does for CASE/UNION/VALUES
+SELECT COALESCE(NULL, NULL) AS none, pg_typeof(COALESCE(NULL, NULL)) AS ty;
+-- arguments of differing numeric types resolve to the common type
+SELECT COALESCE(1, 2.5) AS promoted, pg_typeof(COALESCE(1, 2.5)) AS ty;
+SELECT pg_typeof(COALESCE(1::int, 2::bigint)) AS ty;
+-- an untyped literal adapts to the resolved type per argument
+SELECT COALESCE(NULL::int, '42') + 1 AS added;
+-- the string types convert to each other both ways, so the *first* argument's type
+-- wins rather than the category's preferred text -- and a char(n) first keeps its
+-- blank padding, while a char(n) anywhere else loses it to the conversion
+SELECT pg_typeof(COALESCE('a'::char(3), 'b'::varchar)) AS bpchar_first,
+       pg_typeof(COALESCE('a'::varchar, 'b'::char(3))) AS varchar_first,
+       pg_typeof(COALESCE('a'::name, 'b'::text)) AS name_first,
+       pg_typeof(COALESCE('a'::varchar, 'b'::name)) AS name_wins;
+SELECT octet_length(COALESCE('a  '::char(3), 'b'::varchar)) AS padded,
+       octet_length(COALESCE(NULL::varchar, 'b  '::char(3))) AS stripped;
+-- arguments after the first non-NULL one are never evaluated, so a division by
+-- zero that can never be reached is not an error
+SELECT COALESCE(1, 1/0) AS lazy;
+-- ... but it is reached when the arguments before it are all NULL
+SELECT COALESCE(NULL::int, 1/0);
+-- COALESCE over a table column, once per row
+CREATE TABLE readings (station text, temp integer);
+INSERT INTO readings VALUES ('a', 12), ('b', NULL), ('c', -3);
+SELECT station, COALESCE(temp, 0) AS temp FROM readings ORDER BY station;
+-- in a WHERE predicate, and under an aggregate
+SELECT station FROM readings WHERE COALESCE(temp, 0) >= 0 ORDER BY station;
+SELECT sum(COALESCE(temp, 0)) AS total FROM readings;
+-- as a GROUP BY key
+SELECT COALESCE(temp, 0) AS temp, count(*) AS n
+  FROM readings GROUP BY COALESCE(temp, 0) ORDER BY 1;
+-- error: incompatible concrete argument types cannot be matched. Known gap: PG
+-- also prints a `LINE 1: ... ^` cursor under the offending argument, which the
+-- result-type unifier does not carry a span for yet.
+SELECT COALESCE(1, 'abc'::text);
+-- error: an untyped argument that does not fit the resolved type
+SELECT COALESCE(1, 'x');
+-- error: at least one argument is required. PG rejects this in the grammar and
+-- prints the same message, with a cursor under the paren
+SELECT COALESCE();
+-- error: two explicit collations that disagree (PG prints a cursor here too)
+SELECT COALESCE('a' COLLATE "C", 'b' COLLATE "POSIX");
+-- COALESCE is a keyword, so it is spelled in any case ...
+SELECT CoAlEsCe(NULL, 1) AS keyword_case;
+-- ... but only bare: a quoted or schema-qualified name is an ordinary function
+-- lookup, and no schema holds a function by that name. Known gap: for the
+-- qualified form PG names the missing function `pg_catalog.coalesce(integer,
+-- integer)`, and both add a cursor and a HINT.
+SELECT "coalesce"(1, 2);
+SELECT pg_catalog.coalesce(1, 2);
+-- error: PG's grammar gives COALESCE a bare expression list, so every decoration a
+-- function call may carry is a syntax error, reported at its own keyword. Known
+-- gap: PG echoes the token as it was written and adds a cursor; the parsed tree
+-- keeps no source text for these keywords, so they are always spelled lower case
+-- here.
+SELECT COALESCE(1, 2) OVER ();
+SELECT COALESCE(1, 2) FILTER (WHERE true);
+SELECT COALESCE(1, 2) WITHIN GROUP (ORDER BY 1);
+SELECT COALESCE(DISTINCT 1, 2);
+SELECT COALESCE(1 ORDER BY 1);
+SELECT COALESCE(x => 1);
+-- a deparsed COALESCE is upper case, and its untyped arguments carry the type the
+-- list resolved to
+CREATE TABLE dflt (a integer DEFAULT COALESCE(NULL, 5));
+SELECT pg_get_expr(adbin, adrelid) AS deparsed FROM pg_attrdef WHERE adrelid = 'dflt'::regclass;
+DROP TABLE dflt;
+DROP TABLE readings;
