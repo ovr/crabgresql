@@ -69,7 +69,25 @@ pub(crate) fn push_where_into_joins(
 /// *how often* a factored conjunct is evaluated, which is why a volatile one is
 /// left where it was written. Hoisting only a subset of the common conjuncts
 /// stays correct — distributivity is applied to the hoisted ones alone.
-fn factor_common_or_conjuncts(expr: BoundExpr) -> BoundExpr {
+///
+/// # Where this runs
+///
+/// Only where splitting a predicate into conjuncts can change the *plan*: the
+/// join tree ([`push_where_into_joins`]) and index selection
+/// ([`choose_access`](crate::choose_access), which classifies each conjunct as a
+/// possible index key). A `Subquery`/`TableFunction`/`Values` filter or an
+/// aggregate over a plain scan evaluates its predicate whole, so there is
+/// nothing to win there — and the rewrite is not free of observable effect: a
+/// hoisted conjunct is evaluated on rows the arms used to gate, so
+/// `(x <> 0 AND 100/x > 1) OR (y <> 0 AND 100/x > 1)` starts raising `22012` on
+/// a `x = 0` row. PostgreSQL makes exactly that trade in `prepqual.c`, but
+/// [`qualorder`](crate::qualorder) sets the house rule that a pass which exists
+/// to make queries faster should not change which of them succeed — so this one
+/// stays where it pays for itself.
+///
+/// DML is out of scope for a different reason: `dml_targets` keeps the whole
+/// predicate as written and uses the conjuncts only to pick a probe.
+pub(crate) fn factor_common_or_conjuncts(expr: BoundExpr) -> BoundExpr {
     match expr {
         BoundExpr::Binary { op: BinOp::And, .. } => {
             let mut conjuncts = Vec::new();

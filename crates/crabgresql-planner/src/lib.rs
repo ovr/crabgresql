@@ -660,6 +660,11 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             sort,
             distinct,
         },
+        // The predicate is factored before the access path is chosen, so a
+        // `WHERE` written as one OR still offers `choose_access` the conjuncts
+        // every arm repeats — without it, `(k = 5 AND a = 1) OR (k = 5 AND a =
+        // 2)` probes an index on `k` when the query joins a second relation but
+        // scans the whole table when it does not.
         LogicalPlan::Query(QueryPlan {
             table,
             columns,
@@ -667,7 +672,7 @@ fn lower(logical: LogicalPlan) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => match choose_access(&table, predicate) {
+        }) => match choose_access(&table, predicate.map(pushdown::factor_common_or_conjuncts)) {
             AccessPath::Index {
                 index_name,
                 key,
@@ -2895,6 +2900,38 @@ mod tests {
         else {
             panic!("expected a residual text-equality filter");
         };
+    }
+
+    #[test]
+    fn or_arms_sharing_an_equality_still_probe_the_index() {
+        // The single-table counterpart of the Q19 shape: the key equality is
+        // written once per arm, so it only becomes a probe once the common
+        // conjunct has been factored out of the OR.
+        let plan = plan_sql_indexed(
+            "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR (id = 1 AND name = 'y')",
+            Some(pk_on_id()),
+        );
+        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+            panic!("expected IndexScan");
+        };
+        assert_eq!(key.len(), 1);
+        assert_eq!(key[0].0, 0);
+        // What is left of the OR is not an index key, so it filters at runtime.
+        assert!(
+            matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Or, .. })),
+            "the residual OR must survive as a filter"
+        );
+    }
+
+    #[test]
+    fn an_equality_in_only_one_or_arm_does_not_probe() {
+        // Nothing is common to both arms, so the OR stays whole and a row with
+        // `id <> 1` is still reachable — an index probe would drop it.
+        let plan = plan_sql_indexed(
+            "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR name = 'y'",
+            Some(pk_on_id()),
+        );
+        assert!(matches!(plan, PhysicalPlan::Select { .. }));
     }
 
     #[test]
