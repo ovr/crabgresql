@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786456988534,
+  "lastUpdate": 1786456990886,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -16816,6 +16816,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 40270.098666,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "847ef0abd3c6ad0d2bb2ba7133d8a2374daa2716",
+          "message": "perf(planner): factor common conjuncts out of a top-level OR (#213)\n\nQ19 44.186s -> 0.044s (~1000x)",
+          "timestamp": "2026-08-11T14:54:29+02:00",
+          "tree_id": "c59debb48b2f893b15f06f694ad39ebfb0f8884f",
+          "url": "https://github.com/ovr/crabgresql/commit/847ef0abd3c6ad0d2bb2ba7133d8a2374daa2716"
+        },
+        "date": 1786456990785,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 491.868602,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20730.970276,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
