@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786475218604,
+  "lastUpdate": 1786475220411,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -19408,6 +19408,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 21067.610372,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9f92118e162ad26e21b321bb4cb65fdd4c115334",
+          "message": "test(server): build extended-query batches from wire message structs (#218)",
+          "timestamp": "2026-08-11T17:40:25Z",
+          "tree_id": "c205b4f9faebedb9ef516272065cadcdb40a0263",
+          "url": "https://github.com/ovr/crabgresql/commit/9f92118e162ad26e21b321bb4cb65fdd4c115334"
+        },
+        "date": 1786475220310,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 478.62383,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 24751.716165,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
