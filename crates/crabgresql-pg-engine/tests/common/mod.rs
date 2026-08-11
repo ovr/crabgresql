@@ -99,11 +99,21 @@ pub fn open_from_with_wal(
     Ok((engine, tm, wal))
 }
 
-/// The WAL stream file, for tests that corrupt or truncate it directly. Defers
-/// to the WAL crate so the layout is defined in exactly one place — a test that
-/// scribbled a stale path would silently become a no-op and still pass.
-pub fn wal_file_path(dir: &Path) -> PathBuf {
-    crabgresql_wal::wal_path(dir)
+/// Destroy every WAL page below the one `redo` sits on, so a replay that read
+/// the prefix would fail rather than quietly succeed.
+///
+/// Works in *stream* positions and defers to the WAL crate for the mapping onto
+/// segment files: a test that scribbled a stale path would silently become a
+/// no-op and still pass.
+///
+/// It stops at `redo`'s own page rather than at `redo`, and that boundary is
+/// load-bearing. Destroying that page's header would make recovery refuse to
+/// start on a *page* fault — which is a real error, but not the property these
+/// tests exist to prove. What they prove is that the bytes below the redo point
+/// are never read.
+pub fn scribble_wal_below(dir: &Path, redo: Lsn) -> std::io::Result<()> {
+    let stop = Lsn(crabgresql_wal::page_start(redo.0));
+    crabgresql_wal::scribble(dir, Lsn::INVALID, stop, 0xAB).map_err(std::io::Error::other)
 }
 
 /// The on-disk path of a relation's data file: `<dir>/base/<relfilenode>`.

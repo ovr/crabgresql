@@ -1,35 +1,141 @@
 //! The append/flush WAL stream with group-commit fsync.
+//!
+//! Records are staged into whole [`XLOG_BLCKSZ`] pages and written out as whole
+//! pages at page-aligned offsets, split across [`WAL_SEG_SIZE`] segment files.
+//! See [`crate::page`] for the layout and [`crate::reader`] for the rules that
+//! make the end of the log knowable without the file's length.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crabgresql_txn::{CommitSink, Xid};
 
+use crate::aligned::AlignedBuf;
+use crate::control::read_control;
+use crate::page::{
+    PageHeader, XLOG_BLCKSZ, XLP_FIRST_IS_CONTRECORD, XLP_PAGE_HEADER_SIZE, advance,
+    is_record_position, page_offset, page_start,
+};
+use crate::reader::end_of_wal;
 use crate::record::{Lsn, LsnRange, WalError, WalRecord};
 use crate::rmgr::{RmgrId, XACT_ABORT, XACT_COMMIT};
+use crate::segment::{
+    Segments, WAL_SEG_SIZE, seg_offset, segment_bounds, segment_start, segno_of, wal_dir,
+};
 
-/// The single WAL file lives at `<dir>/pg_wal/wal`. Segment rotation is a
-/// follow-up (`docs/ARCHITECTURE.md §3`); a single growing file is enough for a
-/// correct first cut and keeps LSN==byte-offset trivially true.
-const WAL_SUBDIR: &str = "pg_wal";
-const WAL_FILE: &str = "wal";
+/// Pages the staging buffer starts at, and is trimmed back to once a record big
+/// enough to grow it has been flushed.
+const WAL_BUF_PAGES: usize = 8;
 
-pub fn wal_path(dir: &Path) -> PathBuf {
-    dir.join(WAL_SUBDIR).join(WAL_FILE)
+/// The pre-paging log: one growing file at `<dir>/pg_wal/wal`. Nothing writes it
+/// any more; [`Wal::open`] only looks for it, because a directory left over from
+/// that build would otherwise read as an *empty* log — its first four bytes are a
+/// record length, which is not a page magic — and an empty log is discarded
+/// without a word.
+fn legacy_wal_path(dir: &Path) -> PathBuf {
+    wal_dir(dir).join("wal")
 }
 
 struct Inner {
-    /// Bytes appended but not yet handed to a writer.
-    unwritten: Vec<u8>,
-    /// End-LSN of everything appended so far (monotonic; == bytes accounted).
+    /// Whole pages of staged stream: `[buf_base, buf_base + buf.len())`. The last
+    /// page is usually partly filled, and every byte past the fill mark is zero —
+    /// which is what the flush writes out as that page's on-disk tail.
+    buf: AlignedBuf,
+    /// Stream LSN of `buf[0]`. Always page-aligned.
+    buf_base: u64,
+    /// End-LSN of everything appended so far. Always `buf_base + buf.len()`.
     insert_lsn: u64,
-    /// Bytes already written to the file (may not yet be fsynced).
+    /// Highest LSN whose bytes are on disk (may not yet be fsynced).
     written: u64,
     /// True while one thread owns the write+fsync; others coalesce behind it.
     flushing: bool,
+}
+
+impl Inner {
+    /// Copy `bytes` into the staging buffer, opening a new page — header and all
+    /// — each time the current one fills.
+    fn put(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let room = (XLOG_BLCKSZ - page_offset(self.insert_lsn)) as usize;
+            let take = room.min(bytes.len());
+            self.buf.extend_from_slice(&bytes[..take]);
+            self.insert_lsn += take as u64;
+            bytes = &bytes[take..];
+            if page_offset(self.insert_lsn) == 0 {
+                self.open_page(bytes.len() as u32);
+            }
+        }
+        debug_assert_eq!(self.insert_lsn, self.buf_base + self.buf.len() as u64);
+    }
+
+    /// Lay down the header of the page starting at `insert_lsn`.
+    ///
+    /// `rem_len` is how much of the record now in flight is still owed. Zero when
+    /// the record ended flush with the page edge — and then the contrecord flag
+    /// stays clear, even though the page was opened from inside [`Inner::put`],
+    /// because nothing continues onto it.
+    fn open_page(&mut self, rem_len: u32) {
+        let mut header = [0u8; XLP_PAGE_HEADER_SIZE as usize];
+        PageHeader {
+            info: if rem_len > 0 { XLP_FIRST_IS_CONTRECORD } else { 0 },
+            rem_len,
+            pageaddr: self.insert_lsn,
+        }
+        .encode(&mut header);
+        self.buf.extend_from_slice(&header);
+        self.insert_lsn += XLP_PAGE_HEADER_SIZE;
+    }
+}
+
+/// Where a scan for the end of the log must begin: the redo point `pg_control`
+/// names, or [`Lsn::INVALID`] to let the reader resolve the head of the
+/// surviving log for itself.
+///
+/// The redo point is what keeps an open from reading the whole log. It is
+/// discarded when it names a segment recycling has already reclaimed — which the
+/// checkpointer will not produce, but a stale or hand-written control file can —
+/// because the reader's own resolution is the safe answer there, and it is not a
+/// position this function can compute: the head of the lowest surviving segment
+/// may be owed to a record that started in a segment now gone.
+fn scan_origin(dir: &Path) -> Result<Lsn, WalError> {
+    let redo = read_control(dir)?
+        .map(|control| control.redo_lsn)
+        .filter(|lsn| lsn.is_valid());
+    let lowest = segment_bounds(dir)?.map(|(lo, _)| segment_start(lo));
+    Ok(match (redo, lowest) {
+        (Some(redo), Some(lowest)) if redo.0 >= lowest => redo,
+        _ => Lsn::INVALID,
+    })
+}
+
+/// Prime a staging buffer with the existing bytes of the page `lsn` sits in.
+///
+/// A flush writes whole pages, so resuming mid-page means re-emitting the bytes
+/// below `lsn` — they are live log. The page's real header is read back verbatim
+/// rather than regenerated: its contrecord flag may legitimately be set by a
+/// record that began on the previous page and ended before `lsn`, and inventing a
+/// cleared one would break that record on the next flush. A page that was never
+/// written gets a generated header instead.
+fn position_at(dir: &Path, lsn: Lsn) -> Result<(AlignedBuf, u64), WalError> {
+    debug_assert!(is_record_position(lsn.0), "cannot position inside a page header");
+    let base = page_start(lsn.0);
+    let mut page = vec![0u8; XLOG_BLCKSZ as usize];
+    let mut segs = Segments::new(dir);
+    let found = segs.read_at(segno_of(base), seg_offset(base), &mut page)?;
+    let intact = found && PageHeader::decode(&page).is_some_and(|h| h.pageaddr == base);
+    if !intact {
+        page.fill(0);
+        PageHeader {
+            info: 0,
+            rem_len: 0,
+            pageaddr: base,
+        }
+        .encode(&mut page);
+    }
+    let mut buf = AlignedBuf::with_pages(WAL_BUF_PAGES);
+    buf.extend_from_slice(&page[..(lsn.0 - base) as usize]);
+    Ok((buf, base))
 }
 
 /// Checkpoint-delay bookkeeping. Guarded by its own mutex, independent of
@@ -53,9 +159,14 @@ struct Delay {
 /// durable with a single fsync shared by all concurrent committers (group
 /// commit).
 pub struct Wal {
+    dir: PathBuf,
     inner: Mutex<Inner>,
-    /// Held only by the current flusher, so appends proceed during an fsync.
-    file: Mutex<File>,
+    /// Open segment handles, held only by the current flusher so appends proceed
+    /// during an fsync.
+    segments: Mutex<Segments>,
+    /// The flusher's scratch copy of the staged pages. Held across the write so
+    /// `inner` can be released and appends can continue into the same tail page.
+    snapshot: Mutex<AlignedBuf>,
     /// Highest LSN known to be on stable storage (fsynced).
     flushed: AtomicU64,
     cond: Condvar,
@@ -142,30 +253,44 @@ impl Drop for CheckpointDelay<'_> {
 }
 
 impl Wal {
-    /// Open (creating if absent) the WAL under `dir`, positioned to append after
-    /// the existing file contents. Everything already in the file is treated as
-    /// durable. After a crash, call [`crate::recover`] first and then
-    /// [`Wal::reset_to`] to discard any torn tail past the last valid record.
+    /// Open the WAL under `dir`, positioned after the last valid record.
+    ///
+    /// The position comes from a **scan**, not from a file's length: segments are
+    /// preallocated and the tail page is zero-padded, so length says nothing.
+    /// The scan is bounded by the redo point in `pg_control` — everything below
+    /// it is durable by construction — and uses the same reader replay does, so
+    /// the two cannot disagree about where the log ends.
+    ///
+    /// Opening **writes nothing**: no segment is preallocated and no header is
+    /// stamped. [`crate::recover`] reads these files immediately afterwards and
+    /// must not be shown bytes this invented.
+    ///
+    /// After a crash, call [`crate::recover`] and then [`Wal::reset_to`] with the
+    /// end it reports; that is the authority on where to resume.
     pub fn open(dir: &Path) -> Result<Wal, WalError> {
-        std::fs::create_dir_all(dir.join(WAL_SUBDIR))?;
-        let path = wal_path(dir);
-        // truncate(false): never discard an existing WAL — we append to it.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        let len = file.metadata()?.len();
+        std::fs::create_dir_all(wal_dir(dir))?;
+        if legacy_wal_path(dir).exists() {
+            return Err(WalError::IncompatibleWalFormat {
+                detail: format!(
+                    "{} is a pre-paged write-ahead log",
+                    legacy_wal_path(dir).display()
+                ),
+            });
+        }
+        let end = end_of_wal(dir, scan_origin(dir)?)?;
+        let (buf, buf_base) = position_at(dir, end)?;
         Ok(Wal {
+            dir: dir.to_path_buf(),
             inner: Mutex::new(Inner {
-                unwritten: Vec::new(),
-                insert_lsn: len,
-                written: len,
+                buf,
+                buf_base,
+                insert_lsn: end.0,
+                written: end.0,
                 flushing: false,
             }),
-            file: Mutex::new(file),
-            flushed: AtomicU64::new(len),
+            segments: Mutex::new(Segments::new(dir)),
+            snapshot: Mutex::new(AlignedBuf::with_pages(WAL_BUF_PAGES)),
+            flushed: AtomicU64::new(end.0),
             cond: Condvar::new(),
             delay: Mutex::new(Delay {
                 active: 0,
@@ -251,24 +376,49 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Truncate the stream back to `lsn`, discarding anything after it. Used
-    /// after recovery to drop a torn tail so new records overwrite the garbage.
+    /// Reposition the writer at `lsn`, discarding anything above it. Used after
+    /// recovery to drop a torn tail so new records overwrite the garbage.
+    ///
+    /// There is no truncation to do, and none is needed. Segments are
+    /// preallocated, so the files are full-length regardless; what makes the
+    /// bytes above `lsn` unreachable is that a flush writes **whole pages** from
+    /// a buffer that is zero past its fill mark. The next flush therefore zeroes
+    /// the rest of `lsn`'s page, and a reader — which walks forward and never
+    /// seeks — stops there and never consults the pages beyond it.
+    ///
+    /// Before that first flush, the page still holds what a crash left, which is
+    /// exactly the bytes recovery already declined to decode.
     pub fn reset_to(&self, lsn: Lsn) -> Result<(), WalError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let file = self
-            .file
-            .lock()
-            .unwrap_or_else(|_| panic!("mutex poisoned"));
-        file.set_len(lsn.0)?;
-        file.sync_data()?;
-        inner.unwritten.clear();
+        let (buf, buf_base) = position_at(&self.dir, lsn)?;
+        inner.buf = buf;
+        inner.buf_base = buf_base;
         inner.insert_lsn = lsn.0;
         inner.written = lsn.0;
         self.flushed.store(lsn.0, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Reclaim the segments below `redo`, which must already be durable in
+    /// `pg_control`: reclaiming ahead of that publication would leave a control
+    /// file naming a segment that is gone.
+    ///
+    /// An invalid `redo` reclaims nothing. That is not a shortcut — a checkpoint
+    /// that cannot bound replay publishes [`Lsn::INVALID`], meaning "resume from
+    /// the head of the stream", and every segment is then still needed.
+    pub fn recycle(&self, redo: Lsn) -> Result<(), WalError> {
+        if !redo.is_valid() {
+            return Ok(());
+        }
+        let highest = segno_of(self.current_lsn().0);
+        let mut segs = self
+            .segments
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        segs.recycle_below(segno_of(redo.0), highest)
     }
 
     /// Stage one record for a resource manager, returning the byte range it
@@ -282,17 +432,23 @@ impl Wal {
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
         let start = Lsn(inner.insert_lsn);
-        let rec = WalRecord {
+        let mut encoded = Vec::new();
+        let n = WalRecord {
             rec_lsn: start,
             xid,
             rmgr: rmgr.0,
             info,
             payload,
-        };
-        let mut scratch = std::mem::take(&mut inner.unwritten);
-        let n = rec.encode(&mut scratch);
-        inner.unwritten = scratch;
-        inner.insert_lsn += n as u64;
+        }
+        .encode(&mut encoded);
+        // The reader refuses anything longer, so producing one would write a
+        // record that can never be replayed.
+        debug_assert!(n <= WalRecord::MAX_LEN, "wal record of {n} bytes is too long");
+        inner.put(&encoded);
+        // Two independent implementations of the header-skipping arithmetic now
+        // exist — this one and the reader's — and the log is only readable if
+        // they agree.
+        debug_assert_eq!(inner.insert_lsn, advance(start.0, n as u64));
         LsnRange {
             start,
             end: Lsn(inner.insert_lsn),
@@ -335,7 +491,7 @@ impl Wal {
         if up_to.0 > inner.insert_lsn {
             return Err(WalError::FlushPastEnd {
                 target: up_to,
-                appended: inner.insert_lsn,
+                appended: Lsn(inner.insert_lsn),
             });
         }
         loop {
@@ -350,52 +506,79 @@ impl Wal {
                 };
                 continue;
             }
-            // Become the flusher for everything appended so far.
+            // Become the flusher for everything appended so far. The staged bytes
+            // are *copied*, not drained: a concurrent `append` must keep seeing
+            // the partly filled tail page, since the next flush rewrites it in
+            // place. The copy also makes the failure path trivial — nothing was
+            // removed, so nothing has to be put back.
             inner.flushing = true;
-            let bytes = std::mem::take(&mut inner.unwritten);
-            let start = inner.written;
-            let target = start + bytes.len() as u64;
-            drop(inner);
-
-            // Positioned write at the logical offset `start`, never the OS file
-            // cursor: after a reopen the cursor is 0 but the log continues at
-            // `written`, and on a partial-write retry the cursor is desynced —
-            // both would otherwise corrupt the stream.
-            let write_result = (|| -> Result<(), WalError> {
-                let file = self
-                    .file
+            let base = inner.buf_base;
+            let filled = inner.buf.len();
+            let target = inner.insert_lsn;
+            {
+                let mut snapshot = self
+                    .snapshot
                     .lock()
                     .unwrap_or_else(|_| panic!("mutex poisoned"));
-                file.write_all_at(&bytes, start)?;
-                file.sync_data()?;
-                Ok(())
-            })();
+                snapshot.clear();
+                snapshot.extend_from_slice(inner.buf.whole_pages());
+            }
+            drop(inner);
+
+            let write_result = self.write_pages(base);
 
             inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(|_| panic!("mutex poisoned"));
+            inner.flushing = false;
+            self.cond.notify_all();
             match write_result {
                 Ok(()) => {
                     inner.written = target;
                     self.flushed.store(target, Ordering::SeqCst);
-                    inner.flushing = false;
-                    self.cond.notify_all();
+                    // Retire only the pages that are now complete. The partial
+                    // tail stays: the next flush writes it again, which is what
+                    // PostgreSQL does too and what zeroes the bytes past it.
+                    let complete = filled / XLOG_BLCKSZ as usize * XLOG_BLCKSZ as usize;
+                    inner.buf.drain_front(complete);
+                    inner.buf_base += complete as u64;
+                    inner.buf.shrink_to_pages(WAL_BUF_PAGES);
+                    debug_assert_eq!(inner.insert_lsn, inner.buf_base + inner.buf.len() as u64);
                 }
-                Err(e) => {
-                    // Put the drained bytes back so a retry can flush them, and
-                    // wake any waiters to observe the failure on their own retry.
-                    let mut returned = bytes;
-                    returned.extend_from_slice(&inner.unwritten);
-                    inner.unwritten = returned;
-                    inner.flushing = false;
-                    self.cond.notify_all();
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
             // target >= up_to because up_to was appended before this call, so the
-            // drain captured it; the top-of-loop check returns Ok.
+            // snapshot captured it; the top-of-loop check returns Ok.
         }
+    }
+
+    /// Write the snapshot's whole pages at stream offset `base`, splitting across
+    /// segment files and fsyncing each one touched.
+    ///
+    /// `base` is page-aligned and the length is a whole number of pages, which is
+    /// the point of the whole exercise: a partial write into the middle of a
+    /// block is a read-modify-write at the filesystem and device level, and it is
+    /// what puts direct I/O out of reach.
+    fn write_pages(&self, base: u64) -> Result<(), WalError> {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut segs = self
+            .segments
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut at = base;
+        let mut rest = snapshot.as_slice();
+        while !rest.is_empty() {
+            let offset = seg_offset(at);
+            let take = ((WAL_SEG_SIZE - offset) as usize).min(rest.len());
+            segs.write_at(segno_of(at), offset, &rest[..take])?;
+            at += take as u64;
+            rest = &rest[take..];
+        }
+        Ok(())
     }
 }
 
@@ -428,6 +611,7 @@ impl CommitSink for Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page::XLP_USABLE;
     use std::sync::Arc;
 
     #[test]
@@ -438,10 +622,11 @@ mod tests {
         let b = wal.append(RmgrId::HEAP, 0, Xid(3), &[4, 5]).end;
         assert!(b > a);
         assert_eq!(wal.current_lsn(), b);
-        assert_eq!(wal.flushed_lsn(), Lsn::INVALID);
+        assert_eq!(wal.flushed_lsn(), Lsn::START);
         wal.flush(b)?;
         assert_eq!(wal.flushed_lsn(), b);
-        // Reopen: the durable position is restored from the file length.
+        // Reopen: the durable position comes from a scan of the pages, since a
+        // preallocated segment's length says nothing.
         drop(wal);
         let wal2 = Wal::open(dir.path())?;
         assert_eq!(wal2.current_lsn(), b);
@@ -480,17 +665,10 @@ mod tests {
 
     /// Decode every record in the on-disk WAL, returning `(xid, payload)` pairs.
     fn read_all(dir: &Path) -> Vec<(Xid, Vec<u8>)> {
-        let bytes = match std::fs::read(wal_path(dir)) {
-            Ok(bytes) => bytes,
+        match crate::reader::testkit::read_all(dir, Lsn::INVALID) {
+            Ok((records, _)) => records,
             Err(error) => panic!("failed to read WAL test fixture: {error}"),
-        };
-        let mut out = Vec::new();
-        let mut pos = 0;
-        while let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) {
-            out.push((rec.xid, rec.payload.to_vec()));
-            pos += len;
         }
-        out
     }
 
     #[test]
@@ -527,7 +705,6 @@ mod tests {
 
     #[test]
     fn reset_to_discards_a_torn_tail_before_appending() -> anyhow::Result<()> {
-        use std::io::Write;
         let dir = tempfile::tempdir()?;
         let valid_end;
         {
@@ -537,14 +714,12 @@ mod tests {
             wal.flush(valid_end)?;
         }
         // A crash leaves raw garbage on disk past the last valid record.
-        {
-            let mut f = OpenOptions::new().append(true).open(wal_path(dir.path()))?;
-            f.write_all(&[0xAB; 37])?;
-        }
+        crate::segment::scribble(dir.path(), valid_end, Lsn(valid_end.0 + 37), 0xAB)?;
         {
             let wal = Wal::open(dir.path())?;
-            // Recovery computes `valid_end`; clamp to it (truncating the garbage),
-            // then continue appending cleanly.
+            // Recovery computes `valid_end`; reposition there and continue
+            // appending. The next flush rewrites the whole page, so the garbage
+            // is gone without any truncation.
             wal.reset_to(valid_end)?;
             let l = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(10), &[]).end;
             wal.flush(l)?;
@@ -564,19 +739,41 @@ mod tests {
     fn append_returns_the_records_own_byte_range() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Wal::open(dir.path())?;
-        let mut previous_end = Lsn(0);
+        let mut previous_end = Lsn::START;
         for i in 0..4usize {
             let payload = vec![i as u8; i * 11];
             let range = wal.append(RmgrId::HEAP, 0, Xid(3), &payload);
+            // Contiguity is the contract the buffer pool's write-ahead check
+            // leans on, and it survives paging unchanged.
             assert_eq!(range.start, previous_end, "ranges must be contiguous");
             assert_eq!(
                 range.end.0 - range.start.0,
-                (WalRecord::HEADER_LEN + payload.len() + 4) as u64,
-                "range width must be the encoded record length"
+                (WalRecord::MIN_LEN + payload.len()) as u64,
+                "a record wholly inside one page occupies exactly its own bytes"
             );
             previous_end = range.end;
         }
         assert_eq!(wal.current_lsn(), previous_end);
+
+        Ok(())
+    }
+
+    /// The width of a range is no longer the encoded length: a record crossing a
+    /// page boundary also spans the header the writer laid down in front of it.
+    #[test]
+    fn a_range_that_crosses_a_page_widens_by_the_header_it_spans() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        // Leave 40 bytes of the first page, then write a record that will not fit.
+        let filler = XLP_USABLE as usize - 40 - WalRecord::MIN_LEN;
+        wal.append(RmgrId::HEAP, 0, Xid(3), &vec![0xAA; filler]);
+        let range = wal.append(RmgrId::HEAP, 0, Xid(3), &[0xBB; 200]);
+        assert_eq!(
+            range.end.0 - range.start.0,
+            (WalRecord::MIN_LEN + 200) as u64 + XLP_PAGE_HEADER_SIZE
+        );
+        wal.flush(range.end)?;
+        assert_eq!(read_all(dir.path()).len(), 2);
 
         Ok(())
     }
@@ -591,7 +788,7 @@ mod tests {
         let wal = Arc::new(Wal::open(dir.path())?);
         let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"only");
         wal.flush(range.end)?;
-        wal.reset_to(Lsn::INVALID)?;
+        wal.reset_to(Lsn::START)?;
 
         // Under a watchdog: without the guard this call does not return a wrong
         // answer, it never returns at all, and a bare call here would hang the
@@ -607,7 +804,8 @@ mod tests {
             anyhow::bail!("flushing past the end of the stream must fail");
         };
         assert!(
-            err.to_string().contains("only 0 bytes have been appended"),
+            err.to_string()
+                .contains(&format!("nothing above {} has been appended", Lsn::START)),
             "unexpected error: {err}"
         );
 
@@ -618,7 +816,7 @@ mod tests {
     fn redo_point_is_the_insert_lsn_when_nothing_is_delayed() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Wal::open(dir.path())?;
-        assert_eq!(wal.redo_point()?, Lsn::INVALID);
+        assert_eq!(wal.redo_point()?, Lsn::START);
         let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"a");
         assert_eq!(wal.redo_point()?, range.end);
         // Repeatable: sampling does not consume anything.
@@ -627,16 +825,21 @@ mod tests {
         Ok(())
     }
 
-    /// The redo point must never name a byte past the end of the on-disk log:
-    /// recovery hard-errors on that, so publishing one would leave a cluster
-    /// that refuses to start.
+    /// The redo point must be backed by bytes on disk: recovery hard-errors when
+    /// asked to resume where there is no page, so publishing one would leave a
+    /// cluster that refuses to start.
+    ///
+    /// "Backed by bytes" no longer means "inside the file's length" — a
+    /// preallocated segment is full-length from the moment it exists. It means
+    /// the page holding the redo point is written, records its own address, and
+    /// has a record decoding at exactly that LSN.
     #[test]
     fn redo_point_is_durable_on_return() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let wal = Wal::open(dir.path())?;
         // Staged but never explicitly flushed.
         let range = wal.append(RmgrId::HEAP, 0, Xid(3), b"staged-only");
-        assert_eq!(wal.flushed_lsn(), Lsn::INVALID, "nothing flushed yet");
+        assert_eq!(wal.flushed_lsn(), Lsn::START, "nothing flushed yet");
 
         let redo = wal.redo_point()?;
         assert_eq!(redo, range.end);
@@ -644,11 +847,16 @@ mod tests {
             wal.flushed_lsn() >= redo,
             "redo_point must flush through the LSN it returns"
         );
-        let on_disk = std::fs::metadata(wal_path(dir.path()))?.len();
-        assert!(
-            on_disk >= redo.0,
-            "the file must be at least as long as the redo point ({on_disk} < {redo})"
-        );
+        // The record *below* the redo point is on disk, and the page carrying the
+        // redo point itself records the address it sits at.
+        assert_eq!(read_all(dir.path()), vec![(Xid(3), b"staged-only".to_vec())]);
+        let mut page = vec![0u8; XLOG_BLCKSZ as usize];
+        let mut segs = Segments::new(dir.path());
+        let page_lsn = page_start(redo.0);
+        assert!(segs.read_at(segno_of(page_lsn), seg_offset(page_lsn), &mut page)?);
+        let header = PageHeader::decode(&page)
+            .ok_or_else(|| anyhow::anyhow!("the redo point's page is not on disk"))?;
+        assert_eq!(header.pageaddr, page_lsn);
 
         Ok(())
     }
@@ -777,7 +985,7 @@ mod tests {
             drop(held);
             sampler
                 .join()
-                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))?;
+                .map_err(|_| anyhow::anyhow!("redo_point sampler panicked"))??;
             waiter
                 .join()
                 .map_err(|_| anyhow::anyhow!("delay waiter panicked"))?;
@@ -811,7 +1019,7 @@ mod tests {
         let guard = wal.delay_checkpoint();
         drop(guard);
         let lsn = wal.redo_point()?;
-        assert_eq!(lsn, Lsn::INVALID);
+        assert_eq!(lsn, Lsn::START);
 
         Ok(())
     }
@@ -1086,5 +1294,261 @@ mod tests {
             |clog, xid| clog.status(xid) != XactStatus::Aborted,
             |clog, xid| clog.status(xid) == XactStatus::Aborted,
         )
+    }
+
+    // --- The paged format ---
+
+    /// The precondition for direct I/O, asserted rather than assumed. An
+    /// unaligned or partial write has no observable symptom — it is merely slower
+    /// and shuts the door on `O_DIRECT` — so nothing else would catch a
+    /// regression here.
+    #[test]
+    fn every_wal_write_is_a_whole_page_at_a_page_aligned_offset() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        // Odd sizes, enough of them to cross a segment boundary.
+        for i in 0..1_400u64 {
+            let range = wal.append(RmgrId::HEAP, 0, Xid(3), &vec![i as u8; 12_000 + (i % 7) as usize]);
+            if i % 97 == 0 {
+                wal.flush(range.end)?;
+            }
+        }
+        wal.flush(wal.current_lsn())?;
+        let segs = wal
+            .segments
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        assert!(segs.writes.len() > 1, "the test never crossed a segment");
+        for write in &segs.writes {
+            assert!(write.offset.is_multiple_of(XLOG_BLCKSZ), "{write:?}");
+            assert!((write.len as u64).is_multiple_of(XLOG_BLCKSZ), "{write:?}");
+            assert!(write.buf_aligned, "the write buffer was not 4K-aligned: {write:?}");
+        }
+        assert!(
+            segs.writes.iter().any(|w| w.segno > 1),
+            "the test never crossed a segment boundary"
+        );
+
+        Ok(())
+    }
+
+    /// The partly filled tail page is rewritten on every flush — deliberately,
+    /// and as PostgreSQL does. What must not happen is that the rewrite loses the
+    /// records already on that page.
+    #[test]
+    fn the_tail_page_is_rewritten_without_losing_its_earlier_records() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        for i in 0..10u8 {
+            let range = wal.append(RmgrId::HEAP, 0, Xid(3), &[i; 4]);
+            wal.flush(range.end)?;
+        }
+        assert_eq!(read_all(dir.path()).len(), 10);
+        let segs = wal
+            .segments
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        assert_eq!(segs.writes.len(), 10, "one write per flush");
+        assert!(
+            segs.writes.iter().all(|w| w.offset == segs.writes[0].offset),
+            "all ten flushes rewrote the same page"
+        );
+
+        Ok(())
+    }
+
+    /// The direct pin that a file's length is no longer load-bearing: the segment
+    /// is a full 16 MiB the whole time, and reopening still lands exactly after
+    /// the last record.
+    #[test]
+    fn reopening_positions_after_the_last_record_without_a_file_length() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let end = {
+            let wal = Wal::open(dir.path())?;
+            let end = wal.append(RmgrId::HEAP, 0, Xid(3), b"one").end;
+            wal.flush(end)?;
+            end
+        };
+        let segment = crate::segment::segment_path(dir.path(), segno_of(end.0));
+        assert_eq!(std::fs::metadata(&segment)?.len(), WAL_SEG_SIZE);
+        assert_eq!(Wal::open(dir.path())?.current_lsn(), end);
+
+        Ok(())
+    }
+
+    /// `reset_to` does not truncate anything, so the records above it are
+    /// physically still there. What makes them unreachable is that the next flush
+    /// zeroes the rest of their page and the reader never seeks past it.
+    ///
+    /// The second case is the sharp one: the new stream ends *exactly* on a page
+    /// boundary, so the discarded records begin at a page whose address is
+    /// genuinely correct for where it sits. `pageaddr` cannot reject that page —
+    /// what saves it is that opening the next page stages its header, so the
+    /// flush's round-up writes it whole and erases what was there.
+    #[test]
+    fn a_reset_and_reappend_does_not_resurrect_the_records_it_dropped() -> anyhow::Result<()> {
+        for land_on_a_boundary in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let rewind_to;
+            {
+                let wal = Wal::open(dir.path())?;
+                rewind_to = wal.append(RmgrId::HEAP, 0, Xid(3), b"keep").end;
+                // Well past a page boundary, so the discarded records live on
+                // pages the new stream will not reach on its own.
+                for i in 0..4u8 {
+                    wal.append(RmgrId::HEAP, 0, Xid(9), &vec![i; 5_000]);
+                }
+                wal.flush(wal.current_lsn())?;
+                assert_eq!(read_all(dir.path()).len(), 5);
+            }
+            {
+                let wal = Wal::open(dir.path())?;
+                wal.reset_to(rewind_to)?;
+                let payload = if land_on_a_boundary {
+                    // Size the record so the stream stops flush with the page edge.
+                    let room = XLOG_BLCKSZ - page_offset(rewind_to.0);
+                    vec![0xEE; (room as usize) - WalRecord::MIN_LEN]
+                } else {
+                    vec![0xEE; 8]
+                };
+                let end = wal.append(RmgrId::HEAP, 0, Xid(4), &payload).end;
+                wal.flush(end)?;
+                if land_on_a_boundary {
+                    assert_eq!(page_offset(end.0), XLP_PAGE_HEADER_SIZE);
+                }
+                assert_eq!(Wal::open(dir.path())?.current_lsn(), end);
+            }
+            let xids: Vec<Xid> = read_all(dir.path()).iter().map(|(x, _)| *x).collect();
+            assert_eq!(
+                xids,
+                vec![Xid(3), Xid(4)],
+                "a discarded record came back (boundary case: {land_on_a_boundary})"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The writer's end LSN, the reader's, and therefore what `RedoContext`
+    /// carries must be the same number. The per-page LSN gate in every redo
+    /// handler is stated in terms of it.
+    #[test]
+    fn the_writer_and_the_reader_agree_on_a_records_end_lsn() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        let mut ends = Vec::new();
+        // Sizes chosen to land records inside a page, across a page, and across a
+        // segment boundary.
+        while wal.current_lsn().0 < WAL_SEG_SIZE * 2 + 100 {
+            ends.push(wal.append(RmgrId::HEAP, 0, Xid(3), &vec![0x3C; 6_001]).end);
+        }
+        wal.flush(wal.current_lsn())?;
+        assert!(ends.iter().any(|e| segno_of(e.0) == 2), "no segment crossing");
+
+        let mut reader = crate::reader::WalReader::open(dir.path(), Lsn::INVALID)?;
+        let mut buf = Vec::new();
+        let mut seen = Vec::new();
+        while let Some((_, end)) = reader.next_into(&mut buf)? {
+            seen.push(end);
+        }
+        assert_eq!(seen, ends);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_spanning_a_segment_boundary_round_trips() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        while wal.current_lsn().0 + 4_000 < 2 * WAL_SEG_SIZE {
+            wal.append(RmgrId::HEAP, 0, Xid(3), &[0xAA; 3_900]);
+        }
+        // Now within a page of the boundary; a big record must straddle it.
+        let range = wal.append(RmgrId::HEAP, 0, Xid(7), &[0xBB; 40_000]);
+        wal.flush(range.end)?;
+        assert_eq!(segno_of(range.start.0), 1);
+        assert_eq!(segno_of(range.end.0), 2);
+        let records = read_all(dir.path());
+        assert_eq!(
+            records.last().map(|(x, p)| (*x, p.len())),
+            Some((Xid(7), 40_000))
+        );
+
+        Ok(())
+    }
+
+    // --- Segment recycling ---
+
+    /// Fill past `through` segments and flush.
+    fn fill_segments(wal: &Wal, through: u64) -> Result<(), WalError> {
+        while wal.current_lsn().0 < through * WAL_SEG_SIZE {
+            wal.append(RmgrId::HEAP, 0, Xid(3), &[0x77; 7_000]);
+        }
+        wal.flush(wal.current_lsn())
+    }
+
+    /// The end-to-end shape of recycling: spent segments are renamed forward
+    /// rather than rewritten, the log above the redo point still reads, and
+    /// nothing from a segment's previous life comes back.
+    #[test]
+    fn recycling_reclaims_the_prefix_without_resurrecting_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        fill_segments(&wal, 3)?;
+        let redo = wal.current_lsn();
+        let above = wal.append(RmgrId::HEAP, 0, Xid(4), b"above the redo point");
+        wal.flush(above.end)?;
+
+        wal.recycle(redo)?;
+        let (lowest, highest) = crate::segment::segment_bounds(dir.path())?
+            .ok_or_else(|| anyhow::anyhow!("every segment was reclaimed"))?;
+        assert_eq!(lowest, segno_of(redo.0), "the redo point's segment must stay");
+        assert!(highest > segno_of(redo.0), "nothing was recycled forward");
+
+        // The recycled segments are the *same files*, not fresh ones: that is the
+        // whole point, and it is also what makes their stale contents a hazard.
+        let recycled = crate::segment::segment_path(dir.path(), highest);
+        assert_eq!(std::fs::metadata(&recycled)?.len(), WAL_SEG_SIZE);
+
+        // Replay from the redo point still finds the record above it, and the
+        // walk stops rather than running on into a recycled segment.
+        let reopened = Wal::open(dir.path())?;
+        assert_eq!(reopened.current_lsn(), above.end);
+
+        Ok(())
+    }
+
+    /// A checkpoint that cannot bound replay publishes an invalid redo point,
+    /// meaning "resume from the head of the stream". Every segment is then still
+    /// needed, and reclaiming any of them would make the cluster unstartable.
+    #[test]
+    fn a_clamped_redo_point_reclaims_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        fill_segments(&wal, 3)?;
+        let before = crate::segment::segment_bounds(dir.path())?;
+        wal.recycle(Lsn::INVALID)?;
+        assert_eq!(crate::segment::segment_bounds(dir.path())?, before);
+
+        Ok(())
+    }
+
+    /// A directory from before the paged log must refuse to start. It would
+    /// otherwise read as an *empty* log — the old format's first four bytes are a
+    /// record length, not a page magic — and be discarded without a word.
+    #[test]
+    fn a_pre_paged_data_directory_refuses_to_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(wal_dir(dir.path()))?;
+        std::fs::write(legacy_wal_path(dir.path()), b"a flat write-ahead log")?;
+        let Err(error) = Wal::open(dir.path()) else {
+            anyhow::bail!("a pre-paged data directory must not open");
+        };
+        assert!(
+            matches!(error, WalError::IncompatibleWalFormat { .. }),
+            "unexpected error: {error}"
+        );
+
+        Ok(())
     }
 }

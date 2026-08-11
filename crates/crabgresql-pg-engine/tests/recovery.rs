@@ -1272,7 +1272,7 @@ fn a_commit_below_the_redo_point_survives_a_bounded_replay() -> anyhow::Result<(
     // commit records would fail rather than quietly succeed. Only the durable
     // CLOG can answer now.
     assert!(redo.is_valid(), "redo_point() never advanced");
-    common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
+    common::scribble_wal_below(dir.path(), redo)?;
 
     let (engine, tm) = common::open_from(dir.path(), redo)?;
     let table = engine.open_table("t")?;
@@ -1311,21 +1311,19 @@ fn production_startup_resumes_from_the_recorded_redo_point() -> anyhow::Result<(
         control.redo_lsn.is_valid(),
         "a heap-only cluster must publish a bounded redo point"
     );
-    common::scribble(
-        &common::wal_file_path(dir.path()),
-        0,
-        control.redo_lsn.0,
-        0xAB,
-    )?;
+    common::scribble_wal_below(dir.path(), control.redo_lsn)?;
 
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
-    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
+    // If recovery had read the scribbled prefix instead of skipping it, it would
+    // have decoded nothing, reported an empty log, and repositioned the writer at
+    // the head of the stream — far below the redo point it was told to resume at.
+    let resumed = crabgresql_wal::Wal::open(dir.path())?.current_lsn();
     assert!(
-        wal_len > control.redo_lsn.0,
-        "the log was truncated to {wal_len}, below the redo point {} it should have \
-         resumed at — recovery read the prefix instead of skipping it",
+        resumed > control.redo_lsn,
+        "the log was repositioned at {resumed}, below the redo point {} it should \
+         have resumed at — recovery read the prefix instead of skipping it",
         control.redo_lsn
     );
 
@@ -1345,12 +1343,7 @@ fn a_crash_after_a_bounded_recovery_still_recovers_everything() -> anyhow::Resul
         TableEngine::shutdown(engine.as_ref());
     }
     let first = crabgresql_wal::read_control(dir.path())?.expect("a control file");
-    common::scribble(
-        &common::wal_file_path(dir.path()),
-        0,
-        first.redo_lsn.0,
-        0xAB,
-    )?;
+    common::scribble_wal_below(dir.path(), first.redo_lsn)?;
     {
         // Bounded startup, then more work, then a crash: dropped without a
         // checkpoint, so only replay can bring the new rows back.
@@ -1446,12 +1439,14 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
-    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
     let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    // A whole segment past the end: no file there at all. A nearer overshoot
+    // lands on the tail page's padding, which is refused too, but by the guard
+    // rather than by the missing-segment check.
     crabgresql_wal::write_control(
         dir.path(),
         &crabgresql_wal::ControlFile {
-            redo_lsn: crabgresql_wal::Lsn(wal_len + 1),
+            redo_lsn: crabgresql_wal::Lsn(control.redo_lsn.0 + crabgresql_wal::WAL_SEG_SIZE),
             ..control
         },
     )?;
@@ -1460,8 +1455,8 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
         anyhow::bail!("a redo point past the end of the log must not start");
     };
     assert!(
-        err.to_string().contains("bytes"),
-        "the error should name the log length: {err}"
+        err.to_string().contains("segment"),
+        "the error should name the missing segment: {err}"
     );
 
     Ok(())

@@ -26,7 +26,11 @@ use crate::record::{Lsn, WalError};
 const CONTROL_SUBDIR: &str = "global";
 const CONTROL_FILE: &str = "pg_control";
 const MAGIC: u32 = 0xCA6D_0001;
-const VERSION: u32 = 2;
+/// Version 3 has the same fields at the same offsets as version 2. The bump is
+/// not about the layout: it is the marker that the *write-ahead log* underneath
+/// changed to a paged, segmented format that a version-2 directory's WAL cannot
+/// be read as. See [`WalError::IncompatibleWalFormat`].
+const VERSION: u32 = 3;
 /// Encoded length of a version-2 image, and the offset of its trailing CRC —
 /// which is also the number of leading bytes that CRC covers. The reader and the
 /// writer both take the covered range from `CRC_OFFSET`: a range that disagreed
@@ -37,13 +41,17 @@ const LEN: usize = 32;
 const CRC_OFFSET: usize = 28;
 
 /// Version 1 predates the redo point: 24 bytes with `clean_shutdown` at 16 and
-/// the CRC at 20. Still decoded, because an on-disk format is a compatibility
-/// boundary (`AGENTS.md`) — and because reading a v1 file as absent would lose
-/// its `clean_shutdown` flag, which is what stops `PgEngine::open_recovered`
-/// emptying every unlogged relation on the first start after an upgrade.
-const V1_VERSION: u32 = 1;
-const V1_LEN: usize = 24;
-const V1_CRC_OFFSET: usize = 20;
+/// the CRC at 20. Version 2 has version 3's layout but a pre-paging WAL beside
+/// it. Both are recognized only in order to be **refused**.
+///
+/// An on-disk format is a compatibility boundary (`AGENTS.md`), and refusing is
+/// how this one is honored. The alternative is not "read the old control file" —
+/// its fields still decode fine — but "read the old control file and then read
+/// the old WAL", and the old WAL parses as an empty log rather than as an error.
+/// Loading these would therefore start a cluster that silently threw its log
+/// away. Corrupt and unknown-version images still read as absent, so the
+/// fall-back to a whole-stream replay is unchanged.
+const LEGACY_VERSIONS: [(u32, usize, usize); 2] = [(1, 24, 20), (2, 32, 28)];
 
 fn read_u32(bytes: &[u8], start: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -83,39 +91,45 @@ pub fn read_control(dir: &Path) -> Result<Option<ControlFile>, WalError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    if let Some(version) = legacy_version(&bytes) {
+        return Err(WalError::IncompatibleWalFormat {
+            detail: format!("pg_control is version {version}"),
+        });
+    }
     Ok(decode(&bytes))
+}
+
+/// The version of a control file this build recognizes but will not load, or
+/// `None`. A legacy image must pass its own CRC to be reported: an unreadable
+/// file is deliberately indistinguishable from an absent one, and turning noise
+/// into a refusal to start would be the wrong trade.
+fn legacy_version(bytes: &[u8]) -> Option<u32> {
+    if read_u32(bytes, 0)? != MAGIC {
+        return None;
+    }
+    let version = read_u32(bytes, 4)?;
+    let (_, len, crc_offset) = LEGACY_VERSIONS.iter().find(|(v, ..)| *v == version)?;
+    if bytes.len() < *len {
+        return None;
+    }
+    (crc32c::crc32c(&bytes[0..*crc_offset]) == read_u32(bytes, *crc_offset)?).then_some(version)
 }
 
 /// Parse a control-file image. `None` for anything we cannot vouch for.
 fn decode(bytes: &[u8]) -> Option<ControlFile> {
-    if read_u32(bytes, 0)? != MAGIC {
+    if read_u32(bytes, 0)? != MAGIC || read_u32(bytes, 4)? != VERSION {
         return None;
     }
-    // Every version so far keeps `magic`, `version` and `next_xid` at the same
-    // offsets and only extends the tail, so this field alone picks the layout.
-    let (len, crc_offset) = match read_u32(bytes, 4)? {
-        V1_VERSION => (V1_LEN, V1_CRC_OFFSET),
-        VERSION => (LEN, CRC_OFFSET),
-        _ => return None,
-    };
-    if bytes.len() < len {
+    if bytes.len() < LEN {
         return None;
     }
-    if crc32c::crc32c(&bytes[0..crc_offset]) != read_u32(bytes, crc_offset)? {
+    if crc32c::crc32c(&bytes[0..CRC_OFFSET]) != read_u32(bytes, CRC_OFFSET)? {
         return None;
     }
-    let next_xid = Xid(read_u64(bytes, 8)?);
-    // A v1 file was written by a build whose every recovery started at the head
-    // of the stream, so that is exactly what its redo point means.
-    let (redo_lsn, clean_shutdown_at) = if len == V1_LEN {
-        (Lsn::INVALID, 16)
-    } else {
-        (Lsn(read_u64(bytes, 16)?), 24)
-    };
     Some(ControlFile {
-        next_xid,
-        redo_lsn,
-        clean_shutdown: *bytes.get(clean_shutdown_at)? != 0,
+        next_xid: Xid(read_u64(bytes, 8)?),
+        redo_lsn: Lsn(read_u64(bytes, 16)?),
+        clean_shutdown: *bytes.get(24)? != 0,
     })
 }
 
@@ -172,15 +186,24 @@ mod tests {
         std::fs::write(control_path(dir), bytes)
     }
 
-    /// A version-1 image, as a build before the redo point would have written it.
-    fn v1_image(next_xid: Xid, clean_shutdown: bool) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(V1_LEN);
+    /// A legacy image, as the build that wrote `version` would have produced it.
+    /// Version 1 predates the redo point (24 bytes); version 2 has version 3's
+    /// layout but a pre-paged WAL beside it.
+    fn legacy_image(version: u32, next_xid: Xid, clean_shutdown: bool) -> Vec<u8> {
+        let Some(&(_, len, crc_offset)) = LEGACY_VERSIONS.iter().find(|(v, ..)| *v == version)
+        else {
+            panic!("{version} is not a legacy control-file version");
+        };
+        let mut bytes = Vec::with_capacity(len);
         bytes.extend_from_slice(&MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&V1_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&version.to_le_bytes());
         bytes.extend_from_slice(&next_xid.0.to_le_bytes());
+        if version >= 2 {
+            bytes.extend_from_slice(&Lsn(8192).0.to_le_bytes());
+        }
         bytes.push(clean_shutdown as u8);
         bytes.extend_from_slice(&[0u8; 3]);
-        assert_eq!(bytes.len(), V1_CRC_OFFSET);
+        assert_eq!(bytes.len(), crc_offset);
         let crc = crc32c::crc32c(&bytes);
         bytes.extend_from_slice(&crc.to_le_bytes());
         bytes
@@ -230,22 +253,40 @@ mod tests {
         Ok(())
     }
 
-    /// An on-disk format is a compatibility boundary: a control file written
-    /// before the redo point existed must still load, and must keep saying the
-    /// run shut down cleanly — otherwise the upgrade empties every unlogged
-    /// relation.
+    /// A directory from before the paged WAL is refused, not loaded.
+    ///
+    /// Loading it would succeed — these fields still decode — and then the WAL
+    /// beside it would read as an *empty* log, because its first four bytes are a
+    /// record length rather than a page magic. The cluster would start, silently
+    /// having thrown its log away. An on-disk format is a compatibility boundary
+    /// (`AGENTS.md`), and this is how this one is honored: loudly.
     #[test]
-    fn a_version_1_control_file_loads_with_a_whole_stream_redo() -> anyhow::Result<()> {
+    fn a_pre_paged_control_file_refuses_to_load() -> anyhow::Result<()> {
+        for version in [1u32, 2] {
+            let dir = tempfile::tempdir()?;
+            write_raw(dir.path(), &legacy_image(version, Xid(99), true))?;
+            let Err(error) = read_control(dir.path()) else {
+                anyhow::bail!("a version-{version} control file was accepted");
+            };
+            assert!(
+                matches!(error, WalError::IncompatibleWalFormat { .. }),
+                "unexpected error for version {version}: {error}"
+            );
+            assert!(error.to_string().contains(&format!("version {version}")));
+        }
+
+        Ok(())
+    }
+
+    /// Corruption stays indistinguishable from absence even at a legacy version:
+    /// turning noise into a refusal to start would be the wrong trade.
+    #[test]
+    fn a_legacy_image_that_fails_its_crc_reads_as_absent() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        write_raw(dir.path(), &v1_image(Xid(99), true))?;
-        assert_eq!(
-            read_control(dir.path())?,
-            Some(ControlFile {
-                next_xid: Xid(99),
-                redo_lsn: Lsn::INVALID,
-                clean_shutdown: true,
-            })
-        );
+        let mut image = legacy_image(2, Xid(99), true);
+        image[8] ^= 0xFF;
+        write_raw(dir.path(), &image)?;
+        assert_eq!(read_control(dir.path())?, None);
 
         Ok(())
     }
@@ -258,7 +299,7 @@ mod tests {
             clean_shutdown: false,
         };
         let good = encode(&ctl);
-        for truncated in [0, 1, V1_LEN, LEN - 1] {
+        for truncated in [0, 1, 24, LEN - 1] {
             let dir = tempfile::tempdir()?;
             write_raw(dir.path(), &good[..truncated])?;
             assert_eq!(
@@ -290,7 +331,7 @@ mod tests {
             clean_shutdown: true,
         });
         assert_eq!(&bytes[0..4], &MAGIC.to_le_bytes());
-        assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes());
         assert_eq!(&bytes[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&bytes[16..24], &0x1112_1314_1516_1718u64.to_le_bytes());
         assert_eq!(bytes[24], 1);

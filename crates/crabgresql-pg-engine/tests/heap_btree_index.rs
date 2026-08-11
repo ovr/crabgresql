@@ -616,7 +616,7 @@ fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::
         redo.is_valid(),
         "the checkpointer never sampled a redo point"
     );
-    common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
+    common::scribble_wal_below(dir.path(), redo)?;
     {
         let (engine, tm) = common::open_from(dir.path(), redo)?;
         let table = engine.open_table("t")?;

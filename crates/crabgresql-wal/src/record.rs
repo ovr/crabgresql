@@ -15,6 +15,15 @@ pub struct Lsn(pub u64);
 impl Lsn {
     pub const INVALID: Lsn = Lsn(0);
 
+    /// The first byte a record can occupy in a fresh cluster: past the header of
+    /// the first page of segment 1.
+    ///
+    /// Segment 1 rather than 0, as in PostgreSQL. Starting at byte 0 would make
+    /// `Lsn(0)` both "empty stream" and a real position inside the first page's
+    /// header, and every "is this zero because nothing was written, or because it
+    /// is the head of the log?" question would need an exception.
+    pub const START: Lsn = Lsn(crate::segment::WAL_SEG_SIZE + crate::page::XLP_PAGE_HEADER_SIZE);
+
     pub fn is_valid(self) -> bool {
         self.0 != 0
     }
@@ -48,8 +57,20 @@ pub enum WalError {
     UnknownRmgr(u8),
     #[error("wal redo failed: {0}")]
     Redo(String),
-    #[error("cannot flush the wal to {target}: only {appended} bytes have been appended")]
-    FlushPastEnd { target: Lsn, appended: u64 },
+    #[error("cannot flush the wal to {target}: nothing above {appended} has been appended")]
+    FlushPastEnd { target: Lsn, appended: Lsn },
+    /// A data directory from before the WAL became paged and segmented.
+    ///
+    /// Refused loudly rather than read, because the failure mode of reading it is
+    /// silent: the old format's first four bytes are a record length, which is
+    /// not a page magic, so the log would parse as *empty* — and an empty log is
+    /// discarded without a word.
+    #[error(
+        "this data directory predates the paged write-ahead log ({detail}); \
+         the page and segment layout changed and there is no in-place upgrade — \
+         re-initialize the cluster"
+    )]
+    IncompatibleWalFormat { detail: String },
 }
 
 /// One decoded WAL record, borrowing its payload from the replay buffer.
@@ -83,6 +104,16 @@ pub struct WalRecord<'a> {
 impl<'a> WalRecord<'a> {
     pub const HEADER_LEN: usize = 24;
     const CRC_LEN: usize = 4;
+    /// Smallest possible encoded record: a header and a CRC with no payload.
+    pub const MIN_LEN: usize = Self::HEADER_LEN + Self::CRC_LEN;
+
+    /// Ceiling on an encoded record, enforced by the reader before it allocates.
+    ///
+    /// `total_len` is the first field read off the disk, so a garbage length on a
+    /// torn page would otherwise drive a multi-gigabyte allocation during
+    /// recovery — on the one code path that must not fail. The writer asserts the
+    /// same bound, so it cannot produce a record the reader would refuse.
+    pub const MAX_LEN: usize = 64 << 20;
 
     /// Serialize this record onto the end of `buf` and return its total encoded
     /// length. The start LSN is carried by [`WalRecord::rec_lsn`], which the
