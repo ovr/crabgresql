@@ -3551,16 +3551,7 @@ impl NestedLoopJoin {
             right_rows.push(row);
         }
         let right_matched = vec![false; right_rows.len()];
-        // Which slots of the joined row the join filter reads. `None` — an
-        // expression whose dependencies cannot be pinned down — means "all of
-        // them", the same fail-safe the projection pass uses.
-        let mut refs = std::collections::BTreeSet::new();
-        let touched = match &predicate {
-            None => Some(Vec::new()),
-            Some(predicate) => predicate
-                .collect_column_refs(&mut refs)
-                .then(|| refs.into_iter().collect::<Vec<_>>()),
-        };
+        let touched = touched_slots(&predicate);
         Ok(Self {
             left,
             right_rows,
@@ -3585,13 +3576,6 @@ impl NestedLoopJoin {
 
     fn preserves_right(&self) -> bool {
         matches!(self.kind, JoinKind::Right | JoinKind::Full)
-    }
-
-    fn combined_row(&self, left: &[Value], right: &[Value]) -> Tuple {
-        let mut row = Vec::with_capacity(self.left_width + self.right_width);
-        row.extend_from_slice(left);
-        row.extend_from_slice(right);
-        row
     }
 }
 
@@ -3622,11 +3606,7 @@ impl ExecNode for NestedLoopJoin {
                             continue;
                         }
                         // Test the pair against the reused probe buffer rather
-                        // than a freshly built row: for a wide relation the row
-                        // is an allocation plus a deep clone of every column
-                        // (`Value::Text` is an owned `String`), paid for every
-                        // candidate pair and thrown away on a mismatch. Only the
-                        // columns the filter reads are copied in.
+                        // than a freshly built row — see `fill_probe`.
                         //
                         // Field-by-field borrows, so the fill can hold `&mut
                         // probe` while reading the two source rows.
@@ -3639,24 +3619,7 @@ impl ExecNode for NestedLoopJoin {
                             ..
                         } = self;
                         let left = current_left.as_deref().unwrap_or(&[]);
-                        let right = &right_rows[right_index];
-                        match touched {
-                            Some(touched) => {
-                                for slot in touched {
-                                    let source = if *slot < *left_width {
-                                        left.get(*slot)
-                                    } else {
-                                        right.get(*slot - *left_width)
-                                    };
-                                    probe[*slot] = source.cloned().unwrap_or(Value::Null);
-                                }
-                            }
-                            None => {
-                                probe.truncate(0);
-                                probe.extend_from_slice(left);
-                                probe.extend_from_slice(right);
-                            }
-                        }
+                        fill_probe(probe, touched, left, &right_rows[right_index], *left_width);
                         // A cross join carries no predicate, and `predicate_holds`
                         // already answers `true` for `None`, so there is no
                         // kind-specific short circuit here: an unconditional check
@@ -3665,12 +3628,22 @@ impl ExecNode for NestedLoopJoin {
                         if matched {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
-                            let Some(left) = self.current_left.as_ref() else {
+                            let Self {
+                                probe,
+                                touched,
+                                current_left,
+                                right_rows,
+                                ..
+                            } = self;
+                            let Some(left) = current_left.as_deref() else {
                                 continue;
                             };
-                            return Ok(Some(
-                                self.combined_row(left, &self.right_rows[right_index]),
-                            ));
+                            return Ok(Some(take_joined_row(
+                                probe,
+                                touched,
+                                left,
+                                &right_rows[right_index],
+                            )));
                         }
                     }
 
@@ -3743,6 +3716,13 @@ pub struct HashJoin {
     current_probe_hash: Option<u64>,
     probe_pos: usize,
     right_index: usize,
+    /// A full-width joined row reused across candidate pairs, so testing the
+    /// residual costs no allocation. Only the slots in `touched` are meaningful;
+    /// the rest hold whatever an earlier pair left there, which nothing reads.
+    probe: Vec<Value>,
+    /// The slots of the joined row the residual reads, ascending. `None` means
+    /// "could not be determined — copy the whole row".
+    touched: Option<Vec<usize>>,
 }
 
 impl HashJoin {
@@ -3794,6 +3774,7 @@ impl HashJoin {
         }
 
         let right_matched = vec![false; right_rows.len()];
+        let touched = touched_slots(&residual);
         Ok(Self {
             left,
             right_rows,
@@ -3813,6 +3794,8 @@ impl HashJoin {
             current_probe_hash: None,
             probe_pos: 0,
             right_index: 0,
+            probe: vec![Value::Null; left_width + right_width],
+            touched,
         })
     }
 
@@ -3822,13 +3805,6 @@ impl HashJoin {
 
     fn preserves_right(&self) -> bool {
         matches!(self.kind, JoinKind::Right | JoinKind::Full)
-    }
-
-    fn combined_row(&self, left: &[Value], right: &[Value]) -> Tuple {
-        let mut row = Vec::with_capacity(self.left_width + self.right_width);
-        row.extend_from_slice(left);
-        row.extend_from_slice(right);
-        row
     }
 
     /// Look up the candidate right rows for a freshly pulled left row: evaluate
@@ -3906,17 +3882,49 @@ impl ExecNode for HashJoin {
                                 None => break,
                             }
                         };
-                        // Then the residual (non-equi) conjuncts of the ON clause.
-                        let Some(left) = self.current_left.as_ref() else {
+                        // Then the residual (non-equi) conjuncts of the ON
+                        // clause, tested against the reused probe buffer so a
+                        // pair it rejects never builds a row — see `fill_probe`.
+                        //
+                        // Field-by-field borrows, so the fill can hold `&mut
+                        // probe` while reading the two source rows.
+                        let Self {
+                            probe,
+                            touched,
+                            current_left,
+                            right_rows,
+                            left_width,
+                            ..
+                        } = self;
+                        let Some(left) = current_left.as_deref() else {
                             continue;
                         };
-                        let row = self.combined_row(left, &self.right_rows[right_index]);
-                        if !predicate_holds(&self.residual, &row, &self.ctx)? {
+                        fill_probe(probe, touched, left, &right_rows[right_index], *left_width);
+                        if !predicate_holds(&self.residual, &self.probe, &self.ctx)? {
                             continue;
                         }
+                        // Only now, for a surviving pair, is the output row
+                        // built and the match bookkeeping updated — moving
+                        // either above the residual test would null-extend the
+                        // wrong rows on a preserved side.
                         self.current_left_matched = true;
                         self.right_matched[right_index] = true;
-                        return Ok(Some(row));
+                        let Self {
+                            probe,
+                            touched,
+                            current_left,
+                            right_rows,
+                            ..
+                        } = self;
+                        let Some(left) = current_left.as_deref() else {
+                            continue;
+                        };
+                        return Ok(Some(take_joined_row(
+                            probe,
+                            touched,
+                            left,
+                            &right_rows[right_index],
+                        )));
                     }
 
                     if !self.current_left_matched && self.preserves_left() {
@@ -3943,6 +3951,96 @@ impl ExecNode for HashJoin {
                 JoinPhase::Done => return Ok(None),
             }
         }
+    }
+}
+
+/// Concatenate a left and a right row into a joined output row.
+fn combined_row(left: &[Value], right: &[Value]) -> Tuple {
+    let mut row = Vec::with_capacity(left.len() + right.len());
+    row.extend_from_slice(left);
+    row.extend_from_slice(right);
+    row
+}
+
+/// Which slots of the joined row `predicate` reads, ascending. `None` — an
+/// expression whose dependencies cannot be pinned down — means "all of them",
+/// the same fail-safe the projection pass uses. `Some(vec![])` means there is
+/// nothing to test.
+fn touched_slots(predicate: &Option<BoundExpr>) -> Option<Vec<usize>> {
+    match predicate {
+        // No predicate reads nothing — not "reads everything". Returning `None`
+        // here would make every candidate pair copy a full row for a test that
+        // never runs.
+        None => Some(Vec::new()),
+        Some(predicate) => {
+            let mut refs = std::collections::BTreeSet::new();
+            predicate
+                .collect_column_refs(&mut refs)
+                .then(|| refs.into_iter().collect())
+        }
+    }
+}
+
+/// Fill the reused probe buffer with the candidate pair, ready for a predicate
+/// test. Only the slots the predicate reads are copied in: for a wide relation
+/// a full joined row is an allocation plus a deep clone of every column
+/// (`Value::Text` is an owned `String`), paid for every candidate pair and
+/// thrown away on a mismatch. Slots outside `touched` keep whatever an earlier
+/// pair left there, which nothing reads.
+fn fill_probe(
+    probe: &mut Vec<Value>,
+    touched: &Option<Vec<usize>>,
+    left: &[Value],
+    right: &[Value],
+    left_width: usize,
+) {
+    match touched {
+        Some(touched) => {
+            debug_assert!(
+                touched.last().is_none_or(|slot| *slot < probe.len()),
+                "refreshing only some slots needs a full-width buffer: the buffer is \
+                 handed out as an output row in `None` mode only, where the next fill \
+                 rebuilds it whole"
+            );
+            for slot in touched {
+                let source = if *slot < left_width {
+                    left.get(*slot)
+                } else {
+                    right.get(*slot - left_width)
+                };
+                probe[*slot] = source.cloned().unwrap_or(Value::Null);
+            }
+        }
+        None => {
+            // One reservation: `take_joined_row` hands this buffer out, so it
+            // comes back empty and two bare `extend_from_slice` calls would
+            // grow it twice.
+            probe.clear();
+            probe.reserve(left.len() + right.len());
+            probe.extend_from_slice(left);
+            probe.extend_from_slice(right);
+        }
+    }
+}
+
+/// Build the output row for a pair that passed the predicate.
+///
+/// When `touched` is `None` the probe buffer already *is* the joined row, so
+/// hand it out rather than deep-cloning every column a second time. Emptying it
+/// is safe because the next `fill_probe` in that mode rebuilds it from scratch,
+/// so an emitted row costs exactly one allocation — what the code paid before
+/// the buffer existed.
+fn take_joined_row(
+    probe: &mut Vec<Value>,
+    touched: &Option<Vec<usize>>,
+    left: &[Value],
+    right: &[Value],
+) -> Tuple {
+    match touched {
+        None => std::mem::take(probe),
+        // A partial buffer: only the predicate's slots are meaningful, so the
+        // row has to be built from the source rows.
+        Some(_) => combined_row(left, right),
     }
 }
 
