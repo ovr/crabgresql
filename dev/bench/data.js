@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786574126361,
+  "lastUpdate": 1786574128378,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -23296,6 +23296,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20085.582109,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3622dd5f6768a1c517e8d88233209682df06d814",
+          "message": "feat(optimizer): fold constant expressions on the logical plan (#223)\n\nA bound plan went to the planner exactly as the binder built it, so\n`WHERE price > 10 + 5` re-evaluated the addition on every row, and the\ncost model could not read the key: `key_selectivity` consults a column's\ndistribution only through `const_of`, which matches a literal `Const` and\nnothing else, so an arithmetic key fell back to PostgreSQL's generic\n`var_eq_non_const` estimate.\n\nThe new `crabgresql-optimizer` crate holds a list of rules applied to the\nplan tree over passes until it stops changing, with `SimplifyExpressions`\n(constant folding and the boolean identities, cooperating in one post-order\nwalk) as the first of them. It runs per execution, immediately before\nplanning, through `executor::optimize_and_plan`.\n\nEvaluating `10 + 5` needs the arithmetic that lived in the executor, which\nsits *above* any logical optimizer, so it moves down to\n`crabgresql_types::arith` and the executor keeps thin wrappers over it:\nper-row evaluation and constant folding then cannot disagree about overflow\nor division by zero, and nothing in the rule re-implements a value operation\nthe executor implements separately.\n\nA folding failure leaves the node untouched rather than raising: `SELECT 1/0\nFROM t` over an empty `t` raises nothing today and must keep doing so, and an\nunfolded operand keeps its parent non-constant, which is what preserves the\nlaziness of `WHERE false AND 1/0 = 1`. The `ANY`/`ALL` `cmp` is a template\n(`needle op <hole>`) whose shape the executor drives, so only its needle folds.\n\nThe plan-wide expression walk existed once already, inside\n`substitute_params`. It is extracted to `binder::walk_exprs_mut` with an\n`ExprVisitor` trait and `substitute_params` reimplemented on top, so a plan\nnode cannot be visited by one pass and forgotten by the other.",
+          "timestamp": "2026-08-12T20:57:27Z",
+          "tree_id": "a866adf8eb25b35b77f2c839d2ac8b37ffff257f",
+          "url": "https://github.com/ovr/crabgresql/commit/3622dd5f6768a1c517e8d88233209682df06d814"
+        },
+        "date": 1786574128272,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 481.339644,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20350.655729,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
