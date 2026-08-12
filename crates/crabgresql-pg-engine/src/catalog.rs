@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crabgresql_storage_api::{
-    CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
-    PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
-    RelPersistence, RelStats, SequenceAdvance, SequenceDefinition, TableAccessMethod, TableSchema,
-    ViewDefinition,
+    CheckConstraint, Column, GeneratedColumn, Generation, IndexConstraint, IndexKey, IndexMetadata,
+    IndexMethod, InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
+    PartitionStrategy, RelPersistence, RelStats, SequenceAdvance, SequenceDefinition,
+    TableAccessMethod, TableSchema, ViewDefinition,
 };
 use crabgresql_types::PgType;
 
@@ -117,6 +117,13 @@ const INHERIT_MAGIC: &[u8; 4] = b"INH1";
 /// what every relation written before this tail had: the DDL that declares one
 /// was rejected outright.
 const CHECK_MAGIC: &[u8; 4] = b"CHK1";
+/// Marks the generated-column section, appended after the [`CHECK_MAGIC`] block
+/// — a fifteenth backward-compatible tail carrying each column's generation
+/// expression and kind. A reader that predates generated columns stops above and
+/// decodes every column as an ordinary one, which is what every column written
+/// before this tail was: the DDL that declares a generated column used to be
+/// rejected outright.
+const GEN_MAGIC: &[u8; 4] = b"GEN1";
 struct PersistCol {
     name: String,
     oid: u32,
@@ -129,6 +136,11 @@ struct PersistCol {
     /// each time its stored SELECT text is re-bound, so it is never persisted
     /// and always decodes as `None` here.
     collation: Option<u32>,
+    /// The column's generation expression and kind, persisted in the
+    /// [`GEN_MAGIC`] tail. `None` for an ordinary column and for one written
+    /// before that tail existed. Like `collation`, only relation columns carry
+    /// one — a view has no generated columns to record.
+    generated: Option<GeneratedColumn>,
 }
 
 /// A persisted index: its semantic metadata plus the relfilenode of its physical
@@ -283,6 +295,7 @@ impl RelCatalog {
                         col.not_null_constraint = c.not_null_constraint.clone();
                         col.default = c.default.clone();
                         col.collation = c.collation;
+                        col.generated = c.generated.clone();
                         col
                     })
                     .collect();
@@ -345,6 +358,7 @@ impl RelCatalog {
                     not_null_constraint: c.not_null_constraint.clone(),
                     default: c.default.clone(),
                     collation: c.collation,
+                    generated: c.generated.clone(),
                 })
                 .collect(),
             indexes: Vec::new(),
@@ -908,6 +922,8 @@ impl RelCatalog {
                     default: c.default.clone(),
                     // Never persisted for a view; re-derived from its SELECT.
                     collation: None,
+                    // A view has no generated columns.
+                    generated: None,
                 })
                 .collect(),
             depends_on: def.depends_on.clone(),
@@ -1415,6 +1431,27 @@ fn encode(state: &State) -> Vec<u8> {
             out.extend_from_slice(&check.inhcount.to_le_bytes());
         }
     }
+    // Generated columns: a fifteenth backward-compatible tail, one byte per
+    // column (0 = not generated) plus the expression when there is one. Written
+    // per relation in the same order as every section above, so a reader can zip
+    // it back on.
+    out.extend_from_slice(GEN_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.cols.len() as u32).to_le_bytes());
+        for c in &r.cols {
+            match &c.generated {
+                None => out.push(0),
+                Some(g) => {
+                    out.push(match g.kind {
+                        Generation::Stored => 1,
+                        Generation::Virtual => 2,
+                    });
+                    put_str(&mut out, &g.expr);
+                }
+            }
+        }
+    }
     out
 }
 
@@ -1576,6 +1613,8 @@ fn decode(bytes: &[u8]) -> State {
                 default: None,
                 // Overridden below from the COL1 tail when present.
                 collation: None,
+                // Overridden below from the GEN1 tail when present.
+                generated: None,
             });
         }
         rels.push(PersistRel {
@@ -1683,6 +1722,7 @@ fn decode(bytes: &[u8]) -> State {
                     not_null_constraint,
                     default,
                     collation: None,
+                    generated: None,
                 });
             }
             views.push(PersistView {
@@ -1936,6 +1976,27 @@ fn decode(bytes: &[u8]) -> State {
                 .collect();
         }
     }
+    // Generated-column tail: absent means no column is generated, which is both
+    // the legacy state and the state of every ordinary column.
+    if d.remaining().starts_with(GEN_MAGIC) {
+        d.p += GEN_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let ncols = d.u32();
+            for i in 0..ncols as usize {
+                let kind = match d.byte() {
+                    1 => Some(Generation::Stored),
+                    2 => Some(Generation::Virtual),
+                    _ => None,
+                };
+                let Some(kind) = kind else { continue };
+                let expr = d.s();
+                if let Some(c) = r.cols.get_mut(i) {
+                    c.generated = Some(GeneratedColumn { kind, expr });
+                }
+            }
+        }
+    }
     State {
         next,
         rels,
@@ -2052,6 +2113,66 @@ mod tests {
         assert!(schema.columns[0].nullable);
         assert!(schema.columns[0].default.is_none());
         assert!(indexes.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_columns_round_trip_and_legacy_catalog_has_none() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        let mut stored = Column::new("s", PgType::Int4);
+        stored.generated = Some(GeneratedColumn {
+            kind: Generation::Stored,
+            expr: "(a * 2)".to_string(),
+        });
+        let mut virt = Column::new("v", PgType::Int4);
+        virt.generated = Some(GeneratedColumn {
+            kind: Generation::Virtual,
+            expr: "(a + 1)".to_string(),
+        });
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("a", PgType::Int4), stored, virt],
+        ))?;
+        drop(catalog);
+
+        let loaded = RelCatalog::load(dir.path())?;
+        let (_, _, _, schema, _) = loaded
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("loaded catalog is empty"))?;
+        assert!(schema.columns[0].generated.is_none());
+        assert_eq!(
+            schema.columns[1].generated,
+            Some(GeneratedColumn {
+                kind: Generation::Stored,
+                expr: "(a * 2)".to_string()
+            })
+        );
+        assert_eq!(
+            schema.columns[2].generated,
+            Some(GeneratedColumn {
+                kind: Generation::Virtual,
+                expr: "(a + 1)".to_string()
+            })
+        );
+
+        // A catalog written before this tail existed decodes with no generated
+        // column at all — which is what those relations have.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(GEN_MAGIC.len())
+            .position(|w| w == GEN_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("generated-column marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        let (_, _, _, schema, _) = legacy
+            .schemas()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("legacy catalog is empty"))?;
+        assert!(schema.columns.iter().all(|c| c.generated.is_none()));
 
         Ok(())
     }

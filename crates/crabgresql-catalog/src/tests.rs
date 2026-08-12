@@ -759,6 +759,72 @@ fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()
     Ok(())
 }
 
+/// A generated column reports its kind in `attgenerated`, is flagged
+/// `atthasdef`, and keeps its expression in `pg_attrdef` — the same three
+/// places PostgreSQL puts it, which is what lets psql's `\d` find it through the
+/// join it already writes.
+#[test]
+fn generated_columns_are_reported_like_postgres_does() -> anyhow::Result<()> {
+    use crabgresql_storage_api::{Column, GeneratedColumn, Generation, TableSchema};
+    use crabgresql_types::PgType;
+
+    let generated = |name: &str, kind: Generation, expr: &str| {
+        let mut c = Column::new(name, PgType::Int4);
+        c.generated = Some(GeneratedColumn {
+            kind,
+            expr: expr.to_string(),
+        });
+        c
+    };
+    let cat = SystemCatalog::with_relations(vec![TableSchema::new(
+        "t",
+        vec![
+            Column::new("a", PgType::Int4),
+            generated("s", Generation::Stored, "(a * 2)"),
+            generated("v", Generation::Virtual, "(a + 1)"),
+        ],
+    )]);
+
+    let (schema, rows) = required(
+        cat.build_pg_catalog("pg_attribute"),
+        "pg_attribute is missing",
+    )?;
+    let attname = required(schema.column_index("attname"), "attname is missing")?;
+    let cell = |name: &str, col: &str| -> anyhow::Result<Value> {
+        let i = required(schema.column_index(col), col)?;
+        required(
+            rows.iter()
+                .find(|r| r[attname] == Value::Text(name.to_string()))
+                .map(|r| r[i].clone()),
+            name,
+        )
+    };
+    assert_eq!(cell("a", "attgenerated")?, Value::Char(0));
+    assert_eq!(cell("s", "attgenerated")?, Value::Char(b's'));
+    assert_eq!(cell("v", "attgenerated")?, Value::Char(b'v'));
+    assert_eq!(cell("a", "atthasdef")?, Value::Bool(false));
+    assert_eq!(cell("s", "atthasdef")?, Value::Bool(true));
+    assert_eq!(cell("v", "atthasdef")?, Value::Bool(true));
+
+    let (schema, rows) = required(cat.build_pg_catalog("pg_attrdef"), "pg_attrdef is missing")?;
+    let adnum = required(schema.column_index("adnum"), "adnum is missing")?;
+    let adbin = required(schema.column_index("adbin"), "adbin is missing")?;
+    let expr = |attnum: i16| -> Option<Value> {
+        rows.iter()
+            .find(|r| r[adnum] == Value::Int2(attnum))
+            .map(|r| r[adbin].clone())
+    };
+    assert_eq!(
+        expr(1),
+        None,
+        "an ordinary column with no default has no row"
+    );
+    assert_eq!(expr(2), Some(Value::Text("(a * 2)".to_string())));
+    assert_eq!(expr(3), Some(Value::Text("(a + 1)".to_string())));
+
+    Ok(())
+}
+
 /// `pg_attribute.atttypmod` is emitted in PostgreSQL's encoding, not the raw
 /// modifier crabgresql stores on the column, so `format_type(atttypid,
 /// atttypmod)` reproduces PG's `\d` type strings. The character types and
@@ -807,10 +873,11 @@ fn pg_attribute_encodes_postgres_atttypmod() -> anyhow::Result<()> {
     assert_eq!(cell("n", "atttypmod")?, Value::Int4(327686));
     assert_eq!(cell("nn", "atttypmod")?, Value::Int4(264194));
     assert_eq!(cell("i", "atttypmod")?, Value::Int4(-1));
-    // TODO: report attidentity/attgenerated once identity and generated
-    // columns can be declared. Until then both carry PG's "neither" spelling:
-    // `\0` rather than NULL — a `"char"` that prints as the empty string,
-    // which psql projects directly.
+    // An ordinary column carries PG's "neither" spelling for both: `\0` rather
+    // than NULL — a `"char"` that prints as the empty string, which psql
+    // projects directly.
+    //
+    // TODO: report attidentity once identity columns can be declared.
     assert_eq!(cell("i", "attidentity")?, Value::Char(0));
     assert_eq!(cell("i", "attgenerated")?, Value::Char(0));
 

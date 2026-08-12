@@ -1,0 +1,219 @@
+-- GENERATED COLUMNS
+-- Both kinds: STORED materializes on write, VIRTUAL is recomputed on read.
+-- A clause naming neither is VIRTUAL, PostgreSQL's default since 18.
+CREATE TABLE gen_both (
+  a integer,
+  s integer GENERATED ALWAYS AS (a * 2) STORED,
+  v text GENERATED ALWAYS AS (a || 'x') VIRTUAL,
+  b integer GENERATED ALWAYS AS (a + 1)
+);
+-- The catalog reports the kind, flags the column as having a default
+-- expression, and keeps the expression in pg_attrdef.
+SELECT a.attname, a.attgenerated, a.atthasdef,
+       pg_get_expr(d.adbin, d.adrelid) AS adbin,
+       pg_get_expr(d.adbin, d.adrelid, true) AS pretty
+  FROM pg_attribute a
+  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'gen_both'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+ attname | attgenerated | atthasdef |      adbin       |     pretty     
+---------+--------------+-----------+------------------+----------------
+ a       |              | f         |                  | 
+ s       | s            | t         | (a * 2)          | a * 2
+ v       | v            | t         | (a || 'x'::text) | a || 'x'::text
+ b       | v            | t         | (a + 1)          | a + 1
+(4 rows)
+
+SELECT column_name, is_generated, generation_expression, column_default
+  FROM information_schema.columns
+ WHERE table_name = 'gen_both'
+ ORDER BY ordinal_position;
+ column_name | is_generated | generation_expression | column_default 
+-------------+--------------+-----------------------+----------------
+ a           | NEVER        |                       | 
+ s           | ALWAYS       | (a * 2)               | 
+ v           | ALWAYS       | (a || 'x'::text)      | 
+ b           | ALWAYS       | (a + 1)               | 
+(4 rows)
+
+\d gen_both
+                            Table "public.gen_both"
+ Column |  Type   | Collation | Nullable |               Default                
+--------+---------+-----------+----------+--------------------------------------
+ a      | integer |           |          | 
+ s      | integer |           |          | generated always as (a * 2) stored
+ v      | text    |           |          | generated always as (a || 'x'::text)
+ b      | integer |           |          | generated always as (a + 1)
+
+-- The column list may omit a generated column; naming it with DEFAULT is the
+-- one value a statement may write.
+INSERT INTO gen_both (a) VALUES (1), (2);
+INSERT INTO gen_both VALUES (3, DEFAULT, DEFAULT, DEFAULT);
+SELECT * FROM gen_both ORDER BY a;
+ a | s | v  | b 
+---+---+----+---
+ 1 | 2 | 1x | 2
+ 2 | 4 | 2x | 3
+ 3 | 6 | 3x | 4
+(3 rows)
+
+-- A virtual column reads back through every path: a bare reference, a
+-- qualified one, a predicate, and a join key.
+SELECT gen_both.v, b FROM gen_both WHERE v = '2x';
+ v  | b 
+----+---
+ 2x | 3
+(1 row)
+
+SELECT count(*) FROM gen_both x JOIN gen_both y ON x.v = y.v;
+ count 
+-------
+     3
+(1 row)
+
+-- Anything but DEFAULT is refused, wherever the value would come from.
+INSERT INTO gen_both VALUES (4, 44);
+ERROR:  cannot insert a non-DEFAULT value into column "s"
+DETAIL:  Column "s" is a generated column.
+INSERT INTO gen_both (a, s) VALUES (4, 44);
+ERROR:  cannot insert a non-DEFAULT value into column "s"
+DETAIL:  Column "s" is a generated column.
+INSERT INTO gen_both (a, s) SELECT 4, 44;
+ERROR:  cannot insert a non-DEFAULT value into column "s"
+DETAIL:  Column "s" is a generated column.
+UPDATE gen_both SET s = 1;
+ERROR:  column "s" can only be updated to DEFAULT
+DETAIL:  Column "s" is a generated column.
+UPDATE gen_both SET v = 'q';
+ERROR:  column "v" can only be updated to DEFAULT
+DETAIL:  Column "v" is a generated column.
+-- An UPDATE recomputes both kinds from the new row, whichever column it
+-- assigned, and RETURNING sees the recomputed values.
+UPDATE gen_both SET a = 10 WHERE a = 1 RETURNING a, s, v, b;
+ a  | s  |  v  | b  
+----+----+-----+----
+ 10 | 20 | 10x | 11
+(1 row)
+
+UPDATE gen_both SET s = DEFAULT WHERE a = 2;
+SELECT * FROM gen_both ORDER BY a;
+ a  | s  |  v  | b  
+----+----+-----+----
+  2 |  4 | 2x  |  3
+  3 |  6 | 3x  |  4
+ 10 | 20 | 10x | 11
+(3 rows)
+
+-- NOT NULL and CHECK are enforced against a virtual column's computed value.
+CREATE TABLE gen_checked (
+  a integer,
+  v integer GENERATED ALWAYS AS (a * 2) VIRTUAL CHECK (v < 10),
+  n integer GENERATED ALWAYS AS (a) VIRTUAL NOT NULL
+);
+INSERT INTO gen_checked (a) VALUES (1);
+INSERT INTO gen_checked (a) VALUES (100);
+ERROR:  new row for relation "gen_checked" violates check constraint "gen_checked_v_check"
+DETAIL:  Failing row contains (100, virtual, virtual).
+INSERT INTO gen_checked (a) VALUES (NULL);
+ERROR:  null value in column "n" of relation "gen_checked" violates not-null constraint
+DETAIL:  Failing row contains (null, virtual, virtual).
+SELECT * FROM gen_checked;
+ a | v | n 
+---+---+---
+ 1 | 2 | 1
+(1 row)
+
+-- COPY carries no generated column: the implicit column list leaves it out …
+COPY gen_checked FROM stdin;
+SELECT * FROM gen_checked ORDER BY a;
+ a | v | n 
+---+---+---
+ 1 | 2 | 1
+ 4 | 8 | 4
+(2 rows)
+
+-- An inheritance child inherits the column and recomputes it on its own rows.
+CREATE TABLE gen_parent (a integer, s integer GENERATED ALWAYS AS (a * 3) STORED);
+CREATE TABLE gen_child (b text) INHERITS (gen_parent);
+INSERT INTO gen_child (a, b) VALUES (2, 'x');
+SELECT * FROM gen_parent ORDER BY a;
+ a | s 
+---+---
+ 2 | 6
+(1 row)
+
+UPDATE gen_parent SET a = 5;
+SELECT * FROM gen_child ORDER BY a;
+ a | s  | b 
+---+----+---
+ 5 | 15 | x
+(1 row)
+
+-- Rejections at DDL time. PostgreSQL points its error cursor at the clause it
+-- refuses, and so does this build — with two deviations recorded below:
+--   * a column spelling GENERATED before DEFAULT gets no cursor at all, where
+--     PG points at the DEFAULT clause: only a DEFAULT's *expression* has a span
+--     here, and a cursor under the value would be worse than none;
+--   * a subquery's cursor lands one column right of PG's, on the `SELECT`
+--     rather than on the parenthesis that opens it — where the parser puts a
+--     subquery expression's span.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED GENERATED ALWAYS AS (a * 3) STORED);
+ERROR:  multiple generation clauses specified for column "b" of table "gen_err"
+LINE 1: ...ger, b integer GENERATED ALWAYS AS (a * 2) STORED GENERATED ...
+                                                             ^
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (b * 2) STORED);
+ERROR:  cannot use generated column "b" in column generation expression
+LINE 1: ...en_err (a integer, b integer GENERATED ALWAYS AS (b * 2) STO...
+                                                             ^
+DETAIL:  A generated column cannot reference another generated column.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL, c integer GENERATED ALWAYS AS (b * 3) VIRTUAL);
+ERROR:  cannot use generated column "b" in column generation expression
+LINE 1: ...S (a * 2) VIRTUAL, c integer GENERATED ALWAYS AS (b * 3) VIR...
+                                                             ^
+DETAIL:  A generated column cannot reference another generated column.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (c * 2) STORED);
+ERROR:  column "c" does not exist
+LINE 1: ...en_err (a integer, b integer GENERATED ALWAYS AS (c * 2) STO...
+                                                             ^
+CREATE TABLE gen_err (a integer, b timestamptz GENERATED ALWAYS AS (now()) STORED);
+ERROR:  generation expression is not immutable
+CREATE TABLE gen_err (a integer, b integer DEFAULT 5 GENERATED ALWAYS AS (a * 2) STORED);
+ERROR:  both default and generation expression specified for column "b" of table "gen_err"
+LINE 1: ...ATE TABLE gen_err (a integer, b integer DEFAULT 5 GENERATED ...
+                                                             ^
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED DEFAULT 5);
+ERROR:  both default and generation expression specified for column "b" of table "gen_err"
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (sum(a)) STORED);
+ERROR:  aggregate functions are not allowed in column generation expressions
+LINE 1: ...en_err (a integer, b integer GENERATED ALWAYS AS (sum(a)) ST...
+                                                             ^
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS ((SELECT 1)) STORED);
+ERROR:  cannot use subquery in column generation expression
+LINE 1: ...n_err (a integer, b integer GENERATED ALWAYS AS ((SELECT 1))...
+                                                             ^
+CREATE TABLE gen_err (a integer, b integer GENERATED BY DEFAULT AS (a * 2) STORED);
+ERROR:  for a generated column, GENERATED ALWAYS must be specified
+LINE 1: ...ATE TABLE gen_err (a integer, b integer GENERATED BY DEFAULT...
+                                                             ^
+-- A virtual column stores nothing, so nothing can key on it.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL UNIQUE);
+ERROR:  unique constraints on virtual generated columns are not supported
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL PRIMARY KEY);
+ERROR:  primary keys on virtual generated columns are not supported
+-- Routing reads the key before the generated columns are computed, so no
+-- generated column may be part of one.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY RANGE (b);
+ERROR:  cannot use generated column in partition key
+LINE 1: ... GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY RANGE (b);
+                                                                    ^
+DETAIL:  Column "b" is a generated column.
+DROP TABLE gen_child;
+DROP TABLE gen_parent;
+DROP TABLE gen_both;
+-- … and naming a generated column in a COPY column list is an error. Last in
+-- the file deliberately: a refused `COPY … FROM STDIN` leaves the regress
+-- runner's copy-in stream unfinished, so anything after it would be read as
+-- data rather than executed.
+COPY gen_checked (a, v) FROM stdin;
+ERROR:  column "v" is a generated column
+DETAIL:  Generated columns cannot be used in COPY.

@@ -135,13 +135,10 @@ ORDER BY a.attnum;"
     let Some(columns) = query_rows(client, &columns_sql, statement_timeout).await? else {
         return Ok(None);
     };
-    // TODO: build the Default cell text psql prints for an identity or a
-    // generated column. Neither column kind exists in crabgresql, so declining
-    // costs nothing today, and printing the cell empty would be a wrong answer.
-    if columns
-        .iter()
-        .any(|row| !cell(row, 5).is_empty() || !cell(row, 6).is_empty())
-    {
+    // TODO: build the Default cell text psql prints for an *identity* column.
+    // Identity columns do not exist in crabgresql, so declining costs nothing
+    // today, and printing the cell empty would be a wrong answer.
+    if columns.iter().any(|row| !cell(row, 5).is_empty()) {
         return Ok(None);
     }
 
@@ -154,7 +151,7 @@ ORDER BY a.attnum;"
                 Some(cell(row, 1).to_string()),
                 Some(cell(row, 4).to_string()),
                 Some(if cell(row, 3) == "t" { "not null" } else { "" }.to_string()),
-                Some(cell(row, 2).to_string()),
+                Some(default_cell(row)),
             ]
         })
         .collect();
@@ -163,6 +160,21 @@ ORDER BY a.attnum;"
         &["Column", "Type", "Collation", "Nullable", "Default"],
         &rows,
     )))
+}
+
+/// The Default cell psql prints for one column: a generated column's clause, or
+/// the column's own default.
+///
+/// psql builds the clause itself around the *pretty* `pg_get_expr` the query
+/// already asked for, and spells the kind out only for `STORED` — a virtual
+/// column, PostgreSQL 18's default, prints the bare `generated always as (…)`.
+fn default_cell(row: &[Option<String>]) -> String {
+    let expr = cell(row, 2);
+    match cell(row, 6) {
+        "" => expr.to_string(),
+        "s" => format!("generated always as ({expr}) stored"),
+        _ => format!("generated always as ({expr})"),
+    }
 }
 
 /// The `pg_class` columns psql's second describe query projects, narrowed to the

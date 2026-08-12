@@ -10,6 +10,7 @@ mod agg;
 mod checks;
 pub mod eval;
 mod generate_series;
+mod generated;
 mod hash;
 mod keyindex;
 mod md5;
@@ -51,6 +52,7 @@ pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
 };
 use generate_series::Series;
+use generated::GeneratedSet;
 use unique::UniqueKeySet;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
@@ -2197,6 +2199,13 @@ fn insert_direct(
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
     let checks = CheckSet::for_schema(&schema, ctx)?;
+    // Generated columns are filled in before anything looks at the row: NOT NULL,
+    // CHECK, UNIQUE and RETURNING all see the computed values.
+    let generated = GeneratedSet::for_schema(&schema, ctx)?;
+    let mut tuples = tuples;
+    for tuple in &mut tuples {
+        generated.compute(tuple, ctx)?;
+    }
     for tuple in &tuples {
         validate_constraints(&schema, tuple, &mut visible, &checks, ctx)?;
         // The rows of this statement are not written until every one of them has
@@ -2224,6 +2233,11 @@ fn insert_direct(
         )?),
         None => None,
     };
+    // A virtual column stores nothing; its value existed only for the checks and
+    // the projection above.
+    for tuple in &mut tuples {
+        generated.blank_virtual(tuple);
+    }
     let frozen = write_context(freeze, txn);
     table.insert_many(tuples, frozen.as_ref().unwrap_or(txn))?;
     finish_insert(returning, output, inserted)
@@ -2264,11 +2278,23 @@ fn insert_routed(
     // schedule as `shapes` — kept in its own vector because binding can fail and
     // `get_or_insert_with` has no room for a `Result`.
     let mut leaf_checks: Vec<Option<CheckSet>> = (0..leaves.len()).map(|_| None).collect();
+    // The leaves' generated columns, lazily like their checks. A generated
+    // column is never part of a partition key, so routing reads only stored
+    // values and can run before this.
+    let mut leaf_generated: Vec<Option<GeneratedSet>> = (0..leaves.len()).map(|_| None).collect();
     let mut routes: Vec<usize> = Vec::with_capacity(tuples.len());
-    for tuple in &tuples {
+    let mut tuples = tuples;
+    for tuple in &mut tuples {
         let leaf = route_tuple(&parent_schema, leaves, tuple, ctx)?;
         let (leaf_schema, leaf_indexes) =
             &*shapes[leaf].get_or_insert_with(|| (leaves[leaf].schema(), leaves[leaf].indexes()));
+        if leaf_generated[leaf].is_none() {
+            leaf_generated[leaf] = Some(GeneratedSet::for_schema(leaf_schema, ctx)?);
+        }
+        leaf_generated[leaf]
+            .as_ref()
+            .expect("just seeded")
+            .compute(tuple, ctx)?;
         let has_unique = leaf_indexes.iter().any(|index| index.unique);
         if has_unique && visible[leaf].is_none() {
             visible[leaf] = Some(UniqueKeySet::for_insert(
@@ -2316,7 +2342,12 @@ fn insert_routed(
         None => None,
     };
     let mut batches: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
-    for (tuple, leaf) in tuples.into_iter().zip(routes) {
+    for (mut tuple, leaf) in tuples.into_iter().zip(routes) {
+        // Each row is blanked by its own leaf's set: the leaves of one parent
+        // share its column list, but each answers for its own storage.
+        if let Some(generated) = &leaf_generated[leaf] {
+            generated.blank_virtual(&mut tuple);
+        }
         batches[leaf].push(tuple);
     }
     let frozen = write_context(freeze, txn);
@@ -2495,6 +2526,14 @@ fn update_inherited(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
+    // One bound generated-column set per target, on the same schedule. Each
+    // child answers with its own: an inheritance child may redeclare the
+    // column's expression, and its layout is its own in any case.
+    let generated: Vec<GeneratedSet> = shapes
+        .iter()
+        .map(|(schema, _)| GeneratedSet::for_schema(schema, ctx))
+        .collect::<Result<_, _>>()?;
+
     // Each target's own OID, resolved once per relation rather than per row.
     let target_oids = target_oids(&targets, ctx)?;
     let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
@@ -2525,12 +2564,18 @@ fn update_inherited(
             for (index, expr) in assignments {
                 new_view[*index] = eval(expr, old_probe, ctx)?;
             }
+            let mut new = target.relation.rebuild(old, new_view);
+            // Recomputed from the NEW row, whichever columns the statement
+            // assigned — as upstream does, and for the same reason a CHECK is
+            // re-evaluated unconditionally.
+            generated[i].compute(&mut new, ctx)?;
             // RETURNING is bound against the named relation, so it sees the NEW
-            // row in that shape, not the child's wider one — kept aside because
-            // `rebuild` consumes the view. Nothing is cloned without a RETURNING
-            // clause to read it.
-            let returned = returning.is_some().then(|| new_view.clone());
-            let new = target.relation.rebuild(old, new_view);
+            // row in that shape, not the child's wider one. Read back through
+            // the view so it carries the generated values just computed; nothing
+            // is cloned without a RETURNING clause to read it.
+            let returned = returning
+                .is_some()
+                .then(|| target.relation.view(&new).into_owned());
 
             if has_unique[i] {
                 // Mirror `update_direct`: a tid absent from the simulation is a
@@ -2577,6 +2622,9 @@ fn update_inherited(
     };
     let mut affected = 0u64;
     for (i, target) in targets.iter().enumerate() {
+        for (_, tuple) in &mut pending[i] {
+            generated[i].blank_virtual(tuple);
+        }
         affected += target
             .relation
             .table
@@ -2632,8 +2680,10 @@ fn update_direct(
     };
     // Unlike the unique snapshot, this is not conditional on which columns the
     // statement assigns: PostgreSQL re-evaluates *every* check against the new
-    // row, not only those reading an updated column.
+    // row, not only those reading an updated column. A generated column is
+    // recomputed on the same terms.
     let checks = CheckSet::for_schema(&schema, ctx)?;
+    let generated = GeneratedSet::for_schema(&schema, ctx)?;
     // One relation, so every row reports the same OID.
     let oid = tableoid
         .then(|| resolve_tableoid(&RelationIdent::of(&schema), ctx))
@@ -2660,6 +2710,7 @@ fn update_direct(
         for (index, expr) in assignments {
             new[*index] = eval(expr, old_probe, ctx)?;
         }
+        generated.compute(&mut new, ctx)?;
         if has_unique {
             // The row's own OLD key must not conflict with its NEW one, so it
             // leaves the simulation for the check. A tid the simulation does not
@@ -2691,10 +2742,20 @@ fn update_direct(
                 oids.as_deref(),
                 ctx,
             )?;
+            let mut pending = pending;
+            for (_, tuple) in &mut pending {
+                generated.blank_virtual(tuple);
+            }
             table.update_many(pending, txn)?;
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
-        None => Ok(Execution::Updated(table.update_many(pending, txn)?)),
+        None => {
+            let mut pending = pending;
+            for (_, tuple) in &mut pending {
+                generated.blank_virtual(tuple);
+            }
+            Ok(Execution::Updated(table.update_many(pending, txn)?))
+        }
     }
 }
 
@@ -2787,6 +2848,14 @@ fn update_routed(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
+    // One bound generated-column set per leaf, alongside `leaf_checks`. A row
+    // that moves between leaves is generated for its *destination*, which is the
+    // relation whose constraints it then has to satisfy.
+    let leaf_generated: Vec<GeneratedSet> = leaf_shapes
+        .iter()
+        .map(|(schema, _)| GeneratedSet::for_schema(schema, ctx))
+        .collect::<Result<_, _>>()?;
+
     // Writes are grouped per leaf: in-place updates, deletes of moved-out rows,
     // and inserts of moved-in rows. `new_rows` records every affected NEW row in
     // scan order for RETURNING.
@@ -2823,6 +2892,9 @@ fn update_routed(
                 new[*index] = eval(expr, old_probe, ctx)?;
             }
             let dst = route_tuple(&parent_schema, &leaf_tables, &new, ctx)?;
+            // No generated column can be part of the partition key, so routing
+            // above read only stored values and this cannot change `dst`.
+            leaf_generated[dst].compute(&mut new, ctx)?;
 
             // Validate against the destination leaf. When it has a unique index,
             // check the NEW row against that leaf's simulated rows (excluding the
@@ -2910,6 +2982,12 @@ fn update_routed(
     // UPDATE tag reports.
     let mut affected = 0u64;
     for i in 0..leaves.len() {
+        for (_, tuple) in &mut pending_update[i] {
+            leaf_generated[i].blank_virtual(tuple);
+        }
+        for tuple in &mut pending_insert[i] {
+            leaf_generated[i].blank_virtual(tuple);
+        }
         affected += leaf_tables[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
         affected += leaf_tables[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
         leaf_tables[i].insert_many(std::mem::take(&mut pending_insert[i]), txn)?;
@@ -2944,7 +3022,7 @@ fn validate_constraints(
             )
             .with_detail(Some(format!(
                 "Failing row contains ({}).",
-                display_tuple(tuple, ctx)
+                display_tuple(schema, tuple, ctx)
             ))));
         }
     }
@@ -3011,7 +3089,7 @@ fn check_partition_bound(
     )
     .with_detail(Some(format!(
         "Failing row contains ({}).",
-        display_tuple(tuple, ctx)
+        display_tuple(schema, tuple, ctx)
     ))))
 }
 
@@ -3079,10 +3157,26 @@ fn clip_failing_row_field(mut s: String) -> String {
     s
 }
 
-fn display_tuple(tuple: &Tuple, ctx: &ExecContext) -> String {
+/// The `Failing row contains (…)` list a constraint violation reports.
+///
+/// A **virtual** generated column prints the literal `virtual` rather than a
+/// value, as upstream does: nothing is stored for it, so there is no row value
+/// to name — the constraint was checked against a value computed for the
+/// occasion. Probed against PostgreSQL 18.4.
+fn display_tuple(schema: &TableSchema, tuple: &Tuple, ctx: &ExecContext) -> String {
     tuple
         .iter()
-        .map(|value| clip_failing_row_field(display_value(value, ctx)))
+        .enumerate()
+        .map(|(index, value)| {
+            match schema
+                .columns
+                .get(index)
+                .is_some_and(|c| c.is_virtual_generated())
+            {
+                true => "virtual".to_string(),
+                false => clip_failing_row_field(display_value(value, ctx)),
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

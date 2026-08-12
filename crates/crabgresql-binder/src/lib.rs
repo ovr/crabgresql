@@ -21,12 +21,13 @@ pub use collation::{
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ColumnDefault,
     ParamCtx, ParamState, Scope, Subplan, SubplanId, UnaryOp, WindowKind, WindowSortKey,
-    bind_check_constraint, bind_column_default, bind_expr, bind_scalar, bind_sql_function_body,
-    bool_test_clause, builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod,
-    coerce_to_column, coerce_to_param, const_type_label, datetime_precision, declared_typmod,
-    deparse_literal_default, inline_params, interval_typmod, length_typmod, literal_int,
-    map_data_type, param_ctx_capped, param_ctx_extended, param_ctx_none, param_types,
-    reject_agg_or_window, require_all_resolved, resolve_data_type, subquery_in_execute_param,
+    bind_check_constraint, bind_column_default, bind_expr, bind_generation_expr, bind_scalar,
+    bind_sql_function_body, bind_stored_generation, bool_test_clause, builtin_type_from_syntax,
+    checked_length_typmod, checked_numeric_typmod, coerce_to_column, coerce_to_param,
+    const_type_label, datetime_precision, declared_typmod, deparse_literal_default, inline_params,
+    interval_typmod, length_typmod, literal_int, map_data_type, param_ctx_capped,
+    param_ctx_extended, param_ctx_none, param_types, parse_stored_expr, reject_agg_or_window,
+    require_all_resolved, resolve_data_type, subquery_in_execute_param,
 };
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
@@ -79,6 +80,14 @@ pub struct OutputColumn {
     /// themselves as `character varying(20)` rather than as a bare
     /// `character varying`.
     pub typmod: i32,
+    /// Set when this column is a **generated column of a base relation**, so a
+    /// scope built over the rowset knows to resolve a reference to a *virtual*
+    /// one as its expression rather than as the empty slot it occupies.
+    ///
+    /// `None` for everything else, including a derived rowset (subquery, CTE,
+    /// view) whose own binder already made that substitution: what such a
+    /// rowset exposes is a computed column like any other.
+    pub generated: Option<crabgresql_storage_api::GeneratedColumn>,
 }
 
 impl OutputColumn {
@@ -90,6 +99,7 @@ impl OutputColumn {
             collation: None,
             strength: Strength::None,
             typmod: -1,
+            generated: None,
         }
     }
 

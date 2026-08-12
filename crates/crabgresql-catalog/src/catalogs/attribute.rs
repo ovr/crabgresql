@@ -89,11 +89,17 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 align,
                 storage,
                 Value::Bool(!c.nullable),
-                Value::Bool(c.default.is_some()),
-                // attidentity / attgenerated: no identity or generated columns.
+                // `atthasdef` covers a generation expression too: upstream keeps
+                // it in `pg_attrdef` and flags the column here, which is what
+                // makes psql's `\d` join find it.
+                Value::Bool(c.default.is_some() || c.generated.is_some()),
+                // attidentity: identity columns do not exist in this build.
                 // PostgreSQL spells "not one" as `\0`, which prints empty.
                 chr('\0'),
-                chr('\0'),
+                match &c.generated {
+                    Some(g) => chr(g.kind.attgenerated()),
+                    None => chr('\0'),
+                },
                 Value::Bool(false),
                 Value::Oid(attcollation_of(c)),
                 Value::Null,
@@ -171,12 +177,19 @@ pub(crate) fn pg_attrdef_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     for (table_oid, schema) in relations {
         for (position, column) in schema.columns.iter().enumerate() {
-            if let Some(default) = &column.default {
+            // A generated column's expression lives here too, exactly as a
+            // default does — `pg_get_expr(adbin, adrelid)` is how both are read
+            // back, and `attgenerated` is what tells them apart.
+            let expr = column
+                .default
+                .as_ref()
+                .or(column.generated.as_ref().map(|g| &g.expr));
+            if let Some(expr) = expr {
                 rows.push(vec![
                     Value::Oid(next_oid),
                     Value::Oid(*table_oid),
                     Value::Int2((position + 1) as i16),
-                    Value::Text(default.clone()),
+                    Value::Text(expr.clone()),
                 ]);
                 next_oid += 1;
             }

@@ -989,6 +989,52 @@ async fn psql_describe_columns_match_pg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The same psql query over a table with generated columns: `attgenerated`
+/// names the kind, and the expression comes back through the `pg_attrdef`
+/// subquery `atthasdef` gates — which is how psql builds the
+/// `generated always as (…)` cell it prints under Default.
+#[tokio::test]
+async fn psql_describe_reports_generated_columns() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "CREATE TABLE g1 (a int,              s int GENERATED ALWAYS AS (a * 2) STORED,              v text GENERATED ALWAYS AS (a || 'x') VIRTUAL,              d int DEFAULT 7)",
+        )
+        .await?;
+
+    let columns = client
+        .simple_query(
+            "SELECT a.attname,\n                 (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true)\n                   FROM pg_catalog.pg_attrdef d\n                   WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum AND a.atthasdef),\n                 a.attgenerated\n             FROM pg_catalog.pg_attribute a, pg_catalog.pg_class c\n             WHERE c.relname = 'g1' AND a.attrelid = c.oid AND a.attnum > 0              AND NOT a.attisdropped\n             ORDER BY a.attnum;",
+        )
+        .await?;
+    let described = rows(&columns)
+        .iter()
+        .map(|r| {
+            format!(
+                "{}|{}|{}",
+                r.get(0).unwrap_or("?"),
+                r.get(1).unwrap_or(""),
+                r.get(2).unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>();
+    // What PostgreSQL 18.4 returns: `s`/`v` report their kind and deparse
+    // pretty-printed, an ordinary default is unchanged, and a plain column
+    // stays blank in both projections.
+    assert_eq!(
+        described,
+        vec![
+            "a||".to_string(),
+            "s|a * 2|s".to_string(),
+            "v|a || 'x'::text|v".to_string(),
+            "d|7|".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;

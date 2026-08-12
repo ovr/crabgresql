@@ -91,7 +91,7 @@ impl CheckSet {
             )
             .with_detail(Some(format!(
                 "Failing row contains ({}).",
-                display_tuple(tuple, ctx)
+                display_tuple(schema, tuple, ctx)
             ))));
         }
         Ok(())

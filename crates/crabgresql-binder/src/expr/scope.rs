@@ -137,13 +137,17 @@ enum NameLookup {
     Missing,
 }
 
-/// A column resolved by name: where it sits in the combined row, its type, and
-/// its declared collation (`None` for the type default).
+/// A column resolved by name: which relation of the scope holds it, and where
+/// within that relation.
+///
+/// Deliberately *not* the combined-row index: every caller turns this into an
+/// expression through [`Scope::column_expr`], which needs the relation itself —
+/// a virtual generated column's substitution binds against that relation's own
+/// columns before it is rebased.
 #[derive(Clone, Copy)]
 struct ResolvedColumn {
-    index: usize,
-    ty: PgType,
-    collation: Option<u32>,
+    rel: usize,
+    local: usize,
 }
 
 /// Wrap a column reference in its declared collation, so the collation travels
@@ -166,17 +170,13 @@ pub(crate) fn with_column_collation(expr: BoundExpr, collation: Option<u32>) -> 
 /// outer (correlated) unqualified resolution.
 fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<ResolvedColumn, ()>> {
     let mut found: Option<ResolvedColumn> = None;
-    for rel in rels {
+    for (r, rel) in rels.iter().enumerate() {
         for (local, col) in rel.columns.iter().enumerate() {
             if col.name == name {
                 if found.is_some() {
                     return Some(Err(()));
                 }
-                found = Some(ResolvedColumn {
-                    index: rel.offset + local,
-                    ty: col.ty,
-                    collation: col.collation,
-                });
+                found = Some(ResolvedColumn { rel: r, local });
             }
         }
     }
@@ -184,15 +184,11 @@ fn lookup_in_rels(rels: &[ScopeRel], name: &str) -> Option<Result<ResolvedColumn
 }
 
 /// Resolve `column` within a single relation `rel` for a qualified
-/// `qualifier.column` reference — its *local* index (the caller adds the
-/// relation's offset), type, and collation. `42702` if the relation exposes the
-/// name more than once (e.g. an alias list `v(x, x)`), or `42703` — spelled with
-/// the qualifier, as PG does — if it is absent.
-fn column_in_rel(
-    rel: &ScopeRel,
-    qualifier: &str,
-    column: &str,
-) -> Result<ResolvedColumn, BindError> {
+/// `qualifier.column` reference, returning its *local* index within that
+/// relation. `42702` if the relation exposes the name more than once (e.g. an
+/// alias list `v(x, x)`), or `42703` — spelled with the qualifier, as PG does —
+/// if it is absent.
+fn column_in_rel(rel: &ScopeRel, qualifier: &str, column: &str) -> Result<usize, BindError> {
     let mut local: Option<usize> = None;
     for (i, col) in rel.columns.iter().enumerate() {
         if col.name == column {
@@ -205,16 +201,11 @@ fn column_in_rel(
             local = Some(i);
         }
     }
-    let local = local.ok_or_else(|| {
+    local.ok_or_else(|| {
         BindError::new(
             sqlstate::UNDEFINED_COLUMN,
             format!("column {qualifier}.{column} does not exist"),
         )
-    })?;
-    Ok(ResolvedColumn {
-        index: local,
-        ty: rel.columns[local].ty,
-        collation: rel.columns[local].collation,
     })
 }
 
@@ -264,27 +255,44 @@ fn window_not_allowed(clause: &str) -> BindError {
 /// `level`, cloning everything else. Used to turn a merged-join `visible`
 /// column's expression — a `ColumnRef` (inner/left/right join) or a full join's
 /// `COALESCE`-as-`CASE` over both sides — into a correlated reference when it is
-/// resolved from an enclosing query by an inner subquery.
+/// resolved from an enclosing query by an inner subquery. A virtual generated
+/// column's substituted expression takes the same path.
 fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
+    map_column_refs(expr, &|index, ty| BoundExpr::OuterColumnRef {
+        level,
+        index,
+        ty,
+    })
+}
+
+/// Shift every `ColumnRef` in `expr` by `offset`, moving an expression bound
+/// against one relation's own columns into the combined row that relation sits
+/// in. This is what places a virtual generated column's substituted expression
+/// at the right indexes when its relation is not the first FROM item.
+fn shift_columns(expr: &BoundExpr, offset: usize) -> BoundExpr {
+    map_column_refs(expr, &|index, ty| BoundExpr::ColumnRef {
+        index: index + offset,
+        ty,
+    })
+}
+
+/// Rebuild `expr` with every `ColumnRef` replaced by `f(index, type)`.
+fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> BoundExpr {
     match expr {
-        BoundExpr::ColumnRef { index, ty } => BoundExpr::OuterColumnRef {
-            level,
-            index: *index,
-            ty: *ty,
-        },
+        BoundExpr::ColumnRef { index, ty } => f(*index, *ty),
         BoundExpr::Const { .. } | BoundExpr::Param { .. } | BoundExpr::OuterColumnRef { .. } => {
             expr.clone()
         }
         BoundExpr::Unary { op, expr } => BoundExpr::Unary {
             op: *op,
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
         },
         BoundExpr::Collate {
             expr,
             collation,
             explicit,
         } => BoundExpr::Collate {
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
             collation: *collation,
             explicit: *explicit,
         },
@@ -298,11 +306,11 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             op: *op,
             arg_ty: *arg_ty,
             collation: *collation,
-            left: Box::new(outerize_columns(left, level)),
-            right: Box::new(outerize_columns(right, level)),
+            left: Box::new(map_column_refs(left, f)),
+            right: Box::new(map_column_refs(right, f)),
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
             negated: *negated,
         },
         BoundExpr::BoolTest {
@@ -310,12 +318,12 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             value,
             negated,
         } => BoundExpr::BoolTest {
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
             value: *value,
             negated: *negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
             ty: *ty,
         },
         BoundExpr::Reinterpret {
@@ -323,14 +331,14 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             reported,
             rep,
         } => BoundExpr::Reinterpret {
-            expr: Box::new(outerize_columns(expr, level)),
+            expr: Box::new(map_column_refs(expr, f)),
             reported: *reported,
             rep: *rep,
         },
         BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
             func: *func,
             ret: *ret,
-            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
         },
         BoundExpr::Routine {
             oid,
@@ -344,34 +352,36 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             name: Arc::clone(name),
             arg_types: Arc::clone(arg_types),
             strict: *strict,
-            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
             ret: *ret,
         },
 
         BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
             elem: *elem,
             ty: *ty,
-            elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
+            elems: elems.iter().map(|a| map_column_refs(a, f)).collect(),
         },
         BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
-            base: Box::new(outerize_columns(base, level)),
-            index: Box::new(outerize_columns(index, level)),
+            base: Box::new(map_column_refs(base, f)),
+            index: Box::new(map_column_refs(index, f)),
             ty: *ty,
         },
         BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
             whens: whens
                 .iter()
-                .map(|(c, r)| (outerize_columns(c, level), outerize_columns(r, level)))
+                .map(|(c, r)| (map_column_refs(c, f), map_column_refs(r, f)))
                 .collect(),
-            else_: else_.as_ref().map(|e| Box::new(outerize_columns(e, level))),
+            else_: else_.as_ref().map(|e| Box::new(map_column_refs(e, f))),
             ty: *ty,
         },
         BoundExpr::Coalesce { args, ty } => BoundExpr::Coalesce {
-            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
             ty: *ty,
         },
-        // A merged-join visible column expression is only ever a ColumnRef or a
-        // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
+        // Neither caller can see these: a merged-join visible column is a
+        // ColumnRef or a COALESCE/CASE over ColumnRefs, and a generation
+        // expression may hold no SRF, aggregate, window function or subquery
+        // (the DDL refuses all four). Cloned defensively rather than panicking.
         BoundExpr::Srf { .. }
         | BoundExpr::Aggregate { .. }
         | BoundExpr::WindowFunc { .. }
@@ -420,6 +430,17 @@ pub struct Scope {
     /// The `WINDOW w AS (…)` definitions of the SELECT being bound, so `OVER w`
     /// resolves. `None` where a `WINDOW` clause cannot appear.
     named_windows: Option<NamedWindows>,
+    /// Whether a reference to a **virtual** generated column resolves to its
+    /// generation expression rather than to the (empty) slot the column occupies
+    /// in the row.
+    ///
+    /// True everywhere a row is *read*, which is what makes a virtual column
+    /// work at all: nothing is stored for it, so the value has to be recomputed
+    /// from the row's other columns. The two DDL binders turn it off, and each
+    /// needs the raw reference for its own reason — a stored CHECK records the
+    /// column positions it reads, and a generation expression must *refuse* a
+    /// reference to another generated column rather than quietly inline it.
+    expand_generated: bool,
 }
 
 /// The handle a [`Scope`] carries so `bind_expr` can bind a nested query. Shared
@@ -459,6 +480,7 @@ impl Scope {
             outer: Vec::new(),
             func_params: None,
             named_windows: None,
+            expand_generated: true,
         }
     }
 
@@ -519,6 +541,7 @@ impl Scope {
             outer: Vec::new(),
             func_params: None,
             named_windows: None,
+            expand_generated: true,
         }
     }
 
@@ -564,7 +587,50 @@ impl Scope {
             outer: Vec::new(),
             func_params: None,
             named_windows: None,
+            expand_generated: true,
         }
+    }
+
+    /// Resolve a reference to a virtual generated column as the plain slot it
+    /// occupies rather than as its generation expression — see
+    /// [`Scope::expand_generated`].
+    pub fn without_generated_expansion(mut self) -> Scope {
+        self.expand_generated = false;
+        self
+    }
+
+    /// The expression a resolved column binds to, within one relation of this
+    /// scope: its `ColumnRef` in the combined row, or — for a virtual generated
+    /// column this scope expands — the generation expression, rebased onto the
+    /// combined row.
+    ///
+    /// The expression is re-parsed and re-bound per reference. That is the same
+    /// per-statement cost a stored CHECK or a column default already pays, and
+    /// it keeps the substitution honest: the expression binds against the
+    /// relation's *current* shape, not one cached when the scope was built.
+    fn column_expr(&self, rel: &ScopeRel, local: usize) -> Result<BoundExpr, BindError> {
+        let column = &rel.columns[local];
+        let plain = || {
+            with_column_collation(
+                BoundExpr::ColumnRef {
+                    index: rel.offset + local,
+                    ty: column.ty,
+                },
+                column.collation,
+            )
+        };
+        if !self.expand_generated || !column.is_virtual_generated() {
+            return Ok(plain());
+        }
+        // The stored text is unqualified (the DDL deparse drops the `t.`), so it
+        // resolves against the relation's own columns whatever this scope calls
+        // the relation here.
+        let schema = TableSchema::new(rel.qualifier.clone(), rel.columns.clone());
+        let bound = crate::bind_stored_generation(&schema, local, &self.catalog)?;
+        Ok(with_column_collation(
+            shift_columns(&bound, rel.offset),
+            column.collation,
+        ))
     }
 
     /// Attach the context needed to bind expression subqueries against this
@@ -672,7 +738,7 @@ impl Scope {
     /// query (a correlated reference) resolves to that column via an
     /// [`BoundExpr::OuterColumnRef`], preferring the nearest scope — as in PG.
     pub(super) fn resolve(&self, name: &str) -> Result<BoundExpr, BindError> {
-        match self.resolve_local(name) {
+        match self.resolve_local(name)? {
             NameLookup::Found(expr) => Ok(expr),
             NameLookup::Ambiguous => Err(BindError::new(
                 sqlstate::AMBIGUOUS_COLUMN,
@@ -708,7 +774,7 @@ impl Scope {
 
     /// Look a name up in this scope's own relations (or its merged-join `visible`
     /// view), without consulting enclosing queries.
-    fn resolve_local(&self, name: &str) -> NameLookup {
+    fn resolve_local(&self, name: &str) -> Result<NameLookup, BindError> {
         // A merged join namespace resolves unqualified names against its visible
         // columns: the join column appears once (never ambiguous), the merged
         // expression carrying its combined-row value.
@@ -717,21 +783,17 @@ impl Scope {
             // system column never takes part in `USING`, so a name it does not
             // claim still falls through to the relations below.
             match lookup_visible(visible, name) {
-                VisibleLookup::Found(expr) => return NameLookup::Found(expr.clone()),
-                VisibleLookup::Ambiguous => return NameLookup::Ambiguous,
+                VisibleLookup::Found(expr) => return Ok(NameLookup::Found(expr.clone())),
+                VisibleLookup::Ambiguous => return Ok(NameLookup::Ambiguous),
                 VisibleLookup::Missing => {}
             }
         }
         match lookup_in_rels(&self.rels, name) {
-            Some(Ok(col)) => NameLookup::Found(with_column_collation(
-                BoundExpr::ColumnRef {
-                    index: col.index,
-                    ty: col.ty,
-                },
-                col.collation,
+            Some(Ok(col)) => Ok(NameLookup::Found(
+                self.column_expr(&self.rels[col.rel], col.local)?,
             )),
-            Some(Err(())) => NameLookup::Ambiguous,
-            None => NameLookup::Missing,
+            Some(Err(())) => Ok(NameLookup::Ambiguous),
+            None => Ok(NameLookup::Missing),
         }
     }
 
@@ -762,14 +824,11 @@ impl Scope {
             }
             match lookup_in_rels(&level.rels, name) {
                 Some(Ok(col)) => {
-                    return Ok(with_column_collation(
-                        BoundExpr::OuterColumnRef {
-                            level: level_no,
-                            index: col.index,
-                            ty: col.ty,
-                        },
-                        col.collation,
-                    ));
+                    // A virtual generated column of an enclosing query resolves
+                    // to its expression over *that* query's row, so the whole
+                    // substituted tree becomes correlated at this level.
+                    let expr = self.column_expr(&level.rels[col.rel], col.local)?;
+                    return Ok(outerize_columns(&expr, level_no));
                 }
                 Some(Err(())) => return Err(ambiguous()),
                 None => continue,
@@ -804,26 +863,14 @@ impl Scope {
             return Ok(expr);
         }
         if let Some(rel) = self.rels.iter().find(|r| r.qualifier == qualifier) {
-            let col = column_in_rel(rel, qualifier, column)?;
-            return Ok(with_column_collation(
-                BoundExpr::ColumnRef {
-                    index: rel.offset + col.index,
-                    ty: col.ty,
-                },
-                col.collation,
-            ));
+            let local = column_in_rel(rel, qualifier, column)?;
+            return self.column_expr(rel, local);
         }
         for (depth, level) in self.outer.iter().enumerate() {
             if let Some(rel) = level.rels.iter().find(|r| r.qualifier == qualifier) {
-                let col = column_in_rel(rel, qualifier, column)?;
-                return Ok(with_column_collation(
-                    BoundExpr::OuterColumnRef {
-                        level: depth + 1,
-                        index: rel.offset + col.index,
-                        ty: col.ty,
-                    },
-                    col.collation,
-                ));
+                let local = column_in_rel(rel, qualifier, column)?;
+                let expr = self.column_expr(rel, local)?;
+                return Ok(outerize_columns(&expr, depth + 1));
             }
         }
         Err(BindError::new(
@@ -850,12 +897,12 @@ impl Scope {
     /// Expand `*`: every relation's columns in FROM order, each as an output
     /// column paired with a `ColumnRef` at its combined-row index. Duplicate
     /// output names are allowed, as in PG.
-    pub fn expand_wildcard(&self) -> Vec<(crate::OutputColumn, BoundExpr)> {
+    pub fn expand_wildcard(&self) -> Result<Vec<(crate::OutputColumn, BoundExpr)>, BindError> {
         // With a merged join namespace, `*` follows the visible columns: merged
         // join columns first (in clause order), then each input's remaining
         // columns — the join column appearing exactly once, as in PG.
         if let Some(visible) = &self.visible {
-            return visible
+            return Ok(visible
                 .iter()
                 .map(|col| {
                     let (collation, strength) = crate::collation::output_collation(&col.expr);
@@ -866,17 +913,20 @@ impl Scope {
                             collation,
                             strength,
                             typmod: expr_typmod(&col.expr, self),
+                            // A merged join column is an expression over both
+                            // sides, not a relation's column.
+                            generated: None,
                         },
                         col.expr.clone(),
                     )
                 })
-                .collect();
+                .collect());
         }
         let mut out = Vec::new();
         for rel in &self.rels {
-            expand_rel(rel, &mut out);
+            self.expand_rel(rel, &mut out)?;
         }
-        out
+        Ok(out)
     }
 
     /// The type modifier of the column at a combined-row `index`, or `-1` when
@@ -914,36 +964,40 @@ impl Scope {
     ) -> Result<Vec<(crate::OutputColumn, BoundExpr)>, BindError> {
         let rel = self.relation(qualifier)?;
         let mut out = Vec::new();
-        expand_rel(rel, &mut out);
+        self.expand_rel(rel, &mut out)?;
         Ok(out)
     }
-}
 
-/// Append every *declared* column of `rel` as an `(output column, ColumnRef)`
-/// pair at its combined-row index. A system column is reachable by name and by
-/// name alone, so `*` and `q.*` skip the slot, as they do upstream.
-fn expand_rel(rel: &ScopeRel, out: &mut Vec<(crate::OutputColumn, BoundExpr)>) {
-    for (i, col) in rel.declared().iter().enumerate() {
-        out.push((
-            crate::OutputColumn {
-                name: col.name.clone(),
-                ty: col.ty,
-                collation: col.collation,
-                // A resolved column reference is always implicit strength in
-                // PG's model, whether or not its collation happens to equal
-                // the type default (mirroring `expr_collation`'s `ColumnRef`
-                // arm).
-                strength: crate::collation::Strength::Implicit,
-                typmod: col.typmod,
-            },
-            with_column_collation(
-                BoundExpr::ColumnRef {
-                    index: rel.offset + i,
+    /// Append every *declared* column of `rel` as an `(output column,
+    /// expression)` pair — a `ColumnRef` at its combined-row index, or a virtual
+    /// generated column's substituted expression. A system column is reachable
+    /// by name and by name alone, so `*` and `q.*` skip the slot, as they do
+    /// upstream.
+    fn expand_rel(
+        &self,
+        rel: &ScopeRel,
+        out: &mut Vec<(crate::OutputColumn, BoundExpr)>,
+    ) -> Result<(), BindError> {
+        for (i, col) in rel.declared().iter().enumerate() {
+            out.push((
+                crate::OutputColumn {
+                    name: col.name.clone(),
                     ty: col.ty,
+                    collation: col.collation,
+                    // A resolved column reference is always implicit strength in
+                    // PG's model, whether or not its collation happens to equal
+                    // the type default (mirroring `expr_collation`'s `ColumnRef`
+                    // arm).
+                    strength: crate::collation::Strength::Implicit,
+                    typmod: col.typmod,
+                    // What `*` exposes is this column's *value*: a virtual one
+                    // was already substituted by `column_expr` just below.
+                    generated: None,
                 },
-                col.collation,
-            ),
-        ));
+                self.column_expr(rel, i)?,
+            ));
+        }
+        Ok(())
     }
 }
 

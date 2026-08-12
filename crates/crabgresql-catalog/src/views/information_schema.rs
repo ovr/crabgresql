@@ -311,8 +311,22 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         Value::Null,
                         Value::Null,
                         Value::Null,
-                        Value::Text("NEVER".to_string()),
-                        Value::Null,
+                        // is_generated / generation_expression. PostgreSQL
+                        // reports the same non-pretty text `pg_get_expr` gives
+                        // without its `pretty` flag, which is what the catalog
+                        // stores.
+                        Value::Text(
+                            match column.generated.is_some() {
+                                true => "ALWAYS",
+                                false => "NEVER",
+                            }
+                            .to_string(),
+                        ),
+                        column
+                            .generated
+                            .as_ref()
+                            .map(|g| Value::Text(g.expr.clone()))
+                            .unwrap_or(Value::Null),
                         Value::Text("YES".to_string()),
                     ]
                 })
