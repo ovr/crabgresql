@@ -1,132 +1,17 @@
-//! Columnar projection and sort.
-//!
-//! These two go together. `project_pipeline` builds `Filter → Projection →
-//! Sort`, and a [`SortKey`] indexes the *projected* tuple, so a columnar sort is
-//! only reachable if the projection above the filter also stays columnar.
-//! [`ProjectBatch`] exists to bridge that gap and nothing more: it reorders and
-//! duplicates columns, it does not evaluate expressions.
+//! Columnar sort.
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field, Schema};
 use arrow_select::concat::concat_batches;
-use arrow_select::take::take as take_kernel;
-use crabgresql_binder::{BoundExpr, SortKey};
+use crabgresql_binder::SortKey;
 use crabgresql_planner::vectorize;
-use crabgresql_storage_api::arrow::{build_array, scan_schema};
-use crabgresql_storage_api::{Column, IndexKey, sort};
+use crabgresql_storage_api::arrow::scan_schema;
+use crabgresql_storage_api::{IndexKey, sort};
 
-use super::{BatchLayout, BatchNode};
+use super::{BatchLayout, BatchNode, internal};
 use crate::ExecError;
-
-/// How one output column of a projection is produced.
-pub enum Take {
-    /// Column `n` of the input batch, unchanged.
-    Column(usize),
-    /// A length-1 array, broadcast to the batch's height.
-    ///
-    /// Built once at compile time rather than per batch. That is not only
-    /// cheaper — it is what makes an unrepresentable constant *decline* instead
-    /// of failing mid-scan: roughly half of `PgType` (json, inet, arrays, …)
-    /// has no Arrow encoding, and a `Const` of such a type is perfectly legal
-    /// in a target list even on a relation that could never store one.
-    Const(ArrayRef),
-}
-
-/// Reorders, duplicates and drops columns — the take-only subset of
-/// [`crate::Projection`].
-///
-/// Deliberately not an expression evaluator. Every projection that is anything
-/// more than a column reference or a constant ends the columnar segment, so the
-/// row `Projection` keeps sole responsibility for evaluating expressions and
-/// there is no second implementation of any operator's semantics.
-pub struct ProjectBatch {
-    child: Box<dyn BatchNode>,
-    takes: Vec<Take>,
-    schema: Arc<Schema>,
-}
-
-impl ProjectBatch {
-    /// Compile `projections` to a take list, or `None` if any of them computes
-    /// or names a constant Arrow cannot hold.
-    ///
-    /// Gated on the planner's [`vectorize::vectorizable_projection`] first, so
-    /// this can only ever accept a subset of what `EXPLAIN` advertises.
-    pub fn compile(projections: &[BoundExpr], layout: &BatchLayout) -> Option<Vec<Take>> {
-        if !vectorize::vectorizable_projection(projections, layout.len()) {
-            return None;
-        }
-        projections
-            .iter()
-            .map(|expr| match unwrap_collate(expr) {
-                BoundExpr::ColumnRef { index, .. } => {
-                    (*index < layout.len()).then_some(Take::Column(*index))
-                }
-                // Built here, not per batch: `ok()?` turns a type with no Arrow
-                // encoding into a declined projection rather than a query that
-                // dies on its first batch.
-                BoundExpr::Const { value, ty } => {
-                    let column = Column::new("const", *ty);
-                    let row = [vec![value.clone()]];
-                    build_array(&column, &row, 0).ok().map(Take::Const)
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn new(child: Box<dyn BatchNode>, takes: Vec<Take>, layout: &BatchLayout) -> Self {
-        ProjectBatch {
-            schema: scan_schema(&crabgresql_storage_api::TableSchema::new(
-                "",
-                layout.to_vec(),
-            )),
-            child,
-            takes,
-        }
-    }
-
-    /// The layout a projection produces, for the node above.
-    pub fn layout(projections: &[BoundExpr]) -> BatchLayout {
-        Arc::from(
-            projections
-                .iter()
-                .enumerate()
-                .map(|(index, expr)| Column::new(format!("c{index}"), expr.ty()))
-                .collect::<Vec<_>>(),
-        )
-    }
-}
-
-impl BatchNode for ProjectBatch {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        let Some(batch) = self.child.next_batch()? else {
-            return Ok(None);
-        };
-        let rows = batch.num_rows();
-        // Index 0 repeated: `take` broadcasts the length-1 constant array to the
-        // batch's height in one allocation, the same trick `expr.rs` uses for a
-        // predicate literal.
-        let broadcast: UInt64Array = std::iter::repeat_n(0u64, rows).collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.takes.len());
-        for take in &self.takes {
-            columns.push(match take {
-                Take::Column(index) => batch
-                    .columns()
-                    .get(*index)
-                    .map(Arc::clone)
-                    .ok_or_else(|| internal("projection names a missing column"))?,
-                Take::Const(array) => take_kernel(array.as_ref(), &broadcast, None)
-                    .map_err(|error| internal(&format!("constant broadcast failed: {error}")))?,
-            });
-        }
-        let options = RecordBatchOptions::new().with_row_count(Some(rows));
-        RecordBatch::try_new_with_options(Arc::clone(&self.schema), columns, &options)
-            .map(Some)
-            .map_err(|error| internal(&format!("projection failed: {error}")))
-    }
-}
 
 /// Materializing sort — the columnar [`crate::Sort`].
 ///
@@ -220,13 +105,189 @@ impl BatchNode for SortBatch {
     }
 }
 
-fn unwrap_collate(expr: &BoundExpr) -> &BoundExpr {
-    match expr {
-        BoundExpr::Collate { expr, .. } => unwrap_collate(expr),
-        other => other,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use crabgresql_storage_api::Tuple;
+    use crabgresql_types::{PgType, Value};
 
-fn internal(message: &str) -> ExecError {
-    ExecError::new("XX000", message)
+    use super::SortBatch;
+    use crate::vector::layout_of;
+    use crate::vector::testutil::{
+        assert_same_order, columnar_sort, int_rows, schema_of, sort_key,
+    };
+
+    /// All four ASC/DESC × NULLS FIRST/LAST combinations. PostgreSQL keeps NULL
+    /// placement independent of the direction, so a DESC sort does not flip it —
+    /// assumed nowhere, checked here against the row node.
+    #[test]
+    fn every_direction_and_null_placement_agrees() {
+        let schema = schema_of(&[PgType::Int4]);
+        let rows = int_rows();
+        for asc in [true, false] {
+            for nulls_first in [true, false] {
+                assert_same_order(
+                    &schema,
+                    &rows,
+                    &[sort_key(0, PgType::Int4, asc, nulls_first)],
+                    1,
+                );
+            }
+        }
+    }
+
+    /// Equal keys must come out in input order. `lexsort_to_indices` is not a
+    /// stable sort, so this passes only because of the appended position key.
+    #[test]
+    fn ties_keep_input_order() {
+        let schema = schema_of(&[PgType::Int4, PgType::Text]);
+        // One key value, many payloads: every row is a tie.
+        let rows: Vec<Tuple> = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|s| vec![Value::Int4(1), Value::Text(s.into())])
+            .collect();
+        let sorted = columnar_sort(&schema, &rows, &[sort_key(0, PgType::Int4, true, false)], 2)
+            .expect("columnar sort");
+        assert_eq!(sorted, rows, "a tie must preserve input order");
+        assert_same_order(&schema, &rows, &[sort_key(0, PgType::Int4, true, false)], 2);
+    }
+
+    /// The float repair. PostgreSQL calls `-0.0` and `0.0` equal and every NaN
+    /// equal to every other; Arrow's total order does neither. Without
+    /// canonicalization the two paths would order these rows differently.
+    #[test]
+    fn float_zero_and_nan_sort_as_postgresql_does() {
+        let schema = schema_of(&[PgType::Float8, PgType::Int4]);
+        let rows: Vec<Tuple> = [
+            (0.0_f64, 1),
+            (-0.0, 2),
+            (f64::NAN, 3),
+            (1.5, 4),
+            (-f64::NAN, 5),
+            (-1.5, 6),
+            (0.0, 7),
+        ]
+        .into_iter()
+        .map(|(f, i)| vec![Value::Float8(f), Value::Int4(i)])
+        .collect();
+        for asc in [true, false] {
+            assert_same_order(
+                &schema,
+                &rows,
+                &[sort_key(0, PgType::Float8, asc, false)],
+                2,
+            );
+        }
+    }
+
+    /// A multi-key sort, where the second key only decides rows the first ties.
+    #[test]
+    fn multi_key_sorts_agree() {
+        let schema = schema_of(&[PgType::Int4, PgType::Text]);
+        let rows: Vec<Tuple> = [
+            (Some(2), Some("b")),
+            (Some(1), Some("z")),
+            (Some(2), Some("a")),
+            (None, Some("m")),
+            (Some(1), None),
+            (Some(1), Some("a")),
+        ]
+        .into_iter()
+        .map(|(i, s)| {
+            vec![
+                i.map_or(Value::Null, Value::Int4),
+                s.map_or(Value::Null, |s| Value::Text(s.into())),
+            ]
+        })
+        .collect();
+        assert_same_order(
+            &schema,
+            &rows,
+            &[
+                sort_key(0, PgType::Int4, true, false),
+                sort_key(1, PgType::Text, false, true),
+            ],
+            2,
+        );
+    }
+
+    /// A hidden ORDER BY column — one the planner appended past the visible output —
+    /// orders the rows and is then dropped, leaving the client width.
+    #[test]
+    fn hidden_sort_columns_are_dropped_after_ordering() {
+        let schema = schema_of(&[PgType::Text, PgType::Int4]);
+        let rows: Vec<Tuple> = [("a", 3), ("b", 1), ("c", 2)]
+            .into_iter()
+            .map(|(s, i)| vec![Value::Text(s.into()), Value::Int4(i)])
+            .collect();
+        // Order by column 1, emit only column 0.
+        let keys = [sort_key(1, PgType::Int4, true, false)];
+        let sorted = columnar_sort(&schema, &rows, &keys, 1).expect("columnar sort");
+        assert_eq!(
+            sorted,
+            vec![
+                vec![Value::Text("b".into())],
+                vec![Value::Text("c".into())],
+                vec![Value::Text("a".into())],
+            ]
+        );
+        assert_same_order(&schema, &rows, &keys, 1);
+    }
+
+    /// `"char"` sorts columnar, and by its *unsigned* byte. It is stored as
+    /// `UInt8` for exactly that reason — under a signed encoding `0xFF` would sort
+    /// below `0x00` and contradict the type — so the columnar node must agree with
+    /// the row node on a high-bit byte.
+    #[test]
+    fn a_char_column_sorts_columnar_by_its_unsigned_byte() {
+        let schema = schema_of(&[PgType::Char]);
+        let rows: Vec<Tuple> = [0xFF, 0x41, 0x00, 0x80]
+            .into_iter()
+            .map(|byte| vec![Value::Char(byte)])
+            .collect();
+        let keys = [sort_key(0, PgType::Char, true, false)];
+        assert!(SortBatch::compilable(&keys, &layout_of(&schema)));
+        let sorted = columnar_sort(&schema, &rows, &keys, 1).expect("columnar sort");
+        assert_eq!(
+            sorted,
+            [0x00, 0x41, 0x80, 0xFF]
+                .into_iter()
+                .map(|byte| vec![Value::Char(byte)])
+                .collect::<Vec<_>>()
+        );
+        assert_same_order(&schema, &rows, &keys, 1);
+    }
+
+    /// Sort keys whose Arrow order is not PostgreSQL's are refused, so the row
+    /// `Sort` keeps them. `numeric` is the dangerous one: stored as text, it would
+    /// sort `'10'` before `'9'` without any error.
+    #[test]
+    fn unsortable_key_types_are_refused() {
+        for ty in [
+            PgType::Numeric,
+            PgType::Bpchar,
+            PgType::Interval,
+            PgType::TimeTz,
+        ] {
+            let schema = schema_of(&[ty]);
+            assert!(
+                !SortBatch::compilable(&[sort_key(0, ty, true, false)], &layout_of(&schema)),
+                "{ty:?} must not sort columnar"
+            );
+        }
+        // An ICU collation orders text by locale rules, not bytes.
+        let schema = schema_of(&[PgType::Text]);
+        let mut key = sort_key(0, PgType::Text, true, false);
+        key.collation = 0xC000_0000;
+        assert!(!SortBatch::compilable(&[key], &layout_of(&schema)));
+    }
+
+    /// An empty input sorts to an empty result rather than failing on the
+    /// zero-batch concat.
+    #[test]
+    fn an_empty_input_sorts_to_nothing() {
+        let schema = schema_of(&[PgType::Int4]);
+        let sorted = columnar_sort(&schema, &[], &[sort_key(0, PgType::Int4, true, false)], 1)
+            .expect("columnar sort");
+        assert!(sorted.is_empty());
+    }
 }

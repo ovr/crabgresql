@@ -316,3 +316,228 @@ fn compile_operand(expr: &BoundExpr, layout: &BatchLayout) -> Option<Node> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
+    use crabgresql_storage_api::Tuple;
+    use crabgresql_types::collation::{C_COLLATION_OID, DEFAULT_COLLATION_OID};
+    use crabgresql_types::{PgType, Value};
+
+    use crate::vector::testutil::{assert_same, column, compare, constant, logic, schema_of};
+    use crate::vector::{expr, layout_of};
+
+    /// Every type on the comparison whitelist really is comparable by Arrow. A type
+    /// that reached a kernel it has no implementation for would fail the query, so
+    /// this pins the list to what actually works rather than to what looks right.
+    #[test]
+    fn whitelisted_types_all_compile_and_run() {
+        let cases: Vec<(PgType, Value)> = vec![
+            (PgType::Bool, Value::Bool(true)),
+            (PgType::Int2, Value::Int2(1)),
+            (PgType::Int4, Value::Int4(1)),
+            (PgType::Int8, Value::Int8(1)),
+            (PgType::Date, Value::Date(1)),
+            (PgType::Time, Value::Time(1)),
+            (PgType::Timestamp, Value::Timestamp(1)),
+            (PgType::TimestampTz, Value::TimestampTz(1)),
+            (PgType::Bytea, Value::Bytea(vec![1, 2])),
+            (PgType::Uuid, Value::Uuid([1; 16])),
+            (PgType::Text, Value::Text("b".into())),
+            (PgType::Varchar, Value::Text("b".into())),
+            (PgType::Name, Value::Text("b".into())),
+        ];
+        for (ty, value) in cases {
+            let schema = schema_of(&[ty]);
+            let rows: Vec<Tuple> = vec![vec![value.clone()], vec![Value::Null]];
+            for op in [BinOp::Eq, BinOp::NotEq, BinOp::Lt, BinOp::Gt] {
+                let predicate = compare(op, ty, column(0, ty), constant(value.clone(), ty));
+                assert!(
+                    expr::compile_predicate(&predicate, &layout_of(&schema)).is_some(),
+                    "{ty:?} {op:?} should be vectorizable"
+                );
+                assert_same(&schema, &rows, &predicate);
+            }
+        }
+    }
+
+    /// The exclusions, each for a reason recorded in the module docs. If one of
+    /// these ever starts compiling, it needs a matching argument that Arrow now
+    /// reproduces PostgreSQL's answer — not just that the kernel exists.
+    #[test]
+    fn types_whose_arrow_semantics_differ_are_refused() {
+        let refused = [
+            // Stored as Utf8, so Arrow would compare text: '9' > '10'.
+            PgType::Numeric,
+            // Arrow's `eq` is bitwise: `-0.0 = 0.0` is false, PG says true.
+            PgType::Float4,
+            PgType::Float8,
+            // Compares with trailing blanks trimmed.
+            PgType::Bpchar,
+        ];
+        for ty in refused {
+            let schema = schema_of(&[ty]);
+            let predicate = compare(
+                BinOp::Eq,
+                ty,
+                column(0, ty),
+                constant(Value::Null, PgType::Int4),
+            );
+            assert!(
+                expr::compile_predicate(&predicate, &layout_of(&schema)).is_none(),
+                "{ty:?} must not vectorize"
+            );
+        }
+    }
+
+    /// Text equality is bytewise under every supported collation, so it vectorizes
+    /// regardless. Ordering is not: an ICU collation orders by locale rules that no
+    /// Arrow kernel reproduces, so `<` is refused there and allowed under `C`.
+    #[test]
+    fn text_ordering_respects_the_collation() {
+        let schema = schema_of(&[PgType::Text]);
+        let layout = layout_of(&schema);
+        let icu = 0xC000_0000; // the seeded `<locale>-x-icu` OID base
+        let text_compare = |op, collation| BoundExpr::Binary {
+            op,
+            arg_ty: PgType::Text,
+            collation,
+            left: Box::new(column(0, PgType::Text)),
+            right: Box::new(constant(Value::Text("m".into()), PgType::Text)),
+        };
+
+        for collation in [DEFAULT_COLLATION_OID, C_COLLATION_OID, icu] {
+            assert!(
+                expr::compile_predicate(&text_compare(BinOp::Eq, collation), &layout).is_some(),
+                "equality is bytewise under every deterministic collation"
+            );
+        }
+        assert!(
+            expr::compile_predicate(&text_compare(BinOp::Lt, C_COLLATION_OID), &layout).is_some()
+        );
+        assert!(
+            expr::compile_predicate(&text_compare(BinOp::Lt, icu), &layout).is_none(),
+            "an ICU ordering is not byte order and must not vectorize"
+        );
+    }
+
+    /// Expressions the compiler must decline rather than approximate.
+    #[test]
+    fn uncompilable_expressions_decline() {
+        let schema = schema_of(&[PgType::Int4]);
+        let layout = layout_of(&schema);
+
+        // TODO(perf): vectorize computed operands (arithmetic) so a predicate over
+        // `c0 + 1` stops falling back to the row filter.
+        let arithmetic = compare(
+            BinOp::Eq,
+            PgType::Int4,
+            BoundExpr::Binary {
+                op: BinOp::Add,
+                arg_ty: PgType::Int4,
+                collation: DEFAULT_COLLATION_OID,
+                left: Box::new(column(0, PgType::Int4)),
+                right: Box::new(constant(Value::Int4(1), PgType::Int4)),
+            },
+            constant(Value::Int4(2), PgType::Int4),
+        );
+        assert!(expr::compile_predicate(&arithmetic, &layout).is_none());
+
+        // A bind parameter is a per-execution value the compiler never sees.
+        let param = compare(
+            BinOp::Eq,
+            PgType::Int4,
+            column(0, PgType::Int4),
+            BoundExpr::Param {
+                index: 0,
+                ty: PgType::Int4,
+            },
+        );
+        assert!(expr::compile_predicate(&param, &layout).is_none());
+
+        // A column past the batch's width would be a runtime error mid-scan.
+        let out_of_range = compare(
+            BinOp::Eq,
+            PgType::Int4,
+            column(9, PgType::Int4),
+            constant(Value::Int4(1), PgType::Int4),
+        );
+        assert!(expr::compile_predicate(&out_of_range, &layout).is_none());
+    }
+
+    /// The planner decides *whether* and the executor decides *how*, so the two
+    /// must agree exactly: a shape the planner accepts and the executor declines
+    /// makes EXPLAIN advertise work that never happens, and the reverse hides work
+    /// that does. Nothing but this test enforces it — they are separate walks over
+    /// `BoundExpr` in separate crates.
+    #[test]
+    fn the_planner_and_the_executor_agree_on_every_shape() {
+        let schema = schema_of(&[PgType::Int4, PgType::Text, PgType::Numeric]);
+        let layout = layout_of(&schema);
+        let int = || column(0, PgType::Int4);
+        let one = || constant(Value::Int4(1), PgType::Int4);
+
+        let shapes: Vec<BoundExpr> = vec![
+            // Accepted.
+            compare(BinOp::Eq, PgType::Int4, int(), one()),
+            compare(BinOp::Lt, PgType::Int4, int(), one()),
+            logic(
+                BinOp::And,
+                compare(BinOp::Eq, PgType::Int4, int(), one()),
+                compare(BinOp::Gt, PgType::Int4, int(), one()),
+            ),
+            BoundExpr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(compare(BinOp::Eq, PgType::Int4, int(), one())),
+            },
+            BoundExpr::IsNull {
+                expr: Box::new(int()),
+                negated: true,
+            },
+            compare(
+                BinOp::Eq,
+                PgType::Text,
+                column(1, PgType::Text),
+                constant(Value::Text("x".into()), PgType::Text),
+            ),
+            // Declined, each for its own reason.
+            compare(
+                BinOp::Eq,
+                PgType::Numeric,
+                column(2, PgType::Numeric),
+                one(),
+            ),
+            compare(BinOp::Eq, PgType::Int4, column(9, PgType::Int4), one()),
+            compare(
+                BinOp::Eq,
+                PgType::Int4,
+                int(),
+                BoundExpr::Param {
+                    index: 0,
+                    ty: PgType::Int4,
+                },
+            ),
+            compare(
+                BinOp::Eq,
+                PgType::Int4,
+                int(),
+                constant(Value::Json("{}".into()), PgType::Json),
+            ),
+            BoundExpr::IsNull {
+                expr: Box::new(constant(Value::Json("{}".into()), PgType::Json)),
+                negated: false,
+            },
+            constant(Value::Bool(true), PgType::Bool),
+        ];
+
+        for shape in shapes {
+            let planner =
+                crabgresql_planner::vectorize::vectorizable_predicate(&shape, layout.len());
+            let executor = expr::compile_predicate(&shape, &layout).is_some();
+            assert_eq!(
+                planner, executor,
+                "planner says {planner}, executor says {executor} for {shape:?}"
+            );
+        }
+    }
+}
