@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786539848821,
+  "lastUpdate": 1786539850486,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -22000,6 +22000,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 33245.738596,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "zaets28rus@gmail.com",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "ed59bf6934684e8defec3eec9b1c1c460e9d64eb",
+          "message": "chore(release): v0.0.2\n\nBump the workspace version to 0.0.2 and regenerate CHANGELOG.md.\n\nThe `cargo release` pre-release hook ran git-cliff from each crate's\ndirectory, where it found neither cliff.toml nor the repository. It now\ngoes through scripts/release-changelog.sh, which pins both to\n$WORKSPACE_ROOT and leaves the tree untouched on a dry run.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-12T13:32:57+02:00",
+          "tree_id": "559d259565bea605f601e07dfe5e37d5c2f599f4",
+          "url": "https://github.com/ovr/crabgresql/commit/ed59bf6934684e8defec3eec9b1c1c460e9d64eb"
+        },
+        "date": 1786539850385,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 163.551256,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 34396.947941,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
