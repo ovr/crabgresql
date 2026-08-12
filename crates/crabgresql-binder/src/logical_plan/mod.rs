@@ -11,6 +11,7 @@ mod keys;
 mod query;
 mod relation;
 mod setop;
+mod visit;
 mod window;
 
 pub use aggregate::{AggInput, AggregatePlan};
@@ -20,6 +21,7 @@ pub use keys::{DistinctKey, SortKey};
 pub use query::{AppendPlan, LimitPlan, QueryPlan, SubqueryPlan, TableFunctionPlan, ValuesPlan};
 pub use relation::{MappedRelation, RelationIdent};
 pub use setop::{SetOpArm, SetOpPlan};
+pub use visit::{ExprVisitor, walk_exprs_mut};
 pub use window::WindowPlan;
 
 /// A bound query or DML statement.

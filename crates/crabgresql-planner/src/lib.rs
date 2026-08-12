@@ -2164,6 +2164,12 @@ mod tests {
     /// Plan `sql` against table `t(id int4, big int8, name text)`, optionally
     /// registering an index (name + `IndexMetadata`) first.
     fn plan_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> PhysicalPlan {
+        plan(bind_sql_indexed(sql, index), cost::CostSettings::default())
+    }
+
+    /// [`plan_sql_indexed`] stopping at the bound plan, for a test that wants to
+    /// rewrite it before planning.
+    fn bind_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> LogicalPlan {
         let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         if let Err(error) = engine.create_table(TableSchema::in_namespace(
@@ -2196,7 +2202,56 @@ mod tests {
             Ok(plan) => plan,
             Err(error) => panic!("failed to bind planner test SQL `{sql}`: {error}"),
         };
-        plan(logical, cost::CostSettings::default())
+        logical
+    }
+
+    /// What constant folding buys the planner. The access path is unchanged —
+    /// `is_row_constant` already accepts an arithmetic key, and the executor
+    /// evaluates it once per scan either way — but a *folded* key is a literal,
+    /// and only a literal reaches `const_of`, which is what lets
+    /// `key_selectivity` consult the column's distribution instead of falling
+    /// back to PostgreSQL's `var_eq_non_const` guess. The `Index Cond` line is
+    /// the observable half of that difference.
+    #[test]
+    fn a_folded_key_becomes_a_literal_index_cond() {
+        let sql = "SELECT id FROM t WHERE id = 2 + 3";
+        let mut logical = bind_sql_indexed(sql, Some(pk_on_id()));
+        assert_eq!(
+            explain(&plan(logical.clone(), cost::CostSettings::default())),
+            vec!["Index Scan using t_pkey on t", "  Index Cond: (id = 2 + 3)"],
+            "unoptimized, the key is an expression the estimator cannot read"
+        );
+        crabgresql_optimizer::optimize(
+            &mut logical,
+            &crabgresql_optimizer::OptimizerContext {
+                fmt: crabgresql_types::FmtCtx::utc_default(),
+            },
+        );
+        assert_eq!(
+            explain(&plan(logical, cost::CostSettings::default())),
+            vec!["Index Scan using t_pkey on t", "  Index Cond: (id = 5)"]
+        );
+    }
+
+    /// A qual that folds to `TRUE` filters nothing, and disappears from the scan
+    /// rather than being evaluated per row.
+    #[test]
+    fn a_constantly_true_qual_leaves_no_filter() {
+        let mut logical = bind_sql_indexed("SELECT id FROM t WHERE 1 = 1", None);
+        assert_eq!(
+            explain(&plan(logical.clone(), cost::CostSettings::default())),
+            vec!["Seq Scan on t", "  Filter: (1 = 1)"]
+        );
+        crabgresql_optimizer::optimize(
+            &mut logical,
+            &crabgresql_optimizer::OptimizerContext {
+                fmt: crabgresql_types::FmtCtx::utc_default(),
+            },
+        );
+        assert_eq!(
+            explain(&plan(logical, cost::CostSettings::default())),
+            vec!["Seq Scan on t"]
+        );
     }
 
     #[test]

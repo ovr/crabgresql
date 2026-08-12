@@ -14,6 +14,7 @@ crabgresql-buffer-engine = { path = "crates/crabgresql-buffer-engine" }
 crabgresql-catalog = { path = "crates/crabgresql-catalog" }
 crabgresql-config = { path = "crates/crabgresql-config" }
 crabgresql-executor = { path = "crates/crabgresql-executor" }
+crabgresql-optimizer = { path = "crates/crabgresql-optimizer" }
 crabgresql-planner = { path = "crates/crabgresql-planner" }
 crabgresql-parser = { path = "crates/crabgresql-parser" }
 crabgresql-parquet-engine = { path = "crates/crabgresql-parquet-engine" }
