@@ -21,8 +21,9 @@ mod params;
 mod scope;
 
 pub use assign::{
-    ColumnDefault, bind_check_constraint, bind_column_default, coerce_to_column, coerce_to_param,
-    const_type_label, deparse_literal_default, subquery_in_execute_param,
+    ColumnDefault, bind_check_constraint, bind_column_default, bind_generation_expr,
+    bind_stored_generation, coerce_to_column, coerce_to_param, const_type_label,
+    deparse_literal_default, parse_stored_expr, subquery_in_execute_param,
 };
 pub use bind::{bind_expr, bind_scalar};
 pub use bound::{
@@ -56,7 +57,8 @@ pub(crate) use operators::{
     bind_array_function, bind_binary_op, is_text_family, to_concat_operand,
 };
 pub(crate) use params::{ViewExpansion, param_ctx_view_body, view_expansion};
+pub(crate) use scope::column_value;
 pub(crate) use scope::{
     NamedWindows, OuterLevel, ScopeItem, VisibleColumn, VisibleLookup, common_typmod,
-    lookup_visible, normalize_ident, projection_typmod, reject_window, with_column_collation,
+    lookup_visible, normalize_ident, projection_typmod, reject_window,
 };

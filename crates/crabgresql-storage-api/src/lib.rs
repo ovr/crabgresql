@@ -146,6 +146,41 @@ pub struct Column {
     /// (`PgType::is_collatable`); it decides how the column's values order in
     /// comparisons and `ORDER BY` unless a nearer `COLLATE` overrides it.
     pub collation: Option<u32>,
+    /// The column's generation expression, when it is a generated column.
+    /// Mutually exclusive with [`Column::default`] — PostgreSQL rejects a column
+    /// declaring both.
+    pub generated: Option<GeneratedColumn>,
+}
+
+/// A generated column's kind and expression.
+///
+/// The expression is canonical SQL text, for the same reason
+/// [`Column::default`] is: this crate depends on neither the parser nor the
+/// binder. A `Stored` column's value is computed once per write and lives in the
+/// tuple; a `Virtual` column stores nothing (its slot holds NULL) and the binder
+/// substitutes the expression wherever the column is referenced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedColumn {
+    pub kind: Generation,
+    pub expr: String,
+}
+
+/// Whether a generated column's value is materialized on write (`STORED`) or
+/// recomputed on every read (`VIRTUAL`, PostgreSQL's default since 18).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Generation {
+    Stored,
+    Virtual,
+}
+
+impl Generation {
+    /// `pg_attribute.attgenerated`: `s` for stored, `v` for virtual.
+    pub fn attgenerated(self) -> char {
+        match self {
+            Generation::Stored => 's',
+            Generation::Virtual => 'v',
+        }
+    }
 }
 
 impl Column {
@@ -159,6 +194,7 @@ impl Column {
             not_null_constraint: None,
             default: None,
             collation: None,
+            generated: None,
         }
     }
 
@@ -172,7 +208,19 @@ impl Column {
             not_null_constraint: None,
             default: None,
             collation: None,
+            generated: None,
         }
+    }
+
+    /// Whether this column's value is recomputed on read rather than stored.
+    pub fn is_virtual_generated(&self) -> bool {
+        matches!(
+            self.generated,
+            Some(GeneratedColumn {
+                kind: Generation::Virtual,
+                ..
+            })
+        )
     }
 
     /// PostgreSQL's `atttypmod` encoding of this column's declared modifier,

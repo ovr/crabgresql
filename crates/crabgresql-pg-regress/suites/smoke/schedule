@@ -52,6 +52,7 @@ test: pg_catalog
 test: information_schema
 test: constraints
 test: check_constraint
+test: generated
 test: unique_index_build
 test: index_row_size
 test: returning

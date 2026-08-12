@@ -694,7 +694,7 @@ impl Spanned for ColumnOption {
             ColumnOption::Collation(object_name) => object_name.span(),
             ColumnOption::Comment(_) => Span::empty(),
             ColumnOption::OnUpdate(expr) => expr.span(),
-            ColumnOption::Generated { .. } => Span::empty(),
+            ColumnOption::Generated { span, .. } => *span,
             ColumnOption::Options(vec) => union_spans(vec.iter().map(|i| i.span())),
             ColumnOption::Identity(..) => Span::empty(),
             ColumnOption::OnConflict(..) => Span::empty(),

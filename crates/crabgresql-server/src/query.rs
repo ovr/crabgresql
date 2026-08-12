@@ -23,9 +23,9 @@ use crabgresql_executor::{
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
 use crabgresql_storage_api::{
-    CheckConstraint, Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, InheritParent,
-    PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme, PartitionStrategy,
-    RelPersistence, RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig,
+    CheckConstraint, Column, GeneratedColumn, Generation, IndexConstraint, IndexKey, IndexMetadata,
+    IndexMethod, InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
+    PartitionStrategy, RelPersistence, RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig,
     SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema,
     TypeCatalog, ViewDefinition,
 };
@@ -2301,7 +2301,9 @@ fn execute_create_index(
     }
     let table = engine.open_table(&table_name)?;
     reject_partitioned_parent(&table, &table_name)?;
-    let keys = simple_index_keys(&table.schema(), &create.columns)?;
+    // `CREATE UNIQUE INDEX` is still refused as an *index*: only a constraint
+    // is named by its kind.
+    let keys = simple_index_keys(&table.schema(), &create.columns, None)?;
     // PG names an unnamed index after the table and every key column, e.g.
     // `t_a_b_idx`, then bumps the label on collision (`t_a_b_idx1`).
     let index_name = explicit_name.unwrap_or_else(|| {
@@ -2797,7 +2799,7 @@ fn execute_alter_table(
                 continue;
             }
         };
-        let keys = simple_index_keys(&schema, &columns)?;
+        let keys = simple_index_keys(&schema, &columns, Some(kind))?;
         if kind == IndexConstraint::PrimaryKey {
             if existing_primary_key || added_primary_key {
                 return Err(PgError::new(
@@ -3029,6 +3031,16 @@ fn validate_primary_key_not_null(
 /// rely on, and it matters here: a full-width scan would detoast every column of
 /// every row for a predicate reading one.
 ///
+/// A relation with a **virtual** generated column is the one exception to the
+/// narrow read: a stored predicate names the generated column itself (it binds
+/// with the substitution off, so `check.columns` holds that ordinal rather than
+/// the columns its expression reads), and a virtual column's stored slot is the
+/// NULL nothing was written to. Such a relation is scanned full-width and each
+/// row is completed by the same `GeneratedSet` the write paths use, so the
+/// backfill judges the values a reader would see. Without it, `ALTER TABLE …
+/// ADD CHECK (v < 10)` was accepted over rows that violate it. A *stored*
+/// generated column needs none of this: its value is on disk like any other.
+///
 /// PostgreSQL's message here names the *constraint and relation* rather than the
 /// offending row, and carries **no DETAIL** — unlike the DML-time violation,
 /// which prints `Failing row contains (…)`. Probed against 18.4. A predicate
@@ -3042,10 +3054,18 @@ fn validate_check_constraint(
     ctx: &crabgresql_executor::ExecContext,
 ) -> Result<(), PgError> {
     let schema = table.schema();
-    let projection =
-        crabgresql_storage_api::ColumnProjection::of(check.columns.iter().copied(), &schema);
+    let generated = crabgresql_executor::generated::GeneratedSet::for_schema(&schema, ctx)?;
+    let projection = match generated.has_virtual() {
+        false => {
+            crabgresql_storage_api::ColumnProjection::of(check.columns.iter().copied(), &schema)
+        }
+        true => crabgresql_storage_api::ColumnProjection::All,
+    };
     for row in table.scan(txn, &projection) {
-        let (_, tuple) = row?;
+        let (_, mut tuple) = row?;
+        if generated.has_virtual() {
+            generated.compute(&mut tuple, ctx)?;
+        }
         if matches!(
             crabgresql_executor::eval::eval(bound, &tuple, ctx)?,
             crabgresql_types::Value::Bool(false)
@@ -4068,9 +4088,20 @@ fn execute_create_table(
         expr: ast::Expr,
     }
 
+    /// A `GENERATED ALWAYS AS (…)` clause, held for the same reason a
+    /// [`PendingCheck`] is: its expression binds against the row, so it can only
+    /// be validated once the inherited-column merge has settled the layout. The
+    /// column is carried by *name*, not by position — the merge may prepend the
+    /// parents' columns.
+    struct PendingGenerated {
+        column: String,
+        expr: ast::Expr,
+    }
+
     let mut columns = Vec::new();
     let mut pending = Vec::<PendingIndex>::new();
     let mut pending_checks = Vec::<PendingCheck>::new();
+    let mut pending_generated = Vec::<PendingGenerated>::new();
     let mut constraint_names = HashSet::new();
     // `serial`/`bigserial`/`smallserial` desugar to an int column plus an owned
     // sequence and a `nextval(...)` default. The sequences are created together
@@ -4165,6 +4196,9 @@ fn execute_create_table(
                             "multiple default values specified for column \"{column_name}\" of table \"{name}\""
                         )));
                     }
+                    if column.generated.is_some() {
+                        return Err(both_default_and_generation(&column_name, &name));
+                    }
                     let bound =
                         crabgresql_binder::bind_column_default(expr, &column, type_catalog)?;
                     // The default is stored already deparsed, so `pg_get_expr`
@@ -4192,6 +4226,59 @@ fn execute_create_table(
                                 .unwrap_or(source),
                         ),
                     };
+                }
+                // `b int GENERATED ALWAYS AS (a * 2) STORED` — and its VIRTUAL
+                // sibling, which is what PostgreSQL 18 made the default for a
+                // clause naming neither. The identity form (`… AS IDENTITY`,
+                // which the parser reports as a `Generated` with no expression)
+                // is a different feature and still unsupported.
+                ast::ColumnOption::Generated {
+                    generated_as,
+                    generation_expr: Some(expr),
+                    generation_expr_mode,
+                    span,
+                    ..
+                } => {
+                    // PostgreSQL points its cursor at the clause it is refusing,
+                    // which for all three of these is the one being read here.
+                    let at_clause = |e: PgError| e.at(*span);
+                    if column.generated.is_some() {
+                        return Err(at_clause(PgError::syntax(format!(
+                            "multiple generation clauses specified for column \"{column_name}\" of table \"{name}\""
+                        ))));
+                    }
+                    if column.default.is_some() {
+                        return Err(at_clause(both_default_and_generation(&column_name, &name)));
+                    }
+                    if *generated_as == ast::GeneratedAs::ByDefault {
+                        return Err(at_clause(PgError::syntax(
+                            "for a generated column, GENERATED ALWAYS must be specified",
+                        )));
+                    }
+                    let kind = match generation_expr_mode {
+                        Some(ast::GeneratedExpressionMode::Stored) => Generation::Stored,
+                        // No modifier means VIRTUAL, PostgreSQL's default since 18.
+                        Some(ast::GeneratedExpressionMode::Virtual) | None => Generation::Virtual,
+                    };
+                    // Stored in the same non-pretty, unqualified form a CHECK is:
+                    // `pg_get_expr` echoes it, and dropping the `t.` qualifier is
+                    // what lets the text re-bind against an inheritance child.
+                    // The expression itself is validated after the merge below,
+                    // which is also when a reference to another generated column
+                    // can be recognized — the flag being set here is what makes
+                    // that check see this column.
+                    let source = expr.to_string();
+                    let text = crabgresql_binder::ruleutils::deparse_check_expr(
+                        &source,
+                        &name,
+                        type_catalog,
+                    )
+                    .unwrap_or(source);
+                    column.generated = Some(GeneratedColumn { kind, expr: text });
+                    pending_generated.push(PendingGenerated {
+                        column: column_name.clone(),
+                        expr: expr.clone(),
+                    });
                 }
                 ast::ColumnOption::PrimaryKey(pk) => {
                     reject_primary_key_options(pk)?;
@@ -4407,10 +4494,22 @@ fn execute_create_table(
     // rule looks at them, so "this method cannot store `json`" wins over the
     // B-tree-operator-class complaint that the same column would otherwise draw.
     target.validate_schema(&schema)?;
+    // Validate every generation expression against the settled layout. The
+    // stored text is left as the deparse produced it above; what this adds is
+    // the refusals (unknown column, another generated column, non-immutable
+    // call) and the certainty that the expression binds at all, so no DML
+    // statement is the first to find out that it does not.
+    let mut schema = schema;
+    for p in &pending_generated {
+        let index = schema
+            .column_index(&p.column)
+            .expect("the generated column was just declared");
+        crabgresql_binder::bind_generation_expr(&p.expr, &schema, index, type_catalog)?;
+    }
     let mut indexes = Vec::new();
     for p in pending {
         reject_deferred_characteristics(p.characteristics)?;
-        let keys = simple_index_keys(&schema, &p.columns)?;
+        let keys = simple_index_keys(&schema, &p.columns, Some(p.constraint))?;
         let base = constraint_index_base(&name, &schema, p.constraint, &keys);
         let index_name = p
             .explicit_name
@@ -4430,7 +4529,6 @@ fn execute_create_table(
             constraint: Some(p.constraint),
         });
     }
-    let mut schema = schema;
     for index in &indexes {
         if index.constraint == Some(IndexConstraint::PrimaryKey) {
             for key in &index.keys {
@@ -4603,9 +4701,9 @@ fn build_partition_scheme(
             "multi-column partition keys are not supported yet",
         ));
     }
-    let key = match &list.args[0] {
+    let (key, key_span) = match &list.args[0] {
         ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Identifier(ident))) => {
-            normalize_ident(ident)
+            (normalize_ident(ident), ident.span)
         }
         _ => {
             return Err(PgError::feature_not_supported(
@@ -4618,6 +4716,19 @@ fn build_partition_scheme(
     // (A user type can only reach here as an enum — non-enum user types are
     // rejected as column types upstream — and enums are orderable.)
     let idx = resolve_orderable_column(columns, &key, "partition key", None)?;
+    // Routing reads the key out of the row before the generated columns are
+    // computed, and PostgreSQL refuses the DDL for the same reason — for a
+    // stored column as firmly as for a virtual one. Probed against 18.4.
+    if columns[idx].generated.is_some() {
+        return Err(
+            PgError::new("42P17", "cannot use generated column in partition key")
+                .with_detail(format!(
+                    "Column \"{}\" is a generated column.",
+                    columns[idx].name
+                ))
+                .at(key_span),
+        );
+    }
     Ok(PartitionScheme {
         strategy: PartitionStrategy::Range,
         key_columns: vec![idx],
@@ -4831,6 +4942,14 @@ fn build_sort_key(
         // Parquet stores, so `validate_schema` rejects the column first with the
         // truer message — but it holds for the method that eventually stores one.
         let column = resolve_orderable_column(&schema.columns, &name, "sort key", None)?;
+        // Nothing is stored for a virtual column, so a layout ordered by one
+        // would order by NULLs. PostgreSQL has no layout sort key to refuse this
+        // for, so the wording is ours.
+        if schema.columns[column].is_virtual_generated() {
+            return Err(PgError::feature_not_supported(
+                "layout sort keys on virtual generated columns are not supported",
+            ));
+        }
         if keys.iter().any(|key| key.column == column) {
             return Err(PgError::new(
                 sqlstate::INVALID_OBJECT_DEFINITION,
@@ -5824,6 +5943,19 @@ fn resolve_checks(
     Ok(out)
 }
 
+/// PostgreSQL's refusal for a column declaring both a DEFAULT and a generation
+/// expression, in either order. `42601`, probed against 18.4.
+///
+/// The caller stamps the cursor. PostgreSQL points it at whichever clause it
+/// reads *second*, so a column spelling `GENERATED … DEFAULT 5` gets no cursor
+/// here: this build has no span for a `DEFAULT` clause, only for its
+/// expression, and a cursor under the value would be worse than none.
+fn both_default_and_generation(column: &str, table: &str) -> PgError {
+    PgError::syntax(format!(
+        "both default and generation expression specified for column \"{column}\" of table \"{table}\""
+    ))
+}
+
 fn reject_deferred_characteristics(
     characteristics: Option<ast::ConstraintCharacteristics>,
 ) -> Result<(), PgError> {
@@ -5904,9 +6036,27 @@ fn reject_unique_options(constraint: &ast::UniqueConstraint) -> Result<(), PgErr
     reject_constraint_key_columns(&constraint.columns, "unique")
 }
 
+/// PostgreSQL's refusal of a virtual generated column as an index key, worded by
+/// what the index *backs*: a plain (even `UNIQUE`) `CREATE INDEX` is refused as
+/// an index, while a constraint is refused by its kind. Probed against 18.4.
+fn virtual_key_refusal(backs: Option<IndexConstraint>) -> &'static str {
+    match backs {
+        None => "indexes on virtual generated columns are not supported",
+        Some(IndexConstraint::Unique) => {
+            "unique constraints on virtual generated columns are not supported"
+        }
+        Some(IndexConstraint::PrimaryKey) => {
+            "primary keys on virtual generated columns are not supported"
+        }
+    }
+}
+
+/// `backs` names the constraint this index will back, or `None` for a plain
+/// `CREATE INDEX` — it decides nothing but the wording of the refusal above.
 fn simple_index_keys(
     schema: &TableSchema,
     columns: &[ast::IndexColumn],
+    backs: Option<IndexConstraint>,
 ) -> Result<Vec<IndexKey>, PgError> {
     let mut keys = Vec::with_capacity(columns.len());
     for col in columns {
@@ -5928,6 +6078,14 @@ fn simple_index_keys(
         // here, matching PostgreSQL — otherwise unique enforcement would later
         // call `compare_values` on an unorderable type and panic the backend.
         let column = resolve_orderable_column(&schema.columns, &ident, "key", Some(OPCLASS_HINT))?;
+        // A virtual column stores nothing, so there is no value to key on — and
+        // a unique constraint over one would silently enforce nothing, every
+        // blanked slot being a distinct NULL. Refused here rather than at each
+        // caller, so `CREATE INDEX`, `ALTER TABLE ... ADD` and the inline
+        // `CREATE TABLE` forms cannot drift apart.
+        if schema.columns[column].is_virtual_generated() {
+            return Err(PgError::feature_not_supported(virtual_key_refusal(backs)));
+        }
         keys.push(IndexKey {
             column,
             descending: col.column.options.asc == Some(false),
@@ -6236,21 +6394,15 @@ fn type_shape_from_options(
                         .map(|p| p.as_ident().map(normalize_ident).unwrap_or_default())
                         .collect::<Vec<_>>()
                         .join(".");
-                    let mut err = PgError::new(
+                    let err = PgError::new(
                         sqlstate::UNDEFINED_OBJECT,
                         format!("type \"{display}\" does not exist"),
                     );
-                    let start = name
-                        .0
-                        .first()
-                        .and_then(|p| p.as_ident())
-                        .map(|i| i.span.start);
-                    if let Some(start) = start {
-                        if start.line != 0 {
-                            err.location = Some((start.line, start.column));
-                        }
-                    }
-                    return Err(err);
+                    let span = name.0.first().and_then(|p| p.as_ident()).map(|i| i.span);
+                    return Err(match span {
+                        Some(span) => err.at(span),
+                        None => err,
+                    });
                 }
             }
             _ => {}

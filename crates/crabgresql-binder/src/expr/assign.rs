@@ -12,6 +12,7 @@ use crabgresql_storage_api::{Column, TableSchema, TypeCatalog};
 use crabgresql_types::{PgType, Value};
 
 use crate::BindError;
+use crate::functions::ScalarFn;
 
 use super::bind::{NO_SUBQUERY_CONTEXT, bind_expr};
 use super::bound::BoundExpr;
@@ -172,14 +173,11 @@ pub fn bind_check_constraint(
     schema: &TableSchema,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
-    bind_check_inner(expr, schema, catalog).map_err(|e| match e.location {
-        // PostgreSQL points its cursor at the start of the CHECK expression for
-        // every one of these — the unknown column, the subquery, the aggregate.
-        // Only `to_bool_operand` sets a finer one of its own, so anything still
-        // location-less gets the predicate's own span.
-        None => e.at(expr.span()),
-        Some(_) => e,
-    })
+    // PostgreSQL points its cursor at the start of the CHECK expression for
+    // every one of these — the unknown column, the subquery, the aggregate.
+    // Only `to_bool_operand` sets a finer one of its own, so anything still
+    // location-less gets the predicate's own span.
+    bind_check_inner(expr, schema, catalog).map_err(|e| e.at_if_unset(expr.span()))
 }
 
 fn bind_check_inner(
@@ -188,16 +186,14 @@ fn bind_check_inner(
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
     let params = param_ctx_none();
-    // Deliberately built with no subquery context, which is what makes a
-    // subquery in the predicate fail — restated below in PostgreSQL's words.
-    // No system column: a stored CHECK is re-bound against each leaf it runs
-    // for, so a `tableoid` in one would silently mean a different relation per
-    // partition. PostgreSQL records the reference as a negative `conkey` and
-    // evaluates it per row instead.
+    // The scope's missing subquery context is what makes a subquery in the
+    // predicate fail — restated below in PostgreSQL's words. PostgreSQL records
+    // a system-column reference as a negative `conkey` and evaluates it per row;
+    // this scope exposes none, so such a predicate is refused instead.
     //
     // TODO: CHECK over a system column, which needs `conkey` to carry negative
     // attnums and the predicate to be evaluated against the leaf's identity.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false);
+    let scope = Scope::stored_row(schema, catalog, &params);
     let bound = to_bool_operand(
         bind_expr(expr, &scope).map_err(subquery_in_check)?,
         "CHECK",
@@ -214,6 +210,177 @@ fn bind_check_inner(
         return Err(subquery_in_check_error());
     }
     Ok((bound, columns.into_iter().collect()))
+}
+
+/// Reparse a persisted expression (a column default, a generation expression)
+/// back into an AST node. Storing canonical SQL keeps the storage API
+/// independent of the parser/binder IR; `what` names the kind in the syntax
+/// error a corrupt catalog would raise.
+pub fn parse_stored_expr(sql: &str, what: &str) -> Result<ast::Expr, BindError> {
+    crate::ruleutils::parse_expression(sql)
+        .ok_or_else(|| BindError::syntax(format!("invalid stored {what}")))
+}
+
+/// Reparse and bind the generation expression `schema`'s column at `index`
+/// carries, ready to be evaluated against a row of that shape.
+///
+/// The DDL path validated the expression once, when the column was declared, so
+/// this re-runs the same binding rather than the checks around it: what a
+/// statement needs here is the tree, and a rejection at this point would be a
+/// catalog that no longer matches its own relation.
+pub fn bind_stored_generation(
+    schema: &TableSchema,
+    index: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<BoundExpr, BindError> {
+    let column = &schema.columns[index];
+    let generated = column
+        .generated
+        .as_ref()
+        .expect("caller checked the column is generated");
+    let expr = parse_stored_expr(&generated.expr, "generation expression")?;
+    let params = param_ctx_none();
+    let scope = Scope::stored_row(schema, catalog, &params);
+    coerce_to_column(bind_expr(&expr, &scope)?, column, &scope)
+}
+
+/// Bind a column's generation expression against the relation it belongs to,
+/// returning the expression coerced to the column's type and the column
+/// positions it reads.
+///
+/// Like a CHECK — and unlike a DEFAULT — this binds in a scope over `schema`'s
+/// columns: it is a statement about the row. `schema` must already carry every
+/// column in its final position, and `column` is the generated column's own
+/// index in it.
+///
+/// The rejections and their SQLSTATEs were probed against PostgreSQL 18.4:
+///
+/// * a reference to any generated column, including the column itself, is
+///   `42P17` with a DETAIL naming the rule;
+/// * a non-immutable expression is `42P17` — PostgreSQL demands IMMUTABLE here,
+///   so `now()` (STABLE) is refused as firmly as `random()` (VOLATILE);
+/// * an aggregate is `42803` and a window function `42P20`, which is what
+///   [`reject_agg_or_window`] already distinguishes;
+/// * a subquery and a set-returning function are both `0A000`.
+///
+/// A reference to a *system* column is `42P10` upstream (`cannot use system
+/// column "xmin" …`). The scope built here exposes none, so such a reference
+/// reports `42703` (`column "xmin" does not exist`) instead — the same refusal
+/// a CHECK over a system column already gives.
+pub fn bind_generation_expr(
+    expr: &ast::Expr,
+    schema: &TableSchema,
+    column: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(BoundExpr, Vec<usize>), BindError> {
+    // PostgreSQL points its cursor at the start of the generation expression for
+    // the parse-time refusals, exactly as it does for a CHECK.
+    let (bound, columns) = bind_generation_inner(expr, schema, column, catalog)
+        .map_err(|e| e.at_if_unset(expr.span()))?;
+    // Immutability is checked *after* that stamping, and deliberately: PG
+    // reports this one with no cursor at all, having already left the parse
+    // analysis that would carry a position.
+    if !is_immutable(&bound) {
+        return Err(BindError::new(
+            "42P17",
+            "generation expression is not immutable",
+        ));
+    }
+    Ok((bound, columns))
+}
+
+fn bind_generation_inner(
+    expr: &ast::Expr,
+    schema: &TableSchema,
+    column: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(BoundExpr, Vec<usize>), BindError> {
+    let params = param_ctx_none();
+    // The scope's missing subquery context is what refuses a subquery below, in
+    // PostgreSQL's words.
+    let scope = Scope::stored_row(schema, catalog, &params);
+    let bound = coerce_to_column(
+        bind_expr(expr, &scope).map_err(subquery_in_generation)?,
+        &schema.columns[column],
+        &scope,
+    )?;
+    if bound.contains_srf() {
+        return Err(BindError::feature_not_supported(
+            "set-returning functions are not allowed in column generation expressions",
+        ));
+    }
+    reject_agg_or_window(&bound, "column generation expressions")?;
+    let mut columns = BTreeSet::new();
+    if !bound.collect_column_refs(&mut columns) {
+        return Err(subquery_in_generation_error());
+    }
+    // A self-reference is just the same rule applied to this column, which is
+    // already marked generated in `schema` by the time this runs.
+    for &index in &columns {
+        if schema.columns[index].generated.is_some() {
+            return Err(BindError::new(
+                "42P17",
+                format!(
+                    "cannot use generated column \"{}\" in column generation expression",
+                    schema.columns[index].name
+                ),
+            )
+            .with_detail(Some(
+                "A generated column cannot reference another generated column.".to_string(),
+            )));
+        }
+    }
+    Ok((bound, columns.into_iter().collect()))
+}
+
+/// Whether every function call in `expr` is IMMUTABLE in PostgreSQL's sense —
+/// the bar a generation expression has to clear.
+///
+/// [`BoundExpr::contains_volatile_fn`] is not enough on its own: it deliberately
+/// treats `now()` and `statement_timestamp()` as the STABLE functions they are,
+/// so that a predicate over them can still be pushed down. A generation
+/// expression may use neither, so the STABLE calls the binder knows are listed
+/// here as well.
+///
+/// Known gap: a coercion between `timestamp` and `timestamptz` without an
+/// explicit zone is STABLE upstream (it reads the session's `TimeZone`), and is
+/// accepted here. Nothing else in the tree reads session state without going
+/// through one of the calls below.
+fn is_immutable(expr: &BoundExpr) -> bool {
+    if expr.contains_volatile_fn() {
+        return false;
+    }
+    let mut immutable = true;
+    crate::plan::for_each_subexpr(expr, 1, &mut |e, _| {
+        if let BoundExpr::FuncCall { func, .. } = e
+            && matches!(
+                func,
+                ScalarFn::TransactionTimestamp
+                    | ScalarFn::StatementTimestamp
+                    | ScalarFn::PgPostmasterStartTime
+                    | ScalarFn::CurrentSetting
+                    | ScalarFn::Version
+            )
+        {
+            immutable = false;
+        }
+    });
+    immutable
+}
+
+/// PostgreSQL's wording for a subquery inside a generation expression: `0A000`,
+/// like the CHECK case. Probed against 18.4.
+fn subquery_in_generation_error() -> BindError {
+    BindError::feature_not_supported("cannot use subquery in column generation expression")
+}
+
+/// Restate the generic "no subquery context here" refusal as the generation-
+/// expression one. Any other error passes through untouched.
+fn subquery_in_generation(e: BindError) -> BindError {
+    match e.message == NO_SUBQUERY_CONTEXT {
+        true => subquery_in_generation_error(),
+        false => e,
+    }
 }
 
 /// PostgreSQL's wording for a subquery inside a CHECK: `0A000`, and *not* the

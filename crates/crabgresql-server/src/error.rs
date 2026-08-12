@@ -55,6 +55,16 @@ impl PgError {
         self
     }
 
+    /// Stamp the cursor position `span` starts at, the way
+    /// [`crabgresql_binder::BindError::at`] does for a bind-time error. An empty
+    /// span (line 0) leaves the error position-less.
+    pub fn at(mut self, span: crabgresql_parser::Span) -> Self {
+        if span.start.line != 0 {
+            self.location = Some((span.start.line, span.start.column));
+        }
+        self
+    }
+
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self

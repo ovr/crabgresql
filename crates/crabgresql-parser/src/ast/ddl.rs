@@ -1919,6 +1919,9 @@ pub enum ColumnOption {
         generation_expr_mode: Option<GeneratedExpressionMode>,
         /// false if 'GENERATED ALWAYS' is skipped (option starts with AS)
         generated_keyword: bool,
+        /// Where the clause starts — the `GENERATED` keyword, or the `AS` that
+        /// stands in for it. PostgreSQL points its error cursor here.
+        span: Span,
     },
     /// BigQuery specific: Explicit column options in a view [1] or table [2]
     /// Syntax
@@ -2058,6 +2061,7 @@ impl fmt::Display for ColumnOption {
                 generation_expr,
                 generation_expr_mode,
                 generated_keyword,
+                span: _,
             } => {
                 if let Some(expr) = generation_expr {
                     let modifier = match generation_expr_mode {

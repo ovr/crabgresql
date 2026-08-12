@@ -1,0 +1,131 @@
+-- GENERATED COLUMNS
+-- Both kinds: STORED materializes on write, VIRTUAL is recomputed on read.
+-- A clause naming neither is VIRTUAL, PostgreSQL's default since 18.
+CREATE TABLE gen_both (
+  a integer,
+  s integer GENERATED ALWAYS AS (a * 2) STORED,
+  v text GENERATED ALWAYS AS (a || 'x') VIRTUAL,
+  b integer GENERATED ALWAYS AS (a + 1)
+);
+-- The catalog reports the kind, flags the column as having a default
+-- expression, and keeps the expression in pg_attrdef.
+SELECT a.attname, a.attgenerated, a.atthasdef,
+       pg_get_expr(d.adbin, d.adrelid) AS adbin,
+       pg_get_expr(d.adbin, d.adrelid, true) AS pretty
+  FROM pg_attribute a
+  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+ WHERE a.attrelid = 'gen_both'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+SELECT column_name, is_generated, generation_expression, column_default
+  FROM information_schema.columns
+ WHERE table_name = 'gen_both'
+ ORDER BY ordinal_position;
+\d gen_both
+
+-- The column list may omit a generated column; naming it with DEFAULT is the
+-- one value a statement may write.
+INSERT INTO gen_both (a) VALUES (1), (2);
+INSERT INTO gen_both VALUES (3, DEFAULT, DEFAULT, DEFAULT);
+SELECT * FROM gen_both ORDER BY a;
+-- A virtual column reads back through every path: a bare reference, a
+-- qualified one, a predicate, and a join key.
+SELECT gen_both.v, b FROM gen_both WHERE v = '2x';
+SELECT count(*) FROM gen_both x JOIN gen_both y ON x.v = y.v;
+-- A USING / NATURAL join resolves its non-join columns through a merged view of
+-- its own, which has to substitute a virtual column too.
+CREATE TABLE gen_side (a integer, w integer GENERATED ALWAYS AS (a + 100) VIRTUAL);
+INSERT INTO gen_side (a) VALUES (1), (2);
+SELECT a, v, w FROM gen_both JOIN gen_side USING (a) ORDER BY a;
+SELECT * FROM gen_both NATURAL JOIN gen_side ORDER BY a;
+
+-- Anything but DEFAULT is refused, wherever the value would come from.
+INSERT INTO gen_both VALUES (4, 44);
+INSERT INTO gen_both (a, s) VALUES (4, 44);
+INSERT INTO gen_both (a, s) SELECT 4, 44;
+UPDATE gen_both SET s = 1;
+UPDATE gen_both SET v = 'q';
+
+-- An UPDATE recomputes both kinds from the new row, whichever column it
+-- assigned, and RETURNING sees the recomputed values.
+UPDATE gen_both SET a = 10 WHERE a = 1 RETURNING a, s, v, b;
+UPDATE gen_both SET s = DEFAULT WHERE a = 2;
+SELECT * FROM gen_both ORDER BY a;
+
+-- NOT NULL and CHECK are enforced against a virtual column's computed value.
+CREATE TABLE gen_checked (
+  a integer,
+  v integer GENERATED ALWAYS AS (a * 2) VIRTUAL CHECK (v < 10),
+  n integer GENERATED ALWAYS AS (a) VIRTUAL NOT NULL
+);
+INSERT INTO gen_checked (a) VALUES (1);
+INSERT INTO gen_checked (a) VALUES (100);
+INSERT INTO gen_checked (a) VALUES (NULL);
+SELECT * FROM gen_checked;
+
+-- COPY carries no generated column: the implicit column list leaves it out …
+COPY gen_checked FROM stdin;
+4
+\.
+SELECT * FROM gen_checked ORDER BY a;
+
+-- Nothing can key on a virtual column, on any path that defines one — and a
+-- stored column, whose value really is in the row, keys like any other.
+CREATE INDEX ON gen_checked (v);
+CREATE UNIQUE INDEX ON gen_checked (v);
+ALTER TABLE gen_checked ADD UNIQUE (v);
+ALTER TABLE gen_checked ADD PRIMARY KEY (v);
+CREATE INDEX ON gen_both (s);
+
+-- ALTER TABLE ... ADD CHECK judges the values a reader sees, so a predicate an
+-- existing row violates through its virtual column is refused — the backfill
+-- scan reads stored slots, where a virtual column holds nothing.
+CREATE TABLE gen_backfill (a integer, v integer GENERATED ALWAYS AS (a * 2) VIRTUAL);
+INSERT INTO gen_backfill (a) VALUES (1), (100);
+ALTER TABLE gen_backfill ADD CHECK (v < 10);
+ALTER TABLE gen_backfill ADD CHECK (v < 1000);
+SELECT * FROM gen_backfill ORDER BY a;
+
+-- An inheritance child inherits the column and recomputes it on its own rows.
+CREATE TABLE gen_parent (a integer, s integer GENERATED ALWAYS AS (a * 3) STORED);
+CREATE TABLE gen_child (b text) INHERITS (gen_parent);
+INSERT INTO gen_child (a, b) VALUES (2, 'x');
+SELECT * FROM gen_parent ORDER BY a;
+UPDATE gen_parent SET a = 5;
+SELECT * FROM gen_child ORDER BY a;
+
+-- Rejections at DDL time. PostgreSQL points its error cursor at the clause it
+-- refuses, and so does this build — with two deviations recorded below:
+--   * a column spelling GENERATED before DEFAULT gets no cursor at all, where
+--     PG points at the DEFAULT clause: only a DEFAULT's *expression* has a span
+--     here, and a cursor under the value would be worse than none;
+--   * a subquery's cursor lands one column right of PG's, on the `SELECT`
+--     rather than on the parenthesis that opens it — where the parser puts a
+--     subquery expression's span.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED GENERATED ALWAYS AS (a * 3) STORED);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (b * 2) STORED);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL, c integer GENERATED ALWAYS AS (b * 3) VIRTUAL);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (c * 2) STORED);
+CREATE TABLE gen_err (a integer, b timestamptz GENERATED ALWAYS AS (now()) STORED);
+CREATE TABLE gen_err (a integer, b integer DEFAULT 5 GENERATED ALWAYS AS (a * 2) STORED);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED DEFAULT 5);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (sum(a)) STORED);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS ((SELECT 1)) STORED);
+CREATE TABLE gen_err (a integer, b integer GENERATED BY DEFAULT AS (a * 2) STORED);
+-- A virtual column stores nothing, so nothing can key on it.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL UNIQUE);
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) VIRTUAL PRIMARY KEY);
+-- Routing reads the key before the generated columns are computed, so no
+-- generated column may be part of one.
+CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY RANGE (b);
+
+DROP TABLE gen_child;
+DROP TABLE gen_parent;
+DROP TABLE gen_backfill;
+DROP TABLE gen_side;
+DROP TABLE gen_both;
+
+-- … and naming a generated column in a COPY column list is an error. Last in
+-- the file deliberately: a refused `COPY … FROM STDIN` leaves the regress
+-- runner's copy-in stream unfinished, so anything after it would be read as
+-- data rather than executed.
+COPY gen_checked (a, v) FROM stdin;

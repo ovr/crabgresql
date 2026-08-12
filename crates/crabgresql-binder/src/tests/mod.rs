@@ -9,6 +9,7 @@ mod copy;
 mod distinct_order_limit;
 mod dml;
 mod expressions;
+mod generated;
 mod inheritance;
 mod insert_select;
 mod joins;

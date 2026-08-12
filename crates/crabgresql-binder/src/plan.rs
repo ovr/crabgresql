@@ -1385,7 +1385,11 @@ fn expr_has_outer_ref(expr: &BoundExpr, depth: usize) -> bool {
 /// that pushes a level — see [`plan_has_outer_refs`]. Callers decide what to do
 /// with `depth` themselves, since "escapes this plan" and "names *this* row" are
 /// different questions asked of the same walk.
-fn for_each_subexpr(expr: &BoundExpr, depth: usize, f: &mut dyn FnMut(&BoundExpr, usize)) {
+pub(crate) fn for_each_subexpr(
+    expr: &BoundExpr,
+    depth: usize,
+    f: &mut dyn FnMut(&BoundExpr, usize),
+) {
     f(expr, depth);
     match expr {
         BoundExpr::OuterColumnRef { .. }
@@ -2042,6 +2046,7 @@ fn unify_set_columns(
             collation,
             strength,
             typmod: merged_typmod,
+            generated: None,
         });
     }
     Ok(columns)
@@ -2612,7 +2617,7 @@ fn bind_table_query(
     let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let mut columns = Vec::new();
     let mut projections = Vec::new();
-    for (col, expr) in scope.expand_wildcard() {
+    for (col, expr) in scope.expand_wildcard()? {
         columns.push(col);
         projections.push(expr);
     }
@@ -2667,6 +2672,7 @@ fn to_columns(columns: &[OutputColumn]) -> Vec<Column> {
         .map(|c| {
             let mut col = Column::with_typmod(c.name.clone(), c.ty, c.typmod);
             col.collation = c.collation;
+            col.generated = c.generated.clone();
             col
         })
         .collect()
@@ -2969,6 +2975,10 @@ fn bind_from_item(
                             // default.
                             strength: crate::collation::Strength::Implicit,
                             typmod: c.typmod,
+                            // The one place this is set: a base relation's own
+                            // column, so a scope built over the FROM item can
+                            // substitute a virtual one's expression.
+                            generated: c.generated.clone(),
                         })
                         .collect();
                     // `information_schema` is the one namespace served as
@@ -3340,9 +3350,9 @@ fn bind_from_clause(
             (Some(acc), Some(gv)) => {
                 acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
             }
-            (Some(acc), None) => acc.extend(default_visible(&group_relations, width)),
+            (Some(acc), None) => acc.extend(default_visible(&group_relations, width, catalog)?),
             (None, Some(gv)) => {
-                let mut acc = default_visible(&relations, 0);
+                let mut acc = default_visible(&relations, 0, catalog)?;
                 acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
                 visible = Some(acc);
             }
@@ -3447,7 +3457,7 @@ fn bind_table_with_joins(
         let (kind, predicate) = match join_kind_and_constraint(&join.join_operator)? {
             JoinBinding::Cross => {
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width));
+                    v.extend(default_visible(&right.relations, left_width, catalog)?);
                 }
                 (JoinKind::Cross, None)
             }
@@ -3456,11 +3466,14 @@ fn bind_table_with_joins(
                 on_relations.extend(right.relations.clone());
                 // A prior USING/NATURAL join makes the merged view govern
                 // unqualified names inside this ON clause too.
-                let on_visible = visible.as_ref().map(|v| {
-                    let mut ov = v.clone();
-                    ov.extend(default_visible(&right.relations, left_width));
-                    ov
-                });
+                let on_visible = match visible.as_ref() {
+                    Some(v) => {
+                        let mut ov = v.clone();
+                        ov.extend(default_visible(&right.relations, left_width, catalog)?);
+                        Some(ov)
+                    }
+                    None => None,
+                };
                 let scope =
                     Scope::relations_with_visible(on_relations, on_visible, catalog, params)
                         .with_subqueries(engine, ctes)
@@ -3471,23 +3484,25 @@ fn bind_table_with_joins(
                     reject_agg_or_window(expr, "JOIN conditions")?;
                 }
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width));
+                    v.extend(default_visible(&right.relations, left_width, catalog)?);
                 }
                 (kind, Some(to_bool_operand(binding, "JOIN/ON", on.span())?))
             }
             JoinBinding::Using(kind, names) => {
-                let left_view = visible
-                    .take()
-                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
+                let left_view = match visible.take() {
+                    Some(view) => view,
+                    None => default_visible(&bound.relations, 0, catalog)?,
+                };
                 let (predicate, new_visible) =
                     build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
             JoinBinding::Natural(kind) => {
-                let left_view = visible
-                    .take()
-                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
+                let left_view = match visible.take() {
+                    Some(view) => view,
+                    None => default_visible(&bound.relations, 0, catalog)?,
+                };
                 let names = natural_join_names(&left_view, &right);
                 let (predicate, new_visible) =
                     build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
@@ -3511,27 +3526,37 @@ fn bind_table_with_joins(
 /// The plain visible view for a run of relations laid out from `base` in the
 /// combined row: every column as a `ColumnRef`, in order — exactly what
 /// unqualified resolution and `*` produce without any merged join columns.
-fn default_visible(relations: &[ScopeItem], base: usize) -> Vec<VisibleColumn> {
+pub(crate) fn default_visible(
+    relations: &[ScopeItem],
+    base: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<VisibleColumn>, BindError> {
     let mut out = Vec::new();
-    let mut index = base;
+    let mut offset = base;
     for rel in relations {
         // The merged view drives unqualified resolution and `*`, and a system
         // column belongs to neither: it never takes part in `USING`, and `*`
         // does not expand it.
-        for col in rel.declared() {
+        for (local, col) in rel.declared().iter().enumerate() {
             out.push(VisibleColumn {
                 name: col.name.clone(),
-                // Carry the column's declared collation, as unqualified
-                // resolution against `rels` does — this view shadows that path.
-                expr: crate::expr::with_column_collation(
-                    BoundExpr::ColumnRef { index, ty: col.ty },
-                    col.collation,
-                ),
+                // Through the same helper name resolution uses, so a virtual
+                // generated column substitutes its expression here too — this
+                // view *shadows* that path, and a `ColumnRef` would read the
+                // slot nothing is stored in. It also carries the column's
+                // declared collation, as the shadowed path does.
+                expr: crate::expr::column_value(
+                    &rel.columns,
+                    local,
+                    offset,
+                    &rel.qualifier,
+                    catalog,
+                )?,
             });
-            index += 1;
         }
+        offset += rel.columns.len();
     }
-    out
+    Ok(out)
 }
 
 /// The columns a `NATURAL` join equates: every name present in both the
@@ -3588,7 +3613,7 @@ fn build_merged_join(
     left_width: usize,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
-    let right_visible = default_visible(&right.relations, left_width);
+    let right_visible = default_visible(&right.relations, left_width, catalog)?;
     let mut predicate: Option<BoundExpr> = None;
     let mut merged_cols: Vec<VisibleColumn> = Vec::new();
 
@@ -4443,6 +4468,7 @@ fn bind_values_select(
             collation,
             strength,
             typmod: crate::expr::projection_typmod(expr, &bound, &scope),
+            generated: None,
         });
         row.push(bound);
     }
@@ -4590,7 +4616,7 @@ fn bind_target_list(items: &[ast::SelectItem], scope: &Scope) -> Result<Returnin
     for item in items {
         match classify_select_item(item)? {
             SelectField::Wildcard => {
-                for (col, expr) in scope.expand_wildcard() {
+                for (col, expr) in scope.expand_wildcard()? {
                     columns.push(col);
                     projections.push(expr);
                 }
@@ -4611,6 +4637,7 @@ fn bind_target_list(items: &[ast::SelectItem], scope: &Scope) -> Result<Returnin
                     collation,
                     strength,
                     typmod: crate::expr::projection_typmod(expr, &bound, scope),
+                    generated: None,
                 });
                 projections.push(bound);
             }
@@ -5630,6 +5657,23 @@ fn is_default_keyword(expr: &ast::Expr) -> bool {
     )
 }
 
+/// PostgreSQL's refusal for a statement writing a value into a generated
+/// column. `428C9`, with the same DETAIL for every verb; the message names what
+/// the statement could have written instead. Probed against 18.4.
+fn generated_column_write_error(column: &Column, verb: WriteVerb) -> BindError {
+    let message = match verb {
+        WriteVerb::Update => format!("column \"{}\" can only be updated to DEFAULT", column.name),
+        _ => format!(
+            "cannot insert a non-DEFAULT value into column \"{}\"",
+            column.name
+        ),
+    };
+    BindError::new("428C9", message).with_detail(Some(format!(
+        "Column \"{}\" is a generated column.",
+        column.name
+    )))
+}
+
 /// Reparse and bind a persisted default. Storing canonical SQL keeps the
 /// storage API independent of the parser/binder IR while still evaluating the
 /// expression for every inserted/updated row.
@@ -5643,19 +5687,8 @@ fn default_for_column(
             ty: column.ty,
         });
     };
-    let statements = crabgresql_parser::parse(&format!("SELECT {sql}"))
-        .map_err(|e| BindError::syntax(format!("invalid stored default expression: {e}")))?;
-    let expr = match statements.as_slice() {
-        [ast::Statement::Query(query)] => match query.body.as_ref() {
-            ast::SetExpr::Select(select) => match select.projection.as_slice() {
-                [ast::SelectItem::UnnamedExpr(expr)] => expr,
-                _ => return Err(BindError::syntax("invalid stored default expression")),
-            },
-            _ => return Err(BindError::syntax("invalid stored default expression")),
-        },
-        _ => return Err(BindError::syntax("invalid stored default expression")),
-    };
-    bind_column_default(expr, column, catalog)
+    let expr = crate::parse_stored_expr(sql, "default expression")?;
+    bind_column_default(&expr, column, catalog)
 }
 
 pub fn bind_insert(
@@ -5771,6 +5804,14 @@ pub fn bind_insert_with_params(
         let scope = Scope::empty(catalog, params);
         let mut projections = defaults.clone();
         for (i, &idx) in target_indices.iter().enumerate().take(src_cols.len()) {
+            // A query source has no way to spell DEFAULT, so any column it
+            // covers is a value the statement supplies.
+            if schema.columns[idx].generated.is_some() {
+                return Err(generated_column_write_error(
+                    &schema.columns[idx],
+                    WriteVerb::Insert,
+                ));
+            }
             let src_ref = BoundExpr::ColumnRef {
                 index: i,
                 ty: src_cols[i].ty,
@@ -5829,6 +5870,14 @@ pub fn bind_insert_with_params(
                 row[idx] = if is_default_keyword(expr) {
                     defaults[idx].clone()
                 } else {
+                    // `DEFAULT` is the one thing a generated column accepts —
+                    // and it means "compute it", which the executor does.
+                    if schema.columns[idx].generated.is_some() {
+                        return Err(generated_column_write_error(
+                            &schema.columns[idx],
+                            WriteVerb::Insert,
+                        ));
+                    }
                     let binding = bind_expr(expr, &scope)?;
                     if let Binding::Typed(expr) = &binding {
                         reject_agg_or_window(expr, "VALUES")?;
@@ -6208,9 +6257,12 @@ pub fn bind_copy_from(
         .map(|column| default_for_column(column, catalog))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Map the optional column list (empty = every column, in schema order).
+    // Map the optional column list. An absent one is every column a COPY may
+    // carry, which excludes the generated ones: their value is not something the
+    // data stream provides, and upstream leaves them out of the implicit list in
+    // both directions.
     let target_indices: Vec<usize> = if columns.is_empty() {
-        (0..schema.columns.len()).collect()
+        copy_all_columns(&schema)
     } else {
         let mut indices = Vec::with_capacity(columns.len());
         for ident in columns {
@@ -6227,6 +6279,7 @@ pub fn bind_copy_from(
                     format!("column \"{col}\" specified more than once"),
                 ));
             }
+            reject_generated_in_copy(&schema.columns[idx])?;
             indices.push(idx);
         }
         indices
@@ -6265,6 +6318,29 @@ pub fn bind_copy_from(
         routing,
         rows,
     })
+}
+
+/// The columns an unqualified `COPY` carries: every column but the generated
+/// ones, whose values are not part of the data stream in either direction.
+fn copy_all_columns(schema: &TableSchema) -> Vec<usize> {
+    (0..schema.columns.len())
+        .filter(|&i| schema.columns[i].generated.is_none())
+        .collect()
+}
+
+/// PostgreSQL's refusal for a generated column named in a `COPY` column list,
+/// `42P10` in both directions. Probed against 18.4.
+fn reject_generated_in_copy(column: &Column) -> Result<(), BindError> {
+    if column.generated.is_none() {
+        return Ok(());
+    }
+    Err(BindError::new(
+        "42P10",
+        format!("column \"{}\" is a generated column", column.name),
+    )
+    .with_detail(Some(
+        "Generated columns cannot be used in COPY.".to_string(),
+    )))
 }
 
 /// Split the column defaults into what every row starts from and what the
@@ -6604,6 +6680,14 @@ pub fn bind_update_with_params(
         let value = if is_default_keyword(&assignment.value) {
             default_for_column(&schema.columns[idx], catalog)?
         } else {
+            // `SET b = DEFAULT` is accepted above and means "recompute it"; any
+            // other value is the statement writing a generated column.
+            if schema.columns[idx].generated.is_some() {
+                return Err(generated_column_write_error(
+                    &schema.columns[idx],
+                    WriteVerb::Update,
+                ));
+            }
             let binding = bind_expr(&assignment.value, &scope)?;
             if let Binding::Typed(expr) = &binding {
                 reject_agg_or_window(expr, "UPDATE")?;
