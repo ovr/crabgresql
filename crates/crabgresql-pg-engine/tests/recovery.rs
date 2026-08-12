@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use crabgresql_pg_engine::{PgEngine, RelFileNode};
-use crabgresql_storage_api::{Column, ColumnProjection, TableAm, TableEngine, TableSchema, Tid};
+use crabgresql_storage_api::{
+    Column, ColumnProjection, IndexProbeKey, TableAm, TableEngine, TableSchema, Tid,
+};
 use crabgresql_txn::{Clog, CommandId, CommitSink, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal, recover};
@@ -512,7 +514,11 @@ fn seed_three_indexed(
 /// The visible `id`s an index probe for `key` returns, sorted.
 fn probe_ids(tm: &TransactionManager, table: &dyn TableAm, key: i32) -> Vec<i32> {
     let mut v: Vec<i32> = table
-        .index_lookup("t_id_idx", &[Value::Int4(key)], &read(tm))
+        .index_lookup(
+            "t_id_idx",
+            &IndexProbeKey::equality(&[Value::Int4(key)]),
+            &read(tm),
+        )
         .expect("index serves the probe")
         .map(|row| match row.expect("index probe failed").1[0] {
             Value::Int4(x) => x,
@@ -1884,7 +1890,11 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
     let table = engine.open_table("t")?;
 
     let probe: Vec<_> = table
-        .index_lookup("t_id_idx", &[Value::Int4(1)], &read(&tm))
+        .index_lookup(
+            "t_id_idx",
+            &IndexProbeKey::equality(&[Value::Int4(1)]),
+            &read(&tm),
+        )
         .expect("the index serves the probe")
         .collect();
     assert!(

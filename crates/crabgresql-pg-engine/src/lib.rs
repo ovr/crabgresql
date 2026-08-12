@@ -52,12 +52,11 @@ use crabgresql_parquet_engine::{
 };
 use crabgresql_storage_api::{
     BatchStream, CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe,
-    RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance, SequenceDefinition,
-    StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine, TableSchema, Tid,
-    Tuple, TupleStream, UpdateResult, ViewDefinition,
+    IndexProbeKey, RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance,
+    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult, ViewDefinition,
 };
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
-use crabgresql_types::Value;
 use crabgresql_wal::{
     CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint, ControlFile, Lsn, RmgrId, RmgrRedo,
     RmgrRegistry, Wal, read_control, recover, write_control,
@@ -241,7 +240,7 @@ impl TableAm for ManagedTable {
     fn index_lookup(
         &self,
         index_name: &str,
-        key: &[Value],
+        key: &IndexProbeKey<'_>,
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
         self.as_am().index_lookup(index_name, key, txn)
@@ -2665,14 +2664,23 @@ mod tests {
         }
 
         let key = |id: i32| {
-            crate::btkey::encode_values(&table.schema(), &[0], &[Value::Int4(id)])
-                .expect("an int4 key encodes")
+            let keys = [IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }];
+            let crate::btkey::Encoded::Bytes(bytes) =
+                crate::btkey::encode_prefix(&table.schema(), &keys, &[Value::Int4(id)])
+            else {
+                panic!("an int4 key encodes");
+            };
+            crate::nbtree::KeyRange::prefix(bytes)
         };
         // Positive control: without it, an assertion that the tree is empty would
         // also pass if the build had simply never indexed anything.
         assert!(
             !tree_of(&engine, "t", "t_id_idx")?
-                .search_equal(&key(1))
+                .search_range(&key(1))
                 .is_empty(),
             "the pre-truncate tree must hold the seeded keys"
         );
@@ -2684,7 +2692,7 @@ mod tests {
         let tree = tree_of(&engine, "t", "t_id_idx")?;
         for id in 1..=3 {
             assert!(
-                tree.search_equal(&key(id)).is_empty(),
+                tree.search_range(&key(id)).is_empty(),
                 "key {id} is still in the tree: the index was not swapped"
             );
         }

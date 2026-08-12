@@ -52,9 +52,9 @@ pub enum PhysicalPlan {
         sort: Vec<SortKey>,
         distinct: Option<Vec<DistinctKey>>,
     },
-    /// A single-table read served by an equality probe on `index_name`: the
-    /// executor evaluates each `key` value once and asks the engine for the
-    /// matching rows. The planner only emits this when the engine reports
+    /// A single-table read served by a probe on `index_name`: the executor
+    /// evaluates each `key` value once and asks the engine for the matching
+    /// rows. The planner only emits this when the engine reports
     /// [`TableAm::supports_index_scan`], but the executor still scan-fallbacks
     /// defensively. `predicate` is the residual WHERE the index did not consume,
     /// applied as a `Filter`; the standard Projection → Sort tail follows,
@@ -65,9 +65,9 @@ pub enum PhysicalPlan {
         /// `key` column: the executor's scan fallback re-checks the key per row.
         projection: ColumnProjection,
         index_name: String,
-        /// One `(key column, equality value)` pair per index key column, in key
-        /// order. The value expressions are row-constant and evaluated once.
-        key: Vec<(usize, BoundExpr)>,
+        /// What to search for. The value expressions are row-constant and
+        /// evaluated once.
+        key: IndexProbeSpec,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -218,7 +218,63 @@ pub struct DmlTarget {
     pub probe: Option<DmlIndexProbe>,
 }
 
-/// An equality index probe standing in for one DML target's sequential scan.
+/// One end of an index range: the column it bounds, the value, and whether the
+/// bound itself matches. Mirrors [`crabgresql_storage_api::IndexBound`], whose
+/// value the executor produces by evaluating `value` once.
+#[derive(Clone)]
+pub struct IndexBoundExpr {
+    pub column: usize,
+    pub value: BoundExpr,
+    pub inclusive: bool,
+}
+
+/// What an index probe searches for: leading key columns pinned by equality,
+/// plus optional bounds on the one column after them.
+///
+/// The shape follows what a B-tree can serve and what
+/// [`crabgresql_storage_api::IndexProbeKey`] accepts — `eq` need not cover every
+/// key column (an index on `(a, b)` probed by `a` alone narrows the scan just
+/// fine), and it may be empty when only the first key column is bounded.
+#[derive(Clone)]
+pub struct IndexProbeSpec {
+    /// One `(key column, equality value)` pair per pinned key column, in key
+    /// order, covering a *prefix* of the index's keys.
+    pub eq: Vec<(usize, BoundExpr)>,
+    /// Boxed because most probes have no bounds at all, and a `BoundExpr` held
+    /// inline twice over would widen every `PhysicalPlan` in the tree.
+    pub lower: Option<Box<IndexBoundExpr>>,
+    pub upper: Option<Box<IndexBoundExpr>>,
+}
+
+impl IndexProbeSpec {
+    /// Every column the probe reads, in key order — what a scan fallback has to
+    /// re-check per row, and so what the projection pass must keep.
+    pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
+        self.eq
+            .iter()
+            .map(|(column, _)| *column)
+            .chain(self.lower.iter().chain(&self.upper).map(|b| b.column))
+    }
+
+    /// Every value expression the probe evaluates, in the same order.
+    pub fn exprs(&self) -> impl Iterator<Item = &BoundExpr> + '_ {
+        self.eq
+            .iter()
+            .map(|(_, value)| value)
+            .chain(self.lower.iter().chain(&self.upper).map(|b| &b.value))
+    }
+
+    pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut BoundExpr> + '_ {
+        self.eq.iter_mut().map(|(_, value)| value).chain(
+            self.lower
+                .iter_mut()
+                .chain(&mut self.upper)
+                .map(|b| &mut b.value),
+        )
+    }
+}
+
+/// An index probe standing in for one DML target's sequential scan.
 ///
 /// Unlike [`PhysicalPlan::IndexScan`], a probe here does *not* consume the
 /// conjuncts it matched: the plan's `predicate` stays the whole `WHERE` and is
@@ -228,10 +284,9 @@ pub struct DmlTarget {
 /// independently, in its own column space.
 pub struct DmlIndexProbe {
     pub index_name: String,
-    /// One `(key column, equality value)` pair per index key column, in key
-    /// order. Columns are ordinals in the *target's* own schema, already
+    /// The columns are ordinals in the *target's* own schema, already
     /// translated through [`MappedRelation::map`] where one applies.
-    pub key: Vec<(usize, BoundExpr)>,
+    pub key: IndexProbeSpec,
     /// The conjuncts the key did *not* cover, for `EXPLAIN` only.
     ///
     /// The executor re-checks the whole `WHERE`, so this never drives execution;
@@ -946,27 +1001,21 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
 
 /// The access path chosen for a single-table read.
 enum AccessPath {
-    /// An equality index probe (see [`PhysicalPlan::IndexScan`]).
+    /// An index probe (see [`PhysicalPlan::IndexScan`]).
     Index {
         index_name: String,
-        /// One `(key column, equality value)` pair per index key column, in key
-        /// order.
-        key: Vec<(usize, BoundExpr)>,
+        key: IndexProbeSpec,
         residual: Option<BoundExpr>,
     },
     /// A full scan carrying the whole (unconsumed) predicate.
     Scan { predicate: Option<BoundExpr> },
 }
 
-/// Choose an access path for a `WHERE` predicate: an equality index probe when
-/// some index's every key column is pinned by an `col = <constant>` conjunct and
-/// probing it is estimated to cost less than reading the relation, else a full
-/// scan. See [`pick_index`] for how the two are compared.
-///
-/// TODO: serve range predicates (`<`, `>`, `BETWEEN`) from an index too; only
-/// equality conjuncts are considered here, and the storage API offers only an
-/// equality probe ([`TableAm::index_lookup`]). The estimate a range path needs
-/// is already written and tested — [`cost::range_selectivity`].
+/// Choose an access path for a `WHERE` predicate: an index probe when some
+/// index's leading key columns are pinned by `col = <constant>` conjuncts —
+/// optionally with `<`/`>` bounds on the column after them — and probing it is
+/// estimated to cost less than reading the relation, else a full scan. See
+/// [`pick_index`] for how the two are compared.
 fn choose_access(
     table: &Arc<dyn TableAm>,
     predicate: Option<BoundExpr>,
@@ -985,9 +1034,9 @@ fn choose_access(
     // Flatten the AND-tree and classify each conjunct once.
     let mut conjuncts = Vec::new();
     flatten_and(predicate, &mut conjuncts);
-    let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
+    let quals: Vec<Option<KeyQual>> = conjuncts.iter().map(as_key_qual).collect();
 
-    let Some((probe, consumed)) = pick_index(table, &indexes, &eqs, costs) else {
+    let Some((probe, consumed)) = pick_index(table, &indexes, &quals, costs) else {
         return AccessPath::Scan {
             predicate: rebuild_and(conjuncts),
         };
@@ -1008,14 +1057,13 @@ fn choose_access(
 /// Pick the index to probe for a set of already-classified conjuncts, returning
 /// the probe and a per-conjunct flag saying which conjuncts the key consumed.
 ///
-/// Every index whose key columns are fully pinned by equality conjuncts, and
-/// which the engine can physically scan, is costed against a sequential scan of
-/// the relation ([`cost`]); the cheapest wins, and `None` means the scan did.
-/// That is PostgreSQL's rule, and it is what keeps a probe of a two-page table —
-/// where four random pages cost more than reading everything — from being chosen
-/// just because an index exists. Ties break structurally, PRIMARY KEY then
-/// UNIQUE then the rest, so the choice is deterministic when the estimates
-/// cannot separate two indexes.
+/// Every index [`cover_index`] can narrow, and which the engine can physically
+/// scan, is costed against a sequential scan of the relation ([`cost`]); the
+/// cheapest wins, and `None` means the scan did. That is PostgreSQL's rule, and
+/// it is what keeps a probe of a two-page table — where four random pages cost
+/// more than reading everything — from being chosen just because an index
+/// exists. Ties break structurally, PRIMARY KEY then UNIQUE then the rest, so
+/// the choice is deterministic when the estimates cannot separate two indexes.
 ///
 /// Shared by the read path ([`choose_access`], which turns the unconsumed
 /// conjuncts into a residual filter the scan applies) and the DML path
@@ -1028,21 +1076,21 @@ fn choose_access(
 fn pick_index(
     table: &Arc<dyn TableAm>,
     indexes: &[IndexMetadata],
-    eqs: &[Option<(usize, BoundExpr)>],
+    quals: &[Option<KeyQual>],
     costs: cost::CostSettings,
 ) -> Option<(DmlIndexProbe, Vec<bool>)> {
     // Which indexes are even in the running, in tie-break order. Settled before
     // anything is measured: asking for statistics reads the relation's file
     // length, and every planned statement — including one against a relation
     // with no index at all — would otherwise pay for it.
-    let candidates: Vec<(&IndexMetadata, Vec<(usize, usize)>)> = [
+    let candidates: Vec<(&IndexMetadata, IndexCover)> = [
         Some(IndexConstraint::PrimaryKey),
         Some(IndexConstraint::Unique),
         None,
     ]
     .into_iter()
     .flat_map(|pref| indexes.iter().filter(move |i| i.constraint == pref))
-    .filter_map(|index| Some((index, cover_index(index, eqs)?)))
+    .filter_map(|index| Some((index, cover_index(index, quals)?)))
     // Only route to an index scan the engine can physically serve; otherwise
     // `EXPLAIN` would advertise an index scan that silently degrades to a
     // sequential scan at execution time.
@@ -1058,22 +1106,50 @@ fn pick_index(
     // Conjuncts the scan would have to evaluate per row. The index path's
     // residual is never larger, and the difference is one CPU term either way;
     // charging both sides the same keeps the comparison about the I/O.
-    let nquals = eqs.len();
+    let nquals = quals.len();
     let mut best: Option<(f64, DmlIndexProbe, Vec<bool>)> = None;
     for (index, chosen) in candidates {
-        let mut key = Vec::with_capacity(chosen.len());
-        let mut consumed = vec![false; eqs.len()];
+        let mut consumed = vec![false; quals.len()];
+        let mut key = IndexProbeSpec {
+            eq: Vec::with_capacity(chosen.eq.len()),
+            lower: None,
+            upper: None,
+        };
         // Independent per-column selectivities multiply, as in PG's
         // `clauselist_selectivity`.
         let mut selectivity = 1.0;
-        for (column, conjunct) in chosen {
-            // `cover_index` only ever returns conjuncts classified as an
-            // equality key, so `eqs[conjunct]` is always `Some`.
-            if let Some((_, value)) = &eqs[conjunct] {
+        for (column, conjunct) in chosen.eq {
+            // `cover_index` only returns conjuncts it classified as this role,
+            // so the match always binds.
+            if let Some(KeyQual::Eq { value, .. }) = &quals[conjunct] {
                 selectivity *= key_selectivity(&schema, &stats, column, value, size.rows);
-                key.push((column, value.clone()));
+                key.eq.push((column, value.clone()));
                 consumed[conjunct] = true;
             }
+        }
+        if let Some(bounded) = chosen.bounded {
+            let mut ends = [None, None];
+            for (slot, conjunct) in [bounded.lower, bounded.upper].into_iter().enumerate() {
+                if let Some(conjunct) = conjunct
+                    && let Some(KeyQual::Bound {
+                        column,
+                        value,
+                        inclusive,
+                        ..
+                    }) = &quals[conjunct]
+                {
+                    ends[slot] = Some(Box::new(IndexBoundExpr {
+                        column: *column,
+                        value: value.clone(),
+                        inclusive: *inclusive,
+                    }));
+                    consumed[conjunct] = true;
+                }
+            }
+            let [lower, upper] = ends;
+            selectivity *= bound_selectivity(&schema, &stats, bounded.column, &lower, &upper);
+            key.lower = lower;
+            key.upper = upper;
         }
         let total = cost::index_scan_cost(
             costs,
@@ -1100,6 +1176,39 @@ fn pick_index(
     }
     let (total, probe, consumed) = best?;
     (total < cost::seq_scan_cost(costs, size, nquals)).then_some((probe, consumed))
+}
+
+/// The fraction of the relation the bounded key column keeps.
+///
+/// Feeds [`cost::range_selectivity`] the same literal-or-nothing the equality
+/// side uses ([`const_of`]): a bound whose value is only known at execution time
+/// gets the estimator's default, which is what PostgreSQL does too.
+fn bound_selectivity(
+    schema: &TableSchema,
+    stats: &RelStats,
+    column: usize,
+    lower: &Option<Box<IndexBoundExpr>>,
+    upper: &Option<Box<IndexBoundExpr>>,
+) -> f64 {
+    let Some(meta) = schema.columns.get(column) else {
+        return 1.0;
+    };
+    // A bound whose value is not a literal still *is* a bound — dropping it
+    // would estimate an unbounded side and make the index look worse than it is.
+    // It is passed as a NULL instead, which no column's statistics describe, so
+    // the estimator falls back to its default for that side.
+    fn end(bound: &Option<Box<IndexBoundExpr>>) -> Option<(&Value, bool)> {
+        bound
+            .as_ref()
+            .map(|b| (const_of(&b.value).unwrap_or(&Value::Null), b.inclusive))
+    }
+    cost::range_selectivity(
+        stats.columns.get(column),
+        meta.ty,
+        meta.collation.unwrap_or(DEFAULT_COLLATION_OID),
+        end(lower),
+        end(upper),
+    )
 }
 
 /// The fraction of the relation one `col = <value>` key column keeps.
@@ -1198,14 +1307,14 @@ fn dml_targets(
     Vec<DmlTarget>,
     Option<DmlIndexProbe>,
 ) {
-    let eqs = predicate.as_ref().map(|predicate| {
+    let quals = predicate.as_ref().map(|predicate| {
         let mut conjuncts = Vec::new();
         flatten_and(predicate.clone(), &mut conjuncts);
-        let eqs: Vec<Option<(usize, BoundExpr)>> = conjuncts.iter().map(as_eq_key).collect();
-        (conjuncts, eqs)
+        let quals: Vec<Option<KeyQual>> = conjuncts.iter().map(as_key_qual).collect();
+        (conjuncts, quals)
     });
     let probe_for = |target: &Arc<dyn TableAm>, map: &Option<Arc<[usize]>>| {
-        let (conjuncts, eqs) = eqs.as_ref()?;
+        let (conjuncts, quals) = quals.as_ref()?;
         if keep.is_some_and(|keep| !keep(target, map)) {
             return None;
         }
@@ -1213,14 +1322,11 @@ fn dml_targets(
         // invariant the executor's `view` rests on — so only the key columns are
         // translated into the target's own. A conjunct whose column the map does
         // not cover simply stops being an index candidate.
-        let translated: Vec<Option<(usize, BoundExpr)>> = match map {
-            None => eqs.clone(),
-            Some(map) => eqs
+        let translated: Vec<Option<KeyQual>> = match map {
+            None => quals.to_vec(),
+            Some(map) => quals
                 .iter()
-                .map(|eq| {
-                    let (column, value) = eq.as_ref()?;
-                    Some((*map.get(*column)?, value.clone()))
-                })
+                .map(|qual| qual.as_ref()?.remapped(|column| map.get(column).copied()))
                 .collect(),
         };
         let (mut probe, consumed) = pick_index(target, &target.indexes(), &translated, costs)?;
@@ -1311,32 +1417,120 @@ pub fn map_assigned_columns(
         .collect()
 }
 
-/// Match each of `index`'s key columns to a distinct equality conjunct, or
-/// `None` if any key column has no `= <constant>` conjunct. Returns the
-/// `(key column, conjunct index)` pairs in key order.
-fn cover_index(
-    index: &IndexMetadata,
-    eqs: &[Option<(usize, BoundExpr)>],
-) -> Option<Vec<(usize, usize)>> {
-    let mut used = vec![false; eqs.len()];
-    let mut chosen = Vec::with_capacity(index.keys.len());
-    for key in &index.keys {
-        let conjunct = eqs.iter().enumerate().position(|(i, eq)| {
-            !used[i] && matches!(eq, Some((column, _)) if *column == key.column)
-        })?;
-        used[conjunct] = true;
-        chosen.push((key.column, conjunct));
-    }
-    Some(chosen)
+/// Which conjuncts an index's keys can consume: the equality-pinned leading key
+/// columns, then at most one bounded column after them.
+struct IndexCover {
+    /// `(key column, conjunct index)` per pinned column, in key order.
+    eq: Vec<(usize, usize)>,
+    bounded: Option<BoundedColumn>,
 }
 
-/// A conjunct of the form `col = <constant>` (either operand order), returning
-/// the column index and the constant value expression. The column side must be
-/// a bare [`BoundExpr::ColumnRef`] — a `Coerce` around it means the comparison
-/// runs at a different type than the index key, so it is not an index match.
-fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
+/// The one key column a probe may bound, and the conjuncts bounding it.
+struct BoundedColumn {
+    column: usize,
+    lower: Option<usize>,
+    upper: Option<usize>,
+}
+
+/// Match `index`'s key columns against the classified conjuncts, left to right:
+/// equalities for as long as they last, then bounds on the first key column no
+/// equality pinned. `None` when nothing matched — such an index would scan the
+/// whole key space and narrow nothing.
+///
+/// Stopping at the first unpinned column is not a simplification, it is what an
+/// index *is*: keys are ordered left to right, so a predicate on `b` alone says
+/// nothing about where in an `(a, b)` index its rows are. That is also why only
+/// one column can be bounded — `a > 1 AND b > 2` selects a contiguous stretch
+/// only in `a`, and the `b` test stays a residual filter.
+fn cover_index(index: &IndexMetadata, quals: &[Option<KeyQual>]) -> Option<IndexCover> {
+    let mut used = vec![false; quals.len()];
+    let mut cover = IndexCover {
+        eq: Vec::with_capacity(index.keys.len()),
+        bounded: None,
+    };
+    for key in &index.keys {
+        let equality = quals.iter().enumerate().position(|(i, qual)| {
+            !used[i] && matches!(qual, Some(KeyQual::Eq { column, .. }) if *column == key.column)
+        });
+        if let Some(conjunct) = equality {
+            used[conjunct] = true;
+            cover.eq.push((key.column, conjunct));
+            continue;
+        }
+        // No equality on this column: it may still be bounded, and then the key
+        // stops there either way.
+        let end = |want: BoundSide| {
+            quals.iter().position(|qual| {
+                matches!(qual, Some(KeyQual::Bound { column, side, .. })
+                    if *column == key.column && *side == want)
+            })
+        };
+        let (lower, upper) = (end(BoundSide::Lower), end(BoundSide::Upper));
+        if lower.is_some() || upper.is_some() {
+            cover.bounded = Some(BoundedColumn {
+                column: key.column,
+                lower,
+                upper,
+            });
+        }
+        break;
+    }
+    (!cover.eq.is_empty() || cover.bounded.is_some()).then_some(cover)
+}
+
+/// Which end of a range a bound is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundSide {
+    Lower,
+    Upper,
+}
+
+/// A conjunct an index key can consume: one column compared against a
+/// row-constant value.
+#[derive(Clone)]
+enum KeyQual {
+    Eq {
+        column: usize,
+        value: BoundExpr,
+    },
+    Bound {
+        column: usize,
+        side: BoundSide,
+        inclusive: bool,
+        value: BoundExpr,
+    },
+}
+
+impl KeyQual {
+    /// The same qualification about a different column ordinal — the
+    /// translation one DML target needs to read a predicate written in the named
+    /// relation's column space. `None` from `map` (a column the target does not
+    /// have) drops the qualification rather than guessing an ordinal.
+    fn remapped(&self, map: impl Fn(usize) -> Option<usize>) -> Option<KeyQual> {
+        let mut out = self.clone();
+        match &mut out {
+            KeyQual::Eq { column, .. } | KeyQual::Bound { column, .. } => *column = map(*column)?,
+        }
+        Some(out)
+    }
+}
+
+/// Classify a conjunct of the form `col <op> <constant>` (either operand order).
+///
+/// The column side must be a bare [`BoundExpr::ColumnRef`] — a `Coerce` around
+/// it means the comparison runs at a different type than the index key, so it is
+/// not an index match.
+///
+/// An ordering comparison additionally has to agree with the order the index is
+/// built in, which is byte order: under an ICU collation `'a' < 'B'` while the
+/// bytes say otherwise, so a text range under one would select the wrong stretch
+/// of the index. Equality is exempt — every supported collation is
+/// deterministic, so two strings are equal under it exactly when their bytes
+/// are — and that exemption is the reason [`strip_collate`] applies to `=` only.
+fn as_key_qual(conjunct: &BoundExpr) -> Option<KeyQual> {
     let BoundExpr::Binary {
-        op: BinOp::Eq,
+        op,
+        collation,
         left,
         right,
         ..
@@ -1344,14 +1538,62 @@ fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
     else {
         return None;
     };
-    match (strip_collate(left), strip_collate(right)) {
+    if *op == BinOp::Eq {
+        return match (strip_collate(left), strip_collate(right)) {
+            (BoundExpr::ColumnRef { index, .. }, value) if is_row_constant(value) => {
+                Some(KeyQual::Eq {
+                    column: *index,
+                    value: value.clone(),
+                })
+            }
+            (value, BoundExpr::ColumnRef { index, .. }) if is_row_constant(value) => {
+                Some(KeyQual::Eq {
+                    column: *index,
+                    value: value.clone(),
+                })
+            }
+            _ => None,
+        };
+    }
+    // `collation` is the collation the binder resolved for this comparison, so
+    // one check covers both an explicit `COLLATE` and the column's own.
+    if !crabgresql_types::collation::is_byte_order(*collation) {
+        return None;
+    }
+    // Reading the comparison with the column on the left: flipping the operands
+    // flips which end of the range the constant bounds.
+    let (column, value, op) = match (&**left, &**right) {
         (BoundExpr::ColumnRef { index, .. }, value) if is_row_constant(value) => {
-            Some((*index, value.clone()))
+            (*index, value, *op)
         }
         (value, BoundExpr::ColumnRef { index, .. }) if is_row_constant(value) => {
-            Some((*index, value.clone()))
+            (*index, value, flip_comparison(*op))
         }
-        _ => None,
+        _ => return None,
+    };
+    let (side, inclusive) = match op {
+        BinOp::Gt => (BoundSide::Lower, false),
+        BinOp::GtEq => (BoundSide::Lower, true),
+        BinOp::Lt => (BoundSide::Upper, false),
+        BinOp::LtEq => (BoundSide::Upper, true),
+        _ => return None,
+    };
+    Some(KeyQual::Bound {
+        column,
+        side,
+        inclusive,
+        value: value.clone(),
+    })
+}
+
+/// The comparison that means the same with its operands swapped.
+fn flip_comparison(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::LtEq => BinOp::GtEq,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::GtEq => BinOp::LtEq,
+        other => other,
     }
 }
 
@@ -1359,8 +1601,8 @@ fn as_eq_key(conjunct: &BoundExpr) -> Option<(usize, BoundExpr)> {
 ///
 /// Safe for an *equality* index probe specifically: every supported collation is
 /// deterministic, so two values are equal under a collation exactly when their
-/// bytes are equal — which is the order the index is built in. A collation would
-/// matter for a range probe, but those are not index-served.
+/// bytes are equal — which is the order the index is built in. A range probe
+/// must not use this; see the collation check in [`as_key_qual`].
 fn strip_collate(expr: &BoundExpr) -> &BoundExpr {
     match expr {
         BoundExpr::Collate { expr, .. } => strip_collate(expr),
@@ -1626,25 +1868,40 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
 fn index_scan_lines(
     table: &Arc<dyn TableAm>,
     index_name: &str,
-    key: &[(usize, BoundExpr)],
+    key: &IndexProbeSpec,
     predicate: Option<&BoundExpr>,
     names: &[Option<String>],
 ) -> Vec<String> {
     let schema = table.schema();
 
     let mut lines = vec![format!("Index Scan using {index_name} on {}", schema.name)];
-    let cond = key
+    let column = |column: usize| schema.columns[column].name.clone();
+    let bound = |b: &IndexBoundExpr, op: &str, eq: &str| {
+        let op = if b.inclusive { eq } else { op };
+        format!(
+            "{} {op} {}",
+            column(b.column),
+            explain_expr(&b.value, names)
+        )
+    };
+    let conds: Vec<String> = key
+        .eq
         .iter()
-        .map(|(column, value)| {
-            format!(
-                "{} = {}",
-                schema.columns[*column].name,
-                explain_expr(value, names)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(") AND (");
-    lines.push(format!("  Index Cond: ({cond})"));
+        .map(|(c, value)| format!("{} = {}", column(*c), explain_expr(value, names)))
+        // PG prints the bounds after the equality keys, in that order, which is
+        // also index-key order: the bounded column follows the pinned ones, and
+        // its lower bound precedes its upper.
+        .chain(key.lower.iter().map(|b| bound(b, ">", ">=")))
+        .chain(key.upper.iter().map(|b| bound(b, "<", "<=")))
+        .collect();
+    // One condition prints bare inside its own parentheses, several are
+    // parenthesized individually *and* as a whole — `((a = 1) AND (b > 5))`,
+    // matching what PG 18.4 prints for the same index and predicate.
+    let cond = conds.join(") AND (");
+    lines.push(match conds.len() {
+        1 => format!("  Index Cond: ({cond})"),
+        _ => format!("  Index Cond: (({cond}))"),
+    });
     if let Some(predicate) = predicate {
         lines.push(format!("  Filter: ({})", explain_expr(predicate, names)));
     }
@@ -2047,8 +2304,8 @@ mod tests {
     use crabgresql_binder::{BinOp, bind_delete, bind_insert, bind_query, bind_update};
     use crabgresql_parser::ast;
     use crabgresql_storage_api::{
-        Column, DeleteResult, EmptyTypeCatalog, IndexKey, IndexMethod, StorageError, TableEngine,
-        TableSchema, Tid, Tuple, TupleStream, TypeCatalog, UpdateResult,
+        ColStats, Column, DeleteResult, EmptyTypeCatalog, IndexKey, IndexMethod, StorageError,
+        TableEngine, TableSchema, Tid, Tuple, TupleStream, TypeCatalog, UpdateResult,
     };
     use crabgresql_txn::TxnContext;
     use crabgresql_types::{PgType, Value};
@@ -2079,6 +2336,11 @@ mod tests {
     struct MetaTable {
         schema: Arc<TableSchema>,
         indexes: Mutex<Vec<IndexMetadata>>,
+        /// What `ANALYZE` would have measured. Left at "nothing known" unless a
+        /// test sets it: the cost model's answer for an unmeasured relation is
+        /// itself worth asserting, and every plan choice that does not depend on
+        /// size should be made without one.
+        stats: Mutex<Option<RelStats>>,
     }
 
     impl TableAm for MetaTable {
@@ -2090,6 +2352,12 @@ mod tests {
         }
         fn supports_index_scan(&self, _index_name: &str) -> bool {
             true
+        }
+        fn statistics(&self) -> RelStats {
+            match self.stats.lock().expect("mutex").clone() {
+                Some(stats) => stats,
+                None => RelStats::unknown(&self.schema),
+            }
         }
         fn scan(&self, _txn: &TxnContext, _projection: &ColumnProjection) -> TupleStream {
             unimplemented!("planner tests never scan")
@@ -2118,6 +2386,7 @@ mod tests {
             let table = Arc::new(MetaTable {
                 schema: Arc::new(schema.clone()),
                 indexes: Mutex::new(Vec::new()),
+                stats: Mutex::new(None),
             });
             self.tables
                 .lock()
@@ -2164,13 +2433,39 @@ mod tests {
     /// Plan `sql` against table `t(id int4, big int8, name text)`, optionally
     /// registering an index (name + `IndexMetadata`) first.
     fn plan_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> PhysicalPlan {
-        plan(bind_sql_indexed(sql, index), cost::CostSettings::default())
+        plan_sql_analyzed(sql, index, None)
+    }
+
+    /// As [`plan_sql_indexed`], with `t`'s statistics as `ANALYZE` would have
+    /// left them. Needed wherever the choice is a cost comparison rather than a
+    /// structural one: an unmeasured relation is assumed small, and reading a
+    /// third of a small table is cheaper through a sequential scan.
+    fn plan_sql_analyzed(
+        sql: &str,
+        index: Option<IndexMetadata>,
+        stats: Option<RelStats>,
+    ) -> PhysicalPlan {
+        plan(
+            bind_sql_analyzed(sql, index, stats),
+            cost::CostSettings::default(),
+        )
     }
 
     /// [`plan_sql_indexed`] stopping at the bound plan, for a test that wants to
     /// rewrite it before planning.
     fn bind_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> LogicalPlan {
-        let engine: Arc<dyn TableEngine> = Arc::new(MetaEngine::default());
+        bind_sql_analyzed(sql, index, None)
+    }
+
+    /// The bound plan, with `t`'s statistics set. The plan holds the table by
+    /// `Arc`, so statistics recorded here are the ones the planner reads.
+    fn bind_sql_analyzed(
+        sql: &str,
+        index: Option<IndexMetadata>,
+        stats: Option<RelStats>,
+    ) -> LogicalPlan {
+        let meta = Arc::new(MetaEngine::default());
+        let engine: Arc<dyn TableEngine> = Arc::clone(&meta) as Arc<dyn TableEngine>;
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
         if let Err(error) = engine.create_table(TableSchema::in_namespace(
             "t",
@@ -2187,6 +2482,11 @@ mod tests {
             && let Err(error) = engine.create_index("public", "t", index)
         {
             panic!("failed to create planner test index: {error}");
+        }
+        if let Some(stats) = stats {
+            let tables = meta.tables.lock().expect("mutex");
+            let table = tables.get("t").expect("the test table exists");
+            *table.stats.lock().expect("mutex") = Some(stats);
         }
         let stmts = match crabgresql_parser::parse(sql) {
             Ok(stmts) => stmts,
@@ -3060,18 +3360,34 @@ mod tests {
             panic!("expected IndexScan");
         };
         assert_eq!(index_name, "t_pkey");
-        assert_eq!(
-            key,
-            vec![(
-                0,
-                BoundExpr::Const {
-                    value: Value::Int4(1),
-                    ty: PgType::Int4
-                }
-            )]
-        );
+        assert_eq!(eq_key(&key), vec![(0, Value::Int4(1))]);
+        assert!(key.lower.is_none() && key.upper.is_none());
         // The equality conjunct is fully consumed by the index.
         assert!(predicate.is_none());
+    }
+
+    /// A probe's equality keys as `(column, literal)`, for tests that care about
+    /// which conjunct the index consumed rather than how it is spelled.
+    fn eq_key(key: &IndexProbeSpec) -> Vec<(usize, Value)> {
+        key.eq
+            .iter()
+            .map(|(column, value)| match value {
+                BoundExpr::Const { value, .. } => (*column, value.clone()),
+                other => panic!("expected a literal key value, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A probe's bounds as `(column, inclusive, literal)`, lower then upper.
+    fn bounds(key: &IndexProbeSpec) -> Vec<(usize, bool, Value)> {
+        key.lower
+            .iter()
+            .chain(&key.upper)
+            .map(|b| match &b.value {
+                BoundExpr::Const { value, .. } => (b.column, b.inclusive, value.clone()),
+                other => panic!("expected a literal bound value, got {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -3083,8 +3399,7 @@ mod tests {
         let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
             panic!("expected IndexScan");
         };
-        assert_eq!(key.len(), 1);
-        assert_eq!(key[0].0, 0);
+        assert_eq!(eq_key(&key), vec![(0, Value::Int4(1))]);
         // `name = 'x'` is not on the index key, so it remains a runtime filter.
         let Some(BoundExpr::Binary {
             op: BinOp::Eq,
@@ -3108,8 +3423,7 @@ mod tests {
         let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
             panic!("expected IndexScan");
         };
-        assert_eq!(key.len(), 1);
-        assert_eq!(key[0].0, 0);
+        assert_eq!(eq_key(&key), vec![(0, Value::Int4(1))]);
         // What is left of the OR is not an index key, so it filters at runtime.
         assert!(
             matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Or, .. })),
@@ -3137,13 +3451,192 @@ mod tests {
         );
     }
 
+    /// `t` as `ANALYZE` would leave it after 100k rows of `id` running 1..=100000
+    /// in physical order: big enough, and correlated enough, for a narrow range
+    /// through the index to beat reading everything.
+    fn analyzed_ids() -> RelStats {
+        let histogram = (0..=10)
+            .map(|bucket| Value::Int4(bucket * 10_000))
+            .collect();
+        let id = ColStats {
+            null_frac: 0.0,
+            avg_width: 4,
+            n_distinct: -1.0,
+            mcv: Vec::new(),
+            histogram,
+            correlation: 1.0,
+        };
+        let blank = ColStats {
+            null_frac: 0.0,
+            avg_width: 8,
+            n_distinct: 0.0,
+            mcv: Vec::new(),
+            histogram: Vec::new(),
+            correlation: 0.0,
+        };
+        RelStats {
+            relpages: 1_000,
+            reltuples: 100_000.0,
+            analyzed: true,
+            curpages: Some(1_000),
+            columns: Arc::from([id, blank.clone(), blank]),
+        }
+    }
+
     #[test]
-    fn range_on_pk_stays_seq_scan() {
-        // Equality only: `choose_access` classifies equality conjuncts alone, so
-        // a range falls back to a sequential scan even on this B-tree index —
-        // see its TODO on serving ranges from an index.
-        let plan = plan_sql_indexed("SELECT * FROM t WHERE id > 1", Some(pk_on_id()));
+    fn a_narrow_range_on_the_pk_becomes_an_index_scan() {
+        for (sql, want) in [
+            (
+                "SELECT * FROM t WHERE id > 99000",
+                vec![(0, false, Value::Int4(99000))],
+            ),
+            (
+                "SELECT * FROM t WHERE id >= 99000",
+                vec![(0, true, Value::Int4(99000))],
+            ),
+            (
+                "SELECT * FROM t WHERE id BETWEEN 1 AND 9",
+                vec![(0, true, Value::Int4(1)), (0, true, Value::Int4(9))],
+            ),
+        ] {
+            let plan = plan_sql_analyzed(sql, Some(pk_on_id()), Some(analyzed_ids()));
+            let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+                panic!("expected IndexScan for {sql}");
+            };
+            assert!(key.eq.is_empty(), "{sql} pins no column by equality");
+            assert_eq!(bounds(&key), want, "{sql}");
+            assert!(predicate.is_none(), "{sql} leaves no residual");
+        }
+    }
+
+    /// An index on `name`, the text column — where a range has to answer to the
+    /// collation.
+    fn index_on_name() -> IndexMetadata {
+        IndexMetadata {
+            name: "t_name_idx".into(),
+            keys: vec![IndexKey {
+                column: 2,
+                descending: false,
+                nulls_first: false,
+            }],
+            unique: false,
+            constraint: None,
+            ..pk_on_id()
+        }
+    }
+
+    /// `t` analyzed with `name` running `'a'..'z'`, so a narrow text range would
+    /// be worth an index scan if the collation allowed one.
+    fn analyzed_names() -> RelStats {
+        let mut stats = analyzed_ids();
+        let name = ColStats {
+            null_frac: 0.0,
+            avg_width: 4,
+            n_distinct: -1.0,
+            histogram: ["a", "f", "k", "p", "u", "z"]
+                .iter()
+                .map(|s| Value::Text((*s).to_string()))
+                .collect(),
+            mcv: Vec::new(),
+            correlation: 1.0,
+        };
+        let columns: Vec<ColStats> = stats
+            .columns
+            .iter()
+            .take(2)
+            .cloned()
+            .chain([name])
+            .collect();
+        stats.columns = Arc::from(columns);
+        stats
+    }
+
+    #[test]
+    fn a_text_range_is_index_served_only_under_a_byte_order_collation() {
+        // The index stores raw bytes, so its order *is* byte order. Under `C`
+        // that is also the comparison's order and the range is exact; under an
+        // ICU collation the two disagree (`'a' < 'B'` by the locale, not by the
+        // bytes), so the stretch of the index between the bounds is not the set
+        // of rows the predicate selects. Equality is unaffected either way —
+        // every supported collation is deterministic.
+        let served = |sql: &str| {
+            matches!(
+                plan_sql_analyzed(sql, Some(index_on_name()), Some(analyzed_names())),
+                PhysicalPlan::IndexScan { .. }
+            )
+        };
+        assert!(served("SELECT * FROM t WHERE name > 'y'"));
+        assert!(served("SELECT * FROM t WHERE name > 'y' COLLATE \"C\""));
+        assert!(
+            !served("SELECT * FROM t WHERE name > 'y' COLLATE \"unicode\""),
+            "an ICU-collated range must not be served from a byte-ordered index"
+        );
+        // …while the same collation on an equality is still probed.
+        assert!(served(
+            "SELECT * FROM t WHERE name = 'y' COLLATE \"unicode\""
+        ));
+    }
+
+    /// The `Index Cond` spellings, as PostgreSQL 18.4 prints them for the same
+    /// index and predicates: one condition bare inside its parentheses, several
+    /// parenthesized individually and as a whole, bounds after the equality keys
+    /// with the lower one first.
+    #[test]
+    fn explain_renders_range_index_conds_the_way_pg_does() {
+        let cond = |sql: &str| {
+            let plan = plan_sql_analyzed(sql, Some(pk_on_id()), Some(analyzed_ids()));
+            explain(&plan)
+                .into_iter()
+                .find(|line| line.starts_with("  Index Cond:"))
+                .unwrap_or_else(|| panic!("no Index Cond for {sql}"))
+        };
+        assert_eq!(
+            cond("SELECT * FROM t WHERE id = 1"),
+            "  Index Cond: (id = 1)"
+        );
+        assert_eq!(
+            cond("SELECT * FROM t WHERE id > 99000"),
+            "  Index Cond: (id > 99000)"
+        );
+        assert_eq!(
+            cond("SELECT * FROM t WHERE id >= 99000"),
+            "  Index Cond: (id >= 99000)"
+        );
+        assert_eq!(
+            cond("SELECT * FROM t WHERE id BETWEEN 1 AND 9"),
+            "  Index Cond: ((id >= 1) AND (id <= 9))"
+        );
+    }
+
+    #[test]
+    fn a_wide_range_stays_a_seq_scan() {
+        // Two thirds of the relation: reading it all sequentially beats fetching
+        // that many pages at random, index or no index. The cost model decides
+        // this, not the shape of the predicate — which is the whole reason a
+        // range path had to be costed rather than always taken.
+        let plan = plan_sql_analyzed(
+            "SELECT * FROM t WHERE id > 33000",
+            Some(pk_on_id()),
+            Some(analyzed_ids()),
+        );
         assert!(matches!(plan, PhysicalPlan::Select { .. }));
+    }
+
+    #[test]
+    fn a_reversed_range_bounds_the_same_end() {
+        // `99000 < id` is `id > 99000`: the constant on the left flips which end
+        // of the range it bounds, and reading it the other way would select
+        // everything below the bound instead of above it.
+        let plan = plan_sql_analyzed(
+            "SELECT * FROM t WHERE 99000 < id",
+            Some(pk_on_id()),
+            Some(analyzed_ids()),
+        );
+        let PhysicalPlan::IndexScan { key, .. } = plan else {
+            panic!("expected IndexScan");
+        };
+        assert!(key.upper.is_none(), "`99000 < id` is a lower bound");
+        assert_eq!(bounds(&key), vec![(0, false, Value::Int4(99000))]);
     }
 
     #[test]
@@ -3171,16 +3664,7 @@ mod tests {
                 panic!("expected a probe for {sql}");
             };
             assert_eq!(probe.index_name, "t_pkey");
-            assert_eq!(
-                probe.key,
-                vec![(
-                    0,
-                    BoundExpr::Const {
-                        value: Value::Int4(1),
-                        ty: PgType::Int4
-                    }
-                )]
-            );
+            assert_eq!(eq_key(&probe.key), vec![(0, Value::Int4(1))]);
         }
     }
 
@@ -3225,7 +3709,6 @@ mod tests {
         for (sql, index) in [
             ("UPDATE t SET big = 1 WHERE id = 1", None),
             ("DELETE FROM t WHERE name = 'x'", Some(pk_on_id())),
-            ("DELETE FROM t WHERE id > 1", Some(pk_on_id())),
             ("DELETE FROM t", Some(pk_on_id())),
         ] {
             let plan = plan_sql_indexed(sql, index);

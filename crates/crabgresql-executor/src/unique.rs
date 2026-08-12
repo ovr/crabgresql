@@ -26,7 +26,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crabgresql_storage_api::{
-    ColumnProjection, IndexMetadata, StorageError, TableAm, TableSchema, Tid, Tuple,
+    ColumnProjection, IndexMetadata, IndexProbeKey, StorageError, TableAm, TableSchema, Tid, Tuple,
 };
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
@@ -293,7 +293,8 @@ impl<'a> UniqueKeySet<'a> {
         // The one place the key is copied on a read path: `index_lookup` is a
         // trait-object method, so it cannot be generic over a borrowed key.
         let owned: Vec<Value> = key.iter().map(|v| (*v).clone()).collect();
-        match table.index_lookup(&self.indexes[i].name, &owned, txn) {
+        let probe = IndexProbeKey::equality(&owned);
+        match table.index_lookup(&self.indexes[i].name, &probe, txn) {
             Some(rows) => {
                 let set = &self.indexes[i];
                 for row in rows {

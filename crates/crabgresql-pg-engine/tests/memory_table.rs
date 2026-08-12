@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
-    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, IndexProbeKey,
     RelPersistence, StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple,
 };
 use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnContext, TxnFinalize, Xid};
@@ -196,8 +196,12 @@ fn temporary_index_is_metadata_only() -> anyhow::Result<()> {
     // No physical B-tree: probe returns None (executor falls back to a scan).
     assert!(!t.supports_index_scan("t_idx"));
     assert!(
-        t.index_lookup("t_idx", &[Value::Int4(1)], &read(&h.tm))
-            .is_none()
+        t.index_lookup(
+            "t_idx",
+            &IndexProbeKey::equality(&[Value::Int4(1)]),
+            &read(&h.tm)
+        )
+        .is_none()
     );
     assert_eq!(
         base_file_count(&h),
@@ -235,7 +239,11 @@ fn temp_before_indexed_permanent_does_not_desync_index_tail() -> anyhow::Result<
         "permanent index silently downgraded by an IXR1 desync"
     );
     let rows: Vec<Value> = p2
-        .index_lookup("p_idx", &[Value::Int4(2)], &read(&h2.tm))
+        .index_lookup(
+            "p_idx",
+            &IndexProbeKey::equality(&[Value::Int4(2)]),
+            &read(&h2.tm),
+        )
         .expect("physical index should serve the probe")
         .map(|row| row.expect("index probe failed").1[1].clone())
         .collect();
@@ -310,9 +318,13 @@ fn unlogged_indexed_truncate_survives_a_clean_restart() -> anyhow::Result<()> {
     let u = h.engine.open_table("u")?;
     assert_eq!(ids(&h.tm, &*u), vec![7]);
     let probe = |key: i32| {
-        u.index_lookup("u_idx", &[Value::Int4(key)], &read(&h.tm))
-            .expect("index serves the probe")
-            .count()
+        u.index_lookup(
+            "u_idx",
+            &IndexProbeKey::equality(&[Value::Int4(key)]),
+            &read(&h.tm),
+        )
+        .expect("index serves the probe")
+        .count()
     };
     assert_eq!(probe(1), 0, "a truncated-away key came back");
     assert_eq!(probe(7), 1);
@@ -337,8 +349,12 @@ fn temporary_index_stays_metadata_only_across_a_truncate() -> anyhow::Result<()>
 
     assert!(!t.supports_index_scan("t_idx"));
     assert!(
-        t.index_lookup("t_idx", &[Value::Int4(1)], &read(&h.tm))
-            .is_none()
+        t.index_lookup(
+            "t_idx",
+            &IndexProbeKey::equality(&[Value::Int4(1)]),
+            &read(&h.tm)
+        )
+        .is_none()
     );
     assert_eq!(ids(&h.tm, &*t), vec![7]);
     assert_eq!(base_file_count(&h), 0, "still nothing on disk");
@@ -401,7 +417,11 @@ fn unlogged_index_is_physical_survives_clean_and_resets_on_crash() -> anyhow::Re
     let u = h2.engine.open_table("u")?;
     assert!(u.supports_index_scan("u_idx"));
     let hit: Vec<Value> = u
-        .index_lookup("u_idx", &[Value::Int4(2)], &read(&h2.tm))
+        .index_lookup(
+            "u_idx",
+            &IndexProbeKey::equality(&[Value::Int4(2)]),
+            &read(&h2.tm),
+        )
         .expect("physical index after clean restart")
         .map(|row| row.expect("index probe failed").1[1].clone())
         .collect();
@@ -415,7 +435,11 @@ fn unlogged_index_is_physical_survives_clean_and_resets_on_crash() -> anyhow::Re
     assert_eq!(ids(&h3.tm, &*u), Vec::<i32>::new());
     assert!(u.supports_index_scan("u_idx"));
     let miss = u
-        .index_lookup("u_idx", &[Value::Int4(2)], &read(&h3.tm))
+        .index_lookup(
+            "u_idx",
+            &IndexProbeKey::equality(&[Value::Int4(2)]),
+            &read(&h3.tm),
+        )
         .expect("empty index still serves probes")
         .count();
     assert_eq!(miss, 0);

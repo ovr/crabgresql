@@ -5,8 +5,8 @@
 //! is never reachable by a stale key), crash recovery, and file lifecycle.
 
 use crabgresql_storage_api::{
-    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, StorageError,
-    TableAm, TableEngine, TableSchema, Tid,
+    Column, ColumnProjection, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, IndexProbeKey,
+    StorageError, TableAm, TableEngine, TableSchema, Tid,
 };
 use crabgresql_txn::{CommandId, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
@@ -71,7 +71,11 @@ fn insert_committed(tm: &TransactionManager, table: &dyn TableAm, id: i32, name:
 /// Probe `key` and return the visible `id`s, sorted.
 fn probe_ids(table: &dyn TableAm, txn: &TxnContext, key: i32) -> Vec<i32> {
     let mut v: Vec<i32> = table
-        .index_lookup("t_id_idx", &[Value::Int4(key)], txn)
+        .index_lookup(
+            "t_id_idx",
+            &IndexProbeKey::equality(&[Value::Int4(key)]),
+            txn,
+        )
         .expect("index serves the probe")
         .map(|row| match &row.expect("index probe failed").1[0] {
             Value::Int4(x) => *x,
@@ -186,7 +190,11 @@ fn duplicate_keys_return_every_matching_row_across_split_leaves() -> anyhow::Res
     tm.commit(x)?;
 
     let hits = table
-        .index_lookup("t_id_idx", &[Value::Int4(7)], &read(&tm))
+        .index_lookup(
+            "t_id_idx",
+            &IndexProbeKey::equality(&[Value::Int4(7)]),
+            &read(&tm),
+        )
         .expect("served")
         .count();
     assert_eq!(hits, DUPES, "every duplicate of key 7 is returned");
@@ -267,7 +275,11 @@ fn null_key_is_not_indexed_and_probing_null_is_empty() -> anyhow::Result<()> {
 
     // A NULL probe is served (the index is physical) but matches nothing.
     let null_hits = table
-        .index_lookup("t_id_idx", &[Value::Null], &read(&tm))
+        .index_lookup(
+            "t_id_idx",
+            &IndexProbeKey::equality(&[Value::Null]),
+            &read(&tm),
+        )
         .expect("served")
         .count();
     assert_eq!(null_hits, 0);
@@ -306,7 +318,11 @@ fn un_indexable_key_type_falls_back_to_scan() -> anyhow::Result<()> {
     assert!(!table.supports_index_scan("t_id_idx"));
     assert!(
         table
-            .index_lookup("t_id_idx", &[Value::Float8(1.5)], &read(&tm))
+            .index_lookup(
+                "t_id_idx",
+                &IndexProbeKey::equality(&[Value::Float8(1.5)]),
+                &read(&tm)
+            )
             .is_none(),
         "an un-indexable key type falls back to a scan"
     );
@@ -764,7 +780,11 @@ fn large_and_mixed_size_keys_split_without_panic_or_corruption() -> anyhow::Resu
     // Every key resolves to exactly one row.
     for key in &keys {
         let hits = table
-            .index_lookup("t_s_idx", &[Value::Text(key.clone())], &read(&tm))
+            .index_lookup(
+                "t_s_idx",
+                &IndexProbeKey::equality(&[Value::Text(key.clone())]),
+                &read(&tm),
+            )
             .expect("served")
             .count();
         assert_eq!(hits, 1, "probe for a {}-byte key", key.len());
@@ -772,7 +792,11 @@ fn large_and_mixed_size_keys_split_without_panic_or_corruption() -> anyhow::Resu
     // A never-inserted key is empty.
     assert!(
         table
-            .index_lookup("t_s_idx", &[Value::Text("nope".into())], &read(&tm))
+            .index_lookup(
+                "t_s_idx",
+                &IndexProbeKey::equality(&[Value::Text("nope".into())]),
+                &read(&tm)
+            )
             .expect("served")
             .count()
             == 0
@@ -886,7 +910,11 @@ fn oversized_key_fails_the_insert_that_carries_it() -> anyhow::Result<()> {
     table.insert(vec![Value::Text("small".into())], &txn)?;
     tm.commit(x)?;
     let found = table
-        .index_lookup("t_s_idx", &[Value::Text("small".into())], &read(&tm))
+        .index_lookup(
+            "t_s_idx",
+            &IndexProbeKey::equality(&[Value::Text("small".into())]),
+            &read(&tm),
+        )
         .expect("the index serves probes")
         .count();
     assert_eq!(found, 1, "the fitting key is indexed");

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::{
     Column, ColumnProjection, DeleteResult, IndexConstraint, IndexKey, IndexMetadata, IndexMethod,
-    StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
+    IndexProbeKey, StorageError, TableAm, TableEngine, TableSchema, Tid, Tuple, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, CommandId, CommitSink, LockOwner, TransactionManager, TxnContext, TxnFinalize, Xid,
@@ -784,7 +784,11 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     // probe directly.
     assert!(table.supports_index_scan("t_pkey"));
     let hits: Vec<Tuple> = table
-        .index_lookup("t_pkey", &[Value::Int4(2)], &read(&h.tm))
+        .index_lookup(
+            "t_pkey",
+            &IndexProbeKey::equality(&[Value::Int4(2)]),
+            &read(&h.tm),
+        )
         .expect("the index serves the probe")
         .map(|row| row.expect("index probe failed").1)
         .collect();
@@ -800,7 +804,11 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
 
     // A key with no matching row is served as an empty result, not a fallback.
     let miss: Vec<Tuple> = table
-        .index_lookup("t_pkey", &[Value::Int4(999)], &read(&h.tm))
+        .index_lookup(
+            "t_pkey",
+            &IndexProbeKey::equality(&[Value::Int4(999)]),
+            &read(&h.tm),
+        )
         .expect("the index serves an absent key too")
         .map(|row| row.expect("index probe failed").1)
         .collect();
@@ -809,7 +817,11 @@ fn heap_index_lookup_uses_btree() -> anyhow::Result<()> {
     // An unknown index name falls back (None), keeping the scan path correct.
     assert!(
         table
-            .index_lookup("nope", &[Value::Int4(2)], &read(&h.tm))
+            .index_lookup(
+                "nope",
+                &IndexProbeKey::equality(&[Value::Int4(2)]),
+                &read(&h.tm)
+            )
             .is_none()
     );
     Ok(())

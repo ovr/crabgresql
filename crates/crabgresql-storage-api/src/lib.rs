@@ -28,6 +28,44 @@ pub use stats::{ColStats, RelStats};
 /// one row fewer than a sequential scan of the same table.
 pub type IndexProbe = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
 
+/// One end of an index range: the value, and whether the bound itself matches.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexBound<'a> {
+    pub value: &'a Value,
+    pub inclusive: bool,
+}
+
+/// What [`TableAm::index_lookup`] searches for: the index's leading key columns
+/// pinned to values, and optional bounds on the one column after them.
+///
+/// This is the shape a B-tree can actually serve, and it is deliberately not
+/// more general — an index orders its keys left to right, so a predicate can
+/// narrow a contiguous stretch of it only by fixing a prefix and then bounding
+/// the next column. `eq` holds that prefix, in key order, and may be shorter
+/// than the index's key list (an index on `(a, b)` searched by `a` alone) or
+/// empty (bounds on the first key column). `lower`/`upper` apply to key column
+/// number `eq.len()`, which must exist.
+///
+/// Borrowed rather than owned because `UNIQUE` enforcement probes once per
+/// inserted row; an owning key would allocate on that path.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexProbeKey<'a> {
+    pub eq: &'a [Value],
+    pub lower: Option<IndexBound<'a>>,
+    pub upper: Option<IndexBound<'a>>,
+}
+
+impl<'a> IndexProbeKey<'a> {
+    /// The whole key pinned by equality — every index key column, in key order.
+    pub fn equality(eq: &'a [Value]) -> Self {
+        IndexProbeKey {
+            eq,
+            lower: None,
+            upper: None,
+        }
+    }
+}
+
 /// A materialized row. Always as wide as the table schema, with column order
 /// matching it. A scan restricted by a [`ColumnProjection`] still returns a
 /// full-width tuple; only the values at unselected positions are unspecified.
@@ -1163,11 +1201,10 @@ pub trait TableAm: Send + Sync {
         None
     }
 
-    /// Whether the engine can physically serve an equality index scan on
-    /// `index_name` — i.e. whether [`TableAm::index_lookup`] would return `Some`
-    /// rather than fall back to a scan. The planner consults this so it only
-    /// chooses an index scan the executor can actually perform, keeping `EXPLAIN`
-    /// honest.
+    /// Whether the engine can physically serve an index scan on `index_name` —
+    /// i.e. whether [`TableAm::index_lookup`] would return `Some` rather than
+    /// fall back to a scan. The planner consults this so it only chooses an
+    /// index scan the executor can actually perform, keeping `EXPLAIN` honest.
     ///
     /// The answer is about the *index*, not about a particular key: an engine
     /// that says yes here and then declines a probe for one key would make a
@@ -1182,20 +1219,38 @@ pub trait TableAm: Send + Sync {
         false
     }
 
-    /// Probe the physical index `index_name` for versions whose key equals
-    /// `key` (one [`Value`] per index key column, in key order), yielding those
-    /// visible to `txn`. Returns `None` when the engine has no physical index
-    /// able to serve this probe (no such index, or a key type it cannot index) —
-    /// the caller then falls back to a full [`TableAm::scan`], so an index scan
-    /// stays correct on every engine.
+    /// Probe the physical index `index_name` for the versions [`IndexProbeKey`]
+    /// describes, yielding those visible to `txn`. Returns `None` when the
+    /// engine has no physical index able to serve this probe (no such index, or
+    /// a key type it cannot index) — the caller then falls back to a full
+    /// [`TableAm::scan`] and re-checks the key itself, so an index scan stays
+    /// correct on every engine.
     ///
     /// `Some` of an empty iterator is a different answer: the probe *was*
-    /// served and nothing matched. A key an engine cannot encode lands here
-    /// rather than in `None`, because such a key is also one no stored row was
-    /// indexed under — the two agree, and equality is what a probe answers. A
-    /// NULL is the everyday case: it matches nothing, so `Some(empty)` is
-    /// right, and only a caller for whom NULLs *do* collide (`UNIQUE NULLS NOT
-    /// DISTINCT`) has to stay off the probe.
+    /// served and nothing matched. A **NULL** anywhere in the key lands here:
+    /// no row is indexed under a NULL and no comparison a bound expresses is
+    /// ever true of one, so "served, no match" is the accurate answer, and only
+    /// a caller for whom NULLs *do* collide (`UNIQUE NULLS NOT DISTINCT`) has
+    /// to stay off the probe. A **non-NULL** value the engine cannot encode
+    /// (its type does not match the key column) is the opposite case: the index
+    /// says nothing about it, so the engine declines with `None` rather than
+    /// reporting an empty result that would silently drop rows.
+    ///
+    /// A range's bounds are **prefix-wise**, which is what a composite key
+    /// requires: on an index over `(a, b, c)`, a probe with `eq = [1]` and an
+    /// exclusive lower bound of `5` must exclude every row with `b = 5`
+    /// whatever its `c`, even though such a row sorts after the bound. Stated
+    /// per end, where a *matching* key is one whose column `eq.len()` holds the
+    /// bound's value:
+    ///
+    /// * exclusive lower: past the bound, and not one of the matching keys;
+    /// * inclusive lower: at or past the bound (the matching keys are past it);
+    /// * inclusive upper: before the bound, or one of the matching keys;
+    /// * exclusive upper: before the bound.
+    ///
+    /// A `DESC` key column reverses each bound's direction; that is the
+    /// engine's business, not the caller's — bounds are always stated in value
+    /// order.
     ///
     /// The default is `None`, which the columnar engines and the read-only
     /// system catalogs inherit; the durable heap engine serves this from its
@@ -1203,7 +1258,7 @@ pub trait TableAm: Send + Sync {
     fn index_lookup(
         &self,
         _index_name: &str,
-        _key: &[Value],
+        _key: &IndexProbeKey<'_>,
         _txn: &TxnContext,
     ) -> Option<IndexProbe> {
         None

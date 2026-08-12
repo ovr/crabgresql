@@ -8,12 +8,14 @@
 //! lock: change the page, append the WAL record, stamp `pd_lsn` with the record
 //! LSN, mark the page dirty — so the page can never reach disk ahead of its log.
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelPersistence,
-    RelStats, StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    CheckConstraint, ColumnProjection, DeleteResult, IndexBound, IndexKey, IndexMetadata,
+    IndexProbe, IndexProbeKey, RelPersistence, RelStats, StorageError, TableAm, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -24,7 +26,7 @@ use crabgresql_wal::{Lsn, RmgrId};
 
 use crate::EngineInner;
 use crate::btkey;
-use crate::nbtree::BTree;
+use crate::nbtree::{BTree, KeyRange};
 use crate::page::{self, PAGE_HEADER_LEN};
 use crate::rec;
 use crate::smgr::RelFileNode;
@@ -465,7 +467,6 @@ impl HeapTable {
         );
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
         btree.create();
-        let cols = btkey::key_columns(&meta.keys);
         let heap_rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(heap_rel));
@@ -487,7 +488,7 @@ impl HeapTable {
                 // statement; it must not take the process down, since CREATE INDEX
                 // is an ordinary user command.
                 let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
-                if let Some(key) = btkey::encode_row(&schema, &cols, &tuple) {
+                if let Some(key) = btkey::encode_row(&schema, &meta.keys, &tuple) {
                     Self::index_row_fits(&key, tid, &meta.name, &schema.name)?;
                     btree.insert(&key, tid);
                 }
@@ -563,8 +564,7 @@ impl HeapTable {
             if !entry.is_physical(&schema) {
                 continue;
             }
-            let cols = btkey::key_columns(&entry.meta.keys);
-            if let Some(key) = btkey::encode_row(&schema, &cols, tuple) {
+            if let Some(key) = btkey::encode_row(&schema, &entry.meta.keys, tuple) {
                 Self::index_row_fits(&key, tid, &entry.meta.name, &schema.name)?;
                 self.btree(entry, xid).insert(&key, tid);
             }
@@ -1229,6 +1229,75 @@ fn detoast(engine: &EngineInner, p: &toast::ToastPointer) -> Result<Vec<u8>, Sto
     Ok(out)
 }
 
+/// What a probe key encodes to.
+enum ProbeBytes {
+    Search(KeyRange),
+    /// A NULL in the key: the tree indexed no row under one and no bound is
+    /// ever satisfied by one, so the probe is served and empty.
+    NoMatch,
+    /// A non-NULL value this encoding cannot represent. The tree says nothing
+    /// about such a value, so the probe is declined and the caller scans.
+    Decline,
+}
+
+/// Turn a probe key into the byte range the tree searches.
+///
+/// The bounds arrive in *value* order and leave in *stored* order: a `DESC` key
+/// column is stored bit-inverted (see [`crate::btkey`]), which reverses its
+/// byte order, so `col > v` becomes bytes *below* `v`'s and the two bounds swap
+/// ends. Doing that here — the one place that holds both the index metadata and
+/// the encoded bytes — is what lets `nbtree` scan forward and know nothing
+/// about direction.
+fn encode_probe(
+    schema: &TableSchema,
+    index_keys: &[IndexKey],
+    key: &IndexProbeKey<'_>,
+) -> ProbeBytes {
+    let prefix = match btkey::encode_prefix(schema, index_keys, key.eq) {
+        btkey::Encoded::Bytes(bytes) => bytes,
+        btkey::Encoded::Null => return ProbeBytes::NoMatch,
+        btkey::Encoded::Unsupported => return ProbeBytes::Decline,
+    };
+    if key.lower.is_none() && key.upper.is_none() {
+        return ProbeBytes::Search(KeyRange::prefix(prefix));
+    }
+    // Both bounds constrain the key column right after the equality prefix. A
+    // caller that bounds a column the index does not have is asking about a key
+    // this tree cannot answer for.
+    let Some(bounded) = index_keys.get(key.eq.len()) else {
+        return ProbeBytes::Decline;
+    };
+    // Each bound becomes the whole key it would appear in: the prefix plus its
+    // own column's bytes, which is what `KeyRange` compares against.
+    let encode = |bound: Option<IndexBound<'_>>| match bound {
+        None => Ok(Bound::Unbounded),
+        Some(bound) => match btkey::encode_bound(schema, bounded, bound.value) {
+            btkey::Encoded::Bytes(bytes) => {
+                let full = [&prefix[..], &bytes[..]].concat();
+                Ok(match bound.inclusive {
+                    true => Bound::Included(full),
+                    false => Bound::Excluded(full),
+                })
+            }
+            btkey::Encoded::Null => Err(ProbeBytes::NoMatch),
+            btkey::Encoded::Unsupported => Err(ProbeBytes::Decline),
+        },
+    };
+    let (lower, upper) = match (encode(key.lower), encode(key.upper)) {
+        (Ok(lower), Ok(upper)) => (lower, upper),
+        (Err(refusal), _) | (_, Err(refusal)) => return refusal,
+    };
+    let (lower, upper) = match bounded.descending {
+        false => (lower, upper),
+        true => (upper, lower),
+    };
+    ProbeBytes::Search(KeyRange {
+        prefix,
+        lower,
+        upper,
+    })
+}
+
 impl TableAm for HeapTable {
     fn schema(&self) -> Arc<TableSchema> {
         self.snap()
@@ -1327,19 +1396,19 @@ impl TableAm for HeapTable {
             .any(|e| e.meta.name == index_name && e.is_physical(&schema))
     }
 
-    /// Probe the physical B-tree `index_name` for versions whose key equals
-    /// `key`, returning those visible to `txn`. `None` (caller falls back to a
-    /// scan) when the index is absent or has no physical B-tree; `Some(empty)`
-    /// when it is served but nothing matches (including a key `btkey` cannot
-    /// encode — a NULL, say — which is also a key `maintain_insert` indexed no
-    /// row under, so the tree and the probe agree). Visibility is decided by
-    /// re-fetching each heap tuple through [`TableAm::fetch`] — the index entry
-    /// is never trusted for visibility, exactly like a PostgreSQL secondary
-    /// index.
+    /// Probe the physical B-tree `index_name` for the versions `key` describes,
+    /// returning those visible to `txn`. `None` (caller falls back to a scan)
+    /// when the index is absent, has no physical B-tree, or the key holds a
+    /// non-NULL value this encoding cannot represent; `Some(empty)` when it is
+    /// served but nothing matches — including a NULL anywhere in the key, which
+    /// is also a value `maintain_insert` indexed no row under, so the tree and
+    /// the probe agree. Visibility is decided by re-fetching each heap tuple
+    /// through [`TableAm::fetch`] — the index entry is never trusted for
+    /// visibility, exactly like a PostgreSQL secondary index.
     fn index_lookup(
         &self,
         index_name: &str,
-        key: &[Value],
+        key: &IndexProbeKey<'_>,
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
         // Hold the table's shared lock across the tree descent, exactly as `scan`
@@ -1358,7 +1427,7 @@ impl TableAm for HeapTable {
         // Bound before the index guard: the filter and the key encoding below
         // must agree on `columns`.
         let schema = self.snap();
-        let (rel, latch, cols) = {
+        let (rel, latch, index_keys) = {
             let indexes = self
                 .indexes
                 .read()
@@ -1372,12 +1441,16 @@ impl TableAm for HeapTable {
                 // probe agrees with a scan of the file it reads.
                 self.effective_index_rel(entry, txn.xid),
                 Arc::clone(&entry.latch),
-                btkey::key_columns(&entry.meta.keys),
+                entry.meta.keys.clone(),
             )
         };
-        let Some(kb) = btkey::encode_values(&schema, &cols, key) else {
-            // A NULL (or otherwise un-encodable) probe key: served, no match.
-            return Some(Box::new(std::iter::empty()));
+        let range = match encode_probe(&schema, &index_keys, key) {
+            ProbeBytes::Search(range) => range,
+            // A NULL somewhere in the key: served, no match.
+            ProbeBytes::NoMatch => return Some(Box::new(std::iter::empty())),
+            // A value this encoding cannot represent: the tree knows nothing
+            // about it, so decline and let the caller scan.
+            ProbeBytes::Decline => return None,
         };
         let tids = BTree::open(
             Arc::clone(&self.engine),
@@ -1385,7 +1458,7 @@ impl TableAm for HeapTable {
             latch,
             self.persistence.is_unlogged(),
         )
-        .search_equal(&kb);
+        .search_range(&range);
         let mut out = Vec::new();
         for tid in tids {
             // `fetch` can fail now that a value may live out of line, and the
@@ -1401,7 +1474,8 @@ impl TableAm for HeapTable {
                 // returned row turns that whole class of defect into rows quietly
                 // absent, which a probe-versus-scan test catches.
                 Ok(Some(tuple))
-                    if btkey::encode_row(&schema, &cols, &tuple).is_some_and(|k| k == kb) =>
+                    if btkey::encode_row(&schema, &index_keys, &tuple)
+                        .is_some_and(|k| range.contains(&k)) =>
                 {
                     out.push(Ok((tid, tuple)))
                 }
@@ -1737,19 +1811,13 @@ impl TableAm for HeapTable {
         // Snapshot the physical indexes so each reclaimed version's index entry
         // can be removed too — otherwise a stale `key -> tid` would point at a
         // heap slot that a later insert reuses, yielding wrong rows.
-        let phys: Vec<(RelFileNode, Arc<RwLock<()>>, Vec<usize>)> = self
+        let phys: Vec<(RelFileNode, Arc<RwLock<()>>, Vec<IndexKey>)> = self
             .indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .iter()
             .filter(|e| e.is_physical(&schema))
-            .map(|e| {
-                (
-                    e.rel,
-                    Arc::clone(&e.latch),
-                    btkey::key_columns(&e.meta.keys),
-                )
-            })
+            .map(|e| (e.rel, Arc::clone(&e.latch), e.meta.keys.clone()))
             .collect();
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(rel));
@@ -1822,8 +1890,8 @@ impl TableAm for HeapTable {
             // entry is gone, and a probe would then return the reused row for the
             // old key. Deleting entries first closes that window.
             for (tid, tuple) in &victims {
-                for (irel, latch, cols) in &phys {
-                    if let Some(key) = btkey::encode_row(&schema, cols, tuple) {
+                for (irel, latch, index_keys) in &phys {
+                    if let Some(key) = btkey::encode_row(&schema, index_keys, tuple) {
                         BTree::open(
                             Arc::clone(&self.engine),
                             *irel,
