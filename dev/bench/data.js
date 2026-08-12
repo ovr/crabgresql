@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786539845218,
+  "lastUpdate": 1786539846891,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -15138,6 +15138,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q22",
             "value": 0.017,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "zaets28rus@gmail.com",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "ed59bf6934684e8defec3eec9b1c1c460e9d64eb",
+          "message": "chore(release): v0.0.2\n\nBump the workspace version to 0.0.2 and regenerate CHANGELOG.md.\n\nThe `cargo release` pre-release hook ran git-cliff from each crate's\ndirectory, where it found neither cliff.toml nor the repository. It now\ngoes through scripts/release-changelog.sh, which pins both to\n$WORKSPACE_ROOT and leaves the tree untouched on a dry run.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-12T13:32:57+02:00",
+          "tree_id": "559d259565bea605f601e07dfe5e37d5c2f599f4",
+          "url": "https://github.com/ovr/crabgresql/commit/ed59bf6934684e8defec3eec9b1c1c460e9d64eb"
+        },
+        "date": 1786539846791,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.679,
+            "unit": "s",
+            "extra": "dataset load — heap, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.155,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.014,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.05,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 0.039,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.063,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.046,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.084,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.06,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.084,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.049,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.008,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.033,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.015,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.037,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.07,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.006,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.05,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.197,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 0.04,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 1.48,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 3.491,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.014,
             "unit": "s",
             "extra": "best of the timed runs — heap, 86805 rows"
           }
