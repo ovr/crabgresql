@@ -77,7 +77,10 @@
 use crabgresql_binder::{BinOp, BoundExpr, UnaryOp};
 
 use crate::{
-    PhysicalAggInput, PhysicalInsertSource, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
+    PhysicalAggInput, PhysicalAggregate, PhysicalDelete, PhysicalIndexScan, PhysicalInsert,
+    PhysicalInsertQuery, PhysicalInsertSource, PhysicalJoin, PhysicalJoinExpr, PhysicalJoinInput,
+    PhysicalJoinLeaf, PhysicalJoinPair, PhysicalLimit, PhysicalPlan, PhysicalSelect, PhysicalSetOp,
+    PhysicalSubquery, PhysicalTableFunction, PhysicalUpdate, PhysicalValues, PhysicalWindow,
 };
 use crate::{flatten_and, rebuild_and};
 
@@ -88,50 +91,51 @@ use crate::{flatten_and, rebuild_and};
 /// ones it was written next to.
 pub(crate) fn reorder_quals(plan: &mut PhysicalPlan) {
     match plan {
-        PhysicalPlan::Values { predicate, .. }
-        | PhysicalPlan::Select { predicate, .. }
-        | PhysicalPlan::IndexScan { predicate, .. }
-        | PhysicalPlan::TableFunction { predicate, .. }
-        | PhysicalPlan::Update { predicate, .. }
-        | PhysicalPlan::Delete { predicate, .. } => reorder(predicate),
-        PhysicalPlan::Subquery {
+        PhysicalPlan::Values(PhysicalValues { predicate, .. })
+        | PhysicalPlan::Select(PhysicalSelect { predicate, .. })
+        | PhysicalPlan::IndexScan(PhysicalIndexScan { predicate, .. })
+        | PhysicalPlan::TableFunction(PhysicalTableFunction { predicate, .. })
+        | PhysicalPlan::Update(PhysicalUpdate { predicate, .. })
+        | PhysicalPlan::Delete(PhysicalDelete { predicate, .. }) => reorder(predicate),
+        PhysicalPlan::Subquery(PhysicalSubquery {
             source, predicate, ..
-        } => {
+        }) => {
             reorder(predicate);
             reorder_quals(source);
         }
-        PhysicalPlan::Join {
+        PhysicalPlan::Join(PhysicalJoin {
             source, predicate, ..
-        } => {
+        }) => {
             reorder(predicate);
             reorder_join(source);
         }
-        PhysicalPlan::Aggregate {
+        PhysicalPlan::Aggregate(PhysicalAggregate {
             input,
             predicate,
             having,
             ..
-        } => {
+        }) => {
             reorder(predicate);
             reorder(having);
             match input {
                 PhysicalAggInput::Join(source) => reorder_join(source),
-                PhysicalAggInput::Scan { .. } | PhysicalAggInput::SingleRow => {}
+                PhysicalAggInput::Scan(_) | PhysicalAggInput::SingleRow => {}
             }
         }
         // An `Append` arm is a bare relation: the `WHERE` over it lives on the
         // `Subquery` this node is always wrapped in, and was handled there.
-        PhysicalPlan::Append { .. } => {}
-        PhysicalPlan::SetOp { arms, .. } => {
+        PhysicalPlan::Append(_) => {}
+        PhysicalPlan::SetOp(PhysicalSetOp { arms, .. }) => {
             for arm in arms {
                 reorder_quals(&mut arm.plan);
             }
         }
-        PhysicalPlan::Window { source, .. } | PhysicalPlan::Limit { source, .. } => {
+        PhysicalPlan::Window(PhysicalWindow { source, .. })
+        | PhysicalPlan::Limit(PhysicalLimit { source, .. }) => {
             reorder_quals(source);
         }
-        PhysicalPlan::Insert { source, .. } => {
-            if let PhysicalInsertSource::Query { input, .. } = source {
+        PhysicalPlan::Insert(PhysicalInsert { source, .. }) => {
+            if let PhysicalInsertSource::Query(PhysicalInsertQuery { input, .. }) = source {
                 reorder_quals(input);
             }
         }
@@ -142,21 +146,21 @@ pub(crate) fn reorder_quals(plan: &mut PhysicalPlan) {
 /// conjuncts `sink_leaf_filters` left on a leaf, plus any nested subplan.
 fn reorder_join(node: &mut PhysicalJoinExpr) {
     match node {
-        PhysicalJoinExpr::Input {
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input, predicate, ..
-        } => {
+        }) => {
             reorder(predicate);
             match input {
                 PhysicalJoinInput::Subplan(source) => reorder_quals(source),
-                PhysicalJoinInput::Scan { .. } | PhysicalJoinInput::TableFunction { .. } => {}
+                PhysicalJoinInput::Scan(_) | PhysicalJoinInput::TableFunction(_) => {}
             }
         }
-        PhysicalJoinExpr::Join {
+        PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             predicate,
             ..
-        } => {
+        }) => {
             reorder(predicate);
             reorder_join(left);
             reorder_join(right);
@@ -250,9 +254,9 @@ mod tests {
     /// The conjuncts of a plan-level filter, in evaluation order.
     fn quals(plan: PhysicalPlan) -> Vec<BoundExpr> {
         let predicate = match plan {
-            PhysicalPlan::Select { predicate, .. }
-            | PhysicalPlan::Join { predicate, .. }
-            | PhysicalPlan::Aggregate { predicate, .. } => predicate,
+            PhysicalPlan::Select(PhysicalSelect { predicate, .. })
+            | PhysicalPlan::Join(PhysicalJoin { predicate, .. })
+            | PhysicalPlan::Aggregate(PhysicalAggregate { predicate, .. }) => predicate,
             _ => panic!("expected a filtering plan node"),
         };
         let mut out = Vec::new();

@@ -10,388 +10,49 @@
 //! table statistics this layer has no source for (docs/ARCHITECTURE.md §3).
 
 pub mod cost;
+mod physical_plan;
 mod projection;
 mod pushdown;
 mod qualorder;
 pub mod vectorize;
 
+pub use physical_plan::*;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use crabgresql_binder::{
-    AggInput, AggregatePlan, AppendPlan, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc,
-    BoundWindowSpec, DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput,
-    JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, OutputColumn, QueryPlan,
-    RelationIdent, Returning, SetOpPlan, SortKey, SubqueryPlan, TableFn, TableFunctionPlan,
-    UpdatePlan, ValuesPlan, WindowPlan,
+    AggInput, AggregatePlan, AppendPlan, BinOp, BoundExpr, BoundWindowSpec, DeletePlan, InsertPlan,
+    InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
+    QueryPlan, RelationIdent, SetOpPlan, SubqueryPlan, TableFunctionPlan, UpdatePlan, ValuesPlan,
+    WindowPlan,
 };
 use crabgresql_storage_api::{
-    ColumnProjection, IndexConstraint, IndexMetadata, RelStats, TableAm, TableSchema, Tuple,
+    ColumnProjection, IndexConstraint, IndexMetadata, RelStats, TableAm, TableSchema,
 };
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, Value};
 
-/// An executable plan. `Select` describes the SeqScan → Filter → Projection →
-/// Sort pipeline the executor builds.
-pub enum PhysicalPlan {
-    Values {
-        columns: Vec<OutputColumn>,
-        rows: Vec<Vec<BoundExpr>>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    Select {
-        table: Arc<dyn TableAm>,
-        /// The columns this scan's own expressions read, for engines that can
-        /// skip the rest (see [`projection`]). Rows stay full width regardless.
-        projection: ColumnProjection,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// A single-table read served by an equality probe on `index_name`: the
-    /// executor evaluates each `key` value once and asks the engine for the
-    /// matching rows. The planner only emits this when the engine reports
-    /// [`TableAm::supports_index_scan`], but the executor still scan-fallbacks
-    /// defensively. `predicate` is the residual WHERE the index did not consume,
-    /// applied as a `Filter`; the standard Projection → Sort tail follows,
-    /// exactly as for [`Self::Select`].
-    IndexScan {
-        table: Arc<dyn TableAm>,
-        /// As for [`Self::Select`], and additionally always covering every
-        /// `key` column: the executor's scan fallback re-checks the key per row.
-        projection: ColumnProjection,
-        index_name: String,
-        /// One `(key column, equality value)` pair per index key column, in key
-        /// order. The value expressions are row-constant and evaluated once.
-        key: Vec<(usize, BoundExpr)>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    Subquery {
-        source: Box<PhysicalPlan>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    TableFunction {
-        func: TableFn,
-        args: Vec<BoundExpr>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// Recursive joined row source, then the standard Filter → Projection →
-    /// Sort tail. Mirrors [`LogicalPlan::Join`].
-    Join {
-        source: PhysicalJoinExpr,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        predicate: Option<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// Grouped aggregation. Mirrors [`LogicalPlan::Aggregate`]: the executor
-    /// filters `input` by `predicate`, groups by `group_exprs`, accumulates the
-    /// `aggregates`, filters groups by `having`, then runs the standard
-    /// projection/sort tail.
-    Aggregate {
-        input: PhysicalAggInput,
-        predicate: Option<BoundExpr>,
-        group_exprs: Vec<BoundExpr>,
-        aggregates: Vec<BoundAggregate>,
-        having: Option<BoundExpr>,
-        columns: Vec<OutputColumn>,
-        projections: Vec<BoundExpr>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// Union scan over the several relations one FROM item names. Mirrors
-    /// [`LogicalPlan::Append`]: the executor concatenates each arm's scan into
-    /// one row stream. Such a FROM item is planned as a [`Self::Subquery`]
-    /// wrapping this, so the standard projection/predicate/sort tail runs on top.
-    Append {
-        arms: Vec<PhysicalAppendArm>,
-        columns: Vec<OutputColumn>,
-    },
-    /// A `UNION` / `UNION ALL`. Mirrors [`LogicalPlan::SetOp`]: the executor
-    /// drains each arm into one row stream, coercing arms that need it, then
-    /// applies this node's own deduplication and sort.
-    SetOp {
-        arms: Vec<PhysicalSetOpArm>,
-        columns: Vec<OutputColumn>,
-        sort: Vec<SortKey>,
-        distinct: Option<Vec<DistinctKey>>,
-    },
-    /// One step of window-function evaluation. Mirrors [`LogicalPlan::Window`]:
-    /// the executor materializes `source`, sorts it by `spec`'s partition keys
-    /// then its ORDER BY keys, and fills each of `funcs` into the slot it names.
-    /// A window query is planned as a [`Self::Subquery`] wrapping the chain, so
-    /// the standard projection/sort tail runs on top.
-    Window {
-        source: Box<PhysicalPlan>,
-        spec: BoundWindowSpec,
-        funcs: Vec<BoundWindowFunc>,
-        input_width: usize,
-        output_width: usize,
-    },
-    /// LIMIT/OFFSET above a source plan (after its sort). Mirrors
-    /// [`LogicalPlan::Limit`].
-    Limit {
-        source: Box<PhysicalPlan>,
-        limit: Option<i64>,
-        offset: Option<i64>,
-    },
-    Insert {
-        table: Arc<dyn TableAm>,
-        source: PhysicalInsertSource,
-        returning: Option<Returning>,
-        /// Leaf partitions for tuple routing when `table` is a partitioned parent
-        /// (see [`LogicalPlan::Insert`]); `None` for an ordinary table.
-        routing: Option<Vec<Arc<dyn TableAm>>>,
-        /// `COPY … FREEZE` (see [`LogicalPlan::Insert`]): the executor freezes
-        /// this target's write and nothing else.
-        freeze: bool,
-        /// Whether each inserted row carries a trailing `tableoid` slot for
-        /// RETURNING to read (see [`LogicalPlan::Insert`]). The executor fills
-        /// it with the leaf the row was routed to.
-        tableoid: bool,
-    },
-    Update {
-        /// Whether each row carries a trailing `tableoid` slot for WHERE, SET or
-        /// RETURNING to read (see [`LogicalPlan::Insert`]).
-        tableoid: bool,
-        table: Arc<dyn TableAm>,
-        predicate: Option<BoundExpr>,
-        assignments: Vec<(usize, BoundExpr)>,
-        returning: Option<Returning>,
-        /// Leaf partitions for tuple routing when `table` is a partitioned parent
-        /// (see [`LogicalPlan::Update`]); `None` for an ordinary table.
-        routing: Option<Vec<DmlTarget>>,
-        /// `table` and its inheritance descendants, each with its column map
-        /// (see [`LogicalPlan::Update`]); empty for a table with no children.
-        inherited: Vec<DmlTarget>,
-        /// The row source for `table` itself, used when it is neither partitioned
-        /// nor inherited (the other two arms carry their own).
-        probe: Option<DmlIndexProbe>,
-    },
-    Delete {
-        /// Whether each row carries a trailing `tableoid` slot for WHERE or
-        /// RETURNING to read (see [`LogicalPlan::Insert`]).
-        tableoid: bool,
-        table: Arc<dyn TableAm>,
-        predicate: Option<BoundExpr>,
-        returning: Option<Returning>,
-        /// Leaf partitions for tuple routing when `table` is a partitioned parent
-        /// (see [`LogicalPlan::Delete`]); `None` for an ordinary table.
-        routing: Option<Vec<DmlTarget>>,
-        /// `table` and its inheritance descendants, each with its column map
-        /// (see [`LogicalPlan::Delete`]); empty for a table with no children.
-        inherited: Vec<DmlTarget>,
-        /// The row source for `table` itself, used when it is neither partitioned
-        /// nor inherited (the other two arms carry their own).
-        probe: Option<DmlIndexProbe>,
-    },
-}
-
-/// One relation an `UPDATE`/`DELETE` reads rows from, with the row source chosen
-/// for it.
-///
-/// The probe travels *with* its relation rather than in a vector alongside one,
-/// so the two cannot fall out of step — the same reason [`PhysicalAppendArm`]
-/// embeds its [`MappedRelation`] instead of running parallel to it. A positional
-/// pairing would survive partition pruning skipping a leaf, and read leaf B
-/// through leaf A's index.
-pub struct DmlTarget {
-    pub relation: MappedRelation,
-    /// `None` scans the whole relation.
-    pub probe: Option<DmlIndexProbe>,
-}
-
-/// An equality index probe standing in for one DML target's sequential scan.
-///
-/// Unlike [`PhysicalPlan::IndexScan`], a probe here does *not* consume the
-/// conjuncts it matched: the plan's `predicate` stays the whole `WHERE` and is
-/// re-checked per row. The probe only narrows the row source, so a target that
-/// cannot serve one falls back to a scan without any predicate rewriting — which
-/// is what lets each inheritance descendant and each leaf partition decide
-/// independently, in its own column space.
-pub struct DmlIndexProbe {
-    pub index_name: String,
-    /// One `(key column, equality value)` pair per index key column, in key
-    /// order. Columns are ordinals in the *target's* own schema, already
-    /// translated through [`MappedRelation::map`] where one applies.
-    pub key: Vec<(usize, BoundExpr)>,
-    /// The conjuncts the key did *not* cover, for `EXPLAIN` only.
-    ///
-    /// The executor re-checks the whole `WHERE`, so this never drives execution;
-    /// it exists so a plan can show the same `Index Cond` / `Filter` split PG
-    /// shows. Re-checking a conjunct the index already satisfied is not
-    /// observable, which is what lets display and execution differ here.
-    pub residual: Option<BoundExpr>,
-}
-
-/// One arm of a [`PhysicalPlan::Append`]: a [`MappedRelation`] plus the columns
-/// its scan must materialize.
-///
-/// The relation is embedded rather than flattened so the permutation has one
-/// definition — the executor reads a row through [`MappedRelation::view`]
-/// instead of open-coding the same indexing a second time.
-///
-/// The projection is per-arm rather than shared: with a remap in play, an
-/// ordinal in one arm's schema names a different column in another's, so a
-/// single [`ColumnProjection`] could not be right for both.
-pub struct PhysicalAppendArm {
-    pub relation: MappedRelation,
-    /// Which of this arm's own columns the scan must materialize. Supplied by
-    /// the wrapping [`PhysicalPlan::Subquery`], which owns the expressions that
-    /// read these rows, translated through the map into this arm's ordinals.
-    pub projection: ColumnProjection,
-}
-
-/// One arm of a [`PhysicalPlan::SetOp`], mirroring [`SetOpArm`].
-pub struct PhysicalSetOpArm {
-    pub plan: PhysicalPlan,
-    /// Projections mapping this arm onto the set operation's output layout;
-    /// `None` when it already emits that layout.
-    pub coercion: Option<Vec<BoundExpr>>,
-}
-
-/// The rows an INSERT writes, mirroring [`InsertSource`] with the query source's
-/// subplan already lowered to a [`PhysicalPlan`].
-pub enum PhysicalInsertSource {
-    /// Fully-formed rows, full-width in schema order, evaluated against the empty
-    /// row.
-    Values(Vec<Vec<BoundExpr>>),
-    /// Rows whose cells are already values, mirroring [`InsertSource::Tuples`].
-    /// `defaults` names the columns whose `DEFAULT` still needs evaluating once
-    /// per row.
-    Tuples {
-        rows: Vec<Tuple>,
-        defaults: Vec<(usize, BoundExpr)>,
-    },
-    /// Rows pulled from `input`, each mapped through `projections` (full-width,
-    /// schema order) evaluated against the source tuple.
-    Query {
-        input: Box<PhysicalPlan>,
-        projections: Vec<BoundExpr>,
-    },
-}
-
-/// A join input, mirroring [`JoinInput`] but with the subplan already lowered
-/// to a [`PhysicalPlan`].
-pub enum PhysicalJoinInput {
-    Scan {
-        table: Arc<dyn TableAm>,
-        /// The columns this leaf's own row supplies to the join tree above it,
-        /// in the leaf's base-0 space (see [`projection`]).
-        projection: ColumnProjection,
-    },
-    Subplan(Box<PhysicalPlan>),
-    TableFunction {
-        func: TableFn,
-        args: Vec<BoundExpr>,
-    },
-}
-
-/// One equi-join key of a hash join: a pair of expressions, one addressing the
-/// left input and one the right, that must compare equal. Both evaluate to `ty`
-/// (the operands' promoted comparison type), so the hash/equality of the two
-/// sides is computed under a single type. Extracted from `col = col` conjuncts
-/// of the ON predicate (see [`extract_hash_keys`]).
-///
-/// The operand expressions still index into the *concatenated* `left || right`
-/// row (the form the binder produced): `left` references `[0, left_width)` and
-/// `right` references `[left_width, ..)`. The executor evaluates each against a
-/// padded row so the indices stay valid.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HashKey {
-    pub left: BoundExpr,
-    pub right: BoundExpr,
-    pub ty: PgType,
-}
-
-/// A [`JoinExpr`] whose leaf subplans have already been physically planned.
-pub enum PhysicalJoinExpr {
-    Input {
-        input: PhysicalJoinInput,
-        width: usize,
-        /// Single-relation conjuncts the planner sank to this leaf, applied
-        /// above the source before any join sees the row. Indexes the leaf's own
-        /// row, so a right child's conjuncts are rebased on the way down.
-        predicate: Option<BoundExpr>,
-    },
-    /// A binary join. When `hash_keys` is non-empty the executor runs a hash
-    /// join keyed on them and `predicate` holds only the residual (non-equi)
-    /// conjuncts of the ON clause; when empty it runs a nested-loop join and
-    /// `predicate` is the whole ON condition (`None` for CROSS/comma joins).
-    Join {
-        left: Box<PhysicalJoinExpr>,
-        right: Box<PhysicalJoinExpr>,
-        kind: JoinKind,
-        predicate: Option<BoundExpr>,
-        hash_keys: Vec<HashKey>,
-    },
-}
-
-impl PhysicalJoinExpr {
-    pub fn width(&self) -> usize {
-        match self {
-            PhysicalJoinExpr::Input { width, .. } => *width,
-            PhysicalJoinExpr::Join { left, right, .. } => left.width() + right.width(),
-        }
-    }
-
-    /// The executor and EXPLAIN must use the same physical-algorithm decision.
-    /// Keeping it here prevents the renderer from drifting away if the
-    /// selection rule grows beyond the presence of extracted hash keys.
-    pub fn uses_hash_join(&self) -> bool {
-        matches!(
-            self,
-            PhysicalJoinExpr::Join { hash_keys, .. } if !hash_keys.is_empty()
-        )
-    }
-}
-
-/// The row source of a [`PhysicalPlan::Aggregate`], mirroring [`AggInput`].
-pub enum PhysicalAggInput {
-    Scan {
-        table: Arc<dyn TableAm>,
-        /// The columns the grouping keys, aggregate arguments and WHERE read.
-        projection: ColumnProjection,
-    },
-    Join(PhysicalJoinExpr),
-    SingleRow,
-}
-
 fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinInput {
     match input {
-        JoinInput::Scan(table) => PhysicalJoinInput::Scan {
+        JoinInput::Scan(table) => PhysicalJoinInput::Scan(PhysicalJoinScan {
             table,
             projection: ColumnProjection::All,
-        },
+        }),
         JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source, costs))),
-        JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
+        JoinInput::TableFunction { func, args } => {
+            PhysicalJoinInput::TableFunction(PhysicalJoinTableFunction { func, args })
+        }
     }
 }
 
 fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinExpr {
     match source {
-        JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
+        JoinExpr::Input { input, width } => PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input: plan_join_input(input, costs),
             width,
             predicate: None,
-        },
+        }),
         JoinExpr::Join {
             left,
             right,
@@ -408,13 +69,13 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
             let mut left = Box::new(plan_join_expr(*left, costs));
             let mut right = Box::new(plan_join_expr(*right, costs));
             let predicate = sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
-            PhysicalJoinExpr::Join {
+            PhysicalJoinExpr::Join(PhysicalJoinPair {
                 left,
                 right,
                 kind,
                 predicate,
                 hash_keys,
-            }
+            })
         }
     }
 }
@@ -458,9 +119,9 @@ fn sink_leaf_filters(
                 continue;
             }
         };
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: leaf, ..
-        } = target
+        }) = target
         else {
             kept.push(conjunct);
             continue;
@@ -659,13 +320,13 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => PhysicalPlan::Values {
+        }) => PhysicalPlan::Values(PhysicalValues {
             columns,
             rows,
             predicate,
             sort,
             distinct,
-        },
+        }),
         // The predicate is factored before the access path is chosen, so a
         // `WHERE` written as one OR still offers `choose_access` the conjuncts
         // every arm repeats — without it, `(k = 5 AND a = 1) OR (k = 5 AND a =
@@ -687,7 +348,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 index_name,
                 key,
                 residual,
-            } => PhysicalPlan::IndexScan {
+            } => PhysicalPlan::IndexScan(PhysicalIndexScan {
                 table,
                 projection: ColumnProjection::All,
                 index_name,
@@ -697,8 +358,8 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 predicate: residual,
                 sort,
                 distinct,
-            },
-            AccessPath::Scan { predicate } => PhysicalPlan::Select {
+            }),
+            AccessPath::Scan { predicate } => PhysicalPlan::Select(PhysicalSelect {
                 table,
                 projection: ColumnProjection::All,
                 columns,
@@ -706,9 +367,9 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 predicate,
                 sort,
                 distinct,
-            },
+            }),
         },
-        LogicalPlan::Append(AppendPlan { arms, columns }) => PhysicalPlan::Append {
+        LogicalPlan::Append(AppendPlan { arms, columns }) => PhysicalPlan::Append(PhysicalAppend {
             arms: arms
                 .into_iter()
                 .map(|relation| PhysicalAppendArm {
@@ -719,13 +380,13 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 })
                 .collect(),
             columns,
-        },
+        }),
         LogicalPlan::SetOp(SetOpPlan {
             arms,
             columns,
             sort,
             distinct,
-        }) => PhysicalPlan::SetOp {
+        }) => PhysicalPlan::SetOp(PhysicalSetOp {
             arms: arms
                 .into_iter()
                 .map(|arm| PhysicalSetOpArm {
@@ -736,7 +397,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             columns,
             sort,
             distinct,
-        },
+        }),
         LogicalPlan::Subquery(SubqueryPlan {
             source,
             columns,
@@ -744,27 +405,27 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => PhysicalPlan::Subquery {
+        }) => PhysicalPlan::Subquery(PhysicalSubquery {
             source: Box::new(lower(*source, costs)),
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        },
+        }),
         LogicalPlan::Window(WindowPlan {
             source,
             spec,
             funcs,
             input_width,
             output_width,
-        }) => PhysicalPlan::Window {
+        }) => PhysicalPlan::Window(PhysicalWindow {
             source: Box::new(lower(*source, costs)),
             spec,
             funcs,
             input_width,
             output_width,
-        },
+        }),
         LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
@@ -773,7 +434,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        }) => PhysicalPlan::TableFunction {
+        }) => PhysicalPlan::TableFunction(PhysicalTableFunction {
             func,
             args,
             columns,
@@ -781,7 +442,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             predicate,
             sort,
             distinct,
-        },
+        }),
         LogicalPlan::Join(JoinPlan {
             mut source,
             columns,
@@ -791,14 +452,14 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             distinct,
         }) => {
             let predicate = pushdown::push_where_into_joins(&mut source, predicate);
-            PhysicalPlan::Join {
+            PhysicalPlan::Join(PhysicalJoin {
                 source: plan_join_expr(source, costs),
                 columns,
                 projections,
                 predicate,
                 sort,
                 distinct,
-            }
+            })
         }
         LogicalPlan::Aggregate(AggregatePlan {
             input,
@@ -816,10 +477,10 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             // too, or every aggregating join (most of TPC-H) misses it.
             let (input, predicate) = match input {
                 AggInput::Scan(table) => (
-                    PhysicalAggInput::Scan {
+                    PhysicalAggInput::Scan(PhysicalAggScan {
                         table,
                         projection: ColumnProjection::All,
-                    },
+                    }),
                     predicate,
                 ),
                 AggInput::Join(mut source) => {
@@ -831,7 +492,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 }
                 AggInput::SingleRow => (PhysicalAggInput::SingleRow, predicate),
             };
-            PhysicalPlan::Aggregate {
+            PhysicalPlan::Aggregate(PhysicalAggregate {
                 input,
                 predicate,
                 group_exprs,
@@ -841,17 +502,17 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 projections,
                 sort,
                 distinct,
-            }
+            })
         }
         LogicalPlan::Limit(LimitPlan {
             source,
             limit,
             offset,
-        }) => PhysicalPlan::Limit {
+        }) => PhysicalPlan::Limit(PhysicalLimit {
             source: Box::new(lower(*source, costs)),
             limit,
             offset,
-        },
+        }),
         LogicalPlan::Insert(InsertPlan {
             table,
             source,
@@ -859,23 +520,25 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             routing,
             freeze,
             tableoid,
-        }) => PhysicalPlan::Insert {
+        }) => PhysicalPlan::Insert(PhysicalInsert {
             tableoid,
             table,
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
                 InsertSource::Tuples { rows, defaults } => {
-                    PhysicalInsertSource::Tuples { rows, defaults }
+                    PhysicalInsertSource::Tuples(PhysicalInsertTuples { rows, defaults })
                 }
-                InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
-                    input: Box::new(lower(*input, costs)),
-                    projections,
-                },
+                InsertSource::Query { input, projections } => {
+                    PhysicalInsertSource::Query(PhysicalInsertQuery {
+                        input: Box::new(lower(*input, costs)),
+                        projections,
+                    })
+                }
             },
             returning,
             routing,
             freeze,
-        },
+        }),
         LogicalPlan::Update(UpdatePlan {
             table,
             predicate,
@@ -908,7 +571,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 tableoid,
                 costs,
             );
-            PhysicalPlan::Update {
+            PhysicalPlan::Update(PhysicalUpdate {
                 tableoid,
                 table,
                 predicate,
@@ -917,7 +580,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 routing,
                 inherited,
                 probe,
-            }
+            })
         }
         LogicalPlan::Delete(DeletePlan {
             table,
@@ -931,7 +594,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             let (routing, inherited, probe) = dml_targets(
                 &table, routing, inherited, &predicate, None, tableoid, costs,
             );
-            PhysicalPlan::Delete {
+            PhysicalPlan::Delete(PhysicalDelete {
                 tableoid,
                 table,
                 predicate,
@@ -939,7 +602,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 routing,
                 inherited,
                 probe,
-            }
+            })
         }
     }
 }
@@ -1434,9 +1097,9 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
 /// not find it here. Only the two footers are byte-identical to PG's.
 pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
-        PhysicalPlan::Select {
+        PhysicalPlan::Select(PhysicalSelect {
             table, predicate, ..
-        } => {
+        }) => {
             let schema = table.schema();
             let names = schema_names(&schema);
             let mut lines = vec![format!(
@@ -1449,21 +1112,21 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::IndexScan {
+        PhysicalPlan::IndexScan(PhysicalIndexScan {
             table,
             index_name,
             key,
             predicate,
             ..
-        } => index_scan_lines(
+        }) => index_scan_lines(
             table,
             index_name,
             key,
             predicate.as_ref(),
             &schema_names(&table.schema()),
         ),
-        PhysicalPlan::Values { .. } => vec!["Values Scan".to_string()],
-        PhysicalPlan::Append { arms, .. } => {
+        PhysicalPlan::Values(_) => vec!["Values Scan".to_string()],
+        PhysicalPlan::Append(PhysicalAppend { arms, .. }) => {
             // PG's Append: one child scan per arm, in scan order. A WHERE
             // predicate lives on the wrapping Subquery in this pipeline, so it is
             // not re-rendered per child (reduced EXPLAIN).
@@ -1484,12 +1147,12 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::SetOp {
+        PhysicalPlan::SetOp(PhysicalSetOp {
             arms,
             sort,
             distinct,
             ..
-        } => {
+        }) => {
             // As in PG: an Append over the arms, with the deduplication and the
             // sort shown above it — so a `UNION` is distinguishable from a
             // `UNION ALL`, and the cost of each step is visible.
@@ -1505,9 +1168,9 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::Subquery {
+        PhysicalPlan::Subquery(PhysicalSubquery {
             source, predicate, ..
-        } => {
+        }) => {
             let mut lines = explain(source);
             // The tail on this wrapper is what vectorizes, but the node the user
             // sees is the child's root line — an engine-managed relation renders
@@ -1531,13 +1194,15 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             }
             lines
         }
-        PhysicalPlan::TableFunction { .. } => vec!["Function Scan".to_string()],
-        PhysicalPlan::Join {
+        PhysicalPlan::TableFunction(_) => {
+            vec!["Function Scan".to_string()]
+        }
+        PhysicalPlan::Join(PhysicalJoin {
             source, predicate, ..
-        } => explain_join(source, predicate.as_ref()),
-        PhysicalPlan::Aggregate {
+        }) => explain_join(source, predicate.as_ref()),
+        PhysicalPlan::Aggregate(PhysicalAggregate {
             input, predicate, ..
-        } => match input {
+        }) => match input {
             // Only the join input is rendered in detail: it is the shape whose
             // access strategy is worth observing, and the one pushdown changes.
             PhysicalAggInput::Join(source) => {
@@ -1549,7 +1214,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
         // property, numbering the specs in *evaluation* order — so the bottom
         // node of a chain is `w1`. Numbering here is by depth for the same
         // reason: `window_number` counts the `Window` nodes below this one.
-        PhysicalPlan::Window { source, spec, .. } => {
+        PhysicalPlan::Window(PhysicalWindow { source, spec, .. }) => {
             let mut lines = nest_under("WindowAgg", explain(source));
             let names = source_column_names(source);
             push_root_property(
@@ -1562,28 +1227,28 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             );
             lines
         }
-        PhysicalPlan::Limit { source, .. } => {
+        PhysicalPlan::Limit(PhysicalLimit { source, .. }) => {
             let mut lines = vec!["Limit".to_string()];
             lines.extend(explain(source).into_iter().map(|l| format!("  {l}")));
             lines
         }
-        PhysicalPlan::Insert { table, source, .. } => {
+        PhysicalPlan::Insert(PhysicalInsert { table, source, .. }) => {
             let mut lines = vec![format!("Insert on {}", table.schema().name)];
             // A query source (`INSERT ... SELECT` / `TABLE t`) has a child plan;
             // render it indented under the Insert, as Limit/Subquery do.
-            if let PhysicalInsertSource::Query { input, .. } = source {
+            if let PhysicalInsertSource::Query(PhysicalInsertQuery { input, .. }) = source {
                 lines.extend(explain(input).into_iter().map(|l| format!("  {l}")));
             }
             lines
         }
-        PhysicalPlan::Update {
+        PhysicalPlan::Update(PhysicalUpdate {
             table,
             predicate,
             routing,
             inherited,
             probe,
             ..
-        } => {
+        }) => {
             let mut lines = vec![format!("Update on {}", table.schema().name)];
             lines.extend(dml_child_lines(
                 table,
@@ -1594,14 +1259,14 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             ));
             lines
         }
-        PhysicalPlan::Delete {
+        PhysicalPlan::Delete(PhysicalDelete {
             table,
             predicate,
             routing,
             inherited,
             probe,
             ..
-        } => {
+        }) => {
             let mut lines = vec![format!("Delete on {}", table.schema().name)];
             lines.extend(dml_child_lines(
                 table,
@@ -1856,7 +1521,7 @@ fn schema_names(schema: &TableSchema) -> Vec<Option<String>> {
 fn window_number(plan: &PhysicalPlan) -> usize {
     let mut node = plan;
     let mut depth = 1;
-    while let PhysicalPlan::Window { source, .. } = node {
+    while let PhysicalPlan::Window(PhysicalWindow { source, .. }) = node {
         node = source;
         depth += 1;
     }
@@ -1917,17 +1582,16 @@ fn explain_window_spec(spec: &BoundWindowSpec, names: &[Option<String>]) -> Stri
 /// [`explain_expr`] renders as `$index`.
 fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<String>> {
     match plan {
-        PhysicalPlan::Append { columns, .. } => {
+        PhysicalPlan::Append(PhysicalAppend { columns, .. }) => {
             columns.iter().map(|c| Some(c.name.clone())).collect()
         }
-        PhysicalPlan::Select { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
-            schema_names(&table.schema())
-        }
+        PhysicalPlan::Select(PhysicalSelect { table, .. })
+        | PhysicalPlan::IndexScan(PhysicalIndexScan { table, .. }) => schema_names(&table.schema()),
         // A window step reproduces its input row and appends slots, so the
         // names below it still apply — and every spec in a chain reads that
         // same row, so seeing through is what lets the upper `Window:` lines
         // name their columns instead of falling back to `$n`.
-        PhysicalPlan::Window { source, .. } => source_column_names(source),
+        PhysicalPlan::Window(PhysicalWindow { source, .. }) => source_column_names(source),
         _ => Vec::new(),
     }
 }
@@ -1937,21 +1601,23 @@ fn source_column_names(plan: &PhysicalPlan) -> Vec<Option<String>> {
 /// no schema name to show, so an expression over them renders as `$index`.
 fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
     match join {
-        PhysicalJoinExpr::Input { input, width, .. } => match input {
-            PhysicalJoinInput::Scan { table, .. } => schema_names(&table.schema()),
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf { input, width, .. }) => match input {
+            PhysicalJoinInput::Scan(PhysicalJoinScan { table, .. }) => {
+                schema_names(&table.schema())
+            }
             // An `Append` here is one relation read from several physical
             // sources, not a genuine subquery: its columns are the relation's, so
             // an expression over them must still render by name. Without this a
             // join or filter touching such a relation prints `$0`.
             PhysicalJoinInput::Subplan(plan) => match plan.as_ref() {
-                PhysicalPlan::Append { columns, .. } if columns.len() == *width => {
+                PhysicalPlan::Append(PhysicalAppend { columns, .. }) if columns.len() == *width => {
                     columns.iter().map(|c| Some(c.name.clone())).collect()
                 }
                 _ => vec![None; *width],
             },
             _ => vec![None; *width],
         },
-        PhysicalJoinExpr::Join { left, right, .. } => {
+        PhysicalJoinExpr::Join(PhysicalJoinPair { left, right, .. }) => {
             let mut names = join_column_names(left);
             names.extend(join_column_names(right));
             names
@@ -1969,14 +1635,16 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
     let names = join_column_names(join);
     let hashed = join.uses_hash_join();
     match join {
-        PhysicalJoinExpr::Input {
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input, predicate, ..
-        } => {
+        }) => {
             let mut lines = match input {
-                PhysicalJoinInput::Scan { table, .. } => {
+                PhysicalJoinInput::Scan(PhysicalJoinScan { table, .. }) => {
                     vec![format!("Seq Scan on {}", table.schema().name)]
                 }
-                PhysicalJoinInput::TableFunction { .. } => vec!["Function Scan".to_string()],
+                PhysicalJoinInput::TableFunction(_) => {
+                    vec!["Function Scan".to_string()]
+                }
                 PhysicalJoinInput::Subplan(source) => explain(source),
             };
             for predicate in predicate.iter().chain(filter) {
@@ -1987,13 +1655,13 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
             }
             lines
         }
-        PhysicalJoinExpr::Join {
+        PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             predicate,
             hash_keys,
             ..
-        } => {
+        }) => {
             let mut lines = vec![if hashed { "Hash Join" } else { "Nested Loop" }.to_string()];
             if hashed {
                 let cond = hash_keys
@@ -2044,7 +1712,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use crabgresql_binder::{BinOp, bind_delete, bind_insert, bind_query, bind_update};
+    use crabgresql_binder::{
+        BinOp, DistinctKey, OutputColumn, SortKey, bind_delete, bind_insert, bind_query,
+        bind_update,
+    };
     use crabgresql_parser::ast;
     use crabgresql_storage_api::{
         Column, DeleteResult, EmptyTypeCatalog, IndexKey, IndexMethod, StorageError, TableEngine,
@@ -2201,12 +1872,12 @@ mod tests {
 
     #[test]
     fn select_one_becomes_values() {
-        let PhysicalPlan::Values {
+        let PhysicalPlan::Values(PhysicalValues {
             columns,
             rows,
             predicate,
             ..
-        } = plan_sql("SELECT 1")
+        }) = plan_sql("SELECT 1")
         else {
             panic!("expected Values");
         };
@@ -2225,12 +1896,12 @@ mod tests {
 
     #[test]
     fn filtered_scan_becomes_select_with_predicate() {
-        let PhysicalPlan::Select {
+        let PhysicalPlan::Select(PhysicalSelect {
             columns,
             projections,
             predicate,
             ..
-        } = plan_sql("SELECT * FROM t WHERE id = 1")
+        }) = plan_sql("SELECT * FROM t WHERE id = 1")
         else {
             panic!("expected Select");
         };
@@ -2255,11 +1926,11 @@ mod tests {
 
     #[test]
     fn expression_projection_is_named_column() {
-        let PhysicalPlan::Select {
+        let PhysicalPlan::Select(PhysicalSelect {
             columns,
             projections,
             ..
-        } = plan_sql("SELECT id + 1 FROM t")
+        }) = plan_sql("SELECT id + 1 FROM t")
         else {
             panic!("expected Select");
         };
@@ -2277,7 +1948,8 @@ mod tests {
 
     #[test]
     fn mixed_width_comparison_coerces_int4_side() {
-        let PhysicalPlan::Select { predicate, .. } = plan_sql("SELECT id FROM t WHERE id < big")
+        let PhysicalPlan::Select(PhysicalSelect { predicate, .. }) =
+            plan_sql("SELECT id FROM t WHERE id < big")
         else {
             panic!("expected Select");
         };
@@ -2300,11 +1972,11 @@ mod tests {
 
     #[test]
     fn update_plan_carries_indexed_assignments() {
-        let PhysicalPlan::Update {
+        let PhysicalPlan::Update(PhysicalUpdate {
             assignments,
             predicate,
             ..
-        } = plan_sql("UPDATE t SET name = 'x' WHERE id = 2")
+        }) = plan_sql("UPDATE t SET name = 'x' WHERE id = 2")
         else {
             panic!("expected Update");
         };
@@ -2323,7 +1995,8 @@ mod tests {
 
     #[test]
     fn unfiltered_delete_has_no_predicate() {
-        let PhysicalPlan::Delete { predicate, .. } = plan_sql("DELETE FROM t") else {
+        let PhysicalPlan::Delete(PhysicalDelete { predicate, .. }) = plan_sql("DELETE FROM t")
+        else {
             panic!("expected Delete");
         };
         assert!(predicate.is_none());
@@ -2331,19 +2004,19 @@ mod tests {
 
     #[test]
     fn cross_join_maps_to_physical_join() {
-        let PhysicalPlan::Join {
+        let PhysicalPlan::Join(PhysicalJoin {
             source, columns, ..
-        } = plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
+        }) = plan_sql("SELECT * FROM t, (VALUES (1)) v(x)")
         else {
             panic!("expected Join");
         };
         assert!(matches!(
             source,
-            PhysicalJoinExpr::Join {
+            PhysicalJoinExpr::Join(PhysicalJoinPair {
                 kind: JoinKind::Cross,
                 predicate: None,
                 ..
-            }
+            })
         ));
         // t's three columns plus v's one.
         assert_eq!(columns.len(), 4);
@@ -2351,21 +2024,21 @@ mod tests {
 
     #[test]
     fn outer_join_and_aggregate_input_map_recursively() {
-        let PhysicalPlan::Aggregate {
+        let PhysicalPlan::Aggregate(PhysicalAggregate {
             input: PhysicalAggInput::Join(source),
             ..
-        } = plan_sql("SELECT count(*) FROM t a FULL JOIN t b ON a.id = b.id")
+        }) = plan_sql("SELECT count(*) FROM t a FULL JOIN t b ON a.id = b.id")
         else {
             panic!("expected Aggregate over Join");
         };
         // `a.id = b.id` is a cross-side equality, so it lowers to a hash join
         // with one key and no residual predicate.
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             kind,
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join");
         };
@@ -2377,17 +2050,17 @@ mod tests {
     #[test]
     fn equi_join_extracts_hash_key_and_leaves_residual() {
         // `a.id = b.id` is the sole key; `a.big > b.big` is a non-equi residual.
-        let PhysicalPlan::Join { source, .. } =
+        let PhysicalPlan::Join(PhysicalJoin { source, .. }) =
             plan_sql("SELECT * FROM t a INNER JOIN t b ON a.id = b.id AND a.big > b.big")
         else {
             panic!("expected Join");
         };
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             kind,
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2405,16 +2078,16 @@ mod tests {
     fn non_equi_and_constant_equalities_stay_nested_loop() {
         // `a.id = 1` compares a column to a constant (a filter, not a join key),
         // and `a.big < b.big` is non-equi: neither yields a hash key.
-        let PhysicalPlan::Join { source, .. } =
+        let PhysicalPlan::Join(PhysicalJoin { source, .. }) =
             plan_sql("SELECT * FROM t a INNER JOIN t b ON a.id = 1 AND a.big < b.big")
         else {
             panic!("expected Join");
         };
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2427,17 +2100,17 @@ mod tests {
         // `interval` equality is orderable (so the join binds) but agg::hash_key
         // can't distinguish interval values — they'd all share one bucket — so the
         // planner must keep it as a nested-loop predicate, not a hash key.
-        let PhysicalPlan::Join { source, .. } = plan_sql(
+        let PhysicalPlan::Join(PhysicalJoin { source, .. }) = plan_sql(
             "SELECT * FROM (VALUES ('1 day'::interval)) a(x) \
              JOIN (VALUES ('1 day'::interval)) b(y) ON a.x = b.y",
         ) else {
             panic!("expected Join");
         };
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2449,13 +2122,13 @@ mod tests {
     fn equi_join_on_hashable_nonint_type_extracts_key() {
         // `money` compares by its raw i64 and is now hashed distinctly, so an
         // equality on it is a hash key.
-        let PhysicalPlan::Join { source, .. } = plan_sql(
+        let PhysicalPlan::Join(PhysicalJoin { source, .. }) = plan_sql(
             "SELECT * FROM (VALUES ('$1'::money)) a(x) \
              JOIN (VALUES ('$1'::money)) b(y) ON a.x = b.y",
         ) else {
             panic!("expected Join");
         };
-        let PhysicalJoinExpr::Join { hash_keys, .. } = source else {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair { hash_keys, .. }) = source else {
             panic!("expected Join node");
         };
         assert_eq!(hash_keys.len(), 1);
@@ -2465,9 +2138,9 @@ mod tests {
     /// The root join node of a `PhysicalPlan::Join`, plus whatever predicate was
     /// left behind above it.
     fn join_root(plan: PhysicalPlan) -> (PhysicalJoinExpr, Option<BoundExpr>) {
-        let PhysicalPlan::Join {
+        let PhysicalPlan::Join(PhysicalJoin {
             source, predicate, ..
-        } = plan
+        }) = plan
         else {
             panic!("expected Join");
         };
@@ -2475,12 +2148,12 @@ mod tests {
     }
 
     fn join_parts(source: PhysicalJoinExpr) -> (JoinKind, Option<BoundExpr>, Vec<HashKey>) {
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             kind,
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected a Join node, not a leaf");
         };
@@ -2517,11 +2190,11 @@ mod tests {
     fn aggregate_over_comma_join_pushes_its_where() {
         // A grouped query keeps its WHERE on the Aggregate node, so extraction has
         // to run on that path too — this is the shape most of TPC-H has.
-        let PhysicalPlan::Aggregate {
+        let PhysicalPlan::Aggregate(PhysicalAggregate {
             input: PhysicalAggInput::Join(source),
             predicate,
             ..
-        } = plan_sql("SELECT a.name, count(*) FROM t a, t b WHERE a.id = b.id GROUP BY a.name")
+        }) = plan_sql("SELECT a.name, count(*) FROM t a, t b WHERE a.id = b.id GROUP BY a.name")
         else {
             panic!("expected Aggregate over Join");
         };
@@ -2537,11 +2210,11 @@ mod tests {
         // The TPC-H Q19 shape: the whole WHERE is one OR, but every arm repeats
         // the join equality and one single-relation restriction. Factoring those
         // out is what keeps this from planning as a Cartesian product.
-        let PhysicalPlan::Aggregate {
+        let PhysicalPlan::Aggregate(PhysicalAggregate {
             input: PhysicalAggInput::Join(source),
             predicate,
             ..
-        } = plan_sql(
+        }) = plan_sql(
             "SELECT count(*) FROM t a, t b \
              WHERE (a.id = b.id AND a.name = 'x' AND b.big = 1) \
                 OR (a.id = b.id AND a.name = 'x' AND b.big = 2)",
@@ -2549,30 +2222,30 @@ mod tests {
         else {
             panic!("expected Aggregate over Join");
         };
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             kind,
             right,
             predicate: residual,
             hash_keys,
-        } = source
+        }) = source
         else {
             panic!("expected a Join node");
         };
         assert_eq!(kind, JoinKind::Inner, "Cross must flip once conditioned");
         assert_eq!(hash_keys.len(), 1, "the factored equality is the hash key");
         // `a.name = 'x'` is common to both arms too, so it reaches the left leaf.
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: Some(_), ..
-        } = *left
+        }) = *left
         else {
             panic!("the common single-relation conjunct must sink to the leaf");
         };
         // What is left of the OR (`b.big = 1 OR b.big = 2`) touches only `b`, so
         // it sinks to the right leaf rather than filtering joined rows.
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: Some(_), ..
-        } = *right
+        }) = *right
         else {
             panic!("the residual OR must sink to the right leaf");
         };
@@ -2591,12 +2264,12 @@ mod tests {
         let (source, filter) = join_root(plan_sql(
             "SELECT * FROM t a, t b, t c WHERE a.id = b.id AND b.id = c.id",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             kind,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2619,12 +2292,12 @@ mod tests {
         let (source, filter) = join_root(plan_sql(
             "SELECT * FROM t a, t b JOIN t c ON b.id = c.id WHERE b.big = c.big",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             right,
             kind,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2732,12 +2405,12 @@ mod tests {
             "SELECT * FROM t a JOIN t b ON a.id = b.id \
              AND b.big = (SELECT max(c.big) FROM t c WHERE c.id = a.big)",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             right,
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2747,10 +2420,10 @@ mod tests {
             "the correlated ON residual stays on the join"
         );
         assert!(filter.is_none());
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: right_leaf,
             ..
-        } = *right
+        }) = *right
         else {
             panic!("expected a leaf on the right");
         };
@@ -2766,12 +2439,12 @@ mod tests {
             "SELECT * FROM t a JOIN t b \
              ON a.id = b.id AND b.big > nextval('s')",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             right,
             predicate,
             hash_keys,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2781,10 +2454,10 @@ mod tests {
             "the volatile ON residual stays on the join"
         );
         assert!(filter.is_none());
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: right_leaf,
             ..
-        } = *right
+        }) = *right
         else {
             panic!("expected a leaf on the right");
         };
@@ -2826,13 +2499,13 @@ mod tests {
         let (source, filter) = join_root(plan_sql(
             "SELECT * FROM t a, t b WHERE a.id = b.id AND a.big = 7",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             kind,
             predicate,
             hash_keys,
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2841,10 +2514,10 @@ mod tests {
         assert!(predicate.is_none(), "nothing left on the join node");
         assert!(filter.is_none(), "nothing left above the join");
 
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: left_leaf,
             ..
-        } = *left
+        }) = *left
         else {
             panic!("expected a leaf on the left");
         };
@@ -2852,10 +2525,10 @@ mod tests {
             left_leaf,
             Some(BoundExpr::Binary { op: BinOp::Eq, .. })
         ));
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: right_leaf,
             ..
-        } = *right
+        }) = *right
         else {
             panic!("expected a leaf on the right");
         };
@@ -2869,13 +2542,13 @@ mod tests {
         let (source, _) = join_root(plan_sql(
             "SELECT * FROM t a, t b WHERE a.id = b.id AND b.big = 7",
         ));
-        let PhysicalJoinExpr::Join { right, .. } = source else {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair { right, .. }) = source else {
             panic!("expected Join node");
         };
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: Some(BoundExpr::Binary { left, .. }),
             ..
-        } = *right
+        }) = *right
         else {
             panic!("expected a filtered leaf on the right");
         };
@@ -2897,12 +2570,12 @@ mod tests {
         let (source, _) = join_root(plan_sql(
             "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id AND b.big > 5",
         ));
-        let PhysicalJoinExpr::Join {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair {
             right,
             kind,
             predicate,
             ..
-        } = source
+        }) = source
         else {
             panic!("expected Join node");
         };
@@ -2911,10 +2584,10 @@ mod tests {
             matches!(predicate, Some(BoundExpr::Binary { op: BinOp::Gt, .. })),
             "the ON residual stays on the join node"
         );
-        let PhysicalJoinExpr::Input {
+        let PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             predicate: right_leaf,
             ..
-        } = *right
+        }) = *right
         else {
             panic!("expected a leaf on the right");
         };
@@ -2923,12 +2596,12 @@ mod tests {
 
     #[test]
     fn aggregate_query_maps_to_physical_aggregate() {
-        let PhysicalPlan::Aggregate {
+        let PhysicalPlan::Aggregate(PhysicalAggregate {
             group_exprs,
             aggregates,
             projections,
             ..
-        } = plan_sql("SELECT count(*) FROM t")
+        }) = plan_sql("SELECT count(*) FROM t")
         else {
             panic!("expected Aggregate");
         };
@@ -2945,11 +2618,11 @@ mod tests {
 
     #[test]
     fn grouped_aggregate_maps_to_physical_aggregate() {
-        let PhysicalPlan::Aggregate {
+        let PhysicalPlan::Aggregate(PhysicalAggregate {
             group_exprs,
             aggregates,
             ..
-        } = plan_sql("SELECT id, count(*) FROM t GROUP BY id")
+        }) = plan_sql("SELECT id, count(*) FROM t GROUP BY id")
         else {
             panic!("expected Aggregate");
         };
@@ -2959,7 +2632,8 @@ mod tests {
 
     #[test]
     fn insert_rows_are_prebound_constants() {
-        let PhysicalPlan::Insert { source, .. } = plan_sql("INSERT INTO t (id) VALUES (1), (2)")
+        let PhysicalPlan::Insert(PhysicalInsert { source, .. }) =
+            plan_sql("INSERT INTO t (id) VALUES (1), (2)")
         else {
             panic!("expected Insert");
         };
@@ -2995,12 +2669,12 @@ mod tests {
     #[test]
     fn equality_on_pk_becomes_index_scan() {
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", Some(pk_on_id()));
-        let PhysicalPlan::IndexScan {
+        let PhysicalPlan::IndexScan(PhysicalIndexScan {
             index_name,
             key,
             predicate,
             ..
-        } = plan
+        }) = plan
         else {
             panic!("expected IndexScan");
         };
@@ -3025,7 +2699,7 @@ mod tests {
             "SELECT * FROM t WHERE id = 1 AND name = 'x'",
             Some(pk_on_id()),
         );
-        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+        let PhysicalPlan::IndexScan(PhysicalIndexScan { key, predicate, .. }) = plan else {
             panic!("expected IndexScan");
         };
         assert_eq!(key.len(), 1);
@@ -3050,7 +2724,7 @@ mod tests {
             "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR (id = 1 AND name = 'y')",
             Some(pk_on_id()),
         );
-        let PhysicalPlan::IndexScan { key, predicate, .. } = plan else {
+        let PhysicalPlan::IndexScan(PhysicalIndexScan { key, predicate, .. }) = plan else {
             panic!("expected IndexScan");
         };
         assert_eq!(key.len(), 1);
@@ -3070,14 +2744,14 @@ mod tests {
             "SELECT * FROM t WHERE (id = 1 AND name = 'x') OR name = 'y'",
             Some(pk_on_id()),
         );
-        assert!(matches!(plan, PhysicalPlan::Select { .. }));
+        assert!(matches!(plan, PhysicalPlan::Select(_)));
     }
 
     #[test]
     fn equality_on_unindexed_column_stays_seq_scan() {
         let plan = plan_sql_indexed("SELECT * FROM t WHERE name = 'x'", Some(pk_on_id()));
         assert!(
-            matches!(plan, PhysicalPlan::Select { .. }),
+            matches!(plan, PhysicalPlan::Select(_)),
             "unindexed column must not use an index scan"
         );
     }
@@ -3088,19 +2762,20 @@ mod tests {
         // a range falls back to a sequential scan even on this B-tree index —
         // see its TODO on serving ranges from an index.
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id > 1", Some(pk_on_id()));
-        assert!(matches!(plan, PhysicalPlan::Select { .. }));
+        assert!(matches!(plan, PhysicalPlan::Select(_)));
     }
 
     #[test]
     fn equality_without_index_stays_seq_scan() {
         let plan = plan_sql_indexed("SELECT * FROM t WHERE id = 1", None);
-        assert!(matches!(plan, PhysicalPlan::Select { .. }));
+        assert!(matches!(plan, PhysicalPlan::Select(_)));
     }
 
     /// The probe a single-table DML plan chose for its own relation.
     fn direct_probe(plan: &PhysicalPlan) -> &Option<DmlIndexProbe> {
         match plan {
-            PhysicalPlan::Update { probe, .. } | PhysicalPlan::Delete { probe, .. } => probe,
+            PhysicalPlan::Update(PhysicalUpdate { probe, .. })
+            | PhysicalPlan::Delete(PhysicalDelete { probe, .. }) => probe,
             _ => panic!("expected a DML plan"),
         }
     }
@@ -3149,7 +2824,7 @@ mod tests {
         else {
             panic!("expected the uncovered text equality as the residual");
         };
-        let PhysicalPlan::Update { predicate, .. } = &plan else {
+        let PhysicalPlan::Update(PhysicalUpdate { predicate, .. }) = &plan else {
             panic!("expected Update");
         };
         let Some(BoundExpr::Binary { op: BinOp::And, .. }) = predicate else {
@@ -3377,13 +3052,13 @@ mod tests {
                 ))
                 .expect("create leaf")
         };
-        let plan = PhysicalPlan::Append {
+        let plan = PhysicalPlan::Append(PhysicalAppend {
             arms: [leaf("sales_2023"), leaf("sales_2024")]
                 .into_iter()
                 .map(identity_arm)
                 .collect(),
             columns: vec![OutputColumn::new("id", PgType::Int4)],
-        };
+        });
         assert_eq!(
             explain(&plan),
             vec![
@@ -3397,7 +3072,7 @@ mod tests {
     /// A three-armed set operation with the given tail, for EXPLAIN tests.
     fn setop_plan(sort: Vec<SortKey>, distinct: Option<Vec<DistinctKey>>) -> PhysicalPlan {
         let columns = vec![OutputColumn::new("id", PgType::Int4)];
-        PhysicalPlan::SetOp {
+        PhysicalPlan::SetOp(PhysicalSetOp {
             arms: (0..3)
                 .map(|_| PhysicalSetOpArm {
                     plan: plan_sql("SELECT * FROM t"),
@@ -3407,7 +3082,7 @@ mod tests {
             columns,
             sort,
             distinct,
-        }
+        })
     }
 
     #[test]
@@ -3505,6 +3180,7 @@ mod projection_tests {
 
     use super::tests::{MetaEngine, identity_arm, plan_sql};
     use super::*;
+    use crabgresql_binder::OutputColumn;
     use crabgresql_storage_api::{Column, TableEngine};
 
     /// The stamped projection, as a plain `Vec` (`None` = every column).
@@ -3517,7 +3193,7 @@ mod projection_tests {
 
     fn select_projection(sql: &str) -> Option<Vec<usize>> {
         match plan_sql(sql) {
-            PhysicalPlan::Select { projection, .. } => cols(&projection),
+            PhysicalPlan::Select(PhysicalSelect { projection, .. }) => cols(&projection),
             other => panic!("expected Select for `{sql}`, got {}", explain(&other)[0]),
         }
     }
@@ -3561,18 +3237,18 @@ mod projection_tests {
 
     fn agg_projection(sql: &str) -> Option<Vec<usize>> {
         match plan_sql(sql) {
-            PhysicalPlan::Aggregate {
-                input: PhysicalAggInput::Scan { projection, .. },
+            PhysicalPlan::Aggregate(PhysicalAggregate {
+                input: PhysicalAggInput::Scan(PhysicalAggScan { projection, .. }),
                 ..
-            } => cols(&projection),
-            PhysicalPlan::Aggregate {
+            }) => cols(&projection),
+            PhysicalPlan::Aggregate(PhysicalAggregate {
                 input: PhysicalAggInput::Join(source),
                 ..
-            } => match source {
-                PhysicalJoinExpr::Input {
-                    input: PhysicalJoinInput::Scan { projection, .. },
+            }) => match source {
+                PhysicalJoinExpr::Input(PhysicalJoinLeaf {
+                    input: PhysicalJoinInput::Scan(PhysicalJoinScan { projection, .. }),
                     ..
-                } => cols(&projection),
+                }) => cols(&projection),
                 other => panic!("expected a single scan leaf, got {:?}", other.width()),
             },
             other => panic!("expected Aggregate for `{sql}`, got {}", explain(&other)[0]),
@@ -3606,19 +3282,19 @@ mod projection_tests {
     fn a_join_splits_its_demand_across_the_width_boundary() {
         // a.id=0 a.big=1 a.name=2 | b.id=3 b.big=4 b.name=5
         // read: a.id (0), b.name (5); join key: a.big (1) = b.big (4)
-        let PhysicalPlan::Join { source, .. } =
+        let PhysicalPlan::Join(PhysicalJoin { source, .. }) =
             plan_sql("SELECT a.id, b.name FROM t a JOIN t b ON a.big = b.big")
         else {
             panic!("expected Join");
         };
-        let PhysicalJoinExpr::Join { left, right, .. } = source else {
+        let PhysicalJoinExpr::Join(PhysicalJoinPair { left, right, .. }) = source else {
             panic!("expected a binary join");
         };
         let leaf = |node: PhysicalJoinExpr| match node {
-            PhysicalJoinExpr::Input {
-                input: PhysicalJoinInput::Scan { projection, .. },
+            PhysicalJoinExpr::Input(PhysicalJoinLeaf {
+                input: PhysicalJoinInput::Scan(PhysicalJoinScan { projection, .. }),
                 ..
-            } => cols(&projection),
+            }) => cols(&projection),
             _ => panic!("expected a scan leaf"),
         };
         assert_eq!(leaf(*left), Some(vec![0, 1]), "left keeps its own indices");
@@ -3639,10 +3315,10 @@ mod projection_tests {
     #[test]
     fn demand_threads_through_a_derived_table() {
         let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s");
-        let PhysicalPlan::Subquery { source, .. } = plan else {
+        let PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) = plan else {
             panic!("expected a Subquery over the derived table");
         };
-        let PhysicalPlan::Select { projection, .. } = *source else {
+        let PhysicalPlan::Select(PhysicalSelect { projection, .. }) = *source else {
             panic!("expected the derived table to lower to a Select");
         };
         assert_eq!(cols(&projection), Some(vec![0]));
@@ -3656,8 +3332,8 @@ mod projection_tests {
         let mut node = &plan;
         loop {
             match node {
-                PhysicalPlan::Subquery { source, .. } => node = source,
-                PhysicalPlan::Select { projection, .. } => {
+                PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) => node = source,
+                PhysicalPlan::Select(PhysicalSelect { projection, .. }) => {
                     // `id` for the output, `big` for the inner WHERE.
                     assert_eq!(cols(projection), Some(vec![0, 1]));
                     return;
@@ -3675,9 +3351,9 @@ mod projection_tests {
         let mut node = &plan;
         loop {
             match node {
-                PhysicalPlan::Subquery { source, .. } => node = source,
-                PhysicalPlan::Limit { source, .. } => node = source,
-                PhysicalPlan::Select { projection, .. } => {
+                PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) => node = source,
+                PhysicalPlan::Limit(PhysicalLimit { source, .. }) => node = source,
+                PhysicalPlan::Select(PhysicalSelect { projection, .. }) => {
                     assert_eq!(cols(projection), Some(vec![0]));
                     return;
                 }
@@ -3694,13 +3370,13 @@ mod projection_tests {
     #[test]
     fn a_window_query_still_prunes_the_columns_it_does_not_read() {
         let plan = plan_sql("SELECT id, rank() OVER (ORDER BY name) FROM t");
-        let PhysicalPlan::Subquery { source, .. } = plan else {
+        let PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) = plan else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let PhysicalPlan::Window { source, .. } = *source else {
+        let PhysicalPlan::Window(PhysicalWindow { source, .. }) = *source else {
             panic!("expected a Window");
         };
-        let PhysicalPlan::Select { projection, .. } = *source else {
+        let PhysicalPlan::Select(PhysicalSelect { projection, .. }) = *source else {
             panic!("expected a Select");
         };
         assert_eq!(
@@ -3716,13 +3392,13 @@ mod projection_tests {
     #[test]
     fn a_window_partition_key_is_read_even_when_it_is_not_projected() {
         let plan = plan_sql("SELECT rank() OVER (PARTITION BY big ORDER BY name) FROM t");
-        let PhysicalPlan::Subquery { source, .. } = plan else {
+        let PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) = plan else {
             panic!("expected a Subquery wrapping the window chain");
         };
-        let PhysicalPlan::Window { source, .. } = *source else {
+        let PhysicalPlan::Window(PhysicalWindow { source, .. }) = *source else {
             panic!("expected a Window");
         };
-        let PhysicalPlan::Select { projection, .. } = *source else {
+        let PhysicalPlan::Select(PhysicalSelect { projection, .. }) = *source else {
             panic!("expected a Select");
         };
         assert_eq!(cols(&projection), Some(vec![1, 2]));
@@ -3767,10 +3443,10 @@ mod projection_tests {
     #[test]
     fn a_hidden_order_by_column_survives_threading() {
         let plan = plan_sql("SELECT id FROM (SELECT * FROM t) s ORDER BY name");
-        let PhysicalPlan::Subquery { source, .. } = plan else {
+        let PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) = plan else {
             panic!("expected a Subquery");
         };
-        let PhysicalPlan::Select { projection, .. } = *source else {
+        let PhysicalPlan::Select(PhysicalSelect { projection, .. }) = *source else {
             panic!("expected a Select");
         };
         assert_eq!(
@@ -3786,13 +3462,13 @@ mod projection_tests {
     /// that references no source column.
     #[test]
     fn a_set_operation_arm_prunes_from_its_own_tail_only() {
-        let PhysicalPlan::SetOp { arms, .. } =
+        let PhysicalPlan::SetOp(PhysicalSetOp { arms, .. }) =
             plan_sql("SELECT id FROM t UNION ALL SELECT big FROM t")
         else {
             panic!("expected a SetOp");
         };
         let projection = |arm: &PhysicalSetOpArm| match &arm.plan {
-            PhysicalPlan::Select { projection, .. } => cols(projection),
+            PhysicalPlan::Select(PhysicalSelect { projection, .. }) => cols(projection),
             other => panic!(
                 "expected each arm to be a Select, got {}",
                 explain(other)[0]
@@ -3803,12 +3479,12 @@ mod projection_tests {
 
         // But an arm that selects everything is not narrowed by what the
         // consumer of the set operation happens to read.
-        let PhysicalPlan::Subquery { source, .. } =
+        let PhysicalPlan::Subquery(PhysicalSubquery { source, .. }) =
             plan_sql("SELECT id FROM (SELECT * FROM t UNION ALL SELECT * FROM t) s")
         else {
             panic!("expected a Subquery over the set operation");
         };
-        let PhysicalPlan::SetOp { arms, .. } = *source else {
+        let PhysicalPlan::SetOp(PhysicalSetOp { arms, .. }) = *source else {
             panic!("expected a SetOp under the subquery");
         };
         assert_eq!(projection(&arms[0]), None);
@@ -3836,16 +3512,16 @@ mod projection_tests {
         let wide = leaf("wide", &[PgType::Int4, PgType::Int4, PgType::Int4]);
         let narrow = leaf("narrow", &[PgType::Int4, PgType::Int4]);
 
-        let mut plan = PhysicalPlan::Append {
+        let mut plan = PhysicalPlan::Append(PhysicalAppend {
             arms: [wide, narrow].into_iter().map(identity_arm).collect(),
             columns: vec![
                 OutputColumn::new("c0", PgType::Int4),
                 OutputColumn::new("c1", PgType::Int4),
                 OutputColumn::new("c2", PgType::Int4),
             ],
-        };
+        });
         projection::push_column_projections(&mut plan);
-        let PhysicalPlan::Append { arms, .. } = &plan else {
+        let PhysicalPlan::Append(PhysicalAppend { arms, .. }) = &plan else {
             unreachable!()
         };
         for arm in arms {

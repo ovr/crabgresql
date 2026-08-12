@@ -35,9 +35,13 @@ use crabgresql_binder::{
     LogicalPlan, RelationIdent, Returning, SortKey, TableFn, WindowFn, WindowKind,
 };
 use crabgresql_planner::{
-    DmlIndexProbe, DmlTarget, HashKey, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
-    PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, map_assigned_columns,
-    update_needs_unique_snapshot,
+    DmlIndexProbe, DmlTarget, HashKey, PhysicalAggInput, PhysicalAggScan, PhysicalAggregate,
+    PhysicalAppend, PhysicalAppendArm, PhysicalDelete, PhysicalIndexScan, PhysicalInsert,
+    PhysicalInsertQuery, PhysicalInsertSource, PhysicalInsertTuples, PhysicalJoin,
+    PhysicalJoinExpr, PhysicalJoinInput, PhysicalJoinLeaf, PhysicalJoinPair, PhysicalJoinScan,
+    PhysicalJoinTableFunction, PhysicalLimit, PhysicalPlan, PhysicalSelect, PhysicalSetOp,
+    PhysicalSubquery, PhysicalTableFunction, PhysicalUpdate, PhysicalValues, PhysicalWindow,
+    map_assigned_columns, update_needs_unique_snapshot,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
@@ -534,13 +538,13 @@ pub fn execute(
     // node evaluates an expression.
     resolve_subqueries(&mut plan, ctx, txn)?;
     match plan {
-        PhysicalPlan::Values {
+        PhysicalPlan::Values(PhysicalValues {
             columns,
             rows,
             predicate,
             sort,
             distinct,
-        } => {
+        }) => {
             // The emitted tuple width, including any hidden ORDER BY / DISTINCT ON
             // columns a FROM-less `SELECT DISTINCT ON (expr)` appended past the
             // visible output — captured before `rows` is moved so a Distinct can
@@ -553,7 +557,7 @@ pub fn execute(
             node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
             Ok(Execution::Rows { columns, node })
         }
-        PhysicalPlan::Select {
+        PhysicalPlan::Select(PhysicalSelect {
             table,
             projection,
             columns,
@@ -561,7 +565,7 @@ pub fn execute(
             predicate,
             sort,
             distinct,
-        } => project_pipeline(
+        }) => project_pipeline(
             scan_source(&table, txn, &projection),
             projections,
             predicate,
@@ -570,7 +574,7 @@ pub fn execute(
             columns,
             ctx,
         ),
-        PhysicalPlan::Append { arms, columns } => {
+        PhysicalPlan::Append(PhysicalAppend { arms, columns }) => {
             // A fanned-out relation read: concatenate every arm's scan. The
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
@@ -578,12 +582,12 @@ pub fn execute(
                 node: append_source(&arms, ctx, txn)?.into_rows(),
             })
         }
-        PhysicalPlan::SetOp {
+        PhysicalPlan::SetOp(PhysicalSetOp {
             arms,
             columns,
             sort,
             distinct,
-        } => {
+        }) => {
             // A UNION [ALL]: run each arm, coerce the ones whose own column types
             // differ from the unified output, and concatenate the streams. Then
             // apply this node's own deduplication (UNION) and ORDER BY.
@@ -609,7 +613,7 @@ pub fn execute(
             )?;
             Ok(Execution::Rows { columns, node })
         }
-        PhysicalPlan::IndexScan {
+        PhysicalPlan::IndexScan(PhysicalIndexScan {
             table,
             projection,
             index_name,
@@ -619,7 +623,7 @@ pub fn execute(
             predicate,
             sort,
             distinct,
-        } => {
+        }) => {
             let source = IndexScan::new(&table, &index_name, key, ctx, txn, &projection)?;
             project_pipeline(
                 Source::Rows(Box::new(source)),
@@ -631,14 +635,14 @@ pub fn execute(
                 ctx,
             )
         }
-        PhysicalPlan::Subquery {
+        PhysicalPlan::Subquery(PhysicalSubquery {
             source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => {
+        }) => {
             // Stream the source's rows straight into this level's pipeline. A
             // single FROM reference needs no materialization.
             // TODO: materialize a CTE referenced more than once, instead of
@@ -646,13 +650,13 @@ pub fn execute(
             let source = subquery_source(*source, ctx, txn)?;
             project_pipeline(source, projections, predicate, sort, distinct, columns, ctx)
         }
-        PhysicalPlan::Window {
+        PhysicalPlan::Window(PhysicalWindow {
             source,
             spec,
             funcs,
             output_width,
             ..
-        } => {
+        }) => {
             let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
@@ -667,7 +671,7 @@ pub fn execute(
                 node: Box::new(WindowAgg::new(node, spec, funcs, output_width, ctx)?),
             })
         }
-        PhysicalPlan::TableFunction {
+        PhysicalPlan::TableFunction(PhysicalTableFunction {
             func,
             args,
             columns,
@@ -675,7 +679,7 @@ pub fn execute(
             predicate,
             sort,
             distinct,
-        } => project_pipeline(
+        }) => project_pipeline(
             Source::Rows(Box::new(TableFunctionSource::new(func, args, ctx.clone()))),
             projections,
             predicate,
@@ -684,14 +688,14 @@ pub fn execute(
             columns,
             ctx,
         ),
-        PhysicalPlan::Join {
+        PhysicalPlan::Join(PhysicalJoin {
             source,
             columns,
             projections,
             predicate,
             sort,
             distinct,
-        } => {
+        }) => {
             let joined = build_join_expr(source, ctx, txn)?;
             project_pipeline(
                 Source::Rows(joined),
@@ -703,11 +707,11 @@ pub fn execute(
                 ctx,
             )
         }
-        PhysicalPlan::Limit {
+        PhysicalPlan::Limit(PhysicalLimit {
             source,
             limit,
             offset,
-        } => {
+        }) => {
             let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
@@ -719,7 +723,7 @@ pub fn execute(
                 node: Box::new(Limit::new(node, limit, offset)),
             })
         }
-        PhysicalPlan::Aggregate {
+        PhysicalPlan::Aggregate(PhysicalAggregate {
             input,
             predicate,
             group_exprs,
@@ -729,11 +733,11 @@ pub fn execute(
             projections,
             sort,
             distinct,
-        } => {
+        }) => {
             // Source rows: a base table scan or the single virtual row of a
             // FROM-less aggregate.
             let source: Box<dyn ExecNode> = match input {
-                PhysicalAggInput::Scan { table, projection } => {
+                PhysicalAggInput::Scan(PhysicalAggScan { table, projection }) => {
                     Box::new(SeqScan::new(&table, txn, &projection))
                 }
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
@@ -761,56 +765,9 @@ pub fn execute(
                 ctx,
             )
         }
-        PhysicalPlan::Insert {
-            table,
-            source,
-            returning,
-            routing,
-            freeze,
-            tableoid,
-        } => execute_insert(
-            &table, source, returning, routing, freeze, tableoid, ctx, txn,
-        ),
-        PhysicalPlan::Update {
-            table,
-            predicate,
-            assignments,
-            returning,
-            routing,
-            inherited,
-            probe,
-            tableoid,
-        } => execute_update(
-            &table,
-            &predicate,
-            &assignments,
-            returning,
-            routing,
-            inherited,
-            probe.as_ref(),
-            tableoid,
-            ctx,
-            txn,
-        ),
-        PhysicalPlan::Delete {
-            table,
-            predicate,
-            returning,
-            routing,
-            inherited,
-            probe,
-            tableoid,
-        } => execute_delete(
-            &table,
-            &predicate,
-            returning,
-            routing,
-            inherited,
-            probe.as_ref(),
-            tableoid,
-            ctx,
-            txn,
-        ),
+        PhysicalPlan::Insert(insert) => execute_insert(insert, ctx, txn),
+        PhysicalPlan::Update(update) => execute_update(update, ctx, txn),
+        PhysicalPlan::Delete(delete) => execute_delete(delete, ctx, txn),
     }
 }
 
@@ -828,26 +785,26 @@ fn resolve_subqueries(
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     match plan {
-        PhysicalPlan::Values {
+        PhysicalPlan::Values(PhysicalValues {
             rows, predicate, ..
-        } => {
+        }) => {
             for row in rows {
                 resolve_exprs(row, ctx, txn)?;
             }
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalPlan::Select {
+        PhysicalPlan::Select(PhysicalSelect {
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
         // An Append holds only leaf table handles — no subquery expressions.
-        PhysicalPlan::Append { .. } => {}
+        PhysicalPlan::Append(_) => {}
         // A SetOp holds no exprs of its own, but each arm's sub-plan may — recurse.
-        PhysicalPlan::SetOp { arms, .. } => {
+        PhysicalPlan::SetOp(PhysicalSetOp { arms, .. }) => {
             for arm in arms.iter_mut() {
                 resolve_subqueries(&mut arm.plan, ctx, txn)?;
                 if let Some(coercion) = &mut arm.coercion {
@@ -855,34 +812,34 @@ fn resolve_subqueries(
                 }
             }
         }
-        PhysicalPlan::IndexScan {
+        PhysicalPlan::IndexScan(PhysicalIndexScan {
             key,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             for (_, value) in key.iter_mut() {
                 resolve_expr(value, ctx, txn)?;
             }
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalPlan::Subquery {
+        PhysicalPlan::Subquery(PhysicalSubquery {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             resolve_subqueries(source, ctx, txn)?;
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalPlan::Window {
+        PhysicalPlan::Window(PhysicalWindow {
             source,
             spec,
             funcs,
             ..
-        } => {
+        }) => {
             resolve_subqueries(source, ctx, txn)?;
             for expr in spec.exprs_mut() {
                 resolve_expr(expr, ctx, txn)?;
@@ -891,27 +848,27 @@ fn resolve_subqueries(
                 resolve_exprs(func.kind.args_mut(), ctx, txn)?;
             }
         }
-        PhysicalPlan::TableFunction {
+        PhysicalPlan::TableFunction(PhysicalTableFunction {
             args,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             resolve_exprs(args, ctx, txn)?;
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalPlan::Join {
+        PhysicalPlan::Join(PhysicalJoin {
             source,
             projections,
             predicate,
             ..
-        } => {
+        }) => {
             resolve_join(source, ctx, txn)?;
             resolve_exprs(projections, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalPlan::Aggregate {
+        PhysicalPlan::Aggregate(PhysicalAggregate {
             input,
             predicate,
             group_exprs,
@@ -919,7 +876,7 @@ fn resolve_subqueries(
             having,
             projections,
             ..
-        } => {
+        }) => {
             if let PhysicalAggInput::Join(join) = input {
                 resolve_join(join, ctx, txn)?;
             }
@@ -933,10 +890,10 @@ fn resolve_subqueries(
             resolve_opt(having, ctx, txn)?;
             resolve_exprs(projections, ctx, txn)?;
         }
-        PhysicalPlan::Limit { source, .. } => resolve_subqueries(source, ctx, txn)?,
-        PhysicalPlan::Insert {
+        PhysicalPlan::Limit(PhysicalLimit { source, .. }) => resolve_subqueries(source, ctx, txn)?,
+        PhysicalPlan::Insert(PhysicalInsert {
             source, returning, ..
-        } => {
+        }) => {
             match source {
                 PhysicalInsertSource::Values(rows) => {
                     for row in rows {
@@ -946,19 +903,19 @@ fn resolve_subqueries(
                 // The rows are values, so only the deferred defaults can hold a
                 // subquery. Not walking the rows is the point: a bulk load's
                 // per-cell walk is O(rows x columns) for nothing.
-                PhysicalInsertSource::Tuples { defaults, .. } => {
+                PhysicalInsertSource::Tuples(PhysicalInsertTuples { defaults, .. }) => {
                     for (_, default) in defaults.iter_mut() {
                         resolve_expr(default, ctx, txn)?;
                     }
                 }
-                PhysicalInsertSource::Query { input, projections } => {
+                PhysicalInsertSource::Query(PhysicalInsertQuery { input, projections }) => {
                     resolve_subqueries(input, ctx, txn)?;
                     resolve_exprs(projections, ctx, txn)?;
                 }
             }
             resolve_returning(returning, ctx, txn)?;
         }
-        PhysicalPlan::Update {
+        PhysicalPlan::Update(PhysicalUpdate {
             predicate,
             assignments,
             returning,
@@ -966,7 +923,7 @@ fn resolve_subqueries(
             inherited,
             probe,
             ..
-        } => {
+        }) => {
             resolve_opt(predicate, ctx, txn)?;
             for (_, value) in assignments.iter_mut() {
                 resolve_expr(value, ctx, txn)?;
@@ -974,14 +931,14 @@ fn resolve_subqueries(
             resolve_probe_keys(routing, inherited, probe, ctx, txn)?;
             resolve_returning(returning, ctx, txn)?;
         }
-        PhysicalPlan::Delete {
+        PhysicalPlan::Delete(PhysicalDelete {
             predicate,
             returning,
             routing,
             inherited,
             probe,
             ..
-        } => {
+        }) => {
             resolve_opt(predicate, ctx, txn)?;
             resolve_probe_keys(routing, inherited, probe, ctx, txn)?;
             resolve_returning(returning, ctx, txn)?;
@@ -1053,23 +1010,25 @@ fn resolve_join(
     txn: &TxnContext,
 ) -> Result<(), ExecError> {
     match join {
-        PhysicalJoinExpr::Input {
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input, predicate, ..
-        } => {
+        }) => {
             match input {
-                PhysicalJoinInput::Scan { .. } => {}
+                PhysicalJoinInput::Scan(_) => {}
                 PhysicalJoinInput::Subplan(source) => resolve_subqueries(source, ctx, txn)?,
-                PhysicalJoinInput::TableFunction { args, .. } => resolve_exprs(args, ctx, txn)?,
+                PhysicalJoinInput::TableFunction(PhysicalJoinTableFunction { args, .. }) => {
+                    resolve_exprs(args, ctx, txn)?
+                }
             }
             resolve_opt(predicate, ctx, txn)?;
         }
-        PhysicalJoinExpr::Join {
+        PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             predicate,
             hash_keys,
             ..
-        } => {
+        }) => {
             resolve_join(left, ctx, txn)?;
             resolve_join(right, ctx, txn)?;
             resolve_opt(predicate, ctx, txn)?;
@@ -1795,7 +1754,7 @@ fn subquery_source(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Source, ExecError> {
-    if let PhysicalPlan::Append { arms, .. } = &source {
+    if let PhysicalPlan::Append(PhysicalAppend { arms, .. }) = &source {
         return append_source(arms, ctx, txn);
     }
     let Execution::Rows { node, .. } = execute(source, ctx, txn)? else {
@@ -2071,15 +2030,18 @@ fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb)
 /// freezing those rows would leave them visible after a rollback.
 #[allow(clippy::too_many_arguments)]
 fn execute_insert(
-    table: &Arc<dyn TableAm>,
-    source: PhysicalInsertSource,
-    returning: Option<Returning>,
-    routing: Option<Vec<Arc<dyn TableAm>>>,
-    freeze: bool,
-    tableoid: bool,
+    plan: PhysicalInsert,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let PhysicalInsert {
+        table,
+        source,
+        returning,
+        routing,
+        freeze,
+        tableoid,
+    } = plan;
     // Materialize every source tuple before any write. Draining a query source
     // to completion first is what makes `INSERT INTO t SELECT ... FROM t` read
     // only pre-insert rows (no Halloween problem), and lets validation/routing
@@ -2089,10 +2051,10 @@ fn execute_insert(
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
         // its key and write there.
         Some(leaves) => insert_routed(
-            table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
+            &table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
         ),
         // Ordinary table: rows go straight to `table`.
-        None => insert_direct(table, tuples, returning, freeze, tableoid, ctx, txn),
+        None => insert_direct(&table, tuples, returning, freeze, tableoid, ctx, txn),
     }
 }
 
@@ -2151,7 +2113,7 @@ fn collect_insert_tuples(
         // left to fill. Row-major and in ascending column order, which is the
         // order the `Values` path evaluates a full-width row in — what makes a
         // `serial` column's sequence advance identically.
-        PhysicalInsertSource::Tuples { rows, defaults } => {
+        PhysicalInsertSource::Tuples(PhysicalInsertTuples { rows, defaults }) => {
             tuples = rows;
             if !defaults.is_empty() {
                 for tuple in &mut tuples {
@@ -2161,7 +2123,7 @@ fn collect_insert_tuples(
                 }
             }
         }
-        PhysicalInsertSource::Query { input, projections } => {
+        PhysicalInsertSource::Query(PhysicalInsertQuery { input, projections }) => {
             let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
@@ -2417,28 +2379,39 @@ fn route_tuple(
 /// a different leaf when the key change relocates it ([`update_routed`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_update(
-    table: &Arc<dyn TableAm>,
-    predicate: &Option<BoundExpr>,
-    assignments: &[(usize, BoundExpr)],
-    returning: Option<Returning>,
-    routing: Option<Vec<DmlTarget>>,
-    inherited: Vec<DmlTarget>,
-    probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    plan: PhysicalUpdate,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let PhysicalUpdate {
+        table,
+        predicate,
+        assignments,
+        returning,
+        routing,
+        inherited,
+        probe,
+        tableoid,
+    } = plan;
     match routing {
-        Some(leaves) => update_routed(table, &leaves, predicate, assignments, returning, ctx, txn),
+        Some(leaves) => update_routed(
+            &table,
+            &leaves,
+            &predicate,
+            &assignments,
+            returning,
+            ctx,
+            txn,
+        ),
         None if !inherited.is_empty() => {
-            update_inherited(&inherited, predicate, assignments, returning, ctx, txn)
+            update_inherited(&inherited, &predicate, &assignments, returning, ctx, txn)
         }
         None => update_direct(
-            table,
-            predicate,
-            assignments,
+            &table,
+            &predicate,
+            &assignments,
             returning,
-            probe,
+            probe.as_ref(),
             tableoid,
             ctx,
             txn,
@@ -3181,22 +3154,33 @@ fn display_tuple(schema: &TableSchema, tuple: &Tuple, ctx: &ExecContext) -> Stri
 /// rows from whichever leaf holds them ([`delete_routed`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_delete(
-    table: &Arc<dyn TableAm>,
-    predicate: &Option<BoundExpr>,
-    returning: Option<Returning>,
-    routing: Option<Vec<DmlTarget>>,
-    inherited: Vec<DmlTarget>,
-    probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    plan: PhysicalDelete,
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let PhysicalDelete {
+        table,
+        predicate,
+        returning,
+        routing,
+        inherited,
+        probe,
+        tableoid,
+    } = plan;
     match routing {
-        Some(leaves) => delete_routed(&leaves, predicate, returning, ctx, txn),
+        Some(leaves) => delete_routed(&leaves, &predicate, returning, ctx, txn),
         None if !inherited.is_empty() => {
-            delete_inherited(&inherited, predicate, returning, ctx, txn)
+            delete_inherited(&inherited, &predicate, returning, ctx, txn)
         }
-        None => delete_direct(table, predicate, returning, probe, tableoid, ctx, txn),
+        None => delete_direct(
+            &table,
+            &predicate,
+            returning,
+            probe.as_ref(),
+            tableoid,
+            ctx,
+            txn,
+        ),
     }
 }
 
@@ -3521,10 +3505,10 @@ fn build_join_source(
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
-        PhysicalJoinInput::Scan { table, projection } => {
+        PhysicalJoinInput::Scan(PhysicalJoinScan { table, projection }) => {
             Box::new(SeqScan::new(&table, txn, &projection))
         }
-        PhysicalJoinInput::TableFunction { func, args } => {
+        PhysicalJoinInput::TableFunction(PhysicalJoinTableFunction { func, args }) => {
             Box::new(TableFunctionSource::new(func, args, ctx.clone()))
         }
         PhysicalJoinInput::Subplan(source) => {
@@ -3549,22 +3533,22 @@ fn build_join_expr(
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     let uses_hash_join = source.uses_hash_join();
     match source {
-        PhysicalJoinExpr::Input {
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input, predicate, ..
-        } => {
+        }) => {
             let source = build_join_source(input, ctx, txn)?;
             Ok(match predicate {
                 Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
                 None => source,
             })
         }
-        PhysicalJoinExpr::Join {
+        PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             kind,
             predicate,
             hash_keys,
-        } => {
+        }) => {
             let left_width = left.width();
             let right_width = right.width();
             let left = build_join_expr(*left, ctx, txn)?;
@@ -5915,6 +5899,42 @@ mod tests {
         })
     }
 
+    /// An UPDATE of one ordinary (unpartitioned, uninherited) table.
+    fn update_plan(
+        table: &Arc<dyn TableAm>,
+        predicate: Option<BoundExpr>,
+        assignments: Vec<(usize, BoundExpr)>,
+        probe: Option<DmlIndexProbe>,
+    ) -> PhysicalUpdate {
+        PhysicalUpdate {
+            tableoid: false,
+            table: Arc::clone(table),
+            predicate,
+            assignments,
+            returning: None,
+            routing: None,
+            inherited: Vec::new(),
+            probe,
+        }
+    }
+
+    /// A DELETE from one ordinary (unpartitioned, uninherited) table.
+    fn delete_plan(
+        table: &Arc<dyn TableAm>,
+        predicate: Option<BoundExpr>,
+        probe: Option<DmlIndexProbe>,
+    ) -> PhysicalDelete {
+        PhysicalDelete {
+            tableoid: false,
+            table: Arc::clone(table),
+            predicate,
+            returning: None,
+            routing: None,
+            inherited: Vec::new(),
+            probe,
+        }
+    }
+
     fn remaining(table: &Arc<dyn TableAm>) -> Vec<Tuple> {
         table
             .scan(&rtxn(), &ColumnProjection::All)
@@ -5929,13 +5949,7 @@ mod tests {
         for probe in [probe_on_id("t_id_key", 2), None] {
             let table = indexed_table();
             let Execution::Deleted(n) = test_ok(execute_delete(
-                &table,
-                &id_eq_2(),
-                None,
-                None,
-                Vec::new(),
-                probe.as_ref(),
-                false,
+                delete_plan(&table, id_eq_2(), probe),
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -5965,14 +5979,7 @@ mod tests {
         for probe in [probe_on_id("t_id_key", 2), None] {
             let table = indexed_table();
             let Execution::Updated(n) = test_ok(execute_update(
-                &table,
-                &id_eq_2(),
-                &assignments,
-                None,
-                None,
-                Vec::new(),
-                probe.as_ref(),
-                false,
+                update_plan(&table, id_eq_2(), assignments.clone(), probe),
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -6002,13 +6009,7 @@ mod tests {
     fn a_probe_the_engine_declines_falls_back_to_a_scan() {
         let table = test_table();
         let Execution::Deleted(n) = test_ok(execute_delete(
-            &table,
-            &id_eq_2(),
-            None,
-            None,
-            Vec::new(),
-            probe_on_id("missing_index", 2).as_ref(),
-            false,
+            delete_plan(&table, id_eq_2(), probe_on_id("missing_index", 2)),
             &ExecContext::default(),
             &wtxn(),
         )) else {
@@ -6301,14 +6302,7 @@ mod tests {
             ),
         )];
         let Execution::Updated(n) = execute_update(
-            &table,
-            &None,
-            &assignments,
-            None,
-            None,
-            Vec::new(),
-            None,
-            false,
+            update_plan(&table, None, assignments, None),
             &ExecContext::default(),
             &wtxn(),
         )?
@@ -6350,14 +6344,7 @@ mod tests {
             ),
         )];
         let Err(e) = execute_update(
-            &table,
-            &None,
-            &assignments,
-            None,
-            None,
-            Vec::new(),
-            None,
-            false,
+            update_plan(&table, None, assignments, None),
             &ExecContext::default(),
             &wtxn(),
         ) else {
@@ -6384,13 +6371,7 @@ mod tests {
             int4(1),
         ));
         let Execution::Deleted(n) = execute_delete(
-            &table,
-            &predicate,
-            None,
-            None,
-            Vec::new(),
-            None,
-            false,
+            delete_plan(&table, predicate, None),
             &ExecContext::default(),
             &wtxn(),
         )?
