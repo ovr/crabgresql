@@ -23,6 +23,7 @@ tag-message = "crabgresql {{version}}"
 pre-release-commit-message = "chore(release): v{{version}}"
 
 # git-cliff reads cliff.toml and rewrites CHANGELOG.md in place, so the release
-# commit carries the notes. `--tag` tells it which version the pending commits
-# belong to, since the tag does not exist yet at this point.
-pre-release-hook = ["git-cliff", "--tag", "v{{version}}", "-o", "CHANGELOG.md"]
+# commit carries the notes. The hook runs with the working directory set to a
+# crate root, so it goes through a script that pins git-cliff back to
+# $WORKSPACE_ROOT; see scripts/release-changelog.sh.
+pre-release-hook = ["sh", "-c", 'exec "$WORKSPACE_ROOT/scripts/release-changelog.sh"']

@@ -4,9 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the entries are
 generated from [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.0.2] - 2026-08-12
+
+### Features
+- support generated columns (STORED and VIRTUAL) ([#220](https://github.com/ovr/crabgresql-new/pull/220))
+- Collect statistics ([#214](https://github.com/ovr/crabgresql-new/pull/214))
+- **binder**: Support COALESCE and NULLIF ([#208](https://github.com/ovr/crabgresql-new/pull/208))
+- Support sha224/sha256/sha384/sha512 and crc32/crc32c functions ([#206](https://github.com/ovr/crabgresql-new/pull/206))
+- **types**: Support the bytea_output GUC ([#202](https://github.com/ovr/crabgresql-new/pull/202))
+- **functions**: length/octet_length/bit_length over bytea ([#204](https://github.com/ovr/crabgresql-new/pull/204))
+
+### Performance
+- **engine**: honor a scan's column projection in the heap and catalog ([#219](https://github.com/ovr/crabgresql-new/pull/219))
+- **executor**: test a hash join's residual before building the row ([#215](https://github.com/ovr/crabgresql-new/pull/215))
+- **executor**: borrow a binary operator's operands instead of cloning them ([#216](https://github.com/ovr/crabgresql-new/pull/216))
+- **planner**: factor common conjuncts out of a top-level OR ([#213](https://github.com/ovr/crabgresql-new/pull/213))
+- **executor**: hash and memoize correlated subqueries ([#211](https://github.com/ovr/crabgresql-new/pull/211))
+- **planner**: order a filter's conjuncts so a subquery is checked last ([#210](https://github.com/ovr/crabgresql-new/pull/210))
+- **executor**: test a nested-loop pair without building the row ([#209](https://github.com/ovr/crabgresql-new/pull/209))
+
+### Documentation
+- normalize code comments and mark missing functionality as TODO ([#212](https://github.com/ovr/crabgresql-new/pull/212))
+
 ## [0.0.1] - 2026-08-09
 
 ### Features
+- Upgrade rust to 1.97.1
 - Docker + release process ([#198](https://github.com/ovr/crabgresql-new/pull/198))
 - **catalog**: tableoid system column, and pg_attribute.attacl ([#193](https://github.com/ovr/crabgresql-new/pull/193))
 - **planner**: let an enum equality drive a hash join
@@ -168,6 +191,7 @@ generated from [Conventional Commits](https://www.conventionalcommits.org).
 - Cargo workspace, pgwire v3 handshake, SELECT 1 on the memory engine ([#2](https://github.com/ovr/crabgresql-new/pull/2))
 
 ### Bug Fixes
+- **ci**: strip sha256: prefix from digest artifact filenames
 - **agg**: restore the defensive path for an enum key
 - **catalog**: reject a binary-coercible cast to or from an enum
 - **name**: clip to 63 bytes, not 63 characters
