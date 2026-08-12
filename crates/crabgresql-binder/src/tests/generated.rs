@@ -26,6 +26,18 @@ fn engine_with_generated() -> anyhow::Result<Arc<dyn TableEngine>> {
             ],
         ))
         .context("creating the generated-column test table")?;
+    // A second relation, so a `USING` join can expose a virtual column under a
+    // name only one side answers to — an unqualified reference then resolves
+    // through the merged view rather than through `rels`.
+    engine
+        .create_table(TableSchema::new(
+            "h",
+            vec![
+                Column::new("a", PgType::Int4),
+                generated("w", Generation::Virtual, "(a + 100)"),
+            ],
+        ))
+        .context("creating the second generated-column test table")?;
     Ok(engine)
 }
 
@@ -107,6 +119,42 @@ fn a_substituted_expression_is_rebased_in_a_join() -> anyhow::Result<()> {
     assert!(
         matches!(left.as_ref(), BoundExpr::ColumnRef { index: 3, .. }),
         "the right arm's `a` sits at index 3 of the combined row, got {left:?}",
+    );
+    Ok(())
+}
+
+/// The `USING`/`NATURAL` merged view shadows unqualified resolution, so it has
+/// to substitute a virtual column too — otherwise every such join reads it as
+/// the NULL its slot holds.
+#[test]
+fn a_using_join_substitutes_a_virtual_column() -> anyhow::Result<()> {
+    let JoinPlan { projections, .. } = bind("SELECT w FROM g JOIN h USING (a)")?.into_join()?;
+    let BoundExpr::Binary {
+        op: BinOp::Add,
+        left,
+        ..
+    } = &projections[0]
+    else {
+        anyhow::bail!(
+            "a virtual column must substitute its expression, got {:?}",
+            projections[0]
+        );
+    };
+    assert!(
+        matches!(left.as_ref(), BoundExpr::ColumnRef { index: 3, .. }),
+        "`h`'s own `a` sits at index 3 of the combined row, got {left:?}",
+    );
+
+    // `*` follows the same view: the merged `a` first, then each side's
+    // remaining columns — with both virtual columns substituted.
+    let JoinPlan { projections, .. } = bind("SELECT * FROM g x JOIN g y USING (a)")?.into_join()?;
+    let substituted = projections
+        .iter()
+        .filter(|p| matches!(p, BoundExpr::Binary { op: BinOp::Add, .. }))
+        .count();
+    assert_eq!(
+        substituted, 2,
+        "both arms' virtual columns must substitute, got {projections:?}"
     );
     Ok(())
 }

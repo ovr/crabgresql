@@ -31,6 +31,12 @@ SELECT * FROM gen_both ORDER BY a;
 -- qualified one, a predicate, and a join key.
 SELECT gen_both.v, b FROM gen_both WHERE v = '2x';
 SELECT count(*) FROM gen_both x JOIN gen_both y ON x.v = y.v;
+-- A USING / NATURAL join resolves its non-join columns through a merged view of
+-- its own, which has to substitute a virtual column too.
+CREATE TABLE gen_side (a integer, w integer GENERATED ALWAYS AS (a + 100) VIRTUAL);
+INSERT INTO gen_side (a) VALUES (1), (2);
+SELECT a, v, w FROM gen_both JOIN gen_side USING (a) ORDER BY a;
+SELECT * FROM gen_both NATURAL JOIN gen_side ORDER BY a;
 
 -- Anything but DEFAULT is refused, wherever the value would come from.
 INSERT INTO gen_both VALUES (4, 44);
@@ -61,6 +67,23 @@ COPY gen_checked FROM stdin;
 4
 \.
 SELECT * FROM gen_checked ORDER BY a;
+
+-- Nothing can key on a virtual column, on any path that defines one — and a
+-- stored column, whose value really is in the row, keys like any other.
+CREATE INDEX ON gen_checked (v);
+CREATE UNIQUE INDEX ON gen_checked (v);
+ALTER TABLE gen_checked ADD UNIQUE (v);
+ALTER TABLE gen_checked ADD PRIMARY KEY (v);
+CREATE INDEX ON gen_both (s);
+
+-- ALTER TABLE ... ADD CHECK judges the values a reader sees, so a predicate an
+-- existing row violates through its virtual column is refused — the backfill
+-- scan reads stored slots, where a virtual column holds nothing.
+CREATE TABLE gen_backfill (a integer, v integer GENERATED ALWAYS AS (a * 2) VIRTUAL);
+INSERT INTO gen_backfill (a) VALUES (1), (100);
+ALTER TABLE gen_backfill ADD CHECK (v < 10);
+ALTER TABLE gen_backfill ADD CHECK (v < 1000);
+SELECT * FROM gen_backfill ORDER BY a;
 
 -- An inheritance child inherits the column and recomputes it on its own rows.
 CREATE TABLE gen_parent (a integer, s integer GENERATED ALWAYS AS (a * 3) STORED);
@@ -97,6 +120,8 @@ CREATE TABLE gen_err (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED) P
 
 DROP TABLE gen_child;
 DROP TABLE gen_parent;
+DROP TABLE gen_backfill;
+DROP TABLE gen_side;
 DROP TABLE gen_both;
 
 -- … and naming a generated column in a COPY column list is an error. Last in

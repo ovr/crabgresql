@@ -165,6 +165,52 @@ pub(crate) fn with_column_collation(expr: BoundExpr, collation: Option<u32>) -> 
     }
 }
 
+/// A column read straight out of the row: its `ColumnRef` at `index`, wrapped
+/// in the column's declared collation.
+pub(crate) fn plain_column_ref(column: &Column, index: usize) -> BoundExpr {
+    with_column_collation(
+        BoundExpr::ColumnRef {
+            index,
+            ty: column.ty,
+        },
+        column.collation,
+    )
+}
+
+/// The expression a reference to `columns[local]` binds to, for a relation
+/// whose columns start at `offset` in the combined row: the plain `ColumnRef`,
+/// or — for a **virtual** generated column — its generation expression rebased
+/// onto that row.
+///
+/// The one substitution site. Both name resolution ([`Scope::column_expr`]) and
+/// the merged-join `visible` view ([`crate::plan::default_visible`]) go through
+/// it, because a virtual column that keeps its slot in either place reads back
+/// as the NULL nothing was ever stored in.
+///
+/// The expression is re-parsed and re-bound per reference. That is the same
+/// per-statement cost a stored CHECK or a column default already pays, and it
+/// keeps the substitution honest: the expression binds against the relation's
+/// *current* shape, not one cached when the scope was built.
+pub(crate) fn column_value(
+    columns: &[Column],
+    local: usize,
+    offset: usize,
+    qualifier: &str,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<BoundExpr, BindError> {
+    let column = &columns[local];
+    if !column.is_virtual_generated() {
+        return Ok(plain_column_ref(column, offset + local));
+    }
+    // The stored text is unqualified (the DDL deparse drops the `t.`), so it
+    // resolves against the relation's own columns whatever the caller calls the
+    // relation here.
+    let schema = TableSchema::new(qualifier.to_string(), columns.to_vec());
+    let mut bound = crate::bind_stored_generation(&schema, local, catalog)?;
+    bound.shift_column_refs(offset as isize);
+    Ok(with_column_collation(bound, column.collation))
+}
+
 /// Find `name` among `rels`' columns, returning it (`Ok`) — or `Err(())` for
 /// more than one match (ambiguous), or `None` for no match. Shared by local and
 /// outer (correlated) unqualified resolution.
@@ -261,17 +307,6 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
     map_column_refs(expr, &|index, ty| BoundExpr::OuterColumnRef {
         level,
         index,
-        ty,
-    })
-}
-
-/// Shift every `ColumnRef` in `expr` by `offset`, moving an expression bound
-/// against one relation's own columns into the combined row that relation sits
-/// in. This is what places a virtual generated column's substituted expression
-/// at the right indexes when its relation is not the first FROM item.
-fn shift_columns(expr: &BoundExpr, offset: usize) -> BoundExpr {
-    map_column_refs(expr, &|index, ty| BoundExpr::ColumnRef {
-        index: index + offset,
         ty,
     })
 }
@@ -603,34 +638,17 @@ impl Scope {
     /// scope: its `ColumnRef` in the combined row, or — for a virtual generated
     /// column this scope expands — the generation expression, rebased onto the
     /// combined row.
-    ///
-    /// The expression is re-parsed and re-bound per reference. That is the same
-    /// per-statement cost a stored CHECK or a column default already pays, and
-    /// it keeps the substitution honest: the expression binds against the
-    /// relation's *current* shape, not one cached when the scope was built.
     fn column_expr(&self, rel: &ScopeRel, local: usize) -> Result<BoundExpr, BindError> {
-        let column = &rel.columns[local];
-        let plain = || {
-            with_column_collation(
-                BoundExpr::ColumnRef {
-                    index: rel.offset + local,
-                    ty: column.ty,
-                },
-                column.collation,
-            )
-        };
-        if !self.expand_generated || !column.is_virtual_generated() {
-            return Ok(plain());
+        if !self.expand_generated {
+            return Ok(plain_column_ref(&rel.columns[local], rel.offset + local));
         }
-        // The stored text is unqualified (the DDL deparse drops the `t.`), so it
-        // resolves against the relation's own columns whatever this scope calls
-        // the relation here.
-        let schema = TableSchema::new(rel.qualifier.clone(), rel.columns.clone());
-        let bound = crate::bind_stored_generation(&schema, local, &self.catalog)?;
-        Ok(with_column_collation(
-            shift_columns(&bound, rel.offset),
-            column.collation,
-        ))
+        column_value(
+            &rel.columns,
+            local,
+            rel.offset,
+            &rel.qualifier,
+            &self.catalog,
+        )
     }
 
     /// Attach the context needed to bind expression subqueries against this

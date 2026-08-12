@@ -3350,9 +3350,9 @@ fn bind_from_clause(
             (Some(acc), Some(gv)) => {
                 acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
             }
-            (Some(acc), None) => acc.extend(default_visible(&group_relations, width)),
+            (Some(acc), None) => acc.extend(default_visible(&group_relations, width, catalog)?),
             (None, Some(gv)) => {
-                let mut acc = default_visible(&relations, 0);
+                let mut acc = default_visible(&relations, 0, catalog)?;
                 acc.extend(gv.into_iter().map(|c| shift_visible(c, width)));
                 visible = Some(acc);
             }
@@ -3457,7 +3457,7 @@ fn bind_table_with_joins(
         let (kind, predicate) = match join_kind_and_constraint(&join.join_operator)? {
             JoinBinding::Cross => {
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width));
+                    v.extend(default_visible(&right.relations, left_width, catalog)?);
                 }
                 (JoinKind::Cross, None)
             }
@@ -3466,11 +3466,14 @@ fn bind_table_with_joins(
                 on_relations.extend(right.relations.clone());
                 // A prior USING/NATURAL join makes the merged view govern
                 // unqualified names inside this ON clause too.
-                let on_visible = visible.as_ref().map(|v| {
-                    let mut ov = v.clone();
-                    ov.extend(default_visible(&right.relations, left_width));
-                    ov
-                });
+                let on_visible = match visible.as_ref() {
+                    Some(v) => {
+                        let mut ov = v.clone();
+                        ov.extend(default_visible(&right.relations, left_width, catalog)?);
+                        Some(ov)
+                    }
+                    None => None,
+                };
                 let scope =
                     Scope::relations_with_visible(on_relations, on_visible, catalog, params)
                         .with_subqueries(engine, ctes)
@@ -3481,23 +3484,25 @@ fn bind_table_with_joins(
                     reject_agg_or_window(expr, "JOIN conditions")?;
                 }
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width));
+                    v.extend(default_visible(&right.relations, left_width, catalog)?);
                 }
                 (kind, Some(to_bool_operand(binding, "JOIN/ON", on.span())?))
             }
             JoinBinding::Using(kind, names) => {
-                let left_view = visible
-                    .take()
-                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
+                let left_view = match visible.take() {
+                    Some(view) => view,
+                    None => default_visible(&bound.relations, 0, catalog)?,
+                };
                 let (predicate, new_visible) =
                     build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
             JoinBinding::Natural(kind) => {
-                let left_view = visible
-                    .take()
-                    .unwrap_or_else(|| default_visible(&bound.relations, 0));
+                let left_view = match visible.take() {
+                    Some(view) => view,
+                    None => default_visible(&bound.relations, 0, catalog)?,
+                };
                 let names = natural_join_names(&left_view, &right);
                 let (predicate, new_visible) =
                     build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
@@ -3521,27 +3526,37 @@ fn bind_table_with_joins(
 /// The plain visible view for a run of relations laid out from `base` in the
 /// combined row: every column as a `ColumnRef`, in order — exactly what
 /// unqualified resolution and `*` produce without any merged join columns.
-fn default_visible(relations: &[ScopeItem], base: usize) -> Vec<VisibleColumn> {
+pub(crate) fn default_visible(
+    relations: &[ScopeItem],
+    base: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<VisibleColumn>, BindError> {
     let mut out = Vec::new();
-    let mut index = base;
+    let mut offset = base;
     for rel in relations {
         // The merged view drives unqualified resolution and `*`, and a system
         // column belongs to neither: it never takes part in `USING`, and `*`
         // does not expand it.
-        for col in rel.declared() {
+        for (local, col) in rel.declared().iter().enumerate() {
             out.push(VisibleColumn {
                 name: col.name.clone(),
-                // Carry the column's declared collation, as unqualified
-                // resolution against `rels` does — this view shadows that path.
-                expr: crate::expr::with_column_collation(
-                    BoundExpr::ColumnRef { index, ty: col.ty },
-                    col.collation,
-                ),
+                // Through the same helper name resolution uses, so a virtual
+                // generated column substitutes its expression here too — this
+                // view *shadows* that path, and a `ColumnRef` would read the
+                // slot nothing is stored in. It also carries the column's
+                // declared collation, as the shadowed path does.
+                expr: crate::expr::column_value(
+                    &rel.columns,
+                    local,
+                    offset,
+                    &rel.qualifier,
+                    catalog,
+                )?,
             });
-            index += 1;
         }
+        offset += rel.columns.len();
     }
-    out
+    Ok(out)
 }
 
 /// The columns a `NATURAL` join equates: every name present in both the
@@ -3598,7 +3613,7 @@ fn build_merged_join(
     left_width: usize,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
-    let right_visible = default_visible(&right.relations, left_width);
+    let right_visible = default_visible(&right.relations, left_width, catalog)?;
     let mut predicate: Option<BoundExpr> = None;
     let mut merged_cols: Vec<VisibleColumn> = Vec::new();
 

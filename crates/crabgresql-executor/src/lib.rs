@@ -10,7 +10,7 @@ mod agg;
 mod checks;
 pub mod eval;
 mod generate_series;
-mod generated;
+pub mod generated;
 mod hash;
 mod keyindex;
 mod md5;

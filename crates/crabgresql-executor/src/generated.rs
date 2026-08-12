@@ -23,7 +23,7 @@ use crabgresql_types::Value;
 use crate::{ExecContext, ExecError, eval};
 
 /// A relation's generated columns, bound and ready to evaluate against a row.
-pub(crate) struct GeneratedSet {
+pub struct GeneratedSet {
     /// `(column position, kind, expression)`, in column order — which is also
     /// the order a row is filled in, so a `serial` column's sequence advances
     /// identically whether or not the relation has generated columns.
@@ -34,7 +34,7 @@ pub(crate) struct GeneratedSet {
 
 impl GeneratedSet {
     /// Bind every generation expression of `schema`.
-    pub(crate) fn for_schema(schema: &TableSchema, ctx: &ExecContext) -> Result<Self, ExecError> {
+    pub fn for_schema(schema: &TableSchema, ctx: &ExecContext) -> Result<Self, ExecError> {
         // The overwhelmingly common case — a relation with no generated column
         // — pays one scan of the column list and never touches the catalog.
         if schema.columns.iter().all(|c| c.generated.is_none()) {
@@ -66,16 +66,16 @@ impl GeneratedSet {
 
     /// A set that generates nothing, for a relation that declares no generated
     /// column.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         GeneratedSet {
             entries: Vec::new(),
             has_virtual: false,
         }
     }
 
-    /// Whether this relation has any generated column at all.
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    /// Whether this relation has any generated column at all. A caller that
+    /// only needs the *values* can skip its own widening work when this holds.
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -86,7 +86,7 @@ impl GeneratedSet {
     ///
     /// A generation expression cannot reference another generated column (the
     /// DDL refuses it), so the order the slots are filled in cannot matter.
-    pub(crate) fn compute(&self, tuple: &mut Tuple, ctx: &ExecContext) -> Result<(), ExecError> {
+    pub fn compute(&self, tuple: &mut Tuple, ctx: &ExecContext) -> Result<(), ExecError> {
         for (index, _, expr) in &self.entries {
             tuple[*index] = eval(expr, tuple, ctx)?;
         }
@@ -95,7 +95,7 @@ impl GeneratedSet {
 
     /// Clear the virtual slots, which store nothing. Called after the row has
     /// been validated and projected, immediately before it is written.
-    pub(crate) fn blank_virtual(&self, tuple: &mut Tuple) {
+    pub fn blank_virtual(&self, tuple: &mut Tuple) {
         if !self.has_virtual {
             return;
         }
