@@ -301,33 +301,27 @@ fn window_not_allowed(clause: &str) -> BindError {
 /// `level`, cloning everything else. Used to turn a merged-join `visible`
 /// column's expression — a `ColumnRef` (inner/left/right join) or a full join's
 /// `COALESCE`-as-`CASE` over both sides — into a correlated reference when it is
-/// resolved from an enclosing query by an inner subquery. A virtual generated
-/// column's substituted expression takes the same path.
+/// resolved from an enclosing query by an inner subquery.
 fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
-    map_column_refs(expr, &|index, ty| BoundExpr::OuterColumnRef {
-        level,
-        index,
-        ty,
-    })
-}
-
-/// Rebuild `expr` with every `ColumnRef` replaced by `f(index, type)`.
-fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> BoundExpr {
     match expr {
-        BoundExpr::ColumnRef { index, ty } => f(*index, *ty),
+        BoundExpr::ColumnRef { index, ty } => BoundExpr::OuterColumnRef {
+            level,
+            index: *index,
+            ty: *ty,
+        },
         BoundExpr::Const { .. } | BoundExpr::Param { .. } | BoundExpr::OuterColumnRef { .. } => {
             expr.clone()
         }
         BoundExpr::Unary { op, expr } => BoundExpr::Unary {
             op: *op,
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
         },
         BoundExpr::Collate {
             expr,
             collation,
             explicit,
         } => BoundExpr::Collate {
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
             collation: *collation,
             explicit: *explicit,
         },
@@ -341,11 +335,11 @@ fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> 
             op: *op,
             arg_ty: *arg_ty,
             collation: *collation,
-            left: Box::new(map_column_refs(left, f)),
-            right: Box::new(map_column_refs(right, f)),
+            left: Box::new(outerize_columns(left, level)),
+            right: Box::new(outerize_columns(right, level)),
         },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
             negated: *negated,
         },
         BoundExpr::BoolTest {
@@ -353,12 +347,12 @@ fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> 
             value,
             negated,
         } => BoundExpr::BoolTest {
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
             value: *value,
             negated: *negated,
         },
         BoundExpr::Coerce { expr, ty } => BoundExpr::Coerce {
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
             ty: *ty,
         },
         BoundExpr::Reinterpret {
@@ -366,14 +360,14 @@ fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> 
             reported,
             rep,
         } => BoundExpr::Reinterpret {
-            expr: Box::new(map_column_refs(expr, f)),
+            expr: Box::new(outerize_columns(expr, level)),
             reported: *reported,
             rep: *rep,
         },
         BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
             func: *func,
             ret: *ret,
-            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
         },
         BoundExpr::Routine {
             oid,
@@ -387,36 +381,34 @@ fn map_column_refs(expr: &BoundExpr, f: &dyn Fn(usize, PgType) -> BoundExpr) -> 
             name: Arc::clone(name),
             arg_types: Arc::clone(arg_types),
             strict: *strict,
-            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
             ret: *ret,
         },
 
         BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
             elem: *elem,
             ty: *ty,
-            elems: elems.iter().map(|a| map_column_refs(a, f)).collect(),
+            elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
         },
         BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
-            base: Box::new(map_column_refs(base, f)),
-            index: Box::new(map_column_refs(index, f)),
+            base: Box::new(outerize_columns(base, level)),
+            index: Box::new(outerize_columns(index, level)),
             ty: *ty,
         },
         BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {
             whens: whens
                 .iter()
-                .map(|(c, r)| (map_column_refs(c, f), map_column_refs(r, f)))
+                .map(|(c, r)| (outerize_columns(c, level), outerize_columns(r, level)))
                 .collect(),
-            else_: else_.as_ref().map(|e| Box::new(map_column_refs(e, f))),
+            else_: else_.as_ref().map(|e| Box::new(outerize_columns(e, level))),
             ty: *ty,
         },
         BoundExpr::Coalesce { args, ty } => BoundExpr::Coalesce {
-            args: args.iter().map(|a| map_column_refs(a, f)).collect(),
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
             ty: *ty,
         },
-        // Neither caller can see these: a merged-join visible column is a
-        // ColumnRef or a COALESCE/CASE over ColumnRefs, and a generation
-        // expression may hold no SRF, aggregate, window function or subquery
-        // (the DDL refuses all four). Cloned defensively rather than panicking.
+        // A merged-join visible column expression is only ever a ColumnRef or a
+        // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
         BoundExpr::Srf { .. }
         | BoundExpr::Aggregate { .. }
         | BoundExpr::WindowFunc { .. }
@@ -626,12 +618,26 @@ impl Scope {
         }
     }
 
-    /// Resolve a reference to a virtual generated column as the plain slot it
-    /// occupies rather than as its generation expression — see
-    /// [`Scope::expand_generated`].
-    pub fn without_generated_expansion(mut self) -> Scope {
-        self.expand_generated = false;
-        self
+    /// The scope a **stored per-row expression** binds against: a CHECK
+    /// predicate, a generation expression, or either of them re-bound from the
+    /// catalog. It is [`Scope::table`] over the relation's raw storage layout —
+    /// no system slot, no subquery context, and no generated-column expansion.
+    ///
+    /// All three properties are the same decision seen from different sides: the
+    /// expression is evaluated against a tuple, once per row, by whoever holds
+    /// it. A `tableoid` would mean a different relation per leaf it is re-bound
+    /// for; a subquery has no plan to run there; and a reference to a generated
+    /// column must stay a reference, so that a CHECK can record its ordinal and
+    /// a generation expression can *refuse* it.
+    pub fn stored_row(
+        schema: &TableSchema,
+        catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
+    ) -> Scope {
+        Scope {
+            expand_generated: false,
+            ..Scope::table(schema, schema.name.clone(), catalog, params, false)
+        }
     }
 
     /// The expression a resolved column binds to, within one relation of this

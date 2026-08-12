@@ -2303,7 +2303,7 @@ fn execute_create_index(
     reject_partitioned_parent(&table, &table_name)?;
     // `CREATE UNIQUE INDEX` is still refused as an *index*: only a constraint
     // is named by its kind.
-    let keys = simple_index_keys(&table.schema(), &create.columns, IndexBacking::Index)?;
+    let keys = simple_index_keys(&table.schema(), &create.columns, None)?;
     // PG names an unnamed index after the table and every key column, e.g.
     // `t_a_b_idx`, then bumps the label on collision (`t_a_b_idx1`).
     let index_name = explicit_name.unwrap_or_else(|| {
@@ -2799,7 +2799,7 @@ fn execute_alter_table(
                 continue;
             }
         };
-        let keys = simple_index_keys(&schema, &columns, IndexBacking::of(Some(kind)))?;
+        let keys = simple_index_keys(&schema, &columns, Some(kind))?;
         if kind == IndexConstraint::PrimaryKey {
             if existing_primary_key || added_primary_key {
                 return Err(PgError::new(
@@ -3031,14 +3031,15 @@ fn validate_primary_key_not_null(
 /// rely on, and it matters here: a full-width scan would detoast every column of
 /// every row for a predicate reading one.
 ///
-/// A relation with **generated** columns is the one exception to the narrow
-/// read: a stored predicate names the generated column itself (it binds with
-/// the substitution off, so `check.columns` holds that ordinal rather than the
-/// columns its expression reads), and a *virtual* one's stored slot is the NULL
-/// nothing was written to. Such a relation is scanned full-width and each row is
-/// completed by the same [`GeneratedSet`] the write paths use, so the backfill
-/// judges the values a reader would see. Without it, `ALTER TABLE … ADD CHECK
-/// (v < 10)` was accepted over rows that violate it.
+/// A relation with a **virtual** generated column is the one exception to the
+/// narrow read: a stored predicate names the generated column itself (it binds
+/// with the substitution off, so `check.columns` holds that ordinal rather than
+/// the columns its expression reads), and a virtual column's stored slot is the
+/// NULL nothing was written to. Such a relation is scanned full-width and each
+/// row is completed by the same `GeneratedSet` the write paths use, so the
+/// backfill judges the values a reader would see. Without it, `ALTER TABLE …
+/// ADD CHECK (v < 10)` was accepted over rows that violate it. A *stored*
+/// generated column needs none of this: its value is on disk like any other.
 ///
 /// PostgreSQL's message here names the *constraint and relation* rather than the
 /// offending row, and carries **no DETAIL** — unlike the DML-time violation,
@@ -3054,15 +3055,17 @@ fn validate_check_constraint(
 ) -> Result<(), PgError> {
     let schema = table.schema();
     let generated = crabgresql_executor::generated::GeneratedSet::for_schema(&schema, ctx)?;
-    let projection = match generated.is_empty() {
-        true => {
+    let projection = match generated.has_virtual() {
+        false => {
             crabgresql_storage_api::ColumnProjection::of(check.columns.iter().copied(), &schema)
         }
-        false => crabgresql_storage_api::ColumnProjection::All,
+        true => crabgresql_storage_api::ColumnProjection::All,
     };
     for row in table.scan(txn, &projection) {
         let (_, mut tuple) = row?;
-        generated.compute(&mut tuple, ctx)?;
+        if generated.has_virtual() {
+            generated.compute(&mut tuple, ctx)?;
+        }
         if matches!(
             crabgresql_executor::eval::eval(bound, &tuple, ctx)?,
             crabgresql_types::Value::Bool(false)
@@ -4238,7 +4241,7 @@ fn execute_create_table(
                 } => {
                     // PostgreSQL points its cursor at the clause it is refusing,
                     // which for all three of these is the one being read here.
-                    let at_clause = |e: PgError| at_span(e, *span);
+                    let at_clause = |e: PgError| e.at(*span);
                     if column.generated.is_some() {
                         return Err(at_clause(PgError::syntax(format!(
                             "multiple generation clauses specified for column \"{column_name}\" of table \"{name}\""
@@ -4506,7 +4509,7 @@ fn execute_create_table(
     let mut indexes = Vec::new();
     for p in pending {
         reject_deferred_characteristics(p.characteristics)?;
-        let keys = simple_index_keys(&schema, &p.columns, IndexBacking::of(Some(p.constraint)))?;
+        let keys = simple_index_keys(&schema, &p.columns, Some(p.constraint))?;
         let base = constraint_index_base(&name, &schema, p.constraint, &keys);
         let index_name = p
             .explicit_name
@@ -4717,12 +4720,14 @@ fn build_partition_scheme(
     // computed, and PostgreSQL refuses the DDL for the same reason — for a
     // stored column as firmly as for a virtual one. Probed against 18.4.
     if columns[idx].generated.is_some() {
-        return Err(at_span(
-            PgError::new("42P17", "cannot use generated column in partition key").with_detail(
-                format!("Column \"{}\" is a generated column.", columns[idx].name),
-            ),
-            key_span,
-        ));
+        return Err(
+            PgError::new("42P17", "cannot use generated column in partition key")
+                .with_detail(format!(
+                    "Column \"{}\" is a generated column.",
+                    columns[idx].name
+                ))
+                .at(key_span),
+        );
     }
     Ok(PartitionScheme {
         strategy: PartitionStrategy::Range,
@@ -5938,15 +5943,6 @@ fn resolve_checks(
     Ok(out)
 }
 
-/// Stamp `e` with the cursor position `span` starts at, the way
-/// [`crabgresql_binder::BindError::at`] does for a bind-time error.
-fn at_span(mut e: PgError, span: crabgresql_parser::Span) -> PgError {
-    if span.start.line != 0 {
-        e.location = Some((span.start.line, span.start.column));
-    }
-    e
-}
-
 /// PostgreSQL's refusal for a column declaring both a DEFAULT and a generation
 /// expression, in either order. `42601`, probed against 18.4.
 ///
@@ -6040,44 +6036,27 @@ fn reject_unique_options(constraint: &ast::UniqueConstraint) -> Result<(), PgErr
     reject_constraint_key_columns(&constraint.columns, "unique")
 }
 
-/// What an index being defined backs, which is all PostgreSQL's refusal of a
-/// virtual generated column distinguishes: a plain (even `UNIQUE`) `CREATE
-/// INDEX` is refused as an *index*, while a constraint is refused by its kind.
-/// Probed against 18.4.
-#[derive(Clone, Copy, PartialEq)]
-enum IndexBacking {
-    Index,
-    Unique,
-    PrimaryKey,
-}
-
-impl IndexBacking {
-    /// The constraint form of `constraint`, or a plain index when it backs none.
-    fn of(constraint: Option<IndexConstraint>) -> Self {
-        match constraint {
-            Some(IndexConstraint::PrimaryKey) => IndexBacking::PrimaryKey,
-            Some(IndexConstraint::Unique) => IndexBacking::Unique,
-            None => IndexBacking::Index,
+/// PostgreSQL's refusal of a virtual generated column as an index key, worded by
+/// what the index *backs*: a plain (even `UNIQUE`) `CREATE INDEX` is refused as
+/// an index, while a constraint is refused by its kind. Probed against 18.4.
+fn virtual_key_refusal(backs: Option<IndexConstraint>) -> &'static str {
+    match backs {
+        None => "indexes on virtual generated columns are not supported",
+        Some(IndexConstraint::Unique) => {
+            "unique constraints on virtual generated columns are not supported"
         }
-    }
-
-    fn virtual_column_refusal(self) -> &'static str {
-        match self {
-            IndexBacking::Index => "indexes on virtual generated columns are not supported",
-            IndexBacking::Unique => {
-                "unique constraints on virtual generated columns are not supported"
-            }
-            IndexBacking::PrimaryKey => {
-                "primary keys on virtual generated columns are not supported"
-            }
+        Some(IndexConstraint::PrimaryKey) => {
+            "primary keys on virtual generated columns are not supported"
         }
     }
 }
 
+/// `backs` names the constraint this index will back, or `None` for a plain
+/// `CREATE INDEX` — it decides nothing but the wording of the refusal above.
 fn simple_index_keys(
     schema: &TableSchema,
     columns: &[ast::IndexColumn],
-    backing: IndexBacking,
+    backs: Option<IndexConstraint>,
 ) -> Result<Vec<IndexKey>, PgError> {
     let mut keys = Vec::with_capacity(columns.len());
     for col in columns {
@@ -6105,9 +6084,7 @@ fn simple_index_keys(
         // caller, so `CREATE INDEX`, `ALTER TABLE ... ADD` and the inline
         // `CREATE TABLE` forms cannot drift apart.
         if schema.columns[column].is_virtual_generated() {
-            return Err(PgError::feature_not_supported(
-                backing.virtual_column_refusal(),
-            ));
+            return Err(PgError::feature_not_supported(virtual_key_refusal(backs)));
         }
         keys.push(IndexKey {
             column,
@@ -6417,21 +6394,15 @@ fn type_shape_from_options(
                         .map(|p| p.as_ident().map(normalize_ident).unwrap_or_default())
                         .collect::<Vec<_>>()
                         .join(".");
-                    let mut err = PgError::new(
+                    let err = PgError::new(
                         sqlstate::UNDEFINED_OBJECT,
                         format!("type \"{display}\" does not exist"),
                     );
-                    let start = name
-                        .0
-                        .first()
-                        .and_then(|p| p.as_ident())
-                        .map(|i| i.span.start);
-                    if let Some(start) = start {
-                        if start.line != 0 {
-                            err.location = Some((start.line, start.column));
-                        }
-                    }
-                    return Err(err);
+                    let span = name.0.first().and_then(|p| p.as_ident()).map(|i| i.span);
+                    return Err(match span {
+                        Some(span) => err.at(span),
+                        None => err,
+                    });
                 }
             }
             _ => {}

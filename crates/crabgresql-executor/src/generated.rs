@@ -40,15 +40,7 @@ impl GeneratedSet {
         if schema.columns.iter().all(|c| c.generated.is_none()) {
             return Ok(Self::none());
         }
-        let Some(catalog) = ctx.types.clone() else {
-            return Err(ExecError::new(
-                "XX000",
-                format!(
-                    "no type catalog available to bind the generated columns of relation \"{}\"",
-                    schema.name
-                ),
-            ));
-        };
+        let catalog = crate::checks::require_types(ctx, schema, "generated columns")?;
         let mut entries = Vec::new();
         let mut has_virtual = false;
         for (index, column) in schema.columns.iter().enumerate() {
@@ -66,17 +58,24 @@ impl GeneratedSet {
 
     /// A set that generates nothing, for a relation that declares no generated
     /// column.
-    pub fn none() -> Self {
+    fn none() -> Self {
         GeneratedSet {
             entries: Vec::new(),
             has_virtual: false,
         }
     }
 
-    /// Whether this relation has any generated column at all. A caller that
-    /// only needs the *values* can skip its own widening work when this holds.
+    /// Whether this relation has any generated column at all, so a caller can
+    /// skip a pass it would spend on nothing.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether any of them is **virtual** — the only kind whose value is absent
+    /// from a stored row, and so the only reason a reader has to complete a row
+    /// it scanned.
+    pub fn has_virtual(&self) -> bool {
+        self.has_virtual
     }
 
     /// Overwrite every generated slot of `tuple` with the value its expression
@@ -93,15 +92,19 @@ impl GeneratedSet {
         Ok(())
     }
 
-    /// Clear the virtual slots, which store nothing. Called after the row has
-    /// been validated and projected, immediately before it is written.
-    pub fn blank_virtual(&self, tuple: &mut Tuple) {
+    /// Clear every row's virtual slots, which store nothing. Called after the
+    /// rows have been validated and projected, immediately before they are
+    /// written — the one place that decides what a virtual column leaves behind,
+    /// so that no write path has to remember the rule per tuple.
+    pub fn blank_virtual<'a>(&self, rows: impl IntoIterator<Item = &'a mut Tuple>) {
         if !self.has_virtual {
             return;
         }
-        for (index, kind, _) in &self.entries {
-            if *kind == Generation::Virtual {
-                tuple[*index] = Value::Null;
+        for tuple in rows {
+            for (index, kind, _) in &self.entries {
+                if *kind == Generation::Virtual {
+                    tuple[*index] = Value::Null;
+                }
             }
         }
     }
@@ -156,7 +159,7 @@ mod tests {
         let mut tuple = vec![Value::Int4(21), Value::Null];
         set.compute(&mut tuple, &ctx())?;
         assert_eq!(tuple[1], Value::Int4(42));
-        set.blank_virtual(&mut tuple);
+        set.blank_virtual([&mut tuple]);
         assert_eq!(tuple[1], Value::Int4(42));
         Ok(())
     }
@@ -170,7 +173,7 @@ mod tests {
         // The value exists for as long as NOT NULL / CHECK need to see it …
         assert_eq!(tuple[1], Value::Int4(42));
         // … and nothing of it reaches storage.
-        set.blank_virtual(&mut tuple);
+        set.blank_virtual([&mut tuple]);
         assert_eq!(tuple[1], Value::Null);
         Ok(())
     }

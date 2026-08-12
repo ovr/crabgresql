@@ -40,15 +40,7 @@ impl CheckSet {
         if schema.checks.is_empty() {
             return Ok(Self::none());
         }
-        let Some(catalog) = ctx.types.clone() else {
-            return Err(ExecError::new(
-                "XX000",
-                format!(
-                    "no type catalog available to bind the check constraints of relation \"{}\"",
-                    schema.name
-                ),
-            ));
-        };
+        let catalog = require_types(ctx, schema, "check constraints")?;
         let mut entries = Vec::with_capacity(schema.checks.len());
         for check in &schema.checks {
             entries.push((check.name.clone(), bind_stored(schema, check, &catalog)?));
@@ -96,6 +88,26 @@ impl CheckSet {
         }
         Ok(())
     }
+}
+
+/// The type catalog a stored expression needs to re-bind, or the internal error
+/// that says this context cannot bind one at all. Shared with
+/// [`crate::generated::GeneratedSet`], which re-binds its own stored text under
+/// exactly the same conditions; `what` names the set in the message.
+pub(crate) fn require_types(
+    ctx: &ExecContext,
+    schema: &TableSchema,
+    what: &str,
+) -> Result<Arc<dyn TypeCatalog>, ExecError> {
+    ctx.types.clone().ok_or_else(|| {
+        ExecError::new(
+            "XX000",
+            format!(
+                "no type catalog available to bind the {what} of relation \"{}\"",
+                schema.name
+            ),
+        )
+    })
 }
 
 /// Re-parse and re-bind one stored predicate against `schema`.

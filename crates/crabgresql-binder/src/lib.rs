@@ -196,6 +196,16 @@ impl BindError {
         self
     }
 
+    /// [`BindError::at`], but only for an error that carries no cursor yet — so
+    /// a clause-level fallback position never overwrites the finer one an
+    /// operand already set.
+    pub fn at_if_unset(self, span: Span) -> Self {
+        match self.location {
+            Some(_) => self,
+            None => self.at(span),
+        }
+    }
+
     pub fn feature_not_supported(message: impl Into<String>) -> Self {
         Self::new(sqlstate::FEATURE_NOT_SUPPORTED, message)
     }

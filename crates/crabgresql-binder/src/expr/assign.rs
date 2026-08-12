@@ -173,14 +173,11 @@ pub fn bind_check_constraint(
     schema: &TableSchema,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
-    bind_check_inner(expr, schema, catalog).map_err(|e| match e.location {
-        // PostgreSQL points its cursor at the start of the CHECK expression for
-        // every one of these — the unknown column, the subquery, the aggregate.
-        // Only `to_bool_operand` sets a finer one of its own, so anything still
-        // location-less gets the predicate's own span.
-        None => e.at(expr.span()),
-        Some(_) => e,
-    })
+    // PostgreSQL points its cursor at the start of the CHECK expression for
+    // every one of these — the unknown column, the subquery, the aggregate.
+    // Only `to_bool_operand` sets a finer one of its own, so anything still
+    // location-less gets the predicate's own span.
+    bind_check_inner(expr, schema, catalog).map_err(|e| e.at_if_unset(expr.span()))
 }
 
 fn bind_check_inner(
@@ -189,20 +186,14 @@ fn bind_check_inner(
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
     let params = param_ctx_none();
-    // Deliberately built with no subquery context, which is what makes a
-    // subquery in the predicate fail — restated below in PostgreSQL's words.
-    // No system column: a stored CHECK is re-bound against each leaf it runs
-    // for, so a `tableoid` in one would silently mean a different relation per
-    // partition. PostgreSQL records the reference as a negative `conkey` and
-    // evaluates it per row instead.
+    // The scope's missing subquery context is what makes a subquery in the
+    // predicate fail — restated below in PostgreSQL's words. PostgreSQL records
+    // a system-column reference as a negative `conkey` and evaluates it per row;
+    // this scope exposes none, so such a predicate is refused instead.
     //
     // TODO: CHECK over a system column, which needs `conkey` to carry negative
     // attnums and the predicate to be evaluated against the leaf's identity.
-    // A CHECK records the column positions it reads and is evaluated against a
-    // row whose generated slots the executor has already filled, so a reference
-    // to a virtual column stays a reference here.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false)
-        .without_generated_expansion();
+    let scope = Scope::stored_row(schema, catalog, &params);
     let bound = to_bool_operand(
         bind_expr(expr, &scope).map_err(subquery_in_check)?,
         "CHECK",
@@ -226,18 +217,8 @@ fn bind_check_inner(
 /// independent of the parser/binder IR; `what` names the kind in the syntax
 /// error a corrupt catalog would raise.
 pub fn parse_stored_expr(sql: &str, what: &str) -> Result<ast::Expr, BindError> {
-    let statements = crabgresql_parser::parse(&format!("SELECT {sql}"))
-        .map_err(|e| BindError::syntax(format!("invalid stored {what}: {e}")))?;
-    match statements.as_slice() {
-        [ast::Statement::Query(query)] => match query.body.as_ref() {
-            ast::SetExpr::Select(select) => match select.projection.as_slice() {
-                [ast::SelectItem::UnnamedExpr(expr)] => Ok(expr.clone()),
-                _ => Err(BindError::syntax(format!("invalid stored {what}"))),
-            },
-            _ => Err(BindError::syntax(format!("invalid stored {what}"))),
-        },
-        _ => Err(BindError::syntax(format!("invalid stored {what}"))),
-    }
+    crate::ruleutils::parse_expression(sql)
+        .ok_or_else(|| BindError::syntax(format!("invalid stored {what}")))
 }
 
 /// Reparse and bind the generation expression `schema`'s column at `index`
@@ -259,11 +240,7 @@ pub fn bind_stored_generation(
         .expect("caller checked the column is generated");
     let expr = parse_stored_expr(&generated.expr, "generation expression")?;
     let params = param_ctx_none();
-    // No expansion, for the same reason the DDL binder wants none: the columns
-    // this expression reads are never generated ones, so the flag only decides
-    // whether an impossible reference would silently inline itself.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false)
-        .without_generated_expansion();
+    let scope = Scope::stored_row(schema, catalog, &params);
     coerce_to_column(bind_expr(&expr, &scope)?, column, &scope)
 }
 
@@ -296,14 +273,10 @@ pub fn bind_generation_expr(
     column: usize,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
-    let (bound, columns) =
-        bind_generation_inner(expr, schema, column, catalog).map_err(|e| match e.location {
-            // PostgreSQL points its cursor at the start of the generation
-            // expression for the parse-time refusals, exactly as it does for a
-            // CHECK.
-            None => e.at(expr.span()),
-            Some(_) => e,
-        })?;
+    // PostgreSQL points its cursor at the start of the generation expression for
+    // the parse-time refusals, exactly as it does for a CHECK.
+    let (bound, columns) = bind_generation_inner(expr, schema, column, catalog)
+        .map_err(|e| e.at_if_unset(expr.span()))?;
     // Immutability is checked *after* that stamping, and deliberately: PG
     // reports this one with no cursor at all, having already left the parse
     // analysis that would carry a position.
@@ -323,14 +296,9 @@ fn bind_generation_inner(
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(BoundExpr, Vec<usize>), BindError> {
     let params = param_ctx_none();
-    // No subquery context and no system slot, for the same reasons a CHECK has
-    // neither: a subquery is refused below in PostgreSQL's words, and a stored
-    // expression re-bound against each leaf must not carry a `tableoid` that
-    // would silently mean a different relation per partition.
-    // Without the expansion: a reference to another generated column has to
-    // survive as a reference for the refusal below to see it.
-    let scope = Scope::table(schema, schema.name.clone(), catalog, &params, false)
-        .without_generated_expansion();
+    // The scope's missing subquery context is what refuses a subquery below, in
+    // PostgreSQL's words.
+    let scope = Scope::stored_row(schema, catalog, &params);
     let bound = coerce_to_column(
         bind_expr(expr, &scope).map_err(subquery_in_generation)?,
         &schema.columns[column],

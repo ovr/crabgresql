@@ -2203,8 +2203,12 @@ fn insert_direct(
     // CHECK, UNIQUE and RETURNING all see the computed values.
     let generated = GeneratedSet::for_schema(&schema, ctx)?;
     let mut tuples = tuples;
-    for tuple in &mut tuples {
-        generated.compute(tuple, ctx)?;
+    // Skipped outright for the overwhelmingly common relation with no generated
+    // column, rather than walking the whole batch to call a no-op per row.
+    if !generated.is_empty() {
+        for tuple in &mut tuples {
+            generated.compute(tuple, ctx)?;
+        }
     }
     for tuple in &tuples {
         validate_constraints(&schema, tuple, &mut visible, &checks, ctx)?;
@@ -2235,9 +2239,7 @@ fn insert_direct(
     };
     // A virtual column stores nothing; its value existed only for the checks and
     // the projection above.
-    for tuple in &mut tuples {
-        generated.blank_virtual(tuple);
-    }
+    generated.blank_virtual(&mut tuples);
     let frozen = write_context(freeze, txn);
     table.insert_many(tuples, frozen.as_ref().unwrap_or(txn))?;
     finish_insert(returning, output, inserted)
@@ -2342,13 +2344,15 @@ fn insert_routed(
         None => None,
     };
     let mut batches: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
-    for (mut tuple, leaf) in tuples.into_iter().zip(routes) {
-        // Each row is blanked by its own leaf's set: the leaves of one parent
-        // share its column list, but each answers for its own storage.
-        if let Some(generated) = &leaf_generated[leaf] {
-            generated.blank_virtual(&mut tuple);
-        }
+    for (tuple, leaf) in tuples.into_iter().zip(routes) {
         batches[leaf].push(tuple);
+    }
+    // Each batch is blanked by its own leaf's set: the leaves of one parent
+    // share its column list, but each answers for its own storage.
+    for (leaf, batch) in batches.iter_mut().enumerate() {
+        if let Some(generated) = &leaf_generated[leaf] {
+            generated.blank_virtual(batch.iter_mut());
+        }
     }
     let frozen = write_context(freeze, txn);
     let write_txn = frozen.as_ref().unwrap_or(txn);
@@ -2622,9 +2626,7 @@ fn update_inherited(
     };
     let mut affected = 0u64;
     for (i, target) in targets.iter().enumerate() {
-        for (_, tuple) in &mut pending[i] {
-            generated[i].blank_virtual(tuple);
-        }
+        generated[i].blank_virtual(pending[i].iter_mut().map(|(_, tuple)| tuple));
         affected += target
             .relation
             .table
@@ -2733,29 +2735,25 @@ fn update_direct(
     // With RETURNING, project the NEW rows (in schema order) before
     // `update_many` consumes `pending`, so a faulting expression aborts the
     // statement before any row is written.
-    match returning {
+    let output = match &returning {
         Some(returning) => {
             let oids = oid.map(|oid| vec![oid; pending.len()]);
-            let output = project_returning(
+            Some(project_returning(
                 pending.iter().map(|(_, new)| new),
                 &returning.projections,
                 oids.as_deref(),
                 ctx,
-            )?;
-            let mut pending = pending;
-            for (_, tuple) in &mut pending {
-                generated.blank_virtual(tuple);
-            }
-            table.update_many(pending, txn)?;
+            )?)
+        }
+        None => None,
+    };
+    generated.blank_virtual(pending.iter_mut().map(|(_, tuple)| tuple));
+    let updated = table.update_many(pending, txn)?;
+    match (returning, output) {
+        (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
         }
-        None => {
-            let mut pending = pending;
-            for (_, tuple) in &mut pending {
-                generated.blank_virtual(tuple);
-            }
-            Ok(Execution::Updated(table.update_many(pending, txn)?))
-        }
+        _ => Ok(Execution::Updated(updated)),
     }
 }
 
@@ -2982,12 +2980,8 @@ fn update_routed(
     // UPDATE tag reports.
     let mut affected = 0u64;
     for i in 0..leaves.len() {
-        for (_, tuple) in &mut pending_update[i] {
-            leaf_generated[i].blank_virtual(tuple);
-        }
-        for tuple in &mut pending_insert[i] {
-            leaf_generated[i].blank_virtual(tuple);
-        }
+        leaf_generated[i].blank_virtual(pending_update[i].iter_mut().map(|(_, tuple)| tuple));
+        leaf_generated[i].blank_virtual(pending_insert[i].iter_mut());
         affected += leaf_tables[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
         affected += leaf_tables[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
         leaf_tables[i].insert_many(std::mem::take(&mut pending_insert[i]), txn)?;
