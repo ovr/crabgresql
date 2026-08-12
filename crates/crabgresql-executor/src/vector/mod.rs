@@ -20,6 +20,10 @@
 //!   └──────────── columnar ───────────┘
 //! ```
 //!
+//! In practice the shred and the row nodes that immediately follow it are built
+//! as one [`ShredProject`], because that is what lets the wide decoded row stay
+//! inside a single node as a reused buffer.
+//!
 //! # What a batch means here
 //!
 //! Batches carry `Value` semantics, not Arrow's — see the invariant on
@@ -36,12 +40,14 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
+use crabgresql_binder::BoundExpr;
 use crabgresql_planner::PhysicalAppendArm;
-use crabgresql_storage_api::arrow::decode_columns;
+use crabgresql_storage_api::arrow::{decode_columns, decode_columns_into};
 use crabgresql_storage_api::{BatchStream, Column, ColumnProjection, TableAm, TableSchema};
 use crabgresql_txn::TxnContext;
+use crabgresql_types::Value;
 
-use crate::{ExecError, ExecNode, Tuple};
+use crate::{ExecContext, ExecError, ExecNode, Tuple, eval, predicate_holds};
 
 /// A columnar execution node: `next_batch()` pulls many rows at a time.
 ///
@@ -186,6 +192,61 @@ impl BatchNode for FilterBatch {
     }
 }
 
+/// Walks a batch stream one row at a time, so the nodes that turn batches back
+/// into rows only have to say what to do with a row.
+///
+/// A batch with no rows is skipped rather than ending the stream — an empty
+/// batch means "nothing here", not "nothing left", and a filter that rejects
+/// everything in one batch produces exactly that.
+struct BatchCursor {
+    child: Box<dyn BatchNode>,
+    batch: Option<RecordBatch>,
+    row: usize,
+}
+
+impl BatchCursor {
+    fn new(child: Box<dyn BatchNode>) -> Self {
+        BatchCursor {
+            child,
+            batch: None,
+            row: 0,
+        }
+    }
+
+    /// The next `(batch, row)` to decode, or `None` at end of stream.
+    fn next_row(&mut self) -> Result<Option<(&RecordBatch, usize)>, ExecError> {
+        loop {
+            match &self.batch {
+                Some(batch) if self.row < batch.num_rows() => break,
+                _ => match self.child.next_batch()? {
+                    Some(batch) => {
+                        self.batch = Some(batch);
+                        self.row = 0;
+                    }
+                    None => return Ok(None),
+                },
+            }
+        }
+        let row = self.row;
+        self.row += 1;
+        Ok(Some((
+            self.batch.as_ref().expect("the loop only breaks on Some"),
+            row,
+        )))
+    }
+}
+
+/// Which batch columns actually carry values.
+///
+/// A scan's batch is full width, but the columns outside its
+/// [`ColumnProjection`] are all-NULL padding that only exists so a schema
+/// ordinal is a batch ordinal. Decoding those would make the per-row cost scale
+/// with the table's width instead of with the query's — on a hundred-column
+/// relation read for two columns, fifty times the work the row scan does. The
+/// slots outside this list read back as `Null`, which is exactly the row scan's
+/// contract for an unprojected column.
+type Positions = Vec<usize>;
+
 /// Turns a batch stream back into a tuple stream — the boundary where a
 /// columnar segment ends and the row executor resumes.
 ///
@@ -194,36 +255,24 @@ impl BatchNode for FilterBatch {
 /// that survive), which is the whole argument for pushing selective operators
 /// like a filter *below* it: fewer surviving rows, less to shred.
 ///
-/// A batch with no rows is skipped rather than ending the stream — an empty
-/// batch means "nothing here", not "nothing left", and a filter that rejects
-/// everything in one batch produces exactly that.
+/// This is the general form, which hands a full-width tuple to whatever row
+/// node comes next. [`ShredProject`] is the specialization for the shape that
+/// dominates — a shred whose consumer is a projection — and it is what the
+/// pipeline builds when it can.
 pub struct Shred {
-    child: Box<dyn BatchNode>,
+    cursor: BatchCursor,
     /// The batch's column types, in the shape [`decode_columns`] takes. Only
     /// its `columns` are read; the relation name is never used.
     schema: TableSchema,
-    /// Which batch columns actually carry values.
-    ///
-    /// A scan's batch is full width, but the columns outside its
-    /// [`ColumnProjection`] are all-NULL padding that only exists so a schema
-    /// ordinal is a batch ordinal. Decoding those would make the per-row cost
-    /// scale with the table's width instead of with the query's — on a
-    /// hundred-column relation read for two columns, fifty times the work the
-    /// row scan does. `decode_columns` leaves the slots it is not given as `Null`,
-    /// which is exactly the row scan's contract for an unprojected column.
-    positions: Vec<usize>,
-    batch: Option<RecordBatch>,
-    row: usize,
+    positions: Positions,
 }
 
 impl Shred {
-    pub fn new(child: Box<dyn BatchNode>, layout: BatchLayout, positions: Vec<usize>) -> Self {
+    pub fn new(child: Box<dyn BatchNode>, layout: BatchLayout, positions: Positions) -> Self {
         Shred {
-            child,
+            cursor: BatchCursor::new(child),
             schema: TableSchema::new("", layout.to_vec()),
             positions,
-            batch: None,
-            row: 0,
         }
     }
 
@@ -237,23 +286,90 @@ impl Shred {
 
 impl ExecNode for Shred {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        loop {
-            if let Some(batch) = &self.batch
-                && self.row < batch.num_rows()
-            {
-                let row = self.row;
-                self.row += 1;
-                return decode_columns(&self.schema, &self.positions, batch, row)
-                    .map(Some)
-                    .map_err(ExecError::from);
-            }
-            match self.child.next_batch()? {
-                Some(batch) => {
-                    self.batch = Some(batch);
-                    self.row = 0;
-                }
-                None => return Ok(None),
-            }
+        let Some((batch, row)) = self.cursor.next_row()? else {
+            return Ok(None);
+        };
+        decode_columns(&self.schema, &self.positions, batch, row)
+            .map(Some)
+            .map_err(ExecError::from)
+    }
+}
+
+/// A shred fused with the row `Filter` and `Projection` above it — the shape
+/// nearly every scan-bearing plan ends in.
+///
+/// Fusing them is what lets the wide input row become a **buffer this node
+/// reuses**. Split across three nodes it cannot be: `Shred` has to hand an owned
+/// tuple up, so it pays a full-width allocation per row — on a hundred-column
+/// relation read for two columns, ~5.9 KB and a hundred `Value` writes to build
+/// padding that the projection one node later throws away. Held here, the wide
+/// row never crosses a node boundary: it is allocated once, its unprojected
+/// slots are set to `Value::Null` once, and each row only rewrites the slots the
+/// scan actually filled.
+///
+/// The filter is folded in rather than left outside because it has to run
+/// *between* the decode and the projection — a `WHERE` the columnar
+/// [`FilterBatch`] declined still must reject rows before they are projected.
+/// Leaving it outside would put a node boundary back in the middle and give the
+/// reuse away.
+///
+/// Not usable when the target list contains a set-returning function: that is
+/// [`crate::ProjectSet`], which keeps its input row alive across every output
+/// row it expands to. Such a plan falls back to [`Shred`] and the separate row
+/// nodes, and simply keeps paying what it paid before.
+pub struct ShredProject {
+    cursor: BatchCursor,
+    schema: TableSchema,
+    positions: Positions,
+    /// The `WHERE` the columnar filter declined, or `None` if there was none or
+    /// it ran on batches. Applied to the decoded row before the projection.
+    predicate: Option<BoundExpr>,
+    exprs: Vec<BoundExpr>,
+    ctx: ExecContext,
+    /// The decoded input row, allocated once and rewritten per row.
+    ///
+    /// Slots outside `positions` are `Value::Null` from construction and nothing
+    /// ever writes them again, which is the row scan's contract for an
+    /// unprojected column. That holds only because `positions` is fixed for the
+    /// node's life and the buffer is private to it.
+    scratch: Tuple,
+}
+
+impl ShredProject {
+    pub fn new(
+        child: Box<dyn BatchNode>,
+        layout: BatchLayout,
+        positions: Positions,
+        predicate: Option<BoundExpr>,
+        exprs: Vec<BoundExpr>,
+        ctx: ExecContext,
+    ) -> Self {
+        ShredProject {
+            cursor: BatchCursor::new(child),
+            scratch: vec![Value::Null; layout.len()],
+            schema: TableSchema::new("", layout.to_vec()),
+            positions,
+            predicate,
+            exprs,
+            ctx,
         }
+    }
+}
+
+impl ExecNode for ShredProject {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        while let Some((batch, row)) = self.cursor.next_row()? {
+            decode_columns_into(&self.schema, &self.positions, batch, row, &mut self.scratch)?;
+            if !predicate_holds(&self.predicate, &self.scratch, &self.ctx)? {
+                continue;
+            }
+            let projected = self
+                .exprs
+                .iter()
+                .map(|expr| eval(expr, &self.scratch, &self.ctx))
+                .collect::<Result<_, _>>()?;
+            return Ok(Some(projected));
+        }
+        Ok(None)
     }
 }

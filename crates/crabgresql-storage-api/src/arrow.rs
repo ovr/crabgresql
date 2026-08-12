@@ -586,6 +586,37 @@ pub fn decode_columns(
     row: usize,
 ) -> Result<Tuple, StorageError> {
     let mut tuple = vec![Value::Null; schema.columns.len()];
+    decode_columns_into(schema, indices, batch, row, &mut tuple)?;
+    Ok(tuple)
+}
+
+/// [`decode_columns`] writing into a tuple the caller owns, so a scan can reuse
+/// one buffer across rows instead of allocating a full-width one per row.
+///
+/// **Only the `indices` slots are written.** Everything else keeps whatever
+/// `out` already held, which is the point: a caller that primes the buffer once
+/// with `Value::Null` and then never varies `indices` pays a per-row cost
+/// proportional to the query's width rather than to the table's. On a
+/// hundred-column relation read for two columns, that is the difference between
+/// a fresh five-kilobyte allocation per row and two stores.
+///
+/// The corollary is that the buffer belongs to exactly one caller for its whole
+/// life. Hand the same one to two decoders with different `indices` and the
+/// second reads the first's leftovers where it should read NULL.
+///
+/// `out` must already be as wide as the schema; a mismatch is reported rather
+/// than repaired, because silently resizing would hide precisely the aliasing
+/// mistake above.
+pub fn decode_columns_into(
+    schema: &TableSchema,
+    indices: &[usize],
+    batch: &RecordBatch,
+    row: usize,
+    out: &mut Tuple,
+) -> Result<(), StorageError> {
+    if out.len() != schema.columns.len() {
+        return Err(corrupt("decode target is not as wide as the table schema"));
+    }
     for &index in indices {
         let column = schema
             .columns
@@ -595,9 +626,9 @@ pub fn decode_columns(
             .columns()
             .get(index)
             .ok_or_else(|| corrupt("decode names a column outside the batch"))?;
-        tuple[index] = decode_value(column, array.as_ref(), row)?;
+        out[index] = decode_value(column, array.as_ref(), row)?;
     }
-    Ok(tuple)
+    Ok(())
 }
 
 /// Decode one row of `batch` into a full-width tuple.
@@ -932,6 +963,67 @@ mod tests {
         ]);
         assert!(matches!(
             build_batch(&schema, &[vec![Value::Int4(1)]]),
+            Err(StorageError::CorruptData(_))
+        ));
+    }
+
+    fn three_column_batch() -> (TableSchema, RecordBatch) {
+        let schema = schema_of(vec![
+            Column::new("a", PgType::Int4),
+            Column::new("b", PgType::Int4),
+            Column::new("c", PgType::Int4),
+        ]);
+        let batch = build_batch(
+            &schema,
+            &[vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]],
+        )
+        .expect("batch");
+        (schema, batch)
+    }
+
+    /// `decode_columns_into` writes the named slots and **nothing else** — the
+    /// documented behaviour, and the whole reason a caller can reuse one buffer.
+    /// Pinned against a dirty buffer so a future "helpfully clear it first"
+    /// change fails here rather than silently costing what this saved.
+    #[test]
+    fn decode_into_touches_only_the_named_columns() {
+        let (schema, batch) = three_column_batch();
+        let mut out = vec![Value::Int8(-1), Value::Int8(-1), Value::Int8(-1)];
+        decode_columns_into(&schema, &[1], &batch, 0, &mut out).expect("decode");
+        assert_eq!(out, vec![Value::Int8(-1), Value::Int4(2), Value::Int8(-1)]);
+    }
+
+    /// The allocating form still fills the rest with NULL, which is the row
+    /// scan's contract for an unprojected column.
+    #[test]
+    fn decode_columns_nulls_what_it_was_not_given() {
+        let (schema, batch) = three_column_batch();
+        let tuple = decode_columns(&schema, &[1], &batch, 0).expect("decode");
+        assert_eq!(tuple, vec![Value::Null, Value::Int4(2), Value::Null]);
+    }
+
+    /// The two entry points are one decode: `decode_columns` is `decode_columns_into`
+    /// over a freshly NULLed buffer, and must stay observably so.
+    #[test]
+    fn the_two_decode_forms_agree() {
+        let (schema, batch) = three_column_batch();
+        for indices in [&[][..], &[0][..], &[2, 0][..], &[0, 1, 2][..]] {
+            let owned = decode_columns(&schema, indices, &batch, 0).expect("decode");
+            let mut out = vec![Value::Null; schema.columns.len()];
+            decode_columns_into(&schema, indices, &batch, 0, &mut out).expect("decode");
+            assert_eq!(owned, out, "indices {indices:?}");
+        }
+    }
+
+    /// A buffer of the wrong width is reported, not repaired: resizing it here
+    /// would hide the one mistake the width is checked for — a buffer shared
+    /// between two decoders.
+    #[test]
+    fn a_decode_target_of_the_wrong_width_is_rejected() {
+        let (schema, batch) = three_column_batch();
+        let mut out = vec![Value::Null; 2];
+        assert!(matches!(
+            decode_columns_into(&schema, &[1], &batch, 0, &mut out),
             Err(StorageError::CorruptData(_))
         ));
     }

@@ -1926,16 +1926,39 @@ fn project_pipeline(
         });
     }
 
-    let mut node = source.into_rows();
-    if let Some(predicate) = predicate {
-        node = Box::new(Filter::new(node, predicate, ctx.clone()));
-    }
-    // A set-returning function in the target list turns one input row into many,
-    // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
-    node = if projections.iter().any(BoundExpr::is_srf) {
-        Box::new(ProjectSet::new(node, projections, ctx.clone()))
-    } else {
-        Box::new(Projection::new(node, projections, ctx.clone()))
+    let mut node: Box<dyn ExecNode> = match source {
+        // The shred, the row filter and the projection collapse into one node
+        // whenever the target list is one-in/one-out. That is not a shortcut for
+        // its own sake: it is what keeps the wide input row *inside* a single
+        // node, where it can be a buffer reused across rows instead of a
+        // full-width tuple allocated per row and dropped one node later.
+        Source::Batches {
+            node,
+            layout,
+            positions,
+        } if !projections.iter().any(BoundExpr::is_srf) => Box::new(vector::ShredProject::new(
+            node,
+            layout,
+            positions,
+            predicate,
+            projections,
+            ctx.clone(),
+        )),
+        source => {
+            let mut node = source.into_rows();
+            if let Some(predicate) = predicate {
+                node = Box::new(Filter::new(node, predicate, ctx.clone()));
+            }
+            // A set-returning function in the target list turns one input row
+            // into many, so it needs `ProjectSet` rather than the one-in/one-out
+            // `Projection` — and `ProjectSet` keeps its input row alive across
+            // the expansion, which is why it cannot fuse.
+            if projections.iter().any(BoundExpr::is_srf) {
+                Box::new(ProjectSet::new(node, projections, ctx.clone()))
+            } else {
+                Box::new(Projection::new(node, projections, ctx.clone()))
+            }
+        }
     };
     node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
     Ok(Execution::Rows { columns, node })
