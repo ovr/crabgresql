@@ -17,7 +17,7 @@
 use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, UnaryOp};
 use crabgresql_types::{PgType, collation};
 
-use crate::{PhysicalAppendArm, PhysicalPlan};
+use crate::{PhysicalAppend, PhysicalAppendArm, PhysicalPlan, PhysicalSelect, PhysicalSubquery};
 
 /// Which parts of one plan node run columnar. Rendered by
 /// [`explain`](crate::explain) and consulted by the executor as it builds.
@@ -261,7 +261,7 @@ impl PhysicalPlan {
     /// plan that runs.
     pub fn vectorization(&self) -> Vectorization {
         match self {
-            PhysicalPlan::Select {
+            PhysicalPlan::Select(PhysicalSelect {
                 table,
                 columns,
                 projections,
@@ -269,7 +269,7 @@ impl PhysicalPlan {
                 sort,
                 distinct,
                 ..
-            } => tail_vectorization(
+            }) => tail_vectorization(
                 table.supports_batch_scan(),
                 table.schema().columns.len(),
                 Tail {
@@ -284,18 +284,18 @@ impl PhysicalPlan {
             // leaves wrapped in a `Subquery`, and the tail lives on the wrapper.
             // Recognising that shape here is what lets such a relation report a
             // columnar filter at all.
-            PhysicalPlan::Subquery {
+            PhysicalPlan::Subquery(PhysicalSubquery {
                 source,
                 columns,
                 projections,
                 predicate,
                 sort,
                 distinct,
-            } => {
-                let PhysicalPlan::Append {
+            }) => {
+                let PhysicalPlan::Append(PhysicalAppend {
                     arms,
                     columns: append_columns,
-                } = source.as_ref()
+                }) = source.as_ref()
                 else {
                     return Vectorization::default();
                 };
@@ -313,7 +313,7 @@ impl PhysicalPlan {
                     },
                 )
             }
-            PhysicalPlan::Append { arms, .. } => Vectorization {
+            PhysicalPlan::Append(PhysicalAppend { arms, .. }) => Vectorization {
                 scan: arms_batch(arms),
                 ..Vectorization::default()
             },

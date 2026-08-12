@@ -41,8 +41,11 @@ use crabgresql_binder::{BoundAggregate, BoundExpr, BoundWindowFunc, DistinctKey,
 use crabgresql_storage_api::{ColumnProjection, TableSchema};
 
 use crate::{
-    PhysicalAggInput, PhysicalAppendArm, PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan,
-    PhysicalSetOpArm,
+    PhysicalAggInput, PhysicalAggScan, PhysicalAggregate, PhysicalAppend, PhysicalAppendArm,
+    PhysicalIndexScan, PhysicalInsert, PhysicalInsertQuery, PhysicalJoin, PhysicalJoinExpr,
+    PhysicalJoinInput, PhysicalJoinLeaf, PhysicalJoinPair, PhysicalJoinScan, PhysicalLimit,
+    PhysicalPlan, PhysicalSelect, PhysicalSetOp, PhysicalSetOpArm, PhysicalSubquery,
+    PhysicalWindow,
 };
 
 /// The columns a node's consumers read, in that node's own base-0 index space.
@@ -65,7 +68,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
     match plan {
         // The tail-bearing single-table nodes: their own `projections` and
         // `predicate` are the only things that read the scanned row.
-        PhysicalPlan::Select {
+        PhysicalPlan::Select(PhysicalSelect {
             table,
             projection,
             projections,
@@ -73,11 +76,11 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             sort,
             distinct,
             ..
-        } => {
+        }) => {
             let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
             *projection = resolve(demand, &table.schema());
         }
-        PhysicalPlan::IndexScan {
+        PhysicalPlan::IndexScan(PhysicalIndexScan {
             table,
             projection,
             key,
@@ -86,7 +89,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             sort,
             distinct,
             ..
-        } => {
+        }) => {
             let mut demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
             // The executor's index-scan fallback (`index_probe_rows`) re-checks
             // every key column per row whenever the engine declines the probe —
@@ -102,26 +105,26 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             let demand = add_exprs(demand, key.iter().map(|(_, value)| value));
             *projection = resolve(demand, &table.schema());
         }
-        PhysicalPlan::Subquery {
+        PhysicalPlan::Subquery(PhysicalSubquery {
             source,
             projections,
             predicate,
             sort,
             distinct,
             ..
-        } => {
+        }) => {
             let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
             push(source, demand);
         }
         // Transparent: output row is the source row, no expressions of its own.
-        PhysicalPlan::Limit { source, .. } => push(source, demand),
-        PhysicalPlan::Window {
+        PhysicalPlan::Limit(PhysicalLimit { source, .. }) => push(source, demand),
+        PhysicalPlan::Window(PhysicalWindow {
             source,
             spec,
             funcs,
             input_width,
             ..
-        } => {
+        }) => {
             // This node's output row is `[input row…, window slots…]`, so the
             // parent's demand spans two index spaces. A demanded *slot* is
             // computed here, not read from below, and must be dropped rather
@@ -146,29 +149,29 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
         // Also transparent, and the node that actually reaches storage. The
         // demand arrives in the *named* relation's index space, which an
         // identity arm shares and a remapped one does not.
-        PhysicalPlan::Append { arms, columns } => {
+        PhysicalPlan::Append(PhysicalAppend { arms, columns }) => {
             prune_append(arms, demand, columns.len());
         }
-        PhysicalPlan::Join {
+        PhysicalPlan::Join(PhysicalJoin {
             source,
             projections,
             predicate,
             sort,
             distinct,
             ..
-        } => {
+        }) => {
             // `projections`/`predicate` index the whole concatenated join row,
             // which is exactly `source`'s own base-0 space.
             let demand = through_tail(demand, projections, predicate.as_ref(), sort, distinct);
             prune_join(source, demand);
         }
-        PhysicalPlan::Aggregate {
+        PhysicalPlan::Aggregate(PhysicalAggregate {
             input,
             predicate,
             group_exprs,
             aggregates,
             ..
-        } => {
+        }) => {
             // The parent's demand is deliberately ignored. Only WHERE, the
             // grouping keys and the aggregate arguments read the *source* row —
             // `projections`, `having`, `sort` and `distinct` all index the
@@ -183,7 +186,7 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
                     add_exprs(demand, agg.args.iter())
                 });
             match input {
-                PhysicalAggInput::Scan { table, projection } => {
+                PhysicalAggInput::Scan(PhysicalAggScan { table, projection }) => {
                     *projection = resolve(demand, &table.schema());
                 }
                 PhysicalAggInput::Join(source) => prune_join(source, demand),
@@ -195,23 +198,23 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
         // is not threaded through them: a non-ALL `UNION` deduplicates on every
         // output column anyway, and an arm's `coercion` may hold a NULL constant
         // that references no source column at all.
-        PhysicalPlan::SetOp { arms, .. } => {
+        PhysicalPlan::SetOp(PhysicalSetOp { arms, .. }) => {
             for PhysicalSetOpArm { plan, .. } in arms {
                 push(plan, ALL);
             }
         }
-        PhysicalPlan::Insert { source, .. } => {
-            if let crate::PhysicalInsertSource::Query { input, .. } = source {
+        PhysicalPlan::Insert(PhysicalInsert { source, .. }) => {
+            if let crate::PhysicalInsertSource::Query(PhysicalInsertQuery { input, .. }) = source {
                 push(input, ALL);
             }
         }
         // Leaves that hold no scan, plus the DML nodes — those rebuild rows by
         // ordinal and their RETURNING may name any column, so the executor
         // passes `ColumnProjection::All` on every DML scan explicitly.
-        PhysicalPlan::Values { .. }
-        | PhysicalPlan::TableFunction { .. }
-        | PhysicalPlan::Update { .. }
-        | PhysicalPlan::Delete { .. } => {}
+        PhysicalPlan::Values(_)
+        | PhysicalPlan::TableFunction(_)
+        | PhysicalPlan::Update(_)
+        | PhysicalPlan::Delete(_) => {}
     }
 }
 
@@ -312,11 +315,11 @@ fn prune_append(arms: &mut [PhysicalAppendArm], demand: Demand, columns: usize) 
 /// scan leaves beneath it.
 fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
     match node {
-        PhysicalJoinExpr::Input {
+        PhysicalJoinExpr::Input(PhysicalJoinLeaf {
             input,
             width,
             predicate,
-        } => {
+        }) => {
             // A leaf's own sunk conjuncts were rebased into the leaf's row by
             // `sink_leaf_filters` (which applies `shift_column_refs(-base)` on
             // the way down), so they share this space and need no shift here.
@@ -330,20 +333,20 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
                 other => other,
             };
             match input {
-                PhysicalJoinInput::Scan { table, projection } => {
+                PhysicalJoinInput::Scan(PhysicalJoinScan { table, projection }) => {
                     *projection = resolve(demand, &table.schema());
                 }
                 PhysicalJoinInput::Subplan(source) => push(source, demand),
-                PhysicalJoinInput::TableFunction { .. } => {}
+                PhysicalJoinInput::TableFunction(_) => {}
             }
         }
-        PhysicalJoinExpr::Join {
+        PhysicalJoinExpr::Join(PhysicalJoinPair {
             left,
             right,
             predicate,
             hash_keys,
             ..
-        } => {
+        }) => {
             // This node's own ON condition and hash keys index its concatenated
             // `left || right` row — the same space `demand` arrives in.
             let demand = add_exprs(demand, predicate.as_ref());
