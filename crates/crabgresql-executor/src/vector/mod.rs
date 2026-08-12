@@ -73,9 +73,10 @@ pub fn layout_of(schema: &TableSchema) -> BatchLayout {
     Arc::from(schema.columns.clone())
 }
 
-/// An Arrow kernel that failed where the compile step promised it would not:
-/// the columnar nodes decline anything they cannot run, so a failure here is a
-/// defect in that gate rather than anything the user wrote.
+/// A columnar node that met a state its compile step promised to rule out — a
+/// kernel that failed, a column that is not there, an operand of the wrong
+/// type. The nodes decline anything they cannot run, so reaching one of these
+/// is a defect in that gate rather than anything the user wrote.
 fn internal(message: &str) -> ExecError {
     ExecError::new("XX000", message)
 }

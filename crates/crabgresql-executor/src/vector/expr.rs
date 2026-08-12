@@ -50,7 +50,7 @@ use crabgresql_storage_api::Column;
 use crabgresql_storage_api::arrow::build_array;
 use crabgresql_types::PgType;
 
-use super::BatchLayout;
+use super::{BatchLayout, internal};
 use crate::ExecError;
 
 /// A predicate compiled to Arrow kernels, evaluated once per batch.
@@ -202,10 +202,6 @@ fn fit(mask: BooleanArray, rows: usize) -> BooleanArray {
 
 fn boxed(array: BooleanArray) -> Operand {
     Operand::Array(Arc::new(array))
-}
-
-fn internal(message: &str) -> ExecError {
-    ExecError::new("XX000", message)
 }
 
 fn kernel_error(error: ArrowError) -> ExecError {

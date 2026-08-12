@@ -1,7 +1,7 @@
 use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
 
-use super::{BatchNode, expr};
+use super::{BatchNode, expr, internal};
 use crate::ExecError;
 
 /// Drops the rows of each batch that fail a predicate — the columnar
@@ -34,7 +34,7 @@ impl BatchNode for FilterBatch {
         // which is SQL's rule for a `WHERE` and matches `predicate_holds`.
         filter_record_batch(&batch, &mask)
             .map(Some)
-            .map_err(|error| ExecError::new("XX000", format!("vectorized filter failed: {error}")))
+            .map_err(|error| internal(&format!("vectorized filter failed: {error}")))
     }
 }
 
