@@ -14007,3 +14007,82 @@ async fn an_extended_query_batch_shares_one_transaction_timestamp() -> anyhow::R
     assert_ne!(next[0], values[0], "a new batch starts a new transaction");
     Ok(())
 }
+
+/// A row-limited `Execute` suspends the portal and the next one resumes it,
+/// across a result set several executor chunks long.
+///
+/// The row budget a client asks for has nothing to do with the chunk boundaries
+/// the executor produces, so a portal has to hand back part of a chunk and keep
+/// the rest. Sized past one chunk (1024 rows) with a budget that divides neither
+/// the chunk nor the result: a portal that served only what one chunk held, or
+/// that dropped a part-consumed chunk on suspend, would lose rows here and
+/// nowhere smaller.
+#[tokio::test]
+async fn a_row_limited_execute_resumes_across_chunk_boundaries() -> anyhow::Result<()> {
+    const ROWS: usize = 2600;
+    const BUDGET: usize = 700;
+
+    let port = spawn_server().await;
+    let mut socket = raw_session(port).await;
+    socket
+        .write_all(&frontend_batch(&[FrontendMessage::Query(
+            "BEGIN".to_string(),
+        )]))
+        .await?;
+    read_until_ready(&mut socket).await;
+
+    let limited = |portal: &str| FrontendMessage::Execute {
+        portal: portal.to_string(),
+        max_rows: BUDGET as i32,
+    };
+    let batch = frontend_batch(&[
+        parse_message(
+            "st",
+            &format!("SELECT i FROM generate_series(1, {ROWS}) AS i"),
+        ),
+        bind_message("po", "st"),
+        limited("po"),
+        FrontendMessage::Sync,
+    ]);
+    socket.write_all(&batch).await?;
+
+    // Every Execute but the last hits the budget and answers PortalSuspended
+    // (`s`); the rows arrive in order across all of them.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut suspends = 0;
+    loop {
+        let msgs = read_until_ready(&mut socket).await;
+        for (tag, body) in &msgs {
+            match tag {
+                b'D' => {
+                    // One text column: 2-byte count, 4-byte length, then digits.
+                    let text = String::from_utf8_lossy(&body[6..]);
+                    seen.push(text.parse()?);
+                }
+                b'E' => panic!("unexpected error: {}", String::from_utf8_lossy(body)),
+                _ => {}
+            }
+        }
+        if !msgs.iter().any(|(t, _)| *t == b's') {
+            break;
+        }
+        suspends += 1;
+        socket
+            .write_all(&frontend_batch(&[limited("po"), FrontendMessage::Sync]))
+            .await?;
+    }
+
+    assert_eq!(seen.len(), ROWS, "every row is delivered exactly once");
+    assert_eq!(
+        seen,
+        (1..=ROWS as i64).collect::<Vec<_>>(),
+        "rows arrive in order, with none dropped at a chunk or budget boundary"
+    );
+    assert_eq!(
+        suspends,
+        ROWS.div_ceil(BUDGET) - 1,
+        "one suspend per full budget before the short final Execute"
+    );
+
+    Ok(())
+}

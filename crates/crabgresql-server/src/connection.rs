@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crabgresql_executor::OutputColumn;
+use crabgresql_executor::stream::{ROW_CHUNK, RowCursor};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{
     BackendMessage, BackendWriter, CopyResponse, FieldDescription, Format, FrontendMessage,
@@ -13,6 +14,7 @@ use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::cast::CastError;
 use crabgresql_types::{FmtCtx, PgType, Value, wire};
+use futures_util::StreamExt;
 use tokio::net::TcpStream;
 
 use crate::error::PgError;
@@ -234,7 +236,8 @@ pub async fn handle_connection(
                         &mut writer,
                         &portal,
                         max_rows,
-                    );
+                    )
+                    .await;
                     report(
                         &mut writer,
                         &mut session,
@@ -549,7 +552,7 @@ async fn write_result(
         }
         QueryResult::Rows {
             columns,
-            mut node,
+            mut rows,
             tag,
             notices,
         } => {
@@ -564,18 +567,23 @@ async fn write_result(
             writer.row_description(&fields);
             let mut count = 0usize;
             loop {
-                match node.next() {
-                    Ok(Some(row)) => {
-                        let cols: Vec<Option<String>> =
-                            row.iter().map(|v| v.encode_text_with(fmt)).collect();
-                        writer.data_row(&cols);
-                        count += 1;
+                match rows.next().await {
+                    Some(Ok(chunk)) => {
+                        for row in chunk {
+                            let cols: Vec<Option<String>> =
+                                row.iter().map(|v| v.encode_text_with(fmt)).collect();
+                            writer.data_row(&cols);
+                            count += 1;
+                        }
+                        // Flushing on the chunk boundary rather than per row:
+                        // the check is what bounds the buffer, and a chunk is
+                        // small enough that it cannot overshoot by much.
                         if writer.buffered() >= STREAM_FLUSH_BYTES {
                             writer.flush().await?;
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) => {
+                    None => break,
+                    Some(Err(e)) => {
                         // Mid-stream: rows have already gone out. The error can
                         // still carry a HINT and a CONTEXT traceback (a routine
                         // body raising on row N), so route it through the same
@@ -929,7 +937,7 @@ fn handle_describe(
 /// Execute (`E`): run a portal, streaming its rows in the requested formats. A
 /// row limit (`max_rows > 0`) suspends the portal after that many rows; a later
 /// Execute resumes it. Does not send RowDescription — that is Describe's job.
-fn handle_execute(
+async fn handle_execute(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -948,7 +956,7 @@ fn handle_execute(
         // A portal a previous row-limited Execute left suspended resumes from its
         // live iterator, without re-running the query.
         PortalState::Suspended(_) => {
-            return resume_portal(session, writer, portal_name, max_rows);
+            return resume_portal(session, writer, portal_name, max_rows).await;
         }
         // A finished portal is answered from what it recorded: an exhausted result
         // set re-reports as an empty one, and a statement that produced no result
@@ -1021,12 +1029,13 @@ fn handle_execute(
         &fmt,
         max_rows,
     )
+    .await
 }
 
 /// Stream a freshly executed portal's result. Rows are encoded per the portal's
 /// result formats; a row limit materializes the remainder into the portal and
 /// answers PortalSuspended.
-fn stream_execute(
+async fn stream_execute(
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     portal_name: &str,
@@ -1046,51 +1055,60 @@ fn stream_execute(
         }
         QueryResult::Rows {
             columns: _,
-            mut node,
+            rows,
             tag,
             notices,
         } => {
             emit_notices(writer, &notices, None);
+            let mut cursor = RowCursor::new(rows);
             let limit = (max_rows > 0).then_some(max_rows as usize);
+            // Chunk at a time, not result at a time: an unlimited `Execute` is
+            // the ordinary protocol client's spelling of "give me everything",
+            // and buffering the whole result set to write it would hold it in
+            // memory twice over.
             let mut count = 0usize;
             loop {
-                match node.next() {
-                    Ok(Some(row)) => {
-                        writer.write(&BackendMessage::DataRow(encode_row(&row, formats, fmt)?));
-                        count += 1;
-                        if limit == Some(count) {
-                            // Row budget reached, result not yet exhausted: keep
-                            // the live iterator on the portal and resume it on the
-                            // next Execute — streaming, not buffering. A result of
-                            // exactly `max_rows` rows suspends here and the next
-                            // Execute returns `SELECT 0` (a valid PG sequence).
-                            if let Some(portal) = session.portals.get_mut(portal_name) {
-                                portal.state = PortalState::Suspended(SuspendedRows {
-                                    node,
-                                    delivered: count,
-                                    tag,
-                                });
-                            }
-                            writer.write(&BackendMessage::PortalSuspended);
-                            return Ok(());
-                        }
-                    }
-                    Ok(None) => {
-                        writer.command_complete(&tag.complete(count));
-                        finish_portal(session, portal_name, Some(tag));
-                        return Ok(());
-                    }
-                    Err(e) => return Err(e.into()),
+                let want = limit.map_or(ROW_CHUNK, |limit| (limit - count).min(ROW_CHUNK));
+                if want == 0 {
+                    break;
+                }
+                let served = cursor.take(want).await?;
+                let last = served.len() < want;
+                for row in served {
+                    writer.write(&BackendMessage::DataRow(encode_row(&row, formats, fmt)?));
+                    count += 1;
+                }
+                if last {
+                    break;
                 }
             }
+            if limit == Some(count) {
+                // Row budget reached, result not yet exhausted: keep the live
+                // cursor on the portal and resume it on the next Execute —
+                // streaming, not buffering. A result of exactly `max_rows` rows
+                // suspends here and the next Execute returns `SELECT 0` (a valid
+                // PG sequence).
+                if let Some(portal) = session.portals.get_mut(portal_name) {
+                    portal.state = PortalState::Suspended(SuspendedRows {
+                        rows: cursor,
+                        delivered: count,
+                        tag,
+                    });
+                }
+                writer.write(&BackendMessage::PortalSuspended);
+                return Ok(());
+            }
+            writer.command_complete(&tag.complete(count));
+            finish_portal(session, portal_name, Some(tag));
+            Ok(())
         }
     }
 }
 
 /// Resume a suspended portal: pull up to `max_rows` more rows from its live
-/// iterator, then PortalSuspended (still more) or CommandComplete with the
+/// cursor, then PortalSuspended (still more) or CommandComplete with the
 /// running total (exhausted).
-fn resume_portal(
+async fn resume_portal(
     session: &mut Session,
     writer: &mut BackendWriter<impl tokio::io::AsyncWrite + Unpin>,
     portal_name: &str,
@@ -1112,21 +1130,27 @@ fn resume_portal(
     let PortalState::Suspended(sus) = &mut portal.state else {
         return Err(PgError::new("XX000", "portal is not suspended"));
     };
-    let mut served = 0usize;
     // `writer` is independent of `session`, so writing while the portal is
-    // mutably borrowed is fine.
+    // mutably borrowed is fine. Pulled a chunk at a time, so an unlimited
+    // resume streams rather than buffering the rest of the result set.
+    let mut served = 0usize;
     let exhausted = loop {
-        if served >= limit {
+        let want = (limit - served).min(ROW_CHUNK);
+        if want == 0 {
             break false;
         }
-        match sus.node.next() {
-            Ok(Some(row)) => {
-                writer.write(&BackendMessage::DataRow(encode_row(&row, &formats, &fmt)?));
-                sus.delivered += 1;
-                served += 1;
-            }
-            Ok(None) => break true,
-            Err(e) => return Err(e.into()),
+        let rows = sus.rows.take(want).await?;
+        // A short answer means the stream ran dry inside the budget; a full one
+        // leaves the portal suspended, even if the next pull would have found
+        // nothing (which is the row-limited Execute's contract).
+        let last = rows.len() < want;
+        for row in rows {
+            writer.write(&BackendMessage::DataRow(encode_row(&row, &formats, &fmt)?));
+            sus.delivered += 1;
+            served += 1;
+        }
+        if last {
+            break true;
         }
     };
     let delivered = sus.delivered;

@@ -14,16 +14,18 @@ use crabgresql_storage_api::{Column, TableSchema, Tuple};
 use crabgresql_types::collation::{C_COLLATION_OID, DEFAULT_COLLATION_OID};
 use crabgresql_types::{PgType, Value};
 
-use super::{BatchLayout, BatchNode, FilterBatch, Shred, expr};
-use crate::{ExecContext, ExecError, ExecNode, predicate_holds};
+use super::{BatchLayout, expr, filter_batches, shred_dense};
+use crate::stream::{BatchStream, RowStream, drain_rows};
+use crate::{ExecContext, ExecError, predicate_holds};
 
 /// A batch source over a fixed list of batches.
-struct Batches(std::vec::IntoIter<RecordBatch>);
+fn batches(list: Vec<RecordBatch>) -> BatchStream {
+    Box::pin(futures_util::stream::iter(list.into_iter().map(Ok)))
+}
 
-impl BatchNode for Batches {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        Ok(self.0.next())
-    }
+/// Drain a row stream, blocking — these tests are synchronous.
+fn drain(rows: RowStream) -> Result<Vec<Tuple>, ExecError> {
+    drain_rows(rows)
 }
 
 fn schema_of(types: &[PgType]) -> TableSchema {
@@ -53,18 +55,12 @@ fn columnar_filter(
         .ok_or_else(|| ExecError::new("XX000", "predicate did not compile"))?;
 
     let split = rows.len() / 2;
-    let batches = vec![
+    let batches_list = vec![
         build_scan_batch(schema, &rows[..split])?,
         build_scan_batch(schema, &rows[split..])?,
     ];
-    let filtered = FilterBatch::new(Box::new(Batches(batches.into_iter())), compiled);
-
-    let mut node = Shred::dense(Box::new(filtered), layout);
-    let mut out = Vec::new();
-    while let Some(row) = node.next()? {
-        out.push(row);
-    }
-    Ok(out)
+    let filtered = filter_batches(batches(batches_list), compiled);
+    drain(shred_dense(filtered, layout))
 }
 
 /// Run the same rows through the row `Filter`'s own truth test.
@@ -391,8 +387,9 @@ fn uncompilable_expressions_decline() {
 
 // ---------------------------------------------------------------- sort
 
-use super::sort::{ProjectBatch, SortBatch};
-use crate::Sort as RowSort;
+use super::sort::{ProjectBatch, project_batches, sort_batches};
+use crate::sort_rows;
+use crate::stream::rows_once;
 use crabgresql_binder::SortKey;
 
 fn sort_key(column: usize, ty: PgType, asc: bool, nulls_first: bool) -> SortKey {
@@ -424,20 +421,15 @@ fn columnar_sort(
     let projected = ProjectBatch::layout(&identity);
 
     let split = rows.len() / 2;
-    let batches = vec![
+    let batches_list = vec![
         build_scan_batch(schema, &rows[..split])?,
         build_scan_batch(schema, &rows[split..])?,
     ];
-    let project = ProjectBatch::new(Box::new(Batches(batches.into_iter())), takes, &projected);
-    let sorted = SortBatch::new(Box::new(project), keys, &projected, visible_width)?;
+    let project = project_batches(batches(batches_list), takes, &projected);
+    let sorted = sort_batches(project, keys, &projected, visible_width);
 
     let visible: BatchLayout = Arc::from(&projected[..visible_width]);
-    let mut node = Shred::dense(Box::new(sorted), visible);
-    let mut out = Vec::new();
-    while let Some(row) = node.next()? {
-        out.push(row);
-    }
-    Ok(out)
+    drain(shred_dense(sorted, visible))
 }
 
 /// Sort the same rows with the row `Sort`, the node this stands in for.
@@ -446,13 +438,11 @@ fn row_sort(
     keys: &[SortKey],
     visible_width: usize,
 ) -> Result<Vec<Tuple>, ExecError> {
-    let source = crate::MaterializedRows::new(rows.to_vec());
-    let mut node = RowSort::new(Box::new(source), keys.to_vec(), visible_width)?;
-    let mut out = Vec::new();
-    while let Some(row) = node.next()? {
-        out.push(row);
-    }
-    Ok(out)
+    drain(sort_rows(
+        rows_once(rows.to_vec()),
+        keys.to_vec(),
+        visible_width,
+    ))
 }
 
 fn column_ref(index: usize, ty: PgType) -> BoundExpr {
@@ -603,7 +593,7 @@ fn a_char_column_sorts_columnar_by_its_unsigned_byte() {
         .map(|byte| vec![Value::Char(byte)])
         .collect();
     let keys = [sort_key(0, PgType::Char, true, false)];
-    assert!(SortBatch::compilable(&keys, &layout_of(&schema)));
+    assert!(super::sort::sortable(&keys, &layout_of(&schema)));
     let sorted = columnar_sort(&schema, &rows, &keys, 1).expect("columnar sort");
     assert_eq!(
         sorted,
@@ -628,7 +618,7 @@ fn unsortable_key_types_are_refused() {
     ] {
         let schema = schema_of(&[ty]);
         assert!(
-            !SortBatch::compilable(&[sort_key(0, ty, true, false)], &layout_of(&schema)),
+            !super::sort::sortable(&[sort_key(0, ty, true, false)], &layout_of(&schema)),
             "{ty:?} must not sort columnar"
         );
     }
@@ -636,7 +626,7 @@ fn unsortable_key_types_are_refused() {
     let schema = schema_of(&[PgType::Text]);
     let mut key = sort_key(0, PgType::Text, true, false);
     key.collation = 0xC000_0000;
-    assert!(!SortBatch::compilable(&[key], &layout_of(&schema)));
+    assert!(!super::sort::sortable(&[key], &layout_of(&schema)));
 }
 
 /// An empty input sorts to an empty result rather than failing on the
@@ -860,13 +850,16 @@ fn shred_decodes_only_the_projected_columns() {
 
     // Only column 2 was "projected"; the rest read back as Null, which is what
     // the row scan promises for an unselected column.
-    let mut node = Shred::new(
-        Box::new(Batches(vec![batch].into_iter())),
+    let shredded = drain(super::shred(
+        batches(vec![batch]),
         layout_of(&schema),
         vec![2],
+    ))
+    .expect("shred");
+    assert_eq!(
+        shredded,
+        vec![vec![Value::Null, Value::Null, Value::Int8(9)]]
     );
-    let row = node.next().expect("shred").expect("a row");
-    assert_eq!(row, vec![Value::Null, Value::Null, Value::Int8(9)]);
 }
 
 /// A filter that rejects everything in a batch yields an empty batch, and the

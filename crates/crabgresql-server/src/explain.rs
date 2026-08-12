@@ -6,9 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crabgresql_executor::{
-    ExecContext, ExecError, ExecNode, Execution, OutputColumn, Values, execute,
-};
+use crabgresql_executor::{ExecContext, ExecError, Execution, OutputColumn, execute, values};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_planner::PhysicalPlan;
@@ -288,8 +286,11 @@ pub fn run_analyze(
 ) -> Result<Duration, ExecError> {
     let started = Instant::now();
     match execute(plan, ctx, txn)? {
-        Execution::Rows { mut node, .. } | Execution::ReturningRows { mut node, .. } => {
-            while node.next()?.is_some() {}
+        Execution::Rows { rows, .. } | Execution::ReturningRows { rows, .. } => {
+            // Blocking, because EXPLAIN ANALYZE runs on the synchronous
+            // statement path and the whole point is to have measured the run
+            // before this returns.
+            crabgresql_executor::stream::drain_rows(rows)?;
         }
         // A non-RETURNING mutation has already applied every row by the time
         // `execute` returns; there is nothing left to pull.
@@ -310,10 +311,9 @@ pub fn explain_result(lines: Vec<String>, session: &Session) -> QueryResult {
             }]
         })
         .collect();
-    let node: Box<dyn ExecNode> = Box::new(Values::new(rows, session.exec_context()));
     QueryResult::Rows {
         columns: explain_columns(),
-        node,
+        rows: values(rows, session.exec_context()),
         tag: RowTag::Explain,
         notices: Vec::new(),
     }

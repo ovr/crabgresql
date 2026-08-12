@@ -11,13 +11,13 @@
 //!
 //! A columnar **segment** starts at a scan whose engine can hand up Arrow
 //! batches and continues as far up the pipeline as every operator has a
-//! vectorized form. Wherever it stops, [`Shred`] turns batches back into tuples
-//! and the ordinary row nodes carry on. Nothing above the shred can tell the
-//! difference, which is what makes the choice safe to make per-node:
+//! vectorized form. Wherever it stops, [`shred`] turns batches back into row
+//! chunks and the ordinary row nodes carry on. Nothing above the shred can tell
+//! the difference, which is what makes the choice safe to make per-node:
 //!
 //! ```text
-//!   BatchScan ──▶ FilterBatch ──▶ Shred ──▶ Projection ──▶ Sort   (row nodes)
-//!   └──────────── columnar ───────────┘
+//!   batch_scan ──▶ filter_batches ──▶ shred ──▶ projection ──▶ sort  (row nodes)
+//!   └──────────────── columnar ────────────┘
 //! ```
 //!
 //! # What a batch means here
@@ -34,23 +34,17 @@ mod tests;
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use arrow_select::filter::filter_record_batch;
+use async_stream::try_stream;
+use futures_util::StreamExt;
+
 use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_storage_api::arrow::decode_columns;
-use crabgresql_storage_api::{BatchStream, Column, ColumnProjection, TableAm, TableSchema};
+use crabgresql_storage_api::{Column, ColumnProjection, TableAm, TableSchema};
 use crabgresql_txn::TxnContext;
 
-use crate::{ExecError, ExecNode, Tuple};
-
-/// A columnar execution node: `next_batch()` pulls many rows at a time.
-///
-/// The columnar twin of [`ExecNode`], and deliberately the same shape — pull
-/// based, `Send`, no lifetime — so a node can be suspended inside a portal and
-/// resumed across `Execute` round trips just as a row node can.
-pub trait BatchNode: Send {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError>;
-}
+use crate::ExecError;
+use crate::stream::{BatchStream, ROW_CHUNK, RowChunk, RowStream, blocking_batches};
 
 /// The columns a batch carries, in batch order.
 ///
@@ -64,196 +58,142 @@ pub fn layout_of(schema: &TableSchema) -> BatchLayout {
     Arc::from(schema.columns.clone())
 }
 
-/// A full table scan that yields batches — [`crate::SeqScan`]'s columnar twin.
+/// A full table scan that yields batches — [`crate::seq_scan`]'s columnar twin.
 ///
-/// [`BatchScan::open`] returns `None` when the engine has no batch path, so a
-/// caller always has the row scan to fall back on.
-pub struct BatchScan {
-    iter: BatchStream,
+/// `None` when the engine has no batch path, so a caller always has the row scan
+/// to fall back on. The engine's scan is a synchronous iterator, so the pulls go
+/// through [`blocking_batches`] rather than holding a worker per batch.
+pub fn batch_scan(
+    table: &Arc<dyn TableAm>,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Option<BatchStream> {
+    table
+        .scan_batches(txn, projection)
+        .map(|iter| blocking_batches(iter))
 }
 
-impl BatchScan {
-    pub fn open(
-        table: &Arc<dyn TableAm>,
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Option<Self> {
-        table
-            .scan_batches(txn, projection)
-            .map(|iter| BatchScan { iter })
-    }
-}
-
-impl BatchNode for BatchScan {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        self.iter.next().transpose().map_err(ExecError::from)
-    }
-}
-
-/// Concatenates several batch sources — the columnar [`crate::Append`].
+/// Concatenates several batch sources — the columnar [`crate::append_scan`].
 ///
 /// A Parquet relation is always read through this: it plans as an `Append` over
 /// its chunk store and its RAM write buffer. Without a columnar Append the
 /// batches would be shredded at the leaves and nothing above could vectorize,
 /// so this is load-bearing rather than an extra.
 ///
-/// [`BatchAppend::open`] is all-or-nothing: one row-only arm puts the whole
-/// relation back on the row path, because the arms' outputs are concatenated
-/// and must share one representation.
-pub struct BatchAppend {
-    children: Vec<Box<dyn BatchNode>>,
-    cursor: usize,
-}
-
-impl BatchAppend {
-    /// `None` — stay on the row path — if any arm cannot hand up batches, if
-    /// any arm carries a column remap, or if any arm must append a `tableoid`.
-    /// A batch is in its own relation's column order and there is nowhere here
-    /// to permute one, so a remapped arm would concatenate mis-ordered columns
-    /// rather than fail loudly.
-    ///
-    /// The remap branch is unreachable today: DDL refuses an engine-managed
-    /// relation on either side of an inheritance link, so no remapped arm can be
-    /// batch-capable. The planner's `arms_batch` applies that same remap rule,
-    /// so a remapped arm never makes `EXPLAIN` disagree with what runs.
-    ///
-    /// TODO: hand up batches for an arm that must append a `tableoid` slot.
-    /// `arms_batch` does not test for that slot, so until then `EXPLAIN` calls
-    /// such an `Append` columnar while it runs on rows.
-    pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<Self> {
-        let children = arms
-            .iter()
-            .map(|arm| {
-                // A remapped arm, or one that must append a `tableoid`, changes
-                // the row shape the batch layout describes.
-                if arm.relation.map.is_some() || arm.relation.tableoid.is_some() {
-                    return None;
-                }
-                BatchScan::open(&arm.relation.table, txn, &arm.projection)
-                    .map(|scan| Box::new(scan) as Box<dyn BatchNode>)
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(BatchAppend {
-            children,
-            cursor: 0,
-        })
-    }
-}
-
-impl BatchNode for BatchAppend {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        while self.cursor < self.children.len() {
-            if let Some(batch) = self.children[self.cursor].next_batch()? {
-                return Ok(Some(batch));
+/// All-or-nothing: one row-only arm puts the whole relation back on the row
+/// path, because the arms' outputs are concatenated and must share one
+/// representation. `None` — stay on the row path — if any arm cannot hand up
+/// batches, if any arm carries a column remap, or if any arm must append a
+/// `tableoid`. A batch is in its own relation's column order and there is
+/// nowhere here to permute one, so a remapped arm would concatenate mis-ordered
+/// columns rather than fail loudly.
+///
+/// The remap branch is unreachable today: DDL refuses an engine-managed
+/// relation on either side of an inheritance link, so no remapped arm can be
+/// batch-capable. The planner's `arms_batch` applies that same remap rule, so a
+/// remapped arm never makes `EXPLAIN` disagree with what runs.
+///
+/// TODO: hand up batches for an arm that must append a `tableoid` slot.
+/// `arms_batch` does not test for that slot, so until then `EXPLAIN` calls
+/// such an `Append` columnar while it runs on rows.
+pub fn batch_append(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<BatchStream> {
+    let children = arms
+        .iter()
+        .map(|arm| {
+            // A remapped arm, or one that must append a `tableoid`, changes
+            // the row shape the batch layout describes.
+            if arm.relation.map.is_some() || arm.relation.tableoid.is_some() {
+                return None;
             }
-            self.cursor += 1;
+            batch_scan(&arm.relation.table, txn, &arm.projection)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Box::pin(try_stream! {
+        for child in children {
+            let mut child = child;
+            while let Some(batch) = child.next().await {
+                yield batch?;
+            }
         }
-        Ok(None)
-    }
+    }))
 }
 
 /// Drops the rows of each batch that fail a predicate — the columnar
-/// [`crate::Filter`].
+/// [`crate::filter`].
 ///
-/// This is the operator that makes vectorizing pay. [`Shred`] costs one tuple
+/// This is the operator that makes vectorizing pay. [`shred`] costs one tuple
 /// build per surviving row, so filtering *below* the shred is what turns a
 /// selective `WHERE` into work the row executor never does at all.
 ///
-/// A batch that loses every row is passed on empty rather than skipped; `Shred`
+/// A batch that loses every row is passed on empty rather than skipped; `shred`
 /// treats an empty batch as "nothing here", not "nothing left".
-pub struct FilterBatch {
-    child: Box<dyn BatchNode>,
-    predicate: expr::VectorPredicate,
+pub fn filter_batches(child: BatchStream, predicate: expr::VectorPredicate) -> BatchStream {
+    Box::pin(try_stream! {
+        let mut child = child;
+        while let Some(batch) = child.next().await {
+            let batch = batch?;
+            let mask = predicate.evaluate(&batch)?;
+            // `filter_record_batch` keeps only `true`; `false` and NULL both
+            // drop, which is SQL's rule for a `WHERE` and matches
+            // `predicate_holds`.
+            yield filter_record_batch(&batch, &mask).map_err(|error| {
+                ExecError::new("XX000", format!("vectorized filter failed: {error}"))
+            })?;
+        }
+    })
 }
 
-impl FilterBatch {
-    pub fn new(child: Box<dyn BatchNode>, predicate: expr::VectorPredicate) -> Self {
-        FilterBatch { child, predicate }
-    }
-}
-
-impl BatchNode for FilterBatch {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        let Some(batch) = self.child.next_batch()? else {
-            return Ok(None);
-        };
-        let mask = self.predicate.evaluate(&batch)?;
-        // `filter_record_batch` keeps only `true`; `false` and NULL both drop,
-        // which is SQL's rule for a `WHERE` and matches `predicate_holds`.
-        filter_record_batch(&batch, &mask)
-            .map(Some)
-            .map_err(|error| ExecError::new("XX000", format!("vectorized filter failed: {error}")))
-    }
-}
-
-/// Turns a batch stream back into a tuple stream — the boundary where a
-/// columnar segment ends and the row executor resumes.
+/// Turns a batch stream back into a row stream — the boundary where a columnar
+/// segment ends and the row executor resumes.
 ///
 /// Every vectorized plan has exactly one of these per segment. It is pure cost
 /// (the work the columnar nodes below it saved has to be paid back for the rows
 /// that survive), which is the whole argument for pushing selective operators
 /// like a filter *below* it: fewer surviving rows, less to shred.
 ///
-/// A batch with no rows is skipped rather than ending the stream — an empty
+/// A batch becomes whole [`RowChunk`]s, which is why the row path counts in
+/// chunks at all: the boundary between the two representations is a regroup, not
+/// a per-row handover. A batch wider than [`ROW_CHUNK`] rows is split rather
+/// than shredded whole — a columnar sort hands its entire output up as one
+/// batch, and building every tuple of it before releasing any would hold the
+/// result set twice over, once as Arrow and once as tuples.
+///
+/// A batch with no rows yields no chunk rather than ending the stream — an empty
 /// batch means "nothing here", not "nothing left", and a filter that rejects
 /// everything in one batch produces exactly that.
-pub struct Shred {
-    child: Box<dyn BatchNode>,
-    /// The batch's column types, in the shape [`decode_columns`] takes. Only
-    /// its `columns` are read; the relation name is never used.
-    schema: TableSchema,
-    /// Which batch columns actually carry values.
-    ///
-    /// A scan's batch is full width, but the columns outside its
-    /// [`ColumnProjection`] are all-NULL padding that only exists so a schema
-    /// ordinal is a batch ordinal. Decoding those would make the per-row cost
-    /// scale with the table's width instead of with the query's — on a
-    /// hundred-column relation read for two columns, fifty times the work the
-    /// row scan does. `decode_columns` leaves the slots it is not given as `Null`,
-    /// which is exactly the row scan's contract for an unprojected column.
-    positions: Vec<usize>,
-    batch: Option<RecordBatch>,
-    row: usize,
-}
-
-impl Shred {
-    pub fn new(child: Box<dyn BatchNode>, layout: BatchLayout, positions: Vec<usize>) -> Self {
-        Shred {
-            child,
-            schema: TableSchema::new("", layout.to_vec()),
-            positions,
-            batch: None,
-            row: 0,
-        }
-    }
-
-    /// Every column of the batch carries a value — the shape an operator that
-    /// builds its own output columns (a projection, a sort) hands up.
-    pub fn dense(child: Box<dyn BatchNode>, layout: BatchLayout) -> Self {
-        let positions = (0..layout.len()).collect();
-        Shred::new(child, layout, positions)
-    }
-}
-
-impl ExecNode for Shred {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        loop {
-            if let Some(batch) = &self.batch
-                && self.row < batch.num_rows()
-            {
-                let row = self.row;
-                self.row += 1;
-                return decode_columns(&self.schema, &self.positions, batch, row)
-                    .map(Some)
-                    .map_err(ExecError::from);
-            }
-            match self.child.next_batch()? {
-                Some(batch) => {
-                    self.batch = Some(batch);
-                    self.row = 0;
+///
+/// `positions` names which batch columns actually carry values. A scan's batch
+/// is full width, but the columns outside its [`ColumnProjection`] are all-NULL
+/// padding that only exists so a schema ordinal is a batch ordinal. Decoding
+/// those would make the per-row cost scale with the table's width instead of
+/// with the query's — on a hundred-column relation read for two columns, fifty
+/// times the work the row scan does. `decode_columns` leaves the slots it is not
+/// given as `Null`, which is exactly the row scan's contract for an unprojected
+/// column.
+pub fn shred(child: BatchStream, layout: BatchLayout, positions: Vec<usize>) -> RowStream {
+    // Only its `columns` are read; the relation name is never used.
+    let schema = TableSchema::new("", layout.to_vec());
+    Box::pin(try_stream! {
+        let mut child = child;
+        while let Some(batch) = child.next().await {
+            let batch = batch?;
+            let mut start = 0;
+            while start < batch.num_rows() {
+                let end = (start + ROW_CHUNK).min(batch.num_rows());
+                let mut chunk: RowChunk = Vec::with_capacity(end - start);
+                for row in start..end {
+                    chunk.push(decode_columns(&schema, &positions, &batch, row)?);
                 }
-                None => return Ok(None),
+                yield chunk;
+                start = end;
             }
         }
-    }
+    })
+}
+
+/// [`shred`] for a batch every column of which carries a value — the shape an
+/// operator that builds its own output columns (a projection, a sort) hands up.
+pub fn shred_dense(child: BatchStream, layout: BatchLayout) -> RowStream {
+    let positions = (0..layout.len()).collect();
+    shred(child, layout, positions)
 }

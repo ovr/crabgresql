@@ -7,9 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
+use crabgresql_executor::stream::RowCursor;
 use crabgresql_executor::{
-    CatalogOps, ExecContext, ExecError, ExecNode, GucOps, NoticeSink, OutputColumn, RoutineOps,
-    SequenceOps,
+    CatalogOps, ExecContext, ExecError, GucOps, NoticeSink, OutputColumn, RoutineOps, SequenceOps,
 };
 use crabgresql_plpgsql::RoutineCache;
 
@@ -129,9 +129,10 @@ impl PortalState {
 /// A portal suspended by a row-limited `Execute`: the still-running result
 /// iterator and how many rows it has already delivered.
 pub struct SuspendedRows {
-    /// The result iterator, paused mid-stream. Owns its snapshot, so resuming it
+    /// The result stream, paused mid-flight, plus whatever is left of the chunk
+    /// the last `Execute` was served from. Owns its snapshot, so resuming it
     /// later sees the same rows.
-    pub node: Box<dyn ExecNode>,
+    pub rows: RowCursor,
     /// Total rows already delivered across every `Execute` of this portal, so the
     /// final `CommandComplete` reports the whole portal's count.
     pub delivered: usize,
@@ -162,10 +163,10 @@ pub enum CursorMove {
 
 /// A SQL cursor opened by `DECLARE … CURSOR`.
 ///
-/// The rows are materialised at `DECLARE` time rather than streamed. The
-/// executor's [`ExecNode`] is forward-only with no rewind, and a statement's
+/// The rows are materialised at `DECLARE` time rather than streamed. A
+/// [`RowCursor`] is forward-only with no rewind, and a statement's
 /// transaction is finalised before its rows are pulled, so holding a live
-/// iterator across statements would need per-portal transaction lifetimes.
+/// stream across statements would need per-portal transaction lifetimes.
 /// Materialising instead pins the `DECLARE`-time snapshot (which is what
 /// PostgreSQL guarantees), makes `SCROLL` free, and makes `WITH HOLD` free —
 /// PostgreSQL itself spools a holdable cursor into a tuplestore at commit. The

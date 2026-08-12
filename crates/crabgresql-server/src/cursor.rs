@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_executor::MaterializedRows;
+use crabgresql_executor::stream::rows_once;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::TableEngine;
@@ -97,13 +97,13 @@ pub(crate) fn execute_declare(
         params,
         true,
     )?;
-    let (columns, mut node, notices) = match result {
+    let (columns, stream, notices) = match result {
         QueryResult::Rows {
             columns,
-            node,
+            rows,
             notices,
             ..
-        } => (columns, node, notices),
+        } => (columns, rows, notices),
         // The binder resolves a cursor's body as a query, so this is not
         // reachable from any statement the grammar admits.
         QueryResult::Command { .. } => {
@@ -111,11 +111,8 @@ pub(crate) fn execute_declare(
         }
     };
     // Already materialised by `force_materialize`, so this only moves the rows
-    // out of the node — nothing runs after the transaction closed.
-    let mut rows = Vec::new();
-    while let Some(row) = node.next()? {
-        rows.push(row);
-    }
+    // out of the stream — nothing runs after the transaction closed.
+    let rows = crabgresql_executor::stream::drain_rows(stream)?;
 
     session.cursors.insert(
         name,
@@ -157,7 +154,7 @@ pub(crate) fn execute_fetch(
     let rows = cursor.fetch(movement)?;
     Ok(QueryResult::Rows {
         columns,
-        node: Box::new(MaterializedRows::new(rows)),
+        rows: rows_once(rows),
         tag: RowTag::Fetch,
         notices: Vec::new(),
     })

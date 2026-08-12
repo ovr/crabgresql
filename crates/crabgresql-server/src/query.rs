@@ -16,9 +16,9 @@ use crabgresql_binder::{
     bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
     param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
+use crabgresql_executor::stream::{RowStream, drain_rows, rows_once};
 use crabgresql_executor::{
-    CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, MaterializedRows, OutputColumn,
-    RoutineOps, execute,
+    CatalogOps, DmlVerb, ExecContext, Execution, OutputColumn, RoutineOps, execute,
 };
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{ErrorFields, TransactionStatus, sqlstate};
@@ -123,11 +123,11 @@ impl Notice {
 }
 
 pub enum QueryResult {
-    /// A result set, streamed: the caller pulls tuples from the node and derives
-    /// the CommandComplete tag from `tag` and the row count.
+    /// A result set, streamed: the caller pulls chunks of tuples from the stream
+    /// and derives the CommandComplete tag from `tag` and the row count.
     Rows {
         columns: Vec<OutputColumn>,
-        node: Box<dyn ExecNode>,
+        rows: RowStream,
         /// Which command tag to report once the rows are drained. A plain SELECT
         /// uses `SELECT n`, EXPLAIN the bare `EXPLAIN`, and a `RETURNING` DML keeps
         /// its mutation tag (`INSERT 0 n` / `UPDATE n` / `DELETE n`).
@@ -1235,19 +1235,19 @@ pub(crate) fn execute_statement_with(
     // caller alongside the result so it goes out ahead of the rows.
     let notices = session.notices.drain();
     let result = match exec {
-        Execution::Rows { columns, node } => QueryResult::Rows {
+        Execution::Rows { columns, rows } => QueryResult::Rows {
             columns,
-            node,
+            rows,
             tag: RowTag::Select,
             notices,
         },
         Execution::ReturningRows {
             columns,
-            node,
+            rows,
             verb,
         } => QueryResult::Rows {
             columns,
-            node,
+            rows,
             tag: verb.into(),
             notices,
         },
@@ -1294,27 +1294,27 @@ fn command_with(tag: String, notices: Vec<Notice>) -> QueryResult {
 /// Pull a result set into memory, so nothing is left to run after the
 /// statement's transaction closes. Mutation counts pass through untouched.
 fn materialize(exec: Execution) -> Result<Execution, PgError> {
-    let (columns, mut node, verb) = match exec {
-        Execution::Rows { columns, node } => (columns, node, None),
+    let (columns, stream, verb) = match exec {
+        Execution::Rows { columns, rows } => (columns, rows, None),
         Execution::ReturningRows {
             columns,
-            node,
+            rows,
             verb,
-        } => (columns, node, Some(verb)),
+        } => (columns, rows, Some(verb)),
         done => return Ok(done),
     };
-    let mut rows = Vec::new();
-    while let Some(row) = node.next()? {
-        rows.push(row);
-    }
-    let node: Box<dyn ExecNode> = Box::new(MaterializedRows::new(rows));
+    // The statement path is synchronous, so the drain goes through the
+    // executor's blocking bridge. Nothing under it reaches the blocking pool
+    // (see `crabgresql_executor::stream`), which is what makes parking this
+    // thread no worse than the row-at-a-time drain it replaces.
+    let rows = rows_once(drain_rows(stream)?);
     Ok(match verb {
         Some(verb) => Execution::ReturningRows {
             columns,
-            node,
+            rows,
             verb,
         },
-        None => Execution::Rows { columns, node },
+        None => Execution::Rows { columns, rows },
     })
 }
 
@@ -3725,7 +3725,7 @@ fn join_show_name(variable: &[ast::Ident]) -> String {
 fn show_result(columns: Vec<OutputColumn>, rows: Vec<Vec<Value>>) -> QueryResult {
     QueryResult::Rows {
         columns,
-        node: Box::new(MaterializedRows::new(rows)),
+        rows: rows_once(rows),
         tag: RowTag::Show,
         notices: Vec::new(),
     }

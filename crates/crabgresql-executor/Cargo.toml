@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 arrow-arith.workspace = true
+async-stream.workspace = true
 arrow-array.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
@@ -22,10 +23,13 @@ crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 crc32c.workspace = true
 crc32fast.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
 md-5.workspace = true
 rand.workspace = true
 rustc-hash.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

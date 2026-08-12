@@ -17,6 +17,7 @@ mod md5;
 pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
+pub mod stream;
 mod subplan;
 mod unique;
 mod uuid_gen;
@@ -27,6 +28,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_stream::try_stream;
+use futures_util::StreamExt;
 use rustc_hash::FxHashMap;
 
 pub use crabgresql_binder::OutputColumn;
@@ -53,6 +56,7 @@ pub use eval::{
 };
 use generate_series::Series;
 use generated::GeneratedSet;
+use stream::{ROW_CHUNK, RowChunk, RowStream, drain_rows, first_row, rows_once};
 use unique::UniqueKeySet;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
@@ -458,16 +462,11 @@ impl From<crabgresql_binder::SoftError> for ExecError {
     }
 }
 
-/// A Volcano execution node: `next()` pulls one tuple at a time.
-pub trait ExecNode: Send {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError>;
-}
-
 /// The outcome of a statement: a streamable result set, or a mutation count.
 pub enum Execution {
     Rows {
         columns: Vec<OutputColumn>,
-        node: Box<dyn ExecNode>,
+        rows: RowStream,
     },
     Inserted(u64),
     Updated(u64),
@@ -485,7 +484,7 @@ pub enum Execution {
     /// [`update_direct`]).
     ReturningRows {
         columns: Vec<OutputColumn>,
-        node: Box<dyn ExecNode>,
+        rows: RowStream,
         verb: DmlVerb,
     },
 }
@@ -546,12 +545,15 @@ pub fn execute(
             // visible output — captured before `rows` is moved so a Distinct can
             // keep those columns through the sort.
             let full_width = rows.first().map_or(columns.len(), Vec::len);
-            let mut node: Box<dyn ExecNode> = Box::new(Values::new(rows, ctx.clone()));
+            let mut node = values(rows, ctx.clone());
             if let Some(predicate) = predicate {
-                node = Box::new(Filter::new(node, predicate, ctx.clone()));
+                node = filter(node, predicate, ctx.clone());
             }
-            node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
-            Ok(Execution::Rows { columns, node })
+            let node = finish_sort_distinct(node, sort, distinct, full_width, &columns);
+            Ok(Execution::Rows {
+                columns,
+                rows: node,
+            })
         }
         PhysicalPlan::Select {
             table,
@@ -575,7 +577,7 @@ pub fn execute(
             // wrapping Subquery applies this level's projection/predicate/sort.
             Ok(Execution::Rows {
                 columns,
-                node: append_source(&arms, ctx, txn)?.into_rows(),
+                rows: append_source(&arms, ctx, txn)?.into_rows(),
             })
         }
         PhysicalPlan::SetOp {
@@ -587,27 +589,25 @@ pub fn execute(
             // A UNION [ALL]: run each arm, coerce the ones whose own column types
             // differ from the unified output, and concatenate the streams. Then
             // apply this node's own deduplication (UNION) and ORDER BY.
-            let mut children: Vec<Box<dyn ExecNode>> = Vec::with_capacity(arms.len());
+            let mut children: Vec<RowStream> = Vec::with_capacity(arms.len());
             for arm in arms {
-                let Execution::Rows { node, .. } = execute(arm.plan, ctx, txn)? else {
+                let Execution::Rows { rows, .. } = execute(arm.plan, ctx, txn)? else {
                     return Err(ExecError::new(
                         "XX000",
                         "UNION arm did not produce a row set",
                     ));
                 };
                 children.push(match arm.coercion {
-                    Some(projections) => Box::new(Projection::new(node, projections, ctx.clone())),
-                    None => node,
+                    Some(projections) => projection(rows, projections, ctx.clone()),
+                    None => rows,
                 });
             }
-            let node = finish_sort_distinct(
-                Box::new(Concat::new(children)),
-                sort,
-                distinct,
-                columns.len(),
-                &columns,
-            )?;
-            Ok(Execution::Rows { columns, node })
+            let node =
+                finish_sort_distinct(concat(children), sort, distinct, columns.len(), &columns);
+            Ok(Execution::Rows {
+                columns,
+                rows: node,
+            })
         }
         PhysicalPlan::IndexScan {
             table,
@@ -620,9 +620,9 @@ pub fn execute(
             sort,
             distinct,
         } => {
-            let source = IndexScan::new(&table, &index_name, key, ctx, txn, &projection)?;
+            let source = index_scan(&table, &index_name, key, ctx, txn, &projection)?;
             project_pipeline(
-                Source::Rows(Box::new(source)),
+                Source::Rows(source),
                 projections,
                 predicate,
                 sort,
@@ -653,7 +653,7 @@ pub fn execute(
             output_width,
             ..
         } => {
-            let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
+            let Execution::Rows { columns, rows } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "window source did not produce a row set",
@@ -664,7 +664,7 @@ pub fn execute(
             // supplies the real output columns — these are never surfaced.
             Ok(Execution::Rows {
                 columns,
-                node: Box::new(WindowAgg::new(node, spec, funcs, output_width, ctx)?),
+                rows: window_agg(rows, spec, funcs, output_width, ctx.clone()),
             })
         }
         PhysicalPlan::TableFunction {
@@ -676,7 +676,7 @@ pub fn execute(
             sort,
             distinct,
         } => project_pipeline(
-            Source::Rows(Box::new(TableFunctionSource::new(func, args, ctx.clone()))),
+            Source::Rows(table_function(func, args, ctx.clone())),
             projections,
             predicate,
             sort,
@@ -708,7 +708,7 @@ pub fn execute(
             limit,
             offset,
         } => {
-            let Execution::Rows { columns, node } = execute(*source, ctx, txn)? else {
+            let Execution::Rows { columns, rows } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "LIMIT source did not produce a row set",
@@ -716,7 +716,7 @@ pub fn execute(
             };
             Ok(Execution::Rows {
                 columns,
-                node: Box::new(Limit::new(node, limit, offset)),
+                rows: limit_offset(rows, limit, offset),
             })
         }
         PhysicalPlan::Aggregate {
@@ -732,22 +732,20 @@ pub fn execute(
         } => {
             // Source rows: a base table scan or the single virtual row of a
             // FROM-less aggregate.
-            let source: Box<dyn ExecNode> = match input {
-                PhysicalAggInput::Scan { table, projection } => {
-                    Box::new(SeqScan::new(&table, txn, &projection))
-                }
+            let source: RowStream = match input {
+                PhysicalAggInput::Scan { table, projection } => seq_scan(&table, txn, &projection),
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
-                PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
+                PhysicalAggInput::SingleRow => values(vec![vec![]], ctx.clone()),
             };
             // WHERE filters rows before aggregation.
-            let mut node: Box<dyn ExecNode> = match predicate {
-                Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
+            let mut node: RowStream = match predicate {
+                Some(predicate) => filter(source, predicate, ctx.clone()),
                 None => source,
             };
-            node = Box::new(Aggregate::new(node, group_exprs, aggregates, ctx.clone()));
+            node = aggregate(node, group_exprs, aggregates, ctx.clone());
             // HAVING filters the per-group rows.
             if let Some(having) = having {
-                node = Box::new(Filter::new(node, having, ctx.clone()));
+                node = filter(node, having, ctx.clone());
             }
             // The projection list and ORDER BY were rewritten to reference the
             // aggregate output row, so the standard tail finishes the job.
@@ -1396,7 +1394,7 @@ pub(crate) fn run_subplan(
     txn: &TxnContext,
 ) -> Result<Vec<Tuple>, ExecError> {
     match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, txn)? {
-        Execution::Rows { node, .. } => drain(node),
+        Execution::Rows { rows, .. } => drain_rows(rows),
         _ => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
             "subquery did not produce a result set",
@@ -1412,20 +1410,12 @@ fn subplan_has_rows(
     txn: &TxnContext,
 ) -> Result<bool, ExecError> {
     match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, txn)? {
-        Execution::Rows { mut node, .. } => Ok(node.next()?.is_some()),
+        Execution::Rows { rows, .. } => Ok(first_row(rows)?.is_some()),
         _ => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
             "subquery did not produce a result set",
         )),
     }
-}
-
-fn drain(mut node: Box<dyn ExecNode>) -> Result<Vec<Tuple>, ExecError> {
-    let mut out = Vec::new();
-    while let Some(tuple) = node.next()? {
-        out.push(tuple);
-    }
-    Ok(out)
 }
 
 /// The first column of a subquery's materialized rows — the candidate values a
@@ -1656,9 +1646,9 @@ fn substitute_hole(
 /// vectorizable operator be pushed *below* the shred; a source that never had a
 /// batch form stays [`Source::Rows`] and every such attempt simply declines.
 enum Source {
-    Rows(Box<dyn ExecNode>),
+    Rows(RowStream),
     Batches {
-        node: Box<dyn vector::BatchNode>,
+        node: stream::BatchStream,
         layout: vector::BatchLayout,
         /// Which batch columns carry values. A scan's batch is full width, but
         /// the columns outside its `ColumnProjection` are all-NULL padding, and
@@ -1670,19 +1660,19 @@ enum Source {
 
 impl Source {
     /// End the columnar segment, shredding back to tuples if it had begun.
-    fn into_rows(self) -> Box<dyn ExecNode> {
+    fn into_rows(self) -> RowStream {
         match self {
             Source::Rows(node) => node,
             Source::Batches {
                 node,
                 layout,
                 positions,
-            } => Box::new(vector::Shred::new(node, layout, positions)),
+            } => vector::shred(node, layout, positions),
         }
     }
 
     /// Apply `predicate` columnar-side if it compiles, returning it unconsumed
-    /// otherwise so the caller can build the row [`Filter`] instead.
+    /// otherwise so the caller can build the row [`filter`] instead.
     fn filter(self, predicate: BoundExpr) -> (Self, Option<BoundExpr>) {
         let Source::Batches {
             node,
@@ -1696,7 +1686,7 @@ impl Source {
         match vector::expr::compile_predicate(&predicate, &layout) {
             Some(compiled) => (
                 Source::Batches {
-                    node: Box::new(vector::FilterBatch::new(node, compiled)),
+                    node: vector::filter_batches(node, compiled),
                     layout,
                     positions,
                 },
@@ -1722,48 +1712,46 @@ impl Source {
     /// it always did.
     ///
     /// `sort` must be non-empty — a columnar projection on its own gains
-    /// nothing, since the row `Projection` it would replace does exactly the
-    /// tuple-building work `Shred` would then have to do anyway.
+    /// nothing, since the row projection it would replace does exactly the
+    /// tuple-building work the shred would then have to do anyway.
     fn project_and_sort(
         self,
         projections: &[BoundExpr],
         sort: &[SortKey],
         visible_width: usize,
-    ) -> Result<(Self, bool), ExecError> {
+    ) -> (Self, bool) {
         let Source::Batches {
             node,
             layout,
             positions,
         } = self
         else {
-            return Ok((self, false));
+            return (self, false);
         };
         let projected = vector::sort::ProjectBatch::layout(projections);
         let takes = vector::sort::ProjectBatch::compile(projections, &layout);
         let takes = match takes {
             Some(takes)
-                if vector::sort::SortBatch::compilable(sort, &projected)
-                    && visible_width <= projected.len() =>
+                if vector::sort::sortable(sort, &projected) && visible_width <= projected.len() =>
             {
                 takes
             }
             _ => {
-                return Ok((
+                return (
                     Source::Batches {
                         node,
                         layout,
                         positions,
                     },
                     false,
-                ));
+                );
             }
         };
-        let project = vector::sort::ProjectBatch::new(node, takes, &projected);
-        let sorted =
-            vector::sort::SortBatch::new(Box::new(project), sort, &projected, visible_width)?;
-        Ok((
+        let project = vector::sort::project_batches(node, takes, &projected);
+        let sorted = vector::sort::sort_batches(project, sort, &projected, visible_width);
+        (
             Source::Batches {
-                node: Box::new(sorted),
+                node: sorted,
                 // The sort dropped the hidden ORDER BY columns, so what remains
                 // above it is the visible prefix of the projected layout.
                 layout: Arc::from(&projected[..visible_width]),
@@ -1772,7 +1760,7 @@ impl Source {
                 positions: (0..visible_width).collect(),
             },
             true,
-        ))
+        )
     }
 }
 
@@ -1798,13 +1786,13 @@ fn subquery_source(
     if let PhysicalPlan::Append { arms, .. } = &source {
         return append_source(arms, ctx, txn);
     }
-    let Execution::Rows { node, .. } = execute(source, ctx, txn)? else {
+    let Execution::Rows { rows, .. } = execute(source, ctx, txn)? else {
         return Err(ExecError::new(
             "XX000",
             "subquery source did not produce a row set",
         ));
     };
-    Ok(Source::Rows(node))
+    Ok(Source::Rows(rows))
 }
 
 /// The batch columns a scan under `projection` actually fills.
@@ -1830,17 +1818,17 @@ fn scan_source(
     txn: &TxnContext,
     projection: &ColumnProjection,
 ) -> Source {
-    match vector::BatchScan::open(table, txn, projection) {
+    match vector::batch_scan(table, txn, projection) {
         Some(scan) => {
             let layout = vector::layout_of(&table.schema());
             let positions = scan_positions(projection, layout.len());
             Source::Batches {
-                node: Box::new(scan),
+                node: scan,
                 layout,
                 positions,
             }
         }
-        None => Source::Rows(Box::new(SeqScan::new(table, txn, projection))),
+        None => Source::Rows(seq_scan(table, txn, projection)),
     }
 }
 
@@ -1848,10 +1836,10 @@ fn scan_source(
 /// inheritance parent with its descendants, or the storage leaves of one
 /// engine-managed relation.
 ///
-/// All arms or none: [`vector::BatchAppend`] concatenates their outputs, so a
+/// All arms or none: [`vector::batch_append`] concatenates their outputs, so a
 /// single row-only arm puts the whole node back on the row path rather than
 /// mixing representations. An arm that remaps disqualifies the batch path
-/// outright — see [`vector::BatchAppend::open`].
+/// outright — see [`vector::batch_append`].
 fn append_source(
     arms: &[PhysicalAppendArm],
     ctx: &ExecContext,
@@ -1862,19 +1850,19 @@ fn append_source(
     // arms is not a shape the planner emits.
     let first = arms.first();
     let layout = first.map(|arm| vector::layout_of(&arm.relation.table.schema()));
-    Ok(match (vector::BatchAppend::open(arms, txn), layout) {
+    Ok(match (vector::batch_append(arms, txn), layout) {
         (Some(append), Some(layout)) => {
             let positions = scan_positions(
                 &first.expect("layout implies an arm").projection,
                 layout.len(),
             );
             Source::Batches {
-                node: Box::new(append),
+                node: append,
                 layout,
                 positions,
             }
         }
-        _ => Source::Rows(Box::new(Append::new(arms, ctx, txn)?)),
+        _ => Source::Rows(append_scan(arms, ctx, txn)?),
     })
 }
 
@@ -1915,30 +1903,33 @@ fn project_pipeline(
     //   columns that the sort would have dropped.
     // * there is a sort at all; a columnar projection alone gains nothing.
     let (source, sorted) = match predicate.is_none() && distinct.is_none() && !sort.is_empty() {
-        true => source.project_and_sort(&projections, &sort, columns.len())?,
+        true => source.project_and_sort(&projections, &sort, columns.len()),
         false => (source, false),
     };
     if sorted {
         // Projection and sort are both already done, columnar-side.
         return Ok(Execution::Rows {
             columns,
-            node: source.into_rows(),
+            rows: source.into_rows(),
         });
     }
 
     let mut node = source.into_rows();
     if let Some(predicate) = predicate {
-        node = Box::new(Filter::new(node, predicate, ctx.clone()));
+        node = filter(node, predicate, ctx.clone());
     }
     // A set-returning function in the target list turns one input row into many,
-    // so it needs `ProjectSet` rather than the one-in/one-out `Projection`.
+    // so it needs `project_set` rather than the one-in/one-out `projection`.
     node = if projections.iter().any(BoundExpr::is_srf) {
-        Box::new(ProjectSet::new(node, projections, ctx.clone()))
+        project_set(node, projections, ctx.clone())
     } else {
-        Box::new(Projection::new(node, projections, ctx.clone()))
+        projection(node, projections, ctx.clone())
     };
-    node = finish_sort_distinct(node, sort, distinct, full_width, &columns)?;
-    Ok(Execution::Rows { columns, node })
+    let node = finish_sort_distinct(node, sort, distinct, full_width, &columns);
+    Ok(Execution::Rows {
+        columns,
+        rows: node,
+    })
 }
 
 /// Apply the ORDER BY and DISTINCT tail. Without DISTINCT this is just the sort
@@ -1946,20 +1937,20 @@ fn project_pipeline(
 /// its hidden columns, so it is built with a no-op width and the `Distinct` node
 /// performs the final trim to the visible output width.
 fn finish_sort_distinct(
-    node: Box<dyn ExecNode>,
+    node: RowStream,
     sort: Vec<SortKey>,
     distinct: Option<Vec<DistinctKey>>,
     full_width: usize,
     columns: &[OutputColumn],
-) -> Result<Box<dyn ExecNode>, ExecError> {
+) -> RowStream {
     let Some(keys) = distinct else {
         return maybe_sort(node, sort, columns);
     };
     let mut node = node;
     if !sort.is_empty() {
-        node = Box::new(Sort::new(node, sort, full_width)?);
+        node = sort_rows(node, sort, full_width);
     }
-    Ok(Box::new(Distinct::new(node, keys, columns.len())?))
+    distinct_rows(node, keys, columns.len())
 }
 
 /// Evaluate an expression that references no row — a `CALL` argument, which
@@ -1967,27 +1958,6 @@ fn finish_sort_distinct(
 /// rejected any column reference, so the empty row is never indexed.
 pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecError> {
     eval(expr, &[], ctx)
-}
-
-/// A source node that replays already-computed output rows. `RETURNING`
-/// projects eagerly and streams the finished rows through this — unlike
-/// [`Values`], which evaluates `BoundExpr`s on each pull.
-pub struct MaterializedRows {
-    rows: std::vec::IntoIter<Tuple>,
-}
-
-impl MaterializedRows {
-    pub fn new(rows: Vec<Tuple>) -> Self {
-        Self {
-            rows: rows.into_iter(),
-        }
-    }
-}
-
-impl ExecNode for MaterializedRows {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.rows.next())
-    }
 }
 
 /// Project a bound `RETURNING` list over the rows a DML statement affects,
@@ -2052,7 +2022,7 @@ fn target_oids(targets: &[DmlTarget], ctx: &ExecContext) -> Result<Vec<Option<u3
 fn returning_rows(output: Vec<Tuple>, columns: Vec<OutputColumn>, verb: DmlVerb) -> Execution {
     Execution::ReturningRows {
         columns,
-        node: Box::new(MaterializedRows::new(output)),
+        rows: rows_once(output),
         verb,
     }
 }
@@ -2162,13 +2132,16 @@ fn collect_insert_tuples(
             }
         }
         PhysicalInsertSource::Query { input, projections } => {
-            let Execution::Rows { mut node, .. } = execute(*input, ctx, txn)? else {
+            let Execution::Rows { rows, .. } = execute(*input, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "insert source did not produce a row set",
                 ));
             };
-            while let Some(row) = node.next()? {
+            // Drained here rather than streamed into the write: `INSERT ...
+            // SELECT` over the very table it writes must read the pre-insert
+            // snapshot, and the writes below happen after this returns.
+            for row in drain_rows(rows)? {
                 let mut tuple = Tuple::with_capacity(projections.len());
                 for expr in &projections {
                     tuple.push(eval(expr, &row, ctx)?);
@@ -3388,6 +3361,13 @@ fn delete_routed(
     }
 }
 
+/// How much room to reserve for a chunk derived one-for-one from `chunk`. The
+/// borrow ends before the chunk is consumed, so the length has to be read out
+/// first.
+fn chunk_hint(chunk: &Result<RowChunk, ExecError>) -> usize {
+    chunk.as_ref().map_or(0, Vec::len)
+}
+
 /// WHERE keeps a row only when the predicate is exactly true: false and NULL
 /// both drop it.
 fn predicate_holds(
@@ -3402,94 +3382,59 @@ fn predicate_holds(
 }
 
 /// Constant rows evaluated lazily: `SELECT 1`, a FROM-less SELECT.
-pub struct Values {
-    rows: std::vec::IntoIter<Vec<BoundExpr>>,
-    ctx: ExecContext,
-}
-
-impl Values {
-    pub fn new(rows: Vec<Vec<BoundExpr>>, ctx: ExecContext) -> Self {
-        Self {
-            rows: rows.into_iter(),
-            ctx,
+///
+/// The expressions are evaluated when the stream is first pulled, not when it is
+/// built, so an unread result set does no work and a faulting expression faults
+/// where the caller can attribute it.
+pub fn values(rows: Vec<Vec<BoundExpr>>, ctx: ExecContext) -> RowStream {
+    Box::pin(try_stream! {
+        let mut chunk: RowChunk = Vec::with_capacity(rows.len().min(ROW_CHUNK));
+        for row in rows {
+            let tuple = row
+                .iter()
+                .map(|expr| eval(expr, &[], &ctx))
+                .collect::<Result<Tuple, _>>()?;
+            chunk.push(tuple);
+            if chunk.len() == ROW_CHUNK {
+                yield std::mem::replace(&mut chunk, Vec::with_capacity(ROW_CHUNK));
+            }
         }
-    }
-}
-
-impl ExecNode for Values {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        let Some(row) = self.rows.next() else {
-            return Ok(None);
-        };
-        let tuple = row
-            .iter()
-            .map(|expr| eval(expr, &[], &self.ctx))
-            .collect::<Result<_, _>>()?;
-        Ok(Some(tuple))
-    }
+        if !chunk.is_empty() {
+            yield chunk;
+        }
+    })
 }
 
 /// A set-returning function in FROM position. Evaluates its arguments once (on
 /// the first pull) and streams the function's rowset. `pg_input_error_info`
 /// yields exactly one row; `generate_series` yields one row per value.
-pub struct TableFunctionSource {
-    func: TableFn,
-    args: Vec<BoundExpr>,
-    ctx: ExecContext,
-    /// Iteration state, initialized lazily from the evaluated arguments.
-    state: Option<TableFnState>,
-}
-
-enum TableFnState {
-    /// `pg_input_error_info`: a single pending row, then exhausted.
-    Single(Option<Tuple>),
-    /// `generate_series`: a lazy integer range.
-    Series(Series),
-}
-
-impl TableFunctionSource {
-    pub fn new(func: TableFn, args: Vec<BoundExpr>, ctx: ExecContext) -> Self {
-        Self {
-            func,
-            args,
-            ctx,
-            state: None,
-        }
-    }
-
-    /// Evaluate the (constant) arguments once and build the iteration state.
-    fn init(&mut self) -> Result<&mut TableFnState, ExecError> {
-        if self.state.is_none() {
-            let values = self
-                .args
-                .iter()
-                .map(|expr| eval(expr, &[], &self.ctx))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.state = Some(match self.func {
-                TableFn::PgInputErrorInfo => {
-                    TableFnState::Single(Some(pg_input_error_info_row(&values, &self.ctx)?))
+pub fn table_function(func: TableFn, args: Vec<BoundExpr>, ctx: ExecContext) -> RowStream {
+    Box::pin(try_stream! {
+        let values = args
+            .iter()
+            .map(|expr| eval(expr, &[], &ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        match func {
+            // A single pending row, then exhausted.
+            TableFn::PgInputErrorInfo => {
+                let row = pg_input_error_info_row(&values, &ctx)?;
+                yield vec![row];
+            }
+            other => {
+                let mut series = build_series(other, &values)?;
+                let mut chunk: RowChunk = Vec::with_capacity(ROW_CHUNK);
+                while let Some(value) = series.next_value()? {
+                    chunk.push(vec![value]);
+                    if chunk.len() == ROW_CHUNK {
+                        yield std::mem::replace(&mut chunk, Vec::with_capacity(ROW_CHUNK));
+                    }
                 }
-                TableFn::GenerateSeries(elem) => {
-                    TableFnState::Series(Series::from_args(elem, &values)?)
+                if !chunk.is_empty() {
+                    yield chunk;
                 }
-                TableFn::JsonbPathQuery => TableFnState::Series(jsonb_path_query_series(&values)?),
-                TableFn::Unnest(_) => TableFnState::Series(unnest_series(&values)),
-            });
+            }
         }
-        match self.state.as_mut() {
-            Some(state) => Ok(state),
-            None => panic!("table-function state was not initialized"),
-        }
-    }
-}
-
-impl ExecNode for TableFunctionSource {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        match self.init()? {
-            TableFnState::Single(row) => Ok(row.take()),
-            TableFnState::Series(series) => Ok(series.next_value()?.map(|v| vec![v])),
-        }
-    }
+    })
 }
 
 /// One row of `pg_input_error_info(value, type_name)`:
@@ -3519,22 +3464,18 @@ fn build_join_source(
     input: PhysicalJoinInput,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<Box<dyn ExecNode>, ExecError> {
+) -> Result<RowStream, ExecError> {
     Ok(match input {
-        PhysicalJoinInput::Scan { table, projection } => {
-            Box::new(SeqScan::new(&table, txn, &projection))
-        }
-        PhysicalJoinInput::TableFunction { func, args } => {
-            Box::new(TableFunctionSource::new(func, args, ctx.clone()))
-        }
+        PhysicalJoinInput::Scan { table, projection } => seq_scan(&table, txn, &projection),
+        PhysicalJoinInput::TableFunction { func, args } => table_function(func, args, ctx.clone()),
         PhysicalJoinInput::Subplan(source) => {
-            let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
+            let Execution::Rows { rows, .. } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
                     "XX000",
                     "join source did not produce a row set",
                 ));
             };
-            node
+            rows
         }
     })
 }
@@ -3546,7 +3487,7 @@ fn build_join_expr(
     source: PhysicalJoinExpr,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<Box<dyn ExecNode>, ExecError> {
+) -> Result<RowStream, ExecError> {
     let uses_hash_join = source.uses_hash_join();
     match source {
         PhysicalJoinExpr::Input {
@@ -3554,7 +3495,7 @@ fn build_join_expr(
         } => {
             let source = build_join_source(input, ctx, txn)?;
             Ok(match predicate {
-                Some(predicate) => Box::new(Filter::new(source, predicate, ctx.clone())),
+                Some(predicate) => filter(source, predicate, ctx.clone()),
                 None => source,
             })
         }
@@ -3569,8 +3510,8 @@ fn build_join_expr(
             let right_width = right.width();
             let left = build_join_expr(*left, ctx, txn)?;
             let right = build_join_expr(*right, ctx, txn)?;
-            if uses_hash_join {
-                Ok(Box::new(HashJoin::new(
+            Ok(if uses_hash_join {
+                hash_join(
                     left,
                     right,
                     left_width,
@@ -3579,9 +3520,9 @@ fn build_join_expr(
                     hash_keys,
                     predicate,
                     ctx.clone(),
-                )?))
+                )
             } else {
-                Ok(Box::new(NestedLoopJoin::new(
+                nested_loop_join(
                     left,
                     right,
                     left_width,
@@ -3589,256 +3530,131 @@ fn build_join_expr(
                     kind,
                     predicate,
                     ctx.clone(),
-                )?))
-            }
+                )
+            })
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JoinPhase {
-    LeftRows,
-    UnmatchedRight,
-    Done,
+/// Which sides of a join survive without a match.
+fn preserves_left(kind: JoinKind) -> bool {
+    matches!(kind, JoinKind::Left | JoinKind::Full)
+}
+
+fn preserves_right(kind: JoinKind) -> bool {
+    matches!(kind, JoinKind::Right | JoinKind::Full)
 }
 
 /// Binary nested-loop join with right-side materialization. For right/full
 /// joins, `right_matched` records which materialized rows participated in at
 /// least one match so they can be null-extended after the left stream ends.
-pub struct NestedLoopJoin {
-    left: Box<dyn ExecNode>,
-    right_rows: Vec<Tuple>,
-    right_matched: Vec<bool>,
+///
+/// Output order is the row-at-a-time order this replaced: left rows in stream
+/// order, each one's matches in right materialization order, then the unmatched
+/// right rows. Chunking only decides where the boundaries between yields fall.
+#[allow(clippy::too_many_arguments)]
+pub fn nested_loop_join(
+    left: RowStream,
+    right: RowStream,
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
     predicate: Option<BoundExpr>,
     ctx: ExecContext,
-    phase: JoinPhase,
-    current_left: Option<Tuple>,
-    current_left_matched: bool,
-    right_index: usize,
-    /// A full-width joined row reused across candidate pairs, so testing one
-    /// costs no allocation. Only the slots in `touched` are meaningful; the rest
-    /// hold whatever an earlier pair left there, which nothing reads.
-    probe: Vec<Value>,
-    /// The slots of the joined row the filter reads, ascending. `None` means
-    /// "could not be determined — copy the whole row".
-    touched: Option<Vec<usize>>,
-}
-
-impl NestedLoopJoin {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        left: Box<dyn ExecNode>,
-        mut right: Box<dyn ExecNode>,
-        left_width: usize,
-        right_width: usize,
-        kind: JoinKind,
-        predicate: Option<BoundExpr>,
-        ctx: ExecContext,
-    ) -> Result<Self, ExecError> {
-        debug_assert!(
-            kind != JoinKind::Cross || predicate.is_none(),
-            "a cross join carries no predicate; the planner flips the kind to Inner \
-             when it attaches one"
-        );
-        let mut right_rows = Vec::new();
-        while let Some(row) = right.next()? {
-            right_rows.push(row);
-        }
-        let right_matched = vec![false; right_rows.len()];
+) -> RowStream {
+    debug_assert!(
+        kind != JoinKind::Cross || predicate.is_none(),
+        "a cross join carries no predicate; the planner flips the kind to Inner \
+         when it attaches one"
+    );
+    Box::pin(try_stream! {
+        let mut left = left;
+        let right_rows = collect_rows(right).await?;
+        let mut right_matched = vec![false; right_rows.len()];
+        // The slots of the joined row the filter reads, and a full-width row
+        // reused across candidate pairs so testing one costs no allocation.
         let touched = touched_slots(&predicate);
-        Ok(Self {
-            left,
-            right_rows,
-            right_matched,
-            left_width,
-            right_width,
-            kind,
-            predicate,
-            ctx,
-            phase: JoinPhase::LeftRows,
-            current_left: None,
-            current_left_matched: false,
-            right_index: 0,
-            probe: vec![Value::Null; left_width + right_width],
-            touched,
-        })
-    }
+        let mut probe = vec![Value::Null; left_width + right_width];
+        let mut out: RowChunk = Vec::with_capacity(ROW_CHUNK);
 
-    fn preserves_left(&self) -> bool {
-        matches!(self.kind, JoinKind::Left | JoinKind::Full)
-    }
-
-    fn preserves_right(&self) -> bool {
-        matches!(self.kind, JoinKind::Right | JoinKind::Full)
-    }
-}
-
-impl ExecNode for NestedLoopJoin {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        loop {
-            match self.phase {
-                JoinPhase::LeftRows => {
-                    if self.current_left.is_none() {
-                        self.current_left = self.left.next()?;
-                        let Some(_) = self.current_left else {
-                            self.phase = if self.preserves_right() {
-                                JoinPhase::UnmatchedRight
-                            } else {
-                                JoinPhase::Done
-                            };
-                            self.right_index = 0;
-                            continue;
-                        };
-                        self.current_left_matched = false;
-                        self.right_index = 0;
+        while let Some(chunk) = left.next().await {
+            for left_row in chunk? {
+                let mut matched = false;
+                for (index, right_row) in right_rows.iter().enumerate() {
+                    fill_probe(&mut probe, &touched, &left_row, right_row, left_width);
+                    // A cross join carries no predicate, and `predicate_holds`
+                    // already answers `true` for `None`, so there is no
+                    // kind-specific short circuit here: an unconditional check
+                    // means a predicate that reaches this node is always applied.
+                    if !predicate_holds(&predicate, &probe, &ctx)? {
+                        continue;
                     }
-
-                    while self.right_index < self.right_rows.len() {
-                        let right_index = self.right_index;
-                        self.right_index += 1;
-                        if self.current_left.is_none() {
-                            continue;
-                        }
-                        // Test the pair against the reused probe buffer rather
-                        // than a freshly built row — see `fill_probe`.
-                        //
-                        // Field-by-field borrows, so the fill can hold `&mut
-                        // probe` while reading the two source rows.
-                        let Self {
-                            probe,
-                            touched,
-                            current_left,
-                            right_rows,
-                            left_width,
-                            ..
-                        } = self;
-                        let left = current_left.as_deref().unwrap_or(&[]);
-                        fill_probe(probe, touched, left, &right_rows[right_index], *left_width);
-                        // A cross join carries no predicate, and `predicate_holds`
-                        // already answers `true` for `None`, so there is no
-                        // kind-specific short circuit here: an unconditional check
-                        // means a predicate that reaches this node is always applied.
-                        let matched = predicate_holds(&self.predicate, &self.probe, &self.ctx)?;
-                        if matched {
-                            self.current_left_matched = true;
-                            self.right_matched[right_index] = true;
-                            let Self {
-                                probe,
-                                touched,
-                                current_left,
-                                right_rows,
-                                ..
-                            } = self;
-                            let Some(left) = current_left.as_deref() else {
-                                continue;
-                            };
-                            return Ok(Some(take_joined_row(
-                                probe,
-                                touched,
-                                left,
-                                &right_rows[right_index],
-                            )));
-                        }
+                    matched = true;
+                    right_matched[index] = true;
+                    out.push(take_joined_row(&mut probe, &touched, &left_row, right_row));
+                    if out.len() >= ROW_CHUNK {
+                        yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
                     }
-
-                    if !self.current_left_matched && self.preserves_left() {
-                        let Some(mut row) = self.current_left.take() else {
-                            continue;
-                        };
-                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
-                        return Ok(Some(row));
-                    }
-                    self.current_left = None;
                 }
-                JoinPhase::UnmatchedRight => {
-                    while self.right_index < self.right_rows.len() {
-                        let right_index = self.right_index;
-                        self.right_index += 1;
-                        if !self.right_matched[right_index] {
-                            let mut row = vec![Value::Null; self.left_width];
-                            row.extend_from_slice(&self.right_rows[right_index]);
-                            return Ok(Some(row));
-                        }
+                if !matched && preserves_left(kind) {
+                    let mut row = left_row;
+                    row.extend(std::iter::repeat_n(Value::Null, right_width));
+                    out.push(row);
+                    if out.len() >= ROW_CHUNK {
+                        yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
                     }
-                    self.phase = JoinPhase::Done;
                 }
-                JoinPhase::Done => return Ok(None),
             }
         }
-    }
+
+        if preserves_right(kind) {
+            for (index, right_row) in right_rows.iter().enumerate() {
+                if right_matched[index] {
+                    continue;
+                }
+                let mut row = vec![Value::Null; left_width];
+                row.extend_from_slice(right_row);
+                out.push(row);
+                if out.len() >= ROW_CHUNK {
+                    yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
+                }
+            }
+        }
+        if !out.is_empty() {
+            yield out;
+        }
+    })
 }
 
 /// Binary hash join over one or more equi-keys, with the hash table built on the
 /// materialized right (inner) side and the left side streamed as the probe. It
-/// emits rows in the same order a [`NestedLoopJoin`] would — left-driven, right
+/// emits rows in the same order a [`nested_loop_join`] would — left-driven, right
 /// rows in materialization order within each match — so results are identical
 /// whether or not the query sorts.
 ///
-/// Outer-join bookkeeping matches `NestedLoopJoin`: `right_matched` tracks which
+/// Outer-join bookkeeping matches the nested loop: `right_matched` tracks which
 /// inner rows participated in a match (for RIGHT/FULL), and unmatched left rows
 /// are null-extended for LEFT/FULL. NULL keys never match (SQL join equality),
 /// so rows with a NULL key are excluded from the hash table and the probe but
 /// still surface as null-extended rows on a preserved side.
-pub struct HashJoin {
-    left: Box<dyn ExecNode>,
-    right_rows: Vec<Tuple>,
-    right_matched: Vec<bool>,
-    /// Key hash → the `(right-row index, key values)` of every inner row carrying
-    /// that hash. Only rows with fully non-NULL keys appear here; the stored key
-    /// values are the collision guard checked by `keys_equal` at probe time.
-    buckets: FxHashMap<u64, Vec<(usize, Vec<Value>)>>,
+#[allow(clippy::too_many_arguments)]
+pub fn hash_join(
+    left: RowStream,
+    right: RowStream,
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
-    /// The left-side operand of each equi-key and its comparison type.
-    /// `left_keys[i]` indexes the left (probe) input; `key_tys[i]` drives hashing
-    /// and equality. The right-side operands are consumed at build time to fill
-    /// `buckets`, so they aren't retained.
-    left_keys: Vec<BoundExpr>,
-    key_tys: Vec<PgType>,
-    /// Non-equi conjuncts of the ON clause, checked per candidate pair.
+    hash_keys: Vec<HashKey>,
     residual: Option<BoundExpr>,
     ctx: ExecContext,
-    phase: JoinPhase,
-    current_left: Option<Tuple>,
-    current_left_matched: bool,
-    /// Key values of the current left row (valid while its matches are emitted).
-    current_left_keys: Vec<Value>,
-    /// The bucket the current left row probes (its key hash), or `None` when the
-    /// left key was NULL or unmatched. The bucket is re-borrowed per candidate via
-    /// this hash — never cloned — and `probe_pos` cursors into it.
-    current_probe_hash: Option<u64>,
-    probe_pos: usize,
-    right_index: usize,
-    /// A full-width joined row reused across candidate pairs, so testing the
-    /// residual costs no allocation. Only the slots in `touched` are meaningful;
-    /// the rest hold whatever an earlier pair left there, which nothing reads.
-    probe: Vec<Value>,
-    /// The slots of the joined row the residual reads, ascending. `None` means
-    /// "could not be determined — copy the whole row".
-    touched: Option<Vec<usize>>,
-}
-
-impl HashJoin {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        left: Box<dyn ExecNode>,
-        mut right: Box<dyn ExecNode>,
-        left_width: usize,
-        right_width: usize,
-        kind: JoinKind,
-        hash_keys: Vec<HashKey>,
-        residual: Option<BoundExpr>,
-        ctx: ExecContext,
-    ) -> Result<Self, ExecError> {
-        debug_assert!(
-            kind != JoinKind::Cross,
-            "a cross join has no equi-keys; the planner flips the kind to Inner when \
-             it attaches a predicate"
-        );
+) -> RowStream {
+    debug_assert!(
+        kind != JoinKind::Cross,
+        "a cross join has no equi-keys; the planner flips the kind to Inner when \
+         it attaches a predicate"
+    );
+    Box::pin(try_stream! {
+        let mut left = left;
         let key_tys: Vec<PgType> = hash_keys.iter().map(|k| k.ty).collect();
         let mut left_keys = Vec::with_capacity(hash_keys.len());
         let mut right_keys = Vec::with_capacity(hash_keys.len());
@@ -3847,16 +3663,18 @@ impl HashJoin {
             right_keys.push(key.right);
         }
 
-        let mut right_rows = Vec::new();
-        while let Some(row) = right.next()? {
-            right_rows.push(row);
-        }
+        let right_rows = collect_rows(right).await?;
 
         // Build the hash table over the inner side. A right key expression
         // indexes the concatenated row, so evaluate it against a full-width row
         // whose left half is NULL padding and whose right half is the inner row.
         // One scratch buffer is reused across rows: its left half stays NULL and
         // only the right half is overwritten per row.
+        //
+        // Key hash → the `(right-row index, key values)` of every inner row
+        // carrying that hash. Only rows with fully non-NULL keys appear here;
+        // the stored key values are the collision guard `keys_equal` checks at
+        // probe time.
         let mut buckets: FxHashMap<u64, Vec<(usize, Vec<Value>)>> = FxHashMap::default();
         let mut scratch = vec![Value::Null; left_width + right_width];
         for (index, row) in right_rows.iter().enumerate() {
@@ -3869,186 +3687,89 @@ impl HashJoin {
                     .push((index, vals));
             }
         }
+        drop(scratch);
 
-        let right_matched = vec![false; right_rows.len()];
+        let mut right_matched = vec![false; right_rows.len()];
         let touched = touched_slots(&residual);
-        Ok(Self {
-            left,
-            right_rows,
-            right_matched,
-            buckets,
-            left_width,
-            right_width,
-            kind,
-            left_keys,
-            key_tys,
-            residual,
-            ctx,
-            phase: JoinPhase::LeftRows,
-            current_left: None,
-            current_left_matched: false,
-            current_left_keys: Vec::new(),
-            current_probe_hash: None,
-            probe_pos: 0,
-            right_index: 0,
-            probe: vec![Value::Null; left_width + right_width],
-            touched,
-        })
-    }
+        let mut probe = vec![Value::Null; left_width + right_width];
+        let mut out: RowChunk = Vec::with_capacity(ROW_CHUNK);
 
-    fn preserves_left(&self) -> bool {
-        matches!(self.kind, JoinKind::Left | JoinKind::Full)
-    }
-
-    fn preserves_right(&self) -> bool {
-        matches!(self.kind, JoinKind::Right | JoinKind::Full)
-    }
-
-    /// Look up the candidate right rows for a freshly pulled left row: evaluate
-    /// its keys (a NULL key yields no candidates) and pull the matching bucket.
-    fn load_probe(&mut self) -> Result<(), ExecError> {
-        self.probe_pos = 0;
-        let Some(left) = self.current_left.as_ref() else {
-            self.current_left_keys.clear();
-            self.current_probe_hash = None;
-            return Ok(());
-        };
-        match eval_join_keys(&self.left_keys, left, &self.ctx)? {
-            Some(vals) => {
-                // Record only the bucket's hash; the bucket itself is re-borrowed
-                // per candidate during probing, never copied.
-                self.current_probe_hash = Some(agg::hash_key(&self.key_tys, &vals));
-                self.current_left_keys = vals;
-            }
-            None => {
-                self.current_left_keys.clear();
-                self.current_probe_hash = None;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ExecNode for HashJoin {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        loop {
-            match self.phase {
-                JoinPhase::LeftRows => {
-                    if self.current_left.is_none() {
-                        self.current_left = self.left.next()?;
-                        let Some(_) = self.current_left else {
-                            self.phase = if self.preserves_right() {
-                                JoinPhase::UnmatchedRight
-                            } else {
-                                JoinPhase::Done
-                            };
-                            self.right_index = 0;
+        while let Some(chunk) = left.next().await {
+            for left_row in chunk? {
+                let mut matched = false;
+                // A NULL key can never match, so such a row probes nothing.
+                let candidates = match eval_join_keys(&left_keys, &left_row, &ctx)? {
+                    Some(vals) => buckets
+                        .get(&agg::hash_key(&key_tys, &vals))
+                        .map(|bucket| (vals, bucket)),
+                    None => None,
+                };
+                if let Some((left_vals, bucket)) = candidates {
+                    for (index, right_vals) in bucket {
+                        // A bucket hit can be a hash collision, so confirm on
+                        // the key values.
+                        if !agg::keys_equal(&key_tys, &left_vals, right_vals) {
                             continue;
-                        };
-                        self.current_left_matched = false;
-                        self.load_probe()?;
-                    }
-
-                    loop {
-                        // Pull the next candidate whose key actually matches (a
-                        // bucket hit can be a hash collision), scoping the bucket
-                        // borrow so it ends before we build the row and mutate
-                        // match state below.
-                        let right_index = {
-                            let Some(hash) = self.current_probe_hash else {
-                                break;
-                            };
-                            let Some(bucket) = self.buckets.get(&hash) else {
-                                break;
-                            };
-                            let mut found = None;
-                            while self.probe_pos < bucket.len() {
-                                let (index, right_vals) = &bucket[self.probe_pos];
-                                self.probe_pos += 1;
-                                if agg::keys_equal(
-                                    &self.key_tys,
-                                    &self.current_left_keys,
-                                    right_vals,
-                                ) {
-                                    found = Some(*index);
-                                    break;
-                                }
-                            }
-                            match found {
-                                Some(index) => index,
-                                None => break,
-                            }
-                        };
+                        }
                         // Then the residual (non-equi) conjuncts of the ON
                         // clause, tested against the reused probe buffer so a
-                        // pair it rejects never builds a row — see `fill_probe`.
-                        //
-                        // Field-by-field borrows, so the fill can hold `&mut
-                        // probe` while reading the two source rows.
-                        let Self {
-                            probe,
-                            touched,
-                            current_left,
-                            right_rows,
-                            left_width,
-                            ..
-                        } = self;
-                        let Some(left) = current_left.as_deref() else {
-                            continue;
-                        };
-                        fill_probe(probe, touched, left, &right_rows[right_index], *left_width);
-                        if !predicate_holds(&self.residual, &self.probe, &self.ctx)? {
+                        // pair it rejects never builds a row.
+                        let right_row = &right_rows[*index];
+                        fill_probe(&mut probe, &touched, &left_row, right_row, left_width);
+                        if !predicate_holds(&residual, &probe, &ctx)? {
                             continue;
                         }
                         // Only now, for a surviving pair, is the output row
                         // built and the match bookkeeping updated — moving
                         // either above the residual test would null-extend the
                         // wrong rows on a preserved side.
-                        self.current_left_matched = true;
-                        self.right_matched[right_index] = true;
-                        let Self {
-                            probe,
-                            touched,
-                            current_left,
-                            right_rows,
-                            ..
-                        } = self;
-                        let Some(left) = current_left.as_deref() else {
-                            continue;
-                        };
-                        return Ok(Some(take_joined_row(
-                            probe,
-                            touched,
-                            left,
-                            &right_rows[right_index],
-                        )));
-                    }
-
-                    if !self.current_left_matched && self.preserves_left() {
-                        let Some(mut row) = self.current_left.take() else {
-                            continue;
-                        };
-                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
-                        return Ok(Some(row));
-                    }
-                    self.current_left = None;
-                }
-                JoinPhase::UnmatchedRight => {
-                    while self.right_index < self.right_rows.len() {
-                        let right_index = self.right_index;
-                        self.right_index += 1;
-                        if !self.right_matched[right_index] {
-                            let mut row = vec![Value::Null; self.left_width];
-                            row.extend_from_slice(&self.right_rows[right_index]);
-                            return Ok(Some(row));
+                        matched = true;
+                        right_matched[*index] = true;
+                        out.push(take_joined_row(&mut probe, &touched, &left_row, right_row));
+                        if out.len() >= ROW_CHUNK {
+                            yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
                         }
                     }
-                    self.phase = JoinPhase::Done;
                 }
-                JoinPhase::Done => return Ok(None),
+                if !matched && preserves_left(kind) {
+                    let mut row = left_row;
+                    row.extend(std::iter::repeat_n(Value::Null, right_width));
+                    out.push(row);
+                    if out.len() >= ROW_CHUNK {
+                        yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
+                    }
+                }
             }
         }
+
+        if preserves_right(kind) {
+            for (index, right_row) in right_rows.iter().enumerate() {
+                if right_matched[index] {
+                    continue;
+                }
+                let mut row = vec![Value::Null; left_width];
+                row.extend_from_slice(right_row);
+                out.push(row);
+                if out.len() >= ROW_CHUNK {
+                    yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
+                }
+            }
+        }
+        if !out.is_empty() {
+            yield out;
+        }
+    })
+}
+
+/// Drain a stream into its rows — how a node that must see all of its input
+/// (the inner side of a join, a sort, an aggregate) consumes a child.
+async fn collect_rows(stream: RowStream) -> Result<Vec<Tuple>, ExecError> {
+    let mut stream = stream;
+    let mut rows = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        rows.extend(chunk?);
     }
+    Ok(rows)
 }
 
 /// Concatenate a left and a right row into a joined output row.
@@ -4160,38 +3881,23 @@ fn eval_join_keys(
     Ok(Some(vals))
 }
 
-/// Wrap `node` in a `Sort` when there are ORDER BY keys. `columns` is the
+/// Wrap `node` in a sort when there are ORDER BY keys. `columns` is the
 /// client-visible output width; sort keys may address hidden ("resjunk")
 /// columns past it, which the sort trims before emitting.
-fn maybe_sort(
-    node: Box<dyn ExecNode>,
-    sort: Vec<SortKey>,
-    columns: &[OutputColumn],
-) -> Result<Box<dyn ExecNode>, ExecError> {
+fn maybe_sort(node: RowStream, sort: Vec<SortKey>, columns: &[OutputColumn]) -> RowStream {
     if sort.is_empty() {
-        return Ok(node);
+        return node;
     }
-    Ok(Box::new(Sort::new(node, sort, columns.len())?))
+    sort_rows(node, sort, columns.len())
 }
 
 /// Materializing sort (ORDER BY). NULLs order per `SortKey.nulls_first`;
 /// non-null values compare via the key's type total order. Keys may reference
 /// hidden columns appended past `visible_width`; those are dropped from each
 /// emitted tuple so only the client-visible columns leave the node.
-pub struct Sort {
-    rows: std::vec::IntoIter<Tuple>,
-}
-
-impl Sort {
-    pub fn new(
-        mut child: Box<dyn ExecNode>,
-        keys: Vec<SortKey>,
-        visible_width: usize,
-    ) -> Result<Self, ExecError> {
-        let mut rows: Vec<Tuple> = Vec::new();
-        while let Some(row) = child.next()? {
-            rows.push(row);
-        }
+pub fn sort_rows(child: RowStream, keys: Vec<SortKey>, visible_width: usize) -> RowStream {
+    Box::pin(try_stream! {
+        let mut rows = collect_rows(child).await?;
         // Stable sort preserves input order for equal keys, as PG does for a
         // sort with no tiebreak.
         rows.sort_by(|a, b| compare_rows(a, b, &keys));
@@ -4201,20 +3907,14 @@ impl Sort {
         for row in &mut rows {
             row.truncate(visible_width);
         }
-        Ok(Self {
-            rows: rows.into_iter(),
-        })
-    }
-}
-
-impl ExecNode for Sort {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.rows.next())
-    }
+        for chunk in stream::chunks_of(rows) {
+            yield chunk;
+        }
+    })
 }
 
 /// Order two rows by `keys`, the comparison behind every `ORDER BY` in the
-/// engine. Shared by [`Sort`] and [`WindowAgg`] so the window sort and the
+/// engine. Shared by [`sort_rows`] and [`window_agg`] so the window sort and the
 /// query's own can never disagree about where NULLs go.
 fn compare_rows(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> Ordering {
     for key in keys {
@@ -4250,74 +3950,47 @@ fn compare_rows(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> Ordering {
     Ordering::Equal
 }
 
-/// Materializing de-duplication for `SELECT DISTINCT` / `DISTINCT ON`. On the
-/// first pull it buffers every child row and keeps the first row seen per
-/// distinct-key group (NULL-aware, so two NULL keys collapse — PG's DISTINCT
-/// semantics), preserving input order. When the input is already sorted (as
-/// `DISTINCT ON` requires), "first per group" is the sort-order winner. Keys may
-/// reference hidden columns the child kept past `visible_width`; those are
-/// dropped from each surviving row here (the sort below no longer truncates when
-/// a Distinct follows).
-pub struct Distinct {
-    rows: std::vec::IntoIter<Tuple>,
-}
-
-impl Distinct {
-    pub fn new(
-        mut child: Box<dyn ExecNode>,
-        keys: Vec<DistinctKey>,
-        visible_width: usize,
-    ) -> Result<Self, ExecError> {
+/// Materializing de-duplication for `SELECT DISTINCT` / `DISTINCT ON`. Buffers
+/// every child row and keeps the first row seen per distinct-key group
+/// (NULL-aware, so two NULL keys collapse — PG's DISTINCT semantics), preserving
+/// input order. When the input is already sorted (as `DISTINCT ON` requires),
+/// "first per group" is the sort-order winner. Keys may reference hidden columns
+/// the child kept past `visible_width`; those are dropped from each surviving
+/// row here (the sort below no longer truncates when a Distinct follows).
+pub fn distinct_rows(child: RowStream, keys: Vec<DistinctKey>, visible_width: usize) -> RowStream {
+    Box::pin(try_stream! {
+        let mut child = child;
         let key_tys: Vec<PgType> = keys.iter().map(|k| k.ty).collect();
         let mut out: Vec<Tuple> = Vec::new();
         // A row's distinct key → the index into `out` of the row that already
-        // represents it. Mirrors the grouping in `Aggregate::build`.
+        // represents it. Mirrors the grouping in `aggregate`.
         let mut lookup = keyindex::GroupIndex::new(&key_tys);
-        while let Some(row) = child.next()? {
-            let key: Vec<Value> = keys.iter().map(|k| row[k.column].clone()).collect();
-            // A surviving row's key is read column by column out of `out[i]`
-            // rather than gathered into a `Vec`: a probe compares against every
-            // candidate, and materializing each one would allocate per
-            // comparison (a `String` per text key column at that).
-            let slot = lookup.find_or_insert(&key, out.len(), |i| {
-                keys.iter()
-                    .zip(&key)
-                    .all(|(k, probe)| agg::value_eq(k.ty, &out[i][k.column], probe))
-            });
-            if slot == keyindex::Slot::Vacant {
-                out.push(row);
+        while let Some(chunk) = child.next().await {
+            for row in chunk? {
+                let key: Vec<Value> = keys.iter().map(|k| row[k.column].clone()).collect();
+                // A surviving row's key is read column by column out of `out[i]`
+                // rather than gathered into a `Vec`: a probe compares against
+                // every candidate, and materializing each one would allocate per
+                // comparison (a `String` per text key column at that).
+                let slot = lookup.find_or_insert(&key, out.len(), |i| {
+                    keys.iter()
+                        .zip(&key)
+                        .all(|(k, probe)| agg::value_eq(k.ty, &out[i][k.column], probe))
+                });
+                if slot == keyindex::Slot::Vacant {
+                    out.push(row);
+                }
             }
         }
         // Drop hidden distinct/sort-only columns so downstream sees exactly the
-        // visible output width, as `Sort` does when no Distinct follows.
+        // visible output width, as the sort does when no Distinct follows.
         for row in &mut out {
             row.truncate(visible_width);
         }
-        Ok(Self {
-            rows: out.into_iter(),
-        })
-    }
-}
-
-impl ExecNode for Distinct {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.rows.next())
-    }
-}
-
-/// Grouped aggregation. On the first pull it buffers every child row, groups
-/// them by the NULL-aware equality of the group-key expressions in first-seen
-/// order — so per-group accumulation follows scan order, matching PG's hash
-/// aggregate — and emits one row per group laid out `[group keys…, aggregates…]`.
-/// An empty group-key list is the implicit single group: exactly one output row
-/// even over no input (`SELECT count(*)` → 0).
-pub struct Aggregate {
-    child: Box<dyn ExecNode>,
-    group_exprs: Vec<BoundExpr>,
-    aggregates: Vec<BoundAggregate>,
-    ctx: ExecContext,
-    /// Output rows, built lazily on the first `next()`.
-    output: Option<std::vec::IntoIter<Tuple>>,
+        for chunk in stream::chunks_of(out) {
+            yield chunk;
+        }
+    })
 }
 
 /// One accumulating group: its key values and one accumulator per aggregate.
@@ -4334,44 +4007,40 @@ struct AggGroup {
     distinct_values: Vec<Option<agg::DistinctValues>>,
 }
 
-impl Aggregate {
-    pub fn new(
-        child: Box<dyn ExecNode>,
-        group_exprs: Vec<BoundExpr>,
-        aggregates: Vec<BoundAggregate>,
-        ctx: ExecContext,
-    ) -> Self {
-        Self {
-            child,
-            group_exprs,
-            aggregates,
-            ctx,
-            output: None,
-        }
+/// A fresh group for `key`, with one accumulator per aggregate. Both the
+/// implicit single group and every keyed group come through here, so the two
+/// cannot disagree on what a new group holds.
+fn new_agg_group(aggregates: &[BoundAggregate], key: Vec<Value>, any_distinct: bool) -> AggGroup {
+    AggGroup {
+        key,
+        accumulators: aggregates.iter().map(agg::Accumulator::new).collect(),
+        distinct_values: if any_distinct {
+            aggregates
+                .iter()
+                .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
+}
 
-    /// A fresh group for `key`, with one accumulator per aggregate. Both the
-    /// implicit single group and every keyed group come through here, so the
-    /// two cannot disagree on what a new group holds.
-    fn new_group(&self, key: Vec<Value>, any_distinct: bool) -> AggGroup {
-        AggGroup {
-            key,
-            accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
-            distinct_values: if any_distinct {
-                self.aggregates
-                    .iter()
-                    .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        }
-    }
-
-    /// Drain the child, accumulate per group, and materialize the output rows.
-    fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
-        let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
-        let any_distinct = self.aggregates.iter().any(|agg| agg.distinct);
+/// Grouped aggregation. Buffers every child row, groups them by the NULL-aware
+/// equality of the group-key expressions in first-seen order — so per-group
+/// accumulation follows scan order, matching PG's hash aggregate — and emits one
+/// row per group laid out `[group keys…, aggregates…]`. An empty group-key list
+/// is the implicit single group: exactly one output row even over no input
+/// (`SELECT count(*)` → 0).
+pub fn aggregate(
+    child: RowStream,
+    group_exprs: Vec<BoundExpr>,
+    aggregates: Vec<BoundAggregate>,
+    ctx: ExecContext,
+) -> RowStream {
+    Box::pin(try_stream! {
+        let mut child = child;
+        let key_tys: Vec<_> = group_exprs.iter().map(BoundExpr::ty).collect();
+        let any_distinct = aggregates.iter().any(|agg| agg.distinct);
         let mut groups: Vec<AggGroup> = Vec::new();
         // Each group's key → its index in `groups`, so a row finds its group in
         // ~O(1). Groups stay in first-seen order (accumulation follows scan
@@ -4379,87 +4048,78 @@ impl Aggregate {
         let mut lookup = keyindex::GroupIndex::new(&key_tys);
         // The implicit single group needs one seeded group so an empty input
         // still produces a row.
-        if self.group_exprs.is_empty() {
-            groups.push(self.new_group(Vec::new(), any_distinct));
+        if group_exprs.is_empty() {
+            groups.push(new_agg_group(&aggregates, Vec::new(), any_distinct));
         }
-        while let Some(row) = self.child.next()? {
-            let idx = if self.group_exprs.is_empty() {
-                0
-            } else {
-                let key = self
-                    .group_exprs
-                    .iter()
-                    .map(|e| eval(e, &row, &self.ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let next = groups.len();
-                match lookup.find_or_insert(&key, next, |i| {
-                    agg::keys_equal(&key_tys, &groups[i].key, &key)
-                }) {
-                    keyindex::Slot::Existing(i) => i,
-                    keyindex::Slot::Vacant => {
-                        groups.push(self.new_group(key, any_distinct));
-                        next
+        while let Some(chunk) = child.next().await {
+            for row in chunk? {
+                let idx = if group_exprs.is_empty() {
+                    0
+                } else {
+                    let key = group_exprs
+                        .iter()
+                        .map(|e| eval(e, &row, &ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let next = groups.len();
+                    match lookup.find_or_insert(&key, next, |i| {
+                        agg::keys_equal(&key_tys, &groups[i].key, &key)
+                    }) {
+                        keyindex::Slot::Existing(i) => i,
+                        keyindex::Slot::Vacant => {
+                            groups.push(new_agg_group(&aggregates, key, any_distinct));
+                            next
+                        }
                     }
+                };
+                let AggGroup {
+                    accumulators,
+                    distinct_values,
+                    ..
+                } = &mut groups[idx];
+                // `distinct_values` is indexed rather than zipped: it is empty
+                // when no aggregate is DISTINCT, and a third `zip` would then
+                // yield nothing at all — feeding no aggregate and counting no
+                // row.
+                for (i, (agg, acc)) in aggregates.iter().zip(accumulators.iter_mut()).enumerate() {
+                    let seen = distinct_values.get_mut(i).and_then(Option::as_mut);
+                    // Evaluated into a small stack buffer, sized to the largest
+                    // aggregate arity (2, for `string_agg`), so the common
+                    // single-argument aggregates (sum/avg/min/max/count(expr))
+                    // don't pay a per-row Vec allocation.
+                    debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
+                    let mut buf = [Value::Null, Value::Null];
+                    for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
+                        *slot = eval(arg, &row, &ctx)?;
+                    }
+                    agg::feed(acc, agg, &buf[..agg.args.len()], seen)?;
                 }
-            };
-            let AggGroup {
-                accumulators,
-                distinct_values,
-                ..
-            } = &mut groups[idx];
-            // `distinct_values` is indexed rather than zipped: it is empty when
-            // no aggregate is DISTINCT, and a third `zip` would then yield
-            // nothing at all — feeding no aggregate and counting no row.
-            for (i, (agg, acc)) in self
-                .aggregates
-                .iter()
-                .zip(accumulators.iter_mut())
-                .enumerate()
-            {
-                let seen = distinct_values.get_mut(i).and_then(Option::as_mut);
-                // Evaluated into a small stack buffer, sized to the largest
-                // aggregate arity (2, for `string_agg`), so the common
-                // single-argument aggregates (sum/avg/min/max/count(expr))
-                // don't pay a per-row Vec allocation.
-                debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
-                let mut buf = [Value::Null, Value::Null];
-                for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
-                    *slot = eval(arg, &row, &self.ctx)?;
-                }
-                agg::feed(acc, agg, &buf[..agg.args.len()], seen)?;
             }
         }
-        let mut out = Vec::with_capacity(groups.len());
+        let mut out: RowChunk = Vec::with_capacity(groups.len().min(ROW_CHUNK));
         for group in groups {
             let mut tuple = group.key;
             for acc in &group.accumulators {
                 tuple.push(acc.finalize()?);
             }
             out.push(tuple);
+            if out.len() == ROW_CHUNK {
+                yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
+            }
         }
-        Ok(out.into_iter())
-    }
-}
-
-impl ExecNode for Aggregate {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        if self.output.is_none() {
-            self.output = Some(self.build()?);
+        if !out.is_empty() {
+            yield out;
         }
-        match self.output.as_mut() {
-            Some(output) => Ok(output.next()),
-            None => panic!("aggregate output was not initialized"),
-        }
-    }
+    })
 }
 
 /// One step of window-function evaluation: partition the input, order each
 /// partition, and fill this step's results into the slots the binder assigned.
 ///
-/// Eagerly materializing, like [`Sort`] rather than [`Aggregate`] — the node *is*
-/// a sort plus a forward pass, and draining the child in `new()` lets it (and its
-/// buffer) drop before the next link of a chain builds, so peak memory stays at
-/// roughly two buffers instead of one per link.
+/// Eagerly materializing, like [`sort_rows`] rather than [`aggregate`] — the node
+/// *is* a sort plus a forward pass, and it drains the child before emitting
+/// anything, which lets the child (and its buffer) drop before the next link of
+/// a chain runs, so peak memory stays at roughly two buffers instead of one per
+/// link.
 ///
 /// **Rows come out in window-sort order, not input order.** That is PG's
 /// behavior: a window query with no `ORDER BY` of its own returns rows in the
@@ -4475,22 +4135,15 @@ impl ExecNode for Aggregate {
 ///
 /// TODO: evaluate explicit window frames (ROWS/RANGE/GROUPS bounds and
 /// EXCLUDE); anything but the default frame is rejected at bind time.
-pub struct WindowAgg {
-    rows: std::vec::IntoIter<Tuple>,
-}
-
-impl WindowAgg {
-    pub fn new(
-        mut child: Box<dyn ExecNode>,
-        spec: BoundWindowSpec,
-        funcs: Vec<BoundWindowFunc>,
-        output_width: usize,
-        ctx: &ExecContext,
-    ) -> Result<Self, ExecError> {
-        let mut rows: Vec<Tuple> = Vec::new();
-        while let Some(row) = child.next()? {
-            rows.push(row);
-        }
+pub fn window_agg(
+    child: RowStream,
+    spec: BoundWindowSpec,
+    funcs: Vec<BoundWindowFunc>,
+    output_width: usize,
+    ctx: ExecContext,
+) -> RowStream {
+    Box::pin(try_stream! {
+        let mut rows = collect_rows(child).await?;
 
         // Widen every row to the chain's full width. The bottom node of a chain
         // finds rows `input_width` wide and pads them; the ones above find the
@@ -4501,10 +4154,10 @@ impl WindowAgg {
         // reports the broken plan rather than computing a wrong answer.
         for row in &mut rows {
             if row.len() > output_width {
-                return Err(ExecError::new(
+                Err(ExecError::new(
                     crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
                     "window input row is wider than the window chain's output row",
-                ));
+                ))?;
             }
             row.resize(output_width, Value::Null);
         }
@@ -4546,7 +4199,7 @@ impl WindowAgg {
                 .iter()
                 .chain(spec.order_by.iter().map(|k| &k.expr))
             {
-                let value = eval(expr, row, ctx)?;
+                let value = eval(expr, row, &ctx)?;
                 row.push(value);
             }
         }
@@ -4559,112 +4212,106 @@ impl WindowAgg {
         while start < rows.len() {
             // The rows are sorted on the partition keys, so a partition is a run
             // of adjacent equal rows and one comparison per row finds its end —
-            // no hashing, unlike `Aggregate`, whose input is unordered.
+            // no hashing, unlike `aggregate`, whose input is unordered.
             let mut end = start + 1;
             while end < rows.len() && rows_match(&rows[end - 1], &rows[end], partition_keys) {
                 end += 1;
             }
-            Self::fill_partition(&mut rows[start..end], order_keys, &funcs, ctx)?;
+            fill_window_partition(&mut rows[start..end], order_keys, &funcs, &ctx)?;
             start = end;
         }
 
         for row in &mut rows {
             row.truncate(output_width);
         }
-        Ok(Self {
-            rows: rows.into_iter(),
-        })
-    }
-
-    /// Compute every window call over one partition, already sorted.
-    fn fill_partition(
-        rows: &mut [Tuple],
-        order_keys: &[SortKey],
-        funcs: &[BoundWindowFunc],
-        ctx: &ExecContext,
-    ) -> Result<(), ExecError> {
-        // Peer groups: maximal runs equal on the window's ORDER BY keys. With no
-        // ORDER BY the key list is empty and `rows_match` is vacuously true, so
-        // the whole partition is one peer group — which is exactly why `rank()
-        // OVER ()` is 1 everywhere and `sum(x) OVER ()` is the partition total.
-        // `peer_start[i]` is the index of the first row of `i`'s group, and
-        // `peer_group[i]` that group's 0-based ordinal.
-        let mut peer_start = Vec::with_capacity(rows.len());
-        let mut peer_group = Vec::with_capacity(rows.len());
-        for i in 0..rows.len() {
-            if i > 0 && rows_match(&rows[i - 1], &rows[i], order_keys) {
-                peer_start.push(peer_start[i - 1]);
-                peer_group.push(peer_group[i - 1]);
-            } else {
-                peer_start.push(i);
-                peer_group.push(if i == 0 { 0 } else { peer_group[i - 1] + 1 });
-            }
+        for chunk in stream::chunks_of(rows) {
+            yield chunk;
         }
-
-        for func in funcs {
-            match &func.kind {
-                WindowKind::Builtin { func: builtin, .. } => {
-                    for i in 0..rows.len() {
-                        let value = match builtin {
-                            WindowFn::RowNumber => i as i64 + 1,
-                            WindowFn::Rank => peer_start[i] as i64 + 1,
-                            WindowFn::DenseRank => peer_group[i] as i64 + 1,
-                        };
-                        rows[i][func.slot] = Value::Int8(value);
-                    }
-                }
-                WindowKind::Aggregate(agg) => {
-                    Self::fill_aggregate(rows, &peer_start, agg, func.slot, ctx)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Accumulate one window aggregate across a sorted partition.
-    ///
-    /// The default frame ends at the current row's *last peer*, so every row of a
-    /// peer group sees the same frame and therefore the same value. Feeding rows
-    /// in order and only reading the running total once a group is complete gives
-    /// that in a single pass.
-    fn fill_aggregate(
-        rows: &mut [Tuple],
-        peer_start: &[usize],
-        agg: &BoundAggregate,
-        slot: usize,
-        ctx: &ExecContext,
-    ) -> Result<(), ExecError> {
-        debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
-        let mut acc = agg::Accumulator::new(agg);
-        let mut group_start = 0;
-        for i in 0..=rows.len() {
-            // At a peer-group boundary (and at the end), the accumulator holds
-            // every row through the group that just closed: publish it to all of
-            // that group's rows.
-            if i == rows.len() || peer_start[i] != group_start {
-                let value = acc.finalize()?;
-                for row in &mut rows[group_start..i] {
-                    row[slot] = value.clone();
-                }
-                if i == rows.len() {
-                    break;
-                }
-                group_start = peer_start[i];
-            }
-            let mut buf = [Value::Null, Value::Null];
-            for (dest, arg) in buf.iter_mut().zip(agg.args.iter()) {
-                *dest = eval(arg, &rows[i], ctx)?;
-            }
-            agg::feed(&mut acc, agg, &buf[..agg.args.len()], None)?;
-        }
-        Ok(())
-    }
+    })
 }
 
-impl ExecNode for WindowAgg {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        Ok(self.rows.next())
+/// Compute every window call over one partition, already sorted.
+fn fill_window_partition(
+    rows: &mut [Tuple],
+    order_keys: &[SortKey],
+    funcs: &[BoundWindowFunc],
+    ctx: &ExecContext,
+) -> Result<(), ExecError> {
+    // Peer groups: maximal runs equal on the window's ORDER BY keys. With no
+    // ORDER BY the key list is empty and `rows_match` is vacuously true, so
+    // the whole partition is one peer group — which is exactly why `rank()
+    // OVER ()` is 1 everywhere and `sum(x) OVER ()` is the partition total.
+    // `peer_start[i]` is the index of the first row of `i`'s group, and
+    // `peer_group[i]` that group's 0-based ordinal.
+    let mut peer_start = Vec::with_capacity(rows.len());
+    let mut peer_group = Vec::with_capacity(rows.len());
+    for i in 0..rows.len() {
+        if i > 0 && rows_match(&rows[i - 1], &rows[i], order_keys) {
+            peer_start.push(peer_start[i - 1]);
+            peer_group.push(peer_group[i - 1]);
+        } else {
+            peer_start.push(i);
+            peer_group.push(if i == 0 { 0 } else { peer_group[i - 1] + 1 });
+        }
     }
+
+    for func in funcs {
+        match &func.kind {
+            WindowKind::Builtin { func: builtin, .. } => {
+                for i in 0..rows.len() {
+                    let value = match builtin {
+                        WindowFn::RowNumber => i as i64 + 1,
+                        WindowFn::Rank => peer_start[i] as i64 + 1,
+                        WindowFn::DenseRank => peer_group[i] as i64 + 1,
+                    };
+                    rows[i][func.slot] = Value::Int8(value);
+                }
+            }
+            WindowKind::Aggregate(agg) => {
+                fill_window_aggregate(rows, &peer_start, agg, func.slot, ctx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Accumulate one window aggregate across a sorted partition.
+///
+/// The default frame ends at the current row's *last peer*, so every row of a
+/// peer group sees the same frame and therefore the same value. Feeding rows
+/// in order and only reading the running total once a group is complete gives
+/// that in a single pass.
+fn fill_window_aggregate(
+    rows: &mut [Tuple],
+    peer_start: &[usize],
+    agg: &BoundAggregate,
+    slot: usize,
+    ctx: &ExecContext,
+) -> Result<(), ExecError> {
+    debug_assert!(agg.args.len() <= 2, "widen ARG_BUF for a >2-arg aggregate");
+    let mut acc = agg::Accumulator::new(agg);
+    let mut group_start = 0;
+    for i in 0..=rows.len() {
+        // At a peer-group boundary (and at the end), the accumulator holds
+        // every row through the group that just closed: publish it to all of
+        // that group's rows.
+        if i == rows.len() || peer_start[i] != group_start {
+            let value = acc.finalize()?;
+            for row in &mut rows[group_start..i] {
+                row[slot] = value.clone();
+            }
+            if i == rows.len() {
+                break;
+            }
+            group_start = peer_start[i];
+        }
+        let mut buf = [Value::Null, Value::Null];
+        for (dest, arg) in buf.iter_mut().zip(agg.args.iter()) {
+            *dest = eval(arg, &rows[i], ctx)?;
+        }
+        agg::feed(&mut acc, agg, &buf[..agg.args.len()], None)?;
+    }
+    Ok(())
 }
 
 /// Whether two rows are equal on every one of `keys` — the boundary test for
@@ -4679,139 +4326,123 @@ fn rows_match(a: &Tuple, b: &Tuple, keys: &[SortKey]) -> bool {
     compare_rows(a, b, keys) == Ordering::Equal
 }
 
-/// Streaming LIMIT/OFFSET. Discards the first `remaining_offset` child tuples,
-/// then passes through up to `remaining_limit` more before stopping. Unlike
-/// [`Sort`] it never materializes: rows flow through one at a time, and once the
-/// limit is reached it stops pulling from the child entirely.
-pub struct Limit {
-    child: Box<dyn ExecNode>,
-    remaining_offset: u64,
-    /// `None` = unbounded (no LIMIT).
-    remaining_limit: Option<u64>,
-}
-
-impl Limit {
-    /// Negative counts are rejected at bind time, so both are non-negative here.
-    pub fn new(child: Box<dyn ExecNode>, limit: Option<i64>, offset: Option<i64>) -> Self {
-        Self {
-            child,
-            remaining_offset: offset.unwrap_or(0).max(0) as u64,
-            remaining_limit: limit.map(|n| n.max(0) as u64),
+/// Streaming LIMIT/OFFSET. Discards the first `offset` child tuples, then passes
+/// through up to `limit` more before stopping. Unlike [`sort_rows`] it never
+/// materializes: chunks flow through, trimmed at both ends, and once the limit
+/// is reached the child stream is dropped rather than pulled again.
+///
+/// Negative counts are rejected at bind time, so both are non-negative here.
+pub fn limit_offset(child: RowStream, limit: Option<i64>, offset: Option<i64>) -> RowStream {
+    let mut remaining_offset = offset.unwrap_or(0).max(0) as u64;
+    let remaining_limit = limit.map(|n| n.max(0) as u64);
+    Box::pin(try_stream! {
+        let mut child = child;
+        let mut remaining_limit = remaining_limit;
+        if remaining_limit == Some(0) {
+            return;
         }
-    }
-}
-
-impl ExecNode for Limit {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        // Skip the offset rows first (they still count as consumed).
-        while self.remaining_offset > 0 {
-            match self.child.next()? {
-                Some(_) => self.remaining_offset -= 1,
-                None => return Ok(None),
+        while let Some(chunk) = child.next().await {
+            let mut chunk = chunk?;
+            // Skip the offset rows first (they still count as consumed).
+            if remaining_offset > 0 {
+                let skip = (remaining_offset as usize).min(chunk.len());
+                remaining_offset -= skip as u64;
+                chunk.drain(..skip);
+                if chunk.is_empty() {
+                    continue;
+                }
+            }
+            let done = match &mut remaining_limit {
+                None => false,
+                Some(left) => {
+                    if (chunk.len() as u64) >= *left {
+                        chunk.truncate(*left as usize);
+                        *left = 0;
+                        true
+                    } else {
+                        *left -= chunk.len() as u64;
+                        false
+                    }
+                }
+            };
+            if !chunk.is_empty() {
+                yield chunk;
+            }
+            if done {
+                break;
             }
         }
-        match self.remaining_limit {
-            Some(0) => Ok(None),
-            Some(n) => match self.child.next()? {
-                Some(row) => {
-                    self.remaining_limit = Some(n - 1);
-                    Ok(Some(row))
-                }
-                None => Ok(None),
-            },
-            None => self.child.next(),
-        }
-    }
+    })
 }
 
 /// Full table scan through the storage API.
-pub struct SeqScan {
-    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-}
-
-impl SeqScan {
-    pub fn new(table: &Arc<dyn TableAm>, txn: &TxnContext, projection: &ColumnProjection) -> Self {
-        Self {
-            iter: Box::new(
-                table
-                    .scan(txn, projection)
-                    .map(|row| row.map(|(_, tuple)| tuple)),
-            ),
-        }
-    }
-}
-
-impl ExecNode for SeqScan {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        self.iter.next().transpose().map_err(ExecError::from)
-    }
+pub fn seq_scan(
+    table: &Arc<dyn TableAm>,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> RowStream {
+    stream::blocking_rows(Box::new(
+        table
+            .scan(txn, projection)
+            .map(|row| row.map(|(_, tuple)| tuple)),
+    ))
 }
 
 /// Union scan over the relations one FROM item named: concatenates each arm's
 /// snapshot scan into one row stream, in arm order (see
 /// [`PhysicalPlan::Append`](crabgresql_planner::PhysicalPlan::Append)). Each arm
-/// captures its own MVCC snapshot up front, exactly as [`SeqScan`] does.
-pub struct Append {
-    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-}
-
-impl Append {
-    pub fn new(
-        arms: &[PhysicalAppendArm],
-        ctx: &ExecContext,
-        txn: &TxnContext,
-    ) -> Result<Self, ExecError> {
-        let mut scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> =
-            Vec::with_capacity(arms.len());
-        for arm in arms {
-            let scan = arm
-                .relation
-                .table
-                .scan(txn, &arm.projection)
-                .map(|row| row.map(|(_, tuple)| tuple));
-            let scan: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send> = match &arm
-                .relation
-                .map
-            {
-                // The arm already carries the named relation's layout, so
-                // its tuples pass through untouched.
-                None => Box::new(scan),
-                // A wider arm reads through the same `view` the write paths
-                // use. The scan's projection was translated through this
-                // same map, so a slot the projection skipped is a
-                // placeholder in both spaces and stays one here.
-                Some(_) => {
-                    let relation = arm.relation.clone();
-                    Box::new(
-                        scan.map(move |row| row.map(|tuple| relation.view(&tuple).into_owned())),
-                    )
-                }
-            };
-            scans.push(match &arm.relation.tableoid {
-                None => scan,
-                // Resolved once here rather than per row: within one statement
-                // the catalog snapshot is fixed, so the OID cannot change under
-                // the scan — and leaving it to execution rather than to binding
-                // is what keeps a prepared statement honest when a relation is
-                // created or dropped ahead of this one.
-                //
-                // Appended *after* `view`, so `map` stays a pure gather and the
-                // write-back paths never meet a column with nowhere to write.
-                Some(ident) => {
-                    let oid = resolve_tableoid(ident, ctx)?;
-                    Box::new(scan.map(move |row| {
-                        row.map(|mut tuple| {
-                            tuple.push(Value::Oid(oid));
-                            tuple
-                        })
-                    }))
-                }
-            });
-        }
-        Ok(Self {
-            iter: Box::new(scans.into_iter().flatten()),
-        })
+/// captures its own MVCC snapshot up front, exactly as [`seq_scan`] does.
+pub fn append_scan(
+    arms: &[PhysicalAppendArm],
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<RowStream, ExecError> {
+    let mut scans: Vec<Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>> =
+        Vec::with_capacity(arms.len());
+    for arm in arms {
+        let scan = arm
+            .relation
+            .table
+            .scan(txn, &arm.projection)
+            .map(|row| row.map(|(_, tuple)| tuple));
+        let scan: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send> = match &arm
+            .relation
+            .map
+        {
+            // The arm already carries the named relation's layout, so
+            // its tuples pass through untouched.
+            None => Box::new(scan),
+            // A wider arm reads through the same `view` the write paths
+            // use. The scan's projection was translated through this
+            // same map, so a slot the projection skipped is a
+            // placeholder in both spaces and stays one here.
+            Some(_) => {
+                let relation = arm.relation.clone();
+                Box::new(scan.map(move |row| row.map(|tuple| relation.view(&tuple).into_owned())))
+            }
+        };
+        scans.push(match &arm.relation.tableoid {
+            None => scan,
+            // Resolved once here rather than per row: within one statement
+            // the catalog snapshot is fixed, so the OID cannot change under
+            // the scan — and leaving it to execution rather than to binding
+            // is what keeps a prepared statement honest when a relation is
+            // created or dropped ahead of this one.
+            //
+            // Appended *after* `view`, so `map` stays a pure gather and the
+            // write-back paths never meet a column with nowhere to write.
+            Some(ident) => {
+                let oid = resolve_tableoid(ident, ctx)?;
+                Box::new(scan.map(move |row| {
+                    row.map(|mut tuple| {
+                        tuple.push(Value::Oid(oid));
+                        tuple
+                    })
+                }))
+            }
+        });
     }
+    Ok(stream::blocking_rows(Box::new(scans.into_iter().flatten())))
 }
 
 /// The OID a `tableoid` slot reports for `ident`.
@@ -4839,43 +4470,24 @@ pub(crate) fn resolve_tableoid(ident: &RelationIdent, ctx: &ExecContext) -> Resu
         })
 }
 
-impl ExecNode for Append {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        self.iter.next().transpose().map_err(ExecError::from)
-    }
-}
-
 /// Concatenation of child pipelines — the executor side of a `UNION ALL` body
 /// (see [`PhysicalPlan::SetOp`](crabgresql_planner::PhysicalPlan::SetOp)). Drains
-/// each child fully, in order, before advancing to the next. Unlike [`Append`],
-/// the children are already-projected `ExecNode` arms, so rows are pulled through
-/// the Volcano `next()` rather than by flattening iterators. `UNION`
-/// deduplication and ORDER BY belong to the `SetOp` node itself and are layered
-/// on top of this one.
-pub struct Concat {
-    children: Vec<Box<dyn ExecNode>>,
-    cursor: usize,
-}
-
-impl Concat {
-    pub fn new(children: Vec<Box<dyn ExecNode>>) -> Self {
-        Self {
-            children,
-            cursor: 0,
-        }
-    }
-}
-
-impl ExecNode for Concat {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        while self.cursor < self.children.len() {
-            if let Some(tuple) = self.children[self.cursor].next()? {
-                return Ok(Some(tuple));
+/// each child fully, in order, before advancing to the next. Unlike
+/// [`append_scan`], the children are already-projected pipelines, so their chunks
+/// pass through as they are. `UNION` deduplication and ORDER BY belong to the
+/// `SetOp` node itself and are layered on top of this one.
+pub fn concat(children: Vec<RowStream>) -> RowStream {
+    Box::pin(try_stream! {
+        for child in children {
+            let mut child = child;
+            while let Some(chunk) = child.next().await {
+                let chunk = chunk?;
+                if !chunk.is_empty() {
+                    yield chunk;
+                }
             }
-            self.cursor += 1;
         }
-        Ok(None)
-    }
+    })
 }
 
 /// Equality index scan: probes the engine's physical index for the key. When
@@ -4884,24 +4496,18 @@ impl ExecNode for Concat {
 /// re-checks key equality per row, which is what makes that fallback correct.
 /// The physical-index path is already exact (the engine returns only rows whose
 /// key equals the probe), so it needs no re-check. NULL never matches under `=`.
-pub struct IndexScan {
-    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-}
-
-impl IndexScan {
-    pub fn new(
-        table: &Arc<dyn TableAm>,
-        index_name: &str,
-        key: Vec<(usize, BoundExpr)>,
-        ctx: &ExecContext,
-        txn: &TxnContext,
-        projection: &ColumnProjection,
-    ) -> Result<Self, ExecError> {
-        let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
-        Ok(Self {
-            iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
-        })
-    }
+pub fn index_scan(
+    table: &Arc<dyn TableAm>,
+    index_name: &str,
+    key: Vec<(usize, BoundExpr)>,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Result<RowStream, ExecError> {
+    let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+    Ok(stream::blocking_rows(Box::new(
+        rows.map(|row| row.map(|(_, tuple)| tuple)),
+    )))
 }
 
 /// The rows an equality index probe yields, each with its `Tid`.
@@ -4909,7 +4515,7 @@ impl IndexScan {
 /// Two paths, both producing exactly the key-matching, MVCC-visible rows:
 /// the engine's own `index_lookup`, or — when it declines with `None` — a full
 /// scan re-checking the key per row. The `Tid` is kept because DML needs it to
-/// write the row back; [`IndexScan`] drops it.
+/// write the row back; [`index_scan`] drops it.
 fn index_probe_rows(
     table: &Arc<dyn TableAm>,
     index_name: &str,
@@ -4998,65 +4604,49 @@ fn dml_rows(
     }
 }
 
-impl ExecNode for IndexScan {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        self.iter.next().transpose().map_err(ExecError::from)
-    }
-}
-
 /// Filters child rows by a boolean predicate (WHERE).
-pub struct Filter {
-    child: Box<dyn ExecNode>,
-    predicate: Option<BoundExpr>,
-    ctx: ExecContext,
-}
-
-impl Filter {
-    pub fn new(child: Box<dyn ExecNode>, predicate: BoundExpr, ctx: ExecContext) -> Self {
-        Self {
-            child,
-            predicate: Some(predicate),
-            ctx,
-        }
-    }
-}
-
-impl ExecNode for Filter {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        while let Some(row) = self.child.next()? {
-            if predicate_holds(&self.predicate, &row, &self.ctx)? {
-                return Ok(Some(row));
+///
+/// A chunk in, at most a chunk out: the rows a predicate rejects are dropped
+/// where they are, so a selective filter shrinks chunks rather than regrouping
+/// them.
+pub fn filter(child: RowStream, predicate: BoundExpr, ctx: ExecContext) -> RowStream {
+    Box::pin(try_stream! {
+        let mut child = child;
+        let predicate = Some(predicate);
+        while let Some(chunk) = child.next().await {
+            let mut kept: RowChunk = Vec::with_capacity(chunk_hint(&chunk));
+            for row in chunk? {
+                if predicate_holds(&predicate, &row, &ctx)? {
+                    kept.push(row);
+                }
+            }
+            if !kept.is_empty() {
+                yield kept;
             }
         }
-        Ok(None)
-    }
+    })
 }
 
 /// Evaluates one expression per output column on top of a child node.
-pub struct Projection {
-    child: Box<dyn ExecNode>,
-    exprs: Vec<BoundExpr>,
-    ctx: ExecContext,
-}
-
-impl Projection {
-    pub fn new(child: Box<dyn ExecNode>, exprs: Vec<BoundExpr>, ctx: ExecContext) -> Self {
-        Self { child, exprs, ctx }
-    }
-}
-
-impl ExecNode for Projection {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        let Some(row) = self.child.next()? else {
-            return Ok(None);
-        };
-        let projected = self
-            .exprs
-            .iter()
-            .map(|expr| eval(expr, &row, &self.ctx))
-            .collect::<Result<_, _>>()?;
-        Ok(Some(projected))
-    }
+pub fn projection(child: RowStream, exprs: Vec<BoundExpr>, ctx: ExecContext) -> RowStream {
+    Box::pin(try_stream! {
+        let mut child = child;
+        while let Some(chunk) = child.next().await {
+            let chunk = chunk?;
+            let mut out: RowChunk = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                out.push(
+                    exprs
+                        .iter()
+                        .map(|expr| eval(expr, &row, &ctx))
+                        .collect::<Result<Tuple, _>>()?,
+                );
+            }
+            if !out.is_empty() {
+                yield out;
+            }
+        }
+    })
 }
 
 /// Projection with one or more set-returning functions in the target list. Each
@@ -5064,92 +4654,65 @@ impl ExecNode for Projection {
 /// SRFs are NULL-padded once exhausted (PG's `ROWS FROM` semantics since PG 10)
 /// and scalar columns repeat. An input row whose SRFs are all empty yields no
 /// output rows.
-pub struct ProjectSet {
-    child: Box<dyn ExecNode>,
-    exprs: Vec<BoundExpr>,
-    ctx: ExecContext,
-    /// Expansion state for the current input row; `None` before the first pull
-    /// and between fully-expanded input rows.
-    current: Option<RowExpansion>,
-}
-
-/// The per-Srf iterators for one input row, parallel to `exprs` (scalar slots
-/// are `None`), plus the input row scalar projections evaluate against.
-struct RowExpansion {
-    input: Tuple,
-    series: Vec<Option<Series>>,
-}
-
-impl ProjectSet {
-    pub fn new(child: Box<dyn ExecNode>, exprs: Vec<BoundExpr>, ctx: ExecContext) -> Self {
-        Self {
-            child,
-            exprs,
-            ctx,
-            current: None,
-        }
-    }
-
-    /// Build the per-Srf series for a fresh input row.
-    fn expand(&self, input: Tuple) -> Result<RowExpansion, ExecError> {
-        let mut series = Vec::with_capacity(self.exprs.len());
-        for expr in &self.exprs {
-            match expr {
-                BoundExpr::Srf { func, args, .. } => {
-                    let values = args
-                        .iter()
-                        .map(|a| eval(a, &input, &self.ctx))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    series.push(Some(build_series(*func, &values)?));
+///
+/// One input row can outgrow a whole chunk, so the output is cut at [`ROW_CHUNK`]
+/// as it accumulates rather than per input chunk.
+pub fn project_set(child: RowStream, exprs: Vec<BoundExpr>, ctx: ExecContext) -> RowStream {
+    Box::pin(try_stream! {
+        let mut child = child;
+        let mut out: RowChunk = Vec::with_capacity(ROW_CHUNK);
+        while let Some(chunk) = child.next().await {
+            for input in chunk? {
+                // The per-SRF iterators for this input row, parallel to `exprs`
+                // (scalar slots are `None`).
+                let mut series: Vec<Option<Series>> = Vec::with_capacity(exprs.len());
+                for expr in &exprs {
+                    match expr {
+                        BoundExpr::Srf { func, args, .. } => {
+                            let values = args
+                                .iter()
+                                .map(|a| eval(a, &input, &ctx))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            series.push(Some(build_series(*func, &values)?));
+                        }
+                        _ => series.push(None),
+                    }
                 }
-                _ => series.push(None),
-            }
-        }
-        Ok(RowExpansion { input, series })
-    }
-}
-
-impl ExecNode for ProjectSet {
-    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        loop {
-            if self.current.is_none() {
-                let Some(input) = self.child.next()? else {
-                    return Ok(None);
-                };
-                self.current = Some(self.expand(input)?);
-            }
-            let Some(exp) = self.current.as_mut() else {
-                continue;
-            };
-
-            // Advance every SRF once; the input row is exhausted when they all are.
-            let mut srf_vals: Vec<Option<Value>> = Vec::with_capacity(exp.series.len());
-            let mut any = false;
-            for slot in exp.series.iter_mut() {
-                let value = match slot {
-                    Some(series) => series.next_value()?,
-                    None => None,
-                };
-                any |= value.is_some();
-                srf_vals.push(value);
-            }
-            if !any {
-                self.current = None;
-                continue;
-            }
-
-            let input = exp.input.clone();
-            let mut out = Vec::with_capacity(self.exprs.len());
-            for (expr, srf_val) in self.exprs.iter().zip(srf_vals) {
-                match expr {
-                    // Exhausted SRFs pad with NULL to match the longest.
-                    BoundExpr::Srf { .. } => out.push(srf_val.unwrap_or(Value::Null)),
-                    _ => out.push(eval(expr, &input, &self.ctx)?),
+                loop {
+                    // Advance every SRF once; the input row is exhausted when
+                    // they all are.
+                    let mut srf_vals: Vec<Option<Value>> = Vec::with_capacity(series.len());
+                    let mut any = false;
+                    for slot in series.iter_mut() {
+                        let value = match slot {
+                            Some(series) => series.next_value()?,
+                            None => None,
+                        };
+                        any |= value.is_some();
+                        srf_vals.push(value);
+                    }
+                    if !any {
+                        break;
+                    }
+                    let mut row = Vec::with_capacity(exprs.len());
+                    for (expr, srf_val) in exprs.iter().zip(srf_vals) {
+                        match expr {
+                            // Exhausted SRFs pad with NULL to match the longest.
+                            BoundExpr::Srf { .. } => row.push(srf_val.unwrap_or(Value::Null)),
+                            _ => row.push(eval(expr, &input, &ctx)?),
+                        }
+                    }
+                    out.push(row);
+                    if out.len() >= ROW_CHUNK {
+                        yield std::mem::replace(&mut out, Vec::with_capacity(ROW_CHUNK));
+                    }
                 }
             }
-            return Ok(Some(out));
         }
-    }
+        if !out.is_empty() {
+            yield out;
+        }
+    })
 }
 
 /// Build the [`Series`] a target-list SRF (`generate_series`, `unnest` or
@@ -5602,12 +5165,10 @@ mod tests {
         table
     }
 
-    fn collect(node: &mut dyn ExecNode) -> Vec<Tuple> {
-        let mut rows = Vec::new();
-        while let Some(row) = test_ok(node.next()) {
-            rows.push(row);
-        }
-        rows
+    /// Drain a stream to its rows. Blocking, as every synchronous caller of the
+    /// executor is.
+    fn collect(rows: RowStream) -> Vec<Tuple> {
+        test_ok(stream::drain_rows(rows))
     }
 
     /// `test_table`'s rows plus a physical unique index on `id`.
@@ -5847,7 +5408,7 @@ mod tests {
     #[test]
     fn index_scan_probes_physical_index() {
         let table = indexed_table();
-        let mut node = test_ok(IndexScan::new(
+        let node = test_ok(index_scan(
             &table,
             "t_id_key",
             vec![(0, int4(2))],
@@ -5856,7 +5417,7 @@ mod tests {
             &ColumnProjection::All,
         ));
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![vec![Value::Int4(2), Value::Text("two".into())]]
         );
     }
@@ -5866,7 +5427,7 @@ mod tests {
         // `test_table` has no physical index: `index_lookup` returns None and the
         // node scans, re-checking the key so the result is still exact.
         let table = test_table();
-        let mut node = test_ok(IndexScan::new(
+        let node = test_ok(index_scan(
             &table,
             "missing_index",
             vec![(0, int4(2))],
@@ -5875,7 +5436,7 @@ mod tests {
             &ColumnProjection::All,
         ));
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![vec![Value::Int4(2), Value::Text("two".into())]]
         );
     }
@@ -5883,7 +5444,7 @@ mod tests {
     #[test]
     fn index_scan_empty_for_missing_key() {
         let table = indexed_table();
-        let mut node = test_ok(IndexScan::new(
+        let node = test_ok(index_scan(
             &table,
             "t_id_key",
             vec![(0, int4(99))],
@@ -5891,7 +5452,7 @@ mod tests {
             &rtxn(),
             &ColumnProjection::All,
         ));
-        assert!(collect(&mut node).is_empty());
+        assert!(collect(node).is_empty());
     }
 
     /// `WHERE id = 2`, in the parent's column space.
@@ -6031,12 +5592,12 @@ mod tests {
             },
             int4(2),
         );
-        let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+        let node = filter(
+            seq_scan(&table, &rtxn(), &ColumnProjection::All),
             predicate,
             ExecContext::default(),
         );
-        assert_eq!(collect(&mut node).len(), 2);
+        assert_eq!(collect(node).len(), 2);
 
         // WHERE label < 'zzz' — NULL label makes the predicate NULL: dropped.
         let predicate = binary(
@@ -6051,12 +5612,12 @@ mod tests {
                 ty: PgType::Text,
             },
         );
-        let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+        let node = filter(
+            seq_scan(&table, &rtxn(), &ColumnProjection::All),
             predicate,
             ExecContext::default(),
         );
-        assert_eq!(collect(&mut node).len(), 2);
+        assert_eq!(collect(node).len(), 2);
     }
 
     #[test]
@@ -6071,13 +5632,13 @@ mod tests {
             },
             int4(10),
         )];
-        let mut node = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+        let node = projection(
+            seq_scan(&table, &rtxn(), &ColumnProjection::All),
             exprs,
             ExecContext::default(),
         );
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![
                 vec![Value::Int4(11)],
                 vec![Value::Int4(12)],
@@ -6103,8 +5664,8 @@ mod tests {
                 ty: PgType::Text,
             },
         ];
-        let projection = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+        let projected = projection(
+            seq_scan(&table, &rtxn(), &ColumnProjection::All),
             exprs,
             ExecContext::default(),
         );
@@ -6117,9 +5678,9 @@ mod tests {
             asc: true,
             nulls_first: false,
         };
-        let mut node = Sort::new(Box::new(projection), vec![key], 1)?;
+        let node = sort_rows(projected, vec![key], 1);
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![
                 vec![Value::Int4(1)],
                 vec![Value::Int4(2)],
@@ -6132,19 +5693,19 @@ mod tests {
     }
 
     /// Scan `t` (ids 1,2,3 in insertion order), keeping just the `id` column.
-    fn id_scan(table: &Arc<dyn TableAm>) -> Box<dyn ExecNode> {
-        Box::new(Projection::new(
-            Box::new(SeqScan::new(table, &rtxn(), &ColumnProjection::All)),
+    fn id_scan(table: &Arc<dyn TableAm>) -> RowStream {
+        projection(
+            seq_scan(table, &rtxn(), &ColumnProjection::All),
             vec![BoundExpr::ColumnRef {
                 index: 0,
                 ty: PgType::Int4,
             }],
             ExecContext::default(),
-        ))
+        )
     }
 
-    fn ids(node: &mut dyn ExecNode) -> Vec<i32> {
-        collect(node)
+    fn ids(rows: RowStream) -> Vec<i32> {
+        collect(rows)
             .into_iter()
             .map(|row| match row[0] {
                 Value::Int4(n) => n,
@@ -6156,57 +5717,37 @@ mod tests {
     #[test]
     fn limit_caps_row_count() {
         let table = test_table();
-        let mut node = Limit::new(id_scan(&table), Some(2), None);
-        assert_eq!(ids(&mut node), vec![1, 2]);
+        let node = limit_offset(id_scan(&table), Some(2), None);
+        assert_eq!(ids(node), vec![1, 2]);
     }
 
     #[test]
     fn offset_skips_leading_rows() {
         let table = test_table();
-        let mut node = Limit::new(id_scan(&table), None, Some(1));
-        assert_eq!(ids(&mut node), vec![2, 3]);
+        let node = limit_offset(id_scan(&table), None, Some(1));
+        assert_eq!(ids(node), vec![2, 3]);
     }
 
     #[test]
     fn limit_offset_together_slice_the_middle() {
         let table = test_table();
-        let mut node = Limit::new(id_scan(&table), Some(1), Some(1));
-        assert_eq!(ids(&mut node), vec![2]);
+        let node = limit_offset(id_scan(&table), Some(1), Some(1));
+        assert_eq!(ids(node), vec![2]);
     }
 
     #[test]
     fn offset_zero_passes_everything_through() {
         // The float4/float8 fence: OFFSET 0 is a no-op over the full input.
         let table = test_table();
-        let mut node = Limit::new(id_scan(&table), None, Some(0));
-        assert_eq!(ids(&mut node), vec![1, 2, 3]);
+        let node = limit_offset(id_scan(&table), None, Some(0));
+        assert_eq!(ids(node), vec![1, 2, 3]);
     }
 
     #[test]
     fn offset_past_end_yields_nothing() {
         let table = test_table();
-        let mut node = Limit::new(id_scan(&table), None, Some(10));
-        assert_eq!(ids(&mut node), Vec::<i32>::new());
-    }
-
-    /// A source node that streams pre-built tuples, for exercising nodes that
-    /// consume arbitrary rows (Sort, Distinct) without going through storage.
-    struct VecSource {
-        rows: std::vec::IntoIter<Tuple>,
-    }
-
-    impl VecSource {
-        fn boxed(rows: Vec<Tuple>) -> Box<dyn ExecNode> {
-            Box::new(Self {
-                rows: rows.into_iter(),
-            })
-        }
-    }
-
-    impl ExecNode for VecSource {
-        fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-            Ok(self.rows.next())
-        }
+        let node = limit_offset(id_scan(&table), None, Some(10));
+        assert_eq!(ids(node), Vec::<i32>::new());
     }
 
     #[test]
@@ -6225,9 +5766,9 @@ mod tests {
             column: 0,
             ty: PgType::Int4,
         }];
-        let mut node = Distinct::new(VecSource::boxed(rows), keys, 1)?;
+        let node = distinct_rows(rows_once(rows), keys, 1);
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![
                 vec![Value::Int4(2)],
                 vec![Value::Int4(1)],
@@ -6254,9 +5795,9 @@ mod tests {
             column: 1,
             ty: PgType::Int4,
         }];
-        let mut node = Distinct::new(VecSource::boxed(rows), keys, 1)?;
+        let node = distinct_rows(rows_once(rows), keys, 1);
         assert_eq!(
-            collect(&mut node),
+            collect(node),
             vec![vec![Value::Int4(10)], vec![Value::Int4(20)]],
             "one row per DISTINCT ON group, hidden key column trimmed"
         );
@@ -6267,7 +5808,7 @@ mod tests {
     fn limit_applies_after_sort() -> anyhow::Result<()> {
         // ORDER BY id DESC LIMIT 1 must return the max, not the first-scanned row.
         let table = test_table();
-        let sort = Sort::new(
+        let sort = sort_rows(
             id_scan(&table),
             vec![SortKey {
                 column: 0,
@@ -6277,9 +5818,9 @@ mod tests {
                 nulls_first: false,
             }],
             1,
-        )?;
-        let mut node = Limit::new(Box::new(sort), Some(1), None);
-        assert_eq!(ids(&mut node), vec![3]);
+        );
+        let node = limit_offset(sort, Some(1), None);
+        assert_eq!(ids(node), vec![3]);
 
         Ok(())
     }
@@ -6447,13 +5988,13 @@ mod tests {
         let physical = crabgresql_planner::plan(logical, Default::default());
         let Execution::ReturningRows {
             columns,
-            mut node,
+            rows,
             verb,
         } = test_ok(execute(physical, &ExecContext::default(), &wtxn()))
         else {
             panic!("expected ReturningRows");
         };
-        (columns, collect(node.as_mut()), verb)
+        (columns, collect(rows), verb)
     }
 
     #[test]
@@ -6619,16 +6160,12 @@ mod tests {
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let logical = test_ok(crabgresql_binder::bind_query(engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical, Default::default());
-        let Execution::Rows { columns, mut node } =
+        let Execution::Rows { columns, rows } =
             test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };
-        let mut rows = Vec::new();
-        while let Some(tuple) = test_ok(node.next()) {
-            rows.push(tuple);
-        }
-        (columns, rows)
+        (columns, collect(rows))
     }
 
     /// An engine with `t(a int, b int)` seeded with two groups (a=1,2) plus a
@@ -7047,7 +6584,7 @@ mod tests {
     }
 
     /// Drain a query, returning the first runtime error (SRF errors surface on
-    /// the first `next()`, not at plan time).
+    /// the first pull, not at plan time).
     fn run_err(sql: &str) -> ExecError {
         let engine: Arc<dyn TableEngine> = crabgresql_pg_engine::ephemeral_engine();
         let stmts = test_ok(crabgresql_parser::parse(sql));
@@ -7058,17 +6595,14 @@ mod tests {
             Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
         let logical = test_ok(crabgresql_binder::bind_query(&engine, &catalog, query));
         let physical = crabgresql_planner::plan(logical, Default::default());
-        let Execution::Rows { mut node, .. } =
+        let Execution::Rows { rows, .. } =
             test_ok(execute(physical, &ExecContext::default(), &rtxn()))
         else {
             panic!("expected rows");
         };
-        loop {
-            match node.next() {
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("expected a runtime error for: {sql}"),
-                Err(e) => return e,
-            }
+        match stream::drain_rows(rows) {
+            Ok(_) => panic!("expected a runtime error for: {sql}"),
+            Err(e) => e,
         }
     }
 

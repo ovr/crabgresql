@@ -893,8 +893,11 @@ impl Interpreter {
         };
 
         match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, &txn)? {
-            Execution::Rows { node, .. } | Execution::ReturningRows { node, .. } => {
-                Ok(Rows::Set(drain(node)?))
+            Execution::Rows { rows, .. } | Execution::ReturningRows { rows, .. } => {
+                // A routine body runs inside the synchronous evaluator, so the
+                // statement's stream is drained through the executor's blocking
+                // bridge rather than awaited.
+                Ok(Rows::Set(crabgresql_executor::stream::drain_rows(rows)?))
             }
             Execution::Inserted(n) | Execution::Updated(n) | Execution::Deleted(n) => {
                 Ok(Rows::Count(n))
@@ -967,14 +970,6 @@ impl Interpreter {
 enum Rows {
     Set(Vec<Tuple>),
     Count(u64),
-}
-
-fn drain(mut node: Box<dyn crabgresql_executor::ExecNode>) -> Result<Vec<Tuple>, ExecError> {
-    let mut rows = Vec::new();
-    while let Some(row) = node.next()? {
-        rows.push(row);
-    }
-    Ok(rows)
 }
 
 /// How a flow signal interacts with the loop it reaches.

@@ -12,13 +12,16 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow_schema::{Field, Schema};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take as take_kernel;
+use async_stream::try_stream;
 use crabgresql_binder::{BoundExpr, SortKey};
 use crabgresql_planner::vectorize;
 use crabgresql_storage_api::arrow::{build_array, scan_schema};
 use crabgresql_storage_api::{Column, IndexKey, sort};
+use futures_util::StreamExt;
 
-use super::{BatchLayout, BatchNode};
+use super::BatchLayout;
 use crate::ExecError;
+use crate::stream::BatchStream;
 
 /// How one output column of a projection is produced.
 pub enum Take {
@@ -35,17 +38,13 @@ pub enum Take {
 }
 
 /// Reorders, duplicates and drops columns — the take-only subset of
-/// [`crate::Projection`].
+/// [`crate::projection`].
 ///
 /// Deliberately not an expression evaluator. Every projection that is anything
 /// more than a column reference or a constant ends the columnar segment, so the
-/// row `Projection` keeps sole responsibility for evaluating expressions and
+/// row projection keeps sole responsibility for evaluating expressions and
 /// there is no second implementation of any operator's semantics.
-pub struct ProjectBatch {
-    child: Box<dyn BatchNode>,
-    takes: Vec<Take>,
-    schema: Arc<Schema>,
-}
+pub struct ProjectBatch;
 
 impl ProjectBatch {
     /// Compile `projections` to a take list, or `None` if any of them computes
@@ -76,17 +75,6 @@ impl ProjectBatch {
             .collect()
     }
 
-    pub fn new(child: Box<dyn BatchNode>, takes: Vec<Take>, layout: &BatchLayout) -> Self {
-        ProjectBatch {
-            schema: scan_schema(&crabgresql_storage_api::TableSchema::new(
-                "",
-                layout.to_vec(),
-            )),
-            child,
-            takes,
-        }
-    }
-
     /// The layout a projection produces, for the node above.
     pub fn layout(projections: &[BoundExpr]) -> BatchLayout {
         Arc::from(
@@ -99,74 +87,92 @@ impl ProjectBatch {
     }
 }
 
-impl BatchNode for ProjectBatch {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        let Some(batch) = self.child.next_batch()? else {
-            return Ok(None);
-        };
-        let rows = batch.num_rows();
-        // Index 0 repeated: `take` broadcasts the length-1 constant array to the
-        // batch's height in one allocation, the same trick `expr.rs` uses for a
-        // predicate literal.
-        let broadcast: UInt64Array = std::iter::repeat_n(0u64, rows).collect();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.takes.len());
-        for take in &self.takes {
-            columns.push(match take {
-                Take::Column(index) => batch
-                    .columns()
-                    .get(*index)
-                    .map(Arc::clone)
-                    .ok_or_else(|| internal("projection names a missing column"))?,
-                Take::Const(array) => take_kernel(array.as_ref(), &broadcast, None)
-                    .map_err(|error| internal(&format!("constant broadcast failed: {error}")))?,
-            });
+/// Apply a compiled take list to every batch. `layout` is the layout the
+/// projection *produces* — [`ProjectBatch::layout`] — since that is the schema
+/// the rebuilt batches carry.
+pub fn project_batches(child: BatchStream, takes: Vec<Take>, layout: &BatchLayout) -> BatchStream {
+    let schema = scan_schema(&crabgresql_storage_api::TableSchema::new(
+        "",
+        layout.to_vec(),
+    ));
+    Box::pin(try_stream! {
+        let mut child = child;
+        while let Some(batch) = child.next().await {
+            let batch = batch?;
+            let rows = batch.num_rows();
+            // Index 0 repeated: `take` broadcasts the length-1 constant array to
+            // the batch's height in one allocation, the same trick `expr.rs`
+            // uses for a predicate literal.
+            let broadcast: UInt64Array = std::iter::repeat_n(0u64, rows).collect();
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(takes.len());
+            for take in &takes {
+                columns.push(match take {
+                    Take::Column(index) => batch
+                        .columns()
+                        .get(*index)
+                        .map(Arc::clone)
+                        .ok_or_else(|| internal("projection names a missing column"))?,
+                    Take::Const(array) => {
+                        take_kernel(array.as_ref(), &broadcast, None).map_err(|error| {
+                            internal(&format!("constant broadcast failed: {error}"))
+                        })?
+                    }
+                });
+            }
+            let options = RecordBatchOptions::new().with_row_count(Some(rows));
+            yield RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
+                .map_err(|error| internal(&format!("projection failed: {error}")))?;
         }
-        let options = RecordBatchOptions::new().with_row_count(Some(rows));
-        RecordBatch::try_new_with_options(Arc::clone(&self.schema), columns, &options)
-            .map(Some)
-            .map_err(|error| internal(&format!("projection failed: {error}")))
-    }
+    })
 }
 
-/// Materializing sort — the columnar [`crate::Sort`].
+/// Whether every key can be sorted by Arrow with PostgreSQL's ordering.
+pub fn sortable(keys: &[SortKey], layout: &BatchLayout) -> bool {
+    !keys.is_empty()
+        && keys
+            .iter()
+            .all(|key| key.column < layout.len() && vectorize::sortable_key(key))
+}
+
+/// Materializing sort — the columnar [`crate::sort`].
 ///
 /// Same memory model as the row node: everything is buffered before the first
-/// row comes out, so this changes the representation, not the contract.
+/// row comes out, so this changes the representation, not the contract. The
+/// buffering happens on the first poll rather than when the plan is built, which
+/// is what makes it a stream at all — an unpulled result set does no work.
 ///
 /// The ordering itself belongs to [`crabgresql_storage_api::sort`], which the
 /// columnar write path shares: PostgreSQL's `-0.0`/NaN key rewrite and the
 /// stability tiebreak are stated once, there.
-pub struct SortBatch {
-    rows: Option<RecordBatch>,
-    emitted: bool,
-}
-
-impl SortBatch {
-    /// Whether every key can be sorted by Arrow with PostgreSQL's ordering.
-    pub fn compilable(keys: &[SortKey], layout: &BatchLayout) -> bool {
-        !keys.is_empty()
-            && keys
-                .iter()
-                .all(|key| key.column < layout.len() && vectorize::sortable_key(key))
-    }
-
-    /// Drain `child`, sort it, and keep the result for [`BatchNode::next_batch`].
-    ///
-    /// `visible_width` drops the hidden ORDER BY columns the planner appended
-    /// past the output, exactly as the row node's truncation does.
-    pub fn new(
-        mut child: Box<dyn BatchNode>,
-        keys: &[SortKey],
-        layout: &BatchLayout,
-        visible_width: usize,
-    ) -> Result<Self, ExecError> {
-        let schema = scan_schema(&crabgresql_storage_api::TableSchema::new(
-            "",
-            layout.to_vec(),
-        ));
+///
+/// `visible_width` drops the hidden ORDER BY columns the planner appended past
+/// the output, exactly as the row node's truncation does.
+pub fn sort_batches(
+    child: BatchStream,
+    keys: &[SortKey],
+    layout: &BatchLayout,
+    visible_width: usize,
+) -> BatchStream {
+    let schema = scan_schema(&crabgresql_storage_api::TableSchema::new(
+        "",
+        layout.to_vec(),
+    ));
+    // A `SortKey` is an `IndexKey` with the direction spelled the other way
+    // round; everything else about the two is the same column-and-flags triple
+    // the sort kernel wants.
+    let index_keys: Vec<IndexKey> = keys
+        .iter()
+        .map(|key| IndexKey {
+            column: key.column,
+            descending: !key.asc,
+            nulls_first: key.nulls_first,
+        })
+        .collect();
+    Box::pin(try_stream! {
+        let mut child = child;
         let mut batches = Vec::new();
-        while let Some(batch) = child.next_batch()? {
-            batches.push(batch);
+        while let Some(batch) = child.next().await {
+            batches.push(batch?);
         }
         let all = concat_batches(&schema, &batches)
             .map_err(|error| internal(&format!("sort concat failed: {error}")))?;
@@ -176,17 +182,6 @@ impl SortBatch {
         // over turns a sort that fit into one that does not.
         drop(batches);
 
-        // A `SortKey` is an `IndexKey` with the direction spelled the other way
-        // round; everything else about the two is the same column-and-flags
-        // triple the sort kernel wants.
-        let index_keys: Vec<IndexKey> = keys
-            .iter()
-            .map(|key| IndexKey {
-                column: key.column,
-                descending: !key.asc,
-                nulls_first: key.nulls_first,
-            })
-            .collect();
         let indices = sort::sort_permutation(&all, &index_keys)?;
         let sorted = sort::take_columns(&all, &indices, visible_width)?;
 
@@ -200,24 +195,9 @@ impl SortBatch {
         // The sorted copy is complete; the unsorted one is dead weight now.
         drop(all);
         let options = RecordBatchOptions::new().with_row_count(Some(height));
-        let rows =
-            RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), sorted, &options)
-                .map_err(|error| internal(&format!("sort rebuild failed: {error}")))?;
-        Ok(SortBatch {
-            rows: Some(rows),
-            emitted: false,
-        })
-    }
-}
-
-impl BatchNode for SortBatch {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
-        if self.emitted {
-            return Ok(None);
-        }
-        self.emitted = true;
-        Ok(self.rows.take())
-    }
+        yield RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), sorted, &options)
+            .map_err(|error| internal(&format!("sort rebuild failed: {error}")))?;
+    })
 }
 
 fn unwrap_collate(expr: &BoundExpr) -> &BoundExpr {
