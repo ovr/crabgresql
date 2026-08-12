@@ -506,6 +506,36 @@ pub enum DmlVerb {
     Delete,
 }
 
+/// Optimize a bound plan and turn it into a physical one — the step every
+/// caller takes between the binder and [`execute`].
+///
+/// The two halves belong together: the logical rewrites
+/// ([`crabgresql_optimizer`]) feed the planner — a folded key is a literal, and
+/// only a literal lets the cost model read the column's distribution — so a
+/// statement planned without them is silently costed worse. Keeping both in one
+/// function is what keeps the pipeline identical at every call site.
+///
+/// Optimization runs per execution, against this session's [`FmtCtx`], and its
+/// result is never cached across executions — a prepared statement keeps the
+/// plan the binder produced.
+pub fn optimize_and_plan(logical: LogicalPlan, ctx: &ExecContext) -> PhysicalPlan {
+    optimize_and_plan_with(logical, &ctx.fmt, ctx.costs)
+}
+
+/// [`optimize_and_plan`] for a caller that has the session settings but no
+/// [`ExecContext`] yet — the server builds one only after it has a plan.
+pub fn optimize_and_plan_with(
+    mut logical: LogicalPlan,
+    fmt: &FmtCtx,
+    costs: crabgresql_planner::cost::CostSettings,
+) -> PhysicalPlan {
+    crabgresql_optimizer::optimize(
+        &mut logical,
+        &crabgresql_optimizer::OptimizerContext { fmt: fmt.clone() },
+    );
+    crabgresql_planner::plan(logical, costs)
+}
+
 pub fn execute(
     mut plan: PhysicalPlan,
     ctx: &ExecContext,
@@ -1397,6 +1427,13 @@ pub(crate) fn eval_correlated_subquery(
 }
 
 /// Plan and execute a subplan, draining its result set into materialized rows.
+///
+/// Planned, not [`optimize_and_plan`]ed, and deliberately so: a subplan's body
+/// was already rewritten once, with the statement that encloses it (the
+/// optimizer descends into every subquery marker it walks). Optimizing again
+/// here would buy only the folding of the constants `substitute_outer` just
+/// baked in — and it would buy it once per *outer row*, which is exactly the
+/// shape (a correlated subquery) where per-row work is already the problem.
 pub(crate) fn run_subplan(
     logical: LogicalPlan,
     ctx: &ExecContext,
@@ -1412,7 +1449,8 @@ pub(crate) fn run_subplan(
 }
 
 /// Whether a subplan yields at least one row, stopping at the first — for
-/// `EXISTS`, which needs existence only, not the rows themselves.
+/// `EXISTS`, which needs existence only, not the rows themselves. Planned
+/// without a rewrite pass for the reason [`run_subplan`] gives.
 fn subplan_has_rows(
     logical: LogicalPlan,
     ctx: &ExecContext,

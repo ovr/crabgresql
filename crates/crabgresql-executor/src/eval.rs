@@ -11,16 +11,14 @@ use std::cmp::Ordering;
 use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_types::text::quote_ident;
-use crabgresql_types::{Interval, Numeric, PgType, Value, cast, float};
+use crabgresql_types::{Interval, PgType, Value, arith, cast};
 
 // The comparator and the `Value` accessors it is built from live in
 // `crabgresql-types`, where the engine (column statistics) and the planner
 // (selectivity) can reach them too. Re-exported rather than moved-and-renamed so
 // every caller that knows them as `executor::compare_values` still compiles.
 pub(crate) use crabgresql_types::compare::{array_elems, uuid_of, vector_elems};
-use crabgresql_types::compare::{
-    compare_elementwise, float4, float8, int2, int4, int8, numeric, oid_of,
-};
+use crabgresql_types::compare::{compare_elementwise, int8, oid_of};
 pub use crabgresql_types::compare::{compare_values, compare_values_collated};
 
 use crate::{CatalogOps, ExecContext, ExecError};
@@ -1144,46 +1142,41 @@ fn seq_ref_owned(v: &Value, ctx: &ExecContext) -> Option<(Option<String>, String
     }
 }
 
+/// Unary operators, delegated to [`crabgresql_types::arith`] so the optimizer's
+/// constant folding and this per-row path cannot disagree on overflow.
 fn eval_unary(op: UnaryOp, operand: Value) -> Result<Value, ExecError> {
-    match (op, operand) {
-        (_, Value::Null) => Ok(Value::Null),
-        (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-        (UnaryOp::Neg, Value::Int4(v)) => v
-            .checked_neg()
-            .map(Value::Int4)
-            .ok_or_else(|| out_of_range(PgType::Int4)),
-        (UnaryOp::Neg, Value::Int8(v)) => v
-            .checked_neg()
-            .map(Value::Int8)
-            .ok_or_else(|| out_of_range(PgType::Int8)),
-        (UnaryOp::Neg, Value::Int2(v)) => v
-            .checked_neg()
-            .map(Value::Int2)
-            .ok_or_else(|| out_of_range(PgType::Int2)),
-        (UnaryOp::Neg, Value::Float4(v)) => Ok(Value::Float4(-v)),
-        (UnaryOp::Neg, Value::Float8(v)) => Ok(Value::Float8(-v)),
-        (UnaryOp::Neg, Value::Numeric(v)) => Ok(Value::Numeric(v.neg())),
-        (UnaryOp::Abs, Value::Int2(v)) => v
-            .checked_abs()
-            .map(Value::Int2)
-            .ok_or_else(|| out_of_range(PgType::Int2)),
-        (UnaryOp::Abs, Value::Int4(v)) => v
-            .checked_abs()
-            .map(Value::Int4)
-            .ok_or_else(|| out_of_range(PgType::Int4)),
-        (UnaryOp::Abs, Value::Int8(v)) => v
-            .checked_abs()
-            .map(Value::Int8)
-            .ok_or_else(|| out_of_range(PgType::Int8)),
-        (UnaryOp::Abs, Value::Float4(v)) => Ok(Value::Float4(v.abs())),
-        (UnaryOp::Abs, Value::Float8(v)) => Ok(Value::Float8(v.abs())),
-        (UnaryOp::Abs, Value::Numeric(v)) => Ok(Value::Numeric(v.abs())),
-        (UnaryOp::Sqrt, Value::Float8(v)) => {
-            float::f8_sqrt(v).map(Value::Float8).map_err(float_error)
-        }
-        (UnaryOp::Cbrt, Value::Float8(v)) => Ok(Value::Float8(float::f8_cbrt(v))),
-        (op, operand) => unreachable!("binder let through {op:?} on {operand:?}"),
+    arith::eval_unary(unary_arith_op(op), operand).map_err(arith_error)
+}
+
+/// The binder's `UnaryOp` in the types crate's spelling. A plain rename: the
+/// binder sits above `crabgresql-types`, so the shared implementation cannot
+/// name its enum.
+fn unary_arith_op(op: UnaryOp) -> arith::UnaryArithOp {
+    match op {
+        UnaryOp::Not => arith::UnaryArithOp::Not,
+        UnaryOp::Neg => arith::UnaryArithOp::Neg,
+        UnaryOp::Abs => arith::UnaryArithOp::Abs,
+        UnaryOp::Sqrt => arith::UnaryArithOp::Sqrt,
+        UnaryOp::Cbrt => arith::UnaryArithOp::Cbrt,
     }
+}
+
+/// The arithmetic subset of `BinOp`, likewise. Only reached under
+/// [`BinOp::is_arithmetic`].
+fn arith_op(op: BinOp) -> arith::ArithOp {
+    match op {
+        BinOp::Add => arith::ArithOp::Add,
+        BinOp::Sub => arith::ArithOp::Sub,
+        BinOp::Mul => arith::ArithOp::Mul,
+        BinOp::Div => arith::ArithOp::Div,
+        BinOp::Mod => arith::ArithOp::Mod,
+        BinOp::Pow => arith::ArithOp::Pow,
+        other => unreachable!("{other:?} is not arithmetic"),
+    }
+}
+
+fn arith_error(e: arith::ArithError) -> ExecError {
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }
 
 fn eval_binary(
@@ -1209,15 +1202,7 @@ fn eval_binary(
         return Ok(Value::Null);
     }
     if op.is_arithmetic() {
-        return match arg_ty {
-            PgType::Int2 => eval_arith_int2(op, int2(l), int2(r)),
-            PgType::Int4 => eval_arith_int4(op, int4(l), int4(r)),
-            PgType::Int8 => eval_arith_int8(op, int8(l), int8(r)),
-            PgType::Float4 => eval_arith_f4(op, float4(l), float4(r)),
-            PgType::Float8 => eval_arith_f8(op, float8(l), float8(r)),
-            PgType::Numeric => eval_arith_numeric(op, numeric(l), numeric(r)),
-            other => unreachable!("binder let arithmetic through on {other:?}"),
-        };
+        return arith::eval_arith(arith_op(op), arg_ty, l, r).map_err(arith_error);
     }
     Ok(Value::Bool(apply_comparison(op, arg_ty, collation, l, r)))
 }
@@ -1314,134 +1299,7 @@ pub fn compare_values_for_aggregate(ty: PgType, l: &Value, r: &Value, collation:
 }
 
 pub(crate) fn out_of_range(ty: PgType) -> ExecError {
-    let message = match ty {
-        PgType::Int2 => "smallint out of range",
-        PgType::Int4 => "integer out of range",
-        PgType::Int8 => "bigint out of range",
-        _ => unreachable!(),
-    };
-    ExecError::new(sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, message)
-}
-
-fn float_error(e: float::FloatError) -> ExecError {
-    ExecError::new(e.sqlstate, e.message)
-}
-
-fn division_by_zero() -> ExecError {
-    ExecError::new(sqlstate::DIVISION_BY_ZERO, "division by zero")
-}
-
-fn eval_arith_int2(op: BinOp, a: i16, b: i16) -> Result<Value, ExecError> {
-    let result = match op {
-        BinOp::Add => a.checked_add(b),
-        BinOp::Sub => a.checked_sub(b),
-        BinOp::Mul => a.checked_mul(b),
-        BinOp::Div => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            a.checked_div(b)
-        }
-        BinOp::Mod => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            return Ok(Value::Int2(a.checked_rem(b).unwrap_or(0)));
-        }
-        _ => unreachable!(),
-    };
-    result
-        .map(Value::Int2)
-        .ok_or_else(|| out_of_range(PgType::Int2))
-}
-
-fn eval_arith_int4(op: BinOp, a: i32, b: i32) -> Result<Value, ExecError> {
-    let result = match op {
-        BinOp::Add => a.checked_add(b),
-        BinOp::Sub => a.checked_sub(b),
-        BinOp::Mul => a.checked_mul(b),
-        BinOp::Div => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            // MIN / -1 overflows; MIN % -1 is 0 in PG, but checked_rem
-            // refuses it, so special-case below.
-            a.checked_div(b)
-        }
-        BinOp::Mod => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            return Ok(Value::Int4(a.checked_rem(b).unwrap_or(0)));
-        }
-        _ => unreachable!(),
-    };
-    result
-        .map(Value::Int4)
-        .ok_or_else(|| out_of_range(PgType::Int4))
-}
-
-fn eval_arith_int8(op: BinOp, a: i64, b: i64) -> Result<Value, ExecError> {
-    let result = match op {
-        BinOp::Add => a.checked_add(b),
-        BinOp::Sub => a.checked_sub(b),
-        BinOp::Mul => a.checked_mul(b),
-        BinOp::Div => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            a.checked_div(b)
-        }
-        BinOp::Mod => {
-            if b == 0 {
-                return Err(division_by_zero());
-            }
-            return Ok(Value::Int8(a.checked_rem(b).unwrap_or(0)));
-        }
-        _ => unreachable!(),
-    };
-    result
-        .map(Value::Int8)
-        .ok_or_else(|| out_of_range(PgType::Int8))
-}
-
-fn eval_arith_f4(op: BinOp, a: f32, b: f32) -> Result<Value, ExecError> {
-    let r = match op {
-        BinOp::Add => float::f4_add(a, b),
-        BinOp::Sub => float::f4_sub(a, b),
-        BinOp::Mul => float::f4_mul(a, b),
-        BinOp::Div => float::f4_div(a, b),
-        other => unreachable!("float4 arithmetic {other:?}"),
-    };
-    r.map(Value::Float4).map_err(float_error)
-}
-
-fn eval_arith_f8(op: BinOp, a: f64, b: f64) -> Result<Value, ExecError> {
-    let r = match op {
-        BinOp::Add => float::f8_add(a, b),
-        BinOp::Sub => float::f8_sub(a, b),
-        BinOp::Mul => float::f8_mul(a, b),
-        BinOp::Div => float::f8_div(a, b),
-        BinOp::Pow => float::f8_pow(a, b),
-        other => unreachable!("float8 arithmetic {other:?}"),
-    };
-    r.map(Value::Float8).map_err(float_error)
-}
-
-fn eval_arith_numeric(op: BinOp, a: &Numeric, b: &Numeric) -> Result<Value, ExecError> {
-    let r = match op {
-        BinOp::Add => a.add(b),
-        BinOp::Sub => a.sub(b),
-        BinOp::Mul => a.mul(b),
-        BinOp::Div => a.div(b).map_err(numeric_error)?,
-        BinOp::Mod => a.modulo(b).map_err(numeric_error)?,
-        other => unreachable!("numeric arithmetic {other:?}"),
-    };
-    Ok(Value::Numeric(r))
-}
-
-fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
-    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
+    arith_error(arith::out_of_range(ty))
 }
 
 #[cfg(test)]

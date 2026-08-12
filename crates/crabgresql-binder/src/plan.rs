@@ -28,10 +28,10 @@ use crate::expr::{
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
-    AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, InsertPlan, InsertSource,
-    JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, QueryPlan,
-    RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan, TableFunctionPlan,
-    UpdatePlan, ValuesPlan, WindowPlan,
+    AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
+    InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
+    QueryPlan, RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan,
+    TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan, walk_exprs_mut,
 };
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
 
@@ -513,175 +513,18 @@ pub(crate) type CteEnv = HashMap<String, CteRelation>;
 /// `Param` whose index is past the list is left untouched (the executor reports
 /// the missing binding), which cannot happen once Bind validates the count.
 pub fn substitute_params(plan: &mut LogicalPlan, params: &[Value]) {
-    match plan {
-        LogicalPlan::Values(ValuesPlan {
-            rows, predicate, ..
-        }) => {
-            for row in rows {
-                subst_exprs(row, params);
-            }
-            subst_opt(predicate, params);
-        }
-        LogicalPlan::Query(QueryPlan {
-            projections,
-            predicate,
-            ..
-        }) => {
-            subst_exprs(projections, params);
-            subst_opt(predicate, params);
-        }
-        LogicalPlan::Subquery(SubqueryPlan {
-            source,
-            projections,
-            predicate,
-            ..
-        }) => {
-            substitute_params(source, params);
-            subst_exprs(projections, params);
-            subst_opt(predicate, params);
-        }
-        LogicalPlan::Window(WindowPlan {
-            source,
-            spec,
-            funcs,
-            ..
-        }) => {
-            substitute_params(source, params);
-            for expr in spec.exprs_mut() {
-                subst_expr(expr, params);
-            }
-            for func in funcs {
-                subst_exprs(func.kind.args_mut(), params);
-            }
-        }
-        LogicalPlan::TableFunction(TableFunctionPlan {
-            args,
-            projections,
-            predicate,
-            ..
-        }) => {
-            subst_exprs(args, params);
-            subst_exprs(projections, params);
-            subst_opt(predicate, params);
-        }
-        LogicalPlan::Join(JoinPlan {
-            source,
-            projections,
-            predicate,
-            ..
-        }) => {
-            subst_join(source, params);
-            subst_exprs(projections, params);
-            subst_opt(predicate, params);
-        }
-        // An Append carries only leaf table handles, no parameterizable exprs.
-        LogicalPlan::Append(AppendPlan { .. }) => {}
-        LogicalPlan::SetOp(SetOpPlan { arms, .. }) => {
-            for arm in arms.iter_mut() {
-                substitute_params(&mut arm.plan, params);
-                if let Some(coercion) = &mut arm.coercion {
-                    subst_exprs(coercion, params);
-                }
-            }
-        }
-        LogicalPlan::Limit(LimitPlan { source, .. }) => substitute_params(source, params),
-        LogicalPlan::Aggregate(AggregatePlan {
-            input,
-            predicate,
-            group_exprs,
-            aggregates,
-            having,
-            projections,
-            ..
-        }) => {
-            if let AggInput::Join(join) = input {
-                subst_join(join, params);
-            }
-            subst_opt(predicate, params);
-            subst_exprs(group_exprs, params);
-            for agg in aggregates {
-                for arg in agg.args.iter_mut() {
-                    subst_expr(arg, params);
-                }
-            }
-            subst_opt(having, params);
-            subst_exprs(projections, params);
-        }
-        LogicalPlan::Insert(InsertPlan {
-            source, returning, ..
-        }) => {
-            match source {
-                InsertSource::Values(rows) => {
-                    for row in rows {
-                        subst_exprs(row, params);
-                    }
-                }
-                // The rows hold no expressions at all, and a column default is
-                // bound in an empty scope, so neither can name a parameter.
-                InsertSource::Tuples { defaults, .. } => {
-                    for (_, default) in defaults.iter_mut() {
-                        subst_expr(default, params);
-                    }
-                }
-                InsertSource::Query { input, projections } => {
-                    substitute_params(input, params);
-                    subst_exprs(projections, params);
-                }
-            }
-            subst_returning(returning, params);
-        }
-        LogicalPlan::Update(UpdatePlan {
-            predicate,
-            assignments,
-            returning,
-            ..
-        }) => {
-            subst_opt(predicate, params);
-            for (_, expr) in assignments {
-                subst_expr(expr, params);
-            }
-            subst_returning(returning, params);
-        }
-        LogicalPlan::Delete(DeletePlan {
-            predicate,
-            returning,
-            ..
-        }) => {
-            subst_opt(predicate, params);
-            subst_returning(returning, params);
-        }
-    }
+    walk_exprs_mut(plan, &mut ParamSubstitution { params });
 }
 
-fn subst_returning(returning: &mut Option<Returning>, params: &[Value]) {
-    if let Some(returning) = returning {
-        subst_exprs(&mut returning.projections, params);
-    }
+/// The [`ExprVisitor`] behind [`substitute_params`]: the plan walk is shared
+/// (see [`crate::logical_plan::walk_exprs_mut`]), only the leaf rewrite is ours.
+struct ParamSubstitution<'a> {
+    params: &'a [Value],
 }
 
-fn subst_join(join: &mut JoinExpr, params: &[Value]) {
-    match join {
-        JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
-            JoinInput::Subplan(plan) => substitute_params(plan, params),
-            JoinInput::TableFunction { args, .. } => subst_exprs(args, params),
-        },
-        JoinExpr::Join {
-            left,
-            right,
-            predicate,
-            ..
-        } => {
-            subst_join(left, params);
-            subst_join(right, params);
-            subst_opt(predicate, params);
-        }
-    }
-}
-
-fn subst_opt(expr: &mut Option<BoundExpr>, params: &[Value]) {
-    if let Some(e) = expr {
-        subst_expr(e, params);
+impl ExprVisitor for ParamSubstitution<'_> {
+    fn expr(&mut self, expr: &mut BoundExpr) {
+        subst_expr(expr, self.params);
     }
 }
 

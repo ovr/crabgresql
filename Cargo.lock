@@ -520,6 +520,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "crabgresql-binder",
+ "crabgresql-optimizer",
  "crabgresql-parser",
  "crabgresql-pg-engine",
  "crabgresql-pg-wire",
@@ -533,6 +534,14 @@ dependencies = [
  "rand",
  "rustc-hash",
  "sha2",
+]
+
+[[package]]
+name = "crabgresql-optimizer"
+version = "0.0.2"
+dependencies = [
+ "crabgresql-binder",
+ "crabgresql-types",
 ]
 
 [[package]]
@@ -612,6 +621,7 @@ name = "crabgresql-planner"
 version = "0.0.2"
 dependencies = [
  "crabgresql-binder",
+ "crabgresql-optimizer",
  "crabgresql-parser",
  "crabgresql-storage-api",
  "crabgresql-txn",

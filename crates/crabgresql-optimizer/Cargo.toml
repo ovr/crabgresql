@@ -1,5 +1,5 @@
 [package]
-name = "crabgresql-planner"
+name = "crabgresql-optimizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,4 @@ workspace = true
 
 [dependencies]
 crabgresql-binder.workspace = true
-crabgresql-storage-api.workspace = true
 crabgresql-types.workspace = true
-
-[dev-dependencies]
-crabgresql-optimizer.workspace = true
-crabgresql-parser.workspace = true
-crabgresql-txn.workspace = true

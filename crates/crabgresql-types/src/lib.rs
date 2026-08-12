@@ -4,6 +4,7 @@
 //! type's input, output, comparison and arithmetic live in the module named
 //! after it. `float` and `cast` hold the PG-exact I/O and cast machinery.
 
+pub mod arith;
 pub mod array;
 pub mod bit;
 pub mod bytea;

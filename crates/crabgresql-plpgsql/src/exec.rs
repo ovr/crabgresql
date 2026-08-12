@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crabgresql_binder::{DeletePlan, InsertPlan, LogicalPlan, UpdatePlan};
-use crabgresql_executor::{ExecContext, ExecError, Execution, RuntimeNotice, Severity, execute};
+use crabgresql_executor::{
+    ExecContext, ExecError, Execution, RuntimeNotice, Severity, execute, optimize_and_plan,
+};
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{TableEngine, Tuple, TypeCatalog};
@@ -892,7 +894,7 @@ impl Interpreter {
             None => txn.clone(),
         };
 
-        match execute(crabgresql_planner::plan(logical, ctx.costs), ctx, &txn)? {
+        match execute(optimize_and_plan(logical, ctx), ctx, &txn)? {
             Execution::Rows { node, .. } | Execution::ReturningRows { node, .. } => {
                 Ok(Rows::Set(drain(node)?))
             }
