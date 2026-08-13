@@ -898,7 +898,7 @@ fn resolve_subqueries(
             predicate,
             ..
         } => {
-            for (_, value) in key.iter_mut() {
+            for value in key.exprs_mut() {
                 resolve_expr(value, ctx, txn)?;
             }
             resolve_exprs(projections, ctx, txn)?;
@@ -1044,7 +1044,7 @@ fn resolve_probe_keys(
         .map(|target| &mut target.probe)
         .chain(std::iter::once(probe));
     for probe in arms.flatten() {
-        for (_, value) in probe.key.iter_mut() {
+        for value in probe.key.exprs_mut() {
             resolve_expr(value, ctx, txn)?;
         }
     }
@@ -3592,8 +3592,9 @@ fn dml_rows(
 mod tests {
     use super::*;
     use crabgresql_binder::{BinOp, UnaryOp};
+    use crabgresql_planner::IndexProbeSpec;
     use crabgresql_storage_api::{
-        Column, IndexConstraint, IndexKey, IndexMethod, TableEngine, TableSchema,
+        Column, IndexConstraint, IndexKey, IndexMethod, IndexProbeKey, TableEngine, TableSchema,
     };
     use crabgresql_txn::TxnContext;
     use crabgresql_types::PgType;
@@ -3977,7 +3978,7 @@ mod tests {
         fn index_lookup(
             &self,
             _index_name: &str,
-            _key: &[Value],
+            _key: &IndexProbeKey<'_>,
             _txn: &TxnContext,
         ) -> Option<crabgresql_storage_api::IndexProbe> {
             None
@@ -4128,7 +4129,7 @@ mod tests {
     fn probe_on_id(index_name: &str, id: i32) -> Option<DmlIndexProbe> {
         Some(DmlIndexProbe {
             index_name: index_name.into(),
-            key: vec![(0, int4(id))],
+            key: IndexProbeSpec::equality(vec![(0, int4(id))]),
             residual: None,
         })
     }

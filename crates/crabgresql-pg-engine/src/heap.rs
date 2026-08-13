@@ -8,12 +8,14 @@
 //! lock: change the page, append the WAL record, stamp `pd_lsn` with the record
 //! LSN, mark the page dirty — so the page can never reach disk ahead of its log.
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
-    CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe, RelPersistence,
-    RelStats, StorageError, TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    CheckConstraint, ColumnProjection, DeleteResult, IndexBound, IndexKey, IndexMetadata,
+    IndexProbe, IndexProbeKey, RelPersistence, RelStats, StorageError, TableAm, TableSchema, Tid,
+    Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -24,7 +26,7 @@ use crabgresql_wal::{Lsn, RmgrId};
 
 use crate::EngineInner;
 use crate::btkey;
-use crate::nbtree::BTree;
+use crate::nbtree::{BTree, KeyRange};
 use crate::page::{self, PAGE_HEADER_LEN};
 use crate::rec;
 use crate::smgr::RelFileNode;
@@ -465,7 +467,6 @@ impl HeapTable {
         );
         Self::io(self.engine.bufpool.smgr().create_if_missing(rel));
         btree.create();
-        let cols = btkey::key_columns(&meta.keys);
         let heap_rel = RelFileNode(self.live_rel.load(Ordering::Relaxed));
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(heap_rel));
@@ -487,7 +488,7 @@ impl HeapTable {
                 // statement; it must not take the process down, since CREATE INDEX
                 // is an ordinary user command.
                 let tuple = raw.and_then(|raw| raw.resolve(|p| detoast(&self.engine, p)))?;
-                if let Some(key) = btkey::encode_row(&schema, &cols, &tuple) {
+                if let Some(key) = btkey::encode_row(&schema, &meta.keys, &tuple) {
                     Self::index_row_fits(&key, tid, &meta.name, &schema.name)?;
                     btree.insert(&key, tid);
                 }
@@ -563,8 +564,7 @@ impl HeapTable {
             if !entry.is_physical(&schema) {
                 continue;
             }
-            let cols = btkey::key_columns(&entry.meta.keys);
-            if let Some(key) = btkey::encode_row(&schema, &cols, tuple) {
+            if let Some(key) = btkey::encode_row(&schema, &entry.meta.keys, tuple) {
                 Self::index_row_fits(&key, tid, &entry.meta.name, &schema.name)?;
                 self.btree(entry, xid).insert(&key, tid);
             }
@@ -1229,6 +1229,202 @@ fn detoast(engine: &EngineInner, p: &toast::ToastPointer) -> Result<Vec<u8>, Sto
     Ok(out)
 }
 
+/// What a probe key encodes to.
+enum ProbeBytes {
+    Search(KeyRange),
+    /// A NULL in the key: the tree indexed no row under one and no bound is
+    /// ever satisfied by one, so the probe is served and empty.
+    NoMatch,
+    /// A non-NULL value this encoding cannot represent. The tree says nothing
+    /// about such a value, so the probe is declined and the caller scans.
+    Decline,
+}
+
+/// Turn a probe key into the byte range the tree searches.
+///
+/// The bounds arrive in *value* order and leave in *stored* order: a `DESC` key
+/// column is stored bit-inverted (see [`crate::btkey`]), which reverses its
+/// byte order, so `col > v` becomes bytes *below* `v`'s and the two bounds swap
+/// ends. Doing that here — the one place that holds both the index metadata and
+/// the encoded bytes — is what lets `nbtree` scan forward and know nothing
+/// about direction.
+fn encode_probe(
+    schema: &TableSchema,
+    index_keys: &[IndexKey],
+    key: &IndexProbeKey<'_>,
+) -> ProbeBytes {
+    // A row holding a NULL in any key column is not in the tree at all
+    // (`btkey::encode_row` declines it). For the columns this probe constrains
+    // that is exactly right — a NULL satisfies neither an equality nor a bound,
+    // so those rows are ones the probe rejects anyway. For a key column it
+    // leaves *unconstrained* it is not: `a = 1` is true of a row whose `b` is
+    // NULL, and the tree does not have that row. Such a probe cannot be
+    // answered, so it is declined and the caller scans.
+    let constrained = key.eq.len() + usize::from(key.lower.is_some() || key.upper.is_some());
+    if index_keys
+        .get(constrained..)
+        .is_none_or(|tail| tail.iter().any(|k| is_nullable(schema, k.column)))
+    {
+        return ProbeBytes::Decline;
+    }
+    let prefix = match btkey::encode_prefix(schema, index_keys, key.eq) {
+        btkey::Encoded::Bytes(bytes) => bytes,
+        btkey::Encoded::Null => return ProbeBytes::NoMatch,
+        btkey::Encoded::Unsupported => return ProbeBytes::Decline,
+    };
+    if key.lower.is_none() && key.upper.is_none() {
+        return ProbeBytes::Search(KeyRange::prefix(prefix));
+    }
+    // Both bounds constrain the key column right after the equality prefix. A
+    // caller that bounds a column the index does not have is asking about a key
+    // this tree cannot answer for.
+    let Some(bounded) = index_keys.get(key.eq.len()) else {
+        return ProbeBytes::Decline;
+    };
+    // Each bound becomes the whole key it would appear in: the prefix plus its
+    // own column's bytes, which is what `KeyRange` compares against.
+    let encode = |bound: Option<IndexBound<'_>>| match bound {
+        None => Ok(Bound::Unbounded),
+        Some(bound) => match btkey::encode_bound(schema, bounded, bound.value) {
+            btkey::Encoded::Bytes(bytes) => {
+                let full = [&prefix[..], &bytes[..]].concat();
+                Ok(match bound.inclusive {
+                    true => Bound::Included(full),
+                    false => Bound::Excluded(full),
+                })
+            }
+            btkey::Encoded::Null => Err(ProbeBytes::NoMatch),
+            btkey::Encoded::Unsupported => Err(ProbeBytes::Decline),
+        },
+    };
+    let (lower, upper) = match (encode(key.lower), encode(key.upper)) {
+        (Ok(lower), Ok(upper)) => (lower, upper),
+        (Err(refusal), _) | (_, Err(refusal)) => return refusal,
+    };
+    let (lower, upper) = match bounded.descending {
+        false => (lower, upper),
+        true => (upper, lower),
+    };
+    ProbeBytes::Search(KeyRange {
+        prefix,
+        lower,
+        upper,
+    })
+}
+
+/// Whether a key column may hold NULL. A column the schema does not have counts
+/// as nullable: the answer decides whether a probe is safe to serve, so the
+/// unknown case has to be the refusing one.
+fn is_nullable(schema: &TableSchema, column: usize) -> bool {
+    schema.columns.get(column).is_none_or(|c| c.nullable)
+}
+
+/// The rows a probe yields, fetched one at a time as the caller asks for them.
+///
+/// The tids come from the tree in one go — the coarse latch makes that the only
+/// shape a traversal can have — but the *rows* are read lazily, so a probe costs
+/// one heap page fetch and one detoast per row actually consumed. That is what
+/// keeps `… LIMIT 1` over a wide range from reading the whole match set, and
+/// what stops a range scan from holding its entire result in memory where a
+/// sequential scan streams.
+struct IndexProbeIter {
+    engine: Arc<EngineInner>,
+    /// The heap relfilenode as this transaction sees it (the staged one while it
+    /// is truncating), resolved once: it cannot change under a scan that holds
+    /// the shared lock below.
+    heap: RelFileNode,
+    /// `heap`'s length in pages when the probe started. The relation only grows,
+    /// and every tid here came from a traversal that already finished, so a page
+    /// count read once is the bound each fetch needs — asking per row would cost
+    /// a lock pair and an `fstat` each time.
+    nblocks: u32,
+    txn: TxnContext,
+    schema: Arc<TableSchema>,
+    index_keys: Vec<IndexKey>,
+    range: KeyRange,
+    tids: std::vec::IntoIter<Tid>,
+    /// Scratch for the per-row key re-check below, reused across rows so a wide
+    /// range allocates once rather than once per row it returns.
+    key_buf: Vec<u8>,
+    /// Shared table-lock hold kept for the iterator's whole life, so a concurrent
+    /// TRUNCATE cannot unlink `heap` mid-probe — the same reason `HeapScan` holds
+    /// one.
+    _guard: SharedGuard,
+}
+
+impl Iterator for IndexProbeIter {
+    type Item = Result<(Tid, Tuple), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for tid in self.tids.by_ref() {
+            // A fetch can fail now that a value may live out of line, and the
+            // failure must reach the caller: swallowing it here would make an
+            // index scan quietly return fewer rows than a sequential scan of the
+            // same table — the same query answering differently by plan.
+            match fetch_at(&self.engine, self.heap, self.nblocks, tid, &self.txn) {
+                // Re-check the key against the row we actually read. The B-tree
+                // is *supposed* to be exact here — that is why the executor's
+                // index scan re-checks nothing — but nothing else enforces it,
+                // and an entry naming a tid the heap has since reused is a wrong
+                // answer rather than a missing row. One encode plus a compare per
+                // returned row turns that whole class of defect into rows quietly
+                // absent, which a probe-versus-scan test catches.
+                Ok(Some(tuple))
+                    if btkey::encode_row_into(
+                        &self.schema,
+                        &self.index_keys,
+                        &tuple,
+                        &mut self.key_buf,
+                    ) && self.range.contains(&self.key_buf) =>
+                {
+                    return Some(Ok((tid, tuple)));
+                }
+                // Either not visible to this snapshot or not actually a match:
+                // neither is an error, and neither ends the probe.
+                Ok(_) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        None
+    }
+}
+
+/// One version by tid from `rel`, if `txn`'s snapshot can see it.
+///
+/// Free-standing rather than a method so a probe's iterator can fetch rows
+/// lazily: it owns the pieces this needs ([`EngineInner`], the relfilenode, the
+/// block count, the snapshot) without borrowing the table. [`TableAm::fetch`] is
+/// this plus the table lock and the relfilenode a truncating transaction sees.
+fn fetch_at(
+    engine: &EngineInner,
+    rel: RelFileNode,
+    nblocks: u32,
+    tid: Tid,
+    txn: &TxnContext,
+) -> Result<Option<Tuple>, StorageError> {
+    // Bounds-check before pinning: `pin` *extends* the relation to cover an
+    // out-of-range block. `nblocks` is the caller's, because asking the storage
+    // manager costs a lock pair and an `fstat` — per row, for a caller in a
+    // loop.
+    if tid.block >= nblocks {
+        return Ok(None);
+    }
+    let page = HeapTable::io(engine.bufpool.pin(rel, tid.block));
+    // Decode under the page's frame lock, but reassemble any out-of-line
+    // attribute after it drops: detoasting pins pages of another relation,
+    // which must never happen while this one is held.
+    let raw = page.read(|pg| {
+        let bytes = page::get_item(pg, tid.offset)?;
+        let head = tuple::decode_header(bytes);
+        satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
+            .then(|| tuple::decode_raw(bytes))
+    });
+    match raw {
+        Some(raw) => Ok(Some(raw?.resolve(|p| detoast(engine, p))?)),
+        None => Ok(None),
+    }
+}
+
 impl TableAm for HeapTable {
     fn schema(&self) -> Arc<TableSchema> {
         self.snap()
@@ -1327,19 +1523,19 @@ impl TableAm for HeapTable {
             .any(|e| e.meta.name == index_name && e.is_physical(&schema))
     }
 
-    /// Probe the physical B-tree `index_name` for versions whose key equals
-    /// `key`, returning those visible to `txn`. `None` (caller falls back to a
-    /// scan) when the index is absent or has no physical B-tree; `Some(empty)`
-    /// when it is served but nothing matches (including a key `btkey` cannot
-    /// encode — a NULL, say — which is also a key `maintain_insert` indexed no
-    /// row under, so the tree and the probe agree). Visibility is decided by
-    /// re-fetching each heap tuple through [`TableAm::fetch`] — the index entry
-    /// is never trusted for visibility, exactly like a PostgreSQL secondary
-    /// index.
+    /// Probe the physical B-tree `index_name` for the versions `key` describes,
+    /// returning those visible to `txn`. `None` (caller falls back to a scan)
+    /// when the index is absent, has no physical B-tree, or the key holds a
+    /// non-NULL value this encoding cannot represent; `Some(empty)` when it is
+    /// served but nothing matches — including a NULL anywhere in the key, which
+    /// is also a value `maintain_insert` indexed no row under, so the tree and
+    /// the probe agree. Visibility is decided by re-fetching each heap tuple
+    /// through [`TableAm::fetch`] — the index entry is never trusted for
+    /// visibility, exactly like a PostgreSQL secondary index.
     fn index_lookup(
         &self,
         index_name: &str,
-        key: &[Value],
+        key: &IndexProbeKey<'_>,
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
         // Hold the table's shared lock across the tree descent, exactly as `scan`
@@ -1350,15 +1546,15 @@ impl TableAm for HeapTable {
         // zeroed meta page.
         //
         // Safe for the truncating transaction's own probe: `acquire_shared` grants
-        // immediately when the exclusive holder is this same owner, and the per-tid
-        // holds `fetch` takes underneath are refcounted per owner. The guard need
-        // only live to the end of this function — the result is materialized into a
-        // `Vec`, so the returned iterator reads no page.
-        let _guard = self.lock.acquire_shared(txn.lock_owner);
+        // immediately when the exclusive holder is this same owner, and the holds
+        // taken underneath are refcounted per owner. The returned iterator keeps
+        // reading heap pages, so — exactly as in `scan` — the guard moves into it
+        // and lives for the whole iteration rather than for this call.
+        let guard = self.lock.acquire_shared(txn.lock_owner);
         // Bound before the index guard: the filter and the key encoding below
         // must agree on `columns`.
         let schema = self.snap();
-        let (rel, latch, cols) = {
+        let (rel, latch, index_keys) = {
             let indexes = self
                 .indexes
                 .read()
@@ -1372,12 +1568,16 @@ impl TableAm for HeapTable {
                 // probe agrees with a scan of the file it reads.
                 self.effective_index_rel(entry, txn.xid),
                 Arc::clone(&entry.latch),
-                btkey::key_columns(&entry.meta.keys),
+                entry.meta.keys.clone(),
             )
         };
-        let Some(kb) = btkey::encode_values(&schema, &cols, key) else {
-            // A NULL (or otherwise un-encodable) probe key: served, no match.
-            return Some(Box::new(std::iter::empty()));
+        let range = match encode_probe(&schema, &index_keys, key) {
+            ProbeBytes::Search(range) => range,
+            // A NULL somewhere in the key: served, no match.
+            ProbeBytes::NoMatch => return Some(Box::new(std::iter::empty())),
+            // A value this encoding cannot represent: the tree knows nothing
+            // about it, so decline and let the caller scan.
+            ProbeBytes::Decline => return None,
         };
         let tids = BTree::open(
             Arc::clone(&self.engine),
@@ -1385,33 +1585,27 @@ impl TableAm for HeapTable {
             latch,
             self.persistence.is_unlogged(),
         )
-        .search_equal(&kb);
-        let mut out = Vec::new();
-        for tid in tids {
-            // `fetch` can fail now that a value may live out of line, and the
-            // failure must reach the caller: swallowing it here would make an
-            // index scan quietly return fewer rows than a sequential scan of the
-            // same table — the same query answering differently by plan.
-            match self.fetch(tid, txn) {
-                // Re-check the key against the row we actually read. The B-tree
-                // is *supposed* to be exact here — that is why the executor's
-                // index scan re-checks nothing — but nothing else enforces it,
-                // and an entry naming a tid the heap has since reused is a wrong
-                // answer rather than a missing row. One encode plus a compare per
-                // returned row turns that whole class of defect into rows quietly
-                // absent, which a probe-versus-scan test catches.
-                Ok(Some(tuple))
-                    if btkey::encode_row(&schema, &cols, &tuple).is_some_and(|k| k == kb) =>
-                {
-                    out.push(Ok((tid, tuple)))
-                }
-                // Either not visible to this snapshot or not actually a match:
-                // neither is an error.
-                Ok(_) => {}
-                Err(error) => out.push(Err(error)),
-            }
+        .search_range(&range);
+        // Nothing matched: hand back an empty iterator rather than the machinery
+        // for walking one. This is the ordinary outcome of the `UNIQUE` check,
+        // which probes once per inserted row, and it is the one place where the
+        // snapshot clone and the guard below would be pure overhead.
+        if tids.is_empty() {
+            return Some(Box::new(std::iter::empty()));
         }
-        Some(Box::new(out.into_iter()))
+        let heap = self.effective_rel(txn.xid);
+        Some(Box::new(IndexProbeIter {
+            nblocks: Self::io(self.engine.bufpool.smgr().nblocks(heap)),
+            engine: Arc::clone(&self.engine),
+            heap,
+            txn: txn.clone(),
+            schema,
+            index_keys,
+            range,
+            tids: tids.into_iter(),
+            key_buf: Vec::new(),
+            _guard: guard,
+        }))
     }
 
     /// The heap stores whole tuples per page, so a projection saves no I/O — the
@@ -1447,24 +1641,8 @@ impl TableAm for HeapTable {
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
-        let smgr = self.engine.bufpool.smgr();
-        if tid.block >= Self::io(smgr.nblocks(rel)) {
-            return Ok(None);
-        }
-        let page = Self::io(self.engine.bufpool.pin(rel, tid.block));
-        // Decode under the page's frame lock, but reassemble any out-of-line
-        // attribute after it drops: detoasting pins pages of another relation,
-        // which must never happen while this one is held.
-        let raw = page.read(|pg| {
-            let bytes = page::get_item(pg, tid.offset)?;
-            let head = tuple::decode_header(bytes);
-            satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
-                .then(|| tuple::decode_raw(bytes))
-        });
-        match raw {
-            Some(raw) => Ok(Some(raw?.resolve(|p| detoast(&self.engine, p))?)),
-            None => Ok(None),
-        }
+        let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
+        fetch_at(&self.engine, rel, nblocks, tid, txn)
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
@@ -1737,19 +1915,13 @@ impl TableAm for HeapTable {
         // Snapshot the physical indexes so each reclaimed version's index entry
         // can be removed too — otherwise a stale `key -> tid` would point at a
         // heap slot that a later insert reuses, yielding wrong rows.
-        let phys: Vec<(RelFileNode, Arc<RwLock<()>>, Vec<usize>)> = self
+        let phys: Vec<(RelFileNode, Arc<RwLock<()>>, Vec<IndexKey>)> = self
             .indexes
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .iter()
             .filter(|e| e.is_physical(&schema))
-            .map(|e| {
-                (
-                    e.rel,
-                    Arc::clone(&e.latch),
-                    btkey::key_columns(&e.meta.keys),
-                )
-            })
+            .map(|e| (e.rel, Arc::clone(&e.latch), e.meta.keys.clone()))
             .collect();
         let smgr = self.engine.bufpool.smgr();
         let nblocks = Self::io(smgr.nblocks(rel));
@@ -1822,8 +1994,8 @@ impl TableAm for HeapTable {
             // entry is gone, and a probe would then return the reused row for the
             // old key. Deleting entries first closes that window.
             for (tid, tuple) in &victims {
-                for (irel, latch, cols) in &phys {
-                    if let Some(key) = btkey::encode_row(&schema, cols, tuple) {
+                for (irel, latch, index_keys) in &phys {
+                    if let Some(key) = btkey::encode_row(&schema, index_keys, tuple) {
                         BTree::open(
                             Arc::clone(&self.engine),
                             *irel,
@@ -1949,5 +2121,113 @@ impl Iterator for HeapScan {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crabgresql_storage_api::{
+        Column, IndexKey, IndexMetadata, IndexMethod, TableEngine, TableSchema,
+    };
+    use crabgresql_txn::{CommandId, CommitSink, TransactionManager, TxnFinalize, Xid};
+    use crabgresql_types::{PgType, Value};
+    use crabgresql_wal::Wal;
+
+    use crate::{PgEngine, bufpool::PoolStats};
+
+    /// A probe fetches its rows lazily, so the cost of one is the cost of the
+    /// rows the caller actually reads.
+    ///
+    /// Measured in buffer-pool pins rather than asserted from the code's shape:
+    /// "materializes the result" and "streams it" differ in nothing a result
+    /// comparison can see, and the whole point of the iterator is the work it
+    /// does *not* do. The tree traversal happens before the iterator is handed
+    /// over — it is bounded by the coarse latch — so it lands in the baseline
+    /// and what the deltas below measure is the heap fetches alone.
+    #[test]
+    fn a_probe_fetches_its_rows_only_as_they_are_consumed() -> anyhow::Result<()> {
+        const ROWS: i32 = 2_000;
+
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            crate::BufferPoolPolicy::minimal(),
+        )?;
+        let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+        let mut tm = TransactionManager::new_recovered(sink, clog, next_xid);
+        tm.set_finalize(Arc::clone(&engine) as Arc<dyn TxnFinalize>);
+
+        let mut schema = TableSchema::new("t", vec![Column::new("id", PgType::Int4)]);
+        // NOT NULL, so a range leaving no key column unconstrained is servable.
+        schema.columns[0].nullable = false;
+        let table = engine.create_table(schema)?;
+        let x = tm.allocate_xid();
+        for id in 0..ROWS {
+            table.insert(vec![Value::Int4(id)], &tm.context(x, CommandId::FIRST))?;
+        }
+        tm.commit(x)?;
+        engine.create_index(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_id_idx".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+        )?;
+
+        let txn = tm.context(Xid::INVALID, CommandId::FIRST);
+        let pins = || {
+            let PoolStats {
+                hits,
+                misses,
+                extends,
+            } = engine.bufpool().hit_stats();
+            hits + misses + extends
+        };
+        // Everything above `0`: the whole relation.
+        let lower = Value::Int4(-1);
+        let key = crabgresql_storage_api::IndexProbeKey {
+            eq: &[],
+            lower: Some(crabgresql_storage_api::IndexBound {
+                value: &lower,
+                inclusive: false,
+            }),
+            upper: None,
+        };
+        let mut rows = table
+            .index_lookup("t_id_idx", &key, &txn)
+            .expect("the index serves the probe");
+
+        let after_open = pins();
+        assert!(rows.next().is_some(), "the probe matches every row");
+        let one = pins() - after_open;
+        let drained = 1 + rows.count();
+        let all = pins() - after_open;
+
+        assert_eq!(
+            drained as i32, ROWS,
+            "the probe must still return every row"
+        );
+        // One row costs a pin or two; the whole relation costs one per row. The
+        // ratio is what the assertion is about — an exact count would pin the
+        // fetch's internals rather than its laziness.
+        assert!(
+            one * 10 < all,
+            "reading one row cost {one} pins and reading all {ROWS} cost {all}: \
+             the probe is not fetching lazily"
+        );
+        Ok(())
     }
 }

@@ -95,11 +95,11 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             // `DROP INDEX` can remove it mid-statement. Pruning a key column
             // would make that re-check read NULL and drop every row.
             if let Some(demand) = &mut demand {
-                demand.extend(key.iter().map(|(column, _)| *column));
+                demand.extend(key.columns());
             }
             // Key *values* are row-constant, but folding them in costs nothing
             // and keeps the set correct if that ever loosens.
-            let demand = add_exprs(demand, key.iter().map(|(_, value)| value));
+            let demand = add_exprs(demand, key.exprs());
             *projection = resolve(demand, &table.schema());
         }
         PhysicalPlan::Subquery {

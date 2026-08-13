@@ -19,6 +19,7 @@ use crabgresql_storage_api::{
 };
 use crabgresql_types::PgType;
 
+use crate::btkey;
 use crate::smgr::RelFileNode;
 
 /// A relation as the engine reopens it: its name, heap relfilenode, out-of-line
@@ -124,6 +125,13 @@ const CHECK_MAGIC: &[u8; 4] = b"CHK1";
 /// before this tail was: the DDL that declares a generated column used to be
 /// rejected outright.
 const GEN_MAGIC: &[u8; 4] = b"GEN1";
+/// Marks the index-key-encoding section, appended after the [`GEN_MAGIC`] block
+/// — a sixteenth backward-compatible tail carrying one byte per index saying
+/// which key encoding its B-tree file was built with. A reader that predates it
+/// stops above and decodes every index as [`btkey::ENCODING_ASCENDING_ONLY`],
+/// which is what every file written before this tail actually holds; see
+/// [`PersistIndex::usable_rel`] for what that costs a `DESC` index.
+const IKEY_MAGIC: &[u8; 4] = b"IKV1";
 struct PersistCol {
     name: String,
     oid: u32,
@@ -149,6 +157,27 @@ struct PersistCol {
 struct PersistIndex {
     meta: IndexMetadata,
     rel: u32,
+    /// Which key encoding the file was built with, persisted in the
+    /// [`IKEY_MAGIC`] tail. Opaque here: see [`btkey::ENCODING_VERSION`].
+    key_encoding: u8,
+}
+
+impl PersistIndex {
+    /// The relfilenode the engine may actually read, or `0` for an index it must
+    /// treat as metadata-only.
+    ///
+    /// A file [`btkey::readable`] rejects is stored in an order this build no
+    /// longer searches in: probes would find nothing, quietly answering queries
+    /// with no rows. There is no `REINDEX` to rebuild it with, so it is demoted
+    /// to metadata-only — the planner then scans, which is slower and correct.
+    /// Dropping the index still unlinks the file, because `rel` itself is left
+    /// intact.
+    fn usable_rel(&self) -> u32 {
+        match btkey::readable(self.key_encoding, &self.meta.keys) {
+            true => self.rel,
+            false => 0,
+        }
+    }
 }
 
 struct PersistRel {
@@ -317,7 +346,7 @@ impl RelCatalog {
                     },
                     r.indexes
                         .iter()
-                        .map(|i| (i.meta.clone(), RelFileNode(i.rel)))
+                        .map(|i| (i.meta.clone(), RelFileNode(i.usable_rel())))
                         .collect(),
                 )
             })
@@ -850,6 +879,8 @@ impl RelCatalog {
         target.indexes.push(PersistIndex {
             meta: index,
             rel: rel.0,
+            // Built by this process, so it is in this build's key encoding.
+            key_encoding: btkey::ENCODING_VERSION,
         });
         self.persist(&state)?;
         Ok(())
@@ -1452,6 +1483,17 @@ fn encode(state: &State) -> Vec<u8> {
             }
         }
     }
+    // Index key encodings: a sixteenth backward-compatible tail, one byte per
+    // index in each relation's index order — the same order the `CRM1` block and
+    // the `IDXR` tail use, so a reader zips all three back together.
+    out.extend_from_slice(IKEY_MAGIC);
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        out.extend_from_slice(&(r.indexes.len() as u32).to_le_bytes());
+        for pi in &r.indexes {
+            out.push(pi.key_encoding);
+        }
+    }
     out
 }
 
@@ -1689,6 +1731,9 @@ fn decode(bytes: &[u8]) -> State {
                     // Physical relfilenode is filled from the IXR1 tail below;
                     // 0 (metadata-only) if that tail is absent (legacy file).
                     rel: 0,
+                    // Likewise filled from the IKV1 tail below; its absence means
+                    // the file predates the descending key encoding.
+                    key_encoding: btkey::ENCODING_ASCENDING_ONLY,
                 });
             }
         }
@@ -1997,6 +2042,22 @@ fn decode(bytes: &[u8]) -> State {
             }
         }
     }
+    // Index-key-encoding tail: absent means every index file was built with the
+    // ascending-only encoding, which is exactly what a catalog written before
+    // this tail describes.
+    if d.remaining().starts_with(IKEY_MAGIC) {
+        d.p += IKEY_MAGIC.len();
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            let nindexes = d.u32();
+            for i in 0..nindexes as usize {
+                let encoding = d.byte();
+                if let Some(index) = r.indexes.get_mut(i) {
+                    index.key_encoding = encoding;
+                }
+            }
+        }
+    }
     State {
         next,
         rels,
@@ -2263,6 +2324,76 @@ mod tests {
                 "a catalog written before the tail existed must decode as heap ({name})"
             );
         }
+        Ok(())
+    }
+
+    /// A `DESC` index file written before the key encoding recorded direction is
+    /// in an order this build no longer searches in. Its relfilenode must stop
+    /// being handed out, so the engine treats it as metadata-only and the
+    /// planner scans — the alternative is a probe that silently finds nothing.
+    #[test]
+    fn a_legacy_descending_index_is_not_handed_out_as_physical() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                Column::new("a", PgType::Int4),
+                Column::new("b", PgType::Int4),
+            ],
+        );
+        catalog.create(&schema)?;
+        let index = |name: &str, descending: bool| IndexMetadata {
+            name: name.into(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending,
+                nulls_first: false,
+            }],
+            unique: false,
+            nulls_distinct: true,
+            constraint: None,
+        };
+        catalog.add_index_in("public", "t", index("t_desc", true), RelFileNode(42))?;
+        catalog.add_index_in("public", "t", index("t_asc", false), RelFileNode(43))?;
+        drop(catalog);
+
+        let rel_of = |catalog: &RelCatalog, want: &str| {
+            catalog
+                .schemas()
+                .into_iter()
+                .find(|(name, _, _, _, _)| name == "t")
+                .and_then(|(_, _, _, _, indexes)| {
+                    indexes
+                        .into_iter()
+                        .find(|(meta, _)| meta.name == want)
+                        .map(|(_, rel)| rel)
+                })
+        };
+        // Written by this build, so both are readable.
+        let loaded = RelCatalog::load(dir.path())?;
+        assert_eq!(rel_of(&loaded, "t_desc"), Some(RelFileNode(42)));
+        assert_eq!(rel_of(&loaded, "t_asc"), Some(RelFileNode(43)));
+        drop(loaded);
+
+        // Now as a catalog written before the tail existed.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(IKEY_MAGIC.len())
+            .position(|window| window == IKEY_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("index key encoding marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+        let legacy = RelCatalog::load(dir.path())?;
+        assert_eq!(
+            rel_of(&legacy, "t_desc"),
+            Some(RelFileNode(0)),
+            "a legacy DESC index must be demoted to metadata-only"
+        );
+        // An ascending index is unaffected: its stored order never depended on
+        // the change, so demoting it too would cost every old index its speed.
+        assert_eq!(rel_of(&legacy, "t_asc"), Some(RelFileNode(43)));
         Ok(())
     }
 

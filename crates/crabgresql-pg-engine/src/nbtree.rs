@@ -1,9 +1,18 @@
 //! The durable B-tree access method: a page-backed, WAL-logged index over an
-//! index relfilenode. Only **equality** probes are served; the on-disk
-//! structure is fully ordered (right-links, high keys, order-preserving keys via
-//! [`crate::btkey`]) so range scans need no format change.
+//! index relfilenode. Equality and range probes are served by one routine,
+//! [`BTree::search_range`]: the on-disk structure is fully ordered (right-links,
+//! high keys, order-preserving keys via [`crate::btkey`]), so neither needed a
+//! format change.
 //!
-//! TODO: serve range and ordered scans, not only equality probes.
+//! TODO: serve *ordered* scans — a scan that hands its rows to the caller in
+//! index order, letting an `ORDER BY` on the key columns drop its sort.
+//!
+//! TODO(perf): a search materializes every matching `Tid` into a `Vec` before
+//! returning. That is what lets the coarse latch and every page pin be released
+//! at the end of the call, which the current locking design relies on; a
+//! streaming cursor has to hold them across the caller's iteration instead.
+//! Until then a range wide enough to select most of the relation buffers one
+//! tid per matching row.
 //!
 //! Concurrency is a single coarse per-index latch: writers take it exclusively,
 //! readers share it, so the tree is quiescent during any one operation. The
@@ -21,6 +30,7 @@
 //! exactly like a PostgreSQL secondary index.
 
 use std::cmp::Ordering;
+use std::ops::Bound;
 use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::Tid;
@@ -273,17 +283,25 @@ impl BTree {
 
     // -- Search ------------------------------------------------------------
 
-    /// Every heap `Tid` whose key equals `key`, in `(key, tid)` order, spanning
-    /// leaf pages via right-links when a run of duplicates was split apart.
-    pub fn search_equal(&self, key: &[u8]) -> Vec<Tid> {
+    /// Every heap `Tid` whose key lies in `range`, in `(key, tid)` order,
+    /// spanning leaf pages via right-links.
+    pub fn search_range(&self, range: &KeyRange) -> Vec<Tid> {
         let _r = self
             .latch
             .read()
             .unwrap_or_else(|_| panic!("btree latch poisoned"));
-        let s = (key, 0u64); // tid 0 sorts below every real entry (offsets are 1-based)
+        // Descend to the first key the scan could accept. A lower bound always
+        // starts with the prefix (it is the prefix plus one column), so it is
+        // never to the left of it; without one the prefix itself is the start.
+        // `tid = 0` sorts below every real entry (offsets are 1-based), so the
+        // descent lands at the start of a run rather than inside it.
+        let start_key = match &range.lower {
+            Bound::Included(b) | Bound::Excluded(b) => &b[..],
+            Bound::Unbounded => &range.prefix[..],
+        };
         let mut blk = {
             let mut stack = Vec::new();
-            self.descend(s, &mut stack)
+            self.descend((start_key, 0u64), &mut stack)
         };
         let mut out = Vec::new();
         loop {
@@ -291,25 +309,23 @@ impl BTree {
             let follow = page.read(|pg| {
                 let start = btpage::first_data_off(pg);
                 let maxoff = page::max_offset(pg);
-                let mut saw_greater = false;
                 for off in start..=maxoff {
                     let item = page::get_item(pg, off).expect("leaf slot is normal");
-                    match btkey::leaf_key(item).cmp(key) {
-                        Ordering::Less => continue,
-                        Ordering::Equal => out.push(btkey::leaf_tid(item)),
-                        Ordering::Greater => {
-                            saw_greater = true;
-                            break;
-                        }
+                    match range.classify(btkey::leaf_key(item)) {
+                        Place::In => out.push(btkey::leaf_tid(item)),
+                        // Below the range: skipped rather than stopped on, since
+                        // the descent lands on the page owning the start key,
+                        // which normally also holds smaller keys before it.
+                        Place::Below => {}
+                        // Keys only grow from here, so once one is past the
+                        // range's end no later entry on this or any later page
+                        // can match.
+                        Place::Past => return None,
                     }
                 }
-                // The run may continue on the next leaf unless we already passed
-                // it (saw a key > `key`) or this is the rightmost page.
-                if !saw_greater && !btpage::is_rightmost(pg) {
-                    Some(btpage::get_opaque(pg).next)
-                } else {
-                    None
-                }
+                // Fell off the end of the page still inside the range: the run
+                // continues on the next leaf, unless this is the rightmost one.
+                (!btpage::is_rightmost(pg)).then(|| btpage::get_opaque(pg).next)
             });
             match follow {
                 Some(n) => blk = n,
@@ -617,6 +633,103 @@ impl BTree {
                 Continue(n) => blk = n,
                 Done => return,
             }
+        }
+    }
+}
+
+/// The stretch of key space one search covers: an equality-pinned `prefix` (the
+/// leading key columns, empty for none) and optional bounds on the column right
+/// after it, each stated as the whole key it would appear in — `prefix`
+/// followed by that column's bytes.
+///
+/// **The bounds are prefix-wise, not bytewise.** On a key `(a, b, c)`, the
+/// predicate `a = 1 AND b > 5` has an exclusive lower bound of
+/// `enc(1) ++ enc(5)`, and every row with `b = 5` encodes to something bytewise
+/// *greater* than that (its `c` follows) while satisfying neither `b > 5` nor
+/// the query. So an exclusive bound excludes the whole run of keys extending
+/// its bytes, and an inclusive upper bound includes it:
+///
+/// * lower `Included(b)`: `key >= b`
+/// * lower `Excluded(b)`: `key > b` **and** `!key.starts_with(b)`
+/// * upper `Included(b)`: `key < b` **or** `key.starts_with(b)`
+/// * upper `Excluded(b)`: `key < b`
+///
+/// Direction is not this type's business: a `DESC` key column is stored
+/// inverted (see [`crate::btkey`]), so its builder has already swapped the two
+/// bounds and everything here reads forward.
+///
+/// [`KeyRange::contains`] is the whole rule in one place, which is what lets a
+/// caller re-check a fetched row against exactly what the scan selected.
+pub struct KeyRange {
+    pub prefix: Vec<u8>,
+    pub lower: Bound<Vec<u8>>,
+    pub upper: Bound<Vec<u8>>,
+}
+
+/// Where one key falls relative to a [`KeyRange`].
+#[derive(PartialEq, Eq)]
+enum Place {
+    /// Before the range starts — a scan reading in order skips it.
+    Below,
+    In,
+    /// Past everything the range can still accept — a scan reading in order
+    /// stops.
+    Past,
+}
+
+impl KeyRange {
+    /// A range covering exactly the keys starting with `prefix` — a prefix probe
+    /// when `prefix` is shorter than a whole key, and **equality** when it is a
+    /// whole one: [`crate::btkey`] encodes each column prefix-free, so no stored
+    /// key of the same column count can start with another one's bytes and still
+    /// differ from it. That is what lets one traversal serve both, rather than
+    /// two that could drift apart on the boundary rules.
+    pub fn prefix(prefix: Vec<u8>) -> KeyRange {
+        KeyRange {
+            prefix,
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        }
+    }
+
+    /// Whether `key` is in the range.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.classify(key) == Place::In
+    }
+
+    /// Where `key` falls. One pass over the rules, because a scan asks both
+    /// questions ("take it?" and "stop?") about every entry it reads and the
+    /// prefix and upper-bound comparisons answer both.
+    fn classify(&self, key: &[u8]) -> Place {
+        let in_prefix = key.starts_with(&self.prefix);
+        // Leaving the prefix's stretch *upward* is past; leaving it downward is
+        // below, which is what the descent's landing page holds before the
+        // start key.
+        if !in_prefix && key > &self.prefix[..] {
+            return Place::Past;
+        }
+        let within_upper = match &self.upper {
+            Bound::Unbounded => true,
+            // Mirror of the lower `Excluded` case below: those extensions of `b`
+            // are the rows holding exactly the bound's value, which an inclusive
+            // bound keeps even though their bytes run past it.
+            Bound::Included(b) => key < &b[..] || key.starts_with(b),
+            Bound::Excluded(b) => key < &b[..],
+        };
+        if !within_upper {
+            return Place::Past;
+        }
+        let within_lower = match &self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(b) => key >= &b[..],
+            // A key that starts with `b` carries `b`'s value in the bounded
+            // column and a further column after it — the value the bound
+            // excludes.
+            Bound::Excluded(b) => key > &b[..] && !key.starts_with(b),
+        };
+        match in_prefix && within_lower {
+            true => Place::In,
+            false => Place::Below,
         }
     }
 }
