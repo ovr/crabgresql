@@ -139,5 +139,64 @@ fn fixed_point(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, division, accumulation, fixed_point);
+/// Rendering, which every value pays on its way to the client — and which a
+/// stored `numeric` now pays more of, since a column with no typmod reads back
+/// at scale 16 and so prints eighteen characters where the user wrote four.
+fn rendering(c: &mut Criterion) {
+    let mut g = c.benchmark_group("numeric_render");
+
+    let money = Numeric::parse("321000.00").expect("valid");
+    g.bench_function("display_d64", |b| b.iter(|| black_box(&money).to_display()));
+
+    // The same value as an unconstrained column stores it.
+    let padded = Numeric::parse("321000.0000000000000000").expect("valid");
+    g.bench_function("display_bare", |b| {
+        b.iter(|| black_box(&padded).to_display())
+    });
+
+    // Leading zeros after the point, which is the other side of the same walk.
+    let small = Numeric::parse("0.0000000000000015").expect("valid");
+    g.bench_function("display_small", |b| {
+        b.iter(|| black_box(&small).to_display())
+    });
+
+    let whole = Numeric::from_i128(9_223_372_036_854_775_807);
+    g.bench_function("display_integer", |b| {
+        b.iter(|| black_box(&whole).to_display())
+    });
+
+    g.finish();
+}
+
+/// What the columnar write gate runs per cell: prove the value fits the
+/// column's decimal, then put it in the form the column stores.
+fn storage_form(c: &mut Criterion) {
+    let mut g = c.benchmark_group("numeric_storage_form");
+
+    // A `numeric(15,2)` value, already at the column's scale — the common case,
+    // since `apply_typmod` has been through it.
+    let money = Numeric::parse("321000.00").expect("valid");
+    g.bench_function("fits_d64", |b| {
+        b.iter(|| black_box(&money).fits_decimal(15, 2))
+    });
+    g.bench_function("trunc_d64", |b| b.iter(|| black_box(&money).trunc(2)));
+
+    // The same value entering a column with no typmod, where the scale it is
+    // stored at is not the scale it arrived with.
+    g.bench_function("fits_bare", |b| {
+        b.iter(|| black_box(&money).fits_decimal(38, 16))
+    });
+    g.bench_function("trunc_bare", |b| b.iter(|| black_box(&money).trunc(16)));
+
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    division,
+    accumulation,
+    fixed_point,
+    rendering,
+    storage_form
+);
 criterion_main!(benches);

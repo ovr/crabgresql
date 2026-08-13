@@ -101,7 +101,9 @@ macro_rules! digits_of {
             len += 1;
         }
         digits[..len].reverse();
-        Numeric::from_coeff($neg, digits[..len].to_vec(), low, $dscale)
+        // Canonical by construction: the magnitude was non-zero, so the leading
+        // digit is non-zero, and the loop above stripped the trailing zeros.
+        Numeric::from_canonical($neg, digits[..len].to_vec(), low, $dscale)
     }};
 }
 
@@ -196,6 +198,13 @@ impl Numeric {
         }
     }
 
+    /// The display scale: how many fractional digits this value prints with.
+    /// Part of the *value* in PostgreSQL, which is why a storage mapping that
+    /// fixes it in the type has to say so.
+    pub fn display_scale(&self) -> i32 {
+        self.dscale
+    }
+
     pub fn is_nan(&self) -> bool {
         self.sign == Sign::NaN
     }
@@ -225,6 +234,23 @@ impl Numeric {
         };
         n.normalize();
         n
+    }
+
+    /// Build from digits already known to be canonical: no leading or trailing
+    /// zero, and non-empty. Skips [`Numeric::normalize`], which for a value
+    /// extracted digit by digit out of an integer can only walk the coefficient
+    /// twice to confirm what the extraction already guaranteed.
+    fn from_canonical(neg: bool, digits: Vec<u8>, low: i32, dscale: i32) -> Numeric {
+        debug_assert!(
+            digits.first().is_some_and(|d| *d != 0) && digits.last().is_some_and(|d| *d != 0),
+            "from_canonical was handed a coefficient normalize would have changed"
+        );
+        Numeric {
+            sign: if neg { Sign::Neg } else { Sign::Pos },
+            weight: low + digits.len() as i32 - 1,
+            dscale: dscale.max(0),
+            digits,
+        }
     }
 
     /// Exact conversion from a signed 128-bit integer (used by int→numeric).
@@ -357,21 +383,50 @@ impl Numeric {
             Sign::NInf => return "-Infinity".to_string(),
             _ => {}
         }
-        let mut out = String::new();
-        if self.is_neg() && !self.digits.is_empty() {
-            out.push('-');
+        // Written as three runs — stored digits, then padding — rather than a
+        // walk over decimal positions asking `digit_at` for each. The two agree
+        // digit for digit, but the walk re-derives `low` and bounds-checks per
+        // character, and the runs it would produce are long: a column with no
+        // typmod renders sixteen fractional places, most of them padding.
+        let neg = self.is_neg() && !self.digits.is_empty();
+        let int_len = (self.weight + 1).max(1) as usize;
+        let frac_len = self.dscale.max(0) as usize;
+        let mut out =
+            Vec::with_capacity(neg as usize + int_len + (frac_len > 0) as usize + frac_len);
+        if neg {
+            out.push(b'-');
         }
-        let hi = self.weight.max(0);
-        for pos in (0..=hi).rev() {
-            out.push((b'0' + self.digit_at(pos)) as char);
+        // The integer part. A value below one has no stored digit there and
+        // renders the single `0` PostgreSQL prints.
+        if self.weight < 0 {
+            out.push(b'0');
+        } else {
+            let stored = int_len.min(self.digits.len());
+            out.extend(self.digits[..stored].iter().map(|digit| b'0' + digit));
+            out.resize(out.len() + int_len - stored, b'0');
         }
-        if self.dscale > 0 {
-            out.push('.');
-            for k in 1..=self.dscale {
-                out.push((b'0' + self.digit_at(-k)) as char);
-            }
+        if frac_len > 0 {
+            out.push(b'.');
+            // `weight + 1` is where the fractional digits start in `digits`; a
+            // negative one means that many zeros come first.
+            let start = self.weight + 1;
+            let leading = (-start).max(0) as usize;
+            let zeros = leading.min(frac_len);
+            out.resize(out.len() + zeros, b'0');
+            let remaining = frac_len - zeros;
+            // Clamped to the length, not just to zero: a value with no stored
+            // digits at all (zero itself) would otherwise slice from past the
+            // end, even though it takes nothing.
+            let from = (start.max(0) as usize).min(self.digits.len());
+            let taken = remaining.min(self.digits.len() - from);
+            out.extend(
+                self.digits[from..from + taken]
+                    .iter()
+                    .map(|digit| b'0' + digit),
+            );
+            out.resize(out.len() + remaining - taken, b'0');
         }
-        out
+        String::from_utf8(out).expect("digits and punctuation are ASCII")
     }
 
     /// Decimal position of the least-significant stored digit. For an empty

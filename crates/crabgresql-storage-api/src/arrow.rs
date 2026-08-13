@@ -88,17 +88,30 @@ fn value_mismatch(column: &str, ty: PgType) -> StorageError {
 /// [`NUMERIC_DEFAULT_SCALE`] fractional digits or [`NUMERIC_DEFAULT_PRECISION`]
 /// digits in all — a deliberate deviation: PostgreSQL stores those, we refuse
 /// them.
-pub fn numeric_stored(value: &Numeric, typmod: i32) -> Option<Numeric> {
+pub fn numeric_stored(value: &Numeric, typmod: i32) -> Option<StoredNumeric> {
     let (precision, scale) = numeric_decimal(typmod);
-    // The decimal's scale is the only thing storage imposes, and `trunc` is
-    // already the operation that imposes one — it truncates nothing here,
-    // because `fits_decimal` has just established there is nothing below
-    // `-scale` to truncate. Round tripping through the integer (or, for the
-    // 256-bit widths, through a rendered string) would arrive at the same
-    // value by a longer road.
-    value
-        .fits_decimal(precision, scale)
-        .then(|| value.trunc(scale as i32))
+    if !value.fits_decimal(precision, scale) {
+        return None;
+    }
+    // A value already at the column's scale *is* the stored form, and saying so
+    // costs one comparison against rebuilding an identical `Numeric` — which is
+    // an allocation per cell on a path that runs per inserted row. This is the
+    // common case: `apply_typmod` has already put every value of a
+    // `numeric(p, s)` column at scale `s`.
+    if value.display_scale() == scale as i32 {
+        return Some(StoredNumeric::AsIs);
+    }
+    // Otherwise the scale is the only thing storage imposes, and `trunc` is
+    // already the operation that imposes one — it truncates nothing here, since
+    // `fits_decimal` established there is nothing below `-scale` to lose.
+    Some(StoredNumeric::Rewritten(value.trunc(scale as i32)))
+}
+
+/// The outcome of [`numeric_stored`]: either the value is already in the form
+/// the column stores, or here is that form.
+pub enum StoredNumeric {
+    AsIs,
+    Rewritten(Numeric),
 }
 
 /// PostgreSQL's `22003` for a value this column's decimal cannot hold.
@@ -198,7 +211,8 @@ impl NumericColumns {
                 };
                 let column = &schema.columns[index];
                 match numeric_stored(value, column.typmod) {
-                    Some(stored) => tuple[index] = Value::Numeric(stored),
+                    Some(StoredNumeric::AsIs) => {}
+                    Some(StoredNumeric::Rewritten(stored)) => tuple[index] = Value::Numeric(stored),
                     // The encoder's own error, raised one step earlier: a value
                     // refused here and a value refused there is the same
                     // refusal, and it should not read as two.
