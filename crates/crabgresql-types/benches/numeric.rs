@@ -80,5 +80,64 @@ fn accumulation(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, division, accumulation);
+/// The `Value` ⇄ decimal conversions the columnar stores run **per cell**:
+/// `to_scaled_i128` once per value written, `from_scaled_i128` once per value
+/// read. Every case below is a real column shape, because the cost turns on the
+/// magnitude *after* scaling rather than on the value the user sees.
+///
+/// The pairs to watch are `bare_*` against `d64_*`. A column with no typmod is
+/// stored at scale 16, so `321000.00` becomes `3.21e21` — past `u64::MAX`, and
+/// so onto 128-bit division, which is a libcall. The same value in a
+/// `numeric(15,2)` column scales to `32100000`, which stays in a register.
+fn fixed_point(c: &mut Criterion) {
+    let mut g = c.benchmark_group("numeric_fixed_point");
+
+    // A `numeric(15,2)` column: the TPC-H money shape, stored as `Decimal64`.
+    let money = Numeric::parse("321000.00").expect("valid");
+    g.bench_function("d64_to_scaled", |b| {
+        b.iter(|| black_box(&money).to_scaled_i128(15, 2))
+    });
+    g.bench_function("d64_from_scaled", |b| {
+        b.iter(|| Numeric::from_scaled_i128(black_box(32_100_000), 2))
+    });
+
+    // The same value in a column with no typmod, stored at scale 16.
+    g.bench_function("bare_to_scaled", |b| {
+        b.iter(|| black_box(&money).to_scaled_i128(38, 16))
+    });
+    g.bench_function("bare_from_scaled", |b| {
+        b.iter(|| Numeric::from_scaled_i128(black_box(3_210_000_000_000_000_000_000), 16))
+    });
+
+    // A quotient, which is what an unconstrained column most often holds after
+    // arithmetic: sixteen significant digits, so nothing is trailing padding.
+    let quotient = Numeric::parse("3.3333333333333333").expect("valid");
+    g.bench_function("bare_to_scaled_quotient", |b| {
+        b.iter(|| black_box(&quotient).to_scaled_i128(38, 16))
+    });
+    g.bench_function("bare_from_scaled_quotient", |b| {
+        b.iter(|| Numeric::from_scaled_i128(black_box(33_333_333_333_333_333), 16))
+    });
+
+    // A `numeric(9,2)` column, stored as `Decimal32` — the narrowest width.
+    let small = Numeric::parse("1234.56").expect("valid");
+    g.bench_function("d32_to_scaled", |b| {
+        b.iter(|| black_box(&small).to_scaled_i128(9, 2))
+    });
+    g.bench_function("d32_from_scaled", |b| {
+        b.iter(|| Numeric::from_scaled_i128(black_box(123_456), 2))
+    });
+
+    // A `numeric(76,38)` column, past every Rust integer: the conversion goes
+    // through the value's own decimal rendering.
+    let wide = Numeric::parse("12345678901234567890123456789012345678.5").expect("valid");
+    let mut buffer = String::new();
+    g.bench_function("d256_write_scaled", |b| {
+        b.iter(|| black_box(&wide).write_scaled_string(76, 38, &mut buffer))
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, division, accumulation, fixed_point);
 criterion_main!(benches);

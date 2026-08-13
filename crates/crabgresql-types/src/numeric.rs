@@ -48,22 +48,47 @@ const POW10_I128: [i128; 39] = {
     table
 };
 
+/// `10^i` for every `i` a `u64` holds, so the common fold stays in registers.
+const POW10_U64: [u64; 20] = {
+    let mut table = [1u64; 20];
+    let mut i = 1;
+    while i < 20 {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// `10^i` as `u128`, for the steps that pull an over-wide magnitude down into a
+/// register. Separate from [`POW10_I128`] only to keep the casts out of the
+/// hot loop.
+const POW10_U128: [u128; 39] = {
+    let mut table = [1u128; 39];
+    let mut i = 1;
+    while i < 39 {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
 /// The base-10 digits of a **non-zero** magnitude, most-significant first, as a
-/// canonical [`Numeric`] scaled by `10^-scale`.
+/// canonical [`Numeric`] whose least-significant digit sits at `low`.
 ///
-/// A macro rather than a generic so each width divides by its own type —
-/// 128-bit division is a libcall, and the 64-bit path exists to avoid it — while
-/// there is still only one copy of the loop to maintain.
+/// A macro rather than a generic so each width divides by its own type. That is
+/// the whole point: dividing a `u64` by the literal 10 compiles to a multiply,
+/// while the same division on a `u128` is a call to `__udivti3`, so the two
+/// widths are not a stylistic choice — they differ by an order of magnitude per
+/// digit. One body, two instantiations.
 ///
-/// Trailing zeros are stripped *before* the digits are extracted: a scaled
-/// decimal is mostly padding (`1.5` at scale 16 is `15000000000000000`), and
-/// dividing them out, copying them, and then having `normalize` pop them again
-/// is three passes over digits that do not survive.
+/// Any remaining trailing zeros are stripped first: a scaled decimal is mostly
+/// padding (`1.5` at scale 16 is `15000000000000000`), and extracting those
+/// zeros only to have `normalize` pop them again is two wasted passes.
 macro_rules! digits_of {
-    ($mag:expr, $cap:expr, $neg:expr, $scale:expr) => {{
+    ($mag:expr, $cap:expr, $neg:expr, $low:expr, $dscale:expr) => {{
         let mut mag = $mag;
+        let mut low = $low;
         debug_assert!(mag > 0, "digits_of on zero would not terminate");
-        let mut low = -($scale as i32);
         while mag % 10 == 0 {
             mag /= 10;
             low += 1;
@@ -76,7 +101,7 @@ macro_rules! digits_of {
             len += 1;
         }
         digits[..len].reverse();
-        Numeric::from_coeff($neg, digits[..len].to_vec(), low, ($scale as i32).max(0))
+        Numeric::from_coeff($neg, digits[..len].to_vec(), low, $dscale)
     }};
 }
 
@@ -857,14 +882,26 @@ impl Numeric {
         // the sixteen zeros back out of `digit_at` — which recomputes `low` and
         // bounds-checks each time — is work proportional to the *column* rather
         // than to the value. The padding is one multiply instead.
-        let mut acc: i128 = 0;
-        for &digit in &self.digits {
-            acc = acc.checked_mul(10)?.checked_add(digit as i128)?;
-        }
         // `scaled_span` proved `low() >= -scale`, so the shift is never
         // negative and never drops a digit.
         let shift = (self.low() + scale as i32).max(0) as usize;
-        acc = acc.checked_mul(*POW10_I128.get(shift)?)?;
+        // 19 digits is what a `u64` always holds, so a value that fits folds in
+        // registers; only a genuinely wide one pays 128-bit arithmetic. The
+        // common column is well inside this — `numeric(15,2)` cannot leave it,
+        // and even a quotient at scale 16 has seventeen digits.
+        let acc = if self.digits.len() + shift <= 19 {
+            let mut acc: u64 = 0;
+            for &digit in &self.digits {
+                acc = acc * 10 + digit as u64;
+            }
+            (acc * POW10_U64[shift]) as i128
+        } else {
+            let mut acc: i128 = 0;
+            for &digit in &self.digits {
+                acc = acc.checked_mul(10)?.checked_add(digit as i128)?;
+            }
+            acc.checked_mul(*POW10_I128.get(shift)?)?
+        };
         if neg { acc.checked_neg() } else { Some(acc) }
     }
 
@@ -933,20 +970,46 @@ impl Numeric {
     /// `scale` as its display scale — which is what makes a `numeric(p, s)`
     /// column round trip exactly, trailing zeros and all.
     ///
-    /// The `u64` branch is not a micro-optimization: 128-bit division is a
-    /// libcall (`__udivti3`), and this runs per decoded cell, so taking it for
-    /// every value of a `numeric(15,2)` column — which never leaves 64 bits —
-    /// cost more than the text parsing this replaced. Both branches share one
-    /// digit loop through [`digits_of`], so only the divisor width differs.
+    /// Runs once per decoded cell, and the width it runs at is what it costs:
+    /// dividing a `u64` by 10 is a multiply, dividing a `u128` is a call to
+    /// `__udivti3`. So the whole shape of this function is "reach a `u64` in as
+    /// few 128-bit operations as possible".
+    ///
+    /// The magnitude that forces the wide path is not a large *value* — it is a
+    /// large *scale*. A column with no typmod stores at scale 16, so an
+    /// unremarkable `321000.00` becomes `3.21e21`, past `u64::MAX`, even though
+    /// it has five significant digits. Those sixteen zeros are padding the
+    /// caller does not want back, and dividing them out one at a time is
+    /// sixteen libcalls; [`POW10_U128`] removes them in chunks instead, biggest
+    /// first, and stops the moment the value fits a register.
     pub fn from_scaled_i128(v: i128, scale: i8) -> Numeric {
         if v == 0 {
             return Numeric::zero(scale.max(0) as i32);
         }
         let neg = v < 0;
-        let mag = v.unsigned_abs();
+        let mut mag = v.unsigned_abs();
+        let mut low = -(scale as i32);
+        let dscale = (scale as i32).max(0);
+        if mag > u64::MAX as u128 {
+            // Only exact divisions: a chunk that does not divide evenly would
+            // drop significant digits, so the step falls back to a smaller one.
+            for step in [16usize, 8, 4, 2, 1] {
+                let power = POW10_U128[step];
+                while mag.is_multiple_of(power) {
+                    mag /= power;
+                    low += step as i32;
+                    if mag <= u64::MAX as u128 {
+                        break;
+                    }
+                }
+                if mag <= u64::MAX as u128 {
+                    break;
+                }
+            }
+        }
         match u64::try_from(mag) {
-            Ok(mag) => digits_of!(mag, 20, neg, scale),
-            Err(_) => digits_of!(mag, 39, neg, scale),
+            Ok(mag) => digits_of!(mag, 20, neg, low, dscale),
+            Err(_) => digits_of!(mag, 39, neg, low, dscale),
         }
     }
 
