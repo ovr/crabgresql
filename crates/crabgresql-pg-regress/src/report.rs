@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::runner::SuiteReport;
+use crate::runner::{Status, SuiteReport};
 
 /// How many of the slowest tests [`Detail::Slowest`] lists.
 const SLOWEST: usize = 5;
@@ -46,14 +46,14 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> St
     // unproven rather than broken, and listing it would bury the one that failed.
     let failed: Vec<&str> = report
         .failed()
-        .filter(|o| o.ran)
+        .filter(|o| o.ran())
         .map(|o| o.name.as_str())
         .collect();
     if !failed.is_empty() {
         let names: Vec<String> = failed.iter().map(|name| format!("`{name}`")).collect();
         let _ = write!(out, "\nFailed: {}\n", names.join(", "));
     }
-    let not_run = report.outcomes.iter().filter(|o| !o.ran).count();
+    let not_run = report.outcomes.iter().filter(|o| !o.ran()).count();
     if not_run > 0 {
         let _ = write!(out, "\nNot run: {not_run} test(s) after the crash\n");
     }
@@ -78,10 +78,10 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> St
                 out,
                 "| `{}` | {} | {} |",
                 outcome.name,
-                match (outcome.passed, outcome.ran) {
-                    (true, _) => "ok",
-                    (false, true) => "**FAILED**",
-                    (false, false) => "**not run**",
+                match outcome.status {
+                    Status::Passed => "ok",
+                    Status::Failed => "**FAILED**",
+                    Status::NotRun => "**not run**",
                 },
                 format_duration(outcome.duration)
             );
@@ -98,8 +98,11 @@ mod tests {
     fn outcome(name: &str, passed: bool, millis: u64) -> TestOutcome {
         TestOutcome {
             name: name.to_string(),
-            passed,
-            ran: true,
+            status: if passed {
+                Status::Passed
+            } else {
+                Status::Failed
+            },
             duration: Duration::from_millis(millis),
         }
     }
@@ -141,7 +144,7 @@ mod tests {
     #[test]
     fn reports_a_crash_above_the_failures() {
         let not_run = TestOutcome {
-            ran: false,
+            status: Status::NotRun,
             ..outcome("later", false, 0)
         };
         let report = SuiteReport {

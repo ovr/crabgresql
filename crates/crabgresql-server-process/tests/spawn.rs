@@ -6,11 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crabgresql_server_process::{ServerProcess, locate_server_binary};
+use crabgresql_server_process::{ServerProcess, listening_line, locate_server_binary};
 use tokio_postgres::NoTls;
 
 async fn start(dir: &Path) -> anyhow::Result<ServerProcess> {
-    let binary = locate_server_binary()?;
+    let binary = locate_server_binary(None)?;
     Ok(ServerProcess::start(&binary, dir, &[], &dir.join("server.log")).await?)
 }
 
@@ -35,7 +35,7 @@ async fn starts_answers_and_stops() -> anyhow::Result<()> {
     // successful boot would mean the redirection is broken.
     let log = std::fs::read_to_string(server.log_path())?;
     assert!(
-        log.contains(&format!("listening on 127.0.0.1:{port}")),
+        log.contains(&listening_line(port)),
         "the log does not show the bound port: {log}"
     );
 

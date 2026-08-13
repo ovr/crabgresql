@@ -49,7 +49,7 @@ async fn smoke_suite_passes() -> anyhow::Result<()> {
     let schedule = std::fs::read_to_string(suite_dir.join("schedule"))?;
     let env = pinned_srcdir(&suite_dir);
     let config = SuiteConfig {
-        server_bin: locate_server_binary()?,
+        server_bin: locate_server_binary(None)?,
         regress_dir: suite_dir,
         setup: vec![],
         tests: parse_schedule(&schedule),
@@ -84,7 +84,7 @@ async fn upstream_must_pass() -> anyhow::Result<()> {
     }
     let env = pinned_srcdir(&regress_dir);
     let config = SuiteConfig {
-        server_bin: locate_server_binary()?,
+        server_bin: locate_server_binary(None)?,
         regress_dir,
         setup: vec!["test_setup".to_string()],
         tests,

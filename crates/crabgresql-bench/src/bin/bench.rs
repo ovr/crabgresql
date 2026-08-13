@@ -43,9 +43,9 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
 
-        /// The crabgresql server binary to benchmark
-        /// [default: the one built next to this executable]
-        #[arg(long, value_name = "PATH", env = crabgresql_server_process::SERVER_BIN_ENV)]
+        /// The crabgresql server binary to benchmark, also
+        /// CRABGRESQL_SERVER_BIN [default: the one built next to this executable]
+        #[arg(long, value_name = "PATH")]
         server_bin: Option<PathBuf>,
 
         /// Benchmark an external server instead (libpq connection string)

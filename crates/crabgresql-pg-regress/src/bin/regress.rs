@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crabgresql_pg_regress::report::{Detail, format_duration, markdown_summary};
-use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
+use crabgresql_pg_regress::runner::{Status, SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
 use crabgresql_server_process::locate_server_binary;
 
@@ -41,9 +41,9 @@ struct Args {
     #[arg(long, value_name = "DIR", default_value = "vendor/postgres/regress")]
     regress_dir: PathBuf,
 
-    /// The crabgresql server binary to run the suite against
-    /// [default: the one built next to this executable]
-    #[arg(long, value_name = "PATH", env = crabgresql_server_process::SERVER_BIN_ENV)]
+    /// The crabgresql server binary to run the suite against, also
+    /// CRABGRESQL_SERVER_BIN [default: the one built next to this executable]
+    #[arg(long, value_name = "PATH")]
     server_bin: Option<PathBuf>,
 
     /// Where results/ and regression.diffs are written
@@ -131,12 +131,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let server_bin = match args
-        .server_bin
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(locate_server_binary)
-    {
+    let server_bin = match locate_server_binary(args.server_bin.clone()) {
         Ok(path) => path,
         Err(e) => {
             eprintln!("regress: {e}");
@@ -170,10 +165,10 @@ async fn main() -> ExitCode {
     for outcome in &report.outcomes {
         println!(
             "{} {:width$}  {}",
-            match (outcome.passed, outcome.ran) {
-                (true, _) => "ok    ",
-                (false, true) => "FAILED",
-                (false, false) => "NOTRUN",
+            match outcome.status {
+                Status::Passed => "ok    ",
+                Status::Failed => "FAILED",
+                Status::NotRun => "NOTRUN",
             },
             outcome.name,
             format_duration(outcome.duration),

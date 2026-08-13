@@ -60,29 +60,12 @@ struct Target {
     description: String,
 }
 
-/// How long a lost connection is given to become an exit status: a dying server
-/// closes its sockets before the kernel is done with it, so the client notices
-/// first. Long enough for the SIGCHLD hop, short enough not to be felt.
-const EXIT_GRACE: Duration = Duration::from_millis(500);
-
 impl Target {
-    /// The reason the server is gone, or `None` if it is still running (always,
-    /// for an external `--url` target — that one is not ours to diagnose).
-    ///
-    /// `lost_connection` says whether the client already noticed, which is what
-    /// makes waiting for the status worth it.
+    /// Why the server is gone, or `None` if it is still running — always so for
+    /// an external `--url` target, which is not ours to diagnose.
     async fn server_died(&mut self, lost_connection: bool) -> Option<String> {
-        let server = self.server.as_mut()?;
-        let status = match lost_connection {
-            true => server.exited_within(EXIT_GRACE).await,
-            false => server.exited(),
-        };
-        let status = status.ok().flatten()?;
-        Some(format!(
-            "bench: the server exited with {status}; see {}\n{}",
-            server.log_path().display(),
-            server.log_tail(),
-        ))
+        let death = self.server.as_mut()?.death(lost_connection).await.ok()??;
+        Some(format!("bench: {death}\n{}", death.log_tail))
     }
 }
 
@@ -517,10 +500,7 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
             (Some(dir), path)
         }
     };
-    let binary = match &config.server_bin {
-        Some(path) => path.clone(),
-        None => locate_server_binary()?,
-    };
+    let binary = locate_server_binary(config.server_bin.clone())?;
     // The dataset is streamed in through `COPY … FROM STDIN`, so the server
     // needs no read access outside its own data directory.
     let server = ServerProcess::start(&binary, &path, &[], &path.join("server.log"))

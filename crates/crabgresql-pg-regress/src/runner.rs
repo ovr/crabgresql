@@ -17,20 +17,8 @@ use crate::format;
 use crate::psql_var::{self, Variables};
 use crate::script::{QueryEnd, ScriptItem, is_copy_from_stdin, lex};
 
-/// psql's wording when a connection dies, and the hint that the server behind
-/// it may have crashed.
+/// psql's wording when a connection dies.
 const CONNECTION_LOST: &str = "connection to server was lost\n";
-
-/// How long a lost connection is given to turn into a child exit status before
-/// the runner concludes the server is still alive.
-///
-/// It only has to cover the SIGCHLD hop: a dying server's socket close is part
-/// of the same teardown as its exit. Kept short because a script can lose its
-/// connection for reasons of its own — a desync after a failed `COPY`, say — and
-/// that test would otherwise pay the whole window on a healthy server. Missing
-/// the window is self-correcting: the next test's connect is refused and the
-/// crash is reported one test later.
-const EXIT_GRACE: Duration = Duration::from_millis(500);
 
 pub struct SuiteConfig {
     /// The `crabgresql` binary to run the suite against, from
@@ -94,13 +82,19 @@ pub fn regress_environment(regress_dir: &Path, outdir: &Path) -> BTreeMap<String
     .collect()
 }
 
+/// How one test ended. `NotRun` is a failure — nothing proved the test passes —
+/// but it is not a regression of its own: the server was gone before its turn
+/// came.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Passed,
+    Failed,
+    NotRun,
+}
+
 pub struct TestOutcome {
     pub name: String,
-    pub passed: bool,
-    /// False for a test the run never reached because the server died first.
-    /// Still a failure — nothing proved it passes — but not a regression of its
-    /// own.
-    pub ran: bool,
+    pub status: Status,
     /// Wall-clock time spent executing the script, without the diff against
     /// `expected/`.
     pub duration: Duration,
@@ -110,10 +104,18 @@ impl TestOutcome {
     fn not_run(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            passed: false,
-            ran: false,
+            status: Status::NotRun,
             duration: Duration::ZERO,
         }
+    }
+
+    pub fn passed(&self) -> bool {
+        self.status == Status::Passed
+    }
+
+    /// Whether the run got as far as this test at all.
+    pub fn ran(&self) -> bool {
+        self.status != Status::NotRun
     }
 }
 
@@ -130,7 +132,7 @@ pub struct SuiteReport {
 
 impl SuiteReport {
     pub fn passed(&self) -> usize {
-        self.outcomes.iter().filter(|o| o.passed).count()
+        self.outcomes.iter().filter(|o| o.passed()).count()
     }
 
     pub fn total(&self) -> usize {
@@ -142,7 +144,7 @@ impl SuiteReport {
     }
 
     pub fn failed(&self) -> impl Iterator<Item = &TestOutcome> {
-        self.outcomes.iter().filter(|o| !o.passed)
+        self.outcomes.iter().filter(|o| !o.passed())
     }
 
     /// The `n` longest-running tests, slowest first.
@@ -192,40 +194,48 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
         // tests); they can only fail, but they must not abort the run.
         let sql = String::from_utf8_lossy(&std::fs::read(&sql_path)?).into_owned();
         let test_started = Instant::now();
-        let output = run_test(port, &sql, config.statement_timeout, &environment).await?;
+        let run = match run_test(port, &sql, config.statement_timeout, &environment).await {
+            Ok(run) => run,
+            // The script could not even connect. Either the server is gone —
+            // the case this whole mechanism exists for — or the runner ran out
+            // of something of its own, which is not a regression to report.
+            Err(_) if server.death(true).await?.is_some() => TestRun {
+                output: CONNECTION_LOST.to_string(),
+                lost_connection: true,
+            },
+            Err(e) => return Err(e),
+        };
         let duration = test_started.elapsed();
         let result_path = results_dir.join(format!("{name}.out"));
-        std::fs::write(&result_path, &output)?;
+        std::fs::write(&result_path, &run.output)?;
         if check {
-            let passed = compare(config, name, &output, &result_path, &mut diffs)?;
+            let passed = compare(config, name, &run.output, &result_path, &mut diffs)?;
             outcomes.push(TestOutcome {
                 name: name.clone(),
-                passed,
-                ran: true,
+                status: if passed {
+                    Status::Passed
+                } else {
+                    Status::Failed
+                },
                 duration,
             });
         }
         // A dead server makes every later test meaningless, so the run stops
-        // here. A lost connection is worth waiting on: that is what a crash
-        // looks like from the client side, a beat before the status exists.
-        let exit = if output.contains(CONNECTION_LOST) {
-            server.exited_within(EXIT_GRACE).await?
-        } else {
-            server.exited()?
-        };
-        let Some(status) = exit else {
+        // here.
+        let Some(death) = server.death(run.lost_connection).await? else {
             continue;
         };
         let reason = format!(
-            "server exited with {status} during test {name}; see {}",
-            server.log_path().display()
+            "server exited with {} during test {name}; see {}",
+            death.status,
+            death.log_path.display()
         );
-        diffs.push_str(&format!("{reason}\n{}\n\n", server.log_tail()));
+        diffs.push_str(&format!("{reason}\n{}\n\n", death.log_tail));
         if !check {
             // A setup test took the server with it: there is no partial
             // report to return, only the crash.
             std::fs::write(&diffs_path, &diffs)?;
-            return Err(io::Error::other(format!("{reason}\n{}", server.log_tail())));
+            return Err(io::Error::other(format!("{reason}\n{}", death.log_tail)));
         }
         let ran: usize = outcomes.len();
         outcomes.extend(
@@ -304,6 +314,15 @@ fn expected_candidates(regress_dir: &Path, name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// What one script produced: the text psql would have printed, and whether its
+/// connection died on the way. The flag is reported rather than left to be read
+/// back out of the text, so that deciding "the server may be gone" does not
+/// depend on the wording of an emulated psql message.
+struct TestRun {
+    output: String,
+    lost_connection: bool,
+}
+
 /// Execute one script on a fresh connection, producing the text psql would
 /// print. A timeout or lost connection appends a deterministic marker and
 /// abandons the rest of the file, like a dying psql would.
@@ -312,17 +331,12 @@ async fn run_test(
     sql: &str,
     statement_timeout: Duration,
     environment: &BTreeMap<String, String>,
-) -> io::Result<String> {
-    let mut client = match Client::connect(port).await {
-        Ok(client) => client,
-        // A refused or reset connection is a server that died between tests:
-        // report it as a lost connection, so the caller attributes it to the
-        // crash. Anything else — out of file descriptors, out of memory — is the
-        // runner's own problem and must not be dressed up as 200 regressions.
-        Err(e) if is_connection_lost(&e) => return Ok(CONNECTION_LOST.to_string()),
-        Err(e) => return Err(e),
-    };
+) -> io::Result<TestRun> {
+    let mut client = Client::connect(port).await?;
     let mut out = String::new();
+    // Set with every `CONNECTION_LOST` below: the marker is what psql prints,
+    // this is what the caller acts on.
+    let mut lost_connection = false;
     // psql's output settings, scoped to this script: `\pset`, `\x`, `\a`
     // and `\t` all change them.
     let mut printing = format::Printing::default();
@@ -391,6 +405,7 @@ async fn run_test(
                         Ok(fresh) => client = fresh,
                         Err(_) => {
                             out.push_str(CONNECTION_LOST);
+                            lost_connection = true;
                             break;
                         }
                     }
@@ -405,6 +420,7 @@ async fn run_test(
                             // connection: mark it and abandon the file.
                             Err(_) => {
                                 out.push_str(CONNECTION_LOST);
+                                lost_connection = true;
                                 break;
                             }
                         }
@@ -462,6 +478,7 @@ async fn run_test(
                         Ok(Ok(events)) => events,
                         Ok(Err(_)) => {
                             out.push_str(CONNECTION_LOST);
+                            lost_connection = true;
                             break;
                         }
                         Err(_) => {
@@ -504,6 +521,7 @@ async fn run_test(
                                 }
                                 Ok(Err(_)) => {
                                     lost = Some(CONNECTION_LOST);
+                                    lost_connection = true;
                                     break;
                                 }
                                 Err(_) => {
@@ -541,6 +559,7 @@ async fn run_test(
                     Ok(Ok(events)) => render_events(&mut out, &events, &statement, &printing),
                     Ok(Err(_)) => {
                         out.push_str(CONNECTION_LOST);
+                        lost_connection = true;
                         break;
                     }
                     Err(_) => {
@@ -551,20 +570,10 @@ async fn run_test(
             }
         }
     }
-    Ok(out)
-}
-
-/// Whether an I/O error means the server is gone, as opposed to the runner
-/// having run out of something.
-fn is_connection_lost(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::UnexpectedEof
-    )
+    Ok(TestRun {
+        output: out,
+        lost_connection,
+    })
 }
 
 /// Print a statement's responses: result tables, errors and notices. Command

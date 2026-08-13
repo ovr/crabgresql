@@ -158,14 +158,14 @@ The server binary is taken from next to the `regress` executable
 points the run at another one. Its output goes to `<outdir>/server.log` — that
 is where a crash's backtrace is, and a server that dies mid-run stops the run
 with the remaining tests reported as `NOTRUN` instead of taking the runner down
-with it.
+with it. `CRABGRESQL_SERVER_LOG` sets the child's `RUST_LOG` for that file; the
+ambient one is not inherited, so an unrelated `RUST_LOG=trace` cannot bury it.
 
 The score is the compatibility dashboard, so a near-zero percentage at M0 is
 expected and honest. Regression protection lives in `cargo test`: the
 crabgresql-authored smoke suite must always pass, plus every upstream test
 promoted to `crates/crabgresql-pg-regress/suites/upstream_must_pass.txt` as
-coverage grows. Those two tests need the server binary too, so build it first
-(a plain `cargo build --workspace --all-targets`, as CI runs, covers it).
+coverage grows. Those two tests need the server binary too — see AGENTS.md.
 
 ## Benchmarks
 

@@ -9,10 +9,11 @@
 //! reports, with the server's stderr preserved in its log file.
 
 use std::io;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
@@ -31,6 +32,11 @@ const SERVER_BIN_NAME: &str = "crabgresql";
 const BUILD_HINT: &str = "build it with `cargo build -p crabgresql-server --bin crabgresql`, \
                           or point CRABGRESQL_SERVER_BIN at it";
 
+/// The harness only ever runs a server for itself, so every socket here is a
+/// loopback one; the three places that say so have to agree or startup can only
+/// fail as a timeout.
+const LOOPBACK: &str = "127.0.0.1";
+
 /// How long the server may take to accept its first connection. Generous
 /// because startup includes opening the engine and running crash recovery, and
 /// a loaded CI machine is slow at both.
@@ -43,7 +49,21 @@ const READY_POLL: Duration = Duration::from_millis(20);
 /// way, most often — and the child then dies with "address in use".
 const PORT_ATTEMPTS: usize = 5;
 
+/// How long a lost connection is given to become an exit status.
+///
+/// It only has to cover the SIGCHLD hop: a dying server's socket close is part
+/// of the same teardown as its exit. Kept short because a client can lose its
+/// connection for reasons of its own, and would otherwise pay the whole window
+/// against a healthy server.
+pub const EXIT_GRACE: Duration = Duration::from_millis(500);
+
 const LOG_TAIL_LINES: usize = 40;
+
+/// How much of the log's end is read, both for [`ServerProcess::log_tail`] and
+/// while waiting for the readiness line. Bounds the work per poll: a log written
+/// under a debug filter grows without bound, and the readiness loop reads it
+/// every [`READY_POLL`].
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// A running `crabgresql` child process, killed on drop.
 pub struct ServerProcess {
@@ -52,10 +72,18 @@ pub struct ServerProcess {
     log_path: PathBuf,
 }
 
-/// The `crabgresql` binary to spawn: `CRABGRESQL_SERVER_BIN` if set, otherwise
-/// the one built alongside the running executable — `target/<profile>/` for a
-/// binary, and its parent for a test harness in `target/<profile>/deps/`.
-pub fn locate_server_binary() -> io::Result<PathBuf> {
+/// The `crabgresql` binary to spawn: `explicit` if a caller was given one on its
+/// command line, else `CRABGRESQL_SERVER_BIN`, else the one built alongside the
+/// running executable — `target/<profile>/` for a binary, and its parent for a
+/// test harness in `target/<profile>/deps/`.
+///
+/// The whole rule lives here, rather than each caller resolving its own flag, so
+/// that one of them cannot end up reading the environment variable by a
+/// different path and skipping the checks below.
+pub fn locate_server_binary(explicit: Option<PathBuf>) -> io::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
     if let Some(path) = std::env::var_os(SERVER_BIN_ENV) {
         let path = PathBuf::from(path);
         if !path.exists() {
@@ -68,15 +96,10 @@ pub fn locate_server_binary() -> io::Result<PathBuf> {
     }
     let exe = std::env::current_exe()?;
     let name = format!("{SERVER_BIN_NAME}{}", std::env::consts::EXE_SUFFIX);
-    let candidates: Vec<PathBuf> = exe
-        .parent()
+    exe.parent()
         .into_iter()
         .flat_map(|dir| [dir.join(&name), dir.join("..").join(&name)])
-        .collect();
-    candidates
-        .iter()
         .find(|path| path.is_file())
-        .cloned()
         .ok_or_else(|| {
             io::Error::other(format!(
                 "cannot find the {SERVER_BIN_NAME} server binary near {} — {BUILD_HINT}",
@@ -118,7 +141,7 @@ impl ServerProcess {
                 Err(StartError::Timeout(e)) => return Err(e),
             }
         }
-        Err(last.unwrap_or_else(|| io::Error::other("no server start attempts were made")))
+        Err(last.expect("PORT_ATTEMPTS is not zero, so a failure was recorded"))
     }
 
     pub fn port(&self) -> u16 {
@@ -150,6 +173,23 @@ impl ServerProcess {
             Ok(status) => status.map(Some),
             Err(_elapsed) => Ok(None),
         }
+    }
+
+    /// What is known about a server that is no longer running, or `None` while
+    /// it is alive.
+    ///
+    /// `lost_connection` says whether a client already noticed, which is what
+    /// makes waiting [`EXIT_GRACE`] for the status worth it.
+    pub async fn death(&mut self, lost_connection: bool) -> io::Result<Option<ServerDeath>> {
+        let status = match lost_connection {
+            true => self.exited_within(EXIT_GRACE).await?,
+            false => self.exited()?,
+        };
+        Ok(status.map(|status| ServerDeath {
+            status,
+            log_path: self.log_path.clone(),
+            log_tail: self.log_tail(),
+        }))
     }
 
     /// The end of the log, which is where a panic's message and backtrace are.
@@ -184,18 +224,11 @@ impl ServerProcess {
         let port = self.port;
         let log_path = self.log_path.clone();
         let needle = listening_line(port);
-        let announced = async {
-            let deadline = Instant::now() + READY_TIMEOUT;
-            loop {
-                if std::fs::read_to_string(&log_path).is_ok_and(|log| log.contains(&needle)) {
-                    return true;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
+        let announced = tokio::time::timeout(READY_TIMEOUT, async {
+            while !log_end(&log_path).contains(&needle) {
                 tokio::time::sleep(READY_POLL).await;
             }
-        };
+        });
         tokio::select! {
             status = self.child.wait() => Err(StartError::ChildExited(match status {
                 Ok(status) => io::Error::other(format!(
@@ -205,27 +238,44 @@ impl ServerProcess {
                 )),
                 Err(e) => e,
             })),
-            ready = announced => if ready {
-                Ok(())
-            } else {
-                Err(StartError::Timeout(io::Error::other(format!(
+            ready = announced => ready.map_err(|_elapsed| {
+                StartError::Timeout(io::Error::other(format!(
                     "server did not report listening on port {port} within \
                      {READY_TIMEOUT:?}; see {}\n{}",
                     log_path.display(),
                     log_tail(&log_path, LOG_TAIL_LINES),
-                ))))
-            },
+                )))
+            }),
         }
     }
 }
 
 /// What the server logs once its listener is up, which is what
-/// [`ServerProcess::wait_ready`] waits for. Kept in one place because the
-/// harness reads a line the server writes: the integration test asserts the
-/// same text, so a reworded message fails there rather than only as a startup
-/// timeout here.
-fn listening_line(port: u16) -> String {
-    format!("listening on 127.0.0.1:{port}")
+/// [`ServerProcess::start`] waits for. Public because the harness reads a line
+/// the server writes: the integration test asserts this same text, so a reworded
+/// message fails there rather than only as a startup timeout here.
+pub fn listening_line(port: u16) -> String {
+    format!("listening on {LOOPBACK}:{port}")
+}
+
+/// A server that is no longer running, and the evidence a caller reports it
+/// with. `Display` is the sentence both harnesses build their own wording
+/// around; `log_tail` is kept separate because they place it differently.
+pub struct ServerDeath {
+    pub status: ExitStatus,
+    pub log_path: PathBuf,
+    pub log_tail: String,
+}
+
+impl std::fmt::Display for ServerDeath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server exited with {}; see {}",
+            self.status,
+            self.log_path.display()
+        )
+    }
 }
 
 /// Why a start attempt failed, which decides whether another port would help.
@@ -253,7 +303,7 @@ fn spawn(
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--listen-address")
-        .arg("127.0.0.1")
+        .arg(LOOPBACK)
         .arg("--port")
         .arg(port.to_string());
     for path in copy_allow {
@@ -301,19 +351,39 @@ fn log_filter() -> String {
 /// A port nothing is listening on, found by binding one and letting it go. The
 /// server binds it again a moment later; see [`PORT_ATTEMPTS`] for the gap.
 fn free_port() -> io::Result<u16> {
-    let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
+    let listener = StdTcpListener::bind((LOOPBACK, 0))?;
     listener.local_addr().map(|addr| addr.port())
 }
 
 /// The last `lines` lines of a file, or a note about why there are none.
 fn log_tail(path: &Path, lines: usize) -> String {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => return format!("({}: {e})", path.display()),
-    };
+    if let Err(e) = std::fs::metadata(path) {
+        return format!("({}: {e})", path.display());
+    }
+    let text = log_end(path);
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);
     all[start..].join("\n")
+}
+
+/// The last [`LOG_TAIL_BYTES`] of a file, or the empty string if it cannot be
+/// read — the callers are looking for text in it, not opening it for its own
+/// sake. Lossy, because the window can start mid-character.
+fn log_end(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    if size > LOG_TAIL_BYTES && file.seek(SeekFrom::End(-(LOG_TAIL_BYTES as i64))).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -347,7 +417,7 @@ mod tests {
     /// Readiness must not be declared on someone else's socket.
     #[tokio::test]
     async fn a_child_that_lost_its_port_is_not_ready() {
-        let binary = locate_server_binary().expect("the server binary");
+        let binary = locate_server_binary(None).expect("the server binary");
         let dir = tempfile::tempdir().expect("a temp dir");
         let log_path = dir.path().join("server.log");
         // Held open for the whole test: this is the listener the probe finds.
