@@ -19,6 +19,9 @@ pub struct SuiteRun {
     /// Time the load took, when this run loaded the dataset.
     pub load_time: Option<Duration>,
     pub queries: Vec<QueryRun>,
+    /// Set when the server died mid-run, which makes `queries` a partial list.
+    /// Kept out of the JSON, which is shaped like the upstream result files.
+    pub crash: Option<String>,
 }
 
 /// One loaded table and how many rows it holds.
@@ -193,6 +196,9 @@ impl SuiteRun {
             self.succeeded(),
             self.queries.len(),
         );
+        if let Some(crash) = &self.crash {
+            let _ = writeln!(out, "\n{crash}");
+        }
         out
     }
 
@@ -313,6 +319,7 @@ mod tests {
                 rows: 10,
             }],
             load_time: Some(Duration::from_secs(1)),
+            crash: None,
             queries: vec![
                 QueryRun {
                     number: 1,
@@ -333,6 +340,22 @@ mod tests {
         let run = run();
         assert_eq!(run.queries[0].best(), Some(0.25));
         assert_eq!(run.queries[1].best(), None);
+    }
+
+    /// A crashed server is the reason the table stops where it does, so it has
+    /// to be under the table rather than only on stderr.
+    #[test]
+    fn table_carries_the_crash_reason() {
+        let crashed = SuiteRun {
+            crash: Some("bench: the server exited with signal: 6".to_string()),
+            ..run()
+        };
+        assert!(
+            crashed.table().contains("the server exited with signal: 6"),
+            "{}",
+            crashed.table()
+        );
+        assert!(!run().table().contains("exited"));
     }
 
     #[test]

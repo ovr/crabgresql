@@ -237,6 +237,14 @@ jobs:
             "ClickBench — parquet, ${CLICKBENCH_ROWS} rows" \
             target/bench/clickbench.txt > target/bench/clickbench.md
 
+      # The server runs as a child process and logs into its data directory,
+      # which is outside the uploaded tree; a crash's backtrace is in there.
+      - name: collect the server log
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/clickbench-data/server.log" \
+             target/bench/clickbench.server.log || true
+
       - name: upload results
         if: always()
         uses: actions/upload-artifact@v7
@@ -307,6 +315,12 @@ jobs:
             "TPC-H — ${{ matrix.am }}, sf=0.01" \
             target/bench/tpch-${{ matrix.am }}.txt \
             > target/bench/tpch-${{ matrix.am }}.md
+
+      - name: collect the server log
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/tpch-${{ matrix.am }}/server.log" \
+             target/bench/tpch-${{ matrix.am }}.server.log || true
 
       # The name has to keep the `bench-` prefix: that is what bench-report
       # downloads by pattern.

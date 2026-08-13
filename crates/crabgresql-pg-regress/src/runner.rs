@@ -23,7 +23,14 @@ const CONNECTION_LOST: &str = "connection to server was lost\n";
 
 /// How long a lost connection is given to turn into a child exit status before
 /// the runner concludes the server is still alive.
-const EXIT_GRACE: Duration = Duration::from_secs(2);
+///
+/// It only has to cover the SIGCHLD hop: a dying server's socket close is part
+/// of the same teardown as its exit. Kept short because a script can lose its
+/// connection for reasons of its own — a desync after a failed `COPY`, say — and
+/// that test would otherwise pay the whole window on a healthy server. Missing
+/// the window is self-correcting: the next test's connect is refused and the
+/// crash is reported one test later.
+const EXIT_GRACE: Duration = Duration::from_millis(500);
 
 pub struct SuiteConfig {
     /// The `crabgresql` binary to run the suite against, from
@@ -306,10 +313,14 @@ async fn run_test(
     statement_timeout: Duration,
     environment: &BTreeMap<String, String>,
 ) -> io::Result<String> {
-    // The server died between tests: report it as a lost connection so the
-    // caller attributes it to the crash instead of to an errno.
-    let Ok(mut client) = Client::connect(port).await else {
-        return Ok(CONNECTION_LOST.to_string());
+    let mut client = match Client::connect(port).await {
+        Ok(client) => client,
+        // A refused or reset connection is a server that died between tests:
+        // report it as a lost connection, so the caller attributes it to the
+        // crash. Anything else — out of file descriptors, out of memory — is the
+        // runner's own problem and must not be dressed up as 200 regressions.
+        Err(e) if is_connection_lost(&e) => return Ok(CONNECTION_LOST.to_string()),
+        Err(e) => return Err(e),
     };
     let mut out = String::new();
     // psql's output settings, scoped to this script: `\pset`, `\x`, `\a`
@@ -541,6 +552,19 @@ async fn run_test(
         }
     }
     Ok(out)
+}
+
+/// Whether an I/O error means the server is gone, as opposed to the runner
+/// having run out of something.
+fn is_connection_lost(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// Print a statement's responses: result tables, errors and notices. Command

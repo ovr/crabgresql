@@ -134,7 +134,9 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    if report.succeeded() == report.queries.len() {
+    // A crash fails the run even when every query it got to ran: the report is
+    // a partial one, and the queries after it were never measured.
+    if report.crash.is_none() && report.succeeded() == report.queries.len() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

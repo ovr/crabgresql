@@ -48,6 +48,24 @@ for the entire codebase:
   explicit versioned/back-compatible decoding) and **PG-facing observable
   behavior** (wire protocol, SQL surface, error text/SQLSTATE, EXPLAIN output).
 
+## Running the harnesses
+
+Both harnesses drive the shipped server as a child process, so the binary has to
+exist before they run:
+
+```console
+$ cargo build -p crabgresql-server --bin crabgresql
+```
+
+That is a prerequisite of `cargo test -p crabgresql-pg-regress`, `cargo test -p
+crabgresql-server-process` and every `bench` run; without it they fail with a
+message naming this command. `cargo build --workspace --all-targets` — what CI
+runs before `cargo test --workspace` — covers it, which is why the full test run
+needs nothing extra. Cargo has no stable way for a crate to depend on another
+crate's *binary*, so this stays a manual step rather than something the tests
+build for you: a nested `cargo build` inside a test would block on the outer
+build-directory lock and hang.
+
 ## Regression test scoreboard
 
 - When you land work that changes how many regression tests pass — promoting a

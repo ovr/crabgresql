@@ -46,13 +46,44 @@ pub struct RunConfig {
     pub reload: bool,
 }
 
-/// The server under test, kept alive for the length of the run. The child
-/// process is killed when this is dropped, whichever way the run ended.
+/// The server under test, kept alive for the length of the run. The child is
+/// killed when this is dropped, whichever way the run ended.
+///
+/// Field order is load-bearing: fields drop in declaration order, so the server
+/// has to be listed before the temporary data directory. The other way round
+/// unlinks the tree while the flush worker is still writing to it, which leaves
+/// a re-created directory behind in `/tmp`.
 struct Target {
+    server: Option<ServerProcess>,
+    _data_dir: Option<tempfile::TempDir>,
     conninfo: String,
     description: String,
-    _data_dir: Option<tempfile::TempDir>,
-    _server: Option<ServerProcess>,
+}
+
+/// How long a lost connection is given to become an exit status: a dying server
+/// closes its sockets before the kernel is done with it, so the client notices
+/// first. Long enough for the SIGCHLD hop, short enough not to be felt.
+const EXIT_GRACE: Duration = Duration::from_millis(500);
+
+impl Target {
+    /// The reason the server is gone, or `None` if it is still running (always,
+    /// for an external `--url` target — that one is not ours to diagnose).
+    ///
+    /// `lost_connection` says whether the client already noticed, which is what
+    /// makes waiting for the status worth it.
+    async fn server_died(&mut self, lost_connection: bool) -> Option<String> {
+        let server = self.server.as_mut()?;
+        let status = match lost_connection {
+            true => server.exited_within(EXIT_GRACE).await,
+            false => server.exited(),
+        };
+        let status = status.ok().flatten()?;
+        Some(format!(
+            "bench: the server exited with {status}; see {}\n{}",
+            server.log_path().display(),
+            server.log_tail(),
+        ))
+    }
 }
 
 /// What the load phase established about the dataset under test.
@@ -88,11 +119,12 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
         );
     }
 
-    let target = start_target(config).await?;
+    let mut target = start_target(config).await?;
     let mut client = client::connect(&target.conninfo).await?;
     let loaded = load_if_needed(&client, suite, config).await?;
 
-    let mut results = Vec::with_capacity(queries.len());
+    let total_queries = queries.len();
+    let mut results = Vec::with_capacity(total_queries);
     for query in queries {
         let mut runs = Vec::with_capacity(config.runs as usize);
         for _ in 0..config.runs {
@@ -116,7 +148,23 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
                 // silent stall is indistinguishable from a hang.
                 eprintln!("  q{:<3} {:>9}  {}", query.number, "-", outcome.summary());
             }
+            let lost_connection = matches!(outcome, Outcome::Disconnected(_));
             runs.push(outcome);
+            // A dead server makes every later query meaningless, and reconnecting
+            // to it would spend the timeout to say so once per query. Report what
+            // was measured, with the reason and the server's own log.
+            if broken && let Some(reason) = target.server_died(lost_connection).await {
+                eprintln!("{reason}");
+                results.push(QueryRun {
+                    number: query.number,
+                    runs,
+                });
+                let reason = format!(
+                    "{reason}\n{} of {total_queries} queries did not run.",
+                    total_queries - results.len(),
+                );
+                return Ok(report(suite, &target, &loaded, results, Some(reason)));
+            }
             if broken {
                 match reconnect(&target.conninfo, config.timeout).await {
                     Ok(fresh) => client = fresh,
@@ -128,7 +176,7 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
                             number: query.number,
                             runs,
                         });
-                        return Ok(report(suite, &target, &loaded, results));
+                        return Ok(report(suite, &target, &loaded, results, None));
                     }
                 }
             }
@@ -156,10 +204,16 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
         results.push(result);
     }
 
-    Ok(report(suite, &target, &loaded, results))
+    Ok(report(suite, &target, &loaded, results, None))
 }
 
-fn report(suite: &Suite, target: &Target, loaded: &Loaded, queries: Vec<QueryRun>) -> SuiteRun {
+fn report(
+    suite: &Suite,
+    target: &Target,
+    loaded: &Loaded,
+    queries: Vec<QueryRun>,
+    crash: Option<String>,
+) -> SuiteRun {
     SuiteRun {
         suite: suite.name.to_string(),
         target: target.description.clone(),
@@ -167,6 +221,7 @@ fn report(suite: &Suite, target: &Target, loaded: &Loaded, queries: Vec<QueryRun
         tables: loaded.tables.clone(),
         load_time: loaded.time,
         queries,
+        crash,
     }
 }
 
@@ -443,10 +498,10 @@ fn no_data_hint(suite: &Suite) -> String {
 async fn start_target(config: &RunConfig) -> Result<Target> {
     if let Some(url) = &config.url {
         return Ok(Target {
+            server: None,
+            _data_dir: None,
             conninfo: url.clone(),
             description: format!("external server ({url})"),
-            _data_dir: None,
-            _server: None,
         });
     }
 
@@ -477,9 +532,9 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
             "host=127.0.0.1 port={} user=postgres dbname=bench",
             server.port()
         ),
-        description: format!("CrabgreSQL ({})", path.display()),
+        server: Some(server),
         _data_dir: temp_dir,
-        _server: Some(server),
+        description: format!("CrabgreSQL ({})", path.display()),
     })
 }
 
