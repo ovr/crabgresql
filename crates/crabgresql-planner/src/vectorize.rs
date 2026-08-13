@@ -188,10 +188,27 @@ fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
 /// Whether a projection is a pure column take — a reorder or a constant, never
 /// a computation. Only such a projection keeps the columnar segment alive as far
 /// as a sort, because a [`SortKey`] indexes the *projected* tuple.
+///
+/// Stricter than [`vectorizable_predicate`] about constants, and for a reason a
+/// predicate does not have: a projected constant is **handed to the client**,
+/// while a predicate's only reaches a comparison kernel. A `numeric` constant
+/// encodes at the storage decimal's fixed scale (see
+/// [`crabgresql_storage_api::arrow::encoding_ignores_typmod`]) and would print
+/// `1.5000000000000000` where the row path prints `1.50`, so it declines here.
 pub fn vectorizable_projection(projections: &[BoundExpr], width: usize) -> bool {
     projections
         .iter()
-        .all(|expr| vectorizable_operand(expr, width))
+        .all(|expr| vectorizable_operand(expr, width) && projectable_constant(expr))
+}
+
+/// Whether a projected constant renders the same through a batch as through a
+/// row. Trivially true of anything that is not a constant.
+fn projectable_constant(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Collate { expr, .. } => projectable_constant(expr),
+        BoundExpr::Const { ty, .. } => crabgresql_storage_api::arrow::encoding_ignores_typmod(*ty),
+        _ => true,
+    }
 }
 
 /// The tail a scan-bearing plan node carries, in the order the executor applies

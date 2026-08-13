@@ -36,6 +36,50 @@ const MAX_RESULT_SCALE: i32 = 1000;
 /// a result whose weight exceeds this overflows the numeric format.
 const MAX_DECIMAL_WEIGHT: f64 = ((MAX_NBASE_WEIGHT + 1) * 4) as f64;
 
+/// `10^i` for every `i` a 128-bit decimal can shift by, so scaling by the
+/// stored digits' distance from the point is one multiply rather than a loop.
+const POW10_I128: [i128; 39] = {
+    let mut table = [1i128; 39];
+    let mut i = 1;
+    while i < 39 {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// The base-10 digits of a **non-zero** magnitude, most-significant first, as a
+/// canonical [`Numeric`] scaled by `10^-scale`.
+///
+/// A macro rather than a generic so each width divides by its own type —
+/// 128-bit division is a libcall, and the 64-bit path exists to avoid it — while
+/// there is still only one copy of the loop to maintain.
+///
+/// Trailing zeros are stripped *before* the digits are extracted: a scaled
+/// decimal is mostly padding (`1.5` at scale 16 is `15000000000000000`), and
+/// dividing them out, copying them, and then having `normalize` pop them again
+/// is three passes over digits that do not survive.
+macro_rules! digits_of {
+    ($mag:expr, $cap:expr, $neg:expr, $scale:expr) => {{
+        let mut mag = $mag;
+        debug_assert!(mag > 0, "digits_of on zero would not terminate");
+        let mut low = -($scale as i32);
+        while mag % 10 == 0 {
+            mag /= 10;
+            low += 1;
+        }
+        let mut digits = [0u8; $cap];
+        let mut len = 0;
+        while mag > 0 {
+            digits[len] = (mag % 10) as u8;
+            mag /= 10;
+            len += 1;
+        }
+        digits[..len].reverse();
+        Numeric::from_coeff($neg, digits[..len].to_vec(), low, ($scale as i32).max(0))
+    }};
+}
+
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 enum Sign {
     Pos,
@@ -159,19 +203,14 @@ impl Numeric {
     }
 
     /// Exact conversion from a signed 128-bit integer (used by int→numeric).
+    ///
+    /// An integer is a fixed-point value of scale 0, so this is
+    /// [`Numeric::from_scaled_i128`] with nothing after the point — worth
+    /// spelling that way rather than keeping a second digit loop, since the two
+    /// would otherwise have to agree about canonicalization by hand. It is also
+    /// the hot one (`sum`/`avg` call it per row) and inherits the 64-bit divide.
     pub fn from_i128(v: i128) -> Numeric {
-        if v == 0 {
-            return Numeric::zero(0);
-        }
-        let neg = v < 0;
-        let mut mag = v.unsigned_abs();
-        let mut rev = Vec::new();
-        while mag > 0 {
-            rev.push((mag % 10) as u8);
-            mag /= 10;
-        }
-        rev.reverse();
-        Numeric::from_coeff(neg, rev, 0, 0)
+        Numeric::from_scaled_i128(v, 0)
     }
 
     /// `float8_numeric`/`float4_numeric`: render `v` with `sig` significant
@@ -800,16 +839,21 @@ impl Numeric {
     ///
     /// `None` for NaN and ±Infinity too: neither has a fixed-point image.
     pub fn to_scaled_i128(&self, precision: u8, scale: i8) -> Option<i128> {
-        let (neg, hi) = self.scaled_span(precision, scale)?;
-        // Accumulated straight off `digit_at`, with no intermediate buffer:
-        // this runs once per stored value, and an allocation here showed up as
-        // whole percent of a fragment write.
+        let (neg, _) = self.scaled_span(precision, scale)?;
+        // Walks the *stored* digits, not the decimal positions between `hi` and
+        // `-scale`. Those differ by the scale's padding: `5` in a column of
+        // scale 16 has one stored digit and seventeen positions, and reading
+        // the sixteen zeros back out of `digit_at` — which recomputes `low` and
+        // bounds-checks each time — is work proportional to the *column* rather
+        // than to the value. The padding is one multiply instead.
         let mut acc: i128 = 0;
-        for pos in (-(scale as i32)..=hi).rev() {
-            acc = acc
-                .checked_mul(10)?
-                .checked_add(self.digit_at(pos) as i128)?;
+        for &digit in &self.digits {
+            acc = acc.checked_mul(10)?.checked_add(digit as i128)?;
         }
+        // `scaled_span` proved `low() >= -scale`, so the shift is never
+        // negative and never drops a digit.
+        let shift = (self.low() + scale as i32).max(0) as usize;
+        acc = acc.checked_mul(*POW10_I128.get(shift)?)?;
         if neg { acc.checked_neg() } else { Some(acc) }
     }
 
@@ -829,9 +873,16 @@ impl Numeric {
         Some(out)
     }
 
+    /// Whether the value is **exactly** representable as
+    /// `numeric(precision, scale)` — the question every fixed-point conversion
+    /// here asks first, and the one a storage mapping asks to decide whether a
+    /// column can hold a value at all.
+    pub fn fits_decimal(&self, precision: u8, scale: i8) -> bool {
+        self.scaled_span(precision, scale).is_some()
+    }
+
     /// The sign and leading digit position of `self * 10^scale`, or `None` when
-    /// the value does not fit `numeric(precision, scale)`. The digits
-    /// themselves are then read off `digit_at` from `hi` down to `-scale`.
+    /// the value does not fit `numeric(precision, scale)`.
     ///
     /// Two ways to not fit, and both are refusals rather than approximations:
     /// a digit below position `-scale` (the value needs a finer scale than the
@@ -866,7 +917,8 @@ impl Numeric {
     /// The `u64` branch is not a micro-optimization: 128-bit division is a
     /// libcall (`__udivti3`), and this runs per decoded cell, so taking it for
     /// every value of a `numeric(15,2)` column — which never leaves 64 bits —
-    /// cost more than the text parsing this replaced.
+    /// cost more than the text parsing this replaced. Both branches share one
+    /// digit loop through [`digits_of`], so only the divisor width differs.
     pub fn from_scaled_i128(v: i128, scale: i8) -> Numeric {
         if v == 0 {
             return Numeric::zero(scale.max(0) as i32);
@@ -874,34 +926,9 @@ impl Numeric {
         let neg = v < 0;
         let mag = v.unsigned_abs();
         match u64::try_from(mag) {
-            Ok(mag) => Numeric::from_magnitude(neg, mag, scale),
-            Err(_) => {
-                let mut digits = [0u8; 39];
-                let mut len = 0;
-                let mut mag = mag;
-                while mag > 0 {
-                    digits[len] = (mag % 10) as u8;
-                    mag /= 10;
-                    len += 1;
-                }
-                digits[..len].reverse();
-                Numeric::from_coeff(neg, digits[..len].to_vec(), -(scale as i32), scale as i32)
-            }
+            Ok(mag) => digits_of!(mag, 20, neg, scale),
+            Err(_) => digits_of!(mag, 39, neg, scale),
         }
-    }
-
-    /// `neg ? -mag : mag`, scaled by `10^-scale`. Split out so the common
-    /// 64-bit width divides in registers.
-    fn from_magnitude(neg: bool, mut mag: u64, scale: i8) -> Numeric {
-        let mut digits = [0u8; 20];
-        let mut len = 0;
-        while mag > 0 {
-            digits[len] = (mag % 10) as u8;
-            mag /= 10;
-            len += 1;
-        }
-        digits[..len].reverse();
-        Numeric::from_coeff(neg, digits[..len].to_vec(), -(scale as i32), scale as i32)
     }
 
     /// As [`Numeric::from_scaled_i128`], from the decimal string a wider

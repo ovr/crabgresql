@@ -38,7 +38,10 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use crabgresql_storage_api::arrow::{arrow_schema, build_batch, decode_row};
+use crabgresql_storage_api::arrow::{
+    NUMERIC_MAX_PRECISION, arrow_schema, build_batch, decode_row, numeric_decimal,
+    numeric_overflow, numeric_stored,
+};
 use crabgresql_storage_api::sort::{sort_permutation, sortable_layout, take_batch};
 use crabgresql_storage_api::{
     BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
@@ -185,15 +188,14 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
         if column.ty != PgType::Numeric || column.typmod < 0 {
             continue;
         }
-        let (precision, scale) = crabgresql_storage_api::arrow::numeric_decimal(column.typmod);
+        let method = schema.access_method.as_str();
+        let (precision, scale) = numeric_decimal(column.typmod);
         // The widest Arrow decimal is 256 bits, which stops at 76 digits, while
         // PostgreSQL's `numeric(p, s)` allows a thousand.
-        if i32::from(precision) > crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION {
+        if precision > NUMERIC_MAX_PRECISION {
             return Err(StorageError::UnsupportedType(format!(
-                "numeric precision {precision} exceeds the maximum {} supported by table access \
-                 method \"{}\"",
-                crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION,
-                schema.access_method.as_str(),
+                "numeric precision {precision} exceeds the maximum {NUMERIC_MAX_PRECISION} \
+                 supported by table access method \"{method}\"",
             )));
         }
         // Parquet's DECIMAL is defined only for `0 <= scale <= precision`, but
@@ -201,11 +203,10 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
         // hundreds and is perfectly ordinary. Arrow carries a negative scale as
         // far as the batch, so this only surfaces when the file is written —
         // which is why the declaration has to be refused up front.
-        if !(0..=i32::from(precision)).contains(&i32::from(scale)) {
+        if scale < 0 || scale as u8 > precision {
             return Err(StorageError::UnsupportedType(format!(
-                "numeric scale {scale} is outside 0..{precision}, which table access method \
-                 \"{}\" requires",
-                schema.access_method.as_str(),
+                "numeric scale {scale} is outside 0..{precision}, which table access \
+                 method \"{method}\" requires",
             )));
         }
     }
@@ -255,20 +256,12 @@ pub fn store_tuples(schema: &TableSchema, tuples: &mut [Tuple]) -> Result<(), St
                 continue;
             };
             let column = &schema.columns[index];
-            match crabgresql_storage_api::arrow::numeric_stored(value, column.typmod) {
+            match numeric_stored(value, column.typmod) {
                 Some(stored) => tuple[index] = Value::Numeric(stored),
-                None => {
-                    let (precision, scale) =
-                        crabgresql_storage_api::arrow::numeric_decimal(column.typmod);
-                    return Err(StorageError::NumericFieldOverflow {
-                        detail: Some(format!(
-                            "Column \"{}\" is stored as numeric({precision},{scale}), \
-                             which cannot hold {}.",
-                            column.name,
-                            value.to_display(),
-                        )),
-                    });
-                }
+                // The encoder's own error, raised one step earlier: a value
+                // refused here and a value refused there is the same refusal,
+                // and it should not read as two.
+                None => return Err(numeric_overflow(&column.name, value, column.typmod)),
             }
         }
     }

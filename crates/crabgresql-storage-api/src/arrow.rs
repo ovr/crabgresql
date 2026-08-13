@@ -90,37 +90,62 @@ fn value_mismatch(column: &str, ty: PgType) -> StorageError {
 /// them.
 pub fn numeric_stored(value: &Numeric, typmod: i32) -> Option<Numeric> {
     let (precision, scale) = numeric_decimal(typmod);
-    if precision as usize > 38 {
-        let text = value.to_scaled_string(precision, scale)?;
-        return Numeric::from_scaled_str(&text, scale);
-    }
-    Some(Numeric::from_scaled_i128(
-        value.to_scaled_i128(precision, scale)?,
-        scale,
-    ))
+    // The decimal's scale is the only thing storage imposes, and `trunc` is
+    // already the operation that imposes one — it truncates nothing here,
+    // because `fits_decimal` has just established there is nothing below
+    // `-scale` to truncate. Round tripping through the integer (or, for the
+    // 256-bit widths, through a rendered string) would arrive at the same
+    // value by a longer road.
+    value
+        .fits_decimal(precision, scale)
+        .then(|| value.trunc(scale as i32))
 }
 
-/// Whether `value` is storable in a `numeric` column of `typmod`.
-pub fn numeric_fits(value: &Numeric, typmod: i32) -> bool {
-    numeric_stored(value, typmod).is_some()
-}
-
-/// PostgreSQL's `22003` for a value this column's decimal cannot hold, with the
-/// DETAIL its own `numeric` field-overflow raises.
-fn numeric_overflow(column: &str, value: &Numeric, precision: u8, scale: i8) -> StorageError {
+/// PostgreSQL's `22003` for a value this column's decimal cannot hold.
+///
+/// The one constructor for the condition, so the message does not depend on
+/// which caller found it: [`build_array`] raises it for a value that reached
+/// the encoder unchecked, and the columnar engines raise it from their write
+/// gate for the same value one step earlier.
+pub fn numeric_overflow(column: &str, value: &Numeric, typmod: i32) -> StorageError {
+    let (precision, scale) = numeric_decimal(typmod);
+    // Both arms name the column: unlike PostgreSQL's own typmod overflow, this
+    // one has no statement position to point at, so the column is the only
+    // handle the reader gets. `NaN` and `±Infinity` are quoted outright because
+    // "cannot hold NaN" is the whole explanation; an ordinary value is not,
+    // since it may run to 38 digits and its magnitude is not the point.
     let detail = if value.is_nan() || value.is_infinite() {
         format!(
-            "A field with precision {precision}, scale {scale} cannot hold {}.",
+            "Column \"{column}\" is stored as numeric({precision},{scale}), \
+             which cannot hold {}.",
             value.to_display()
         )
     } else {
         format!(
-            "A field with precision {precision}, scale {scale} cannot hold the value of column \"{column}\" exactly."
+            "Column \"{column}\" is stored as numeric({precision},{scale}), \
+             which cannot hold that value exactly."
         )
     };
     StorageError::NumericFieldOverflow {
         detail: Some(detail),
     }
+}
+
+/// Whether a value's Arrow encoding is decided by its type **alone**, or also
+/// by the column's type modifier.
+///
+/// `numeric` is the only type where the modifier is part of the encoding: it
+/// fixes the decimal's scale, and a value stored under one scale reads back
+/// rendered at that scale. Everywhere a value is encoded *without* a column to
+/// take the modifier from — a constant in a vectorized projection, whose
+/// `Column::new` leaves the typmod at -1 — that fixed scale would be imposed on
+/// a value that has no storage at all, and `1.50` would come back
+/// `1.5000000000000000` from a columnar plan and `1.50` from a row plan.
+///
+/// So such a constant declines to vectorize instead. The row path renders it,
+/// exactly as PostgreSQL does.
+pub fn encoding_ignores_typmod(ty: PgType) -> bool {
+    ty != PgType::Numeric
 }
 
 /// Whether a type has an Arrow representation in this mapping.
@@ -154,6 +179,17 @@ pub fn supports_type(ty: PgType) -> bool {
     )
 }
 
+/// The precision a `numeric` column with no typmod is stored at.
+pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
+
+/// The scale a `numeric` column with no typmod is stored at. See
+/// [`numeric_decimal`] for why it is 16 and not something rounder.
+pub const NUMERIC_DEFAULT_SCALE: i8 = 16;
+
+/// The largest `numeric` precision any Arrow decimal holds; `numeric(p, s)`
+/// above it has no columnar representation at all and DDL rejects the column.
+pub const NUMERIC_MAX_PRECISION: u8 = 76;
+
 /// The `(precision, scale)` a `numeric` column is stored at.
 ///
 /// A column **with** a typmod uses its own: every value in it has been through
@@ -168,20 +204,58 @@ pub fn supports_type(ty: PgType) -> bool {
 /// [`crabgresql_types::numeric`]'s 16 significant digits, so `10/3` and
 /// `avg(x)` both land on 16 fractional digits. Values needing more are refused
 /// rather than rounded — see [`build_array`].
-pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
-pub const NUMERIC_DEFAULT_SCALE: i8 = 16;
-
-/// The largest `numeric` precision any Arrow decimal holds; `numeric(p, s)`
-/// above it has no columnar representation at all and DDL rejects the column.
-pub const NUMERIC_MAX_PRECISION: i32 = 76;
-
-/// The decimal `(precision, scale)` for a `numeric` column of `typmod`.
 pub fn numeric_decimal(typmod: i32) -> (u8, i8) {
     if typmod < 0 {
         return (NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE);
     }
     let (precision, scale) = Numeric::unpack_typmod(typmod);
     (precision as u8, scale as i8)
+}
+
+/// Which Arrow decimal a precision is stored in — the ladder ClickHouse uses,
+/// and the same digit counts: 9 / 18 / 38 / 76.
+///
+/// One decision, consulted by all four sites that depend on it (the Arrow type,
+/// the builder, the array a cell decodes from, and the choice between the
+/// 128-bit and the string conversion). They must agree exactly: a column that
+/// encoded at one width and decoded at another would read back garbage, and a
+/// fragment already on disk cannot be re-decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecimalWidth {
+    Bits32,
+    Bits64,
+    Bits128,
+    Bits256,
+}
+
+/// The width `precision` is stored in.
+pub fn decimal_width(precision: u8) -> DecimalWidth {
+    match precision {
+        0..=9 => DecimalWidth::Bits32,
+        10..=18 => DecimalWidth::Bits64,
+        19..=38 => DecimalWidth::Bits128,
+        _ => DecimalWidth::Bits256,
+    }
+}
+
+/// The components `timetz` is stored as. Named rather than inlined because
+/// [`build_array`] needs the same `Fields` to build the struct, and recovering
+/// them by asking [`arrow_type`] and re-matching the `DataType` it just built
+/// would need a typmod this type does not have.
+fn timetz_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("time_us", DataType::Int64, false),
+        Field::new("offset_seconds", DataType::Int32, false),
+    ])
+}
+
+/// The components `interval` is stored as; see [`timetz_fields`].
+fn interval_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("months", DataType::Int32, false),
+        Field::new("days", DataType::Int32, false),
+        Field::new("micros", DataType::Int64, false),
+    ])
 }
 
 /// The Arrow type a column of `ty` with `typmod` is stored as.
@@ -214,11 +288,11 @@ pub fn arrow_type(ty: PgType, typmod: i32) -> DataType {
         PgType::Float8 => DataType::Float64,
         PgType::Numeric => {
             let (precision, scale) = numeric_decimal(typmod);
-            match precision {
-                0..=9 => DataType::Decimal32(precision, scale),
-                10..=18 => DataType::Decimal64(precision, scale),
-                19..=38 => DataType::Decimal128(precision, scale),
-                _ => DataType::Decimal256(precision, scale),
+            match decimal_width(precision) {
+                DecimalWidth::Bits32 => DataType::Decimal32(precision, scale),
+                DecimalWidth::Bits64 => DataType::Decimal64(precision, scale),
+                DecimalWidth::Bits128 => DataType::Decimal128(precision, scale),
+                DecimalWidth::Bits256 => DataType::Decimal256(precision, scale),
             }
         }
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => DataType::Utf8,
@@ -226,17 +300,10 @@ pub fn arrow_type(ty: PgType, typmod: i32) -> DataType {
         PgType::Uuid => DataType::FixedSizeBinary(16),
         PgType::Date => DataType::Date32,
         PgType::Time => DataType::Time64(TimeUnit::Microsecond),
-        PgType::TimeTz => DataType::Struct(Fields::from(vec![
-            Field::new("time_us", DataType::Int64, false),
-            Field::new("offset_seconds", DataType::Int32, false),
-        ])),
+        PgType::TimeTz => DataType::Struct(timetz_fields()),
         PgType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
         PgType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        PgType::Interval => DataType::Struct(Fields::from(vec![
-            Field::new("months", DataType::Int32, false),
-            Field::new("days", DataType::Int32, false),
-            Field::new("micros", DataType::Int64, false),
-        ])),
+        PgType::Interval => DataType::Struct(interval_fields()),
         _ => DataType::Binary,
     }
 }
@@ -335,7 +402,7 @@ pub fn build_array(
         PgType::Float8 => primitive!(Float64Builder, Value::Float8),
         // A decimal of the width the precision asks for; the scale comes from
         // the column, not from the value. A value that does not fit is an
-        // error rather than a rounding — see [`numeric_fits`], which the
+        // error rather than a rounding — see [`numeric_stored`], which the
         // columnar engines call on the way *in* so this cannot be the first
         // time a row is found unstorable.
         PgType::Numeric => {
@@ -350,7 +417,7 @@ pub fn build_array(
                             Value::Null => builder.append_null(),
                             Value::Numeric(value) => {
                                 builder.append_value($convert(value).ok_or_else(|| {
-                                    numeric_overflow(&column.name, value, precision, scale)
+                                    numeric_overflow(&column.name, value, column.typmod)
                                 })?)
                             }
                             _ => return Err(value_mismatch(&column.name, column.ty)),
@@ -360,11 +427,13 @@ pub fn build_array(
                 }};
             }
             let narrow = |value: &Numeric| value.to_scaled_i128(precision, scale);
-            match precision {
-                0..=9 => decimal!(Decimal32Builder, |v| narrow(v).map(|n| n as i32)),
-                10..=18 => decimal!(Decimal64Builder, |v| narrow(v).map(|n| n as i64)),
-                19..=38 => decimal!(Decimal128Builder, narrow),
-                _ => decimal!(Decimal256Builder, |value: &Numeric| value
+            match decimal_width(precision) {
+                DecimalWidth::Bits32 => decimal!(Decimal32Builder, |v| narrow(v).map(|n| n as i32)),
+                DecimalWidth::Bits64 => decimal!(Decimal64Builder, |v| narrow(v).map(|n| n as i64)),
+                DecimalWidth::Bits128 => decimal!(Decimal128Builder, narrow),
+                // No Rust integer is this wide, so the value goes through its
+                // own decimal rendering; `i256` parses the same digits back.
+                DecimalWidth::Bits256 => decimal!(Decimal256Builder, |value: &Numeric| value
                     .to_scaled_string(precision, scale)
                     .and_then(|text| i256::from_string(&text))),
             }
@@ -420,12 +489,8 @@ pub fn build_array(
         }
         PgType::Time => primitive!(Time64MicrosecondBuilder, Value::Time),
         PgType::TimeTz => {
-            let fields = match arrow_type(PgType::TimeTz, -1) {
-                DataType::Struct(fields) => fields,
-                _ => return Err(corrupt("invalid timetz Arrow schema")),
-            };
             let mut builder = StructBuilder::new(
-                fields,
+                timetz_fields(),
                 vec![Box::new(Int64Builder::new()), Box::new(Int32Builder::new())],
             );
             for tuple in tuples {
@@ -480,12 +545,8 @@ pub fn build_array(
             }
         }
         PgType::Interval => {
-            let fields = match arrow_type(PgType::Interval, -1) {
-                DataType::Struct(fields) => fields,
-                _ => return Err(corrupt("invalid interval Arrow schema")),
-            };
             let mut builder = StructBuilder::new(
-                fields,
+                interval_fields(),
                 vec![
                     Box::new(Int32Builder::new()),
                     Box::new(Int32Builder::new()),
@@ -642,20 +703,19 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
         PgType::Float8 => primitive!(Float64Array, Value::Float8),
         PgType::Numeric => {
             let (precision, scale) = numeric_decimal(column.typmod);
-            let value = match precision {
-                0..=9 => {
-                    let values = required_array::<Decimal32Array>(array, &column.name)?;
+            // The scale comes from the column, so the stored integer is all the
+            // array has to carry — the same trade `build_array` made writing it.
+            macro_rules! decimal {
+                ($array:ty) => {{
+                    let values = required_array::<$array>(array, &column.name)?;
                     Numeric::from_scaled_i128(values.value(row) as i128, scale)
-                }
-                10..=18 => {
-                    let values = required_array::<Decimal64Array>(array, &column.name)?;
-                    Numeric::from_scaled_i128(values.value(row) as i128, scale)
-                }
-                19..=38 => {
-                    let values = required_array::<Decimal128Array>(array, &column.name)?;
-                    Numeric::from_scaled_i128(values.value(row), scale)
-                }
-                _ => {
+                }};
+            }
+            let value = match decimal_width(precision) {
+                DecimalWidth::Bits32 => decimal!(Decimal32Array),
+                DecimalWidth::Bits64 => decimal!(Decimal64Array),
+                DecimalWidth::Bits128 => decimal!(Decimal128Array),
+                DecimalWidth::Bits256 => {
                     let values = required_array::<Decimal256Array>(array, &column.name)?;
                     Numeric::from_scaled_str(&values.value(row).to_string(), scale).ok_or_else(
                         || corrupt(format!("invalid numeric in column \"{}\"", column.name)),
@@ -1006,7 +1066,7 @@ mod tests {
     -> Result<(), StorageError> {
         let schema = schema_of(vec![Column::new("c", PgType::Numeric)]);
         let quotient = parse("3.3333333333333333")?;
-        assert!(numeric_fits(&quotient, -1));
+        assert!(numeric_stored(&quotient, -1).is_some());
         let batch = build_batch(&schema, &[vec![Value::Numeric(quotient.clone())]])?;
         assert_eq!(
             rendered(&decode_row(&schema, &[0], &batch, 0)?[0]),
@@ -1015,7 +1075,7 @@ mod tests {
 
         // 17 fractional digits: one past what the column can hold.
         let finer = parse("0.33333333333333333")?;
-        assert!(!numeric_fits(&finer, -1));
+        assert!(numeric_stored(&finer, -1).is_none());
         assert!(matches!(
             build_batch(&schema, &[vec![Value::Numeric(finer)]]),
             Err(StorageError::NumericFieldOverflow { .. })
@@ -1028,7 +1088,7 @@ mod tests {
     fn numeric_specials_have_no_decimal_image() -> Result<(), StorageError> {
         let schema = schema_of(vec![Column::new("c", PgType::Numeric)]);
         for special in [Numeric::nan(), Numeric::pos_inf(), Numeric::neg_inf()] {
-            assert!(!numeric_fits(&special, -1));
+            assert!(numeric_stored(&special, -1).is_none());
             assert!(matches!(
                 build_batch(&schema, &[vec![Value::Numeric(special)]]),
                 Err(StorageError::NumericFieldOverflow { .. })
