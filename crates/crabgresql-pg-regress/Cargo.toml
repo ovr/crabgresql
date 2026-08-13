@@ -13,7 +13,9 @@ path = "src/bin/regress.rs"
 
 [dependencies]
 clap.workspace = true
-crabgresql-server.workspace = true
+# Only for the environment-variable names the spawned server reads; the server
+# itself is a child process, not a library dependency.
+crabgresql-config.workspace = true
 similar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -55,7 +55,7 @@ rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 sha2 = { version = "0.11", default-features = false }
 similar = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "process", "sync", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

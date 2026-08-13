@@ -1,8 +1,8 @@
-//! pg_regress-style runner: execute regression scripts against an in-process
-//! CrabgreSQL server and diff the output against the expected files.
+//! pg_regress-style runner: execute regression scripts against a CrabgreSQL
+//! server child process and diff the output against the expected files.
 //!
 //! Exit codes: 0 — all tests passed, 1 — at least one failed, 2 — bad usage
-//! or an infrastructure error (missing files, I/O).
+//! or an infrastructure error (missing files, I/O, no server binary).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -13,8 +13,9 @@ use clap::Parser;
 use crabgresql_pg_regress::report::{Detail, format_duration, markdown_summary};
 use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
+use crabgresql_pg_regress::server::locate_server_binary;
 
-/// Run PostgreSQL regression tests against an in-process CrabgreSQL server.
+/// Run PostgreSQL regression tests against a CrabgreSQL server child process.
 #[derive(Parser)]
 #[command(name = "regress")]
 struct Args {
@@ -39,6 +40,11 @@ struct Args {
     /// Directory containing sql/ and expected/
     #[arg(long, value_name = "DIR", default_value = "vendor/postgres/regress")]
     regress_dir: PathBuf,
+
+    /// The crabgresql server binary to run the suite against
+    /// [default: the one built next to this executable]
+    #[arg(long, value_name = "PATH", env = crabgresql_pg_regress::server::SERVER_BIN_ENV)]
+    server_bin: Option<PathBuf>,
 
     /// Where results/ and regression.diffs are written
     #[arg(long, value_name = "DIR", default_value = "target/regress")]
@@ -125,7 +131,21 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let server_bin = match args
+        .server_bin
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(locate_server_binary)
+    {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("regress: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let config = SuiteConfig {
+        server_bin,
         regress_dir: args.regress_dir,
         setup,
         tests,
@@ -150,7 +170,11 @@ async fn main() -> ExitCode {
     for outcome in &report.outcomes {
         println!(
             "{} {:width$}  {}",
-            if outcome.passed { "ok    " } else { "FAILED" },
+            match (outcome.passed, outcome.ran) {
+                (true, _) => "ok    ",
+                (false, true) => "FAILED",
+                (false, false) => "NOTRUN",
+            },
             outcome.name,
             format_duration(outcome.duration),
         );
@@ -161,6 +185,9 @@ async fn main() -> ExitCode {
         passed * 100 / total,
         format_duration(report.duration),
     );
+    if let Some(crash) = &report.crash {
+        println!("\n{crash}");
+    }
 
     let summaries = [
         (&args.summary, Detail::Slowest),

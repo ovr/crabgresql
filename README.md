@@ -141,21 +141,31 @@ Building it yourself: `docker build -t crabgresql .`
 The PostgreSQL regression corpus (`src/test/regress`, pinned to a master
 commit) is vendored under [`vendor/postgres/`](vendor/postgres/README.md) —
 populate or bump it with `scripts/sync-regress.sh`. The pg_regress-style
-runner in `crabgresql-pg-regress` executes the scripts against an in-process
-server, emulating `psql -a -q` output, and diffs against `expected/*.out`:
+runner in `crabgresql-pg-regress` executes the scripts against a `crabgresql`
+server it starts as a child process, emulating `psql -a -q` output, and diffs
+against `expected/*.out`:
 
 ```console
+$ cargo build -p crabgresql-server --bin crabgresql           # the server under test
 $ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
 $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
 20 of 245 tests passed (8%).
 See target/regress/regression.diffs for details.
 ```
 
+The server binary is taken from next to the `regress` executable
+(`target/<profile>/crabgresql`); `--server-bin` or `CRABGRESQL_SERVER_BIN`
+points the run at another one. Its output goes to `<outdir>/server.log` — that
+is where a crash's backtrace is, and a server that dies mid-run stops the run
+with the remaining tests reported as `NOTRUN` instead of taking the runner down
+with it.
+
 The score is the compatibility dashboard, so a near-zero percentage at M0 is
 expected and honest. Regression protection lives in `cargo test`: the
 crabgresql-authored smoke suite must always pass, plus every upstream test
 promoted to `crates/crabgresql-pg-regress/suites/upstream_must_pass.txt` as
-coverage grows.
+coverage grows. Those two tests need the server binary too, so build it first
+(a plain `cargo build --workspace --all-targets`, as CI runs, covers it).
 
 ## Benchmarks
 

@@ -53,8 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      # The runner spawns the server as a child process, so both binaries are
+      # needed; `regress` finds `crabgresql` next to itself in target/release.
       - name: cargo build --release
-        run: cargo build --release -p crabgresql-pg-regress --bin regress --locked
+        run: |
+          cargo build --release --locked \
+            -p crabgresql-pg-regress --bin regress \
+            -p crabgresql-server --bin crabgresql
 
       # Both suites run to completion even when one is red, so the report
       # covers everything; the job is failed at the end instead.
@@ -117,7 +122,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: regression-diffs
-          path: target/regress/**/regression.diffs
+          path: |
+            target/regress/**/regression.diffs
+            target/regress/**/server.log
           if-no-files-found: ignore
 
       - name: fail on regressions
