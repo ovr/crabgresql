@@ -806,7 +806,9 @@ impl Numeric {
         // whole percent of a fragment write.
         let mut acc: i128 = 0;
         for pos in (-(scale as i32)..=hi).rev() {
-            acc = acc.checked_mul(10)?.checked_add(self.digit_at(pos) as i128)?;
+            acc = acc
+                .checked_mul(10)?
+                .checked_add(self.digit_at(pos) as i128)?;
         }
         if neg { acc.checked_neg() } else { Some(acc) }
     }
