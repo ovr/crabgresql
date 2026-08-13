@@ -68,6 +68,15 @@ pub fn keys_indexable(schema: &TableSchema, keys: &[IndexKey]) -> bool {
 /// bytes, or `None` when any key column is NULL (a NULL never satisfies
 /// equality, so such a row is simply not indexed) or holds a value of an
 /// un-indexable form.
+///
+/// TODO: index NULLs, as PostgreSQL's B-tree does. Leaving them out costs the
+/// probes that do *not* constrain every key column: a row with a NULL in an
+/// unconstrained column satisfies such a probe and is not in the tree, so the
+/// engine has to decline it (see `heap::encode_probe`) and the planner falls
+/// back to a scan. Doing it needs a per-column NULL tag in the encoding — which
+/// changes every key's bytes, not just a `DESC` one's, so it is a wider format
+/// break than `IKV1` handles — plus `NULLS FIRST`/`LAST` ordering and the
+/// `nulls_distinct` unique semantics.
 pub fn encode_row(schema: &TableSchema, keys: &[IndexKey], tuple: &Tuple) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for key in keys {

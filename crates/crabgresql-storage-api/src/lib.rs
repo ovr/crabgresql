@@ -1236,6 +1236,15 @@ pub trait TableAm: Send + Sync {
     /// says nothing about it, so the engine declines with `None` rather than
     /// reporting an empty result that would silently drop rows.
     ///
+    /// A key column this probe leaves **unconstrained** is the same case again,
+    /// and it is why a partial key is not always servable. An engine whose index
+    /// omits rows with a NULL key column (the durable heap's B-tree does) cannot
+    /// answer `eq = [1]` on an index over `(a, b)` while some row has `a = 1`
+    /// and `b` NULL: that row satisfies the probe and is not in the index. Such
+    /// an engine declines unless every unconstrained key column is `NOT NULL`.
+    /// The constrained ones never need that check, since a NULL satisfies
+    /// neither an equality nor a bound.
+    ///
     /// A range's bounds are **prefix-wise**, which is what a composite key
     /// requires: on an index over `(a, b, c)`, a probe with `eq = [1]` and an
     /// exclusive lower bound of `5` must exclude every row with `b = 5`

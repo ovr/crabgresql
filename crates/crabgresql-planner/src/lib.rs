@@ -1083,6 +1083,10 @@ fn pick_index(
     // anything is measured: asking for statistics reads the relation's file
     // length, and every planned statement — including one against a relation
     // with no index at all — would otherwise pay for it.
+    //
+    // The schema is read here rather than below because `cover_index` needs it;
+    // it is an `Arc` snapshot, unlike the statistics.
+    let schema = table.schema();
     let candidates: Vec<(&IndexMetadata, IndexCover)> = [
         Some(IndexConstraint::PrimaryKey),
         Some(IndexConstraint::Unique),
@@ -1090,7 +1094,7 @@ fn pick_index(
     ]
     .into_iter()
     .flat_map(|pref| indexes.iter().filter(move |i| i.constraint == pref))
-    .filter_map(|index| Some((index, cover_index(index, quals)?)))
+    .filter_map(|index| Some((index, cover_index(index, &schema, quals)?)))
     // Only route to an index scan the engine can physically serve; otherwise
     // `EXPLAIN` would advertise an index scan that silently degrades to a
     // sequential scan at execution time.
@@ -1100,7 +1104,6 @@ fn pick_index(
         return None;
     }
 
-    let schema = table.schema();
     let stats = table.statistics();
     let size = cost::estimate_rel_size(&stats, &schema);
     // Conjuncts the scan would have to evaluate per row. The index path's
@@ -1442,7 +1445,19 @@ struct BoundedColumn {
 /// nothing about where in an `(a, b)` index its rows are. That is also why only
 /// one column can be bounded — `a > 1 AND b > 2` selects a contiguous stretch
 /// only in `a`, and the `b` test stays a residual filter.
-fn cover_index(index: &IndexMetadata, quals: &[Option<KeyQual>]) -> Option<IndexCover> {
+///
+/// A cover that leaves a **nullable** key column unconstrained is refused, and
+/// that is a property of the storage rather than of the predicate: an engine
+/// whose index omits rows with a NULL key column cannot answer such a probe (see
+/// [`TableAm::index_lookup`]), so it declines and the executor scans. Refusing
+/// here as well is what keeps `EXPLAIN` from advertising an index scan that
+/// silently degrades. A probe pinning every key column is unaffected, which is
+/// every probe that existed before ranges did.
+fn cover_index(
+    index: &IndexMetadata,
+    schema: &TableSchema,
+    quals: &[Option<KeyQual>],
+) -> Option<IndexCover> {
     let mut used = vec![false; quals.len()];
     let mut cover = IndexCover {
         eq: Vec::with_capacity(index.keys.len()),
@@ -1475,7 +1490,18 @@ fn cover_index(index: &IndexMetadata, quals: &[Option<KeyQual>]) -> Option<Index
         }
         break;
     }
-    (!cover.eq.is_empty() || cover.bounded.is_some()).then_some(cover)
+    if cover.eq.is_empty() && cover.bounded.is_none() {
+        return None;
+    }
+    // The key columns past the cover: the equality prefix, then the bounded one.
+    let constrained = cover.eq.len() + usize::from(cover.bounded.is_some());
+    let servable = index.keys[constrained..].iter().all(|key| {
+        schema
+            .columns
+            .get(key.column)
+            .is_some_and(|column| !column.nullable)
+    });
+    servable.then_some(cover)
 }
 
 /// Which end of a range a bound is.
@@ -2445,8 +2471,18 @@ mod tests {
         index: Option<IndexMetadata>,
         stats: Option<RelStats>,
     ) -> PhysicalPlan {
+        plan_sql_analyzed_with(sql, index, stats, true)
+    }
+
+    /// As [`plan_sql_analyzed`], choosing whether `big` accepts NULL.
+    fn plan_sql_analyzed_with(
+        sql: &str,
+        index: Option<IndexMetadata>,
+        stats: Option<RelStats>,
+        big_nullable: bool,
+    ) -> PhysicalPlan {
         plan(
-            bind_sql_analyzed(sql, index, stats),
+            bind_sql_full(sql, index, stats, big_nullable),
             cost::CostSettings::default(),
         )
     }
@@ -2464,15 +2500,28 @@ mod tests {
         index: Option<IndexMetadata>,
         stats: Option<RelStats>,
     ) -> LogicalPlan {
+        bind_sql_full(sql, index, stats, true)
+    }
+
+    /// The whole fixture, with `big`'s nullability spelled out: it is what
+    /// decides whether a cover stopping before it is servable at all.
+    fn bind_sql_full(
+        sql: &str,
+        index: Option<IndexMetadata>,
+        stats: Option<RelStats>,
+        big_nullable: bool,
+    ) -> LogicalPlan {
         let meta = Arc::new(MetaEngine::default());
         let engine: Arc<dyn TableEngine> = Arc::clone(&meta) as Arc<dyn TableEngine>;
         let catalog: Arc<dyn TypeCatalog> = Arc::new(EmptyTypeCatalog);
+        let mut big = Column::new("big", PgType::Int8);
+        big.nullable = big_nullable;
         if let Err(error) = engine.create_table(TableSchema::in_namespace(
             "t",
             "public",
             vec![
                 Column::new("id", PgType::Int4),
-                Column::new("big", PgType::Int8),
+                big,
                 Column::new("name", PgType::Text),
             ],
         )) {
@@ -3481,6 +3530,53 @@ mod tests {
             curpages: Some(1_000),
             columns: Arc::from([id, blank.clone(), blank]),
         }
+    }
+
+    /// A partial cover is only planned when the key columns it leaves
+    /// unconstrained are `NOT NULL`. The engine cannot serve it otherwise — a
+    /// row with a NULL there satisfies the probe and is not in the index — so
+    /// planning one would advertise an index scan that degrades to a sequential
+    /// scan, and quietly return too few rows if it did not.
+    #[test]
+    fn a_partial_cover_needs_its_unconstrained_key_columns_not_null() {
+        let index = IndexMetadata {
+            name: "t_id_big_idx".into(),
+            keys: vec![
+                IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                },
+                IndexKey {
+                    column: 1,
+                    descending: false,
+                    nulls_first: false,
+                },
+            ],
+            unique: false,
+            constraint: None,
+            ..pk_on_id()
+        };
+        // `id = 1` covers only the first of the two key columns.
+        let plan = |big_nullable: bool| {
+            let mut stats = analyzed_ids();
+            // Narrow enough that cost is not what decides this.
+            stats.relpages = 10_000;
+            plan_sql_analyzed_with(
+                "SELECT * FROM t WHERE id = 1",
+                Some(index.clone()),
+                Some(stats),
+                big_nullable,
+            )
+        };
+        assert!(
+            matches!(plan(true), PhysicalPlan::Select { .. }),
+            "a nullable `big` leaves rows out of the index, so no probe"
+        );
+        let PhysicalPlan::IndexScan { key, .. } = plan(false) else {
+            panic!("a NOT NULL `big` is servable and should be probed");
+        };
+        assert_eq!(eq_key(&key), vec![(0, Value::Int4(1))]);
     }
 
     #[test]

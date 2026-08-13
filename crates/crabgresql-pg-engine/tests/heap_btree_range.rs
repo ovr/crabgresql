@@ -17,17 +17,28 @@ use crabgresql_types::{PgType, Value};
 mod common;
 use common::open;
 
-/// `t(a int4, b int4, c int4)` — the shape that exposes the boundary rules: a
-/// composite key whose bounded column is followed by another.
+/// `t(a int4, b int4, c int4)`, all `NOT NULL` — the shape that exposes the
+/// boundary rules: a composite key whose bounded column is followed by another.
+///
+/// The `NOT NULL` is load-bearing, not decoration. A row with a NULL key column
+/// is not in the tree, so a probe that leaves a *nullable* key column
+/// unconstrained is declined outright (see
+/// `a_probe_leaving_a_nullable_key_column_unconstrained_is_declined`), and every
+/// prefix and range case below would test the refusal instead of the boundary
+/// rule it is written for.
 fn schema() -> TableSchema {
-    TableSchema::new(
+    let mut schema = TableSchema::new(
         "t",
         vec![
             Column::new("a", PgType::Int4),
             Column::new("b", PgType::Int4),
             Column::new("c", PgType::Int4),
         ],
-    )
+    );
+    for column in schema.columns.iter_mut() {
+        column.nullable = false;
+    }
+    schema
 }
 
 /// An index over `(a, b, c)`, each column ascending unless named in `descending`.
@@ -322,6 +333,97 @@ fn an_unencodable_bound_declines_the_probe() -> anyhow::Result<()> {
         table.index_lookup("t_abc_idx", &key, &read(&tm)).is_none(),
         "a bound of the wrong type must decline, not answer empty"
     );
+    Ok(())
+}
+
+/// A row with a NULL in *any* key column is not in the tree at all
+/// (`btkey::encode_row` declines it), which was invisible while every probe
+/// pinned every key column: such a row satisfies no equality either. A probe
+/// that leaves a key column unconstrained changes that — `a = 1` is true of a
+/// row whose `b` is NULL, and the tree does not have it.
+///
+/// So the probe must be **declined** rather than answered short, and the caller
+/// falls back to a scan. Checked against the scan oracle so the assertion is
+/// about rows, not just about which branch was taken.
+#[test]
+fn a_probe_leaving_a_nullable_key_column_unconstrained_is_declined() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm) = open(dir.path())?;
+    // Only `c` is nullable here, so the only rows the tree is missing are the
+    // ones a probe that ignores `c` would have to return.
+    let mut schema = schema();
+    schema.columns[2].nullable = true;
+    let table = engine.create_table(schema)?;
+    let x = tm.allocate_xid();
+    for row in [
+        vec![Value::Int4(1), Value::Int4(7), Value::Int4(3)],
+        vec![Value::Int4(1), Value::Int4(7), Value::Null],
+        vec![Value::Int4(2), Value::Int4(8), Value::Int4(4)],
+    ] {
+        table.insert(row, &tm.context(x, CommandId::FIRST))?;
+    }
+    tm.commit(x)?;
+    engine.create_index("public", "t", index_on_abc(&[]))?;
+    let txn = read(&tm);
+
+    let declined = |eq: &[i32], lower: Option<Bound>, upper: Option<Bound>| {
+        let eq: Vec<Value> = eq.iter().copied().map(Value::Int4).collect();
+        let (lo, hi) = (
+            lower.map(|b| Value::Int4(b.value)),
+            upper.map(|b| Value::Int4(b.value)),
+        );
+        let key = IndexProbeKey {
+            eq: &eq,
+            lower: lo.as_ref().map(|value| IndexBound {
+                value,
+                inclusive: lower.expect("bound present").inclusive,
+            }),
+            upper: hi.as_ref().map(|value| IndexBound {
+                value,
+                inclusive: upper.expect("bound present").inclusive,
+            }),
+        };
+        table.index_lookup("t_abc_idx", &key, &txn).is_none()
+    };
+
+    // `a = 1` and `a = 1 AND b > 5` both leave `c` unconstrained, and both would
+    // otherwise return one row where a scan returns two.
+    assert!(
+        declined(&[1], None, None),
+        "a prefix probe leaving a nullable key column unconstrained must decline"
+    );
+    assert!(
+        declined(&[1], excl(5), None),
+        "a range probe leaving a nullable key column unconstrained must decline"
+    );
+    // Constraining every key column is unaffected: a NULL satisfies neither an
+    // equality nor a bound, so the rows the tree lacks are rows the predicate
+    // rejects anyway.
+    assert!(
+        !declined(&[1, 7, 3], None, None),
+        "a full-key equality probe is still served"
+    );
+    assert!(
+        !declined(&[1, 7], excl(0), None),
+        "a probe that bounds the last key column is still served"
+    );
+
+    // And the served probe still answers with the right rows. Compared against
+    // this table's own scan rather than the shared oracle, which reads every
+    // column as an `i32` and has no NULL to read here.
+    let eq = [Value::Int4(1), Value::Int4(7), Value::Int4(3)];
+    let probed: Vec<Vec<Value>> = table
+        .index_lookup("t_abc_idx", &IndexProbeKey::equality(&eq), &txn)
+        .expect("a full-key probe is served")
+        .map(|row| row.expect("probe failed").1)
+        .collect();
+    let scanned: Vec<Vec<Value>> = table
+        .scan(&txn, &ColumnProjection::All)
+        .map(|row| row.expect("scan failed").1)
+        .filter(|row| row[..3] == eq[..])
+        .collect();
+    assert_eq!(probed, scanned, "the served probe disagreed with a scan");
+    assert_eq!(probed.len(), 1, "the fixture holds one such row");
     Ok(())
 }
 
