@@ -837,9 +837,8 @@ pub enum StorageError {
     ValueTooBig { size: usize, max: usize },
     /// A `numeric` a columnar column's decimal cannot hold: NaN or ±Infinity,
     /// or — in a column with no typmod to round by — a value needing a finer
-    /// scale or more digits than the storage decimal has. PostgreSQL reports
-    /// `22003 numeric_value_out_of_range` for the analogous typmod failure, so
-    /// this borrows both the SQLSTATE and the shape of its DETAIL.
+    /// scale or more digits than it has. PostgreSQL's analogous typmod failure
+    /// is `22003`, which this borrows along with the shape of its DETAIL.
     #[error("numeric field overflow")]
     NumericFieldOverflow { detail: Option<String> },
     /// A key too large for an index page. A row can be far bigger than this and

@@ -60,8 +60,7 @@ const POW10_U64: [u64; 20] = {
 };
 
 /// `10^i` as `u128`, for the steps that pull an over-wide magnitude down into a
-/// register. Separate from [`POW10_I128`] only to keep the casts out of the
-/// hot loop.
+/// register.
 const POW10_U128: [u128; 39] = {
     let mut table = [1u128; 39];
     let mut i = 1;
@@ -75,15 +74,13 @@ const POW10_U128: [u128; 39] = {
 /// The base-10 digits of a **non-zero** magnitude, most-significant first, as a
 /// canonical [`Numeric`] whose least-significant digit sits at `low`.
 ///
-/// A macro rather than a generic so each width divides by its own type. That is
-/// the whole point: dividing a `u64` by the literal 10 compiles to a multiply,
-/// while the same division on a `u128` is a call to `__udivti3`, so the two
-/// widths are not a stylistic choice — they differ by an order of magnitude per
-/// digit. One body, two instantiations.
+/// A macro rather than a generic so each width divides by its own type:
+/// dividing a `u64` by the literal 10 compiles to a multiply, while the same
+/// division on a `u128` is a call to `__udivti3`.
 ///
-/// Any remaining trailing zeros are stripped first: a scaled decimal is mostly
-/// padding (`1.5` at scale 16 is `15000000000000000`), and extracting those
-/// zeros only to have `normalize` pop them again is two wasted passes.
+/// Trailing zeros are stripped first — a scaled decimal is mostly padding
+/// (`1.5` at scale 16 is `15000000000000000`), and extracting those zeros only
+/// to drop them again is a wasted pass.
 macro_rules! digits_of {
     ($mag:expr, $cap:expr, $neg:expr, $low:expr, $dscale:expr) => {{
         let mut mag = $mag;
@@ -101,8 +98,6 @@ macro_rules! digits_of {
             len += 1;
         }
         digits[..len].reverse();
-        // Canonical by construction: the magnitude was non-zero, so the leading
-        // digit is non-zero, and the loop above stripped the trailing zeros.
         Numeric::from_canonical($neg, digits[..len].to_vec(), low, $dscale)
     }};
 }
@@ -199,8 +194,7 @@ impl Numeric {
     }
 
     /// The display scale: how many fractional digits this value prints with.
-    /// Part of the *value* in PostgreSQL, which is why a storage mapping that
-    /// fixes it in the type has to say so.
+    /// Part of the *value* in PostgreSQL, not of the type.
     pub fn display_scale(&self) -> i32 {
         self.dscale
     }
@@ -236,10 +230,10 @@ impl Numeric {
         n
     }
 
-    /// Build from digits already known to be canonical: no leading or trailing
-    /// zero, and non-empty. Skips [`Numeric::normalize`], which for a value
-    /// extracted digit by digit out of an integer can only walk the coefficient
-    /// twice to confirm what the extraction already guaranteed.
+    /// Build from digits already known to be canonical: non-empty, no leading
+    /// or trailing zero. Skips [`Numeric::normalize`]'s two passes, which for
+    /// digits extracted out of an integer can only confirm what the extraction
+    /// guaranteed.
     fn from_canonical(neg: bool, digits: Vec<u8>, low: i32, dscale: i32) -> Numeric {
         debug_assert!(
             digits.first().is_some_and(|d| *d != 0) && digits.last().is_some_and(|d| *d != 0),
@@ -256,10 +250,8 @@ impl Numeric {
     /// Exact conversion from a signed 128-bit integer (used by int→numeric).
     ///
     /// An integer is a fixed-point value of scale 0, so this is
-    /// [`Numeric::from_scaled_i128`] with nothing after the point — worth
-    /// spelling that way rather than keeping a second digit loop, since the two
-    /// would otherwise have to agree about canonicalization by hand. It is also
-    /// the hot one (`sum`/`avg` call it per row) and inherits the 64-bit divide.
+    /// [`Numeric::from_scaled_i128`] with nothing after the point rather than a
+    /// second digit loop that would have to agree with it by hand.
     pub fn from_i128(v: i128) -> Numeric {
         Numeric::from_scaled_i128(v, 0)
     }
@@ -383,11 +375,9 @@ impl Numeric {
             Sign::NInf => return "-Infinity".to_string(),
             _ => {}
         }
-        // Written as three runs — stored digits, then padding — rather than a
-        // walk over decimal positions asking `digit_at` for each. The two agree
-        // digit for digit, but the walk re-derives `low` and bounds-checks per
-        // character, and the runs it would produce are long: a column with no
-        // typmod renders sixteen fractional places, most of them padding.
+        // Three runs — stored digits, then padding — rather than a walk asking
+        // `digit_at` per character, which re-derives `low` and bounds-checks
+        // each time. The runs are long: a scale-16 column is mostly padding.
         let neg = self.is_neg() && !self.digits.is_empty();
         let int_len = (self.weight + 1).max(1) as usize;
         let frac_len = self.dscale.max(0) as usize;
@@ -396,8 +386,6 @@ impl Numeric {
         if neg {
             out.push(b'-');
         }
-        // The integer part. A value below one has no stored digit there and
-        // renders the single `0` PostgreSQL prints.
         if self.weight < 0 {
             out.push(b'0');
         } else {
@@ -407,16 +395,15 @@ impl Numeric {
         }
         if frac_len > 0 {
             out.push(b'.');
-            // `weight + 1` is where the fractional digits start in `digits`; a
-            // negative one means that many zeros come first.
+            // Where the fractional digits start; negative means that many
+            // zeros come first.
             let start = self.weight + 1;
             let leading = (-start).max(0) as usize;
             let zeros = leading.min(frac_len);
             out.resize(out.len() + zeros, b'0');
             let remaining = frac_len - zeros;
-            // Clamped to the length, not just to zero: a value with no stored
-            // digits at all (zero itself) would otherwise slice from past the
-            // end, even though it takes nothing.
+            // Clamped to the length too: zero has no stored digits at all and
+            // would otherwise slice from past the end.
             let from = (start.max(0) as usize).min(self.digits.len());
             let taken = remaining.min(self.digits.len() - from);
             out.extend(
@@ -886,14 +873,11 @@ impl Numeric {
     /// DETAIL, which states that bound outright). NaN is allowed unchanged;
     /// ±Infinity cannot be stored in a constrained numeric.
     ///
-    /// The bound is a **signed** exponent, which is the whole subtlety.
-    /// PostgreSQL allows `scale > precision` — `numeric(2,5)` holds values below
-    /// `10^-3` — so the digit count on the left of the point can legitimately be
-    /// negative, meaning "and this many leading zeros after the point too".
-    /// Clamping it at zero would reject every value of such a column: verified
-    /// against PostgreSQL 18.4, `0.0001::numeric(2,5)` is `0.00010` and only
-    /// `0.001` overflows. For the ordinary `scale <= precision` the bound is
-    /// non-negative and the distinction never arises.
+    /// The bound is a **signed** exponent: PostgreSQL allows `scale > precision`
+    /// — `numeric(2,5)` holds values below `10^-3` — so clamping it at zero
+    /// would reject every value of such a column. For the ordinary
+    /// `scale <= precision` it is non-negative and the distinction never
+    /// arises.
     pub fn apply_typmod(&self, precision: i32, scale: i32) -> Result<Numeric, NumErr> {
         if self.is_nan() {
             return Ok(self.clone());
@@ -902,14 +886,11 @@ impl Numeric {
             return Err(field_overflow(precision, scale, true));
         }
         let rounded = self.round(scale);
-        // Zero is below every bound, including a negative one — PostgreSQL
-        // stores `0::numeric(2,5)` as `0.00000` — and has no leading digit whose
-        // position could be compared.
+        // Zero is below every bound, and has no leading digit to compare.
         if rounded.is_zero() {
             return Ok(rounded);
         }
-        // `weight` is the position of the leading digit, so `weight + 1` is the
-        // exponent of the smallest power of ten above the value.
+        // `weight + 1` is the exponent of the smallest power of ten above it.
         if rounded.weight + 1 > precision - scale {
             return Err(field_overflow(precision, scale, false));
         }
@@ -921,29 +902,21 @@ impl Numeric {
     /// The value as the integer `self * 10^scale`, or `None` when it is not
     /// **exactly** representable in `numeric(precision, scale)`.
     ///
-    /// This is the columnar storage mapping's entry point, and it deliberately
-    /// refuses rather than rounds. A column with a typmod has already been
-    /// through [`Numeric::apply_typmod`], so every value in it rounds to
-    /// `scale` by construction and this cannot fail; a column without one has
-    /// no rounding rule of its own, and silently dropping digits there would
-    /// turn a stored value into a different stored value.
-    ///
-    /// `None` for NaN and ±Infinity too: neither has a fixed-point image.
+    /// Refuses rather than rounds: a column with a typmod has been through
+    /// [`Numeric::apply_typmod`] and cannot fail here, and one without has no
+    /// rounding rule of its own, so dropping digits would silently store a
+    /// different value. `None` for NaN and ±Infinity, which have no fixed-point
+    /// image at all.
     pub fn to_scaled_i128(&self, precision: u8, scale: i8) -> Option<i128> {
         let (neg, _) = self.scaled_span(precision, scale)?;
-        // Walks the *stored* digits, not the decimal positions between `hi` and
-        // `-scale`. Those differ by the scale's padding: `5` in a column of
-        // scale 16 has one stored digit and seventeen positions, and reading
-        // the sixteen zeros back out of `digit_at` — which recomputes `low` and
-        // bounds-checks each time — is work proportional to the *column* rather
-        // than to the value. The padding is one multiply instead.
-        // `scaled_span` proved `low() >= -scale`, so the shift is never
-        // negative and never drops a digit.
+        // The scale's padding is one multiply, not a walk over the positions it
+        // occupies: `5` in a scale-16 column has one stored digit and seventeen
+        // positions. `scaled_span` proved `low() >= -scale`, so the shift never
+        // drops a digit.
         let shift = (self.low() + scale as i32).max(0) as usize;
-        // 19 digits is what a `u64` always holds, so a value that fits folds in
-        // registers; only a genuinely wide one pays 128-bit arithmetic. The
-        // common column is well inside this — `numeric(15,2)` cannot leave it,
-        // and even a quotient at scale 16 has seventeen digits.
+        // 19 digits always fit a `u64`, and the common column is well inside
+        // that — `numeric(15,2)` cannot leave it, and even a scale-16 quotient
+        // has seventeen.
         let acc = if self.digits.len() + shift <= 19 {
             let mut acc: u64 = 0;
             for &digit in &self.digits {
@@ -965,9 +938,8 @@ impl Numeric {
     /// Arrow stores as a 256-bit decimal). The caller parses it into its own
     /// wide integer.
     ///
-    /// Writes into a caller-owned buffer rather than returning a `String` so a
-    /// column's worth of values can share one allocation; `false` leaves `out`
-    /// in an unspecified state, which callers discard along with the value.
+    /// Writes into a caller-owned buffer so a column's worth of values can
+    /// share one allocation; `false` leaves `out` unspecified.
     pub fn write_scaled_string(&self, precision: u8, scale: i8, out: &mut String) -> bool {
         out.clear();
         let Some((neg, hi)) = self.scaled_span(precision, scale) else {
@@ -985,9 +957,7 @@ impl Numeric {
     }
 
     /// Whether the value is **exactly** representable as
-    /// `numeric(precision, scale)` — the question every fixed-point conversion
-    /// here asks first, and the one a storage mapping asks to decide whether a
-    /// column can hold a value at all.
+    /// `numeric(precision, scale)`.
     pub fn fits_decimal(&self, precision: u8, scale: i8) -> bool {
         self.scaled_span(precision, scale).is_some()
     }
@@ -1009,11 +979,8 @@ impl Numeric {
         if self.low() < -scale {
             return None;
         }
-        // `weight` is the position of the leading digit and `-scale` that of
-        // the trailing one, so the count is fixed by the two ends: a value
-        // smaller than one ulp of the scale was rejected above, and a value
-        // below 1 has a negative weight, which shortens the run rather than
-        // extending it past the point.
+        // The digit count is fixed by the two ends: `weight` holds the leading
+        // digit's position and `-scale` the trailing one.
         let hi = self.weight.max(-scale);
         if (hi + scale + 1) as usize > precision as usize {
             return None;
@@ -1025,18 +992,11 @@ impl Numeric {
     /// `scale` as its display scale — which is what makes a `numeric(p, s)`
     /// column round trip exactly, trailing zeros and all.
     ///
-    /// Runs once per decoded cell, and the width it runs at is what it costs:
-    /// dividing a `u64` by 10 is a multiply, dividing a `u128` is a call to
-    /// `__udivti3`. So the whole shape of this function is "reach a `u64` in as
-    /// few 128-bit operations as possible".
-    ///
-    /// The magnitude that forces the wide path is not a large *value* — it is a
-    /// large *scale*. A column with no typmod stores at scale 16, so an
-    /// unremarkable `321000.00` becomes `3.21e21`, past `u64::MAX`, even though
-    /// it has five significant digits. Those sixteen zeros are padding the
-    /// caller does not want back, and dividing them out one at a time is
-    /// sixteen libcalls; [`POW10_U128`] removes them in chunks instead, biggest
-    /// first, and stops the moment the value fits a register.
+    /// Shaped to reach a `u64` in as few 128-bit divisions as possible, since
+    /// each is a libcall. What forces the wide path is not a large value but a
+    /// large *scale*: a column with no typmod stores at scale 16, so an
+    /// unremarkable `321000.00` becomes `3.21e21` on five significant digits.
+    /// Those sixteen zeros come off in chunks rather than one at a time.
     pub fn from_scaled_i128(v: i128, scale: i8) -> Numeric {
         if v == 0 {
             return Numeric::zero(scale.max(0) as i32);

@@ -67,43 +67,24 @@ fn value_mismatch(column: &str, ty: PgType) -> StorageError {
 /// `value` as a `numeric` column of `typmod` **stores** it, or `None` when the
 /// column's decimal cannot hold it.
 ///
-/// The columnar engines call this on the way in, for two reasons that are
-/// really one:
-///
-/// - a row that cannot be encoded is refused by the `INSERT` that wrote it
-///   rather than by the flush that finds it much later — the same contract
-///   [`supports_type`] keeps for types, one level down at the value;
-/// - a row that *can* be encoded is stored in the form it will come back in.
-///   A decimal's scale is fixed by the type, so `1.50` in a column with no
-///   typmod reads back as `1.5000000000000000`. A relation has two stores (a
-///   RAM buffer and a fragment file) and only the file is decimal-encoded, so
-///   without this the same row would print one way before a flush and another
-///   after it — and differently again depending on whether the plan happened
-///   to be vectorized.
-///
-/// A `numeric(p, s)` column only ever fails here on NaN, which PostgreSQL
-/// accepts and no decimal represents; everything else it holds has already
-/// been rounded to `s` by `apply_typmod`, so this is the identity for it. A
-/// column *without* a typmod fails on anything needing more than
-/// [`NUMERIC_DEFAULT_SCALE`] fractional digits or [`NUMERIC_DEFAULT_PRECISION`]
-/// digits in all — a deliberate deviation: PostgreSQL stores those, we refuse
-/// them.
+/// For a `numeric(p, s)` column this is the identity except on NaN, which
+/// PostgreSQL accepts and no decimal represents: `apply_typmod` has already put
+/// every other value at scale `s`. A column *without* a typmod refuses anything
+/// finer than [`NUMERIC_DEFAULT_SCALE`] or wider than
+/// [`NUMERIC_DEFAULT_PRECISION`] rather than rounding it — a deliberate
+/// deviation, since PostgreSQL stores those.
 pub fn numeric_stored(value: &Numeric, typmod: i32) -> Option<StoredNumeric> {
     let (precision, scale) = numeric_decimal(typmod);
     if !value.fits_decimal(precision, scale) {
         return None;
     }
-    // A value already at the column's scale *is* the stored form, and saying so
-    // costs one comparison against rebuilding an identical `Numeric` — which is
-    // an allocation per cell on a path that runs per inserted row. This is the
-    // common case: `apply_typmod` has already put every value of a
-    // `numeric(p, s)` column at scale `s`.
+    // The common case, and worth a comparison: rebuilding an identical value
+    // would allocate once per inserted cell.
     if value.display_scale() == scale as i32 {
         return Some(StoredNumeric::AsIs);
     }
-    // Otherwise the scale is the only thing storage imposes, and `trunc` is
-    // already the operation that imposes one — it truncates nothing here, since
-    // `fits_decimal` established there is nothing below `-scale` to lose.
+    // `trunc` truncates nothing here — `fits_decimal` established there is
+    // nothing below `-scale` — it only imposes the scale.
     Some(StoredNumeric::Rewritten(value.trunc(scale as i32)))
 }
 
@@ -117,16 +98,11 @@ pub enum StoredNumeric {
 /// PostgreSQL's `22003` for a value this column's decimal cannot hold.
 ///
 /// The one constructor for the condition, so the message does not depend on
-/// which caller found it: [`build_array`] raises it for a value that reached
-/// the encoder unchecked, and the columnar engines raise it from their write
-/// gate for the same value one step earlier.
+/// whether the write gate or the encoder found it.
 pub fn numeric_overflow(column: &str, value: &Numeric, typmod: i32) -> StorageError {
     let (precision, scale) = numeric_decimal(typmod);
-    // Both arms name the column: unlike PostgreSQL's own typmod overflow, this
-    // one has no statement position to point at, so the column is the only
-    // handle the reader gets. `NaN` and `±Infinity` are quoted outright because
-    // "cannot hold NaN" is the whole explanation; an ordinary value is not,
-    // since it may run to 38 digits and its magnitude is not the point.
+    // Both arms name the column: this error has no statement position to point
+    // at, so the column is the only handle the reader gets.
     let detail = if value.is_nan() || value.is_infinite() {
         format!(
             "Column \"{column}\" is stored as numeric({precision},{scale}), \
@@ -145,12 +121,9 @@ pub fn numeric_overflow(column: &str, value: &Numeric, typmod: i32) -> StorageEr
 }
 
 /// The columns of a relation that need [`NumericColumns::normalize`] on the way
-/// in, resolved once from the schema.
-///
-/// Every columnar engine holds one beside its [`TableSchema`]. Which columns
-/// need normalizing is a property of the schema, not of a row, so a relation
-/// with no `numeric` column answers without touching the rows at all, and one
-/// that has them does not re-scan a hundred columns per row to find the two.
+/// in, resolved once from the schema and held beside it by each columnar
+/// engine — so a single-row INSERT does not re-scan a hundred columns to find
+/// the two that matter.
 #[derive(Clone, Debug, Default)]
 pub struct NumericColumns(Arc<[usize]>);
 
@@ -174,25 +147,12 @@ impl NumericColumns {
     /// Put every `numeric` in `tuples` into the form the columnar stores read
     /// back, or reject the batch.
     ///
-    /// The type whitelist ([`supports_type`]) is not enough for `numeric`: the
-    /// column's decimal fixes a scale and a digit budget, and PostgreSQL accepts
-    /// values outside both — `NaN` in any `numeric` column, and in a column with
-    /// no typmod anything finer than [`NUMERIC_DEFAULT_SCALE`]. Refusing those
-    /// here keeps the engines' promise that a row an INSERT acknowledged is a
-    /// row a flush can write; discovering it at flush time would fail a later,
-    /// unrelated statement — or a background one with no client to report to.
-    ///
-    /// The rewrite matters as much as the refusal, and is why this is not just a
-    /// validation. A `numeric` reads back at the decimal's fixed scale, so a
-    /// value that kept its own display scale in a RAM buffer would print one way
-    /// from the buffer and another from a fragment — and differently again
-    /// depending on whether the plan happened to vectorize, since only the batch
-    /// path goes through the decimal. Normalizing on the way in makes every
-    /// store of a relation agree by construction.
-    ///
-    /// Lives here rather than in an engine because both columnar engines need
-    /// exactly this, and a second copy would be a second place for the storage
-    /// form to drift from what [`build_array`] actually encodes.
+    /// Refusing early keeps the engines' promise that a row an INSERT
+    /// acknowledged is a row a flush can write — a flush has no statement left
+    /// to fail. The **rewrite** is why this is not merely a validation: only the
+    /// batch path goes through the decimal, so a value that kept its own display
+    /// scale would print one way from a RAM buffer and another from a fragment,
+    /// and differently again depending on whether the plan vectorized.
     pub fn normalize(
         &self,
         schema: &TableSchema,
@@ -203,9 +163,8 @@ impl NumericColumns {
         }
         for tuple in tuples {
             for &index in self.0.iter() {
-                // `get`, not indexing: a tuple whose width does not match the
-                // schema is caught with a proper error where the batch is
-                // built, and panicking here would beat it to the report.
+                // `get`, not indexing: a mis-sized tuple is reported where the
+                // batch is built, and panicking here would beat it to it.
                 let Some(Value::Numeric(value)) = tuple.get(index) else {
                     continue;
                 };
@@ -213,9 +172,7 @@ impl NumericColumns {
                 match numeric_stored(value, column.typmod) {
                     Some(StoredNumeric::AsIs) => {}
                     Some(StoredNumeric::Rewritten(stored)) => tuple[index] = Value::Numeric(stored),
-                    // The encoder's own error, raised one step earlier: a value
-                    // refused here and a value refused there is the same
-                    // refusal, and it should not read as two.
+                    // The encoder's own error, raised one step earlier.
                     None => return Err(numeric_overflow(&column.name, value, column.typmod)),
                 }
             }
@@ -228,15 +185,11 @@ impl NumericColumns {
 /// by the column's type modifier.
 ///
 /// `numeric` is the only type where the modifier is part of the encoding: it
-/// fixes the decimal's scale, and a value stored under one scale reads back
-/// rendered at that scale. Everywhere a value is encoded *without* a column to
-/// take the modifier from — a constant in a vectorized projection, whose
-/// `Column::new` leaves the typmod at -1 — that fixed scale would be imposed on
-/// a value that has no storage at all, and `1.50` would come back
-/// `1.5000000000000000` from a columnar plan and `1.50` from a row plan.
-///
-/// So such a constant declines to vectorize instead. The row path renders it,
-/// exactly as PostgreSQL does.
+/// fixes the decimal's scale. Encoding a value that has no column to take a
+/// modifier from — a constant in a vectorized projection — would impose the
+/// storage scale on something that has no storage, so `1.50` would print as
+/// `1.5000000000000000` from a columnar plan and `1.50` from a row plan. Such a
+/// constant declines to vectorize instead.
 pub fn encoding_ignores_typmod(ty: PgType) -> bool {
     ty != PgType::Numeric
 }
@@ -285,18 +238,16 @@ pub const NUMERIC_MAX_PRECISION: u8 = 76;
 
 /// The `(precision, scale)` a `numeric` column is stored at.
 ///
-/// A column **with** a typmod uses its own: every value in it has been through
-/// [`Numeric::apply_typmod`], which rounds to exactly `scale` fractional digits
-/// and rejects anything wider than `precision`, so the fixed-point form is
-/// exact and the display scale is recoverable from the type alone.
+/// A column **with** a typmod uses its own: [`Numeric::apply_typmod`] has
+/// rounded every value to `scale`, so the fixed-point form is exact and the
+/// display scale is recoverable from the type alone.
 ///
 /// A column **without** one has no such rule, and no fixed pair can hold every
 /// `numeric` — the type runs to 131072 integer digits and 16383 fractional
 /// ones. [`NUMERIC_DEFAULT_SCALE`] is the smallest scale that keeps ordinary
-/// division whole: PostgreSQL gives a quotient at least
-/// [`crabgresql_types::numeric`]'s 16 significant digits, so `10/3` and
-/// `avg(x)` both land on 16 fractional digits. Values needing more are refused
-/// rather than rounded — see [`build_array`].
+/// division whole: PostgreSQL gives a quotient at least 16 significant digits,
+/// so `10/3` and `avg(x)` both land on 16 fractional places. Values needing
+/// more are refused rather than rounded.
 pub fn numeric_decimal(typmod: i32) -> (u8, i8) {
     if typmod < 0 {
         return (NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE);
@@ -308,11 +259,9 @@ pub fn numeric_decimal(typmod: i32) -> (u8, i8) {
 /// Which Arrow decimal a precision is stored in — the ladder ClickHouse uses,
 /// and the same digit counts: 9 / 18 / 38 / 76.
 ///
-/// One decision, consulted by all four sites that depend on it (the Arrow type,
-/// the builder, the array a cell decodes from, and the choice between the
-/// 128-bit and the string conversion). They must agree exactly: a column that
-/// encoded at one width and decoded at another would read back garbage, and a
-/// fragment already on disk cannot be re-decided.
+/// One decision, because the Arrow type, the builder and the decoder must agree
+/// exactly: a column encoded at one width and decoded at another reads back
+/// garbage, and a fragment already on disk cannot be re-decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecimalWidth {
     Bits32,
@@ -331,10 +280,8 @@ pub fn decimal_width(precision: u8) -> DecimalWidth {
     }
 }
 
-/// The components `timetz` is stored as. Named rather than inlined because
-/// [`build_array`] needs the same `Fields` to build the struct, and recovering
-/// them by asking [`arrow_type`] and re-matching the `DataType` it just built
-/// would need a typmod this type does not have.
+/// The components `timetz` is stored as, named so [`build_array`] can build the
+/// struct from the same `Fields` [`arrow_type`] declares.
 fn timetz_fields() -> Fields {
     Fields::from(vec![
         Field::new("time_us", DataType::Int64, false),
@@ -356,12 +303,9 @@ fn interval_fields() -> Fields {
 /// Two entries are worth stating outright, because they decide what a
 /// vectorized operator may and may not do with the column:
 ///
-/// - `numeric` is a **`Decimal`**, whose width follows the precision the way
-///   ClickHouse's does: `p <= 9` is 32 bits, `<= 18` 64, `<= 38` 128, `<= 76`
-///   256. This is why the type modifier reaches this function at all — it is
-///   part of the *type*, not just a constraint on the values. See
-///   [`numeric_decimal`] for what a column without a typmod gets, and for the
-///   one place this mapping is not lossless.
+/// - `numeric` is a **`Decimal`** of [`decimal_width`]'s width. This is why the
+///   type modifier reaches this function at all — for this one type it is part
+///   of the *type*, not just a constraint on the values.
 /// - `timetz` and `interval` are `Struct`s of their components, because neither
 ///   has an Arrow type with matching semantics (Arrow's
 ///   `IntervalMonthDayNano` orders differently than PostgreSQL's canonical
@@ -493,11 +437,9 @@ pub fn build_array(
         PgType::Int8 => primitive!(Int64Builder, Value::Int8),
         PgType::Float4 => primitive!(Float32Builder, Value::Float4),
         PgType::Float8 => primitive!(Float64Builder, Value::Float8),
-        // A decimal of the width the precision asks for; the scale comes from
-        // the column, not from the value. A value that does not fit is an
-        // error rather than a rounding — see [`numeric_stored`], which the
-        // columnar engines call on the way *in* so this cannot be the first
-        // time a row is found unstorable.
+        // The scale comes from the column, not from the value, and a value that
+        // does not fit is an error rather than a rounding. The engines call
+        // `numeric_stored` on the way in, so this is the backstop, not the gate.
         PgType::Numeric => {
             let (precision, scale) = numeric_decimal(column.typmod);
             macro_rules! decimal {
@@ -525,9 +467,8 @@ pub fn build_array(
                 DecimalWidth::Bits64 => decimal!(Decimal64Builder, |v| narrow(v).map(|n| n as i64)),
                 DecimalWidth::Bits128 => decimal!(Decimal128Builder, narrow),
                 // No Rust integer is this wide, so the value goes through its
-                // own decimal rendering and `i256` parses the same digits back.
-                // The buffer is hoisted out of the closure so the column costs
-                // one allocation rather than one per value.
+                // own decimal rendering; the buffer is hoisted so the column
+                // costs one allocation rather than one per value.
                 DecimalWidth::Bits256 => {
                     let mut text = String::new();
                     let mut wide = |value: &Numeric| {
@@ -805,8 +746,6 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
         PgType::Float8 => primitive!(Float64Array, Value::Float8),
         PgType::Numeric => {
             let (precision, scale) = numeric_decimal(column.typmod);
-            // The scale comes from the column, so the stored integer is all the
-            // array has to carry — the same trade `build_array` made writing it.
             macro_rules! decimal {
                 ($array:ty) => {{
                     let values = required_array::<$array>(array, &column.name)?;
@@ -819,9 +758,9 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
                 DecimalWidth::Bits128 => decimal!(Decimal128Array),
                 DecimalWidth::Bits256 => {
                     let values = required_array::<Decimal256Array>(array, &column.name)?;
+                    // Even a 256-bit column mostly holds values an `i128`
+                    // covers, and that path needs no rendering at all.
                     let wide = values.value(row);
-                    // Even a 256-bit column mostly holds values a `i128` covers,
-                    // and that path needs no rendering at all.
                     match wide.to_i128() {
                         Some(narrow) => Numeric::from_scaled_i128(narrow, scale),
                         None => {

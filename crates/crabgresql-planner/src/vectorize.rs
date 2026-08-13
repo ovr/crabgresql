@@ -65,12 +65,10 @@ impl Vectorization {
 /// Each exclusion is a case where Arrow's answer would be *wrong*, not merely
 /// different:
 ///
-/// - `numeric` is stored as a `Decimal` of the *column's* `(precision, scale)`,
-///   and Arrow's comparison kernels require both operands to be one decimal
-///   type. A `BoundExpr::Const` carries no typmod to rescale it to, so the
-///   constant side of `price > 9.99` cannot be built to match the column.
-///   Excluded until an operand can be rescaled to its neighbour's type — the
-///   sort path has no such problem, since it orders a column against itself.
+/// - `numeric` is a `Decimal` of the *column's* `(precision, scale)`, and a
+///   comparison kernel wants both operands in one decimal type. A `Const`
+///   carries no typmod to rescale to, so `price > 9.99` cannot be built. The
+///   sort path has no such problem: a column orders against itself.
 /// - `float4`/`float8` — Arrow's comparison kernels are not IEEE `==` but
 ///   bitwise, i.e. IEEE's totalOrder predicate. So `-0.0 = 0.0` is false where
 ///   PostgreSQL says true, and two NaNs of different bit patterns compare
@@ -189,12 +187,11 @@ fn vectorizable_operand(expr: &BoundExpr, width: usize) -> bool {
 /// a computation. Only such a projection keeps the columnar segment alive as far
 /// as a sort, because a [`SortKey`] indexes the *projected* tuple.
 ///
-/// Stricter than [`vectorizable_predicate`] about constants, and for a reason a
+/// Stricter than [`vectorizable_predicate`] about constants, for a reason a
 /// predicate does not have: a projected constant is **handed to the client**,
 /// while a predicate's only reaches a comparison kernel. A `numeric` constant
-/// encodes at the storage decimal's fixed scale (see
-/// [`crabgresql_storage_api::arrow::encoding_ignores_typmod`]) and would print
-/// `1.5000000000000000` where the row path prints `1.50`, so it declines here.
+/// encodes at the storage decimal's fixed scale and would print
+/// `1.5000000000000000` where the row path prints `1.50`.
 pub fn vectorizable_projection(projections: &[BoundExpr], width: usize) -> bool {
     projections
         .iter()

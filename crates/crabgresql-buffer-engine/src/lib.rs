@@ -184,11 +184,9 @@ pub struct BufferTable {
     clog: RwLock<Option<Arc<Clog>>>,
     /// Resolved once from the schema, which does not change after `open`.
     ///
-    /// A buffer's rows are handed up as batches as well as tuples
-    /// ([`TableAm::scan_batches`]), and only the batch goes through a decimal,
-    /// so a `numeric` that kept its own display scale here would render one way
-    /// per plan shape. Normalizing at the write entries is what keeps the two
-    /// readings of one row identical.
+    /// A buffer's rows are read as batches as well as tuples, and only the
+    /// batch goes through a decimal, so a `numeric` that kept its own display
+    /// scale here would render differently per plan shape.
     numeric: NumericColumns,
 }
 
@@ -949,9 +947,8 @@ impl TableAm for BufferTable {
     }
 
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
-        // The write entries normalize, not `append`: `append_in` reaches the
-        // same code from `BufferedParquetTable`, which has already done it for
-        // both of its leaves, and doing it twice is pure duplicate work.
+        // Here rather than in `append`, which `append_in` also reaches from
+        // `BufferedParquetTable` — where this has already run.
         let mut tuples = tuples;
         self.numeric.normalize(&self.schema, &mut tuples)?;
         self.append(self.relfilenode(), tuples, txn)

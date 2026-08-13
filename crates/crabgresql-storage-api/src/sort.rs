@@ -28,13 +28,11 @@ use crate::{Column, IndexKey, StorageError, TableSchema};
 /// PostgreSQL's: [`sort_permutation`] canonicalizes the key column first, which
 /// makes the two coincide. `"char"` is included because [`crate::arrow`] stores
 /// it as `UInt8` precisely so that Arrow's order is the type's own unsigned
-/// one. `numeric` is included and needs no canonicalization: it is stored as a
-/// `Decimal` of the column's own `(precision, scale)`, so every value in the
-/// column is one integer on one scale and the integer order *is* the numeric
-/// order — and the two values a float has to be rewritten for, `-0.0` and NaN,
-/// a decimal cannot hold at all (the write path refuses NaN outright).
-/// `bpchar` ignores trailing blanks, which byte order does not; `timetz` and
-/// `interval` are `Struct`s, which no ordering kernel accepts.
+/// one. `numeric` needs no canonicalization: a column is one decimal type, so
+/// the integer order *is* the numeric order, and a decimal holds neither of the
+/// values a float has to be rewritten for. `bpchar` ignores trailing blanks,
+/// which byte order does not; `timetz` and `interval` are `Struct`s, which no
+/// ordering kernel accepts.
 pub fn sortable(ty: PgType, collation: u32) -> bool {
     match ty {
         PgType::Bool

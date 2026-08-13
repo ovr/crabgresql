@@ -257,14 +257,12 @@ mod tests {
         assert_same_order(&schema, &rows, &keys, 1);
     }
 
-    /// A `numeric` column sorts columnar, and **numerically**. It is stored as a
-    /// decimal for exactly that reason: under the text encoding it once had,
-    /// `'10'` and `'100'` would both sort below `'9'` with no error to notice.
+    /// A `numeric` column sorts columnar, and **numerically** — under a text
+    /// encoding `'10'` and `'100'` would sort below `'9'` with no error.
     #[test]
     fn a_numeric_column_sorts_columnar_by_value() {
-        // With a typmod, as a stored column has: the decimal's scale is then the
-        // column's own, so the batch and the row path agree digit for digit and
-        // `assert_same_order` below compares like with like.
+        // With a typmod, as a stored column has, so the batch and the row path
+        // agree digit for digit and `assert_same_order` compares like with like.
         let mut schema = schema_of(&[PgType::Numeric]);
         schema.columns[0].typmod = crabgresql_types::numeric::Numeric::pack_typmod(10, 2);
         let numeric = |n: &str| {

@@ -177,12 +177,9 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
         )));
     }
     // `numeric` is the one type whose *modifier* can put it outside the format,
-    // and it does so in two ways. Both are caught here rather than at the first
-    // INSERT, because unlike a value that does not fit, this is a property of
-    // the declaration, and DDL is where a declaration is judged. Getting this
-    // wrong is worse than a late error: the relation's RAM buffer would accept
-    // rows all day and the *flush* would fail — in the background, with no
-    // statement left to report to.
+    // in two ways. Both belong at DDL: unlike a value that does not fit, this is
+    // a property of the declaration, and a relation that passed it would accept
+    // rows all day and fail in the *flush*, with no statement to report to.
     for column in &schema.columns {
         if column.ty != PgType::Numeric || column.typmod < 0 {
             continue;
@@ -198,10 +195,9 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
             )));
         }
         // Parquet's DECIMAL is defined only for `0 <= scale <= precision`, but
-        // PostgreSQL's runs from -1000 to 1000: `numeric(4,-2)` rounds to
-        // hundreds and is perfectly ordinary. Arrow carries a negative scale as
-        // far as the batch, so this only surfaces when the file is written —
-        // which is why the declaration has to be refused up front.
+        // PostgreSQL's runs from -1000 to 1000 — `numeric(4,-2)` rounds to
+        // hundreds. Arrow carries a negative scale as far as the batch, so
+        // otherwise this surfaces only when the file is written.
         if scale < 0 || scale as u8 > precision {
             return Err(StorageError::UnsupportedType(format!(
                 "numeric scale {scale} is outside 0..{precision}, which table access \
@@ -3612,10 +3608,9 @@ mod tests {
             }))
     }
 
-    /// A `numeric` column lands in the Parquet physical type its precision
-    /// asks for, which is where the space is won: `INT32` up to 9 digits,
-    /// `INT64` to 18, then a fixed-length byte array sized by the precision.
-    /// The text encoding this replaced was a `BYTE_ARRAY` for every width.
+    /// A `numeric` column lands in the Parquet physical type its precision asks
+    /// for, which is where the space is won: `INT32` up to 9 digits, `INT64` to
+    /// 18, then a fixed-length byte array sized by the precision.
     #[test]
     fn a_numeric_column_lands_in_the_physical_type_its_precision_asks_for() -> anyhow::Result<()> {
         use parquet::basic::Type as Physical;
@@ -3835,10 +3830,8 @@ mod tests {
         Ok(())
     }
 
-    /// A `numeric` sort key orders **numerically**. This is the test that fails
-    /// if the column ever goes back to a text encoding: `"10"` and `"100"` both
-    /// sort below `"9"` as strings, and the expected order below is the one
-    /// string order gets wrong.
+    /// A `numeric` sort key orders **numerically** — the order below is the one
+    /// a text encoding gets wrong, since `"10"` and `"100"` sort below `"9"`.
     #[test]
     fn a_numeric_sort_key_orders_numerically() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3871,8 +3864,8 @@ mod tests {
     }
 
     /// NaN is a legal `numeric` in PostgreSQL and has no decimal image, so the
-    /// INSERT that wrote it is refused — not the flush that would have found it
-    /// later, with no statement left to blame.
+    /// INSERT that wrote it is refused rather than the flush that would have
+    /// found it later.
     #[test]
     fn a_nan_is_refused_by_the_insert_not_the_flush() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3897,11 +3890,8 @@ mod tests {
 
     /// A `numeric(p, s)` the format cannot represent is a property of the
     /// declaration, so it is DDL that says no — for both ways it can happen.
-    ///
-    /// The scale case is the one that bites hardest if missed: PostgreSQL's
-    /// `numeric(4,-2)` is ordinary, Arrow carries a negative scale without
-    /// complaint, and only the Parquet writer refuses it. That refusal lands in
-    /// a flush, which has no statement to fail — so it has to be caught here.
+    /// The scale case is the one that bites: only the Parquet writer refuses a
+    /// negative scale, and that refusal lands in a flush.
     #[test]
     fn a_typmod_the_format_cannot_represent_is_rejected_by_ddl() {
         let refused = |precision, scale| {

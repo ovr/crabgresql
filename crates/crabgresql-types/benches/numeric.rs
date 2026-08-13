@@ -80,15 +80,14 @@ fn accumulation(c: &mut Criterion) {
     g.finish();
 }
 
-/// The `Value` ⇄ decimal conversions the columnar stores run **per cell**:
-/// `to_scaled_i128` once per value written, `from_scaled_i128` once per value
-/// read. Every case below is a real column shape, because the cost turns on the
-/// magnitude *after* scaling rather than on the value the user sees.
+/// The `Value` ⇄ decimal conversions the columnar stores run **per cell**, one
+/// case per real column shape: the cost turns on the magnitude *after* scaling,
+/// not on the value the user sees.
 ///
-/// The pairs to watch are `bare_*` against `d64_*`. A column with no typmod is
-/// stored at scale 16, so `321000.00` becomes `3.21e21` — past `u64::MAX`, and
-/// so onto 128-bit division, which is a libcall. The same value in a
-/// `numeric(15,2)` column scales to `32100000`, which stays in a register.
+/// The pair to watch is `bare_*` against `d64_*`. A column with no typmod
+/// stores at scale 16, so `321000.00` becomes `3.21e21` — past `u64::MAX`, and
+/// so onto 128-bit division — while the same value in `numeric(15,2)` scales to
+/// `32100000` and stays in a register.
 fn fixed_point(c: &mut Criterion) {
     let mut g = c.benchmark_group("numeric_fixed_point");
 
@@ -139,9 +138,9 @@ fn fixed_point(c: &mut Criterion) {
     g.finish();
 }
 
-/// Rendering, which every value pays on its way to the client — and which a
-/// stored `numeric` now pays more of, since a column with no typmod reads back
-/// at scale 16 and so prints eighteen characters where the user wrote four.
+/// Rendering, which every value pays on its way to the client — and a column
+/// with no typmod pays most, printing eighteen characters for a value the user
+/// wrote as four.
 fn rendering(c: &mut Criterion) {
     let mut g = c.benchmark_group("numeric_render");
 
@@ -181,8 +180,8 @@ fn storage_form(c: &mut Criterion) {
     });
     g.bench_function("trunc_d64", |b| b.iter(|| black_box(&money).trunc(2)));
 
-    // The same value entering a column with no typmod, where the scale it is
-    // stored at is not the scale it arrived with.
+    // The same value entering a column with no typmod, whose scale it does not
+    // already carry.
     g.bench_function("fits_bare", |b| {
         b.iter(|| black_box(&money).fits_decimal(38, 16))
     });

@@ -63,11 +63,9 @@ impl ProjectBatch {
                 // Built here, not per batch: `ok()?` turns a type with no Arrow
                 // encoding into a declined projection rather than a query that
                 // dies on its first batch.
-                //
-                // The `encoding_ignores_typmod` guard is the same decision one
-                // level down: a type whose encoding a *column's* modifier
-                // decides has no faithful form here, where there is no column
-                // to ask. The planner refuses these first; repeated because
+                // The typmod guard is the same decision for a type whose
+                // encoding a *column's* modifier decides: there is no column to
+                // ask here. The planner refuses these first; repeated because
                 // this is where the unfaithful array would be built.
                 BoundExpr::Const { value, ty } => {
                     if !arrow::encoding_ignores_typmod(*ty) {
@@ -95,13 +93,10 @@ impl ProjectBatch {
 
     /// The layout a projection produces, for the node above.
     ///
-    /// A taken column keeps its **typmod**, not just its type. For `numeric`
-    /// that modifier is part of the Arrow type — the decimal's precision and
-    /// scale — so dropping it here would stamp the output batch with one
-    /// decimal type while the take handed up an array of another, and Arrow
-    /// rejects the batch. A constant has no typmod and gets `-1`, which is what
-    /// [`build_array`] encoded it as in [`Self::compile`]; the two agree
-    /// because both ask the same question of the same missing modifier.
+    /// A taken column keeps its **typmod**, not just its type: for `numeric`
+    /// that modifier is part of the Arrow type, so dropping it would stamp the
+    /// batch with one decimal type while the take hands up an array of another,
+    /// and Arrow rejects the batch.
     pub fn layout(projections: &[BoundExpr], input: &BatchLayout) -> BatchLayout {
         Arc::from(
             projections
@@ -191,14 +186,11 @@ mod tests {
         assert!(ProjectBatch::compile(&ok, &layout).is_some());
     }
 
-    /// A `numeric` constant is declined too, and for a subtler reason than the
+    /// A `numeric` constant is declined for a subtler reason than the
     /// unrepresentable types above: Arrow *can* hold it, but only at a scale a
-    /// column's typmod fixes — and a constant has no column. Encoded here it
-    /// would take the storage default, so `SELECT 1.50::numeric` would answer
-    /// `1.5000000000000000` from a columnar plan and `1.50` from a row plan.
-    ///
-    /// The `numeric` *column* beside it still compiles: it has a typmod, and
-    /// its values were stored under it.
+    /// column's typmod fixes, and a constant has no column — so
+    /// `SELECT 1.50::numeric` would answer `1.5000000000000000` columnar and
+    /// `1.50` row-wise. The `numeric` *column* beside it still compiles.
     #[test]
     fn a_numeric_constant_is_declined_because_its_scale_would_come_from_storage() {
         let mut schema = schema_of(&[PgType::Int4, PgType::Numeric]);
