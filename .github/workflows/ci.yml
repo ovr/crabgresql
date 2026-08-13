@@ -53,8 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      # The runner spawns the server as a child process, so both binaries are
+      # needed; `regress` finds `crabgresql` next to itself in target/release.
       - name: cargo build --release
-        run: cargo build --release -p crabgresql-pg-regress --bin regress --locked
+        run: |
+          cargo build --release --locked \
+            -p crabgresql-pg-regress --bin regress \
+            -p crabgresql-server --bin crabgresql
 
       # Both suites run to completion even when one is red, so the report
       # covers everything; the job is failed at the end instead.
@@ -117,7 +122,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: regression-diffs
-          path: target/regress/**/regression.diffs
+          path: |
+            target/regress/**/regression.diffs
+            target/regress/**/server.log
           if-no-files-found: ignore
 
       - name: fail on regressions
@@ -199,8 +206,12 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           df -h /
 
+      # bench starts the server binary as a child process, so both are needed.
       - name: cargo build --release
-        run: cargo build --release -p crabgresql-bench --bin bench --locked
+        run: |
+          cargo build --release --locked \
+            -p crabgresql-bench --bin bench \
+            -p crabgresql-server --bin crabgresql
 
       - name: fetch the dataset
         run: scripts/bench/fetch-clickbench.sh "$CLICKBENCH_ROWS" "$RUNNER_TEMP/hits.tsv"
@@ -225,6 +236,14 @@ jobs:
           scripts/bench/report.sh \
             "ClickBench — parquet, ${CLICKBENCH_ROWS} rows" \
             target/bench/clickbench.txt > target/bench/clickbench.md
+
+      # The server runs as a child process and logs into its data directory,
+      # which is outside the uploaded tree; a crash's backtrace is in there.
+      - name: collect the server log
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/clickbench-data/server.log" \
+             target/bench/clickbench.server.log || true
 
       - name: upload results
         if: always()
@@ -256,8 +275,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
 
+      # bench starts the server binary as a child process, so both are needed.
       - name: cargo build --release
-        run: cargo build --release -p crabgresql-bench --bin bench --locked
+        run: |
+          cargo build --release --locked \
+            -p crabgresql-bench --bin bench \
+            -p crabgresql-server --bin crabgresql
 
       # Cheap enough to repeat per access method: sf=0.01 is a DuckDB CLI
       # download plus seconds of dbgen, less than a job that ships a dataset
@@ -292,6 +315,12 @@ jobs:
             "TPC-H — ${{ matrix.am }}, sf=0.01" \
             target/bench/tpch-${{ matrix.am }}.txt \
             > target/bench/tpch-${{ matrix.am }}.md
+
+      - name: collect the server log
+        if: always()
+        run: |
+          cp "$RUNNER_TEMP/tpch-${{ matrix.am }}/server.log" \
+             target/bench/tpch-${{ matrix.am }}.server.log || true
 
       # The name has to keep the `bench-` prefix: that is what bench-report
       # downloads by pattern.

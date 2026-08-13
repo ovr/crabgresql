@@ -854,6 +854,7 @@ crates/
   crabgresql-parquet-engine  # buffered immutable Parquet chunks + compaction
   crabgresql-plpgsql         # PL/pgSQL parser + interpreter
   crabgresql-server          # session, GUCs, wiring it all together; bin: crabgresql
+  crabgresql-server-process  # start that binary as a child process, for the harnesses
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
   crabgresql-bench           # analytical benchmark harness (ClickBench, TPC-H)
 ```

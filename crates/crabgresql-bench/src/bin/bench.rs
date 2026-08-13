@@ -39,9 +39,14 @@ enum Command {
         #[arg(long, value_name = "N")]
         rows: Option<u64>,
 
-        /// Data directory for the in-process server [default: a temp dir]
+        /// Data directory for the server under test [default: a temp dir]
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
+
+        /// The crabgresql server binary to benchmark, also
+        /// CRABGRESQL_SERVER_BIN [default: the one built next to this executable]
+        #[arg(long, value_name = "PATH")]
+        server_bin: Option<PathBuf>,
 
         /// Benchmark an external server instead (libpq connection string)
         #[arg(long, value_name = "CONNINFO")]
@@ -81,6 +86,7 @@ async fn main() -> ExitCode {
         data,
         rows,
         data_dir,
+        server_bin,
         url,
         runs,
         query,
@@ -104,6 +110,7 @@ async fn main() -> ExitCode {
         data,
         rows,
         data_dir,
+        server_bin,
         url,
         runs,
         only: query.into_iter().map(|n| n as usize).collect(),
@@ -127,7 +134,9 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    if report.succeeded() == report.queries.len() {
+    // A crash fails the run even when every query it got to ran: the report is
+    // a partial one, and the queries after it were never measured.
+    if report.crash.is_none() && report.succeeded() == report.queries.len() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

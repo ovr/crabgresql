@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::runner::SuiteReport;
+use crate::runner::{Status, SuiteReport};
 
 /// How many of the slowest tests [`Detail::Slowest`] lists.
 const SLOWEST: usize = 5;
@@ -37,10 +37,25 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> St
         format_duration(report.duration)
     );
 
-    let failed: Vec<&str> = report.failed().map(|o| o.name.as_str()).collect();
+    // A crashed server explains every failure under it, so it goes above them.
+    if let Some(crash) = &report.crash {
+        let _ = write!(out, "\n> ⚠️ {crash}\n");
+    }
+
+    // Only tests that ran are named: after a crash the tail of the schedule is
+    // unproven rather than broken, and listing it would bury the one that failed.
+    let failed: Vec<&str> = report
+        .failed()
+        .filter(|o| o.ran())
+        .map(|o| o.name.as_str())
+        .collect();
     if !failed.is_empty() {
         let names: Vec<String> = failed.iter().map(|name| format!("`{name}`")).collect();
         let _ = write!(out, "\nFailed: {}\n", names.join(", "));
+    }
+    let not_run = report.outcomes.iter().filter(|o| !o.ran()).count();
+    if not_run > 0 {
+        let _ = write!(out, "\nNot run: {not_run} test(s) after the crash\n");
     }
 
     // Slowest first either way: on the full table that is the ordering worth
@@ -63,7 +78,11 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> St
                 out,
                 "| `{}` | {} | {} |",
                 outcome.name,
-                if outcome.passed { "ok" } else { "**FAILED**" },
+                match outcome.status {
+                    Status::Passed => "ok",
+                    Status::Failed => "**FAILED**",
+                    Status::NotRun => "**not run**",
+                },
                 format_duration(outcome.duration)
             );
         }
@@ -79,7 +98,11 @@ mod tests {
     fn outcome(name: &str, passed: bool, millis: u64) -> TestOutcome {
         TestOutcome {
             name: name.to_string(),
-            passed,
+            status: if passed {
+                Status::Passed
+            } else {
+                Status::Failed
+            },
             duration: Duration::from_millis(millis),
         }
     }
@@ -89,6 +112,7 @@ mod tests {
         let report = SuiteReport {
             outcomes: vec![outcome("fast", true, 100), outcome("slow", true, 2500)],
             duration: Duration::from_millis(2600),
+            crash: None,
         };
         let md = markdown_summary("smoke", &report, Detail::Slowest);
         assert_eq!(
@@ -109,11 +133,30 @@ mod tests {
         let report = SuiteReport {
             outcomes: vec![outcome("ok", true, 10), outcome("bad", false, 20)],
             duration: Duration::from_millis(30),
+            crash: None,
         };
         let md = markdown_summary("upstream", &report, Detail::Slowest);
         assert!(md.starts_with("### ❌ upstream — 1/2 passed (50%) in 0.03s\n"));
         assert!(md.contains("\nFailed: `bad`\n"));
         assert!(md.contains("| `bad` | **FAILED** | 0.02s |\n"));
+    }
+
+    #[test]
+    fn reports_a_crash_above_the_failures() {
+        let not_run = TestOutcome {
+            status: Status::NotRun,
+            ..outcome("later", false, 0)
+        };
+        let report = SuiteReport {
+            outcomes: vec![outcome("boom", false, 20), not_run],
+            duration: Duration::from_millis(30),
+            crash: Some("server exited with signal 6 during test boom".to_string()),
+        };
+        let md = markdown_summary("upstream", &report, Detail::All);
+        assert!(md.contains("\n> ⚠️ server exited with signal 6 during test boom\n"));
+        assert!(md.contains("\nFailed: `boom`\n"));
+        assert!(md.contains("\nNot run: 1 test(s) after the crash\n"));
+        assert!(md.contains("| `later` | **not run** | 0.00s |\n"));
     }
 
     /// `Detail::All` keeps every test, where `Detail::Slowest` caps the table.
@@ -125,6 +168,7 @@ mod tests {
         let report = SuiteReport {
             outcomes,
             duration: Duration::from_millis(100),
+            crash: None,
         };
 
         let all = markdown_summary("smoke", &report, Detail::All);

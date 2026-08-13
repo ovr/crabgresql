@@ -1,5 +1,5 @@
-//! Suite orchestration: run each test's `sql/<name>.sql` against an
-//! in-process server, write `results/<name>.out`, and compare byte-for-byte
+//! Suite orchestration: run each test's `sql/<name>.sql` against a server
+//! child process, write `results/<name>.out`, and compare byte-for-byte
 //! against `expected/<name>.out` (or its `_1` … `_9` variants, pg_regress
 //! style). Failures land as unified diffs in `<outdir>/regression.diffs`.
 
@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crabgresql_server_process::ServerProcess;
 use similar::TextDiff;
-use tokio::net::TcpListener;
 
 use crate::client::{Client, Field, QueryEvent};
 use crate::describe;
@@ -17,7 +17,13 @@ use crate::format;
 use crate::psql_var::{self, Variables};
 use crate::script::{QueryEnd, ScriptItem, is_copy_from_stdin, lex};
 
+/// psql's wording when a connection dies.
+const CONNECTION_LOST: &str = "connection to server was lost\n";
+
 pub struct SuiteConfig {
+    /// The `crabgresql` binary to run the suite against, from
+    /// [`crabgresql_server_process::locate_server_binary`] or `--server-bin`.
+    pub server_bin: PathBuf,
     /// Directory containing `sql/` and `expected/`.
     pub regress_dir: PathBuf,
     /// Tests run first whose output is not checked (pg_regress's
@@ -76,12 +82,41 @@ pub fn regress_environment(regress_dir: &Path, outdir: &Path) -> BTreeMap<String
     .collect()
 }
 
+/// How one test ended. `NotRun` is a failure — nothing proved the test passes —
+/// but it is not a regression of its own: the server was gone before its turn
+/// came.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Passed,
+    Failed,
+    NotRun,
+}
+
 pub struct TestOutcome {
     pub name: String,
-    pub passed: bool,
+    pub status: Status,
     /// Wall-clock time spent executing the script, without the diff against
     /// `expected/`.
     pub duration: Duration,
+}
+
+impl TestOutcome {
+    fn not_run(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            status: Status::NotRun,
+            duration: Duration::ZERO,
+        }
+    }
+
+    pub fn passed(&self) -> bool {
+        self.status == Status::Passed
+    }
+
+    /// Whether the run got as far as this test at all.
+    pub fn ran(&self) -> bool {
+        self.status != Status::NotRun
+    }
 }
 
 pub struct SuiteReport {
@@ -90,11 +125,14 @@ pub struct SuiteReport {
     /// Wall-clock time of the whole run, including server startup and the
     /// setup tests that `outcomes` leaves out.
     pub duration: Duration,
+    /// Set when the server process died mid-run, which makes the report a
+    /// partial one.
+    pub crash: Option<String>,
 }
 
 impl SuiteReport {
     pub fn passed(&self) -> usize {
-        self.outcomes.iter().filter(|o| o.passed).count()
+        self.outcomes.iter().filter(|o| o.passed()).count()
     }
 
     pub fn total(&self) -> usize {
@@ -106,7 +144,7 @@ impl SuiteReport {
     }
 
     pub fn failed(&self) -> impl Iterator<Item = &TestOutcome> {
-        self.outcomes.iter().filter(|o| !o.passed)
+        self.outcomes.iter().filter(|o| !o.passed())
     }
 
     /// The `n` longest-running tests, slowest first.
@@ -118,28 +156,30 @@ impl SuiteReport {
     }
 }
 
-/// Run the whole suite against one server + engine instance, mirroring how
-/// pg_regress runs every test in a single cluster. Each test gets a fresh
-/// connection, as each pg_regress test gets a fresh psql.
+/// Run the whole suite against one server process, mirroring how pg_regress
+/// runs every test in a single cluster. Each test gets a fresh connection, as
+/// each pg_regress test gets a fresh psql.
+///
+/// The server is a child process, so its death is survivable: the run stops
+/// there and its log is left in `<outdir>/server.log`.
 pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let started = Instant::now();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
     // The whole suite runs against one durable pg-engine over a throwaway data
-    // directory (kept alive until this function returns, past `server.abort()`).
+    // directory (kept alive until this function returns, past the shutdown).
     let data_dir = tempfile::tempdir()?;
-    let (engine, txnmgr) = crabgresql_server::open_pg_engine(data_dir.path())?;
-    // Scripts load fixtures with `COPY … FROM :'abs_srcdir/data/x.data'`, which
-    // is the suite's source tree, not the throwaway PGDATA — so the server has
-    // to be told that tree is readable.
-    let copy_files = crabgresql_server::CopyFileAccess::confined_to(data_dir.path())
-        .allowing(&config.regress_dir);
-    let server = tokio::spawn(crabgresql_server::serve_with(
-        listener, engine, txnmgr, copy_files,
-    ));
-
     let results_dir = config.outdir.join("results");
     std::fs::create_dir_all(&results_dir)?;
+    // Scripts load fixtures with `COPY … FROM :'abs_srcdir/data/x.data'`, which
+    // is the suite's source tree and not the throwaway PGDATA.
+    let mut server = ServerProcess::start(
+        &config.server_bin,
+        data_dir.path(),
+        std::slice::from_ref(&config.regress_dir),
+        &config.outdir.join("server.log"),
+    )
+    .await?;
+    let port = server.port();
+
     let diffs_path = config.outdir.join("regression.diffs");
     let mut diffs = String::new();
 
@@ -147,27 +187,66 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let setup = config.setup.iter().map(|name| (name, false));
     let checked = config.tests.iter().map(|name| (name, true));
     let mut outcomes = Vec::new();
+    let mut crash = None;
     for (name, check) in setup.chain(checked) {
         let sql_path = config.regress_dir.join("sql").join(format!("{name}.sql"));
         // Lossy: a few upstream scripts are deliberately not UTF-8 (encoding
         // tests); they can only fail, but they must not abort the run.
         let sql = String::from_utf8_lossy(&std::fs::read(&sql_path)?).into_owned();
         let test_started = Instant::now();
-        let output = run_test(port, &sql, config.statement_timeout, &environment).await?;
+        let run = match run_test(port, &sql, config.statement_timeout, &environment).await {
+            Ok(run) => run,
+            // The script could not even connect. Either the server is gone —
+            // the case this whole mechanism exists for — or the runner ran out
+            // of something of its own, which is not a regression to report.
+            Err(_) if server.death(true).await?.is_some() => TestRun {
+                output: CONNECTION_LOST.to_string(),
+                lost_connection: true,
+            },
+            Err(e) => return Err(e),
+        };
         let duration = test_started.elapsed();
         let result_path = results_dir.join(format!("{name}.out"));
-        std::fs::write(&result_path, &output)?;
-        if !check {
-            continue;
+        std::fs::write(&result_path, &run.output)?;
+        if check {
+            let passed = compare(config, name, &run.output, &result_path, &mut diffs)?;
+            outcomes.push(TestOutcome {
+                name: name.clone(),
+                status: if passed {
+                    Status::Passed
+                } else {
+                    Status::Failed
+                },
+                duration,
+            });
         }
-        let passed = compare(config, name, &output, &result_path, &mut diffs)?;
-        outcomes.push(TestOutcome {
-            name: name.clone(),
-            passed,
-            duration,
-        });
+        // A dead server makes every later test meaningless, so the run stops
+        // here.
+        let Some(death) = server.death(run.lost_connection).await? else {
+            continue;
+        };
+        let reason = format!(
+            "server exited with {} during test {name}; see {}",
+            death.status,
+            death.log_path.display()
+        );
+        diffs.push_str(&format!("{reason}\n{}\n\n", death.log_tail));
+        if !check {
+            // A setup test took the server with it: there is no partial
+            // report to return, only the crash.
+            std::fs::write(&diffs_path, &diffs)?;
+            return Err(io::Error::other(format!("{reason}\n{}", death.log_tail)));
+        }
+        let ran: usize = outcomes.len();
+        outcomes.extend(
+            config.tests[ran..]
+                .iter()
+                .map(|name| TestOutcome::not_run(name)),
+        );
+        crash = Some(reason);
+        break;
     }
-    server.abort();
+    server.shutdown().await;
 
     if diffs.is_empty() {
         let _ = std::fs::remove_file(&diffs_path);
@@ -177,6 +256,7 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     Ok(SuiteReport {
         outcomes,
         duration: started.elapsed(),
+        crash,
     })
 }
 
@@ -234,6 +314,15 @@ fn expected_candidates(regress_dir: &Path, name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// What one script produced: the text psql would have printed, and whether its
+/// connection died on the way. The flag is reported rather than left to be read
+/// back out of the text, so that deciding "the server may be gone" does not
+/// depend on the wording of an emulated psql message.
+struct TestRun {
+    output: String,
+    lost_connection: bool,
+}
+
 /// Execute one script on a fresh connection, producing the text psql would
 /// print. A timeout or lost connection appends a deterministic marker and
 /// abandons the rest of the file, like a dying psql would.
@@ -242,9 +331,12 @@ async fn run_test(
     sql: &str,
     statement_timeout: Duration,
     environment: &BTreeMap<String, String>,
-) -> io::Result<String> {
+) -> io::Result<TestRun> {
     let mut client = Client::connect(port).await?;
     let mut out = String::new();
+    // Set with every `CONNECTION_LOST` below: the marker is what psql prints,
+    // this is what the caller acts on.
+    let mut lost_connection = false;
     // psql's output settings, scoped to this script: `\pset`, `\x`, `\a`
     // and `\t` all change them.
     let mut printing = format::Printing::default();
@@ -312,7 +404,8 @@ async fn run_test(
                     match Client::connect(port).await {
                         Ok(fresh) => client = fresh,
                         Err(_) => {
-                            out.push_str("connection to server was lost\n");
+                            out.push_str(CONNECTION_LOST);
+                            lost_connection = true;
                             break;
                         }
                     }
@@ -326,7 +419,8 @@ async fn run_test(
                             // Same handling as a statement that loses the
                             // connection: mark it and abandon the file.
                             Err(_) => {
-                                out.push_str("connection to server was lost\n");
+                                out.push_str(CONNECTION_LOST);
+                                lost_connection = true;
                                 break;
                             }
                         }
@@ -383,7 +477,8 @@ async fn run_test(
                     {
                         Ok(Ok(events)) => events,
                         Ok(Err(_)) => {
-                            out.push_str("connection to server was lost\n");
+                            out.push_str(CONNECTION_LOST);
+                            lost_connection = true;
                             break;
                         }
                         Err(_) => {
@@ -425,7 +520,8 @@ async fn run_test(
                                     render_events(&mut out, &events, &generated, &printing)
                                 }
                                 Ok(Err(_)) => {
-                                    lost = Some("connection to server was lost\n");
+                                    lost = Some(CONNECTION_LOST);
+                                    lost_connection = true;
                                     break;
                                 }
                                 Err(_) => {
@@ -462,7 +558,8 @@ async fn run_test(
                 {
                     Ok(Ok(events)) => render_events(&mut out, &events, &statement, &printing),
                     Ok(Err(_)) => {
-                        out.push_str("connection to server was lost\n");
+                        out.push_str(CONNECTION_LOST);
+                        lost_connection = true;
                         break;
                     }
                     Err(_) => {
@@ -473,7 +570,10 @@ async fn run_test(
             }
         }
     }
-    Ok(out)
+    Ok(TestRun {
+        output: out,
+        lost_connection,
+    })
 }
 
 /// Print a statement's responses: result tables, errors and notices. Command

@@ -456,7 +456,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
- "crabgresql-server",
+ "crabgresql-server-process",
  "crabgresql-storage-api",
  "futures-util",
  "tempfile",
@@ -600,7 +600,7 @@ version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
- "crabgresql-server",
+ "crabgresql-server-process",
  "similar",
  "tempfile",
  "tokio",
@@ -671,6 +671,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "crabgresql-server-process"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "crabgresql-config",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

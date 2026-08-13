@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use crabgresql_server_process::{ServerProcess, locate_server_binary};
 use crabgresql_storage_api::TableAccessMethod;
-use tokio::net::TcpListener;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 use crate::client;
@@ -21,9 +21,12 @@ pub struct RunConfig {
     /// benchmark. Single-table suites only: slicing each table of a joined
     /// schema independently leaves its keys dangling.
     pub rows: Option<u64>,
-    /// Data directory for the in-process server; a temporary one when unset,
+    /// Data directory for the server under test; a temporary one when unset,
     /// so a persistent path is what lets a load be reused by the next run.
     pub data_dir: Option<PathBuf>,
+    /// The `crabgresql` binary to benchmark. Unset takes the one built next to
+    /// this executable; ignored with `url`.
+    pub server_bin: Option<PathBuf>,
     /// Benchmark an external server instead (a libpq connection string), for
     /// side-by-side numbers against stock PostgreSQL.
     pub url: Option<String>,
@@ -43,19 +46,26 @@ pub struct RunConfig {
     pub reload: bool,
 }
 
-/// The server under test, kept alive for the length of the run.
+/// The server under test, kept alive for the length of the run. The child is
+/// killed when this is dropped, whichever way the run ended.
+///
+/// Field order is load-bearing: fields drop in declaration order, so the server
+/// has to be listed before the temporary data directory. The other way round
+/// unlinks the tree while the flush worker is still writing to it, which leaves
+/// a re-created directory behind in `/tmp`.
 struct Target {
+    server: Option<ServerProcess>,
+    _data_dir: Option<tempfile::TempDir>,
     conninfo: String,
     description: String,
-    _data_dir: Option<tempfile::TempDir>,
-    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
-impl Drop for Target {
-    fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
+impl Target {
+    /// Why the server is gone, or `None` if it is still running — always so for
+    /// an external `--url` target, which is not ours to diagnose.
+    async fn server_died(&mut self, lost_connection: bool) -> Option<String> {
+        let death = self.server.as_mut()?.death(lost_connection).await.ok()??;
+        Some(format!("bench: {death}\n{}", death.log_tail))
     }
 }
 
@@ -92,11 +102,12 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
         );
     }
 
-    let target = start_target(config).await?;
+    let mut target = start_target(config).await?;
     let mut client = client::connect(&target.conninfo).await?;
     let loaded = load_if_needed(&client, suite, config).await?;
 
-    let mut results = Vec::with_capacity(queries.len());
+    let total_queries = queries.len();
+    let mut results = Vec::with_capacity(total_queries);
     for query in queries {
         let mut runs = Vec::with_capacity(config.runs as usize);
         for _ in 0..config.runs {
@@ -120,7 +131,23 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
                 // silent stall is indistinguishable from a hang.
                 eprintln!("  q{:<3} {:>9}  {}", query.number, "-", outcome.summary());
             }
+            let lost_connection = matches!(outcome, Outcome::Disconnected(_));
             runs.push(outcome);
+            // A dead server makes every later query meaningless, and reconnecting
+            // to it would spend the timeout to say so once per query. Report what
+            // was measured, with the reason and the server's own log.
+            if broken && let Some(reason) = target.server_died(lost_connection).await {
+                eprintln!("{reason}");
+                results.push(QueryRun {
+                    number: query.number,
+                    runs,
+                });
+                let reason = format!(
+                    "{reason}\n{} of {total_queries} queries did not run.",
+                    total_queries - results.len(),
+                );
+                return Ok(report(suite, &target, &loaded, results, Some(reason)));
+            }
             if broken {
                 match reconnect(&target.conninfo, config.timeout).await {
                     Ok(fresh) => client = fresh,
@@ -132,7 +159,7 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
                             number: query.number,
                             runs,
                         });
-                        return Ok(report(suite, &target, &loaded, results));
+                        return Ok(report(suite, &target, &loaded, results, None));
                     }
                 }
             }
@@ -160,10 +187,16 @@ pub async fn run(suite: &Suite, config: &RunConfig) -> Result<SuiteRun> {
         results.push(result);
     }
 
-    Ok(report(suite, &target, &loaded, results))
+    Ok(report(suite, &target, &loaded, results, None))
 }
 
-fn report(suite: &Suite, target: &Target, loaded: &Loaded, queries: Vec<QueryRun>) -> SuiteRun {
+fn report(
+    suite: &Suite,
+    target: &Target,
+    loaded: &Loaded,
+    queries: Vec<QueryRun>,
+    crash: Option<String>,
+) -> SuiteRun {
     SuiteRun {
         suite: suite.name.to_string(),
         target: target.description.clone(),
@@ -171,6 +204,7 @@ fn report(suite: &Suite, target: &Target, loaded: &Loaded, queries: Vec<QueryRun
         tables: loaded.tables.clone(),
         load_time: loaded.time,
         queries,
+        crash,
     }
 }
 
@@ -438,20 +472,22 @@ fn no_data_hint(suite: &Suite) -> String {
     format!("Get the dataset first:\n{}", suite.dataset_hint)
 }
 
-/// Either connect to the external server named by `--url`, or boot one in this
-/// process over the durable heap engine, exactly as `crabgresql-server` does.
+/// Either connect to the external server named by `--url`, or start the
+/// `crabgresql` binary as a child process over the durable heap engine.
+///
+/// A child process is what a benchmark should measure: the same binary a user
+/// runs, and a load that OOMs or panics it no longer takes the harness holding
+/// the results down with it. Its log goes to `<data-dir>/server.log`.
 async fn start_target(config: &RunConfig) -> Result<Target> {
     if let Some(url) = &config.url {
         return Ok(Target {
+            server: None,
+            _data_dir: None,
             conninfo: url.clone(),
             description: format!("external server ({url})"),
-            _data_dir: None,
-            server: None,
         });
     }
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
     let (temp_dir, path) = match &config.data_dir {
         Some(path) => {
             std::fs::create_dir_all(path)
@@ -464,19 +500,21 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
             (Some(dir), path)
         }
     };
-    let (engine, txnmgr) = crabgresql_server::open_pg_engine(&path)
-        .with_context(|| format!("opening the engine over {}", path.display()))?;
-    // Benchmarks load from their own generated data directory only.
-    let copy_files = crabgresql_server::CopyFileAccess::confined_to(&path);
-    let server = tokio::spawn(crabgresql_server::serve_with(
-        listener, engine, txnmgr, copy_files,
-    ));
+    let binary = locate_server_binary(config.server_bin.clone())?;
+    // The dataset is streamed in through `COPY … FROM STDIN`, so the server
+    // needs no read access outside its own data directory.
+    let server = ServerProcess::start(&binary, &path, &[], &path.join("server.log"))
+        .await
+        .with_context(|| format!("starting {} over {}", binary.display(), path.display()))?;
 
     Ok(Target {
-        conninfo: format!("host=127.0.0.1 port={port} user=postgres dbname=bench"),
-        description: format!("in-process CrabgreSQL ({})", path.display()),
-        _data_dir: temp_dir,
+        conninfo: format!(
+            "host=127.0.0.1 port={} user=postgres dbname=bench",
+            server.port()
+        ),
         server: Some(server),
+        _data_dir: temp_dir,
+        description: format!("CrabgreSQL ({})", path.display()),
     })
 }
 
