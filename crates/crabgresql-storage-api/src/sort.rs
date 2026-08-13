@@ -28,10 +28,11 @@ use crate::{Column, IndexKey, StorageError, TableSchema};
 /// PostgreSQL's: [`sort_permutation`] canonicalizes the key column first, which
 /// makes the two coincide. `"char"` is included because [`crate::arrow`] stores
 /// it as `UInt8` precisely so that Arrow's order is the type's own unsigned
-/// one. `numeric` is excluded and cannot be included — it is stored as `Utf8`,
-/// so an Arrow comparison on it is a string comparison; `bpchar` ignores
-/// trailing blanks, which byte order does not; `timetz` and `interval` are
-/// `Struct`s, which no ordering kernel accepts.
+/// one. `numeric` needs no canonicalization: a column is one decimal type, so
+/// the integer order *is* the numeric order, and a decimal holds neither of the
+/// values a float has to be rewritten for. `bpchar` ignores trailing blanks,
+/// which byte order does not; `timetz` and `interval` are `Struct`s, which no
+/// ordering kernel accepts.
 pub fn sortable(ty: PgType, collation: u32) -> bool {
     match ty {
         PgType::Bool
@@ -41,6 +42,7 @@ pub fn sortable(ty: PgType, collation: u32) -> bool {
         | PgType::Int8
         | PgType::Float4
         | PgType::Float8
+        | PgType::Numeric
         | PgType::Date
         | PgType::Time
         | PgType::Timestamp
@@ -249,17 +251,13 @@ mod tests {
             PgType::TimestampTz,
             PgType::Bytea,
             PgType::Uuid,
+            PgType::Numeric,
         ] {
             assert!(sortable(ty, collation::DEFAULT_COLLATION_OID), "{ty:?}");
         }
-        // Stored as `Utf8`, as a `Struct`, or blank-padded — none of the three
-        // orders like PostgreSQL does.
-        for ty in [
-            PgType::Numeric,
-            PgType::TimeTz,
-            PgType::Interval,
-            PgType::Bpchar,
-        ] {
+        // Stored as a `Struct` or blank-padded — neither orders like
+        // PostgreSQL does.
+        for ty in [PgType::TimeTz, PgType::Interval, PgType::Bpchar] {
             assert!(!sortable(ty, collation::DEFAULT_COLLATION_OID), "{ty:?}");
         }
     }
@@ -279,25 +277,25 @@ mod tests {
         let sortable_schema = schema(
             vec![
                 Column::new("a", PgType::Int4),
-                Column::new("b", PgType::Numeric),
+                Column::new("b", PgType::Interval),
             ],
             vec![key(0)],
         );
         assert!(sortable_layout(&sortable_schema));
         assert!(unsortable_column(&sortable_schema.columns, &sortable_schema.sort_key).is_none());
 
-        let numeric_key = schema(
+        let interval_key = schema(
             vec![
                 Column::new("a", PgType::Int4),
-                Column::new("b", PgType::Numeric),
+                Column::new("b", PgType::Interval),
             ],
             vec![key(0), key(1)],
         );
-        assert!(!sortable_layout(&numeric_key));
+        assert!(!sortable_layout(&interval_key));
         // The offending column is named, so the DDL gate reports the same one
         // the write path would have refused to order.
         assert_eq!(
-            unsortable_column(&numeric_key.columns, &numeric_key.sort_key)
+            unsortable_column(&interval_key.columns, &interval_key.sort_key)
                 .map(|column| column.name.as_str()),
             Some("b")
         );

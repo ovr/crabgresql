@@ -835,6 +835,12 @@ pub enum StorageError {
     /// PostgreSQL caps a varlena at 1 GB and reports `54000` for it too.
     #[error("value is too large: size {size}, maximum size {max}")]
     ValueTooBig { size: usize, max: usize },
+    /// A `numeric` a columnar column's decimal cannot hold: NaN or ±Infinity,
+    /// or — in a column with no typmod to round by — a value needing a finer
+    /// scale or more digits than it has. PostgreSQL's analogous typmod failure
+    /// is `22003`, which this borrows along with the shape of its DETAIL.
+    #[error("numeric field overflow")]
+    NumericFieldOverflow { detail: Option<String> },
     /// A key too large for an index page. A row can be far bigger than this and
     /// still be storable — only the *indexed* columns are capped — so the error
     /// names the index and the heap tuple rather than the row, as PostgreSQL's
@@ -861,6 +867,7 @@ impl StorageError {
                 "Index row references tuple ({},{}) in relation \"{relation}\".",
                 tid.block, tid.offset
             )),
+            StorageError::NumericFieldOverflow { detail } => detail.clone(),
             _ => None,
         }
     }

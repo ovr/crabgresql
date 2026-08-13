@@ -82,12 +82,14 @@ Four rules keep this honest:
   the compatibility it costs. Row-path plans render exactly as before.
 
 Where Arrow's semantics differ from PostgreSQL's, the type is excluded rather
-than approximated: `numeric` (stored as text, so Arrow would compare `'9' >
-'10'`), floats under equality (PG defines `NaN = NaN` as true), `bpchar`
+than approximated: `numeric` (a decimal of the *column's* precision and scale,
+which a constant carries no typmod to match), floats under equality (PG defines
+`NaN = NaN` as true), `bpchar`
 (blank-trimmed comparison), `timetz`/`interval` (structs with their own orders),
 and text ordering under an ICU collation. Floats *are* usable as sort keys,
 because canonicalizing `-0.0` and NaN makes Arrow's total order coincide with
-PG's — ordering is repairable where equality is not. `AND`/`OR` use Arrow's
+PG's — ordering is repairable where equality is not; `numeric` sorts too, since
+a column orders against itself and one decimal type covers it. `AND`/`OR` use Arrow's
 Kleene kernels; the plain ones return NULL for `false AND NULL` and would
 silently drop rows.
 

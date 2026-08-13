@@ -154,7 +154,7 @@ pub(super) fn columnar_sort(
         .map(|(index, c)| column(index, c.ty))
         .collect();
     let takes = ProjectBatch::compile(&identity, &layout).expect("identity projection compiles");
-    let projected = ProjectBatch::layout(&identity);
+    let projected = ProjectBatch::layout(&identity, &layout);
 
     let split = rows.len() / 2;
     let batches = vec![

@@ -7344,14 +7344,13 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
     );
 
     // A key the storage layer cannot order is refused rather than recorded and
-    // ignored: `numeric` is stored as text in a fragment, so Arrow's order over
-    // it is a string order, and `timetz` is a struct no kernel orders at all.
+    // ignored: `interval` and `timetz` are structs no kernel orders at all.
     let (code, message, hint) =
-        fails("CREATE TABLE n10 (n numeric) USING parquet ORDER BY (n)").await?;
+        fails("CREATE TABLE n10 (n interval) USING parquet ORDER BY (n)").await?;
     assert_eq!(code, "42P17");
     assert_eq!(
         message,
-        "column \"n\" of type numeric cannot be used in a sort key"
+        "column \"n\" of type interval cannot be used in a sort key"
     );
     assert_eq!(
         hint.as_deref(),
@@ -7367,11 +7366,11 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
     // Inherited from the PRIMARY KEY, so the remedy is a different clause
     // rather than a different column in the one they wrote.
     let (code, message, hint) =
-        fails("CREATE TABLE n12 (n numeric PRIMARY KEY) USING parquet").await?;
+        fails("CREATE TABLE n12 (t timetz PRIMARY KEY) USING parquet").await?;
     assert_eq!(code, "42P17");
     assert_eq!(
         message,
-        "column \"n\" of type numeric cannot be used in a sort key"
+        "column \"t\" of type time with time zone cannot be used in a sort key"
     );
     assert_eq!(
         hint.as_deref(),
@@ -7392,6 +7391,10 @@ async fn an_engine_managed_table_must_declare_its_sort_key() -> anyhow::Result<(
         // unsigned one, so parquet can honor it and must not refuse it.
         "CREATE TABLE k10 (c \"char\") USING parquet ORDER BY (c)",
         "CREATE TABLE k11 (c \"char\" PRIMARY KEY) USING parquet",
+        // `numeric` is a decimal in a fragment, whose integer order is the
+        // numeric one, so parquet honors it too — with or without a typmod.
+        "CREATE TABLE k12 (n numeric) USING parquet ORDER BY (n)",
+        "CREATE TABLE k13 (n numeric(10,2) PRIMARY KEY) USING parquet",
     ] {
         client
             .simple_query(sql)

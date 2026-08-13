@@ -38,7 +38,9 @@ use arrow_array::{
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use crabgresql_storage_api::arrow::{arrow_schema, build_batch, decode_row};
+use crabgresql_storage_api::arrow::{
+    NUMERIC_MAX_PRECISION, arrow_schema, build_batch, decode_row, numeric_decimal,
+};
 use crabgresql_storage_api::sort::{sort_permutation, sortable_layout, take_batch};
 use crabgresql_storage_api::{
     BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_PHYSICAL_BLOCK, RelStats,
@@ -49,7 +51,7 @@ use crabgresql_txn::{
     CommandId, Infomask, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, Xid,
     satisfies_mvcc,
 };
-use crabgresql_types::PgType;
+use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, Wal, WalError};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -173,6 +175,35 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
             column.ty.name(),
             schema.access_method.as_str(),
         )));
+    }
+    // `numeric` is the one type whose *modifier* can put it outside the format,
+    // in two ways. Both belong at DDL: unlike a value that does not fit, this is
+    // a property of the declaration, and a relation that passed it would accept
+    // rows all day and fail in the *flush*, with no statement to report to.
+    for column in &schema.columns {
+        if column.ty != PgType::Numeric || column.typmod < 0 {
+            continue;
+        }
+        let method = schema.access_method.as_str();
+        let (precision, scale) = numeric_decimal(column.typmod);
+        // The widest Arrow decimal is 256 bits, which stops at 76 digits, while
+        // PostgreSQL's `numeric(p, s)` allows a thousand.
+        if precision > NUMERIC_MAX_PRECISION {
+            return Err(StorageError::UnsupportedType(format!(
+                "numeric precision {precision} exceeds the maximum {NUMERIC_MAX_PRECISION} \
+                 supported by table access method \"{method}\"",
+            )));
+        }
+        // Parquet's DECIMAL is defined only for `0 <= scale <= precision`, but
+        // PostgreSQL's runs from -1000 to 1000 — `numeric(4,-2)` rounds to
+        // hundreds. Arrow carries a negative scale as far as the batch, so
+        // otherwise this surfaces only when the file is written.
+        if scale < 0 || scale as u8 > precision {
+            return Err(StorageError::UnsupportedType(format!(
+                "numeric scale {scale} is outside 0..{precision}, which table access \
+                 method \"{method}\" requires",
+            )));
+        }
     }
     Ok(())
 }
@@ -1618,8 +1649,8 @@ impl TableAm for ParquetTable {
         // unsorted one's — the same argument the executor's `SortBatch` makes.
         drop(tuples);
         // Sorting is best-effort by design. A key naming a column Arrow cannot
-        // order the way PostgreSQL does (`numeric` is stored as text, `timetz`
-        // and `interval` as structs) leaves the rows in insertion order instead
+        // order the way PostgreSQL does (`timetz` and `interval` are structs)
+        // leaves the rows in insertion order instead
         // of failing: DDL rejects such a key going forward, but a relation
         // created before that check still has to accept writes, and a flush
         // that failed forever would grow the buffer without bound and surface
@@ -3577,6 +3608,52 @@ mod tests {
             }))
     }
 
+    /// A `numeric` column lands in the Parquet physical type its precision asks
+    /// for, which is where the space is won: `INT32` up to 9 digits, `INT64` to
+    /// 18, then a fixed-length byte array sized by the precision.
+    #[test]
+    fn a_numeric_column_lands_in_the_physical_type_its_precision_asks_for() -> anyhow::Result<()> {
+        use parquet::basic::Type as Physical;
+
+        for (precision, scale, expected, length) in [
+            (9i32, 2i32, Physical::INT32, 0),
+            (18, 2, Physical::INT64, 0),
+            (38, 2, Physical::FIXED_LEN_BYTE_ARRAY, 16),
+            (76, 2, Physical::FIXED_LEN_BYTE_ARRAY, 32),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let wal = Arc::new(Wal::open(dir.path())?);
+            let tm = manager(&wal);
+            let mut schema = schema("phys", &[PgType::Numeric]);
+            schema.columns[0].typmod = Numeric::pack_typmod(precision, scale);
+            let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+            insert_committed(
+                &table,
+                &tm,
+                vec![vec![Value::Numeric(
+                    Numeric::parse("1.25")?.apply_typmod(precision, scale)?,
+                )]],
+            )?;
+
+            let file = parquet_files(dir.path(), 1)?
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&file)?)?;
+            let column = reader.metadata().file_metadata().schema_descr().column(0);
+            assert_eq!(
+                column.physical_type(),
+                expected,
+                "numeric({precision},{scale})"
+            );
+            assert_eq!(
+                column.type_length().max(0),
+                length,
+                "numeric({precision},{scale}) byte length"
+            );
+        }
+        Ok(())
+    }
+
     /// Insert `rows` in one transaction and commit it.
     fn insert_committed(
         table: &ParquetTable,
@@ -3722,16 +3799,23 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let wal = Arc::new(Wal::open(dir.path())?);
         let tm = manager(&wal);
-        // `numeric` is stored as text, so Arrow's order over it is a string
-        // order. DDL rejects such a key today, but a relation created before
+        // `interval` maps to a `Struct`, which no ordering kernel accepts, and
+        // its PostgreSQL order is by canonical span rather than field by field
+        // anyway. DDL rejects such a key today, but a relation created before
         // that check still has to accept writes — unsorted, and saying so.
-        let schema = sorted_schema("legacy", &[PgType::Numeric], &[0]);
+        let schema = sorted_schema("legacy", &[PgType::Interval], &[0]);
         let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
 
-        let rows: Vec<Tuple> = ["10", "9", "100"]
+        let rows: Vec<Tuple> = [2, 1, 3]
             .into_iter()
-            .map(|n| Ok(vec![Value::Numeric(Numeric::parse(n)?)]))
-            .collect::<anyhow::Result<_>>()?;
+            .map(|days| {
+                vec![Value::Interval(crabgresql_types::Interval {
+                    months: 0,
+                    days,
+                    usec: 0,
+                })]
+            })
+            .collect();
         insert_committed(&table, &tm, rows.clone())?;
 
         assert_eq!(stored_rows(dir.path(), 1, &schema)?, rows);
@@ -3744,6 +3828,95 @@ mod tests {
             "an unsorted fragment must not claim to be clustered"
         );
         Ok(())
+    }
+
+    /// A `numeric` sort key orders **numerically** — the order below is the one
+    /// a text encoding gets wrong, since `"10"` and `"100"` sort below `"9"`.
+    #[test]
+    fn a_numeric_sort_key_orders_numerically() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let mut schema = sorted_schema("nums", &[PgType::Numeric], &[0]);
+        schema.columns[0].typmod = Numeric::pack_typmod(10, 2);
+        let table = open_table(dir.path(), 1, schema.clone(), Arc::clone(&wal))?;
+
+        let numeric = |n: &str| -> anyhow::Result<Tuple> {
+            Ok(vec![Value::Numeric(
+                Numeric::parse(n)?.apply_typmod(10, 2)?,
+            )])
+        };
+        insert_committed(
+            &table,
+            &tm,
+            vec![numeric("10")?, numeric("9")?, numeric("100")?],
+        )?;
+
+        assert_eq!(
+            stored_rows(dir.path(), 1, &schema)?,
+            vec![numeric("9")?, numeric("10")?, numeric("100")?],
+        );
+        let file = parquet_files(dir.path(), 1)?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("missing fragment"))?;
+        assert_eq!(declared_sort(&file)?, Some(vec![(0, false, false)]));
+        Ok(())
+    }
+
+    /// NaN is a legal `numeric` in PostgreSQL and has no decimal image, so the
+    /// INSERT that wrote it is refused rather than the flush that would have
+    /// found it later.
+    #[test]
+    fn a_nan_is_refused_by_the_insert_not_the_flush() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(Wal::open(dir.path())?);
+        let tm = manager(&wal);
+        let schema = schema("nan", &[PgType::Numeric]);
+        let table = open_table(dir.path(), 1, schema, Arc::clone(&wal))?;
+
+        let xid = tm.allocate_xid();
+        let txn = tm.context(xid, CommandId::FIRST);
+        let error = table
+            .insert(vec![Value::Numeric(Numeric::nan())], &txn)
+            .expect_err("NaN has no decimal representation");
+        assert!(
+            matches!(error, StorageError::NumericFieldOverflow { .. }),
+            "unexpected error: {error:?}"
+        );
+        // Nothing was staged: the refusal happened before any file appeared.
+        assert!(parquet_files(dir.path(), 1)?.is_empty());
+        Ok(())
+    }
+
+    /// A `numeric(p, s)` the format cannot represent is a property of the
+    /// declaration, so it is DDL that says no — for both ways it can happen.
+    /// The scale case is the one that bites: only the Parquet writer refuses a
+    /// negative scale, and that refusal lands in a flush.
+    #[test]
+    fn a_typmod_the_format_cannot_represent_is_rejected_by_ddl() {
+        let refused = |precision, scale| {
+            let mut schema = schema("t", &[PgType::Numeric]);
+            schema.columns[0].typmod = Numeric::pack_typmod(precision, scale);
+            matches!(
+                super::validate_schema(&schema),
+                Err(StorageError::UnsupportedType(_))
+            )
+        };
+        assert!(refused(80, 2), "precision past the widest decimal");
+        assert!(
+            refused(4, -2),
+            "negative scale, which Parquet has no DECIMAL for"
+        );
+        assert!(refused(2, 5), "scale past the precision");
+
+        assert!(!refused(76, 38), "the widest decimal itself");
+        assert!(!refused(9, 0), "scale 0 is the boundary, not an exclusion");
+        assert!(!refused(9, 9), "scale == precision is legal");
+
+        // No typmod at all is the common case and is stored at the default
+        // precision and scale, not refused.
+        let bare = schema("bare", &[PgType::Numeric]);
+        assert!(super::validate_schema(&bare).is_ok());
     }
 
     #[test]

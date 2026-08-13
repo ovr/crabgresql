@@ -25,6 +25,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use crabgresql_buffer_engine::BufferTable;
+use crabgresql_storage_api::arrow::NumericColumns;
 use crabgresql_storage_api::{
     BatchStream, ColumnProjection, DeleteResult, IndexMetadata, RelStats, StorageError, TableAm,
     TableCapabilities, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
@@ -51,12 +52,16 @@ pub struct BufferedParquetTable {
     /// copy the same rows into its own fragment and neither's tombstones would
     /// apply to the other's view.
     flushing: Mutex<()>,
+    /// Resolved once from the schema, which does not change after `open`.
+    numeric: NumericColumns,
 }
 
 impl BufferedParquetTable {
     pub fn open(chunks: ParquetTable, buffer: BufferTable, indexes: Vec<IndexMetadata>) -> Self {
+        let schema = chunks.schema().clone();
         BufferedParquetTable {
-            schema: chunks.schema().clone(),
+            numeric: NumericColumns::of(&schema),
+            schema,
             chunks: Arc::new(chunks),
             buffer: Arc::new(buffer),
             indexes: RwLock::new(indexes),
@@ -381,6 +386,10 @@ impl TableAm for BufferedParquetTable {
     /// Writing whole fragments is also what `COPY FREEZE` is for, so the load
     /// skips the buffer's later flush entirely.
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        // Ahead of the freeze branch, so both leaves store the same form of a
+        // row — and the only place on this relation's write path that does.
+        let mut tuples = tuples;
+        self.numeric.normalize(&self.schema, &mut tuples)?;
         if txn.freeze_inserts {
             return self.chunks.insert_many(tuples, txn);
         }

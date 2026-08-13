@@ -398,6 +398,7 @@ impl From<StorageError> for ExecError {
             StorageError::RowTooBig { .. }
             | StorageError::ValueTooBig { .. }
             | StorageError::IndexRowTooBig { .. } => "54000",
+            StorageError::NumericFieldOverflow { .. } => "22003",
         };
         Self::new(code, error.to_string())
             .with_detail(error.detail())
@@ -1783,7 +1784,7 @@ impl Source {
         else {
             return Ok((self, false));
         };
-        let projected = vector::ProjectBatch::layout(projections);
+        let projected = vector::ProjectBatch::layout(projections, &layout);
         let takes = vector::ProjectBatch::compile(projections, &layout);
         let takes = match takes {
             Some(takes)

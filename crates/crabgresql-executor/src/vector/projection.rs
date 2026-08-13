@@ -12,7 +12,7 @@ use arrow_select::take::take as take_kernel;
 use crabgresql_binder::BoundExpr;
 use crabgresql_planner::vectorize;
 use crabgresql_storage_api::Column;
-use crabgresql_storage_api::arrow::{build_array, scan_schema};
+use crabgresql_storage_api::arrow::{self, build_array, scan_schema};
 
 use super::{BatchLayout, BatchNode, internal};
 use crate::ExecError;
@@ -63,7 +63,14 @@ impl ProjectBatch {
                 // Built here, not per batch: `ok()?` turns a type with no Arrow
                 // encoding into a declined projection rather than a query that
                 // dies on its first batch.
+                // The typmod guard is the same decision for a type whose
+                // encoding a *column's* modifier decides: there is no column to
+                // ask here. The planner refuses these first; repeated because
+                // this is where the unfaithful array would be built.
                 BoundExpr::Const { value, ty } => {
+                    if !arrow::encoding_ignores_typmod(*ty) {
+                        return None;
+                    }
                     let column = Column::new("const", *ty);
                     let row = [vec![value.clone()]];
                     build_array(&column, &row, 0).ok().map(Take::Const)
@@ -85,12 +92,25 @@ impl ProjectBatch {
     }
 
     /// The layout a projection produces, for the node above.
-    pub fn layout(projections: &[BoundExpr]) -> BatchLayout {
+    ///
+    /// A taken column keeps its **typmod**, not just its type: for `numeric`
+    /// that modifier is part of the Arrow type, so dropping it would stamp the
+    /// batch with one decimal type while the take hands up an array of another,
+    /// and Arrow rejects the batch.
+    pub fn layout(projections: &[BoundExpr], input: &BatchLayout) -> BatchLayout {
         Arc::from(
             projections
                 .iter()
                 .enumerate()
-                .map(|(index, expr)| Column::new(format!("c{index}"), expr.ty()))
+                .map(|(index, expr)| {
+                    let mut column = Column::new(format!("c{index}"), expr.ty());
+                    if let BoundExpr::ColumnRef { index, .. } = unwrap_collate(expr)
+                        && let Some(source) = input.get(*index)
+                    {
+                        column.typmod = source.typmod;
+                    }
+                    column
+                })
                 .collect::<Vec<_>>(),
         )
     }
@@ -164,5 +184,35 @@ mod tests {
         // A representable constant still compiles, so the guard is not a blanket ban.
         let ok = vec![id, constant(Value::Int4(7), PgType::Int4)];
         assert!(ProjectBatch::compile(&ok, &layout).is_some());
+    }
+
+    /// A `numeric` constant is declined for a subtler reason than the
+    /// unrepresentable types above: Arrow *can* hold it, but only at a scale a
+    /// column's typmod fixes, and a constant has no column — so
+    /// `SELECT 1.50::numeric` would answer `1.5000000000000000` columnar and
+    /// `1.50` row-wise. The `numeric` *column* beside it still compiles.
+    #[test]
+    fn a_numeric_constant_is_declined_because_its_scale_would_come_from_storage() {
+        let mut schema = schema_of(&[PgType::Int4, PgType::Numeric]);
+        schema.columns[1].typmod = crabgresql_types::numeric::Numeric::pack_typmod(10, 2);
+        let layout = layout_of(&schema);
+        let id = column(0, PgType::Int4);
+
+        let value =
+            Value::Numeric(crabgresql_types::numeric::Numeric::parse("1.50").expect("1.50"));
+        let projections = vec![id.clone(), constant(value, PgType::Numeric)];
+        assert!(
+            ProjectBatch::compile(&projections, &layout).is_none(),
+            "a numeric constant has no typmod to encode at"
+        );
+        // The planner must agree, or `EXPLAIN` advertises a columnar projection
+        // the executor then refuses.
+        assert!(!crabgresql_planner::vectorize::vectorizable_projection(
+            &projections,
+            layout.len()
+        ));
+
+        let columns = vec![id, column(1, PgType::Numeric)];
+        assert!(ProjectBatch::compile(&columns, &layout).is_some());
     }
 }

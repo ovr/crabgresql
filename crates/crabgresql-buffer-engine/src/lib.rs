@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crabgresql_storage_api::arrow::NumericColumns;
 use crabgresql_storage_api::{
     BatchStream, ColumnProjection, DeleteResult, IndexMetadata, MAX_ROW_ID, RelStats, StorageError,
     TableAm, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
@@ -181,11 +182,18 @@ pub struct BufferTable {
     /// stamped row is actually dead needs the deleter's fate. Absent (a bare table
     /// in a unit test) the count falls back to treating any `xmax` as dead.
     clog: RwLock<Option<Arc<Clog>>>,
+    /// Resolved once from the schema, which does not change after `open`.
+    ///
+    /// A buffer's rows are read as batches as well as tuples, and only the
+    /// batch goes through a decimal, so a `numeric` that kept its own display
+    /// scale here would render differently per plan shape.
+    numeric: NumericColumns,
 }
 
 impl BufferTable {
     pub fn open(rel: u32, schema: TableSchema, indexes: Vec<IndexMetadata>, wal: Arc<Wal>) -> Self {
         BufferTable {
+            numeric: NumericColumns::of(&schema),
             schema: Arc::new(schema),
             rel: AtomicU32::new(rel),
             rows: RwLock::new(Vec::new()),
@@ -932,13 +940,17 @@ impl TableAm for BufferTable {
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
-        let tids = self.append(self.relfilenode(), vec![tuple], txn)?;
+        let tids = self.insert_many(vec![tuple], txn)?;
         tids.into_iter()
             .next()
             .ok_or_else(|| corrupt("buffer table insert produced no tid".to_string()))
     }
 
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        // Here rather than in `append`, which `append_in` also reaches from
+        // `BufferedParquetTable` — where this has already run.
+        let mut tuples = tuples;
+        self.numeric.normalize(&self.schema, &mut tuples)?;
         self.append(self.relfilenode(), tuples, txn)
     }
 
@@ -961,7 +973,9 @@ impl TableAm for BufferTable {
         if self.stamp_deleted(rel, &[row_id], txn).is_empty() {
             return Ok(UpdateResult::NotFound);
         }
-        self.append(rel, vec![tuple], txn)?;
+        let mut tuple = vec![tuple];
+        self.numeric.normalize(&self.schema, &mut tuple)?;
+        self.append(rel, tuple, txn)?;
         Ok(UpdateResult::Updated)
     }
 
