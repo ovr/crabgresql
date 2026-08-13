@@ -174,23 +174,40 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
             schema.access_method.as_str(),
         )));
     }
-    // `numeric` is the one type whose *modifier* can put it outside the format:
-    // the widest Arrow decimal is 256 bits, which stops at 76 digits, while
-    // PostgreSQL's `numeric(p, s)` allows a thousand. Caught here rather than at
-    // the first INSERT, because unlike a value that does not fit, this is a
-    // property of the declaration and DDL is where a declaration is judged.
-    if let Some(column) = schema.columns.iter().find(|column| {
-        column.ty == PgType::Numeric
-            && column.typmod >= 0
-            && i32::from(crabgresql_storage_api::arrow::numeric_decimal(column.typmod).0)
-                > crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION
-    }) {
-        return Err(StorageError::UnsupportedType(format!(
-            "numeric precision {} exceeds the maximum {} supported by table access method \"{}\"",
-            crabgresql_storage_api::arrow::numeric_decimal(column.typmod).0,
-            crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION,
-            schema.access_method.as_str(),
-        )));
+    // `numeric` is the one type whose *modifier* can put it outside the format,
+    // and it does so in two ways. Both are caught here rather than at the first
+    // INSERT, because unlike a value that does not fit, this is a property of
+    // the declaration, and DDL is where a declaration is judged. Getting this
+    // wrong is worse than a late error: the relation's RAM buffer would accept
+    // rows all day and the *flush* would fail — in the background, with no
+    // statement left to report to.
+    for column in &schema.columns {
+        if column.ty != PgType::Numeric || column.typmod < 0 {
+            continue;
+        }
+        let (precision, scale) = crabgresql_storage_api::arrow::numeric_decimal(column.typmod);
+        // The widest Arrow decimal is 256 bits, which stops at 76 digits, while
+        // PostgreSQL's `numeric(p, s)` allows a thousand.
+        if i32::from(precision) > crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION {
+            return Err(StorageError::UnsupportedType(format!(
+                "numeric precision {precision} exceeds the maximum {} supported by table access \
+                 method \"{}\"",
+                crabgresql_storage_api::arrow::NUMERIC_MAX_PRECISION,
+                schema.access_method.as_str(),
+            )));
+        }
+        // Parquet's DECIMAL is defined only for `0 <= scale <= precision`, but
+        // PostgreSQL's runs from -1000 to 1000: `numeric(4,-2)` rounds to
+        // hundreds and is perfectly ordinary. Arrow carries a negative scale as
+        // far as the batch, so this only surfaces when the file is written —
+        // which is why the declaration has to be refused up front.
+        if !(0..=i32::from(precision)).contains(&i32::from(scale)) {
+            return Err(StorageError::UnsupportedType(format!(
+                "numeric scale {scale} is outside 0..{precision}, which table access method \
+                 \"{}\" requires",
+                schema.access_method.as_str(),
+            )));
+        }
     }
     Ok(())
 }
@@ -3646,8 +3663,7 @@ mod tests {
     /// `INT64` to 18, then a fixed-length byte array sized by the precision.
     /// The text encoding this replaced was a `BYTE_ARRAY` for every width.
     #[test]
-    fn a_numeric_column_lands_in_the_physical_type_its_precision_asks_for()
-    -> anyhow::Result<()> {
+    fn a_numeric_column_lands_in_the_physical_type_its_precision_asks_for() -> anyhow::Result<()> {
         use parquet::basic::Type as Physical;
 
         for (precision, scale, expected, length) in [
@@ -3925,20 +3941,38 @@ mod tests {
         Ok(())
     }
 
-    /// `numeric(p, s)` beyond the widest Arrow decimal is a property of the
-    /// declaration, so it is DDL that says no.
+    /// A `numeric(p, s)` the format cannot represent is a property of the
+    /// declaration, so it is DDL that says no — for both ways it can happen.
+    ///
+    /// The scale case is the one that bites hardest if missed: PostgreSQL's
+    /// `numeric(4,-2)` is ordinary, Arrow carries a negative scale without
+    /// complaint, and only the Parquet writer refuses it. That refusal lands in
+    /// a flush, which has no statement to fail — so it has to be caught here.
     #[test]
-    fn a_precision_past_the_widest_decimal_is_rejected_by_ddl() {
-        let mut wide = schema("wide", &[PgType::Numeric]);
-        wide.columns[0].typmod = Numeric::pack_typmod(80, 2);
-        assert!(matches!(
-            super::validate_schema(&wide),
-            Err(StorageError::UnsupportedType(_))
-        ));
+    fn a_typmod_the_format_cannot_represent_is_rejected_by_ddl() {
+        let refused = |precision, scale| {
+            let mut schema = schema("t", &[PgType::Numeric]);
+            schema.columns[0].typmod = Numeric::pack_typmod(precision, scale);
+            matches!(
+                super::validate_schema(&schema),
+                Err(StorageError::UnsupportedType(_))
+            )
+        };
+        assert!(refused(80, 2), "precision past the widest decimal");
+        assert!(
+            refused(4, -2),
+            "negative scale, which Parquet has no DECIMAL for"
+        );
+        assert!(refused(2, 5), "scale past the precision");
 
-        let mut ok = schema("ok", &[PgType::Numeric]);
-        ok.columns[0].typmod = Numeric::pack_typmod(76, 38);
-        assert!(super::validate_schema(&ok).is_ok());
+        assert!(!refused(76, 38), "the widest decimal itself");
+        assert!(!refused(9, 0), "scale 0 is the boundary, not an exclusion");
+        assert!(!refused(9, 9), "scale == precision is legal");
+
+        // No typmod at all is the common case and is stored at the default
+        // precision and scale, not refused.
+        let bare = schema("bare", &[PgType::Numeric]);
+        assert!(super::validate_schema(&bare).is_ok());
     }
 
     #[test]
