@@ -1,4 +1,4 @@
-//! The three `StorageError` constructors this engine builds its messages with.
+//! The `StorageError` constructors this engine builds its messages with.
 
 use crabgresql_storage_api::StorageError;
 

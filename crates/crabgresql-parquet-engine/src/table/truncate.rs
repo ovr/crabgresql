@@ -158,7 +158,7 @@ impl ParquetTable {
     }
 
     /// Create the staged directory, WAL-log the swap and record it in memory.
-    /// Split out of [`TableAm::truncate`] so every failure before the state
+    /// Split out of [`ParquetTable::truncate_in`] so every failure before the state
     /// transition takes the same cleanup path.
     pub(crate) fn stage_truncate(
         &self,

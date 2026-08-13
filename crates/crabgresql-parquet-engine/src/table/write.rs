@@ -68,7 +68,7 @@ impl ParquetTable {
             .set_sorting_columns(sorting.map(<[SortingColumn]>::to_vec))
             .build();
         // Arrives in PG semantics, and is shifted here — once, per fragment —
-        // into the epoch the file format is defined in (see [`rebase_epoch`]).
+        // into the epoch the file format is defined in (see `crate::epoch::rebase_epoch`).
         // The caller may already have sorted it: `rebase_epoch` adds a constant
         // to every non-sentinel and leaves the ±infinity sentinels at the
         // extremes of Arrow's order, so the shift preserves the order and the
@@ -87,7 +87,6 @@ impl ParquetTable {
         Ok((temp, pending))
     }
 
-    /// The body of [`TableAm::insert_many`].
     pub(super) fn insert_rows(
         &self,
         tuples: Vec<Tuple>,

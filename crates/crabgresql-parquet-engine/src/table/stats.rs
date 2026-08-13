@@ -97,7 +97,6 @@ impl ParquetTable {
             .unwrap_or_else(|_| panic!("rwlock poisoned")) = Some((xid, relpages, reltuples));
     }
 
-    /// The body of [`TableAm::statistics`].
     pub(super) fn stats_snapshot(&self) -> RelStats {
         if let Some((_, relpages, reltuples)) = *self
             .analyzed

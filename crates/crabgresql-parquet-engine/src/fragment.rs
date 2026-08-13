@@ -157,7 +157,7 @@ pub(crate) fn fragments(dir: &Path) -> Result<Vec<Fragment>, StorageError> {
 /// writer and by the cleanup path that has to name a half-written `.tmp`.
 ///
 /// The writer's XID stays in the name even for a frozen fragment, because that is
-/// what [`ParquetTable::reconcile_pending_in`] matches on to promote or unlink the
+/// what [`crate::ParquetTable::reconcile_pending_in`] matches on to promote or unlink the
 /// file; the `-f` segment is what marks its rows frozen for readers. Encoding
 /// `Xid::FROZEN` as the name's XID instead would strand the fragment `.pending`
 /// forever — visible, since frozen rows ignore that suffix, and never unlinked on
@@ -205,7 +205,7 @@ pub(crate) fn metadata_map(metadata: Option<&Vec<KeyValue>>) -> HashMap<&str, &s
 ///
 /// **Invariant P1.** Every fragment under `parquet/<r>/` carries `META_REL = r`,
 /// so `rel` must be the relfilenode that *named the directory the fragment was
-/// listed from* — [`ParquetTable::effective_rel`] for a reader inside a
+/// listed from* — [`crate::ParquetTable::effective_rel`] for a reader inside a
 /// transaction with a staged TRUNCATE, not the live one. Directories are only ever
 /// created and removed, never renamed, so no footer has to be rewritten; the price
 /// is that passing the wrong generation's id reports perfectly good bytes as

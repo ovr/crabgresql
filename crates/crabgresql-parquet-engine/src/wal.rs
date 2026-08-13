@@ -9,7 +9,7 @@ use crabgresql_wal::{RedoContext, RmgrId, RmgrRedo, WalError};
 
 pub const RMGR_PARQUET: RmgrId = RmgrId(12);
 pub const PARQUET_XID_OBSERVED: u8 = 1;
-/// A directory-swap TRUNCATE: see [`encode_truncate`] for the payload.
+/// A directory-swap TRUNCATE: see `encode_truncate` for the payload.
 pub const PARQUET_TRUNCATE: u8 = 2;
 
 /// A committed TRUNCATE's applied directory swap, handed to the engine so it can

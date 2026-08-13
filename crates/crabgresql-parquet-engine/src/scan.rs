@@ -135,7 +135,7 @@ impl Iterator for ParquetScan {
             if let Some(reader) = &mut self.reader {
                 match reader.next() {
                     // One vectorized rebase per batch, at the file boundary and
-                    // nowhere else — see [`rebase_epoch`].
+                    // nowhere else — see `crate::epoch::rebase_epoch`.
                     Some(Ok(batch)) => match from_file_epoch(&batch) {
                         Ok(batch) => {
                             self.batch = Some(batch);

@@ -104,7 +104,6 @@ impl ParquetTable {
             .collect())
     }
 
-    /// The body of [`TableAm::fetch`].
     pub(super) fn fetch_in(
         &self,
         tid: Tid,
