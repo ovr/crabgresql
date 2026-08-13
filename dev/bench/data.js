@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786651323672,
+  "lastUpdate": 1786651325243,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -24592,6 +24592,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19438.792912,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6a22395a37df7d92554a01a58bd1b010cb372fcc",
+          "message": "test: Run benchmarks/regress test suite on isolated process (#227)",
+          "timestamp": "2026-08-13T21:24:44+02:00",
+          "tree_id": "c75174d81b0a2400f470fdcb029265a2d25bc6cc",
+          "url": "https://github.com/ovr/crabgresql/commit/6a22395a37df7d92554a01a58bd1b010cb372fcc"
+        },
+        "date": 1786651325130,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 275.048152,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 43604.057161,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
