@@ -65,8 +65,12 @@ impl Vectorization {
 /// Each exclusion is a case where Arrow's answer would be *wrong*, not merely
 /// different:
 ///
-/// - `numeric` has no Arrow type (arbitrary precision), so it is stored as text
-///   and an Arrow comparison would compare text: `'9' > '10'`.
+/// - `numeric` is stored as a `Decimal` of the *column's* `(precision, scale)`,
+///   and Arrow's comparison kernels require both operands to be one decimal
+///   type. A `BoundExpr::Const` carries no typmod to rescale it to, so the
+///   constant side of `price > 9.99` cannot be built to match the column.
+///   Excluded until an operand can be rescaled to its neighbour's type — the
+///   sort path has no such problem, since it orders a column against itself.
 /// - `float4`/`float8` — Arrow's comparison kernels are not IEEE `==` but
 ///   bitwise, i.e. IEEE's totalOrder predicate. So `-0.0 = 0.0` is false where
 ///   PostgreSQL says true, and two NaNs of different bit patterns compare

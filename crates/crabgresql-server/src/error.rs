@@ -123,6 +123,7 @@ impl From<StorageError> for PgError {
             StorageError::RowTooBig { .. }
             | StorageError::ValueTooBig { .. }
             | StorageError::IndexRowTooBig { .. } => sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            StorageError::NumericFieldOverflow { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
         };
         let (detail, hint) = (e.detail(), e.hint());
         Self {

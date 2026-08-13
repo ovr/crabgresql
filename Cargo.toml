@@ -33,6 +33,7 @@ pg-ryu = { path = "vendor/ryu" }
 bytes = "1"
 arrow-arith = "59.1"
 arrow-array = "59.1"
+arrow-buffer = "59.1"
 arrow-ord = "59.1"
 arrow-schema = "59.1"
 arrow-select = "59.1"

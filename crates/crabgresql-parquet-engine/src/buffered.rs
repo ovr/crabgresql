@@ -381,6 +381,14 @@ impl TableAm for BufferedParquetTable {
     /// Writing whole fragments is also what `COPY FREEZE` is for, so the load
     /// skips the buffer's later flush entirely.
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        // Ahead of the freeze branch, so both halves of the relation store the
+        // same form of a row and refuse the same ones. The buffer is the half
+        // that needs it most: its rows are encoded by a later flush, which has
+        // no statement left to fail.
+        let mut tuples = tuples;
+        for tuple in &mut tuples {
+            crate::store_tuple(&self.schema, tuple)?;
+        }
         if txn.freeze_inserts {
             return self.chunks.insert_many(tuples, txn);
         }

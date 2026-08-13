@@ -257,17 +257,39 @@ mod tests {
         assert_same_order(&schema, &rows, &keys, 1);
     }
 
+    /// A `numeric` column sorts columnar, and **numerically**. It is stored as a
+    /// decimal for exactly that reason: under the text encoding it once had,
+    /// `'10'` and `'100'` would both sort below `'9'` with no error to notice.
+    #[test]
+    fn a_numeric_column_sorts_columnar_by_value() {
+        // With a typmod, as a stored column has: the decimal's scale is then the
+        // column's own, so the batch and the row path agree digit for digit and
+        // `assert_same_order` below compares like with like.
+        let mut schema = schema_of(&[PgType::Numeric]);
+        schema.columns[0].typmod = crabgresql_types::numeric::Numeric::pack_typmod(10, 2);
+        let numeric = |n: &str| {
+            vec![Value::Numeric(
+                crabgresql_types::numeric::Numeric::parse(n)
+                    .expect("numeric")
+                    .apply_typmod(10, 2)
+                    .expect("fits numeric(10,2)"),
+            )]
+        };
+        let rows = vec![numeric("10"), numeric("9"), numeric("100")];
+        let keys = [sort_key(0, PgType::Numeric, true, false)];
+        assert!(SortBatch::compilable(&keys, &layout_of(&schema)));
+        assert_eq!(
+            columnar_sort(&schema, &rows, &keys, 1).expect("columnar sort"),
+            vec![numeric("9"), numeric("10"), numeric("100")]
+        );
+        assert_same_order(&schema, &rows, &keys, 1);
+    }
+
     /// Sort keys whose Arrow order is not PostgreSQL's are refused, so the row
-    /// `Sort` keeps them. `numeric` is the dangerous one: stored as text, it would
-    /// sort `'10'` before `'9'` without any error.
+    /// `Sort` keeps them: two `Struct`s and a blank-padded string.
     #[test]
     fn unsortable_key_types_are_refused() {
-        for ty in [
-            PgType::Numeric,
-            PgType::Bpchar,
-            PgType::Interval,
-            PgType::TimeTz,
-        ] {
+        for ty in [PgType::Bpchar, PgType::Interval, PgType::TimeTz] {
             let schema = schema_of(&[ty]);
             assert!(
                 !SortBatch::compilable(&[sort_key(0, ty, true, false)], &layout_of(&schema)),

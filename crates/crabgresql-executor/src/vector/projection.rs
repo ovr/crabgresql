@@ -85,12 +85,28 @@ impl ProjectBatch {
     }
 
     /// The layout a projection produces, for the node above.
-    pub fn layout(projections: &[BoundExpr]) -> BatchLayout {
+    ///
+    /// A taken column keeps its **typmod**, not just its type. For `numeric`
+    /// that modifier is part of the Arrow type — the decimal's precision and
+    /// scale — so dropping it here would stamp the output batch with one
+    /// decimal type while the take handed up an array of another, and Arrow
+    /// rejects the batch. A constant has no typmod and gets `-1`, which is what
+    /// [`build_array`] encoded it as in [`Self::compile`]; the two agree
+    /// because both ask the same question of the same missing modifier.
+    pub fn layout(projections: &[BoundExpr], input: &BatchLayout) -> BatchLayout {
         Arc::from(
             projections
                 .iter()
                 .enumerate()
-                .map(|(index, expr)| Column::new(format!("c{index}"), expr.ty()))
+                .map(|(index, expr)| {
+                    let mut column = Column::new(format!("c{index}"), expr.ty());
+                    if let BoundExpr::ColumnRef { index, .. } = unwrap_collate(expr)
+                        && let Some(source) = input.get(*index)
+                    {
+                        column.typmod = source.typmod;
+                    }
+                    column
+                })
                 .collect::<Vec<_>>(),
         )
     }

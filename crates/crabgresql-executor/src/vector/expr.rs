@@ -11,8 +11,10 @@
 //! are defined by its own type semantics. Mostly they coincide. The cases where
 //! they do not are the entire content of [`comparable`]:
 //!
-//! - **`numeric`** is stored as `Utf8` — arbitrary precision has no Arrow type —
-//!   so an Arrow comparison would compare *text*, making `'9' > '10'`. Excluded.
+//! - **`numeric`** is a `Decimal` of the column's own `(precision, scale)`, and
+//!   a comparison kernel wants both sides in one decimal type. A constant
+//!   carries no typmod to rescale to, so `price > 9.99` cannot be built.
+//!   Excluded from comparisons; sorting is fine, a column orders against itself.
 //! - **`float4`/`float8`** — Arrow's comparison kernels are bitwise, which is
 //!   IEEE's totalOrder predicate and not IEEE `==`: `-0.0 = 0.0` comes out
 //!   false where PostgreSQL says true, and two NaNs with distinct bit

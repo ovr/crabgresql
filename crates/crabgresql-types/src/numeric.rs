@@ -786,6 +786,141 @@ impl Numeric {
         Ok(rounded)
     }
 
+    // ---- fixed-point (decimal) conversions --------------------------------
+
+    /// The value as the integer `self * 10^scale`, or `None` when it is not
+    /// **exactly** representable in `numeric(precision, scale)`.
+    ///
+    /// This is the columnar storage mapping's entry point, and it deliberately
+    /// refuses rather than rounds. A column with a typmod has already been
+    /// through [`Numeric::apply_typmod`], so every value in it rounds to
+    /// `scale` by construction and this cannot fail; a column without one has
+    /// no rounding rule of its own, and silently dropping digits there would
+    /// turn a stored value into a different stored value.
+    ///
+    /// `None` for NaN and ±Infinity too: neither has a fixed-point image.
+    pub fn to_scaled_i128(&self, precision: u8, scale: i8) -> Option<i128> {
+        let (neg, hi) = self.scaled_span(precision, scale)?;
+        // Accumulated straight off `digit_at`, with no intermediate buffer:
+        // this runs once per stored value, and an allocation here showed up as
+        // whole percent of a fragment write.
+        let mut acc: i128 = 0;
+        for pos in (-(scale as i32)..=hi).rev() {
+            acc = acc.checked_mul(10)?.checked_add(self.digit_at(pos) as i128)?;
+        }
+        if neg { acc.checked_neg() } else { Some(acc) }
+    }
+
+    /// As [`Numeric::to_scaled_i128`], but rendered as a decimal string, for the
+    /// widths no Rust integer covers (`precision > 38`, which Arrow stores as a
+    /// 256-bit decimal). The caller parses it into its own wide integer.
+    pub fn to_scaled_string(&self, precision: u8, scale: i8) -> Option<String> {
+        let (neg, hi) = self.scaled_span(precision, scale)?;
+        let scale = scale as i32;
+        let mut out = String::with_capacity((hi + scale + 2) as usize);
+        if neg {
+            out.push('-');
+        }
+        for pos in (-scale..=hi).rev() {
+            out.push((b'0' + self.digit_at(pos)) as char);
+        }
+        Some(out)
+    }
+
+    /// The sign and leading digit position of `self * 10^scale`, or `None` when
+    /// the value does not fit `numeric(precision, scale)`. The digits
+    /// themselves are then read off `digit_at` from `hi` down to `-scale`.
+    ///
+    /// Two ways to not fit, and both are refusals rather than approximations:
+    /// a digit below position `-scale` (the value needs a finer scale than the
+    /// column has), or more than `precision` digits in total.
+    fn scaled_span(&self, precision: u8, scale: i8) -> Option<(bool, i32)> {
+        if self.is_special() {
+            return None;
+        }
+        let scale = scale as i32;
+        if self.is_zero() {
+            return Some((false, -scale));
+        }
+        if self.low() < -scale {
+            return None;
+        }
+        // `weight` is the position of the leading digit and `-scale` that of
+        // the trailing one, so the count is fixed by the two ends: a value
+        // smaller than one ulp of the scale was rejected above, and a value
+        // below 1 has a negative weight, which shortens the run rather than
+        // extending it past the point.
+        let hi = self.weight.max(-scale);
+        if (hi + scale + 1) as usize > precision as usize {
+            return None;
+        }
+        Some((self.is_neg(), hi))
+    }
+
+    /// Inverse of [`Numeric::to_scaled_i128`]: the value `v * 10^-scale`, with
+    /// `scale` as its display scale — which is what makes a `numeric(p, s)`
+    /// column round trip exactly, trailing zeros and all.
+    ///
+    /// The `u64` branch is not a micro-optimization: 128-bit division is a
+    /// libcall (`__udivti3`), and this runs per decoded cell, so taking it for
+    /// every value of a `numeric(15,2)` column — which never leaves 64 bits —
+    /// cost more than the text parsing this replaced.
+    pub fn from_scaled_i128(v: i128, scale: i8) -> Numeric {
+        if v == 0 {
+            return Numeric::zero(scale.max(0) as i32);
+        }
+        let neg = v < 0;
+        let mag = v.unsigned_abs();
+        match u64::try_from(mag) {
+            Ok(mag) => Numeric::from_magnitude(neg, mag, scale),
+            Err(_) => {
+                let mut digits = [0u8; 39];
+                let mut len = 0;
+                let mut mag = mag;
+                while mag > 0 {
+                    digits[len] = (mag % 10) as u8;
+                    mag /= 10;
+                    len += 1;
+                }
+                digits[..len].reverse();
+                Numeric::from_coeff(neg, digits[..len].to_vec(), -(scale as i32), scale as i32)
+            }
+        }
+    }
+
+    /// `neg ? -mag : mag`, scaled by `10^-scale`. Split out so the common
+    /// 64-bit width divides in registers.
+    fn from_magnitude(neg: bool, mut mag: u64, scale: i8) -> Numeric {
+        let mut digits = [0u8; 20];
+        let mut len = 0;
+        while mag > 0 {
+            digits[len] = (mag % 10) as u8;
+            mag /= 10;
+            len += 1;
+        }
+        digits[..len].reverse();
+        Numeric::from_coeff(neg, digits[..len].to_vec(), -(scale as i32), scale as i32)
+    }
+
+    /// As [`Numeric::from_scaled_i128`], from the decimal string a wider
+    /// integer renders to. Rejects anything that is not `-?[0-9]+`.
+    pub fn from_scaled_str(v: &str, scale: i8) -> Option<Numeric> {
+        let (neg, digits) = match v.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, v),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits: Vec<u8> = digits.bytes().map(|b| b - b'0').collect();
+        Some(Numeric::from_coeff(
+            neg,
+            digits,
+            -(scale as i32),
+            scale as i32,
+        ))
+    }
+
     // ---- integer / float conversions -------------------------------------
 
     /// `numeric_int*`: round half-away-from-zero to an integer, as an `i128`.

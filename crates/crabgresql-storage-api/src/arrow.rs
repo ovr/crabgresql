@@ -35,16 +35,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal32Builder, Decimal64Builder,
+    Decimal128Builder, Decimal256Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
+    Int16Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
     Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt8Builder,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, StructArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, new_null_array,
 };
+use arrow_buffer::i256;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use crabgresql_types::numeric::Numeric;
 use crabgresql_types::{Interval, PgType, TimeTz, Value};
 
 use crate::{Column, StorageError, TableSchema, Tuple};
@@ -58,6 +62,65 @@ fn value_mismatch(column: &str, ty: PgType) -> StorageError {
         "Arrow conversion for column \"{column}\" expected {}",
         ty.name()
     ))
+}
+
+/// `value` as a `numeric` column of `typmod` **stores** it, or `None` when the
+/// column's decimal cannot hold it.
+///
+/// The columnar engines call this on the way in, for two reasons that are
+/// really one:
+///
+/// - a row that cannot be encoded is refused by the `INSERT` that wrote it
+///   rather than by the flush that finds it much later — the same contract
+///   [`supports_type`] keeps for types, one level down at the value;
+/// - a row that *can* be encoded is stored in the form it will come back in.
+///   A decimal's scale is fixed by the type, so `1.50` in a column with no
+///   typmod reads back as `1.5000000000000000`. A relation has two stores (a
+///   RAM buffer and a fragment file) and only the file is decimal-encoded, so
+///   without this the same row would print one way before a flush and another
+///   after it — and differently again depending on whether the plan happened
+///   to be vectorized.
+///
+/// A `numeric(p, s)` column only ever fails here on NaN, which PostgreSQL
+/// accepts and no decimal represents; everything else it holds has already
+/// been rounded to `s` by `apply_typmod`, so this is the identity for it. A
+/// column *without* a typmod fails on anything needing more than
+/// [`NUMERIC_DEFAULT_SCALE`] fractional digits or [`NUMERIC_DEFAULT_PRECISION`]
+/// digits in all — a deliberate deviation: PostgreSQL stores those, we refuse
+/// them.
+pub fn numeric_stored(value: &Numeric, typmod: i32) -> Option<Numeric> {
+    let (precision, scale) = numeric_decimal(typmod);
+    if precision as usize > 38 {
+        let text = value.to_scaled_string(precision, scale)?;
+        return Numeric::from_scaled_str(&text, scale);
+    }
+    Some(Numeric::from_scaled_i128(
+        value.to_scaled_i128(precision, scale)?,
+        scale,
+    ))
+}
+
+/// Whether `value` is storable in a `numeric` column of `typmod`.
+pub fn numeric_fits(value: &Numeric, typmod: i32) -> bool {
+    numeric_stored(value, typmod).is_some()
+}
+
+/// PostgreSQL's `22003` for a value this column's decimal cannot hold, with the
+/// DETAIL its own `numeric` field-overflow raises.
+fn numeric_overflow(column: &str, value: &Numeric, precision: u8, scale: i8) -> StorageError {
+    let detail = if value.is_nan() || value.is_infinite() {
+        format!(
+            "A field with precision {precision}, scale {scale} cannot hold {}.",
+            value.to_display()
+        )
+    } else {
+        format!(
+            "A field with precision {precision}, scale {scale} cannot hold the value of column \"{column}\" exactly."
+        )
+    };
+    StorageError::NumericFieldOverflow {
+        detail: Some(detail),
+    }
 }
 
 /// Whether a type has an Arrow representation in this mapping.
@@ -91,21 +154,52 @@ pub fn supports_type(ty: PgType) -> bool {
     )
 }
 
-/// The Arrow type a column of `ty` is stored as.
+/// The `(precision, scale)` a `numeric` column is stored at.
+///
+/// A column **with** a typmod uses its own: every value in it has been through
+/// [`Numeric::apply_typmod`], which rounds to exactly `scale` fractional digits
+/// and rejects anything wider than `precision`, so the fixed-point form is
+/// exact and the display scale is recoverable from the type alone.
+///
+/// A column **without** one has no such rule, and no fixed pair can hold every
+/// `numeric` — the type runs to 131072 integer digits and 16383 fractional
+/// ones. [`NUMERIC_DEFAULT_SCALE`] is the smallest scale that keeps ordinary
+/// division whole: PostgreSQL gives a quotient at least
+/// [`crabgresql_types::numeric`]'s 16 significant digits, so `10/3` and
+/// `avg(x)` both land on 16 fractional digits. Values needing more are refused
+/// rather than rounded — see [`build_array`].
+pub const NUMERIC_DEFAULT_PRECISION: u8 = 38;
+pub const NUMERIC_DEFAULT_SCALE: i8 = 16;
+
+/// The largest `numeric` precision any Arrow decimal holds; `numeric(p, s)`
+/// above it has no columnar representation at all and DDL rejects the column.
+pub const NUMERIC_MAX_PRECISION: i32 = 76;
+
+/// The decimal `(precision, scale)` for a `numeric` column of `typmod`.
+pub fn numeric_decimal(typmod: i32) -> (u8, i8) {
+    if typmod < 0 {
+        return (NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE);
+    }
+    let (precision, scale) = Numeric::unpack_typmod(typmod);
+    (precision as u8, scale as i8)
+}
+
+/// The Arrow type a column of `ty` with `typmod` is stored as.
 ///
 /// Two entries are worth stating outright, because they decide what a
 /// vectorized operator may and may not do with the column:
 ///
-/// - `numeric` is **`Utf8`**, not a `Decimal`. `Numeric` is arbitrary-precision
-///   and Arrow's decimals are not, so the text form is the only lossless one
-///   available. It follows that an Arrow comparison on this column is a *string*
-///   comparison and would be wrong; `numeric` is excluded from every vectorized
-///   comparison and sort.
+/// - `numeric` is a **`Decimal`**, whose width follows the precision the way
+///   ClickHouse's does: `p <= 9` is 32 bits, `<= 18` 64, `<= 38` 128, `<= 76`
+///   256. This is why the type modifier reaches this function at all — it is
+///   part of the *type*, not just a constraint on the values. See
+///   [`numeric_decimal`] for what a column without a typmod gets, and for the
+///   one place this mapping is not lossless.
 /// - `timetz` and `interval` are `Struct`s of their components, because neither
 ///   has an Arrow type with matching semantics (Arrow's
 ///   `IntervalMonthDayNano` orders differently than PostgreSQL's canonical
 ///   span). Their ordering is likewise not Arrow's to compute.
-pub fn arrow_type(ty: PgType) -> DataType {
+pub fn arrow_type(ty: PgType, typmod: i32) -> DataType {
     match ty {
         PgType::Bool => DataType::Boolean,
         // `"char"` is `UInt8`, not `Utf8` or `Int8`. `Utf8` cannot hold a
@@ -118,9 +212,16 @@ pub fn arrow_type(ty: PgType) -> DataType {
         PgType::Int8 => DataType::Int64,
         PgType::Float4 => DataType::Float32,
         PgType::Float8 => DataType::Float64,
-        PgType::Numeric | PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-            DataType::Utf8
+        PgType::Numeric => {
+            let (precision, scale) = numeric_decimal(typmod);
+            match precision {
+                0..=9 => DataType::Decimal32(precision, scale),
+                10..=18 => DataType::Decimal64(precision, scale),
+                19..=38 => DataType::Decimal128(precision, scale),
+                _ => DataType::Decimal256(precision, scale),
+            }
         }
+        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => DataType::Utf8,
         PgType::Bytea => DataType::Binary,
         PgType::Uuid => DataType::FixedSizeBinary(16),
         PgType::Date => DataType::Date32,
@@ -159,8 +260,12 @@ pub fn arrow_schema(schema: &TableSchema) -> Arc<Schema> {
                     ),
                     ("crabgresql.typmod".to_string(), column.typmod.to_string()),
                 ]);
-                Field::new(&column.name, arrow_type(column.ty), column.nullable)
-                    .with_metadata(metadata)
+                Field::new(
+                    &column.name,
+                    arrow_type(column.ty, column.typmod),
+                    column.nullable,
+                )
+                .with_metadata(metadata)
             })
             .collect::<Vec<_>>(),
     ))
@@ -196,8 +301,8 @@ pub fn scan_schema(schema: &TableSchema) -> Arc<Schema> {
 
 /// An all-NULL array of `len` rows, used to widen a projected batch back to the
 /// table's full width.
-pub fn null_array(ty: PgType, len: usize) -> ArrayRef {
-    new_null_array(&arrow_type(ty), len)
+pub fn null_array(ty: PgType, typmod: i32, len: usize) -> ArrayRef {
+    new_null_array(&arrow_type(ty, typmod), len)
 }
 
 /// Build one column's array from the `index`th field of each tuple.
@@ -228,17 +333,41 @@ pub fn build_array(
         PgType::Int8 => primitive!(Int64Builder, Value::Int8),
         PgType::Float4 => primitive!(Float32Builder, Value::Float4),
         PgType::Float8 => primitive!(Float64Builder, Value::Float8),
-        // Text, not a decimal: see [`arrow_type`].
+        // A decimal of the width the precision asks for; the scale comes from
+        // the column, not from the value. A value that does not fit is an
+        // error rather than a rounding — see [`numeric_fits`], which the
+        // columnar engines call on the way *in* so this cannot be the first
+        // time a row is found unstorable.
         PgType::Numeric => {
-            let mut builder = StringBuilder::new();
-            for tuple in tuples {
-                match &tuple[index] {
-                    Value::Null => builder.append_null(),
-                    Value::Numeric(value) => builder.append_value(value.to_display()),
-                    _ => return Err(value_mismatch(&column.name, column.ty)),
-                }
+            let (precision, scale) = numeric_decimal(column.typmod);
+            macro_rules! decimal {
+                ($builder:ty, $convert:expr) => {{
+                    let mut builder = <$builder>::with_capacity(tuples.len())
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|error| corrupt(format!("numeric column type: {error}")))?;
+                    for tuple in tuples {
+                        match &tuple[index] {
+                            Value::Null => builder.append_null(),
+                            Value::Numeric(value) => {
+                                builder.append_value($convert(value).ok_or_else(|| {
+                                    numeric_overflow(&column.name, value, precision, scale)
+                                })?)
+                            }
+                            _ => return Err(value_mismatch(&column.name, column.ty)),
+                        }
+                    }
+                    Ok(Arc::new(builder.finish()) as ArrayRef)
+                }};
             }
-            Ok(Arc::new(builder.finish()))
+            let narrow = |value: &Numeric| value.to_scaled_i128(precision, scale);
+            match precision {
+                0..=9 => decimal!(Decimal32Builder, |v| narrow(v).map(|n| n as i32)),
+                10..=18 => decimal!(Decimal64Builder, |v| narrow(v).map(|n| n as i64)),
+                19..=38 => decimal!(Decimal128Builder, narrow),
+                _ => decimal!(Decimal256Builder, |value: &Numeric| value
+                    .to_scaled_string(precision, scale)
+                    .and_then(|text| i256::from_string(&text))),
+            }
         }
         // The four string types share one array; which one a column is stays in
         // the table schema, where the typmod and padding rules live too.
@@ -291,7 +420,7 @@ pub fn build_array(
         }
         PgType::Time => primitive!(Time64MicrosecondBuilder, Value::Time),
         PgType::TimeTz => {
-            let fields = match arrow_type(PgType::TimeTz) {
+            let fields = match arrow_type(PgType::TimeTz, -1) {
                 DataType::Struct(fields) => fields,
                 _ => return Err(corrupt("invalid timetz Arrow schema")),
             };
@@ -351,7 +480,7 @@ pub fn build_array(
             }
         }
         PgType::Interval => {
-            let fields = match arrow_type(PgType::Interval) {
+            let fields = match arrow_type(PgType::Interval, -1) {
                 DataType::Struct(fields) => fields,
                 _ => return Err(corrupt("invalid interval Arrow schema")),
             };
@@ -475,7 +604,7 @@ pub fn widen(
     let columns: Vec<ArrayRef> = columns
         .into_iter()
         .zip(&schema.columns)
-        .map(|(array, column)| array.unwrap_or_else(|| null_array(column.ty, rows)))
+        .map(|(array, column)| array.unwrap_or_else(|| null_array(column.ty, column.typmod, rows)))
         .collect();
     let options = RecordBatchOptions::new().with_row_count(Some(rows));
     RecordBatch::try_new_with_options(Arc::clone(stamp), columns, &options)
@@ -512,10 +641,28 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
         PgType::Float4 => primitive!(Float32Array, Value::Float4),
         PgType::Float8 => primitive!(Float64Array, Value::Float8),
         PgType::Numeric => {
-            let values = required_array::<StringArray>(array, &column.name)?;
-            crabgresql_types::numeric::Numeric::parse(values.value(row))
-                .map(Value::Numeric)
-                .map_err(|_| corrupt(format!("invalid numeric in column \"{}\"", column.name)))
+            let (precision, scale) = numeric_decimal(column.typmod);
+            let value = match precision {
+                0..=9 => {
+                    let values = required_array::<Decimal32Array>(array, &column.name)?;
+                    Numeric::from_scaled_i128(values.value(row) as i128, scale)
+                }
+                10..=18 => {
+                    let values = required_array::<Decimal64Array>(array, &column.name)?;
+                    Numeric::from_scaled_i128(values.value(row) as i128, scale)
+                }
+                19..=38 => {
+                    let values = required_array::<Decimal128Array>(array, &column.name)?;
+                    Numeric::from_scaled_i128(values.value(row), scale)
+                }
+                _ => {
+                    let values = required_array::<Decimal256Array>(array, &column.name)?;
+                    Numeric::from_scaled_str(&values.value(row).to_string(), scale).ok_or_else(
+                        || corrupt(format!("invalid numeric in column \"{}\"", column.name)),
+                    )?
+                }
+            };
+            Ok(Value::Numeric(value))
         }
         PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
             let values = required_array::<StringArray>(array, &column.name)?;
@@ -786,24 +933,136 @@ mod tests {
         Ok(())
     }
 
+    fn parse(s: &str) -> Result<Numeric, StorageError> {
+        Numeric::parse(s).map_err(|_| corrupt("test numeric"))
+    }
+
+    /// A decoded cell as PostgreSQL would print it. Used where the display
+    /// scale is the point: `Numeric`'s equality is by value and ignores it.
+    fn rendered(value: &Value) -> String {
+        match value {
+            Value::Numeric(n) => n.to_display(),
+            other => panic!("not a numeric: {other:?}"),
+        }
+    }
+
+    /// A `numeric(p, s)` column round trips **exactly**, display scale included:
+    /// every value in such a column has been through `apply_typmod`, so its
+    /// scale is `s` and the type carries it. One case per decimal width, since
+    /// the width is picked from the precision and a wrong branch would decode
+    /// against the wrong array type.
     #[test]
-    fn numeric_round_trips_through_text() -> Result<(), StorageError> {
-        let parse = |s: &str| {
-            crabgresql_types::numeric::Numeric::parse(s)
-                .map(Value::Numeric)
-                .map_err(|_| corrupt("test numeric"))
-        };
-        round_trip(
-            PgType::Numeric,
-            vec![
-                parse("0")?,
-                // 1.0 and 1.00 are equal but not identical: the scale is part of
-                // the value, so a text round trip has to preserve it.
-                parse("1.0")?,
-                parse("1.00")?,
-                parse("-12345678901234567890.123456789")?,
-            ],
-        )
+    fn a_constrained_numeric_round_trips_exactly() -> Result<(), StorageError> {
+        for (precision, scale, text) in [
+            (9i32, 2i32, "-1234567.89"),
+            (18, 4, "12345678901234.5678"),
+            (38, 10, "-1234567890123456789012345678.0123456789"),
+            (76, 38, "12345678901234567890123456789012345678.5"),
+        ] {
+            let mut column = Column::new("c", PgType::Numeric);
+            column.typmod = Numeric::pack_typmod(precision, scale);
+            let schema = schema_of(vec![column]);
+            let value = parse(text)?
+                .apply_typmod(precision, scale)
+                .map_err(|e| corrupt(e.message))?;
+            let tuples = vec![vec![Value::Numeric(value.clone())], vec![Value::Null]];
+
+            let batch = build_batch(&schema, &tuples)?;
+            let decoded = decode_row(&schema, &[0], &batch, 0)?;
+            // Rendered, not compared: `Numeric`'s equality is by value and
+            // ignores the display scale, which is exactly what this asserts is
+            // preserved.
+            assert_eq!(
+                rendered(&decoded[0]),
+                value.to_display(),
+                "numeric({precision},{scale})"
+            );
+            assert_eq!(decode_row(&schema, &[0], &batch, 1)?, vec![Value::Null]);
+        }
+        Ok(())
+    }
+
+    /// A column with **no** typmod is stored at one fixed scale, so the display
+    /// scale is not preserved — `1.50` comes back as `1.5000000000000000`. The
+    /// value is unchanged; only its rendering is. Deliberate: no fixed decimal
+    /// can carry a per-value scale, and this is the documented deviation.
+    #[test]
+    fn an_unconstrained_numeric_keeps_the_value_but_not_its_scale() -> Result<(), StorageError> {
+        let schema = schema_of(vec![Column::new("c", PgType::Numeric)]);
+        let value = parse("1.50")?;
+        let batch = build_batch(&schema, &[vec![Value::Numeric(value.clone())]])?;
+        let decoded = decode_row(&schema, &[0], &batch, 0)?;
+
+        assert_eq!(decoded[0], Value::Numeric(value));
+        assert_eq!(rendered(&decoded[0]), "1.5000000000000000");
+        Ok(())
+    }
+
+    /// The default scale is chosen so that ordinary division survives: PG gives
+    /// a quotient 16 significant digits, so `10/3` fits and nothing rounds it
+    /// away. A value needing more is refused rather than truncated.
+    #[test]
+    fn an_unconstrained_numeric_holds_a_quotient_and_refuses_a_finer_one()
+    -> Result<(), StorageError> {
+        let schema = schema_of(vec![Column::new("c", PgType::Numeric)]);
+        let quotient = parse("3.3333333333333333")?;
+        assert!(numeric_fits(&quotient, -1));
+        let batch = build_batch(&schema, &[vec![Value::Numeric(quotient.clone())]])?;
+        assert_eq!(
+            rendered(&decode_row(&schema, &[0], &batch, 0)?[0]),
+            "3.3333333333333333"
+        );
+
+        // 17 fractional digits: one past what the column can hold.
+        let finer = parse("0.33333333333333333")?;
+        assert!(!numeric_fits(&finer, -1));
+        assert!(matches!(
+            build_batch(&schema, &[vec![Value::Numeric(finer)]]),
+            Err(StorageError::NumericFieldOverflow { .. })
+        ));
+        Ok(())
+    }
+
+    /// NaN and ±Infinity are legal `numeric`s with no decimal image at all.
+    #[test]
+    fn numeric_specials_have_no_decimal_image() -> Result<(), StorageError> {
+        let schema = schema_of(vec![Column::new("c", PgType::Numeric)]);
+        for special in [Numeric::nan(), Numeric::pos_inf(), Numeric::neg_inf()] {
+            assert!(!numeric_fits(&special, -1));
+            assert!(matches!(
+                build_batch(&schema, &[vec![Value::Numeric(special)]]),
+                Err(StorageError::NumericFieldOverflow { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    /// The decimal width follows the precision, the way ClickHouse's does. A
+    /// column that changed width would still round trip within one process, but
+    /// would silently stop matching the fragments already on disk.
+    #[test]
+    fn the_decimal_width_follows_the_precision() {
+        let typmod = |p, s| Numeric::pack_typmod(p, s);
+        assert_eq!(
+            arrow_type(PgType::Numeric, typmod(9, 2)),
+            DataType::Decimal32(9, 2)
+        );
+        assert_eq!(
+            arrow_type(PgType::Numeric, typmod(18, 2)),
+            DataType::Decimal64(18, 2)
+        );
+        assert_eq!(
+            arrow_type(PgType::Numeric, typmod(38, 2)),
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            arrow_type(PgType::Numeric, typmod(76, 2)),
+            DataType::Decimal256(76, 2)
+        );
+        assert_eq!(
+            arrow_type(PgType::Numeric, -1),
+            DataType::Decimal128(NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE)
+        );
     }
 
     /// A projected batch decodes into the schema slots the projection named,
@@ -899,10 +1158,10 @@ mod tests {
 
     #[test]
     fn a_null_array_is_full_width_padding() {
-        let array = null_array(PgType::Int4, 3);
+        let array = null_array(PgType::Int4, -1, 3);
         assert_eq!(array.len(), 3);
         assert_eq!(array.null_count(), 3);
-        assert_eq!(array.data_type(), &arrow_type(PgType::Int4));
+        assert_eq!(array.data_type(), &arrow_type(PgType::Int4, -1));
     }
 
     #[test]
