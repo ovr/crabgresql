@@ -201,15 +201,15 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
         }
         // A dead server makes every later test meaningless, so the run stops
         // here — with the reason recorded, which is the whole reason the server
-        // is a separate process. A test that lost its connection is the one
-        // case worth waiting a moment on: that is what a crash looks like from
-        // the client side, a beat before the exit status exists.
-        let grace = if output.contains(CONNECTION_LOST) {
-            EXIT_GRACE
+        // is a separate process. A test that lost its connection is the one case
+        // worth waiting on: that is what a crash looks like from the client
+        // side, a beat before the exit status exists.
+        let exit = if output.contains(CONNECTION_LOST) {
+            server.exited_within(EXIT_GRACE).await?
         } else {
-            Duration::ZERO
+            server.exited()?
         };
-        let Some(status) = server.exited_within(grace).await? else {
+        let Some(status) = exit else {
             continue;
         };
         let reason = format!(

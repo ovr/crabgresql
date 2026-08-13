@@ -136,27 +136,28 @@ impl ServerProcess {
         self.child.try_wait()
     }
 
-    /// Same, but give a dying child up to `grace` to actually die.
+    /// Same, but wait up to `grace` for a child that is on its way out.
     ///
-    /// A crashing server closes its sockets before the kernel is done with it,
-    /// so the connection is lost a moment *before* the exit status exists. Ask
-    /// the instant the client notices and the answer is "still running", and
-    /// the crash gets misreported as one bad test.
+    /// A dying server closes its sockets before the kernel is done with it, so
+    /// the connection is lost a moment *before* the exit status exists. Asking
+    /// the instant the client notices gets "still running", and the crash is
+    /// misreported as one bad test. The wait is the SIGCHLD-driven
+    /// [`Child::wait`], not a poll: the status arrives when it arrives.
     pub async fn exited_within(&mut self, grace: Duration) -> io::Result<Option<ExitStatus>> {
-        let deadline = Instant::now() + grace;
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(Some(status));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            tokio::time::sleep(READY_POLL).await;
+        match tokio::time::timeout(grace, self.child.wait()).await {
+            Ok(status) => status.map(Some),
+            // The grace ran out with the child still alive.
+            Err(_elapsed) => Ok(None),
         }
     }
 
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// The child's process id while it runs, for a test that needs to signal it.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     /// The end of `server.log`, which is where a panic's message and backtrace
@@ -172,31 +173,45 @@ impl ServerProcess {
         let _ = self.child.wait().await;
     }
 
-    /// Poll the port until the server answers, failing as soon as the child
-    /// exits instead of waiting out the timeout.
+    /// Wait until the server answers on its port, or until it dies trying.
+    ///
+    /// The port has to be probed — nothing notifies a client that a listener
+    /// appeared, so this is the one loop here that legitimately polls. The
+    /// child, in contrast, is awaited: a server that exits during startup (its
+    /// port taken, recovery failed) is reported the moment SIGCHLD arrives
+    /// rather than at the next probe.
     async fn wait_ready(&mut self) -> io::Result<()> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Err(io::Error::other(format!(
-                    "server exited during startup with {status}; see {}\n{}",
-                    self.log_path.display(),
-                    self.log_tail(),
-                )));
+        let port = self.port;
+        let log_path = self.log_path.clone();
+        let probe = async move {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            loop {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(READY_POLL).await;
             }
-            if TcpStream::connect(("127.0.0.1", self.port)).await.is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::other(format!(
-                    "server did not accept connections on port {} within {:?}; see {}\n{}",
-                    self.port,
-                    READY_TIMEOUT,
-                    self.log_path.display(),
-                    self.log_tail(),
-                )));
-            }
-            tokio::time::sleep(READY_POLL).await;
+        };
+        tokio::select! {
+            status = self.child.wait() => Err(io::Error::other(format!(
+                "server exited during startup with {}; see {}\n{}",
+                status?,
+                log_path.display(),
+                log_tail(&log_path, LOG_TAIL_LINES),
+            ))),
+            answered = probe => if answered {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "server did not accept connections on port {port} within {READY_TIMEOUT:?}; \
+                     see {}\n{}",
+                    log_path.display(),
+                    log_tail(&log_path, LOG_TAIL_LINES),
+                )))
+            },
         }
     }
 }
