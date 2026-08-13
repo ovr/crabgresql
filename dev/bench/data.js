@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786660086797,
+  "lastUpdate": 1786660088259,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -25240,6 +25240,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 43604.057161,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6328312843e18f7809a15f87f366e5448ffaa8cb",
+          "message": "feat(parquet-engine): Store numeric as a Decimal32/64/128/256, sized by its precision (#228)",
+          "timestamp": "2026-08-13T21:33:57Z",
+          "tree_id": "4efb17f96884c44e0748ed9e8542de6d1035ba50",
+          "url": "https://github.com/ovr/crabgresql/commit/6328312843e18f7809a15f87f366e5448ffaa8cb"
+        },
+        "date": 1786660088188,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1205.577885,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19324.461925,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
