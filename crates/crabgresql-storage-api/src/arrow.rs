@@ -131,6 +131,85 @@ pub fn numeric_overflow(column: &str, value: &Numeric, typmod: i32) -> StorageEr
     }
 }
 
+/// The columns of a relation that need [`NumericColumns::normalize`] on the way
+/// in, resolved once from the schema.
+///
+/// Every columnar engine holds one beside its [`TableSchema`]. Which columns
+/// need normalizing is a property of the schema, not of a row, so a relation
+/// with no `numeric` column answers without touching the rows at all, and one
+/// that has them does not re-scan a hundred columns per row to find the two.
+#[derive(Clone, Debug, Default)]
+pub struct NumericColumns(Arc<[usize]>);
+
+impl NumericColumns {
+    pub fn of(schema: &TableSchema) -> Self {
+        NumericColumns(
+            schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.ty == PgType::Numeric)
+                .map(|(index, _)| index)
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Put every `numeric` in `tuples` into the form the columnar stores read
+    /// back, or reject the batch.
+    ///
+    /// The type whitelist ([`supports_type`]) is not enough for `numeric`: the
+    /// column's decimal fixes a scale and a digit budget, and PostgreSQL accepts
+    /// values outside both — `NaN` in any `numeric` column, and in a column with
+    /// no typmod anything finer than [`NUMERIC_DEFAULT_SCALE`]. Refusing those
+    /// here keeps the engines' promise that a row an INSERT acknowledged is a
+    /// row a flush can write; discovering it at flush time would fail a later,
+    /// unrelated statement — or a background one with no client to report to.
+    ///
+    /// The rewrite matters as much as the refusal, and is why this is not just a
+    /// validation. A `numeric` reads back at the decimal's fixed scale, so a
+    /// value that kept its own display scale in a RAM buffer would print one way
+    /// from the buffer and another from a fragment — and differently again
+    /// depending on whether the plan happened to vectorize, since only the batch
+    /// path goes through the decimal. Normalizing on the way in makes every
+    /// store of a relation agree by construction.
+    ///
+    /// Lives here rather than in an engine because both columnar engines need
+    /// exactly this, and a second copy would be a second place for the storage
+    /// form to drift from what [`build_array`] actually encodes.
+    pub fn normalize(
+        &self,
+        schema: &TableSchema,
+        tuples: &mut [Tuple],
+    ) -> Result<(), StorageError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        for tuple in tuples {
+            for &index in self.0.iter() {
+                // `get`, not indexing: a tuple whose width does not match the
+                // schema is caught with a proper error where the batch is
+                // built, and panicking here would beat it to the report.
+                let Some(Value::Numeric(value)) = tuple.get(index) else {
+                    continue;
+                };
+                let column = &schema.columns[index];
+                match numeric_stored(value, column.typmod) {
+                    Some(stored) => tuple[index] = Value::Numeric(stored),
+                    // The encoder's own error, raised one step earlier: a value
+                    // refused here and a value refused there is the same
+                    // refusal, and it should not read as two.
+                    None => return Err(numeric_overflow(&column.name, value, column.typmod)),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Whether a value's Arrow encoding is decided by its type **alone**, or also
 /// by the column's type modifier.
 ///
@@ -432,10 +511,19 @@ pub fn build_array(
                 DecimalWidth::Bits64 => decimal!(Decimal64Builder, |v| narrow(v).map(|n| n as i64)),
                 DecimalWidth::Bits128 => decimal!(Decimal128Builder, narrow),
                 // No Rust integer is this wide, so the value goes through its
-                // own decimal rendering; `i256` parses the same digits back.
-                DecimalWidth::Bits256 => decimal!(Decimal256Builder, |value: &Numeric| value
-                    .to_scaled_string(precision, scale)
-                    .and_then(|text| i256::from_string(&text))),
+                // own decimal rendering and `i256` parses the same digits back.
+                // The buffer is hoisted out of the closure so the column costs
+                // one allocation rather than one per value.
+                DecimalWidth::Bits256 => {
+                    let mut text = String::new();
+                    let mut wide = |value: &Numeric| {
+                        value
+                            .write_scaled_string(precision, scale, &mut text)
+                            .then(|| i256::from_string(&text))
+                            .flatten()
+                    };
+                    decimal!(Decimal256Builder, wide)
+                }
             }
         }
         // The four string types share one array; which one a column is stays in
@@ -717,9 +805,17 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
                 DecimalWidth::Bits128 => decimal!(Decimal128Array),
                 DecimalWidth::Bits256 => {
                     let values = required_array::<Decimal256Array>(array, &column.name)?;
-                    Numeric::from_scaled_str(&values.value(row).to_string(), scale).ok_or_else(
-                        || corrupt(format!("invalid numeric in column \"{}\"", column.name)),
-                    )?
+                    let wide = values.value(row);
+                    // Even a 256-bit column mostly holds values a `i128` covers,
+                    // and that path needs no rendering at all.
+                    match wide.to_i128() {
+                        Some(narrow) => Numeric::from_scaled_i128(narrow, scale),
+                        None => {
+                            Numeric::from_scaled_str(&wide.to_string(), scale).ok_or_else(|| {
+                                corrupt(format!("invalid numeric in column \"{}\"", column.name))
+                            })?
+                        }
+                    }
                 }
             };
             Ok(Value::Numeric(value))
@@ -1123,6 +1219,78 @@ mod tests {
             arrow_type(PgType::Numeric, -1),
             DataType::Decimal128(NUMERIC_DEFAULT_PRECISION, NUMERIC_DEFAULT_SCALE)
         );
+    }
+
+    /// Each `numeric` column is normalized at its **own** typmod, and a value
+    /// that does not fit names the column it was in.
+    ///
+    /// The point of the test is the indexing: [`NumericColumns`] walks a list of
+    /// column ordinals rather than zipping the row against the schema, so a
+    /// column and its typmod could drift apart without anything else noticing —
+    /// the two `numeric`s below sit at ordinals 1 and 3 with a non-`numeric`
+    /// between them, which is the arrangement that catches it.
+    #[test]
+    fn each_numeric_column_normalizes_at_its_own_typmod() -> Result<(), StorageError> {
+        let mut constrained = Column::new("price", PgType::Numeric);
+        constrained.typmod = Numeric::pack_typmod(10, 2);
+        let schema = schema_of(vec![
+            Column::new("id", PgType::Int4),
+            constrained,
+            Column::new("label", PgType::Text),
+            // No typmod: the unconstrained default.
+            Column::new("raw", PgType::Numeric),
+        ]);
+        let numeric = NumericColumns::of(&schema);
+
+        let row = |value: Numeric| {
+            vec![
+                Value::Int4(7),
+                Value::Numeric(value.clone()),
+                Value::Text("x".into()),
+                Value::Numeric(value),
+            ]
+        };
+        let mut rows = vec![row(parse("1.5")?)];
+        numeric.normalize(&schema, &mut rows)?;
+
+        assert_eq!(rendered(&rows[0][1]), "1.50", "numeric(10,2)");
+        assert_eq!(
+            rendered(&rows[0][3]),
+            "1.5000000000000000",
+            "no typmod, so the default scale"
+        );
+        // The columns either side are untouched.
+        assert_eq!(rows[0][0], Value::Int4(7));
+        assert_eq!(rows[0][2], Value::Text("x".into()));
+
+        // A refusal names the offending column, not merely its position.
+        let mut bad = vec![row(Numeric::nan())];
+        let error = numeric
+            .normalize(&schema, &mut bad)
+            .expect_err("NaN has no decimal image");
+        let detail = match &error {
+            StorageError::NumericFieldOverflow { detail } => detail.clone().unwrap_or_default(),
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(detail.contains("\"price\""), "wrong column named: {detail}");
+        Ok(())
+    }
+
+    /// A relation with no `numeric` column is not walked row by row at all.
+    #[test]
+    fn normalizing_a_relation_without_a_numeric_column_is_a_no_op() -> Result<(), StorageError> {
+        let schema = schema_of(vec![
+            Column::new("a", PgType::Int4),
+            Column::new("b", PgType::Text),
+        ]);
+        let numeric = NumericColumns::of(&schema);
+        assert!(numeric.is_empty());
+
+        let original = vec![vec![Value::Int4(1), Value::Text("a".into())]];
+        let mut rows = original.clone();
+        numeric.normalize(&schema, &mut rows)?;
+        assert_eq!(rows, original);
+        Ok(())
     }
 
     /// A projected batch decodes into the schema slots the projection named,
