@@ -386,9 +386,7 @@ impl TableAm for BufferedParquetTable {
         // that needs it most: its rows are encoded by a later flush, which has
         // no statement left to fail.
         let mut tuples = tuples;
-        for tuple in &mut tuples {
-            crate::store_tuple(&self.schema, tuple)?;
-        }
+        crate::store_tuples(&self.schema, &mut tuples)?;
         if txn.freeze_inserts {
             return self.chunks.insert_many(tuples, txn);
         }

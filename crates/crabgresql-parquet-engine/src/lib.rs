@@ -212,7 +212,7 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Put a row into the form this format stores, or reject it.
+/// Put a batch of rows into the form this format stores, or reject it.
 ///
 /// The type whitelist ([`validate_schema`]) is not enough for `numeric`: the
 /// column's decimal fixes a scale and a digit budget, and PostgreSQL accepts
@@ -229,11 +229,34 @@ pub fn validate_schema(schema: &TableSchema) -> Result<(), StorageError> {
 /// kept its own display scale in the buffer would print differently before and
 /// after a flush. Normalizing on the way in makes the two halves agree by
 /// construction — the same reason the epoch rebase lives at one boundary.
-pub fn store_tuple(schema: &TableSchema, tuple: &mut Tuple) -> Result<(), StorageError> {
-    for (column, value) in schema.columns.iter().zip(tuple.iter_mut()) {
-        if let (PgType::Numeric, Value::Numeric(numeric)) = (column.ty, &*value) {
-            match crabgresql_storage_api::arrow::numeric_stored(numeric, column.typmod) {
-                Some(stored) => *value = Value::Numeric(stored),
+///
+/// Takes the whole batch rather than a row because *which* columns need this is
+/// a property of the schema, not of the row: the ordinals are collected once
+/// per call, and a relation with no `numeric` column collects an empty vector —
+/// which does not allocate — and returns. Per row, the loop would instead
+/// re-scan every column of a hundred-column relation to find nothing.
+pub fn store_tuples(schema: &TableSchema, tuples: &mut [Tuple]) -> Result<(), StorageError> {
+    let numeric: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.ty == PgType::Numeric)
+        .map(|(index, _)| index)
+        .collect();
+    if numeric.is_empty() {
+        return Ok(());
+    }
+    for tuple in tuples {
+        for &index in &numeric {
+            // `get`, not indexing: a tuple whose width does not match the
+            // schema is caught with a proper error where the batch is built,
+            // and panicking here would beat it to the report.
+            let Some(Value::Numeric(value)) = tuple.get(index) else {
+                continue;
+            };
+            let column = &schema.columns[index];
+            match crabgresql_storage_api::arrow::numeric_stored(value, column.typmod) {
+                Some(stored) => tuple[index] = Value::Numeric(stored),
                 None => {
                     let (precision, scale) =
                         crabgresql_storage_api::arrow::numeric_decimal(column.typmod);
@@ -242,7 +265,7 @@ pub fn store_tuple(schema: &TableSchema, tuple: &mut Tuple) -> Result<(), Storag
                             "Column \"{}\" is stored as numeric({precision},{scale}), \
                              which cannot hold {}.",
                             column.name,
-                            numeric.to_display(),
+                            value.to_display(),
                         )),
                     });
                 }
@@ -1658,9 +1681,7 @@ impl TableAm for ParquetTable {
         // Before anything is staged: a row that cannot be encoded fails the
         // statement that wrote it, never the file it would have gone into.
         let mut tuples = tuples;
-        for tuple in &mut tuples {
-            store_tuple(&self.schema, tuple)?;
-        }
+        store_tuples(&self.schema, &mut tuples)?;
         // A frozen fragment is visible the instant it is fsynced: `header` reports
         // `Xid::FROZEN` for it and `visible_fragments` never looks at the `.pending`
         // suffix. What keeps that from being a dirty read is that the fragment
@@ -2118,6 +2139,72 @@ mod tests {
         );
         schema.access_method = TableAccessMethod::Parquet;
         schema
+    }
+
+    /// Each `numeric` column is normalized at its **own** typmod, and a value
+    /// that does not fit names the column it was in.
+    ///
+    /// The point of the test is the indexing: [`store_tuples`] walks a list of
+    /// column ordinals rather than zipping the row against the schema, so a
+    /// column and its typmod could drift apart without anything else noticing —
+    /// the two `numeric`s below sit at ordinals 1 and 3 with a non-`numeric`
+    /// between them, which is the arrangement that catches it.
+    #[test]
+    fn store_tuples_normalizes_each_numeric_at_its_own_typmod() -> anyhow::Result<()> {
+        let mut schema = schema(
+            "mixed",
+            &[PgType::Int4, PgType::Numeric, PgType::Text, PgType::Numeric],
+        );
+        schema.columns[1].typmod = Numeric::pack_typmod(10, 2);
+        // Column 3 keeps typmod -1: the unconstrained default.
+
+        let mut rows = vec![vec![
+            Value::Int4(7),
+            Value::Numeric(Numeric::parse("1.5")?.apply_typmod(10, 2)?),
+            Value::Text("x".into()),
+            Value::Numeric(Numeric::parse("1.5")?),
+        ]];
+        super::store_tuples(&schema, &mut rows)?;
+
+        let rendered = |value: &Value| match value {
+            Value::Numeric(n) => n.to_display(),
+            other => panic!("not a numeric: {other:?}"),
+        };
+        assert_eq!(rendered(&rows[0][1]), "1.50", "column 1 is numeric(10,2)");
+        assert_eq!(
+            rendered(&rows[0][3]),
+            "1.5000000000000000",
+            "column 3 has no typmod and is stored at the default scale"
+        );
+        // The columns either side are untouched.
+        assert_eq!(rows[0][0], Value::Int4(7));
+        assert_eq!(rows[0][2], Value::Text("x".into()));
+
+        // A refusal names the offending column, not merely the position.
+        let mut bad = vec![vec![
+            Value::Int4(7),
+            Value::Numeric(Numeric::parse("1.5")?.apply_typmod(10, 2)?),
+            Value::Text("x".into()),
+            Value::Numeric(Numeric::nan()),
+        ]];
+        let error = super::store_tuples(&schema, &mut bad).expect_err("NaN has no decimal image");
+        let detail = match &error {
+            StorageError::NumericFieldOverflow { detail } => detail.clone().unwrap_or_default(),
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(detail.contains("\"c3\""), "wrong column named: {detail}");
+        Ok(())
+    }
+
+    /// A relation with no `numeric` column is not walked row by row at all.
+    #[test]
+    fn store_tuples_is_a_no_op_without_a_numeric_column() -> anyhow::Result<()> {
+        let schema = schema("plain", &[PgType::Int4, PgType::Text]);
+        let original = vec![vec![Value::Int4(1), Value::Text("a".into())]];
+        let mut rows = original.clone();
+        super::store_tuples(&schema, &mut rows)?;
+        assert_eq!(rows, original);
+        Ok(())
     }
 
     fn parquet_files(dir: &Path, rel: u32) -> anyhow::Result<Vec<PathBuf>> {
