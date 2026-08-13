@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use crabgresql_server_process::{ServerProcess, locate_server_binary};
 use crabgresql_storage_api::TableAccessMethod;
-use tokio::net::TcpListener;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 use crate::client;
@@ -21,9 +21,12 @@ pub struct RunConfig {
     /// benchmark. Single-table suites only: slicing each table of a joined
     /// schema independently leaves its keys dangling.
     pub rows: Option<u64>,
-    /// Data directory for the in-process server; a temporary one when unset,
+    /// Data directory for the server under test; a temporary one when unset,
     /// so a persistent path is what lets a load be reused by the next run.
     pub data_dir: Option<PathBuf>,
+    /// The `crabgresql` binary to benchmark. Unset takes the one built next to
+    /// this executable; ignored with `url`.
+    pub server_bin: Option<PathBuf>,
     /// Benchmark an external server instead (a libpq connection string), for
     /// side-by-side numbers against stock PostgreSQL.
     pub url: Option<String>,
@@ -43,20 +46,13 @@ pub struct RunConfig {
     pub reload: bool,
 }
 
-/// The server under test, kept alive for the length of the run.
+/// The server under test, kept alive for the length of the run. The child
+/// process is killed when this is dropped, whichever way the run ended.
 struct Target {
     conninfo: String,
     description: String,
     _data_dir: Option<tempfile::TempDir>,
-    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
-}
-
-impl Drop for Target {
-    fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
-    }
+    _server: Option<ServerProcess>,
 }
 
 /// What the load phase established about the dataset under test.
@@ -438,20 +434,22 @@ fn no_data_hint(suite: &Suite) -> String {
     format!("Get the dataset first:\n{}", suite.dataset_hint)
 }
 
-/// Either connect to the external server named by `--url`, or boot one in this
-/// process over the durable heap engine, exactly as `crabgresql-server` does.
+/// Either connect to the external server named by `--url`, or start the
+/// `crabgresql` binary as a child process over the durable heap engine.
+///
+/// A child process is what a benchmark should measure: the same binary a user
+/// runs, and a load that OOMs or panics it no longer takes the harness holding
+/// the results down with it. Its log goes to `<data-dir>/server.log`.
 async fn start_target(config: &RunConfig) -> Result<Target> {
     if let Some(url) = &config.url {
         return Ok(Target {
             conninfo: url.clone(),
             description: format!("external server ({url})"),
             _data_dir: None,
-            server: None,
+            _server: None,
         });
     }
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
     let (temp_dir, path) = match &config.data_dir {
         Some(path) => {
             std::fs::create_dir_all(path)
@@ -464,19 +462,24 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
             (Some(dir), path)
         }
     };
-    let (engine, txnmgr) = crabgresql_server::open_pg_engine(&path)
-        .with_context(|| format!("opening the engine over {}", path.display()))?;
-    // Benchmarks load from their own generated data directory only.
-    let copy_files = crabgresql_server::CopyFileAccess::confined_to(&path);
-    let server = tokio::spawn(crabgresql_server::serve_with(
-        listener, engine, txnmgr, copy_files,
-    ));
+    let binary = match &config.server_bin {
+        Some(path) => path.clone(),
+        None => locate_server_binary()?,
+    };
+    // The dataset is streamed in through `COPY … FROM STDIN`, so the server
+    // needs no read access outside its own data directory.
+    let server = ServerProcess::start(&binary, &path, &[], &path.join("server.log"))
+        .await
+        .with_context(|| format!("starting {} over {}", binary.display(), path.display()))?;
 
     Ok(Target {
-        conninfo: format!("host=127.0.0.1 port={port} user=postgres dbname=bench"),
-        description: format!("in-process CrabgreSQL ({})", path.display()),
+        conninfo: format!(
+            "host=127.0.0.1 port={} user=postgres dbname=bench",
+            server.port()
+        ),
+        description: format!("CrabgreSQL ({})", path.display()),
         _data_dir: temp_dir,
-        server: Some(server),
+        _server: Some(server),
     })
 }
 

@@ -13,7 +13,7 @@ use clap::Parser;
 use crabgresql_pg_regress::report::{Detail, format_duration, markdown_summary};
 use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
-use crabgresql_pg_regress::server::locate_server_binary;
+use crabgresql_server_process::locate_server_binary;
 
 /// Run PostgreSQL regression tests against a CrabgreSQL server child process.
 #[derive(Parser)]
@@ -43,7 +43,7 @@ struct Args {
 
     /// The crabgresql server binary to run the suite against
     /// [default: the one built next to this executable]
-    #[arg(long, value_name = "PATH", env = crabgresql_pg_regress::server::SERVER_BIN_ENV)]
+    #[arg(long, value_name = "PATH", env = crabgresql_server_process::SERVER_BIN_ENV)]
     server_bin: Option<PathBuf>,
 
     /// Where results/ and regression.diffs are written

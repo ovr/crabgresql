@@ -1,12 +1,12 @@
-//! The server under test, run as a child process.
+//! Run the shipped `crabgresql` binary as a child process.
 //!
-//! pg_regress drives a `postgres` the same way: a real binary, its own
-//! process, its own log file. Running it in-process would be less code, but a
-//! panic in the engine would take the runner down with it — no report, no
-//! stdout, nothing but a signal — and the CLI the users actually get
-//! (`--data-dir`, `--copy-allow-path`, their defaults) would never be
-//! exercised. Here a crash is an event the runner observes and reports, with
-//! the server's stderr — backtrace included — preserved in `server.log`.
+//! The regression runner and the benchmark runner both drive a server they own
+//! for the length of a run, the way pg_regress and pgbench drive a real
+//! `postgres`. In-process would be less code, but a panic in the engine would
+//! take the harness down with it — no report, nothing but a signal — and the
+//! CLI users actually get (`--data-dir`, `--copy-allow-path`, their defaults)
+//! would never be exercised. Here a crash is an event the caller observes and
+//! reports, with the server's stderr preserved in its log file.
 
 use std::io;
 use std::net::TcpListener as StdTcpListener;
@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
-/// Overrides the binary the runner spawns; otherwise it is found next to the
-/// running executable (see [`locate_server_binary`]).
+/// Overrides the binary to spawn; otherwise it is found next to the running
+/// executable (see [`locate_server_binary`]).
 pub const SERVER_BIN_ENV: &str = "CRABGRESQL_SERVER_BIN";
 
 /// The child's `RUST_LOG`. The ambient one is deliberately not inherited: a
@@ -26,12 +26,9 @@ pub const SERVER_BIN_ENV: &str = "CRABGRESQL_SERVER_BIN";
 /// from, and their `RUST_LOG=trace` would bury it.
 pub const SERVER_LOG_ENV: &str = "CRABGRESQL_SERVER_LOG";
 
-/// The name of the shipped server binary, as `crabgresql-server`'s `[[bin]]`
-/// declares it.
+/// As `crabgresql-server`'s `[[bin]]` declares it.
 const SERVER_BIN_NAME: &str = "crabgresql";
 
-/// How to get the binary when it is missing — the one thing the reader of the
-/// error needs to know.
 const BUILD_HINT: &str = "build it with `cargo build -p crabgresql-server --bin crabgresql`, \
                           or point CRABGRESQL_SERVER_BIN at it";
 
@@ -40,7 +37,6 @@ const BUILD_HINT: &str = "build it with `cargo build -p crabgresql-server --bin 
 /// a loaded CI machine is slow at both.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Poll interval while waiting for the port to answer.
 const READY_POLL: Duration = Duration::from_millis(20);
 
 /// How many ports to try before giving up. A port picked from the ephemeral
@@ -48,11 +44,9 @@ const READY_POLL: Duration = Duration::from_millis(20);
 /// that is rare and retrying a fresh one fixes it.
 const PORT_ATTEMPTS: usize = 5;
 
-/// Lines of `server.log` quoted when the server dies.
 const LOG_TAIL_LINES: usize = 40;
 
-/// A running `crabgresql` child process, killed on drop so an aborted run
-/// leaves nothing behind.
+/// A running `crabgresql` child process, killed on drop.
 pub struct ServerProcess {
     child: Child,
     port: u16,
@@ -60,9 +54,8 @@ pub struct ServerProcess {
 }
 
 /// The `crabgresql` binary to spawn: `CRABGRESQL_SERVER_BIN` if set, otherwise
-/// the one built alongside the running executable — `target/<profile>/` for the
-/// `regress` binary, and its parent for a test harness in
-/// `target/<profile>/deps/`.
+/// the one built alongside the running executable — `target/<profile>/` for a
+/// binary, and its parent for a test harness in `target/<profile>/deps/`.
 pub fn locate_server_binary() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os(SERVER_BIN_ENV) {
         let path = PathBuf::from(path);
@@ -94,15 +87,17 @@ pub fn locate_server_binary() -> io::Result<PathBuf> {
 }
 
 impl ServerProcess {
-    /// Start a server over `data_dir` and wait until it accepts connections.
+    /// Start a server over `data_dir` on a free loopback port and wait until it
+    /// accepts connections.
     ///
-    /// `copy_allow` is the suite's source tree: scripts load fixtures with
-    /// `COPY … FROM :'abs_srcdir/data/x.data'`, which lives there and not in the
-    /// throwaway PGDATA, so the server has to be told that tree is readable.
+    /// `copy_allow` are extra directories a server-side `COPY … FROM '<file>'`
+    /// may read: the regression suites keep their fixtures in the source tree
+    /// rather than in the data directory. A load that goes through
+    /// `COPY … FROM STDIN` needs none.
     pub async fn start(
         binary: &Path,
         data_dir: &Path,
-        copy_allow: &Path,
+        copy_allow: &[PathBuf],
         log_path: &Path,
     ) -> io::Result<Self> {
         let mut last: Option<io::Error> = None;
@@ -115,23 +110,29 @@ impl ServerProcess {
             };
             match server.wait_ready().await {
                 Ok(()) => return Ok(server),
-                // The server exited on its own: most often the port was taken
-                // between the probe and its bind, which another port fixes.
-                // Anything else fails the same way on every attempt, and the
-                // last error is the one reported.
+                // Most often the port was taken between the probe and the
+                // server's bind, which another port fixes. Anything else fails
+                // the same way every time, and the last error is reported.
                 Err(e) => last = Some(e),
             }
         }
         Err(last.unwrap_or_else(|| io::Error::other("no server start attempts were made")))
     }
 
-    /// The port the server accepts connections on.
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// The child's exit status if it has already died, without blocking. `None`
-    /// means it is still running.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    /// The child's process id while it runs, for a caller that has to signal it.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// The child's exit status if it has already died, without blocking.
     pub fn exited(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
@@ -140,34 +141,23 @@ impl ServerProcess {
     ///
     /// A dying server closes its sockets before the kernel is done with it, so
     /// the connection is lost a moment *before* the exit status exists. Asking
-    /// the instant the client notices gets "still running", and the crash is
-    /// misreported as one bad test. The wait is the SIGCHLD-driven
-    /// [`Child::wait`], not a poll: the status arrives when it arrives.
+    /// the instant a client notices gets "still running", and the crash is
+    /// misreported as one bad query.
     pub async fn exited_within(&mut self, grace: Duration) -> io::Result<Option<ExitStatus>> {
         match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(status) => status.map(Some),
-            // The grace ran out with the child still alive.
             Err(_elapsed) => Ok(None),
         }
     }
 
-    pub fn log_path(&self) -> &Path {
-        &self.log_path
-    }
-
-    /// The child's process id while it runs, for a test that needs to signal it.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    /// The end of `server.log`, which is where a panic's message and backtrace
-    /// are. Quoted into the failure so a CI log alone explains the crash.
+    /// The end of the log, which is where a panic's message and backtrace are.
     pub fn log_tail(&self) -> String {
         log_tail(&self.log_path, LOG_TAIL_LINES)
     }
 
-    /// Stop the server and reap it. The data directory is a throwaway, so this
-    /// kills rather than asking for the clean-shutdown flush.
+    /// Stop the server and reap it, without asking for the clean-shutdown
+    /// flush: a caller's data directory is either a throwaway or reused by a
+    /// run that recovers it anyway.
     pub async fn shutdown(mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -176,10 +166,8 @@ impl ServerProcess {
     /// Wait until the server answers on its port, or until it dies trying.
     ///
     /// The port has to be probed — nothing notifies a client that a listener
-    /// appeared, so this is the one loop here that legitimately polls. The
-    /// child, in contrast, is awaited: a server that exits during startup (its
-    /// port taken, recovery failed) is reported the moment SIGCHLD arrives
-    /// rather than at the next probe.
+    /// appeared. The child, in contrast, is awaited, so a server that exits
+    /// during startup is reported the moment SIGCHLD arrives.
     async fn wait_ready(&mut self) -> io::Result<()> {
         let port = self.port;
         let log_path = self.log_path.clone();
@@ -221,7 +209,7 @@ impl ServerProcess {
 fn spawn(
     binary: &Path,
     data_dir: &Path,
-    copy_allow: &Path,
+    copy_allow: &[PathBuf],
     log_path: &Path,
     port: u16,
 ) -> io::Result<Child> {
@@ -230,15 +218,18 @@ fn spawn(
     }
     let log = std::fs::File::create(log_path)?;
     let stderr = log.try_clone()?;
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--listen-address")
         .arg("127.0.0.1")
         .arg("--port")
-        .arg(port.to_string())
-        .arg("--copy-allow-path")
-        .arg(copy_allow)
+        .arg(port.to_string());
+    for path in copy_allow {
+        command.arg("--copy-allow-path").arg(path);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
@@ -250,14 +241,14 @@ fn spawn(
                 .unwrap_or_else(|_| crabgresql_config::DEFAULT_LOG_FILTER.to_string()),
         )
         // The server reads these as fallbacks for the arguments above; an
-        // inherited value must not decide where a regression run stores its
-        // data or which files it may read.
+        // inherited value must not decide where a run stores its data or which
+        // files it may read.
         .env_remove(crabgresql_config::DATA_DIR)
         .env_remove(crabgresql_config::PORT)
         .env_remove(crabgresql_config::LISTEN_ADDRESS)
         .env_remove(crabgresql_config::COPY_ALLOW_PATHS)
-        // An aborted run (Ctrl-C, a panicking test) must not leave a server
-        // holding a port and a data directory.
+        // Ctrl-C or a panicking harness must not leave a server holding a port
+        // and a data directory.
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
@@ -301,7 +292,7 @@ mod tests {
         let error = ServerProcess::start(
             Path::new("/nonexistent/crabgresql"),
             dir.path(),
-            dir.path(),
+            &[],
             &dir.path().join("server.log"),
         )
         .await

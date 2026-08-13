@@ -170,8 +170,9 @@ coverage grows. Those two tests need the server binary too, so build it first
 ## Benchmarks
 
 `crabgresql-bench` runs published analytical benchmarks — ClickBench for scans
-and aggregation over one wide table, TPC-H for joins over eight — against an
-in-process server, or against stock PostgreSQL for comparison. A query that hits
+and aggregation over one wide table, TPC-H for joins over eight — against a
+`crabgresql` server it starts as a child process, or against stock PostgreSQL
+for comparison. A query that hits
 an engine gap is reported in place instead of aborting the run, so the results
 table doubles as a gap list. See
 [`crates/crabgresql-bench/README.md`](crates/crabgresql-bench/README.md).

@@ -15,7 +15,7 @@ use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 /// `COPY` payload and materializes it as rows before inserting any of it, so
 /// this — not the size of the file — is what bounds memory on both sides.
 /// Loading a 70 GB TSV therefore means thousands of batches, not one giant
-/// transfer that would OOM the (in-process) server.
+/// transfer that would OOM the server.
 const COPY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Connect and spawn the connection task that drives the socket. The task ends

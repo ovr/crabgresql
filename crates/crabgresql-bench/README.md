@@ -1,8 +1,8 @@
 # crabgresql-bench
 
 A harness for running published analytical benchmarks against CrabgreSQL. It
-boots a server in-process (or connects to an external one), loads the dataset
-once, times every query, and prints a results table — or JSON shaped like the
+starts the `crabgresql` binary as a child process (or connects to an external
+server), loads the dataset once, times every query, and prints a results table — or JSON shaped like the
 upstream benchmarks' own result files.
 
 Failing queries do not abort the run: a query that hits a missing function or
@@ -106,7 +106,7 @@ Start small. TPC-H is quadratic in the wrong places for a young planner, so
 
 The load streams in as a sequence of `COPY` batches, because the server
 materializes a whole `COPY` payload before inserting any of it — one statement
-for the full file would OOM the (in-process) server long before the engine's
+for the full file would OOM the server long before the engine's
 own limits mattered. Even so, the loaded data has to fit in the machine, so
 take a slice with `--rows` until the engine grows out-of-core execution.
 
@@ -124,6 +124,12 @@ take a slice with `--rows` until the engine grows out-of-core execution.
   that is only partly there is refused too, rather than half-loaded — the check
   is on rows, not on the tables merely existing, because they are all created
   before any of them is filled.
+- `--server-bin PATH` — the `crabgresql` binary to benchmark, or
+  `CRABGRESQL_SERVER_BIN`. By default it is the one built next to the `bench`
+  executable, so `cargo build --release -p crabgresql-server --bin crabgresql`
+  is a prerequisite of a release run. The server's own log — including a
+  panic's backtrace, should the run kill it — is written to
+  `<data-dir>/server.log`.
 - `--using AM` — create the tables with an access method (`heap`, `parquet`,
   `buffer`) instead of leaving it to the server's default. Every report names the
   storage its numbers were measured on. `parquet` and `buffer` require a layout

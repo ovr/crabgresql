@@ -306,7 +306,7 @@ mod tests {
     fn run() -> SuiteRun {
         SuiteRun {
             suite: "clickbench".to_string(),
-            target: "in-process".to_string(),
+            target: "CrabgreSQL".to_string(),
             access_method: Some("parquet".to_string()),
             tables: vec![TableRows {
                 name: "hits".to_string(),

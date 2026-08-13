@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crabgresql_server_process::ServerProcess;
 use similar::TextDiff;
 
 use crate::client::{Client, Field, QueryEvent};
@@ -15,10 +16,9 @@ use crate::describe;
 use crate::format;
 use crate::psql_var::{self, Variables};
 use crate::script::{QueryEnd, ScriptItem, is_copy_from_stdin, lex};
-use crate::server::ServerProcess;
 
-/// What a script prints when its connection dies, psql's own wording. Also the
-/// hint that the server may have crashed (see [`EXIT_GRACE`]).
+/// psql's wording when a connection dies, and the hint that the server behind
+/// it may have crashed.
 const CONNECTION_LOST: &str = "connection to server was lost\n";
 
 /// How long a lost connection is given to turn into a child exit status before
@@ -27,7 +27,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 pub struct SuiteConfig {
     /// The `crabgresql` binary to run the suite against, from
-    /// [`crate::server::locate_server_binary`] or a `--server-bin` argument.
+    /// [`crabgresql_server_process::locate_server_binary`] or `--server-bin`.
     pub server_bin: PathBuf,
     /// Directory containing `sql/` and `expected/`.
     pub regress_dir: PathBuf,
@@ -91,8 +91,8 @@ pub struct TestOutcome {
     pub name: String,
     pub passed: bool,
     /// False for a test the run never reached because the server died first.
-    /// It still counts as a failure — nothing proved it passes — but saying so
-    /// keeps a crash from reading as a hundred independent regressions.
+    /// Still a failure — nothing proved it passes — but not a regression of its
+    /// own.
     pub ran: bool,
     /// Wall-clock time spent executing the script, without the diff against
     /// `expected/`.
@@ -100,8 +100,6 @@ pub struct TestOutcome {
 }
 
 impl TestOutcome {
-    /// A test that never ran, because the server was gone by the time its turn
-    /// came.
     fn not_run(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -118,8 +116,8 @@ pub struct SuiteReport {
     /// Wall-clock time of the whole run, including server startup and the
     /// setup tests that `outcomes` leaves out.
     pub duration: Duration,
-    /// Set when the server process died mid-run: the report is then a partial
-    /// one, and this says so in a line a human can act on.
+    /// Set when the server process died mid-run, which makes the report a
+    /// partial one.
     pub crash: Option<String>,
 }
 
@@ -154,8 +152,7 @@ impl SuiteReport {
 /// each pg_regress test gets a fresh psql.
 ///
 /// The server is a child process, so its death is survivable: the run stops
-/// there, the tests it never reached are reported as not run, and its log is
-/// left in `<outdir>/server.log`.
+/// there and its log is left in `<outdir>/server.log`.
 pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let started = Instant::now();
     // The whole suite runs against one durable pg-engine over a throwaway data
@@ -163,10 +160,12 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
     let data_dir = tempfile::tempdir()?;
     let results_dir = config.outdir.join("results");
     std::fs::create_dir_all(&results_dir)?;
+    // Scripts load fixtures with `COPY … FROM :'abs_srcdir/data/x.data'`, which
+    // is the suite's source tree and not the throwaway PGDATA.
     let mut server = ServerProcess::start(
         &config.server_bin,
         data_dir.path(),
-        &config.regress_dir,
+        std::slice::from_ref(&config.regress_dir),
         &config.outdir.join("server.log"),
     )
     .await?;
@@ -200,10 +199,8 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
             });
         }
         // A dead server makes every later test meaningless, so the run stops
-        // here — with the reason recorded, which is the whole reason the server
-        // is a separate process. A test that lost its connection is the one case
-        // worth waiting on: that is what a crash looks like from the client
-        // side, a beat before the exit status exists.
+        // here. A lost connection is worth waiting on: that is what a crash
+        // looks like from the client side, a beat before the status exists.
         let exit = if output.contains(CONNECTION_LOST) {
             server.exited_within(EXIT_GRACE).await?
         } else {
@@ -218,8 +215,8 @@ pub async fn run_suite(config: &SuiteConfig) -> io::Result<SuiteReport> {
         );
         diffs.push_str(&format!("{reason}\n{}\n\n", server.log_tail()));
         if !check {
-            // A setup test took the server with it: there is no partial report
-            // worth returning, only the crash.
+            // A setup test took the server with it: there is no partial
+            // report to return, only the crash.
             std::fs::write(&diffs_path, &diffs)?;
             return Err(io::Error::other(format!("{reason}\n{}", server.log_tail())));
         }
@@ -309,9 +306,8 @@ async fn run_test(
     statement_timeout: Duration,
     environment: &BTreeMap<String, String>,
 ) -> io::Result<String> {
-    // A refused connection means the server died between tests: report it as a
-    // lost connection, the same as losing one mid-script, so the caller can
-    // attribute it to the crash instead of failing the run with an errno.
+    // The server died between tests: report it as a lost connection so the
+    // caller attributes it to the crash instead of to an errno.
     let Ok(mut client) = Client::connect(port).await else {
         return Ok(CONNECTION_LOST.to_string());
     };

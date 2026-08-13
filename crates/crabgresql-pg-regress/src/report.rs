@@ -42,9 +42,8 @@ pub fn markdown_summary(suite: &str, report: &SuiteReport, detail: Detail) -> St
         let _ = write!(out, "\n> ⚠️ {crash}\n");
     }
 
-    // Only tests that actually ran are named: after a crash the tail of the
-    // schedule is unproven, not broken, and listing it would bury the one test
-    // that matters.
+    // Only tests that ran are named: after a crash the tail of the schedule is
+    // unproven rather than broken, and listing it would bury the one that failed.
     let failed: Vec<&str> = report
         .failed()
         .filter(|o| o.ran)
@@ -139,8 +138,6 @@ mod tests {
         assert!(md.contains("| `bad` | **FAILED** | 0.02s |\n"));
     }
 
-    /// A crashed server: the reason leads, the test that was running is named
-    /// as a failure, and the untouched tail is counted rather than listed.
     #[test]
     fn reports_a_crash_above_the_failures() {
         let not_run = TestOutcome {

@@ -39,9 +39,14 @@ enum Command {
         #[arg(long, value_name = "N")]
         rows: Option<u64>,
 
-        /// Data directory for the in-process server [default: a temp dir]
+        /// Data directory for the server under test [default: a temp dir]
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
+
+        /// The crabgresql server binary to benchmark
+        /// [default: the one built next to this executable]
+        #[arg(long, value_name = "PATH", env = crabgresql_server_process::SERVER_BIN_ENV)]
+        server_bin: Option<PathBuf>,
 
         /// Benchmark an external server instead (libpq connection string)
         #[arg(long, value_name = "CONNINFO")]
@@ -81,6 +86,7 @@ async fn main() -> ExitCode {
         data,
         rows,
         data_dir,
+        server_bin,
         url,
         runs,
         query,
@@ -104,6 +110,7 @@ async fn main() -> ExitCode {
         data,
         rows,
         data_dir,
+        server_bin,
         url,
         runs,
         only: query.into_iter().map(|n| n as usize).collect(),

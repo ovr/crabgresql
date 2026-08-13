@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crabgresql_pg_regress::runner::{SuiteConfig, run_suite};
 use crabgresql_pg_regress::schedule::parse_schedule;
-use crabgresql_pg_regress::server::locate_server_binary;
+use crabgresql_server_process::locate_server_binary;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

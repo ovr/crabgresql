@@ -7,7 +7,7 @@
 # `vendor/ryu` opts out in its own manifest; it carries upstream ryu's version.
 
 # Every crate inherits `version.workspace`, so the bump is one line in the root
-# Cargo.toml and all 18 crates move together.
+# Cargo.toml and every crate moves with it.
 shared-version = true
 
 # Nothing here is published to crates.io. The artifacts are binaries and a
