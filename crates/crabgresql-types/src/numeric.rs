@@ -801,9 +801,19 @@ impl Numeric {
     }
 
     /// Apply a `numeric(precision, scale)` type modifier: round to `scale`
-    /// fractional digits and verify the integer part fits `precision - scale`
-    /// digits, else `22003 numeric field overflow` (with PG's DETAIL). NaN is
-    /// allowed unchanged; ±Infinity cannot be stored in a constrained numeric.
+    /// fractional digits and verify the result is smaller than
+    /// `10^(precision - scale)`, else `22003 numeric field overflow` (with PG's
+    /// DETAIL, which states that bound outright). NaN is allowed unchanged;
+    /// ±Infinity cannot be stored in a constrained numeric.
+    ///
+    /// The bound is a **signed** exponent, which is the whole subtlety.
+    /// PostgreSQL allows `scale > precision` — `numeric(2,5)` holds values below
+    /// `10^-3` — so the digit count on the left of the point can legitimately be
+    /// negative, meaning "and this many leading zeros after the point too".
+    /// Clamping it at zero would reject every value of such a column: verified
+    /// against PostgreSQL 18.4, `0.0001::numeric(2,5)` is `0.00010` and only
+    /// `0.001` overflows. For the ordinary `scale <= precision` the bound is
+    /// non-negative and the distinction never arises.
     pub fn apply_typmod(&self, precision: i32, scale: i32) -> Result<Numeric, NumErr> {
         if self.is_nan() {
             return Ok(self.clone());
@@ -812,14 +822,15 @@ impl Numeric {
             return Err(field_overflow(precision, scale, true));
         }
         let rounded = self.round(scale);
-        let max_int_digits = precision - scale;
-        // Integer digits of `rounded`: weight + 1 when weight >= 0, else 0.
-        let int_digits = if rounded.is_zero() {
-            0
-        } else {
-            (rounded.weight + 1).max(0)
-        };
-        if int_digits > max_int_digits {
+        // Zero is below every bound, including a negative one — PostgreSQL
+        // stores `0::numeric(2,5)` as `0.00000` — and has no leading digit whose
+        // position could be compared.
+        if rounded.is_zero() {
+            return Ok(rounded);
+        }
+        // `weight` is the position of the leading digit, so `weight + 1` is the
+        // exponent of the smallest power of ten above the value.
+        if rounded.weight + 1 > precision - scale {
             return Err(field_overflow(precision, scale, false));
         }
         Ok(rounded)
@@ -857,20 +868,28 @@ impl Numeric {
         if neg { acc.checked_neg() } else { Some(acc) }
     }
 
-    /// As [`Numeric::to_scaled_i128`], but rendered as a decimal string, for the
-    /// widths no Rust integer covers (`precision > 38`, which Arrow stores as a
-    /// 256-bit decimal). The caller parses it into its own wide integer.
-    pub fn to_scaled_string(&self, precision: u8, scale: i8) -> Option<String> {
-        let (neg, hi) = self.scaled_span(precision, scale)?;
+    /// As [`Numeric::to_scaled_i128`], but rendered into `out` as a decimal
+    /// string, for the widths no Rust integer covers (`precision > 38`, which
+    /// Arrow stores as a 256-bit decimal). The caller parses it into its own
+    /// wide integer.
+    ///
+    /// Writes into a caller-owned buffer rather than returning a `String` so a
+    /// column's worth of values can share one allocation; `false` leaves `out`
+    /// in an unspecified state, which callers discard along with the value.
+    pub fn write_scaled_string(&self, precision: u8, scale: i8, out: &mut String) -> bool {
+        out.clear();
+        let Some((neg, hi)) = self.scaled_span(precision, scale) else {
+            return false;
+        };
         let scale = scale as i32;
-        let mut out = String::with_capacity((hi + scale + 2) as usize);
+        out.reserve((hi + scale + 2).max(0) as usize);
         if neg {
             out.push('-');
         }
         for pos in (-scale..=hi).rev() {
             out.push((b'0' + self.digit_at(pos)) as char);
         }
-        Some(out)
+        true
     }
 
     /// Whether the value is **exactly** representable as
@@ -2304,6 +2323,47 @@ mod tests {
         );
         assert!(Numeric::nan().apply_typmod(4, 4)?.is_nan());
 
+        Ok(())
+    }
+
+    /// A typmod whose scale exceeds its precision, which PostgreSQL has allowed
+    /// since 15: `numeric(2,5)` holds values below `10^-3`, so the bound on the
+    /// integer side is a *negative* exponent rather than a digit count.
+    ///
+    /// Every expectation below is PostgreSQL 18.4's own output.
+    #[test]
+    fn a_scale_past_the_precision_bounds_by_a_negative_exponent() -> anyhow::Result<()> {
+        assert_eq!(n("0.00001").apply_typmod(2, 5)?.to_display(), "0.00001");
+        // Rounded up to the declared scale, and still below the bound.
+        assert_eq!(n("0.0001").apply_typmod(2, 5)?.to_display(), "0.00010");
+        // Zero is below every bound, negative exponents included.
+        assert_eq!(n("0").apply_typmod(2, 5)?.to_display(), "0.00000");
+
+        let e = n("0.001")
+            .apply_typmod(2, 5)
+            .expect_err("0.001 is not below 10^-3");
+        assert_eq!(e.sqlstate, "22003");
+        assert_eq!(
+            e.detail
+                .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
+            "A field with precision 2, scale 5 must round to an absolute value less than 10^-3."
+        );
+        Ok(())
+    }
+
+    /// The mirror case: a negative scale rounds to the left of the point, so the
+    /// bound is a *larger* power of ten than the precision alone would suggest.
+    #[test]
+    fn a_negative_scale_rounds_left_of_the_point() -> anyhow::Result<()> {
+        assert_eq!(n("12345").apply_typmod(4, -2)?.to_display(), "12300");
+        let e = n("1234567")
+            .apply_typmod(4, -2)
+            .expect_err("1234567 rounds to 1234600, which is not below 10^6");
+        assert_eq!(
+            e.detail
+                .ok_or_else(|| anyhow::anyhow!("typmod detail is missing"))?,
+            "A field with precision 4, scale -2 must round to an absolute value less than 10^6."
+        );
         Ok(())
     }
 
