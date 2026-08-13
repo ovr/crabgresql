@@ -30,6 +30,29 @@
 use crabgresql_storage_api::{IndexKey, TableSchema, Tid, Tuple};
 use crabgresql_types::{PgType, Value};
 
+/// The key encoding this build writes: a `DESC` key column stored bit-inverted,
+/// as the module docs describe.
+///
+/// Persisted per index by the catalog so an older file is recognized rather than
+/// searched in an order it was not written in; the catalog only stores and
+/// forwards the byte, since what each version means is this module's to say.
+pub const ENCODING_VERSION: u8 = 1;
+
+/// The encoding used before direction reached the key: every column ascending,
+/// whatever the index declared.
+pub const ENCODING_ASCENDING_ONLY: u8 = 0;
+
+/// Whether a file written under `encoding` is still searchable by this build's
+/// key encoding.
+///
+/// Only the `DESC` columns moved, so an ascending index written under any
+/// version reads the same. A `DESC` one written before [`ENCODING_VERSION`] is
+/// in the opposite order for that column: probing it would encode the inverted
+/// bytes and match nothing, so the caller must treat it as no index at all.
+pub fn readable(encoding: u8, keys: &[IndexKey]) -> bool {
+    encoding >= ENCODING_VERSION || !keys.iter().any(|k| k.descending)
+}
+
 /// Whether `ty` is a key type this B-tree can physically index. Kept in sync
 /// with [`encode_one`]: exactly the types that arm handles.
 pub fn type_indexable(ty: PgType) -> bool {
@@ -79,11 +102,29 @@ pub fn keys_indexable(schema: &TableSchema, keys: &[IndexKey]) -> bool {
 /// `nulls_distinct` unique semantics.
 pub fn encode_row(schema: &TableSchema, keys: &[IndexKey], tuple: &Tuple) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    for key in keys {
-        let ty = schema.columns.get(key.column)?.ty;
-        append_key_column(ty, key.descending, tuple.get(key.column)?, &mut out)?;
-    }
-    Some(out)
+    encode_row_into(schema, keys, tuple, &mut out).then_some(out)
+}
+
+/// [`encode_row`] into a caller-owned buffer, which it clears first — for a
+/// caller re-encoding a key per row (a probe's re-check), so the allocation
+/// happens once rather than once per row. `false` leaves `out`'s contents
+/// unspecified, exactly as [`encode_row`] returns nothing.
+pub fn encode_row_into(
+    schema: &TableSchema,
+    keys: &[IndexKey],
+    tuple: &Tuple,
+    out: &mut Vec<u8>,
+) -> bool {
+    out.clear();
+    keys.iter().all(|key| {
+        schema
+            .columns
+            .get(key.column)
+            .zip(tuple.get(key.column))
+            .is_some_and(|(column, value)| {
+                append_key_column(column.ty, key.descending, value, out).is_some()
+            })
+    })
 }
 
 /// Why a probe's bytes could not be produced — a distinction the caller must
@@ -115,10 +156,8 @@ pub fn encode_prefix(schema: &TableSchema, keys: &[IndexKey], vals: &[Value]) ->
     }
     let mut out = Vec::new();
     for (key, v) in keys.iter().zip(vals) {
-        match encode_column(schema, key, v, &mut out) {
-            ColumnEncode::Ok => {}
-            ColumnEncode::Null => return Encoded::Null,
-            ColumnEncode::Unsupported => return Encoded::Unsupported,
+        if let Err(refusal) = encode_column(schema, key, v, &mut out) {
+            return refusal;
         }
     }
     Encoded::Bytes(out)
@@ -129,36 +168,28 @@ pub fn encode_prefix(schema: &TableSchema, keys: &[IndexKey], vals: &[Value]) ->
 pub fn encode_bound(schema: &TableSchema, key: &IndexKey, val: &Value) -> Encoded {
     let mut out = Vec::new();
     match encode_column(schema, key, val, &mut out) {
-        ColumnEncode::Ok => Encoded::Bytes(out),
-        ColumnEncode::Null => Encoded::Null,
-        ColumnEncode::Unsupported => Encoded::Unsupported,
+        Ok(()) => Encoded::Bytes(out),
+        Err(refusal) => refusal,
     }
 }
 
-/// [`Encoded`] without the bytes: what appending one column to a caller-owned
-/// buffer can report.
-enum ColumnEncode {
-    Ok,
-    Null,
-    Unsupported,
-}
-
+/// Append one key column to a caller-owned buffer. The error carries the
+/// [`Encoded`] the caller must report, so the two refusals have one spelling.
 fn encode_column(
     schema: &TableSchema,
     key: &IndexKey,
     v: &Value,
     out: &mut Vec<u8>,
-) -> ColumnEncode {
+) -> Result<(), Encoded> {
     if matches!(v, Value::Null) {
-        return ColumnEncode::Null;
+        return Err(Encoded::Null);
     }
-    let Some(ty) = schema.columns.get(key.column).map(|c| c.ty) else {
-        return ColumnEncode::Unsupported;
-    };
-    match append_key_column(ty, key.descending, v, out) {
-        Some(()) => ColumnEncode::Ok,
-        None => ColumnEncode::Unsupported,
-    }
+    let ty = schema
+        .columns
+        .get(key.column)
+        .map(|c| c.ty)
+        .ok_or(Encoded::Unsupported)?;
+    append_key_column(ty, key.descending, v, out).ok_or(Encoded::Unsupported)
 }
 
 /// Append one value's key encoding, inverted when the key column is `DESC` (see
@@ -546,7 +577,7 @@ mod tests {
     }
 
     /// The full key is itself a prefix — that is what lets one scan routine
-    /// serve equality and range alike (`nbtree::search_equal`).
+    /// serve equality and range alike (`nbtree::BTree::search_range`).
     #[test]
     fn a_full_length_prefix_equals_the_row_encoding() {
         let schema = text_int_schema();

@@ -1333,11 +1333,19 @@ struct IndexProbeIter {
     /// is truncating), resolved once: it cannot change under a scan that holds
     /// the shared lock below.
     heap: RelFileNode,
+    /// `heap`'s length in pages when the probe started. The relation only grows,
+    /// and every tid here came from a traversal that already finished, so a page
+    /// count read once is the bound each fetch needs — asking per row would cost
+    /// a lock pair and an `fstat` each time.
+    nblocks: u32,
     txn: TxnContext,
     schema: Arc<TableSchema>,
     index_keys: Vec<IndexKey>,
     range: KeyRange,
     tids: std::vec::IntoIter<Tid>,
+    /// Scratch for the per-row key re-check below, reused across rows so a wide
+    /// range allocates once rather than once per row it returns.
+    key_buf: Vec<u8>,
     /// Shared table-lock hold kept for the iterator's whole life, so a concurrent
     /// TRUNCATE cannot unlink `heap` mid-probe — the same reason `HeapScan` holds
     /// one.
@@ -1353,7 +1361,7 @@ impl Iterator for IndexProbeIter {
             // failure must reach the caller: swallowing it here would make an
             // index scan quietly return fewer rows than a sequential scan of the
             // same table — the same query answering differently by plan.
-            match fetch_at(&self.engine, self.heap, tid, &self.txn) {
+            match fetch_at(&self.engine, self.heap, self.nblocks, tid, &self.txn) {
                 // Re-check the key against the row we actually read. The B-tree
                 // is *supposed* to be exact here — that is why the executor's
                 // index scan re-checks nothing — but nothing else enforces it,
@@ -1362,8 +1370,12 @@ impl Iterator for IndexProbeIter {
                 // returned row turns that whole class of defect into rows quietly
                 // absent, which a probe-versus-scan test catches.
                 Ok(Some(tuple))
-                    if btkey::encode_row(&self.schema, &self.index_keys, &tuple)
-                        .is_some_and(|k| self.range.contains(&k)) =>
+                    if btkey::encode_row_into(
+                        &self.schema,
+                        &self.index_keys,
+                        &tuple,
+                        &mut self.key_buf,
+                    ) && self.range.contains(&self.key_buf) =>
                 {
                     return Some(Ok((tid, tuple)));
                 }
@@ -1381,16 +1393,20 @@ impl Iterator for IndexProbeIter {
 ///
 /// Free-standing rather than a method so a probe's iterator can fetch rows
 /// lazily: it owns the pieces this needs ([`EngineInner`], the relfilenode, the
-/// snapshot) without borrowing the table. [`TableAm::fetch`] is this plus the
-/// table lock and the relfilenode a truncating transaction sees.
+/// block count, the snapshot) without borrowing the table. [`TableAm::fetch`] is
+/// this plus the table lock and the relfilenode a truncating transaction sees.
 fn fetch_at(
     engine: &EngineInner,
     rel: RelFileNode,
+    nblocks: u32,
     tid: Tid,
     txn: &TxnContext,
 ) -> Result<Option<Tuple>, StorageError> {
-    let smgr = engine.bufpool.smgr();
-    if tid.block >= HeapTable::io(smgr.nblocks(rel)) {
+    // Bounds-check before pinning: `pin` *extends* the relation to cover an
+    // out-of-range block. `nblocks` is the caller's, because asking the storage
+    // manager costs a lock pair and an `fstat` — per row, for a caller in a
+    // loop.
+    if tid.block >= nblocks {
         return Ok(None);
     }
     let page = HeapTable::io(engine.bufpool.pin(rel, tid.block));
@@ -1570,14 +1586,24 @@ impl TableAm for HeapTable {
             self.persistence.is_unlogged(),
         )
         .search_range(&range);
+        // Nothing matched: hand back an empty iterator rather than the machinery
+        // for walking one. This is the ordinary outcome of the `UNIQUE` check,
+        // which probes once per inserted row, and it is the one place where the
+        // snapshot clone and the guard below would be pure overhead.
+        if tids.is_empty() {
+            return Some(Box::new(std::iter::empty()));
+        }
+        let heap = self.effective_rel(txn.xid);
         Some(Box::new(IndexProbeIter {
+            nblocks: Self::io(self.engine.bufpool.smgr().nblocks(heap)),
             engine: Arc::clone(&self.engine),
-            heap: self.effective_rel(txn.xid),
+            heap,
             txn: txn.clone(),
             schema,
             index_keys,
             range,
             tids: tids.into_iter(),
+            key_buf: Vec::new(),
             _guard: guard,
         }))
     }
@@ -1614,7 +1640,9 @@ impl TableAm for HeapTable {
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
-        fetch_at(&self.engine, self.effective_rel(txn.xid), tid, txn)
+        let rel = self.effective_rel(txn.xid);
+        let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
+        fetch_at(&self.engine, rel, nblocks, tid, txn)
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {

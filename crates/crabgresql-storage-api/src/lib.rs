@@ -1206,11 +1206,17 @@ pub trait TableAm: Send + Sync {
     /// fall back to a scan. The planner consults this so it only chooses an
     /// index scan the executor can actually perform, keeping `EXPLAIN` honest.
     ///
-    /// The answer is about the *index*, not about a particular key: an engine
-    /// that says yes here and then declines a probe for one key would make a
-    /// per-key caller (`UNIQUE` enforcement) fall back once per row. Declining
-    /// because the index went away under a concurrent `DROP INDEX` is the
-    /// sanctioned reason, and it is sticky rather than per-key.
+    /// The answer is about the *index*, not about a particular key *value*: an
+    /// engine that says yes here and then declines a probe for one value would
+    /// make a per-key caller (`UNIQUE` enforcement) fall back once per row.
+    /// Declining because the index went away under a concurrent `DROP INDEX` is
+    /// the sanctioned reason, and it is sticky rather than per-value.
+    ///
+    /// A probe's *shape* is a different matter, and this cannot answer for it: a
+    /// key an engine serves in full may be one it cannot serve as a prefix (see
+    /// [`TableAm::index_lookup`] on unconstrained key columns). A caller that
+    /// builds partial keys — the planner — applies that rule itself so it does
+    /// not advertise a path the engine will decline.
     ///
     /// The default is `false` — no physical index — which the columnar engines
     /// and the read-only system catalogs inherit; the durable heap engine
@@ -1260,6 +1266,15 @@ pub trait TableAm: Send + Sync {
     /// A `DESC` key column reverses each bound's direction; that is the
     /// engine's business, not the caller's — bounds are always stated in value
     /// order.
+    ///
+    /// The bounds themselves are ordered the way the engine's index is, which
+    /// for a byte-ordered index is not the way every collation orders text: an
+    /// engine may store keys by their bytes, and under an ICU collation the
+    /// stretch between two bounds is then not the set of rows the comparison
+    /// selects. Bounding a collatable column is therefore the **caller's** to
+    /// restrict to byte-order collations
+    /// (`crabgresql_types::collation::is_byte_order`); equality is exempt,
+    /// since every supported collation is deterministic.
     ///
     /// The default is `None`, which the columnar engines and the read-only
     /// system catalogs inherit; the durable heap engine serves this from its

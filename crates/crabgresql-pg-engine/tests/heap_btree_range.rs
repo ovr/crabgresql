@@ -95,6 +95,34 @@ const fn excl(value: i32) -> Option<Bound> {
     })
 }
 
+/// Ask the index for `(eq, lower, upper)`, whatever it answers — `None` when it
+/// declines the probe.
+fn lookup(
+    table: &dyn TableAm,
+    txn: &TxnContext,
+    eq: &[i32],
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+) -> Option<crabgresql_storage_api::IndexProbe> {
+    let eq: Vec<Value> = eq.iter().copied().map(Value::Int4).collect();
+    // The values outlive the borrowed key, and each carries its own
+    // inclusiveness rather than re-reading it off the argument.
+    let end = |bound: Option<Bound>| bound.map(|b| (Value::Int4(b.value), b.inclusive));
+    let (lo, hi) = (end(lower), end(upper));
+    fn bound(end: &Option<(Value, bool)>) -> Option<IndexBound<'_>> {
+        end.as_ref().map(|(value, inclusive)| IndexBound {
+            value,
+            inclusive: *inclusive,
+        })
+    }
+    let key = IndexProbeKey {
+        eq: &eq,
+        lower: bound(&lo),
+        upper: bound(&hi),
+    };
+    table.index_lookup("t_abc_idx", &key, txn)
+}
+
 /// Probe `(eq, lower, upper)` and return the matching rows, sorted.
 fn probe(
     table: &dyn TableAm,
@@ -103,24 +131,7 @@ fn probe(
     lower: Option<Bound>,
     upper: Option<Bound>,
 ) -> Vec<[i32; 3]> {
-    let eq: Vec<Value> = eq.iter().copied().map(Value::Int4).collect();
-    let (lo, hi) = (
-        lower.map(|b| Value::Int4(b.value)),
-        upper.map(|b| Value::Int4(b.value)),
-    );
-    let key = IndexProbeKey {
-        eq: &eq,
-        lower: lo.as_ref().map(|value| IndexBound {
-            value,
-            inclusive: lower.expect("bound present").inclusive,
-        }),
-        upper: hi.as_ref().map(|value| IndexBound {
-            value,
-            inclusive: upper.expect("bound present").inclusive,
-        }),
-    };
-    let mut rows: Vec<[i32; 3]> = table
-        .index_lookup("t_abc_idx", &key, txn)
+    let mut rows: Vec<[i32; 3]> = lookup(table, txn, eq, lower, upper)
         .expect("the index serves the probe")
         .map(|row| ints(&row.expect("probe failed").1))
         .collect();
@@ -367,23 +378,7 @@ fn a_probe_leaving_a_nullable_key_column_unconstrained_is_declined() -> anyhow::
     let txn = read(&tm);
 
     let declined = |eq: &[i32], lower: Option<Bound>, upper: Option<Bound>| {
-        let eq: Vec<Value> = eq.iter().copied().map(Value::Int4).collect();
-        let (lo, hi) = (
-            lower.map(|b| Value::Int4(b.value)),
-            upper.map(|b| Value::Int4(b.value)),
-        );
-        let key = IndexProbeKey {
-            eq: &eq,
-            lower: lo.as_ref().map(|value| IndexBound {
-                value,
-                inclusive: lower.expect("bound present").inclusive,
-            }),
-            upper: hi.as_ref().map(|value| IndexBound {
-                value,
-                inclusive: upper.expect("bound present").inclusive,
-            }),
-        };
-        table.index_lookup("t_abc_idx", &key, &txn).is_none()
+        lookup(&*table, &txn, eq, lower, upper).is_none()
     };
 
     // `a = 1` and `a = 1 AND b > 5` both leave `c` unconstrained, and both would

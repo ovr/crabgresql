@@ -87,50 +87,64 @@ pub(crate) fn index_probe_rows(
     // as well as the equalities, or the scan would return every row past the
     // probe's start.
     let column_ty = |column: usize| table.schema().columns[column].ty;
-    let eq: Vec<(usize, PgType, Value)> = key
+    // One list, because an equality is the degenerate bound: the value must
+    // compare `Equal`, and `Equal` is accepted. A lower bound keeps rows *above*
+    // its value and an upper bound rows below it, so the third field is the
+    // ordering each test accepts besides its own `Equal` case.
+    let tests: Vec<KeyTest> = key
         .eq
         .iter()
         .zip(eq)
-        .map(|((column, _), want)| (*column, column_ty(*column), want))
+        .map(|((column, _), want)| (*column, want, Ordering::Equal, true))
+        .chain(lower.map(|(b, value)| (b.column, value, Ordering::Greater, b.inclusive)))
+        .chain(upper.map(|(b, value)| (b.column, value, Ordering::Less, b.inclusive)))
+        .map(|(column, want, side, inclusive)| KeyTest {
+            column,
+            ty: column_ty(column),
+            want,
+            side,
+            inclusive,
+        })
         .collect();
-    let bound = |end: Option<(&IndexBoundExpr, Value)>, want: Ordering| {
-        end.map(|(b, value)| (b.column, column_ty(b.column), value, want, b.inclusive))
-    };
-    // A lower bound keeps rows *above* its value, an upper bound rows below it.
-    let range: Vec<(usize, PgType, Value, Ordering, bool)> = [
-        bound(lower, Ordering::Greater),
-        bound(upper, Ordering::Less),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
     // The planner folds every key column into `projection` precisely so this
     // re-check can read them.
     Ok(Box::new(table.scan(txn, projection).filter_map(
         move |row| {
             match row {
-                Ok((tid, tuple)) => {
-                    // NULL satisfies neither an equality nor a bound, on either
-                    // side of it.
-                    let compare = |column: usize, ty: PgType, want: &Value| {
-                        let cell = &tuple[column];
-                        (!matches!(cell, Value::Null) && !matches!(want, Value::Null))
-                            .then(|| compare_values(ty, cell, want))
-                    };
-                    let matches = eq.iter().all(|(column, ty, want)| {
-                        compare(*column, *ty, want) == Some(Ordering::Equal)
-                    }) && range.iter().all(|(column, ty, want, side, inclusive)| {
-                        match compare(*column, *ty, want) {
-                            Some(Ordering::Equal) => *inclusive,
-                            other => other == Some(*side),
-                        }
-                    });
-                    matches.then_some(Ok((tid, tuple)))
-                }
+                Ok((tid, tuple)) => tests
+                    .iter()
+                    .all(|test| test.holds(&tuple))
+                    .then_some(Ok((tid, tuple))),
                 Err(error) => Some(Err(error)),
             }
         },
     )))
+}
+
+/// One key column's test, as the scan fallback re-checks it per row.
+struct KeyTest {
+    column: usize,
+    ty: PgType,
+    want: Value,
+    /// The ordering that satisfies this test outright: `Equal` for an equality,
+    /// `Greater` for a lower bound, `Less` for an upper one.
+    side: Ordering,
+    /// Whether comparing `Equal` satisfies it too.
+    inclusive: bool,
+}
+
+impl KeyTest {
+    fn holds(&self, tuple: &[Value]) -> bool {
+        let cell = &tuple[self.column];
+        // NULL satisfies neither an equality nor a bound, on either side of it.
+        if matches!(cell, Value::Null) || matches!(self.want, Value::Null) {
+            return false;
+        }
+        match compare_values(self.ty, cell, &self.want) {
+            Ordering::Equal => self.inclusive,
+            other => other == self.side,
+        }
+    }
 }
 
 impl ExecNode for IndexScan {
@@ -148,16 +162,7 @@ mod tests {
 
     use super::IndexScan;
     use crate::ExecContext;
-    use crate::testutil::{collect, indexed_table, int4, rtxn, test_ok, test_table};
-
-    /// A one-column equality probe.
-    fn eq_probe(column: usize, value: BoundExpr) -> IndexProbeSpec {
-        IndexProbeSpec {
-            eq: vec![(column, value)],
-            lower: None,
-            upper: None,
-        }
-    }
+    use crate::testutil::{collect, ids, indexed_table, int4, rtxn, test_ok, test_table};
 
     #[test]
     fn index_scan_probes_physical_index() {
@@ -165,7 +170,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "t_id_key",
-            eq_probe(0, int4(2)),
+            IndexProbeSpec::equality(vec![(0, int4(2))]),
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -184,7 +189,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "missing_index",
-            eq_probe(0, int4(2)),
+            IndexProbeSpec::equality(vec![(0, int4(2))]),
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -232,14 +237,7 @@ mod tests {
                 &rtxn(),
                 &ColumnProjection::All,
             ));
-            let ids: Vec<i32> = collect(&mut node)
-                .iter()
-                .map(|row| match row[0] {
-                    Value::Int4(id) => id,
-                    ref other => panic!("unexpected id {other:?}"),
-                })
-                .collect();
-            assert_eq!(ids, want, "lower={lower:?} upper={upper:?}");
+            assert_eq!(ids(&mut node), want, "lower={lower:?} upper={upper:?}");
         }
     }
 
@@ -249,7 +247,7 @@ mod tests {
         let mut node = test_ok(IndexScan::new(
             &table,
             "t_id_key",
-            eq_probe(0, int4(99)),
+            IndexProbeSpec::equality(vec![(0, int4(99))]),
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,

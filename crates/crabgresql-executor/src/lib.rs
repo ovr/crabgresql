@@ -4129,11 +4129,7 @@ mod tests {
     fn probe_on_id(index_name: &str, id: i32) -> Option<DmlIndexProbe> {
         Some(DmlIndexProbe {
             index_name: index_name.into(),
-            key: IndexProbeSpec {
-                eq: vec![(0, int4(id))],
-                lower: None,
-                upper: None,
-            },
+            key: IndexProbeSpec::equality(vec![(0, int4(id))]),
             residual: None,
         })
     }

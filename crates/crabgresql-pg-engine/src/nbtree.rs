@@ -311,17 +311,16 @@ impl BTree {
                 let maxoff = page::max_offset(pg);
                 for off in start..=maxoff {
                     let item = page::get_item(pg, off).expect("leaf slot is normal");
-                    let key = btkey::leaf_key(item);
-                    // Keys only grow from here, so once one is past the range's
-                    // end no later entry on this or any later page can match.
-                    if range.past_end(key) {
-                        return None;
-                    }
-                    // Entries *below* the range are skipped rather than stopped
-                    // on: the descent lands on the page owning the start key,
-                    // which normally also holds smaller keys before it.
-                    if range.contains(key) {
-                        out.push(btkey::leaf_tid(item));
+                    match range.classify(btkey::leaf_key(item)) {
+                        Place::In => out.push(btkey::leaf_tid(item)),
+                        // Below the range: skipped rather than stopped on, since
+                        // the descent lands on the page owning the start key,
+                        // which normally also holds smaller keys before it.
+                        Place::Below => {}
+                        // Keys only grow from here, so once one is past the
+                        // range's end no later entry on this or any later page
+                        // can match.
+                        Place::Past => return None,
                     }
                 }
                 // Fell off the end of the page still inside the range: the run
@@ -667,6 +666,17 @@ pub struct KeyRange {
     pub upper: Bound<Vec<u8>>,
 }
 
+/// Where one key falls relative to a [`KeyRange`].
+#[derive(PartialEq, Eq)]
+enum Place {
+    /// Before the range starts — a scan reading in order skips it.
+    Below,
+    In,
+    /// Past everything the range can still accept — a scan reading in order
+    /// stops.
+    Past,
+}
+
 impl KeyRange {
     /// A range covering exactly the keys starting with `prefix` — a prefix probe
     /// when `prefix` is shorter than a whole key, and **equality** when it is a
@@ -684,37 +694,43 @@ impl KeyRange {
 
     /// Whether `key` is in the range.
     pub fn contains(&self, key: &[u8]) -> bool {
-        key.starts_with(&self.prefix) && self.within_lower(key) && self.within_upper(key)
+        self.classify(key) == Place::In
     }
 
-    fn within_lower(&self, key: &[u8]) -> bool {
-        match &self.lower {
+    /// Where `key` falls. One pass over the rules, because a scan asks both
+    /// questions ("take it?" and "stop?") about every entry it reads and the
+    /// prefix and upper-bound comparisons answer both.
+    fn classify(&self, key: &[u8]) -> Place {
+        let in_prefix = key.starts_with(&self.prefix);
+        // Leaving the prefix's stretch *upward* is past; leaving it downward is
+        // below, which is what the descent's landing page holds before the
+        // start key.
+        if !in_prefix && key > &self.prefix[..] {
+            return Place::Past;
+        }
+        let within_upper = match &self.upper {
+            Bound::Unbounded => true,
+            // Mirror of the lower `Excluded` case below: those extensions of `b`
+            // are the rows holding exactly the bound's value, which an inclusive
+            // bound keeps even though their bytes run past it.
+            Bound::Included(b) => key < &b[..] || key.starts_with(b),
+            Bound::Excluded(b) => key < &b[..],
+        };
+        if !within_upper {
+            return Place::Past;
+        }
+        let within_lower = match &self.lower {
             Bound::Unbounded => true,
             Bound::Included(b) => key >= &b[..],
             // A key that starts with `b` carries `b`'s value in the bounded
             // column and a further column after it — the value the bound
             // excludes.
             Bound::Excluded(b) => key > &b[..] && !key.starts_with(b),
+        };
+        match in_prefix && within_lower {
+            true => Place::In,
+            false => Place::Below,
         }
-    }
-
-    fn within_upper(&self, key: &[u8]) -> bool {
-        match &self.upper {
-            Bound::Unbounded => true,
-            // Mirror of the lower `Excluded` case: those extensions of `b` are
-            // the rows holding exactly the bound's value, which an inclusive
-            // bound keeps even though their bytes run past it.
-            Bound::Included(b) => key < &b[..] || key.starts_with(b),
-            Bound::Excluded(b) => key < &b[..],
-        }
-    }
-
-    /// Whether `key` is past everything the range can still accept — so a scan
-    /// reading keys in order can stop rather than skip. True once the key leaves
-    /// the prefix's stretch *upward* or fails the upper bound; a key below the
-    /// range is neither.
-    fn past_end(&self, key: &[u8]) -> bool {
-        (!key.starts_with(&self.prefix) && key > &self.prefix[..]) || !self.within_upper(key)
     }
 }
 

@@ -19,6 +19,7 @@ use crabgresql_storage_api::{
 };
 use crabgresql_types::PgType;
 
+use crate::btkey;
 use crate::smgr::RelFileNode;
 
 /// A relation as the engine reopens it: its name, heap relfilenode, out-of-line
@@ -127,8 +128,8 @@ const GEN_MAGIC: &[u8; 4] = b"GEN1";
 /// Marks the index-key-encoding section, appended after the [`GEN_MAGIC`] block
 /// — a sixteenth backward-compatible tail carrying one byte per index saying
 /// which key encoding its B-tree file was built with. A reader that predates it
-/// stops above and decodes every index as [`KEY_ENCODING_ASCENDING_ONLY`], which
-/// is what every file written before this tail actually holds; see
+/// stops above and decodes every index as [`btkey::ENCODING_ASCENDING_ONLY`],
+/// which is what every file written before this tail actually holds; see
 /// [`PersistIndex::usable_rel`] for what that costs a `DESC` index.
 const IKEY_MAGIC: &[u8; 4] = b"IKV1";
 struct PersistCol {
@@ -157,32 +158,25 @@ struct PersistIndex {
     meta: IndexMetadata,
     rel: u32,
     /// Which key encoding the file was built with, persisted in the
-    /// [`IKEY_MAGIC`] tail. See [`KEY_ENCODING_CURRENT`].
+    /// [`IKEY_MAGIC`] tail. Opaque here: see [`btkey::ENCODING_VERSION`].
     key_encoding: u8,
 }
-
-/// The key encoding this build writes: `DESC` key columns stored bit-inverted,
-/// so the file is in the order a descending scan reads forward.
-const KEY_ENCODING_CURRENT: u8 = 1;
-/// The encoding a catalog written before [`IKEY_MAGIC`] existed used: every key
-/// column ascending, whatever its declared direction.
-const KEY_ENCODING_ASCENDING_ONLY: u8 = 0;
 
 impl PersistIndex {
     /// The relfilenode the engine may actually read, or `0` for an index it must
     /// treat as metadata-only.
     ///
-    /// A file written under [`KEY_ENCODING_ASCENDING_ONLY`] with a `DESC` key
-    /// column is stored in an order this build no longer searches in: probes
-    /// would encode the inverted bytes and find nothing, quietly answering
-    /// queries with no rows. There is no `REINDEX` to rebuild it with, so it is
-    /// demoted to metadata-only — the planner then scans, which is slower and
-    /// correct. Dropping the index still unlinks the file, because `rel` itself
-    /// is left intact.
+    /// A file [`btkey::readable`] rejects is stored in an order this build no
+    /// longer searches in: probes would find nothing, quietly answering queries
+    /// with no rows. There is no `REINDEX` to rebuild it with, so it is demoted
+    /// to metadata-only — the planner then scans, which is slower and correct.
+    /// Dropping the index still unlinks the file, because `rel` itself is left
+    /// intact.
     fn usable_rel(&self) -> u32 {
-        let stale = self.key_encoding == KEY_ENCODING_ASCENDING_ONLY
-            && self.meta.keys.iter().any(|k| k.descending);
-        if stale { 0 } else { self.rel }
+        match btkey::readable(self.key_encoding, &self.meta.keys) {
+            true => self.rel,
+            false => 0,
+        }
     }
 }
 
@@ -886,7 +880,7 @@ impl RelCatalog {
             meta: index,
             rel: rel.0,
             // Built by this process, so it is in this build's key encoding.
-            key_encoding: KEY_ENCODING_CURRENT,
+            key_encoding: btkey::ENCODING_VERSION,
         });
         self.persist(&state)?;
         Ok(())
@@ -1739,7 +1733,7 @@ fn decode(bytes: &[u8]) -> State {
                     rel: 0,
                     // Likewise filled from the IKV1 tail below; its absence means
                     // the file predates the descending key encoding.
-                    key_encoding: KEY_ENCODING_ASCENDING_ONLY,
+                    key_encoding: btkey::ENCODING_ASCENDING_ONLY,
                 });
             }
         }

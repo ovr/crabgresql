@@ -247,6 +247,18 @@ pub struct IndexProbeSpec {
 }
 
 impl IndexProbeSpec {
+    /// The leading key columns pinned by equality and nothing else — the shape
+    /// every probe had before ranges existed. Mirrors
+    /// [`crabgresql_storage_api::IndexProbeKey::equality`], which the executor
+    /// turns this into.
+    pub fn equality(eq: Vec<(usize, BoundExpr)>) -> Self {
+        IndexProbeSpec {
+            eq,
+            lower: None,
+            upper: None,
+        }
+    }
+
     /// Every column the probe reads, in key order — what a scan fallback has to
     /// re-check per row, and so what the projection pass must keep.
     pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
@@ -1113,11 +1125,7 @@ fn pick_index(
     let mut best: Option<(f64, DmlIndexProbe, Vec<bool>)> = None;
     for (index, chosen) in candidates {
         let mut consumed = vec![false; quals.len()];
-        let mut key = IndexProbeSpec {
-            eq: Vec::with_capacity(chosen.eq.len()),
-            lower: None,
-            upper: None,
-        };
+        let mut key = IndexProbeSpec::equality(Vec::with_capacity(chosen.eq.len()));
         // Independent per-column selectivities multiply, as in PG's
         // `clauselist_selectivity`.
         let mut selectivity = 1.0;
@@ -1131,25 +1139,24 @@ fn pick_index(
             }
         }
         if let Some(bounded) = chosen.bounded {
-            let mut ends = [None, None];
-            for (slot, conjunct) in [bounded.lower, bounded.upper].into_iter().enumerate() {
-                if let Some(conjunct) = conjunct
-                    && let Some(KeyQual::Bound {
-                        column,
-                        value,
-                        inclusive,
-                        ..
-                    }) = &quals[conjunct]
-                {
-                    ends[slot] = Some(Box::new(IndexBoundExpr {
-                        column: *column,
-                        value: value.clone(),
-                        inclusive: *inclusive,
-                    }));
-                    consumed[conjunct] = true;
-                }
-            }
-            let [lower, upper] = ends;
+            let mut end = |conjunct: Option<usize>| {
+                let conjunct = conjunct?;
+                // `cover_index` only returns conjuncts it classified as this
+                // role, so the match always binds.
+                let KeyQual::Bound {
+                    value, inclusive, ..
+                } = quals[conjunct].as_ref()?
+                else {
+                    return None;
+                };
+                consumed[conjunct] = true;
+                Some(Box::new(IndexBoundExpr {
+                    column: bounded.column,
+                    value: value.clone(),
+                    inclusive: *inclusive,
+                }))
+            };
+            let (lower, upper) = (end(bounded.lower), end(bounded.upper));
             selectivity *= bound_selectivity(&schema, &stats, bounded.column, &lower, &upper);
             key.lower = lower;
             key.upper = upper;
@@ -1198,8 +1205,11 @@ fn bound_selectivity(
     };
     // A bound whose value is not a literal still *is* a bound — dropping it
     // would estimate an unbounded side and make the index look worse than it is.
-    // It is passed as a NULL instead, which no column's statistics describe, so
-    // the estimator falls back to its default for that side.
+    // It is passed as a NULL instead, which `cost::describes` rejects for every
+    // analyzed column, so the estimator falls back to its default for that side.
+    // That is an in-band signal: teaching the estimator to read NULLs (a
+    // null_frac-aware selectivity) has to give "bounded, value unknown" a name
+    // of its own first.
     fn end(bound: &Option<Box<IndexBoundExpr>>) -> Option<(&Value, bool)> {
         bound
             .as_ref()
@@ -2490,19 +2500,11 @@ mod tests {
     /// [`plan_sql_indexed`] stopping at the bound plan, for a test that wants to
     /// rewrite it before planning.
     fn bind_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> LogicalPlan {
-        bind_sql_analyzed(sql, index, None)
+        bind_sql_full(sql, index, None, true)
     }
 
     /// The bound plan, with `t`'s statistics set. The plan holds the table by
     /// `Arc`, so statistics recorded here are the ones the planner reads.
-    fn bind_sql_analyzed(
-        sql: &str,
-        index: Option<IndexMetadata>,
-        stats: Option<RelStats>,
-    ) -> LogicalPlan {
-        bind_sql_full(sql, index, stats, true)
-    }
-
     /// The whole fixture, with `big`'s nullability spelled out: it is what
     /// decides whether a cover stopping before it is servable at all.
     fn bind_sql_full(
@@ -3508,20 +3510,15 @@ mod tests {
             .map(|bucket| Value::Int4(bucket * 10_000))
             .collect();
         let id = ColStats {
-            null_frac: 0.0,
             avg_width: 4,
             n_distinct: -1.0,
-            mcv: Vec::new(),
             histogram,
             correlation: 1.0,
+            ..ColStats::default()
         };
         let blank = ColStats {
-            null_frac: 0.0,
             avg_width: 8,
-            n_distinct: 0.0,
-            mcv: Vec::new(),
-            histogram: Vec::new(),
-            correlation: 0.0,
+            ..ColStats::default()
         };
         RelStats {
             relpages: 1_000,
@@ -3626,15 +3623,14 @@ mod tests {
     fn analyzed_names() -> RelStats {
         let mut stats = analyzed_ids();
         let name = ColStats {
-            null_frac: 0.0,
             avg_width: 4,
             n_distinct: -1.0,
             histogram: ["a", "f", "k", "p", "u", "z"]
                 .iter()
                 .map(|s| Value::Text((*s).to_string()))
                 .collect(),
-            mcv: Vec::new(),
             correlation: 1.0,
+            ..ColStats::default()
         };
         let columns: Vec<ColStats> = stats
             .columns
