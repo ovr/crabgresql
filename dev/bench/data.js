@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786612508969,
+  "lastUpdate": 1786612511204,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -23944,6 +23944,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20350.655729,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9acf52e2ed286cb8f926d6f934cf204964fd2c0a",
+          "message": "feat(engine): serve range and prefix index scans from the B-tree (#222)",
+          "timestamp": "2026-08-13T10:38:55+02:00",
+          "tree_id": "cd151034f2abc3e73e6a0a4a6e6bfe35d86a551c",
+          "url": "https://github.com/ovr/crabgresql/commit/9acf52e2ed286cb8f926d6f934cf204964fd2c0a"
+        },
+        "date": 1786612511111,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1288.97731,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19438.792912,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
