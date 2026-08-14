@@ -19,6 +19,12 @@
 //! statement later. A text column still allocates once — where the [`Value`] is
 //! built, not here.
 //!
+//! Being spans is also what keeps the text format down to **one** copy of its
+//! input: a completed line goes into the arena whole, in one `push_str`, and
+//! its fields are ranges inside that copy. Only a field the escape decoder has
+//! to rewrite gets bytes of its own. Delimiters and NULL markers ride along in
+//! the arena addressed by nothing, which is the price of not copying the rest.
+//!
 //! [`Value`]: crabgresql_types::Value
 //!
 //! Decoding is resumable: [`CopyDecoder`] takes bytes in arbitrary slabs and
@@ -111,7 +117,9 @@ fn validate_field(bytes: &[u8]) -> Result<&str, PgError> {
 pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<RowBatch, PgError> {
     let mut decoder = CopyDecoder::new(format);
     // The whole stream is in hand, so the arena is sized once instead of
-    // doubling its way there. It cannot need more than the input.
+    // doubling its way there. The input's length is the right estimate — the
+    // arena holds the lines themselves — though not a bound: a de-escaped field
+    // is appended alongside the line it came from.
     decoder.batch = RowBatch::with_capacity(bytes.len());
     decoder.push(bytes)?;
     decoder.finish()?;
@@ -239,7 +247,7 @@ impl CopyDecoder {
         }
         if !self.format.csv {
             if !self.line.is_empty() {
-                self.complete_text_line()?;
+                self.complete_carried_text_line()?;
             }
             return Ok(());
         }
@@ -278,13 +286,26 @@ impl CopyDecoder {
         Ok(())
     }
 
+    /// Split `bytes` on newlines and turn each completed line into a row.
+    ///
+    /// A line that arrives whole inside this slab — every line of a wire COPY,
+    /// and all but one per read of a file COPY — never touches `self.line`: it
+    /// goes to [`Self::finish_text_line`] as a slice of the caller's buffer and
+    /// is copied exactly once, into the batch's arena. `self.line` exists only
+    /// for the line a slab boundary cut in half.
     fn push_text(&mut self, bytes: &[u8]) -> Result<(), PgError> {
         let mut rest = bytes;
-        while let Some(k) = rest.iter().position(|&b| b == b'\n') {
+        while let Some(k) = memchr::memchr(b'\n', rest) {
             self.charge(k + 1)?;
-            self.line.extend_from_slice(&rest[..k]);
-            rest = &rest[k + 1..];
-            self.complete_text_line()?;
+            let (line, tail) = rest.split_at(k);
+            rest = &tail[1..];
+            self.record_bytes = 0;
+            if self.line.is_empty() {
+                self.finish_text_line(strip_cr(line))?;
+            } else {
+                self.line.extend_from_slice(line);
+                self.complete_carried_text_line()?;
+            }
             if self.end_of_data {
                 return Ok(());
             }
@@ -294,24 +315,31 @@ impl CopyDecoder {
         Ok(())
     }
 
-    /// Turn the accumulated raw line into a row. A straddled CRLF needs no
-    /// special handling: the `\r` simply sits in `line` until the `\n` arrives.
-    fn complete_text_line(&mut self) -> Result<(), PgError> {
-        if self.line.last() == Some(&b'\r') {
-            self.line.pop();
-        }
-        self.record_bytes = 0;
-        let outcome = self.take_text_line();
+    /// Turn the line carried in `self.line` into a row — the path a line that a
+    /// slab boundary cut in half takes.
+    ///
+    /// The buffer is moved out so the line can be read while the decoder is
+    /// written, and moved back emptied so its allocation belongs to the load
+    /// rather than to the line. A straddled CRLF needs no special handling: the
+    /// `\r` simply sat in the buffer until the `\n` arrived.
+    fn complete_carried_text_line(&mut self) -> Result<(), PgError> {
+        let mut carried = std::mem::take(&mut self.line);
+        let outcome = self.finish_text_line(strip_cr(&carried));
         // One clear on every path, including the error one, rather than an
         // invariant each early return has to remember.
-        self.line.clear();
+        carried.clear();
+        self.line = carried;
         outcome
     }
 
-    /// The accumulated line as a row — or as the end-of-data marker, or as the
-    /// header. The caller owns clearing `line`.
-    fn take_text_line(&mut self) -> Result<(), PgError> {
-        if self.line == b"\\." {
+    /// One completed line as a row — or as the end-of-data marker, or as the
+    /// header.
+    ///
+    /// The line comes in as a parameter rather than off `self`, which is what
+    /// lets the common path pass a slice of the caller's slab and skip the
+    /// carry buffer entirely.
+    fn finish_text_line(&mut self, line: &[u8]) -> Result<(), PgError> {
+        if line == b"\\." {
             self.end_of_data = true;
             return Ok(());
         }
@@ -323,36 +351,28 @@ impl CopyDecoder {
             if !matches!(self.format.header, CopyHeader::Match(_)) {
                 return Ok(());
             }
-            self.decode_text_line()?;
-            return self.consume_header_row();
+            self.decode_text_line(line)?;
+            return consume_header_row(&self.format, &mut self.batch);
         }
-        self.decode_text_line()
+        self.decode_text_line(line)
     }
 
-    /// Check the row just closed as the `HEADER` line against the statement's
-    /// column list, then drop it — a header is not data.
-    fn consume_header_row(&mut self) -> Result<(), PgError> {
-        let check = match &self.format.header {
-            CopyHeader::Match(expected) => {
-                check_header_names(self.batch.row(self.batch.len() - 1), expected)
-            }
-            _ => Ok(()),
-        };
-        self.batch.pop_row();
-        check
-    }
-
-    /// Split the accumulated raw line into fields on unescaped delimiters and
-    /// append it to the batch as one row.
+    /// Split a raw line into fields on unescaped delimiters and append it to
+    /// the batch as one row.
+    ///
+    /// The line is copied into the arena **once**, whole, and each field that
+    /// needs no rewriting is then a span inside that copy — so a byte of input
+    /// is copied once for the load rather than once into a line buffer and
+    /// again per field. The delimiters and NULL markers ride along in the
+    /// arena, addressed by nothing; see [`RowBatch::push_line`].
     ///
     /// The NULL marker is compared against the *raw*, still-escaped field, and
     /// a field is de-escaped only when the scan actually saw a backslash in it
     /// — which for a typical load is no field at all.
-    fn decode_text_line(&mut self) -> Result<(), PgError> {
-        // Destructured so the line can be read while the batch is written; they
-        // are disjoint fields, which a method call could not express.
+    fn decode_text_line(&mut self, line: &[u8]) -> Result<(), PgError> {
+        // Destructured so the batch can be written while the format is read;
+        // `line` is the caller's, so it is not part of the borrow.
         let CopyDecoder {
-            line,
             unescaped,
             batch,
             format,
@@ -364,8 +384,12 @@ impl CopyDecoder {
         // does, which converts the input's encoding before it parses fields —
         // while a 100-column row would otherwise pay 100 calls over a handful
         // of bytes each, never reaching the vectorized path. Only a field the
-        // escape decoder rewrites is re-checked, below.
+        // escape decoder rewrites is re-checked, below. It also has to run
+        // before the line reaches the arena, which is a `String`.
         let line = validate_field(line)?;
+        // The scan below walks `line` — the caller's bytes — and not the arena,
+        // so the copy needs no reborrow and the batch stays writable.
+        let base = batch.push_line(line);
 
         let mut start = 0;
         let mut i = 0;
@@ -383,7 +407,7 @@ impl CopyDecoder {
                     i += 2;
                 }
                 b if b == delimiter => {
-                    push_text_field(&line[start..i], escaped, null, batch, unescaped)?;
+                    push_text_field(line, base, start..i, escaped, null, batch, unescaped)?;
                     i += 1;
                     start = i;
                     escaped = false;
@@ -391,7 +415,15 @@ impl CopyDecoder {
                 _ => i += 1,
             }
         }
-        push_text_field(&line[start..], escaped, null, batch, unescaped)?;
+        push_text_field(
+            line,
+            base,
+            start..line.len(),
+            escaped,
+            null,
+            batch,
+            unescaped,
+        )?;
         batch.end_row();
         Ok(())
     }
@@ -528,7 +560,7 @@ impl CopyDecoder {
         // the asymmetry with the text format is PG's.
         if self.skip_header {
             self.skip_header = false;
-            return self.consume_header_row();
+            return consume_header_row(&self.format, &mut self.batch);
         }
         Ok(())
     }
@@ -564,21 +596,46 @@ fn record_too_long(have: usize, added: usize, max: usize) -> PgError {
     )
 }
 
-/// Append one raw (still-escaped) text field to the batch.
+/// A line's bytes without the `\r` of a CRLF terminator.
+fn strip_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((b'\r', head)) => head,
+        _ => line,
+    }
+}
+
+/// Check the row just closed as the `HEADER` line against the statement's
+/// column list, then drop it — a header is not data.
+fn consume_header_row(format: &CopyFormat, batch: &mut RowBatch) -> Result<(), PgError> {
+    let check = match &format.header {
+        CopyHeader::Match(expected) => check_header_names(batch.row(batch.len() - 1), expected),
+        _ => Ok(()),
+    };
+    batch.pop_row();
+    check
+}
+
+/// Append one raw (still-escaped) text field to the batch, given the line it
+/// belongs to, where that line starts in the arena, and the field's range
+/// inside it.
 ///
 /// `escaped` is what the splitting scan already learned — whether this field
-/// contains a backslash — so the common field goes into the arena as the text
-/// that arrived, with no de-escaping pass, no buffer of its own, and no second
-/// encoding check: the line it is a slice of has already passed one. Only an
-/// escape decode can produce bytes the line did not contain (`\351`), so only
-/// that path validates.
+/// contains a backslash — so the common field is already in the arena as the
+/// text that arrived and costs only its span, with no copy, no de-escaping
+/// pass, no buffer of its own, and no second encoding check: the line it is a
+/// slice of has already passed one. Only an escape decode can produce bytes the
+/// line did not contain (`\351`), so only that path builds a field of its own —
+/// appended after the line, which is where the arena's next free byte is.
 fn push_text_field(
-    raw: &str,
+    line: &str,
+    base: usize,
+    range: std::ops::Range<usize>,
     escaped: bool,
     null: &str,
     batch: &mut RowBatch,
     unescaped: &mut Vec<u8>,
 ) -> Result<(), PgError> {
+    let raw = &line[range.clone()];
     if raw == null {
         batch.push_null();
     } else if escaped {
@@ -586,7 +643,7 @@ fn push_text_field(
         unescape_text_into(raw.as_bytes(), unescaped);
         batch.push_field(validate_field(unescaped)?);
     } else {
-        batch.push_field(raw);
+        batch.push_field_at(base + range.start, base + range.end);
     }
     Ok(())
 }
@@ -1159,6 +1216,92 @@ mod tests {
                 Some("longer-than-any".into()),
             ]]
         );
+        Ok(())
+    }
+
+    /// A line that arrived whole inside one slab goes into the arena directly;
+    /// one a slab boundary cut in two is carried in `line` and lands there a
+    /// step later. The two paths are separate code and must decode a line the
+    /// same way — every field kind at once, including a CRLF that a small enough
+    /// chunk splits down the middle.
+    #[test]
+    fn a_carried_line_decodes_as_a_whole_one_does() -> Result<(), PgError> {
+        let input = "a\\tb\tplain\t\\N\t\tд\tc\\\\d\r\n".as_bytes();
+        let want = vec![vec![
+            Some("a\tb".to_string()),
+            Some("plain".to_string()),
+            None,
+            Some(String::new()),
+            Some("д".to_string()),
+            Some("c\\d".to_string()),
+        ]];
+        assert_eq!(decode_owned(&text_format(), input)?, want, "one slab");
+        for chunk in 1..=8 {
+            assert_eq!(
+                decode_in_chunks(&text_format(), input, chunk)?,
+                want,
+                "chunk {chunk}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `HEADER match` is the one path that decodes a line and then drops it, so
+    /// it has to reach both the name check and the arena's release.
+    #[test]
+    fn header_match_checks_names_on_both_line_paths() -> Result<(), PgError> {
+        let mut fmt = text_format();
+        fmt.header = CopyHeader::Match(vec!["a".to_string(), "b".to_string()]);
+        let want = vec![vec![Some("1".to_string()), Some("x".to_string())]];
+        assert_eq!(decode_owned(&fmt, b"a\tb\n1\tx\n")?, want, "one slab");
+        for chunk in 1..=4 {
+            assert_eq!(
+                decode_in_chunks(&fmt, b"a\tb\n1\tx\n", chunk)?,
+                want,
+                "chunk {chunk}"
+            );
+        }
+
+        let err = decode_owned(&fmt, b"a\tz\n1\tx\n").expect_err("the names do not match");
+        assert_eq!(err.code, sqlstate::BAD_COPY_FILE_FORMAT);
+        for chunk in 1..=4 {
+            assert!(
+                decode_in_chunks(&fmt, b"a\tz\n1\tx\n", chunk).is_err(),
+                "chunk {chunk}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The arena holds completed records and nothing else. A line still being
+    /// carried across a slab boundary must stay out of it: [`RowBatch::split_into`]
+    /// moves rows by rebasing whole byte ranges, and a half-built line sitting
+    /// in the arena would be handed to the consumer with the rows before it.
+    #[test]
+    fn a_carried_line_is_not_in_the_arena_yet() -> Result<(), PgError> {
+        let mut decoder = CopyDecoder::new(&text_format());
+        decoder.push(b"1\ta\n2\tb")?;
+        assert_eq!(decoder.batch().len(), 1);
+        assert_eq!(
+            decoder.batch().arena_len(),
+            "1\ta".len(),
+            "the completed line, and no byte of the one still arriving"
+        );
+        decoder.push(b"\n")?;
+        assert_eq!(decoder.batch().arena_len(), "1\ta".len() + "2\tb".len());
+        Ok(())
+    }
+
+    /// A header line reaches the arena (it has to be decoded to be checked) and
+    /// must not stay there: it is not data, and its bytes would otherwise be
+    /// carried by every batch split for the rest of the load.
+    #[test]
+    fn a_dropped_header_line_releases_its_bytes() -> Result<(), PgError> {
+        let mut fmt = text_format();
+        fmt.header = CopyHeader::Match(vec!["h1".to_string(), "h2".to_string()]);
+        let mut decoder = CopyDecoder::new(&fmt);
+        decoder.push(b"h1\th2\n1\ta\n")?;
+        assert_eq!(decoder.batch().arena_len(), "1\ta".len());
         Ok(())
     }
 

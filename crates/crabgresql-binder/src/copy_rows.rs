@@ -13,6 +13,12 @@
 //! steps rather than a `String` per cell. A text column still pays its one
 //! allocation, but it pays it where the value is actually built.
 //!
+//! Because a field is only ever a span, a decoder that already has a whole
+//! record in hand can hand the *record* to the arena once
+//! ([`RowBatch::push_line`]) and address its fields inside it
+//! ([`RowBatch::push_field_at`]) — one copy of the input instead of one for the
+//! record and another for every field it holds.
+//!
 //! The batch is the unit of reuse: a decoder fills one, the load consumes it by
 //! reference, and [`RowBatch::split_into`] hands the allocations back for the
 //! next batch.
@@ -97,7 +103,14 @@ const ORIGIN: RowStart = RowStart { field: 0, byte: 0 };
 /// ```
 #[derive(Debug)]
 pub struct RowBatch {
-    /// Every completed field's text, concatenated.
+    /// Every completed field's text — and, for a decoder that fills the arena a
+    /// record at a time, the bytes between them.
+    ///
+    /// Nothing reads the arena except through a [`FieldSpan`], so a byte that
+    /// belongs to no field (a delimiter, a NULL marker, a field superseded by
+    /// its de-escaped form) is simply never addressed. What the readers do
+    /// depend on is that a row's spans all fall past the row's recorded byte
+    /// boundary — see [`RowBatch::push_field_at`].
     ///
     /// A `String` and not a `Vec<u8>`: the decoder has to run the UTF-8 check
     /// anyway — it is the layer that can report a bad byte as PostgreSQL's
@@ -171,6 +184,15 @@ impl RowBatch {
         self.fields.len() - self.open().field
     }
 
+    /// Bytes the arena currently holds.
+    ///
+    /// Nothing in production reads this; it exists so a decoder's tests can
+    /// assert what did — and did not — reach the arena, which is the invariant
+    /// [`split_into`](Self::split_into) rests on.
+    pub fn arena_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Where the row under construction begins.
     fn open(&self) -> RowStart {
         *self
@@ -187,6 +209,42 @@ impl RowBatch {
             start,
             end: self.buf.len(),
         });
+    }
+
+    /// Copy a whole raw record into the arena, returning the offset it landed
+    /// at, so its fields can be addressed in place with
+    /// [`push_field_at`](Self::push_field_at).
+    ///
+    /// This is what keeps a text-format load down to one copy of its input: the
+    /// decoder already holds the record, and every field that needs no
+    /// rewriting is a slice of it. The bytes between the fields ride along —
+    /// see [`buf`](Self::buf).
+    pub fn push_line(&mut self, line: &str) -> usize {
+        let at = self.buf.len();
+        self.buf.push_str(line);
+        at
+    }
+
+    /// Append a completed field whose text is *already* in the arena — the
+    /// offsets [`push_line`](Self::push_line) handed out.
+    ///
+    /// `start` must not point before the row under construction: a row's bytes
+    /// living past its own boundary is what lets
+    /// [`split_into`](Self::split_into) move rows by rebasing whole ranges, and
+    /// what lets [`truncate_rows`](Self::truncate_rows) drop a row by cutting
+    /// the arena. Appending the record and only then its fields satisfies this
+    /// by construction.
+    pub fn push_field_at(&mut self, start: usize, end: usize) {
+        debug_assert!(start <= end && end <= self.buf.len(), "span outside arena");
+        debug_assert!(
+            start >= self.open().byte,
+            "a field cannot start before its own row"
+        );
+        debug_assert!(
+            self.buf.is_char_boundary(start) && self.buf.is_char_boundary(end),
+            "span is not on char boundaries"
+        );
+        self.fields.push(FieldSpan { start, end });
     }
 
     /// Append a field that matched the format's NULL representation.
@@ -412,6 +470,85 @@ mod tests {
             assert_eq!(finished.get(1), None);
             assert_eq!(finished.get(2), Some("last"));
         }
+    }
+
+    /// Build a row the way the text decoder does: the whole record into the
+    /// arena once, then a span per field — and a rewritten field appended after
+    /// it, out of the record's own order.
+    fn push_record(batch: &mut RowBatch, record: &str, fields: &[Result<(usize, usize), &str>]) {
+        let base = batch.push_line(record);
+        for field in fields {
+            match field {
+                Ok((start, end)) => batch.push_field_at(base + start, base + end),
+                Err(rewritten) => batch.push_field(rewritten),
+            }
+        }
+        batch.end_row();
+    }
+
+    #[test]
+    fn a_field_addressed_in_place_reads_as_its_own_text() {
+        let mut batch = RowBatch::new();
+        // `1\thello\tc\\d`, whose third field the decoder rewrote.
+        push_record(
+            &mut batch,
+            "1\thello\tc\\\\d",
+            &[Ok((0, 1)), Ok((2, 7)), Err("c\\d")],
+        );
+        batch.push_null();
+        batch.end_row();
+        assert_eq!(
+            owned(&batch),
+            vec![
+                vec![
+                    Some("1".to_string()),
+                    Some("hello".to_string()),
+                    Some("c\\d".to_string())
+                ],
+                vec![None],
+            ]
+        );
+    }
+
+    /// The bytes between the fields — delimiters, NULL markers, a superseded
+    /// field — ride along in the arena, so a split has to move them with the
+    /// row they belong to rather than trip over them.
+    #[test]
+    fn a_split_batch_of_in_place_rows_keeps_every_row_intact() {
+        let build = || {
+            let mut batch = RowBatch::new();
+            for i in 0..5 {
+                push_record(
+                    &mut batch,
+                    "aa\t\\N\tb\\tc",
+                    &[Ok((0, 2)), Err(&format!("row{i}")), Ok((7, 8))],
+                );
+            }
+            batch
+        };
+        for at in 0..=5 {
+            let mut tail = build();
+            let mut head = RowBatch::new();
+            tail.split_into(at, &mut head);
+
+            let mut rejoined = owned(&head);
+            rejoined.extend(owned(&tail));
+            assert_eq!(rejoined, owned(&build()), "split at {at}");
+        }
+    }
+
+    #[test]
+    fn popping_an_in_place_row_releases_the_whole_record() {
+        let mut batch = RowBatch::new();
+        push_record(&mut batch, "h1\th2", &[Ok((0, 2)), Ok((3, 5))]);
+        assert_eq!(batch.arena_len(), "h1\th2".len());
+        batch.pop_row();
+        assert_eq!(batch.arena_len(), 0, "not one byte of the record survives");
+        push_record(&mut batch, "1\t2", &[Ok((0, 1)), Ok((2, 3))]);
+        assert_eq!(
+            owned(&batch),
+            vec![vec![Some("1".to_string()), Some("2".to_string())]]
+        );
     }
 
     /// A row under construction is not a row, and a truncation drops it.
