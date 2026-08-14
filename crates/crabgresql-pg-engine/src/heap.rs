@@ -1141,7 +1141,14 @@ impl HeapTable {
                 let lsn = self.log(rec::HEAP_MULTI_INSERT, xid, &w.finish());
                 page::set_lsn(pg, lsn.0);
             });
-            self.insert_hint.store(target, Ordering::Relaxed);
+            // Only when something landed here: the hint names the page we last
+            // placed into, never merely the one we last pinned. Publishing a page
+            // we just found full — even for the instant before the `extend` below
+            // overwrites it — hands every other writer reading this hint
+            // (`place_item` under `update`, a concurrent load) a wasted pin.
+            if tids.len() > start {
+                self.insert_hint.store(target, Ordering::Relaxed);
+            }
             if tids.len() == items.len() {
                 break;
             }
