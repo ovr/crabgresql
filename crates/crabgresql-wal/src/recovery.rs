@@ -117,6 +117,7 @@ pub fn recover(
     let mut next_xid = control.map(|c| c.next_xid.0).unwrap_or(Xid::FIRST_NORMAL.0);
 
     let bytes = read_from(dir, start)?;
+    tracing::trace!(start = %start, len = bytes.len(), next_xid, "starting WAL replay");
 
     let mut pos = 0usize;
     while let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) {
@@ -135,6 +136,14 @@ pub fn recover(
         if rec.xid.0 >= next_xid {
             next_xid = rec.xid.0 + 1;
         }
+        tracing::trace!(
+            rec_lsn = %rec.rec_lsn,
+            end_lsn = %end_lsn,
+            rmgr = rec.rmgr,
+            info = rec.info,
+            xid = rec.xid.0,
+            "replaying WAL record"
+        );
         match RmgrId(rec.rmgr) {
             RmgrId::XACT => match rec.info {
                 XACT_COMMIT => clog.set_committed(rec.xid),
@@ -212,11 +221,18 @@ pub fn recover(
         }
     }
 
-    Ok(RecoveryResult {
+    let result = RecoveryResult {
         end_of_wal: Lsn(start.0 + pos as u64),
         next_xid: Xid(next_xid),
         replayed_from: start,
-    })
+    };
+    tracing::trace!(
+        end_of_wal = %result.end_of_wal,
+        next_xid = result.next_xid.0,
+        replayed_from = %result.replayed_from,
+        "finished WAL replay"
+    );
+    Ok(result)
 }
 
 #[cfg(test)]

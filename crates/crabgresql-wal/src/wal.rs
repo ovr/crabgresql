@@ -159,6 +159,7 @@ impl Wal {
             .truncate(false)
             .open(&path)?;
         let len = file.metadata()?.len();
+        tracing::trace!(dir = %dir.display(), len, "opened WAL");
         Ok(Wal {
             inner: Mutex::new(Inner {
                 unwritten: Vec::new(),
@@ -270,6 +271,7 @@ impl Wal {
         inner.insert_lsn = lsn.0;
         inner.written = lsn.0;
         self.flushed.store(lsn.0, Ordering::SeqCst);
+        tracing::trace!(lsn = %lsn, "reset WAL to LSN, discarding torn tail");
         Ok(())
     }
 
@@ -295,10 +297,19 @@ impl Wal {
         let n = rec.encode(&mut scratch);
         inner.unwritten = scratch;
         inner.insert_lsn += n as u64;
-        LsnRange {
+        let range = LsnRange {
             start,
             end: Lsn(inner.insert_lsn),
-        }
+        };
+        tracing::trace!(
+            rmgr = rmgr.0,
+            info,
+            xid = xid.0,
+            start = %range.start,
+            end = %range.end,
+            "appended WAL record"
+        );
+        range
     }
 
     /// Highest LSN staged (durable or not).
@@ -319,6 +330,7 @@ impl Wal {
     /// thread drains the staged bytes, writes them, and issues a single fsync;
     /// every other caller whose target is covered returns without its own fsync.
     pub fn flush(&self, up_to: Lsn) -> Result<(), WalError> {
+        tracing::trace!(up_to = %up_to, "flush requested");
         if self.flushed.load(Ordering::SeqCst) >= up_to.0 {
             return Ok(());
         }
@@ -383,6 +395,7 @@ impl Wal {
                     self.flushed.store(target, Ordering::SeqCst);
                     inner.flushing = false;
                     self.cond.notify_all();
+                    tracing::trace!(start, target, "flushed WAL bytes to disk");
                 }
                 Err(e) => {
                     // Put the drained bytes back so a retry can flush them, and
