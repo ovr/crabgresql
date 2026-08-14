@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786738250743,
+  "lastUpdate": 1786738252609,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -29128,6 +29128,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19214.23677,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f258792ceb76fef18f2575da30f9dd3bee5e767b",
+          "message": "perf(heap): place an insert batch page by page, one WAL record per page (#234)",
+          "timestamp": "2026-08-14T19:34:53Z",
+          "tree_id": "875249379f4a838eba03914732e65557cf7a7f39",
+          "url": "https://github.com/ovr/crabgresql/commit/f258792ceb76fef18f2575da30f9dd3bee5e767b"
+        },
+        "date": 1786738252496,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1169.310411,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19966.913841,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
