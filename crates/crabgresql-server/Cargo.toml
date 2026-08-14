@@ -26,6 +26,7 @@ crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 crabgresql-wal.workspace = true
 clap.workspace = true
+memchr.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
