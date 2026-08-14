@@ -12,6 +12,7 @@ pub const HEAP_DELETE: u8 = 2;
 // HEAP_DELETE and its new version as a HEAP_INSERT (see heap::update).
 pub const HEAP_VACUUM: u8 = 4;
 pub const HEAP_TRUNCATE: u8 = 5;
+pub const HEAP_MULTI_INSERT: u8 = 6;
 
 struct W(Vec<u8>);
 impl W {
@@ -86,6 +87,48 @@ pub fn insert(rel: RelFileNode, block: u32, off: u16, tuple: &[u8]) -> Vec<u8> {
     w.u16(off);
     w.bytes(tuple);
     w.0
+}
+
+/// Builder for a `HEAP_MULTI_INSERT`: every tuple one batch placed on a single
+/// page, in one record. Layout:
+/// `[rel:u32][block:u32][n:u32] { [off:u16][len:u32][bytes] }*`.
+///
+/// Grown item by item rather than encoded from a collected list, so the batch
+/// insert can append each tuple straight from the page it just wrote it to —
+/// there is no copy of the tuple bytes anywhere between the page and the log.
+/// `n` is not known until the page fills, so it is written as a placeholder and
+/// patched by [`MultiInsert::finish`].
+pub struct MultiInsert {
+    w: W,
+    n: u32,
+}
+
+impl MultiInsert {
+    /// The item count's byte offset in the payload: it follows `rel` and `block`.
+    const COUNT_AT: usize = 8;
+
+    pub fn new(rel: RelFileNode, block: u32) -> MultiInsert {
+        let mut w = W(Vec::new());
+        w.u32(rel.0);
+        w.u32(block);
+        w.u32(0);
+        MultiInsert { w, n: 0 }
+    }
+
+    pub fn push(&mut self, off: u16, tuple: &[u8]) {
+        self.w.u16(off);
+        self.w.bytes(tuple);
+        self.n += 1;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        self.w.0[Self::COUNT_AT..Self::COUNT_AT + 4].copy_from_slice(&self.n.to_le_bytes());
+        self.w.0
+    }
 }
 
 pub fn delete(rel: RelFileNode, block: u32, off: u16, xmax: Xid, cmax: CommandId) -> Vec<u8> {

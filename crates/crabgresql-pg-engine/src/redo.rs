@@ -54,6 +54,27 @@ impl RmgrRedo for HeapRedo {
                 let tuple = r.bytes().to_vec();
                 self.apply(rel, block, ctx.lsn, |pg| page::put_item_at(pg, off, &tuple))?;
             }
+            rec::HEAP_MULTI_INSERT => {
+                // Every item of this record landed on one page in one critical
+                // section, so it replays as one gated apply: the page either
+                // predates the record and takes the whole batch, or it already
+                // holds all of it. Replaying item by item would need a gate per
+                // item, and the page carries only one LSN.
+                let rel = r.rel();
+                let block = r.u32();
+                let n = r.u32();
+                let items: Vec<(u16, Vec<u8>)> = (0..n)
+                    .map(|_| {
+                        let off = r.u16();
+                        (off, r.bytes().to_vec())
+                    })
+                    .collect();
+                self.apply(rel, block, ctx.lsn, |pg| {
+                    for (off, tuple) in &items {
+                        page::put_item_at(pg, *off, tuple);
+                    }
+                })?;
+            }
             rec::HEAP_DELETE => {
                 let rel = r.rel();
                 let block = r.u32();

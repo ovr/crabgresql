@@ -170,6 +170,69 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
+    // `insert_many` logs one HEAP_MULTI_INSERT per page rather than one record
+    // per row, so replay has to rebuild a whole page's worth of rows from a
+    // single record — at the same offsets, with the same self-ctid — and stay
+    // idempotent when it sees that record twice.
+    let dir = tempfile::tempdir()?;
+    let placed: Vec<Tid>;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
+        let x = tm.allocate_xid();
+        let rows: Vec<Vec<Value>> = (0..500)
+            .map(|i| vec![Value::Int4(i), Value::Text("w".repeat(300))])
+            .collect();
+        placed = table.insert_many(rows, &tm.context(x, CommandId::FIRST))?;
+        tm.commit(x)?;
+        assert!(
+            placed.iter().map(|t| t.block).collect::<Vec<_>>().len() > 1
+                && placed.first().map(|t| t.block) != placed.last().map(|t| t.block),
+            "the batch was meant to cross a page boundary"
+        );
+        // Crash: drop without a checkpoint, so only the WAL carries the batch.
+    }
+
+    // First recovery: every row is back, at the tid the original placement
+    // reported.
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    let rows: Vec<(Tid, Vec<Value>)> = table
+        .scan(&read(&tm), &ColumnProjection::All)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 500);
+    assert_eq!(rows.iter().map(|(tid, _)| *tid).collect::<Vec<_>>(), placed);
+    assert_eq!(visible_ids(&tm, &*table), (0..500).collect::<Vec<i32>>());
+    // Each replayed row still points at itself, which is what `fetch` walks.
+    for (i, tid) in placed.iter().enumerate() {
+        let got = table.fetch(*tid, &read(&tm))?;
+        assert_eq!(got.map(|t| t[0].clone()), Some(Value::Int4(i as i32)));
+    }
+
+    // Push the recovered pages to disk (advancing their pd_lsn), then replay the
+    // same WAL again over them: the LSN gate must make it a no-op rather than
+    // adding a second copy of every row.
+    engine.checkpoint(Xid::FIRST_NORMAL)?;
+    let mut reg = RmgrRegistry::new();
+    let wal = Arc::new(Wal::open(dir.path())?);
+    let engine2 = PgEngine::new_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        &mut reg,
+        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
+    )?;
+    let clog = Arc::new(Clog::new());
+    let res = recover(dir.path(), &reg, &clog, crabgresql_wal::Lsn::INVALID)?;
+    let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+    let tm2 = TransactionManager::new_recovered(sink, clog, res.next_xid);
+    let table2 = engine2.open_table("t")?;
+    assert_eq!(visible_ids(&tm2, &*table2), (0..500).collect::<Vec<i32>>());
+
+    Ok(())
+}
+
+#[test]
 fn writes_survive_across_multiple_restarts() -> anyhow::Result<()> {
     // Regression for the WAL-append-after-reopen corruption: every boot writes
     // and commits, so the WAL is appended to (not just read) after each reopen.
