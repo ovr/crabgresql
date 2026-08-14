@@ -81,7 +81,7 @@ fn out_of_range(orig: &str, type_name: &str) -> FloatParseError {
 
 /// `float8in`: parse text to f64 with PG's error semantics.
 pub fn float8in(orig: &str) -> Result<f64, FloatParseError> {
-    let trimmed = orig.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = orig.trim_ascii();
     let v: f64 = trimmed
         .parse()
         .map_err(|_| invalid_input(orig, "double precision"))?;
@@ -97,7 +97,7 @@ pub fn float8in(orig: &str) -> Result<f64, FloatParseError> {
 /// `float4in`: parse text to f32 with PG's error semantics. Uses `f32::from_str`
 /// directly so correctly-rounded results match strtof (the Paxson cases).
 pub fn float4in(orig: &str) -> Result<f32, FloatParseError> {
-    let trimmed = orig.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = orig.trim_ascii();
     let v: f32 = trimmed.parse().map_err(|_| invalid_input(orig, "real"))?;
     if v.is_infinite() && !spells_infinity(trimmed) {
         return Err(out_of_range(orig, "real"));

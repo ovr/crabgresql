@@ -44,7 +44,7 @@ fn invalid_syntax(input: &str) -> TidError {
 /// magnitude too wide for `u64` is rejected (PG's `ERANGE`), which is why
 /// `'(99999999999999999999999,0)'` is an error rather than a wrap.
 fn field(text: &str) -> Option<u64> {
-    let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let text = text.trim_ascii_start();
     let (negative, digits) = match text.as_bytes().first() {
         Some(b'-') => (true, &text[1..]),
         Some(b'+') => (false, &text[1..]),

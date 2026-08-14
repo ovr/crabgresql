@@ -340,24 +340,47 @@ pub(crate) enum Parsed {
 /// `'today EST'` parse while `'today today'` and `'2020-01-01 today'` conflict.
 pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
     let trimmed = input.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "infinity" | "+infinity" => return Ok(Parsed::Micros(POS_INFINITY)),
-        "-infinity" => return Ok(Parsed::Micros(NEG_INFINITY)),
-        "epoch" => return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY)),
-        "now" => return Ok(Parsed::Now),
+    // The canonical ISO spellings — the ones a dump, a driver, and a COPY file
+    // all write — are answered here without touching the scanner below, which
+    // allocates a lowercased copy of the value and one field per token. The
+    // shapes accepted are a strict subset of what the general path accepts, and
+    // the fields are handed on unvalidated exactly as it hands them on, so the
+    // caller's `validate_fields` still decides `2013-19-99`.
+    if let Some(tm) = scan_iso(trimmed) {
+        return Ok(Parsed::Calendar { tm, zone: None });
+    }
+    parse_parts_general(input, trimmed, fmt)
+}
+
+/// The general scan: everything [`parse_parts`]'s ISO fast path declined, and
+/// the oracle it is tested against (`iso_fast_path_agrees_with_the_scanner`).
+/// `trimmed` is `input` with its surrounding whitespace removed; `input` itself
+/// is what the error messages quote.
+fn parse_parts_general(input: &str, trimmed: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
+    match trimmed {
+        _ if trimmed.eq_ignore_ascii_case("infinity")
+            || trimmed.eq_ignore_ascii_case("+infinity") =>
+        {
+            return Ok(Parsed::Micros(POS_INFINITY));
+        }
+        _ if trimmed.eq_ignore_ascii_case("-infinity") => return Ok(Parsed::Micros(NEG_INFINITY)),
+        _ if trimmed.eq_ignore_ascii_case("epoch") => {
+            return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY));
+        }
+        _ if trimmed.eq_ignore_ascii_case("now") => return Ok(Parsed::Now),
         _ => {}
     }
 
     // Split into whitespace fields, further splitting an ISO date/time joined by
-    // 'T' (e.g. "2001-09-22T18:19:20").
-    let mut fields: Vec<String> = Vec::new();
+    // 'T' (e.g. "2001-09-22T18:19:20"). The fields borrow the input: only the
+    // zone token below outlives this scan.
+    let mut fields: Vec<&str> = Vec::new();
     for raw in trimmed.split_whitespace() {
         if let Some((d, t)) = split_iso_t(raw) {
-            fields.push(d.to_string());
-            fields.push(t.to_string());
+            fields.push(d);
+            fields.push(t);
         } else {
-            fields.push(raw.to_string());
+            fields.push(raw);
         }
     }
     if fields.is_empty() {
@@ -387,16 +410,21 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
     // position that a bind-time diagnostic carries.
     let mut relative: Option<i64> = None;
 
-    for field in &fields {
-        let fl = field.to_ascii_lowercase();
-        if let Some(m) = month_index(&fl) {
+    for &field in &fields {
+        // Lowercased into a stack buffer rather than a `String`: this ran once
+        // per field of every value, and no keyword the comparisons below can
+        // match is longer than `KEYWORD_MAX` — a field that does not fit is
+        // simply not one of them.
+        let mut buf = [0u8; KEYWORD_MAX];
+        let fl = lower_keyword(field, &mut buf).unwrap_or("");
+        if let Some(m) = month_index(fl) {
             if month.is_some() {
                 return Err(invalid_syntax(input));
             }
             month = Some(m);
             continue;
         }
-        if WEEKDAYS.contains(&fl.as_str()) {
+        if WEEKDAYS.contains(&fl) {
             continue; // day-of-week name: decorative, ignored
         }
         if fl == "bc" {
@@ -410,7 +438,7 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
             // A `:`-bearing token that starts with a sign is a zone offset
             // (`-07:00`): the zone for `timestamptz`, decorative for `timestamp`.
             if field.starts_with(['+', '-']) {
-                zone = Some(field.clone());
+                zone = Some(field.to_string());
                 continue;
             }
             if have_time {
@@ -428,7 +456,7 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
             }
             continue;
         }
-        if let Some(shift) = relative_day(&fl) {
+        if let Some(shift) = relative_day(fl) {
             if have_date {
                 return Err(invalid_syntax(input));
             }
@@ -473,13 +501,13 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
         // and `relative_day` both declined — `epoch`, `infinity`, or a second
         // `now`. In company it is a format error, not the zone abbreviation the
         // catch-all below would take it for.
-        if is_reserved_word(&fl) {
+        if is_reserved_word(fl) {
             return Err(invalid_syntax(input));
         }
         // Anything else is a bare time-zone token (an abbreviation like `PST` or
         // an IANA name like `America/New_York`): the zone for `timestamptz`,
         // decorative for `timestamp`.
-        zone = Some(field.clone());
+        zone = Some(field.to_string());
     }
 
     // Resolve the bare numbers into day/year. The year is the 4+-digit or >31
@@ -634,6 +662,92 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
             validate_fields(&tm, input)?;
             Ok(encode(tm))
         }
+    }
+}
+
+/// The longest word the field scan compares against: `september` and
+/// `yesterday` at nine bytes. Anything longer cannot be a month name, a
+/// weekday, `bc`/`ad`, a relative day, or a reserved word.
+const KEYWORD_MAX: usize = 16;
+
+/// ASCII-lowercase `field` into `buf`, or `None` when it cannot be one of the
+/// scanner's keywords — too long for [`KEYWORD_MAX`], or not ASCII (no keyword
+/// is, and `to_ascii_lowercase` would leave a multi-byte character unchanged
+/// anyway, so the comparisons would fail either way).
+fn lower_keyword<'b>(field: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> Option<&'b str> {
+    let bytes = field.as_bytes();
+    if bytes.len() > buf.len() || !field.is_ascii() {
+        return None;
+    }
+    for (dst, &c) in buf.iter_mut().zip(bytes) {
+        *dst = c.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buf[..bytes.len()]).ok()
+}
+
+/// The canonical ISO spellings, scanned byte-wise with no allocation:
+///
+/// ```text
+/// YYYY-MM-DD
+/// YYYY-MM-DD{' '|'T'|'t'}HH:MM:SS[.f{1,6}]
+/// ```
+///
+/// `None` for anything else — a two-digit year, a `/` separator, a BC suffix, a
+/// zone, a leading sign — which then takes the general scan. The fields are
+/// returned as written, without range-checking, because that is what the general
+/// path does too: `validate_fields` is the caller's job either way.
+fn scan_iso(s: &str) -> Option<Tm> {
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let mut acc: i64 = 0;
+        for &c in &b[from..to] {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc * 10 + d as i64;
+        }
+        Some(acc)
+    };
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let mut tm = Tm {
+        year,
+        month,
+        day,
+        hour: 0,
+        min: 0,
+        sec: 0,
+        usec: 0,
+    };
+    if b.len() == 10 {
+        return Some(tm);
+    }
+    // A time must follow, joined by a space or the ISO `T`.
+    if !matches!(b[10], b' ' | b'T' | b't') || b.len() < 19 || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    tm.hour = num(11, 13)?;
+    tm.min = num(14, 16)?;
+    tm.sec = num(17, 19)?;
+    match b.len() {
+        19 => Some(tm),
+        // `.f` up to six digits. A seventh would round (see `parse_fraction`),
+        // which is the general path's business, not this one's.
+        _ if b[19] == b'.' && (21..=26).contains(&b.len()) => {
+            let frac = num(20, b.len())?;
+            let scale = 10i64.pow((26 - b.len()) as u32);
+            tm.usec = frac * scale;
+            Some(tm)
+        }
+        _ => None,
     }
 }
 
@@ -1515,6 +1629,95 @@ mod tests {
         match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
+        }
+    }
+
+    /// [`parse_parts`] answers the canonical ISO spellings from [`scan_iso`]
+    /// without consulting the general scanner, so the two must agree — on the
+    /// value, on the zone, and on which inputs they decline.
+    ///
+    /// The corpus is deliberately wider than the shapes the fast path accepts:
+    /// what matters as much as agreeing on `2001-02-16 20:38:40` is *declining*
+    /// `2001-02-16 20:38:40 PST`, `20010216`, `2001-02-16Z` and `01-02-16`, so
+    /// they still reach the scanner that understands them.
+    #[test]
+    fn iso_fast_path_agrees_with_the_scanner() {
+        let fmt = FmtCtx::utc_default();
+        // The comparable image of a scan: `Parsed` carries no `PartialEq`, and
+        // the interesting content is the calendar fields plus the zone token.
+        let image = |r: Result<Parsed, TimestampError>| -> Result<String, String> {
+            match r {
+                Ok(Parsed::Micros(m)) => Ok(format!("micros {m}")),
+                Ok(Parsed::Now) => Ok("now".to_string()),
+                Ok(Parsed::Calendar { tm, zone }) => Ok(format!(
+                    "{}-{}-{} {}:{}:{}.{} {zone:?}",
+                    tm.year, tm.month, tm.day, tm.hour, tm.min, tm.sec, tm.usec
+                )),
+                Err(e) => Err(format!("{} {}", e.sqlstate, e.message)),
+            }
+        };
+
+        let corpus = [
+            // Shapes the fast path takes.
+            "2001-02-16",
+            "2001-02-16 20:38:40",
+            "2001-02-16T20:38:40",
+            "2001-02-16t20:38:40",
+            "2001-02-16 20:38:40.5",
+            "2001-02-16 20:38:40.123456",
+            "0001-01-01 00:00:00",
+            "  2001-02-16 20:38:40  ",
+            // Out-of-range fields: both paths must hand the same unvalidated
+            // calendar on to the caller.
+            "2001-19-99 25:61:61",
+            "2001-02-29",
+            // Shapes it must decline.
+            "2001-02-16 20:38:40.1234567",
+            "2001-02-16 20:38:40 PST",
+            "2001-02-16 20:38:40-07:00",
+            "2001-02-16 20:38:40Z",
+            "2001-02-16Z",
+            "2001-02-16+00",
+            "2001-02-16 BC",
+            "2001/02/16",
+            "20010216",
+            "01-02-16",
+            "2001-2-16",
+            "2001-02-16 20:38",
+            "2001-02-16 20:38:40.",
+            "2001-02-16  20:38:40",
+            "Feb 16 2001",
+            "infinity",
+            "epoch",
+            "",
+            "garbage",
+        ];
+        // A hand-written corpus only covers the shapes someone thought of. This
+        // sweep covers the ones nobody did: every truncation of a full ISO
+        // value, and every single-byte substitution in it. That is what catches
+        // a fast path whose byte positions are right but whose *guards* are too
+        // loose — accepting a glued zone, say, because the separator test at
+        // position 10 admits one character too many.
+        let base = "2001-02-16 20:38:40.123456";
+        let mut sweep: Vec<String> = (1..=base.len()).map(|n| base[..n].to_string()).collect();
+        for pos in 0..base.len() {
+            for sub in ['-', '/', 'T', 't', 'x', ' ', '9', ':', '.', ',', '+', 'Z'] {
+                let mut m = base.to_string();
+                m.replace_range(pos..pos + 1, &sub.to_string());
+                sweep.push(m.clone());
+                // …and the same substitution with the value cut short there,
+                // which is where a length check and a byte check disagree.
+                sweep.push(m[..pos + 1].to_string());
+            }
+        }
+
+        for text in corpus.iter().map(|s| (*s).to_string()).chain(sweep) {
+            let trimmed = text.trim();
+            assert_eq!(
+                image(parse_parts(&text, &fmt)),
+                image(parse_parts_general(&text, trimmed, &fmt)),
+                "fast and general paths disagree on {text:?}"
+            );
         }
     }
 

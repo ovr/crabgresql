@@ -49,7 +49,7 @@ fn is_delim(c: u8) -> bool {
 /// `.`/`-` as three 4-digit groups; with no delimiter, a bare run of 12 hex
 /// digits. Anything else (notably `0800:2b01:0203`) is `22P02`.
 pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
-    let trimmed = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = input.trim_ascii();
     let s = trimmed.as_bytes();
     let err = || invalid6(input);
 
@@ -106,7 +106,7 @@ pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
 /// `ff:fe` in the middle) or 16 (an eight-byte value taken as-is). Mixed
 /// delimiters, non-hex characters, and any other length are `22P02`.
 pub fn parse_macaddr8(input: &str) -> Result<[u8; 8], MacaddrError> {
-    let trimmed = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = input.trim_ascii();
     let err = || invalid8(input);
 
     let mut nibbles: Vec<u8> = Vec::with_capacity(16);
