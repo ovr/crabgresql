@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786709640744,
+  "lastUpdate": 1786709642522,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -26536,6 +26536,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20606.629116,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "abefb51e00555ff1d69ffe3be624f2f0a8b6adcf",
+          "message": "perf(copy): decode fields into a span arena instead of a String per field (#230)",
+          "timestamp": "2026-08-14T13:21:23+02:00",
+          "tree_id": "7c69ea1f48f8158cc5ac8609c2bd901e85408589",
+          "url": "https://github.com/ovr/crabgresql/commit/abefb51e00555ff1d69ffe3be624f2f0a8b6adcf"
+        },
+        "date": 1786709642414,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1260.776196,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19656.458317,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
