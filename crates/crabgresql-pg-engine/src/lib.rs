@@ -792,14 +792,14 @@ impl PgEngine {
         let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
         // Clamp the WAL to the last valid record before any new append, discarding
         // a torn tail left by a crash.
-        if let Ok(meta) = std::fs::metadata(crabgresql_wal::wal_path(data_dir))
-            && meta.len() > res.end_of_wal.0
+        if let Ok(on_disk) = crabgresql_wal::wal_stream_len(data_dir)
+            && on_disk > res.end_of_wal.0
         {
             // Dropping a torn tail is routine; dropping a large one is the visible
             // symptom of a redo point or a decode that went wrong, and it used to
             // happen in complete silence.
             tracing::warn!(
-                discarded = meta.len() - res.end_of_wal.0,
+                discarded = on_disk - res.end_of_wal.0,
                 end_of_wal = %res.end_of_wal,
                 replayed_from = %res.replayed_from,
                 "discarding the tail of the write-ahead log"
@@ -1096,6 +1096,13 @@ impl PgEngine {
         info: u8,
         clean_shutdown: bool,
     ) -> std::io::Result<()> {
+        // The smallest `max_wal_size` an operator may ask for is one WAL segment,
+        // so a checkpoint triggered at that level can always retire a whole file.
+        // The config crate has no dependencies and had to restate the number;
+        // this is where the two are held together, because both are in scope here
+        // and nowhere else.
+        const _: () =
+            assert!(crabgresql_config::MAX_WAL_SIZE.min as u64 == crabgresql_wal::SEGMENT_SIZE);
         let sampled = self.inner.wal.redo_point().map_err(std::io::Error::other)?;
         // Said out loud on purpose: a silently clamped redo point looks exactly
         // like a working bounded replay from the outside, and the cost — every
@@ -2513,12 +2520,16 @@ mod tests {
             control.redo_lsn.is_valid(),
             "a heap-only cluster has nothing to clamp for, so replay must be bounded"
         );
-        let bytes = std::fs::read(crabgresql_wal::wal_path(dir.path()))?;
         assert!(
-            control.redo_lsn.0 < bytes.len() as u64,
+            control.redo_lsn.0 < crabgresql_wal::wal_stream_len(dir.path())?,
             "the redo point must be backed by bytes on disk"
         );
-        let (rec, _) = crabgresql_wal::WalRecord::decode(&bytes[control.redo_lsn.0 as usize..])
+        // The redo point names a position in the stream; read the segment that
+        // holds it and slice from its offset inside that file.
+        let segment = crabgresql_wal::segment_of(control.redo_lsn);
+        let bytes = std::fs::read(crabgresql_wal::wal_segment_path(dir.path(), segment))?;
+        let at = crabgresql_wal::segment_offset(control.redo_lsn) as usize;
+        let (rec, _) = crabgresql_wal::WalRecord::decode(&bytes[at..])
             .ok_or_else(|| anyhow::anyhow!("no record decodes at the published redo point"))?;
         assert_eq!(rec.rmgr, crabgresql_wal::RmgrId::CHECKPOINT.0);
         assert_eq!(rec.info, crabgresql_wal::CHECKPOINT_ONLINE);

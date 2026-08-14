@@ -158,7 +158,9 @@ Contract with the core:
   correct-but-unoptimized without them: a periodic checkpointer (checkpoints happen
   at startup and clean shutdown only, so a crash still replays everything since the
   process started), full-page writes for torn-page protection beyond page
-  checksums, and WAL segment recycling.
+  checksums, and WAL segment recycling — the log is cut into 32 MiB segment files
+  (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never straddles a
+  boundary, but a finished segment is neither reused nor removed.
 - Syntactically, extensibility is exposed the standard PG way. Plain
   `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet ORDER BY (cols)`
   explicitly selects the columnar method and declares its layout order.

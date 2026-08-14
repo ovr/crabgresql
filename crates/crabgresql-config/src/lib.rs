@@ -87,6 +87,16 @@ const MIN_SHARED_BUFFERS: usize = 8 * MB;
 const MAX_SHARED_BUFFERS: usize = GB.saturating_mul(16);
 /// Anything shorter is a background thread that spends its life waking up.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
+/// One WAL segment (`crabgresql_wal::SEGMENT_SIZE`, restated because this crate
+/// deliberately has no dependencies; the two are pinned together by a
+/// const-assert in `crabgresql-pg-engine`). Below a segment the trigger could
+/// fire before the file the redo point sits in is even full, so the checkpoint
+/// would not let a single one go — it would be pure write amplification.
+const MIN_MAX_WAL_SIZE: usize = 32 * MB;
+/// A backstop against a typo, not a supported setting: 16 GB of log to replay
+/// is a recovery measured in minutes, which is the opposite of what bounding
+/// replay is for.
+const MAX_MAX_WAL_SIZE: usize = GB.saturating_mul(16);
 
 /// Per-relation buffered bytes that make one write buffer flush-eligible.
 ///
@@ -138,6 +148,24 @@ pub const SHARED_BUFFERS: SizeVar = SizeVar {
     max: MAX_SHARED_BUFFERS,
     help: "RAM the buffer pool holds relation pages in, rounded down to whole 8 KiB frames",
 };
+/// WAL written past the published redo point that makes a checkpoint due.
+///
+/// The knob that bounds crash recovery: replay reads from the redo point to the
+/// end of the log, so this is roughly how much of it a restart has to get
+/// through. It is a trigger level, not a cap — nothing refuses a write for
+/// being past it, and a transaction that logs more than this in one go simply
+/// overshoots until it can be checkpointed.
+///
+/// A gigabyte, matching PostgreSQL's `max_wal_size`, for the same reason: it is
+/// the point where the recovery time this buys stops paying for the checkpoint
+/// I/O it costs.
+pub const MAX_WAL_SIZE: SizeVar = SizeVar {
+    name: "CRABGRESQL_MAX_WAL_SIZE",
+    default: GB,
+    min: MIN_MAX_WAL_SIZE,
+    max: MAX_MAX_WAL_SIZE,
+    help: "WAL bytes written past the published redo point that trigger a checkpoint",
+};
 
 // Bounds that are transposed, or a default outside them, would be a startup
 // panic waiting for the first operator to set that variable: `Ord::clamp`
@@ -148,6 +176,7 @@ const _: () = assert!(BUFFER_GLOBAL_HARD_BYTES.is_sane());
 const _: () = assert!(BUFFER_MAX_AGE.is_sane());
 const _: () = assert!(BUFFER_TICK.is_sane());
 const _: () = assert!(SHARED_BUFFERS.is_sane());
+const _: () = assert!(MAX_WAL_SIZE.is_sane());
 
 /// A knob whose value is a quantity: its name, its default, and the range it
 /// is allowed to take.
@@ -388,6 +417,10 @@ mod tests {
         assert_eq!(SHARED_BUFFERS.default.render(), "128MB");
         assert_eq!(SHARED_BUFFERS.min.render(), "8MB");
         assert_eq!(SHARED_BUFFERS.max.render(), "16GB");
+
+        assert_eq!(MAX_WAL_SIZE.default.render(), "1GB");
+        assert_eq!(MAX_WAL_SIZE.min.render(), "32MB");
+        assert_eq!(MAX_WAL_SIZE.max.render(), "16GB");
     }
 
     /// The same table, read rather than transcribed.
@@ -423,6 +456,11 @@ mod tests {
             Row::from(BUFFER_MAX_AGE),
         ));
         rows.push((BUFFER_TICK.name, BUFFER_TICK.help, Row::from(BUFFER_TICK)));
+        rows.push((
+            MAX_WAL_SIZE.name,
+            MAX_WAL_SIZE.help,
+            Row::from(MAX_WAL_SIZE),
+        ));
 
         for (name, help, row) in rows {
             let line = readme

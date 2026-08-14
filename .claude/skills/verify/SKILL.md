@@ -62,18 +62,30 @@ a control file needs the right one or it reads as absent.
 Rows already flushed to disk survive even a replay that reads nothing, so "the rows
 are still there" alone proves little. Two checks that cannot pass by accident:
 
-1. **Scribble the prefix.** Overwrite `[0, redo_lsn)` of `pg_wal/wal` with garbage,
+1. **Scribble the prefix.** Overwrite `[0, redo_lsn)` of the stream with garbage,
    then restart. If recovery read it, the first record fails to decode, the log reads
-   as empty, and `reset_to` truncates the stream — so also assert the WAL is *longer*
-   than `redo_lsn` afterwards.
+   as empty, and `reset_to` truncates the stream — so also assert the stream is
+   *longer* than `redo_lsn` afterwards.
 2. **Commit above the redo point, then crash.** Those rows exist only in the WAL
    suffix, so they come back only if replay actually ran from the redo point.
 
+An LSN is a position in the *stream*, and the stream is cut into 32 MiB segment
+files named `pg_wal/<24 hex digits of the segment number>` — so byte `l` lives in
+segment `l // (32<<20)` at offset `l % (32<<20)`. Anything that pokes at the log by
+LSN has to do that arithmetic; writing at offset `redo_lsn` of the first segment
+would stop at the first boundary and, worse, grow a file whose size is fixed.
+
 ```bash
 python3 -c "
-import os; f=os.open('$D/pg_wal/wal', os.O_RDWR)
-os.pwrite(f, b'\xAB'*REDO, 0); os.fsync(f); os.close(f)"
+import os
+SEG = 32 << 20; D = '$D'; REDO = REDO
+for seg in range(REDO // SEG + 1):
+    f = os.open('%s/pg_wal/%024X' % (D, seg), os.O_RDWR)
+    os.pwrite(f, b'\xAB' * min(REDO - seg * SEG, SEG), 0); os.fsync(f); os.close(f)"
 ```
+
+The stream's on-disk end is `last_segment * 32MiB + len(last_segment)`, not the size
+of any one file.
 
 ## Gotchas
 
