@@ -1,6 +1,7 @@
 //! `COPY FROM`: field parsing, typmods and deferred defaults.
 
 use super::common::*;
+use crate::RowBatch;
 
 /// Bind a `COPY … FROM stdin` the way the server does, so a test starts from
 /// the same `CopyFromPlan` a real load builds its rows against.
@@ -31,10 +32,26 @@ fn copy_plan(engine: &Arc<dyn TableEngine>, sql: &str) -> anyhow::Result<CopyFro
     .with_context(|| format!("binding `{sql}`"))
 }
 
+/// Fill the batch the server's decoder would have handed over, so the tests
+/// keep spelling their input as the rows it is.
+fn batch_of(rows: Vec<Vec<Option<String>>>) -> RowBatch {
+    let mut batch = RowBatch::new();
+    for row in rows {
+        for field in row {
+            match field {
+                Some(text) => batch.push_field(&text),
+                None => batch.push_null(),
+            }
+        }
+        batch.end_row();
+    }
+    batch
+}
+
 fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> anyhow::Result<InsertSource> {
     let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
     let InsertPlan { source, .. } = plan
-        .build_insert(&catalog, &FmtCtx::utc_default(), rows)
+        .build_insert(&catalog, &FmtCtx::utc_default(), &batch_of(rows))
         .context("building the COPY rows")?
         .into_insert()?;
     Ok(source)

@@ -496,7 +496,10 @@ async fn copy_in_stream(
         Ok(rows) => rows,
         Err(e) => return Ok(CopyOutcome::Failed(e)),
     };
-    match run_copy_insert(engine, txnmgr, session, &prepared, rows) {
+    // The decoded batch holds everything the load still needs, and the tuples
+    // it builds are about to be the peak. Nothing reads the raw stream again.
+    drop(buffer);
+    match run_copy_insert(engine, txnmgr, session, &prepared, &rows) {
         Ok(n) => Ok(CopyOutcome::Loaded(n)),
         Err(e) => Ok(CopyOutcome::Failed(e)),
     }

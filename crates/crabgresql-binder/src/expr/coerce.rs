@@ -860,24 +860,6 @@ fn cast_needs_clock(e: &crabgresql_types::cast::CastError) -> bool {
     e.sqlstate == sqlstate::INTERNAL_ERROR && e.message == fmt::CLOCK_UNAVAILABLE
 }
 
-/// [`parse_unknown`] for a caller that owns the input.
-///
-/// The text family's value *is* the input string, so a caller holding a `String`
-/// can hand it over instead of paying for a copy it then drops. That is every
-/// cell of a bulk load: the COPY decoder already builds one owned `String` per
-/// field, and passing it by reference made each text cell allocate twice.
-///
-/// Only the arms whose value is the whole input can take it; everything else
-/// parses a fresh representation out of the text and borrows as before. Kept
-/// beside [`parse_unknown`] rather than special-cased at the call site, so which
-/// types share text's representation stays stated in one place.
-pub(crate) fn parse_unknown_owned(s: String, ty: PgType, fmt: &FmtCtx) -> Result<Value, BindError> {
-    match ty {
-        PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => Ok(Value::Text(s)),
-        _ => parse_unknown(&s, ty, fmt),
-    }
-}
-
 pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, BindError> {
     let invalid = || {
         BindError::new(
@@ -1083,7 +1065,7 @@ fn enum_const(
 ) -> Result<BoundExpr, BindError> {
     let value = match lit {
         None => Value::Null,
-        Some(s) => enum_value(oid, info, s).map_err(|e| e.at(span))?,
+        Some(s) => enum_value(oid, info, &s).map_err(|e| e.at(span))?,
     };
     Ok(BoundExpr::Const {
         value,
@@ -1094,12 +1076,14 @@ fn enum_const(
 /// Map an enum label to its [`Value`]. Split out of [`enum_const`] so COPY's
 /// direct value path resolves labels through the same lookup and raises the same
 /// `enum_in` error, without building an expression to unwrap.
-pub(crate) fn enum_value(oid: u32, info: &EnumInfo, label: String) -> Result<Value, BindError> {
-    match info.labels.iter().position(|l| *l == label) {
+/// Takes the label by reference because COPY's caller only borrows it out of
+/// the decoded batch, and the owned copy is only wanted on the success arm.
+pub(crate) fn enum_value(oid: u32, info: &EnumInfo, label: &str) -> Result<Value, BindError> {
+    match info.labels.iter().position(|l| l == label) {
         Some(ord) => Ok(Value::Enum {
             type_oid: oid,
             ordinal: ord as u32,
-            label,
+            label: label.to_string(),
         }),
         None => Err(BindError::new(
             sqlstate::INVALID_TEXT_REPRESENTATION,
