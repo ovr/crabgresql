@@ -141,9 +141,19 @@ pub enum InsertSource {
         ///
         /// Purely an optimization, and a subtractive one: the executor still
         /// derives the not-null columns from the live schema and only removes
-        /// these, so a stale entry can never turn a violation into an accepted
-        /// row. Empty means "nothing proven", which is what every builder other
-        /// than COPY passes.
+        /// these, so a column that *became* `NOT NULL` after this was built is
+        /// still checked.
+        ///
+        /// The list is positional against the shape `rows` were built for, and
+        /// nothing here re-maps it. That is exactly the assumption the tuples
+        /// themselves already rest on — they are full-width in *that* shape's
+        /// order — and it holds because no `ALTER TABLE` form the server
+        /// implements adds or drops a column (see `alter_table` in the server's
+        /// `query.rs`). A future `ADD COLUMN` has to reckon with both.
+        ///
+        /// Empty means "nothing proven", which is what every builder other than
+        /// COPY passes — and what COPY itself passes for a routed load, whose
+        /// rows are checked against a leaf this list does not index.
         notnull_verified: Vec<u32>,
     },
     /// `INSERT ... SELECT` / `INSERT ... TABLE t`: rows are pulled from `input`

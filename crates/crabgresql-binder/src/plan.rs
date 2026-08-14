@@ -6032,13 +6032,22 @@ impl CopyFromPlan {
         // Ascending, because `target_indices` need not be: a column list may name
         // the columns in any order, and the executor merges this against the
         // schema in one pass.
-        let mut notnull_verified: Vec<u32> = self
-            .target_indices
-            .iter()
-            .zip(&null_seen)
-            .filter(|&(_, &seen)| !seen)
-            .map(|(&idx, _)| idx as u32)
-            .collect();
+        //
+        // Nothing to collect for a routed load: the list indexes the parent's
+        // shape, and a routed row is checked against the leaf it lands in, so
+        // the executor drops it. The per-field mark above stays either way —
+        // it is a compare and an `|=` on a value already in hand, where this is
+        // an allocation and a sort per batch.
+        let mut notnull_verified: Vec<u32> = match self.routing {
+            Some(_) => Vec::new(),
+            None => self
+                .target_indices
+                .iter()
+                .zip(&null_seen)
+                .filter(|&(_, &seen)| !seen)
+                .map(|(&idx, _)| idx as u32)
+                .collect(),
+        };
         notnull_verified.sort_unstable();
         Ok(LogicalPlan::Insert(InsertPlan {
             table: self.table.clone(),

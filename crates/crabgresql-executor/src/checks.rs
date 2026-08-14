@@ -48,6 +48,11 @@ impl NotNullSet {
     /// subtracts from it, so a column that became `NOT NULL` after the statement
     /// was bound is still checked. `verified` is ascending, so the two lists
     /// merge in one pass.
+    ///
+    /// What it does *not* survive is a column being added or dropped under it:
+    /// the indices are positional, like the tuples they came with. No `ALTER
+    /// TABLE` form the server implements does that today — see the caller's
+    /// note on `InsertSource::Tuples::notnull_verified`.
     pub(crate) fn for_schema_excluding(schema: &TableSchema, verified: &[u32]) -> Self {
         let mut next = 0;
         let mut columns = Vec::new();
