@@ -171,7 +171,7 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
     let off_secs = match zone {
         None => session.offset_for_wall(wall),
         Some(tok) => {
-            let zone = tz::resolve_zone(&tok).map_err(zone_error)?;
+            let zone = tz::resolve_zone(tok).map_err(zone_error)?;
             tz::offset_for_local(&zone, wall)
         }
     };
