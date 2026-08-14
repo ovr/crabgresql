@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786723104480,
+  "lastUpdate": 1786723106311,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -27832,6 +27832,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19422.410891,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "61372595ddcb7b21a41371c56bf7b54c475aa803",
+          "message": "perf(copy): apply the text typmod to the arena slice, and drop the row template clone (#232)\n\nA COPY field into `varchar(n)`/`char(n)`/`name` allocated a `String` twice:\n`parse_unknown` built one, and `apply_column_typmod` handed it to\n`varchar_input`/`bpchar_input`/`name_input`, which take `&str` and build\nanother. `text_column_value` applies the length rule to the batch arena's slice\ninstead; `apply_column_typmod`'s text arms delegate to it, so the rules keep one\nimplementation and a length-free `text` still passes through unallocated.",
+          "timestamp": "2026-08-14T17:08:40+02:00",
+          "tree_id": "b3e59542e79403661fa088f7a229d85f8975c54a",
+          "url": "https://github.com/ovr/crabgresql/commit/61372595ddcb7b21a41371c56bf7b54c475aa803"
+        },
+        "date": 1786723106200,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1249.19618,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19110.45692,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
