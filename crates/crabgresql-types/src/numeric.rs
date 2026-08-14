@@ -157,11 +157,8 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 /// The surrounding whitespace [`Numeric::parse`] skips: space, tab, newline and
-/// carriage return. Deliberately **not** [`str::trim_ascii`], which would also
-/// strip a form feed — `numeric_in` rejects `'\x0c1'`, and that acceptance is
-/// observable. Byte-wise rather than `char`-wise for the same reason as
-/// [`crate::intlit`]'s trim: the set is ASCII, so no decode is needed, and a
-/// slice at either index cannot split a character.
+/// carriage return. Deliberately **not** [`str::trim_ascii`], which also strips
+/// a form feed — `numeric_in` rejects `'\x0c1'`, and that is observable.
 #[inline]
 fn trim_numeric_space(s: &str) -> &str {
     const fn is_space(c: u8) -> bool {
@@ -2119,11 +2116,9 @@ mod tests {
         assert_eq!(Numeric::parse("0e2000000000"), Err(ParseError::Overflow));
     }
 
-    /// `numeric_in` skips space/tab/newline/CR around the value and nothing
-    /// else. The form feed is the case that separates this set from ASCII
-    /// whitespace, and the vertical tab from the six characters
-    /// [`crate::intlit`] trims — pinned here because the trims are byte-wise
-    /// now, and it would be easy to reach for a stock one that differs.
+    /// The form feed is what separates this set from ASCII whitespace, and the
+    /// vertical tab what separates it from the six characters
+    /// [`crate::intlit`] trims — easy to lose to a stock trim that differs.
     #[test]
     fn parse_trims_its_own_whitespace_set() {
         for sep in [" ", "\t", "\n", "\r"] {

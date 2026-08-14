@@ -114,10 +114,8 @@ pub fn format(d: i32) -> String {
 pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i32, DateError> {
     // Reuse the shared timestamp scanner, then keep only the date part. A comma
     // is a field separator in the verbose form (`January 8, 1999`), which PG
-    // treats as whitespace. Its error messages name `timestamp`, so remap them.
-    // The rewrite only happens when there *is* a comma: the ISO form every bulk
-    // load carries has none, and copying each value to change nothing was one
-    // allocation per row.
+    // treats as whitespace — rewritten only when there is one, since the ISO
+    // form a load carries has none. Its errors name `timestamp`, so remap them.
     let cleaned = if input.as_bytes().contains(&b',') {
         Cow::Owned(input.replace(',', " "))
     } else {

@@ -1,12 +1,10 @@
 //! Input-function microbenchmarks: the text → `Value` conversions a bulk load
 //! runs once per cell.
 //!
-//! A COPY of a wide table spends a measurable share of its time here — a load
-//! profile put `text_to_int` + `intlit::scan` at ~5.6%, `timestamp::parse_parts`
-//! at 1.3% and the char-based `trim_matches` inside them at 1.1%. The cases
-//! below are the shapes a load actually carries (a bare decimal, an ISO date, an
-//! ISO timestamp), with the awkward spellings kept alongside so an optimization
-//! that only helps the common form does not silently cost the rest.
+//! A COPY of a wide table spends a measurable share of its time here, so the
+//! cases below are the shapes a load actually carries — a bare decimal, an ISO
+//! date, an ISO timestamp. The awkward spellings sit alongside them so an
+//! optimization that only helps the common form does not silently cost the rest.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;

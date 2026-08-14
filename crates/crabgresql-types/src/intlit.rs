@@ -143,13 +143,9 @@ fn scan_trimmed(t: &str) -> Result<Literal<'_>, ScanError> {
 /// caller that can hold more — a `numeric` constant — wants
 /// [`scan_int_literal_decimal`] instead.
 pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
-    // A plain decimal run is what a bulk load carries in essentially every
-    // cell, and it needs neither the general scanner's separator state machine
-    // nor 128-bit arithmetic: at most 19 digits cannot overflow a `u64`. What
-    // makes this safe to short-circuit is that the shape it accepts — optional
-    // sign, then nothing but ASCII digits — is a strict subset of the grammar
-    // in `scan`, folded the same way. Anything else (a separator, a radix
-    // prefix, a longer run, junk) falls through untouched.
+    // The shape a bulk load carries in nearly every cell. Short-circuiting is
+    // safe because what this accepts — sign, then nothing but ASCII digits — is
+    // a strict subset of `scan`'s grammar, folded the same way.
     let t = trim_pg_space(s);
     let bytes = t.as_bytes();
     let (negative, digits) = match bytes.first() {
@@ -189,11 +185,10 @@ pub fn scan_int_literal(s: &str) -> Result<(bool, u128), ScanError> {
 /// digits, so any 19 of them fit.
 const MAX_U64_DIGITS: usize = 19;
 
-/// `body * R + digit`, over a run [`scan`] has already validated.
+/// Fold a digit run [`scan`] has already validated.
 ///
-/// The `else continue` arm is reached only for a `_` separator: every other
-/// byte was proved a digit of this radix by the grammar, which is also why the
-/// separators can be skipped here rather than re-checked.
+/// The `else continue` arm is reached only for a `_` separator: the grammar
+/// proved every other byte a digit of this radix, so none can be re-rejected.
 fn fold<const R: u32>(body: &str) -> Result<u128, ScanError> {
     let mut acc: u128 = 0;
     for &c in body.as_bytes() {
@@ -249,18 +244,15 @@ pub fn scan_int_literal_decimal(s: &str) -> Result<(bool, String), ScanError> {
 /// The same six characters separate `oidvector` elements — see the separator
 /// test in [`crate::vector`].
 ///
-/// Tested per *byte* rather than per `char`: every member is ASCII, so a
-/// multi-byte character can never match a continuation byte, and this skips the
-/// UTF-8 decode `str::trim_matches` would run over the whole literal.
+/// Tested per *byte*: every member is ASCII, so no character can partly match,
+/// and the literal needs no UTF-8 decode on the way past.
 const fn is_pg_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-/// [`str::trim_matches`] over [`is_pg_space`], without the decode.
-///
-/// Slicing at the computed indices cannot split a character: both ends stopped
-/// at a byte that is not one of the six ASCII spaces, and a UTF-8 continuation
-/// byte is never ASCII.
+/// [`str::trim_matches`] over [`is_pg_space`], without the decode. The slice
+/// cannot split a character: both ends stop at a non-ASCII-space byte, and a
+/// continuation byte is never ASCII.
 fn trim_pg_space(s: &str) -> &str {
     let b = s.as_bytes();
     let mut start = 0;
@@ -401,12 +393,10 @@ mod tests {
     }
 
     /// [`scan_int_literal`] answers a plain decimal run without consulting
-    /// [`scan`] at all, so the two have to agree on every input — the value it
-    /// returns *and* which error it declines with.
-    ///
-    /// The corpus is every spelling the tests above pin, plus the boundaries a
-    /// register-sized fast path can get wrong: 19 vs 20 digits, `u64::MAX`
-    /// either side, and a run long enough to need the checked 128-bit fold.
+    /// [`scan`], so the two must agree on every input — the value *and* which
+    /// error they decline with. Beyond the spellings the tests above pin, the
+    /// corpus carries what a register-sized fast path gets wrong: the digit
+    /// counts and magnitudes either side of `u64`.
     #[test]
     fn fast_path_agrees_with_the_general_scanner() {
         let general = |s: &str| -> Result<(bool, u128), ScanError> {

@@ -340,12 +340,9 @@ pub(crate) enum Parsed {
 /// `'today EST'` parse while `'today today'` and `'2020-01-01 today'` conflict.
 pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
     let trimmed = input.trim();
-    // The canonical ISO spellings — the ones a dump, a driver, and a COPY file
-    // all write — are answered here without touching the scanner below, which
-    // allocates a lowercased copy of the value and one field per token. The
-    // shapes accepted are a strict subset of what the general path accepts, and
-    // the fields are handed on unvalidated exactly as it hands them on, so the
-    // caller's `validate_fields` still decides `2013-19-99`.
+    // The spellings a dump, a driver and a COPY file all write, answered
+    // without the scanner below — which allocates a lowercased copy of the
+    // value and one field per token — and accepting a strict subset of it.
     if let Some(tm) = scan_iso(trimmed) {
         return Ok(Parsed::Calendar { tm, zone: None });
     }
@@ -354,8 +351,8 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
 
 /// The general scan: everything [`parse_parts`]'s ISO fast path declined, and
 /// the oracle it is tested against (`iso_fast_path_agrees_with_the_scanner`).
-/// `trimmed` is `input` with its surrounding whitespace removed; `input` itself
-/// is what the error messages quote.
+/// Both spellings are passed because the errors quote `input` as the user wrote
+/// it, while the scan works on `trimmed`.
 fn parse_parts_general(input: &str, trimmed: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
     match trimmed {
         _ if trimmed.eq_ignore_ascii_case("infinity")
@@ -411,10 +408,8 @@ fn parse_parts_general(input: &str, trimmed: &str, fmt: &FmtCtx) -> Result<Parse
     let mut relative: Option<i64> = None;
 
     for &field in &fields {
-        // Lowercased into a stack buffer rather than a `String`: this ran once
-        // per field of every value, and no keyword the comparisons below can
-        // match is longer than `KEYWORD_MAX` — a field that does not fit is
-        // simply not one of them.
+        // Lowercased into a stack buffer instead of a `String` per field; one
+        // too long for the buffer is not any of the keywords compared below.
         let mut buf = [0u8; KEYWORD_MAX];
         let fl = lower_keyword(field, &mut buf).unwrap_or("");
         if let Some(m) = month_index(fl) {
@@ -669,10 +664,9 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
 /// and `+infinity`, at nine bytes. Anything longer cannot be a month name, a
 /// weekday, `bc`/`ad`, a relative day, or a reserved word.
 ///
-/// A keyword that outgrows this stops being *recognized* rather than erroring —
-/// [`lower_keyword`] declines it, and the scan then reads it as a zone
-/// abbreviation. `every_keyword_fits_the_stack_buffer` is what keeps that from
-/// happening quietly.
+/// A keyword that outgrows this stops being *recognized* rather than erroring:
+/// [`lower_keyword`] declines it and the scan reads it as a zone abbreviation.
+/// `every_keyword_fits_the_stack_buffer` is what keeps that from going quiet.
 const KEYWORD_MAX: usize = 9;
 
 /// ASCII-lowercase `field` into `buf`, or `None` when it cannot be one of the
@@ -704,9 +698,8 @@ fn lower_keyword<'b>(field: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> Option<&'b 
 ///
 /// Reading the leading field as the year needs no `DateStyle`: a four-digit
 /// year with `-` separators is Y-M-D under every one of them, which is why the
-/// MDY/DMY TODO in [`parse_date_token`] does not reach here. Widening what this
-/// accepts — a `/` separator, a two-digit year — would end that, and make the
-/// ordering rule this function's business too.
+/// MDY/DMY TODO in [`parse_date_token`] does not reach here. Accepting a `/`
+/// separator or a two-digit year would end that.
 fn scan_iso(s: &str) -> Option<Tm> {
     let b = s.as_bytes();
     if b.len() < 10 {
@@ -741,7 +734,6 @@ fn scan_iso(s: &str) -> Option<Tm> {
     if b.len() == 10 {
         return Some(tm);
     }
-    // A time must follow, joined by a space or the ISO `T`.
     if !matches!(b[10], b' ' | b'T' | b't') || b.len() < 19 || b[13] != b':' || b[16] != b':' {
         return None;
     }
@@ -1645,12 +1637,12 @@ mod tests {
         }
     }
 
-    /// Every word the field scan compares `fl` against has to fit the stack
-    /// buffer, or [`lower_keyword`] hands the scan an empty string and the word
-    /// silently becomes a zone abbreviation instead of a month, a weekday or an
-    /// era. The reserved words are listed here rather than read from
-    /// [`is_reserved_word`], which is a `matches!` and cannot be enumerated —
-    /// so a new one has to be added in both places, which is the point.
+    /// A keyword past the stack buffer turns into a zone abbreviation instead
+    /// of a month, a weekday or an era, with no error anywhere.
+    ///
+    /// The reserved words are repeated here because [`is_reserved_word`] is a
+    /// `matches!` and cannot be enumerated; the second loop is what keeps the
+    /// copy honest.
     #[test]
     fn every_keyword_fits_the_stack_buffer() {
         let relative = ["today", "tomorrow", "yesterday"];
@@ -1687,19 +1679,15 @@ mod tests {
         }
     }
 
-    /// [`parse_parts`] answers the canonical ISO spellings from [`scan_iso`]
-    /// without consulting the general scanner, so the two must agree — on the
-    /// value, on the zone, and on which inputs they decline.
-    ///
-    /// The corpus is deliberately wider than the shapes the fast path accepts:
-    /// what matters as much as agreeing on `2001-02-16 20:38:40` is *declining*
-    /// `2001-02-16 20:38:40 PST`, `20010216`, `2001-02-16Z` and `01-02-16`, so
-    /// they still reach the scanner that understands them.
+    /// [`scan_iso`] answers the canonical ISO spellings without consulting the
+    /// general scanner, so the two must agree — on the value, on the zone, and
+    /// on which inputs they decline. Declining matters as much as agreeing: a
+    /// zone, a compact date or a two-digit year has to reach the scan that
+    /// understands it.
     #[test]
     fn iso_fast_path_agrees_with_the_scanner() {
         let fmt = FmtCtx::utc_default();
-        // The comparable image of a scan: `Parsed` carries no `PartialEq`, and
-        // the interesting content is the calendar fields plus the zone token.
+        // `Parsed` carries no `PartialEq`, so compare it as text.
         let image = |r: Result<Parsed, TimestampError>| -> Result<String, String> {
             match r {
                 Ok(Parsed::Micros(m)) => Ok(format!("micros {m}")),
@@ -1722,8 +1710,7 @@ mod tests {
             "2001-02-16 20:38:40.123456",
             "0001-01-01 00:00:00",
             "  2001-02-16 20:38:40  ",
-            // Out-of-range fields: both paths must hand the same unvalidated
-            // calendar on to the caller.
+            // Out-of-range fields: both must pass the calendar on unvalidated.
             "2001-19-99 25:61:61",
             "2001-02-29",
             // Shapes it must decline.
@@ -1747,12 +1734,10 @@ mod tests {
             "",
             "garbage",
         ];
-        // A hand-written corpus only covers the shapes someone thought of. This
-        // sweep covers the ones nobody did: every truncation of a full ISO
-        // value, and every single-byte substitution in it. That is what catches
-        // a fast path whose byte positions are right but whose *guards* are too
-        // loose — accepting a glued zone, say, because the separator test at
-        // position 10 admits one character too many.
+        // A hand-written corpus covers the shapes someone thought of; this
+        // sweep covers the ones nobody did. It is what catches a guard that is
+        // one character too generous — a separator test admitting `-`, so a
+        // glued zone parses as a timestamp.
         let base = "2001-02-16 20:38:40.123456";
         let mut sweep: Vec<String> = (1..=base.len()).map(|n| base[..n].to_string()).collect();
         for pos in 0..base.len() {
@@ -1760,8 +1745,8 @@ mod tests {
                 let mut m = base.to_string();
                 m.replace_range(pos..pos + 1, &sub.to_string());
                 sweep.push(m.clone());
-                // …and the same substitution with the value cut short there,
-                // which is where a length check and a byte check disagree.
+                // Cut short at the substitution, where a length check and a
+                // byte check disagree.
                 sweep.push(m[..pos + 1].to_string());
             }
         }

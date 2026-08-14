@@ -70,9 +70,8 @@ fn cannot_coerce(from: PgType, to: PgType) -> CastError {
 }
 
 /// `22P02` — an input function rejected the text (`'abc'::int4`).
-/// `#[cold]`, like every other error constructor an input function reaches for:
-/// keeping the `format!` out of line leaves the caller's hot path a plain
-/// value-returning frame instead of one sized for a `CastError`'s temporaries.
+/// `#[cold]` so the `format!` and its temporaries stay out of the caller's
+/// frame: `text_to_int` sits under COPY, and returns a value far more often.
 #[cold]
 #[inline(never)]
 pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
