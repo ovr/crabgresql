@@ -165,17 +165,23 @@ pub fn recover(
     let mut pos = 0usize;
     let mut first = true;
     loop {
-        // A segment tail too short to hold any record is zero-filled by the
-        // writer, so step over it — nothing can start there, which is what makes
-        // the skip safe without inspecting the bytes at all.
+        if pos >= bytes.len() {
+            break;
+        }
+        // A segment tail too short to hold any record is filler the writer zeroed,
+        // so consume it: nothing can *start* there, which is what makes the step
+        // safe without inspecting a byte of it. Bounded by what was read, because
+        // the stream may simply end inside such a tail — reporting an `end_of_wal`
+        // above what is on disk would leave `Wal::reset_to` truncating into a hole.
         //
-        // Only when more bytes follow, though. A stream that simply ends inside
-        // such a tail would otherwise report an `end_of_wal` above what is on
-        // disk, and the caller feeds that to `Wal::reset_to` — which would leave
-        // a hole between the truncation point and the real end of the segment.
+        // `start` itself can land here, which is not an edge case: the insert
+        // position is only carried to the next boundary by the *following* append,
+        // so a redo point sampled in between names a byte inside the tail. That is
+        // why the boundary check below compares against `start + pos` rather than
+        // `start` — after the step, the record must begin where the step left off.
         let gap = (SEGMENT_SIZE - segment_offset(Lsn(start.0 + pos as u64))) as usize;
-        if gap < WalRecord::MIN_LEN && pos + gap < bytes.len() {
-            pos += gap;
+        if gap < WalRecord::MIN_LEN {
+            pos = (pos + gap).min(bytes.len());
             continue;
         }
         let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) else {
@@ -183,7 +189,7 @@ pub fn recover(
         };
         // The first record must begin exactly where we were told to resume, or
         // the redo point is not a record boundary.
-        if first && rec.rec_lsn != start {
+        if first && rec.rec_lsn != Lsn(start.0 + pos as u64) {
             return Err(WalError::Redo(format!(
                 "recovery resumed at {start} but the record there claims to start \
                  at {} — the redo point is not a record boundary",
@@ -273,7 +279,12 @@ pub fn recover(
     // falls back to it — and it is precisely the path on which a damaged head
     // would otherwise erase every record behind it. An empty region is fine either
     // way: that is a checkpoint with no activity after it.
-    if first && !bytes.is_empty() {
+    //
+    // `pos == 0` rather than "nothing was decoded": past zero, either a record was
+    // replayed or a zero-filled segment tail was consumed, and neither is the
+    // damage this refuses. A resume point inside such a tail is legitimate, and
+    // refusing it would keep a cluster from starting over filler.
+    if pos == 0 && !bytes.is_empty() {
         if start.is_valid() {
             return Err(WalError::Redo(format!(
                 "recovery resumed at {start} but no record decodes there \
@@ -842,6 +853,90 @@ mod tests {
             seen.last().map(Vec::as_slice),
             Some(b"after-the-zeros".as_slice()),
             "the record past the zero-filled tail must be replayed"
+        );
+
+        Ok(())
+    }
+
+    /// A redo point can legitimately name a byte inside a segment tail too short
+    /// to hold a record: the insert position is only carried to the boundary by
+    /// the *next* append, so a checkpoint sampling in between publishes exactly
+    /// that. Recovery must step over the filler and resume at the boundary.
+    ///
+    /// The regression was a hard refusal — "the redo point is not a record
+    /// boundary" — which is a cluster that will not start, on a ~27-byte window
+    /// per checkpoint.
+    #[test]
+    fn a_redo_point_inside_an_unusable_tail_still_recovers() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let redo;
+        let above;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+            // Sampled with the insert position parked in the tail, before anything
+            // pads it: this is the published redo point.
+            redo = wal.redo_point()?;
+            assert_eq!(redo, Lsn(SEGMENT_SIZE - (WalRecord::MIN_LEN as u64 - 1)));
+            above = wal.append(RmgrId::HEAP, 7, Xid(4), b"above-the-filler");
+            wal.flush(above.end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        write_floor(dir.path(), 100)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, redo)?;
+
+        assert_eq!(above.start, Lsn(SEGMENT_SIZE));
+        assert_eq!(res.end_of_wal, above.end);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .clone(),
+            vec![b"above-the-filler".to_vec()],
+            "the record past the filler must be replayed"
+        );
+
+        Ok(())
+    }
+
+    /// The same window with nothing after it: a crash can leave the log ending
+    /// inside the filler, and that is a clean end, not damage to refuse over.
+    #[test]
+    fn a_log_that_ends_inside_an_unusable_tail_is_a_clean_end() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let redo;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+            redo = wal.redo_point()?;
+            // The filler is staged and flushed, but the record it was making room
+            // for never lands — a crash between the two. It goes into the next
+            // segment, so dropping that file is what "never landed" looks like on
+            // disk; segment zero keeps the filler.
+            wal.append(RmgrId::HEAP, 7, Xid(4), b"never-flushed");
+            wal.flush(Lsn(SEGMENT_SIZE))?;
+        }
+        std::fs::remove_file(crate::segment::wal_segment_path(dir.path(), 1))?;
+        assert_eq!(
+            std::fs::metadata(wal_segment_path_0(dir.path()))?.len(),
+            SEGMENT_SIZE,
+            "the filler itself did reach disk"
+        );
+
+        let mut reg = RmgrRegistry::new();
+        reg.register(
+            RmgrId::HEAP,
+            Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))),
+        );
+        write_floor(dir.path(), 100)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, redo)?;
+        assert_eq!(
+            res.end_of_wal,
+            Lsn(SEGMENT_SIZE),
+            "the filler is consumed, not read as a torn record"
         );
 
         Ok(())

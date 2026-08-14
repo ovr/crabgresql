@@ -79,7 +79,7 @@ would stop at the first boundary and, worse, grow a file whose size is fixed.
 python3 -c "
 import os
 SEG = 32 << 20; D = '$D'; REDO = REDO
-for seg in range(REDO // SEG + 1):
+for seg in range((REDO + SEG - 1) // SEG):   # ceil: a prefix ending on a boundary stops there
     f = os.open('%s/pg_wal/%024X' % (D, seg), os.O_RDWR)
     os.pwrite(f, b'\xAB' * min(REDO - seg * SEG, SEG), 0); os.fsync(f); os.close(f)"
 ```

@@ -149,7 +149,11 @@ fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
 /// past its fixed size, so the test would go green while proving nothing.
 pub fn scribble_wal_prefix(dir: &Path, upto: crabgresql_wal::Lsn, byte: u8) -> std::io::Result<()> {
     let seg_size = crabgresql_wal::SEGMENT_SIZE;
-    for seg in 0..=crabgresql_wal::segment_of(upto) {
+    // Counted with `div_ceil`, not `0..=segment_of(upto)`: a prefix ending exactly
+    // on a boundary belongs entirely to the segments below it, and the inclusive
+    // range would go one file further — opening a segment that need not exist to
+    // write nothing into it.
+    for seg in 0..upto.0.div_ceil(seg_size) {
         let to = (upto.0 - seg * seg_size).min(seg_size);
         scribble(&crabgresql_wal::wal_segment_path(dir, seg), 0, to, byte)?;
     }

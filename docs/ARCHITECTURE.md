@@ -154,10 +154,13 @@ Contract with the core:
   replay while any state's only durable trace is still a WAL record — rows in a RAM
   write buffer, or a committed TRUNCATE whose swap the catalog does not name yet —
   and records a whole-stream redo point instead.
-  Implemented in `crabgresql-wal` (+ the heap engine's redo). Still deferred, all
-  correct-but-unoptimized without them: a periodic checkpointer (checkpoints happen
-  at startup and clean shutdown only, so a crash still replays everything since the
-  process started), full-page writes for torn-page protection beyond page
+  Implemented in `crabgresql-wal` (+ the heap engine's redo). A checkpoint is due
+  once `CRABGRESQL_MAX_WAL_SIZE` bytes have been logged past the last one's sample,
+  and the committing transaction runs it — that bound on replay is what a
+  long-lived process has instead of a periodic checkpointer. Still deferred, all
+  correct-but-unoptimized without them: a *time*-based checkpointer (an idle
+  cluster's last commit stays unbounded until it shuts down), full-page writes for
+  torn-page protection beyond page
   checksums, and WAL segment recycling — the log is cut into 32 MiB segment files
   (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never straddles a
   boundary, but a finished segment is neither reused nor removed.

@@ -516,6 +516,16 @@ pub struct PgEngine {
     /// Whether the last checkpoint had to record a whole-stream redo point, so the
     /// operator hears about the transition rather than every checkpoint.
     clamped: AtomicBool,
+    /// The WAL position the last checkpoint sampled, and the distance past it at
+    /// which the next one is due ([`crabgresql_config::MAX_WAL_SIZE`]).
+    ///
+    /// The *sampled* position, not the redo point published from it: a checkpoint
+    /// that cannot bound replay publishes `0`, and measuring from there would put
+    /// every subsequent commit past the threshold and checkpoint on each one. The
+    /// two are the same number whenever bounding works, which is the case the knob
+    /// is written for.
+    last_checkpoint_lsn: AtomicU64,
+    max_wal_size: u64,
     /// The background flush thread, present once a transaction manager is
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
@@ -699,6 +709,12 @@ impl PgEngine {
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
             clamped: AtomicBool::new(false),
+            // Whatever is already in the log predates this process and was
+            // checkpointed by the one before it; the startup checkpoint overwrites
+            // this a moment later anyway.
+            last_checkpoint_lsn: AtomicU64::new(wal.current_lsn().0),
+            max_wal_size: crabgresql_config::MAX_WAL_SIZE.get(|problem| tracing::warn!("{problem}"))
+                as u64,
         })
     }
 
@@ -975,6 +991,55 @@ impl PgEngine {
         self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
     }
 
+    /// Checkpoint if more than [`crabgresql_config::MAX_WAL_SIZE`] has been
+    /// written since the last one sampled the log.
+    ///
+    /// This is what bounds crash recovery in a running server: replay reads from
+    /// the redo point to the end of the log, so without a trigger a long-lived
+    /// process replays everything it ever wrote. Checkpoints otherwise happen only
+    /// at startup and at a clean shutdown.
+    ///
+    /// Called from the commit path, after the transaction's fate is durable and
+    /// its [`crabgresql_wal::CheckpointDelay`] released — a checkpoint samples the
+    /// redo point by *waiting* for every outstanding delay, so triggering one while
+    /// holding a delay would be a thread waiting for itself.
+    ///
+    /// The threshold is a level, not a cap: a single transaction that logs more
+    /// than this overshoots it and is checkpointed once it commits. Nothing here
+    /// refuses or throttles a write.
+    fn checkpoint_if_wal_grew(&self, next_xid: Xid) {
+        let sampled = self.last_checkpoint_lsn.load(Ordering::Relaxed);
+        let current = self.inner.wal.current_lsn().0;
+        if current.saturating_sub(sampled) < self.max_wal_size {
+            return;
+        }
+        // Claim the checkpoint by moving the mark. Concurrent committers all see
+        // the same overshoot, and this is what makes exactly one of them act on it
+        // — the loser's compare-exchange fails against the value the winner wrote.
+        // The winner's own `write_control_file` overwrites the mark with the
+        // position it really sampled.
+        if self
+            .last_checkpoint_lsn
+            .compare_exchange(sampled, current, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Err(error) = self.checkpoint(next_xid) {
+            // Put the mark back so the next commit tries again. The transaction
+            // that triggered this is already durable — its commit record was
+            // fsynced before this ran — so a failed checkpoint costs a longer
+            // replay, not correctness, and must not be reported as a failed commit.
+            self.last_checkpoint_lsn.store(sampled, Ordering::Relaxed);
+            tracing::warn!(
+                %error,
+                written = current - sampled,
+                "checkpoint triggered by WAL volume failed; crash recovery stays \
+                 bounded at the previous redo point"
+            );
+        }
+    }
+
     /// Report how the buffer pool is answering pins, at every checkpoint.
     ///
     /// The counters are cumulative and there is no metrics surface to publish
@@ -1155,6 +1220,9 @@ impl PgEngine {
             .end;
         self.inner.wal.flush(end).map_err(std::io::Error::other)?;
         self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
+        // What the next size-triggered checkpoint measures from. The sample, not
+        // `redo` — see the field.
+        self.last_checkpoint_lsn.store(sampled.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,
             &ControlFile {
@@ -1611,6 +1679,12 @@ impl TxnFinalize for PgEngine {
                 ),
             }
         }
+        // Released before the checkpoint below, which reads the same map: a second
+        // read guard taken while a writer is queued between them deadlocks.
+        drop(handles);
+        // The commit is durable at this point, so anything here can only affect how
+        // much a future recovery has to replay.
+        self.checkpoint_if_wal_grew(Xid(xid.0 + 1));
     }
 
     /// Discard the transaction's staged TRUNCATE files (the table keeps its
