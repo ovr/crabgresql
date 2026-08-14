@@ -527,6 +527,14 @@ Per-buffer minimum-LSN tracking, which would let a cluster with resident buffere
 rows still bound replay, is the refinement — and it is a change to that one
 function's body.
 
+That coarseness is also what makes an *unopenable* relation a startup refusal
+rather than a clamp: a relation the engine could not open is not in its table map,
+so it cannot be asked whether it holds rows, and a checkpoint would bound itself
+as if it held none — retiring the segments that are those rows' only copy.
+`PgEngine::refuse_if_unopenable_holds_rows` asks the replayed WAL directly instead
+and refuses to come up, naming the directory to repair. Both that refusal and the
+clamp are consequences of the same missing watermark, and both disappear with it.
+
 ### 2.5 Sorted flush and atomic publication
 
 A flush worker seals eligible committed rows from one `PartitionBuffer`, then:

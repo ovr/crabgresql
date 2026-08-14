@@ -136,6 +136,18 @@ enum RedoClamp {
     BufferedRows,
 }
 
+/// A relation the catalog names that this process could not open, kept so
+/// [`PgEngine::refuse_if_unopenable_holds_rows`] can tell the operator which one
+/// and why.
+struct UnopenableRelation {
+    name: String,
+    rel: u32,
+    /// The open failure, rendered at the point it happened: the error type is
+    /// out of this crate's hands and not `Clone`, and what the operator needs is
+    /// the sentence, not the value.
+    error: String,
+}
+
 /// Exposes the relation catalog's relfilenode counter to an out-of-crate access
 /// method (Parquet), whose TRUNCATE stages a fresh `parquet/<n>/` directory and
 /// must draw its id from the same sequence as every heap file.
@@ -525,6 +537,14 @@ pub struct PgEngine {
     /// works at all.
     last_checkpoint_lsn: AtomicU64,
     max_wal_size: u64,
+    /// Relations the catalog names that this process could not open. Empty on
+    /// every healthy cluster; written once, at construction.
+    unopenable: Vec<UnopenableRelation>,
+    /// Serializes [`PgEngine::write_control_file`], so control files are published
+    /// in the order their redo points were sampled. See the comment there: with
+    /// segments being retired, an out-of-order publish is a data directory that
+    /// cannot be started, not just a longer replay.
+    checkpointing: Mutex<()>,
     /// WAL held back below the published redo point on top of what recovery needs
     /// ([`crabgresql_config::WAL_KEEP_SIZE`]). Zero by default: nothing here reads
     /// the retired log, so the whole of it is dead weight the moment a checkpoint
@@ -601,6 +621,7 @@ impl PgEngine {
         let stats_store = Arc::new(relstats::StatsStore::open(data_dir)?);
 
         let mut tables = HashMap::new();
+        let mut unopenable = Vec::new();
         for (name, rel, toast_rel, schema, indexes) in catalog.schemas() {
             let namespace = schema.namespace.clone();
             // One measurement, stored in two places: the relation-level numbers
@@ -656,6 +677,12 @@ impl PgEngine {
                     // then reports 42P01 on access, and DROP TABLE still clears
                     // the catalog entry (`gc_orphan_parquet_dirs` reclaims the
                     // directory at the next boot).
+                    //
+                    // That leniency has one limit, enforced by
+                    // `refuse_if_unopenable_holds_rows`: an unregistered relation
+                    // is invisible to `redo_clamp`, so if the WAL is holding rows
+                    // for it, a checkpoint would retire their only copy. Hence the
+                    // name and relfilenode are remembered rather than only logged.
                     match ParquetTable::open(
                         data_dir,
                         rel.0,
@@ -691,6 +718,11 @@ impl PgEngine {
                                 "Parquet relation could not be opened; \
                                  it will report as nonexistent until dropped"
                             );
+                            unopenable.push(UnopenableRelation {
+                                name: name.clone(),
+                                rel: rel.0,
+                                error: error.to_string(),
+                            });
                             continue;
                         }
                     }
@@ -718,6 +750,8 @@ impl PgEngine {
             last_checkpoint_lsn: AtomicU64::new(wal.current_lsn().0),
             max_wal_size: crabgresql_config::MAX_WAL_SIZE.get(|problem| tracing::warn!("{problem}"))
                 as u64,
+            unopenable,
+            checkpointing: Mutex::new(()),
             wal_keep_size: crabgresql_config::WAL_KEEP_SIZE
                 .get(|problem| tracing::warn!("{problem}")) as u64,
         })
@@ -811,6 +845,10 @@ impl PgEngine {
         let clog = Arc::new(Clog::open(data_dir)?);
         engine.clog.get_or_init(|| Arc::clone(&clog));
         let res = recover(data_dir, &registry, &clog, redo).map_err(std::io::Error::other)?;
+        // Before anything writes: replay has just filled `buffer_redo`, so this is
+        // the first moment the question can be answered, and the startup checkpoint
+        // below is the first thing that would retire a segment.
+        engine.refuse_if_unopenable_holds_rows()?;
         // Clamp the WAL to the last valid record before any new append, discarding
         // a torn tail left by a crash.
         if let Ok(on_disk) = crabgresql_wal::wal_stream_len(data_dir)
@@ -847,6 +885,46 @@ impl PgEngine {
         // Make the recovered catalog and pages durable and mark the DB running.
         engine.checkpoint(res.next_xid)?;
         Ok((engine, clog, res.next_xid))
+    }
+
+    /// Refuse to start when the WAL is holding rows for a relation this process
+    /// could not open.
+    ///
+    /// A relation that fails to open stays unregistered on purpose — one
+    /// unparseable filename must not make every other table unreachable — and
+    /// that is harmless right up until the rows are irreplaceable. An
+    /// unregistered relation is invisible to [`PgEngine::redo_clamp`], so the
+    /// next checkpoint bounds itself as if nothing were pending and retires the
+    /// segments those rows live in. A situation the operator could repair
+    /// (`parquet/<relfilenode>/` is on disk, the log still has the unflushed
+    /// rows) would become permanent loss, silently.
+    ///
+    /// So: refuse, name the relation, and leave every byte where it is. This is
+    /// the only case where an unopenable relation stops a startup — with nothing
+    /// pending for it in the log there is nothing to lose, and the cluster comes
+    /// up exactly as before.
+    ///
+    /// Asks [`crabgresql_buffer_engine::BufferRedo::holds`] rather than `take`:
+    /// taking would answer the same question by throwing away the very rows being
+    /// declared irreplaceable.
+    fn refuse_if_unopenable_holds_rows(&self) -> std::io::Result<()> {
+        for relation in &self.unopenable {
+            if !self.buffer_redo.holds(relation.rel) {
+                continue;
+            }
+            return Err(std::io::Error::other(format!(
+                "relation {} could not be opened ({}), and the write-ahead log \
+                 still holds rows for it that exist nowhere else — starting would \
+                 let a checkpoint discard that log. Repair or move aside {}/{} \
+                 (a relation whose directory is absent opens empty, and the rows \
+                 are then restored from the log), then start again",
+                relation.name,
+                relation.error,
+                self.data_dir.join("parquet").display(),
+                relation.rel,
+            )));
+        }
+        Ok(())
     }
 
     /// Install the buffer-table rows replay rebuilt.
@@ -1166,6 +1244,24 @@ impl PgEngine {
         // here and nowhere else.
         const _: () =
             assert!(crabgresql_config::MAX_WAL_SIZE.min as u64 == crabgresql_wal::SEGMENT_SIZE);
+        // One checkpointer at a time, so that control files are published in the
+        // order their redo points were sampled.
+        //
+        // Two can be in flight: `checkpoint_if_wal_grew`'s compare-exchange picks
+        // one winner among concurrent committers but excludes neither `shutdown`
+        // nor a second committer once the log has grown by another
+        // `max_wal_size`. Out of order, the loser publishes *its* lower redo point
+        // over the winner's — which used to be merely a longer replay, and is now
+        // a control file naming a segment step 7 already unlinked.
+        //
+        // Cannot deadlock: what this holds across is `redo_point`, which waits for
+        // every outstanding `CheckpointDelay`, and no delay holder ever takes this
+        // lock — `checkpoint_if_wal_grew` is documented as callable only with none
+        // held, which is the same requirement `redo_point` already imposes.
+        let _one_at_a_time = self
+            .checkpointing
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
         let sampled = self.inner.wal.redo_point().map_err(std::io::Error::other)?;
         // Said out loud on purpose: a silently clamped redo point looks exactly
         // like a working bounded replay from the outside, and the cost — every
@@ -2074,6 +2170,10 @@ impl TableEngine for PgEngine {
         // idempotent. Claiming a clean shutdown after a failed page flush would be
         // the opposite — it suppresses the unlogged-relation reset for a run whose
         // pages may be torn.
+        //
+        // "Older is safe" survives segment retirement only because publishing is
+        // serialized (`checkpointing`): a control file left in place was published,
+        // and nothing is ever retired below a point that was not.
         let next_xid = Xid(self.last_next_xid.load(Ordering::Relaxed));
         if let Err(e) = self.write_control_file(next_xid, CHECKPOINT_SHUTDOWN, true) {
             tracing::error!(error = %e, "clean-shutdown flush failed");

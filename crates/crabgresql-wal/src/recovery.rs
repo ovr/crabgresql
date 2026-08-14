@@ -13,9 +13,14 @@
 //! Two things had to exist first, and now do: a durable CLOG, to recover the fate
 //! of transactions that committed *below* the redo point, and something that
 //! writes the redo point down. [`Lsn::INVALID`] (`0`) still means the whole
-//! stream, and is what a fresh cluster — or one whose control file is unreadable —
-//! gets. Replaying more than necessary is always safe, because every redo handler
-//! is gated on the target page's LSN.
+//! stream, and is what a fresh cluster — or a checkpoint that could not bound
+//! itself — gets. Replaying more than necessary is always safe, because every redo
+//! handler is gated on the target page's LSN.
+//!
+//! "The whole stream" is the whole stream *still on disk*: a checkpoint retires
+//! the segments below the redo point it published, so byte zero is not where the
+//! log begins for the life of a cluster. [`recover`] resolves `Lsn::INVALID` to
+//! the oldest surviving segment before reading a byte.
 
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -128,12 +133,40 @@ fn first_valid_record_offset(bytes: &[u8], start: Lsn) -> Option<usize> {
     })
 }
 
+/// Advance past the tail of a record whose head a checkpoint retired, returning
+/// the resume point and the bytes from it.
+///
+/// `applies` is false everywhere except the one case this exists for — a
+/// whole-stream replay of a log whose oldest segments are gone — because the scan
+/// it does is only sound there. Everywhere else "nothing decodes here" has to stay
+/// an error: the bytes below `start` were not read, so a record we are sitting
+/// inside is invisible from here, and skipping ahead would silently drop it.
+fn skip_retired_record_tail(applies: bool, start: Lsn, bytes: Vec<u8>) -> (Lsn, Vec<u8>) {
+    if !applies || WalRecord::decode(&bytes).is_some_and(|(rec, _)| rec.rec_lsn == start) {
+        return (start, bytes);
+    }
+    let Some(offset) = first_valid_record_offset(&bytes, start) else {
+        // Nothing self-identifies anywhere ahead. Leave it alone: the decode loop
+        // reports it as a head that does not decode, which is a far better answer
+        // than a resume point invented from a scan that found nothing.
+        return (start, bytes);
+    };
+    let resumed = Lsn(start.0 + offset as u64);
+    tracing::info!(
+        %start,
+        %resumed,
+        "the oldest surviving wal segment begins inside a record whose head was \
+         retired; resuming at the first record boundary above it"
+    );
+    (resumed, bytes[offset..].to_vec())
+}
+
 /// Replay the WAL under `dir` from `start`, rebuilding `clog` from commit/abort
 /// records and dispatching every other record to its registered redo handler.
 /// Returns the end of the valid log and the next XID to hand out.
 ///
 /// `start` must name a record boundary; pass [`Lsn::INVALID`] to replay the whole
-/// stream.
+/// stream — meaning the whole stream that still *exists*, see below.
 pub fn recover(
     dir: &Path,
     registry: &RmgrRegistry,
@@ -141,23 +174,60 @@ pub fn recover(
     start: Lsn,
 ) -> Result<RecoveryResult, WalError> {
     let control = read_control(dir)?;
+    // "The whole stream" is the whole stream still on disk. A checkpoint retires
+    // the segments below the redo point it published
+    // ([`crate::remove_segments_below`]), so byte zero stops being where the log
+    // begins — and `Lsn::INVALID` is not a rare path: a checkpoint that cannot
+    // bound replay publishes it, and so does an unreadable control file.
+    //
+    // Resolved here, before `read_from`, so that every `start + pos` below still
+    // names the byte it reads. On a cluster that has retired nothing this is
+    // `Lsn(0)` and changes nothing at all.
+    let whole_stream = !start.is_valid();
+    let oldest = segment_numbers(dir)?.first().copied().unwrap_or(0);
+    let start = if whole_stream {
+        Lsn(oldest * SEGMENT_SIZE)
+    } else {
+        start
+    };
     // Replay raises this floor from the records it reads, but only those at or
-    // above `start`. Whole-stream replay therefore sees every XID that ever
-    // appeared in the log; a bounded replay does not, and the control file is
-    // the only remaining floor. Starting without one would let the allocator
-    // reissue an XID already stamped on committed tuples in the skipped prefix —
-    // the reused XID is `InProgress` in the CLOG, so the moment it commits, the
-    // old tuples become visible. Refuse instead.
+    // above `start`. Replay from the head of the stream therefore sees every XID
+    // that ever appeared in it; a replay that starts higher does not, and the
+    // control file is the only remaining floor. Starting without one would let the
+    // allocator reissue an XID already stamped on committed tuples in the skipped
+    // prefix — the reused XID is `InProgress` in the CLOG, so the moment it
+    // commits, the old tuples become visible. Refuse instead.
+    //
+    // Note which `start` this tests: the resolved one. A cluster whose control
+    // file is unreadable *and* whose oldest segments were retired lands here, and
+    // that is the honest answer — the XIDs below the oldest surviving segment are
+    // named by nothing left on disk.
     if start.is_valid() && control.is_none() {
-        return Err(WalError::Redo(format!(
-            "recovery from {start} needs a control file for the next-XID floor, \
-             but none is readable; replay below the redo point would be skipped \
-             and XIDs could be reissued"
-        )));
+        return Err(WalError::Redo(if whole_stream {
+            format!(
+                "no control file is readable and the log below {start} was retired \
+                 by a checkpoint, so the next-XID floor is named by nothing left on \
+                 disk; refusing to start rather than reissue XIDs already stamped \
+                 on committed tuples"
+            )
+        } else {
+            format!(
+                "recovery from {start} needs a control file for the next-XID floor, \
+                 but none is readable; replay below the redo point would be skipped \
+                 and XIDs could be reissued"
+            )
+        }));
     }
     let mut next_xid = control.map(|c| c.next_xid.0).unwrap_or(Xid::FIRST_NORMAL.0);
 
     let bytes = read_from(dir, start)?;
+    // Only a record longer than a whole segment can straddle a boundary, so only
+    // one thing can leave the oldest surviving segment beginning inside a record:
+    // retirement cut that record's head away. Its effect is already on disk —
+    // retirement only ever happens below a redo point a checkpoint published, and
+    // publishing one means everything below it was written back — so stepping over
+    // the tail is both correct and the only way to resume at all.
+    let (start, bytes) = skip_retired_record_tail(whole_stream && oldest > 0, start, bytes);
     tracing::trace!(start = %start, len = bytes.len(), next_xid, "starting WAL replay");
 
     let mut pos = 0usize;
@@ -375,6 +445,134 @@ mod tests {
                 .unwrap_or_else(|_| panic!("mutex poisoned"))
                 .len(),
             2
+        );
+
+        Ok(())
+    }
+
+    /// A payload that makes one record occupy exactly `segments` whole segments,
+    /// so the next append lands on a boundary and the test controls which segment
+    /// every later record is in.
+    fn filler(segments: u64) -> Vec<u8> {
+        vec![0u8; (segments * SEGMENT_SIZE) as usize - WalRecord::MIN_LEN]
+    }
+
+    /// `Lsn::INVALID` means the whole stream that still exists.
+    ///
+    /// A checkpoint retires the segments below the redo point it published, and a
+    /// later one that cannot bound replay publishes `Lsn::INVALID` — a readable
+    /// control file, no corruption anywhere, and byte zero long gone. Reading that
+    /// as "resume at segment 0" is a cluster that will not start.
+    #[test]
+    fn whole_stream_replay_resumes_at_the_oldest_surviving_segment() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let end;
+        {
+            let wal = Wal::open(dir.path())?;
+            // Fills segment 0 exactly, so the records below begin segment 1.
+            wal.append(RmgrId::HEAP, 0, Xid(1), &filler(1));
+            wal.append(RmgrId::HEAP, 7, Xid(3), b"above-the-retired-prefix");
+            end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]).end;
+            wal.flush(end)?;
+        }
+        assert_eq!(crate::segment::segment_numbers(dir.path())?, vec![0, 1]);
+        crate::segment::remove_segments_below(dir.path(), Lsn(SEGMENT_SIZE + 8), 0)?;
+        assert_eq!(crate::segment::segment_numbers(dir.path())?, vec![1]);
+        write_floor(dir.path(), 9)?;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+
+        assert_eq!(res.replayed_from, Lsn(SEGMENT_SIZE));
+        assert_eq!(res.end_of_wal, end, "the whole surviving log was read");
+        assert!(clog.is_committed(Xid(3)));
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .len(),
+            1,
+            "only the record above the retired prefix is redone"
+        );
+
+        Ok(())
+    }
+
+    /// The one case where the oldest surviving segment does not begin on a record
+    /// boundary: a record longer than a segment, whose head was retired. Its effect
+    /// is already on disk — retirement only happens below a published redo point —
+    /// so replay steps over the tail instead of refusing.
+    #[test]
+    fn a_retired_record_head_leaves_a_resumable_tail() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let end;
+        {
+            let wal = Wal::open(dir.path())?;
+            // Two segments and a half: the record ends inside segment 2, so
+            // segment 2 begins in the middle of it.
+            let mut oversized = filler(2);
+            oversized.extend_from_slice(&vec![0u8; (SEGMENT_SIZE / 2) as usize]);
+            wal.append(RmgrId::HEAP, 0, Xid(1), &oversized);
+            wal.append(RmgrId::HEAP, 7, Xid(3), b"after-the-oversized-record");
+            end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(3), &[]).end;
+            wal.flush(end)?;
+        }
+        // Retiring below a redo point inside segment 2 cuts the oversized record's
+        // head away and leaves its tail at the head of the stream.
+        crate::segment::remove_segments_below(dir.path(), Lsn(2 * SEGMENT_SIZE + 8), 0)?;
+        assert_eq!(crate::segment::segment_numbers(dir.path())?, vec![2]);
+        write_floor(dir.path(), 9)?;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+
+        assert!(
+            res.replayed_from > Lsn(2 * SEGMENT_SIZE),
+            "replay must resume above the truncated record, not at the segment's \
+             first byte, but resumed at {}",
+            res.replayed_from
+        );
+        assert_eq!(res.end_of_wal, end);
+        assert!(clog.is_committed(Xid(3)));
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .len(),
+            1
+        );
+
+        Ok(())
+    }
+
+    /// With the prefix retired *and* no control file, the next-XID floor is named
+    /// by nothing left on disk. Refuse, and say which of the two it is.
+    #[test]
+    fn a_retired_prefix_without_a_control_file_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            wal.append(RmgrId::HEAP, 0, Xid(1), &filler(1));
+            let end = wal.append(RmgrId::HEAP, 7, Xid(3), b"orphan").end;
+            wal.flush(end)?;
+        }
+        crate::segment::remove_segments_below(dir.path(), Lsn(SEGMENT_SIZE + 8), 0)?;
+
+        let reg = RmgrRegistry::new();
+        let clog = Clog::new();
+        let Err(error) = recover(dir.path(), &reg, &clog, Lsn::INVALID) else {
+            anyhow::bail!("a retired prefix with no XID floor must not be replayed");
+        };
+        let message = error.to_string();
+        assert!(message.contains("retired"), "{message}");
+        assert!(
+            !message.contains("does not exist"),
+            "the operator must hear about the retirement, not about a missing \
+             segment 0: {message}"
         );
 
         Ok(())

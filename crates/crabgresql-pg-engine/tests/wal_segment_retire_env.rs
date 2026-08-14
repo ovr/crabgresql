@@ -120,5 +120,47 @@ fn a_checkpoint_retires_the_segments_below_its_redo_point() -> anyhow::Result<()
         "every committed row must survive the retirement"
     );
 
+    // And now the combination that has nothing to do with corruption: a
+    // checkpoint that cannot bound replay publishes `Lsn::INVALID` over a log
+    // whose oldest segments are already gone. Read as "resume at segment 0" that
+    // is a data directory nobody can start — the whole stream means the whole
+    // stream still on disk.
+    let clamped = {
+        let mut registry = crabgresql_wal::RmgrRegistry::new();
+        // No commit log, so `redo_clamp` fires for the simplest of its reasons.
+        // A resident write buffer reaches the same published value by the same
+        // path.
+        let engine = PgEngine::new_with_pool(
+            dir.path(),
+            Arc::clone(&wal),
+            &mut registry,
+            BufferPoolPolicy::minimal(),
+        )?;
+        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        read_control(dir.path())?.expect("a control file").redo_lsn
+    };
+    assert_eq!(clamped, Lsn::INVALID, "the checkpoint must have clamped");
+    assert!(
+        !segment_numbers(dir.path())?.contains(&0),
+        "and segment 0 is still gone"
+    );
+
+    drop(engine);
+    let wal = Arc::new(Wal::open(dir.path()).map_err(std::io::Error::other)?);
+    let (engine, clog, next_xid) = PgEngine::open_recovered_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        BufferPoolPolicy::minimal(),
+    )?;
+    let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
+    let tm = TransactionManager::new_recovered(sink, clog, next_xid);
+    let table = engine.open_table("t")?;
+    let read: TxnContext = tm.context(Xid::INVALID, CommandId::FIRST);
+    assert_eq!(
+        table.scan(&read, &ColumnProjection::All).count(),
+        rows as usize,
+        "a whole-stream replay of a retired log must still find every row"
+    );
+
     Ok(())
 }
