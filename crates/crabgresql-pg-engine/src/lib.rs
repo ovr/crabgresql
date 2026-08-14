@@ -525,6 +525,11 @@ pub struct PgEngine {
     /// works at all.
     last_checkpoint_lsn: AtomicU64,
     max_wal_size: u64,
+    /// WAL held back below the published redo point on top of what recovery needs
+    /// ([`crabgresql_config::WAL_KEEP_SIZE`]). Zero by default: nothing here reads
+    /// the retired log, so the whole of it is dead weight the moment a checkpoint
+    /// publishes a redo point above it.
+    wal_keep_size: u64,
     /// The background flush thread, present once a transaction manager is
     /// attached. Tests that build an engine by hand never attach one, so they get
     /// no thread and stay deterministic.
@@ -713,6 +718,8 @@ impl PgEngine {
             last_checkpoint_lsn: AtomicU64::new(wal.current_lsn().0),
             max_wal_size: crabgresql_config::MAX_WAL_SIZE.get(|problem| tracing::warn!("{problem}"))
                 as u64,
+            wal_keep_size: crabgresql_config::WAL_KEEP_SIZE
+                .get(|problem| tracing::warn!("{problem}")) as u64,
         })
     }
 
@@ -1134,6 +1141,9 @@ impl PgEngine {
     /// 5. Append the record only now, so that a durable CHECKPOINT record implies
     ///    that checkpoint's work completed — what a future WAL recycler needs.
     /// 6. Write the control file last. Its rename is the atomic publish.
+    /// 7. Only *then* retire the WAL segments the new redo point made dead. A
+    ///    segment removed before the publish would be one the still-current
+    ///    control file names, and recovery from it would find the file gone.
     ///
     /// Nothing can end up both un-written and un-replayed. A change whose record
     /// ends at or below the redo point had its effect published before the sample
@@ -1219,6 +1229,24 @@ impl PgEngine {
             },
         )
         .map_err(std::io::Error::other)?;
+        // `redo`, never `sampled`: the two differ exactly when the checkpoint could
+        // not bound replay, and removing below the position it sampled would delete
+        // the log it just admitted it still needs.
+        //
+        // A failure here costs disk space, not correctness — the segments stay and
+        // the next checkpoint tries again — so it must not fail a checkpoint, still
+        // less the shutdown that calls one.
+        match crabgresql_wal::remove_segments_below(&self.data_dir, redo, self.wal_keep_size) {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::debug!(removed, redo = %redo, "retired spent WAL segments")
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                redo = %redo,
+                "could not retire spent WAL segments; pg_wal will keep growing"
+            ),
+        }
         Ok(())
     }
 

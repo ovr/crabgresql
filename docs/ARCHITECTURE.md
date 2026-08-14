@@ -161,9 +161,17 @@ Contract with the core:
   correct-but-unoptimized without them: a *time*-based checkpointer (an idle
   cluster's last commit stays unbounded until it shuts down), full-page writes for
   torn-page protection beyond page
-  checksums, and WAL segment recycling — the log is cut into 32 MiB segment files
-  (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never straddles a
-  boundary, but a finished segment is neither reused nor removed.
+  checksums, and WAL segment *recycling* — the log is cut into 32 MiB segment
+  files (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never
+  straddles a boundary. A checkpoint **removes** the segments lying wholly below
+  the redo point it published (`CRABGRESQL_WAL_KEEP_SIZE` holds a tail of them
+  back), so `pg_wal` settles at roughly `max_wal_size`. What is still deferred is
+  reusing one under a future name: our segments are sparse and never
+  preallocated, so a rename would save a single directory operation and cost
+  three invariants — the insert position is derived from the highest segment
+  present, replay checks a record's self-declared LSN only at the redo point, and
+  the stream length is read off the last file. Recycling is worth doing together
+  with preallocation, and not before.
 - Syntactically, extensibility is exposed the standard PG way. Plain
   `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet ORDER BY (cols)`
   explicitly selects the columnar method and declares its layout order.

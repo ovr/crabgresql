@@ -1949,3 +1949,58 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
     assert!(scanned.is_err(), "a seq scan errors on the same table");
     Ok(())
 }
+
+/// A checkpoint that cannot bound replay must retire nothing.
+///
+/// The redo point it publishes is `Lsn::INVALID` — "replay the whole stream" —
+/// so every segment is still needed, including the ones a *bounded* checkpoint
+/// at the same position would have retired. The distinction is invisible until
+/// the next start, at which point recovery reads from byte zero of a log whose
+/// prefix is gone.
+///
+/// Clamped here through the simplest of the reasons `redo_clamp` recognizes: an
+/// engine with no commit log. The others (a resident write buffer, an
+/// unreconciled TRUNCATE) publish the same `Lsn::INVALID` by the same path.
+#[test]
+fn an_unbounded_checkpoint_retires_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut reg = RmgrRegistry::new();
+    let wal = Arc::new(Wal::open(dir.path())?);
+    let engine = PgEngine::new_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        &mut reg,
+        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
+    )?;
+
+    // Two segments' worth of log, so a bounded checkpoint here would have had
+    // something to retire and this test could fail.
+    let payload = vec![7u8; 1 << 20];
+    while wal.current_lsn().0 < 2 * crabgresql_wal::SEGMENT_SIZE {
+        wal.append(
+            crabgresql_wal::RmgrId::XLOG,
+            crabgresql_wal::XLOG_PAD,
+            Xid::INVALID,
+            &payload,
+        );
+    }
+    wal.flush(wal.current_lsn())?;
+    let before = crabgresql_wal::segment_numbers(dir.path())?;
+    assert!(before.len() > 2, "segments to retire: {before:?}");
+
+    engine.checkpoint(Xid::FIRST_NORMAL)?;
+
+    let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    assert_eq!(
+        control.redo_lsn,
+        crabgresql_wal::Lsn::INVALID,
+        "an engine with no commit log cannot bound replay"
+    );
+    assert_eq!(
+        crabgresql_wal::segment_numbers(dir.path())?,
+        before,
+        "an unbounded checkpoint must leave every segment in place"
+    );
+
+    Ok(())
+}

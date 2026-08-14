@@ -96,6 +96,10 @@ const MIN_MAX_WAL_SIZE: usize = 32 * MB;
 /// is a recovery measured in minutes, which is the opposite of what bounding
 /// replay is for.
 const MAX_MAX_WAL_SIZE: usize = GB.saturating_mul(16);
+/// A backstop against a typo in the other direction: the retained log is dead
+/// weight by construction — recovery never reads it — so a value large enough to
+/// fill a disk is far likelier to be a mistake than a wish.
+const MAX_WAL_KEEP_SIZE: usize = GB.saturating_mul(16);
 
 /// Per-relation buffered bytes that make one write buffer flush-eligible.
 ///
@@ -161,6 +165,20 @@ pub const MAX_WAL_SIZE: SizeVar = SizeVar {
     max: MAX_MAX_WAL_SIZE,
     help: "WAL bytes written past the published redo point that trigger a checkpoint",
 };
+/// WAL kept below the published redo point, on top of what recovery needs.
+///
+/// A checkpoint retires every segment lying wholly below the redo point it
+/// published; this holds that many bytes of them back. Zero, like PostgreSQL's
+/// `wal_keep_size`, because nothing in this server reads the retained log —
+/// there is no replication and no archiver yet — so the only thing it buys is a
+/// forensic window after a crash, which costs disk to keep.
+pub const WAL_KEEP_SIZE: SizeVar = SizeVar {
+    name: "CRABGRESQL_WAL_KEEP_SIZE",
+    default: 0,
+    min: 0,
+    max: MAX_WAL_KEEP_SIZE,
+    help: "WAL bytes kept below the published redo point, beyond what recovery needs",
+};
 
 // Bounds that are transposed, or a default outside them, would be a startup
 // panic waiting for the first operator to set that variable: `Ord::clamp`
@@ -172,6 +190,7 @@ const _: () = assert!(BUFFER_MAX_AGE.is_sane());
 const _: () = assert!(BUFFER_TICK.is_sane());
 const _: () = assert!(SHARED_BUFFERS.is_sane());
 const _: () = assert!(MAX_WAL_SIZE.is_sane());
+const _: () = assert!(WAL_KEEP_SIZE.is_sane());
 
 /// A knob whose value is a quantity: its name, its default, and the range it
 /// is allowed to take.
@@ -416,6 +435,10 @@ mod tests {
         assert_eq!(MAX_WAL_SIZE.default.render(), "1GB");
         assert_eq!(MAX_WAL_SIZE.min.render(), "32MB");
         assert_eq!(MAX_WAL_SIZE.max.render(), "16GB");
+
+        assert_eq!(WAL_KEEP_SIZE.default.render(), "0B");
+        assert_eq!(WAL_KEEP_SIZE.min.render(), "0B");
+        assert_eq!(WAL_KEEP_SIZE.max.render(), "16GB");
     }
 
     /// The same table, read rather than transcribed.
@@ -455,6 +478,11 @@ mod tests {
             MAX_WAL_SIZE.name,
             MAX_WAL_SIZE.help,
             Row::from(MAX_WAL_SIZE),
+        ));
+        rows.push((
+            WAL_KEEP_SIZE.name,
+            WAL_KEEP_SIZE.help,
+            Row::from(WAL_KEEP_SIZE),
         ));
 
         for (name, help, row) in rows {

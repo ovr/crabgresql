@@ -14,9 +14,10 @@
 //! is the fail-safe direction: replaying more than necessary is always correct,
 //! because redo is idempotent under the per-page LSN gate.
 //!
-//! TODO: recycle WAL segments below the durable redo point — the other thing it
-//! unlocks, and nothing does it, so the stream grows without bound
-//! (`docs/ARCHITECTURE.md §1.3`).
+//! The durable redo point is also what bounds `pg_wal`: a checkpoint hands it to
+//! [`crate::remove_segments_below`] once this file names it, and everything
+//! wholly below is unlinked. Reusing a spent segment under a future name is
+//! still deferred (`docs/ARCHITECTURE.md §1.3`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

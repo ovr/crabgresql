@@ -10,11 +10,11 @@
 //!   `max(record xid) + 1` is not a sufficient floor; the checkpoint's
 //!   `next_xid` is. That matters exactly when `pg_control` is unreadable and
 //!   replay has fallen back to the whole stream.
-//! * It is the anchor for WAL segment recycling (`docs/ARCHITECTURE.md §1.3`),
-//!   which has to reason about checkpoints in stream order and cannot consult a
-//!   control file that describes only the latest one.
-//!   TODO: recycle WAL segments below the oldest checkpoint replay still needs
-//!   — nothing reads this record for that, so the stream grows without bound.
+//! * It is the anchor for anything that has to reason about checkpoints in
+//!   *stream order* rather than about the latest one, which is all a control file
+//!   describes (`docs/ARCHITECTURE.md §1.3`). Retiring spent segments does not
+//!   need that — [`crate::remove_segments_below`] works off the one redo point
+//!   `pg_control` publishes — but reusing a segment under a future name will.
 //! * It lets a reader verify that the LSN `pg_control` published really names a
 //!   checkpoint boundary.
 //!
