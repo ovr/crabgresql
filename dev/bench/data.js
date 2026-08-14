@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786704970156,
+  "lastUpdate": 1786704972673,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -25888,6 +25888,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19324.461925,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c91cffa2d5b9ee71a0f825f76941b904d3a5efa",
+          "message": "refactor(parquet-engine): Better code organization (#229)",
+          "timestamp": "2026-08-14T12:01:17+02:00",
+          "tree_id": "72338293b27060c1c27b7981f0d705c1834a6ad9",
+          "url": "https://github.com/ovr/crabgresql/commit/3c91cffa2d5b9ee71a0f825f76941b904d3a5efa"
+        },
+        "date": 1786704972586,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1313.469432,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20606.629116,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
