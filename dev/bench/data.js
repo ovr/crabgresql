@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786744695172,
+  "lastUpdate": 1786744696845,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -30424,6 +30424,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 28911.332935,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "63be4714a0fcf34f598dc05b2e2847f070ee90fb",
+          "message": "feat(wal): Use 32 MiB segment files (#236)",
+          "timestamp": "2026-08-14T23:07:59+02:00",
+          "tree_id": "38b07053d24cfb8baafd4089a750d82f34240131",
+          "url": "https://github.com/ovr/crabgresql/commit/63be4714a0fcf34f598dc05b2e2847f070ee90fb"
+        },
+        "date": 1786744696727,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 550.975115,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 41044.26343,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
