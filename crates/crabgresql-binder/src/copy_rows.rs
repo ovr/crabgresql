@@ -16,12 +16,14 @@
 //! Because a field is only ever a span, a decoder that already has a whole
 //! record in hand can hand the *record* to the arena once
 //! ([`RowBatch::push_line`]) and address its fields inside it
-//! ([`RowBatch::push_field_at`]) — one copy of the input instead of one for the
-//! record and another for every field it holds.
+//! ([`RowBatch::push_field_in_line`]) — one copy of the input instead of one
+//! for the record and another for every field it holds.
 //!
 //! The batch is the unit of reuse: a decoder fills one, the load consumes it by
 //! reference, and [`RowBatch::split_into`] hands the allocations back for the
 //! next batch.
+
+use std::ops::Range;
 
 /// One field's text inside a [`RowBatch`]'s arena, or the NULL marker.
 ///
@@ -110,7 +112,7 @@ pub struct RowBatch {
     /// belongs to no field (a delimiter, a NULL marker, a field superseded by
     /// its de-escaped form) is simply never addressed. What the readers do
     /// depend on is that a row's spans all fall past the row's recorded byte
-    /// boundary — see [`RowBatch::push_field_at`].
+    /// boundary — see [`RowBatch::push_field_in_line`].
     ///
     /// A `String` and not a `Vec<u8>`: the decoder has to run the UTF-8 check
     /// anyway — it is the layer that can report a bad byte as PostgreSQL's
@@ -126,6 +128,13 @@ pub struct RowBatch {
     /// pair of "open row" fields is what removes the last-row special case
     /// from the readers and the hand-sync from every mutator.
     bounds: Vec<RowStart>,
+    /// Where the record last handed to [`RowBatch::push_line`] sits in the
+    /// arena, which is what [`RowBatch::push_field_in_line`] addresses against.
+    ///
+    /// Holding the base here rather than handing it back to the caller is what
+    /// makes the span contract structural: a caller cannot get the arithmetic
+    /// wrong, because it never does the arithmetic.
+    line: Range<usize>,
 }
 
 impl Default for RowBatch {
@@ -140,6 +149,7 @@ impl RowBatch {
             buf: String::new(),
             fields: Vec::new(),
             bounds: vec![ORIGIN],
+            line: 0..0,
         }
     }
 
@@ -211,38 +221,38 @@ impl RowBatch {
         });
     }
 
-    /// Copy a whole raw record into the arena, returning the offset it landed
-    /// at, so its fields can be addressed in place with
-    /// [`push_field_at`](Self::push_field_at).
+    /// Copy a whole raw record into the arena, so its fields can be addressed
+    /// in place with [`push_field_in_line`](Self::push_field_in_line).
     ///
     /// This is what keeps a text-format load down to one copy of its input: the
     /// decoder already holds the record, and every field that needs no
     /// rewriting is a slice of it. The bytes between the fields ride along —
     /// see [`buf`](Self::buf).
-    pub fn push_line(&mut self, line: &str) -> usize {
+    pub fn push_line(&mut self, line: &str) {
         let at = self.buf.len();
         self.buf.push_str(line);
-        at
+        self.line = at..self.buf.len();
     }
 
-    /// Append a completed field whose text is *already* in the arena — the
-    /// offsets [`push_line`](Self::push_line) handed out.
+    /// Append a completed field whose text is *already* in the arena, given its
+    /// range within the record [`push_line`](Self::push_line) last took.
     ///
-    /// `start` must not point before the row under construction: a row's bytes
-    /// living past its own boundary is what lets
-    /// [`split_into`](Self::split_into) move rows by rebasing whole ranges, and
-    /// what lets [`truncate_rows`](Self::truncate_rows) drop a row by cutting
-    /// the arena. Appending the record and only then its fields satisfies this
-    /// by construction.
-    pub fn push_field_at(&mut self, start: usize, end: usize) {
-        debug_assert!(start <= end && end <= self.buf.len(), "span outside arena");
+    /// The range is relative to that record and never to the arena, which is
+    /// what makes the readers' invariant — a row's spans all fall past the
+    /// row's byte boundary, so [`split_into`](Self::split_into) can rebase
+    /// whole ranges and [`truncate_rows`](Self::truncate_rows) can drop a row
+    /// by cutting the arena — hold by construction: the record was appended
+    /// after the previous [`end_row`](Self::end_row), and a range into it
+    /// cannot reach back past its start.
+    pub fn push_field_in_line(&mut self, range: Range<usize>) {
         debug_assert!(
-            start >= self.open().byte,
-            "a field cannot start before its own row"
+            range.start <= range.end && range.end <= self.line.len(),
+            "range outside the record"
         );
+        let (start, end) = (self.line.start + range.start, self.line.start + range.end);
         debug_assert!(
             self.buf.is_char_boundary(start) && self.buf.is_char_boundary(end),
-            "span is not on char boundaries"
+            "range is not on char boundaries"
         );
         self.fields.push(FieldSpan { start, end });
     }
@@ -312,15 +322,21 @@ impl RowBatch {
         self.buf.clear();
         self.fields.clear();
         self.bounds.truncate(1);
+        self.line = 0..0;
     }
 
     /// Keep only the first `n` completed rows, dropping the rest **and** any
     /// row under construction.
+    ///
+    /// The remembered record goes with them: it was in the bytes just cut, and
+    /// leaving it behind would let a later `push_field_in_line` address a
+    /// record that is no longer there.
     fn truncate_rows(&mut self, n: usize) {
         let start = self.bounds[n.min(self.len())];
         self.bounds.truncate(n + 1);
         self.fields.truncate(start.field);
         self.buf.truncate(start.byte);
+        self.line = 0..0;
     }
 }
 
@@ -476,10 +492,10 @@ mod tests {
     /// arena once, then a span per field — and a rewritten field appended after
     /// it, out of the record's own order.
     fn push_record(batch: &mut RowBatch, record: &str, fields: &[Result<(usize, usize), &str>]) {
-        let base = batch.push_line(record);
+        batch.push_line(record);
         for field in fields {
             match field {
-                Ok((start, end)) => batch.push_field_at(base + start, base + end),
+                Ok((start, end)) => batch.push_field_in_line(*start..*end),
                 Err(rewritten) => batch.push_field(rewritten),
             }
         }
