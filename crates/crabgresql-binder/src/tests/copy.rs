@@ -90,7 +90,7 @@ fn copy_parses_fields_straight_into_values() -> anyhow::Result<()> {
         &plan,
         vec![vec![field("7"), field("8"), field("hi"), field("t")]],
     )?;
-    let InsertSource::Tuples { rows, defaults } = source else {
+    let InsertSource::Tuples { rows, defaults, .. } = source else {
         bail!("expected a Tuples source");
     };
     assert!(defaults.is_empty(), "no column here has a default to defer");
@@ -220,7 +220,8 @@ fn copy_defers_a_default_that_does_not_fold() -> anyhow::Result<()> {
     }
     let engine: Arc<dyn TableEngine> = engine;
     let plan = copy_plan(&engine, "COPY d (id) FROM stdin")?;
-    let InsertSource::Tuples { rows, defaults } = copy_rows(&plan, vec![vec![field("1")]])? else {
+    let InsertSource::Tuples { rows, defaults, .. } = copy_rows(&plan, vec![vec![field("1")]])?
+    else {
         bail!("expected a Tuples source");
     };
     assert_eq!(

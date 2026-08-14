@@ -342,10 +342,12 @@ pub enum PhysicalInsertSource {
     Values(Vec<Vec<BoundExpr>>),
     /// Rows whose cells are already values, mirroring [`InsertSource::Tuples`].
     /// `defaults` names the columns whose `DEFAULT` still needs evaluating once
-    /// per row.
+    /// per row, and `notnull_verified` the columns the builder already proved
+    /// non-NULL in every row.
     Tuples {
         rows: Vec<Tuple>,
         defaults: Vec<(usize, BoundExpr)>,
+        notnull_verified: Vec<u32>,
     },
     /// Rows pulled from `input`, each mapped through `projections` (full-width,
     /// schema order) evaluated against the source tuple.
@@ -931,9 +933,15 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             table,
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
-                InsertSource::Tuples { rows, defaults } => {
-                    PhysicalInsertSource::Tuples { rows, defaults }
-                }
+                InsertSource::Tuples {
+                    rows,
+                    defaults,
+                    notnull_verified,
+                } => PhysicalInsertSource::Tuples {
+                    rows,
+                    defaults,
+                    notnull_verified,
+                },
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
                     input: Box::new(lower(*input, costs)),
                     projections,

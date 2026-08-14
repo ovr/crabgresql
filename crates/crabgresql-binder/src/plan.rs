@@ -5986,6 +5986,14 @@ impl CopyFromPlan {
         // where the slot walk is already the wire order.
         let mut scattered: Vec<Value> = Vec::new();
 
+        // Whether a NULL ever landed in each data column. The check rides along
+        // with the fill below — the value is in hand there, where the executor
+        // would otherwise re-walk the finished row to find the same answer — but
+        // it does not raise: the row is still half-built here, and a violation's
+        // DETAIL renders the whole row. What ships instead is the negative
+        // result, and only for columns where it held for every row.
+        let mut null_seen = vec![false; self.target_indices.len()];
+
         let mut tuples = Vec::with_capacity(rows.len());
         for fields in rows.iter() {
             self.check_arity(fields.len())?;
@@ -6002,24 +6010,42 @@ impl CopyFromPlan {
                 tuple.push(match slot {
                     CopySlot::Null => Value::Null,
                     CopySlot::Const(value) => value.clone(),
-                    CopySlot::Field(k) if self.rows.ordered => self.field_value(
-                        fields.get(*k),
-                        self.target_indices[*k],
-                        enums[*k].as_ref(),
-                        fmt,
-                    )?,
-                    // Already parsed above, in wire order; move it out rather
-                    // than clone it.
-                    CopySlot::Field(k) => std::mem::replace(&mut scattered[*k], Value::Null),
+                    CopySlot::Field(k) => {
+                        let value = match self.rows.ordered {
+                            true => self.field_value(
+                                fields.get(*k),
+                                self.target_indices[*k],
+                                enums[*k].as_ref(),
+                                fmt,
+                            )?,
+                            // Already parsed above, in wire order; move it out
+                            // rather than clone it.
+                            false => std::mem::replace(&mut scattered[*k], Value::Null),
+                        };
+                        null_seen[*k] |= matches!(value, Value::Null);
+                        value
+                    }
                 });
             }
             tuples.push(tuple);
         }
+        // Ascending, because `target_indices` need not be: a column list may name
+        // the columns in any order, and the executor merges this against the
+        // schema in one pass.
+        let mut notnull_verified: Vec<u32> = self
+            .target_indices
+            .iter()
+            .zip(&null_seen)
+            .filter(|&(_, &seen)| !seen)
+            .map(|(&idx, _)| idx as u32)
+            .collect();
+        notnull_verified.sort_unstable();
         Ok(LogicalPlan::Insert(InsertPlan {
             table: self.table.clone(),
             source: InsertSource::Tuples {
                 rows: tuples,
                 defaults: self.rows.defaults.clone(),
+                notnull_verified,
             },
             returning: None,
             // A partitioned parent routes each decoded row to a leaf, reusing the
