@@ -8,16 +8,16 @@
 //! allocated once per field — and threw most of those allocations away one
 //! statement later, which on a bulk load is the dominant malloc traffic.
 //!
-//! [`RowBatch`] holds the batch's field bytes in one arena and addresses each
+//! [`RowBatch`] holds the batch's field text in one arena and addresses each
 //! field by span, so decoding a batch costs a handful of amortized `Vec` growth
 //! steps rather than a `String` per cell. A text column still pays its one
 //! allocation, but it pays it where the value is actually built.
 //!
 //! The batch is the unit of reuse: a decoder fills one, the load consumes it by
-//! reference, and [`RowBatch::clear`] hands the allocations back for the next
-//! batch.
+//! reference, and [`RowBatch::split_into`] hands the allocations back for the
+//! next batch.
 
-/// One field's bytes inside a [`RowBatch`]'s arena, or the NULL marker.
+/// One field's text inside a [`RowBatch`]'s arena, or the NULL marker.
 ///
 /// A NULL is a sentinel span rather than an `Option<FieldSpan>` so the field
 /// vector stays a flat array of two `usize`s; `start == NULL_FIELD` cannot
@@ -43,27 +43,43 @@ impl FieldSpan {
     fn is_null(self) -> bool {
         self.start == NULL_FIELD
     }
+
+    /// The same field, addressed from `base` rather than from 0. A NULL has no
+    /// offset to move.
+    fn rebased(self, base: usize) -> Self {
+        if self.is_null() {
+            self
+        } else {
+            FieldSpan {
+                start: self.start - base,
+                end: self.end - base,
+            }
+        }
+    }
 }
 
 /// Where a row begins, in both of the batch's arrays. The byte offset is
 /// recorded per row rather than derived from the row's first field, so a row
 /// whose every field is NULL still has a splitting point — see
-/// [`RowBatch::move_rows_from`].
+/// [`RowBatch::split_into`].
 #[derive(Clone, Copy, Debug)]
 struct RowStart {
     field: usize,
     byte: usize,
 }
 
-/// A batch of decoded `COPY` rows: the field bytes in one arena, addressed by
+/// The boundary a batch with no rows starts from.
+const ORIGIN: RowStart = RowStart { field: 0, byte: 0 };
+
+/// A batch of decoded `COPY` rows: the field text in one arena, addressed by
 /// span.
 ///
 /// Fields are appended left to right through [`push_field`](Self::push_field)
 /// and [`push_null`](Self::push_null), and a row is closed with
 /// [`end_row`](Self::end_row). Only *completed* fields ever reach the arena —
 /// a decoder that builds a field incrementally keeps it in its own scratch
-/// buffer — which is what lets [`clear`](Self::clear) and the batch split be
-/// unconditional.
+/// buffer — which is what lets [`split_into`](Self::split_into) be a matter of
+/// moving whole rows rather than of rebasing a half-built one.
 ///
 /// ```
 /// use crabgresql_binder::RowBatch;
@@ -79,72 +95,88 @@ struct RowStart {
 /// assert_eq!(row.get(0), Some("1"));
 /// assert_eq!(row.get(1), None);
 /// ```
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct RowBatch {
     /// Every completed field's text, concatenated.
     ///
     /// A `String` and not a `Vec<u8>`: the decoder has to run the UTF-8 check
     /// anyway — it is the layer that can report a bad byte as PostgreSQL's
     /// `CHARACTER_NOT_IN_REPERTOIRE` at the right point in the stream — so
-    /// taking its `&str` here means a field is validated once for the load
-    /// rather than again on every read. Field spans are on field boundaries,
+    /// taking its `&str` here means the input is validated once for the load
+    /// rather than again on every read. Field spans fall on field boundaries,
     /// which are char boundaries, so every slice below is infallible.
     buf: String,
     fields: Vec<FieldSpan>,
-    /// One entry per *completed* row. Fields pushed since the last
-    /// [`end_row`](Self::end_row) belong to the row under construction and are
-    /// not visible to readers yet.
-    rows: Vec<RowStart>,
-    /// Where the row under construction starts — one past the last field, and
-    /// one past the last byte, of the last completed row.
-    open_field: usize,
-    open_byte: usize,
+    /// Row boundaries: `n + 1` entries for `n` completed rows, so row `i`
+    /// spans `bounds[i]..bounds[i + 1]`. The trailing entry is where the row
+    /// under construction begins — keeping it here rather than in a separate
+    /// pair of "open row" fields is what removes the last-row special case
+    /// from the readers and the hand-sync from every mutator.
+    bounds: Vec<RowStart>,
+}
+
+impl Default for RowBatch {
+    fn default() -> Self {
+        RowBatch::new()
+    }
 }
 
 impl RowBatch {
     pub fn new() -> Self {
-        RowBatch::default()
+        RowBatch {
+            buf: String::new(),
+            fields: Vec::new(),
+            bounds: vec![ORIGIN],
+        }
+    }
+
+    /// A batch sized for `bytes` of input, for the one-shot path that has the
+    /// whole stream in hand and would otherwise grow the arena by doubling.
+    pub fn with_capacity(bytes: usize) -> Self {
+        RowBatch {
+            buf: String::with_capacity(bytes),
+            ..RowBatch::new()
+        }
     }
 
     /// Completed rows. Fields of a row still being built do not count.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.bounds.len() - 1
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len() == 0
     }
 
     /// The fields of completed row `index`.
     ///
     /// # Panics
     /// If `index` is not a completed row.
-    pub fn row(&self, index: usize) -> Row<'_> {
-        let start = self.rows[index].field;
-        let end = match self.rows.get(index + 1) {
-            Some(next) => next.field,
-            None => self.open_field,
-        };
-        Row {
+    pub fn row(&self, index: usize) -> CopyRow<'_> {
+        CopyRow {
             buf: &self.buf,
-            fields: &self.fields[start..end],
+            fields: &self.fields[self.bounds[index].field..self.bounds[index + 1].field],
         }
     }
 
     /// Every completed row, in order.
-    pub fn iter(&self) -> RowBatchIter<'_> {
-        RowBatchIter {
-            batch: self,
-            next: 0,
-            end: self.rows.len(),
-        }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = CopyRow<'_>> {
+        (0..self.len()).map(|i| self.row(i))
     }
 
     /// Number of fields pushed into the row currently under construction —
     /// equivalently, the index the next field will take, which is what
     /// `FORCE_NOT_NULL` is keyed on.
     pub fn current_row_len(&self) -> usize {
-        self.fields.len() - self.open_field
+        self.fields.len() - self.open().field
+    }
+
+    /// Where the row under construction begins.
+    fn open(&self) -> RowStart {
+        *self
+            .bounds
+            .last()
+            .expect("the origin boundary is never popped")
     }
 
     /// Append a completed field.
@@ -164,12 +196,10 @@ impl RowBatch {
 
     /// Close the row built by the pushes since the last `end_row`.
     pub fn end_row(&mut self) {
-        self.rows.push(RowStart {
-            field: self.open_field,
-            byte: self.open_byte,
+        self.bounds.push(RowStart {
+            field: self.fields.len(),
+            byte: self.buf.len(),
         });
-        self.open_field = self.fields.len();
-        self.open_byte = self.buf.len();
     }
 
     /// Drop the row just closed by [`end_row`](Self::end_row), releasing its
@@ -180,129 +210,70 @@ impl RowBatch {
     /// # Panics
     /// If no row has been completed.
     pub fn pop_row(&mut self) {
-        let start = self.rows.pop().expect("a completed row to drop");
-        self.rewind_to(start);
+        assert!(!self.is_empty(), "no completed row to drop");
+        self.truncate_rows(self.len() - 1);
+    }
+
+    /// Split the batch in two: the first `n` rows move to `out`, and the rest
+    /// — including the row still under construction, whose completed fields
+    /// are already in the arena — stay here.
+    ///
+    /// A split lands wherever the batch filled up, which for CSV is routinely
+    /// in the middle of a record, so carrying the open row is the common case
+    /// rather than an edge one.
+    ///
+    /// `out`'s previous contents are dropped and its buffers are handed over
+    /// here, so a load that flushes batch after batch settles into reusing two
+    /// sets of allocations. The bulk of the data is *swapped* rather than
+    /// copied; only the tail past `n` is moved byte-wise.
+    ///
+    /// # Panics
+    /// If `n` exceeds the completed rows.
+    pub fn split_into(&mut self, n: usize, out: &mut RowBatch) {
+        out.clear();
+        std::mem::swap(self, out);
+        // `self` now holds `out`'s recycled — and empty — buffers, so the tail
+        // rebases onto offset zero and needs no shift beyond `base`.
+        let base = out.bounds[n];
+        self.buf.push_str(&out.buf[base.byte..]);
+        self.fields.extend(
+            out.fields[base.field..]
+                .iter()
+                .map(|f| f.rebased(base.byte)),
+        );
+        self.bounds
+            .extend(out.bounds[n + 1..].iter().map(|b| RowStart {
+                field: b.field - base.field,
+                byte: b.byte - base.byte,
+            }));
+        out.truncate_rows(n);
     }
 
     /// Drop every row, keeping the allocations for the next batch.
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.buf.clear();
         self.fields.clear();
-        self.rows.clear();
-        self.open_field = 0;
-        self.open_byte = 0;
+        self.bounds.truncate(1);
     }
 
     /// Keep only the first `n` completed rows, dropping the rest **and** any
     /// row under construction.
-    pub fn truncate_rows(&mut self, n: usize) {
-        if n < self.rows.len() {
-            let start = self.rows[n];
-            self.rows.truncate(n);
-            self.rewind_to(start);
-        } else {
-            // Every completed row is kept; only the open row's fields go.
-            self.fields.truncate(self.open_field);
-            self.buf.truncate(self.open_byte);
-        }
-    }
-
-    fn rewind_to(&mut self, start: RowStart) {
+    fn truncate_rows(&mut self, n: usize) {
+        let start = self.bounds[n.min(self.len())];
+        self.bounds.truncate(n + 1);
         self.fields.truncate(start.field);
         self.buf.truncate(start.byte);
-        self.open_field = start.field;
-        self.open_byte = start.byte;
-    }
-
-    /// Append `src`'s rows from `from` onward — completed rows **and** the row
-    /// still under construction — rebasing their spans onto this arena.
-    ///
-    /// With [`truncate_rows`](Self::truncate_rows) this is the batch split:
-    /// swap the full batch out to the consumer, move the short tail back,
-    /// truncate the consumer's copy to the batch size. The large half is moved
-    /// rather than copied; only the tail — at most one read chunk's worth of
-    /// rows — is memcpy'd.
-    ///
-    /// Carrying the open row is not an edge case but the common one: a split
-    /// lands wherever the batch filled up, which for CSV is routinely in the
-    /// middle of a record whose earlier fields are already in the arena.
-    ///
-    /// # Panics
-    /// If `from` is past `src`'s completed rows.
-    pub fn move_rows_from(&mut self, src: &RowBatch, from: usize) {
-        let base = match src.rows.get(from) {
-            Some(&start) => start,
-            None => {
-                assert_eq!(from, src.rows.len(), "split point past the batch");
-                RowStart {
-                    field: src.open_field,
-                    byte: src.open_byte,
-                }
-            }
-        };
-
-        let byte_shift = self.buf.len();
-        self.buf.push_str(&src.buf[base.byte..]);
-
-        let field_shift = self.fields.len();
-        self.fields.extend(src.fields[base.field..].iter().map(|f| {
-            if f.is_null() {
-                FieldSpan::null()
-            } else {
-                FieldSpan {
-                    start: f.start - base.byte + byte_shift,
-                    end: f.end - base.byte + byte_shift,
-                }
-            }
-        }));
-
-        self.rows.extend(src.rows[from..].iter().map(|r| RowStart {
-            field: r.field - base.field + field_shift,
-            byte: r.byte - base.byte + byte_shift,
-        }));
-        // The open row keeps its identity across the move: the fields it has
-        // collected so far are now this batch's open row.
-        self.open_field = src.open_field - base.field + field_shift;
-        self.open_byte = src.open_byte - base.byte + byte_shift;
     }
 }
 
-/// [`RowBatch::iter`]'s iterator: an owned cursor rather than a closure, so its
-/// item borrows the batch and not the iterator.
-pub struct RowBatchIter<'a> {
-    batch: &'a RowBatch,
-    next: usize,
-    end: usize,
-}
-
-impl<'a> Iterator for RowBatchIter<'a> {
-    type Item = Row<'a>;
-
-    fn next(&mut self) -> Option<Row<'a>> {
-        if self.next == self.end {
-            return None;
-        }
-        let row = self.batch.row(self.next);
-        self.next += 1;
-        Some(row)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let left = self.end - self.next;
-        (left, Some(left))
-    }
-}
-
-impl ExactSizeIterator for RowBatchIter<'_> {}
-
-/// The fields of one row, borrowed from the batch's arena.
+/// The fields of one `COPY` row, borrowed from the batch's arena.
 #[derive(Clone, Copy, Debug)]
-pub struct Row<'a> {
+pub struct CopyRow<'a> {
     buf: &'a str,
     fields: &'a [FieldSpan],
 }
 
-impl<'a> Row<'a> {
+impl<'a> CopyRow<'a> {
     pub fn len(&self) -> usize {
         self.fields.len()
     }
@@ -313,55 +284,18 @@ impl<'a> Row<'a> {
 
     /// Field `index`, or `None` when it matched the NULL representation.
     pub fn get(&self, index: usize) -> Option<&'a str> {
-        let span = self.fields[index];
-        if span.is_null() {
-            return None;
-        }
-        Some(&self.buf[span.start..span.end])
+        self.field(self.fields[index])
     }
 
-    pub fn iter(&self) -> RowIter<'a> {
-        RowIter {
-            row: *self,
-            next: 0,
-        }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<&'a str>> {
+        let row = *self;
+        self.fields.iter().map(move |&span| row.field(span))
+    }
+
+    fn field(&self, span: FieldSpan) -> Option<&'a str> {
+        (!span.is_null()).then(|| &self.buf[span.start..span.end])
     }
 }
-
-impl<'a> IntoIterator for Row<'a> {
-    type Item = Option<&'a str>;
-    type IntoIter = RowIter<'a>;
-
-    fn into_iter(self) -> RowIter<'a> {
-        self.iter()
-    }
-}
-
-/// [`Row::iter`]'s iterator over `Option<&str>` fields.
-pub struct RowIter<'a> {
-    row: Row<'a>,
-    next: usize,
-}
-
-impl<'a> Iterator for RowIter<'a> {
-    type Item = Option<&'a str>;
-
-    fn next(&mut self) -> Option<Option<&'a str>> {
-        if self.next == self.row.fields.len() {
-            return None;
-        }
-        let field = self.row.get(self.next);
-        self.next += 1;
-        Some(field)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let left = self.row.fields.len() - self.next;
-        (left, Some(left))
-    }
-}
-
-impl ExactSizeIterator for RowIter<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -385,11 +319,7 @@ mod tests {
     fn owned(batch: &RowBatch) -> Vec<Vec<Option<String>>> {
         batch
             .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|f| f.map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-            })
+            .map(|row| row.iter().map(|f| f.map(String::from)).collect())
             .collect()
     }
 
@@ -435,17 +365,16 @@ mod tests {
         );
     }
 
-    /// The split: the head goes to the consumer, the tail comes back rebased.
+    /// The head goes to the consumer, the tail stays behind, rebased.
     #[test]
     fn a_split_batch_keeps_every_row_intact() {
         let all: Vec<Vec<Option<&str>>> = (0..7)
             .map(|i| vec![Some("row"), None, Some(["a", "bb", "ccc"][i % 3])])
             .collect();
         for at in 0..=all.len() {
-            let mut head = batch_of(&all);
-            let mut tail = RowBatch::new();
-            tail.move_rows_from(&head, at);
-            head.truncate_rows(at);
+            let mut tail = batch_of(&all);
+            let mut head = RowBatch::new();
+            tail.split_into(at, &mut head);
 
             assert_eq!(head.len(), at);
             assert_eq!(tail.len(), all.len() - at);
@@ -466,13 +395,12 @@ mod tests {
     #[test]
     fn a_split_carries_the_row_under_construction() {
         for at in 0..=2 {
-            let mut head = batch_of(&[vec![Some("a")], vec![Some("b")]]);
-            head.push_field("partial");
-            head.push_null();
+            let mut tail = batch_of(&[vec![Some("a")], vec![Some("b")]]);
+            tail.push_field("partial");
+            tail.push_null();
 
-            let mut tail = RowBatch::new();
-            tail.move_rows_from(&head, at);
-            head.truncate_rows(at);
+            let mut head = RowBatch::new();
+            tail.split_into(at, &mut head);
 
             assert_eq!(head.len(), at, "split at {at}");
             assert_eq!(tail.current_row_len(), 2, "split at {at}");

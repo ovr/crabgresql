@@ -5,9 +5,9 @@
 //! field strings per a resolved [`CopyFormat`] — text-format backslash escapes
 //! and the `\N` NULL marker, or CSV quoting with `""` doubling. Decoding is
 //! **byte-oriented** (as PostgreSQL's COPY is): escapes produce raw bytes,
-//! multi-byte UTF-8 flows through untouched, and each completed field is
-//! validated as UTF-8 only at the end — so an escaped multi-byte character
-//! round-trips and an invalid byte (or NUL) errors exactly as PG does. It never
+//! multi-byte UTF-8 flows through untouched, and the encoding check runs over
+//! the raw input rather than per parsed value — so an escaped multi-byte
+//! character round-trips and an invalid byte (or NUL) errors as PG does. It never
 //! parses values into a type: that is
 //! [`crabgresql_binder::CopyFromPlan::build_insert`]'s job. `None` marks a field
 //! that matched the NULL representation.
@@ -33,7 +33,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use crabgresql_binder::{CopyFormat, CopyHeader, Row, RowBatch};
+use crabgresql_binder::{CopyFormat, CopyHeader, CopyRow, RowBatch};
 use crabgresql_pg_wire::sqlstate;
 
 use crate::copy_access::CopyFileAccess;
@@ -60,7 +60,7 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024 * 1024 - 1;
 /// table's own order, so `COPY t (b, a) … HEADER match` wants `b,a`. A NULL
 /// field cannot name a column, so it compares as the empty string and fails the
 /// way any other wrong name does.
-fn check_header_names(header: Row<'_>, expected: &[String]) -> Result<(), PgError> {
+fn check_header_names(header: CopyRow<'_>, expected: &[String]) -> Result<(), PgError> {
     if header.len() != expected.len() {
         return Err(bad_copy(format!(
             "wrong number of fields in header line: got {}, expected {}",
@@ -116,6 +116,9 @@ fn validate_field(bytes: &[u8]) -> Result<&str, PgError> {
 /// hand; a file is decoded incrementally through [`CopyDecoder`].
 pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<RowBatch, PgError> {
     let mut decoder = CopyDecoder::new(format);
+    // The whole stream is in hand, so the arena is sized once instead of
+    // doubling its way there. It cannot need more than the input.
+    decoder.batch = RowBatch::with_capacity(bytes.len());
     decoder.push(bytes)?;
     decoder.finish()?;
     Ok(decoder.into_batch())
@@ -217,20 +220,9 @@ impl CopyDecoder {
 
     /// Move the first `n` completed rows into `out`, leaving the decoder with
     /// the rest — including the record it is still building, whose finished
-    /// fields are already in the batch.
-    ///
-    /// `out`'s previous contents are dropped and its allocations are handed to
-    /// the decoder, so a load that flushes batch after batch settles into
-    /// reusing two sets of buffers. The bulk of the data is *swapped* rather
-    /// than copied; only the short tail past `n` is moved byte-wise.
-    ///
-    /// # Panics
-    /// If `n` exceeds the completed rows.
+    /// fields are already in the batch. See [`RowBatch::split_into`].
     pub fn take_batch_into(&mut self, n: usize, out: &mut RowBatch) {
-        out.clear();
-        std::mem::swap(&mut self.batch, out);
-        self.batch.move_rows_from(out, n);
-        out.truncate_rows(n);
+        self.batch.split_into(n, out);
     }
 
     /// Consume `bytes`, adding every record they complete to the batch.
@@ -315,34 +307,45 @@ impl CopyDecoder {
             self.line.pop();
         }
         self.record_bytes = 0;
+        let outcome = self.take_text_line();
+        // One clear on every path, including the error one, rather than an
+        // invariant each early return has to remember.
+        self.line.clear();
+        outcome
+    }
+
+    /// The accumulated line as a row — or as the end-of-data marker, or as the
+    /// header. The caller owns clearing `line`.
+    fn take_text_line(&mut self) -> Result<(), PgError> {
         if self.line == b"\\." {
             self.end_of_data = true;
-            self.line.clear();
             return Ok(());
         }
-        // Skipped before decoding, so a plain text HEADER line is never UTF-8
-        // checked. `MATCH` has to read the names, so it decodes first — the same
-        // asymmetry PostgreSQL has.
         if self.skip_header {
             self.skip_header = false;
+            // Skipped before decoding, so a plain text HEADER line is never
+            // UTF-8 checked. `MATCH` has to read the names, so it decodes
+            // first — the same asymmetry PostgreSQL has.
             if !matches!(self.format.header, CopyHeader::Match(_)) {
-                self.line.clear();
                 return Ok(());
             }
             self.decode_text_line()?;
-            let check = match &self.format.header {
-                CopyHeader::Match(expected) => {
-                    check_header_names(self.batch.row(self.batch.len() - 1), expected)
-                }
-                _ => unreachable!("checked just above"),
-            };
-            self.batch.pop_row();
-            self.line.clear();
-            return check;
+            return self.consume_header_row();
         }
-        self.decode_text_line()?;
-        self.line.clear();
-        Ok(())
+        self.decode_text_line()
+    }
+
+    /// Check the row just closed as the `HEADER` line against the statement's
+    /// column list, then drop it — a header is not data.
+    fn consume_header_row(&mut self) -> Result<(), PgError> {
+        let check = match &self.format.header {
+            CopyHeader::Match(expected) => {
+                check_header_names(self.batch.row(self.batch.len() - 1), expected)
+            }
+            _ => Ok(()),
+        };
+        self.batch.pop_row();
+        check
     }
 
     /// Split the accumulated raw line into fields on unescaped delimiters and
@@ -361,14 +364,24 @@ impl CopyDecoder {
             format,
             ..
         } = self;
-        let (delimiter, null) = (format.delimiter, format.null.as_bytes());
+        let (delimiter, null) = (format.delimiter, format.null.as_str());
+        // The encoding check runs once for the line rather than once per field.
+        // It reports the same leftmost bad byte either way — and it is what PG
+        // does, which converts the input's encoding before it parses fields —
+        // while a 100-column row would otherwise pay 100 calls over a handful
+        // of bytes each, never reaching the vectorized path. Only a field the
+        // escape decoder rewrites is re-checked, below.
+        let line = validate_field(line)?;
 
         let mut start = 0;
         let mut i = 0;
         // Whether the field starting at `start` contains a backslash.
         let mut escaped = false;
+        // Splitting on bytes keeps every index on a char boundary: the
+        // delimiter is a single ASCII byte (the binder rejects any other), and
+        // a UTF-8 continuation byte can never equal one.
         while i < line.len() {
-            match line[i] {
+            match line.as_bytes()[i] {
                 // A backslash always consumes the next byte, so a `\<delim>`
                 // never splits.
                 b'\\' => {
@@ -480,15 +493,27 @@ impl CopyDecoder {
         Ok(())
     }
 
+    /// Finish the current CSV field, applying the NULL rule (an unquoted match
+    /// only) and validating the bytes as UTF-8.
+    ///
+    /// The scratch buffer is emptied for the next field whether or not the
+    /// validation passed, so its state never depends on the error path.
     fn finish_csv_field(&mut self) -> Result<(), PgError> {
-        let force = force_not_null_at(&self.format, self.batch.current_row_len());
-        finish_csv_field(
-            &mut self.csv.field,
-            &mut self.csv.was_quoted,
-            &mut self.batch,
-            self.format.null.as_bytes(),
-            force,
-        )
+        let CopyDecoder {
+            csv, batch, format, ..
+        } = self;
+        let force_not_null = format.force_not_null.contains(&batch.current_row_len());
+        let is_null =
+            !csv.was_quoted && !force_not_null && csv.field.as_slice() == format.null.as_bytes();
+        csv.was_quoted = false;
+        let outcome = if is_null {
+            batch.push_null();
+            Ok(())
+        } else {
+            validate_field(&csv.field).map(|text| batch.push_field(text))
+        };
+        csv.field.clear();
+        outcome
     }
 
     fn end_csv_record(&mut self) -> Result<(), PgError> {
@@ -509,14 +534,7 @@ impl CopyDecoder {
         // the asymmetry with the text format is PG's.
         if self.skip_header {
             self.skip_header = false;
-            let check = match &self.format.header {
-                CopyHeader::Match(expected) => {
-                    check_header_names(self.batch.row(self.batch.len() - 1), expected)
-                }
-                _ => Ok(()),
-            };
-            self.batch.pop_row();
-            return check;
+            return self.consume_header_row();
         }
         Ok(())
     }
@@ -555,27 +573,27 @@ fn record_too_long(have: usize, added: usize, max: usize) -> PgError {
 /// Append one raw (still-escaped) text field to the batch.
 ///
 /// `escaped` is what the splitting scan already learned — whether this field
-/// contains a backslash — so the common field goes into the arena as the bytes
-/// that arrived, with no de-escaping pass and no buffer of its own.
+/// contains a backslash — so the common field goes into the arena as the text
+/// that arrived, with no de-escaping pass, no buffer of its own, and no second
+/// encoding check: the line it is a slice of has already passed one. Only an
+/// escape decode can produce bytes the line did not contain (`\351`), so only
+/// that path validates.
 fn push_text_field(
-    raw: &[u8],
+    raw: &str,
     escaped: bool,
-    null: &[u8],
+    null: &str,
     batch: &mut RowBatch,
     unescaped: &mut Vec<u8>,
 ) -> Result<(), PgError> {
     if raw == null {
         batch.push_null();
-        return Ok(());
-    }
-    let bytes = if escaped {
+    } else if escaped {
         unescaped.clear();
-        unescape_text_into(raw, unescaped);
-        unescaped.as_slice()
+        unescape_text_into(raw.as_bytes(), unescaped);
+        batch.push_field(validate_field(unescaped)?);
     } else {
-        raw
-    };
-    batch.push_field(validate_field(bytes)?);
+        batch.push_field(raw);
+    }
     Ok(())
 }
 
@@ -645,34 +663,6 @@ fn unescape_text_into(raw: &[u8], out: &mut Vec<u8>) {
             other => out.push(other),
         }
     }
-}
-
-/// Finish the current CSV field, applying the NULL rule (an unquoted match only)
-/// and validating the bytes as UTF-8.
-///
-/// `field` is emptied for the next field whether or not the validation passed,
-/// so the scratch buffer's state never depends on the error path.
-fn finish_csv_field(
-    field: &mut Vec<u8>,
-    was_quoted: &mut bool,
-    batch: &mut RowBatch,
-    null: &[u8],
-    force_not_null: bool,
-) -> Result<(), PgError> {
-    let is_null = !*was_quoted && !force_not_null && field.as_slice() == null;
-    *was_quoted = false;
-    let outcome = if is_null {
-        batch.push_null();
-        Ok(())
-    } else {
-        validate_field(field).map(|text| batch.push_field(text))
-    };
-    field.clear();
-    outcome
-}
-
-fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
-    format.force_not_null.contains(&field_index)
 }
 
 /// Stream an already-opened COPY source file, handing the decoded rows to `sink`
@@ -838,9 +828,10 @@ mod tests {
             .collect()
     }
 
-    /// Shadows [`super::decode`] so every expectation stays in owned rows.
-    fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
-        super::decode(format, bytes).map(|batch| owned(&batch))
+    /// [`decode`] with its rows read back as owned values, which is how every
+    /// expectation below is written.
+    fn decode_owned(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
+        decode(format, bytes).map(|batch| owned(&batch))
     }
 
     fn text_format() -> CopyFormat {
@@ -895,7 +886,7 @@ mod tests {
 
     #[test]
     fn text_basic_tab_rows() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"1\thello\n2\tworld\n")?;
+        let rows = decode_owned(&text_format(), b"1\thello\n2\tworld\n")?;
         assert_eq!(
             rows,
             vec![
@@ -908,7 +899,7 @@ mod tests {
 
     #[test]
     fn text_null_marker_and_empty_field() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"1\t\\N\n2\t\n")?;
+        let rows = decode_owned(&text_format(), b"1\t\\N\n2\t\n")?;
         assert_eq!(
             rows,
             vec![
@@ -921,7 +912,7 @@ mod tests {
 
     #[test]
     fn text_escapes() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"a\\tb\tc\\\\d\te\\061f\n")?;
+        let rows = decode_owned(&text_format(), b"a\\tb\tc\\\\d\te\\061f\n")?;
         // \t -> tab, \\ -> backslash, \061 (octal) -> '1'
         assert_eq!(
             rows,
@@ -938,39 +929,51 @@ mod tests {
     fn text_octal_and_hex_escapes_form_multibyte_utf8() -> Result<(), PgError> {
         // The three UTF-8 bytes of 日 written as octal, and é as hex — each must
         // round-trip to the single character (byte-oriented decode), not mojibake.
-        let rows = decode(&text_format(), b"\\346\\227\\245\t\\xc3\\xa9\n")?;
+        let rows = decode_owned(&text_format(), b"\\346\\227\\245\t\\xc3\\xa9\n")?;
         assert_eq!(rows, vec![vec![Some("日".into()), Some("é".into())]]);
         Ok(())
     }
 
     #[test]
     fn text_invalid_utf8_byte_errors() {
-        let err =
-            decode(&text_format(), b"\\351\n").expect_err("an invalid UTF-8 byte must be rejected");
+        let err = decode_owned(&text_format(), b"\\351\n")
+            .expect_err("an invalid UTF-8 byte must be rejected");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         assert!(err.message.contains("0xe9"), "{}", err.message);
     }
 
     #[test]
     fn text_nul_byte_errors() {
-        let err =
-            decode(&text_format(), b"a\\000b\n").expect_err("an embedded NUL must be rejected");
+        let err = decode_owned(&text_format(), b"a\\000b\n")
+            .expect_err("an embedded NUL must be rejected");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         assert!(err.message.contains("0x00"), "{}", err.message);
     }
 
+    /// The text line is encoding-checked as a whole, before it is split, so a
+    /// raw bad byte anywhere in the line is reported ahead of one an escape
+    /// would have produced later — the order PostgreSQL has, which converts the
+    /// input's encoding before it parses fields at all.
+    #[test]
+    fn the_raw_line_is_checked_before_any_escape_is_decoded() {
+        let err = decode_owned(&text_format(), b"\\351\t\xff\n")
+            .expect_err("the raw byte must be rejected");
+        assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
+        assert!(err.message.contains("0xff"), "{}", err.message);
+    }
+
     #[test]
     fn text_escaped_delimiter_does_not_split() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"a\\\tb\n")?;
+        let rows = decode_owned(&text_format(), b"a\\\tb\n")?;
         assert_eq!(rows, vec![vec![Some("a\tb".into())]]);
         Ok(())
     }
 
     #[test]
     fn text_end_of_data_marker_and_no_trailing_newline() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"1\ta\n\\.\n")?;
+        let rows = decode_owned(&text_format(), b"1\ta\n\\.\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("a".into())]]);
-        let rows = decode(&text_format(), b"9\tz")?;
+        let rows = decode_owned(&text_format(), b"9\tz")?;
         assert_eq!(rows, vec![vec![Some("9".into()), Some("z".into())]]);
         Ok(())
     }
@@ -979,14 +982,14 @@ mod tests {
     fn text_header_skips_first_line() -> Result<(), PgError> {
         let mut fmt = text_format();
         fmt.header = CopyHeader::On;
-        let rows = decode(&fmt, b"a\tb\n1\tx\n")?;
+        let rows = decode_owned(&fmt, b"a\tb\n1\tx\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("x".into())]]);
         Ok(())
     }
 
     #[test]
     fn csv_quoting_and_doubling() -> Result<(), PgError> {
-        let rows = decode(&csv_format(), b"1,\"a,b\",\"she \"\"said\"\"\"\n")?;
+        let rows = decode_owned(&csv_format(), b"1,\"a,b\",\"she \"\"said\"\"\"\n")?;
         assert_eq!(
             rows,
             vec![vec![
@@ -1002,7 +1005,7 @@ mod tests {
     fn csv_concatenates_unquoted_and_quoted_runs() -> Result<(), PgError> {
         // PG accepts a quote adjacent to unquoted content, concatenating the
         // runs: `1, "two"` -> ` two`, `ab"cd"` -> `abcd`, `"a"b"c"` -> `abc`.
-        let rows = decode(&csv_format(), b"1, \"two\"\nab\"cd\",\"a\"b\"c\"\n")?;
+        let rows = decode_owned(&csv_format(), b"1, \"two\"\nab\"cd\",\"a\"b\"c\"\n")?;
         assert_eq!(
             rows,
             vec![
@@ -1015,7 +1018,7 @@ mod tests {
 
     #[test]
     fn csv_empty_is_null_but_quoted_empty_is_text() -> Result<(), PgError> {
-        let rows = decode(&csv_format(), b"1,,\"\"\n")?;
+        let rows = decode_owned(&csv_format(), b"1,,\"\"\n")?;
         assert_eq!(
             rows,
             vec![vec![Some("1".into()), None, Some(String::new())]]
@@ -1025,7 +1028,7 @@ mod tests {
 
     #[test]
     fn csv_embedded_newline_in_quotes() -> Result<(), PgError> {
-        let rows = decode(&csv_format(), b"\"line1\nline2\",x\n")?;
+        let rows = decode_owned(&csv_format(), b"\"line1\nline2\",x\n")?;
         assert_eq!(
             rows,
             vec![vec![Some("line1\nline2".into()), Some("x".into())]]
@@ -1037,15 +1040,15 @@ mod tests {
     fn csv_force_not_null_keeps_empty_as_text() -> Result<(), PgError> {
         let mut fmt = csv_format();
         fmt.force_not_null = vec![1];
-        let rows = decode(&fmt, b"1,\n")?;
+        let rows = decode_owned(&fmt, b"1,\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some(String::new())]]);
         Ok(())
     }
 
     #[test]
     fn csv_unterminated_quote_errors() {
-        let err =
-            decode(&csv_format(), b"\"oops\n").expect_err("an unterminated quote must be rejected");
+        let err = decode_owned(&csv_format(), b"\"oops\n")
+            .expect_err("an unterminated quote must be rejected");
         assert_eq!(err.code, sqlstate::BAD_COPY_FILE_FORMAT);
     }
 
@@ -1053,17 +1056,17 @@ mod tests {
     fn csv_header_skips_first_row() -> Result<(), PgError> {
         let mut fmt = csv_format();
         fmt.header = CopyHeader::On;
-        let rows = decode(&fmt, b"a,b\n1,x\n")?;
+        let rows = decode_owned(&fmt, b"a,b\n1,x\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("x".into())]]);
         Ok(())
     }
 
     #[test]
     fn csv_end_of_data_marker() -> Result<(), PgError> {
-        let rows = decode(&csv_format(), b"1,a\n\\.\n2,b\n")?;
+        let rows = decode_owned(&csv_format(), b"1,a\n\\.\n2,b\n")?;
         assert_eq!(rows, vec![vec![Some("1".into()), Some("a".into())]]);
         // A quoted `\.` is data, not a terminator.
-        let rows = decode(&csv_format(), b"\"\\.\",x\n")?;
+        let rows = decode_owned(&csv_format(), b"\"\\.\",x\n")?;
         assert_eq!(rows, vec![vec![Some("\\.".into()), Some("x".into())]]);
         Ok(())
     }
@@ -1127,7 +1130,7 @@ mod tests {
             ("csv empty fields", csv_format(), b"1,,\"\"\n2,x,\n3,,y\n"),
         ];
         for (name, fmt, bytes) in cases {
-            let want = decode(fmt, bytes)?;
+            let want = decode_owned(fmt, bytes)?;
             for chunk in 1..=8 {
                 for batch_rows in 1..=4 {
                     assert_eq!(
@@ -1147,7 +1150,7 @@ mod tests {
     /// would show up as one field wearing another's value.
     #[test]
     fn escaped_and_plain_fields_do_not_share_a_buffer() -> Result<(), PgError> {
-        let rows = decode(&text_format(), b"a\\tb\tplain\tc\\\\d\tlonger-than-any\n")?;
+        let rows = decode_owned(&text_format(), b"a\\tb\tplain\tc\\\\d\tlonger-than-any\n")?;
         assert_eq!(
             rows,
             vec![vec![
@@ -1173,7 +1176,7 @@ mod tests {
             for chunk in 1..=16 {
                 assert_eq!(
                     decode_in_chunks(fmt, bytes, chunk)?,
-                    decode(fmt, bytes)?,
+                    decode_owned(fmt, bytes)?,
                     "{name}, chunk {chunk}"
                 );
             }
@@ -1338,7 +1341,7 @@ mod tests {
     #[test]
     fn csv_trailing_quote_at_eof_closes_the_section() -> Result<(), PgError> {
         assert_eq!(
-            decode(&csv_format(), b"1,\"a\"")?,
+            decode_owned(&csv_format(), b"1,\"a\"")?,
             vec![vec![Some("1".into()), Some("a".into())]]
         );
         Ok(())
@@ -1401,11 +1404,11 @@ mod tests {
         // asymmetry is a decision rather than an accident.
         let mut fmt = text_format();
         fmt.header = CopyHeader::On;
-        assert!(decode(&fmt, b"\\351\n1\ta\n").is_ok());
+        assert!(decode_owned(&fmt, b"\\351\n1\ta\n").is_ok());
 
         let mut fmt = csv_format();
         fmt.header = CopyHeader::On;
-        let err = decode(&fmt, b"\xff\n1,a\n").expect_err("csv validates the header");
+        let err = decode_owned(&fmt, b"\xff\n1,a\n").expect_err("csv validates the header");
         assert_eq!(err.code, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
         Ok(())
     }
