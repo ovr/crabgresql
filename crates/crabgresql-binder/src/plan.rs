@@ -24,7 +24,8 @@ use crate::expr::{
     WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
     merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
-    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column, view_expansion,
+    reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
+    view_expansion,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
@@ -5889,15 +5890,32 @@ pub struct CopyFromPlan {
     rows: CopyRowPlan,
 }
 
-/// How to build one row: what every row starts from, and what the executor still
-/// owes it.
+/// Where one column of a row comes from. Together these say how to build a
+/// tuple in one left-to-right pass, with nothing written twice.
+enum CopySlot {
+    /// The decoded field at this position in the data row (an index into
+    /// [`CopyFromPlan::target_indices`], i.e. wire order).
+    Field(usize),
+    /// A `DEFAULT` that folded to a constant. The one value a row still clones,
+    /// and only for the columns COPY does not carry.
+    Const(Value),
+    /// No value here: a column with no `DEFAULT`, or one whose `DEFAULT` the
+    /// executor evaluates per row (see `defaults`).
+    Null,
+}
+
+/// How to build one row: where each column's value comes from, and what the
+/// executor still owes it.
 struct CopyRowPlan {
-    /// Full-width row template in schema order: a column whose `DEFAULT` folded
-    /// to a constant holds it, everything else holds NULL. Target columns are
-    /// overwritten by the decoded field, and the columns below by the executor,
-    /// so leaving those slots NULL avoids cloning a value that is about to be
-    /// replaced.
-    template: Vec<Value>,
+    /// One slot per schema column, in schema order.
+    slots: Vec<CopySlot>,
+    /// Whether the target columns ascend, i.e. whether walking `slots` left to
+    /// right reads the data fields in wire order. True for every COPY without a
+    /// column list, and for any list written in schema order; false only for a
+    /// reordered list like `COPY t (b, a)`, where the fields must still be
+    /// *parsed* in wire order so a row with two bad fields reports the error
+    /// PostgreSQL reports — see `build_insert`.
+    ordered: bool,
     /// Columns whose `DEFAULT` did not fold, ascending. Handed to the executor,
     /// which evaluates them once per row.
     ///
@@ -5962,34 +5980,38 @@ impl CopyFromPlan {
             })
             .collect();
 
+        // A reordered column list parses into this first, so the fields are read
+        // in wire order while the tuple is still assembled in schema order.
+        // Allocated once for the batch — and not at all for the ordered case,
+        // where the slot walk is already the wire order.
+        let mut scattered: Vec<Value> = Vec::new();
+
         let mut tuples = Vec::with_capacity(rows.len());
         for fields in rows.iter() {
             self.check_arity(fields.len())?;
-            let mut tuple = self.rows.template.clone();
-            for ((field, &idx), enum_info) in fields.iter().zip(&self.target_indices).zip(&enums) {
-                let column = &self.schema.columns[idx];
-                tuple[idx] = match field {
-                    // The NULL marker: a genuine SQL NULL, not the column
-                    // default, and it takes no typmod.
-                    None => Value::Null,
-                    Some(text) => {
-                        let value = match enum_info {
-                            Some(info) => {
-                                let PgType::User(oid) = column.ty else {
-                                    unreachable!("only a user type resolves an enum")
-                                };
-                                enum_value(oid, info, text)?
-                            }
-                            // Anything else, including a user type that is not
-                            // an enum: the input dispatch handles it, naming the
-                            // type `user-defined` the way the expression path
-                            // does. Reachable, because dropping a type a column
-                            // still uses is allowed here.
-                            None => parse_unknown(text, column.ty, fmt)?,
-                        };
-                        apply_column_typmod(value, column)?
-                    }
-                };
+            if !self.rows.ordered {
+                scattered.clear();
+                for ((field, &idx), enum_info) in
+                    fields.iter().zip(&self.target_indices).zip(&enums)
+                {
+                    scattered.push(self.field_value(field, idx, enum_info.as_ref(), fmt)?);
+                }
+            }
+            let mut tuple = Vec::with_capacity(self.rows.slots.len());
+            for slot in &self.rows.slots {
+                tuple.push(match slot {
+                    CopySlot::Null => Value::Null,
+                    CopySlot::Const(value) => value.clone(),
+                    CopySlot::Field(k) if self.rows.ordered => self.field_value(
+                        fields.get(*k),
+                        self.target_indices[*k],
+                        enums[*k].as_ref(),
+                        fmt,
+                    )?,
+                    // Already parsed above, in wire order; move it out rather
+                    // than clone it.
+                    CopySlot::Field(k) => std::mem::replace(&mut scattered[*k], Value::Null),
+                });
             }
             tuples.push(tuple);
         }
@@ -6009,6 +6031,45 @@ impl CopyFromPlan {
             // COPY has no RETURNING, so nothing can read a system column.
             tableoid: false,
         }))
+    }
+
+    /// One decoded field as its column's [`Value`]: `None` is the NULL marker,
+    /// anything else parses through the column's input function and then its
+    /// length rule. `enum_info` is the column's labels when it is an enum,
+    /// resolved once per batch by the caller.
+    fn field_value(
+        &self,
+        field: Option<&str>,
+        idx: usize,
+        enum_info: Option<&EnumInfo>,
+        fmt: &FmtCtx,
+    ) -> Result<Value, BindError> {
+        // The NULL marker: a genuine SQL NULL, not the column default, and it
+        // takes no typmod.
+        let Some(text) = field else {
+            return Ok(Value::Null);
+        };
+        let column = &self.schema.columns[idx];
+        if let Some(info) = enum_info {
+            let PgType::User(oid) = column.ty else {
+                unreachable!("only a user type resolves an enum")
+            };
+            return apply_column_typmod(enum_value(oid, info, text)?, column);
+        }
+        match column.ty {
+            // The text family goes straight from the batch's arena to the
+            // finished value: parsing it into a `String` first, only for the
+            // length rule to read that `String` and build another, is the one
+            // allocation a load can drop outright.
+            PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
+                text_column_value(text, column)
+            }
+            // Anything else, including a user type that is not an enum: the
+            // input dispatch handles it, naming the type `user-defined` the way
+            // the expression path does. Reachable, because dropping a type a
+            // column still uses is allowed here.
+            _ => apply_column_typmod(parse_unknown(text, column.ty, fmt)?, column),
+        }
     }
 
     /// A data row must supply exactly the columns the statement named.
@@ -6191,32 +6252,33 @@ fn build_row_plan(
     target_indices: &[usize],
     defaults: Vec<BoundExpr>,
 ) -> CopyRowPlan {
-    // Which slots the decoded fields will overwrite. A membership mask rather
-    // than a scan of `target_indices` per column, so a wide relation does not
-    // pay O(columns x targets) to answer a question with one bit in it.
-    let mut targeted = vec![false; schema.columns.len()];
-    for &index in target_indices {
-        targeted[index] = true;
+    // Which data field fills each column, by schema index. A lookup table
+    // rather than a scan of `target_indices` per column, so a wide relation does
+    // not pay O(columns x targets) to answer a question with one number in it.
+    let mut from_field = vec![None; schema.columns.len()];
+    for (wire, &index) in target_indices.iter().enumerate() {
+        from_field[index] = Some(wire);
     }
-    let mut template = Vec::with_capacity(schema.columns.len());
+    let mut slots = Vec::with_capacity(schema.columns.len());
     let mut deferred = Vec::new();
     for (index, default) in defaults.into_iter().enumerate() {
-        // A target column's default is dead: the decoded field overwrites it.
-        if targeted[index] {
-            template.push(Value::Null);
+        // A target column's default is dead: the decoded field is the value.
+        if let Some(wire) = from_field[index] {
+            slots.push(CopySlot::Field(wire));
             continue;
         }
         match default {
-            BoundExpr::Const { value, .. } => template.push(value),
+            BoundExpr::Const { value, .. } => slots.push(CopySlot::Const(value)),
             // `nextval` on a `serial`, `now()`, a routine — must run per row.
             other => {
-                template.push(Value::Null);
+                slots.push(CopySlot::Null);
                 deferred.push((index, other));
             }
         }
     }
     CopyRowPlan {
-        template,
+        slots,
+        ordered: target_indices.windows(2).all(|pair| pair[0] < pair[1]),
         defaults: deferred,
     }
 }
