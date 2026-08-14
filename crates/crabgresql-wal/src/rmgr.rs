@@ -18,7 +18,7 @@ impl RmgrId {
     /// Checkpoint records (owned by this crate).
     pub const CHECKPOINT: RmgrId = RmgrId(1);
     /// Records about the log itself rather than about any relation (owned by
-    /// this crate). Currently only segment padding.
+    /// this crate): segment padding.
     pub const XLOG: RmgrId = RmgrId(2);
     /// The heap access method (`crabgresql-pg-engine`).
     pub const HEAP: RmgrId = RmgrId(10);

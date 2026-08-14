@@ -88,10 +88,9 @@ const MAX_SHARED_BUFFERS: usize = GB.saturating_mul(16);
 /// Anything shorter is a background thread that spends its life waking up.
 const MIN_INTERVAL: Duration = Duration::from_millis(10);
 /// One WAL segment (`crabgresql_wal::SEGMENT_SIZE`, restated because this crate
-/// deliberately has no dependencies; the two are pinned together by a
-/// const-assert in `crabgresql-pg-engine`). Below a segment the trigger could
-/// fire before the file the redo point sits in is even full, so the checkpoint
-/// would not let a single one go — it would be pure write amplification.
+/// deliberately has no dependencies; a const-assert in `crabgresql-pg-engine`
+/// keeps the two together). Below a segment, a checkpoint could not retire even
+/// one file — pure write amplification.
 const MIN_MAX_WAL_SIZE: usize = 32 * MB;
 /// A backstop against a typo, not a supported setting: 16 GB of log to replay
 /// is a recovery measured in minutes, which is the opposite of what bounding
@@ -148,17 +147,13 @@ pub const SHARED_BUFFERS: SizeVar = SizeVar {
     max: MAX_SHARED_BUFFERS,
     help: "RAM the buffer pool holds relation pages in, rounded down to whole 8 KiB frames",
 };
-/// WAL written past the published redo point that makes a checkpoint due.
+/// WAL written past the published redo point that makes a checkpoint due, and
+/// so roughly how much log a restart has to replay.
 ///
-/// The knob that bounds crash recovery: replay reads from the redo point to the
-/// end of the log, so this is roughly how much of it a restart has to get
-/// through. It is a trigger level, not a cap — nothing refuses a write for
-/// being past it, and a transaction that logs more than this in one go simply
-/// overshoots until it can be checkpointed.
-///
-/// A gigabyte, matching PostgreSQL's `max_wal_size`, for the same reason: it is
-/// the point where the recovery time this buys stops paying for the checkpoint
-/// I/O it costs.
+/// A level, not a cap: nothing refuses a write for being past it, and one
+/// transaction logging more than this overshoots until it can be checkpointed.
+/// A gigabyte, matching PostgreSQL's `max_wal_size` — the point where the
+/// recovery time this buys stops paying for the checkpoint I/O it costs.
 pub const MAX_WAL_SIZE: SizeVar = SizeVar {
     name: "CRABGRESQL_MAX_WAL_SIZE",
     default: GB,

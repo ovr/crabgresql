@@ -4,10 +4,9 @@
 //! is `unsafe` under the 2024 edition because it races any other thread reading
 //! the environment, and a binary with a single test has no other thread to race.
 //!
-//! What this covers is the wiring, not the parsing (`crabgresql-config` has unit
-//! tests for that): that a long-running process re-checkpoints on its own, which
-//! is the only thing keeping crash recovery bounded between a startup and a clean
-//! shutdown.
+//! The wiring, not the parsing (`crabgresql-config` covers that): a long-running
+//! process re-checkpointing on its own is the only thing keeping crash recovery
+//! bounded between a startup and a clean shutdown.
 
 use std::sync::Arc;
 
@@ -56,8 +55,6 @@ fn wal_volume_triggers_a_checkpoint() -> anyhow::Result<()> {
         .expect("the startup checkpoint publishes a control file")
         .redo_lsn;
 
-    // Many small transactions rather than one enormous one, so the trigger is
-    // exercised from the commit path — which is where it has to work.
     let payload = "x".repeat(WIDE);
     let mut rows = 0;
     while wal.current_lsn().0 < threshold + threshold / 2 {
@@ -78,9 +75,6 @@ fn wal_volume_triggers_a_checkpoint() -> anyhow::Result<()> {
         wal.current_lsn().0,
         control.redo_lsn
     );
-    // The trigger is a level, not a cap: the redo point trails the insert position
-    // by less than the threshold, which is the bound on how much a crash here would
-    // have to replay.
     assert!(
         wal.current_lsn().0 - control.redo_lsn.0 <= threshold,
         "the checkpoint left {} bytes to replay, more than the {threshold} asked for",

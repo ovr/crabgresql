@@ -22,23 +22,17 @@ struct Inner {
 }
 
 impl Inner {
-    /// Carry the insert position to the next segment boundary if a record of
-    /// `len` bytes would otherwise straddle it. No-op in the overwhelmingly
-    /// common case where the record fits.
+    /// Carry the insert position to the next segment boundary when a record of
+    /// `len` bytes would otherwise straddle it.
     ///
-    /// Two fillers, because one cannot cover both cases:
+    /// Two fillers, because one cannot cover both cases: a tail of at least
+    /// [`WalRecord::MIN_LEN`] gets a **padding record**, CRC-covered like any
+    /// other, so recovery decodes and ignores it instead of having to tell zeros
+    /// apart from a torn write; a shorter tail gets raw zeros, unambiguous for
+    /// the opposite reason — no record can *start* there, so recovery steps over
+    /// it on arithmetic alone.
     ///
-    /// * a tail of at least [`WalRecord::MIN_LEN`] bytes gets a **padding
-    ///   record** — a real, CRC-covered record whose payload is zeros. Recovery
-    ///   decodes and ignores it, so the scan needs no rule about where segments
-    ///   end and no way to confuse padding with a torn write;
-    /// * a shorter tail gets raw zeros, because no record fits in it. That is
-    ///   unambiguous for a different reason: a record can never *start* there,
-    ///   so recovery can skip such a tail on arithmetic alone.
-    ///
-    /// A record longer than a whole segment is exempt (see [`Wal::append`]): at
-    /// offset 0 there is nothing to pad to, and padding a whole empty segment
-    /// would not help it fit.
+    /// A record longer than a whole segment is exempt (see [`Wal::append`]).
     fn pad_to_boundary(&mut self, len: u64) {
         let off = segment_offset(Lsn(self.insert_lsn));
         if off == 0 {
@@ -188,10 +182,9 @@ impl Wal {
     /// After a crash, call [`crate::recover`] first and then [`Wal::reset_to`]
     /// to discard any torn tail past the last valid record.
     ///
-    /// The insert position comes from the *highest-numbered* segment, not from
-    /// summing them: a segment is only created once the one before it is full
-    /// and fsynced, so the last one is the only partial file and its length is
-    /// where the stream ends.
+    /// The insert position comes from the *highest-numbered* segment rather than
+    /// from summing them: a segment is only created once its predecessor is full
+    /// and fsynced, so the last one is the only partial file.
     pub fn open(dir: &Path) -> Result<Wal, WalError> {
         let last = segment_numbers(dir)?.pop().unwrap_or(0);
         let writer = SegmentWriter::open(dir, last)?;
@@ -318,13 +311,11 @@ impl Wal {
     /// The `start` is the record's own boundary, which is what a redo point has
     /// to name.
     ///
-    /// A record never straddles a segment boundary: when one would, the tail of
-    /// the current segment is filled first (see [`Inner::pad_to_boundary`]) and
-    /// the record starts the next segment. The single exception is a record
-    /// larger than a whole segment, which cannot be placed any other way; it
-    /// begins at a segment boundary and spans as many files as it needs. Keeping
-    /// that case working is why `append` stays infallible — the alternative is
-    /// turning one oversized row into a startup-time error at every call site.
+    /// A record never straddles a segment boundary (see
+    /// [`Inner::pad_to_boundary`]), except one larger than a whole segment,
+    /// which cannot be placed any other way and spans as many files as it needs.
+    /// Serving that case is why `append` stays infallible: the alternative turns
+    /// one oversized row into an error at every call site.
     pub fn append(&self, rmgr: RmgrId, info: u8, xid: Xid, payload: &[u8]) -> LsnRange {
         let mut inner = self
             .inner
@@ -417,13 +408,10 @@ impl Wal {
             let target = start + bytes.len() as u64;
             drop(inner);
 
-            // The writer splits `bytes` across whatever segments they span and
-            // fsyncs each file it touches, reporting how much of the buffer is
-            // durable — which on the error path is not necessarily nothing.
-            let mut durable = 0usize;
-            // A block, so the writer lock is released before `inner` is taken
+            // Scoped so the writer lock is released before `inner` is taken
             // again below: appends must keep running during the fsync, which is
-            // the whole point of holding the two separately.
+            // why the two locks are separate.
+            let mut durable = 0usize;
             let write_result = {
                 let mut writer = self
                     .writer
@@ -445,11 +433,10 @@ impl Wal {
                     tracing::trace!(start, target, "flushed WAL bytes to disk");
                 }
                 Err(e) => {
-                    // Keep the prefix that reached stable storage and put only
-                    // the rest back, so a retry re-writes exactly what is
-                    // missing. Claiming the whole drain failed would be a lie in
-                    // the other direction now: a multi-segment write is several
-                    // fsyncs, and the earlier ones already succeeded.
+                    // Only the part that never reached stable storage goes back:
+                    // a multi-segment write is several fsyncs, so the earlier
+                    // ones have already succeeded and re-writing them would be
+                    // claiming they had not.
                     inner.written = start + durable as u64;
                     self.flushed.store(inner.written, Ordering::SeqCst);
                     let mut returned = bytes;
@@ -550,12 +537,11 @@ mod tests {
     }
 
     /// Append one record that ends exactly `remaining` bytes short of the first
-    /// segment boundary, and flush it.
+    /// segment boundary, and flush it. Only valid as the first append into a
+    /// fresh WAL.
     ///
-    /// The boundary tests below all need the insert position parked at a precise
-    /// distance from the boundary; doing it with one big record rather than a
-    /// loop of small ones keeps a 32 MB test to a single append and a single
-    /// fsync. Only valid as the first append into a fresh WAL.
+    /// One big record rather than a loop of small ones, so a 32 MB test costs a
+    /// single append and a single fsync.
     fn fill_to_within(wal: &Wal, remaining: u64) -> anyhow::Result<LsnRange> {
         let payload = vec![0x5A; (SEGMENT_SIZE - remaining) as usize - WalRecord::MIN_LEN];
         let range = wal.append(RmgrId::HEAP, 7, Xid(3), &payload);
@@ -569,9 +555,6 @@ mod tests {
         Ok(range)
     }
 
-    /// A record that does not fit in what is left of a segment must not straddle
-    /// the boundary: the tail is filled with a padding record and the record
-    /// itself starts the next segment.
     #[test]
     fn a_record_that_does_not_fit_is_padded_to_the_next_segment() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -598,7 +581,6 @@ mod tests {
         );
         assert_eq!(wal_stream_len(dir.path())?, range.end.0);
 
-        // The filler is a real record: it decodes, and it says what it is.
         let seg0 = std::fs::read(wal_segment_path_0(dir.path()))?;
         let (pad, len) = WalRecord::decode(&seg0[(SEGMENT_SIZE - 100) as usize..])
             .ok_or_else(|| anyhow::anyhow!("the padding did not decode as a record"))?;
@@ -610,9 +592,8 @@ mod tests {
         Ok(())
     }
 
-    /// A tail too short for even an empty record cannot be padded with one. It is
-    /// zero-filled instead, and recovery skips it on arithmetic alone — which is
-    /// the only case where the reader needs to know segments exist at all.
+    /// Zeros rather than a padding record, because no record fits: this is the
+    /// only case where recovery needs to know segments exist at all.
     #[test]
     fn a_tail_too_small_for_a_record_is_zero_filled() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -634,9 +615,6 @@ mod tests {
         Ok(())
     }
 
-    /// Crossing a boundary and reopening must resume after the *last* segment,
-    /// not after the first: the insert position comes from the highest-numbered
-    /// segment plus its length, never from segment zero.
     #[test]
     fn reopening_positions_after_the_last_segment() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -650,8 +628,6 @@ mod tests {
         let wal = Wal::open(dir.path())?;
         assert_eq!(wal.current_lsn(), end);
         assert_eq!(wal.flushed_lsn(), end);
-        // And the next append continues the second segment rather than
-        // overwriting it.
         let range = wal.append(RmgrId::HEAP, 7, Xid(5), b"after-reopen");
         assert_eq!(range.start, end);
         wal.flush(range.end)?;
@@ -681,7 +657,6 @@ mod tests {
         assert_eq!(wal_stream_len(dir.path())?, filler.end.0);
         assert_eq!(wal.current_lsn(), filler.end);
 
-        // Appending again re-pads and re-creates the second segment cleanly.
         let again = wal.append(RmgrId::HEAP, 7, Xid(5), &[0xC3; 200]);
         assert_eq!(again.start, Lsn(SEGMENT_SIZE));
         wal.flush(again.end)?;

@@ -99,7 +99,6 @@ pub fn open_from_with_wal(
     Ok((engine, tm, wal))
 }
 
-/// The end of the WAL as it exists on disk, across every segment.
 pub fn wal_stream_len(dir: &Path) -> std::io::Result<u64> {
     crabgresql_wal::wal_stream_len(dir)
 }
@@ -136,23 +135,20 @@ fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Overwrite the WAL stream's `[0, upto)` prefix with `byte`, following it across
-/// however many segments it spans.
+/// Overwrite the WAL stream's `[0, upto)` prefix with `byte`, across however many
+/// segments it spans.
 ///
 /// The adversarial half of a bounded-replay test: scribbling the prefix below a
 /// redo point proves recovery never read it. If it does read one byte below, the
 /// first `decode` fails, the log reads as empty, and everything below the redo
-/// point vanishes — so such a test cannot pass by accident.
-///
-/// Segment-aware rather than "write at offset `lsn` of the first file": that
-/// would stop scribbling at the first boundary and, worse, *extend* segment zero
-/// past its fixed size, so the test would go green while proving nothing.
+/// point vanishes — so such a test cannot pass by accident. Writing at offset
+/// `lsn` of the first segment instead would stop at the first boundary and grow
+/// a file whose size is fixed, going green while proving nothing.
 pub fn scribble_wal_prefix(dir: &Path, upto: crabgresql_wal::Lsn, byte: u8) -> std::io::Result<()> {
     let seg_size = crabgresql_wal::SEGMENT_SIZE;
-    // Counted with `div_ceil`, not `0..=segment_of(upto)`: a prefix ending exactly
-    // on a boundary belongs entirely to the segments below it, and the inclusive
-    // range would go one file further — opening a segment that need not exist to
-    // write nothing into it.
+    // `div_ceil`, not `0..=segment_of(upto)`: a prefix ending exactly on a
+    // boundary would send the inclusive range one file further, opening a segment
+    // that need not exist.
     for seg in 0..upto.0.div_ceil(seg_size) {
         let to = (upto.0 - seg * seg_size).min(seg_size);
         scribble(&crabgresql_wal::wal_segment_path(dir, seg), 0, to, byte)?;

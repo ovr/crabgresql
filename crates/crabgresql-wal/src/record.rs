@@ -83,10 +83,8 @@ pub struct WalRecord<'a> {
 impl<'a> WalRecord<'a> {
     pub const HEADER_LEN: usize = 24;
     const CRC_LEN: usize = 4;
-    /// The encoded length of a record with an empty payload — and therefore the
-    /// smallest gap a record can be written into. A tail shorter than this
-    /// cannot hold even a padding record, which is why the segment writer
-    /// zero-fills it instead.
+    /// The encoded length of a record with an empty payload, and therefore the
+    /// smallest gap one can be written into.
     pub const MIN_LEN: usize = Self::HEADER_LEN + Self::CRC_LEN;
 
     /// Serialize this record onto the end of `buf` and return its total encoded

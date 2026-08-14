@@ -25,43 +25,35 @@ use crate::record::{Lsn, WalError};
 /// than no knob.
 pub const SEGMENT_SIZE: u64 = 32 << 20;
 
-/// Segment file names are exactly this many hex digits, matching PostgreSQL's
-/// WAL file names.
 const NAME_LEN: usize = 24;
 
 const WAL_SUBDIR: &str = "pg_wal";
 
-/// The directory holding the segment files: `<dir>/pg_wal`.
 pub fn wal_dir(dir: &Path) -> PathBuf {
     dir.join(WAL_SUBDIR)
 }
 
-/// The path of one segment file.
 pub fn wal_segment_path(dir: &Path, seg: u64) -> PathBuf {
     wal_dir(dir).join(format!("{seg:0NAME_LEN$X}"))
 }
 
-/// The first segment's path — where a test that writes a short log directly, or
-/// corrupts one, has to reach. Named rather than spelled out at each call site so
-/// that a layout change breaks compilation instead of turning a test into a
-/// silent no-op on a path nothing reads.
+/// Segment zero's path. Named, rather than spelled out at each call site, so a
+/// layout change breaks compilation instead of leaving a test scribbling on a
+/// path nothing reads.
 #[cfg(test)]
 pub(crate) fn wal_segment_path_0(dir: &Path) -> PathBuf {
     wal_segment_path(dir, 0)
 }
 
-/// Which segment holds the byte at `lsn`.
 pub const fn segment_of(lsn: Lsn) -> u64 {
     lsn.0 / SEGMENT_SIZE
 }
 
-/// Where inside its segment the byte at `lsn` sits.
 pub const fn segment_offset(lsn: Lsn) -> u64 {
     lsn.0 % SEGMENT_SIZE
 }
 
-/// Parse a segment number out of a file name, or `None` if the name is not one
-/// of ours.
+/// `None` when the name is not one of ours.
 fn segment_number(name: &str) -> Option<u64> {
     if name.len() != NAME_LEN || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -93,11 +85,9 @@ pub fn segment_numbers(dir: &Path) -> std::io::Result<Vec<u64>> {
     Ok(segments)
 }
 
-/// The end of the stream as it exists on disk: the last segment's number times
-/// [`SEGMENT_SIZE`], plus that segment's length. `0` when there are no segments.
-///
-/// The segmented replacement for "the length of the WAL file", which is what
-/// callers actually mean when they compare against an [`Lsn`].
+/// The end of the stream as it exists on disk, `0` when there are no segments.
+/// The segmented replacement for "the length of the WAL file" — which is what a
+/// caller comparing against an [`Lsn`] means.
 pub fn wal_stream_len(dir: &Path) -> std::io::Result<u64> {
     let Some(last) = segment_numbers(dir)?.pop() else {
         return Ok(0);
@@ -106,14 +96,13 @@ pub fn wal_stream_len(dir: &Path) -> std::io::Result<u64> {
     Ok(last * SEGMENT_SIZE + len)
 }
 
-/// The writer's end of the layout: holds the segment currently being appended
-/// to and moves to the next one as the stream crosses a boundary.
+/// The writer's end of the layout, moving to the next segment as the stream
+/// crosses a boundary.
 ///
-/// Only ever used behind the WAL's writer mutex, so "the current segment" is
-/// single-threaded state and the create-then-fsync sequences below cannot race.
+/// Only ever used behind the WAL's writer mutex, so the create-then-fsync
+/// sequences below cannot race.
 pub struct SegmentWriter {
     dir: PathBuf,
-    /// The segment `file` is open on.
     seg: u64,
     file: File,
 }
@@ -130,18 +119,16 @@ impl SegmentWriter {
         })
     }
 
-    /// The length of the segment currently open.
     pub fn len(&self) -> Result<u64, WalError> {
         Ok(self.file.metadata()?.len())
     }
 
     /// Move to `seg`, leaving the segment being abandoned fsynced first.
     ///
-    /// That order is a durability guarantee recovery reads back: because a
-    /// segment is made durable *before* the next one is created, a crash can
-    /// never leave segment `N+1` on disk with `N` still short. Recovery can
-    /// therefore treat a short non-final segment as corruption rather than as an
-    /// ordinary crash artifact it would have to guess about.
+    /// That order is a durability guarantee recovery reads back: a segment is
+    /// made durable *before* the next is created, so a crash can never leave
+    /// `N+1` on disk with `N` still short — which is what lets a short non-final
+    /// segment be treated as corruption.
     fn switch_to(&mut self, seg: u64) -> Result<(), WalError> {
         self.file.sync_data()?;
         self.file = open_segment(&self.dir, seg)?;
@@ -152,11 +139,10 @@ impl SegmentWriter {
     /// Write `bytes`, which start at stream position `start`, into the segments
     /// they belong to and fsync every file touched.
     ///
-    /// `durable` is advanced to the number of leading bytes that are on stable
-    /// storage. On error it therefore names exactly the prefix the caller may
-    /// count as flushed — a multi-segment write is several fsyncs, so "all or
-    /// nothing" is no longer available and pretending otherwise would either
-    /// lose the durable prefix or claim bytes that never landed.
+    /// `durable` is advanced to the number of leading bytes on stable storage,
+    /// so on error it names exactly the prefix the caller may count as flushed:
+    /// a multi-segment write is several fsyncs, and "all or nothing" would
+    /// either lose the durable part or claim bytes that never landed.
     pub fn write_at(
         &mut self,
         bytes: &[u8],
@@ -171,8 +157,8 @@ impl SegmentWriter {
             let off = pos % SEGMENT_SIZE;
             if seg != self.seg {
                 self.switch_to(seg)?;
-                // Everything before this point lives in segments that are now
-                // fsynced.
+                // The segment just left behind is fsynced, so everything written
+                // before this point is durable.
                 *durable = done;
             }
             let room = (SEGMENT_SIZE - off) as usize;
@@ -296,7 +282,6 @@ mod tests {
         let mut writer = SegmentWriter::open(dir.path(), 0)?;
         assert_eq!(wal_stream_len(dir.path())?, 0, "an empty segment 0");
 
-        // A write that lands astride the boundary fills segment 0 and starts 1.
         let mut durable = 0usize;
         let bytes = vec![7u8; 100];
         writer.write_at(&bytes, SEGMENT_SIZE - 40, &mut durable)?;

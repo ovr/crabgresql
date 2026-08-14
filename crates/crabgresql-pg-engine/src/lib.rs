@@ -521,9 +521,8 @@ pub struct PgEngine {
     ///
     /// The *sampled* position, not the redo point published from it: a checkpoint
     /// that cannot bound replay publishes `0`, and measuring from there would put
-    /// every subsequent commit past the threshold and checkpoint on each one. The
-    /// two are the same number whenever bounding works, which is the case the knob
-    /// is written for.
+    /// every later commit past the threshold. The two agree whenever bounding
+    /// works at all.
     last_checkpoint_lsn: AtomicU64,
     max_wal_size: u64,
     /// The background flush thread, present once a transaction manager is
@@ -709,9 +708,8 @@ impl PgEngine {
             tables: RwLock::new(tables),
             last_next_xid: AtomicU64::new(0),
             clamped: AtomicBool::new(false),
-            // Whatever is already in the log predates this process and was
-            // checkpointed by the one before it; the startup checkpoint overwrites
-            // this a moment later anyway.
+            // Whatever is already in the log belongs to the process before this
+            // one; the startup checkpoint overwrites this a moment later.
             last_checkpoint_lsn: AtomicU64::new(wal.current_lsn().0),
             max_wal_size: crabgresql_config::MAX_WAL_SIZE.get(|problem| tracing::warn!("{problem}"))
                 as u64,
@@ -994,30 +992,23 @@ impl PgEngine {
     /// Checkpoint if more than [`crabgresql_config::MAX_WAL_SIZE`] has been
     /// written since the last one sampled the log.
     ///
-    /// This is what bounds crash recovery in a running server: replay reads from
-    /// the redo point to the end of the log, so without a trigger a long-lived
-    /// process replays everything it ever wrote. Checkpoints otherwise happen only
-    /// at startup and at a clean shutdown.
+    /// What bounds crash recovery in a running server: checkpoints otherwise
+    /// happen only at startup and at a clean shutdown, so a long-lived process
+    /// would replay everything it ever wrote.
     ///
-    /// Called from the commit path, after the transaction's fate is durable and
-    /// its [`crabgresql_wal::CheckpointDelay`] released — a checkpoint samples the
-    /// redo point by *waiting* for every outstanding delay, so triggering one while
-    /// holding a delay would be a thread waiting for itself.
-    ///
-    /// The threshold is a level, not a cap: a single transaction that logs more
-    /// than this overshoots it and is checkpointed once it commits. Nothing here
-    /// refuses or throttles a write.
+    /// Must be called with no [`crabgresql_wal::CheckpointDelay`] held — a
+    /// checkpoint samples the redo point by *waiting* for every outstanding
+    /// delay, so one taken here would be a thread waiting for itself. A level,
+    /// not a cap: nothing refuses or throttles a write for being past it.
     fn checkpoint_if_wal_grew(&self, next_xid: Xid) {
         let sampled = self.last_checkpoint_lsn.load(Ordering::Relaxed);
         let current = self.inner.wal.current_lsn().0;
         if current.saturating_sub(sampled) < self.max_wal_size {
             return;
         }
-        // Claim the checkpoint by moving the mark. Concurrent committers all see
-        // the same overshoot, and this is what makes exactly one of them act on it
-        // — the loser's compare-exchange fails against the value the winner wrote.
-        // The winner's own `write_control_file` overwrites the mark with the
-        // position it really sampled.
+        // Concurrent committers all see the same overshoot; moving the mark is
+        // what makes exactly one of them act on it. The winner's own
+        // `write_control_file` replaces this with the position it really sampled.
         if self
             .last_checkpoint_lsn
             .compare_exchange(sampled, current, Ordering::Relaxed, Ordering::Relaxed)
@@ -1026,10 +1017,9 @@ impl PgEngine {
             return;
         }
         if let Err(error) = self.checkpoint(next_xid) {
-            // Put the mark back so the next commit tries again. The transaction
-            // that triggered this is already durable — its commit record was
-            // fsynced before this ran — so a failed checkpoint costs a longer
-            // replay, not correctness, and must not be reported as a failed commit.
+            // Back so the next commit retries. The transaction that triggered
+            // this is already durable, so a failed checkpoint costs a longer
+            // replay rather than correctness — never a failed commit.
             self.last_checkpoint_lsn.store(sampled, Ordering::Relaxed);
             tracing::warn!(
                 %error,
@@ -1161,11 +1151,9 @@ impl PgEngine {
         info: u8,
         clean_shutdown: bool,
     ) -> std::io::Result<()> {
-        // The smallest `max_wal_size` an operator may ask for is one WAL segment,
-        // so a checkpoint triggered at that level can always retire a whole file.
-        // The config crate has no dependencies and had to restate the number;
-        // this is where the two are held together, because both are in scope here
-        // and nowhere else.
+        // The config crate has no dependencies and had to restate the segment
+        // size, so this is where the two are held together — both are in scope
+        // here and nowhere else.
         const _: () =
             assert!(crabgresql_config::MAX_WAL_SIZE.min as u64 == crabgresql_wal::SEGMENT_SIZE);
         let sampled = self.inner.wal.redo_point().map_err(std::io::Error::other)?;
@@ -1220,8 +1208,7 @@ impl PgEngine {
             .end;
         self.inner.wal.flush(end).map_err(std::io::Error::other)?;
         self.last_next_xid.store(next_xid.0, Ordering::Relaxed);
-        // What the next size-triggered checkpoint measures from. The sample, not
-        // `redo` — see the field.
+        // The sample, not `redo` — see the field.
         self.last_checkpoint_lsn.store(sampled.0, Ordering::Relaxed);
         write_control(
             &self.data_dir,
@@ -1682,8 +1669,6 @@ impl TxnFinalize for PgEngine {
         // Released before the checkpoint below, which reads the same map: a second
         // read guard taken while a writer is queued between them deadlocks.
         drop(handles);
-        // The commit is durable at this point, so anything here can only affect how
-        // much a future recovery has to replay.
         self.checkpoint_if_wal_grew(Xid(xid.0 + 1));
     }
 
@@ -2598,8 +2583,6 @@ mod tests {
             control.redo_lsn.0 < crabgresql_wal::wal_stream_len(dir.path())?,
             "the redo point must be backed by bytes on disk"
         );
-        // The redo point names a position in the stream; read the segment that
-        // holds it and slice from its offset inside that file.
         let segment = crabgresql_wal::segment_of(control.redo_lsn);
         let bytes = std::fs::read(crabgresql_wal::wal_segment_path(dir.path(), segment))?;
         let at = crabgresql_wal::segment_offset(control.redo_lsn) as usize;
