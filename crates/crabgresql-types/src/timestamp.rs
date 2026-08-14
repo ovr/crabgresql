@@ -314,7 +314,7 @@ const WEEKDAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 /// `timestamptz`. The final timestamp-range check is left to the caller
 /// (`timestamp` bounds the civil value; `timestamptz` the post-offset UTC
 /// value), and `timestamp` discards the zone token.
-pub(crate) enum Parsed {
+pub(crate) enum Parsed<'a> {
     /// A special value (`infinity`/`-infinity`/`epoch`), already in micros.
     Micros(i64),
     /// The `now` special. Left unresolved here because each type reads the
@@ -324,7 +324,11 @@ pub(crate) enum Parsed {
     /// A calendar time with an astronomical year (BC already folded), plus the
     /// trailing zone token if one was present. Field ranges are validated by
     /// [`validate_fields`]; the year range is not checked here.
-    Calendar { tm: Tm, zone: Option<String> },
+    ///
+    /// The zone borrows the input rather than owning a copy: `timestamptz`
+    /// resolves it and `timestamp` throws it away, both before the scanned text
+    /// goes anywhere, and a load of a zoned column was allocating it per row.
+    Calendar { tm: Tm, zone: Option<&'a str> },
 }
 
 /// The shared scan behind `timestamp::parse` and `timestamptz::parse`. Accepts
@@ -338,30 +342,38 @@ pub(crate) enum Parsed {
 /// error), but `today`/`tomorrow`/`yesterday` are *date field* tokens: they fix
 /// the calendar date exactly as `2001-02-16` would, so `'today 10:00'` and
 /// `'today EST'` parse while `'today today'` and `'2020-01-01 today'` conflict.
-pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, TimestampError> {
+pub(crate) fn parse_parts<'a>(input: &'a str, fmt: &FmtCtx) -> Result<Parsed<'a>, TimestampError> {
     let trimmed = input.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
-        "infinity" | "+infinity" => return Ok(Parsed::Micros(POS_INFINITY)),
-        "-infinity" => return Ok(Parsed::Micros(NEG_INFINITY)),
-        "epoch" => return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY)),
-        "now" => return Ok(Parsed::Now),
-        _ => {}
+    // The spellings a dump, a driver and a COPY file all write, answered
+    // without the scanner below — which allocates a lowercased copy of the
+    // value and one field per token — and accepting a strict subset of it.
+    if let Some((tm, zone)) = scan_iso(trimmed) {
+        return Ok(Parsed::Calendar { tm, zone });
     }
+    parse_parts_general(input, trimmed, fmt)
+}
 
-    // Split into whitespace fields, further splitting an ISO date/time joined by
-    // 'T' (e.g. "2001-09-22T18:19:20").
-    let mut fields: Vec<String> = Vec::new();
-    for raw in trimmed.split_whitespace() {
-        if let Some((d, t)) = split_iso_t(raw) {
-            fields.push(d.to_string());
-            fields.push(t.to_string());
-        } else {
-            fields.push(raw.to_string());
+/// The general scan: everything [`parse_parts`]'s ISO fast path declined, and
+/// the oracle it is tested against (`iso_fast_path_agrees_with_the_scanner`).
+/// Both spellings are passed because the errors quote `input` as the user wrote
+/// it, while the scan works on `trimmed`.
+fn parse_parts_general<'a>(
+    input: &'a str,
+    trimmed: &'a str,
+    fmt: &FmtCtx,
+) -> Result<Parsed<'a>, TimestampError> {
+    match trimmed {
+        _ if trimmed.eq_ignore_ascii_case("infinity")
+            || trimmed.eq_ignore_ascii_case("+infinity") =>
+        {
+            return Ok(Parsed::Micros(POS_INFINITY));
         }
-    }
-    if fields.is_empty() {
-        return Err(invalid_syntax(input));
+        _ if trimmed.eq_ignore_ascii_case("-infinity") => return Ok(Parsed::Micros(NEG_INFINITY)),
+        _ if trimmed.eq_ignore_ascii_case("epoch") => {
+            return Ok(Parsed::Micros(EPOCH_MINUS_PG_DAYS * USECS_PER_DAY));
+        }
+        _ if trimmed.eq_ignore_ascii_case("now") => return Ok(Parsed::Now),
+        _ => {}
     }
 
     let mut year: Option<i64> = None;
@@ -376,10 +388,15 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
     let mut have_date = false;
     // The trailing time-zone token, if any (last one wins). `timestamp` ignores
     // it; `timestamptz` resolves it to a UTC offset.
-    let mut zone: Option<String> = None;
+    let mut zone: Option<&str> = None;
     // Bare numeric fields (verbose form), as (value, digit count), resolved to
-    // day/year after the scan so their order does not matter.
-    let mut nums: Vec<(i64, usize)> = Vec::new();
+    // day/year after the scan so their order does not matter. Two slots, because
+    // a third can never be absorbed: after two, `year` and `day` are both set —
+    // and anything that set them earlier set `have_date`, which rejects a bare
+    // number outright. `nums_seen` counts past the slots so the third still
+    // errors where it used to.
+    let mut nums = [(0i64, 0usize); 2];
+    let mut nums_seen = 0usize;
     // The day offset of a `today`/`tomorrow`/`yesterday` token, resolved after
     // the scan. Deferring it keeps the clock out of inputs that are going to be
     // rejected anyway — `'today today'` is a duplicate-date error, and must
@@ -387,106 +404,132 @@ pub(crate) fn parse_parts(input: &str, fmt: &FmtCtx) -> Result<Parsed, Timestamp
     // position that a bind-time diagnostic carries.
     let mut relative: Option<i64> = None;
 
-    for field in &fields {
-        let fl = field.to_ascii_lowercase();
-        if let Some(m) = month_index(&fl) {
-            if month.is_some() {
-                return Err(invalid_syntax(input));
-            }
-            month = Some(m);
-            continue;
+    // The whitespace fields, an ISO date/time joined by 'T' counting as two
+    // (e.g. "2001-09-22T18:19:20"). Walked rather than collected: the scan is a
+    // single left-to-right pass, and its "last zone wins" and duplicate-date
+    // rules depend only on that order.
+    let mut saw_field = false;
+    for raw in trimmed.split_whitespace() {
+        let mut parts = [raw, ""];
+        let mut part_count = 1;
+        if let Some((d, t)) = split_iso_t(raw) {
+            parts = [d, t];
+            part_count = 2;
         }
-        if WEEKDAYS.contains(&fl.as_str()) {
-            continue; // day-of-week name: decorative, ignored
-        }
-        if fl == "bc" {
-            bc = true;
-            continue;
-        }
-        if fl == "ad" {
-            continue;
-        }
-        if field.contains(':') {
-            // A `:`-bearing token that starts with a sign is a zone offset
-            // (`-07:00`): the zone for `timestamptz`, decorative for `timestamp`.
-            if field.starts_with(['+', '-']) {
-                zone = Some(field.clone());
+        for &field in &parts[..part_count] {
+            saw_field = true;
+            // Lowercased into a stack buffer instead of a `String` per field; one
+            // too long for the buffer is not any of the keywords compared below.
+            let mut buf = [0u8; KEYWORD_MAX];
+            let fl = lower_keyword(field, &mut buf).unwrap_or("");
+            if let Some(m) = month_index(fl) {
+                if month.is_some() {
+                    return Err(invalid_syntax(input));
+                }
+                month = Some(m);
                 continue;
             }
-            if have_time {
+            if WEEKDAYS.contains(&fl) {
+                continue; // day-of-week name: decorative, ignored
+            }
+            if fl == "bc" {
+                bc = true;
+                continue;
+            }
+            if fl == "ad" {
+                continue;
+            }
+            if field.contains(':') {
+                // A `:`-bearing token that starts with a sign is a zone offset
+                // (`-07:00`): the zone for `timestamptz`, decorative for `timestamp`.
+                if field.starts_with(['+', '-']) {
+                    zone = Some(field);
+                    continue;
+                }
+                if have_time {
+                    return Err(invalid_syntax(input));
+                }
+                let (h, mi, s, us, z) = parse_time(field).ok_or_else(|| invalid_syntax(input))?;
+                hour = h;
+                min = mi;
+                sec = s;
+                usec = us;
+                have_time = true;
+                // An attached zone (`18:19:20-07:00`, `...Z`) travels with the time.
+                if z.is_some() {
+                    zone = z;
+                }
+                continue;
+            }
+            if let Some(shift) = relative_day(fl) {
+                if have_date {
+                    return Err(invalid_syntax(input));
+                }
+                relative = Some(shift);
+                have_date = true;
+                continue;
+            }
+            if let Some((y, m, d)) = parse_date_token(field) {
+                if have_date {
+                    return Err(invalid_syntax(input));
+                }
+                year = Some(y);
+                month = Some(m);
+                day = Some(d);
+                have_date = true;
+                continue;
+            }
+            // A date with a glued zone and no time, e.g. `2001-02-16+00` or
+            // `2001-02-16Z`. A date contains no `+`, and a trailing `Z` is
+            // unambiguous, so these safely split into date + zone. (A glued
+            // negative offset like `2001-02-16-08` is ambiguous with the date
+            // separators; write it space-separated instead.)
+            if let Some((date, z)) = split_date_zone(field)
+                && let Some((y, m, d)) = parse_date_token(date)
+            {
+                if have_date {
+                    return Err(invalid_syntax(input));
+                }
+                year = Some(y);
+                month = Some(m);
+                day = Some(d);
+                have_date = true;
+                zone = Some(z);
+                continue;
+            }
+            if field.bytes().all(|b| b.is_ascii_digit()) {
+                let n: i64 = field.parse().map_err(|_| invalid_syntax(input))?;
+                if nums_seen < nums.len() {
+                    nums[nums_seen] = (n, field.len());
+                }
+                nums_seen += 1;
+                continue;
+            }
+            // A reserved word that got this far is one the whole-value match above
+            // and `relative_day` both declined — `epoch`, `infinity`, or a second
+            // `now`. In company it is a format error, not the zone abbreviation the
+            // catch-all below would take it for.
+            if is_reserved_word(fl) {
                 return Err(invalid_syntax(input));
             }
-            let (h, mi, s, us, z) = parse_time(field).ok_or_else(|| invalid_syntax(input))?;
-            hour = h;
-            min = mi;
-            sec = s;
-            usec = us;
-            have_time = true;
-            // An attached zone (`18:19:20-07:00`, `...Z`) travels with the time.
-            if z.is_some() {
-                zone = z;
-            }
-            continue;
+            // Anything else is a bare time-zone token (an abbreviation like `PST` or
+            // an IANA name like `America/New_York`): the zone for `timestamptz`,
+            // decorative for `timestamp`.
+            zone = Some(field);
         }
-        if let Some(shift) = relative_day(&fl) {
-            if have_date {
-                return Err(invalid_syntax(input));
-            }
-            relative = Some(shift);
-            have_date = true;
-            continue;
-        }
-        if let Some((y, m, d)) = parse_date_token(field) {
-            if have_date {
-                return Err(invalid_syntax(input));
-            }
-            year = Some(y);
-            month = Some(m);
-            day = Some(d);
-            have_date = true;
-            continue;
-        }
-        // A date with a glued zone and no time, e.g. `2001-02-16+00` or
-        // `2001-02-16Z`. A date contains no `+`, and a trailing `Z` is
-        // unambiguous, so these safely split into date + zone. (A glued
-        // negative offset like `2001-02-16-08` is ambiguous with the date
-        // separators; write it space-separated instead.)
-        if let Some((date, z)) = split_date_zone(field)
-            && let Some((y, m, d)) = parse_date_token(date)
-        {
-            if have_date {
-                return Err(invalid_syntax(input));
-            }
-            year = Some(y);
-            month = Some(m);
-            day = Some(d);
-            have_date = true;
-            zone = Some(z);
-            continue;
-        }
-        if field.bytes().all(|b| b.is_ascii_digit()) {
-            let n: i64 = field.parse().map_err(|_| invalid_syntax(input))?;
-            nums.push((n, field.len()));
-            continue;
-        }
-        // A reserved word that got this far is one the whole-value match above
-        // and `relative_day` both declined — `epoch`, `infinity`, or a second
-        // `now`. In company it is a format error, not the zone abbreviation the
-        // catch-all below would take it for.
-        if is_reserved_word(&fl) {
-            return Err(invalid_syntax(input));
-        }
-        // Anything else is a bare time-zone token (an abbreviation like `PST` or
-        // an IANA name like `America/New_York`): the zone for `timestamptz`,
-        // decorative for `timestamp`.
-        zone = Some(field.clone());
     }
 
     // Resolve the bare numbers into day/year. The year is the 4+-digit or >31
     // value; the remaining 1-2 digit value is the day. This is order-independent,
     // so "Feb 10 1997" and "10 Feb 1997" both parse. A bare number alongside a
     // full date token (which already fixed y/m/d) is invalid.
-    for (n, len) in nums {
+    if !saw_field {
+        return Err(invalid_syntax(input));
+    }
+    if nums_seen > nums.len() {
+        return Err(invalid_syntax(input));
+    }
+    for &(n, len) in &nums[..nums_seen] {
         if have_date {
             return Err(invalid_syntax(input));
         }
@@ -637,6 +680,138 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
     }
 }
 
+/// The longest word the field scan compares against: `september`, `yesterday`
+/// and `+infinity`, at nine bytes. Anything longer cannot be a month name, a
+/// weekday, `bc`/`ad`, a relative day, or a reserved word.
+///
+/// A keyword that outgrows this stops being *recognized* rather than erroring:
+/// [`lower_keyword`] declines it and the scan reads it as a zone abbreviation.
+/// `every_keyword_fits_the_stack_buffer` is what keeps that from going quiet.
+const KEYWORD_MAX: usize = 9;
+
+/// ASCII-lowercase `field` into `buf`, or `None` when it cannot be one of the
+/// scanner's keywords — too long for [`KEYWORD_MAX`], or not ASCII (no keyword
+/// is, and `to_ascii_lowercase` would leave a multi-byte character unchanged
+/// anyway, so the comparisons would fail either way).
+fn lower_keyword<'b>(field: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> Option<&'b str> {
+    let bytes = field.as_bytes();
+    if bytes.len() > buf.len() || !field.is_ascii() {
+        return None;
+    }
+    for (dst, &c) in buf.iter_mut().zip(bytes) {
+        *dst = c.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buf[..bytes.len()]).ok()
+}
+
+/// The canonical ISO spellings, scanned byte-wise with no allocation:
+///
+/// ```text
+/// YYYY-MM-DD
+/// YYYY-MM-DD{' '|'T'|'t'}HH:MM:SS[.f{1,6}][zone]
+/// ```
+///
+/// `None` for anything else — a two-digit year, a `/` separator, a BC suffix, a
+/// leading sign, a zone this cannot check itself — which then takes the general
+/// scan. The fields are returned as written, without range-checking, because
+/// that is what the general path does too: `validate_fields` is the caller's job
+/// either way, and so is resolving the zone token.
+///
+/// Reading the leading field as the year needs no `DateStyle`: a four-digit
+/// year with `-` separators is Y-M-D under every one of them, which is why the
+/// MDY/DMY TODO in [`parse_date_token`] does not reach here. Accepting a `/`
+/// separator or a two-digit year would end that.
+fn scan_iso(s: &str) -> Option<(Tm, Option<&str>)> {
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let mut acc: i64 = 0;
+        for &c in &b[from..to] {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc * 10 + d as i64;
+        }
+        Some(acc)
+    };
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let mut tm = Tm {
+        year,
+        month,
+        day,
+        hour: 0,
+        min: 0,
+        sec: 0,
+        usec: 0,
+    };
+    if b.len() == 10 {
+        return Some((tm, None));
+    }
+    if !matches!(b[10], b' ' | b'T' | b't') || b.len() < 19 || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    tm.hour = num(11, 13)?;
+    tm.min = num(14, 16)?;
+    tm.sec = num(17, 19)?;
+
+    let mut i = 19;
+    if b.len() > i && b[i] == b'.' {
+        // Folded in the same pass that finds the end of the run: a second visit
+        // to scale it is measurable on a column of ISO timestamps.
+        let mut frac = 0i64;
+        let mut digits = 0usize;
+        i += 1;
+        while i < b.len() {
+            let d = b[i].wrapping_sub(b'0');
+            if d > 9 {
+                break;
+            }
+            frac = frac * 10 + d as i64;
+            digits += 1;
+            i += 1;
+        }
+        // A seventh digit rounds (see `parse_fraction`), which is the general
+        // path's business, not this one's.
+        if !(1..=6).contains(&digits) {
+            return None;
+        }
+        tm.usec = frac * 10i64.pow((6 - digits) as u32);
+    }
+    if i == b.len() {
+        return Some((tm, None));
+    }
+    Some((tm, Some(scan_zone(&s[i..])?)))
+}
+
+/// The trailing zone tokens the ISO fast path can check for itself: `Z`, and a
+/// numeric offset of digits and colons behind a sign (`+00`, `-07:00`, `+0530`).
+///
+/// An abbreviation (`PST`), an IANA name and an `am`/`pm` suffix are all
+/// declined, so those keep reaching the general scan. The token is returned as
+/// written, which is what `parse_time` hands back for the same input — the sign
+/// included, the case of a `z` untouched.
+fn scan_zone(tok: &str) -> Option<&str> {
+    let b = tok.as_bytes();
+    if b == b"Z" || b == b"z" {
+        return Some(tok);
+    }
+    if !matches!(b[0], b'+' | b'-') || b.len() < 2 {
+        return None;
+    }
+    b[1..]
+        .iter()
+        .all(|&c| c.is_ascii_digit() || c == b':')
+        .then_some(tok)
+}
+
 /// Split "YYYY-MM-DD" from "HH:MM:SS" when joined by an ISO `T`.
 fn split_iso_t(s: &str) -> Option<(&str, &str)> {
     let idx = s.find(['T', 't'])?;
@@ -667,28 +842,34 @@ fn month_index(name: &str) -> Option<i64> {
 /// a trailing zone. Returns `(hour, min, sec, usec, zone)`, where `zone` is the
 /// attached zone token (`Z`, `-07:00`) if one was present — `timestamp` ignores
 /// it, `timestamptz` resolves it.
-fn parse_time(field: &str) -> Option<(i64, i64, i64, i64, Option<String>)> {
+fn parse_time(field: &str) -> Option<(i64, i64, i64, i64, Option<&str>)> {
     // The `am`/`pm` suffix has to come off before the zone scan below, which
     // takes everything from the first non digit/colon/dot character as the
     // zone and would otherwise swallow it. A bare abbreviation needs no such
     // care: it arrived as its own whitespace-separated field.
+    //
+    // Matched on the last two bytes rather than a lowercased copy of the field:
+    // ASCII case-folding does not change a length, so the cut lands in the same
+    // place either way.
     let mut body = field;
     let mut ampm = 0i64; // 0 none, 1 am, 2 pm
-    let lower = field.to_ascii_lowercase();
-    if let Some(stripped) = lower.strip_suffix("pm") {
-        ampm = 2;
-        body = &field[..stripped.len()];
-    } else if let Some(stripped) = lower.strip_suffix("am") {
-        ampm = 1;
-        body = &field[..stripped.len()];
+    if let Some(cut) = field.len().checked_sub(2) {
+        let suffix = &field.as_bytes()[cut..];
+        if suffix.eq_ignore_ascii_case(b"pm") {
+            ampm = 2;
+            body = &field[..cut];
+        } else if suffix.eq_ignore_ascii_case(b"am") {
+            ampm = 1;
+            body = &field[..cut];
+        }
     }
 
     // Strip an attached zone: the time is digits/colons/dot, so anything after
     // it (a trailing `Z`, or a `+`/`-` offset joined without a space, as in the
     // ISO 8601 form `18:19:20-07:00`) is the zone.
-    let mut zone: Option<String> = None;
+    let mut zone: Option<&str> = None;
     if let Some(end) = body.find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '.')) {
-        zone = Some(body[end..].to_string());
+        zone = Some(&body[end..]);
         body = &body[..end];
     }
 
@@ -758,18 +939,18 @@ pub(crate) fn parse_fraction(frac: &str) -> Option<i64> {
 /// `Z`; a named zone or abbreviation is always whitespace-separated. So the
 /// `+` remainder must be an offset shape (digits and colons) — otherwise
 /// `2001-02-16+garbage` would be wrongly accepted (PG rejects it as `22007`).
-fn split_date_zone(field: &str) -> Option<(&str, String)> {
+fn split_date_zone(field: &str) -> Option<(&str, &str)> {
     if let Some(plus) = field.find('+') {
         let rest = &field[plus + 1..];
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
-            return Some((&field[..plus], field[plus..].to_string()));
+            return Some((&field[..plus], &field[plus..]));
         }
         return None;
     }
     if let Some(core) = field.strip_suffix(['Z', 'z']) {
         // Only when the remainder looks like a date, not e.g. a bare "z".
         if core.bytes().any(|b| b.is_ascii_digit()) {
-            return Some((core, "Z".to_string()));
+            return Some((core, "Z"));
         }
     }
     None
@@ -800,6 +981,8 @@ fn parse_date_token(field: &str) -> Option<(i64, i64, i64)> {
     // TODO: accept the `SET DateStyle` MDY/DMY input orders — PG's default
     // DateStyle reads `'02/16/2001'` as 2001-02-16, whereas taking the leading
     // field as the year makes that input an out-of-range month here.
+    // That work stays inside this function: [`scan_iso`] answers a shape PG
+    // reads as Y-M-D under every DateStyle, so it needs no ordering rule.
     let y = parts[0].parse().ok()?;
     let m = parts[1].parse().ok()?;
     let d = parts[2].parse().ok()?;
@@ -1518,6 +1701,151 @@ mod tests {
         }
     }
 
+    /// A keyword past the stack buffer turns into a zone abbreviation instead
+    /// of a month, a weekday or an era, with no error anywhere.
+    ///
+    /// The reserved words are repeated here because [`is_reserved_word`] is a
+    /// `matches!` and cannot be enumerated; the second loop is what keeps the
+    /// copy honest.
+    #[test]
+    fn every_keyword_fits_the_stack_buffer() {
+        let relative = ["today", "tomorrow", "yesterday"];
+        let reserved = [
+            "now",
+            "today",
+            "tomorrow",
+            "yesterday",
+            "allballs",
+            "epoch",
+            "infinity",
+            "+infinity",
+            "-infinity",
+        ];
+        for word in MONTHS
+            .iter()
+            .chain(&MONTH_NAMES)
+            .chain(&WEEKDAYS)
+            .chain(&relative)
+            .chain(&reserved)
+            .chain(&["bc", "ad"])
+        {
+            assert!(
+                word.len() <= KEYWORD_MAX,
+                "{word:?} is {} bytes, past KEYWORD_MAX ({KEYWORD_MAX})",
+                word.len()
+            );
+        }
+        for word in relative {
+            assert!(relative_day(word).is_some(), "{word:?}");
+        }
+        for word in reserved {
+            assert!(is_reserved_word(word), "{word:?}");
+        }
+    }
+
+    /// [`scan_iso`] answers the canonical ISO spellings without consulting the
+    /// general scanner, so the two must agree — on the value, on the zone, and
+    /// on which inputs they decline. Declining matters as much as agreeing: a
+    /// zone, a compact date or a two-digit year has to reach the scan that
+    /// understands it.
+    #[test]
+    fn iso_fast_path_agrees_with_the_scanner() {
+        let fmt = FmtCtx::utc_default();
+        // `Parsed` carries no `PartialEq`, so compare it as text.
+        let image = |r: Result<Parsed, TimestampError>| -> Result<String, String> {
+            match r {
+                Ok(Parsed::Micros(m)) => Ok(format!("micros {m}")),
+                Ok(Parsed::Now) => Ok("now".to_string()),
+                Ok(Parsed::Calendar { tm, zone }) => Ok(format!(
+                    "{}-{}-{} {}:{}:{}.{} {zone:?}",
+                    tm.year, tm.month, tm.day, tm.hour, tm.min, tm.sec, tm.usec
+                )),
+                Err(e) => Err(format!("{} {}", e.sqlstate, e.message)),
+            }
+        };
+
+        let corpus = [
+            // Shapes the fast path takes.
+            "2001-02-16",
+            "2001-02-16 20:38:40",
+            "2001-02-16T20:38:40",
+            "2001-02-16t20:38:40",
+            "2001-02-16 20:38:40.5",
+            "2001-02-16 20:38:40.123456",
+            "0001-01-01 00:00:00",
+            "  2001-02-16 20:38:40  ",
+            // Out-of-range fields: both must pass the calendar on unvalidated.
+            "2001-19-99 25:61:61",
+            "2001-02-29",
+            // Zoned times, which the fast path now takes: the token travels
+            // out as written, sign and case included.
+            "2001-02-16 20:38:40-07:00",
+            "2001-02-16 20:38:40+00",
+            "2001-02-16 20:38:40+0530",
+            "2001-02-16T20:38:40Z",
+            "2001-02-16 20:38:40z",
+            "2001-02-16 20:38:40.123456+05:30",
+            // Shapes it must decline.
+            "2001-02-16 20:38:40.1234567",
+            "2001-02-16 20:38:40 PST",
+            "2001-02-16 20:38:40PST",
+            "2001-02-16 08:38:40pm",
+            "2001-02-16 20:38:40+",
+            "2001-02-16 20:38:40+05.5",
+            // A zone glued to a date with no time still goes to the general
+            // scan, which is also the only place that normalizes `z` to `Z`.
+            "2001-02-16Z",
+            "2001-02-16z",
+            "2001-02-16+00",
+            "2001-02-16 BC",
+            "2001/02/16",
+            "20010216",
+            "01-02-16",
+            "2001-2-16",
+            "2001-02-16 20:38",
+            "2001-02-16 20:38:40.",
+            "2001-02-16  20:38:40",
+            "Feb 16 2001",
+            "infinity",
+            "epoch",
+            "",
+            "garbage",
+        ];
+        // A hand-written corpus covers the shapes someone thought of; this
+        // sweep covers the ones nobody did. It is what catches a guard that is
+        // one character too generous — a separator test admitting `-`, so a
+        // glued zone parses as a timestamp.
+        let mut sweep: Vec<String> = Vec::new();
+        for base in [
+            "2001-02-16 20:38:40.123456",
+            // A second base carrying a zone, so the sweep reaches those bytes
+            // too — the fast path checks them, so it can get them wrong.
+            "2001-02-16 20:38:40.123456+05:30",
+            "2001-02-16T20:38:40Z",
+        ] {
+            sweep.extend((1..=base.len()).map(|n| base[..n].to_string()));
+            for pos in 0..base.len() {
+                for sub in ['-', '/', 'T', 't', 'x', ' ', '9', ':', '.', ',', '+', 'Z'] {
+                    let mut m = base.to_string();
+                    m.replace_range(pos..pos + 1, &sub.to_string());
+                    sweep.push(m.clone());
+                    // Cut short at the substitution, where a length check and a
+                    // byte check disagree.
+                    sweep.push(m[..pos + 1].to_string());
+                }
+            }
+        }
+
+        for text in corpus.iter().map(|s| (*s).to_string()).chain(sweep) {
+            let trimmed = text.trim();
+            assert_eq!(
+                image(parse_parts(&text, &fmt)),
+                image(parse_parts_general(&text, trimmed, &fmt)),
+                "fast and general paths disagree on {text:?}"
+            );
+        }
+    }
+
     /// The tie-breaking rule, pinned against PostgreSQL 18.4. Rounding is half
     /// away from zero on the *internal* count, so the same `.5` goes up after
     /// the 2000-01-01 epoch and down before it — which is only visible because
@@ -1870,6 +2198,29 @@ mod tests {
                 .sqlstate,
             "22007"
         );
+        // A time token whose last two *bytes* are one character's tail: the
+        // `am`/`pm` check reads those bytes, and must not slice between them.
+        // The token itself is a zone as far as this type is concerned —
+        // decorative, like any abbreviation it cannot resolve.
+        assert_eq!(
+            format(ts("2001-02-16 10:20:30\u{e9}")),
+            "2001-02-16 10:20:30"
+        );
+        // `am`/`pm` in either case, and the noon/midnight wrinkles.
+        assert_eq!(format(ts("2001-02-16 08:38:40PM")), "2001-02-16 20:38:40");
+        assert_eq!(format(ts("2001-02-16 08:38:40pm")), "2001-02-16 20:38:40");
+        assert_eq!(format(ts("2001-02-16 12:38:40Am")), "2001-02-16 00:38:40");
+        // Three bare numbers cannot be a date: two fill the year and the day,
+        // and the third has nowhere to go.
+        for bad in ["1 2 3", "Feb 1 2 3", "1997 2 3 4"] {
+            assert_eq!(
+                parse(bad, &FmtCtx::utc_default())
+                    .expect_err("a third bare number has no field left")
+                    .sqlstate,
+                "22007",
+                "for {bad:?}"
+            );
+        }
         // Out-of-range years error instead of overflowing i64.
         assert_eq!(
             parse("5000000000-01-01", &FmtCtx::utc_default())

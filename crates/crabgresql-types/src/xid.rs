@@ -137,7 +137,7 @@ pub(crate) fn scan_prefix(s: &str) -> (Result<u64, ScanError>, usize) {
 /// [`scan_prefix`] over a whole string: the trimmed input must convert in full,
 /// so a trailing character is a syntax error (`'1abc'`, `'08'`, `'0b11'`).
 fn scan(input: &str) -> Result<u64, ScanError> {
-    let text = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let text = input.trim_ascii();
     let (result, stop) = scan_prefix(text);
     let value = result?;
     if stop == text.len() {

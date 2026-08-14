@@ -156,6 +156,26 @@ fn floor_div(a: i64, b: i64) -> i64 {
     a.div_euclid(b)
 }
 
+/// The surrounding whitespace [`Numeric::parse`] skips: space, tab, newline and
+/// carriage return. Deliberately **not** [`str::trim_ascii`], which also strips
+/// a form feed — `numeric_in` rejects `'\x0c1'`, and that is observable.
+#[inline]
+fn trim_numeric_space(s: &str) -> &str {
+    const fn is_space(c: u8) -> bool {
+        matches!(c, b' ' | b'\t' | b'\n' | b'\r')
+    }
+    let b = s.as_bytes();
+    let mut start = 0;
+    while start < b.len() && is_space(b[start]) {
+        start += 1;
+    }
+    let mut end = b.len();
+    while end > start && is_space(b[end - 1]) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
 impl Numeric {
     // ---- constructors -----------------------------------------------------
 
@@ -287,7 +307,7 @@ impl Numeric {
     /// `40.500000` keeps scale 6). Out-of-range magnitude is
     /// [`ParseError::Overflow`]; malformed text is [`ParseError::Syntax`].
     pub fn parse(input: &str) -> Result<Numeric, ParseError> {
-        let s = input.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        let s = trim_numeric_space(input);
         if s.is_empty() {
             return Err(ParseError::Syntax);
         }
@@ -2094,6 +2114,27 @@ mod tests {
             Err(ParseError::Overflow)
         );
         assert_eq!(Numeric::parse("0e2000000000"), Err(ParseError::Overflow));
+    }
+
+    /// The form feed is what separates this set from ASCII whitespace, and the
+    /// vertical tab what separates it from the six characters
+    /// [`crate::intlit`] trims — easy to lose to a stock trim that differs.
+    #[test]
+    fn parse_trims_its_own_whitespace_set() {
+        for sep in [" ", "\t", "\n", "\r"] {
+            assert_eq!(
+                Numeric::parse(&format!("{sep}42{sep}")).map(|v| v.to_display()),
+                Ok("42".to_string()),
+                "sep {sep:?}"
+            );
+        }
+        for sep in ["\x0b", "\x0c", "\u{a0}"] {
+            assert_eq!(
+                Numeric::parse(&format!("{sep}42")),
+                Err(ParseError::Syntax),
+                "sep {sep:?}"
+            );
+        }
     }
 
     fn arith(a: &str, op: char, b: &str) -> String {

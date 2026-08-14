@@ -49,7 +49,7 @@ fn is_delim(c: u8) -> bool {
 /// `.`/`-` as three 4-digit groups; with no delimiter, a bare run of 12 hex
 /// digits. Anything else (notably `0800:2b01:0203`) is `22P02`.
 pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
-    let trimmed = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = input.trim_ascii();
     let s = trimmed.as_bytes();
     let err = || invalid6(input);
 
@@ -60,20 +60,33 @@ pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
         if s.iter().any(|&c| is_delim(c) && c != d) {
             return Err(err());
         }
-        let groups: Vec<&[u8]> = s.split(|&c| c == d).collect();
-        let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        // The group lengths decide the spelling, and six is the most any
+        // accepted one has — so a seventh group is already an error, and the
+        // lengths fit a fixed array rather than a pair of `Vec`s.
+        let mut lens = [0usize; 6];
+        let mut count = 0usize;
+        for g in s.split(|&c| c == d) {
+            if count == lens.len() {
+                return Err(err());
+            }
+            lens[count] = g.len();
+            count += 1;
+        }
         let ok = match d {
-            b':' | b'-' if lens == [2, 2, 2, 2, 2, 2] => true,
-            b':' | b'-' if lens == [6, 6] => true,
-            b'-' | b'.' if lens == [4, 4, 4] => true,
+            b':' | b'-' if lens[..count] == [2, 2, 2, 2, 2, 2] => true,
+            b':' | b'-' if lens[..count] == [6, 6] => true,
+            b'-' | b'.' if lens[..count] == [4, 4, 4] => true,
             _ => false,
         };
         if !ok {
             return Err(err());
         }
+        // Splitting again rather than holding the groups: `split` allocates
+        // nothing, and every accepted spelling has even-length groups, which is
+        // what lets `chunks(2)` index its second byte.
         let mut out = [0u8; 6];
         let mut i = 0usize;
-        for g in groups {
+        for g in s.split(|&c| c == d) {
             for pair in g.chunks(2) {
                 let (Some(hi), Some(lo)) = (hex::val(pair[0]), hex::val(pair[1])) else {
                     return Err(err());
@@ -106,15 +119,22 @@ pub fn parse_macaddr(input: &str) -> Result<[u8; 6], MacaddrError> {
 /// `ff:fe` in the middle) or 16 (an eight-byte value taken as-is). Mixed
 /// delimiters, non-hex characters, and any other length are `22P02`.
 pub fn parse_macaddr8(input: &str) -> Result<[u8; 8], MacaddrError> {
-    let trimmed = input.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = input.trim_ascii();
     let err = || invalid8(input);
 
-    let mut nibbles: Vec<u8> = Vec::with_capacity(16);
+    // Sixteen nibbles is the longest value this type has (eight bytes), so a
+    // seventeenth cannot become one whatever follows it.
+    let mut nibbles = [0u8; 16];
+    let mut len = 0usize;
     let mut delim: Option<u8> = None;
     let mut group_len = 0usize;
     for &c in trimmed.as_bytes() {
         if let Some(n) = hex::val(c) {
-            nibbles.push(n);
+            if len == nibbles.len() {
+                return Err(err());
+            }
+            nibbles[len] = n;
+            len += 1;
             group_len += 1;
         } else if is_delim(c) {
             // A delimiter must sit between two even-length groups of digits.
@@ -136,7 +156,7 @@ pub fn parse_macaddr8(input: &str) -> Result<[u8; 8], MacaddrError> {
         return Err(err());
     }
 
-    match nibbles.len() {
+    match len {
         12 => {
             let mut six = [0u8; 6];
             for i in 0..6 {
@@ -287,7 +307,16 @@ mod tests {
 
     #[test]
     fn macaddr_rejects() {
-        for bad in ["0800:2b01:0203", "not even close", "08:00:2b:01:02", ""] {
+        for bad in [
+            "0800:2b01:0203",
+            "not even close",
+            "08:00:2b:01:02",
+            "",
+            // More groups than any spelling has, which the scan stops counting
+            // at six.
+            "08:00:2b:01:02:03:04",
+            "0:0:0:0:0:0:0:0:0:0:0:0",
+        ] {
             let e = parse_macaddr(bad)
                 .expect_err("not one of macaddr's six-byte groupings of 12 hex digits");
             assert_eq!(e.sqlstate, "22P02", "{bad}");

@@ -70,6 +70,10 @@ fn cannot_coerce(from: PgType, to: PgType) -> CastError {
 }
 
 /// `22P02` — an input function rejected the text (`'abc'::int4`).
+/// `#[cold]` so the `format!` and its temporaries stay out of the caller's
+/// frame: `text_to_int` sits under COPY, and returns a value far more often.
+#[cold]
+#[inline(never)]
 pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
@@ -80,6 +84,8 @@ pub(crate) fn invalid_input(ty: PgType, s: &str) -> CastError {
 
 /// `22003` on the text→int path, which prints the offending literal (unlike the
 /// bare `out_of_range` PG uses for arithmetic and numeric→int overflow).
+#[cold]
+#[inline(never)]
 pub(crate) fn value_out_of_range(ty: PgType, s: &str) -> CastError {
     CastError {
         sqlstate: NUMERIC_VALUE_OUT_OF_RANGE,

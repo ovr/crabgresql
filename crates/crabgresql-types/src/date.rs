@@ -16,6 +16,8 @@
 //! ymd/dmy/mdy orders, Julian `J…` input, and `.NNN` day-of-year forms. Only
 //! ISO `Y-M-D` and the verbose `Mon DD, YYYY` are parsed.
 
+use std::borrow::Cow;
+
 use crate::Numeric;
 use crate::fmt::FmtCtx;
 use crate::interval::Interval;
@@ -112,8 +114,13 @@ pub fn format(d: i32) -> String {
 pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i32, DateError> {
     // Reuse the shared timestamp scanner, then keep only the date part. A comma
     // is a field separator in the verbose form (`January 8, 1999`), which PG
-    // treats as whitespace. Its error messages name `timestamp`, so remap them.
-    let cleaned = input.replace(',', " ");
+    // treats as whitespace — rewritten only when there is one, since the ISO
+    // form a load carries has none. Its errors name `timestamp`, so remap them.
+    let cleaned = if input.as_bytes().contains(&b',') {
+        Cow::Owned(input.replace(',', " "))
+    } else {
+        Cow::Borrowed(input)
+    };
     let parsed = timestamp::parse_parts(&cleaned, fmt).map_err(|e| {
         if e.sqlstate == DATETIME_FIELD_OVERFLOW {
             field_out_of_range(input)
