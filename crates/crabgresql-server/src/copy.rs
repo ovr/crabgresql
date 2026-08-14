@@ -20,10 +20,9 @@
 //! built, not here.
 //!
 //! Being spans is also what keeps the text format down to **one** copy of its
-//! input: a completed line goes into the arena whole, in one `push_str`, and
-//! its fields are ranges inside that copy. Only a field the escape decoder has
-//! to rewrite gets bytes of its own. Delimiters and NULL markers ride along in
-//! the arena addressed by nothing, which is the price of not copying the rest.
+//! input: a completed line goes into the arena whole and its fields are ranges
+//! inside that copy. Only a field the escape decoder has to rewrite gets bytes
+//! of its own.
 //!
 //! [`Value`]: crabgresql_types::Value
 //!
@@ -56,16 +55,11 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024 * 1024 - 1;
 /// Fraction of the input [`decode`] reserves on top of it, for the de-escaped
 /// copies that land in the arena beside the lines they came from.
 ///
-/// The arena takes the lines verbatim, so it wants the input's length; a field
-/// the escape decoder rewrites adds its decoded bytes on top. Measured on
-/// ClickBench's `hits.tsv`: 0.66% of fields are rewritten, adding 0.78% to the
-/// arena — so a reservation of exactly `bytes.len()` is crossed by nearly every
-/// real stream, and crossing it costs a full `String` doubling: one memcpy of
-/// the whole stream, on a path where the caller is still holding the raw
-/// payload. 1/64 clears that with room to spare.
-///
-/// It is a heuristic, not a bound. An escape-heavy stream still exceeds it and
-/// still pays the doubling — the same one it pays today.
+/// Measured on ClickBench's `hits.tsv`: 0.66% of fields are rewritten, adding
+/// 0.78% to the arena — so reserving exactly `bytes.len()` is crossed by nearly
+/// every real stream, and crossing it costs a full `String` doubling while the
+/// caller still holds the raw payload. A heuristic, not a bound: an
+/// escape-heavy stream exceeds it and pays that doubling anyway.
 const ESCAPE_HEADROOM: usize = 64;
 
 /// `HEADER match`: the first line's field names must be the columns the COPY
@@ -132,15 +126,7 @@ fn validate_field(bytes: &[u8]) -> Result<&str, PgError> {
 pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<RowBatch, PgError> {
     let mut decoder = CopyDecoder::new(format);
     // The whole stream is in hand, so the arena is sized once instead of
-    // doubling its way there: it holds the lines themselves, plus a little for
-    // the fields the escape decoder rewrites (see [`ESCAPE_HEADROOM`]).
-    //
-    // Not done, deliberately: coalescing runs of plain fields so a rewritten
-    // field's raw form never enters the arena at all, which would make
-    // `bytes.len()` a true bound again. It needs per-line pending-field state
-    // — a NULL has to keep its place in field order while the plain fields
-    // around it wait for the run to flush — to buy back 0.78%, and the peak
-    // here is set by the caller buffering the entire stream, not by this.
+    // doubling its way there.
     decoder.batch = RowBatch::with_capacity(bytes.len() + bytes.len() / ESCAPE_HEADROOM);
     decoder.push(bytes)?;
     decoder.finish()?;
@@ -311,9 +297,8 @@ impl CopyDecoder {
     ///
     /// A line that arrives whole inside this slab — every line of a wire COPY,
     /// and all but one per read of a file COPY — never touches `self.line`: it
-    /// goes to [`Self::finish_text_line`] as a slice of the caller's buffer and
-    /// is copied exactly once, into the batch's arena. `self.line` exists only
-    /// for the line a slab boundary cut in half.
+    /// travels to the arena as a slice of the caller's buffer, copied exactly
+    /// once. The carry buffer exists for the line a slab boundary cut in half.
     fn push_text(&mut self, bytes: &[u8]) -> Result<(), PgError> {
         let mut rest = bytes;
         while let Some(k) = memchr::memchr(b'\n', rest) {
@@ -335,8 +320,7 @@ impl CopyDecoder {
         Ok(())
     }
 
-    /// Turn the line carried in `self.line` into a row — the path a line that a
-    /// slab boundary cut in half takes.
+    /// Turn the line a slab boundary cut in half into a row.
     ///
     /// The buffer is moved out so the line can be read while the decoder is
     /// written, and moved back emptied so its allocation belongs to the load
@@ -359,10 +343,9 @@ impl CopyDecoder {
     /// lets the common path pass a slice of the caller's slab and skip the
     /// carry buffer entirely.
     fn finish_text_line(&mut self, line: &[u8]) -> Result<(), PgError> {
-        // The one point every completed text record passes through, whichever
-        // path brought it here — including the trailing line `finish()` closes,
-        // which is why the reset does not live in `push_text`'s loop. CSV has
-        // its own, in `end_csv_record`.
+        // Here and not in `push_text`'s loop: the trailing line has no
+        // newline, and `finish()` completes it through this path too. CSV has
+        // its own reset, in `end_csv_record`.
         self.record_bytes = 0;
         if line == b"\\." {
             self.end_of_data = true;
@@ -385,18 +368,17 @@ impl CopyDecoder {
     /// Split a raw line into fields on unescaped delimiters and append it to
     /// the batch as one row.
     ///
-    /// The line is copied into the arena **once**, whole, and each field that
-    /// needs no rewriting is then a span inside that copy — so a byte of input
-    /// is copied once for the load rather than once into a line buffer and
-    /// again per field. The delimiters and NULL markers ride along in the
-    /// arena, addressed by nothing; see [`RowBatch::push_line`].
+    /// The line goes into the arena whole and each field that needs no
+    /// rewriting is a span inside that copy, so a byte of input is copied once
+    /// for the load rather than once into a line buffer and again per field.
     ///
     /// The NULL marker is compared against the *raw*, still-escaped field, and
     /// a field is de-escaped only when the scan actually saw a backslash in it
     /// — which for a typical load is no field at all.
     fn decode_text_line(&mut self, line: &[u8]) -> Result<(), PgError> {
-        // Destructured so the batch can be written while the format is read;
-        // `line` is the caller's, so it is not part of the borrow.
+        // Destructured so the batch can be written while the format is read.
+        // The scan below walks `line`, the caller's bytes, so the copy into the
+        // arena needs no reborrow.
         let CopyDecoder {
             unescaped,
             batch,
@@ -412,8 +394,6 @@ impl CopyDecoder {
         // escape decoder rewrites is re-checked, below. It also has to run
         // before the line reaches the arena, which is a `String`.
         let line = validate_field(line)?;
-        // The scan below walks `line` — the caller's bytes — and not the arena,
-        // so the copy needs no reborrow and the batch stays writable.
         batch.push_line(line);
 
         let mut start = 0;
@@ -613,7 +593,6 @@ fn record_too_long(have: usize, added: usize, max: usize) -> PgError {
     )
 }
 
-/// A line's bytes without the `\r` of a CRLF terminator.
 fn strip_cr(line: &[u8]) -> &[u8] {
     match line.split_last() {
         Some((b'\r', head)) => head,
@@ -635,17 +614,11 @@ fn consume_header_row(format: &CopyFormat, batch: &mut RowBatch) -> Result<(), P
 /// Append one raw (still-escaped) text field to the batch, given the line it
 /// belongs to and the field's range inside it.
 ///
-/// The range is the line's, not the arena's — the batch holds the base itself
-/// (see [`RowBatch::push_field_in_line`]), so there is no offset here to get
-/// wrong.
-///
-/// `escaped` is what the splitting scan already learned — whether this field
-/// contains a backslash — so the common field is already in the arena as the
-/// text that arrived and costs only its span, with no copy, no de-escaping
-/// pass, no buffer of its own, and no second encoding check: the line it is a
-/// slice of has already passed one. Only an escape decode can produce bytes the
-/// line did not contain (`\351`), so only that path builds a field of its own —
-/// appended after the line, which is where the arena's next free byte is.
+/// `escaped` is what the splitting scan already learned, so the common field
+/// costs only its span: it is in the arena already, and it needs no second
+/// encoding check because the line it slices has passed one. Only an escape
+/// decode can produce bytes the line did not contain (`\351`), so only that
+/// path builds a field of its own.
 fn push_text_field(
     line: &str,
     range: std::ops::Range<usize>,
@@ -1238,11 +1211,9 @@ mod tests {
         Ok(())
     }
 
-    /// A line that arrived whole inside one slab goes into the arena directly;
-    /// one a slab boundary cut in two is carried in `line` and lands there a
-    /// step later. The two paths are separate code and must decode a line the
-    /// same way — every field kind at once, including a CRLF that a small enough
-    /// chunk splits down the middle.
+    /// The whole-slab path and the carry path are separate code and must decode
+    /// a line the same way — every field kind at once, including a CRLF that a
+    /// small enough chunk splits down the middle.
     #[test]
     fn a_carried_line_decodes_as_a_whole_one_does() -> Result<(), PgError> {
         let input = "a\\tb\tplain\t\\N\t\tд\tc\\\\d\r\n".as_bytes();
@@ -1292,10 +1263,9 @@ mod tests {
         Ok(())
     }
 
-    /// The arena holds completed records and nothing else. A line still being
-    /// carried across a slab boundary must stay out of it: [`RowBatch::split_into`]
-    /// moves rows by rebasing whole byte ranges, and a half-built line sitting
-    /// in the arena would be handed to the consumer with the rows before it.
+    /// The arena holds completed records and nothing else: `split_into` moves
+    /// rows by rebasing whole byte ranges, so a half-arrived line sitting there
+    /// would be handed to the consumer along with the rows before it.
     #[test]
     fn a_carried_line_is_not_in_the_arena_yet() -> Result<(), PgError> {
         let mut decoder = CopyDecoder::new(&text_format());
@@ -1311,9 +1281,9 @@ mod tests {
         Ok(())
     }
 
-    /// A header line reaches the arena (it has to be decoded to be checked) and
-    /// must not stay there: it is not data, and its bytes would otherwise be
-    /// carried by every batch split for the rest of the load.
+    /// A `HEADER match` line has to be decoded to be checked, so it reaches the
+    /// arena — and must not stay, or every batch split for the rest of the load
+    /// carries its bytes.
     #[test]
     fn a_dropped_header_line_releases_its_bytes() -> Result<(), PgError> {
         let mut fmt = text_format();
@@ -1651,10 +1621,10 @@ mod tests {
         assert_eq!(err.code, sqlstate::PROGRAM_LIMIT_EXCEEDED);
     }
 
-    /// The trailing line has no terminator, so `finish()` is what completes it
-    /// — and completing a record is what clears the counter. A decoder that
-    /// only reset it in the newline loop would carry those bytes forward and
-    /// refuse the next record for a length it no longer has.
+    /// The trailing line has no terminator, so `finish()` completes it — and a
+    /// decoder that cleared the counter only in the newline loop would carry
+    /// those bytes forward and refuse the next record for a length it no longer
+    /// has.
     #[test]
     fn the_cap_resets_on_the_record_finish_completes() -> Result<(), PgError> {
         let mut decoder = CopyDecoder::new(&text_format()).with_max_record_bytes(64);
