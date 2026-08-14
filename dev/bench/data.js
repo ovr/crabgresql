@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786741346647,
+  "lastUpdate": 1786741348217,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -29776,6 +29776,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19966.913841,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "2f79688d746ea037a90d3ed335511d1a876e6b56",
+          "message": "feat(wal): add trace logging for append/flush/replay",
+          "timestamp": "2026-08-14T22:10:28+02:00",
+          "tree_id": "28a1c316e7c96663a12f8df78e72e5a0b07e893b",
+          "url": "https://github.com/ovr/crabgresql/commit/2f79688d746ea037a90d3ed335511d1a876e6b56"
+        },
+        "date": 1786741348103,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1111.987403,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 28911.332935,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
