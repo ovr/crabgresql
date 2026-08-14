@@ -2111,9 +2111,9 @@ fn execute_insert(
     let (tuples, notnull_verified) = collect_insert_tuples(source, ctx, txn)?;
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
-        // its key and write there. `notnull_verified` is dropped here on purpose:
-        // it indexes the parent's shape, and a routed row is checked against the
-        // leaf it lands in.
+        // its key and write there. `notnull_verified` indexes the parent's shape,
+        // so it says nothing about the leaf a row is checked against — ignored
+        // here, and empty by construction for the one source that builds it.
         Some(leaves) => insert_routed(
             table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
         ),
@@ -2195,9 +2195,8 @@ fn collect_insert_tuples(
             notnull_verified,
         } => {
             tuples = rows;
-            // A deferred default writes its column below, so whatever the source
-            // observed there is about to be overwritten — those columns are never
-            // in the list (the builder only vouches for the ones it filled).
+            // Safe against the defaults filled below: a builder only vouches for
+            // the columns it filled itself, never one it left to the executor.
             verified = notnull_verified;
             if !defaults.is_empty() {
                 for tuple in &mut tuples {
@@ -2246,9 +2245,8 @@ fn insert_direct(
     let schema = table.schema();
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
-    // Derived from the schema read just now, minus what the source proved — a
-    // column the source never filled, or one this statement's DDL made not-null
-    // after the source was built, stays in the list.
+    // From the schema read just now, minus what the source proved: a column it
+    // never filled, or one made not-null since, stays in the list.
     let notnull = NotNullSet::for_schema_excluding(&schema, notnull_verified);
     let checks = CheckSet::for_schema(&schema, ctx)?;
     // Generated columns are filled in before anything looks at the row: NOT NULL,
@@ -2332,9 +2330,8 @@ fn insert_routed(
     // schedule as `shapes` — kept in its own vector because binding can fail and
     // `get_or_insert_with` has no room for a `Result`.
     let mut leaf_checks: Vec<Option<CheckSet>> = (0..leaves.len()).map(|_| None).collect();
-    // Each leaf's not-null columns, lazily and on the same schedule. Cheap to
-    // build, but a row is checked against the leaf's own shape, so it cannot be
-    // shared with the parent's.
+    // Each leaf's not-null columns, on the same schedule: a row is checked
+    // against the leaf's own shape, so the parent's list would not answer.
     let mut leaf_notnull: Vec<Option<NotNullSet>> = (0..leaves.len()).map(|_| None).collect();
     // The leaves' generated columns, lazily like their checks. A generated
     // column is never part of a partition key, so routing reads only stored
@@ -2592,8 +2589,8 @@ fn update_inherited(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
-    // One not-null column list per target, on the same schedule: an inheritance
-    // child may hold columns the named relation does not.
+    // One per target, like the checks: an inheritance child may hold columns the
+    // named relation does not.
     let notnull: Vec<NotNullSet> = shapes
         .iter()
         .map(|(schema, _)| NotNullSet::for_schema(schema))
@@ -2931,7 +2928,6 @@ fn update_routed(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
-    // One not-null column list per leaf, alongside `leaf_checks`.
     let leaf_notnull: Vec<NotNullSet> = leaf_shapes
         .iter()
         .map(|(schema, _)| NotNullSet::for_schema(schema))

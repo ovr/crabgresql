@@ -135,25 +135,9 @@ pub enum InsertSource {
         /// sequence advances exactly as it does on the `Values` path. Empty for
         /// the common load, which is why the fast path stays fast.
         defaults: Vec<(usize, BoundExpr)>,
-        /// Columns, ascending, that hold a non-NULL value in **every** row of
-        /// `rows` — the builder saw each value as it produced it, so the
-        /// executor need not walk them again to enforce `NOT NULL`.
-        ///
-        /// Purely an optimization, and a subtractive one: the executor still
-        /// derives the not-null columns from the live schema and only removes
-        /// these, so a column that *became* `NOT NULL` after this was built is
-        /// still checked.
-        ///
-        /// The list is positional against the shape `rows` were built for, and
-        /// nothing here re-maps it. That is exactly the assumption the tuples
-        /// themselves already rest on — they are full-width in *that* shape's
-        /// order — and it holds because no `ALTER TABLE` form the server
-        /// implements adds or drops a column (see `alter_table` in the server's
-        /// `query.rs`). A future `ADD COLUMN` has to reckon with both.
-        ///
-        /// Empty means "nothing proven", which is what every builder other than
-        /// COPY passes — and what COPY itself passes for a routed load, whose
-        /// rows are checked against a leaf this list does not index.
+        /// Columns, ascending, holding a non-NULL value in **every** row of
+        /// `rows`. The executor subtracts them from the live schema's not-null
+        /// list; empty — every builder but COPY — just checks them all.
         notnull_verified: Vec<u32>,
     },
     /// `INSERT ... SELECT` / `INSERT ... TABLE t`: rows are pulled from `input`

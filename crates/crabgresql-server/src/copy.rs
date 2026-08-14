@@ -809,10 +809,9 @@ mod tests {
     use super::*;
     use crabgresql_storage_api::TableAccessMethod;
 
-    /// The row-store batch size, spelled out here so the assertions below read
-    /// as themselves. The value the loader actually uses is the target's, from
-    /// [`TableAccessMethod::bulk_load_batch_rows`] — which is what this is
-    /// checked against rather than assumed equal to.
+    /// The row-store batch size, spelled out so the expectations below read as
+    /// themselves — and checked against the value the loader really uses,
+    /// [`TableAccessMethod::bulk_load_batch_rows`], rather than assumed equal.
     const BATCH_ROWS: usize = 1024;
 
     /// One decoded field, owned. The decoder hands out spans into a batch's

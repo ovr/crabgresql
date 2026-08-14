@@ -5986,12 +5986,10 @@ impl CopyFromPlan {
         // where the slot walk is already the wire order.
         let mut scattered: Vec<Value> = Vec::new();
 
-        // Whether a NULL ever landed in each data column. The check rides along
-        // with the fill below — the value is in hand there, where the executor
-        // would otherwise re-walk the finished row to find the same answer — but
-        // it does not raise: the row is still half-built here, and a violation's
-        // DETAIL renders the whole row. What ships instead is the negative
-        // result, and only for columns where it held for every row.
+        // The check rides along with the fill below, where the value is already
+        // in hand — but it does not raise there: the row is half-built, and a
+        // violation's DETAIL renders the whole row. What ships instead is the
+        // negative result, for the columns it held for in every row.
         let mut null_seen = vec![false; self.target_indices.len()];
 
         let mut tuples = Vec::with_capacity(rows.len());
@@ -6029,15 +6027,12 @@ impl CopyFromPlan {
             }
             tuples.push(tuple);
         }
-        // Ascending, because `target_indices` need not be: a column list may name
+        // Sorted because `target_indices` need not be — a column list may name
         // the columns in any order, and the executor merges this against the
         // schema in one pass.
         //
         // Nothing to collect for a routed load: the list indexes the parent's
-        // shape, and a routed row is checked against the leaf it lands in, so
-        // the executor drops it. The per-field mark above stays either way —
-        // it is a compare and an `|=` on a value already in hand, where this is
-        // an allocation and a sort per batch.
+        // shape, and a routed row is checked against the leaf it lands in.
         let mut notnull_verified: Vec<u32> = match self.routing {
             Some(_) => Vec::new(),
             None => self

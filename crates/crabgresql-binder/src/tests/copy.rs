@@ -365,10 +365,8 @@ fn copy_places_a_reordered_column_list_and_still_reads_it_in_wire_order() -> any
     Ok(())
 }
 
-/// The columns a load vouches for. The executor subtracts them from the
-/// not-null columns of the live schema, so this has to name exactly the target
-/// columns that held a value in **every** row, in ascending schema order — the
-/// order the merge on the other side walks in.
+/// The columns a load vouches for, which the executor subtracts from the
+/// not-null columns of the live schema.
 fn verified_of(source: InsertSource) -> Vec<u32> {
     let InsertSource::Tuples {
         notnull_verified, ..

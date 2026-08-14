@@ -22,13 +22,7 @@ use crate::{ExecContext, ExecError, display_tuple, eval};
 /// The columns of a shape that reject NULL, as tuple indices in ascending order.
 ///
 /// Collapsed once per statement for the same reason a [`CheckSet`] is bound
-/// once: the answer is a property of the shape, not of the row. Walking
-/// `schema.columns` per row to read one `bool` out of each [`Column`] strides
-/// ~130 bytes per column — 14 KB a row on a 105-column load — where this list
-/// is 4 bytes a column and empty for a relation that declares no `NOT NULL` at
-/// all.
-///
-/// [`Column`]: crabgresql_storage_api::Column
+/// once: the answer is a property of the shape, not of the row.
 pub(crate) struct NotNullSet {
     /// Ascending, which is the order PostgreSQL reports a row's first violation
     /// in — a row with two NULLs names the earlier column.
@@ -47,12 +41,9 @@ impl NotNullSet {
     /// The list is always derived from the **live** schema and `verified` only
     /// subtracts from it, so a column that became `NOT NULL` after the statement
     /// was bound is still checked. `verified` is ascending, so the two lists
-    /// merge in one pass.
-    ///
-    /// What it does *not* survive is a column being added or dropped under it:
-    /// the indices are positional, like the tuples they came with. No `ALTER
-    /// TABLE` form the server implements does that today — see the caller's
-    /// note on `InsertSource::Tuples::notnull_verified`.
+    /// merge in one pass. What it does *not* survive is a column added or
+    /// dropped under it, which shifts the indices — the assumption the caller's
+    /// tuples already rest on, and no `ALTER TABLE` form here does that.
     pub(crate) fn for_schema_excluding(schema: &TableSchema, verified: &[u32]) -> Self {
         let mut next = 0;
         let mut columns = Vec::new();
@@ -77,10 +68,8 @@ impl NotNullSet {
         ctx: &ExecContext,
     ) -> Result<(), ExecError> {
         for &index in &self.columns {
-            // `get` rather than indexing: the predecessor zipped the two lists,
-            // which silently stops at a tuple narrower than the shape. Preserved
-            // rather than turned into a panic — nothing here is the place to
-            // discover a short tuple.
+            // `get`, because a tuple narrower than the shape is not this
+            // function's to diagnose: it checks the values there are.
             if matches!(tuple.get(index as usize), Some(Value::Null)) {
                 return Err(violation(schema, tuple, index as usize, ctx));
             }
@@ -89,8 +78,8 @@ impl NotNullSet {
     }
 }
 
-/// Build the 23502. Out of line so the loop above stays a load and a compare:
-/// this arm allocates two strings and renders the whole row.
+/// Build the 23502, out of line so the loop above keeps none of it: this
+/// allocates two strings and renders the whole row.
 #[cold]
 #[inline(never)]
 fn violation(schema: &TableSchema, tuple: &Tuple, index: usize, ctx: &ExecContext) -> ExecError {
@@ -313,7 +302,6 @@ mod tests {
         );
     }
 
-    /// Three columns, the middle one nullable.
     fn notnull_schema() -> TableSchema {
         let mut schema = TableSchema::new(
             "t",
@@ -396,8 +384,8 @@ mod tests {
         assert!(set.validate(&schema, &row, &ctx).is_ok());
     }
 
-    /// A tuple narrower than the shape stops where the values do — the behavior
-    /// of the `zip` this replaced, kept so a short tuple is not a panic.
+    /// A tuple narrower than the shape stops where the values do, rather than
+    /// panicking on the columns it has no value for.
     #[test]
     fn a_short_tuple_checks_only_the_values_it_has() {
         let schema = notnull_schema();
