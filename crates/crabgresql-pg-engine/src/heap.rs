@@ -1074,11 +1074,10 @@ impl HeapTable {
     /// time: one pin, one page lock and one `HEAP_MULTI_INSERT` per page rather
     /// than per row. Returns the tids in the order `items` gave them.
     ///
-    /// This is what makes a bulk load cheap. Placing row by row costs a
-    /// `smgr.nblocks` (a `statx`), a `BufferPool::pin` (the pool-wide map mutex
-    /// plus the frame's), a second frame lock for `modify`, a copy of the tuple
+    /// This is what makes a bulk load cheap: placing row by row pays an
+    /// `smgr.nblocks` (a `statx`), a pin, a page lock, a copy of the tuple back
     /// out of the page and a WAL record with its own header and log-mutex
-    /// acquisition — all per row, while a ClickBench page holds dozens of them.
+    /// acquisition for every row, on a page that holds dozens of them.
     ///
     /// The caller must have encoded `items` **before** calling: nothing in here
     /// may pin another page. `write_planned` can, since a toasted attribute
@@ -1095,9 +1094,8 @@ impl HeapTable {
             return tids;
         }
         let smgr = self.engine.bufpool.smgr();
-        // Once per batch rather than once per row, and the loop below tracks the
-        // file's end itself from then on: every block it writes to past the first
-        // is one it extended.
+        // Read once, then never again: every block this loop moves on to is one
+        // it extended itself, so it always knows where the file ends.
         let nblocks = Self::io(smgr.nblocks(rel));
         let mut target = if nblocks == 0 {
             Self::io(smgr.extend(rel))
@@ -1105,8 +1103,7 @@ impl HeapTable {
             self.insert_hint.load(Ordering::Relaxed).min(nblocks - 1)
         };
         while tids.len() < items.len() {
-            // Where this page's run starts. Read before the closure, which
-            // borrows `tids` mutably to append to it.
+            // Read before the closure, which borrows `tids` mutably to append to.
             let start = tids.len();
             let page = Self::io(self.engine.bufpool.pin(rel, target));
             page.modify(|pg| {
@@ -1114,7 +1111,6 @@ impl HeapTable {
                 for bytes in &items[start..] {
                     debug_assert!(bytes.len() <= MAX_TUPLE, "item was not sized");
                     let Some(off) = page::add_item(pg, bytes) else {
-                        // Page full: the rest of the batch goes to a fresh block.
                         break;
                     };
                     let tid = Tid {
@@ -1125,9 +1121,6 @@ impl HeapTable {
                         panic!("newly inserted tuple is missing from its page");
                     };
                     tuple::set_ctid(item, tid);
-                    let Some(item) = page::get_item(pg, off) else {
-                        panic!("newly inserted tuple is missing from its page");
-                    };
                     // Straight from the page into the record: the self-ctid patch
                     // is already in, and nothing copies the tuple in between.
                     w.push(off, item);
@@ -1787,9 +1780,8 @@ impl TableAm for HeapTable {
         Ok(tid)
     }
 
-    /// One pin, one page lock and one WAL record per *page* instead of per row —
-    /// see [`HeapTable::place_batch`]. This is the write half of a bulk load:
-    /// `COPY` hands the batch straight here.
+    /// The write half of a bulk load — `COPY` hands its batch straight here, and
+    /// [`HeapTable::place_batch`] is where the saving is.
     fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
         self.insert_batch(&tuples, txn)
     }

@@ -63,10 +63,10 @@ impl RmgrRedo for HeapRedo {
                 let rel = r.rel();
                 let block = r.u32();
                 let n = r.u32();
-                let items: Vec<(u16, Vec<u8>)> = (0..n)
+                let items: Vec<(u16, &[u8])> = (0..n)
                     .map(|_| {
                         let off = r.u16();
-                        (off, r.bytes().to_vec())
+                        (off, r.bytes())
                     })
                     .collect();
                 self.apply(rel, block, ctx.lsn, |pg| {

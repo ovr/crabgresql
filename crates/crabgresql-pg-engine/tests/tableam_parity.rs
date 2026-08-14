@@ -624,12 +624,12 @@ fn a_batch_spanning_pages_places_every_row_and_reports_its_tids() -> anyhow::Res
     let scanned = scan_rows(&*table, &read(&h.tm));
     assert_eq!(scanned.len(), rows.len());
     // Scan order is physical, and so is placement order, so the two lists line
-    // up element for element — tid and value both.
+    // up element for element.
     for (i, (tid, tuple)) in scanned.iter().enumerate() {
         assert_eq!(*tid, tids[i], "row {i} was reported at the wrong tid");
         assert_eq!(*tuple, rows[i], "row {i} did not survive the batch");
     }
-    // Each row's ctid points at itself, which is what `fetch` walks.
+    // A reported tid is also usable on its own, not just in scan order.
     for (i, tid) in tids.iter().enumerate() {
         assert_eq!(table.fetch(*tid, &read(&h.tm))?, Some(rows[i].clone()));
     }

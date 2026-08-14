@@ -14,7 +14,7 @@ use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal, recover};
 
 mod common;
-use common::{corrupt_page_byte, open, try_open};
+use common::{corrupt_page_byte, open, open_from, try_open};
 
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -173,8 +173,8 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
 fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
     // `insert_many` logs one HEAP_MULTI_INSERT per page rather than one record
     // per row, so replay has to rebuild a whole page's worth of rows from a
-    // single record — at the same offsets, with the same self-ctid — and stay
-    // idempotent when it sees that record twice.
+    // single record — at the same offsets — and stay idempotent when it sees
+    // that record twice.
     let dir = tempfile::tempdir()?;
     let placed: Vec<Tid>;
     {
@@ -186,10 +186,11 @@ fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
             .collect();
         placed = table.insert_many(rows, &tm.context(x, CommandId::FIRST))?;
         tm.commit(x)?;
+        let blocks: std::collections::BTreeSet<u32> = placed.iter().map(|t| t.block).collect();
         assert!(
-            placed.iter().map(|t| t.block).collect::<Vec<_>>().len() > 1
-                && placed.first().map(|t| t.block) != placed.last().map(|t| t.block),
-            "the batch was meant to cross a page boundary"
+            blocks.len() > 1,
+            "the batch was meant to cross a page boundary, got {} block(s)",
+            blocks.len()
         );
         // Crash: drop without a checkpoint, so only the WAL carries the batch.
     }
@@ -204,28 +205,19 @@ fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
     assert_eq!(rows.len(), 500);
     assert_eq!(rows.iter().map(|(tid, _)| *tid).collect::<Vec<_>>(), placed);
     assert_eq!(visible_ids(&tm, &*table), (0..500).collect::<Vec<i32>>());
-    // Each replayed row still points at itself, which is what `fetch` walks.
+    // A replayed row is reachable by its tid alone, not only through a scan.
     for (i, tid) in placed.iter().enumerate() {
         let got = table.fetch(*tid, &read(&tm))?;
         assert_eq!(got.map(|t| t[0].clone()), Some(Value::Int4(i as i32)));
     }
 
     // Push the recovered pages to disk (advancing their pd_lsn), then replay the
-    // same WAL again over them: the LSN gate must make it a no-op rather than
+    // whole WAL again over them — `Lsn::INVALID` ignores the redo point the
+    // checkpoint just published: the LSN gate must make it a no-op rather than
     // adding a second copy of every row.
     engine.checkpoint(Xid::FIRST_NORMAL)?;
-    let mut reg = RmgrRegistry::new();
-    let wal = Arc::new(Wal::open(dir.path())?);
-    let engine2 = PgEngine::new_with_pool(
-        dir.path(),
-        Arc::clone(&wal),
-        &mut reg,
-        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
-    )?;
-    let clog = Arc::new(Clog::new());
-    let res = recover(dir.path(), &reg, &clog, crabgresql_wal::Lsn::INVALID)?;
-    let sink: Arc<dyn CommitSink> = Arc::clone(&wal) as Arc<dyn CommitSink>;
-    let tm2 = TransactionManager::new_recovered(sink, clog, res.next_xid);
+    drop(engine);
+    let (engine2, tm2) = open_from(dir.path(), crabgresql_wal::Lsn::INVALID)?;
     let table2 = engine2.open_table("t")?;
     assert_eq!(visible_ids(&tm2, &*table2), (0..500).collect::<Vec<i32>>());
 

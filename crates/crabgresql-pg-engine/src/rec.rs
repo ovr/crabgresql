@@ -3,6 +3,7 @@
 
 use crabgresql_txn::{CommandId, Xid};
 
+use crate::page::BLCKSZ;
 use crate::smgr::RelFileNode;
 
 // `info` byte opcodes for [`crabgresql_wal::RmgrId::HEAP`] records.
@@ -89,7 +90,7 @@ pub fn insert(rel: RelFileNode, block: u32, off: u16, tuple: &[u8]) -> Vec<u8> {
     w.0
 }
 
-/// Builder for a `HEAP_MULTI_INSERT`: every tuple one batch placed on a single
+/// Builder for a `HEAP_MULTI_INSERT`: every tuple a batch placed on a single
 /// page, in one record. Layout:
 /// `[rel:u32][block:u32][n:u32] { [off:u16][len:u32][bytes] }*`.
 ///
@@ -101,18 +102,20 @@ pub fn insert(rel: RelFileNode, block: u32, off: u16, tuple: &[u8]) -> Vec<u8> {
 pub struct MultiInsert {
     w: W,
     n: u32,
+    /// Where the placeholder `n` sits, captured as the header is written rather
+    /// than spelled as a constant that silently rots if a field is added.
+    count_at: usize,
 }
 
 impl MultiInsert {
-    /// The item count's byte offset in the payload: it follows `rel` and `block`.
-    const COUNT_AT: usize = 8;
-
     pub fn new(rel: RelFileNode, block: u32) -> MultiInsert {
-        let mut w = W(Vec::new());
+        // The record describes one page, so it can never outgrow one.
+        let mut w = W(Vec::with_capacity(BLCKSZ));
         w.u32(rel.0);
         w.u32(block);
+        let count_at = w.0.len();
         w.u32(0);
-        MultiInsert { w, n: 0 }
+        MultiInsert { w, n: 0, count_at }
     }
 
     pub fn push(&mut self, off: u16, tuple: &[u8]) {
@@ -126,7 +129,8 @@ impl MultiInsert {
     }
 
     pub fn finish(mut self) -> Vec<u8> {
-        self.w.0[Self::COUNT_AT..Self::COUNT_AT + 4].copy_from_slice(&self.n.to_le_bytes());
+        let at = self.count_at;
+        self.w.0[at..at + 4].copy_from_slice(&self.n.to_le_bytes());
         self.w.0
     }
 }
