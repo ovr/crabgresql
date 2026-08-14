@@ -135,6 +135,10 @@ pub enum InsertSource {
         /// sequence advances exactly as it does on the `Values` path. Empty for
         /// the common load, which is why the fast path stays fast.
         defaults: Vec<(usize, BoundExpr)>,
+        /// Columns, ascending, holding a non-NULL value in **every** row of
+        /// `rows`. The executor subtracts them from the live schema's not-null
+        /// list; empty — every builder but COPY — just checks them all.
+        notnull_verified: Vec<u32>,
     },
     /// `INSERT ... SELECT` / `INSERT ... TABLE t`: rows are pulled from `input`
     /// at execution time. `projections` is full-width in schema order — non-target

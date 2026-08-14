@@ -43,12 +43,6 @@ use crate::error::PgError;
 /// smaller than this, so the carried-over partial record stays short.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Rows decoded before they are handed to the inserter, when the caller states
-/// no preference. Bounds how much of a file is materialized at once; a write
-/// target whose batches become whole on-disk units asks for more (see
-/// `TableAccessMethod::bulk_load_batch_rows`).
-const BATCH_ROWS: usize = 1024;
-
 /// The most bytes one COPY record may span, matching `MaxAllocSize` — the
 /// ceiling PostgreSQL's own line buffer hits (see [`record_too_long`]).
 const MAX_RECORD_BYTES: usize = 1024 * 1024 * 1024 - 1;
@@ -814,6 +808,11 @@ fn strerror(e: &std::io::Error) -> String {
 mod tests {
     use super::*;
     use crabgresql_storage_api::TableAccessMethod;
+
+    /// The row-store batch size, spelled out so the expectations below read as
+    /// themselves — and checked against the value the loader really uses,
+    /// [`TableAccessMethod::bulk_load_batch_rows`], rather than assumed equal.
+    const BATCH_ROWS: usize = 1024;
 
     /// One decoded field, owned. The decoder hands out spans into a batch's
     /// arena; the assertions below are written against the *values*, which is

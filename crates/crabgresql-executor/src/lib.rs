@@ -49,7 +49,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
 
-use checks::CheckSet;
+use checks::{CheckSet, NotNullSet};
 use eval::eval;
 pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
@@ -2108,15 +2108,26 @@ fn execute_insert(
     // to completion first is what makes `INSERT INTO t SELECT ... FROM t` read
     // only pre-insert rows (no Halloween problem), and lets validation/routing
     // see a stable set so the statement stays all-or-nothing.
-    let tuples = collect_insert_tuples(source, ctx, txn)?;
+    let (tuples, notnull_verified) = collect_insert_tuples(source, ctx, txn)?;
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
-        // its key and write there.
+        // its key and write there. `notnull_verified` indexes the parent's shape,
+        // so it says nothing about the leaf a row is checked against — ignored
+        // here, and empty by construction for the one source that builds it.
         Some(leaves) => insert_routed(
             table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
         ),
         // Ordinary table: rows go straight to `table`.
-        None => insert_direct(table, tuples, returning, freeze, tableoid, ctx, txn),
+        None => insert_direct(
+            table,
+            tuples,
+            returning,
+            &notnull_verified,
+            freeze,
+            tableoid,
+            ctx,
+            txn,
+        ),
     }
 }
 
@@ -2135,9 +2146,11 @@ fn write_context(freeze: bool, txn: &TxnContext) -> Option<TxnContext> {
     freeze.then(|| txn.with_freeze())
 }
 
-/// Evaluate an INSERT's source into fully-formed, schema-order tuples. No
-/// validation or writing happens here; the caller does both after the whole
-/// source is consumed.
+/// Evaluate an INSERT's source into fully-formed, schema-order tuples, plus the
+/// columns the source vouches are non-NULL in every one of them (empty unless it
+/// arrived already proven — see [`PhysicalInsertSource::Tuples`]). No validation
+/// or writing happens here; the caller does both after the whole source is
+/// consumed.
 ///
 /// Each tuple is pre-sized and filled by hand rather than `collect`ed. The
 /// fallible-iterator shunt behind `collect::<Result<Vec<_>, _>>()` reports a
@@ -2149,8 +2162,9 @@ fn collect_insert_tuples(
     source: PhysicalInsertSource,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<Vec<Tuple>, ExecError> {
+) -> Result<(Vec<Tuple>, Vec<u32>), ExecError> {
     let mut tuples: Vec<Tuple> = Vec::new();
+    let mut verified: Vec<u32> = Vec::new();
     match source {
         PhysicalInsertSource::Values(rows) => {
             for row in rows {
@@ -2175,8 +2189,15 @@ fn collect_insert_tuples(
         // left to fill. Row-major and in ascending column order, which is the
         // order the `Values` path evaluates a full-width row in — what makes a
         // `serial` column's sequence advance identically.
-        PhysicalInsertSource::Tuples { rows, defaults } => {
+        PhysicalInsertSource::Tuples {
+            rows,
+            defaults,
+            notnull_verified,
+        } => {
             tuples = rows;
+            // Safe against the defaults filled below: a builder only vouches for
+            // the columns it filled itself, never one it left to the executor.
+            verified = notnull_verified;
             if !defaults.is_empty() {
                 for tuple in &mut tuples {
                     for (index, default) in &defaults {
@@ -2201,16 +2222,18 @@ fn collect_insert_tuples(
             }
         }
     }
-    Ok(tuples)
+    Ok((tuples, verified))
 }
 
 /// Constraint-check and write every tuple to a single table (the non-partitioned
 /// path). Each row is validated against the pre-existing rows plus the earlier
 /// rows of this statement, so a duplicate within one INSERT is caught.
+#[allow(clippy::too_many_arguments)]
 fn insert_direct(
     table: &Arc<dyn TableAm>,
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
+    notnull_verified: &[u32],
     freeze: bool,
     tableoid: bool,
     ctx: &ExecContext,
@@ -2222,6 +2245,9 @@ fn insert_direct(
     let schema = table.schema();
     let indexes = table.indexes();
     let mut visible = UniqueKeySet::for_insert(table, txn, &schema, &indexes)?;
+    // From the schema read just now, minus what the source proved: a column it
+    // never filled, or one made not-null since, stays in the list.
+    let notnull = NotNullSet::for_schema_excluding(&schema, notnull_verified);
     let checks = CheckSet::for_schema(&schema, ctx)?;
     // Generated columns are filled in before anything looks at the row: NOT NULL,
     // CHECK, UNIQUE and RETURNING all see the computed values.
@@ -2235,7 +2261,7 @@ fn insert_direct(
         }
     }
     for tuple in &tuples {
-        validate_constraints(&schema, tuple, &mut visible, &checks, ctx)?;
+        validate_constraints(&schema, tuple, &mut visible, &notnull, &checks, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -2304,6 +2330,9 @@ fn insert_routed(
     // schedule as `shapes` — kept in its own vector because binding can fail and
     // `get_or_insert_with` has no room for a `Result`.
     let mut leaf_checks: Vec<Option<CheckSet>> = (0..leaves.len()).map(|_| None).collect();
+    // Each leaf's not-null columns, on the same schedule: a row is checked
+    // against the leaf's own shape, so the parent's list would not answer.
+    let mut leaf_notnull: Vec<Option<NotNullSet>> = (0..leaves.len()).map(|_| None).collect();
     // The leaves' generated columns, lazily like their checks. A generated
     // column is never part of a partition key, so routing reads only stored
     // values and can run before this.
@@ -2334,14 +2363,20 @@ fn insert_routed(
             leaf_checks[leaf] = Some(CheckSet::for_schema(leaf_schema, ctx)?);
         }
         let checks = leaf_checks[leaf].as_ref().expect("just seeded");
+        let notnull = leaf_notnull[leaf].get_or_insert_with(|| NotNullSet::for_schema(leaf_schema));
         match visible[leaf].as_mut() {
             Some(seen) => {
-                validate_constraints(leaf_schema, tuple, seen, checks, ctx)?;
+                validate_constraints(leaf_schema, tuple, seen, notnull, checks, ctx)?;
                 seen.record(tuple, None);
             }
-            None => {
-                validate_constraints(leaf_schema, tuple, &mut UniqueKeySet::none(), checks, ctx)?
-            }
+            None => validate_constraints(
+                leaf_schema,
+                tuple,
+                &mut UniqueKeySet::none(),
+                notnull,
+                checks,
+                ctx,
+            )?,
         }
         routes.push(leaf);
     }
@@ -2554,6 +2589,13 @@ fn update_inherited(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
+    // One per target, like the checks: an inheritance child may hold columns the
+    // named relation does not.
+    let notnull: Vec<NotNullSet> = shapes
+        .iter()
+        .map(|(schema, _)| NotNullSet::for_schema(schema))
+        .collect();
+
     // One bound generated-column set per target, on the same schedule. Each
     // child answers with its own: an inheritance child may redeclare the
     // column's expression, and its layout is its own in any case.
@@ -2611,9 +2653,14 @@ fn update_inherited(
                 if !simulated[i].forget(old, *tid) {
                     continue;
                 }
-                if let Err(error) =
-                    validate_constraints(&shapes[i].0, &new, &mut simulated[i], &checks[i], ctx)
-                {
+                if let Err(error) = validate_constraints(
+                    &shapes[i].0,
+                    &new,
+                    &mut simulated[i],
+                    &notnull[i],
+                    &checks[i],
+                    ctx,
+                ) {
                     simulated[i].record(old, Some(*tid));
                     return Err(error);
                 }
@@ -2623,6 +2670,7 @@ fn update_inherited(
                     &shapes[i].0,
                     &new,
                     &mut UniqueKeySet::none(),
+                    &notnull[i],
                     &checks[i],
                     ctx,
                 )?;
@@ -2709,6 +2757,7 @@ fn update_direct(
     // row, not only those reading an updated column. A generated column is
     // recomputed on the same terms.
     let checks = CheckSet::for_schema(&schema, ctx)?;
+    let notnull = NotNullSet::for_schema(&schema);
     let generated = GeneratedSet::for_schema(&schema, ctx)?;
     // One relation, so every row reports the same OID.
     let oid = tableoid
@@ -2746,13 +2795,22 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) = validate_constraints(&schema, &new, &mut simulated, &checks, ctx) {
+            if let Err(error) =
+                validate_constraints(&schema, &new, &mut simulated, &notnull, &checks, ctx)
+            {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
             simulated.record(&new, Some(tid));
         } else {
-            validate_constraints(&schema, &new, &mut UniqueKeySet::none(), &checks, ctx)?;
+            validate_constraints(
+                &schema,
+                &new,
+                &mut UniqueKeySet::none(),
+                &notnull,
+                &checks,
+                ctx,
+            )?;
         }
         pending.push((tid, new));
     }
@@ -2870,6 +2928,11 @@ fn update_routed(
         .map(|(schema, _)| CheckSet::for_schema(schema, ctx))
         .collect::<Result<_, _>>()?;
 
+    let leaf_notnull: Vec<NotNullSet> = leaf_shapes
+        .iter()
+        .map(|(schema, _)| NotNullSet::for_schema(schema))
+        .collect();
+
     // One bound generated-column set per leaf, alongside `leaf_checks`. A row
     // that moves between leaves is generated for its *destination*, which is the
     // relation whose constraints it then has to satisfy.
@@ -2933,6 +2996,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
+                        &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
                     ) {
@@ -2945,6 +3009,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
+                        &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
                     )?;
@@ -2958,6 +3023,7 @@ fn update_routed(
                     &leaf_shapes[dst].0,
                     &new,
                     &mut UniqueKeySet::none(),
+                    &leaf_notnull[dst],
                     &leaf_checks[dst],
                     ctx,
                 )?;
@@ -3026,24 +3092,11 @@ fn validate_constraints(
     schema: &TableSchema,
     tuple: &Tuple,
     existing: &mut UniqueKeySet,
+    notnull: &NotNullSet,
     checks: &CheckSet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
-    for (column, value) in schema.columns.iter().zip(tuple) {
-        if !column.nullable && matches!(value, Value::Null) {
-            return Err(ExecError::new(
-                "23502",
-                format!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
-                    column.name, schema.name
-                ),
-            )
-            .with_detail(Some(format!(
-                "Failing row contains ({}).",
-                display_tuple(schema, tuple, ctx)
-            ))));
-        }
-    }
+    notnull.validate(schema, tuple, ctx)?;
 
     // Order matches PostgreSQL's observable behavior, probed against 18.4 on
     // both INSERT and UPDATE: not-null (above), then CHECK, then the partition

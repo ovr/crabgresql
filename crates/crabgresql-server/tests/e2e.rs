@@ -8307,6 +8307,139 @@ async fn copy_in_bad_value_aborts_load() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A NULL marker in a `NOT NULL` column fails the load with 23502 naming that
+/// column, and the DETAIL renders the whole row — including the fields that
+/// parsed fine. COPY sees the NULL while it builds the row, but the diagnostic
+/// is still the executor's, which is what keeps this identical to an INSERT's.
+#[tokio::test]
+async fn copy_in_null_marker_into_not_null_column_errors() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4 NOT NULL, b int4 NOT NULL)")
+        .await?;
+
+    let sink = client.copy_in("COPY t FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\t2\n\\N\t3\n")).await?;
+    let err = sink
+        .finish()
+        .await
+        .expect_err("a NULL marker in a NOT NULL column must fail the COPY");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "null value in column \"a\" of relation \"t\" violates not-null constraint"
+    );
+    assert_eq!(db.detail(), Some("Failing row contains (null, 3)."));
+
+    // The good row of the same load is not committed either.
+    let messages = client.simple_query("SELECT count(*) AS n FROM t").await?;
+    assert_eq!(rows(&messages)[0].get("n"), Some("0"));
+    Ok(())
+}
+
+/// A row violating a column the COPY names *and* one it omits reports the
+/// earlier column, not the one the load happened to look at first.
+#[tokio::test]
+async fn copy_in_reports_the_first_not_null_column_of_the_row() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int4 NOT NULL, b int4 NOT NULL)")
+        .await?;
+
+    // `a` is absent from the column list and has no default, so it is NULL; `b`
+    // gets an explicit NULL marker. Both violate, and `a` comes first.
+    let sink = client.copy_in("COPY t (b) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"\\N\n")).await?;
+    let err = sink.finish().await.expect_err("both columns violate");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "null value in column \"a\" of relation \"t\" violates not-null constraint"
+    );
+    assert_eq!(db.detail(), Some("Failing row contains (null, null)."));
+    Ok(())
+}
+
+/// A `NOT NULL` column outside the COPY column list whose `DEFAULT` does not
+/// fold is filled by the executor, *after* the load handed the rows over — so
+/// its NULL is caught there, on the row as finally formed.
+#[tokio::test]
+async fn copy_in_deferred_default_evaluating_to_null_is_caught() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    // PL/pgSQL, so the default stays a call the executor makes per row: a SQL
+    // function body would be inlined at bind time and fold to a constant.
+    client
+        .simple_query(
+            "CREATE FUNCTION fnull() RETURNS int4 LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+        )
+        .await?;
+    client
+        .simple_query("CREATE TABLE t (a int4 NOT NULL, b int4 NOT NULL DEFAULT fnull())")
+        .await?;
+
+    let sink = client.copy_in("COPY t (a) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\n")).await?;
+    let err = sink
+        .finish()
+        .await
+        .expect_err("the default evaluates to NULL in a NOT NULL column");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "null value in column \"b\" of relation \"t\" violates not-null constraint"
+    );
+    assert_eq!(db.detail(), Some("Failing row contains (1, null)."));
+    Ok(())
+}
+
+/// The routed (partitioned) load checks against the leaf the row lands in, and
+/// the violation names that leaf — the parent's shape says nothing here.
+#[tokio::test]
+async fn copy_in_not_null_names_the_destination_partition() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE p (id int4 NOT NULL, v int4 NOT NULL) PARTITION BY RANGE (id)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE p_lo PARTITION OF p FOR VALUES FROM (0) TO (100)")
+        .await?;
+
+    let sink = client.copy_in("COPY p FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"7\t\\N\n")).await?;
+    let err = sink.finish().await.expect_err("v rejects NULL");
+    let db = err.as_db_error().expect("db error");
+    assert_eq!(db.code(), &SqlState::NOT_NULL_VIOLATION);
+    assert_eq!(
+        db.message(),
+        "null value in column \"v\" of relation \"p_lo\" violates not-null constraint"
+    );
+    assert_eq!(db.detail(), Some("Failing row contains (7, null)."));
+    Ok(())
+}
+
 /// COPY into a missing relation errors before entering copy mode (no
 /// CopyInResponse), so the driver surfaces `undefined_table` from `copy_in`.
 #[tokio::test]

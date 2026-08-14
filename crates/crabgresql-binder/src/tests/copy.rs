@@ -90,7 +90,7 @@ fn copy_parses_fields_straight_into_values() -> anyhow::Result<()> {
         &plan,
         vec![vec![field("7"), field("8"), field("hi"), field("t")]],
     )?;
-    let InsertSource::Tuples { rows, defaults } = source else {
+    let InsertSource::Tuples { rows, defaults, .. } = source else {
         bail!("expected a Tuples source");
     };
     assert!(defaults.is_empty(), "no column here has a default to defer");
@@ -220,7 +220,8 @@ fn copy_defers_a_default_that_does_not_fold() -> anyhow::Result<()> {
     }
     let engine: Arc<dyn TableEngine> = engine;
     let plan = copy_plan(&engine, "COPY d (id) FROM stdin")?;
-    let InsertSource::Tuples { rows, defaults } = copy_rows(&plan, vec![vec![field("1")]])? else {
+    let InsertSource::Tuples { rows, defaults, .. } = copy_rows(&plan, vec![vec![field("1")]])?
+    else {
         bail!("expected a Tuples source");
     };
     assert_eq!(
@@ -361,6 +362,72 @@ fn copy_places_a_reordered_column_list_and_still_reads_it_in_wire_order() -> any
         .expect_err("neither field is an integer");
     assert_eq!(err.code, sqlstate::INVALID_TEXT_REPRESENTATION);
     assert_eq!(err.message, "invalid input syntax for type integer: \"x\"");
+    Ok(())
+}
+
+/// The columns a load vouches for, which the executor subtracts from the
+/// not-null columns of the live schema.
+fn verified_of(source: InsertSource) -> Vec<u32> {
+    let InsertSource::Tuples {
+        notnull_verified, ..
+    } = source
+    else {
+        panic!("expected a Tuples source");
+    };
+    notnull_verified
+}
+
+/// A batch with no NULL marker vouches for every column it names.
+#[test]
+fn copy_vouches_for_the_columns_it_filled() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
+    let plan = copy_plan(&engine, "COPY t FROM stdin")?;
+    let source = copy_rows(
+        &plan,
+        vec![
+            vec![field("1"), field("2"), field("a"), field("t")],
+            vec![field("3"), field("4"), field("b"), field("f")],
+        ],
+    )?;
+    assert_eq!(verified_of(source), vec![0, 1, 2, 3]);
+    Ok(())
+}
+
+/// One NULL anywhere in the batch disqualifies the column — the claim is about
+/// every row, so a later good value cannot take it back.
+#[test]
+fn one_null_marker_disqualifies_its_column_for_the_whole_batch() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
+    let plan = copy_plan(&engine, "COPY t FROM stdin")?;
+    let source = copy_rows(
+        &plan,
+        vec![
+            vec![field("1"), field("2"), None, field("t")],
+            vec![field("3"), field("4"), field("b"), field("f")],
+        ],
+    )?;
+    assert_eq!(
+        verified_of(source),
+        vec![0, 1, 3],
+        "`name` held a NULL in the first row, so the batch cannot vouch for it"
+    );
+    Ok(())
+}
+
+/// A reordered column list is read in wire order but vouched for in schema
+/// order: the executor merges this against the schema in one pass, and a list
+/// in wire order would silently skip the wrong columns.
+#[test]
+fn a_reordered_column_list_is_vouched_for_in_schema_order() -> anyhow::Result<()> {
+    let engine = engine_with_table()?;
+    let plan = copy_plan(&engine, "COPY t (flag, id) FROM stdin")?;
+    let source = copy_rows(&plan, vec![vec![field("t"), field("1")]])?;
+    assert_eq!(verified_of(source), vec![0, 3]);
+
+    // And the same list with a NULL in the field that *sits* first, which is
+    // the later column.
+    let source = copy_rows(&plan, vec![vec![None, field("1")]])?;
+    assert_eq!(verified_of(source), vec![0]);
     Ok(())
 }
 
