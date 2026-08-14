@@ -1,27 +1,14 @@
 //! The append/flush WAL stream with group-commit fsync.
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use crabgresql_txn::{CommitSink, Xid};
 
 use crate::record::{Lsn, LsnRange, WalError, WalRecord};
-use crate::rmgr::{RmgrId, XACT_ABORT, XACT_COMMIT};
-
-/// The single WAL file lives at `<dir>/pg_wal/wal`. One growing file keeps
-/// LSN==byte-offset trivially true.
-///
-/// TODO: rotate the WAL into segments so finished ones can be recycled
-/// (`docs/ARCHITECTURE.md §1.3`).
-const WAL_SUBDIR: &str = "pg_wal";
-const WAL_FILE: &str = "wal";
-
-pub fn wal_path(dir: &Path) -> PathBuf {
-    dir.join(WAL_SUBDIR).join(WAL_FILE)
-}
+use crate::rmgr::{RmgrId, XACT_ABORT, XACT_COMMIT, XLOG_PAD};
+use crate::segment::{SEGMENT_SIZE, SegmentWriter, segment_numbers, segment_offset};
 
 struct Inner {
     /// Bytes appended but not yet handed to a writer.
@@ -32,6 +19,52 @@ struct Inner {
     written: u64,
     /// True while one thread owns the write+fsync; others coalesce behind it.
     flushing: bool,
+}
+
+impl Inner {
+    /// Carry the insert position to the next segment boundary when a record of
+    /// `len` bytes would otherwise straddle it.
+    ///
+    /// Two fillers, because one cannot cover both cases: a tail of at least
+    /// [`WalRecord::MIN_LEN`] gets a **padding record**, CRC-covered like any
+    /// other, so recovery decodes and ignores it instead of having to tell zeros
+    /// apart from a torn write; a shorter tail gets raw zeros, unambiguous for
+    /// the opposite reason — no record can *start* there, so recovery steps over
+    /// it on arithmetic alone.
+    ///
+    /// A record longer than a whole segment is exempt (see [`Wal::append`]).
+    fn pad_to_boundary(&mut self, len: u64) {
+        let off = segment_offset(Lsn(self.insert_lsn));
+        if off == 0 {
+            return;
+        }
+        let remaining = SEGMENT_SIZE - off;
+        if remaining < WalRecord::MIN_LEN as u64 {
+            self.unwritten
+                .resize(self.unwritten.len() + remaining as usize, 0);
+            self.insert_lsn += remaining;
+            return;
+        }
+        if len <= remaining {
+            return;
+        }
+        let filler = vec![0u8; (remaining - WalRecord::MIN_LEN as u64) as usize];
+        let pad = WalRecord {
+            rec_lsn: Lsn(self.insert_lsn),
+            xid: Xid::INVALID,
+            rmgr: RmgrId::XLOG.0,
+            info: XLOG_PAD,
+            payload: &filler,
+        };
+        let mut scratch = std::mem::take(&mut self.unwritten);
+        let n = pad.encode(&mut scratch);
+        self.unwritten = scratch;
+        debug_assert_eq!(
+            n as u64, remaining,
+            "padding must land exactly on the boundary"
+        );
+        self.insert_lsn += n as u64;
+    }
 }
 
 /// Checkpoint-delay bookkeeping. Guarded by its own mutex, independent of
@@ -57,7 +90,7 @@ struct Delay {
 pub struct Wal {
     inner: Mutex<Inner>,
     /// Held only by the current flusher, so appends proceed during an fsync.
-    file: Mutex<File>,
+    writer: Mutex<SegmentWriter>,
     /// Highest LSN known to be on stable storage (fsynced).
     flushed: AtomicU64,
     cond: Condvar,
@@ -145,21 +178,18 @@ impl Drop for CheckpointDelay<'_> {
 
 impl Wal {
     /// Open (creating if absent) the WAL under `dir`, positioned to append after
-    /// the existing file contents. Everything already in the file is treated as
-    /// durable. After a crash, call [`crate::recover`] first and then
-    /// [`Wal::reset_to`] to discard any torn tail past the last valid record.
+    /// the existing segments. Everything already on disk is treated as durable.
+    /// After a crash, call [`crate::recover`] first and then [`Wal::reset_to`]
+    /// to discard any torn tail past the last valid record.
+    ///
+    /// The insert position comes from the *highest-numbered* segment rather than
+    /// from summing them: a segment is only created once its predecessor is full
+    /// and fsynced, so the last one is the only partial file.
     pub fn open(dir: &Path) -> Result<Wal, WalError> {
-        std::fs::create_dir_all(dir.join(WAL_SUBDIR))?;
-        let path = wal_path(dir);
-        // truncate(false): never discard an existing WAL — we append to it.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        let len = file.metadata()?.len();
-        tracing::trace!(dir = %dir.display(), len, "opened WAL");
+        let last = segment_numbers(dir)?.pop().unwrap_or(0);
+        let writer = SegmentWriter::open(dir, last)?;
+        let len = last * SEGMENT_SIZE + writer.len()?;
+        tracing::trace!(dir = %dir.display(), segment = last, len, "opened WAL");
         Ok(Wal {
             inner: Mutex::new(Inner {
                 unwritten: Vec::new(),
@@ -167,7 +197,7 @@ impl Wal {
                 written: len,
                 flushing: false,
             }),
-            file: Mutex::new(file),
+            writer: Mutex::new(writer),
             flushed: AtomicU64::new(len),
             cond: Condvar::new(),
             delay: Mutex::new(Delay {
@@ -254,19 +284,19 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Truncate the stream back to `lsn`, discarding anything after it. Used
-    /// after recovery to drop a torn tail so new records overwrite the garbage.
+    /// Truncate the stream back to `lsn`, discarding anything after it —
+    /// including whole segments above it. Used after recovery to drop a torn
+    /// tail so new records overwrite the garbage.
     pub fn reset_to(&self, lsn: Lsn) -> Result<(), WalError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let file = self
-            .file
+        let mut writer = self
+            .writer
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        file.set_len(lsn.0)?;
-        file.sync_data()?;
+        writer.reset_to(lsn)?;
         inner.unwritten.clear();
         inner.insert_lsn = lsn.0;
         inner.written = lsn.0;
@@ -280,11 +310,18 @@ impl Wal {
     /// page it changed and, at commit, calls [`Wal::flush`] to make it durable.
     /// The `start` is the record's own boundary, which is what a redo point has
     /// to name.
+    ///
+    /// A record never straddles a segment boundary (see
+    /// [`Inner::pad_to_boundary`]), except one larger than a whole segment,
+    /// which cannot be placed any other way and spans as many files as it needs.
+    /// Serving that case is why `append` stays infallible: the alternative turns
+    /// one oversized row into an error at every call site.
     pub fn append(&self, rmgr: RmgrId, info: u8, xid: Xid, payload: &[u8]) -> LsnRange {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
+        inner.pad_to_boundary((WalRecord::HEADER_LEN + payload.len() + 4) as u64);
         let start = Lsn(inner.insert_lsn);
         let rec = WalRecord {
             rec_lsn: start,
@@ -371,19 +408,17 @@ impl Wal {
             let target = start + bytes.len() as u64;
             drop(inner);
 
-            // Positioned write at the logical offset `start`, never the OS file
-            // cursor: after a reopen the cursor is 0 but the log continues at
-            // `written`, and on a partial-write retry the cursor is desynced —
-            // both would otherwise corrupt the stream.
-            let write_result = (|| -> Result<(), WalError> {
-                let file = self
-                    .file
+            // Scoped so the writer lock is released before `inner` is taken
+            // again below: appends must keep running during the fsync, which is
+            // why the two locks are separate.
+            let mut durable = 0usize;
+            let write_result = {
+                let mut writer = self
+                    .writer
                     .lock()
                     .unwrap_or_else(|_| panic!("mutex poisoned"));
-                file.write_all_at(&bytes, start)?;
-                file.sync_data()?;
-                Ok(())
-            })();
+                writer.write_at(&bytes, start, &mut durable)
+            };
 
             inner = self
                 .inner
@@ -398,9 +433,14 @@ impl Wal {
                     tracing::trace!(start, target, "flushed WAL bytes to disk");
                 }
                 Err(e) => {
-                    // Put the drained bytes back so a retry can flush them, and
-                    // wake any waiters to observe the failure on their own retry.
+                    // Only the part that never reached stable storage goes back:
+                    // a multi-segment write is several fsyncs, so the earlier
+                    // ones have already succeeded and re-writing them would be
+                    // claiming they had not.
+                    inner.written = start + durable as u64;
+                    self.flushed.store(inner.written, Ordering::SeqCst);
                     let mut returned = bytes;
+                    returned.drain(..durable);
                     returned.extend_from_slice(&inner.unwritten);
                     inner.unwritten = returned;
                     inner.flushing = false;
@@ -443,7 +483,10 @@ impl CommitSink for Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::Arc;
+
+    use crate::segment::{wal_segment_path, wal_segment_path_0, wal_stream_len};
 
     #[test]
     fn append_returns_monotonic_end_lsns_and_flush_persists() -> anyhow::Result<()> {
@@ -493,9 +536,138 @@ mod tests {
         Ok(())
     }
 
+    /// Append one record that ends exactly `remaining` bytes short of the first
+    /// segment boundary, and flush it. Only valid as the first append into a
+    /// fresh WAL.
+    ///
+    /// One big record rather than a loop of small ones, so a 32 MB test costs a
+    /// single append and a single fsync.
+    fn fill_to_within(wal: &Wal, remaining: u64) -> anyhow::Result<LsnRange> {
+        let payload = vec![0x5A; (SEGMENT_SIZE - remaining) as usize - WalRecord::MIN_LEN];
+        let range = wal.append(RmgrId::HEAP, 7, Xid(3), &payload);
+        assert_eq!(
+            range.end,
+            Lsn(SEGMENT_SIZE - remaining),
+            "the filler must land where the test expects it"
+        );
+        wal.flush(range.end)?;
+
+        Ok(range)
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_is_padded_to_the_next_segment() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        // 100 bytes left: room for a padding record (>= MIN_LEN), not for the
+        // 228-byte record that follows.
+        fill_to_within(&wal, 100)?;
+        let range = wal.append(RmgrId::HEAP, 7, Xid(4), &[0xC3; 200]);
+        assert_eq!(
+            range.start,
+            Lsn(SEGMENT_SIZE),
+            "the record must start the next segment, not straddle the boundary"
+        );
+        wal.flush(range.end)?;
+
+        assert_eq!(
+            std::fs::metadata(wal_segment_path_0(dir.path()))?.len(),
+            SEGMENT_SIZE,
+            "the segment left behind must be full to the byte"
+        );
+        assert_eq!(
+            std::fs::metadata(wal_segment_path(dir.path(), 1))?.len(),
+            range.end.0 - SEGMENT_SIZE
+        );
+        assert_eq!(wal_stream_len(dir.path())?, range.end.0);
+
+        let seg0 = std::fs::read(wal_segment_path_0(dir.path()))?;
+        let (pad, len) = WalRecord::decode(&seg0[(SEGMENT_SIZE - 100) as usize..])
+            .ok_or_else(|| anyhow::anyhow!("the padding did not decode as a record"))?;
+        assert_eq!(len, 100, "padding must reach the boundary exactly");
+        assert_eq!(pad.rmgr, RmgrId::XLOG.0);
+        assert_eq!(pad.info, XLOG_PAD);
+        assert_eq!(pad.rec_lsn, Lsn(SEGMENT_SIZE - 100));
+
+        Ok(())
+    }
+
+    /// Zeros rather than a padding record, because no record fits: this is the
+    /// only case where recovery needs to know segments exist at all.
+    #[test]
+    fn a_tail_too_small_for_a_record_is_zero_filled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+        let range = wal.append(RmgrId::HEAP, 7, Xid(4), b"x");
+        assert_eq!(range.start, Lsn(SEGMENT_SIZE));
+        wal.flush(range.end)?;
+
+        let seg0 = std::fs::read(wal_segment_path_0(dir.path()))?;
+        assert_eq!(seg0.len() as u64, SEGMENT_SIZE);
+        assert!(
+            seg0[SEGMENT_SIZE as usize - (WalRecord::MIN_LEN - 1)..]
+                .iter()
+                .all(|b| *b == 0),
+            "an unusable tail must be zeros, not stale bytes"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_positions_after_the_last_segment() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let end;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, 100)?;
+            end = wal.append(RmgrId::HEAP, 7, Xid(4), &[0xC3; 200]).end;
+            wal.flush(end)?;
+        }
+        let wal = Wal::open(dir.path())?;
+        assert_eq!(wal.current_lsn(), end);
+        assert_eq!(wal.flushed_lsn(), end);
+        let range = wal.append(RmgrId::HEAP, 7, Xid(5), b"after-reopen");
+        assert_eq!(range.start, end);
+        wal.flush(range.end)?;
+        assert_eq!(wal_stream_len(dir.path())?, range.end.0);
+
+        Ok(())
+    }
+
+    /// `reset_to` below a boundary must unlink the segments above it. A leftover
+    /// segment would put the next `open` back above the truncation point, with an
+    /// unwritten hole in between that recovery would then read as the log.
+    #[test]
+    fn reset_to_below_a_boundary_deletes_the_segments_above() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Wal::open(dir.path())?;
+        let filler = fill_to_within(&wal, 100)?;
+        let above = wal.append(RmgrId::HEAP, 7, Xid(4), &[0xC3; 200]);
+        wal.flush(above.end)?;
+        assert_eq!(crate::segment::segment_numbers(dir.path())?, vec![0, 1]);
+
+        wal.reset_to(filler.end)?;
+        assert_eq!(
+            crate::segment::segment_numbers(dir.path())?,
+            vec![0],
+            "the segment above the truncation point must be gone"
+        );
+        assert_eq!(wal_stream_len(dir.path())?, filler.end.0);
+        assert_eq!(wal.current_lsn(), filler.end);
+
+        let again = wal.append(RmgrId::HEAP, 7, Xid(5), &[0xC3; 200]);
+        assert_eq!(again.start, Lsn(SEGMENT_SIZE));
+        wal.flush(again.end)?;
+        assert_eq!(wal_stream_len(dir.path())?, again.end.0);
+
+        Ok(())
+    }
+
     /// Decode every record in the on-disk WAL, returning `(xid, payload)` pairs.
     fn read_all(dir: &Path) -> Vec<(Xid, Vec<u8>)> {
-        let bytes = match std::fs::read(wal_path(dir)) {
+        let bytes = match std::fs::read(wal_segment_path_0(dir)) {
             Ok(bytes) => bytes,
             Err(error) => panic!("failed to read WAL test fixture: {error}"),
         };
@@ -553,7 +725,9 @@ mod tests {
         }
         // A crash leaves raw garbage on disk past the last valid record.
         {
-            let mut f = OpenOptions::new().append(true).open(wal_path(dir.path()))?;
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(wal_segment_path_0(dir.path()))?;
             f.write_all(&[0xAB; 37])?;
         }
         {
@@ -659,7 +833,7 @@ mod tests {
             wal.flushed_lsn() >= redo,
             "redo_point must flush through the LSN it returns"
         );
-        let on_disk = std::fs::metadata(wal_path(dir.path()))?.len();
+        let on_disk = std::fs::metadata(wal_segment_path_0(dir.path()))?.len();
         assert!(
             on_disk >= redo.0,
             "the file must be at least as long as the redo point ({on_disk} < {redo})"

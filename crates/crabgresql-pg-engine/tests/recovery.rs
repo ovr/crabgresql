@@ -1416,7 +1416,7 @@ fn a_commit_below_the_redo_point_survives_a_bounded_replay() -> anyhow::Result<(
     // commit records would fail rather than quietly succeed. Only the durable
     // CLOG can answer now.
     assert!(redo.is_valid(), "redo_point() never advanced");
-    common::scribble(&common::wal_file_path(dir.path()), 0, redo.0, 0xAB)?;
+    common::scribble_wal_prefix(dir.path(), redo, 0xAB)?;
 
     let (engine, tm) = common::open_from(dir.path(), redo)?;
     let table = engine.open_table("t")?;
@@ -1455,17 +1455,12 @@ fn production_startup_resumes_from_the_recorded_redo_point() -> anyhow::Result<(
         control.redo_lsn.is_valid(),
         "a heap-only cluster must publish a bounded redo point"
     );
-    common::scribble(
-        &common::wal_file_path(dir.path()),
-        0,
-        control.redo_lsn.0,
-        0xAB,
-    )?;
+    common::scribble_wal_prefix(dir.path(), control.redo_lsn, 0xAB)?;
 
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table), vec![1, 2, 3]);
-    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
+    let wal_len = common::wal_stream_len(dir.path())?;
     assert!(
         wal_len > control.redo_lsn.0,
         "the log was truncated to {wal_len}, below the redo point {} it should have \
@@ -1489,12 +1484,7 @@ fn a_crash_after_a_bounded_recovery_still_recovers_everything() -> anyhow::Resul
         TableEngine::shutdown(engine.as_ref());
     }
     let first = crabgresql_wal::read_control(dir.path())?.expect("a control file");
-    common::scribble(
-        &common::wal_file_path(dir.path()),
-        0,
-        first.redo_lsn.0,
-        0xAB,
-    )?;
+    common::scribble_wal_prefix(dir.path(), first.redo_lsn, 0xAB)?;
     {
         // Bounded startup, then more work, then a crash: dropped without a
         // checkpoint, so only replay can bring the new rows back.
@@ -1590,7 +1580,7 @@ fn a_redo_point_past_the_end_of_the_log_refuses_to_start() -> anyhow::Result<()>
         let _ = table;
         TableEngine::shutdown(engine.as_ref());
     }
-    let wal_len = std::fs::metadata(common::wal_file_path(dir.path()))?.len();
+    let wal_len = common::wal_stream_len(dir.path())?;
     let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
     crabgresql_wal::write_control(
         dir.path(),

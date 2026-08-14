@@ -5,11 +5,11 @@
 //! self-describing records; each record names a resource manager, and each rmgr
 //! registers a **redo** handler that knows how to reapply its records to a page
 //! during crash recovery. This crate owns the stream (append, group-commit
-//! fsync, segment file), the record envelope with a CRC, the rmgr registry, and
-//! the redo-only recovery pass. Engines (`crabgresql-pg-engine`,
-//! `crabgresql-parquet-engine`, `crabgresql-buffer-engine`) register their
-//! record types and redo handlers; an `UNLOGGED`/`TEMP` relation's writes
-//! bypass the WAL entirely.
+//! fsync, the [`SEGMENT_SIZE`]-byte segment files it is cut into), the record
+//! envelope with a CRC, the rmgr registry, and the redo-only recovery pass.
+//! Engines (`crabgresql-pg-engine`, `crabgresql-parquet-engine`,
+//! `crabgresql-buffer-engine`) register their record types and redo handlers; an
+//! `UNLOGGED`/`TEMP` relation's writes bypass the WAL entirely.
 //!
 //! Clean-room: the durability behavior (write-ahead rule, redo-only recovery, a
 //! per-record CRC) is reproduced from the published ARIES algorithm and the
@@ -31,6 +31,7 @@ mod fsutil;
 mod record;
 mod recovery;
 mod rmgr;
+mod segment;
 mod wal;
 
 pub use ckpt::{CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint};
@@ -38,5 +39,9 @@ pub use control::{ControlFile, control_path, read_control, write_control};
 pub use fsutil::sync_dir;
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};
-pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
-pub use wal::{CheckpointDelay, Wal, wal_path};
+pub use rmgr::{RedoContext, RmgrId, RmgrRedo, RmgrRegistry, XACT_ABORT, XACT_COMMIT, XLOG_PAD};
+pub use segment::{
+    SEGMENT_SIZE, segment_numbers, segment_of, segment_offset, wal_dir, wal_segment_path,
+    wal_stream_len,
+};
+pub use wal::{CheckpointDelay, Wal};

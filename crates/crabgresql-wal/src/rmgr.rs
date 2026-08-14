@@ -17,6 +17,9 @@ impl RmgrId {
     pub const XACT: RmgrId = RmgrId(0);
     /// Checkpoint records (owned by this crate).
     pub const CHECKPOINT: RmgrId = RmgrId(1);
+    /// Records about the log itself rather than about any relation (owned by
+    /// this crate): segment padding.
+    pub const XLOG: RmgrId = RmgrId(2);
     /// The heap access method (`crabgresql-pg-engine`).
     pub const HEAP: RmgrId = RmgrId(10);
 }
@@ -24,6 +27,11 @@ impl RmgrId {
 /// `info` byte values for [`RmgrId::XACT`] records.
 pub const XACT_COMMIT: u8 = 0x01;
 pub const XACT_ABORT: u8 = 0x02;
+
+/// The `info` byte of a [`RmgrId::XLOG`] padding record: filler that carries the
+/// stream from where a record would no longer fit to the end of its segment. Its
+/// payload is zeros and replay ignores it.
+pub const XLOG_PAD: u8 = 0x01;
 
 /// Everything a redo handler sees for one record during recovery. A handler must
 /// be **idempotent**: apply the change only when the target page's LSN is below

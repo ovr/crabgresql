@@ -5,8 +5,9 @@
 //! logged changes (ARIES redo) and rebuild the transaction state.
 //!
 //! [`recover`] takes the LSN to resume from. Because an [`Lsn`] is literally a
-//! byte offset into the single stream file, that is a positioned read rather
-//! than a scan.
+//! position in the logical byte stream, that is a positioned read rather than a
+//! scan: the segment to open and the offset to start at are both arithmetic on
+//! the LSN.
 //!
 //! Production passes the redo point the last checkpoint recorded in `pg_control`.
 //! Two things had to exist first, and now do: a durable CLOG, to recover the fate
@@ -23,8 +24,8 @@ use crabgresql_txn::{Clog, Xid};
 
 use crate::control::read_control;
 use crate::record::{Lsn, WalError, WalRecord};
-use crate::rmgr::{RedoContext, RmgrId, RmgrRegistry, XACT_ABORT, XACT_COMMIT};
-use crate::wal::wal_path;
+use crate::rmgr::{RedoContext, RmgrId, RmgrRegistry, XACT_ABORT, XACT_COMMIT, XLOG_PAD};
+use crate::segment::{SEGMENT_SIZE, segment_numbers, segment_of, segment_offset, wal_segment_path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryResult {
@@ -37,38 +38,78 @@ pub struct RecoveryResult {
     pub replayed_from: Lsn,
 }
 
-/// Read `[start, end-of-file)` of the WAL under `dir`. A positioned read, not a
-/// whole-file slurp: buffering the prefix would defeat the point of bounding
-/// replay at all.
+/// Read `[start, end-of-stream)` of the WAL under `dir`, concatenating the
+/// segments it spans. A positioned read, not a whole-log slurp: buffering the
+/// prefix would defeat the point of bounding replay at all — the segments below
+/// `start` are never opened.
+///
+/// Joined into one buffer, so a position in it is `start + offset` in the stream
+/// and the decode loop below needs no notion of segments.
 fn read_from(dir: &Path, start: Lsn) -> Result<Vec<u8>, WalError> {
-    let path = wal_path(dir);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && start == Lsn::INVALID => {
+    let segments = segment_numbers(dir)?;
+    let first = segment_of(start);
+    let Some(&last) = segments.last() else {
+        if start == Lsn::INVALID {
             return Ok(Vec::new());
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        return Err(WalError::Redo(format!(
+            "recovery must resume at {start} but {} has no segments",
+            crate::segment::wal_dir(dir).display()
+        )));
+    };
+    if first > last || segments.binary_search(&first).is_err() {
+        return Err(WalError::Redo(format!(
+            "recovery must resume at {start} but {} does not exist",
+            wal_segment_path(dir, first).display()
+        )));
+    }
+    // A hole in the numbering means a segment was lost, and concatenating across
+    // it would shift every LSN above it — records replayed under addresses that
+    // belong to other records. Counting is enough to find one: `first` is known
+    // present from the check above.
+    if segments.iter().filter(|&&seg| seg >= first).count() as u64 != last - first + 1 {
+        return Err(WalError::Redo(format!(
+            "the wal segments between {} and {} are not contiguous",
+            wal_segment_path(dir, first).display(),
+            wal_segment_path(dir, last).display()
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    for seg in first..=last {
+        let path = wal_segment_path(dir, seg);
+        let file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        // The writer fsyncs a segment before creating its successor, so a short
+        // one with a successor on disk is corruption rather than a crash
+        // artifact — and reading past it shifts every LSN above it.
+        if seg != last && len != SEGMENT_SIZE {
             return Err(WalError::Redo(format!(
-                "recovery must resume at {start} but {} does not exist",
+                "wal segment {} is {len} bytes, not {SEGMENT_SIZE}, but is not the last one",
                 path.display()
             )));
         }
-        Err(e) => return Err(e.into()),
-    };
-    let len = file.metadata()?.len();
-    if start.0 > len {
-        return Err(WalError::Redo(format!(
-            "recovery must resume at {start} (byte {}) but {} is only {len} bytes",
-            start.0,
-            path.display()
-        )));
+        let from = if seg == first {
+            segment_offset(start)
+        } else {
+            0
+        };
+        if from > len {
+            return Err(WalError::Redo(format!(
+                "recovery must resume at {start} (byte {} of {}) but that segment is only \
+                 {len} bytes",
+                from,
+                path.display()
+            )));
+        }
+        let at = bytes.len();
+        bytes.resize(at + (len - from) as usize, 0);
+        // `read_exact_at` handles short reads and, unlike a hand-rolled fill loop,
+        // surfaces an unexpected EOF as an error instead of silently shortening the
+        // buffer — which would stop the decode early and hand the caller a lower
+        // `end_of_wal` to truncate to.
+        file.read_exact_at(&mut bytes[at..], from)?;
     }
-    let mut bytes = vec![0u8; (len - start.0) as usize];
-    // `read_exact_at` handles short reads and, unlike a hand-rolled fill loop,
-    // surfaces an unexpected EOF as an error instead of silently shortening the
-    // buffer — which would stop the decode early and hand the caller a lower
-    // `end_of_wal` to truncate to.
-    file.read_exact_at(&mut bytes, start.0)?;
     Ok(bytes)
 }
 
@@ -120,17 +161,39 @@ pub fn recover(
     tracing::trace!(start = %start, len = bytes.len(), next_xid, "starting WAL replay");
 
     let mut pos = 0usize;
-    while let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) {
+    let mut first = true;
+    loop {
+        if pos >= bytes.len() {
+            break;
+        }
+        // A segment tail too short to hold a record is zeroed filler: nothing can
+        // *start* there, which is what makes stepping over it safe without
+        // inspecting a byte. Bounded by what was read, because the stream may end
+        // inside such a tail, and an `end_of_wal` above what is on disk would have
+        // `Wal::reset_to` truncating into a hole.
+        //
+        // `start` itself can land here — the insert position is only carried to
+        // the boundary by the *following* append, so a redo point sampled in
+        // between names a byte inside the tail. Hence the check below is against
+        // `start + pos`.
+        let gap = (SEGMENT_SIZE - segment_offset(Lsn(start.0 + pos as u64))) as usize;
+        if gap < WalRecord::MIN_LEN {
+            pos = (pos + gap).min(bytes.len());
+            continue;
+        }
+        let Some((rec, len)) = WalRecord::decode(&bytes[pos..]) else {
+            break;
+        };
         // The first record must begin exactly where we were told to resume, or
-        // the redo point is not a record boundary. `pos == 0` is true on exactly
-        // the first iteration, since `len` is always positive.
-        if pos == 0 && rec.rec_lsn != start {
+        // the redo point is not a record boundary.
+        if first && rec.rec_lsn != Lsn(start.0 + pos as u64) {
             return Err(WalError::Redo(format!(
                 "recovery resumed at {start} but the record there claims to start \
                  at {} — the redo point is not a record boundary",
                 rec.rec_lsn
             )));
         }
+        first = false;
         let end_lsn = Lsn(start.0 + (pos + len) as u64);
         // The allocator must sit above any XID that ever appeared in the log.
         if rec.xid.0 >= next_xid {
@@ -162,6 +225,15 @@ pub fn recover(
                 let ckpt = crate::ckpt::replay(rec.info, rec.payload, rec.rec_lsn)?;
                 next_xid = next_xid.max(ckpt.next_xid.0);
             }
+            // Filler carrying the stream to the end of a segment. Ignored as a
+            // decoded record rather than as a gap the scan has to recognize,
+            // which is what keeps the loop above free of segment arithmetic.
+            RmgrId::XLOG => match rec.info {
+                XLOG_PAD => {}
+                other => {
+                    return Err(WalError::Redo(format!("unknown xlog info byte {other:#x}")));
+                }
+            },
             other => {
                 let handler = registry
                     .get(other.0)
@@ -203,6 +275,11 @@ pub fn recover(
     // falls back to it — and it is precisely the path on which a damaged head
     // would otherwise erase every record behind it. An empty region is fine either
     // way: that is a checkpoint with no activity after it.
+    //
+    // `pos == 0` rather than "nothing was decoded": past zero, either a record was
+    // replayed or a zero-filled segment tail was consumed, and neither is the
+    // damage this refuses. A resume point inside such a tail is legitimate, and
+    // refusing it would keep a cluster from starting over filler.
     if pos == 0 && !bytes.is_empty() {
         if start.is_valid() {
             return Err(WalError::Redo(format!(
@@ -238,6 +315,7 @@ pub fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::{wal_segment_path_0, wal_stream_len};
     use crate::wal::Wal;
     use std::sync::{Arc, Mutex};
 
@@ -317,7 +395,7 @@ mod tests {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
-                .open(wal_path(dir.path()))?;
+                .open(wal_segment_path_0(dir.path()))?;
             f.write_all(&[0xAB; 40])?;
         }
         let mut reg = RmgrRegistry::new();
@@ -407,7 +485,7 @@ mod tests {
             payload: b"misplaced",
         }
         .encode(&mut bytes);
-        std::fs::write(wal_path(dir.path()), &bytes)?;
+        std::fs::write(wal_segment_path_0(dir.path()), &bytes)?;
 
         let mut reg = RmgrRegistry::new();
         reg.register(
@@ -536,7 +614,7 @@ mod tests {
             use std::os::unix::fs::FileExt;
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .open(wal_path(dir.path()))?;
+                .open(wal_segment_path_0(dir.path()))?;
             file.write_all_at(&[0xAB; 4], WalRecord::HEADER_LEN as u64)?;
             file.sync_all()?;
         }
@@ -574,7 +652,7 @@ mod tests {
         {
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .open(wal_path(dir.path()))?;
+                .open(wal_segment_path_0(dir.path()))?;
             file.set_len(12)?;
             file.sync_all()?;
         }
@@ -597,7 +675,7 @@ mod tests {
     fn a_fresh_cluster_has_an_empty_log_and_recovers_cleanly() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         drop(Wal::open(dir.path())?);
-        assert_eq!(std::fs::metadata(wal_path(dir.path()))?.len(), 0);
+        assert_eq!(std::fs::metadata(wal_segment_path_0(dir.path()))?.len(), 0);
 
         let reg = RmgrRegistry::new();
         let clog = Clog::new();
@@ -683,6 +761,266 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+
+        Ok(())
+    }
+
+    /// Append one record ending exactly `remaining` bytes short of the first
+    /// segment boundary. Only valid as the first append into a fresh WAL; see the
+    /// twin in `wal::tests` for why one big record beats a loop of small ones.
+    fn fill_to_within(wal: &Wal, remaining: u64) -> anyhow::Result<crate::record::LsnRange> {
+        let payload = vec![0x5A; (SEGMENT_SIZE - remaining) as usize - WalRecord::MIN_LEN];
+        let range = wal.append(RmgrId::HEAP, 7, Xid(3), &payload);
+        assert_eq!(range.end, Lsn(SEGMENT_SIZE - remaining));
+        wal.flush(range.end)?;
+
+        Ok(range)
+    }
+
+    /// A payload too long to fit in the 100-byte tail the tests leave, tagged so
+    /// replay can say which record it saw.
+    fn wont_fit(tag: u8) -> Vec<u8> {
+        vec![tag; 200]
+    }
+
+    /// Registering a handler for `HEAP` only is what proves the padding is not
+    /// dispatched: its `XLOG` id has none, so recovery would fail with
+    /// `UnknownRmgr` rather than return.
+    #[test]
+    fn replay_follows_the_stream_across_a_segment_boundary() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let above;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, 100)?;
+            above = wal.append(RmgrId::HEAP, 7, Xid(4), &wont_fit(b'A'));
+            let end = wal.append(RmgrId::XACT, XACT_COMMIT, Xid(4), &[]).end;
+            wal.flush(end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+
+        assert_eq!(res.end_of_wal, Lsn(wal_stream_len(dir.path())?));
+        assert!(
+            res.end_of_wal.0 > SEGMENT_SIZE,
+            "the log spans two segments"
+        );
+        assert!(clog.is_committed(Xid(4)));
+        let seen = seen
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .clone();
+        assert_eq!(seen.len(), 2, "both heap records, and nothing else");
+        assert_eq!(seen[1], wont_fit(b'A'));
+        assert_eq!(above.start, Lsn(SEGMENT_SIZE));
+
+        Ok(())
+    }
+
+    #[test]
+    fn replay_steps_over_a_zero_filled_segment_tail() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+            let end = wal.append(RmgrId::HEAP, 7, Xid(4), b"after-the-zeros").end;
+            wal.flush(end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, Lsn::INVALID)?;
+
+        assert_eq!(res.end_of_wal, Lsn(wal_stream_len(dir.path())?));
+        let seen = seen
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .clone();
+        assert_eq!(
+            seen.last().map(Vec::as_slice),
+            Some(b"after-the-zeros".as_slice()),
+            "the record past the zero-filled tail must be replayed"
+        );
+
+        Ok(())
+    }
+
+    /// Not a contrived position: the insert position is only carried to the
+    /// boundary by the *next* append, so a checkpoint sampling in between
+    /// publishes a redo point inside the tail. Getting this wrong is a cluster
+    /// that refuses to start, on a ~27-byte window per checkpoint.
+    #[test]
+    fn a_redo_point_inside_an_unusable_tail_still_recovers() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let redo;
+        let above;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+            // Sampled before anything pads the tail.
+            redo = wal.redo_point()?;
+            assert_eq!(redo, Lsn(SEGMENT_SIZE - (WalRecord::MIN_LEN as u64 - 1)));
+            above = wal.append(RmgrId::HEAP, 7, Xid(4), b"above-the-filler");
+            wal.flush(above.end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        write_floor(dir.path(), 100)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, redo)?;
+
+        assert_eq!(above.start, Lsn(SEGMENT_SIZE));
+        assert_eq!(res.end_of_wal, above.end);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .clone(),
+            vec![b"above-the-filler".to_vec()],
+            "the record past the filler must be replayed"
+        );
+
+        Ok(())
+    }
+
+    /// The same window with nothing after it: a crash can leave the log ending
+    /// inside the filler, which is a clean end rather than damage to refuse over.
+    #[test]
+    fn a_log_that_ends_inside_an_unusable_tail_is_a_clean_end() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let redo;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, WalRecord::MIN_LEN as u64 - 1)?;
+            redo = wal.redo_point()?;
+            // A crash between the filler and the record it made room for. That
+            // record goes into the next segment, so dropping that file is what
+            // "never landed" looks like on disk.
+            wal.append(RmgrId::HEAP, 7, Xid(4), b"never-flushed");
+            wal.flush(Lsn(SEGMENT_SIZE))?;
+        }
+        std::fs::remove_file(crate::segment::wal_segment_path(dir.path(), 1))?;
+        assert_eq!(
+            std::fs::metadata(wal_segment_path_0(dir.path()))?.len(),
+            SEGMENT_SIZE,
+            "the filler itself did reach disk"
+        );
+
+        let mut reg = RmgrRegistry::new();
+        reg.register(
+            RmgrId::HEAP,
+            Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))),
+        );
+        write_floor(dir.path(), 100)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, redo)?;
+        assert_eq!(
+            res.end_of_wal,
+            Lsn(SEGMENT_SIZE),
+            "the filler is consumed, not read as a torn record"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_replay_can_resume_inside_a_later_segment() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let second;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, 100)?;
+            wal.append(RmgrId::HEAP, 7, Xid(4), &wont_fit(b'A'));
+            second = wal.append(RmgrId::HEAP, 7, Xid(5), &wont_fit(b'B'));
+            wal.flush(second.end)?;
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = RmgrRegistry::new();
+        reg.register(RmgrId::HEAP, Arc::new(Collector(Arc::clone(&seen))));
+        write_floor(dir.path(), 100)?;
+        let clog = Clog::new();
+        let res = recover(dir.path(), &reg, &clog, second.start)?;
+
+        assert!(
+            second.start.0 > SEGMENT_SIZE,
+            "the redo point is in segment 1"
+        );
+        assert_eq!(res.replayed_from, second.start);
+        assert_eq!(res.end_of_wal, second.end);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|_| panic!("mutex poisoned"))
+                .clone(),
+            vec![wont_fit(b'B')],
+            "only the record at the redo point"
+        );
+
+        Ok(())
+    }
+
+    /// The writer fsyncs a segment before creating the next one, so this is
+    /// corruption — and reading through it would replay every record above under
+    /// an address belonging to another one, silently.
+    #[test]
+    fn a_truncated_middle_segment_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, 100)?;
+            let end = wal.append(RmgrId::HEAP, 7, Xid(4), &wont_fit(b'A')).end;
+            wal.flush(end)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(wal_segment_path_0(dir.path()))?;
+        file.set_len(SEGMENT_SIZE - 4096)?;
+        file.sync_all()?;
+
+        let mut reg = RmgrRegistry::new();
+        reg.register(
+            RmgrId::HEAP,
+            Arc::new(Collector(Arc::new(Mutex::new(Vec::new())))),
+        );
+        let clog = Clog::new();
+        let Err(err) = recover(dir.path(), &reg, &clog, Lsn::INVALID) else {
+            anyhow::bail!("a short segment with a successor must not be read through");
+        };
+        assert!(
+            err.to_string().contains("not the last one"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// The same hazard as a short segment, reached a different way.
+    #[test]
+    fn a_gap_in_the_segment_numbering_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        {
+            let wal = Wal::open(dir.path())?;
+            fill_to_within(&wal, 100)?;
+            let end = wal.append(RmgrId::HEAP, 7, Xid(4), &wont_fit(b'A')).end;
+            wal.flush(end)?;
+        }
+        std::fs::rename(
+            crate::segment::wal_segment_path(dir.path(), 1),
+            crate::segment::wal_segment_path(dir.path(), 2),
+        )?;
+
+        let reg = RmgrRegistry::new();
+        let clog = Clog::new();
+        let Err(err) = recover(dir.path(), &reg, &clog, Lsn::INVALID) else {
+            anyhow::bail!("a hole in the segment numbering must be refused");
+        };
+        assert!(
+            err.to_string().contains("not contiguous"),
+            "unexpected error: {err}"
+        );
 
         Ok(())
     }

@@ -99,11 +99,8 @@ pub fn open_from_with_wal(
     Ok((engine, tm, wal))
 }
 
-/// The WAL stream file, for tests that corrupt or truncate it directly. Defers
-/// to the WAL crate so the layout is defined in exactly one place — a test that
-/// scribbled a stale path would silently become a no-op and still pass.
-pub fn wal_file_path(dir: &Path) -> PathBuf {
-    crabgresql_wal::wal_path(dir)
+pub fn wal_stream_len(dir: &Path) -> std::io::Result<u64> {
+    crabgresql_wal::wal_stream_len(dir)
 }
 
 /// The on-disk path of a relation's data file: `<dir>/base/<relfilenode>`.
@@ -129,18 +126,34 @@ pub fn flip_byte(path: &Path, offset: u64) -> std::io::Result<()> {
 }
 
 /// Overwrite `[from, to)` of the file at `path` with `byte`.
-///
-/// The adversarial half of a bounded-replay test: scribbling the WAL prefix
-/// below a redo point proves recovery never read it. If it does read one byte
-/// below, the first `decode` fails, the log reads as empty, and everything below
-/// the redo point vanishes — so such a test cannot pass by accident.
-pub fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
+fn scribble(path: &Path, from: u64, to: u64, byte: u8) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
     f.seek(SeekFrom::Start(from))?;
     let len = to.saturating_sub(from) as usize;
     f.write_all(&vec![byte; len])?;
     f.sync_all()
+}
+
+/// Overwrite the WAL stream's `[0, upto)` prefix with `byte`, across however many
+/// segments it spans.
+///
+/// The adversarial half of a bounded-replay test: scribbling the prefix below a
+/// redo point proves recovery never read it. If it does read one byte below, the
+/// first `decode` fails, the log reads as empty, and everything below the redo
+/// point vanishes — so such a test cannot pass by accident. Writing at offset
+/// `lsn` of the first segment instead would stop at the first boundary and grow
+/// a file whose size is fixed, going green while proving nothing.
+pub fn scribble_wal_prefix(dir: &Path, upto: crabgresql_wal::Lsn, byte: u8) -> std::io::Result<()> {
+    let seg_size = crabgresql_wal::SEGMENT_SIZE;
+    // `div_ceil`, not `0..=segment_of(upto)`: a prefix ending exactly on a
+    // boundary would send the inclusive range one file further, opening a segment
+    // that need not exist.
+    for seg in 0..upto.0.div_ceil(seg_size) {
+        let to = (upto.0 - seg * seg_size).min(seg_size);
+        scribble(&crabgresql_wal::wal_segment_path(dir, seg), 0, to, byte)?;
+    }
+    Ok(())
 }
 
 /// Corrupt a data page by flipping a byte well inside its written region (past
