@@ -665,10 +665,15 @@ pub fn parse(input: &str, fmt: &FmtCtx) -> Result<i64, TimestampError> {
     }
 }
 
-/// The longest word the field scan compares against: `september` and
-/// `yesterday` at nine bytes. Anything longer cannot be a month name, a
+/// The longest word the field scan compares against: `september`, `yesterday`
+/// and `+infinity`, at nine bytes. Anything longer cannot be a month name, a
 /// weekday, `bc`/`ad`, a relative day, or a reserved word.
-const KEYWORD_MAX: usize = 16;
+///
+/// A keyword that outgrows this stops being *recognized* rather than erroring —
+/// [`lower_keyword`] declines it, and the scan then reads it as a zone
+/// abbreviation. `every_keyword_fits_the_stack_buffer` is what keeps that from
+/// happening quietly.
+const KEYWORD_MAX: usize = 9;
 
 /// ASCII-lowercase `field` into `buf`, or `None` when it cannot be one of the
 /// scanner's keywords — too long for [`KEYWORD_MAX`], or not ASCII (no keyword
@@ -696,6 +701,12 @@ fn lower_keyword<'b>(field: &str, buf: &'b mut [u8; KEYWORD_MAX]) -> Option<&'b 
 /// zone, a leading sign — which then takes the general scan. The fields are
 /// returned as written, without range-checking, because that is what the general
 /// path does too: `validate_fields` is the caller's job either way.
+///
+/// Reading the leading field as the year needs no `DateStyle`: a four-digit
+/// year with `-` separators is Y-M-D under every one of them, which is why the
+/// MDY/DMY TODO in [`parse_date_token`] does not reach here. Widening what this
+/// accepts — a `/` separator, a two-digit year — would end that, and make the
+/// ordering rule this function's business too.
 fn scan_iso(s: &str) -> Option<Tm> {
     let b = s.as_bytes();
     if b.len() < 10 {
@@ -914,6 +925,8 @@ fn parse_date_token(field: &str) -> Option<(i64, i64, i64)> {
     // TODO: accept the `SET DateStyle` MDY/DMY input orders — PG's default
     // DateStyle reads `'02/16/2001'` as 2001-02-16, whereas taking the leading
     // field as the year makes that input an out-of-range month here.
+    // That work stays inside this function: [`scan_iso`] answers a shape PG
+    // reads as Y-M-D under every DateStyle, so it needs no ordering rule.
     let y = parts[0].parse().ok()?;
     let m = parts[1].parse().ok()?;
     let d = parts[2].parse().ok()?;
@@ -1629,6 +1642,48 @@ mod tests {
         match parse(s, &FmtCtx::utc_default()) {
             Ok(value) => value,
             Err(error) => panic!("invalid timestamp test fixture `{s}`: {error:?}"),
+        }
+    }
+
+    /// Every word the field scan compares `fl` against has to fit the stack
+    /// buffer, or [`lower_keyword`] hands the scan an empty string and the word
+    /// silently becomes a zone abbreviation instead of a month, a weekday or an
+    /// era. The reserved words are listed here rather than read from
+    /// [`is_reserved_word`], which is a `matches!` and cannot be enumerated —
+    /// so a new one has to be added in both places, which is the point.
+    #[test]
+    fn every_keyword_fits_the_stack_buffer() {
+        let relative = ["today", "tomorrow", "yesterday"];
+        let reserved = [
+            "now",
+            "today",
+            "tomorrow",
+            "yesterday",
+            "allballs",
+            "epoch",
+            "infinity",
+            "+infinity",
+            "-infinity",
+        ];
+        for word in MONTHS
+            .iter()
+            .chain(&MONTH_NAMES)
+            .chain(&WEEKDAYS)
+            .chain(&relative)
+            .chain(&reserved)
+            .chain(&["bc", "ad"])
+        {
+            assert!(
+                word.len() <= KEYWORD_MAX,
+                "{word:?} is {} bytes, past KEYWORD_MAX ({KEYWORD_MAX})",
+                word.len()
+            );
+        }
+        for word in relative {
+            assert!(relative_day(word).is_some(), "{word:?}");
+        }
+        for word in reserved {
+            assert!(is_reserved_word(word), "{word:?}");
         }
     }
 
