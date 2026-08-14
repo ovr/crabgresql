@@ -51,7 +51,7 @@ pub(crate) use coerce::{
 };
 pub(crate) use datatype::{
     apply_column_typmod, apply_datetime_precision, builtin_custom_type, has_equality, is_orderable,
-    numeric_typmod,
+    numeric_typmod, text_column_value,
 };
 pub(crate) use operators::{
     bind_array_function, bind_binary_op, is_text_family, to_concat_operand,

@@ -57,6 +57,24 @@ fn copy_rows(plan: &CopyFromPlan, rows: Vec<Vec<Option<String>>>) -> anyhow::Res
     Ok(source)
 }
 
+/// The rows a load would build, or the [`BindError`] it would raise — the
+/// error unwrapped, because a field's rejection is the thing under test.
+fn copy_result(
+    plan: &CopyFromPlan,
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<Vec<Vec<Value>>, BindError> {
+    let catalog: Arc<dyn TypeCatalog> = Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+    let plan = plan.build_insert(&catalog, &FmtCtx::utc_default(), &batch_of(rows))?;
+    let LogicalPlan::Insert(InsertPlan {
+        source: InsertSource::Tuples { rows, .. },
+        ..
+    }) = plan
+    else {
+        panic!("expected an Insert over Tuples");
+    };
+    Ok(rows)
+}
+
 fn field(text: &str) -> Option<String> {
     Some(text.to_string())
 }
@@ -240,6 +258,135 @@ fn copy_truncates_a_name_column_despite_its_absent_typmod() -> anyhow::Result<()
     let multibyte = stored("é".repeat(70))?;
     assert_eq!(multibyte.len(), 62, "clipped on a character boundary");
     assert_eq!(multibyte.chars().count(), 31);
+    Ok(())
+}
+
+/// The text family reaches its length rules straight from the decoded field,
+/// without a `String` in between — so those rules are asserted through a real
+/// load rather than only through `apply_column_typmod`: blank padding, the
+/// silent truncation of a blank overflow, the `22001` for anything else, and
+/// `name`'s byte clip.
+#[test]
+fn copy_applies_the_text_family_length_rules() -> anyhow::Result<()> {
+    let engine = crabgresql_pg_engine::ephemeral_engine();
+    if let Err(error) = engine.create_table(TableSchema::new(
+        "s",
+        vec![
+            Column::with_typmod("v", PgType::Varchar, 3),
+            Column::with_typmod("c", PgType::Bpchar, 5),
+            Column::new("n", PgType::Name),
+            Column::new("t", PgType::Text),
+        ],
+    )) {
+        bail!("failed to create the text test table: {error}");
+    }
+    let engine: Arc<dyn TableEngine> = engine;
+    let plan = copy_plan(&engine, "COPY s FROM stdin")?;
+
+    let long_name = "é".repeat(70);
+    let rows = copy_result(
+        &plan,
+        vec![vec![
+            // Three characters plus blanks: `varchar(3)` truncates a blank
+            // overflow silently, as it does on assignment.
+            field("abc  "),
+            field("ab"),
+            field(&long_name),
+            field("anything at all"),
+        ]],
+    )?;
+    assert_eq!(rows[0][0], Value::Text("abc".into()));
+    assert_eq!(
+        rows[0][1],
+        Value::Text("ab   ".into()),
+        "char(5) blank-pads"
+    );
+    let Value::Text(name) = &rows[0][2] else {
+        bail!("a name column stores text");
+    };
+    assert_eq!(name.len(), 62, "clipped at 63 bytes, on a char boundary");
+    assert_eq!(name.chars().count(), 31);
+    assert_eq!(rows[0][3], Value::Text("anything at all".into()));
+
+    // A non-blank overflow is an error, with PostgreSQL's text.
+    let err = copy_result(
+        &plan,
+        vec![vec![field("abcd"), field("ab"), field("n"), field("t")]],
+    )
+    .expect_err("varchar(3) must reject a four-character value");
+    assert_eq!(err.code, "22001");
+    assert_eq!(err.message, "value too long for type character varying(3)");
+
+    // `char(n)` says it the same way, and it is assignment context there too:
+    // an explicit cast would have truncated instead.
+    let err = copy_result(
+        &plan,
+        vec![vec![field("abc"), field("abcdef"), field("n"), field("t")]],
+    )
+    .expect_err("char(5) must reject a six-character value");
+    assert_eq!(err.code, "22001");
+    assert_eq!(err.message, "value too long for type character(5)");
+    Ok(())
+}
+
+/// A column list may name the columns in any order, and the tuple is built in
+/// *schema* order — but the fields are still parsed left to right, so a row
+/// with two bad fields reports the one PostgreSQL reports.
+#[test]
+fn copy_places_a_reordered_column_list_and_still_reads_it_in_wire_order() -> anyhow::Result<()> {
+    let engine = crabgresql_pg_engine::ephemeral_engine();
+    if let Err(error) = engine.create_table(TableSchema::new(
+        "r",
+        vec![
+            Column::new("a", PgType::Int4),
+            Column::new("b", PgType::Int4),
+            Column::new("c", PgType::Int4),
+        ],
+    )) {
+        bail!("failed to create the reordered test table: {error}");
+    }
+    let engine: Arc<dyn TableEngine> = engine;
+    let plan = copy_plan(&engine, "COPY r (b, a) FROM stdin")?;
+
+    let rows = copy_result(&plan, vec![vec![field("2"), field("1")]])?;
+    assert_eq!(
+        rows[0],
+        vec![Value::Int4(1), Value::Int4(2), Value::Null],
+        "each field lands in the column the list named, not the one it sits at"
+    );
+
+    // Both fields are malformed; the first *field* is the one that errors,
+    // even though it fills the later column.
+    let err = copy_result(&plan, vec![vec![field("x"), field("y")]])
+        .expect_err("neither field is an integer");
+    assert_eq!(err.code, sqlstate::INVALID_TEXT_REPRESENTATION);
+    assert_eq!(err.message, "invalid input syntax for type integer: \"x\"");
+    Ok(())
+}
+
+/// A constant `DEFAULT` belongs to every row of the batch, so it is cloned per
+/// row rather than moved into the first one.
+#[test]
+fn a_constant_default_reaches_every_row_of_the_batch() -> anyhow::Result<()> {
+    let engine = crabgresql_pg_engine::ephemeral_engine();
+    let mut tag = Column::new("tag", PgType::Text);
+    tag.default = Some("'zzz'".into());
+    if let Err(error) = engine.create_table(TableSchema::new(
+        "k",
+        vec![Column::new("id", PgType::Int4), tag],
+    )) {
+        bail!("failed to create the default test table: {error}");
+    }
+    let engine: Arc<dyn TableEngine> = engine;
+    let plan = copy_plan(&engine, "COPY k (id) FROM stdin")?;
+    let rows = copy_result(&plan, vec![vec![field("1")], vec![field("2")]])?;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int4(1), Value::Text("zzz".into())],
+            vec![Value::Int4(2), Value::Text("zzz".into())],
+        ]
+    );
     Ok(())
 }
 

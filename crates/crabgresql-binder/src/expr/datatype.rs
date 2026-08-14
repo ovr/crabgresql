@@ -921,27 +921,21 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
     // `name` truncates whatever its typmod says, and a `name` column's is always
     // -1 — hence the unconditional arm, exactly as in `apply_length_to_column`.
     match column.ty {
-        PgType::Varchar if column.typmod >= 0 => {
+        // The text family's length rules read the *text*, not the `Value`, so
+        // they live in `text_column_value` — where COPY reaches them without
+        // building a `String` first. A length-free `text`/`varchar` matches
+        // neither arm and falls through untouched, keeping its allocation.
+        PgType::Varchar | PgType::Bpchar if column.typmod >= 0 => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            crabgresql_types::text::varchar_input(&s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
-        }
-        PgType::Bpchar if column.typmod >= 0 => {
-            let Value::Text(s) = value else {
-                return Err(mismatch());
-            };
-            crabgresql_types::text::bpchar_input(&s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
+            text_column_value(&s, column)
         }
         PgType::Name => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            Ok(Value::Text(crabgresql_types::text::name_input(&s)))
+            text_column_value(&s, column)
         }
         PgType::Bit | PgType::Varbit if column.typmod >= 0 => {
             let Value::Bit { len, data } = value else {
@@ -958,5 +952,38 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
             .map_err(|e| BindError::new(e.sqlstate, e.message))
         }
         _ => Ok(value),
+    }
+}
+
+/// A text-family column's value for the field text `s`, built with exactly one
+/// allocation: the length rule is applied to the *slice*, not to a `String` that
+/// was allocated only to be read once and dropped.
+///
+/// This is COPY's route into the text family. The expression path reaches the
+/// same rules through [`apply_column_typmod`], which unwraps its `Value::Text`
+/// and lands here, so `varchar(n)`'s `22001`, `char(n)`'s blank padding and
+/// `name`'s byte clip have one implementation rather than two.
+///
+/// `false` to the input functions is assignment context, as in
+/// [`apply_column_typmod`]: an over-long value whose excess is not blank errors
+/// rather than truncating.
+pub fn text_column_value(s: &str, column: &Column) -> Result<Value, BindError> {
+    match column.ty {
+        PgType::Varchar if column.typmod >= 0 => {
+            crabgresql_types::text::varchar_input(s, column.typmod, false)
+                .map(Value::Text)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
+        PgType::Bpchar if column.typmod >= 0 => {
+            crabgresql_types::text::bpchar_input(s, column.typmod, false)
+                .map(Value::Text)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
+        }
+        // `name` clips at 63 bytes whatever its typmod says (a `name` column's
+        // is always -1), matching the arm above in `apply_column_typmod`.
+        PgType::Name => Ok(Value::Text(crabgresql_types::text::name_input(s))),
+        // `text`, and a `varchar`/`char` with no declared length: no rule to
+        // apply, so the field text is the value.
+        _ => Ok(Value::Text(s.to_string())),
     }
 }

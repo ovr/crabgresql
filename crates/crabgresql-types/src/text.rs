@@ -2717,7 +2717,10 @@ pub fn truncate_chars(s: &str, n: i32) -> String {
 /// excess characters are all spaces (then it is truncated).
 pub fn varchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
     let n = n.max(0) as usize;
-    if s.chars().count() <= n {
+    // A character is at least one byte, so a value no longer than `n` *bytes*
+    // fits in `n` characters without counting them — which is every field of a
+    // bulk ASCII load.
+    if s.len() <= n || s.chars().count() <= n {
         return Ok(s.to_string());
     }
     let chars: Vec<char> = s.chars().collect();
@@ -2750,8 +2753,12 @@ pub fn bpchar_input(s: &str, n: i32, explicit: bool) -> Result<String> {
         }
         return Ok(chars[..n].iter().collect());
     }
-    let mut out: String = s.to_string();
-    out.extend(std::iter::repeat_n(' ', n - len));
+    // Sized for the padded result up front: the value and its blanks are one
+    // allocation, not one plus however many the growth takes.
+    let pad = n - len;
+    let mut out = String::with_capacity(s.len() + pad);
+    out.push_str(s);
+    out.extend(std::iter::repeat_n(' ', pad));
     Ok(out)
 }
 
