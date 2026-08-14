@@ -17,14 +17,14 @@ use crabgresql_storage_api::{
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{FmtCtx, PgType, Value};
 
+use crate::copy_rows::RowBatch;
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
     ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
     WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
-    merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body,
-    parse_unknown_owned, reject_agg_or_window, reject_window, to_bool_operand, unify_value_column,
-    view_expansion,
+    merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
+    reject_agg_or_window, reject_window, to_bool_operand, unify_value_column, view_expansion,
 };
 use crate::functions::{bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
@@ -5944,7 +5944,7 @@ impl CopyFromPlan {
         &self,
         catalog: &Arc<dyn TypeCatalog>,
         fmt: &FmtCtx,
-        rows: Vec<Vec<Option<String>>>,
+        rows: &RowBatch,
     ) -> Result<LogicalPlan, BindError> {
         // An enum label is resolved against the catalog, which `parse_unknown`
         // has no access to — same order as `resolve_unknown_ctx`, whose
@@ -5963,12 +5963,10 @@ impl CopyFromPlan {
             .collect();
 
         let mut tuples = Vec::with_capacity(rows.len());
-        for fields in rows {
+        for fields in rows.iter() {
             self.check_arity(fields.len())?;
             let mut tuple = self.rows.template.clone();
-            for ((field, &idx), enum_info) in
-                fields.into_iter().zip(&self.target_indices).zip(&enums)
-            {
+            for ((field, &idx), enum_info) in fields.iter().zip(&self.target_indices).zip(&enums) {
                 let column = &self.schema.columns[idx];
                 tuple[idx] = match field {
                     // The NULL marker: a genuine SQL NULL, not the column
@@ -5987,7 +5985,7 @@ impl CopyFromPlan {
                             // type `user-defined` the way the expression path
                             // does. Reachable, because dropping a type a column
                             // still uses is allowed here.
-                            None => parse_unknown_owned(text, column.ty, fmt)?,
+                            None => parse_unknown(text, column.ty, fmt)?,
                         };
                         apply_column_typmod(value, column)?
                     }

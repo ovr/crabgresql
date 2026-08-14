@@ -46,8 +46,8 @@ pub use scope::{Binding, Scope, reject_agg_or_window};
 pub(crate) use bind::{bind_coalesce, bind_nullif, bind_projection, output_name};
 pub(crate) use coerce::{
     ArgFail, binding_type_label, coerce_expr, coerce_for_arg, enum_value, implicit_castable,
-    merge_types, parse_unknown, parse_unknown_owned, resolve_unknown_ctx, to_bool_operand,
-    type_label, unify_value_column,
+    merge_types, parse_unknown, resolve_unknown_ctx, to_bool_operand, type_label,
+    unify_value_column,
 };
 pub(crate) use datatype::{
     apply_column_typmod, apply_datetime_precision, builtin_custom_type, has_equality, is_orderable,

@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use crabgresql_binder::{
     BoundExpr, CopyFromPlan, CopyFromSource, DeletePlan, InsertPlan, InsertSource, LogicalPlan,
-    UpdatePlan, bind_copy_from, bind_delete_with_params, bind_insert_with_params, bind_query,
-    bind_query_with_params, bind_update_with_params, output_columns_of, param_ctx_extended,
-    param_ctx_none, param_types, require_all_resolved, substitute_params,
+    RowBatch, UpdatePlan, bind_copy_from, bind_delete_with_params, bind_insert_with_params,
+    bind_query, bind_query_with_params, bind_update_with_params, output_columns_of,
+    param_ctx_extended, param_ctx_none, param_types, require_all_resolved, substitute_params,
 };
 use crabgresql_executor::{
     CatalogOps, DmlVerb, ExecContext, ExecNode, Execution, MaterializedRows, OutputColumn,
@@ -1510,7 +1510,7 @@ pub fn run_copy_insert(
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     prepared: &PreparedCopy,
-    rows: Vec<Vec<Option<String>>>,
+    rows: &RowBatch,
 ) -> Result<u64, PgError> {
     run_copy_rows(engine, txnmgr, session, prepared, |insert| {
         insert(rows).map(|_| ())
@@ -1531,9 +1531,7 @@ pub fn run_copy_rows(
     txnmgr: &Arc<TransactionManager>,
     session: &mut Session,
     prepared: &PreparedCopy,
-    produce: impl FnOnce(
-        &mut dyn FnMut(Vec<Vec<Option<String>>>) -> Result<u64, PgError>,
-    ) -> Result<(), PgError>,
+    produce: impl FnOnce(&mut dyn FnMut(&RowBatch) -> Result<u64, PgError>) -> Result<(), PgError>,
 ) -> Result<u64, PgError> {
     // A COPY is a write (read-only was rejected at prepare time); its context
     // carries a sequence handle so a `serial`/`nextval()` column default advances

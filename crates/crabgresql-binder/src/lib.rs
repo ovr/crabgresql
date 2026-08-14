@@ -5,6 +5,7 @@
 //! not implement.
 
 mod collation;
+mod copy_rows;
 pub mod expr;
 mod functions;
 mod logical_plan;
@@ -18,6 +19,7 @@ pub use collation::{
     Derived, Strength, check_explicit_conflict, collation_name, column_collation, expr_collation,
     output_collation, resolve_collation,
 };
+pub use copy_rows::{Row, RowBatch, RowBatchIter, RowIter};
 pub use expr::{
     BinOp, Binding, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ColumnDefault,
     ParamCtx, ParamState, Scope, Subplan, SubplanId, UnaryOp, WindowKind, WindowSortKey,

@@ -12,9 +12,14 @@
 //! [`crabgresql_binder::CopyFromPlan::build_insert`]'s job. `None` marks a field
 //! that matched the NULL representation.
 //!
-//! Fields come out as owned `String`s because the load consumes them: for the
-//! text family the string *is* the stored value, so `parse_unknown_owned` takes
-//! it by move rather than copying it out of a buffer that is then dropped.
+//! Fields come out as spans into a [`RowBatch`]'s arena rather than as owned
+//! `String`s. Only the text family's value *is* the field string; an `int`, a
+//! `date` or a `numeric` parses the text and drops it, so a `String` per field
+//! meant allocating for every cell of a load and freeing most of them again one
+//! statement later. A text column still allocates once — where the [`Value`] is
+//! built, not here.
+//!
+//! [`Value`]: crabgresql_types::Value
 //!
 //! Decoding is resumable: [`CopyDecoder`] takes bytes in arbitrary slabs and
 //! keeps the quoting state itself, so a record may straddle any number of reads.
@@ -28,15 +33,11 @@
 use std::fs::File;
 use std::io::Read;
 
-use crabgresql_binder::{CopyFormat, CopyHeader};
+use crabgresql_binder::{CopyFormat, CopyHeader, Row, RowBatch};
 use crabgresql_pg_wire::sqlstate;
 
 use crate::copy_access::CopyFileAccess;
 use crate::error::PgError;
-
-/// A single decoded field: `Some(text)` (the de-escaped/unquoted contents) or
-/// `None` when the field matched the format's NULL representation.
-pub type Field = Option<String>;
 
 /// Bytes pulled from a COPY source file per read. Records are expected to be far
 /// smaller than this, so the carried-over partial record stays short.
@@ -59,7 +60,7 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024 * 1024 - 1;
 /// table's own order, so `COPY t (b, a) … HEADER match` wants `b,a`. A NULL
 /// field cannot name a column, so it compares as the empty string and fails the
 /// way any other wrong name does.
-fn check_header_names(header: &[Field], expected: &[String]) -> Result<(), PgError> {
+fn check_header_names(header: Row<'_>, expected: &[String]) -> Result<(), PgError> {
     if header.len() != expected.len() {
         return Err(bad_copy(format!(
             "wrong number of fields in header line: got {}, expected {}",
@@ -68,7 +69,7 @@ fn check_header_names(header: &[Field], expected: &[String]) -> Result<(), PgErr
         )));
     }
     for (index, (got, want)) in header.iter().zip(expected).enumerate() {
-        let got = got.as_deref().unwrap_or_default();
+        let got = got.unwrap_or_default();
         if got != want {
             return Err(bad_copy(format!(
                 "column name mismatch in header line field {}: got \"{got}\", expected \"{want}\"",
@@ -91,18 +92,20 @@ fn invalid_utf8(byte: u8) -> PgError {
     )
 }
 
-/// Turn a completed field's raw bytes into a `String`, erroring exactly as PG
-/// does on a byte sequence that is not valid UTF-8 or on an embedded NUL.
-fn field_string(bytes: Vec<u8>) -> Result<String, PgError> {
-    let s = String::from_utf8(bytes).map_err(|e| {
+/// Read a completed field's raw bytes as text, erroring exactly as PG does on a
+/// byte sequence that is not valid UTF-8 or on an embedded NUL.
+///
+/// The `&str` goes straight into the batch, so a field is decoded once for the
+/// load rather than checked here and re-checked on every read.
+fn validate_field(bytes: &[u8]) -> Result<&str, PgError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
         // The first byte the decoder rejected.
-        let byte = e.as_bytes()[e.utf8_error().valid_up_to()];
-        invalid_utf8(byte)
+        invalid_utf8(bytes[e.valid_up_to()])
     })?;
-    if s.as_bytes().contains(&0) {
+    if bytes.contains(&0) {
         return Err(invalid_utf8(0));
     }
-    Ok(s)
+    Ok(text)
 }
 
 /// Decode a complete COPY byte stream into rows of fields.
@@ -111,12 +114,11 @@ fn field_string(bytes: Vec<u8>) -> Result<String, PgError> {
 /// final newline are dropped; `HEADER` skips the first data line. This is the
 /// one-shot form used by the copy-in wire path, which has the whole stream in
 /// hand; a file is decoded incrementally through [`CopyDecoder`].
-pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
+pub fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<RowBatch, PgError> {
     let mut decoder = CopyDecoder::new(format);
-    let mut rows = Vec::new();
-    decoder.push(bytes, &mut rows)?;
-    decoder.finish(&mut rows)?;
-    Ok(rows)
+    decoder.push(bytes)?;
+    decoder.finish()?;
+    Ok(decoder.into_batch())
 }
 
 /// A streaming, resumable text/CSV record decoder.
@@ -130,7 +132,13 @@ pub struct CopyDecoder {
     format: CopyFormat,
     /// Text format: the raw, still-escaped bytes of the line so far.
     line: Vec<u8>,
+    /// Text format: where a field containing a backslash is de-escaped. One
+    /// buffer reused for every such field, so the escape path costs no
+    /// allocation either; a field with no backslash never touches it.
+    unescaped: Vec<u8>,
     csv: CsvState,
+    /// Rows completed since the last [`CopyDecoder::take_batch_into`].
+    batch: RowBatch,
     /// `HEADER` skips the first data line of the *stream*, not of each slab.
     skip_header: bool,
     end_of_data: bool,
@@ -148,8 +156,14 @@ struct CsvState {
     /// A `\r` ended the previous record; a `\n` now would be its other half.
     cr_pending: bool,
     /// The field being built, already unquoted and unescaped.
+    ///
+    /// It stays here rather than growing straight into the batch's arena
+    /// because the arena must hold only *completed* fields: that is what makes
+    /// a batch split — which routinely lands mid-record — a matter of moving
+    /// whole rows rather than of rebasing a half-built one. The buffer itself
+    /// is reused across fields, so it allocates once per load, not once per
+    /// field.
     field: Vec<u8>,
-    row: Vec<Field>,
     /// This field contained a quoted section, so it is never the NULL marker.
     was_quoted: bool,
 }
@@ -176,7 +190,9 @@ impl CopyDecoder {
         CopyDecoder {
             format: format.clone(),
             line: Vec::new(),
+            unescaped: Vec::new(),
             csv: CsvState::default(),
+            batch: RowBatch::new(),
             skip_header: format.header.present(),
             end_of_data: false,
             record_bytes: 0,
@@ -189,27 +205,55 @@ impl CopyDecoder {
         self.end_of_data
     }
 
-    /// Consume `bytes`, appending every record they complete to `rows`.
-    pub fn push(&mut self, bytes: &[u8], rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    /// The rows completed so far and not yet taken.
+    pub fn batch(&self) -> &RowBatch {
+        &self.batch
+    }
+
+    /// The rows completed so far, for a caller that is done with the decoder.
+    pub fn into_batch(self) -> RowBatch {
+        self.batch
+    }
+
+    /// Move the first `n` completed rows into `out`, leaving the decoder with
+    /// the rest — including the record it is still building, whose finished
+    /// fields are already in the batch.
+    ///
+    /// `out`'s previous contents are dropped and its allocations are handed to
+    /// the decoder, so a load that flushes batch after batch settles into
+    /// reusing two sets of buffers. The bulk of the data is *swapped* rather
+    /// than copied; only the short tail past `n` is moved byte-wise.
+    ///
+    /// # Panics
+    /// If `n` exceeds the completed rows.
+    pub fn take_batch_into(&mut self, n: usize, out: &mut RowBatch) {
+        out.clear();
+        std::mem::swap(&mut self.batch, out);
+        self.batch.move_rows_from(out, n);
+        out.truncate_rows(n);
+    }
+
+    /// Consume `bytes`, adding every record they complete to the batch.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), PgError> {
         if self.end_of_data {
             return Ok(());
         }
         if self.format.csv {
-            self.push_csv(bytes, rows)
+            self.push_csv(bytes)
         } else {
-            self.push_text(bytes, rows)
+            self.push_text(bytes)
         }
     }
 
     /// End of input: a final record with no terminator is still a record, and a
     /// CSV quoted section left open is an error.
-    pub fn finish(&mut self, rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    pub fn finish(&mut self) -> Result<(), PgError> {
         if self.end_of_data {
             return Ok(());
         }
         if !self.format.csv {
             if !self.line.is_empty() {
-                self.complete_text_line(rows)?;
+                self.complete_text_line()?;
             }
             return Ok(());
         }
@@ -228,8 +272,8 @@ impl CopyDecoder {
         if self.csv.quote == QuoteState::Quoted {
             return Err(bad_copy("unterminated CSV quoted field"));
         }
-        if self.csv.was_quoted || !self.csv.field.is_empty() || !self.csv.row.is_empty() {
-            self.end_csv_record(rows)?;
+        if self.csv.was_quoted || !self.csv.field.is_empty() || self.batch.current_row_len() > 0 {
+            self.end_csv_record()?;
         }
         Ok(())
     }
@@ -248,13 +292,13 @@ impl CopyDecoder {
         Ok(())
     }
 
-    fn push_text(&mut self, bytes: &[u8], rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    fn push_text(&mut self, bytes: &[u8]) -> Result<(), PgError> {
         let mut rest = bytes;
         while let Some(k) = rest.iter().position(|&b| b == b'\n') {
             self.charge(k + 1)?;
             self.line.extend_from_slice(&rest[..k]);
             rest = &rest[k + 1..];
-            self.complete_text_line(rows)?;
+            self.complete_text_line()?;
             if self.end_of_data {
                 return Ok(());
             }
@@ -266,7 +310,7 @@ impl CopyDecoder {
 
     /// Turn the accumulated raw line into a row. A straddled CRLF needs no
     /// special handling: the `\r` simply sits in `line` until the `\n` arrives.
-    fn complete_text_line(&mut self, rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    fn complete_text_line(&mut self) -> Result<(), PgError> {
         if self.line.last() == Some(&b'\r') {
             self.line.pop();
         }
@@ -281,28 +325,71 @@ impl CopyDecoder {
         // asymmetry PostgreSQL has.
         if self.skip_header {
             self.skip_header = false;
-            if let CopyHeader::Match(expected) = &self.format.header {
-                let header = decode_text_line(
-                    &self.line,
-                    self.format.delimiter,
-                    self.format.null.as_bytes(),
-                )?;
-                check_header_names(&header, expected)?;
+            if !matches!(self.format.header, CopyHeader::Match(_)) {
+                self.line.clear();
+                return Ok(());
             }
+            self.decode_text_line()?;
+            let check = match &self.format.header {
+                CopyHeader::Match(expected) => {
+                    check_header_names(self.batch.row(self.batch.len() - 1), expected)
+                }
+                _ => unreachable!("checked just above"),
+            };
+            self.batch.pop_row();
             self.line.clear();
-            return Ok(());
+            return check;
         }
-        let row = decode_text_line(
-            &self.line,
-            self.format.delimiter,
-            self.format.null.as_bytes(),
-        )?;
+        self.decode_text_line()?;
         self.line.clear();
-        rows.push(row);
         Ok(())
     }
 
-    fn push_csv(&mut self, bytes: &[u8], rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    /// Split the accumulated raw line into fields on unescaped delimiters and
+    /// append it to the batch as one row.
+    ///
+    /// The NULL marker is compared against the *raw*, still-escaped field, and
+    /// a field is de-escaped only when the scan actually saw a backslash in it
+    /// — which for a typical load is no field at all.
+    fn decode_text_line(&mut self) -> Result<(), PgError> {
+        // Destructured so the line can be read while the batch is written; they
+        // are disjoint fields, which a method call could not express.
+        let CopyDecoder {
+            line,
+            unescaped,
+            batch,
+            format,
+            ..
+        } = self;
+        let (delimiter, null) = (format.delimiter, format.null.as_bytes());
+
+        let mut start = 0;
+        let mut i = 0;
+        // Whether the field starting at `start` contains a backslash.
+        let mut escaped = false;
+        while i < line.len() {
+            match line[i] {
+                // A backslash always consumes the next byte, so a `\<delim>`
+                // never splits.
+                b'\\' => {
+                    escaped = true;
+                    i += 2;
+                }
+                b if b == delimiter => {
+                    push_text_field(&line[start..i], escaped, null, batch, unescaped)?;
+                    i += 1;
+                    start = i;
+                    escaped = false;
+                }
+                _ => i += 1,
+            }
+        }
+        push_text_field(&line[start..], escaped, null, batch, unescaped)?;
+        batch.end_row();
+        Ok(())
+    }
+
+    fn push_csv(&mut self, bytes: &[u8]) -> Result<(), PgError> {
         let (delimiter, quote, escape) =
             (self.format.delimiter, self.format.quote, self.format.escape);
         let mut i = 0;
@@ -374,7 +461,7 @@ impl CopyDecoder {
                         self.csv.cr_pending = b == b'\r';
                         self.charge(1)?;
                         i += 1;
-                        self.end_csv_record(rows)?;
+                        self.end_csv_record()?;
                         if self.end_of_data {
                             return Ok(());
                         }
@@ -394,40 +481,43 @@ impl CopyDecoder {
     }
 
     fn finish_csv_field(&mut self) -> Result<(), PgError> {
-        let force = force_not_null_at(&self.format, self.csv.row.len());
+        let force = force_not_null_at(&self.format, self.batch.current_row_len());
         finish_csv_field(
             &mut self.csv.field,
             &mut self.csv.was_quoted,
-            &mut self.csv.row,
+            &mut self.batch,
             self.format.null.as_bytes(),
             force,
         )
     }
 
-    fn end_csv_record(&mut self, rows: &mut Vec<Vec<Field>>) -> Result<(), PgError> {
+    fn end_csv_record(&mut self) -> Result<(), PgError> {
         // Decided before the field is finished, which clears `was_quoted`: a
         // lone `\.` record is end-of-data, but `\.,x`, `\.a` and `"\."` are data.
-        let is_eod = self.csv.row.is_empty() && !self.csv.was_quoted && self.csv.field == b"\\.";
+        let is_eod =
+            self.batch.current_row_len() == 0 && !self.csv.was_quoted && self.csv.field == b"\\.";
         self.record_bytes = 0;
         if is_eod {
             self.end_of_data = true;
             self.csv.field.clear();
-            self.csv.row.clear();
             self.csv.was_quoted = false;
             return Ok(());
         }
         self.finish_csv_field()?;
-        let row = std::mem::take(&mut self.csv.row);
+        self.batch.end_row();
         // Skipped after decoding, so a CSV HEADER line *is* UTF-8 checked —
         // the asymmetry with the text format is PG's.
         if self.skip_header {
             self.skip_header = false;
-            if let CopyHeader::Match(expected) = &self.format.header {
-                check_header_names(&row, expected)?;
-            }
-            return Ok(());
+            let check = match &self.format.header {
+                CopyHeader::Match(expected) => {
+                    check_header_names(self.batch.row(self.batch.len() - 1), expected)
+                }
+                _ => Ok(()),
+            };
+            self.batch.pop_row();
+            return check;
         }
-        rows.push(row);
         Ok(())
     }
 
@@ -462,41 +552,36 @@ fn record_too_long(have: usize, added: usize, max: usize) -> PgError {
     )
 }
 
-/// Split one text line into fields on unescaped delimiters, then map the NULL
-/// marker (compared against the raw, still-escaped field) and de-escape.
-fn decode_text_line(line: &[u8], delimiter: u8, null: &[u8]) -> Result<Vec<Field>, PgError> {
-    // Split into raw field slices on unescaped delimiters: a backslash always
-    // consumes the next byte, so a `\<delim>` never splits.
-    let mut raw_fields: Vec<&[u8]> = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < line.len() {
-        match line[i] {
-            b'\\' => i += 2,
-            b if b == delimiter => {
-                raw_fields.push(&line[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
-        }
+/// Append one raw (still-escaped) text field to the batch.
+///
+/// `escaped` is what the splitting scan already learned — whether this field
+/// contains a backslash — so the common field goes into the arena as the bytes
+/// that arrived, with no de-escaping pass and no buffer of its own.
+fn push_text_field(
+    raw: &[u8],
+    escaped: bool,
+    null: &[u8],
+    batch: &mut RowBatch,
+    unescaped: &mut Vec<u8>,
+) -> Result<(), PgError> {
+    if raw == null {
+        batch.push_null();
+        return Ok(());
     }
-    raw_fields.push(&line[start..]);
-
-    let mut fields = Vec::with_capacity(raw_fields.len());
-    for raw in raw_fields {
-        if raw == null {
-            fields.push(None);
-        } else {
-            fields.push(Some(field_string(unescape_text(raw))?));
-        }
-    }
-    Ok(fields)
+    let bytes = if escaped {
+        unescaped.clear();
+        unescape_text_into(raw, unescaped);
+        unescaped.as_slice()
+    } else {
+        raw
+    };
+    batch.push_field(validate_field(bytes)?);
+    Ok(())
 }
 
 /// Translate PostgreSQL text-format backslash escapes into raw bytes.
-fn unescape_text(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
+fn unescape_text_into(raw: &[u8], out: &mut Vec<u8>) {
+    out.reserve(raw.len());
     let mut i = 0;
     while i < raw.len() {
         let b = raw[i];
@@ -560,27 +645,30 @@ fn unescape_text(raw: &[u8]) -> Vec<u8> {
             other => out.push(other),
         }
     }
-    out
 }
 
 /// Finish the current CSV field, applying the NULL rule (an unquoted match only)
 /// and validating the bytes as UTF-8.
+///
+/// `field` is emptied for the next field whether or not the validation passed,
+/// so the scratch buffer's state never depends on the error path.
 fn finish_csv_field(
     field: &mut Vec<u8>,
     was_quoted: &mut bool,
-    row: &mut Vec<Field>,
+    batch: &mut RowBatch,
     null: &[u8],
     force_not_null: bool,
 ) -> Result<(), PgError> {
     let is_null = !*was_quoted && !force_not_null && field.as_slice() == null;
-    let taken = std::mem::take(field);
-    row.push(if is_null {
-        None
-    } else {
-        Some(field_string(taken)?)
-    });
     *was_quoted = false;
-    Ok(())
+    let outcome = if is_null {
+        batch.push_null();
+        Ok(())
+    } else {
+        validate_field(field).map(|text| batch.push_field(text))
+    };
+    field.clear();
+    outcome
 }
 
 fn force_not_null_at(format: &CopyFormat, field_index: usize) -> bool {
@@ -601,11 +689,14 @@ pub fn read_file_rows(
     path: &str,
     format: &CopyFormat,
     batch_rows: usize,
-    mut sink: impl FnMut(Vec<Vec<Field>>) -> Result<(), PgError>,
+    mut sink: impl FnMut(&RowBatch) -> Result<(), PgError>,
 ) -> Result<(), PgError> {
     let mut decoder = CopyDecoder::new(format);
     let mut chunk = vec![0u8; READ_CHUNK];
-    let mut pending: Vec<Vec<Field>> = Vec::new();
+    // One batch handed to the sink over and over: `take_batch_into` swaps the
+    // decoder's rows into it and gives its allocations back, so the load's
+    // buffers are acquired once however many batches it takes.
+    let mut ready = RowBatch::new();
 
     loop {
         let read = match file.read(&mut chunk) {
@@ -617,21 +708,21 @@ pub fn read_file_rows(
         if read == 0 {
             // End of file: a final record with no terminator is still a record,
             // and an unterminated CSV quote is rejected here.
-            decoder.finish(&mut pending)?;
+            decoder.finish()?;
             break;
         }
-        decoder.push(&chunk[..read], &mut pending)?;
-        while pending.len() >= batch_rows {
-            let rest = pending.split_off(batch_rows);
-            sink(std::mem::replace(&mut pending, rest))?;
+        decoder.push(&chunk[..read])?;
+        while decoder.batch().len() >= batch_rows {
+            decoder.take_batch_into(batch_rows, &mut ready);
+            sink(&ready)?;
         }
         if decoder.end_of_data() {
             break;
         }
     }
 
-    if !pending.is_empty() {
-        sink(pending)?;
+    if !decoder.batch().is_empty() {
+        sink(decoder.batch())?;
     }
     Ok(())
 }
@@ -733,6 +824,24 @@ fn strerror(e: &std::io::Error) -> String {
 mod tests {
     use super::*;
     use crabgresql_storage_api::TableAccessMethod;
+
+    /// One decoded field, owned. The decoder hands out spans into a batch's
+    /// arena; the assertions below are written against the *values*, which is
+    /// what makes them readable and what makes them survive a change of
+    /// representation like this one.
+    type Field = Option<String>;
+
+    fn owned(batch: &RowBatch) -> Vec<Vec<Field>> {
+        batch
+            .iter()
+            .map(|row| row.iter().map(|f| f.map(String::from)).collect())
+            .collect()
+    }
+
+    /// Shadows [`super::decode`] so every expectation stays in owned rows.
+    fn decode(format: &CopyFormat, bytes: &[u8]) -> Result<Vec<Vec<Field>>, PgError> {
+        super::decode(format, bytes).map(|batch| owned(&batch))
+    }
 
     fn text_format() -> CopyFormat {
         CopyFormat::text()
@@ -968,15 +1077,87 @@ mod tests {
         chunk: usize,
     ) -> Result<Vec<Vec<Field>>, PgError> {
         let mut decoder = CopyDecoder::new(format);
-        let mut rows = Vec::new();
         for slice in bytes.chunks(chunk) {
-            decoder.push(slice, &mut rows)?;
+            decoder.push(slice)?;
             if decoder.end_of_data() {
-                return Ok(rows);
+                return Ok(owned(decoder.batch()));
             }
         }
-        decoder.finish(&mut rows)?;
-        Ok(rows)
+        decoder.finish()?;
+        Ok(owned(decoder.batch()))
+    }
+
+    /// Drive the decoder the way [`read_file_rows`] does — slabs in, fixed-size
+    /// batches out — and rejoin the batches. The split lands wherever the row
+    /// count says, which for a small `batch_rows` is routinely in the middle of
+    /// a record whose earlier fields are already decoded; nothing may be lost,
+    /// duplicated or reordered there.
+    fn decode_in_batches(
+        format: &CopyFormat,
+        bytes: &[u8],
+        chunk: usize,
+        batch_rows: usize,
+    ) -> Result<Vec<Vec<Field>>, PgError> {
+        let mut decoder = CopyDecoder::new(format);
+        let mut ready = RowBatch::new();
+        let mut all = Vec::new();
+        for slice in bytes.chunks(chunk) {
+            decoder.push(slice)?;
+            while decoder.batch().len() >= batch_rows {
+                decoder.take_batch_into(batch_rows, &mut ready);
+                assert_eq!(ready.len(), batch_rows, "a batch is exactly what was asked");
+                all.extend(owned(&ready));
+            }
+            if decoder.end_of_data() {
+                all.extend(owned(decoder.batch()));
+                return Ok(all);
+            }
+        }
+        decoder.finish()?;
+        all.extend(owned(decoder.batch()));
+        Ok(all)
+    }
+
+    #[test]
+    fn batching_does_not_change_the_rows() -> Result<(), PgError> {
+        let cases: &[(&str, CopyFormat, &[u8])] = &[
+            ("text", text_format(), b"1\ta\n2\t\\N\n3\tc\\td\n4\td"),
+            ("text crlf", text_format(), b"1\ta\r\n2\tb\r\n3\tc"),
+            ("csv", csv_format(), b"1,\"a\nb\"\r\n2,\"c\"\"d\"\r\n3,e"),
+            ("csv empty fields", csv_format(), b"1,,\"\"\n2,x,\n3,,y\n"),
+        ];
+        for (name, fmt, bytes) in cases {
+            let want = decode(fmt, bytes)?;
+            for chunk in 1..=8 {
+                for batch_rows in 1..=4 {
+                    assert_eq!(
+                        decode_in_batches(fmt, bytes, chunk, batch_rows)?,
+                        want,
+                        "{name}, chunk {chunk}, batch {batch_rows}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A field that needed de-escaping is built in a scratch buffer and a field
+    /// that did not is copied straight from the line. Both must land in the
+    /// arena as their own bytes — a shared scratch that leaked between them
+    /// would show up as one field wearing another's value.
+    #[test]
+    fn escaped_and_plain_fields_do_not_share_a_buffer() -> Result<(), PgError> {
+        let rows = decode(&text_format(), b"a\\tb\tplain\tc\\\\d\tlonger-than-any\n")?;
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("a\tb".into()),
+                Some("plain".into()),
+                Some("c\\d".into()),
+                Some("longer-than-any".into()),
+            ]]
+        );
+        Ok(())
     }
 
     #[test]
@@ -1084,24 +1265,25 @@ mod tests {
     #[test]
     fn text_partial_line_emits_no_row_until_its_newline() -> Result<(), PgError> {
         let mut decoder = CopyDecoder::new(&text_format());
-        let mut rows = Vec::new();
-        decoder.push(b"1\ta\n2\tb\n3\tc", &mut rows)?;
+        decoder.push(b"1\ta\n2\tb\n3\tc")?;
         assert_eq!(
-            rows.len(),
+            decoder.batch().len(),
             2,
             "the unterminated third line is not a row yet"
         );
-        decoder.push(b"\n", &mut rows)?;
-        assert_eq!(rows.len(), 3);
+        decoder.push(b"\n")?;
+        assert_eq!(decoder.batch().len(), 3);
         Ok(())
     }
 
     #[test]
     fn csv_newline_inside_quotes_does_not_end_a_record() -> Result<(), PgError> {
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
-        decoder.push(b"\"a\nb\",x\n1,2", &mut rows)?;
-        assert_eq!(rows, vec![vec![Some("a\nb".into()), Some("x".into())]]);
+        decoder.push(b"\"a\nb\",x\n1,2")?;
+        assert_eq!(
+            owned(decoder.batch()),
+            vec![vec![Some("a\nb".into()), Some("x".into())]]
+        );
         Ok(())
     }
 
@@ -1110,25 +1292,26 @@ mod tests {
         // A trailing `"` cannot be judged until the next byte arrives: it may be
         // the first half of a doubled `""`, or the close of the section.
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
         // `1,"a"` leaves the quote undecided; `""` resolves it as a doubled
         // quote (so the section is still open) and opens the next decision,
         // which `,` then resolves as the closing quote.
-        decoder.push(b"1,\"a\"", &mut rows)?;
-        assert!(rows.is_empty());
-        decoder.push(b"\"\"", &mut rows)?;
-        assert!(rows.is_empty());
-        decoder.push(b",b\n", &mut rows)?;
+        decoder.push(b"1,\"a\"")?;
+        assert!(decoder.batch().is_empty());
+        decoder.push(b"\"\"")?;
+        assert!(decoder.batch().is_empty());
+        decoder.push(b",b\n")?;
         assert_eq!(
-            rows,
+            owned(decoder.batch()),
             vec![vec![Some("1".into()), Some("a\"".into()), Some("b".into())]]
         );
 
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
-        decoder.push(b"1,\"a\"", &mut rows)?;
-        decoder.push(b"\n", &mut rows)?;
-        assert_eq!(rows, vec![vec![Some("1".into()), Some("a".into())]]);
+        decoder.push(b"1,\"a\"")?;
+        decoder.push(b"\n")?;
+        assert_eq!(
+            owned(decoder.batch()),
+            vec![vec![Some("1".into()), Some("a".into())]]
+        );
         Ok(())
     }
 
@@ -1137,15 +1320,18 @@ mod tests {
         // The `\r` ends the record on its own; a following `\n` is its other half
         // and must not open a second, empty row.
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
-        decoder.push(b"1,a\r", &mut rows)?;
-        assert_eq!(rows.len(), 1);
-        decoder.push(b"\n", &mut rows)?;
-        assert_eq!(rows.len(), 1, "the CRLF pair is one terminator");
-        decoder.push(b"2,b\r", &mut rows)?;
-        assert_eq!(rows.len(), 2);
-        decoder.finish(&mut rows)?;
-        assert_eq!(rows.len(), 2, "a trailing CR leaves nothing pending");
+        decoder.push(b"1,a\r")?;
+        assert_eq!(decoder.batch().len(), 1);
+        decoder.push(b"\n")?;
+        assert_eq!(decoder.batch().len(), 1, "the CRLF pair is one terminator");
+        decoder.push(b"2,b\r")?;
+        assert_eq!(decoder.batch().len(), 2);
+        decoder.finish()?;
+        assert_eq!(
+            decoder.batch().len(),
+            2,
+            "a trailing CR leaves nothing pending"
+        );
         Ok(())
     }
 
@@ -1164,17 +1350,15 @@ mod tests {
         fmt.escape = b'\\';
         // An escape before a quote emits the quote literally...
         let mut decoder = CopyDecoder::new(&fmt);
-        let mut rows = Vec::new();
-        decoder.push(b"\"a\\", &mut rows)?;
-        decoder.push(b"\"b\"\n", &mut rows)?;
-        assert_eq!(rows, vec![vec![Some("a\"b".into())]]);
+        decoder.push(b"\"a\\")?;
+        decoder.push(b"\"b\"\n")?;
+        assert_eq!(owned(decoder.batch()), vec![vec![Some("a\"b".into())]]);
 
         // ...and before anything else it stands for itself.
         let mut decoder = CopyDecoder::new(&fmt);
-        let mut rows = Vec::new();
-        decoder.push(b"\"a\\", &mut rows)?;
-        decoder.push(b"x\"\n", &mut rows)?;
-        assert_eq!(rows, vec![vec![Some("a\\x".into())]]);
+        decoder.push(b"\"a\\")?;
+        decoder.push(b"x\"\n")?;
+        assert_eq!(owned(decoder.batch()), vec![vec![Some("a\\x".into())]]);
         Ok(())
     }
 
@@ -1200,13 +1384,12 @@ mod tests {
     #[test]
     fn unterminated_csv_quote_at_eof_errors_from_finish() {
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
         assert!(
-            decoder.push(b"\"oops\n", &mut rows).is_ok(),
+            decoder.push(b"\"oops\n").is_ok(),
             "an open section is not yet an error while bytes may still arrive"
         );
         let err = decoder
-            .finish(&mut rows)
+            .finish()
             .expect_err("an unterminated quote is an error at end of input");
         assert_eq!(err.code, sqlstate::BAD_COPY_FILE_FORMAT);
     }
@@ -1236,13 +1419,12 @@ mod tests {
 
         // CSV: an unmatched quote at the very start means no record ever ends.
         let mut decoder = CopyDecoder::new(&csv_format());
-        let mut rows = Vec::new();
-        decoder.push(b"\"oops,", &mut rows)?;
+        decoder.push(b"\"oops,")?;
         let slab = vec![b'x'; SLAB];
         for _ in 0..SLABS {
-            decoder.push(&slab, &mut rows)?;
+            decoder.push(&slab)?;
         }
-        assert!(rows.is_empty());
+        assert!(decoder.batch().is_empty());
         // Retained bytes are the in-progress field, not a second copy of the
         // stream: the old code held both `buffer` and the decoded fields.
         assert!(
@@ -1254,14 +1436,13 @@ mod tests {
         // Text: a file with no newline at all is ONE row — correct PG behavior;
         // only the quadratic buffering was ever the bug.
         let mut decoder = CopyDecoder::new(&text_format());
-        let mut rows = Vec::new();
         for _ in 0..SLABS {
-            decoder.push(&slab, &mut rows)?;
+            decoder.push(&slab)?;
         }
-        assert!(rows.is_empty());
-        decoder.finish(&mut rows)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].len(), 1);
+        assert!(decoder.batch().is_empty());
+        decoder.finish()?;
+        assert_eq!(decoder.batch().len(), 1);
+        assert_eq!(decoder.batch().row(0).len(), 1);
         Ok(())
     }
 
@@ -1269,9 +1450,8 @@ mod tests {
     fn record_over_the_cap_errors_with_pgs_limit() {
         for fmt in [text_format(), csv_format()] {
             let mut decoder = CopyDecoder::new(&fmt).with_max_record_bytes(64);
-            let mut rows = Vec::new();
             let err = decoder
-                .push(&[b'x'; 100], &mut rows)
+                .push(&[b'x'; 100])
                 .expect_err("a record past the cap must be refused");
             assert_eq!(err.code, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(
@@ -1288,11 +1468,10 @@ mod tests {
     fn a_record_exactly_at_the_cap_is_accepted() -> Result<(), PgError> {
         // 63 payload bytes plus the newline that completes the record.
         let mut decoder = CopyDecoder::new(&text_format()).with_max_record_bytes(64);
-        let mut rows = Vec::new();
         let mut input = vec![b'x'; 63];
         input.push(b'\n');
-        decoder.push(&input, &mut rows)?;
-        assert_eq!(rows.len(), 1);
+        decoder.push(&input)?;
+        assert_eq!(decoder.batch().len(), 1);
         Ok(())
     }
 
@@ -1300,11 +1479,10 @@ mod tests {
     fn the_cap_counts_across_pushes_not_per_push() {
         // Three 30-byte slabs: each fits alone, together they do not.
         let mut decoder = CopyDecoder::new(&text_format()).with_max_record_bytes(64);
-        let mut rows = Vec::new();
-        assert!(decoder.push(&[b'x'; 30], &mut rows).is_ok());
-        assert!(decoder.push(&[b'x'; 30], &mut rows).is_ok());
+        assert!(decoder.push(&[b'x'; 30]).is_ok());
+        assert!(decoder.push(&[b'x'; 30]).is_ok());
         let err = decoder
-            .push(&[b'x'; 30], &mut rows)
+            .push(&[b'x'; 30])
             .expect_err("the counter carries across slabs");
         assert_eq!(err.code, sqlstate::PROGRAM_LIMIT_EXCEEDED);
     }
@@ -1313,11 +1491,10 @@ mod tests {
     fn the_cap_resets_on_every_completed_record() -> Result<(), PgError> {
         // Many records, each well under the cap, must not accumulate toward it.
         let mut decoder = CopyDecoder::new(&text_format()).with_max_record_bytes(64);
-        let mut rows = Vec::new();
         for _ in 0..100 {
-            decoder.push(b"short\n", &mut rows)?;
+            decoder.push(b"short\n")?;
         }
-        assert_eq!(rows.len(), 100);
+        assert_eq!(decoder.batch().len(), 100);
         Ok(())
     }
 }
