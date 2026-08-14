@@ -55,11 +55,9 @@ impl RmgrRedo for HeapRedo {
                 self.apply(rel, block, ctx.lsn, |pg| page::put_item_at(pg, off, &tuple))?;
             }
             rec::HEAP_MULTI_INSERT => {
-                // Every item of this record landed on one page in one critical
-                // section, so it replays as one gated apply: the page either
-                // predates the record and takes the whole batch, or it already
-                // holds all of it. Replaying item by item would need a gate per
-                // item, and the page carries only one LSN.
+                // One gated apply for the whole record, because the page carries
+                // one LSN: it either predates the record and takes every item, or
+                // already holds all of them.
                 let rel = r.rel();
                 let block = r.u32();
                 let n = r.u32();

@@ -102,8 +102,8 @@ pub fn insert(rel: RelFileNode, block: u32, off: u16, tuple: &[u8]) -> Vec<u8> {
 pub struct MultiInsert {
     w: W,
     n: u32,
-    /// Where the placeholder `n` sits, captured as the header is written rather
-    /// than spelled as a constant that silently rots if a field is added.
+    /// Captured as the header is written rather than spelled as a constant, which
+    /// would silently rot the day a header field is added.
     count_at: usize,
 }
 

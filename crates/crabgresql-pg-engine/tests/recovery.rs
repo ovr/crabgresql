@@ -171,10 +171,9 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
 
 #[test]
 fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
-    // `insert_many` logs one HEAP_MULTI_INSERT per page rather than one record
-    // per row, so replay has to rebuild a whole page's worth of rows from a
-    // single record — at the same offsets — and stay idempotent when it sees
-    // that record twice.
+    // A batch reaches the log as one HEAP_MULTI_INSERT per page, so replay has to
+    // rebuild a whole page of rows from a single record, at the offsets the
+    // original placement chose, and survive seeing that record twice.
     let dir = tempfile::tempdir()?;
     let placed: Vec<Tid>;
     {
@@ -195,8 +194,6 @@ fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
         // Crash: drop without a checkpoint, so only the WAL carries the batch.
     }
 
-    // First recovery: every row is back, at the tid the original placement
-    // reported.
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
     let rows: Vec<(Tid, Vec<Value>)> = table
@@ -211,10 +208,9 @@ fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
         assert_eq!(got.map(|t| t[0].clone()), Some(Value::Int4(i as i32)));
     }
 
-    // Push the recovered pages to disk (advancing their pd_lsn), then replay the
-    // whole WAL again over them — `Lsn::INVALID` ignores the redo point the
-    // checkpoint just published: the LSN gate must make it a no-op rather than
-    // adding a second copy of every row.
+    // Checkpointing advances the pages' pd_lsn; `Lsn::INVALID` then replays the
+    // whole WAL over them anyway, ignoring the redo point that checkpoint just
+    // published. The LSN gate has to make that a no-op.
     engine.checkpoint(Xid::FIRST_NORMAL)?;
     drop(engine);
     let (engine2, tm2) = open_from(dir.path(), crabgresql_wal::Lsn::INVALID)?;

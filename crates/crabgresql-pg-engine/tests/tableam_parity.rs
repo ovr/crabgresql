@@ -602,9 +602,9 @@ fn many_inserts_span_multiple_pages() -> anyhow::Result<()> {
 
 #[test]
 fn a_batch_spanning_pages_places_every_row_and_reports_its_tids() -> anyhow::Result<()> {
-    // `insert_many` fills one page at a time under a single pin, so the batch
-    // that matters is the one that outgrows a page: the tids it hands back have
-    // to name the rows actually stored, across the page boundary it crossed.
+    // The batch that matters is the one that outgrows a page: `insert_many`
+    // reports its tids from two different runs, and both have to name the rows
+    // actually stored.
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;
     let rows: Vec<Tuple> = (0..500)

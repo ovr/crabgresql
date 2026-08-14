@@ -1071,8 +1071,7 @@ impl HeapTable {
     }
 
     /// Place a whole batch of already-encoded heap tuples, filling one page at a
-    /// time: one pin, one page lock and one `HEAP_MULTI_INSERT` per page rather
-    /// than per row. Returns the tids in the order `items` gave them.
+    /// time. Returns the tids in the order `items` gave them.
     ///
     /// This is what makes a bulk load cheap: placing row by row pays an
     /// `smgr.nblocks` (a `statx`), a pin, a page lock, a copy of the tuple back
@@ -1094,8 +1093,8 @@ impl HeapTable {
             return tids;
         }
         let smgr = self.engine.bufpool.smgr();
-        // Read once, then never again: every block this loop moves on to is one
-        // it extended itself, so it always knows where the file ends.
+        // Every block the loop moves on to is one it extended itself, so it never
+        // has to ask where the file ends again.
         let nblocks = Self::io(smgr.nblocks(rel));
         let mut target = if nblocks == 0 {
             Self::io(smgr.extend(rel))
@@ -1103,7 +1102,8 @@ impl HeapTable {
             self.insert_hint.load(Ordering::Relaxed).min(nblocks - 1)
         };
         while tids.len() < items.len() {
-            // Read before the closure, which borrows `tids` mutably to append to.
+            // The closure below borrows `tids` mutably, so the run's start has to
+            // be taken out here.
             let start = tids.len();
             let page = Self::io(self.engine.bufpool.pin(rel, target));
             page.modify(|pg| {
@@ -1121,42 +1121,39 @@ impl HeapTable {
                         panic!("newly inserted tuple is missing from its page");
                     };
                     tuple::set_ctid(item, tid);
-                    // Straight from the page into the record: the self-ctid patch
-                    // is already in, and nothing copies the tuple in between.
+                    // After the patch, and off the page rather than out of
+                    // `bytes`: the record has to carry what the page ends up
+                    // holding, and nothing copies the tuple to get there.
                     w.push(off, item);
                     tids.push(tid);
                 }
-                // Nothing fit — leave the page untouched rather than logging an
-                // empty record and dirtying it for no change.
+                // An empty record would dirty the page for no change.
                 if w.is_empty() {
                     return;
                 }
                 let lsn = self.log(rec::HEAP_MULTI_INSERT, xid, &w.finish());
                 page::set_lsn(pg, lsn.0);
             });
-            // Only when something landed here: the hint names the page we last
-            // placed into, never merely the one we last pinned. Publishing a page
-            // we just found full — even for the instant before the `extend` below
-            // overwrites it — hands every other writer reading this hint
-            // (`place_item` under `update`, a concurrent load) a wasted pin.
+            // The hint names a page something landed on, never merely one we
+            // pinned: publishing a full page — even for the instant before the
+            // `extend` below overwrites it — costs whoever reads it next a pin.
             if tids.len() > start {
                 self.insert_hint.store(target, Ordering::Relaxed);
             }
             if tids.len() == items.len() {
                 break;
             }
-            // A freshly extended block takes at least one item (they are all
-            // `MAX_TUPLE`-bounded), so the loop always makes progress.
+            // A fresh block takes at least one item, which is what makes the loop
+            // terminate.
             target = Self::io(smgr.extend(rel));
         }
         tids
     }
 
-    /// The shared body of [`TableAm::insert`] and [`TableAm::insert_many`]:
-    /// encode every row, place the lot, then index it. Everything that is one
-    /// per *operation* — the freeze check, the table's shared lock, the
-    /// relfilenode, the tuple header — is done once here rather than once per
-    /// row.
+    /// The shared body of [`TableAm::insert`] and [`TableAm::insert_many`].
+    /// Everything that is one per *operation* — the freeze check, the table's
+    /// shared lock, the relfilenode, the tuple header — is settled once here
+    /// rather than once per row.
     ///
     /// Encoding runs to completion before the first row is placed, so a row that
     /// cannot be stored at all (`RowTooBig`) fails the batch with nothing of it
