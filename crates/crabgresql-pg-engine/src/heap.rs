@@ -1070,6 +1070,130 @@ impl HeapTable {
         self.place_item(rel, xid, tuple_bytes, &self.insert_hint, true)
     }
 
+    /// Place a whole batch of already-encoded heap tuples, filling one page at a
+    /// time. Returns the tids in the order `items` gave them.
+    ///
+    /// This is what makes a bulk load cheap: placing row by row pays an
+    /// `smgr.nblocks` (a `statx`), a pin, a page lock, a copy of the tuple back
+    /// out of the page and a WAL record with its own header and log-mutex
+    /// acquisition for every row, on a page that holds dozens of them.
+    ///
+    /// The caller must have encoded `items` **before** calling: nothing in here
+    /// may pin another page. `write_planned` can, since a toasted attribute
+    /// writes chunk pages, and pinning from inside `page.modify` — which holds
+    /// the frame's mutex — against `BufferPool::pin` — which takes the pool map's
+    /// mutex first — is a lock-order inversion.
+    ///
+    /// Each item must be sized at or below `MAX_TUPLE`, exactly as
+    /// [`HeapTable::place_item`] requires: a larger one fits no page, so the
+    /// extend-and-retry loop would never terminate.
+    fn place_batch(&self, rel: RelFileNode, xid: Xid, items: &[Vec<u8>]) -> Vec<Tid> {
+        let mut tids = Vec::with_capacity(items.len());
+        if items.is_empty() {
+            return tids;
+        }
+        let smgr = self.engine.bufpool.smgr();
+        // Every block the loop moves on to is one it extended itself, so it never
+        // has to ask where the file ends again.
+        let nblocks = Self::io(smgr.nblocks(rel));
+        let mut target = if nblocks == 0 {
+            Self::io(smgr.extend(rel))
+        } else {
+            self.insert_hint.load(Ordering::Relaxed).min(nblocks - 1)
+        };
+        while tids.len() < items.len() {
+            // The closure below borrows `tids` mutably, so the run's start has to
+            // be taken out here.
+            let start = tids.len();
+            let page = Self::io(self.engine.bufpool.pin(rel, target));
+            page.modify(|pg| {
+                let mut w = rec::MultiInsert::new(rel, target);
+                for bytes in &items[start..] {
+                    debug_assert!(bytes.len() <= MAX_TUPLE, "item was not sized");
+                    let Some(off) = page::add_item(pg, bytes) else {
+                        break;
+                    };
+                    let tid = Tid {
+                        block: target,
+                        offset: off,
+                    };
+                    let Some(item) = page::get_item_mut(pg, off) else {
+                        panic!("newly inserted tuple is missing from its page");
+                    };
+                    tuple::set_ctid(item, tid);
+                    // After the patch, and off the page rather than out of
+                    // `bytes`: the record has to carry what the page ends up
+                    // holding, and nothing copies the tuple to get there.
+                    w.push(off, item);
+                    tids.push(tid);
+                }
+                // An empty record would dirty the page for no change.
+                if w.is_empty() {
+                    return;
+                }
+                let lsn = self.log(rec::HEAP_MULTI_INSERT, xid, &w.finish());
+                page::set_lsn(pg, lsn.0);
+            });
+            // The hint names a page something landed on, never merely one we
+            // pinned: publishing a full page — even for the instant before the
+            // `extend` below overwrites it — costs whoever reads it next a pin.
+            if tids.len() > start {
+                self.insert_hint.store(target, Ordering::Relaxed);
+            }
+            if tids.len() == items.len() {
+                break;
+            }
+            // A fresh block takes at least one item, which is what makes the loop
+            // terminate.
+            target = Self::io(smgr.extend(rel));
+        }
+        tids
+    }
+
+    /// The shared body of [`TableAm::insert`] and [`TableAm::insert_many`].
+    /// Everything that is one per *operation* — the freeze check, the table's
+    /// shared lock, the relfilenode, the tuple header — is settled once here
+    /// rather than once per row.
+    ///
+    /// Encoding runs to completion before the first row is placed, so a row that
+    /// cannot be stored at all (`RowTooBig`) fails the batch with nothing of it
+    /// written. `place_batch` requires that ordering anyway (it may not pin a
+    /// toast page from under a page lock); the all-or-nothing failure is the
+    /// welcome consequence.
+    fn insert_batch(&self, tuples: &[Tuple], txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        // A frozen tuple is visible to every snapshot the moment it is placed and
+        // names no transaction whose abort could take it back — not on rollback,
+        // not in recovery, since the WAL record carries the already-frozen header.
+        // The only thing that makes it retractable is landing in storage a
+        // rollback discards, which is what `truncated_by` answers. The server
+        // checks it too; asserting it here as well is what turns "the caller was
+        // careful" into an invariant of the heap, and mirrors the same refusal in
+        // `ParquetTable::insert_many`.
+        if txn.freeze_inserts && !self.truncated_by(txn.xid) {
+            return Err(StorageError::UnsupportedOperation(format!(
+                "cannot write frozen rows into \"{}\": \
+                 this transaction has not truncated it",
+                self.snap().name
+            )));
+        }
+        let _guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        // `insert_xid`, not `xid`: a `COPY … FREEZE` stamps the version frozen.
+        // Everything below still names the real transaction — the relfilenode it
+        // writes into, the WAL record, the page lock.
+        let hdr = TupleHeader::inserted(txn.insert_xid(), txn.cid);
+        let mut items = Vec::with_capacity(tuples.len());
+        for tuple in tuples {
+            let planned = self.plan_tuple(tuple, &hdr)?;
+            items.push(self.write_planned(tuple, &hdr, planned, txn)?);
+        }
+        let tids = self.place_batch(rel, txn.xid, &items);
+        for (tuple, tid) in tuples.iter().zip(&tids) {
+            self.maintain_insert(tuple, *tid, txn.xid)?;
+        }
+        Ok(tids)
+    }
+
     /// Whether this relation's writes bypass the WAL (`UNLOGGED`/`TEMP`), for the
     /// engine-level sweeps that log a record per page they touch.
     pub(crate) fn wal_skipped(&self) -> bool {
@@ -1646,32 +1770,17 @@ impl TableAm for HeapTable {
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
-        // A frozen tuple is visible to every snapshot the moment it is placed and
-        // names no transaction whose abort could take it back — not on rollback,
-        // not in recovery, since the WAL record carries the already-frozen header.
-        // The only thing that makes it retractable is landing in storage a
-        // rollback discards, which is what `truncated_by` answers. The server
-        // checks it too; asserting it here as well is what turns "the caller was
-        // careful" into an invariant of the heap, and mirrors the same refusal in
-        // `ParquetTable::insert_many`.
-        if txn.freeze_inserts && !self.truncated_by(txn.xid) {
-            return Err(StorageError::UnsupportedOperation(format!(
-                "cannot write frozen rows into \"{}\": \
-                 this transaction has not truncated it",
-                self.snap().name
-            )));
-        }
-        let _guard = self.lock.acquire_shared(txn.lock_owner);
-        let rel = self.effective_rel(txn.xid);
-        // `insert_xid`, not `xid`: a `COPY … FREEZE` stamps the version frozen.
-        // Everything below still names the real transaction — the relfilenode it
-        // writes into, the WAL record, the page lock.
-        let hdr = TupleHeader::inserted(txn.insert_xid(), txn.cid);
-        let planned = self.plan_tuple(&tuple, &hdr)?;
-        let bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
-        let tid = self.place(rel, txn.xid, &bytes);
-        self.maintain_insert(&tuple, tid, txn.xid)?;
+        let tids = self.insert_batch(std::slice::from_ref(&tuple), txn)?;
+        let Some(&tid) = tids.first() else {
+            panic!("a one-row insert placed no row");
+        };
         Ok(tid)
+    }
+
+    /// The write half of a bulk load — `COPY` hands its batch straight here, and
+    /// [`HeapTable::place_batch`] is where the saving is.
+    fn insert_many(&self, tuples: Vec<Tuple>, txn: &TxnContext) -> Result<Vec<Tid>, StorageError> {
+        self.insert_batch(&tuples, txn)
     }
 
     fn update(

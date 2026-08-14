@@ -601,6 +601,105 @@ fn many_inserts_span_multiple_pages() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_batch_spanning_pages_places_every_row_and_reports_its_tids() -> anyhow::Result<()> {
+    // The batch that matters is the one that outgrows a page: `insert_many`
+    // reports its tids from two different runs, and both have to name the rows
+    // actually stored.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    let rows: Vec<Tuple> = (0..500)
+        .map(|i| vec![Value::Int4(i), Value::Text("y".repeat(300))])
+        .collect();
+    let xid = h.tm.allocate_xid();
+    let tids = table.insert_many(rows.clone(), &h.tm.context(xid, CommandId::FIRST))?;
+    h.tm.commit(xid)?;
+
+    assert_eq!(tids.len(), rows.len());
+    let blocks: std::collections::BTreeSet<u32> = tids.iter().map(|t| t.block).collect();
+    assert!(
+        blocks.len() > 1,
+        "the batch was meant to cross a page boundary, got {} block(s)",
+        blocks.len()
+    );
+    let scanned = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(scanned.len(), rows.len());
+    // Scan order is physical, and so is placement order, so the two lists line
+    // up element for element.
+    for (i, (tid, tuple)) in scanned.iter().enumerate() {
+        assert_eq!(*tid, tids[i], "row {i} was reported at the wrong tid");
+        assert_eq!(*tuple, rows[i], "row {i} did not survive the batch");
+    }
+    // A reported tid is also usable on its own, not just in scan order.
+    for (i, tid) in tids.iter().enumerate() {
+        assert_eq!(table.fetch(*tid, &read(&h.tm))?, Some(rows[i].clone()));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn a_batch_mixing_toasted_and_inline_rows_round_trips() -> anyhow::Result<()> {
+    // A toasted row's chunks are written before the batch touches its heap page
+    // (a page lock may not be held across another pin), so the interesting batch
+    // is the one where wide and narrow rows alternate.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    let rows: Vec<Tuple> = (0..6)
+        .map(|i| {
+            let text = match i % 2 {
+                0 => Value::Text("small".into()),
+                _ => big_text(40_000),
+            };
+            vec![Value::Int4(i), text]
+        })
+        .collect();
+    let xid = h.tm.allocate_xid();
+    let tids = table.insert_many(rows.clone(), &h.tm.context(xid, CommandId::FIRST))?;
+    h.tm.commit(xid)?;
+
+    assert_eq!(tids.len(), rows.len());
+    let scanned = scan_rows(&*table, &read(&h.tm));
+    assert_eq!(
+        scanned.into_iter().map(|(_, t)| t).collect::<Vec<_>>(),
+        rows,
+        "a toasted value did not survive the batch"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn a_batch_maintains_the_unique_index() -> anyhow::Result<()> {
+    // Index maintenance runs after placement now rather than interleaved with
+    // it, so every row of the batch must still reach the tree under the tid it
+    // was placed at.
+    let h = setup();
+    let table = h.engine.create_table(schema("t"))?;
+    h.engine.create_index("public", "t", pk_on_id())?;
+    let rows: Vec<Tuple> = (0..200)
+        .map(|i| vec![Value::Int4(i), Value::Text("z".repeat(200))])
+        .collect();
+    let xid = h.tm.allocate_xid();
+    let tids = table.insert_many(rows.clone(), &h.tm.context(xid, CommandId::FIRST))?;
+    h.tm.commit(xid)?;
+
+    for (i, tid) in tids.iter().enumerate() {
+        let key = [Value::Int4(i as i32)];
+        let hits: Vec<(Tid, Tuple)> = table
+            .index_lookup("t_pkey", &IndexProbeKey::equality(&key), &read(&h.tm))
+            .unwrap_or_else(|| panic!("the index declined to serve id {i}"))
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        assert_eq!(
+            hits,
+            vec![(*tid, rows[i].clone())],
+            "id {i} is missing from the index or points elsewhere"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn concurrent_inserts_are_all_visible_with_distinct_tids() -> anyhow::Result<()> {
     let h = setup();
     let table = h.engine.create_table(schema("t"))?;

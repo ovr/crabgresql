@@ -14,7 +14,7 @@ use crabgresql_types::{PgType, Value};
 use crabgresql_wal::{RmgrRegistry, Wal, recover};
 
 mod common;
-use common::{corrupt_page_byte, open, try_open};
+use common::{corrupt_page_byte, open, open_from, try_open};
 
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -165,6 +165,57 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
     let table2 = engine2.open_table("t")?;
     // Still exactly 50 rows — no duplication from the second replay.
     assert_eq!(visible_ids(&tm2, &*table2).len(), 50);
+
+    Ok(())
+}
+
+#[test]
+fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
+    // A batch reaches the log as one HEAP_MULTI_INSERT per page, so replay has to
+    // rebuild a whole page of rows from a single record, at the offsets the
+    // original placement chose, and survive seeing that record twice.
+    let dir = tempfile::tempdir()?;
+    let placed: Vec<Tid>;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(schema())?;
+        let x = tm.allocate_xid();
+        let rows: Vec<Vec<Value>> = (0..500)
+            .map(|i| vec![Value::Int4(i), Value::Text("w".repeat(300))])
+            .collect();
+        placed = table.insert_many(rows, &tm.context(x, CommandId::FIRST))?;
+        tm.commit(x)?;
+        let blocks: std::collections::BTreeSet<u32> = placed.iter().map(|t| t.block).collect();
+        assert!(
+            blocks.len() > 1,
+            "the batch was meant to cross a page boundary, got {} block(s)",
+            blocks.len()
+        );
+        // Crash: drop without a checkpoint, so only the WAL carries the batch.
+    }
+
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    let rows: Vec<(Tid, Vec<Value>)> = table
+        .scan(&read(&tm), &ColumnProjection::All)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 500);
+    assert_eq!(rows.iter().map(|(tid, _)| *tid).collect::<Vec<_>>(), placed);
+    assert_eq!(visible_ids(&tm, &*table), (0..500).collect::<Vec<i32>>());
+    // A replayed row is reachable by its tid alone, not only through a scan.
+    for (i, tid) in placed.iter().enumerate() {
+        let got = table.fetch(*tid, &read(&tm))?;
+        assert_eq!(got.map(|t| t[0].clone()), Some(Value::Int4(i as i32)));
+    }
+
+    // Checkpointing advances the pages' pd_lsn; `Lsn::INVALID` then replays the
+    // whole WAL over them anyway, ignoring the redo point that checkpoint just
+    // published. The LSN gate has to make that a no-op.
+    engine.checkpoint(Xid::FIRST_NORMAL)?;
+    drop(engine);
+    let (engine2, tm2) = open_from(dir.path(), crabgresql_wal::Lsn::INVALID)?;
+    let table2 = engine2.open_table("t")?;
+    assert_eq!(visible_ids(&tm2, &*table2), (0..500).collect::<Vec<i32>>());
 
     Ok(())
 }
