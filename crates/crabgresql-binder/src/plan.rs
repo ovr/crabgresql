@@ -3887,11 +3887,10 @@ fn bind_table_fn_args(
 /// explicit alias column list (`s(g)`) still wins over the bare alias, and a
 /// composite-returning function keeps its row type's column names.
 ///
-/// `WITH ORDINALITY` appends a trailing `bigint` column named `ordinality`, and
-/// it is part of the rowset from here on: an alias column list renames it like
-/// any other (`a(relid, depth)`), while a *bare* alias still names only the
-/// function's own first column — `generate_series(1, 3) WITH ORDINALITY t`
-/// exposes `t` and `ordinality`, as PG does.
+/// The `WITH ORDINALITY` column joins that rowset, so an alias column list
+/// renames it like any other (`a(relid, depth)`) while a bare alias still names
+/// the function's own column alone: PG's `generate_series(1, 3) WITH ORDINALITY
+/// t` exposes `t` and `ordinality`.
 fn bound_table_fn_item(
     func: TableFn,
     args: Vec<BoundExpr>,
@@ -3905,9 +3904,6 @@ fn bound_table_fn_item(
         columns.push(OutputColumn::new("ordinality", PgType::Int8));
     }
     if func.returns_scalar() && alias.is_some() {
-        // A scalar function's rowset is its one column, plus the ordinal when
-        // `WITH ORDINALITY` asked for it — and the bare alias names the first of
-        // them only.
         debug_assert_eq!(
             columns.len(),
             1 + usize::from(ordinality),

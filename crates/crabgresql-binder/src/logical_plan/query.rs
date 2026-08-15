@@ -73,8 +73,6 @@ pub struct SubqueryPlan {
 pub struct TableFunctionPlan {
     pub func: TableFn,
     pub args: Vec<BoundExpr>,
-    /// `WITH ORDINALITY`: the source rows carry a trailing `bigint` ordinal,
-    /// already present as the last entry of `columns`.
     pub ordinality: bool,
     pub columns: Vec<OutputColumn>,
     pub projections: Vec<BoundExpr>,

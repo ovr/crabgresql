@@ -233,7 +233,6 @@ fn with_ordinality_appends_a_bigint_column() -> anyhow::Result<()> {
         assert_eq!(columns[1].name, "ordinality", "for `{sql}`");
         assert_eq!(columns[1].ty, PgType::Int8, "for `{sql}`");
     }
-    // Without the clause the flag stays off and the rowset is unchanged.
     let TableFunctionPlan {
         columns,
         ordinality,
@@ -246,8 +245,6 @@ fn with_ordinality_appends_a_bigint_column() -> anyhow::Result<()> {
 
 #[test]
 fn with_ordinality_bare_alias_names_only_the_first_column() -> anyhow::Result<()> {
-    // `generate_series(1, 3) WITH ORDINALITY t` exposes `t` and `ordinality`:
-    // the bare alias renames a scalar function's own column, never the ordinal.
     let TableFunctionPlan { columns, .. } =
         bound_table_function("SELECT * FROM generate_series(1, 3) WITH ORDINALITY t")?;
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -257,8 +254,6 @@ fn with_ordinality_bare_alias_names_only_the_first_column() -> anyhow::Result<()
 
 #[test]
 fn with_ordinality_alias_column_list_covers_the_ordinal() -> anyhow::Result<()> {
-    // The ordinal is part of the rowset, so an alias list renames it like any
-    // other column — and a partial list renames the leading columns only.
     let TableFunctionPlan { columns, .. } =
         bound_table_function("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS s(a, b)")?;
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
@@ -269,7 +264,6 @@ fn with_ordinality_alias_column_list_covers_the_ordinal() -> anyhow::Result<()> 
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["a", "ordinality"]);
 
-    // One name past the widened rowset is still 42P10.
     let e = bind_err("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS s(a, b, c)")?;
     assert_eq!(e.code, "42P10");
     Ok(())
@@ -290,9 +284,8 @@ fn with_ordinality_on_a_composite_function_keeps_the_row_type_names() -> anyhow:
 
 #[test]
 fn with_ordinality_column_is_referenceable() -> anyhow::Result<()> {
-    // The ordinal resolves by name in the enclosing query, like any other
-    // column of the FROM item — this is the shape psql's trigger footer uses
-    // (`… WITH ORDINALITY AS a(relid, depth) … ORDER BY a.depth`).
+    // The shape psql's `\d` trigger footer uses: `… WITH ORDINALITY AS
+    // a(relid, depth) … ORDER BY a.depth` names the ordinal in the outer query.
     let TableFunctionPlan {
         columns, predicate, ..
     } = bound_table_function(

@@ -85,8 +85,6 @@ pub enum PhysicalPlan {
     TableFunction {
         func: TableFn,
         args: Vec<BoundExpr>,
-        /// `WITH ORDINALITY`: the source appends a `bigint` ordinal to each row,
-        /// already accounted for by the last entry of `columns`.
         ordinality: bool,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
@@ -373,7 +371,6 @@ pub enum PhysicalJoinInput {
     TableFunction {
         func: TableFn,
         args: Vec<BoundExpr>,
-        /// `WITH ORDINALITY`: see [`PhysicalPlan::TableFunction`].
         ordinality: bool,
     },
 }

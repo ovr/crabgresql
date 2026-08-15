@@ -34,9 +34,8 @@ pub enum JoinInput {
     TableFunction {
         func: TableFn,
         args: Vec<BoundExpr>,
-        /// `WITH ORDINALITY`: append a trailing `bigint` column numbering the
-        /// function's rows from 1. It is part of the rowset, so the item's
-        /// column list (and thus its width) already counts it.
+        /// `WITH ORDINALITY`: the rows carry a trailing `bigint` ordinal, which
+        /// the item's column list — and so its width — already counts.
         ordinality: bool,
     },
 }
