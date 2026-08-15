@@ -375,7 +375,7 @@ fn unlogged_truncated_after_crash() -> anyhow::Result<()> {
     // Flush the Unlogged rows to their file (a running checkpoint keeps the control
     // file dirty), so the reset genuinely has torn-looking data to discard — without
     // it this test would pass even if the reset never ran.
-    h.engine.checkpoint(h.tm.allocate_xid())?;
+    h.engine.checkpoint_at(h.tm.allocate_xid())?;
     drop(u);
     drop(p);
 
@@ -409,7 +409,7 @@ fn unlogged_index_is_physical_survives_clean_and_resets_on_crash() -> anyhow::Re
     );
     // Flush heap + index to disk so both the clean-restart and crash-reset paths
     // operate on real on-disk state.
-    h.engine.checkpoint(h.tm.allocate_xid())?;
+    h.engine.checkpoint_at(h.tm.allocate_xid())?;
     drop(u);
 
     // Clean restart: the index still probes and returns the row.

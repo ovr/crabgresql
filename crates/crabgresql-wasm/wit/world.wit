@@ -1,0 +1,58 @@
+package crabgresql:db@0.1.0;
+
+/// The database an embedder talks to.
+interface engine {
+    /// One session, holding its own transaction state, GUCs and prepared
+    /// statements — and, with it, one open data directory. Dropping it ends the
+    /// session; the directory outlives it for as long as the host's filesystem
+    /// does.
+    resource connection {
+        /// Open (and recover) a data directory, creating it if it is not there.
+        ///
+        /// A function rather than a constructor because it can fail and the
+        /// failure is ordinary: the host's filesystem may refuse the path, and
+        /// a directory already open in this instance is refused outright —
+        /// two engines over one directory means two WALs appending to one log.
+        /// A constructor could only have trapped, taking the whole instance
+        /// down with it.
+        open: static func(data-dir: string) -> result<connection, string>;
+
+        /// Run a simple query — one statement or several separated by `;` — and
+        /// return the results as JSON:
+        ///
+        ///   {"results":[{"columns":["one"],"rows":[["1"]],
+        ///                "command":"SELECT 1"}],
+        ///    "notices":[]}
+        ///
+        /// Every value is the same text encoding the wire protocol would carry,
+        /// or JSON `null` for SQL NULL. `notices` holds any NOTICE/WARNING
+        /// raised along the way, as objects with the same fields as an error.
+        /// A failing statement comes back as the error case, also JSON:
+        /// {"sqlstate":"42P01","message":"…","detail":null,"hint":null,
+        /// "position":null,"severity":"ERROR"}.
+        ///
+        /// `COPY … FROM STDIN` is refused rather than answered: there is no
+        /// second channel to send the data on, and waiting for it would stop
+        /// the one thread this target has, for good.
+        exec: func(sql: string) -> result<string, string>;
+
+        /// Take an online checkpoint: dirty pages, the WAL and the commit log
+        /// all reach the data directory, and a crash after it replays only from
+        /// here. The database keeps running, and this may be called as often as
+        /// the embedder likes.
+        ///
+        /// Rows still held in a `USING buffer` / `USING parquet` RAM buffer are
+        /// *not* written out by this — that is `VACUUM`, per relation. It
+        /// matters more here than natively, because the target has no threads
+        /// and therefore no background flush worker.
+        checkpoint: func() -> result<_, string>;
+    }
+}
+
+/// CrabgreSQL as a WASI 0.2 component: no sockets, no threads. The host
+/// supplies a filesystem (in the browser, jco's in-memory shim) and the
+/// component opens a data directory in it exactly as the native server would —
+/// WAL, recovery, checkpoints and all.
+world database {
+    export engine;
+}

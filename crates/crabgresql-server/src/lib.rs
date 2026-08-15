@@ -24,10 +24,12 @@ use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
 use crabgresql_wal::Wal;
+#[cfg(feature = "net")]
 use tokio::net::TcpListener;
 
+pub use crate::connection::handle_session;
 pub use crate::copy_access::CopyFileAccess;
-use crate::global_catalog::GlobalCatalog;
+pub use crate::global_catalog::GlobalCatalog;
 
 /// Open the durable heap engine over a data directory and run crash recovery:
 /// replay the WAL from the redo point the last checkpoint published, rebuild the
@@ -59,6 +61,7 @@ pub fn open_pg_engine(
 /// (no WAL) and no server-side COPY file access — the in-memory entry point,
 /// which has no data directory to anchor either on. Durable deployments call
 /// [`serve_with`] with a WAL-backed manager.
+#[cfg(feature = "net")]
 pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::io::Result<()> {
     serve_with(
         listener,
@@ -79,6 +82,7 @@ pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::
 /// `copy_files` is passed explicitly rather than defaulted: it decides which
 /// files a client can make the server read, and a silent default is exactly the
 /// kind of security setting that rots unnoticed.
+#[cfg(feature = "net")]
 pub async fn serve_with(
     listener: TcpListener,
     engine: Arc<dyn TableEngine>,

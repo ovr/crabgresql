@@ -11,7 +11,7 @@ workspace = true
 # Only for the environment-variable names the spawned server reads. The server
 # itself is a child process, not a library dependency.
 crabgresql-config.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "process"] }
 
 [dev-dependencies]
 anyhow.workspace = true

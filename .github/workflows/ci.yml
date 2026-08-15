@@ -162,6 +162,35 @@ jobs:
           psql -h 127.0.0.1 -p 55433 -U postgres -qtAc 'SELECT 1' > /dev/null
           docker stop -t 30 ci
 
+  wasm:
+    name: wasm component (browser)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: add the wasm target
+        run: rustup target add wasm32-wasip2
+      # `--locked` like every other job: the component is built from the same
+      # dependency graph the native build resolves.
+      - name: cargo build --target wasm32-wasip2
+        run: cargo build --locked -p crabgresql-wasm --target wasm32-wasip2 --profile wasm-release
+      - name: transpile
+        working-directory: js
+        run: |
+          npm ci
+          npm run build:js
+      # Runs the real component against the same in-memory WASI host the
+      # browser uses, so a break in either the wasm build or the host shows up
+      # here rather than in a demo page nobody runs in CI.
+      - name: smoke
+        working-directory: js
+        run: npm run smoke
+
   # The benchmark jobs below report numbers but gate only on breakage: a query
   # that errored or timed out, or a pgbench run with failed transactions.
   # Timing thresholds are deliberately absent — a shared runner's variance is

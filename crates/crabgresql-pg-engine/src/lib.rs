@@ -883,7 +883,7 @@ impl PgEngine {
             engine.reset_unlogged_relations()?;
         }
         // Make the recovered catalog and pages durable and mark the DB running.
-        engine.checkpoint(res.next_xid)?;
+        engine.checkpoint_at(res.next_xid)?;
         Ok((engine, clog, res.next_xid))
     }
 
@@ -1069,7 +1069,12 @@ impl PgEngine {
     /// crash after this leaves `clean_shutdown = false` and the next startup resets
     /// unlogged relations. A clean exit calls [`TableEngine::shutdown`], which marks
     /// it clean instead.
-    pub fn checkpoint(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
+    ///
+    /// `next_xid` is only a floor — `write_control_file` raises it to the commit
+    /// log's own high-water mark — which is why
+    /// [`TableEngine::checkpoint`](crabgresql_storage_api::TableEngine::checkpoint),
+    /// the caller with no XID in hand, can pass the last one recorded.
+    pub fn checkpoint_at(&self, next_xid: crabgresql_txn::Xid) -> std::io::Result<()> {
         self.log_pool_stats();
         self.write_control_file(next_xid, CHECKPOINT_ONLINE, false)
     }
@@ -1101,7 +1106,7 @@ impl PgEngine {
         {
             return;
         }
-        if let Err(error) = self.checkpoint(next_xid) {
+        if let Err(error) = self.checkpoint_at(next_xid) {
             // Back so the next commit retries. The transaction that triggered
             // this is already durable, so a failed checkpoint costs a longer
             // replay rather than correctness — never a failed commit.
@@ -2145,6 +2150,21 @@ impl TableEngine for PgEngine {
         self.buffer_pressure.wait();
     }
 
+    fn checkpoint(&self) {
+        // The last recorded value is a floor, and `write_control_file` raises it
+        // to the commit log's high-water mark — so a caller with no transaction
+        // in hand does not need one. Before the first checkpoint it is zero,
+        // which that same raise makes harmless.
+        let next_xid = Xid(self.last_next_xid.load(Ordering::Relaxed));
+        if let Err(error) = self.checkpoint_at(next_xid) {
+            // Reported, not returned: the trait method cannot fail, and a
+            // checkpoint that did not happen costs replay time rather than data
+            // — the previous control file stays in place and names an older,
+            // lower redo point.
+            tracing::error!(%error, "checkpoint failed");
+        }
+    }
+
     fn shutdown(&self) {
         // Stop the background worker first, so no flush is mid-write while the
         // control file is being marked clean.
@@ -2704,7 +2724,7 @@ mod tests {
         table.insert(vec![Value::Int4(1)], &tm.context(xid, CommandId::FIRST))?;
         tm.commit(xid)?;
 
-        engine.checkpoint(tm.snapshot().xmax)?;
+        engine.checkpoint_at(tm.snapshot().xmax)?;
 
         let control = read_control(dir.path())?.expect("a checkpoint publishes a control file");
         assert!(

@@ -27,6 +27,7 @@ crabgresql-storage-api = { path = "crates/crabgresql-storage-api" }
 crabgresql-txn = { path = "crates/crabgresql-txn" }
 crabgresql-types = { path = "crates/crabgresql-types" }
 crabgresql-wal = { path = "crates/crabgresql-wal" }
+crabgresql-wasm = { path = "crates/crabgresql-wasm" }
 pg-ryu = { path = "vendor/ryu" }
 
 # external
@@ -57,7 +58,10 @@ rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 sha2 = { version = "0.11", default-features = false }
 similar = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "process", "sync", "signal", "time"] }
+# Only what tokio itself supports on wasm — sockets, processes, signals and the
+# multi-thread runtime are added by the crates that actually need them, so a
+# crate reachable from the wasm build does not inherit an unbuildable tokio.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -69,6 +73,15 @@ tempfile = "3"
 # `uuid`; without it the driver has no Rust type to decode those bytes into.
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 uuid = "1"
+
+# The wasm component travels over the network, so its build trades link time for
+# bytes. Kept out of `release` because the benchmarks build with that profile,
+# and fat LTO would change what they measure.
+[profile.wasm-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

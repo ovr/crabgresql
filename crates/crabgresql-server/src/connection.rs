@@ -13,6 +13,8 @@ use crabgresql_storage_api::TableEngine;
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::cast::CastError;
 use crabgresql_types::{FmtCtx, PgType, Value, wire};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "net")]
 use tokio::net::TcpStream;
 
 use crate::error::PgError;
@@ -33,6 +35,7 @@ use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedR
 /// request during startup.
 static NEXT_BACKEND_ID: AtomicI32 = AtomicI32::new(1);
 
+#[cfg(feature = "net")]
 pub async fn handle_connection(
     socket: TcpStream,
     engine: Arc<dyn TableEngine>,
@@ -41,6 +44,27 @@ pub async fn handle_connection(
 ) -> Result<(), ProtocolError> {
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
+    handle_session(read_half, write_half, engine, catalog, txnmgr).await
+}
+
+/// One pgwire session over any byte stream: the startup handshake, then the
+/// message loop, until the peer terminates or the stream ends.
+///
+/// Generic over the transport rather than taking a socket, because a TCP
+/// connection is only one of the ways a session is driven — the wasm build
+/// speaks the same protocol over an in-memory duplex, with no sockets on the
+/// target at all.
+pub async fn handle_session<R, W>(
+    read_half: R,
+    write_half: W,
+    engine: Arc<dyn TableEngine>,
+    catalog: Arc<GlobalCatalog>,
+    txnmgr: Arc<TransactionManager>,
+) -> Result<(), ProtocolError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut reader = FrontendReader::new(tokio::io::BufReader::new(read_half));
     let mut writer = BackendWriter::new(write_half);
 

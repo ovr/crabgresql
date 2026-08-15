@@ -136,7 +136,7 @@ fn a_checkpoint_retires_the_segments_below_its_redo_point() -> anyhow::Result<()
             &mut registry,
             BufferPoolPolicy::minimal(),
         )?;
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
         read_control(dir.path())?.expect("a control file").redo_lsn
     };
     assert_eq!(clamped, Lsn::INVALID, "the checkpoint must have clamped");

@@ -13,10 +13,9 @@
 //! deny-list.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use crate::fsutil::sync_dir;
+use crate::fsutil::{FileExt, sync_dir};
 use crate::record::{Lsn, WalError};
 
 /// Bytes per segment file. Fixed, not configurable: it is baked into every

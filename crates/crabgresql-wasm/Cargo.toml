@@ -1,0 +1,32 @@
+[package]
+name = "crabgresql-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# `cdylib` is what `wasm32-wasip2` turns into a component; `rlib` keeps the
+# session driver and the JSON encoding testable on the host, where a failure is
+# a stack trace rather than a trap inside a browser.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crabgresql-pg-wire.workspace = true
+# Not `workspace = true`: this is the one consumer that wants the server
+# *without* its default `net` feature, and an inherited dependency cannot turn
+# a workspace default off.
+crabgresql-server = { path = "../crabgresql-server", default-features = false }
+crabgresql-storage-api.workspace = true
+crabgresql-txn.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wit-bindgen = "0.51"
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
