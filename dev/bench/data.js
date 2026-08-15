@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786795635117,
+  "lastUpdate": 1786795636768,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -33016,6 +33016,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19837.027465,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b8b4d9c2164c68e86690b31f983940a3686fb3b4",
+          "message": "feat(catalog): serve 27 more pg_catalog relations, pg_get_indexdef (#239)\n\nA relation missing from CATALOG_RELATIONS fails the whole client query,\nnot just the part that reads it: psql's \\d joins seven relations that a\nlive PostgreSQL also answers with zero rows on this database. This adds\nthem, so those queries start working from files that are honestly empty.\n\nEmpty stubs (the feature does not exist here, and PostgreSQL returns no\nrows for it either): pg_trigger, pg_policy/pg_policies, the four\npg_publication*, the four pg_statistic_ext*, the five foreign-data\nrelations, pg_matviews and pg_rules. Constant rows: pg_extension and the\ntwo pg_available_extension* views, plus the plpgsql row in\npg_description that \\dx reads its Description from. Projections over the\nexisting snapshot: pg_tables, pg_views, pg_indexes, pg_sequences. And\npg_rewrite, whose _RETURN row carries each view's deparsed body.\n\npg_index and pg_constraint were narrower than PostgreSQL's by ten\ncolumns each; \\d broke on indisclustered and conperiod before any new\nrelation was reached, so both are widened to 18.4's shape.\n\nThree functions come with them, because psql calls functions where the\nviews of the same name would not do: pg_get_indexdef (rendered by\nstorage_api::index_definition, shared with pg_indexes.indexdef so the\ntwo cannot drift), pg_partition_ancestors, and pg_available_extensions().\nA qualified function name in FROM position now resolves by the rule a\nscalar call already used, instead of being rejected as a relation name.\n\nCatalogSource gains a view's deparsed definition and a sequence's\nlast_value; the deparse happens in the server, which has the binder,\nrather than in this crate, which deliberately does not depend on it.",
+          "timestamp": "2026-08-15T11:18:11Z",
+          "tree_id": "c83643f5949a8f2b237ad740bfbf29184ff8bf59",
+          "url": "https://github.com/ovr/crabgresql/commit/b8b4d9c2164c68e86690b31f983940a3686fb3b4"
+        },
+        "date": 1786795636639,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1261.553848,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21263.919412,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
