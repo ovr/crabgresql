@@ -710,6 +710,148 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_operator` describes upstream's operator set. Every reference out of it
+/// has to land somewhere — including the two that point back into itself, a
+/// commutator and a negator, which is the reference cycle codegen's two phases
+/// exist for.
+///
+/// # The direction this cannot check
+///
+/// Operators are resolved by `crabgresql-binder`'s own code, not by reading
+/// this table, and that resolver has no enumerable registry — so nothing here
+/// can measure how much of the 805 rows this server actually evaluates. What
+/// it can do is pin, for a handful of operators the server demonstrably runs,
+/// that the row describing each one says the right thing. The converse — that
+/// some described operator is *not* implemented — is stated in
+/// `catalogs::operator`'s docs and shown end to end by the smoke suite.
+#[test]
+fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_operator")?;
+    let (type_schema, type_rows) = build("pg_type")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let oids = |rows: &[Vec<Value>], schema: &TableSchema| -> std::collections::HashSet<u32> {
+        let i = at(schema, "oid");
+        rows.iter().map(|r| oid_at(r, i)).collect()
+    };
+    let types = oids(&type_rows, &type_schema);
+    let procs = oids(&proc_rows, &proc_schema);
+    let operators = oids(&rows, &schema);
+
+    for row in &rows {
+        // A prefix operator has no left operand and writes 0 there; nothing
+        // has no right operand, since PostgreSQL 14 dropped postfix operators.
+        let (kind, left) = (
+            row[at(&schema, "oprkind")].clone(),
+            oid_at(row, at(&schema, "oprleft")),
+        );
+        assert_eq!(
+            left == 0,
+            kind == crate::cols::chr('l'),
+            "oprleft and oprkind disagree"
+        );
+        assert!(left == 0 || types.contains(&left), "oprleft {left} dangles");
+        for column in ["oprright", "oprresult"] {
+            let oid = oid_at(row, at(&schema, column));
+            assert!(types.contains(&oid), "{column} {oid} dangles");
+        }
+        // The commutator and negator are optional, and each is an operator.
+        for column in ["oprcom", "oprnegate"] {
+            let oid = oid_at(row, at(&schema, column));
+            assert!(
+                oid == 0 || operators.contains(&oid),
+                "{column} {oid} dangles"
+            );
+        }
+        // `oprcode` must resolve — an operator nothing evaluates is not an
+        // operator — while the two selectivity estimators may be absent.
+        for (column, required) in [("oprcode", true), ("oprrest", false), ("oprjoin", false)] {
+            let Value::Reg(ref proc) = row[at(&schema, column)] else {
+                anyhow::bail!("{column} is not a regproc");
+            };
+            assert!(
+                (!required && proc.oid == 0) || procs.contains(&proc.oid),
+                "{column} {} dangles",
+                proc.oid
+            );
+        }
+    }
+
+    // A commutator commutes: if A says B, B says A, and their operands are
+    // swapped. This is the property a wrong resolution would break while every
+    // universe check above still passed.
+    let by_oid: std::collections::HashMap<u32, &Vec<Value>> = rows
+        .iter()
+        .map(|r| (oid_at(r, at(&schema, "oid")), r))
+        .collect();
+    for row in &rows {
+        let com = oid_at(row, at(&schema, "oprcom"));
+        if com == 0 {
+            continue;
+        }
+        let other = by_oid[&com];
+        assert_eq!(
+            oid_at(other, at(&schema, "oprcom")),
+            oid_at(row, at(&schema, "oid")),
+            "a commutator that does not commute back"
+        );
+        assert_eq!(
+            oid_at(other, at(&schema, "oprleft")),
+            oid_at(row, at(&schema, "oprright"))
+        );
+        assert_eq!(
+            oid_at(other, at(&schema, "oprright")),
+            oid_at(row, at(&schema, "oprleft"))
+        );
+    }
+
+    // Operators this server evaluates, and what their rows say. Named, not
+    // OID-pinned: `pg_operator.dat` assigns these OIDs itself, but the name is
+    // what a client reads.
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    const BOOL: u32 = 16;
+    let described = |name: &str, left: u32, right: u32| {
+        rows.iter()
+            .find(|r| {
+                r[at(&schema, "oprname")] == Value::Text(name.to_string())
+                    && oid_at(r, at(&schema, "oprleft")) == left
+                    && oid_at(r, at(&schema, "oprright")) == right
+            })
+            .map(|r| {
+                let Value::Reg(ref code) = r[at(&schema, "oprcode")] else {
+                    panic!("oprcode is not a regproc");
+                };
+                (oid_at(r, at(&schema, "oprresult")), code.name.clone())
+            })
+    };
+    for (name, left, right, result, code) in [
+        ("=", INT4, INT4, BOOL, "int4eq"),
+        ("<>", INT4, INT4, BOOL, "int4ne"),
+        ("<", INT4, INT4, BOOL, "int4lt"),
+        ("+", INT4, INT4, INT4, "int4pl"),
+        ("*", INT4, INT4, INT4, "int4mul"),
+        ("||", TEXT, TEXT, TEXT, "textcat"),
+        ("~~", TEXT, TEXT, BOOL, "textlike"),
+        ("=", TEXT, TEXT, BOOL, "texteq"),
+    ] {
+        assert_eq!(
+            described(name, left, right),
+            Some((result, code.to_string())),
+            "the row for {name}({left},{right})"
+        );
+    }
+    // A prefix operator, the shape with no left operand at all.
+    assert_eq!(described("-", 0, INT4), Some((INT4, "int4um".to_string())));
+    Ok(())
+}
+
 /// `pg_amop` and `pg_amproc` finish the operator-class stack: every reference
 /// out of them has to land on a row that exists, or a client joining them —
 /// which is all `\dAo` and `\dAp` do — reads a dangling OID.
@@ -739,6 +881,8 @@ fn pg_amop_and_pg_amproc_join_to_what_they_name() -> anyhow::Result<()> {
             })
             .collect()
     };
+    let (operator_schema, operator_rows) = build("pg_operator")?;
+    let operators = oids(&operator_rows, &operator_schema);
     let families = oids(&fam_rows, &fam_schema);
     let methods = oids(&am_rows, &am_schema);
     let types = oids(&type_rows, &type_schema);
@@ -767,9 +911,8 @@ fn pg_amop_and_pg_amproc_join_to_what_they_name() -> anyhow::Result<()> {
             sortfamily == 0 || families.contains(&sortfamily),
             "amopsortfamily {sortfamily} dangles"
         );
-        // `pg_operator` is not served yet; until it is, the most this can say
-        // is that the column names *something*.
-        assert_ne!(oid_at(row, at(&amop_schema, "amopopr")), 0);
+        let opr = oid_at(row, at(&amop_schema, "amopopr"));
+        assert!(operators.contains(&opr), "amopopr {opr} dangles");
     }
 
     assert_eq!(amproc_rows.len(), PG_AMPROC_ROWS.len());
@@ -2162,11 +2305,13 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // Three from the `.dat`, plus `plpgsql`.
             ("pg_language", 4),
             ("pg_namespace", 3),
+            // Every operator upstream ships; each one carries a `descr`.
+            ("pg_operator", 805),
             // Every function the generated catalogs reference and upstream
-            // wrote a `descr` for. It grew with `pg_amproc`: a support
-            // function is a `pg_proc` row like any other, and its description
-            // comes along.
-            ("pg_proc", 831),
+            // wrote a `descr` for. It grew with `pg_amproc` and `pg_operator`:
+            // a support function or an `oprcode` is a `pg_proc` row like any
+            // other, and its description comes along.
+            ("pg_proc", 888),
             ("pg_type", 109),
         ])
     );

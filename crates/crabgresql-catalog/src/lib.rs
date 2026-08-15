@@ -274,6 +274,29 @@ pub struct PgOpfamilyRow {
     pub opfname: &'static str,
 }
 
+/// A built-in `pg_operator` row, generated from `pg_operator.dat`. Namespace
+/// and owner are not carried, for the reason [`PgOpclassRow`] gives.
+pub struct PgOperatorRow {
+    pub oid: u32,
+    pub oprname: &'static str,
+    /// `b` for an infix operator, `l` for a prefix one — whose
+    /// [`Self::oprleft`] is 0.
+    pub oprkind: &'static str,
+    pub oprcanmerge: bool,
+    pub oprcanhash: bool,
+    pub oprleft: u32,
+    pub oprright: u32,
+    pub oprresult: u32,
+    /// The commutator and negator, each an operator OID or 0 for none.
+    pub oprcom: u32,
+    pub oprnegate: u32,
+    pub oprcode: ProcRef,
+    /// The planner's restriction and join selectivity estimators, or the
+    /// catalog's `-` when upstream declares none.
+    pub oprrest: ProcRef,
+    pub oprjoin: ProcRef,
+}
+
 /// A built-in `pg_amop` row, generated from `pg_amop.dat`: the operator that
 /// implements one strategy of an operator family.
 pub struct PgAmopRow {
@@ -320,6 +343,7 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_operator_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amop_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amproc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));

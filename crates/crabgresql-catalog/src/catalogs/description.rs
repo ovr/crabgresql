@@ -20,10 +20,9 @@
 //! too.
 //!
 //! The count is smaller than PostgreSQL's ~5400 for a reason rather than a
-//! deferral: the bulk of the rest describes `pg_operator` and `pg_conversion`,
-//! which are not relations this build serves at all, and `pg_collation`, whose
-//! descriptions `initdb` writes from the locales it finds rather than from any
-//! `.dat`.
+//! deferral: the rest describes `pg_conversion`, which is not a relation this
+//! build serves, and `pg_collation`, whose descriptions `initdb` writes from
+//! the locales it finds rather than from any `.dat`.
 //!
 //! Nothing may describe an object that is not there — the invariant
 //! [`PUBLISHED`] enforces for the catalogs codegen could not.
@@ -68,15 +67,17 @@ type Published = (&'static str, fn(u32) -> bool);
 
 /// The generated descriptions this build publishes, class by class.
 ///
-/// `pg_type` and `pg_proc` need no test — `catalogs::types` publishes every
-/// generated type row, and codegen already restricted the functions to the ones
-/// `catalogs::proc` publishes. The other three are hand-written, so the test is
+/// `pg_type`, `pg_proc` and `pg_operator` need no test — `catalogs::types` and
+/// `catalogs::operator` publish every generated row of theirs, and codegen
+/// already restricted the functions to the ones `catalogs::proc` publishes. The
+/// other three are hand-written, so the test is
 /// the list they are written from: `pg_namespace.dat`, for instance, also
 /// describes the subscription conflict-log schema, which this build has not
 /// got.
 const PUBLISHED: &[Published] = &[
     ("pg_type", |_| true),
     ("pg_proc", |_| true),
+    ("pg_operator", |_| true),
     ("pg_am", |oid| BUILTIN_AMS.iter().any(|(o, ..)| *o == oid)),
     ("pg_language", |oid| {
         BUILTIN_LANGUAGES.iter().any(|(o, ..)| *o == oid)

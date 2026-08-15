@@ -20,9 +20,9 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     acl, am, amop, attribute, auth, class, collation, constraint, cursors, database, description,
-    extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, policy,
-    prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
-    stat_activity, stat_database, stat_indexes, stat_io, stat_tables, statio, statistic,
+    extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, operator,
+    policy, prepared, proc, progress, publication, relviews, replication, rewrite, sequence,
+    settings, stat_activity, stat_database, stat_indexes, stat_io, stat_tables, statio, statistic,
     statistic_ext, timezone, trigger, types,
 };
 use crate::cols::no_rows;
@@ -373,6 +373,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         opclass::pg_opclass_schema,
         opclass::pg_opclass_rows,
+    ),
+    rel(
+        "pg_operator",
+        2617,
+        PgCatalog,
+        operator::pg_operator_schema,
+        operator::pg_operator_rows,
     ),
     rel(
         "pg_opfamily",

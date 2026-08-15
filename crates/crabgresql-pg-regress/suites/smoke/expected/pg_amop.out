@@ -48,23 +48,30 @@ SELECT f.opfname, p.amprocnum, p.amproc
  integer_ops |         2 | hashint4extended
 (2 rows)
 
--- Every btree strategy of a family, and that each is answered by its own
--- operator. The operator's name comes from pg_operator; until that is served
--- the row count is what says the five strategies are all distinct.
-SELECT p.amopstrategy, p.amoppurpose, count(DISTINCT p.amopopr) AS operators
+-- Every btree strategy of a family and the operator that answers it, by name --
+-- the join \dAo makes, and the reason pg_amop is worth having.
+SELECT p.amopstrategy, p.amoppurpose, o.oprname, o.oprcode
   FROM pg_amop p JOIN pg_opfamily f ON f.oid = p.amopfamily
   JOIN pg_am a ON a.oid = f.opfmethod
+  JOIN pg_operator o ON o.oid = p.amopopr
  WHERE f.opfname = 'integer_ops' AND a.amname = 'btree'
    AND p.amoplefttype = 'int4'::regtype AND p.amoprighttype = 'int4'::regtype
- GROUP BY p.amopstrategy, p.amoppurpose ORDER BY p.amopstrategy;
- amopstrategy | amoppurpose | operators 
---------------+-------------+-----------
-            1 | s           |         1
-            2 | s           |         1
-            3 | s           |         1
-            4 | s           |         1
-            5 | s           |         1
+ ORDER BY p.amopstrategy;
+ amopstrategy | amoppurpose | oprname | oprcode 
+--------------+-------------+---------+---------
+            1 | s           | <       | int4lt
+            2 | s           | <=      | int4le
+            3 | s           | =       | int4eq
+            4 | s           | >=      | int4ge
+            5 | s           | >       | int4gt
 (5 rows)
+
+SELECT count(*) AS dangling_operator FROM pg_amop p
+ WHERE NOT EXISTS (SELECT 1 FROM pg_operator o WHERE o.oid = p.amopopr);
+ dangling_operator 
+-------------------
+                 0
+(1 row)
 
 -- An ordering operator is the only kind that names a sort family, and it names
 -- one that exists. These are gist's distance operators.

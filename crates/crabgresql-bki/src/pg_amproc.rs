@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use crate::OidCounter;
 use crate::dat::{Entry, str_field};
-use crate::symbols::SymbolKind::{Opfamily, Proc, Type};
+use crate::symbols::SymbolKind::{Opfamily, Type};
 use crate::symbols::SymbolTable;
 
 /// Emit `PG_AMPROC_ROWS: &[PgAmprocRow]` from `pg_amproc.dat`, in file order
@@ -49,26 +49,11 @@ amproc: {amproc} }},",
     out
 }
 
-/// The `ProcRef` an entry's `amproc` names.
-///
-/// The column is declared `regproc`, and the data writes it the two ways a
-/// `regproc`-ish reference is written anywhere in these files: as a bare name
-/// where that is unambiguous, and as a full signature (`btint84cmp(int8,int4)`)
-/// where the name alone names more than one function. `pg_cast.castfunc` takes
-/// the same two spellings.
-///
-/// The printed name drops the argument list, because that is what `regproc`
-/// output renders — the signature is how the reference is *written*, not what
-/// the column shows.
+/// The `ProcRef` an entry's `amproc` names — either spelling, see
+/// [`proc_ref_resolved`](crate::proc_ref_resolved).
 fn amproc_ref(symbols: &SymbolTable, reference: &str) -> String {
-    let oid = if reference.contains('(') {
-        symbols.resolve_signature(Proc, reference)
-    } else {
-        symbols.resolve_name(Proc, reference)
-    }
-    .unwrap_or_else(|| panic!("pg_amproc: amproc {reference:?} names no pg_proc entry"));
-    let name = reference.split('(').next().unwrap_or(reference);
-    format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+    crate::proc_ref_resolved(symbols, reference)
+        .unwrap_or_else(|| panic!("pg_amproc: amproc {reference:?} names no pg_proc entry"))
 }
 
 fn type_oid(symbols: &SymbolTable, name: &str) -> u32 {

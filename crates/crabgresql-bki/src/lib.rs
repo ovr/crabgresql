@@ -117,6 +117,10 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         pg_opclass::emit(&opclass_entries, &symbols),
     )?;
     std::fs::write(
+        out_dir.join("pg_operator_rows.rs"),
+        pg_operator::emit(&operator_entries, &symbols),
+    )?;
+    std::fs::write(
         out_dir.join("pg_amop_rows.rs"),
         pg_amop::emit(&amop_entries, &symbols),
     )?;
@@ -150,6 +154,11 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
                 catalog: "pg_proc",
                 entries: &proc_entries,
                 keep: Some(&referenced_procs),
+            },
+            pg_description::Source {
+                catalog: "pg_operator",
+                entries: &operator_entries,
+                keep: None,
             },
             pg_description::Source {
                 catalog: "pg_am",
@@ -207,6 +216,26 @@ fn am_oid(name: &str) -> u32 {
 fn proc_ref(symbols: &SymbolTable, name: &str) -> String {
     let oid = symbols.resolve_name(Proc, name).unwrap_or(0);
     format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+}
+
+/// The `ProcRef` expression for a reference written in either spelling the
+/// catalog data uses: a bare name where that is unambiguous, and a full
+/// signature (`tsquery_phrase(tsquery,tsquery)`) where the name alone names
+/// more than one function. `pg_amproc.amproc`, `pg_operator.oprcode` and
+/// `pg_cast.castfunc` all take both.
+///
+/// The printed name drops the argument list, because that is what `regproc`
+/// output renders — the signature is how the reference is *written*, not what
+/// the column shows. `None` when nothing of that name is defined, which every
+/// caller turns into its own build failure.
+fn proc_ref_resolved(symbols: &SymbolTable, reference: &str) -> Option<String> {
+    let oid = if reference.contains('(') {
+        symbols.resolve_signature(Proc, reference)
+    } else {
+        symbols.resolve_name(Proc, reference)
+    }?;
+    let name = reference.split('(').next().unwrap_or(reference);
+    Some(format!("ProcRef {{ oid: {oid}, name: {name:?} }}"))
 }
 
 /// Where upstream's generated OIDs begin. Below this sit the hand-assigned

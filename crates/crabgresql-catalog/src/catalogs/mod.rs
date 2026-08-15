@@ -22,6 +22,7 @@ pub(crate) mod locks;
 pub(crate) mod misc_empty;
 pub(crate) mod namespace;
 pub(crate) mod opclass;
+pub(crate) mod operator;
 pub(crate) mod policy;
 pub(crate) mod prepared;
 pub(crate) mod proc;
