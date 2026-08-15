@@ -236,9 +236,35 @@ pub struct PgProcRow {
     pub prosrc: &'static str,
 }
 
+/// A built-in `pg_opclass` row, generated from `pg_opclass.dat`. `opcnamespace`
+/// and `opcowner` are not carried: every operator class lives in `pg_catalog`
+/// and belongs to the bootstrap role, and the `.dat` never says otherwise, so
+/// [`catalogs::opclass`] fills both from `oids`.
+pub struct PgOpclassRow {
+    pub oid: u32,
+    pub opcmethod: u32,
+    pub opcname: &'static str,
+    pub opcfamily: u32,
+    pub opcintype: u32,
+    pub opcdefault: bool,
+    /// The type the index actually stores, or `0` when that is `opcintype`
+    /// itself — as PostgreSQL declares the column.
+    pub opckeytype: u32,
+}
+
+/// A built-in `pg_opfamily` row, generated from `pg_opfamily.dat`. Namespace
+/// and owner are constants for the same reason as in [`PgOpclassRow`].
+pub struct PgOpfamilyRow {
+    pub oid: u32,
+    pub opfmethod: u32,
+    pub opfname: &'static str,
+}
+
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including
 /// types crabgresql recognizes but does not implement yet (for example

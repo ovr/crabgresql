@@ -20,7 +20,7 @@ trap 'rm -rf "$tmp"' EXIT
 # TODO: codegen pg_namespace's built-in rows from the vendored
 # pg_namespace.dat — crabgresql-bki never reads that file, so
 # crabgresql-catalog spells the rows out by hand.
-DATS=(pg_type pg_proc pg_cast pg_namespace)
+DATS=(pg_type pg_proc pg_cast pg_namespace pg_opclass pg_opfamily)
 
 echo "Fetching postgres catalog data @$COMMIT ..."
 paths=()

@@ -32,6 +32,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 pub enum SymbolKind {
     Type,
     Proc,
+    /// An operator family, named `<method>/<name>` (`btree/array_ops`) —
+    /// the spelling `pg_opclass.opcfamily` references one by, because the bare
+    /// name is shared across access methods.
+    Opfamily,
 }
 
 #[derive(Default)]

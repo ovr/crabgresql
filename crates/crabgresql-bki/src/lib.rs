@@ -22,6 +22,8 @@
 
 pub mod dat;
 mod pg_cast;
+mod pg_opclass;
+mod pg_opfamily;
 mod pg_proc;
 mod pg_type;
 pub mod symbols;
@@ -72,11 +74,14 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let type_entries = read_dat(catalog_dir, "pg_type.dat")?;
     let cast_entries = read_dat(catalog_dir, "pg_cast.dat")?;
     let proc_entries = read_dat(catalog_dir, "pg_proc.dat")?;
+    let opfamily_entries = read_dat(catalog_dir, "pg_opfamily.dat")?;
+    let opclass_entries = read_dat(catalog_dir, "pg_opclass.dat")?;
 
     // Phase one: define.
     let mut symbols = SymbolTable::default();
     pg_type::define_symbols(&type_entries, &mut symbols);
     pg_proc::define_symbols(&proc_entries, &mut symbols);
+    pg_opfamily::define_symbols(&opfamily_entries, &mut symbols);
 
     // Phase two: resolve and emit.
     std::fs::write(
@@ -86,6 +91,14 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::write(
         out_dir.join("pg_cast_rows.rs"),
         pg_cast::emit(&cast_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_opfamily_rows.rs"),
+        pg_opfamily::emit(&opfamily_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_opclass_rows.rs"),
+        pg_opclass::emit(&opclass_entries, &symbols),
     )?;
     for name in HANDWRITTEN_CATALOG_PROCS {
         assert!(
@@ -99,6 +112,35 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         pg_proc::emit(&proc_entries, &symbols),
     )?;
     Ok(())
+}
+
+/// The `pg_am` OID of each index access method, by the name `pg_opclass.dat`
+/// and `pg_opfamily.dat` write in their `opcmethod`/`opfmethod` columns.
+///
+/// No `pg_am.dat` is vendored — `crabgresql-catalog`'s `catalogs::am` publishes
+/// those rows by hand, seven of them — so the OIDs are repeated here rather
+/// than resolved through the symbol table. The two lists agreeing is checked
+/// where it is observable: `crabgresql-catalog`'s tests join the served
+/// `pg_opclass.opcmethod` against the served `pg_am.oid`, which is the claim a
+/// client would find broken.
+const INDEX_ACCESS_METHODS: [(&str, u32); 6] = [
+    ("btree", 403),
+    ("hash", 405),
+    ("gist", 783),
+    ("gin", 2742),
+    ("brin", 3580),
+    ("spgist", 4000),
+];
+
+/// The `pg_am` OID of the access method `name`. An unknown name is a new
+/// method in a bumped `.dat`, which needs a `pg_am` row before its opclasses
+/// can point at it — so it fails the build rather than emitting a dangling 0.
+fn am_oid(name: &str) -> u32 {
+    INDEX_ACCESS_METHODS
+        .iter()
+        .find(|(am, _)| *am == name)
+        .map(|(_, oid)| *oid)
+        .unwrap_or_else(|| panic!("no pg_am OID known for access method {name:?}"))
 }
 
 /// A `regproc` column as the `ProcRef` expression the generated file carries:
