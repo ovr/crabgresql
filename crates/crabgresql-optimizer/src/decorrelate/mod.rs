@@ -155,7 +155,6 @@ fn rewrite_join_inputs(source: &mut JoinExpr) -> bool {
     }
 }
 
-/// One rewrite on this node, if one applies.
 fn rewrite_here(node: &mut LogicalPlan) -> bool {
     rewrite_semi_anti(node) || rewrite_scalar_aggregate(node)
 }
@@ -269,13 +268,14 @@ fn as_semi_anti(conjunct: &BoundExpr, left_width: usize) -> Option<(SubplanId, A
     }
 }
 
-/// A subplan turned into a join arm: the plan to run, its width, the condition
-/// lifted out of it, and where the value a quantified comparison needs landed.
+/// A subplan turned into a join arm.
 struct Lifted {
     plan: LogicalPlan,
     width: usize,
     /// `None` for an uncorrelated subplan, which has nothing to lift.
     on: Option<BoundExpr>,
+    /// Where the subquery's own output column landed in the joined row, for the
+    /// quantified comparison that asked for it.
     value: Option<BoundExpr>,
 }
 
@@ -821,7 +821,6 @@ fn for_each_source_expr(node: &mut LogicalPlan, f: &mut dyn FnMut(&mut BoundExpr
     }
 }
 
-/// The subplan of a subquery marker, mutably.
 fn subplan_mut(expr: &mut BoundExpr) -> Option<&mut Subplan> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }

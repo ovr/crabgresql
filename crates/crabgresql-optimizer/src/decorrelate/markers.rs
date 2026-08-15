@@ -8,7 +8,6 @@
 
 use crabgresql_binder::{BoundExpr, Subplan, SubplanId};
 
-/// The subplan of a subquery marker, or `None` for every other node.
 pub(super) fn subplan_of(expr: &BoundExpr) -> Option<&Subplan> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }

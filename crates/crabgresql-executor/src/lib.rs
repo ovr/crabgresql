@@ -5928,7 +5928,6 @@ mod tests {
         decorrelated
     }
 
-    /// Bind, optimize (with the decorrelation rule on or off), plan and drain.
     fn run_optimized(engine: &Arc<dyn TableEngine>, sql: &str, decorrelate: bool) -> Vec<Tuple> {
         let stmts = test_ok(crabgresql_parser::parse(sql));
         let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {

@@ -173,13 +173,8 @@ fn with_predicate(mut plan: LogicalPlan, replacement: Option<BoundExpr>) -> Opti
     Some(plan)
 }
 
-/// Whether `conjunct` is `inner-expression = outer-column`, the shape a join
-/// can hash on.
-///
-/// The outer side must be a reference to the immediately enclosing row rather
-/// than an expression over one, so what it becomes is a column of the left
-/// input. The inner side must be evaluable against the inner row alone, and both
-/// must already be *of* the comparison's type — see [`operands_match_arg_ty`].
+/// Whether `conjunct` is the `inner-expression = outer-column` shape a join can
+/// hash on — [`key_sides`] states what that takes.
 ///
 /// A conjunct this rejects is not thereby refused: if it names the enclosing row
 /// it can still ride into the join condition as an ordinary filter (see
@@ -190,8 +185,12 @@ fn is_correlation_key(conjunct: &BoundExpr) -> bool {
 
 /// The two sides of a correlation key, inner first, with the comparison's type
 /// and collation — for the scalar-aggregate rewrite, which groups the arm by the
-/// inner side and joins on the outer one. `None` for any conjunct
-/// [`is_correlation_key`] rejects; the two are the same test.
+/// inner side and joins on the outer one.
+///
+/// The outer side must be a reference to the immediately enclosing row rather
+/// than an expression over one, so what it becomes is a column of the left
+/// input. The inner side must be evaluable against the inner row alone, and both
+/// must already be *of* the comparison's type — see [`operands_match_arg_ty`].
 pub(super) fn key_sides(conjunct: &BoundExpr) -> Option<(&BoundExpr, &BoundExpr, PgType, u32)> {
     let BoundExpr::Binary {
         op: BinOp::Eq,
@@ -300,7 +299,6 @@ pub(super) fn rebuild_and(mut conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
     Some(acc)
 }
 
-/// One `AND` node over two boolean operands.
 pub(super) fn and(left: BoundExpr, right: BoundExpr) -> BoundExpr {
     BoundExpr::Binary {
         op: BinOp::And,
