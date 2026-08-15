@@ -20,9 +20,9 @@
 //! too.
 //!
 //! The count is smaller than PostgreSQL's ~5400 for a reason rather than a
-//! deferral: the rest describes `pg_conversion`, which is not a relation this
-//! build serves, and `pg_collation`, whose descriptions `initdb` writes from
-//! the locales it finds rather than from any `.dat`.
+//! deferral: most of the rest describes `pg_collation`, whose descriptions
+//! `initdb` writes from the locales it finds rather than from any `.dat`, and
+//! the `pg_proc` entries no served catalog references.
 //!
 //! Nothing may describe an object that is not there — the invariant
 //! [`PUBLISHED`] enforces for the catalogs codegen could not.
@@ -78,6 +78,7 @@ const PUBLISHED: &[Published] = &[
     ("pg_type", |_| true),
     ("pg_proc", |_| true),
     ("pg_operator", |_| true),
+    ("pg_conversion", |_| true),
     ("pg_ts_parser", |_| true),
     ("pg_ts_template", |_| true),
     ("pg_ts_dict", |_| true),

@@ -94,3 +94,4 @@ test: pg_amop
 test: pg_operator
 test: pg_aggregate
 test: pg_ts
+test: pg_conversion

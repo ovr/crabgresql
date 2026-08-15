@@ -360,6 +360,17 @@ pub struct PgAmprocRow {
     pub amproc: ProcRef,
 }
 
+/// A built-in `pg_conversion` row, generated from `pg_conversion.dat`.
+/// Namespace and owner are not carried, for the reason [`PgOpclassRow`] gives.
+pub struct PgConversionRow {
+    pub oid: u32,
+    pub conname: &'static str,
+    pub conforencoding: i32,
+    pub contoencoding: i32,
+    pub conproc: ProcRef,
+    pub condefault: bool,
+}
+
 /// The five text-search catalogs' bootstrap rows, generated from the
 /// `pg_ts_*.dat` files. They describe the `default` parser, the four
 /// dictionary templates and the `simple` dictionary and configuration built
@@ -432,6 +443,7 @@ include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_operator_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_aggregate_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_conversion_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_ts_parser_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_ts_template_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_ts_dict_rows.rs"));

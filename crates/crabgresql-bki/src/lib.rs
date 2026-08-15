@@ -25,6 +25,7 @@ mod pg_aggregate;
 mod pg_amop;
 mod pg_amproc;
 mod pg_cast;
+mod pg_conversion;
 mod pg_description;
 mod pg_opclass;
 mod pg_operator;
@@ -91,6 +92,7 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let aggregate_entries = read_dat(catalog_dir, "pg_aggregate.dat")?;
     let amop_entries = read_dat(catalog_dir, "pg_amop.dat")?;
     let amproc_entries = read_dat(catalog_dir, "pg_amproc.dat")?;
+    let conversion_entries = read_dat(catalog_dir, "pg_conversion.dat")?;
     let ts_parser_entries = read_dat(catalog_dir, "pg_ts_parser.dat")?;
     let ts_template_entries = read_dat(catalog_dir, "pg_ts_template.dat")?;
     let ts_dict_entries = read_dat(catalog_dir, "pg_ts_dict.dat")?;
@@ -140,6 +142,10 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         out_dir.join("pg_amproc_rows.rs"),
         pg_amproc::emit(&amproc_entries, &symbols),
     )?;
+    std::fs::write(
+        out_dir.join("pg_conversion_rows.rs"),
+        pg_conversion::emit(&conversion_entries, &symbols),
+    )?;
     let ts = pg_ts::emit(
         &ts_parser_entries,
         &ts_template_entries,
@@ -183,6 +189,11 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
             pg_description::Source {
                 catalog: "pg_operator",
                 entries: &operator_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_conversion",
+                entries: &conversion_entries,
                 keep: None,
             },
             pg_description::Source {

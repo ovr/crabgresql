@@ -710,6 +710,92 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_conversion` describes upstream's encoding conversions. This server
+/// speaks UTF-8 and nothing else, so none of them can ever run — the widest
+/// deviation of the wave, and the reason it says so in its module docs.
+///
+/// The encoding *numbers* are the risk here: unlike everything else in these
+/// catalogs they are not in the vendored data, so a table transcribed from a
+/// running PostgreSQL turns a symbolic name into an integer. A wrong entry
+/// would be silent — a conversion between two plausible encodings — so the
+/// check is against the one number a client can name for itself, `UTF8`, and
+/// against the shape the whole relation has to have.
+#[test]
+fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_conversion")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let procs: std::collections::HashSet<u32> = proc_rows
+        .iter()
+        .map(|r| match r[at(&proc_schema, "oid")] {
+            Value::Oid(oid) => oid,
+            ref other => panic!("expected an OID, got {other:?}"),
+        })
+        .collect();
+    let int_at = |row: &[Value], i: usize| match row[i] {
+        Value::Int4(n) => n,
+        ref other => panic!("expected an int4, got {other:?}"),
+    };
+
+    assert_eq!(rows.len(), PG_CONVERSION_ROWS.len());
+    for row in &rows {
+        let Value::Reg(ref proc) = row[at(&schema, "conproc")] else {
+            anyhow::bail!("conproc is not a regproc");
+        };
+        assert!(procs.contains(&proc.oid), "conproc {} dangles", proc.oid);
+        // A conversion is between two *different* encodings, and both are
+        // numbers the table knows.
+        let (from, to) = (
+            int_at(row, at(&schema, "conforencoding")),
+            int_at(row, at(&schema, "contoencoding")),
+        );
+        assert_ne!(from, to, "a conversion from an encoding to itself");
+        for n in [from, to] {
+            assert!((0..42).contains(&n), "encoding number {n} is out of range");
+        }
+        // Every built-in conversion is the default for its pair.
+        assert_eq!(row[at(&schema, "condefault")], Value::Bool(true));
+    }
+
+    // `UTF8` is 6 — the one encoding number this build can check against
+    // something other than the transcribed table, because it is the encoding
+    // every connection here is in. A shifted table would put a different
+    // encoding on both sides of every `*_to_utf8` conversion.
+    const UTF8: i32 = 6;
+    let name_at = |row: &[Value]| match row[at(&schema, "conname")] {
+        Value::Text(ref name) => name.clone(),
+        ref other => panic!("expected a name, got {other:?}"),
+    };
+    let mut checked = 0;
+    for row in &rows {
+        let name = name_at(row);
+        if let Some(source) = name.strip_suffix("_to_utf8") {
+            assert_eq!(
+                int_at(row, at(&schema, "contoencoding")),
+                UTF8,
+                "{name} does not convert to UTF8"
+            );
+            // ...and the other end is not UTF8, which the name also says.
+            assert_ne!(int_at(row, at(&schema, "conforencoding")), UTF8);
+            assert!(!source.is_empty());
+            checked += 1;
+        } else if name.starts_with("utf8_to_") {
+            assert_eq!(
+                int_at(row, at(&schema, "conforencoding")),
+                UTF8,
+                "{name} does not convert from UTF8"
+            );
+            checked += 1;
+        }
+    }
+    // The conversions to and from UTF8 are the bulk of the relation; a table
+    // that matched none of them would pass every assertion above.
+    assert!(checked > 40, "only {checked} conversions name UTF8");
+    Ok(())
+}
+
 /// The five `pg_ts_*` relations, half generated from the `.dat` and half
 /// reconstructed from the snowball language list.
 ///
@@ -2649,6 +2735,7 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
         std::collections::BTreeMap::from([
             // The seven upstream access methods plus crabgresql's own two.
             ("pg_am", 9),
+            ("pg_conversion", 98),
             ("pg_extension", 1),
             // Three from the `.dat`, plus `plpgsql`.
             ("pg_language", 4),
@@ -2660,7 +2747,7 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // `pg_aggregate`: a support function, an `oprcode` or a transition
             // function is a `pg_proc` row like any other, and its description
             // comes along.
-            ("pg_proc", 1255),
+            ("pg_proc", 1309),
             // The `simple` configuration and dictionary and the default parser
             // come from the `.dat`; the other 29 of each are snowball's, whose
             // comments `initdb` writes with `COMMENT ON`.

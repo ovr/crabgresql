@@ -11,6 +11,7 @@ pub(crate) mod auth;
 pub(crate) mod class;
 pub(crate) mod collation;
 pub(crate) mod constraint;
+pub(crate) mod conversion;
 pub(crate) mod cursors;
 pub(crate) mod database;
 pub(crate) mod description;
