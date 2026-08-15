@@ -2,12 +2,15 @@ use crabgresql_binder::{BoundExpr, JoinKind};
 use crabgresql_storage_api::Tuple;
 use crabgresql_types::Value;
 
-use super::join::{JoinPhase, fill_probe, take_joined_row, touched_slots};
+use super::join::{JoinPhase, MatchMode, fill_probe, take_joined_row, touched_slots};
 use crate::{ExecContext, ExecError, ExecNode, predicate_holds};
 
 /// Binary nested-loop join with right-side materialization. For right/full
 /// joins, `right_matched` records which materialized rows participated in at
 /// least one match so they can be null-extended after the left stream ends.
+///
+/// A semi/anti join runs the same candidate loop and stops scanning at the
+/// first survivor — the answer cannot change after it.
 pub struct NestedLoopJoin {
     left: Box<dyn ExecNode>,
     right_rows: Vec<Tuple>,
@@ -15,6 +18,7 @@ pub struct NestedLoopJoin {
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
+    mode: MatchMode,
     predicate: Option<BoundExpr>,
     ctx: ExecContext,
     phase: JoinPhase,
@@ -59,6 +63,7 @@ impl NestedLoopJoin {
             left_width,
             right_width,
             kind,
+            mode: MatchMode::of(kind),
             predicate,
             ctx,
             phase: JoinPhase::LeftRows,
@@ -128,6 +133,11 @@ impl ExecNode for NestedLoopJoin {
                         if matched {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
+                            match self.mode {
+                                MatchMode::Semi => return Ok(self.current_left.take()),
+                                MatchMode::Anti => break,
+                                MatchMode::Pairs => {}
+                            }
                             let Self {
                                 probe,
                                 touched,
@@ -147,12 +157,17 @@ impl ExecNode for NestedLoopJoin {
                         }
                     }
 
-                    if !self.current_left_matched && self.preserves_left() {
-                        let Some(mut row) = self.current_left.take() else {
-                            continue;
-                        };
-                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
-                        return Ok(Some(row));
+                    if !self.current_left_matched {
+                        if self.preserves_left() {
+                            let Some(mut row) = self.current_left.take() else {
+                                continue;
+                            };
+                            row.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                            return Ok(Some(row));
+                        }
+                        if self.mode == MatchMode::Anti {
+                            return Ok(self.current_left.take());
+                        }
                     }
                     self.current_left = None;
                 }
@@ -171,5 +186,101 @@ impl ExecNode for NestedLoopJoin {
                 JoinPhase::Done => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crabgresql_binder::{BinOp, BoundExpr, JoinKind};
+    use crabgresql_storage_api::Tuple;
+    use crabgresql_types::{PgType, Value};
+
+    use super::NestedLoopJoin;
+    use crate::testutil::{binary, collect, int4, test_ok};
+    use crate::{ExecContext, MaterializedRows};
+
+    fn col(index: usize) -> BoundExpr {
+        BoundExpr::ColumnRef {
+            index,
+            ty: PgType::Int4,
+        }
+    }
+
+    fn rows(values: &[i32]) -> Vec<Tuple> {
+        values.iter().map(|v| vec![Value::Int4(*v)]).collect()
+    }
+
+    /// `left.c0 = right.c0`, in the concatenated `left || right` index space.
+    fn eq_keys() -> BoundExpr {
+        binary(BinOp::Eq, PgType::Int4, col(0), col(1))
+    }
+
+    /// One-column inputs where the left key `1` has two matches, `2` none and
+    /// `3` exactly one.
+    fn join(kind: JoinKind, predicate: BoundExpr) -> NestedLoopJoin {
+        test_ok(NestedLoopJoin::new(
+            Box::new(MaterializedRows::new(rows(&[1, 2, 3]))),
+            Box::new(MaterializedRows::new(rows(&[1, 1, 3]))),
+            1,
+            1,
+            kind,
+            Some(predicate),
+            ExecContext::default(),
+        ))
+    }
+
+    #[test]
+    fn semi_emits_each_matching_left_row_once_and_narrow() {
+        let mut node = join(JoinKind::Semi, eq_keys());
+        assert_eq!(collect(&mut node), rows(&[1, 3]));
+    }
+
+    #[test]
+    fn anti_emits_only_the_unmatched_left_row() {
+        let mut node = join(JoinKind::Anti, eq_keys());
+        assert_eq!(collect(&mut node), rows(&[2]));
+    }
+
+    #[test]
+    fn a_residual_that_rejects_every_pair_leaves_no_row_matched() {
+        // Only distinguishable from "no candidate paired up" if the match is
+        // recorded *after* the predicate rather than on the equality alone.
+        let predicate = binary(
+            BinOp::And,
+            PgType::Bool,
+            eq_keys(),
+            binary(BinOp::Eq, PgType::Int4, col(1), int4(99)),
+        );
+        let mut node = join(JoinKind::Semi, predicate.clone());
+        assert_eq!(collect(&mut node), Vec::<Tuple>::new());
+
+        let mut node = join(JoinKind::Anti, predicate);
+        assert_eq!(collect(&mut node), rows(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn an_empty_right_side_settles_both_kinds() {
+        let empty = || -> Box<dyn crate::ExecNode> { Box::new(MaterializedRows::new(Vec::new())) };
+        let mut node = test_ok(NestedLoopJoin::new(
+            Box::new(MaterializedRows::new(rows(&[1, 2]))),
+            empty(),
+            1,
+            1,
+            JoinKind::Semi,
+            Some(eq_keys()),
+            ExecContext::default(),
+        ));
+        assert_eq!(collect(&mut node), Vec::<Tuple>::new());
+
+        let mut node = test_ok(NestedLoopJoin::new(
+            Box::new(MaterializedRows::new(rows(&[1, 2]))),
+            empty(),
+            1,
+            1,
+            JoinKind::Anti,
+            Some(eq_keys()),
+            ExecContext::default(),
+        ));
+        assert_eq!(collect(&mut node), rows(&[1, 2]));
     }
 }
