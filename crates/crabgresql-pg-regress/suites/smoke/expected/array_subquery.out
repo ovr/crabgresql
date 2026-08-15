@@ -76,5 +76,32 @@ SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.
  3 | 
 (3 rows)
 
+-- a correlated subquery *inside* the array's body: the decorrelation rule
+-- descends into an ARRAY(...) body but must never lift the array itself into a
+-- join arm, which would turn one value per outer row into rows
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE EXISTS (SELECT 1 FROM array_sub_o x WHERE x.k = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+ k |  owned  
+---+---------
+ 1 | {7,8,9}
+ 2 | {7,8,9}
+ 3 | {7,8,9}
+(3 rows)
+
+-- and one correlated to both levels at once
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE i.owner = o.k
+                   AND i.k > (SELECT min(y.k) FROM array_sub_i y WHERE y.owner = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+ k | owned 
+---+-------
+ 1 | {8}
+ 2 | {}
+ 3 | {}
+(3 rows)
+
 DROP TABLE array_sub_i;
 DROP TABLE array_sub_o;

@@ -33,5 +33,18 @@ SELECT k, array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k) 
 -- an aggregate over the array a correlated subquery builds
 SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k), ',') AS joined
   FROM array_sub_o o ORDER BY k;
+-- a correlated subquery *inside* the array's body: the decorrelation rule
+-- descends into an ARRAY(...) body but must never lift the array itself into a
+-- join arm, which would turn one value per outer row into rows
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE EXISTS (SELECT 1 FROM array_sub_o x WHERE x.k = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+-- and one correlated to both levels at once
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE i.owner = o.k
+                   AND i.k > (SELECT min(y.k) FROM array_sub_i y WHERE y.owner = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
 DROP TABLE array_sub_i;
 DROP TABLE array_sub_o;

@@ -824,6 +824,7 @@ fn for_each_source_expr(node: &mut LogicalPlan, f: &mut dyn FnMut(&mut BoundExpr
 fn subplan_mut(expr: &mut BoundExpr) -> Option<&mut Subplan> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::ArraySubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => Some(subplan),
         _ => None,
