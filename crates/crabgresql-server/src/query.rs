@@ -149,12 +149,19 @@ pub enum QueryResult {
 }
 
 impl QueryResult {
-    /// Whether this statement *ended a transaction by rolling it back*: an
-    /// explicit `ROLLBACK`, or the `COMMIT` of a failed block, which PostgreSQL
-    /// also reports (and counts) as a rollback. Read off the command tag, which
-    /// is where that decision is already made and rendered for the client.
-    fn rolled_back(&self) -> bool {
-        matches!(self, QueryResult::Command { tag, .. } if tag == "ROLLBACK")
+    /// Whether this statement *ended an explicit transaction block*, and if so
+    /// whether it rolled it back: `Some(true)` for a `ROLLBACK` — or for the
+    /// `COMMIT` of a failed block, which PostgreSQL also reports and counts as
+    /// one — and `Some(false)` for a `COMMIT` that committed.
+    ///
+    /// Read off the command tag, which is where that decision is already made
+    /// and rendered for the client, rather than re-derived from the statement.
+    fn block_end(&self) -> Option<bool> {
+        match self {
+            QueryResult::Command { tag, .. } if tag == "ROLLBACK" => Some(true),
+            QueryResult::Command { tag, .. } if tag == "COMMIT" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -700,19 +707,18 @@ pub fn execute_statement(
 ) -> Result<QueryResult, PgError> {
     let result =
         execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false);
-    // Where `pg_stat_database.xact_commit` is counted, and the only place — a
-    // statement that succeeded outside a block *is* a committed transaction,
-    // whatever it did, so DDL and utility statements count exactly like a
-    // `SELECT`. A statement inside a block counts nothing here; the block's
-    // COMMIT/ROLLBACK is itself a statement and counts once for the whole
-    // block. This wrapper and not [`execute_statement_with`], which `EXECUTE`
-    // and `DECLARE … CURSOR` re-enter to run the statement they name — counting
-    // there would count those twice.
+    // Where a statement reaches `pg_stat_database`'s transaction counters. A
+    // `COMMIT`/`ROLLBACK` counts its block here; anything else only marks the
+    // *message* as owing an implicit transaction, which the protocol loop
+    // settles at the message boundary — see [`Session::count_statement`], and
+    // `mark_transaction_failed` for the failing side.
     //
-    // Failures are counted by `mark_transaction_failed` instead, which every
-    // error path reaches, including the ones that fail before execution.
+    // This wrapper and not [`execute_statement_with`], which `EXECUTE` and
+    // `DECLARE … CURSOR` re-enter to run the statement they name: marking there
+    // would mark those twice, and a statement that ended a block would count
+    // twice.
     if let Ok(result) = &result {
-        session.count_transaction(result.rolled_back());
+        session.count_statement(result.block_end());
     }
     result
 }
@@ -924,7 +930,7 @@ pub(crate) fn execute_statement_with(
                 cascade,
                 if_exists,
                 ..
-            } => return execute_drop_schema(engine, names, *cascade, *if_exists),
+            } => return execute_drop_schema(engine, session, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Table,
                 names,
@@ -7495,6 +7501,24 @@ fn execute_drop_table(
     let (dependents, mut cascade_notices) =
         plan_drop_cascade(catalog, "table", &all_targets, cascade)?;
     notices.append(&mut cascade_notices);
+    // Which namespace an unqualified target really lives in, read *before* the
+    // drop: `drop_table("public", …)` resolves temp-first, so a temp table
+    // shadowing a permanent one is the one that goes. Statistics are keyed by
+    // namespace, and clearing both keys would wipe the surviving permanent
+    // table's counters.
+    //
+    // Read from the relation list rather than by resolving the name, which
+    // would record the relation into this statement's `pg_locks` set a second
+    // time.
+    let session_temp: Vec<String> = catalog.relation_names_in(&session.temp_schema);
+    let dropped_namespace = |name: &String| match session_temp.contains(name) {
+        true => session.temp_schema.clone(),
+        false => "public".to_string(),
+    };
+    let dropped_plain: Vec<(String, String)> = plain
+        .iter()
+        .map(|name| (dropped_namespace(name), name.clone()))
+        .collect();
     for name in &plain {
         catalog.drop_table("public", name)?;
     }
@@ -7522,14 +7546,23 @@ fn execute_drop_table(
         .collect();
     // A dropped relation's statistics go with it, as in PostgreSQL — otherwise
     // a table recreated under the same name would inherit the dead one's
-    // counters. An unqualified drop may have hit this session's temp table
-    // rather than the `public` one, so both keys are cleared: at most one of
-    // them names anything.
-    for (namespace, name) in &dropped_tables {
+    // counters. The unqualified targets are cleared under the namespace the
+    // drop actually reached (see `dropped_namespace`), never under both.
+    //
+    // Built from `dropped_plain` rather than from `dropped_tables`, which
+    // spells every unqualified target `public` for the sequence rule below.
+    for (namespace, name) in dropped_plain
+        .iter()
+        .map(|(ns, name)| (ns.as_str(), name.as_str()))
+        .chain(qualified.iter().map(|(ns, n)| (ns.as_str(), n.as_str())))
+        .chain(
+            dependents
+                .iter()
+                .filter(|(kind, ..)| *kind == DependentKind::Table)
+                .map(|(_, ns, n)| (ns.as_str(), n.as_str())),
+        )
+    {
         session.stats.forget_relation(namespace, name);
-        if *namespace == "public" {
-            session.stats.forget_relation(&session.temp_schema, name);
-        }
     }
     for seq in catalog.sequences() {
         let owned_by_dropped = seq.owned_by.as_deref().is_some_and(|owner| {
@@ -8164,6 +8197,7 @@ fn execute_create_schema(
 /// to ...` NOTICE), then the schema.
 fn execute_drop_schema(
     engine: &Arc<dyn TableEngine>,
+    session: &Session,
     names: &[ast::ObjectName],
     cascade: bool,
     if_exists: bool,
@@ -8336,6 +8370,18 @@ fn execute_drop_schema(
                     "view" => engine.drop_view(name, obj),
                     _ => engine.drop_sequence(name, obj),
                 };
+            }
+            // Every table this cascade removed takes its statistics with it,
+            // exactly as `execute_drop_table` does — the schema's own tables
+            // and the outside dependents `drop_cascaded` just took.
+            for (_, obj) in contents.iter().filter(|(kind, _)| *kind == "table") {
+                session.stats.forget_relation(name, obj);
+            }
+            for (_, ns, obj) in external
+                .iter()
+                .filter(|(kind, ..)| *kind == DependentKind::Table)
+            {
+                session.stats.forget_relation(ns, obj);
             }
             // A cascaded outside table owns its serial sequences just as one in
             // this schema does; `owned_seqs` only covers the latter, so sweep

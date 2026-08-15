@@ -117,8 +117,10 @@ pub async fn handle_connection(
     .sharing_stats(Arc::clone(&stats));
     // A client that names itself at startup is reported under that name by
     // `pg_stat_activity`; one that does not gets the empty string, as in PG.
+    // Through the same cleaning `SET application_name` goes through, which PG
+    // also applies to the connection parameter.
     if let Some(name) = params.get("application_name") {
-        session.application_name = name.clone();
+        session.application_name = guc::clean_application_name(name);
     }
     // One more backend now, one fewer whenever this function returns — however
     // it returns, which is why the guard is a value and not a pair of calls.
@@ -147,6 +149,7 @@ pub async fn handle_connection(
                 skip_until_sync = false;
                 // `Sync` ends the implicit transaction block the batch formed.
                 session.end_implicit_block();
+                session.end_message_transaction();
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -172,6 +175,7 @@ pub async fn handle_connection(
                     &mut reader,
                 )
                 .await?;
+                session.end_message_transaction();
                 writer.ready_for_query(session.tx_status);
                 writer.flush().await?;
             }
@@ -551,11 +555,11 @@ async fn copy_in_stream(
     drop(buffer);
     match run_copy_insert(engine, txnmgr, session, &prepared, &rows) {
         Ok(n) => {
-            // A COPY drives the sub-protocol here rather than returning through
-            // `execute_statement`, so it counts its own transaction — the
-            // failure side goes through `mark_transaction_failed` like every
-            // other error.
-            session.count_transaction(false);
+            // A COPY drives the sub-protocol here rather than returning
+            // through `execute_statement`, so it marks the message itself —
+            // the failing side goes through `mark_transaction_failed` like
+            // every other error.
+            session.count_statement(None);
             Ok(CopyOutcome::Loaded(n))
         }
         Err(e) => Ok(CopyOutcome::Failed(e)),
@@ -566,18 +570,11 @@ async fn copy_in_stream(
 /// (`E`); an error outside a block leaves the status untouched (the implicit
 /// transaction ends at the statement boundary).
 fn mark_transaction_failed(session: &mut Session) {
-    // Where `pg_stat_database.xact_rollback` is counted for a failed statement,
-    // and the counterpart of the commit counted in `execute_statement`: every
-    // error path reaches this, including the ones that fail before execution
-    // (a syntax error, a bind failure), which PostgreSQL counts as rolled-back
-    // transactions too.
-    //
-    // Only outside a block. A statement that fails *inside* one leaves the
-    // block open in the `Failed` state, and the `ROLLBACK` that ends it is what
-    // counts — one transaction, not one per failed statement.
-    if session.tx_status == TransactionStatus::Idle {
-        session.stats.xact_rollback();
-    }
+    // Where `pg_stat_database.xact_rollback` is counted: every error path
+    // reaches this, including the ones that fail before execution (a syntax
+    // error, a bind failure) and the one that fails after rows have started
+    // streaming, which PostgreSQL counts as rolled-back transactions too.
+    session.fail_message_transaction();
     if session.tx_status == TransactionStatus::InTransaction {
         session.tx_status = TransactionStatus::Failed;
     }

@@ -14742,13 +14742,16 @@ async fn dropping_a_table_forgets_its_statistics() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every statement outside a block is a transaction, and exactly one — DDL and
-/// utility statements included, which is where an accounting hung off the DML
-/// path alone would silently under-count. Asserted as exact deltas rather than
-/// as "grew", because the failure this guards against is a miscount, not a
-/// missing count.
+/// One protocol message outside a block is one transaction — DDL and utility
+/// messages included, which is where an accounting hung off the DML path alone
+/// would silently under-count. Each `batch_execute` here is its own simple-query
+/// message, so message and statement coincide; the multi-statement case is
+/// `pg_stat_database_counts_a_multi_statement_message_once` below.
+///
+/// Asserted as exact deltas rather than as "grew", because the failure this
+/// guards against is a miscount, not a missing count.
 #[tokio::test]
-async fn pg_stat_database_counts_each_statement_once() -> anyhow::Result<()> {
+async fn pg_stat_database_counts_each_message_once() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     async fn read(client: &tokio_postgres::Client) -> anyhow::Result<(i64, i64)> {
         let row = client
@@ -14791,5 +14794,190 @@ async fn pg_stat_database_counts_each_statement_once() -> anyhow::Result<()> {
     assert_eq!(after_commits - commits, 4, "commits");
     // The rolled-back block, the missing table, the syntax error.
     assert_eq!(after_rollbacks - rollbacks, 3, "rollbacks");
+    Ok(())
+}
+
+/// The counters as `pg_stat_database` reports them right now.
+async fn transaction_counts(client: &tokio_postgres::Client) -> anyhow::Result<(i64, i64)> {
+    let row = client
+        .query_one(
+            "SELECT xact_commit, xact_rollback FROM pg_stat_database",
+            &[],
+        )
+        .await?;
+    Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+}
+
+/// A simple-query message runs as **one** implicit transaction, however many
+/// statements it holds, and an error anywhere in it rolls that one back.
+///
+/// Both numbers were measured on PostgreSQL 18.4 before this was written:
+/// `select 1; select 2; select 3` in one message moves `xact_commit` by one (not
+/// three), and `select 1; select 1/0` moves `xact_rollback` by one and
+/// `xact_commit` by none.
+#[tokio::test]
+async fn pg_stat_database_counts_a_multi_statement_message_once() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let (commits, rollbacks) = transaction_counts(&client).await?;
+    client.simple_query("SELECT 1; SELECT 2; SELECT 3").await?;
+    let (after_commits, after_rollbacks) = transaction_counts(&client).await?;
+    // The read above, plus the three-statement message as a single transaction.
+    assert_eq!(after_commits - commits, 2, "commits");
+    assert_eq!(after_rollbacks - rollbacks, 0, "rollbacks");
+
+    let (commits, rollbacks) = transaction_counts(&client).await?;
+    client
+        .simple_query("SELECT 1; SELECT 1/0")
+        .await
+        .expect_err("division by zero");
+    let (after_commits, after_rollbacks) = transaction_counts(&client).await?;
+    // Only the read commits; the message rolls back as a whole, and the
+    // statement that succeeded inside it does not count on its own.
+    assert_eq!(after_commits - commits, 1, "commits");
+    assert_eq!(after_rollbacks - rollbacks, 1, "rollbacks");
+    Ok(())
+}
+
+/// A statement that fails *after its rows have started streaming* is one
+/// transaction, not two.
+///
+/// The statement's own transaction is finalized before the rows are pulled, so
+/// this once counted a commit at execution and a rollback when the stream died
+/// — a client watching the two counters saw a transaction that both committed
+/// and rolled back.
+#[tokio::test]
+async fn a_failure_mid_stream_counts_one_transaction() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    // The zero comes last, so the first rows are on the wire before the
+    // division fails.
+    client
+        .batch_execute("INSERT INTO t SELECT g FROM generate_series(1, 200) g")
+        .await?;
+    client.batch_execute("INSERT INTO t VALUES (0)").await?;
+
+    let (commits, rollbacks) = transaction_counts(&client).await?;
+    client
+        .simple_query("SELECT 1/i FROM t")
+        .await
+        .expect_err("division by zero");
+    let (after_commits, after_rollbacks) = transaction_counts(&client).await?;
+    assert_eq!(after_commits - commits, 1, "only the read commits");
+    assert_eq!(after_rollbacks - rollbacks, 1, "one rollback, not none");
+    Ok(())
+}
+
+/// `DROP TABLE t` with a temp `t` shadowing a permanent one drops the temp
+/// table — so it must clear the temp table's counters and leave the permanent
+/// table's alone.
+#[tokio::test]
+async fn dropping_a_shadowing_temp_table_keeps_the_permanent_counters() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+    client.batch_execute("CREATE TEMP TABLE t (i int)").await?;
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+
+    // The unqualified DROP resolves temp-first, as the INSERT above did.
+    client.batch_execute("DROP TABLE t").await?;
+
+    let row = client
+        .query_one(
+            "SELECT schemaname, n_tup_ins FROM pg_stat_all_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("schemaname"), "public");
+    assert_eq!(
+        row.get::<_, i64>("n_tup_ins"),
+        3,
+        "the permanent table's counters survive the temp table's drop"
+    );
+    Ok(())
+}
+
+/// `DROP SCHEMA … CASCADE` takes its tables' counters with it: a schema
+/// recreated with the same table names must start from zero, not inherit what
+/// the dropped tables had recorded.
+#[tokio::test]
+async fn drop_schema_cascade_forgets_its_tables() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE SCHEMA s").await?;
+    client.batch_execute("CREATE TABLE s.t (i int)").await?;
+    client
+        .batch_execute("INSERT INTO s.t VALUES (1), (2), (3)")
+        .await?;
+    client.batch_execute("DROP SCHEMA s CASCADE").await?;
+
+    client.batch_execute("CREATE SCHEMA s").await?;
+    client.batch_execute("CREATE TABLE s.t (i int)").await?;
+    client.batch_execute("INSERT INTO s.t VALUES (1)").await?;
+    let n_tup_ins: i64 = client
+        .query_one(
+            "SELECT n_tup_ins FROM pg_stat_all_tables WHERE schemaname = 's' AND relname = 't'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(n_tup_ins, 1, "the recreated table starts from zero");
+    Ok(())
+}
+
+/// `application_name` is a settable GUC, not a startup-only field: `SET` reaches
+/// `pg_stat_activity`, and the value goes through PostgreSQL's clip-and-escape
+/// rule on the way in.
+#[tokio::test]
+async fn application_name_is_settable_and_cleaned() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("SET application_name = 'reporter'")
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT current_setting('application_name') AS guc, \
+             (SELECT application_name FROM pg_stat_activity) AS activity, \
+             (SELECT setting FROM pg_settings WHERE name = 'application_name') AS setting",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("guc"), "reporter");
+    assert_eq!(row.get::<_, &str>("activity"), "reporter");
+    assert_eq!(row.get::<_, &str>("setting"), "reporter");
+
+    // 80 ASCII characters clip to 63, and a multi-byte character straddling the
+    // limit is dropped whole rather than split. Both probed against 18.4.
+    let long = "abcdefghij0123456789".repeat(4);
+    client
+        .batch_execute(&format!("SET application_name = '{long}'"))
+        .await?;
+    let clipped: String = client
+        .query_one("SELECT current_setting('application_name')", &[])
+        .await?
+        .get(0);
+    assert_eq!(clipped, long[..63]);
+
+    // Non-printable bytes are escaped one byte at a time.
+    client
+        .batch_execute("SET application_name = 'café'")
+        .await?;
+    let escaped: String = client
+        .query_one("SELECT current_setting('application_name')", &[])
+        .await?
+        .get(0);
+    assert_eq!(escaped, "caf\\xc3\\xa9");
+
+    // And it is transactional like any other GUC.
+    client.batch_execute("BEGIN").await?;
+    client
+        .batch_execute("SET application_name = 'inner'")
+        .await?;
+    client.batch_execute("ROLLBACK").await?;
+    let restored: String = client
+        .query_one("SELECT current_setting('application_name')", &[])
+        .await?
+        .get(0);
+    assert_eq!(restored, "caf\\xc3\\xa9");
     Ok(())
 }

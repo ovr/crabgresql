@@ -15,8 +15,8 @@
 //! clients:
 //!
 //! * An **unrecognized name is silently accepted** by `SET`/`RESET` (PG raises
-//!   `42704`). Drivers set parameters we do not model — `application_name`,
-//!   `search_path`, `client_min_messages` — and erroring would break them.
+//!   `42704`). Drivers set parameters we do not model — `search_path`,
+//!   `client_min_messages` — and erroring would break them.
 //!   `SHOW` does raise `42704`, since there is no value to invent.
 //! * `SHOW ALL` lists only the parameters below, not PG's several hundred.
 //!
@@ -55,6 +55,7 @@ pub enum GucValue {
 #[derive(Clone)]
 pub enum SavedValue {
     TimeZone(std::sync::Arc<SessionZone>),
+    ApplicationName(String),
     ExtraFloatDigits(i32),
     /// Both page costs at once. They live in one struct on the session, and a
     /// pair that saved and restored independently could be reinstated half-way
@@ -173,6 +174,7 @@ impl GucDef {
 
 /// PostgreSQL's `config_group` names, spelled once each.
 const LOCALE: &str = "Client Connection Defaults / Locale and Formatting";
+const LOGGING: &str = "Reporting and Logging / What to Log";
 const STATEMENT: &str = "Client Connection Defaults / Statement Behavior";
 const PRESET: &str = "Preset Options";
 const PLANNER_COST: &str = "Query Tuning / Planner Cost Constants";
@@ -189,6 +191,31 @@ const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL V
 /// in PG, which is what drivers rely on to parse the version and pick their
 /// quoting rules.
 pub static GUCS: &[GucDef] = &[
+    GucDef {
+        key: "application_name",
+        name: "application_name",
+        description: "Sets the application name to be reported in statistics and logs.",
+        extra_desc: None,
+        report: true,
+        show_all: true,
+        category: LOGGING,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "",
+        show: |s| s.application_name.clone(),
+        kind: GucKind::Settable {
+            set: set_application_name,
+            capture: |s| SavedValue::ApplicationName(s.application_name.clone()),
+            restore: |s, v| {
+                if let SavedValue::ApplicationName(name) = v {
+                    s.application_name = name;
+                }
+            },
+        },
+    },
     GucDef {
         key: "bytea_output",
         name: "bytea_output",
@@ -728,6 +755,54 @@ fn set_timezone(session: &mut Session, value: GucValue) -> Result<(), PgError> {
     };
     session.timezone = std::sync::Arc::new(zone);
     Ok(())
+}
+
+/// `SET application_name`. Never fails: PostgreSQL accepts any string and
+/// *rewrites* the parts it will not report verbatim.
+///
+/// Two stages, in this order, probed against 18.4:
+///
+/// 1. Clip the input to 63 bytes (`NAMEDATALEN - 1`) on a character boundary. A
+///    multi-byte character straddling the limit is dropped whole, not split —
+///    62 ASCII characters followed by `é` come back as the 62.
+/// 2. Replace every byte outside printable ASCII with a lowercase `\xHH`
+///    escape, byte by byte: `café\tx` becomes `caf\xc3\xa9\x09x`. The escape
+///    is applied *after* the clip, so the result can be far longer than 63
+///    characters — 31 `é` clip to 62 bytes and render as 248.
+fn set_application_name(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let name = match value {
+        GucValue::Default => String::new(),
+        GucValue::OffsetSecondsEast(secs) => secs.to_string(),
+        GucValue::Str(s) => s,
+    };
+    session.application_name = clean_application_name(&name);
+    Ok(())
+}
+
+/// The clip-then-escape rule [`set_application_name`] documents. Shared with the
+/// startup path, where PostgreSQL applies it to the connection parameter too.
+pub fn clean_application_name(name: &str) -> String {
+    const MAX_BYTES: usize = 63;
+    let clipped = match name.len() > MAX_BYTES {
+        // `floor_char_boundary` is unstable, so walk back to the start of the
+        // character the limit lands inside.
+        true => {
+            let mut end = MAX_BYTES;
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            &name[..end]
+        }
+        false => name,
+    };
+    let mut out = String::with_capacity(clipped.len());
+    for byte in clipped.bytes() {
+        match byte {
+            0x20..=0x7e => out.push(byte as char),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out
 }
 
 fn set_extra_float_digits(session: &mut Session, value: GucValue) -> Result<(), PgError> {

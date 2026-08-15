@@ -432,10 +432,10 @@ pub struct Session {
     pub vxid: u32,
     /// When this connection was established, for `pg_stat_activity`.
     pub backend_start: i64,
-    /// `application_name`, as the client set it at startup or with `SET`.
-    /// Reported by `pg_stat_activity` and by `SHOW application_name`; nothing
-    /// else reads it, which is why it is a plain string rather than a GUC with
-    /// a parse function.
+    /// `application_name`, as the client set it at startup or with `SET`, and
+    /// already through PostgreSQL's clip-and-escape rule (see
+    /// [`crate::guc::clean_application_name`]) — so every reader gets the
+    /// reportable form rather than repeating the cleaning.
     pub application_name: String,
     /// The statement this session is running, as `pg_stat_activity.query`
     /// reports it. Stamped once per protocol message, like [`Session::stmt_start`]
@@ -487,6 +487,15 @@ pub struct Session {
     /// TODO: run an extended-query batch under a single XID, so an error
     /// anywhere in it rolls back every statement of the batch.
     implicit_xact_start: Option<i64>,
+    /// Whether this protocol message has run a statement outside an explicit
+    /// block, and so owes `pg_stat_database` one implicit transaction. See
+    /// [`Session::count_statement`] for why the debt is per message and not per
+    /// statement.
+    ///
+    /// Deliberately *not* folded into `implicit_xact_start`: that one is the
+    /// extended-query batch's clock and stays `None` for a simple query, which
+    /// owes a transaction just the same.
+    implicit_txn_pending: bool,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
     /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
@@ -817,6 +826,7 @@ impl Session {
             // never an invented instant even before the first one arrives.
             stmt_start: crabgresql_types::tz::now_micros(),
             implicit_xact_start: None,
+            implicit_txn_pending: false,
             saved_gucs: Vec::new(),
             explicitly_set: HashSet::new(),
             default_iso: IsolationLevel::ReadCommitted,
@@ -1029,22 +1039,57 @@ impl Session {
         self
     }
 
-    /// Count one finished statement into `pg_stat_database`'s transaction
-    /// counters, if it was a transaction of its own.
+    /// Note a finished statement for `pg_stat_database`'s transaction counters.
     ///
-    /// A statement running *inside* an explicit block is not: the block is one
-    /// transaction, counted when the `COMMIT` or `ROLLBACK` that ends it
-    /// finishes — by which time this session is `Idle` again, so the same test
-    /// covers both. `rolled_back` distinguishes the two counters for a statement
-    /// that ended a block; an ordinary statement that succeeded is a commit.
-    pub fn count_transaction(&self, rolled_back: bool) {
+    /// `block_end` is `Some(rolled_back)` when the statement *itself* ended an
+    /// explicit block — a `COMMIT` or `ROLLBACK`. That block is one transaction
+    /// and is counted here, on the spot.
+    ///
+    /// Everything else only marks the message as owing an implicit transaction,
+    /// which [`Session::end_message_transaction`] counts once. PostgreSQL runs a
+    /// whole protocol message as one implicit transaction, so
+    /// `SELECT 1; SELECT 2` in a single simple query is one commit there and has
+    /// to be one here (verified against 18.4). Counting per statement instead
+    /// would report three transactions for a three-statement message.
+    ///
+    /// A statement inside an open block marks nothing: the block counts when it
+    /// ends.
+    pub fn count_statement(&mut self, block_end: Option<bool>) {
+        match block_end {
+            Some(true) => self.stats.xact_rollback(),
+            Some(false) => self.stats.xact_commit(),
+            None if self.tx_status == TransactionStatus::Idle => {
+                self.implicit_txn_pending = true;
+            }
+            None => {}
+        }
+    }
+
+    /// The protocol message ended without an error: the implicit transaction it
+    /// ran, if it ran one, committed.
+    pub fn end_message_transaction(&mut self) {
+        if std::mem::take(&mut self.implicit_txn_pending) {
+            self.stats.xact_commit();
+        }
+    }
+
+    /// The message failed: its implicit transaction rolled back, whether it had
+    /// run a statement yet or not — a message that dies on a syntax error is a
+    /// rolled-back transaction in PostgreSQL too.
+    ///
+    /// Taking the pending mark is what keeps a statement that fails *after* its
+    /// rows started streaming from being counted twice: the message owes one
+    /// transaction, and this is it.
+    ///
+    /// Nothing is counted inside an open block. There the failure leaves the
+    /// block alive in the failed state, and the `ROLLBACK` that ends it is the
+    /// one transaction to count.
+    pub fn fail_message_transaction(&mut self) {
         if self.tx_status != TransactionStatus::Idle {
             return;
         }
-        match rolled_back {
-            true => self.stats.xact_rollback(),
-            false => self.stats.xact_commit(),
-        }
+        self.implicit_txn_pending = false;
+        self.stats.xact_rollback();
     }
 
     /// This session, as `pg_stat_activity` shows it.
@@ -1225,11 +1270,23 @@ impl Drop for Session {
         // skipped cleanup, not a fatal double-panic abort.
         let engine = Arc::clone(&self.engine);
         let temp_schema = self.temp_schema.clone();
+        let stats = Arc::clone(&self.stats);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             // O(this session's temp tables), reading just their names — not a
             // deep clone of every schema in the cluster.
             for name in engine.relation_names_in(&temp_schema) {
                 let _ = engine.drop_table(&temp_schema, &name);
+                // The counters go with the relation, as they do for any other
+                // drop. Nothing else ever clears a `pg_temp_N` key, and the
+                // namespace carries the backend id, so without this the counter
+                // table grows by one entry per temp relation for the life of
+                // the server.
+                //
+                // No test covers it, and none can: a stale entry is invisible to
+                // `pg_stat_all_tables`, which drops any relation the snapshot
+                // cannot number — and a disconnected session's temp namespace is
+                // never reused. This is a memory fix, not a reporting one.
+                stats.forget_relation(&temp_schema, &name);
             }
         }));
     }
