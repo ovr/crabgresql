@@ -1868,11 +1868,9 @@ impl PgEngine {
 }
 
 impl TableEngine for PgEngine {
-    /// The pool's own hit/miss totals, which `pg_stat_database` publishes as
-    /// `blks_hit`/`blks_read`. An extend is neither: a page this engine created
-    /// was never a candidate for residency, and folding extends into either
-    /// column would report a bulk load as a cache problem (see
-    /// [`bufpool::PoolStats`]).
+    /// An extend is neither a hit nor a read: a page this engine created was
+    /// never a candidate for residency, and folding extends in would report a
+    /// bulk load as a cache problem (see [`bufpool::PoolStats`]).
     fn buffer_stats(&self) -> Option<crabgresql_storage_api::BufferStats> {
         let stats = self.inner.bufpool.hit_stats();
         Some(crabgresql_storage_api::BufferStats {

@@ -758,17 +758,8 @@ fn set_timezone(session: &mut Session, value: GucValue) -> Result<(), PgError> {
 }
 
 /// `SET application_name`. Never fails: PostgreSQL accepts any string and
-/// *rewrites* the parts it will not report verbatim.
-///
-/// Two stages, in this order, probed against 18.4:
-///
-/// 1. Clip the input to 63 bytes (`NAMEDATALEN - 1`) on a character boundary. A
-///    multi-byte character straddling the limit is dropped whole, not split —
-///    62 ASCII characters followed by `é` come back as the 62.
-/// 2. Replace every byte outside printable ASCII with a lowercase `\xHH`
-///    escape, byte by byte: `café\tx` becomes `caf\xc3\xa9\x09x`. The escape
-///    is applied *after* the clip, so the result can be far longer than 63
-///    characters — 31 `é` clip to 62 bytes and render as 248.
+/// rewrites the parts it will not report verbatim. See
+/// [`clean_application_name`] for the rule.
 fn set_application_name(session: &mut Session, value: GucValue) -> Result<(), PgError> {
     let name = match value {
         GucValue::Default => String::new(),
@@ -779,8 +770,15 @@ fn set_application_name(session: &mut Session, value: GucValue) -> Result<(), Pg
     Ok(())
 }
 
-/// The clip-then-escape rule [`set_application_name`] documents. Shared with the
-/// startup path, where PostgreSQL applies it to the connection parameter too.
+/// PostgreSQL's own handling of an application name, probed against 18.4 and
+/// applied to the startup parameter as well as to `SET`:
+///
+/// 1. Clip to 63 bytes (`NAMEDATALEN - 1`) on a character boundary — a
+///    multi-byte character straddling the limit is dropped whole, so 62 ASCII
+///    characters followed by `é` come back as the 62.
+/// 2. Escape every byte outside printable ASCII as a lowercase `\xHH`, byte by
+///    byte: `café\tx` becomes `caf\xc3\xa9\x09x`. This runs *after* the clip,
+///    so the result can far exceed 63 characters — 31 `é` render as 248.
 pub fn clean_application_name(name: &str) -> String {
     const MAX_BYTES: usize = 63;
     let clipped = match name.len() > MAX_BYTES {

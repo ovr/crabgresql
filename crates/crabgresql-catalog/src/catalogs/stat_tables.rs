@@ -1,24 +1,15 @@
 //! The six per-table statistics views: `pg_stat_{all,sys,user}_tables` and the
 //! `pg_stat_xact_*` trio beside them.
 //!
-//! PostgreSQL builds all six from one function over the same counters and
-//! splits them by schema; so does this. Two things differ, and both are
-//! properties of this build rather than of these views:
+//! PostgreSQL builds all six from one function and splits them by schema; so
+//! does this. Two divergences, both properties of this build:
 //!
-//! * The `sys` pair is **always empty**. Its rows are the catalog relations,
-//!   and catalog relations here are served from Rust rather than reflected into
-//!   `pg_class` — they have no storage to scan, no OID assigned by a snapshot,
-//!   and nothing counts a read of one. So `all` and `user` hold the same rows,
-//!   which is what PostgreSQL itself shows for a database whose only activity
-//!   is in `public`.
-//! * The `xact` trio reports what the *current transaction* has done, from
-//!   counters that are not kept per transaction here — a write is counted once,
-//!   when the statement finishes, and never unwound. They are served with their
-//!   full shape and no rows rather than with the cumulative numbers under a
-//!   name that promises transaction scope: a client that reads
-//!   `pg_stat_xact_user_tables` is asking "what has *this* transaction touched",
-//!   and answering with the database's lifetime totals would be a wrong answer,
-//!   where no rows is a true "nothing is being tracked at that scope".
+//! * The `sys` pair is **always empty**: its rows would be the catalog
+//!   relations, which are served from Rust rather than reflected into
+//!   `pg_class`, so nothing counts a read of one.
+//! * The `xact` trio has no rows. It promises transaction scope, and nothing
+//!   here keeps counters at that scope — answering with the lifetime totals
+//!   under that name would be a wrong answer, where no rows is a true one.
 
 use crabgresql_storage_api::TableSchema;
 use crabgresql_storage_api::pgstat::RelStatSnapshot;
@@ -27,9 +18,7 @@ use crabgresql_types::{PgType, Value};
 use crate::SystemCatalog;
 use crate::cols::*;
 
-/// Whether a namespace is one of PostgreSQL's system schemas, which is what
-/// splits `pg_stat_sys_tables` from `pg_stat_user_tables`. PostgreSQL's own
-/// rule, spelled the same way its view definitions do.
+/// PostgreSQL's own `sys` vs `user` split, spelled as its view definitions do.
 pub(crate) fn is_system_namespace(namespace: &str) -> bool {
     namespace == "pg_catalog" || namespace == "information_schema" || namespace == "pg_toast"
 }
@@ -74,9 +63,8 @@ fn all_tables_schema(name: &str) -> TableSchema {
     )
 }
 
-/// The 12 columns of `pg_stat_xact_all_tables`, under `name`. A strict subset
-/// of [`all_tables_schema`]'s: the transaction-scoped view carries no
-/// timestamps and no vacuum history.
+/// The 12 columns of `pg_stat_xact_all_tables`, under `name` — a subset of
+/// [`all_tables_schema`]'s, with no timestamps and no vacuum history.
 fn xact_tables_schema(name: &str) -> TableSchema {
     TableSchema::in_namespace(
         name,
@@ -122,9 +110,9 @@ pub(crate) fn pg_stat_xact_user_tables_schema() -> TableSchema {
     xact_tables_schema("pg_stat_xact_user_tables")
 }
 
-/// One row per relation with counters, dropping any the snapshot cannot number
-/// — a relation dropped since the counters were last touched has no `pg_class`
-/// OID, and PostgreSQL drops its statistics at the same moment.
+/// One row per relation with counters, dropping any this snapshot cannot
+/// number: a relation dropped under them has no `pg_class` OID, and PostgreSQL
+/// drops its statistics at the same moment.
 fn table_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Value>> {
     cat.table_stats()
         .iter()
@@ -148,18 +136,15 @@ fn table_row(cat: &SystemCatalog, stats: &RelStatSnapshot) -> Option<Vec<Value>>
         counter(stats.n_tup_ins),
         counter(stats.n_tup_upd),
         counter(stats.n_tup_del),
-        // HOT and new-page updates are properties of PostgreSQL's page layout
-        // decisions during an update. This build's update path makes no such
-        // distinction, so neither number exists to report.
+        // A HOT update is a PostgreSQL page-layout decision; this update path
+        // makes no such distinction, so neither number exists.
         Value::Int8(0), // n_tup_hot_upd
         Value::Int8(0), // n_tup_newpage_upd
         counter(stats.n_tup_ins.saturating_sub(stats.n_tup_del)),
-        // Dead rows are counted by PostgreSQL's collector as updates plus
-        // deletes since the last vacuum. Reclaiming them here is the engine's
-        // business and it reports no per-relation number for what it found, so
-        // there is nothing to publish — and a count derived from the write
-        // counters alone would keep rising through a `VACUUM` that had already
-        // removed them.
+        // Reclaiming dead rows is the engine's business and it reports no
+        // per-relation number, so there is nothing to publish. Deriving one
+        // from the write counters would keep rising through a `VACUUM` that
+        // had already removed them.
         Value::Int8(0), // n_dead_tup
         counter(stats.n_mod_since_analyze),
         counter(stats.n_ins_since_vacuum),
@@ -171,8 +156,7 @@ fn table_row(cat: &SystemCatalog, stats: &RelStatSnapshot) -> Option<Vec<Value>>
         Value::Int8(0), // autovacuum_count
         counter(stats.analyze_count),
         Value::Int8(0), // autoanalyze_count
-        // The four `total_*_time` columns need each command timed. Nothing
-        // times them, so they stay at PostgreSQL's own never-ran value.
+        // The four `total_*_time` columns: nothing times a command here.
         Value::Float8(0.0),
         Value::Float8(0.0),
         Value::Float8(0.0),

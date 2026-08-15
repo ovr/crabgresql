@@ -384,9 +384,8 @@ pub struct ExecContext {
     /// replaced, by the nested executions a correlated subquery drives — a cache
     /// scoped to a single outer row would never be hit.
     pub subplans: Option<Arc<subplan::SubplanCache>>,
-    /// Where the scan nodes report what they read, for `pg_stat_all_tables` and
-    /// `pg_stat_all_indexes`. `None` in a context with no server behind it — a
-    /// unit test, or an `EXPLAIN` that builds no scan — and then nothing is
+    /// Where the scan nodes report what they read. `None` in a context with no
+    /// server behind it — a unit test, an `EXPLAIN` — and then nothing is
     /// counted at all, which is the truth for work that never ran.
     pub stats: Option<Arc<crabgresql_storage_api::pgstat::PgStatCounters>>,
 }
@@ -3184,10 +3183,8 @@ fn update_routed(
         let moved_in = std::mem::take(&mut pending_insert[i]);
         let inserted = moved_in.len() as u64;
         leaf_tables[i].insert_many(moved_in, txn)?;
-        // A moved row is a delete from one leaf and an insert into another, and
-        // the per-relation counters report it as both — which is how PostgreSQL
-        // accounts for cross-partition movement too, even though the statement's
-        // UPDATE tag counts it once.
+        // The per-relation counters report a moved row as both a delete and an
+        // insert, as PostgreSQL does, even though the UPDATE tag counts it once.
         count_write(ctx, &leaf_tables[i], WriteKind::Update, updated);
         count_write(ctx, &leaf_tables[i], WriteKind::Delete, deleted);
         count_write(ctx, &leaf_tables[i], WriteKind::Insert, inserted);

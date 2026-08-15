@@ -1,20 +1,13 @@
 //! `pg_stat_io`: block I/O broken down by backend type, object and context.
 //!
-//! Empty, deliberately. PostgreSQL's grid is `backend_type × object × context`
-//! — a checkpointer, a background writer, an autovacuum worker and a client
-//! backend, each against permanent or temporary relations, in normal, vacuum,
-//! bulkread or bulkwrite context. This build has one backend type (the client
-//! session), no background writer and no such context distinction, so all but a
-//! single cell of that grid names a worker that does not exist here.
+//! Empty, deliberately. The view is a `backend_type × object × context` grid,
+//! and this build runs one backend type, no background writer and no context
+//! distinction — so all but one cell of it names a worker that does not exist.
 //!
-//! The one cell that *would* be real — a client backend reading permanent
-//! relations in normal context — cannot be filled either: the counters the
-//! buffer pool keeps are cluster-wide totals with no backend attribution, which
-//! is the same limit [`crate::catalogs::statio`] documents. Publishing them as
-//! one row of that grid would claim a breakdown that was never computed, so the
-//! relation is served with its shape and no rows: a client that groups by
-//! `backend_type` reads "nothing measured" rather than a total mislabelled as a
-//! category.
+//! That one cell cannot be filled either: the buffer pool's counters are
+//! cluster-wide totals with no backend attribution (the limit
+//! [`crate::catalogs::statio`] documents), and publishing them as a row of this
+//! grid would claim a breakdown nobody computed.
 
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::PgType;
@@ -30,9 +23,8 @@ pub(crate) fn pg_stat_io_schema() -> TableSchema {
             col("object", PgType::Text),
             col("context", PgType::Text),
             col("reads", PgType::Int8),
-            // The `*_bytes` columns are `numeric`, not `bigint`: a byte count is
-            // a block count times the block size, and PostgreSQL widens it
-            // rather than risk the multiplication overflowing.
+            // `numeric`, not `bigint`: PostgreSQL widens a byte count rather
+            // than risk the block-count multiplication overflowing.
             col("read_bytes", PgType::Numeric),
             col("read_time", PgType::Float8),
             col("writes", PgType::Int8),

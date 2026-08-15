@@ -9,33 +9,18 @@ use crate::{SystemCatalog, source::CatalogBackend};
 
 /// `pg_catalog.pg_stat_activity` — one row per backend.
 ///
-/// **One row: the session reading it.** PostgreSQL answers this from shared
-/// memory and shows every backend in the cluster; there is no registry of live
-/// connections here (the gap [`crate::source::CatalogSource::backends`]
-/// describes, and the same one that leaves a `CancelRequest` with no session to
-/// find), so a session can only describe itself. A monitoring query still binds
-/// and still returns a truthful row — it just sees one backend where PostgreSQL
-/// would list the others too.
+/// **One row: the session reading it.** There is no registry of live
+/// connections (see [`crate::source::CatalogSource::backends`]), so a session
+/// can only describe itself. It is by definition running the query that opened
+/// this relation, which is why `state` is always `active`; PostgreSQL's `idle`
+/// and `idle in transaction` are unreachable for the same reason the other rows
+/// are.
 ///
-/// That reading session is by definition running a query — the one that opened
-/// this relation — so `state` is always `active` and `query` is that statement.
-/// The states PostgreSQL reports for *other* backends (`idle`,
-/// `idle in transaction`) are unreachable here for the same reason the other
-/// rows are.
-///
-/// Constant columns, and why:
-///
-/// * `leader_pid` — parallel query's leader. There is no parallel query.
-/// * `client_addr`/`client_hostname`/`client_port` — NULL, as PostgreSQL
-///   reports for a connection whose address it does not track. The socket's
-///   peer is known at accept time but is not carried on the session.
-/// * `wait_event_type`/`wait_event` — NULL, which PostgreSQL also uses for a
-///   backend that is running rather than waiting. True of this row by
-///   construction: it is executing the query that reads the view.
-/// * `query_id` — NULL unless `compute_query_id` is on in PostgreSQL; nothing
-///   hashes a plan here.
-/// * `backend_type` — always `client backend`. Every other value names a
-///   background process this build does not run.
+/// The constant columns: no parallel query (`leader_pid`), no wait-event
+/// instrumentation (`wait_event*`, which PostgreSQL also leaves NULL for a
+/// backend that is running), no plan hashing (`query_id`), no background
+/// process (`backend_type`), and a client address that is known at accept time
+/// but never carried on the session.
 pub(crate) fn pg_stat_activity_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_stat_activity",

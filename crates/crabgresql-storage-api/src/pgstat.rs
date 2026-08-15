@@ -1,33 +1,23 @@
 //! The cumulative statistics counters behind `pg_stat_database`,
 //! `pg_stat_all_tables` and `pg_stat_all_indexes`.
 //!
-//! PostgreSQL keeps these in shared memory, written by every backend and read
-//! through a snapshot the statistics collector hands out. Here they are one
-//! [`PgStatCounters`] the server owns for its whole life, shared by `Arc`: the
-//! executor's scan nodes and the server's statement paths add to it, and a
-//! catalog snapshot reads it.
+//! In this crate rather than in the server because both ends write here: it is
+//! the one crate the executor, the engines, the catalog and the server all
+//! already depend on.
 //!
-//! It lives in this crate rather than in the server because both ends need it —
-//! `crabgresql-storage-api` is the one crate the executor, the engines, the
-//! catalog and the server all already depend on, so nothing new has to point at
-//! anything else.
+//! **Nothing is persisted.** A restart starts from zero, which is what
+//! PostgreSQL reports after a crash — it discards a statistics file it cannot
+//! prove. A clean shutdown there would keep the counters; `stats_reset` is
+//! where a client sees the difference.
 //!
-//! **Nothing here is persisted.** A restart starts from zero with
-//! [`PgStatCounters::stats_reset`] stamped at startup, which is what PostgreSQL
-//! itself reports after a crash — it discards the statistics file rather than
-//! trusting counters it cannot prove. A clean shutdown there would keep them;
-//! that difference is real and `pg_stat_database.stats_reset` is where a client
-//! sees it.
-//!
-//! Every counter is `Relaxed`. They are read as totals long after the fact, and
+//! Every counter is `Relaxed`: they are read as totals long after the fact, and
 //! ordering them against the work they describe would cost more than the number
-//! is worth — the same argument the buffer pool's hit counters make.
+//! is worth.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Relaxed add, the only way anything here is written.
 fn bump(counter: &AtomicU64, by: u64) {
     if by > 0 {
         counter.fetch_add(by, Ordering::Relaxed);
@@ -40,32 +30,26 @@ fn bump(counter: &AtomicU64, by: u64) {
 /// [`RelCounters`] inside it, which is what keeps the hot path off the map.
 #[derive(Debug)]
 pub struct PgStatCounters {
-    /// Transactions that ended in a commit, and in a rollback. Counted at the
-    /// point the session finalizes, so an autocommit statement counts one and a
-    /// `BEGIN … COMMIT` block counts one, as in PostgreSQL.
+    /// Which transaction ended how. The rule for what counts as one is the
+    /// protocol's, not this crate's — see the server's `Session`.
     xact_commit: AtomicU64,
     xact_rollback: AtomicU64,
-    /// Rows a sequential scan handed up, and rows an index probe fetched from
-    /// the heap. PostgreSQL's split is exactly this one: `tup_returned` is what
-    /// the scan read, `tup_fetched` what an index pointed at.
+    /// PostgreSQL's split: `tup_returned` is what a scan read, `tup_fetched`
+    /// what an index pointed at.
     tup_returned: AtomicU64,
     tup_fetched: AtomicU64,
     tup_inserted: AtomicU64,
     tup_updated: AtomicU64,
     tup_deleted: AtomicU64,
-    /// Connections open right now, and connections ever opened.
     numbackends: AtomicI32,
     sessions: AtomicU64,
-    /// When these counters started counting, in `timestamptz` micros.
+    /// `timestamptz` micros.
     stats_reset: i64,
-    /// Per-relation counters, keyed as `(namespace, name)` — the pair
-    /// `TableSchema` carries, which is also how the catalog resolves a relation
-    /// back to its `pg_class` OID. Not keyed by OID because an OID here is
-    /// assigned by the *reading* snapshot, so a writer has none to use.
+    /// Keyed by name, not by OID: an OID here is assigned by the *reading*
+    /// snapshot, so a writer has none to use.
     ///
-    /// An `RwLock` around a map of `Arc`s rather than a lock per counter: a scan
-    /// takes the read lock once to fetch its `Arc` and never again, so the only
-    /// writer is the first statement to touch a relation.
+    /// A map of `Arc`s rather than a lock per counter, so a scan takes the read
+    /// lock once and never again.
     relations: RwLock<HashMap<(String, String), Arc<RelCounters>>>,
 }
 
@@ -74,9 +58,7 @@ pub struct PgStatCounters {
 pub struct RelCounters {
     seq_scan: AtomicU64,
     seq_tup_read: AtomicU64,
-    /// When the last sequential scan started, in `timestamptz` micros, or `0`
-    /// for a relation nothing has scanned — which the catalog renders as the
-    /// NULL PostgreSQL reports for the same state.
+    /// `timestamptz` micros, or `0` for never; see [`stamp`].
     last_seq_scan: AtomicI64,
     idx_scan: AtomicU64,
     idx_tup_fetch: AtomicU64,
@@ -84,10 +66,8 @@ pub struct RelCounters {
     n_tup_ins: AtomicU64,
     n_tup_upd: AtomicU64,
     n_tup_del: AtomicU64,
-    /// Rows written since the last `ANALYZE` / inserted since the last
-    /// `VACUUM`. Unlike the three above these run *backwards*: each is zeroed
-    /// by the command it counts up to, which is how PostgreSQL's autovacuum
-    /// launcher decides a relation needs attention.
+    /// Unlike the three above, these two are *zeroed* by the command they count
+    /// up to — that is what makes them a backlog rather than a total.
     n_mod_since_analyze: AtomicU64,
     n_ins_since_vacuum: AtomicU64,
     last_vacuum: AtomicI64,
@@ -107,9 +87,9 @@ pub struct IndexCounters {
     last_idx_scan: AtomicI64,
 }
 
-/// The database counters at one instant. Plain numbers: a snapshot is read
-/// column by column while a catalog row is built, and re-reading an atomic per
-/// column would let a row disagree with itself.
+/// The database counters at one instant. Plain numbers, because a catalog row
+/// is built column by column and re-reading an atomic per column would let one
+/// row disagree with itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DbStatSnapshot {
     pub numbackends: i32,
@@ -122,15 +102,13 @@ pub struct DbStatSnapshot {
     pub tup_deleted: u64,
     pub sessions: u64,
     pub stats_reset: i64,
-    /// Blocks the buffer pool had to read in, and blocks it found resident.
-    /// Filled by the server from the engine's pool: this build serves one
-    /// database, so the pool's totals *are* that database's totals.
+    /// Filled by the server from the engine's buffer pool: this build serves
+    /// one database, so the pool's totals *are* that database's totals.
     pub blks_read: u64,
     pub blks_hit: u64,
 }
 
-/// One relation's counters at one instant, named the way the catalog needs
-/// them: it resolves `(schema, relation)` back to a `pg_class` OID.
+/// One relation's counters at one instant.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelStatSnapshot {
     pub namespace: String,
@@ -152,8 +130,8 @@ pub struct RelStatSnapshot {
     pub analyze_count: u64,
 }
 
-/// One index's counters at one instant, carrying the relation it belongs to so
-/// the catalog can resolve both OIDs.
+/// One index's counters at one instant. Carries its relation, which the catalog
+/// needs to resolve both OIDs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexStatSnapshot {
     pub namespace: String,
@@ -165,17 +143,15 @@ pub struct IndexStatSnapshot {
     pub last_idx_scan: Option<i64>,
 }
 
-/// `0` is "never", which PostgreSQL reports as NULL. No real timestamp can
-/// collide with it: it is the 2000-01-01 epoch, and a server whose clock reads
-/// exactly that micro has bigger problems than one missing `last_vacuum`.
+/// `0` is "never", which PostgreSQL reports as NULL. Nothing real collides with
+/// it: as a `timestamptz` it is the 2000-01-01 epoch.
 fn stamp(value: i64) -> Option<i64> {
     (value != 0).then_some(value)
 }
 
 impl PgStatCounters {
-    /// Start counting, stamping [`DbStatSnapshot::stats_reset`] with `now` (in
-    /// `timestamptz` micros). Taken as an argument rather than read from the
-    /// clock so a test can pin it.
+    /// `now` is taken as an argument rather than read from the clock so a test
+    /// can pin `stats_reset`.
     pub fn new(now: i64) -> Self {
         Self {
             xact_commit: AtomicU64::new(0),
@@ -192,9 +168,8 @@ impl PgStatCounters {
         }
     }
 
-    /// The counters for `(namespace, name)`, creating them if this is the first
-    /// mention. Held by a scan node for its life, so the map is touched once per
-    /// scan rather than once per row.
+    /// The counters for `(namespace, name)`, created on first mention. A scan
+    /// node holds the `Arc` for its life, so the map is touched once per scan.
     pub fn relation(&self, namespace: &str, name: &str) -> Arc<RelCounters> {
         let key = (namespace.to_string(), name.to_string());
         if let Ok(relations) = self.relations.read()
@@ -210,9 +185,8 @@ impl PgStatCounters {
         Arc::clone(relations.entry(key).or_default())
     }
 
-    /// Forget a relation's counters, as `DROP TABLE` does in PostgreSQL — its
-    /// statistics go with it, and a table later recreated under the same name
-    /// starts from zero rather than inheriting the dead one's totals.
+    /// Drop a relation's counters with the relation, as PostgreSQL does: one
+    /// recreated under the same name starts from zero.
     pub fn forget_relation(&self, namespace: &str, name: &str) {
         if let Ok(mut relations) = self.relations.write() {
             relations.remove(&(namespace.to_string(), name.to_string()));
@@ -227,8 +201,6 @@ impl PgStatCounters {
         bump(&self.xact_rollback, 1);
     }
 
-    /// Rows a sequential scan handed up, at the database level. The relation's
-    /// own `seq_tup_read` is counted separately, by the scan that read them.
     pub fn tup_returned(&self, rows: u64) {
         bump(&self.tup_returned, rows);
     }
@@ -237,9 +209,8 @@ impl PgStatCounters {
         bump(&self.tup_fetched, rows);
     }
 
-    /// A write of `rows` rows to `(namespace, name)`, counted once at both
-    /// levels: the relation's `n_tup_ins`/`n_tup_upd`/`n_tup_del` and the
-    /// database's `tup_inserted`/`tup_updated`/`tup_deleted`.
+    /// Counted at both levels at once: the relation's `n_tup_*` and the
+    /// database's `tup_*`.
     pub fn tuples_written(&self, namespace: &str, name: &str, kind: WriteKind, rows: u64) {
         if rows == 0 {
             return;
@@ -258,7 +229,6 @@ impl PgStatCounters {
         }
     }
 
-    /// A completed `VACUUM` of `(namespace, name)` at `now`.
     pub fn vacuumed(&self, namespace: &str, name: &str, now: i64) {
         let counters = self.relation(namespace, name);
         counters.last_vacuum.store(now, Ordering::Relaxed);
@@ -266,7 +236,6 @@ impl PgStatCounters {
         bump(&counters.vacuum_count, 1);
     }
 
-    /// A completed `ANALYZE` of `(namespace, name)` at `now`.
     pub fn analyzed(&self, namespace: &str, name: &str, now: i64) {
         let counters = self.relation(namespace, name);
         counters.last_analyze.store(now, Ordering::Relaxed);
@@ -274,15 +243,13 @@ impl PgStatCounters {
         bump(&counters.analyze_count, 1);
     }
 
-    /// A connection opened: one more backend, and one more session ever.
     pub fn backend_started(&self) {
         self.numbackends.fetch_add(1, Ordering::Relaxed);
         bump(&self.sessions, 1);
     }
 
-    /// A connection closed. Floored at zero rather than left to wrap: the count
-    /// is published as `pg_stat_database.numbackends`, and `-1` there is worse
-    /// than a lost decrement.
+    /// Floored at zero: this is published as `pg_stat_database.numbackends`,
+    /// where `-1` would be worse than a lost decrement.
     pub fn backend_ended(&self) {
         let _ = self
             .numbackends
@@ -291,9 +258,8 @@ impl PgStatCounters {
             });
     }
 
-    /// The database counters right now. `blks_read`/`blks_hit` are left at zero
-    /// for the caller to fill from the engine's buffer pool — this crate defines
-    /// the counters but does not own a pool.
+    /// `blks_read`/`blks_hit` are left at zero for the caller to fill: this
+    /// crate defines the counters but owns no buffer pool.
     pub fn database_snapshot(&self) -> DbStatSnapshot {
         DbStatSnapshot {
             numbackends: self.numbackends.load(Ordering::Relaxed),
@@ -311,9 +277,8 @@ impl PgStatCounters {
         }
     }
 
-    /// Every relation with counters, sorted by `(namespace, name)` so a
-    /// `SELECT * FROM pg_stat_user_tables` is stable across runs — PostgreSQL's
-    /// own order is a hash order, so nothing depends on it being different.
+    /// Sorted, so `SELECT * FROM pg_stat_user_tables` is stable across runs.
+    /// PostgreSQL's own order is a hash order, so nothing can depend on it.
     pub fn relation_snapshots(&self) -> Vec<RelStatSnapshot> {
         let Ok(relations) = self.relations.read() else {
             return Vec::new();
@@ -344,7 +309,7 @@ impl PgStatCounters {
         out
     }
 
-    /// Every index with counters, sorted like [`Self::relation_snapshots`].
+    /// Sorted, for the reason [`Self::relation_snapshots`] gives.
     pub fn index_snapshots(&self) -> Vec<IndexStatSnapshot> {
         let Ok(relations) = self.relations.read() else {
             return Vec::new();
@@ -380,21 +345,18 @@ pub enum WriteKind {
 }
 
 impl RelCounters {
-    /// One finished sequential scan that read `rows` rows, started at `at`.
     pub fn seq_scan_finished(&self, rows: u64, at: i64) {
         bump(&self.seq_scan, 1);
         bump(&self.seq_tup_read, rows);
         self.last_seq_scan.store(at, Ordering::Relaxed);
     }
 
-    /// One finished index scan over this relation that fetched `rows` heap rows.
     pub fn idx_scan_finished(&self, rows: u64, at: i64) {
         bump(&self.idx_scan, 1);
         bump(&self.idx_tup_fetch, rows);
         self.last_idx_scan.store(at, Ordering::Relaxed);
     }
 
-    /// The counters for one index of this relation, creating them on first use.
     pub fn index(&self, name: &str) -> Arc<IndexCounters> {
         if let Ok(indexes) = self.indexes.read()
             && let Some(counters) = indexes.get(name)
@@ -409,14 +371,10 @@ impl RelCounters {
 }
 
 impl IndexCounters {
-    /// One finished scan of this index that returned `rows` entries.
-    ///
-    /// `idx_tup_read` and `idx_tup_fetch` take the same number here, where
-    /// PostgreSQL can report fewer fetches than reads: its `fetch` counts only
-    /// the heap visits a scan actually made, and an index-only scan skips them.
-    /// There is no index-only scan in this build — every match is read back from
-    /// the heap — so the two really are equal, and reporting one of them lower
-    /// would be the invention.
+    /// `idx_tup_read` and `idx_tup_fetch` take the same number, where PostgreSQL
+    /// can report fewer fetches: its `fetch` counts heap visits, which an
+    /// index-only scan skips. There is no index-only scan here, so the two
+    /// really are equal.
     pub fn scan_finished(&self, rows: u64, at: i64) {
         bump(&self.idx_scan, 1);
         bump(&self.idx_tup_read, rows);
@@ -444,8 +402,8 @@ mod tests {
         assert_eq!(snapshot[0].last_seq_scan, Some(3_000));
     }
 
-    /// A relation nothing has scanned reports NULL for its `last_*` stamps, not
-    /// the 2000-01-01 epoch a bare `0` would render as.
+    /// A `last_*` stamp nothing has set must read NULL, not the 2000-01-01
+    /// epoch a bare `0` renders as.
     #[test]
     fn untouched_stamps_are_null() {
         let stats = PgStatCounters::new(1_000);
@@ -458,8 +416,6 @@ mod tests {
         assert_eq!(stats.database_snapshot().tup_inserted, 5);
     }
 
-    /// Dropping a relation drops its statistics with it: a table recreated under
-    /// the same name must not inherit the dead one's counters.
     #[test]
     fn forgetting_a_relation_clears_its_counters() {
         let stats = PgStatCounters::new(1_000);

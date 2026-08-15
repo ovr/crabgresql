@@ -87,11 +87,9 @@ pub async fn serve_with(
     copy_files: CopyFileAccess,
 ) -> std::io::Result<()> {
     let catalog = Arc::new(GlobalCatalog::with_copy_files(copy_files));
-    // The cumulative statistics counters (`pg_stat_database` and friends) live
-    // as long as the server does and are shared by every connection — one
-    // server, one set of counters, stamped `stats_reset` at startup because
-    // nothing here reads a statistics file back (see
-    // `crabgresql_storage_api::pgstat`).
+    // One server, one set of counters, for every connection and for as long as
+    // the server runs. `stats_reset` is stamped now because nothing reads a
+    // statistics file back (see `crabgresql_storage_api::pgstat`).
     let stats = Arc::new(PgStatCounters::new(crabgresql_types::tz::now_micros()));
     loop {
         let (socket, peer) = listener.accept().await?;

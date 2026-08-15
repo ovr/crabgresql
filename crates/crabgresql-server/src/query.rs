@@ -149,13 +149,12 @@ pub enum QueryResult {
 }
 
 impl QueryResult {
-    /// Whether this statement *ended an explicit transaction block*, and if so
-    /// whether it rolled it back: `Some(true)` for a `ROLLBACK` — or for the
-    /// `COMMIT` of a failed block, which PostgreSQL also reports and counts as
-    /// one — and `Some(false)` for a `COMMIT` that committed.
+    /// Whether this statement ended an explicit block, and if so whether it
+    /// rolled it back — `Some(true)` for a `ROLLBACK`, and for the `COMMIT` of
+    /// a failed block, which PostgreSQL also reports and counts as one.
     ///
-    /// Read off the command tag, which is where that decision is already made
-    /// and rendered for the client, rather than re-derived from the statement.
+    /// Read off the command tag, where that decision is already made and
+    /// rendered for the client, rather than re-derived from the statement.
     fn block_end(&self) -> Option<bool> {
         match self {
             QueryResult::Command { tag, .. } if tag == "ROLLBACK" => Some(true),
@@ -707,16 +706,12 @@ pub fn execute_statement(
 ) -> Result<QueryResult, PgError> {
     let result =
         execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false);
-    // Where a statement reaches `pg_stat_database`'s transaction counters. A
-    // `COMMIT`/`ROLLBACK` counts its block here; anything else only marks the
-    // *message* as owing an implicit transaction, which the protocol loop
-    // settles at the message boundary — see [`Session::count_statement`], and
-    // `mark_transaction_failed` for the failing side.
+    // Where a statement reaches `pg_stat_database`'s transaction counters; see
+    // `Session::count_statement`, and `mark_transaction_failed` for failures.
     //
-    // This wrapper and not [`execute_statement_with`], which `EXECUTE` and
-    // `DECLARE … CURSOR` re-enter to run the statement they name: marking there
-    // would mark those twice, and a statement that ended a block would count
-    // twice.
+    // This wrapper and not `execute_statement_with`, which `EXECUTE` and
+    // `DECLARE … CURSOR` re-enter to run the statement they name: counting
+    // there would count those twice.
     if let Ok(result) = &result {
         session.count_statement(result.block_end());
     }
@@ -2185,8 +2180,8 @@ fn execute_analyze(
     let txn = build_txn(txnmgr, session, false);
     for (namespace, name) in &targets {
         match engine.analyze(namespace, name, &txn) {
-            // Stamped with the statement's clock, so `last_analyze` agrees with
-            // the `now()` every other statement in this block reports.
+            // The statement's clock, so `last_analyze` agrees with the `now()`
+            // every other statement in this block reports.
             Ok(()) => session.stats.analyzed(namespace, name, session.stmt_start),
             // A bare ANALYZE walks every relation the engine lists, which
             // includes other sessions' temp tables; the engine reports those as
@@ -7502,14 +7497,11 @@ fn execute_drop_table(
         plan_drop_cascade(catalog, "table", &all_targets, cascade)?;
     notices.append(&mut cascade_notices);
     // Which namespace an unqualified target really lives in, read *before* the
-    // drop: `drop_table("public", …)` resolves temp-first, so a temp table
-    // shadowing a permanent one is the one that goes. Statistics are keyed by
-    // namespace, and clearing both keys would wipe the surviving permanent
-    // table's counters.
+    // drop: `drop_table("public", …)` resolves temp-first, and clearing both
+    // keys would wipe a surviving permanent table's counters.
     //
-    // Read from the relation list rather than by resolving the name, which
-    // would record the relation into this statement's `pg_locks` set a second
-    // time.
+    // From the relation list rather than by resolving the name, which would
+    // record the relation into this statement's `pg_locks` set a second time.
     let session_temp: Vec<String> = catalog.relation_names_in(&session.temp_schema);
     let dropped_namespace = |name: &String| match session_temp.contains(name) {
         true => session.temp_schema.clone(),
@@ -7544,13 +7536,11 @@ fn execute_drop_table(
                 .map(|(_, ns, n)| (ns.as_str(), n.as_str())),
         )
         .collect();
-    // A dropped relation's statistics go with it, as in PostgreSQL — otherwise
-    // a table recreated under the same name would inherit the dead one's
-    // counters. The unqualified targets are cleared under the namespace the
-    // drop actually reached (see `dropped_namespace`), never under both.
+    // A dropped relation's statistics go with it, as in PostgreSQL, under the
+    // namespace the drop actually reached (see `dropped_namespace`).
     //
     // Built from `dropped_plain` rather than from `dropped_tables`, which
-    // spells every unqualified target `public` for the sequence rule below.
+    // spells every unqualified target `public` for the sequence rule above.
     for (namespace, name) in dropped_plain
         .iter()
         .map(|(ns, name)| (ns.as_str(), name.as_str()))
@@ -8372,8 +8362,8 @@ fn execute_drop_schema(
                 };
             }
             // Every table this cascade removed takes its statistics with it,
-            // exactly as `execute_drop_table` does — the schema's own tables
-            // and the outside dependents `drop_cascaded` just took.
+            // as in `execute_drop_table`: the schema's own, then the outside
+            // dependents `drop_cascaded` just took.
             for (_, obj) in contents.iter().filter(|(kind, _)| *kind == "table") {
                 session.stats.forget_relation(name, obj);
             }

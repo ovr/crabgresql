@@ -147,13 +147,12 @@ pub struct SessionCatalogSource {
     /// The reading session's `bytea_output`, for `pg_class.relpartbound` — the
     /// one catalog column whose text can hold a rendered `bytea`.
     bytea_output: ByteaOutput,
-    /// The server's cumulative counters, behind `pg_stat_database` and the
-    /// per-relation views. Read through rather than snapshotted here, like the
-    /// engine: a statement that never opens one of those relations must not pay
-    /// for walking the counter table.
+    /// Read through rather than snapshotted here, like the engine: a statement
+    /// that never opens a statistics relation must not pay for walking the
+    /// counter table.
     stats: Arc<PgStatCounters>,
-    /// This session's own `pg_stat_activity` row. Eager like `cursors`, and for
-    /// the same reason — this source outlives the `&Session` it is built from.
+    /// Eager like `cursors`, and for the same reason: this source outlives the
+    /// `&Session` it is built from.
     backend: CatalogBackend,
 }
 
@@ -363,11 +362,9 @@ impl CatalogSource for SessionCatalogSource {
         self.backend_pid
     }
 
-    /// The server's counters, with the block columns filled from the engine's
-    /// buffer pool. The pool's totals are this database's totals because there
-    /// is exactly one database; an engine with no pool leaves them at zero, and
-    /// `pg_stat_database` then reports no block activity, which is the truth for
-    /// a relation held in RAM.
+    /// The block columns come from the engine's buffer pool, whose totals are
+    /// this database's totals because there is exactly one database. An engine
+    /// with no pool leaves them at zero — the truth for a relation held in RAM.
     fn database_stats(&self) -> DbStatSnapshot {
         let mut snapshot = self.stats.database_snapshot();
         if let Some(buffers) = self.engine.buffer_stats() {

@@ -14,9 +14,8 @@ use crate::{ExecContext, ExecError};
 /// caller always has the row scan to fall back on.
 pub struct BatchScan {
     iter: BatchStream,
-    /// What this scan reports to `pg_stat_all_tables` when it is dropped. The
-    /// columnar path has to carry one too, or a relation read through it would
-    /// show `seq_scan = 0` while an identical query against a row-store
+    /// The columnar path carries a tally too, or a relation read through it
+    /// would show `seq_scan = 0` while the same query against a row-store
     /// relation counted — and which path a relation takes is invisible above
     /// the shred.
     tally: Option<ScanTally>,

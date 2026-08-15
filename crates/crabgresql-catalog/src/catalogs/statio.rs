@@ -1,22 +1,18 @@
 //! The nine `pg_statio_*` views: block-level I/O per table, per index and per
 //! sequence, each split three ways by schema.
 //!
-//! **Every block count here is zero, and that is a "not measured", not a
-//! "measured zero".** The engine's buffer pool does count the pins it serves
-//! (hits, misses and extends — see `crabgresql-pg-engine`'s `BufferPool`), and
-//! `pg_stat_database.blks_hit`/`blks_read` publish those totals, which is sound
-//! because this build serves exactly one database. What the pool cannot do is
-//! say *which relation* a pin belonged to: a pin names a `RelFileNode`, the
-//! physical file, and nothing maps that back to the catalog relation a
-//! statistics view is keyed by. Attributing the totals to relations would take
-//! a per-relfilenode table on the pin path — real work, and a real cost on the
-//! hottest path in the engine.
+//! **Every block count is zero, and that is a "not measured", not a "measured
+//! zero".** The buffer pool does count its pins, and
+//! `pg_stat_database.blks_hit`/`blks_read` publish those totals — but a pin
+//! names a `RelFileNode`, and nothing maps that back to a catalog relation.
+//! Attributing them would take a per-relfilenode table on the hottest path in
+//! the engine.
 //!
-//! So the relations are served with their full PostgreSQL shape and rows of
-//! zeros: a monitoring query that joins them binds and runs, and a client that
-//! reads a hit ratio out of them gets 0/0 rather than a number that was made
-//! up. The `heap_blks_*` columns are the ones to fill first if this is ever
-//! attributed.
+//! Served with the full shape and rows of zeros, so a monitoring query still
+//! binds and a hit ratio reads 0/0 rather than a number that was made up.
+//!
+//! TODO: attribute buffer-pool pins to relations, starting with the
+//! `heap_blks_*` pair.
 //!
 //! The `sys` variants are empty for the reason
 //! [`crate::catalogs::stat_tables`] gives.
@@ -118,9 +114,8 @@ pub(crate) fn pg_statio_user_sequences_schema() -> TableSchema {
     all_sequences_schema("pg_statio_user_sequences")
 }
 
-/// The relations a `pg_statio_*_tables` view lists: everything with heap
-/// storage, which is PostgreSQL's rule (`relkind` in `r`, `t`, `m`, `p`) minus
-/// the kinds this build has none of. One row each, all counts zero.
+/// Everything with heap storage — PostgreSQL's rule (`relkind` in `r`, `t`,
+/// `m`, `p`) minus the kinds this build has none of.
 fn table_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Value>> {
     storage_relations(cat, want_system, RelKind::Sequence, false)
         .map(|(oid, namespace, name)| {
@@ -141,7 +136,6 @@ fn table_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Value>>
         .collect()
 }
 
-/// The sequences a `pg_statio_*_sequences` view lists.
 fn sequence_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Value>> {
     storage_relations(cat, want_system, RelKind::Sequence, true)
         .map(|(oid, namespace, name)| {
@@ -156,12 +150,10 @@ fn sequence_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Valu
         .collect()
 }
 
-/// Every relation of this snapshot whose kind either is or is not `kind`
-/// (`matching` says which), filtered by the schema split, as
-/// `(oid, namespace, name)`.
+/// The relations whose kind is (or is not) `kind`, as `(oid, namespace, name)`.
 ///
-/// A view has no storage, so it appears in neither list — the one rule shared
-/// by all nine views, and the reason this is one helper rather than two.
+/// A view has no storage and so appears in neither list — the one rule shared
+/// by the table and sequence views, and why this is one helper, not two.
 fn storage_relations<'a>(
     cat: &'a SystemCatalog,
     want_system: Option<bool>,
@@ -179,8 +171,7 @@ fn storage_relations<'a>(
         .map(|((oid, schema), _)| (*oid, schema.namespace.clone(), schema.name.clone()))
 }
 
-/// The indexes a `pg_statio_*_indexes` view lists: every index of every
-/// relation, all counts zero.
+/// Every index of every relation.
 fn index_rows(cat: &SystemCatalog, want_system: Option<bool>) -> Vec<Vec<Value>> {
     cat.index_oids()
         .iter()

@@ -36,10 +36,9 @@ static NEXT_BACKEND_ID: AtomicI32 = AtomicI32::new(1);
 
 /// Holds `pg_stat_database.numbackends` up for one connection's life.
 ///
-/// A guard rather than an increment and a matching decrement: this connection
-/// leaves through a `return`, a `?` on a protocol error, or a task cancellation,
-/// and every one of those has to put the count back or `numbackends` drifts
-/// upward for as long as the server runs.
+/// A guard, not a pair of calls: this connection leaves through a `return`, a
+/// `?` on a protocol error, or a task cancellation, and every one of those has
+/// to put the count back or the number drifts upward forever.
 struct BackendGuard<'a>(&'a Arc<PgStatCounters>);
 
 impl BackendGuard<'_> {
@@ -115,15 +114,11 @@ pub async fn handle_connection(
         crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
     )
     .sharing_stats(Arc::clone(&stats));
-    // A client that names itself at startup is reported under that name by
-    // `pg_stat_activity`; one that does not gets the empty string, as in PG.
     // Through the same cleaning `SET application_name` goes through, which PG
     // also applies to the connection parameter.
     if let Some(name) = params.get("application_name") {
         session.application_name = guc::clean_application_name(name);
     }
-    // One more backend now, one fewer whenever this function returns — however
-    // it returns, which is why the guard is a value and not a pair of calls.
     let _backend = BackendGuard::new(&stats);
 
     for (name, value) in guc::report_values(&session) {
@@ -162,8 +157,8 @@ pub async fn handle_connection(
                 // neither joins nor continues an extended-query batch's.
                 session.end_implicit_block();
                 session.stamp_message(false);
-                // What `pg_stat_activity.query` shows while this runs: the whole
-                // message, as PostgreSQL reports a multi-statement simple query.
+                // The whole message, as PostgreSQL reports a multi-statement
+                // simple query.
                 session.current_query = sql.clone();
                 run_simple_query(
                     &sql,
@@ -239,9 +234,7 @@ pub async fn handle_connection(
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
                 session.stamp_message(true);
-                // The portal's own statement text, so `pg_stat_activity` reports
-                // an extended-protocol query the same way it reports a simple
-                // one. A portal that no longer exists leaves the previous text
+                // A portal that no longer exists leaves the previous text
                 // standing; the Execute is about to fail anyway.
                 if let Some(text) = portal_statement_text(&session, &portal) {
                     session.current_query = text;
@@ -555,10 +548,8 @@ async fn copy_in_stream(
     drop(buffer);
     match run_copy_insert(engine, txnmgr, session, &prepared, &rows) {
         Ok(n) => {
-            // A COPY drives the sub-protocol here rather than returning
-            // through `execute_statement`, so it marks the message itself —
-            // the failing side goes through `mark_transaction_failed` like
-            // every other error.
+            // COPY drives the sub-protocol here rather than returning through
+            // `execute_statement`, so it marks the message itself.
             session.count_statement(None);
             Ok(CopyOutcome::Loaded(n))
         }
@@ -571,9 +562,8 @@ async fn copy_in_stream(
 /// transaction ends at the statement boundary).
 fn mark_transaction_failed(session: &mut Session) {
     // Where `pg_stat_database.xact_rollback` is counted: every error path
-    // reaches this, including the ones that fail before execution (a syntax
-    // error, a bind failure) and the one that fails after rows have started
-    // streaming, which PostgreSQL counts as rolled-back transactions too.
+    // reaches this, including the ones that fail before execution and the one
+    // that fails after rows have started streaming.
     session.fail_message_transaction();
     if session.tx_status == TransactionStatus::InTransaction {
         session.tx_status = TransactionStatus::Failed;

@@ -19,12 +19,8 @@ use crate::{ExecContext, ExecError, ExecNode, compare_values, eval};
 /// selects), so it needs no re-check. NULL matches no comparison at all.
 pub struct IndexScan {
     iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-    /// What this scan reports to `pg_stat_all_indexes` when it is dropped.
-    ///
-    /// Counted even when the probe fell back to a full scan: the *plan* is an
-    /// index scan, which is what `idx_scan` records, and PostgreSQL counts a
-    /// scan by the node the executor ran, not by how the access method served
-    /// it.
+    /// Counted even when the probe fell back to a full scan: `idx_scan` records
+    /// the plan the executor ran, not how the access method served it.
     tally: Option<ScanTally>,
 }
 

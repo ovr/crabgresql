@@ -8,35 +8,19 @@ use crate::SystemCatalog;
 use crate::cols::*;
 use crate::oids::DATABASE_OID;
 
-/// `pg_catalog.pg_stat_database` — one row per database, counting the work done
-/// in it since the counters were last reset.
+/// `pg_catalog.pg_stat_database` — the work done in this database since the
+/// counters were last reset.
 ///
-/// A crabgresql server serves exactly one database, so this has exactly one
-/// row. PostgreSQL also emits a `datid = 0` / `datname = NULL` row for the work
-/// that belongs to no database (shared relations, checkpoints); there is no
-/// such accounting here, and inventing a zero row for it would suggest one.
+/// One row: one database. PostgreSQL also emits a `datid = 0` row for the work
+/// that belongs to no database, and there is no such accounting here — a zero
+/// row for it would suggest one.
 ///
-/// Live columns: `numbackends`, `xact_commit`/`xact_rollback`, the five `tup_*`
-/// counters, `sessions`, `blks_read`/`blks_hit` (from the engine's buffer pool
-/// — see [`crabgresql_storage_api::TableEngine::buffer_stats`]) and
-/// `stats_reset`. The rest are zero or NULL because the thing they count does
-/// not happen here, not because it happened zero times:
-///
-/// * `conflicts` — recovery conflicts. There is no standby.
-/// * `temp_files`/`temp_bytes` — a sort or hash that spills to disk. Nothing
-///   spills; every sort and hash here runs in memory.
-/// * `deadlocks` — the deadlock detector's finds. There is no detector.
-/// * `checksum_failures`/`checksum_last_failure` — page checksums are not
-///   verified, so no failure can be counted (which is why the timestamp is
-///   NULL rather than an epoch).
-/// * `blk_read_time`/`blk_write_time` — `track_io_timing` instrumentation.
-/// * `active_time`/`idle_in_transaction_time`/`session_time` — per-state
-///   session timing, which needs the state machine `pg_stat_activity` does not
-///   have here either.
-/// * `sessions_abandoned`/`sessions_fatal`/`sessions_killed` — how a session
-///   ended. Only `sessions` (how many there were) is counted.
-/// * `parallel_workers_to_launch`/`parallel_workers_launched` — there is no
-///   parallel query.
+/// The columns held at zero or NULL count something that does not happen here,
+/// rather than something that happened zero times: recovery `conflicts` (no
+/// standby), `temp_files`/`temp_bytes` (no sort or hash spills to disk),
+/// `deadlocks` (no detector), `checksum_failures` (checksums are not verified),
+/// the `blk_*_time` and per-state session timings (nothing is instrumented),
+/// how a session ended, and the parallel-worker counts.
 pub(crate) fn pg_stat_database_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_stat_database",

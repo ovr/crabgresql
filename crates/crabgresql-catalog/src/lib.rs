@@ -942,13 +942,10 @@ impl SystemCatalog {
             .map(|index| index.oid)
     }
 
-    /// The OID of the index `index` on `namespace.table`, or `None` if this
-    /// snapshot holds no such index.
-    ///
-    /// Narrower than [`SystemCatalog::relation_oid_in`], which resolves an index
-    /// by its own name alone: the statistics views name an index *and* the
-    /// relation it belongs to, and matching both is what stops a stale counter
-    /// for a dropped index from landing on a like-named one elsewhere.
+    /// Narrower than [`SystemCatalog::relation_oid_in`], which resolves an
+    /// index by its own name alone: matching the owning relation too is what
+    /// stops a stale counter for a dropped index from landing on a like-named
+    /// one elsewhere.
     pub fn index_oid_in(&self, namespace: &str, table: &str, index: &str) -> Option<u32> {
         self.index_oids()
             .iter()

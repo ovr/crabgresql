@@ -9,8 +9,7 @@ use crate::{ExecContext, ExecError, ExecNode};
 /// Full table scan through the storage API.
 pub struct SeqScan {
     iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
-    /// What this scan reports to `pg_stat_all_tables` when it is dropped. See
-    /// [`ScanTally`] for why counting here costs nothing per row.
+    /// See [`ScanTally`] for why counting here costs nothing per row.
     tally: Option<ScanTally>,
 }
 
