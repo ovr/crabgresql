@@ -365,8 +365,13 @@ pub struct PgAmprocRow {
 pub struct PgConversionRow {
     pub oid: u32,
     pub conname: &'static str,
-    pub conforencoding: i32,
-    pub contoencoding: i32,
+    /// The two encodings, by **name** rather than by the number the column
+    /// stores. PostgreSQL's numbering lives in [`crabgresql_types::encoding`]
+    /// and [`catalogs::conversion`] resolves through it, so codegen needs no
+    /// second copy of that table — which is what a copy would be: one nothing
+    /// keeps in step.
+    pub conforencoding: &'static str,
+    pub contoencoding: &'static str,
     pub conproc: ProcRef,
     pub condefault: bool,
 }

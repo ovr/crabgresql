@@ -715,11 +715,16 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
 /// deviation of the wave, and the reason it says so in its module docs.
 ///
 /// The encoding *numbers* are the risk here: unlike everything else in these
-/// catalogs they are not in the vendored data, so a table transcribed from a
-/// running PostgreSQL turns a symbolic name into an integer. A wrong entry
-/// would be silent — a conversion between two plausible encodings — so the
-/// check is against the one number a client can name for itself, `UTF8`, and
-/// against the shape the whole relation has to have.
+/// catalogs they are not in the vendored data. The generated rows carry the
+/// encoding's *name*, and [`crabgresql_types::encoding`] — the one table this
+/// build records the numbering in — turns it into an integer, so a name that
+/// answers to no encoding arrives as `pg_char_to_encoding`'s own miss
+/// sentinel, `-1`. Refusing that here is what replaces the build-time check
+/// codegen used to do against a second copy of the table.
+///
+/// A *wrong* number would still be silent — a conversion between two plausible
+/// encodings — so the second check is against the one number a client can name
+/// for itself, `UTF8`.
 #[test]
 fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<()> {
     let cat = SystemCatalog::new();
@@ -753,7 +758,14 @@ fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<(
         );
         assert_ne!(from, to, "a conversion from an encoding to itself");
         for n in [from, to] {
-            assert!((0..42).contains(&n), "encoding number {n} is out of range");
+            // `-1` is what a name no encoding answers to resolves to, and an
+            // out-of-range number renders as the empty string; both mean the
+            // row names an encoding this build cannot number.
+            assert_ne!(n, -1, "an encoding this build cannot name");
+            assert!(
+                !crabgresql_types::encoding::encoding_to_char(n).is_empty(),
+                "encoding number {n} names nothing"
+            );
         }
         // Every built-in conversion is the default for its pair.
         assert_eq!(row[at(&schema, "condefault")], Value::Bool(true));

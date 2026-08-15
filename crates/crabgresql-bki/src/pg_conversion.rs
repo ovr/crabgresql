@@ -8,71 +8,22 @@ use std::fmt::Write as _;
 use crate::dat::{Entry, bool_field, str_field};
 use crate::symbols::SymbolTable;
 
-/// PostgreSQL's encoding numbers, which `pg_conversion.conforencoding` and
-/// `contoencoding` store. The `.dat` writes them symbolically — `PG_KOI8R` is
-/// the `PG_` prefix plus the encoding's name — and the numbers themselves live
-/// in a C header this crate does not read.
+/// The encoding an entry names as `PG_<name>`, with the prefix — the `.dat`'s
+/// own spelling — stripped off.
 ///
-/// So they are recorded here, in the order that *is* the numbering: the list
-/// below is what `pg_encoding_to_char(0..41)` reports on PostgreSQL 18.4, which
-/// is the same fact the header states and the one a client can observe. An
-/// encoding a bumped `.dat` names and this list lacks fails the build rather
-/// than emitting a conversion between something and nothing.
-const ENCODINGS: [&str; 42] = [
-    "SQL_ASCII",
-    "EUC_JP",
-    "EUC_CN",
-    "EUC_KR",
-    "EUC_TW",
-    "EUC_JIS_2004",
-    "UTF8",
-    "MULE_INTERNAL",
-    "LATIN1",
-    "LATIN2",
-    "LATIN3",
-    "LATIN4",
-    "LATIN5",
-    "LATIN6",
-    "LATIN7",
-    "LATIN8",
-    "LATIN9",
-    "LATIN10",
-    "WIN1256",
-    "WIN1258",
-    "WIN866",
-    "WIN874",
-    "KOI8R",
-    "WIN1251",
-    "WIN1252",
-    "ISO_8859_5",
-    "ISO_8859_6",
-    "ISO_8859_7",
-    "ISO_8859_8",
-    "WIN1250",
-    "WIN1253",
-    "WIN1254",
-    "WIN1255",
-    "WIN1257",
-    "KOI8U",
-    "SJIS",
-    "BIG5",
-    "GBK",
-    "UHC",
-    "GB18030",
-    "JOHAB",
-    "SHIFT_JIS_2004",
-];
-
-/// The number of the encoding an entry names as `PG_<name>`.
-fn encoding_number(symbol: &str) -> i32 {
-    let name = symbol
+/// The *number* is deliberately not resolved here. PostgreSQL's numbering is a
+/// run-time fact `crabgresql-types` already owns (`encoding::char_to_encoding`,
+/// transcribed from `pg_encoding_to_char` on a stock 18.4), and a second copy
+/// of that 42-entry table in this crate is a copy nothing keeps in step. So the
+/// generated row carries the name and `crabgresql-catalog`'s
+/// `catalogs::conversion` turns it into a number through the one table.
+///
+/// The prefix itself is codegen's business, and an entry without it is a `.dat`
+/// this scanner does not understand — so that fails the build.
+fn encoding_name(symbol: &str) -> &str {
+    symbol
         .strip_prefix("PG_")
-        .unwrap_or_else(|| panic!("pg_conversion: {symbol:?} is not a PG_<encoding> symbol"));
-    ENCODINGS
-        .iter()
-        .position(|e| *e == name)
-        .unwrap_or_else(|| panic!("pg_conversion: no encoding number known for {name:?}"))
-        as i32
+        .unwrap_or_else(|| panic!("pg_conversion: {symbol:?} is not a PG_<encoding> symbol"))
 }
 
 /// Emit `PG_CONVERSION_ROWS: &[PgConversionRow]` from `pg_conversion.dat`, in
@@ -89,11 +40,11 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
         let _ = writeln!(
             out,
             "    PgConversionRow {{ oid: {oid}, conname: {conname:?}, \
-conforencoding: {from}, contoencoding: {to}, conproc: {conproc}, \
+conforencoding: {from:?}, contoencoding: {to:?}, conproc: {conproc}, \
 condefault: {condefault} }},",
             oid = crate::dat::oid_field(e, "oid"),
-            from = encoding_number(str_field(e, "conforencoding", "")),
-            to = encoding_number(str_field(e, "contoencoding", "")),
+            from = encoding_name(str_field(e, "conforencoding", "")),
+            to = encoding_name(str_field(e, "contoencoding", "")),
             conproc = crate::proc_ref_resolved(symbols, proc).unwrap_or_else(|| panic!(
                 "pg_conversion {conname}: conproc {proc:?} names no pg_proc entry"
             )),
@@ -123,25 +74,30 @@ mod tests {
     }
 
     #[test]
-    fn encodings_resolve_to_their_numbers() {
+    fn the_row_carries_the_encoding_name_without_its_prefix() {
         let conversions = parse_dat(
             "[{ oid => '4410', conname => 'koi8_r_to_windows_1251', \
              conforencoding => 'PG_KOI8R', contoencoding => 'PG_WIN1251', \
              conproc => 'koi8r_to_win1251' }]",
         );
         let emitted = emit(&conversions, &symbols());
+        // The numbers are `crabgresql-catalog`'s to resolve, through the one
+        // table `crabgresql-types` owns; see
+        // `pg_conversion_numbers_the_encodings_it_converts_between` there.
         assert!(emitted.contains(
-            "oid: 4410, conname: \"koi8_r_to_windows_1251\", conforencoding: 22, \
-             contoencoding: 23, conproc: ProcRef { oid: 4410, name: \"koi8r_to_win1251\" }, \
+            "oid: 4410, conname: \"koi8_r_to_windows_1251\", conforencoding: \"KOI8R\", \
+             contoencoding: \"WIN1251\", conproc: ProcRef { oid: 4410, name: \"koi8r_to_win1251\" }, \
              condefault: true"
         ));
     }
 
     #[test]
-    #[should_panic(expected = "no encoding number known")]
-    fn an_unknown_encoding_fails_the_build() {
+    #[should_panic(expected = "is not a PG_<encoding> symbol")]
+    fn an_unprefixed_encoding_fails_the_build() {
+        // A name that resolves to no encoding is caught in the catalog crate,
+        // which owns the numbering; what codegen can judge is the spelling.
         let conversions = parse_dat(
-            "[{ oid => '1', conname => 'c', conforencoding => 'PG_NOSUCH', \
+            "[{ oid => '1', conname => 'c', conforencoding => 'KOI8R', \
              contoencoding => 'PG_UTF8', conproc => 'koi8r_to_win1251' }]",
         );
         emit(&conversions, &symbols());
