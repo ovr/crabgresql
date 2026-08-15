@@ -1337,6 +1337,11 @@ pub enum AggFn {
     /// `string_agg(value text, delimiter text) -> text`: concatenates the
     /// non-NULL values of a group, separated by the (per-row) delimiter.
     StringAgg,
+    /// `array_agg(value) -> value[]`: collects the group's inputs into a
+    /// one-dimensional array. Alone among the aggregates it keeps NULL inputs —
+    /// they become NULL elements — while an empty group still finalizes to NULL
+    /// rather than to an empty array.
+    ArrayAgg,
 }
 
 impl AggFn {
@@ -1349,6 +1354,23 @@ impl AggFn {
             AggFn::Sum => "sum",
             AggFn::Avg => "avg",
             AggFn::StringAgg => "string_agg",
+            AggFn::ArrayAgg => "array_agg",
+        }
+    }
+
+    /// Whether a row whose first argument is NULL is dropped before the
+    /// aggregate sees it — true for every aggregate PostgreSQL declares
+    /// `strict`, which is all of them here but `array_agg`, whose whole job is
+    /// to preserve the group's values *including* its NULLs.
+    ///
+    /// The executor's `feed` asks this rather than testing the variant itself,
+    /// so the rule has one statement and the two aggregate drivers cannot drift.
+    pub fn skips_null_input(self) -> bool {
+        match self {
+            AggFn::Count | AggFn::Min | AggFn::Max | AggFn::Sum | AggFn::Avg | AggFn::StringAgg => {
+                true
+            }
+            AggFn::ArrayAgg => false,
         }
     }
 }
@@ -1411,6 +1433,7 @@ pub fn lookup_agg(name: &str) -> Option<AggFn> {
         "sum" => Some(AggFn::Sum),
         "avg" => Some(AggFn::Avg),
         "string_agg" => Some(AggFn::StringAgg),
+        "array_agg" => Some(AggFn::ArrayAgg),
         _ => None,
     }
 }
@@ -1471,6 +1494,19 @@ pub(crate) fn agg_return_type(
         // `string_agg(text, text)` always returns text; `bind_aggregate` calls
         // this directly for the two-argument form's return type.
         AggFn::StringAgg => Ok(PgType::Text),
+        // `array_agg(x)` returns the array over the argument type. PostgreSQL
+        // also has the `anyarray` overload, which stacks arrays into a
+        // higher-dimensional one; this build's arrays are strictly 1-D (see
+        // `crabgresql_types::array`), so an array argument — and any element
+        // type with no array type in this build, such as a user enum — is the
+        // same honest `0A000` the `ARRAY[…]` constructor gives.
+        AggFn::ArrayAgg => match crabgresql_types::array::array_oid_for_elem(input_ty.oid()) {
+            Some(_) => Ok(PgType::Array(input_ty.oid())),
+            None => Err(BindError::feature_not_supported(format!(
+                "could not find array type for data type {}",
+                crate::expr::type_label(input_ty, scope.catalog().as_ref())
+            ))),
+        },
     }
 }
 

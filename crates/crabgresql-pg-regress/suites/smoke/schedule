@@ -95,3 +95,4 @@ test: pg_operator
 test: pg_aggregate
 test: pg_ts
 test: pg_conversion
+test: array_agg

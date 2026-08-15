@@ -1119,7 +1119,15 @@ fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
     // rather than read. That is also why the converse is not asserted: an
     // aggregate added there and missing here would not fail this test, and the
     // smoke suite is where the two are exercised together.
-    for aggregate in ["count", "min", "max", "sum", "avg", "string_agg"] {
+    for aggregate in [
+        "count",
+        "min",
+        "max",
+        "sum",
+        "avg",
+        "string_agg",
+        "array_agg",
+    ] {
         assert!(names.contains(aggregate), "{aggregate} is not described");
     }
 

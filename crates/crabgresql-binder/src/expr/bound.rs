@@ -353,12 +353,15 @@ pub enum BoundExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundAggregate {
     pub func: AggFn,
-    /// Whether duplicate non-NULL input values are eliminated per group before
-    /// accumulation.
+    /// Whether duplicate input values are eliminated per group. Every aggregate
+    /// but `array_agg` eliminates them as the rows stream past and never sees a
+    /// NULL to begin with; `array_agg` dedups at finalize, because PostgreSQL's
+    /// DISTINCT sort makes the element *order* observable there.
     pub distinct: bool,
     /// Evaluated per source row; empty = `COUNT(*)`. The first argument is the
-    /// value (a NULL there skips the row); `string_agg` carries the delimiter
-    /// as a second argument.
+    /// value (a NULL there skips the row for every aggregate but `array_agg` —
+    /// see [`AggFn::skips_null_input`]); `string_agg` carries the delimiter as a
+    /// second argument.
     pub args: Vec<BoundExpr>,
     pub input_ty: PgType,
     pub ret: PgType,

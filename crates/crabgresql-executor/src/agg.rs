@@ -4,8 +4,9 @@
 //! `count` is `bigint` and never NULL (0 over an empty group); `min`/`max` keep
 //! the argument type; `sum` widens small integers to `bigint` and `bigint` to
 //! `numeric`; `avg` of any exact type is `numeric` and of floats is `float8`.
-//! Every aggregate but `count` ignores NULL inputs and yields NULL over an empty
-//! (or all-NULL) group.
+//! Every aggregate but `count` yields NULL over an empty group, and all but
+//! `array_agg` (which collects NULLs as NULL elements) ignore a NULL input, so
+//! an all-NULL group is NULL for them too.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -273,6 +274,20 @@ enum AggState {
     /// `string_agg(value, delimiter)` → `text`: the running concatenation, or
     /// `None` until the first non-null value (an empty group finalizes to NULL).
     StringAgg { cur: Option<String> },
+    /// `array_agg(value)` → `value[]`: the group's values in arrival order,
+    /// NULLs included. `None` until the first row, which is what distinguishes
+    /// the empty group (NULL) from a group of one NULL (`{NULL}`).
+    ///
+    /// `distinct` is carried rather than applied per row because PostgreSQL
+    /// implements a DISTINCT aggregate as a sort followed by an adjacent-dup
+    /// collapse — and for this aggregate the resulting *order* is observable.
+    /// See [`Accumulator::finalize`].
+    ArrayAgg {
+        elem: PgType,
+        collation: u32,
+        distinct: bool,
+        elems: Option<Vec<Value>>,
+    },
 }
 
 // A group-by group holds one accumulator per aggregate, and a query like
@@ -317,6 +332,12 @@ impl Accumulator {
                 },
             },
             AggFn::StringAgg => AggState::StringAgg { cur: None },
+            AggFn::ArrayAgg => AggState::ArrayAgg {
+                elem: agg.input_ty,
+                collation: agg.collation,
+                distinct: agg.distinct,
+                elems: None,
+            },
         };
         Accumulator { state }
     }
@@ -442,6 +463,12 @@ impl Accumulator {
                     }
                 }
             }
+            // NULL reaches here for this aggregate alone (see
+            // `AggFn::skips_null_input`) and is appended like any other value.
+            // DISTINCT is not applied yet — `finalize` sorts and collapses.
+            AggState::ArrayAgg { elems, .. } => {
+                elems.get_or_insert_with(Vec::new).push(values[0].clone());
+            }
         }
         // A register sum is exactly `Numeric::from_i128` of itself — `from_i128`
         // fixes `dscale` at 0 and `normalize` leaves one canonical form per value
@@ -494,14 +521,63 @@ impl Accumulator {
                 }
             }
             AggState::StringAgg { cur } => cur.clone().map(Value::Text).unwrap_or(Value::Null),
+            AggState::ArrayAgg {
+                elem,
+                collation,
+                distinct,
+                elems,
+            } => match elems {
+                None => Value::Null,
+                Some(elems) => {
+                    let mut elems = elems.clone();
+                    if *distinct {
+                        // PostgreSQL runs a DISTINCT aggregate through a sort and
+                        // collapses adjacent equals, so `array_agg(DISTINCT x)`
+                        // comes out ascending with NULLs last — an *observable*
+                        // order, which is why the hashed `DistinctValues` (which
+                        // keeps arrival order) is not used for this aggregate.
+                        elems.sort_by(|a, b| compare_element(*elem, a, b, *collation));
+                        elems.dedup_by(|a, b| {
+                            compare_element(*elem, a, b, *collation) == Ordering::Equal
+                        });
+                    }
+                    Value::Array { elem: *elem, elems }
+                }
+            },
         })
     }
 }
 
+/// Order two array elements the way `array_agg(DISTINCT …)` needs them:
+/// ascending, NULLs last — PostgreSQL's default `ORDER BY` for the implicit
+/// sort behind a DISTINCT aggregate.
+///
+/// The NULL placement is spelled out here rather than borrowed because
+/// `crate::node::sort::compare_rows` reads it off a `SortKey`, and this sort
+/// has no `SortKey` to read. The value comparison is the same
+/// `compare_values_collated` that one uses, so the two cannot order *values*
+/// differently.
+fn compare_element(ty: PgType, a: &Value, b: &Value, collation: u32) -> Ordering {
+    match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => crate::eval::compare_values_collated(ty, a, b, collation),
+    }
+}
+
+/// Whether this aggregate wants a [`DistinctValues`] set built for it — true for
+/// every `DISTINCT` aggregate but `array_agg`, which dedups by sorting at
+/// finalize instead (see [`Accumulator::finalize`]). Asked by the aggregate node
+/// so the rule lives next to the accumulator that depends on it.
+pub fn wants_distinct_set(agg: &BoundAggregate) -> bool {
+    agg.distinct && agg.func != AggFn::ArrayAgg
+}
+
 /// Fold one input row into `acc`, applying the rules every aggregate shares:
-/// `count(*)` (no argument expression) counts the row unconditionally, every
-/// other aggregate skips a row whose first argument is NULL, and a `DISTINCT`
-/// aggregate skips a value `seen` already holds.
+/// `count(*)` (no argument expression) counts the row unconditionally, a strict
+/// aggregate ([`AggFn::skips_null_input`]) skips a row whose first argument is
+/// NULL, and a `DISTINCT` aggregate skips a value `seen` already holds.
 ///
 /// `values` must already hold `agg.args.len()` evaluated arguments. Shared by the
 /// grouped and windowed drivers so the two cannot drift on NULL handling; the
@@ -517,9 +593,12 @@ pub fn feed(
         acc.count_row();
         return Ok(());
     }
-    if matches!(values[0], Value::Null) {
+    if matches!(values[0], Value::Null) && agg.func.skips_null_input() {
         return Ok(());
     }
+    // `seen` is `None` for `array_agg` even under DISTINCT (see
+    // `wants_distinct_set`), which is also what keeps a NULL — the one value
+    // `DistinctValues` has no encoding for — from ever reaching it.
     if !seen.is_none_or(|seen| seen.insert(&values[0])) {
         return Ok(());
     }
