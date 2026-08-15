@@ -20,9 +20,9 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
-    extension, foreign, index, inherits, language, namespace, opclass, policy, prepared, proc,
-    progress, publication, relviews, replication, rewrite, sequence, settings, statistic,
-    statistic_ext, timezone, trigger, types,
+    extension, foreign, index, inherits, language, misc_empty, namespace, opclass, policy,
+    prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
+    statistic, statistic_ext, timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -217,6 +217,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         types::pg_enum_rows,
     ),
     rel(
+        "pg_event_trigger",
+        3466,
+        PgCatalog,
+        misc_empty::pg_event_trigger_schema,
+        no_rows,
+    ),
+    rel(
         "pg_extension",
         3079,
         PgCatalog,
@@ -287,6 +294,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         language::pg_language_rows,
     ),
     rel(
+        "pg_largeobject",
+        2613,
+        PgCatalog,
+        misc_empty::pg_largeobject_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_largeobject_metadata",
+        2995,
+        PgCatalog,
+        misc_empty::pg_largeobject_metadata_schema,
+        no_rows,
+    ),
+    rel(
         "pg_matviews",
         12038,
         PgCatalog,
@@ -350,6 +371,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         prepared::pg_prepared_statements_rows,
     ),
     rel(
+        "pg_prepared_xacts",
+        12090,
+        PgCatalog,
+        misc_empty::pg_prepared_xacts_schema,
+        no_rows,
+    ),
+    rel(
         "pg_proc",
         1255,
         PgCatalog,
@@ -382,6 +410,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         12068,
         PgCatalog,
         publication::pg_publication_tables_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_range",
+        3541,
+        PgCatalog,
+        misc_empty::pg_range_schema,
         no_rows,
     ),
     rel(
@@ -649,6 +684,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         timezone::pg_timezone_names_schema,
         timezone::pg_timezone_names_rows,
+    ),
+    rel(
+        "pg_transform",
+        3576,
+        PgCatalog,
+        misc_empty::pg_transform_schema,
+        no_rows,
     ),
     rel(
         "pg_trigger",
