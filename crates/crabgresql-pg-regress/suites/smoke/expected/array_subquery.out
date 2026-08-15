@@ -66,7 +66,7 @@ SELECT k, array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k) 
  3 | {}
 (3 rows)
 
--- an aggregate over the array a correlated subquery builds
+-- consuming the array a correlated subquery builds
 SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k), ',') AS joined
   FROM array_sub_o o ORDER BY k;
  k | joined 

@@ -309,9 +309,7 @@ pub enum BoundExpr {
     /// cardinality limit: zero rows give the *empty* array, not NULL.
     ArraySubquery {
         subplan: Subplan,
-        /// The single output column's type — the array's element type.
         elem: PgType,
-        /// `PgType::Array(elem)`.
         ty: PgType,
     },
     /// `[NOT] EXISTS (SELECT …)`: folds (in `resolve_subqueries`) to a bool

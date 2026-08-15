@@ -389,11 +389,10 @@ fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, Bi
 /// there is no cardinality limit, and zero rows give the *empty* array, not
 /// NULL.
 ///
-/// The element type is that single column's, so the result type is
-/// `PgType::Array(elem)` — the same rule [`bind_array_ctor`] applies, including
-/// its refusal when this build has no array type for the element. That refusal
-/// is what rejects an array-typed column: PG answers `ARRAY(SELECT ARRAY[…])`
-/// with a two-dimensional array, which this build has no representation for.
+/// The element-type rule is [`bind_array_ctor`]'s, refusal included — and that
+/// refusal is what rejects an array-typed column: PG answers
+/// `ARRAY(SELECT ARRAY[…])` with a two-dimensional array, which this build has
+/// no representation for.
 pub(crate) fn bind_array_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, BindError> {
     let (plan, columns) = bind_subquery_plan(query, scope)?;
     let [col] = columns.as_slice() else {

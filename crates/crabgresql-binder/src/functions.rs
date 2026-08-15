@@ -3399,14 +3399,11 @@ fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
 /// constructor: as an **unqualified, unquoted** keyword — the same rule
 /// [`special_form`] applies to `COALESCE`/`NULLIF`, and for the same reason.
 ///
-/// The check is on the name's *shape* rather than on its last part (what
-/// [`function_name`] returns), because a qualified spelling is otherwise
-/// indistinguishable: `pg_catalog.array(SELECT 1)` starts as the keyword arm and
-/// only the qualifier's presence separates it from the bare form.
-///
-/// The parser now refuses to attach that qualifier at all, so this is the second
-/// gate, not the only one. It stays exact anyway: a binder that recognizes its
-/// own grammar by the whole name owes nothing to how far away the first gate is.
+/// The shape, not the last part (what [`function_name`] returns): only the
+/// qualifier's presence separates `pg_catalog.array(SELECT 1)` from the bare
+/// form. The parser refuses to attach that qualifier at all, so this is the
+/// second gate — kept exact so the binder recognizes its own grammar without
+/// depending on the first.
 fn array_keyword(name: &ast::ObjectName) -> bool {
     let [part] = name.0.as_slice() else {
         return false;
@@ -3522,13 +3519,10 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         )));
     };
     // `ARRAY(SELECT …)` is grammar, not a call: the parser spells it as a
-    // function named `array` whose argument list *is* a query, a shape nothing
-    // else produces (a user's `array(1)` arrives as a positional list). It is
-    // dispatched before the window/aggregate paths because none of their
-    // decorations are grammatical here.
-    //
-    // `array_keyword` and not `name`: the parser flattens `pg_catalog.array(…)`
-    // into a node this cannot otherwise tell apart, and PG has no such function.
+    // function whose argument list *is* a query, a shape nothing else produces
+    // (a user's `array(1)` arrives as a positional list). Dispatched before the
+    // window and aggregate paths because none of their decorations are
+    // grammatical here.
     if array_keyword(&func.name)
         && let ast::FunctionArguments::Subquery(query) = &func.args
     {

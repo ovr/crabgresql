@@ -1979,14 +1979,12 @@ impl<'a> Parser<'a> {
                 return parser_err!("expected function expression", root.span().start);
             };
 
-            // A query where the argument list should be is not a call at all:
-            // it is the `ARRAY(SELECT …)` constructor, which `parse_prefix`
-            // builds when it meets the bare ARRAY keyword. Grammar, not a
-            // function — so it cannot take a schema qualifier, and flattening
-            // it here would forge `pg_catalog.array(SELECT 1)` into a node
-            // indistinguishable from the keyword. PostgreSQL has no `array`
-            // function in any schema and reports a syntax error at the query
-            // that follows; refuse it here for the same reason.
+            // A query for an argument list is the `ARRAY(SELECT …)` constructor
+            // `parse_prefix` builds from the bare keyword — grammar, not a
+            // function, so it takes no qualifier. Flattening would forge
+            // `pg_catalog.array(SELECT 1)` into a node indistinguishable from
+            // the keyword; PostgreSQL, having no `array` function in any schema,
+            // reports a syntax error at the query instead.
             if let FunctionArguments::Subquery(query) = &func.args {
                 return parser_err!(
                     "the ARRAY(SELECT …) constructor cannot be schema-qualified",
@@ -17976,16 +17974,12 @@ mod tests {
         .is_err());
     }
 
-    /// `ARRAY(SELECT …)` is grammar rather than a call, so it takes no schema
-    /// qualifier — PostgreSQL has no `array` function in any schema and reports
-    /// a syntax error at the query inside.
-    ///
-    /// Without the guard the qualifier is silently absorbed: `parse_prefix`
-    /// builds the constructor for the bare keyword after the dot, and
-    /// `build_compound_expr` then flattens it into a `Function` named
+    /// Without the guard a qualifier is silently absorbed: `parse_prefix` builds
+    /// the constructor for the bare keyword after the dot, and
+    /// `build_compound_expr` flattens it into a `Function` named
     /// `pg_catalog.array` that nothing downstream can tell from the real thing.
-    /// The bare spelling must keep parsing, and a qualified *call* — one with an
-    /// ordinary argument list — must still flatten as it always did.
+    /// The two accepted spellings are pinned alongside, since a guard that also
+    /// rejected them would pass a refusal-only test.
     #[test]
     fn parse_array_subquery_rejects_a_schema_qualifier() {
         let dialects = all_dialects();

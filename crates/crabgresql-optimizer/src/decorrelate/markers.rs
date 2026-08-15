@@ -10,14 +10,13 @@ use crabgresql_binder::{BoundExpr, Subplan, SubplanId};
 
 /// The subplan `expr` carries, if it is a marker.
 ///
-/// This is the walk's notion of "marker", not the rule's notion of "rewritable":
-/// `ArraySubquery` is listed so that `rewrite_marker_bodies` descends into an
-/// `ARRAY(SELECT …)` body and optimizes the correlated subqueries *inside* it,
-/// but neither rewrite can act on the marker itself — both match on the variants
-/// they cover, and an array-valued subquery is one of neither shape. It collects
-/// every row into one value, so no join arm reproduces it: a semi/anti join
-/// filters outer rows, and the grouped left join of ② stands in for a single
-/// aggregate, which this is not.
+/// The walk's notion of "marker", not the rule's notion of "rewritable".
+/// `ArraySubquery` is here so `rewrite_marker_bodies` descends into an
+/// `ARRAY(SELECT …)` body and optimizes the correlated subqueries *inside* it;
+/// neither rewrite can act on the marker itself, both matching on the variants
+/// they cover. Nor could one: an array collects every row into a single value,
+/// where a semi/anti join filters outer rows and ②'s grouped left join stands in
+/// for a lone aggregate.
 pub(super) fn subplan_of(expr: &BoundExpr) -> Option<&Subplan> {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }

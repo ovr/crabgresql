@@ -30,7 +30,7 @@ INSERT INTO array_sub_o VALUES (1), (2), (3);
 INSERT INTO array_sub_i VALUES (7, 1), (8, 1), (9, 2);
 SELECT k, array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k) AS owned
   FROM array_sub_o o ORDER BY k;
--- an aggregate over the array a correlated subquery builds
+-- consuming the array a correlated subquery builds
 SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k), ',') AS joined
   FROM array_sub_o o ORDER BY k;
 -- a correlated subquery *inside* the array's body: the decorrelation rule

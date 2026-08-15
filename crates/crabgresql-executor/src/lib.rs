@@ -1402,16 +1402,13 @@ fn scalar_subquery_value(
     }
 }
 
-/// The array an `ARRAY(SELECT …)` folds to from its materialized `rows`: every
-/// row's single column becomes one element, in the order the subplan produced
-/// them, coerced to `elem` for the same reason [`scalar_subquery_value`] coerces
-/// (a set-op or promoted column can arrive narrower than the type the array was
-/// bound against).
+/// The array an `ARRAY(SELECT …)` folds to from its materialized `rows`.
 ///
-/// No row count is an error here, and none of them means NULL: zero rows give
-/// the empty array `{}`. That is the one semantic that separates this from a
-/// scalar subquery, and getting it wrong is invisible until a query asks
-/// `array_to_string(array(…), ',')` of an empty set and gets NULL instead of ''.
+/// The coercion is there for the reason [`scalar_subquery_value`] coerces: a
+/// set-op or promoted column can arrive narrower than the type the array was
+/// bound against. No row count is an error, and none means NULL — zero rows
+/// give `{}`, a divergence invisible until `array_to_string(array(…), ',')` of
+/// an empty set returns NULL instead of `''`.
 fn array_subquery_value(
     rows: Vec<Tuple>,
     elem: PgType,
@@ -4821,9 +4818,8 @@ mod tests {
 
     #[test]
     fn array_subquery_collects_rows_in_subplan_order() {
-        // The elements arrive in the order the subplan yields them, so the inner
-        // ORDER BY is what decides the array — not the order the UNION arms are
-        // written in.
+        // Both spellings of "the subplan decides": arms written 2, 1 stay 2, 1,
+        // and an inner ORDER BY reorders what the VALUES list fixed.
         let (columns, rows) = run_rows(
             "SELECT array(SELECT 2 UNION ALL SELECT 1), array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n)",
         );
@@ -4845,8 +4841,8 @@ mod tests {
 
     #[test]
     fn array_subquery_of_no_rows_is_the_empty_array_not_null() {
-        // The one place this differs from a scalar subquery. `array_to_string`
-        // over it must be the empty string, never NULL.
+        // The one place this differs from a scalar subquery, checked through
+        // `array_to_string` too, where a NULL would surface as a NULL row.
         let (_c, rows) = run_rows(
             "SELECT array(SELECT 1 WHERE false), array_to_string(array(SELECT 1 WHERE false), ',')",
         );

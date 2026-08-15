@@ -16,9 +16,6 @@ fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `ARRAY(SELECT …)` reaches the binder as a *function* named `array` whose
-/// arguments are a query — a shape only this grammar produces — and binds to
-/// the array marker with the column's type as the element type.
 #[test]
 fn array_subquery_binds_with_the_column_element_type() -> anyhow::Result<()> {
     let ValuesPlan { rows, .. } = bound_values("SELECT array(SELECT big FROM t)")?;
@@ -41,7 +38,6 @@ fn array_subquery_multiple_columns_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Uppercase, and with the space PG's grammar tolerates: still the keyword.
 #[test]
 fn array_subquery_keyword_is_case_and_space_insensitive() -> anyhow::Result<()> {
     let ValuesPlan { rows, .. } = bound_values("SELECT ARRAY (SELECT id FROM t)")?;
