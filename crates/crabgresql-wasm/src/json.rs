@@ -18,14 +18,24 @@ pub struct StatementResult {
     pub command: String,
 }
 
+/// A value that is already a complete JSON document.
+///
+/// A newtype rather than a bare `String` because the difference decides how it
+/// is written out: a `String` would be quoted and escaped, which is how a
+/// notice ends up as a JSON document *inside* a JSON string that only the
+/// caller who knows to `JSON.parse` it twice can read.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Json(pub String);
+
 /// Everything one `exec` produced.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ExecOutput {
     pub results: Vec<StatementResult>,
-    /// NOTICE/WARNING text raised along the way, in the order the server sent
-    /// it. Kept separate from the results because a notice belongs to the
-    /// session, not to any one row set.
-    pub notices: Vec<String>,
+    /// NOTICE/WARNING conditions raised along the way, in the order the server
+    /// sent them, each with the same fields an error has. Kept separate from
+    /// the results because a notice belongs to the session, not to any one row
+    /// set.
+    pub notices: Vec<Json>,
 }
 
 impl ExecOutput {
@@ -42,7 +52,9 @@ impl ExecOutput {
             if i > 0 {
                 out.push(',');
             }
-            write_string(&mut out, notice);
+            // Verbatim: it is already an object, not a string that happens to
+            // contain one.
+            out.push_str(&notice.0);
         }
         out.push_str("]}");
         out
@@ -81,9 +93,9 @@ impl StatementResult {
     }
 }
 
-/// A server error, rendered as JSON so the embedder can branch on the SQLSTATE
-/// rather than on message text.
-pub fn error_to_json(fields: &ErrorFields) -> String {
+/// A server error or notice, rendered as JSON so the embedder can branch on the
+/// SQLSTATE rather than on message text.
+pub fn error_to_json(fields: &ErrorFields) -> Json {
     let field = |key: u8| {
         fields
             .fields
@@ -108,7 +120,7 @@ pub fn error_to_json(fields: &ErrorFields) -> String {
         }
     }
     out.push('}');
-    out
+    Json(out)
 }
 
 /// Append `value` as a JSON string literal.
@@ -168,11 +180,11 @@ mod tests {
                 rows: vec![vec![Some("back\\slash\nline\u{1}".to_string())]],
                 command: "SELECT 1".to_string(),
             }],
-            notices: vec!["tab\there".to_string()],
+            notices: vec![],
         };
         assert_eq!(
             output.to_json(),
-            r#"{"results":[{"columns":["quote\""],"rows":[["back\\slash\nline\u0001"]],"command":"SELECT 1"}],"notices":["tab\there"]}"#
+            r#"{"results":[{"columns":["quote\""],"rows":[["back\\slash\nline\u0001"]],"command":"SELECT 1"}],"notices":[]}"#
         );
     }
 
@@ -194,12 +206,29 @@ mod tests {
         );
     }
 
+    /// A notice is embedded as an object. Rendering it as a string would make
+    /// the caller `JSON.parse` twice, and only the caller who knew to.
+    #[test]
+    fn a_notice_is_an_object_not_a_string() {
+        let output = ExecOutput {
+            results: vec![],
+            notices: vec![error_to_json(&ErrorFields::notice(
+                "00000",
+                "table \"t\" does not exist, skipping",
+            ))],
+        };
+        assert_eq!(
+            output.to_json(),
+            r#"{"results":[],"notices":[{"sqlstate":"00000","message":"table \"t\" does not exist, skipping","detail":null,"hint":null,"position":null,"severity":"NOTICE"}]}"#
+        );
+    }
+
     #[test]
     fn an_error_reports_its_sqlstate_and_absent_fields_as_null() {
         let fields =
             ErrorFields::error("42P01", "relation \"t\" does not exist").with_hint("check");
         assert_eq!(
-            error_to_json(&fields),
+            error_to_json(&fields).0,
             r#"{"sqlstate":"42P01","message":"relation \"t\" does not exist","detail":null,"hint":"check","position":null,"severity":"ERROR"}"#
         );
     }

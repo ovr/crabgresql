@@ -40,7 +40,7 @@ function run() {
     const { results, notices } = db.query(sql.value);
     for (const result of results) out.append(renderResult(result));
     for (const notice of notices) {
-      out.append(element('div', JSON.parse(notice).message, 'tag'));
+      out.append(element('div', `${notice.severity}: ${notice.message}`, 'tag'));
     }
     out.append(
       element(

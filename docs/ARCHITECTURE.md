@@ -940,7 +940,8 @@ component boundary is not where the API design belongs.
 
 | Native | wasm | Why |
 |---|---|---|
-| TCP listener, session per connection | one embedded session | no sockets in WASI 0.2 |
+| TCP listener, session per connection | one embedded session, one open data directory | no sockets in WASI 0.2; a second engine on one directory is a second WAL on one log, so the component refuses it |
+| `COPY … FROM STDIN` | refused (`57014`) | the data would arrive on a second channel there is no second thread to wait on — a wait here stops the tab for good |
 | Background flush worker (`FlushWorker`) | flush at `VACUUM`/checkpoint | no threads; the spawn is compiled out (`target_family = "wasm"`) rather than left to fail |
 | `std::os::unix::fs::FileExt` (`pread`/`pwrite`) | seek + read/write in `crabgresql-wal::fsutil` | std exposes WASI's positional I/O only behind the unstable `wasi_ext`; sound because the target is single-threaded |
 | errno table for "cannot fsync a directory" | its own WASI-numbered table | WASI numbers errnos alphabetically from scratch: unix's `EBADF` (9) is WASI's `EBADMSG` |
@@ -955,7 +956,10 @@ write-at-offset, truncate-the-partial-record, publish-by-rename pattern. Its
 Node filesystem refuses `mutate-directory`, which wasi-libc requests on every
 read-write open. The tree is in RAM, so a database lives as long as the page
 does; that module is also the single seam where an OPFS-backed implementation
-would go.
+would go. Because a missed mapping is not an error to jco — it silently falls
+back to the shim, and the component would then write its data directory into one
+filesystem and read it from another — `js/transpile.mjs` fails the build if the
+generated module imports anything but our host.
 
 ## 8. Decisions made
 

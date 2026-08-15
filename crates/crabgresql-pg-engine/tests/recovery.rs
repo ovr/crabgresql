@@ -148,7 +148,7 @@ fn replaying_the_same_wal_twice_is_idempotent() -> anyhow::Result<()> {
     let (engine, tm) = open(dir.path())?;
     let table = engine.open_table("t")?;
     assert_eq!(visible_ids(&tm, &*table).len(), 50);
-    engine.checkpoint(Xid::FIRST_NORMAL)?;
+    engine.checkpoint_at(Xid::FIRST_NORMAL)?;
 
     let mut reg = RmgrRegistry::new();
     let wal = Arc::new(Wal::open(dir.path())?);
@@ -211,7 +211,7 @@ fn a_page_spanning_batch_replays_to_the_same_tids() -> anyhow::Result<()> {
     // Checkpointing advances the pages' pd_lsn; `Lsn::INVALID` then replays the
     // whole WAL over them anyway, ignoring the redo point that checkpoint just
     // published. The LSN gate has to make that a no-op.
-    engine.checkpoint(Xid::FIRST_NORMAL)?;
+    engine.checkpoint_at(Xid::FIRST_NORMAL)?;
     drop(engine);
     let (engine2, tm2) = open_from(dir.path(), crabgresql_wal::Lsn::INVALID)?;
     let table2 = engine2.open_table("t")?;
@@ -406,7 +406,7 @@ fn a_corrupt_data_page_is_rejected_by_any_replay_that_reads_it() -> anyhow::Resu
         let table = seed_three(&engine, &tm)?;
         let _ = table;
         // Flush the rows to disk so the page carries a checksum we can break.
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
     }
     // The first (and only) user table is relfilenode 1.
     corrupt_page_byte(dir.path(), RelFileNode(1), 0)?;
@@ -447,7 +447,7 @@ fn checkpoint_then_more_writes_then_crash_recovers_all() -> anyhow::Result<()> {
         insert(&*table, &ctx, 2, "b");
         tm.commit(x)?;
         // Make rows 1,2 durable on their pages.
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
         // Post-checkpoint committed writes live only in the WAL until replay.
         let y = tm.allocate_xid();
         let ctx = tm.context(y, CommandId::FIRST);
@@ -1413,7 +1413,7 @@ fn a_commit_below_the_redo_point_survives_a_bounded_replay() -> anyhow::Result<(
         // point: the commit and abort records now sit below redo, and the
         // checkpoint is what makes their CLOG bits durable.
         redo = wal.redo_point()?;
-        engine.checkpoint(Xid(aborted.0 + 1))?;
+        engine.checkpoint_at(Xid(aborted.0 + 1))?;
     }
 
     // Destroy the WAL prefix below redo, so a replay that tried to read those
@@ -1529,7 +1529,7 @@ fn a_checkpoint_does_not_bound_replay_over_an_unresolved_truncate() -> anyhow::R
         let x = tm.allocate_xid();
         table.truncate(&tm.context(x, CommandId::FIRST))?;
         tm.commit(x)?;
-        engine.checkpoint(tm.snapshot().xmax)?;
+        engine.checkpoint_at(tm.snapshot().xmax)?;
 
         let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
         assert_eq!(
@@ -1784,7 +1784,7 @@ fn a_corrupt_chunk_page_is_rejected_rather_than_silently_short() -> anyhow::Resu
         table.insert(vec![Value::Int4(1), big_text(50_000)], &txn)?;
         tm.commit(xid)?;
         // Flush so the chunk page carries a checksum we can break.
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
     }
     // The heap is relfilenode 1, so the chunk store is 2.
     corrupt_page_byte(dir.path(), RelFileNode(2), 0)?;
@@ -1829,7 +1829,7 @@ fn table_with_a_corrupt_chunk_page(
         tm.commit(xid)?;
         // Flush so the chunk page carries a checksum, and so the bounded replay
         // below never reads it.
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
     }
     // The heap is relfilenode 1, so the chunk store is 2.
     corrupt_page_byte(dir, RelFileNode(2), 0)?;
@@ -1926,7 +1926,7 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
                 constraint: None,
             },
         )?;
-        engine.checkpoint(Xid::FIRST_NORMAL)?;
+        engine.checkpoint_at(Xid::FIRST_NORMAL)?;
     }
     // The heap is 1 and the chunk store — created by the wide insert, before the
     // index — is 2, so the index is 3. Corrupt the chunk store.
@@ -1992,7 +1992,7 @@ fn an_unbounded_checkpoint_retires_nothing() -> anyhow::Result<()> {
     let before = crabgresql_wal::segment_numbers(dir.path())?;
     assert!(before.len() > 2, "segments to retire: {before:?}");
 
-    engine.checkpoint(Xid::FIRST_NORMAL)?;
+    engine.checkpoint_at(Xid::FIRST_NORMAL)?;
 
     let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
     assert_eq!(
@@ -2070,7 +2070,7 @@ fn concurrent_checkpoints_never_publish_below_what_was_retired() -> anyhow::Resu
                         )
                         .end;
                     wal.flush(end)?;
-                    engine.checkpoint(Xid::FIRST_NORMAL)?;
+                    engine.checkpoint_at(Xid::FIRST_NORMAL)?;
                     control_names_a_present_segment(path)?;
                 }
                 Ok(())

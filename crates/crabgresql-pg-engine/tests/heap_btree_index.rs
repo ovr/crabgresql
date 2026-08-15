@@ -598,7 +598,7 @@ fn a_bounded_replay_after_a_checkpoint_keeps_every_split_reachable() -> anyhow::
                         // itself durable, so nothing here can name a byte past
                         // the end of the on-disk log.
                         let point = wal.redo_point()?;
-                        engine.checkpoint(next_xid)?;
+                        engine.checkpoint_at(next_xid)?;
                         redo.fetch_max(point.0, Ordering::SeqCst);
                     }
                     Ok(())

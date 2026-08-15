@@ -41,6 +41,11 @@ class Pollable {
     this.#deadlineMs = deadlineMs;
   }
 
+  /** When this becomes ready, as an epoch millisecond. */
+  deadline() {
+    return this.#deadlineMs;
+  }
+
   ready() {
     return Date.now() >= this.#deadlineMs;
   }
@@ -122,13 +127,18 @@ export const poll = {
     for (let i = 0; i < pollables.length; i++) {
       if (pollables[i].ready()) ready.push(i);
     }
-    if (ready.length === 0) {
-      // Nothing is ready and nothing can become ready without the guest
-      // returning first, so wait for the earliest deadline.
-      pollables[0].block();
-      return new Uint32Array([0]);
+    if (ready.length > 0) return new Uint32Array(ready);
+    // WASI says `poll` returns only once something is ready, and nothing here
+    // can become ready without the guest returning first — so wait out the
+    // *earliest* deadline. Waiting on the first pollable instead would sleep
+    // for the longest timer in the list whenever it happened to be first.
+    if (pollables.length === 0) return new Uint32Array(0);
+    let earliest = 0;
+    for (let i = 1; i < pollables.length; i++) {
+      if (pollables[i].deadline() < pollables[earliest].deadline()) earliest = i;
     }
-    return new Uint32Array(ready);
+    pollables[earliest].block();
+    return new Uint32Array([earliest]);
   },
 };
 
@@ -536,11 +546,22 @@ class Descriptor {
 }
 
 /** The filesystem every `Descriptor` in this module is a view into. */
-let root = newDirectory();
+const root = newDirectory();
 
-/** Throw away the contents and start over — one database per page, per reset. */
+/**
+ * Throw away the contents and start over — one database per page, per reset.
+ *
+ * Empties the root **in place** rather than rebinding it: the guest asks for
+ * preopens once, at startup, and holds that descriptor for the life of the
+ * instance. A fresh root would be invisible to it, and the next query would
+ * quietly go on using the old database.
+ *
+ * Descriptors already open on *files* keep working, on nodes now detached from
+ * the tree — so close any `Database` first, or its next write lands somewhere
+ * nothing can read.
+ */
 export function resetFilesystem() {
-  root = newDirectory();
+  root.entries.clear();
 }
 
 export const types = {

@@ -31,9 +31,13 @@ export class SqlError extends Error {
 /**
  * Open a database at `dataDir`, creating and recovering it as the native server
  * would.
+ *
+ * Throws if the host's filesystem refuses the path, or if that directory is
+ * already open — two engines over one data directory is two WALs appending to
+ * one log. Close the first (`db.close()`) before opening it again.
  */
 export function open(dataDir = '/pgdata') {
-  return new Database(new engine.Connection(dataDir));
+  return new Database(engine.Connection.open(dataDir));
 }
 
 export class Database {
@@ -48,7 +52,9 @@ export class Database {
    *
    * Returns `{results, notices}`, where each result is
    * `{columns, rows, command}` — `rows` being arrays of strings in the same
-   * text encoding the wire protocol uses, with `null` for SQL NULL.
+   * text encoding the wire protocol uses, with `null` for SQL NULL. Each notice
+   * is an object shaped like a `SqlError`: `{sqlstate, message, detail, hint,
+   * position, severity}`.
    */
   query(sql) {
     let json;
@@ -76,12 +82,18 @@ export class Database {
     );
   }
 
-  /** Flush everything to the data directory. */
+  /**
+   * Take an online checkpoint: dirty pages, the WAL and the commit log all
+   * reach the data directory, and the database keeps running.
+   */
   checkpoint() {
     this.#connection.checkpoint();
   }
 
-  /** End the session. The data directory stays where it is. */
+  /**
+   * End the session, releasing the data directory so it can be opened again.
+   * The directory stays where it is, marked cleanly shut down.
+   */
   close() {
     this.#connection[Symbol.dispose]();
   }

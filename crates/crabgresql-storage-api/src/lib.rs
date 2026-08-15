@@ -1415,6 +1415,21 @@ pub trait TableEngine: Send + Sync {
     /// server exit. The default is a no-op (engines with no durable state).
     fn shutdown(&self) {}
 
+    /// Make everything written so far durable and bound what a crash would have
+    /// to replay — an *online* checkpoint.
+    ///
+    /// Deliberately not [`TableEngine::shutdown`], which the caller may only
+    /// invoke once, on the way out: that one claims a clean shutdown, and a
+    /// cluster that claims one while still writing skips the unlogged-relation
+    /// reset it needs after the next crash. This may be called at any time, any
+    /// number of times, and leaves the engine running.
+    ///
+    /// Does *not* empty an access method's RAM write buffer — that is
+    /// [`TableEngine::vacuum_table`]'s job, per relation.
+    ///
+    /// The default is a no-op (engines with no durable state).
+    fn checkpoint(&self) {}
+
     /// Block until the engine is willing to accept more writes.
     ///
     /// An engine that acknowledges writes into RAM before making them durable

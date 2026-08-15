@@ -13,7 +13,7 @@
 mod json;
 mod session;
 
-pub use json::{ExecOutput, StatementResult, error_to_json};
+pub use json::{ExecOutput, Json, StatementResult, error_to_json};
 pub use session::{Database, EmbedError};
 
 #[cfg(target_family = "wasm")]

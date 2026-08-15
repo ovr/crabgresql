@@ -25,17 +25,13 @@ struct Connection {
 }
 
 impl exports::crabgresql::db::engine::GuestConnection for Connection {
-    fn new(data_dir: String) -> Self {
-        // The constructor cannot fail in WIT, so a directory that will not open
-        // has to become a trap. It is a genuine embedding error — the host
-        // handed us a filesystem we cannot use — and there is no session to
-        // report it through.
-        match Database::open(Path::new(&data_dir)) {
-            Ok(db) => Connection {
+    fn open(data_dir: String) -> Result<exports::crabgresql::db::engine::Connection, String> {
+        let db = Database::open(Path::new(&data_dir)).map_err(|error| error.to_string())?;
+        Ok(exports::crabgresql::db::engine::Connection::new(
+            Connection {
                 db: RefCell::new(db),
             },
-            Err(error) => panic!("{error}"),
-        }
+        ))
     }
 
     fn exec(&self, sql: String) -> Result<String, String> {
@@ -51,7 +47,7 @@ impl exports::crabgresql::db::engine::GuestConnection for Connection {
     }
 
     fn checkpoint(&self) -> Result<(), String> {
-        self.db.borrow().flush();
+        self.db.borrow().checkpoint();
         Ok(())
     }
 }

@@ -7,12 +7,14 @@
 //! [`tokio::io::duplex`]: pgwire messages in one end, pgwire messages out the
 //! other, with the same [`handle_session`] the TCP server runs.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crabgresql_pg_wire::{
-    BackendMessage, BackendReader, FrontendMessage, FrontendWriter, ProtocolError, StartupRequest,
+    BackendMessage, BackendReader, ErrorFields, FrontendMessage, FrontendWriter, ProtocolError,
+    StartupRequest, sqlstate,
 };
 use crabgresql_server::{GlobalCatalog, handle_session, open_pg_engine};
 use crabgresql_storage_api::TableEngine;
@@ -38,6 +40,23 @@ pub struct Database {
     engine: Arc<dyn TableEngine>,
     to_server: FrontendWriter<WriteHalf<DuplexStream>>,
     from_server: BackendReader<ReadHalf<DuplexStream>>,
+    /// The claim released on drop; see [`OPEN_DATA_DIRS`].
+    data_dir: PathBuf,
+}
+
+thread_local! {
+    /// Data directories with a live [`Database`] on them.
+    ///
+    /// Two engines over one directory is two WALs appending to one log and two
+    /// buffer pools writing the same pages — silent corruption, and the kind
+    /// that only shows up at the next recovery. `thread_local` rather than a
+    /// global lock because the target has one thread; on the host it makes the
+    /// guard per-test, which is what test isolation wants anyway.
+    ///
+    /// Matched on the path as written: two spellings of one directory
+    /// (`/pgdata` and `/pgdata/.`) are still two claims. Catching that needs a
+    /// canonicalization the in-memory WASI host does not offer.
+    static OPEN_DATA_DIRS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
 }
 
 /// What went wrong at the level of the embedding, not of a statement: a
@@ -46,6 +65,8 @@ pub struct Database {
 pub enum EmbedError {
     /// The data directory could not be opened or recovered.
     Open(std::io::Error),
+    /// Something else already has this data directory open.
+    AlreadyOpen(PathBuf),
     /// The session ended, or spoke something that is not the protocol. Once
     /// this happens the `Database` is unusable — the session task is gone.
     Protocol(String),
@@ -55,6 +76,11 @@ impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmbedError::Open(error) => write!(f, "could not open the data directory: {error}"),
+            EmbedError::AlreadyOpen(dir) => write!(
+                f,
+                "{} is already open in this instance; close that database first",
+                dir.display()
+            ),
             EmbedError::Protocol(message) => write!(f, "the session ended: {message}"),
         }
     }
@@ -70,6 +96,18 @@ impl Database {
     /// Open (creating it if needed) and recover `data_dir`, then start a
     /// session on it.
     pub fn open(data_dir: &Path) -> Result<Database, EmbedError> {
+        // Claimed before anything is opened, so a refused second open has not
+        // touched the directory the first one is using.
+        let claimed = OPEN_DATA_DIRS.with(|open| open.borrow_mut().insert(data_dir.to_path_buf()));
+        if !claimed {
+            return Err(EmbedError::AlreadyOpen(data_dir.to_path_buf()));
+        }
+        // From here on every early return has to release the claim, which is
+        // what this closure is for: `?` would leak it.
+        Database::open_claimed(data_dir).inspect_err(|_| release_claim(data_dir))
+    }
+
+    fn open_claimed(data_dir: &Path) -> Result<Database, EmbedError> {
         std::fs::create_dir_all(data_dir).map_err(EmbedError::Open)?;
         let (engine, txnmgr) = open_pg_engine(data_dir).map_err(EmbedError::Open)?;
 
@@ -102,6 +140,7 @@ impl Database {
             engine,
             to_server: FrontendWriter::new(client_write),
             from_server: BackendReader::new(client_read),
+            data_dir: data_dir.to_path_buf(),
         };
         db.start_up()?;
         Ok(db)
@@ -190,7 +229,35 @@ impl Database {
                         output.notices.push(error_to_json(&fields));
                     }
                     BackendMessage::ErrorResponse(fields) => {
-                        failure.get_or_insert_with(|| error_to_json(&fields));
+                        failure.get_or_insert_with(|| error_to_json(&fields).0);
+                    }
+                    // The server is now waiting for CopyData; nobody is going to
+                    // send any, because `exec` takes SQL and nothing else. Say so
+                    // in the protocol instead of waiting back: both halves run on
+                    // one thread, so a wait here is not slow — it is the tab
+                    // frozen for good. The server answers a CopyFail with an
+                    // ErrorResponse and a ReadyForQuery, which the arms above
+                    // then turn into the returned error.
+                    BackendMessage::CopyInResponse(_) => {
+                        to_server.write_message(&FrontendMessage::CopyFail(
+                            "COPY FROM STDIN is not available through the embedded API".to_string(),
+                        ));
+                        to_server.flush().await?;
+                    }
+                    // Unreachable today — nothing in the server emits it — and
+                    // deliberately loud rather than silent: whoever lands COPY TO
+                    // STDOUT gets an error here instead of a command tag with
+                    // every row quietly dropped. The CopyData frames that follow
+                    // fall through to the catch-all, which is how the stream
+                    // still gets drained to ReadyForQuery.
+                    BackendMessage::CopyOutResponse(_) => {
+                        failure.get_or_insert_with(|| {
+                            error_to_json(&ErrorFields::error(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "COPY TO STDOUT is not available through the embedded API",
+                            ))
+                            .0
+                        });
                     }
                     // Whatever transaction state the session is left in is
                     // carried by the session itself, not reported per call.
@@ -205,13 +272,29 @@ impl Database {
         })
     }
 
-    /// Flush everything to the data directory and record a clean shutdown, so
-    /// the directory is complete for anyone who copies it out of the host's
-    /// filesystem. There is no background flush worker on wasm, so this is the
-    /// only thing that makes buffered rows reachable without a replay.
-    pub fn flush(&self) {
-        self.engine.shutdown();
+    /// Take an online checkpoint: dirty pages, the WAL and the commit log all
+    /// reach the data directory, and a crash after it replays only from here.
+    ///
+    /// Not a shutdown. [`TableEngine::shutdown`] would also mark the control
+    /// file clean, which is a claim a still-running database has no business
+    /// making — the next startup would skip resetting unlogged relations after a
+    /// crash it was told did not happen.
+    pub fn checkpoint(&self) {
+        self.engine.checkpoint();
     }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Mark the control file clean on the way out: this *is* the shutdown, so
+        // unlogged relations survive a reopen of the same directory.
+        self.engine.shutdown();
+        release_claim(&self.data_dir);
+    }
+}
+
+fn release_claim(data_dir: &Path) {
+    OPEN_DATA_DIRS.with(|open| open.borrow_mut().remove(data_dir));
 }
 
 /// A text-format value as the wire carries it.
@@ -232,6 +315,114 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = Database::open(&dir.path().join("pgdata")).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok((dir, db))
+    }
+
+    /// `COPY … FROM STDIN` leaves the server waiting for data nobody will send.
+    /// On one thread that is not slowness, it is a permanent stop — so the test
+    /// runs the call on its own thread and fails on the timeout rather than
+    /// taking the whole suite down with it.
+    #[test]
+    fn copy_from_stdin_fails_instead_of_hanging() -> anyhow::Result<()> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<String> {
+                let (_dir, mut db) = open_temp()?;
+                db.exec("create table t(a int)")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let error = db
+                    .exec("copy t from stdin")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .expect_err("COPY FROM STDIN must be refused");
+                Ok(error)
+            })();
+            let _ = sender.send(result);
+        });
+
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|_| anyhow::anyhow!("COPY FROM STDIN hung instead of erroring"))??;
+        assert!(
+            error.contains("COPY FROM STDIN is not available"),
+            "unexpected error: {error}"
+        );
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("worker panicked"))?;
+        Ok(())
+    }
+
+    /// The session survives the refusal, so a console user who typed `COPY` by
+    /// accident still has a database.
+    #[test]
+    fn a_refused_copy_leaves_the_session_usable() -> anyhow::Result<()> {
+        let (_dir, mut db) = open_temp()?;
+        db.exec("create table t(a int)")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        db.exec("copy t from stdin")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect_err("COPY FROM STDIN must be refused");
+        let output = db
+            .exec("insert into t values (1)")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(output.results[0].command, "INSERT 0 1");
+        Ok(())
+    }
+
+    /// Two engines over one directory is two WALs on one log. The second open
+    /// has to be refused — and refusing it must not disturb the first.
+    #[test]
+    fn a_second_open_of_the_same_directory_is_refused() -> anyhow::Result<()> {
+        let (dir, mut first) = open_temp()?;
+        let path = dir.path().join("pgdata");
+
+        match Database::open(&path) {
+            Ok(_) => panic!("the second open must be refused"),
+            Err(error) => assert!(
+                matches!(error, EmbedError::AlreadyOpen(_)),
+                "unexpected error: {error}"
+            ),
+        }
+
+        first
+            .exec("select 1")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Dropping the first releases the claim, so the directory can be opened
+        // again — otherwise a page that reset its database could never reopen.
+        drop(first);
+        let mut second = Database::open(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        second
+            .exec("select 1")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// A checkpoint is not a shutdown: the database keeps working after one,
+    /// and taking two in a row is legal.
+    #[test]
+    fn checkpointing_leaves_the_database_running() -> anyhow::Result<()> {
+        let (_dir, mut db) = open_temp()?;
+        db.exec("create table t(a int); insert into t values (1)")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        db.checkpoint();
+        db.checkpoint();
+        let output = db
+            .exec("insert into t values (2)")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(output.results[0].command, "INSERT 0 1");
+        let rows = db
+            .exec("select count(*) from t")
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(rows.results[0].rows, vec![vec![Some("2".to_string())]]);
+        Ok(())
     }
 
     #[test]
