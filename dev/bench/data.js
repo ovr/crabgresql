@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786795631667,
+  "lastUpdate": 1786795633472,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -22782,6 +22782,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q21",
             "value": 4.595,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.018,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b8b4d9c2164c68e86690b31f983940a3686fb3b4",
+          "message": "feat(catalog): serve 27 more pg_catalog relations, pg_get_indexdef (#239)\n\nA relation missing from CATALOG_RELATIONS fails the whole client query,\nnot just the part that reads it: psql's \\d joins seven relations that a\nlive PostgreSQL also answers with zero rows on this database. This adds\nthem, so those queries start working from files that are honestly empty.\n\nEmpty stubs (the feature does not exist here, and PostgreSQL returns no\nrows for it either): pg_trigger, pg_policy/pg_policies, the four\npg_publication*, the four pg_statistic_ext*, the five foreign-data\nrelations, pg_matviews and pg_rules. Constant rows: pg_extension and the\ntwo pg_available_extension* views, plus the plpgsql row in\npg_description that \\dx reads its Description from. Projections over the\nexisting snapshot: pg_tables, pg_views, pg_indexes, pg_sequences. And\npg_rewrite, whose _RETURN row carries each view's deparsed body.\n\npg_index and pg_constraint were narrower than PostgreSQL's by ten\ncolumns each; \\d broke on indisclustered and conperiod before any new\nrelation was reached, so both are widened to 18.4's shape.\n\nThree functions come with them, because psql calls functions where the\nviews of the same name would not do: pg_get_indexdef (rendered by\nstorage_api::index_definition, shared with pg_indexes.indexdef so the\ntwo cannot drift), pg_partition_ancestors, and pg_available_extensions().\nA qualified function name in FROM position now resolves by the rule a\nscalar call already used, instead of being rejected as a relation name.\n\nCatalogSource gains a view's deparsed definition and a sequence's\nlast_value; the deparse happens in the server, which has the binder,\nrather than in this crate, which deliberately does not depend on it.",
+          "timestamp": "2026-08-15T11:18:11Z",
+          "tree_id": "c83643f5949a8f2b237ad740bfbf29184ff8bf59",
+          "url": "https://github.com/ovr/crabgresql/commit/b8b4d9c2164c68e86690b31f983940a3686fb3b4"
+        },
+        "date": 1786795633352,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.407,
+            "unit": "s",
+            "extra": "dataset load — heap, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.197,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.018,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.067,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 0.052,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.08,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.055,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.117,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.076,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.113,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.062,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.011,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.042,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.02,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.046,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.088,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.008,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.063,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.252,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 0.052,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 1.871,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 4.585,
             "unit": "s",
             "extra": "best of the timed runs — heap, 86805 rows"
           },
