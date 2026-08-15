@@ -3395,6 +3395,29 @@ fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
     }
 }
 
+/// `ARRAY` written the one way PG's grammar admits the array-subquery
+/// constructor: as an **unqualified, unquoted** keyword — the same rule
+/// [`special_form`] applies to `COALESCE`/`NULLIF`, and for the same reason.
+///
+/// The check is on the name's *shape*, not on its last part, because the parser
+/// flattens a qualified call: `pg_catalog.array(SELECT 1)` starts as the keyword
+/// arm, then `build_compound_expr` glues the qualifier back on, leaving a node
+/// nothing but the part count distinguishes from the bare spelling. PG has no
+/// `array` function in any schema, so it parses that as an ordinary call and
+/// stops at the query inside — a *syntax* error we deliberately do not
+/// reproduce: PG names the token its grammar choked on, which is not derivable
+/// from the AST we parsed (`pg_catalog.array(VALUES (1))` reports `"("`, not
+/// `"VALUES"`). Falling through to `positional_args` refuses it as an
+/// unsupported argument form instead, which at least does not invent a cursor.
+fn array_keyword(name: &ast::ObjectName) -> bool {
+    let [part] = name.0.as_slice() else {
+        return false;
+    };
+    part.as_ident()
+        .filter(|id| id.quote_style.is_none())
+        .is_some_and(|id| crate::expr::normalize_ident(id) == "array")
+}
+
 /// Bind `COALESCE(…)` / `NULLIF(…)`.
 ///
 /// PG's grammar gives these a bare expression list and nothing else, so every
@@ -3502,10 +3525,13 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     };
     // `ARRAY(SELECT …)` is grammar, not a call: the parser spells it as a
     // function named `array` whose argument list *is* a query, a shape nothing
-    // else produces (a user's `array(1)` arrives as a positional list). So the
-    // interception is exact, and it happens before the window/aggregate paths
-    // because none of their decorations are grammatical here.
-    if name == "array"
+    // else produces (a user's `array(1)` arrives as a positional list). It is
+    // dispatched before the window/aggregate paths because none of their
+    // decorations are grammatical here.
+    //
+    // `array_keyword` and not `name`: the parser flattens `pg_catalog.array(…)`
+    // into a node this cannot otherwise tell apart, and PG has no such function.
+    if array_keyword(&func.name)
         && let ast::FunctionArguments::Subquery(query) = &func.args
     {
         return crate::expr::bind_array_subquery(query, scope);

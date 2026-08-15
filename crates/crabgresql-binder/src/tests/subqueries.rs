@@ -41,6 +41,35 @@ fn array_subquery_multiple_columns_errors() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Uppercase, and with the space PG's grammar tolerates: still the keyword.
+#[test]
+fn array_subquery_keyword_is_case_and_space_insensitive() -> anyhow::Result<()> {
+    let ValuesPlan { rows, .. } = bound_values("SELECT ARRAY (SELECT id FROM t)")?;
+    assert!(matches!(rows[0][0], BoundExpr::ArraySubquery { .. }));
+    Ok(())
+}
+
+/// The constructor is a *keyword*, so only the unqualified spelling is it. The
+/// parser flattens `pg_catalog.array(SELECT 1)` into the same node shape, and PG
+/// — which has no `array` function in any schema — refuses that outright; it
+/// must not silently build an array here.
+///
+/// PG's own answer is `42601 syntax error at or near "SELECT"`. We refuse with
+/// the generic unsupported-argument-form error instead, because the token PG
+/// names comes from its grammar rather than from the AST we parsed: the same
+/// call with `VALUES` reports `"("`, not `"VALUES"`. What this test pins is that
+/// the statement *fails*, not the wording.
+#[test]
+fn a_qualified_array_call_is_not_the_array_constructor() -> anyhow::Result<()> {
+    let e = bind_err("SELECT pg_catalog.array(SELECT id FROM t)")?;
+    assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        e.message,
+        "subquery function arguments are not supported yet"
+    );
+    Ok(())
+}
+
 /// PG answers an array-typed column with a two-dimensional array; this build has
 /// no representation for one, so it refuses exactly the way `ARRAY[[1,2]]` does.
 #[test]
