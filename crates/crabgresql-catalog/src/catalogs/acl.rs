@@ -8,10 +8,11 @@
 //! [`crate::cols::ACLITEM_ARRAY`] documents: there is no `aclitem` type here,
 //! and no row ever renders one.
 //!
-//! Three of these are *not* empty on a stock PostgreSQL. Where that is so the
-//! docstring says which rows are missing and why, because "empty because
-//! reality is empty" and "empty because the subsystem is missing" are different
-//! claims and only the first stays true as the build grows.
+//! Two of these are *not* empty on a stock PostgreSQL — `pg_init_privs` and
+//! `pg_shdescription`. Where that is so the docstring says which rows are
+//! missing and why, because "empty because reality is empty" and "empty because
+//! the subsystem is missing" are different claims and only the first stays true
+//! as the build grows.
 
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, oid};
