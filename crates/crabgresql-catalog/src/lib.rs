@@ -392,7 +392,6 @@ pub struct PgTsParserRow {
     pub prslextype: ProcRef,
 }
 
-/// See [`PgTsParserRow`].
 pub struct PgTsTemplateRow {
     pub oid: u32,
     pub tmplname: &'static str,
@@ -410,7 +409,6 @@ pub struct PgTsDictRow {
     pub dictinitoption: &'static str,
 }
 
-/// See [`PgTsParserRow`].
 pub struct PgTsConfigRow {
     pub oid: u32,
     pub cfgname: &'static str,

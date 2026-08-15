@@ -241,8 +241,6 @@ mod tests {
              proargmodes => '{i,o}', proargnames => '{arg,found}', \
              probin => '$libdir/thing' }]",
         );
-        // The type names resolve like any other reference; the modes and names
-        // travel as written.
         assert!(emitted.contains("proallargtypes: &[2275, 16]"));
         assert!(emitted.contains("proargmodes: &[\"i\", \"o\"]"));
         assert!(emitted.contains("proargnames: &[\"arg\", \"found\"]"));

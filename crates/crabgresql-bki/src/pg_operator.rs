@@ -30,9 +30,7 @@ pub fn signature(e: &Entry) -> (String, String) {
     (name, operands)
 }
 
-/// Phase one: every operator, under the `name(left,right)` spelling
-/// `pg_amop.amopopr`, `pg_aggregate.aggsortop` and this catalog's own
-/// `oprcom`/`oprnegate` reference it by.
+/// Phase one, under the spelling every reference uses.
 pub fn define_symbols(entries: &[Entry], symbols: &mut SymbolTable) {
     for e in entries {
         let (name, operands) = signature(e);
@@ -50,8 +48,8 @@ pub fn define_symbols(entries: &[Entry], symbols: &mut SymbolTable) {
 /// `crabgresql-catalog`'s `catalogs::operator`.
 pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
     let type_oid = |name: &str| match name {
-        // A prefix operator writes its absent operand as the type `0`, which
-        // is PostgreSQL's "no such object" and stays 0 in the column.
+        // The `0` a prefix operator writes for its absent operand is already
+        // PostgreSQL's "no such object", so it needs no resolving.
         "0" => 0,
         name => symbols.resolve_name(Type, name).unwrap_or_else(|| {
             panic!("pg_operator references type {name:?}, which pg_type.dat lacks")
@@ -96,7 +94,6 @@ oprrest: {rest}, oprjoin: {join} }},",
     out
 }
 
-/// The OID a `oprcom`/`oprnegate` reference names, or 0 when there is none.
 fn operator_oid(symbols: &SymbolTable, reference: Option<&str>, of: &str, column: &str) -> u32 {
     let Some(reference) = reference else {
         return 0;
@@ -183,9 +180,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "names no pg_proc entry")]
     fn an_unresolvable_estimator_fails_the_build() {
-        // Before this, the row was emitted as `ProcRef { oid: 0, name:
-        // "nosuchsel" }` — a column naming a function and pointing at nothing,
-        // which no test and no reader would have questioned.
+        // The alternative is `ProcRef { oid: 0, name: "nosuchsel" }` — a column
+        // naming a function and pointing at nothing, which reads like an
+        // absent one and is not.
         emit_one(
             "[{ oid => '96', oprname => '=', oprleft => 'int4', oprright => 'int4', \
              oprresult => 'bool', oprcode => 'int4eq', oprrest => 'nosuchsel' }]",

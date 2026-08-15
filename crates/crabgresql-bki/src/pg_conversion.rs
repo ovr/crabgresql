@@ -26,8 +26,8 @@ fn encoding_name(symbol: &str) -> &str {
         .unwrap_or_else(|| panic!("pg_conversion: {symbol:?} is not a PG_<encoding> symbol"))
 }
 
-/// Emit `PG_CONVERSION_ROWS: &[PgConversionRow]` from `pg_conversion.dat`, in
-/// file order.
+/// Emit `PG_CONVERSION_ROWS` from `pg_conversion.dat`, in file order for the
+/// reason [`pg_amop::emit`](crate::pg_amop::emit) is.
 pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
     let mut out = String::new();
     out.push_str(

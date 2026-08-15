@@ -37,7 +37,6 @@ pub(crate) fn pg_amop_schema() -> TableSchema {
     )
 }
 
-/// The built-in strategy-to-operator mappings, generated from `pg_amop.dat`.
 pub(crate) fn pg_amop_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     PG_AMOP_ROWS
         .iter()
@@ -72,7 +71,6 @@ pub(crate) fn pg_amproc_schema() -> TableSchema {
     )
 }
 
-/// The built-in support functions, generated from `pg_amproc.dat`.
 pub(crate) fn pg_amproc_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     PG_AMPROC_ROWS
         .iter()

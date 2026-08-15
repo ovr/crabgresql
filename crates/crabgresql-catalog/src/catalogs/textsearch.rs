@@ -118,8 +118,6 @@ const STEMMED_TOKENS: [i32; 6] = [
     17, // hword
 ];
 
-/// The `pg_ts_dict` OID of the `simple` dictionary, which every configuration
-/// sends its non-word tokens to.
 fn simple_dict_oid() -> u32 {
     PG_TS_DICT_ROWS
         .iter()
@@ -226,7 +224,6 @@ pub(crate) fn pg_ts_dict_schema() -> TableSchema {
     )
 }
 
-/// `simple` from the `.dat`, then one `<language>_stem` per snowball language.
 pub(crate) fn pg_ts_dict_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let dict = |oid: u32, name: String, template: u32, option: Value| {
         vec![
@@ -285,8 +282,7 @@ pub(crate) fn pg_ts_config_schema() -> TableSchema {
     )
 }
 
-/// `simple` from the `.dat`, then one configuration per snowball language. All
-/// thirty use the `default` parser: snowball supplies dictionaries, not a
+/// All thirty use the `default` parser: snowball supplies dictionaries, not a
 /// parser.
 pub(crate) fn pg_ts_config_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let parser = default_parser_oid();
@@ -321,10 +317,9 @@ pub(crate) fn pg_ts_config_map_schema() -> TableSchema {
     )
 }
 
-/// The `simple` configuration's nineteen rows from the `.dat`, then nineteen
-/// more per snowball language: six word-shaped token types to the language's
-/// stemmer and thirteen to `simple`, which is what `snowball_create.sql`'s
-/// three `ADD MAPPING` statements add up to.
+/// Nineteen rows per configuration — six word-shaped token types to the
+/// language's stemmer and thirteen to `simple`, which is what
+/// `snowball_create.sql`'s three `ADD MAPPING` statements add up to.
 ///
 /// Every row has `mapseqno = 1`: no built-in configuration lists a second
 /// dictionary for a token.

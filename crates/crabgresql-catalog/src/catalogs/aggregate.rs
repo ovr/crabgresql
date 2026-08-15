@@ -57,7 +57,6 @@ pub(crate) fn pg_aggregate_schema() -> TableSchema {
     )
 }
 
-/// The built-in aggregates, generated from `pg_aggregate.dat`.
 pub(crate) fn pg_aggregate_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     PG_AGGREGATE_ROWS
         .iter()

@@ -21,7 +21,7 @@
 //! What must not go unstated is the direction that is *not* checkable: the
 //! resolver has no enumerable registry, so a test can assert that everything
 //! this server evaluates is described here, and cannot assert the converse.
-//! See `operators_this_server_evaluates_are_described` in the crate's tests.
+//! See `pg_operator_describes_upstreams_operators` in the crate's tests.
 
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
@@ -54,7 +54,6 @@ pub(crate) fn pg_operator_schema() -> TableSchema {
     )
 }
 
-/// The built-in operators, generated from `pg_operator.dat`.
 pub(crate) fn pg_operator_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     PG_OPERATOR_ROWS
         .iter()

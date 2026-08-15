@@ -27,7 +27,6 @@ use std::fmt::Write as _;
 use crate::dat::{Entry, get, oid_field, str_field};
 use crate::symbols::SymbolTable;
 
-/// Everything the five files emit, in one string per row array.
 pub struct Emitted {
     pub parsers: String,
     pub templates: String,
@@ -36,8 +35,7 @@ pub struct Emitted {
     pub config_map: String,
 }
 
-/// Emit all five row arrays. They are done together because the last three
-/// reference the first two by name.
+/// All five at once, because the last three reference the first two by name.
 pub fn emit(
     parsers: &[Entry],
     templates: &[Entry],
@@ -175,7 +173,6 @@ mod tests {
     use crate::pg_proc;
     use crate::symbols::SymbolKind::Type;
 
-    /// The five files' worth of entries, plus the functions they name.
     struct Fixture {
         parsers: Vec<Entry>,
         templates: Vec<Entry>,
@@ -251,16 +248,12 @@ mod tests {
             out.templates
                 .contains("tmplinit: ProcRef { oid: 3725, name: \"dsimple_init\" }")
         );
-        // The dictionary names its template and the configuration its parser,
-        // each resolved to the OID the other file assigns.
+        // Each cross-file reference resolves to the OID the other file assigns.
         assert!(out.dicts.contains("dicttemplate: 3727"));
         assert!(out.configs.contains("cfgparser: 3722"));
-        // A map row names both the configuration and the dictionary, and has
-        // no OID of its own.
         assert!(out.config_map.contains(
             "PgTsConfigMapRow { mapcfg: 3748, maptokentype: 1, mapseqno: 1, mapdict: 3765 }"
         ));
-        // `simple` takes no options, which the catalog stores as NULL.
         assert!(out.dicts.contains("dictinitoption: \"\""));
     }
 

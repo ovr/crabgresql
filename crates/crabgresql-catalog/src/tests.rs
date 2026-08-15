@@ -750,8 +750,6 @@ fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<(
             anyhow::bail!("conproc is not a regproc");
         };
         assert!(procs.contains(&proc.oid), "conproc {} dangles", proc.oid);
-        // A conversion is between two *different* encodings, and both are
-        // numbers the table knows.
         let (from, to) = (
             int_at(row, at(&schema, "conforencoding")),
             int_at(row, at(&schema, "contoencoding")),
@@ -767,7 +765,6 @@ fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<(
                 "encoding number {n} names nothing"
             );
         }
-        // Every built-in conversion is the default for its pair.
         assert_eq!(row[at(&schema, "condefault")], Value::Bool(true));
     }
 
@@ -789,7 +786,6 @@ fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<(
                 UTF8,
                 "{name} does not convert to UTF8"
             );
-            // ...and the other end is not UTF8, which the name also says.
             assert_ne!(int_at(row, at(&schema, "conforencoding")), UTF8);
             assert!(!source.is_empty());
             checked += 1;
@@ -849,8 +845,7 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
     assert_eq!(config_rows.len(), 30);
     assert_eq!(map_rows.len(), 570);
 
-    // Every reference lands. The parser's five functions and the templates'
-    // two come from `pg_proc`, including the snowball pair, which no `.dat`
+    // The snowball pair among them is the one `pg_proc` half no `.dat`
     // defines and `catalogs::proc` spells out.
     let procs: std::collections::HashSet<u32> = proc_rows
         .iter()
@@ -963,8 +958,8 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
         assert_eq!(oid_at(row, at(&config_schema, "cfgparser")), parser_oid);
     }
 
-    // Every configuration maps the same nineteen token types, one dictionary
-    // each, and the token set is the `simple` configuration's.
+    // The token set is not written out here either: it is whatever the
+    // `simple` configuration maps, which is where the `.dat` states it.
     let simple_config = config_rows
         .iter()
         .find(|r| name_at(r, at(&config_schema, "cfgname")) == "simple")
@@ -1051,8 +1046,6 @@ fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
         .iter()
         .map(|r| oid_at(r, at(&operator_schema, "oid")))
         .collect();
-    // `pg_proc`, indexed by OID, so a row's key can be checked against what
-    // that function says about itself.
     let procs: std::collections::HashMap<u32, (String, String)> = proc_rows
         .iter()
         .map(|r| {
@@ -1104,7 +1097,6 @@ fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
                 "{column} {oid} of {name} dangles"
             );
         }
-        // The state types, and the ordering operator min/max stand for.
         let transtype = oid_at(row, at(&schema, "aggtranstype"));
         assert!(types.contains(&transtype), "aggtranstype of {name} dangles");
         let mtranstype = oid_at(row, at(&schema, "aggmtranstype"));
@@ -1213,7 +1205,6 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
             let oid = oid_at(row, at(&schema, column));
             assert!(types.contains(&oid), "{column} {oid} dangles");
         }
-        // The commutator and negator are optional, and each is an operator.
         for column in ["oprcom", "oprnegate"] {
             let oid = oid_at(row, at(&schema, column));
             assert!(
@@ -1310,7 +1301,6 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
             "the row for {name}({left},{right})"
         );
     }
-    // A prefix operator, the shape with no left operand at all.
     assert_eq!(described("-", 0, INT4), Some((INT4, "int4um".to_string())));
     Ok(())
 }
@@ -1452,8 +1442,8 @@ fn pg_amop_and_pg_amproc_join_to_what_they_name() -> anyhow::Result<()> {
     assert_eq!(support(BTREE_INTEGER_OPS, 1).as_deref(), Some("btint4cmp"));
     assert_eq!(support(HASH_INTEGER_OPS, 1).as_deref(), Some("hashint4"));
 
-    // The five btree strategies of that family, each answered by a distinct
-    // operator. `pg_operator` is what will name them.
+    // The five btree strategies of that family are all present; the join
+    // that names their operators is in the smoke suite.
     let strategies: Vec<i16> = (1..=5)
         .filter(|n| {
             amop_rows.iter().any(|r| {

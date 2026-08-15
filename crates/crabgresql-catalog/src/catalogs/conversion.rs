@@ -42,8 +42,6 @@ pub(crate) fn pg_conversion_schema() -> TableSchema {
     )
 }
 
-/// The built-in conversions, generated from `pg_conversion.dat`.
-///
 /// The generated rows carry the encodings by name; the numbers the columns
 /// really store come from [`crabgresql_types::encoding`], which is the one
 /// place this build records PostgreSQL's numbering. A name that answers to no
