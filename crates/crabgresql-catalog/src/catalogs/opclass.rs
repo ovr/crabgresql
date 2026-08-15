@@ -13,7 +13,7 @@ use crabgresql_types::{PgType, Value};
 
 use crate::cols::*;
 use crate::oids::*;
-use crate::{PG_CAST_ROWS, PG_OPCLASS_ROWS, PG_OPFAMILY_ROWS, SystemCatalog};
+use crate::{PG_CAST_ROWS, PG_OPCLASS_ROWS, PG_OPFAMILY_ROWS, PG_TYPE_ROWS, SystemCatalog};
 
 /// `anyarray`, the `opcintype` of the one class every array type indexes under.
 const ANYARRAY_OID: u32 = 2277;
@@ -101,9 +101,11 @@ pub(crate) fn pg_opfamily_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
 /// are that rule's observable shape:
 ///
 /// 1. a default class whose `opcintype` is the type itself;
-/// 2. the polymorphic classes — an array type indexes under the `anyarray`
-///    class, an enum under the `anyenum` one, and neither has a class of its
-///    own to be found in tier 1;
+/// 2. the polymorphic classes, reached by the type's **`typcategory`** — `A`
+///    indexes under the `anyarray` class, `E` under the `anyenum` one. The
+///    category is what decides, not how the type is spelled here:
+///    `int2vector` is category `A` and has no class of its own, so
+///    PostgreSQL gives it `array_ops` even though it is not a `PgType::Array`.
 /// 3. a default class for a type this one is *binary-coercible* to, which
 ///    `pg_cast` already records as a `castmethod` of `b`.
 ///
@@ -119,11 +121,20 @@ pub(crate) fn default_opclass(am_oid: u32, ty: PgType) -> u32 {
             .map(|r| r.oid)
     };
     let polymorphic = match ty {
-        PgType::Array(_) => Some(ANYARRAY_OID),
-        // Every user-defined type this build reflects is an enum; see
+        // A user type has no `pg_type.dat` row to read a category from, and
+        // every one this build reflects is an enum; see
         // `catalogs::types::pg_type_user_rows`.
         PgType::User(_) => Some(ANYENUM_OID),
-        _ => None,
+        // `R`/`M` are deliberately absent rather than overlooked: there are no
+        // range or multirange types here, so no key can carry one.
+        _ => PG_TYPE_ROWS
+            .iter()
+            .find(|r| r.oid == ty.oid())
+            .and_then(|r| match r.typcategory {
+                "A" => Some(ANYARRAY_OID),
+                "E" => Some(ANYENUM_OID),
+                _ => None,
+            }),
     };
     let binary_coercible = || {
         PG_CAST_ROWS

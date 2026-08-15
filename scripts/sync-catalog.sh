@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Syncs PostgreSQL's system-catalog *data* files (src/include/catalog/*.dat)
 # into vendor/postgres/catalog/. These BKI data files seed pg_catalog's built-in
-# rows (pg_type, pg_proc, pg_cast, pg_namespace); crabgresql-bki codegens from
-# them at build time, and crabgresql-catalog includes what it emits.
+# rows (pg_type, pg_proc, pg_cast, pg_namespace, pg_opclass, pg_opfamily);
+# crabgresql-bki codegens from them at build time, and crabgresql-catalog
+# includes what it emits.
 #
 # Only the .dat DATA is vendored — never PostgreSQL source code or the Perl
 # Catalog.pm parser; see docs/ARCHITECTURE.md §7 and vendor/postgres/README.md.

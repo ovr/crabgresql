@@ -721,6 +721,7 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
 #[test]
 fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
     use crabgresql_storage_api::{IndexKey, IndexMethod};
+    use crabgresql_types::VectorKind;
 
     let key = |column: usize| IndexKey {
         column,
@@ -742,13 +743,15 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
             Column::new("v", PgType::Varchar),
             Column::new("a", PgType::Array(PgType::Int4.oid())),
             Column::new("m", PgType::User(16_500)),
+            Column::new("i2v", PgType::Vector(VectorKind::Int2)),
+            Column::new("ov", PgType::Vector(VectorKind::Oid)),
         ],
     ));
     relation.indexes = vec![
         index(
             "t_bt",
             IndexMethod::BTree,
-            vec![key(0), key(1), key(2), key(3)],
+            vec![key(0), key(1), key(2), key(3), key(4), key(5)],
         ),
         index("t_hash", IndexMethod::Hash, vec![key(0)]),
     ];
@@ -800,6 +803,19 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
     assert_eq!(
         name_of(&btree[3]),
         Some(Value::Text("enum_ops".to_string()))
+    );
+    // `int2vector` is one of those: PostgreSQL files it under `typcategory`
+    // `A`, so it indexes under the array class even though nothing about it is
+    // an array type here. `oidvector` does have a class of its own and never
+    // reaches the polymorphic tier — the pair is what separates "category A"
+    // from "spelled as an array".
+    assert_eq!(
+        name_of(&btree[4]),
+        Some(Value::Text("array_ops".to_string()))
+    );
+    assert_eq!(
+        name_of(&btree[5]),
+        Some(Value::Text("oidvector_ops".to_string()))
     );
     for (row, expected_am) in rows.iter().zip([403_u32, 405]) {
         for class in classes(row) {

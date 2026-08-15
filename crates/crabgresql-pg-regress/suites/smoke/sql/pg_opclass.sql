@@ -10,9 +10,15 @@
 -- inserted above them, which is a property of PostgreSQL rather than a
 -- regression. Generated with psql -q -a against PostgreSQL 18.4.
 --
-CREATE TABLE oc_t (i int, t text, v varchar(10));
+CREATE TABLE oc_t (i int, t text, v varchar(10), i2v int2vector, ov oidvector);
 CREATE INDEX oc_bt ON oc_t (i, t, v);
 CREATE INDEX oc_hash ON oc_t USING hash (i);
+-- Kept apart from oc_bt so the raw-OID comparison below stays over
+-- hand-assigned classes only: int2vector is typcategory A with no class of its
+-- own, so it indexes under array_ops, while oidvector has oidvector_ops and
+-- never reaches the polymorphic tier. Both of those are numbered by upstream's
+-- codegen, hence compared by name.
+CREATE INDEX oc_vec ON oc_t (i2v, ov);
 -- The hand-assigned classes, verbatim. opckeytype is 0 for all of them: a btree
 -- stores the indexed type itself.
 SELECT oid, opcname, opcintype::regtype, opcdefault, opckeytype
@@ -33,6 +39,12 @@ SELECT c.relname, a.amname, oc.opcname, f.opfname, oc.opcintype::regtype
   JOIN pg_opfamily f ON f.oid = oc.opcfamily
   JOIN pg_am a ON a.oid = oc.opcmethod
  WHERE c.relname LIKE 'oc\_%' ORDER BY c.relname;
+-- Both keys of the vector index, which the query above only shows the first of.
+SELECT k1.opcname AS int2vector_key, k2.opcname AS oidvector_key
+  FROM (SELECT indclass[0] AS c1, indclass[1] AS c2 FROM pg_index
+         WHERE indexrelid = 'oc_vec'::regclass) k
+  JOIN pg_opclass k1 ON k1.oid = k.c1
+  JOIN pg_opclass k2 ON k2.oid = k.c2;
 -- A class is chosen under the index's own access method: the same int column
 -- gets int4_ops under either method, but they are two different rows.
 SELECT count(DISTINCT oc.oid) AS distinct_classes, count(*) AS keys
