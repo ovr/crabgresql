@@ -2263,31 +2263,45 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
             _ => vec![None; *width],
         },
         PhysicalJoinExpr::Join { left, right, .. } => {
-            let mut names = join_column_names(left);
-            names.extend(join_column_names(right));
+            let mut names = emitted_column_names(left);
+            names.extend(emitted_column_names(right));
             names
         }
     }
 }
 
-/// The node label EXPLAIN prints for one binary join.
+/// [`join_column_names`] for a subtree seen from *above*, where only the row it
+/// emits is addressable. The two differ under a semi/anti join, which reads a
+/// concatenated row but emits its left half alone: taking its full name list
+/// would shift every name of the sibling to its right.
+fn emitted_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
+    let mut names = join_column_names(join);
+    names.resize(join.width(), None);
+    names
+}
+
+/// The node label EXPLAIN prints for one binary join: the algorithm, then the
+/// kind for every kind but the inner one — `Hash Left Join`, `Nested Loop Left
+/// Join`, `Hash Full Join`, `Hash Anti Join` (see
+/// `vendor/postgres/regress/expected/generated_virtual.out:1680`,
+/// `create_index.out:2256`, `equivclass.out:528`, `eager_aggregate.out:484`).
 ///
-/// PostgreSQL names the algorithm and, for the kinds where it matters, the
-/// semantics: `Hash Join` / `Nested Loop` for the pairing kinds, and
-/// `Hash Semi Join` / `Nested Loop Anti Join` and friends for the two that only
-/// test for a match. Left/right/full are *not* spelled out here, matching PG,
-/// which prints them as plain `Hash Join`/`Nested Loop` too.
+/// `Cross` prints as an inner join because by EXPLAIN time PostgreSQL no longer
+/// distinguishes the two — a cross join is an inner join whose condition is
+/// absent, which shows as a missing `Join Filter` rather than in the label.
 fn join_node_label(kind: JoinKind, hashed: bool) -> String {
-    let semantics = match kind {
+    let algorithm = if hashed { "Hash" } else { "Nested Loop" };
+    let kind = match kind {
+        JoinKind::Cross | JoinKind::Inner => {
+            return if hashed { "Hash Join" } else { "Nested Loop" }.to_string();
+        }
+        JoinKind::Left => "Left",
+        JoinKind::Right => "Right",
+        JoinKind::Full => "Full",
         JoinKind::Semi => "Semi",
         JoinKind::Anti => "Anti",
-        _ => return if hashed { "Hash Join" } else { "Nested Loop" }.to_string(),
     };
-    if hashed {
-        format!("Hash {semantics} Join")
-    } else {
-        format!("Nested Loop {semantics} Join")
-    }
+    format!("{algorithm} {kind} Join")
 }
 
 /// Render a join tree. `filter` is the plan-level `WHERE` residual that pushdown
@@ -2963,29 +2977,49 @@ mod tests {
     }
 
     #[test]
-    fn explain_names_the_semi_and_anti_kinds() {
+    fn explain_names_the_join_kind() {
         let hashed = "SELECT * FROM t a, t b WHERE a.id = b.id";
-        assert_eq!(
-            explain(&with_kind(hashed, JoinKind::Semi))[0],
-            "Hash Semi Join"
-        );
-        assert_eq!(
-            explain(&with_kind(hashed, JoinKind::Anti))[0],
-            "Hash Anti Join"
-        );
-
         let looped = "SELECT * FROM t a, t b WHERE a.big < b.big";
-        assert_eq!(
-            explain(&with_kind(looped, JoinKind::Semi))[0],
-            "Nested Loop Semi Join"
-        );
-        assert_eq!(
-            explain(&with_kind(looped, JoinKind::Anti))[0],
-            "Nested Loop Anti Join"
-        );
-        // The other kinds keep the algorithm-only labels PG prints for them.
+        // An inner join is the one kind PG leaves unnamed.
         assert_eq!(explain(&plan_sql(hashed))[0], "Hash Join");
         assert_eq!(explain(&plan_sql(looped))[0], "Nested Loop");
+
+        for (kind, hash_label, loop_label) in [
+            (JoinKind::Left, "Hash Left Join", "Nested Loop Left Join"),
+            (JoinKind::Right, "Hash Right Join", "Nested Loop Right Join"),
+            (JoinKind::Full, "Hash Full Join", "Nested Loop Full Join"),
+            (JoinKind::Semi, "Hash Semi Join", "Nested Loop Semi Join"),
+            (JoinKind::Anti, "Hash Anti Join", "Nested Loop Anti Join"),
+        ] {
+            assert_eq!(explain(&with_kind(hashed, kind))[0], hash_label);
+            assert_eq!(explain(&with_kind(looped, kind))[0], loop_label);
+        }
+    }
+
+    #[test]
+    fn column_names_of_a_tree_follow_the_emitted_widths() {
+        // A semi join child emits its left row alone, so it must contribute only
+        // that half's names: taking its full list would leave the parent naming
+        // its right-hand relation's columns one relation too late, and EXPLAIN
+        // would print a plausible wrong name rather than falling back to `$n`.
+        let mut plan = plan_sql("SELECT * FROM t a, t b, t c WHERE a.id = b.id AND b.big = c.big");
+        let PhysicalPlan::Join { source, .. } = &mut plan else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join { left, .. } = source else {
+            panic!("expected a Join node, not a leaf");
+        };
+        let PhysicalJoinExpr::Join { kind, .. } = left.as_mut() else {
+            panic!("expected a nested Join node");
+        };
+        *kind = JoinKind::Semi;
+
+        let names = join_column_names(source);
+        assert_eq!(names.len(), source.width());
+        // `t(id, big, name)` twice: the semi join's own right side is gone, so
+        // the third relation's columns start at the boundary rather than past it.
+        let one = ["id", "big", "name"].map(|n| Some(n.to_string()));
+        assert_eq!(names, [one.clone(), one].concat());
     }
 
     #[test]
@@ -4019,7 +4053,7 @@ mod tests {
         let lines = explain(&plan_sql(
             "SELECT * FROM t a LEFT JOIN t b ON a.id = b.id WHERE b.big IS NULL",
         ));
-        assert_eq!(lines[0], "Hash Join");
+        assert_eq!(lines[0], "Hash Left Join");
         assert_eq!(lines[1], "  Hash Cond: (id = id)");
         assert_eq!(lines[2], "  Filter: (big IS NULL)");
     }
