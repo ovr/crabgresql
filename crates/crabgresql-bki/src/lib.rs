@@ -272,9 +272,8 @@ fn am_oid(name: &str) -> u32 {
 /// `-` is the catalog's spelling of "no function", and it is the **only**
 /// source of a zero here: any other name that fails to resolve is a reference
 /// into a catalog this build claims to have generated, so it fails the build
-/// rather than emitting `ProcRef { oid: 0, name: "eqsel" }` — a row that names
-/// a function and points at nothing, which every reader would take at face
-/// value.
+/// rather than emitting `ProcRef { oid: 0, name: "eqsel" }`, which reads like
+/// an absent function and is not one.
 ///
 /// A name resolves to nothing in two ways, and neither is benign: `pg_proc.dat`
 /// does not define it, or it defines it twice and the bare name is ambiguous

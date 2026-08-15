@@ -935,8 +935,6 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
         let template = template_oids
             .get(&template)
             .unwrap_or_else(|| panic!("{name}'s template dangles"));
-        // `simple` is the `.dat`'s; everything else is a snowball stemmer, and
-        // says so both in its template and in its option string.
         if name == "simple" {
             assert_eq!(template, "simple");
             assert_eq!(row[at(&dict_schema, "dictinitoption")], Value::Null);
@@ -953,8 +951,6 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
         }
     }
     for row in &config_rows {
-        // All thirty use the default parser: snowball supplies dictionaries,
-        // not a parser.
         assert_eq!(oid_at(row, at(&config_schema, "cfgparser")), parser_oid);
     }
 
@@ -1078,9 +1074,8 @@ fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
         assert_eq!(kind, "a", "{name} is an aggregate here but not in pg_proc");
         names.insert(name.clone());
 
-        // The transition function is required — an aggregate with nothing to
-        // fold rows with is not an aggregate — and the other eight are
-        // optional, spelled 0 when absent.
+        // An aggregate with nothing to fold rows with is not one; the other
+        // eight support functions genuinely may be absent.
         for (column, required) in [
             ("aggtransfn", true),
             ("aggfinalfn", false),
@@ -1212,8 +1207,8 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
                 "{column} {oid} dangles"
             );
         }
-        // `oprcode` must resolve — an operator nothing evaluates is not an
-        // operator — while the two selectivity estimators may be absent.
+        // An operator nothing evaluates is not one; the two selectivity
+        // estimators are the pair upstream really does leave out.
         for (column, required) in [("oprcode", true), ("oprrest", false), ("oprjoin", false)] {
             let Value::Reg(ref proc) = row[at(&schema, column)] else {
                 anyhow::bail!("{column} is not a regproc");
@@ -1442,8 +1437,7 @@ fn pg_amop_and_pg_amproc_join_to_what_they_name() -> anyhow::Result<()> {
     assert_eq!(support(BTREE_INTEGER_OPS, 1).as_deref(), Some("btint4cmp"));
     assert_eq!(support(HASH_INTEGER_OPS, 1).as_deref(), Some("hashint4"));
 
-    // The five btree strategies of that family are all present; the join
-    // that names their operators is in the smoke suite.
+    // The join that names each strategy's operator is in the smoke suite.
     let strategies: Vec<i16> = (1..=5)
         .filter(|n| {
             amop_rows.iter().any(|r| {

@@ -75,9 +75,6 @@ const SNOWBALL: &[(&str, bool)] = &[
     ("yiddish", false),
 ];
 
-/// The `pg_ts_dict` OID of the `i`th snowball language, and the `pg_ts_config`
-/// OID one past it.
-///
 /// `initdb` allocates these from the running OID counter as it executes
 /// `snowball_create.sql`, so unlike everything generated from a `.dat` they
 /// cannot be derived from vendored data — they were probed from PostgreSQL
@@ -101,8 +98,6 @@ fn snowball_config_oid(i: usize) -> u32 {
     snowball_dict_oid(i) + 1
 }
 
-/// The token types every configuration maps, and which dictionary each goes to.
-///
 /// The nineteen numbers are the `default` parser's, taken from the `simple`
 /// configuration's own `pg_ts_config_map.dat` rows rather than invented; the
 /// split is `snowball_create.sql`'s, which sends the six word-shaped tokens to
@@ -183,9 +178,9 @@ pub(crate) fn pg_ts_template_schema() -> TableSchema {
     )
 }
 
-/// The four templates the `.dat` spells out, plus `snowball` — which `initdb`
-/// creates from SQL, and which the twenty-nine reconstructed dictionaries point
-/// at, so leaving it out would dangle every one of them.
+/// `snowball` is `initdb`'s rather than the `.dat`'s, and the twenty-nine
+/// reconstructed dictionaries point at it — leaving it out would dangle every
+/// one of them.
 pub(crate) fn pg_ts_template_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let snowball = vec![
         Value::Oid(SNOWBALL_TEMPLATE_OID),

@@ -173,7 +173,6 @@ mod tests {
              oprresult => 'bool', oprcode => 'int4eq', oprrest => 'eqsel' }]",
         );
         assert!(emitted.contains("oprrest: ProcRef { oid: 101, name: \"eqsel\" }"));
-        // `oprjoin` is absent, and absent is the only thing that reads as 0.
         assert!(emitted.contains("oprjoin: ProcRef { oid: 0, name: \"-\" }"));
     }
 
