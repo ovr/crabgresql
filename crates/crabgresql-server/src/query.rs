@@ -148,6 +148,16 @@ pub enum QueryResult {
     },
 }
 
+impl QueryResult {
+    /// Whether this statement *ended a transaction by rolling it back*: an
+    /// explicit `ROLLBACK`, or the `COMMIT` of a failed block, which PostgreSQL
+    /// also reports (and counts) as a rollback. Read off the command tag, which
+    /// is where that decision is already made and rendered for the client.
+    fn rolled_back(&self) -> bool {
+        matches!(self, QueryResult::Command { tag, .. } if tag == "ROLLBACK")
+    }
+}
+
 /// The CommandComplete tag family for a streamed result set. The row count is
 /// filled in once the rows are drained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,7 +698,23 @@ pub fn execute_statement(
     session: &mut Session,
     params: &BoundParams,
 ) -> Result<QueryResult, PgError> {
-    execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false)
+    let result =
+        execute_statement_with(engine, global_catalog, txnmgr, stmt, session, params, false);
+    // Where `pg_stat_database.xact_commit` is counted, and the only place — a
+    // statement that succeeded outside a block *is* a committed transaction,
+    // whatever it did, so DDL and utility statements count exactly like a
+    // `SELECT`. A statement inside a block counts nothing here; the block's
+    // COMMIT/ROLLBACK is itself a statement and counts once for the whole
+    // block. This wrapper and not [`execute_statement_with`], which `EXECUTE`
+    // and `DECLARE … CURSOR` re-enter to run the statement they name — counting
+    // there would count those twice.
+    //
+    // Failures are counted by `mark_transaction_failed` instead, which every
+    // error path reaches, including the ones that fail before execution.
+    if let Ok(result) = &result {
+        session.count_transaction(result.rolled_back());
+    }
+    result
 }
 
 /// [`execute_statement`], plus the one knob `DECLARE … CURSOR` needs.
@@ -905,7 +931,7 @@ pub(crate) fn execute_statement_with(
                 cascade,
                 if_exists,
                 ..
-            } => return execute_drop_table(&catalog, names, *cascade, *if_exists),
+            } => return execute_drop_table(&catalog, session, names, *cascade, *if_exists),
             ast::Statement::Drop {
                 object_type: ast::ObjectType::View,
                 names,
@@ -2153,7 +2179,9 @@ fn execute_analyze(
     let txn = build_txn(txnmgr, session, false);
     for (namespace, name) in &targets {
         match engine.analyze(namespace, name, &txn) {
-            Ok(()) => {}
+            // Stamped with the statement's clock, so `last_analyze` agrees with
+            // the `now()` every other statement in this block reports.
+            Ok(()) => session.stats.analyzed(namespace, name, session.stmt_start),
             // A bare ANALYZE walks every relation the engine lists, which
             // includes other sessions' temp tables; the engine reports those as
             // absent and they are simply skipped. A named target was already
@@ -2247,7 +2275,10 @@ fn execute_vacuum(
     let mut flushed = 0u64;
     for (namespace, name) in &targets {
         match engine.vacuum_table(namespace, name, oldest) {
-            Ok(rows) => flushed += rows,
+            Ok(rows) => {
+                flushed += rows;
+                session.stats.vacuumed(namespace, name, session.stmt_start);
+            }
             // A bare VACUUM walks every relation the engine lists, including other
             // sessions' temp tables, which it reports as absent. A named target was
             // resolved above, so it cannot land here.
@@ -2266,7 +2297,7 @@ fn execute_vacuum(
         let txn = build_txn(txnmgr, session, false);
         for (namespace, name) in &targets {
             match engine.analyze(namespace, name, &txn) {
-                Ok(()) => {}
+                Ok(()) => session.stats.analyzed(namespace, name, session.stmt_start),
                 Err(StorageError::TableNotFound(_)) if vacuum.table_name.is_none() => {}
                 Err(error) => {
                     finalize_statement(txnmgr, session, &txn, false, false, None)?;
@@ -7348,6 +7379,7 @@ fn collect_factor_relations(
 /// under RESTRICT and is dropped along with the target under CASCADE.
 fn execute_drop_table(
     catalog: &Arc<dyn TableEngine>,
+    session: &Session,
     names: &[ast::ObjectName],
     cascade: bool,
     if_exists: bool,
@@ -7488,6 +7520,17 @@ fn execute_drop_table(
                 .map(|(_, ns, n)| (ns.as_str(), n.as_str())),
         )
         .collect();
+    // A dropped relation's statistics go with it, as in PostgreSQL — otherwise
+    // a table recreated under the same name would inherit the dead one's
+    // counters. An unqualified drop may have hit this session's temp table
+    // rather than the `public` one, so both keys are cleared: at most one of
+    // them names anything.
+    for (namespace, name) in &dropped_tables {
+        session.stats.forget_relation(namespace, name);
+        if *namespace == "public" {
+            session.stats.forget_relation(&session.temp_schema, name);
+        }
+    }
     for seq in catalog.sequences() {
         let owned_by_dropped = seq.owned_by.as_deref().is_some_and(|owner| {
             dropped_tables

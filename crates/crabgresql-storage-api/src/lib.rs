@@ -17,10 +17,21 @@ use crabgresql_types::{PgType, Value};
 pub use crabgresql_txn as txn;
 
 pub mod arrow;
+pub mod pgstat;
 pub mod sort;
 
 mod stats;
 pub use stats::{ColStats, RelStats};
+
+/// What an engine's buffer pool reports about the blocks it served, as
+/// `pg_stat_database` counts them. See [`TableEngine::buffer_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BufferStats {
+    /// Blocks found resident.
+    pub hits: u64,
+    /// Blocks that had to be read from storage.
+    pub reads: u64,
+}
 
 /// The rows an index probe yields: `(tid, tuple)` per match, or the error that
 /// stopped the probe. Fallible because a value may live out of line, and a read
@@ -1498,6 +1509,20 @@ pub trait TableEngine: Send + Sync {
     /// "nothing can still see" means — it would be waiting for a condition its
     /// own waiting prevents.
     fn await_write_capacity(&self) {}
+
+    /// How this engine's buffer pool has answered the block requests it served,
+    /// for `pg_stat_database.blks_hit`/`blks_read`. `None` from an engine with
+    /// no pool to report — a relation held in RAM never reads a block, and
+    /// counting its accesses as hits would report a cache that is not there.
+    ///
+    /// Database-wide rather than per-relation because that is the whole of what
+    /// the pool knows: it counts pins, and a pin names a `RelFileNode`, not a
+    /// catalog relation. This build serves exactly one database, so the pool's
+    /// totals *are* that database's totals — which is why `pg_statio_*` is
+    /// empty while these two columns are live.
+    fn buffer_stats(&self) -> Option<BufferStats> {
+        None
+    }
 
     /// Remove a table and all its data from `namespace`. `TableNotFound` if it
     /// doesn't exist.

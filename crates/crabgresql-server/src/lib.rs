@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crabgresql_pg_engine::PgEngine;
 use crabgresql_storage_api::TableEngine;
+use crabgresql_storage_api::pgstat::PgStatCounters;
 use crabgresql_txn::{CommitSink, TransactionManager, TxnFinalize};
 use crabgresql_wal::Wal;
 use tokio::net::TcpListener;
@@ -86,14 +87,23 @@ pub async fn serve_with(
     copy_files: CopyFileAccess,
 ) -> std::io::Result<()> {
     let catalog = Arc::new(GlobalCatalog::with_copy_files(copy_files));
+    // The cumulative statistics counters (`pg_stat_database` and friends) live
+    // as long as the server does and are shared by every connection — one
+    // server, one set of counters, stamped `stats_reset` at startup because
+    // nothing here reads a statistics file back (see
+    // `crabgresql_storage_api::pgstat`).
+    let stats = Arc::new(PgStatCounters::new(crabgresql_types::tz::now_micros()));
     loop {
         let (socket, peer) = listener.accept().await?;
         let engine = engine.clone();
         let catalog = catalog.clone();
         let txnmgr = txnmgr.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             tracing::debug!(%peer, "connection opened");
-            if let Err(e) = connection::handle_connection(socket, engine, catalog, txnmgr).await {
+            if let Err(e) =
+                connection::handle_connection(socket, engine, catalog, txnmgr, stats).await
+            {
                 tracing::warn!(%peer, error = %e, "connection failed");
             }
         });

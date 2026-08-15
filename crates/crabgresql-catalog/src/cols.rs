@@ -35,6 +35,26 @@ pub(crate) fn no_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     Vec::new()
 }
 
+/// A cumulative counter as `bigint`, the type every `pg_stat_*` count has.
+///
+/// The counters are unsigned and the column is signed, so a value past
+/// `i64::MAX` is clamped rather than cast: `as i64` would wrap to a negative
+/// count, and a monitoring client subtracting two samples would read the
+/// wraparound as a reset. Reaching it takes 2^63 rows, so the clamp is a
+/// statement about the cast, not a case anyone will hit.
+pub(crate) fn counter(n: u64) -> Value {
+    Value::Int8(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+/// A `timestamptz` column that PostgreSQL leaves NULL until the thing it stamps
+/// has happened — `last_vacuum`, `last_seq_scan`, `stats_reset`.
+pub(crate) fn stamp_or_null(at: Option<i64>) -> Value {
+    match at {
+        Some(at) => Value::TimestampTz(at),
+        None => Value::Null,
+    }
+}
+
 /// A `pg_node_tree` column.
 ///
 /// PostgreSQL stores a parsed expression tree here and only ever hands it back

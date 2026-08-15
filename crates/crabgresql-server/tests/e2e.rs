@@ -14416,3 +14416,380 @@ async fn pg_locks_reports_no_database_for_a_shared_catalog() -> anyhow::Result<(
     assert_eq!(database(12073), Some(connected));
     Ok(())
 }
+
+/// The per-table counters have to move with the work, not merely exist. Every
+/// number here is one a monitoring client reads to decide whether a table is
+/// hot: rows written, rows read, and by which access path.
+#[tokio::test]
+async fn pg_stat_user_tables_counts_what_the_statements_did() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, v text)")
+        .await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await?;
+    client
+        .batch_execute("UPDATE t SET v = 'z' WHERE id = 1")
+        .await?;
+    client.batch_execute("DELETE FROM t WHERE id = 3").await?;
+    // One sequential scan of the whole table.
+    client.query("SELECT * FROM t", &[]).await?;
+
+    let row = client
+        .query_one(
+            "SELECT schemaname, relname, seq_scan, seq_tup_read, n_tup_ins, n_tup_upd, \
+             n_tup_del, n_live_tup, n_mod_since_analyze, n_ins_since_vacuum, \
+             last_seq_scan IS NOT NULL AS scanned, last_vacuum, vacuum_count, analyze_count \
+             FROM pg_stat_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("schemaname"), "public");
+    assert_eq!(row.get::<_, i64>("n_tup_ins"), 3);
+    assert_eq!(row.get::<_, i64>("n_tup_upd"), 1);
+    assert_eq!(row.get::<_, i64>("n_tup_del"), 1);
+    // PostgreSQL's collector derives this the same way: inserts minus deletes.
+    assert_eq!(row.get::<_, i64>("n_live_tup"), 2);
+    assert_eq!(row.get::<_, i64>("n_mod_since_analyze"), 5);
+    assert_eq!(row.get::<_, i64>("n_ins_since_vacuum"), 3);
+    // The UPDATE and DELETE scan too, so this is "at least the SELECT's one"
+    // rather than exactly one — but a scan must have been counted, and it must
+    // have read rows.
+    assert!(row.get::<_, i64>("seq_scan") >= 1);
+    assert!(row.get::<_, i64>("seq_tup_read") >= 2);
+    assert!(row.get::<_, bool>("scanned"));
+    // Never vacuumed or analyzed: the stamp is NULL, not the epoch.
+    assert_eq!(
+        row.get::<_, Option<std::time::SystemTime>>("last_vacuum"),
+        None
+    );
+    assert_eq!(row.get::<_, i64>("vacuum_count"), 0);
+    assert_eq!(row.get::<_, i64>("analyze_count"), 0);
+
+    // ANALYZE stamps its relation and zeroes the modification counter it feeds.
+    client.batch_execute("ANALYZE t").await?;
+    let row = client
+        .query_one(
+            "SELECT analyze_count, n_mod_since_analyze, last_analyze IS NOT NULL AS analyzed \
+             FROM pg_stat_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>("analyze_count"), 1);
+    assert_eq!(row.get::<_, i64>("n_mod_since_analyze"), 0);
+    assert!(row.get::<_, bool>("analyzed"));
+
+    // `all` and `user` agree, and `sys` is empty: catalog relations are served
+    // from Rust rather than reflected into pg_class, so they have no counters.
+    let counts = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_stat_all_tables WHERE relname = 't') AS all_t, \
+             (SELECT count(*) FROM pg_stat_sys_tables) AS sys",
+            &[],
+        )
+        .await?;
+    assert_eq!(counts.get::<_, i64>("all_t"), 1);
+    assert_eq!(counts.get::<_, i64>("sys"), 0);
+    Ok(())
+}
+
+/// An index scan must land on `pg_stat_user_indexes`, keyed to both the index
+/// and the table it belongs to.
+#[tokio::test]
+async fn pg_stat_user_indexes_counts_index_scans() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY, v text)")
+        .await?;
+    // Enough rows, and statistics to cost them by, that the planner prefers the
+    // index — on a three-row table a sequential scan is cheaper and the plan
+    // under test would never be chosen.
+    client
+        .batch_execute("INSERT INTO t SELECT g, 'v' FROM generate_series(1, 2000) g")
+        .await?;
+    client.batch_execute("ANALYZE t").await?;
+    let plan = client
+        .query("EXPLAIN SELECT v FROM t WHERE id = 2", &[])
+        .await?;
+    let top = plan.first().map(|row| row.get::<_, &str>(0)).unwrap_or("");
+    assert!(
+        top.starts_with("Index Scan"),
+        "the counters under test only move on an index scan, and the plan is: {top}"
+    );
+    let rows = client.query("SELECT v FROM t WHERE id = 2", &[]).await?;
+    assert_eq!(rows.len(), 1);
+
+    let row = client
+        .query_one(
+            "SELECT i.relname, i.indexrelname, i.idx_scan, i.idx_tup_read, i.idx_tup_fetch, \
+             i.relid = c.oid AS relid_joins, i.indexrelid = x.oid AS indexrelid_joins \
+             FROM pg_stat_user_indexes i \
+             JOIN pg_class c ON c.relname = 't' \
+             JOIN pg_class x ON x.relname = 't_pkey' \
+             WHERE i.indexrelname = 't_pkey'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("relname"), "t");
+    assert!(row.get::<_, bool>("relid_joins"), "relid joins pg_class");
+    assert!(
+        row.get::<_, bool>("indexrelid_joins"),
+        "indexrelid joins pg_class"
+    );
+    assert_eq!(row.get::<_, i64>("idx_scan"), 1);
+    assert_eq!(row.get::<_, i64>("idx_tup_read"), 1);
+    assert_eq!(row.get::<_, i64>("idx_tup_fetch"), 1);
+
+    // The table's own view sees the same scan through its `idx_*` columns.
+    let table = client
+        .query_one(
+            "SELECT idx_scan, idx_tup_fetch FROM pg_stat_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?;
+    assert_eq!(table.get::<_, i64>("idx_scan"), 1);
+    assert_eq!(table.get::<_, i64>("idx_tup_fetch"), 1);
+    Ok(())
+}
+
+/// `pg_stat_database` counts transactions and tuples across the whole server,
+/// and reports the connections it is serving.
+#[tokio::test]
+async fn pg_stat_database_counts_transactions_and_tuples() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2)")
+        .await?;
+
+    let before: i64 = client
+        .query_one("SELECT xact_commit FROM pg_stat_database", &[])
+        .await?
+        .get("xact_commit");
+
+    // An explicit block is one transaction however many statements it holds.
+    client.batch_execute("BEGIN").await?;
+    client.batch_execute("SELECT * FROM t").await?;
+    client.batch_execute("SELECT * FROM t").await?;
+    client.batch_execute("COMMIT").await?;
+    // And a rolled-back block counts on the other side.
+    client.batch_execute("BEGIN").await?;
+    client.batch_execute("ROLLBACK").await?;
+
+    let row = client
+        .query_one(
+            "SELECT datid, datname, numbackends, xact_commit, xact_rollback, tup_inserted, \
+             tup_returned, sessions, stats_reset IS NOT NULL AS started, \
+             datname = current_database() AS is_this_database \
+             FROM pg_stat_database",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>("is_this_database"));
+    assert!(row.get::<_, bool>("started"), "stats_reset is stamped");
+    assert_eq!(row.get::<_, i32>("numbackends"), 1);
+    assert!(row.get::<_, i64>("sessions") >= 1);
+    assert_eq!(row.get::<_, i64>("tup_inserted"), 2);
+    assert!(row.get::<_, i64>("tup_returned") >= 4);
+    assert_eq!(row.get::<_, i64>("xact_rollback"), 1);
+    // The block above plus the statements that ran after the reading below
+    // started — so a lower bound, not an equality.
+    assert!(row.get::<_, i64>("xact_commit") > before);
+
+    // `datid` joins pg_database, as every monitoring query assumes.
+    let joined: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_database s JOIN pg_database d ON d.oid = s.datid",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(joined, 1);
+    Ok(())
+}
+
+/// `pg_stat_activity` shows the session reading it, running the very query that
+/// reads it.
+#[tokio::test]
+async fn pg_stat_activity_reports_the_reading_session() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let row = client
+        .query_one(
+            "SELECT pid, pid = pg_backend_pid() AS is_me, datname, usename, state, \
+             backend_type, query, application_name, xact_start, backend_xid::text AS xid, \
+             backend_start IS NOT NULL AS started, query_start IS NOT NULL AS running, \
+             wait_event_type, leader_pid, query_id \
+             FROM pg_stat_activity",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>("is_me"), "the row is this backend");
+    assert_eq!(row.get::<_, &str>("state"), "active");
+    assert_eq!(row.get::<_, &str>("backend_type"), "client backend");
+    assert!(
+        row.get::<_, &str>("query").contains("pg_stat_activity"),
+        "the running query is the one reading the view"
+    );
+    assert!(row.get::<_, bool>("started"));
+    assert!(row.get::<_, bool>("running"));
+    // Outside an explicit block there is no transaction to report, and a
+    // read-only statement is never assigned an XID.
+    assert_eq!(
+        row.get::<_, Option<std::time::SystemTime>>("xact_start"),
+        None
+    );
+    assert_eq!(row.get::<_, Option<&str>>("xid"), None);
+    // Not instrumented, and reported as PostgreSQL reports "nothing to say".
+    assert_eq!(row.get::<_, Option<&str>>("wait_event_type"), None);
+    assert_eq!(row.get::<_, Option<i32>>("leader_pid"), None);
+    assert_eq!(row.get::<_, Option<i64>>("query_id"), None);
+
+    // Inside a block that has written, both transaction columns fill in.
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client.batch_execute("BEGIN").await?;
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+    let row = client
+        .query_one(
+            "SELECT xact_start IS NOT NULL AS in_block, backend_xid IS NOT NULL AS has_xid \
+             FROM pg_stat_activity",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>("in_block"));
+    assert!(row.get::<_, bool>("has_xid"));
+    client.batch_execute("ROLLBACK").await?;
+    Ok(())
+}
+
+/// The block-I/O views exist with PostgreSQL's shape and report zeros: the
+/// buffer pool counts pins, not relations. A monitoring query must still bind
+/// and list every relation it would list in PostgreSQL.
+#[tokio::test]
+async fn pg_statio_views_list_relations_with_zero_blocks() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int PRIMARY KEY)")
+        .await?;
+    client.batch_execute("CREATE SEQUENCE s").await?;
+    client
+        .batch_execute("CREATE VIEW v AS SELECT 1 AS a")
+        .await?;
+
+    let row = client
+        .query_one(
+            "SELECT heap_blks_read, heap_blks_hit, idx_blks_read, toast_blks_hit \
+             FROM pg_statio_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, i64>("heap_blks_read"), 0);
+    assert_eq!(row.get::<_, i64>("heap_blks_hit"), 0);
+    assert_eq!(row.get::<_, i64>("idx_blks_read"), 0);
+    assert_eq!(row.get::<_, i64>("toast_blks_hit"), 0);
+
+    // A view has no storage, so it is in none of the three; the sequence is in
+    // the sequence view and not in the table one.
+    let counts = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_statio_user_tables WHERE relname IN ('t','s','v')) \
+                AS tables, \
+             (SELECT count(*) FROM pg_statio_user_sequences WHERE relname = 's') AS sequences, \
+             (SELECT count(*) FROM pg_statio_user_indexes WHERE indexrelname = 't_pkey') \
+                AS indexes, \
+             (SELECT count(*) FROM pg_stat_io) AS io",
+            &[],
+        )
+        .await?;
+    assert_eq!(counts.get::<_, i64>("tables"), 1, "only the table");
+    assert_eq!(counts.get::<_, i64>("sequences"), 1);
+    assert_eq!(counts.get::<_, i64>("indexes"), 1);
+    // pg_stat_io is empty: its grid is by backend type and context, and neither
+    // is measured here (see the module docs).
+    assert_eq!(counts.get::<_, i64>("io"), 0);
+    Ok(())
+}
+
+/// A dropped table takes its statistics with it, as in PostgreSQL — a table
+/// recreated under the same name must not inherit the dead one's counters.
+#[tokio::test]
+async fn dropping_a_table_forgets_its_statistics() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client
+        .batch_execute("INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+    let before: i64 = client
+        .query_one(
+            "SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?
+        .get("n_tup_ins");
+    assert_eq!(before, 3);
+
+    client.batch_execute("DROP TABLE t").await?;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+    let after: i64 = client
+        .query_one(
+            "SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 't'",
+            &[],
+        )
+        .await?
+        .get("n_tup_ins");
+    assert_eq!(after, 1, "the new table starts from zero");
+    Ok(())
+}
+
+/// Every statement outside a block is a transaction, and exactly one — DDL and
+/// utility statements included, which is where an accounting hung off the DML
+/// path alone would silently under-count. Asserted as exact deltas rather than
+/// as "grew", because the failure this guards against is a miscount, not a
+/// missing count.
+#[tokio::test]
+async fn pg_stat_database_counts_each_statement_once() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    async fn read(client: &tokio_postgres::Client) -> anyhow::Result<(i64, i64)> {
+        let row = client
+            .query_one(
+                "SELECT xact_commit, xact_rollback FROM pg_stat_database",
+                &[],
+            )
+            .await?;
+        Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+    }
+    // A statement counts when it finishes, and the rows of this read are built
+    // before that — so this reading never sees its own commit, and the deltas
+    // below include it.
+    let (commits, rollbacks) = read(&client).await?;
+
+    // A utility statement and a DDL statement: one transaction each.
+    client.batch_execute("SET extra_float_digits = 2").await?;
+    client.batch_execute("CREATE TABLE tt (i int)").await?;
+    // A block is one transaction however many statements it holds.
+    client.batch_execute("BEGIN").await?;
+    client.batch_execute("INSERT INTO tt VALUES (1)").await?;
+    client.batch_execute("INSERT INTO tt VALUES (2)").await?;
+    client.batch_execute("COMMIT").await?;
+    // And a rolled-back block is one on the other side.
+    client.batch_execute("BEGIN").await?;
+    client.batch_execute("ROLLBACK").await?;
+    // A statement that fails outside a block is a rolled-back transaction, and
+    // one that fails before it ever runs (a syntax error) is one too.
+    client
+        .simple_query("SELECT * FROM no_such_table")
+        .await
+        .expect_err("the table does not exist");
+    client
+        .simple_query("SELECT FROM WHERE")
+        .await
+        .expect_err("that is not SQL");
+
+    let (after_commits, after_rollbacks) = read(&client).await?;
+    // The first read, the SET, the CREATE and the committed block.
+    assert_eq!(after_commits - commits, 4, "commits");
+    // The rolled-back block, the missing table, the syntax error.
+    assert_eq!(after_rollbacks - rollbacks, 3, "rollbacks");
+    Ok(())
+}

@@ -5,6 +5,7 @@
 //! is one-way — these types know nothing about how a relation is rendered, so
 //! new live state is added here without touching the snapshot machinery.
 
+use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
 use crabgresql_types::{ByteaOutput, PgType};
 
@@ -306,6 +307,46 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
+    /// The database-wide cumulative counters, to reflect into
+    /// `pg_stat_database`.
+    ///
+    /// The default is all-zero with `stats_reset` unset, which the relation
+    /// renders as a row of zeros and a NULL — what PostgreSQL reports for a
+    /// database whose counters were never touched, and the truth for a snapshot
+    /// with no server behind it.
+    fn database_stats(&self) -> DbStatSnapshot {
+        DbStatSnapshot::default()
+    }
+
+    /// The per-relation counters, to reflect into `pg_stat_all_tables` and the
+    /// `xact` views over it. Named by `(namespace, name)`, resolved to a
+    /// `pg_class` OID by the reading snapshot, exactly as [`CatalogLock`]'s
+    /// relation target is.
+    fn table_stats(&self) -> Vec<RelStatSnapshot> {
+        Vec::new()
+    }
+
+    /// The per-index counters, to reflect into `pg_stat_all_indexes`.
+    fn index_stats(&self) -> Vec<IndexStatSnapshot> {
+        Vec::new()
+    }
+
+    /// The backends to reflect into `pg_stat_activity`.
+    ///
+    /// PostgreSQL answers this from shared memory, so one backend sees every
+    /// other. There is no such registry here — nothing enumerates the live
+    /// connections (the same gap [`CatalogSource::locks`] documents, and the
+    /// same one that leaves `CancelRequest` unanswered), so a session reports
+    /// *itself* and the view shows one row where PostgreSQL would show the
+    /// cluster.
+    ///
+    /// TODO: register every connection in one server-wide table so this can
+    /// report the other backends, and so a cancel request can find the session
+    /// it names.
+    fn backends(&self) -> Vec<CatalogBackend> {
+        Vec::new()
+    }
+
     /// The configuration parameters, to reflect into `pg_settings`. The GUC
     /// table lives in the server, so this crate takes the rendered rows rather
     /// than depending on it.
@@ -569,6 +610,43 @@ pub struct CatalogLock {
     /// When the wait for an ungranted lock began, in `timestamptz` micros.
     /// NULL for a granted lock, as in PostgreSQL.
     pub waitstart: Option<i64>,
+}
+
+/// One backend, as `pg_stat_activity` shows it. See [`CatalogSource::backends`]
+/// for why a session can only describe itself.
+///
+/// Only the columns this build can answer are fields. `wait_event_type`,
+/// `wait_event`, `query_id`, `leader_pid` and the client address columns are
+/// left to the row builder as constants: there is no wait-event instrumentation,
+/// no query-id hashing and no parallel worker here, and a session that filled
+/// them identically at every call site would only be spreading that fact out.
+#[derive(Clone, Debug)]
+pub struct CatalogBackend {
+    /// The connection's backend id; see [`CatalogLock::pid`].
+    pub pid: i32,
+    /// `application_name`, as the client set it at startup or with `SET`. Empty
+    /// when it set neither, which is what PostgreSQL reports too.
+    pub application_name: String,
+    /// When the connection was established, in `timestamptz` micros.
+    pub backend_start: i64,
+    /// When the current transaction started, or `None` outside one.
+    pub xact_start: Option<i64>,
+    /// When the running statement started, in `timestamptz` micros.
+    pub query_start: i64,
+    /// When the backend last changed state. Equal to `query_start` for a
+    /// backend that is running a query, which is the only state a session can
+    /// observe itself in.
+    pub state_change: i64,
+    /// PostgreSQL's `state` string. A session describing itself is always
+    /// `active`: it is running the very query that reads this view.
+    pub state: &'static str,
+    /// The statement text this backend is running.
+    pub query: String,
+    /// The XID this transaction was assigned, or `None` if it has not written
+    /// and so never needed one.
+    pub backend_xid: Option<u32>,
+    /// The oldest XID this backend's snapshot still considers running.
+    pub backend_xmin: Option<u32>,
 }
 
 /// One prepared statement, as `pg_prepared_statements` shows it. Session-local

@@ -7,10 +7,14 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crabgresql_catalog::{
-    CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement, CatalogRelation,
-    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
+    CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
+    CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
+    CatalogUserType, SystemCatalog,
 };
 use crabgresql_executor::{CatalogOps, ConstraintDef, IndexDef};
+use crabgresql_storage_api::pgstat::{
+    DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
+};
 use crabgresql_storage_api::{
     CheckConstraint, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
     StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
@@ -143,6 +147,14 @@ pub struct SessionCatalogSource {
     /// The reading session's `bytea_output`, for `pg_class.relpartbound` — the
     /// one catalog column whose text can hold a rendered `bytea`.
     bytea_output: ByteaOutput,
+    /// The server's cumulative counters, behind `pg_stat_database` and the
+    /// per-relation views. Read through rather than snapshotted here, like the
+    /// engine: a statement that never opens one of those relations must not pay
+    /// for walking the counter table.
+    stats: Arc<PgStatCounters>,
+    /// This session's own `pg_stat_activity` row. Eager like `cursors`, and for
+    /// the same reason — this source outlives the `&Session` it is built from.
+    backend: CatalogBackend,
 }
 
 impl SessionCatalogSource {
@@ -221,6 +233,8 @@ impl SessionCatalogSource {
             relations,
             now: session.xact_start(),
             bytea_output: session.bytea_output,
+            stats: Arc::clone(&session.stats),
+            backend: session.backend(),
         }
     }
 }
@@ -347,6 +361,33 @@ impl CatalogSource for SessionCatalogSource {
 
     fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    /// The server's counters, with the block columns filled from the engine's
+    /// buffer pool. The pool's totals are this database's totals because there
+    /// is exactly one database; an engine with no pool leaves them at zero, and
+    /// `pg_stat_database` then reports no block activity, which is the truth for
+    /// a relation held in RAM.
+    fn database_stats(&self) -> DbStatSnapshot {
+        let mut snapshot = self.stats.database_snapshot();
+        if let Some(buffers) = self.engine.buffer_stats() {
+            snapshot.blks_hit = buffers.hits;
+            snapshot.blks_read = buffers.reads;
+        }
+        snapshot
+    }
+
+    fn table_stats(&self) -> Vec<RelStatSnapshot> {
+        self.stats.relation_snapshots()
+    }
+
+    fn index_stats(&self) -> Vec<IndexStatSnapshot> {
+        self.stats.index_snapshots()
+    }
+
+    /// This session and no other; see [`CatalogSource::backends`].
+    fn backends(&self) -> Vec<CatalogBackend> {
+        vec![self.backend.clone()]
     }
 
     fn settings(&self) -> Vec<CatalogSetting> {

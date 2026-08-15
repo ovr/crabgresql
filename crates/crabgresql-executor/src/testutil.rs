@@ -138,7 +138,12 @@ pub(crate) fn indexed_table() -> Arc<dyn TableAm> {
 /// Scan `t` (ids 1,2,3 in insertion order), keeping just the `id` column.
 pub(crate) fn id_scan(table: &Arc<dyn TableAm>) -> Box<dyn ExecNode> {
     Box::new(Projection::new(
-        Box::new(SeqScan::new(table, &rtxn(), &ColumnProjection::All)),
+        Box::new(SeqScan::new(
+            table,
+            &rtxn(),
+            &ColumnProjection::All,
+            &ExecContext::default(),
+        )),
         vec![BoundExpr::ColumnRef {
             index: 0,
             ty: PgType::Int4,

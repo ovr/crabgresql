@@ -10,6 +10,7 @@ use crabgresql_pg_wire::{
     FrontendReader, ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
 };
 use crabgresql_storage_api::TableEngine;
+use crabgresql_storage_api::pgstat::PgStatCounters;
 use crabgresql_txn::TransactionManager;
 use crabgresql_types::cast::CastError;
 use crabgresql_types::{FmtCtx, PgType, Value, wire};
@@ -33,11 +34,33 @@ use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedR
 /// request during startup.
 static NEXT_BACKEND_ID: AtomicI32 = AtomicI32::new(1);
 
+/// Holds `pg_stat_database.numbackends` up for one connection's life.
+///
+/// A guard rather than an increment and a matching decrement: this connection
+/// leaves through a `return`, a `?` on a protocol error, or a task cancellation,
+/// and every one of those has to put the count back or `numbackends` drifts
+/// upward for as long as the server runs.
+struct BackendGuard<'a>(&'a Arc<PgStatCounters>);
+
+impl BackendGuard<'_> {
+    fn new(stats: &Arc<PgStatCounters>) -> BackendGuard<'_> {
+        stats.backend_started();
+        BackendGuard(stats)
+    }
+}
+
+impl Drop for BackendGuard<'_> {
+    fn drop(&mut self) {
+        self.0.backend_ended();
+    }
+}
+
 pub async fn handle_connection(
     socket: TcpStream,
     engine: Arc<dyn TableEngine>,
     catalog: Arc<GlobalCatalog>,
     txnmgr: Arc<TransactionManager>,
+    stats: Arc<PgStatCounters>,
 ) -> Result<(), ProtocolError> {
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
@@ -90,7 +113,16 @@ pub async fn handle_connection(
         backend_id,
         format!("pg_temp_{backend_id}"),
         crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
-    );
+    )
+    .sharing_stats(Arc::clone(&stats));
+    // A client that names itself at startup is reported under that name by
+    // `pg_stat_activity`; one that does not gets the empty string, as in PG.
+    if let Some(name) = params.get("application_name") {
+        session.application_name = name.clone();
+    }
+    // One more backend now, one fewer whenever this function returns — however
+    // it returns, which is why the guard is a value and not a pair of calls.
+    let _backend = BackendGuard::new(&stats);
 
     for (name, value) in guc::report_values(&session) {
         writer.parameter_status(&name, &value);
@@ -127,6 +159,9 @@ pub async fn handle_connection(
                 // neither joins nor continues an extended-query batch's.
                 session.end_implicit_block();
                 session.stamp_message(false);
+                // What `pg_stat_activity.query` shows while this runs: the whole
+                // message, as PostgreSQL reports a multi-statement simple query.
+                session.current_query = sql.clone();
                 run_simple_query(
                     &sql,
                     &engine,
@@ -200,6 +235,13 @@ pub async fn handle_connection(
             }
             Some(FrontendMessage::Execute { portal, max_rows }) => {
                 session.stamp_message(true);
+                // The portal's own statement text, so `pg_stat_activity` reports
+                // an extended-protocol query the same way it reports a simple
+                // one. A portal that no longer exists leaves the previous text
+                // standing; the Execute is about to fail anyway.
+                if let Some(text) = portal_statement_text(&session, &portal) {
+                    session.current_query = text;
+                }
                 // COPY FROM STDIN needs the socket (to read CopyData frames),
                 // which the pure execute path lacks — drive it here, where the
                 // reader is in scope and errors are ProtocolError. Any other
@@ -414,6 +456,13 @@ fn is_copy_from_stdin(stmt: &ast::Statement) -> bool {
 /// of that statement so the caller can drive the copy sub-protocol. A suspended
 /// portal (never a COPY) or any other statement returns `None`, falling through
 /// to the ordinary execute path.
+/// The SQL text behind an open portal, for `pg_stat_activity.query`. `None` for
+/// a portal that names no live prepared statement.
+fn portal_statement_text(session: &Session, portal_name: &str) -> Option<String> {
+    let portal = session.portals.get(portal_name)?;
+    Some(session.prepared.get(&portal.statement)?.statement.clone())
+}
+
 fn copy_portal_statement(session: &Session, portal_name: &str) -> Option<ast::Statement> {
     let portal = session.portals.get(portal_name)?;
     if portal.state.is_suspended() {
@@ -501,7 +550,14 @@ async fn copy_in_stream(
     // it builds are about to be the peak. Nothing reads the raw stream again.
     drop(buffer);
     match run_copy_insert(engine, txnmgr, session, &prepared, &rows) {
-        Ok(n) => Ok(CopyOutcome::Loaded(n)),
+        Ok(n) => {
+            // A COPY drives the sub-protocol here rather than returning through
+            // `execute_statement`, so it counts its own transaction — the
+            // failure side goes through `mark_transaction_failed` like every
+            // other error.
+            session.count_transaction(false);
+            Ok(CopyOutcome::Loaded(n))
+        }
         Err(e) => Ok(CopyOutcome::Failed(e)),
     }
 }
@@ -510,6 +566,18 @@ async fn copy_in_stream(
 /// (`E`); an error outside a block leaves the status untouched (the implicit
 /// transaction ends at the statement boundary).
 fn mark_transaction_failed(session: &mut Session) {
+    // Where `pg_stat_database.xact_rollback` is counted for a failed statement,
+    // and the counterpart of the commit counted in `execute_statement`: every
+    // error path reaches this, including the ones that fail before execution
+    // (a syntax error, a bind failure), which PostgreSQL counts as rolled-back
+    // transactions too.
+    //
+    // Only outside a block. A statement that fails *inside* one leaves the
+    // block open in the `Failed` state, and the `ROLLBACK` that ends it is what
+    // counts — one transaction, not one per failed statement.
+    if session.tx_status == TransactionStatus::Idle {
+        session.stats.xact_rollback();
+    }
     if session.tx_status == TransactionStatus::InTransaction {
         session.tx_status = TransactionStatus::Failed;
     }

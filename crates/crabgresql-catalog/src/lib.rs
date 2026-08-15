@@ -49,9 +49,9 @@ pub use catalogs::extension::available_extensions;
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid};
 pub use source::{
-    CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement, CatalogRelation,
-    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, RelKind,
-    StaticSource,
+    CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
+    CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
+    CatalogUserType, RelKind, StaticSource,
 };
 
 #[cfg(test)]
@@ -59,6 +59,7 @@ mod tests;
 
 use std::sync::{Arc, OnceLock};
 
+use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
     IndexConstraint, IndexMetadata, RelPersistence, RelStats, StorageError, TableAm, TableEngine,
     TableSchema,
@@ -331,6 +332,10 @@ pub struct SystemCatalog {
     prepared_statements: OnceLock<Vec<CatalogPreparedStatement>>,
     settings: OnceLock<Vec<CatalogSetting>>,
     locks: OnceLock<Vec<CatalogLock>>,
+    database_stats: OnceLock<DbStatSnapshot>,
+    table_stats: OnceLock<Vec<RelStatSnapshot>>,
+    index_stats: OnceLock<Vec<IndexStatSnapshot>>,
+    backends: OnceLock<Vec<CatalogBackend>>,
     namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
 }
 
@@ -390,6 +395,10 @@ impl SystemCatalog {
             prepared_statements: OnceLock::new(),
             settings: OnceLock::new(),
             locks: OnceLock::new(),
+            database_stats: OnceLock::new(),
+            table_stats: OnceLock::new(),
+            index_stats: OnceLock::new(),
+            backends: OnceLock::new(),
             namespace_oids: OnceLock::new(),
         }
     }
@@ -430,6 +439,23 @@ impl SystemCatalog {
 
     fn locks(&self) -> &[CatalogLock] {
         self.locks.get_or_init(|| self.source.locks())
+    }
+
+    fn database_stats(&self) -> &DbStatSnapshot {
+        self.database_stats
+            .get_or_init(|| self.source.database_stats())
+    }
+
+    fn table_stats(&self) -> &[RelStatSnapshot] {
+        self.table_stats.get_or_init(|| self.source.table_stats())
+    }
+
+    fn index_stats(&self) -> &[IndexStatSnapshot] {
+        self.index_stats.get_or_init(|| self.source.index_stats())
+    }
+
+    fn backends(&self) -> &[CatalogBackend] {
+        self.backends.get_or_init(|| self.source.backends())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each
@@ -914,6 +940,24 @@ impl SystemCatalog {
             .iter()
             .find(|index| index.table_schema.namespace == namespace && index.metadata.name == name)
             .map(|index| index.oid)
+    }
+
+    /// The OID of the index `index` on `namespace.table`, or `None` if this
+    /// snapshot holds no such index.
+    ///
+    /// Narrower than [`SystemCatalog::relation_oid_in`], which resolves an index
+    /// by its own name alone: the statistics views name an index *and* the
+    /// relation it belongs to, and matching both is what stops a stale counter
+    /// for a dropped index from landing on a like-named one elsewhere.
+    pub fn index_oid_in(&self, namespace: &str, table: &str, index: &str) -> Option<u32> {
+        self.index_oids()
+            .iter()
+            .find(|candidate| {
+                candidate.table_schema.namespace == namespace
+                    && candidate.table_schema.name == table
+                    && candidate.metadata.name == index
+            })
+            .map(|candidate| candidate.oid)
     }
 
     /// Whether `name` is a `pg_catalog` relation this catalog serves.
