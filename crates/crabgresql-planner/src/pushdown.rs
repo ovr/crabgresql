@@ -251,6 +251,11 @@ fn place(node: &mut JoinExpr, base: usize, conjunct: BoundExpr) -> Option<BoundE
 /// in `a LEFT JOIN b ON true WHERE a.x = 1`, moving `a.x = 1` into the `ON`
 /// makes an `a` row with `x = 2` fail to match, get null-extended, and be
 /// emitted — a row the `WHERE` would have dropped.
+///
+/// It is unsound for a semi/anti join for the mirror-image reason: the `ON`
+/// condition there decides whether a left row *has a match*, so AND-ing a
+/// `WHERE` conjunct into it makes an anti join emit exactly the rows the
+/// `WHERE` meant to drop.
 fn may_attach(kind: JoinKind) -> bool {
     matches!(kind, JoinKind::Cross | JoinKind::Inner)
 }
@@ -259,8 +264,15 @@ fn may_attach(kind: JoinKind) -> bool {
 /// join instead of above it. Sound exactly when the left side is preserved:
 /// every left row then reaches the output with its own columns intact, so
 /// filtering before or after the join drops the same rows.
+///
+/// That covers the semi/anti kinds as well: each emits left rows unchanged (and
+/// at most once), so dropping a left row before the match test drops exactly the
+/// same output row.
 fn may_descend_left(kind: JoinKind) -> bool {
-    matches!(kind, JoinKind::Cross | JoinKind::Inner | JoinKind::Left)
+    matches!(
+        kind,
+        JoinKind::Cross | JoinKind::Inner | JoinKind::Left | JoinKind::Semi | JoinKind::Anti
+    )
 }
 
 /// Mirror of [`may_descend_left`] for the right input.
@@ -423,6 +435,70 @@ mod tests {
             predicate.is_none(),
             "the conjunct was not placed or dropped"
         );
+    }
+
+    /// A semi/anti join emits its left rows unchanged, so a left-only conjunct
+    /// may be evaluated below it — but never AND-ed into its own condition,
+    /// which decides whether a left row counts as matched.
+    #[test]
+    fn a_left_only_conjunct_descends_through_a_semi_join_without_attaching() {
+        for kind in [JoinKind::Semi, JoinKind::Anti] {
+            // The left child is itself a join, so there is a predicate slot
+            // below to land in.
+            let mut join = JoinExpr::Join {
+                left: Box::new(JoinExpr::Join {
+                    left: Box::new(leaf()),
+                    right: Box::new(leaf()),
+                    kind: JoinKind::Inner,
+                    predicate: None,
+                }),
+                right: Box::new(leaf()),
+                kind,
+                predicate: None,
+            };
+            let conjunct = eq(col(0), lit(1));
+
+            assert_eq!(place(&mut join, 0, conjunct.clone()), None, "{kind:?}");
+            let JoinExpr::Join {
+                left, predicate, ..
+            } = join
+            else {
+                panic!("expected Join node");
+            };
+            assert!(
+                predicate.is_none(),
+                "{kind:?}: the conjunct must not become part of the match test"
+            );
+            let JoinExpr::Join { predicate, .. } = *left else {
+                panic!("expected a Join node below");
+            };
+            assert_eq!(predicate, Some(conjunct), "{kind:?}");
+        }
+    }
+
+    /// With no predicate slot below, the same conjunct comes back out rather
+    /// than being attached here.
+    #[test]
+    fn a_semi_join_over_two_leaves_hands_a_conjunct_back() {
+        for kind in [JoinKind::Semi, JoinKind::Anti] {
+            let mut join = JoinExpr::Join {
+                left: Box::new(leaf()),
+                right: Box::new(leaf()),
+                kind,
+                predicate: None,
+            };
+            let conjunct = eq(col(0), lit(1));
+
+            assert_eq!(
+                place(&mut join, 0, conjunct.clone()),
+                Some(conjunct),
+                "{kind:?}"
+            );
+            let JoinExpr::Join { predicate, .. } = join else {
+                panic!("expected Join node");
+            };
+            assert!(predicate.is_none(), "{kind:?}");
+        }
     }
 
     #[test]

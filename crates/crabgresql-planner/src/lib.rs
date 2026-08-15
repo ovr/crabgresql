@@ -414,10 +414,15 @@ pub enum PhysicalJoinExpr {
 }
 
 impl PhysicalJoinExpr {
+    /// The width of the row this subtree *emits* — mirroring [`JoinExpr::width`],
+    /// so a semi/anti join contributes only its left side.
     pub fn width(&self) -> usize {
         match self {
             PhysicalJoinExpr::Input { width, .. } => *width,
-            PhysicalJoinExpr::Join { left, right, .. } => left.width() + right.width(),
+            PhysicalJoinExpr::Join {
+                left, right, kind, ..
+            } if kind.emits_pairs() => left.width() + right.width(),
+            PhysicalJoinExpr::Join { left, .. } => left.width(),
         }
     }
 
@@ -498,6 +503,11 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
 /// side, while one that came from the `ON` clause may only sink into the
 /// null-supplying side. Nothing here records which is which, and an inner join
 /// null-extends neither side, so the distinction cannot arise.
+///
+/// A semi/anti join is excluded for the same reason: its residual decides
+/// *whether a left row has a match*, so sinking a left-only conjunct out of it
+/// changes which rows count as matched — under `Anti` that flips the row's fate
+/// rather than filtering the output.
 fn sink_leaf_filters(
     predicate: Option<BoundExpr>,
     left: &mut PhysicalJoinExpr,
@@ -2260,6 +2270,26 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
     }
 }
 
+/// The node label EXPLAIN prints for one binary join.
+///
+/// PostgreSQL names the algorithm and, for the kinds where it matters, the
+/// semantics: `Hash Join` / `Nested Loop` for the pairing kinds, and
+/// `Hash Semi Join` / `Nested Loop Anti Join` and friends for the two that only
+/// test for a match. Left/right/full are *not* spelled out here, matching PG,
+/// which prints them as plain `Hash Join`/`Nested Loop` too.
+fn join_node_label(kind: JoinKind, hashed: bool) -> String {
+    let semantics = match kind {
+        JoinKind::Semi => "Semi",
+        JoinKind::Anti => "Anti",
+        _ => return if hashed { "Hash Join" } else { "Nested Loop" }.to_string(),
+    };
+    if hashed {
+        format!("Hash {semantics} Join")
+    } else {
+        format!("Nested Loop {semantics} Join")
+    }
+}
+
 /// Render a join tree. `filter` is the plan-level `WHERE` residual that pushdown
 /// could not relocate; it belongs to the root node's row, so only the root call
 /// passes it.
@@ -2291,11 +2321,11 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
         PhysicalJoinExpr::Join {
             left,
             right,
+            kind,
             predicate,
             hash_keys,
-            ..
         } => {
-            let mut lines = vec![if hashed { "Hash Join" } else { "Nested Loop" }.to_string()];
+            let mut lines = vec![join_node_label(*kind, hashed)];
             if hashed {
                 let cond = hash_keys
                     .iter()
@@ -2899,6 +2929,63 @@ mod tests {
             panic!("expected a Join node, not a leaf");
         };
         (kind, predicate, hash_keys)
+    }
+
+    /// Plan `sql` and overwrite the root join's kind, since no SQL syntax binds
+    /// to a semi/anti join (see [`JoinKind::Semi`]).
+    fn with_kind(sql: &str, kind: JoinKind) -> PhysicalPlan {
+        let mut plan = plan_sql(sql);
+        let PhysicalPlan::Join { source, .. } = &mut plan else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join { kind: slot, .. } = source else {
+            panic!("expected a Join node, not a leaf");
+        };
+        *slot = kind;
+        plan
+    }
+
+    #[test]
+    fn a_semi_or_anti_join_emits_only_its_left_row() {
+        let plan = with_kind("SELECT * FROM t a, t b WHERE a.id = b.id", JoinKind::Semi);
+        let PhysicalPlan::Join { source, .. } = &plan else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Join { left, right, .. } = source else {
+            panic!("expected a Join node, not a leaf");
+        };
+        assert!(right.width() > 0, "the right side has columns of its own");
+        assert_eq!(
+            source.width(),
+            left.width(),
+            "a semi join's output is the left row alone"
+        );
+    }
+
+    #[test]
+    fn explain_names_the_semi_and_anti_kinds() {
+        let hashed = "SELECT * FROM t a, t b WHERE a.id = b.id";
+        assert_eq!(
+            explain(&with_kind(hashed, JoinKind::Semi))[0],
+            "Hash Semi Join"
+        );
+        assert_eq!(
+            explain(&with_kind(hashed, JoinKind::Anti))[0],
+            "Hash Anti Join"
+        );
+
+        let looped = "SELECT * FROM t a, t b WHERE a.big < b.big";
+        assert_eq!(
+            explain(&with_kind(looped, JoinKind::Semi))[0],
+            "Nested Loop Semi Join"
+        );
+        assert_eq!(
+            explain(&with_kind(looped, JoinKind::Anti))[0],
+            "Nested Loop Anti Join"
+        );
+        // The other kinds keep the algorithm-only labels PG prints for them.
+        assert_eq!(explain(&plan_sql(hashed))[0], "Hash Join");
+        assert_eq!(explain(&plan_sql(looped))[0], "Nested Loop");
     }
 
     #[test]

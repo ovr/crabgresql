@@ -4,7 +4,7 @@
 //! reused buffer, tested there, and only turned into an output row if it
 //! survives.
 
-use crabgresql_binder::BoundExpr;
+use crabgresql_binder::{BoundExpr, JoinKind};
 use crabgresql_storage_api::Tuple;
 use crabgresql_types::Value;
 
@@ -15,6 +15,30 @@ pub(crate) enum JoinPhase {
     LeftRows,
     UnmatchedRight,
     Done,
+}
+
+/// What a node does with the left row once its candidates have been classified.
+/// Both join nodes read the kind through this, so the two cannot disagree about
+/// which kinds emit pairs and which emit the left row alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatchMode {
+    /// Emit every surviving pair as a concatenated row (`Cross`/`Inner` and the
+    /// three outer kinds, whose null extension is handled separately).
+    Pairs,
+    /// Emit the left row alone on the first surviving match, then move on.
+    Semi,
+    /// Emit the left row alone when no candidate survives.
+    Anti,
+}
+
+impl MatchMode {
+    pub(crate) fn of(kind: JoinKind) -> Self {
+        match kind {
+            JoinKind::Semi => MatchMode::Semi,
+            JoinKind::Anti => MatchMode::Anti,
+            _ => MatchMode::Pairs,
+        }
+    }
 }
 
 /// Concatenate a left and a right row into a joined output row.

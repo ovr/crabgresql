@@ -4,7 +4,9 @@ use crabgresql_storage_api::Tuple;
 use crabgresql_types::{PgType, Value};
 use rustc_hash::FxHashMap;
 
-use super::join::{JoinPhase, eval_join_keys, fill_probe, take_joined_row, touched_slots};
+use super::join::{
+    JoinPhase, MatchMode, eval_join_keys, fill_probe, take_joined_row, touched_slots,
+};
 use crate::{ExecContext, ExecError, ExecNode, agg, predicate_holds};
 
 /// Binary hash join over one or more equi-keys, with the hash table built on the
@@ -18,6 +20,13 @@ use crate::{ExecContext, ExecError, ExecNode, agg, predicate_holds};
 /// are null-extended for LEFT/FULL. NULL keys never match (SQL join equality),
 /// so rows with a NULL key are excluded from the hash table and the probe but
 /// still surface as null-extended rows on a preserved side.
+///
+/// A semi/anti join emits the left row alone — once on the first surviving
+/// match (semi), or only when nothing survives (anti) — and abandons the bucket
+/// as soon as one candidate settles the question. A left row with a NULL key
+/// probes nothing, so an anti join emits it: that is `NOT EXISTS` semantics, and
+/// the reason `NOT IN` may not be lowered to this kind without ruling NULLs out
+/// first (see [`JoinKind::Anti`]).
 pub struct HashJoin {
     left: Box<dyn ExecNode>,
     right_rows: Vec<Tuple>,
@@ -29,6 +38,7 @@ pub struct HashJoin {
     left_width: usize,
     right_width: usize,
     kind: JoinKind,
+    mode: MatchMode,
     /// The left-side operand of each equi-key and its comparison type.
     /// `left_keys[i]` indexes the left (probe) input; `key_tys[i]` drives hashing
     /// and equality. The right-side operands are consumed at build time to fill
@@ -116,6 +126,7 @@ impl HashJoin {
             left_width,
             right_width,
             kind,
+            mode: MatchMode::of(kind),
             left_keys,
             key_tys,
             residual,
@@ -242,6 +253,14 @@ impl ExecNode for HashJoin {
                         // wrong rows on a preserved side.
                         self.current_left_matched = true;
                         self.right_matched[right_index] = true;
+                        match self.mode {
+                            // One surviving candidate settles both narrow kinds,
+                            // so neither probes further: semi emits the left row
+                            // now, anti has just learned it must not emit it.
+                            MatchMode::Semi => return Ok(self.current_left.take()),
+                            MatchMode::Anti => break,
+                            MatchMode::Pairs => {}
+                        }
                         let Self {
                             probe,
                             touched,
@@ -260,12 +279,17 @@ impl ExecNode for HashJoin {
                         )));
                     }
 
-                    if !self.current_left_matched && self.preserves_left() {
-                        let Some(mut row) = self.current_left.take() else {
-                            continue;
-                        };
-                        row.extend(std::iter::repeat_n(Value::Null, self.right_width));
-                        return Ok(Some(row));
+                    if !self.current_left_matched {
+                        if self.preserves_left() {
+                            let Some(mut row) = self.current_left.take() else {
+                                continue;
+                            };
+                            row.extend(std::iter::repeat_n(Value::Null, self.right_width));
+                            return Ok(Some(row));
+                        }
+                        if self.mode == MatchMode::Anti {
+                            return Ok(self.current_left.take());
+                        }
                     }
                     self.current_left = None;
                 }
@@ -284,5 +308,96 @@ impl ExecNode for HashJoin {
                 JoinPhase::Done => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crabgresql_binder::{BinOp, BoundExpr, JoinKind};
+    use crabgresql_planner::HashKey;
+    use crabgresql_storage_api::Tuple;
+    use crabgresql_types::{PgType, Value};
+
+    use super::HashJoin;
+    use crate::testutil::{binary, collect, int4, test_ok};
+    use crate::{ExecContext, MaterializedRows};
+
+    fn col(index: usize) -> BoundExpr {
+        BoundExpr::ColumnRef {
+            index,
+            ty: PgType::Int4,
+        }
+    }
+
+    fn rows(values: &[Option<i32>]) -> Vec<Tuple> {
+        values
+            .iter()
+            .map(|v| vec![v.map(Value::Int4).unwrap_or(Value::Null)])
+            .collect()
+    }
+
+    fn ints(values: &[i32]) -> Vec<Tuple> {
+        rows(&values.iter().map(|v| Some(*v)).collect::<Vec<_>>())
+    }
+
+    /// The single equi-key `left.c0 = right.c0`, in the concatenated index space.
+    fn keys() -> Vec<HashKey> {
+        vec![HashKey {
+            left: col(0),
+            right: col(1),
+            ty: PgType::Int4,
+        }]
+    }
+
+    /// One-column inputs: `left` against right rows `1, 1, 3`, so `1` has two
+    /// matches and `3` exactly one.
+    fn join(kind: JoinKind, left: Vec<Tuple>, residual: Option<BoundExpr>) -> HashJoin {
+        test_ok(HashJoin::new(
+            Box::new(MaterializedRows::new(left)),
+            Box::new(MaterializedRows::new(ints(&[1, 1, 3]))),
+            1,
+            1,
+            kind,
+            keys(),
+            residual,
+            ExecContext::default(),
+        ))
+    }
+
+    #[test]
+    fn semi_emits_each_matching_left_row_once_and_narrow() {
+        let mut node = join(JoinKind::Semi, ints(&[1, 2, 3]), None);
+        // `1` sits in a bucket with two entries but is emitted once, as the left
+        // row alone rather than the concatenated pair.
+        assert_eq!(collect(&mut node), ints(&[1, 3]));
+    }
+
+    #[test]
+    fn anti_emits_only_the_unmatched_left_row() {
+        let mut node = join(JoinKind::Anti, ints(&[1, 2, 3]), None);
+        assert_eq!(collect(&mut node), ints(&[2]));
+    }
+
+    #[test]
+    fn anti_emits_a_left_row_whose_key_is_null() {
+        // A NULL key probes nothing, so it matches nothing — `NOT EXISTS`
+        // semantics, where the row survives. (`NOT IN` would drop it.)
+        let mut node = join(JoinKind::Anti, rows(&[Some(1), None]), None);
+        assert_eq!(collect(&mut node), rows(&[None]));
+
+        let mut node = join(JoinKind::Semi, rows(&[Some(1), None]), None);
+        assert_eq!(collect(&mut node), ints(&[1]));
+    }
+
+    #[test]
+    fn a_residual_that_rejects_every_pair_leaves_no_row_matched() {
+        // The keys still find the bucket; the residual rejects every candidate,
+        // which is only visible if the match is recorded *after* it is tested.
+        let residual = || Some(binary(BinOp::Eq, PgType::Int4, col(1), int4(99)));
+        let mut node = join(JoinKind::Semi, ints(&[1, 2, 3]), residual());
+        assert_eq!(collect(&mut node), Vec::<Tuple>::new());
+
+        let mut node = join(JoinKind::Anti, ints(&[1, 2, 3]), residual());
+        assert_eq!(collect(&mut node), ints(&[1, 2, 3]));
     }
 }
