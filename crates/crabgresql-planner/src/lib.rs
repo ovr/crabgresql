@@ -414,8 +414,7 @@ pub enum PhysicalJoinExpr {
 }
 
 impl PhysicalJoinExpr {
-    /// The width of the row this subtree *emits* — mirroring [`JoinExpr::width`],
-    /// so a semi/anti join contributes only its left side.
+    /// The width of the row this subtree *emits*, mirroring [`JoinExpr::width`].
     pub fn width(&self) -> usize {
         match self {
             PhysicalJoinExpr::Input { width, .. } => *width,
@@ -2271,24 +2270,22 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
 }
 
 /// [`join_column_names`] for a subtree seen from *above*, where only the row it
-/// emits is addressable. The two differ under a semi/anti join, which reads a
-/// concatenated row but emits its left half alone: taking its full name list
-/// would shift every name of the sibling to its right.
+/// emits is addressable. The two differ under a semi/anti join, and taking its
+/// full name list there would shift every name of the sibling to its right.
 fn emitted_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
     let mut names = join_column_names(join);
     names.resize(join.width(), None);
     names
 }
 
-/// The node label EXPLAIN prints for one binary join: the algorithm, then the
-/// kind for every kind but the inner one — `Hash Left Join`, `Nested Loop Left
-/// Join`, `Hash Full Join`, `Hash Anti Join` (see
-/// `vendor/postgres/regress/expected/generated_virtual.out:1680`,
+/// The node label EXPLAIN prints for one binary join, following PG's spelling:
+/// `Hash Left Join`, `Nested Loop Left Join`, `Hash Full Join`, `Hash Anti Join`
+/// (`vendor/postgres/regress/expected/generated_virtual.out:1680`,
 /// `create_index.out:2256`, `equivclass.out:528`, `eager_aggregate.out:484`).
 ///
-/// `Cross` prints as an inner join because by EXPLAIN time PostgreSQL no longer
-/// distinguishes the two — a cross join is an inner join whose condition is
-/// absent, which shows as a missing `Join Filter` rather than in the label.
+/// `Cross` prints as an inner join: by EXPLAIN time PostgreSQL no longer
+/// distinguishes the two, and the absent condition shows as a missing
+/// `Join Filter` instead.
 fn join_node_label(kind: JoinKind, hashed: bool) -> String {
     let algorithm = if hashed { "Hash" } else { "Nested Loop" };
     let kind = match kind {
@@ -2945,8 +2942,8 @@ mod tests {
         (kind, predicate, hash_keys)
     }
 
-    /// Plan `sql` and overwrite the root join's kind, since no SQL syntax binds
-    /// to a semi/anti join (see [`JoinKind::Semi`]).
+    /// The kind is overwritten rather than written in SQL because no syntax
+    /// binds to a semi/anti join (see [`JoinKind::Semi`]).
     fn with_kind(sql: &str, kind: JoinKind) -> PhysicalPlan {
         let mut plan = plan_sql(sql);
         let PhysicalPlan::Join { source, .. } = &mut plan else {
@@ -2998,10 +2995,8 @@ mod tests {
 
     #[test]
     fn column_names_of_a_tree_follow_the_emitted_widths() {
-        // A semi join child emits its left row alone, so it must contribute only
-        // that half's names: taking its full list would leave the parent naming
-        // its right-hand relation's columns one relation too late, and EXPLAIN
-        // would print a plausible wrong name rather than falling back to `$n`.
+        // A misaligned list makes EXPLAIN print a plausible wrong name: the `$n`
+        // fallback only catches an index past the end.
         let mut plan = plan_sql("SELECT * FROM t a, t b, t c WHERE a.id = b.id AND b.big = c.big");
         let PhysicalPlan::Join { source, .. } = &mut plan else {
             panic!("expected Join");
@@ -3016,8 +3011,7 @@ mod tests {
 
         let names = join_column_names(source);
         assert_eq!(names.len(), source.width());
-        // `t(id, big, name)` twice: the semi join's own right side is gone, so
-        // the third relation's columns start at the boundary rather than past it.
+        // `t` twice, not three times: the semi join's own right side is gone.
         let one = ["id", "big", "name"].map(|n| Some(n.to_string()));
         assert_eq!(names, [one.clone(), one].concat());
     }

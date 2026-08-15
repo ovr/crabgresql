@@ -346,11 +346,9 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
         } => {
             // This node's own ON condition and hash keys index its concatenated
             // `left || right` row — the same space `demand` arrives in.
-            //
-            // Under a semi/anti join `demand` covers only the left half, since
-            // that is all the node emits. Folding the condition in first is what
-            // keeps the right side alive there: its demand comes from the match
-            // test alone, never from above.
+            // Under a semi/anti join `demand` reaches only the left half, so
+            // folding the condition in first is what keeps the right side from
+            // being pruned to nothing.
             let demand = add_exprs(demand, predicate.as_ref());
             let demand = hash_keys.iter().fold(demand, |demand, key| {
                 add_exprs(add_exprs(demand, Some(&key.left)), Some(&key.right))

@@ -9,10 +9,8 @@ use crate::{ExecContext, ExecError, ExecNode, predicate_holds};
 /// joins, `right_matched` records which materialized rows participated in at
 /// least one match so they can be null-extended after the left stream ends.
 ///
-/// A semi/anti join runs the same candidate loop but emits the left row alone,
-/// once (semi) or only when nothing matched (anti), and stops scanning the
-/// right side as soon as one candidate survives — the answer cannot change
-/// after that.
+/// A semi/anti join runs the same candidate loop and stops scanning at the
+/// first survivor — the answer cannot change after it.
 pub struct NestedLoopJoin {
     left: Box<dyn ExecNode>,
     right_rows: Vec<Tuple>,
@@ -136,10 +134,6 @@ impl ExecNode for NestedLoopJoin {
                             self.current_left_matched = true;
                             self.right_matched[right_index] = true;
                             match self.mode {
-                                // One surviving candidate settles both narrow
-                                // kinds, so neither looks at another right row:
-                                // semi emits the left row now, anti has just
-                                // learned it must not emit it at all.
                                 MatchMode::Semi => return Ok(self.current_left.take()),
                                 MatchMode::Anti => break,
                                 MatchMode::Pairs => {}
@@ -221,8 +215,8 @@ mod tests {
         binary(BinOp::Eq, PgType::Int4, col(0), col(1))
     }
 
-    /// One-column inputs: the left rows `1, 2, 3` against right rows `1, 1, 3`,
-    /// so `1` has two matches, `2` none and `3` exactly one.
+    /// One-column inputs where the left key `1` has two matches, `2` none and
+    /// `3` exactly one.
     fn join(kind: JoinKind, predicate: BoundExpr) -> NestedLoopJoin {
         test_ok(NestedLoopJoin::new(
             Box::new(MaterializedRows::new(rows(&[1, 2, 3]))),
@@ -238,8 +232,6 @@ mod tests {
     #[test]
     fn semi_emits_each_matching_left_row_once_and_narrow() {
         let mut node = join(JoinKind::Semi, eq_keys());
-        // `1` matches twice but is emitted once, and the row is the left row
-        // alone — not the concatenated pair.
         assert_eq!(collect(&mut node), rows(&[1, 3]));
     }
 
@@ -251,8 +243,8 @@ mod tests {
 
     #[test]
     fn a_residual_that_rejects_every_pair_leaves_no_row_matched() {
-        // The equality still pairs rows up; the second conjunct rejects them all,
-        // which is only visible if the match is recorded *after* the predicate.
+        // Only distinguishable from "no candidate paired up" if the match is
+        // recorded *after* the predicate rather than on the equality alone.
         let predicate = binary(
             BinOp::And,
             PgType::Bool,

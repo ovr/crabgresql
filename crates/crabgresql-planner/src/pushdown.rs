@@ -437,13 +437,10 @@ mod tests {
         );
     }
 
-    /// A semi/anti join emits its left rows unchanged, so a left-only conjunct
-    /// may be evaluated below it — but never AND-ed into its own condition,
-    /// which decides whether a left row counts as matched.
     #[test]
     fn a_left_only_conjunct_descends_through_a_semi_join_without_attaching() {
         for kind in [JoinKind::Semi, JoinKind::Anti] {
-            // The left child is itself a join, so there is a predicate slot
+            // The left child is a join, not a leaf, so there is a predicate slot
             // below to land in.
             let mut join = JoinExpr::Join {
                 left: Box::new(JoinExpr::Join {
@@ -476,8 +473,7 @@ mod tests {
         }
     }
 
-    /// With no predicate slot below, the same conjunct comes back out rather
-    /// than being attached here.
+    /// Two leaves: nowhere below to land, and this node may not take it either.
     #[test]
     fn a_semi_join_over_two_leaves_hands_a_conjunct_back() {
         for kind in [JoinKind::Semi, JoinKind::Anti] {

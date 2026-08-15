@@ -17,17 +17,14 @@ pub(crate) enum JoinPhase {
     Done,
 }
 
-/// What a node does with the left row once its candidates have been classified.
-/// Both join nodes read the kind through this, so the two cannot disagree about
-/// which kinds emit pairs and which emit the left row alone.
+/// What a node does with a left row once its candidates have been tested — the
+/// [`JoinKind`] semantics both join nodes read through, so the two cannot
+/// disagree. Null extension on a preserved side is not part of it; that stays
+/// with the kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MatchMode {
-    /// Emit every surviving pair as a concatenated row (`Cross`/`Inner` and the
-    /// three outer kinds, whose null extension is handled separately).
     Pairs,
-    /// Emit the left row alone on the first surviving match, then move on.
     Semi,
-    /// Emit the left row alone when no candidate survives.
     Anti,
 }
 

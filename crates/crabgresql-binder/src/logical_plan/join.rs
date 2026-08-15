@@ -46,8 +46,7 @@ pub enum JoinKind {
     /// every other kind the output is the left row alone — see
     /// [`JoinExpr::width`] — because the right side of a semi join is a
     /// membership test, not a source of columns. The node's own predicate and
-    /// hash keys still address the concatenated `left || right` row, exactly as
-    /// they do for the other kinds.
+    /// hash keys still address the concatenated `left || right` row.
     ///
     /// TODO: nothing builds this kind yet — `EXISTS`/`IN` subqueries are still
     /// evaluated per outer row, or once through the hashed-subplan path, rather
@@ -65,7 +64,6 @@ pub enum JoinKind {
 
 impl JoinKind {
     /// Whether a node of this kind emits the concatenated `left || right` row.
-    /// False for the semi/anti kinds, which emit the left row alone.
     pub fn emits_pairs(self) -> bool {
         !matches!(self, JoinKind::Semi | JoinKind::Anti)
     }
@@ -96,9 +94,8 @@ pub enum JoinExpr {
 }
 
 impl JoinExpr {
-    /// The width of the row this subtree *emits*. A semi/anti join emits the
-    /// left row alone, so its right side contributes nothing here even though
-    /// the node's predicate reads it.
+    /// The width of the row this subtree *emits* — under a semi/anti join, less
+    /// than the row that node's own predicate reads.
     pub fn width(&self) -> usize {
         match self {
             JoinExpr::Input { width, .. } => *width,

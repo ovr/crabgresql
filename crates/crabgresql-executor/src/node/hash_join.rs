@@ -21,12 +21,10 @@ use crate::{ExecContext, ExecError, ExecNode, agg, predicate_holds};
 /// so rows with a NULL key are excluded from the hash table and the probe but
 /// still surface as null-extended rows on a preserved side.
 ///
-/// A semi/anti join emits the left row alone — once on the first surviving
-/// match (semi), or only when nothing survives (anti) — and abandons the bucket
-/// as soon as one candidate settles the question. A left row with a NULL key
-/// probes nothing, so an anti join emits it: that is `NOT EXISTS` semantics, and
-/// the reason `NOT IN` may not be lowered to this kind without ruling NULLs out
-/// first (see [`JoinKind::Anti`]).
+/// A semi/anti join abandons the bucket at the first survivor — the answer
+/// cannot change after it. A left row with a NULL key probes nothing, so an
+/// anti join emits it: `NOT EXISTS` semantics, and the reason `NOT IN` may not
+/// be lowered to this kind (see [`JoinKind::Anti`]).
 pub struct HashJoin {
     left: Box<dyn ExecNode>,
     right_rows: Vec<Tuple>,
@@ -254,9 +252,6 @@ impl ExecNode for HashJoin {
                         self.current_left_matched = true;
                         self.right_matched[right_index] = true;
                         match self.mode {
-                            // One surviving candidate settles both narrow kinds,
-                            // so neither probes further: semi emits the left row
-                            // now, anti has just learned it must not emit it.
                             MatchMode::Semi => return Ok(self.current_left.take()),
                             MatchMode::Anti => break,
                             MatchMode::Pairs => {}
@@ -349,8 +344,7 @@ mod tests {
         }]
     }
 
-    /// One-column inputs: `left` against right rows `1, 1, 3`, so `1` has two
-    /// matches and `3` exactly one.
+    /// One-column inputs where the key `1` has two matches and `3` exactly one.
     fn join(kind: JoinKind, left: Vec<Tuple>, residual: Option<BoundExpr>) -> HashJoin {
         test_ok(HashJoin::new(
             Box::new(MaterializedRows::new(left)),
@@ -367,8 +361,6 @@ mod tests {
     #[test]
     fn semi_emits_each_matching_left_row_once_and_narrow() {
         let mut node = join(JoinKind::Semi, ints(&[1, 2, 3]), None);
-        // `1` sits in a bucket with two entries but is emitted once, as the left
-        // row alone rather than the concatenated pair.
         assert_eq!(collect(&mut node), ints(&[1, 3]));
     }
 
@@ -380,8 +372,7 @@ mod tests {
 
     #[test]
     fn anti_emits_a_left_row_whose_key_is_null() {
-        // A NULL key probes nothing, so it matches nothing — `NOT EXISTS`
-        // semantics, where the row survives. (`NOT IN` would drop it.)
+        // `NOT EXISTS` semantics: `NOT IN` would answer NULL and drop the row.
         let mut node = join(JoinKind::Anti, rows(&[Some(1), None]), None);
         assert_eq!(collect(&mut node), rows(&[None]));
 
@@ -391,8 +382,8 @@ mod tests {
 
     #[test]
     fn a_residual_that_rejects_every_pair_leaves_no_row_matched() {
-        // The keys still find the bucket; the residual rejects every candidate,
-        // which is only visible if the match is recorded *after* it is tested.
+        // Only distinguishable from an empty bucket if the match is recorded
+        // *after* the residual rather than on the key equality alone.
         let residual = || Some(binary(BinOp::Eq, PgType::Int4, col(1), int4(99)));
         let mut node = join(JoinKind::Semi, ints(&[1, 2, 3]), residual());
         assert_eq!(collect(&mut node), Vec::<Tuple>::new());
