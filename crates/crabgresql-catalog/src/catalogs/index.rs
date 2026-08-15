@@ -4,9 +4,10 @@ use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
 use crate::SystemCatalog;
-use crate::catalogs::attribute;
+use crate::catalogs::{attribute, opclass};
 use crate::cols::*;
-use crabgresql_storage_api::IndexConstraint;
+use crate::oids::{BTREE_AM_OID, HASH_AM_OID};
+use crabgresql_storage_api::{IndexConstraint, IndexMethod};
 
 pub(crate) fn pg_index_schema() -> TableSchema {
     TableSchema::in_namespace(
@@ -43,6 +44,10 @@ pub(crate) fn pg_index_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     indexes
         .iter()
         .map(|index| {
+            let am_oid = match index.metadata.method {
+                IndexMethod::BTree => BTREE_AM_OID,
+                IndexMethod::Hash => HASH_AM_OID,
+            };
             // 1-based key attnums, as PG's `indkey` holds.
             let indkey = attnum_vector(index.metadata.keys.iter().map(|key| key.column));
             let indoption = int2vector(index.metadata.keys.iter().map(|key| {
@@ -91,12 +96,15 @@ pub(crate) fn pg_index_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 indkey,
                 indcollation,
-                // TODO: report real `pg_opclass` OIDs. There is no `pg_opclass`
-                // in this build (nothing chooses an operator class — the access
-                // methods are wired to the types directly), so every key reports
-                // `0`, PostgreSQL's "no such object" OID. This is the one column
-                // here whose constant is not also PostgreSQL's answer.
-                oidvector(index.metadata.keys.iter().map(|_| 0)),
+                // DDL takes no explicit operator class, so every key reports
+                // its type's default under the index's access method.
+                oidvector(index.metadata.keys.iter().map(|key| {
+                    index
+                        .table_schema
+                        .columns
+                        .get(key.column)
+                        .map_or(0, |column| opclass::default_opclass(am_oid, column.ty))
+                })),
                 indoption,
                 // indexprs / indpred: DDL rejects expression and partial
                 // indexes, so no index can carry either.

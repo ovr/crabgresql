@@ -13,7 +13,8 @@ included in this product. See docs/ARCHITECTURE.md §7 and AGENTS.md for the
 clean-room policy.
 
 This product also includes PostgreSQL's system-catalog data files
-(vendor/postgres/catalog/*.dat: pg_type, pg_proc, pg_cast, pg_namespace) under
+(vendor/postgres/catalog/*.dat: pg_type, pg_proc, pg_cast, pg_namespace,
+pg_opclass, pg_opfamily) under
 the same copyright and PostgreSQL License. crates/crabgresql-bki generates
 pg_catalog's built-in rows from this DATA at build time (crates/crabgresql-catalog
 includes them); the `.dat` parser is an original scanner, not a port of

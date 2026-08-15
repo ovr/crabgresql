@@ -625,6 +625,206 @@ fn pg_am_lists_the_builtin_access_methods() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_opclass` carries PostgreSQL's own OIDs, and the join a client follows
+/// out of an index — `indclass` → `pg_opclass` → `pg_opfamily` → `pg_am` —
+/// holds at every hop.
+///
+/// The 13 OIDs pinned below are the ones `pg_opclass.dat` spells out itself, so
+/// they are fixed upstream rather than assigned by codegen. The other 166 are
+/// derived (see `crabgresql-bki`'s `pg_opclass`); pinning one of those here
+/// would pin a number that moves when upstream inserts an entry above it, which
+/// is a property of PostgreSQL, not a regression.
+#[test]
+fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let (schema, rows) = required(cat.build_pg_catalog("pg_opclass"), "pg_opclass is missing")?;
+    let col = |name: &str| schema.column_index(name).expect("column exists");
+    let (oid, method, opcname, intype, default) = (
+        col("oid"),
+        col("opcmethod"),
+        col("opcname"),
+        col("opcintype"),
+        col("opcdefault"),
+    );
+    let default_class = |am: u32, type_oid: u32| {
+        rows.iter()
+            .find(|r| {
+                r[method] == Value::Oid(am)
+                    && r[intype] == Value::Oid(type_oid)
+                    && r[default] == Value::Bool(true)
+            })
+            .map(|r| (r[oid].clone(), r[opcname].clone()))
+    };
+    for (type_oid, expected_oid, expected_name) in [
+        (23_u32, 1978_u32, "int4_ops"),
+        (21, 1979, "int2_ops"),
+        (26, 1981, "oid_ops"),
+        (25, 3126, "text_ops"),
+        (1082, 3122, "date_ops"),
+        (701, 3123, "float8_ops"),
+        (20, 3124, "int8_ops"),
+        (1700, 3125, "numeric_ops"),
+        (1184, 3127, "timestamptz_ops"),
+        (1114, 3128, "timestamp_ops"),
+    ] {
+        assert_eq!(
+            default_class(403, type_oid),
+            Some((
+                Value::Oid(expected_oid),
+                Value::Text(expected_name.to_string())
+            )),
+            "btree default class for type {type_oid}"
+        );
+    }
+
+    // Every reference out of the two relations lands on a row that exists:
+    // `pg_am` is hand-written and the rest is generated, so this is where the
+    // two would be caught disagreeing.
+    let (fam_schema, fam_rows) = required(cat.build_pg_catalog("pg_opfamily"), "pg_opfamily")?;
+    let (fam_oid, fam_method) = (
+        fam_schema.column_index("oid").expect("oid"),
+        fam_schema.column_index("opfmethod").expect("opfmethod"),
+    );
+    let (am_schema, am_rows) = required(cat.build_pg_catalog("pg_am"), "pg_am")?;
+    let am_oid = am_schema.column_index("oid").expect("oid");
+    let (type_schema, type_rows) = required(cat.build_pg_catalog("pg_type"), "pg_type")?;
+    let type_oid_col = type_schema.column_index("oid").expect("oid");
+    let known = |haystack: &[Vec<Value>], at: usize, needle: &Value| {
+        haystack.iter().any(|r| &r[at] == needle)
+    };
+    let family = col("opcfamily");
+    for row in &rows {
+        assert!(known(&am_rows, am_oid, &row[method]), "opcmethod dangles");
+        assert!(known(&fam_rows, fam_oid, &row[family]), "opcfamily dangles");
+        assert!(
+            known(&type_rows, type_oid_col, &row[intype]),
+            "opcintype dangles"
+        );
+    }
+    for row in &fam_rows {
+        assert!(
+            known(&am_rows, am_oid, &row[fam_method]),
+            "opfmethod dangles"
+        );
+    }
+    Ok(())
+}
+
+/// `pg_index.indclass` names the operator class each key is really built
+/// under — the column whose every entry used to be `0`.
+///
+/// `varchar` is the interesting key: it has no default class of its own
+/// (upstream's `varchar_ops` is a non-default alias inside the text family), so
+/// PostgreSQL resolves it through the binary-coercible cast to `text` and
+/// reports `text_ops`. A lookup that only tried an exact `opcintype` match
+/// would report `0` here and look plausible doing it.
+#[test]
+fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
+    use crabgresql_storage_api::{IndexKey, IndexMethod};
+    use crabgresql_types::VectorKind;
+
+    let key = |column: usize| IndexKey {
+        column,
+        descending: false,
+        nulls_first: false,
+    };
+    let index = |name: &str, method: IndexMethod, keys: Vec<IndexKey>| IndexMetadata {
+        name: name.to_string(),
+        method,
+        keys,
+        unique: false,
+        nulls_distinct: true,
+        constraint: None,
+    };
+    let mut relation = CatalogRelation::permanent(TableSchema::new(
+        "t",
+        vec![
+            Column::new("i", PgType::Int4),
+            Column::new("v", PgType::Varchar),
+            Column::new("a", PgType::Array(PgType::Int4.oid())),
+            Column::new("m", PgType::User(16_500)),
+            Column::new("i2v", PgType::Vector(VectorKind::Int2)),
+            Column::new("ov", PgType::Vector(VectorKind::Oid)),
+        ],
+    ));
+    relation.indexes = vec![
+        index(
+            "t_bt",
+            IndexMethod::BTree,
+            vec![key(0), key(1), key(2), key(3), key(4), key(5)],
+        ),
+        index("t_hash", IndexMethod::Hash, vec![key(0)]),
+    ];
+    let cat = SystemCatalog::from_source(Arc::new(StaticSource::new(vec![relation])));
+    let (schema, rows) = required(cat.build_pg_catalog("pg_index"), "pg_index is missing")?;
+    let indclass = schema.column_index("indclass").expect("indclass column");
+    let indexrelid = schema
+        .column_index("indexrelid")
+        .expect("indexrelid column");
+
+    let classes = |row: &Vec<Value>| match &row[indclass] {
+        Value::Vector { elems, .. } => elems.clone(),
+        other => panic!("indclass is not an oidvector: {other:?}"),
+    };
+    // The rows are ordered by index name, so `t_bt` precedes `t_hash`.
+    let btree = classes(&rows[0]);
+    assert_eq!(btree[0], Value::Oid(1978), "int4 btree key is int4_ops");
+    assert_eq!(
+        btree[1],
+        Value::Oid(3126),
+        "varchar btree key is text_ops, reached by binary coercion"
+    );
+    let hash = classes(&rows[1]);
+    assert_ne!(hash[0], btree[0], "the hash class is not the btree one");
+
+    let (opc_schema, opc_rows) = required(cat.build_pg_catalog("pg_opclass"), "pg_opclass")?;
+    let (opc_oid, opc_method) = (
+        opc_schema.column_index("oid").expect("oid"),
+        opc_schema.column_index("opcmethod").expect("opcmethod"),
+    );
+    let opc_name = opc_schema.column_index("opcname").expect("opcname");
+    let name_of = |class: &Value| {
+        opc_rows
+            .iter()
+            .find(|r| &r[opc_oid] == class)
+            .map(|r| r[opc_name].clone())
+    };
+    // The four keys below are asserted by name because none of their classes
+    // carries an upstream OID of its own. An array and an enum have no class
+    // of their own and index under a polymorphic one; `int2vector` joins them
+    // because PostgreSQL files it under `typcategory` A, while `oidvector` —
+    // also category A — has `oidvector_ops` and never gets that far.
+    assert_eq!(
+        name_of(&btree[2]),
+        Some(Value::Text("array_ops".to_string()))
+    );
+    assert_eq!(
+        name_of(&btree[3]),
+        Some(Value::Text("enum_ops".to_string()))
+    );
+    assert_eq!(
+        name_of(&btree[4]),
+        Some(Value::Text("array_ops".to_string()))
+    );
+    assert_eq!(
+        name_of(&btree[5]),
+        Some(Value::Text("oidvector_ops".to_string()))
+    );
+    // Every class is one the index's *own* access method publishes — the
+    // mistake a lookup ignoring `am_oid` would make.
+    for (row, expected_am) in rows.iter().zip([403_u32, 405]) {
+        for class in classes(row) {
+            let published = opc_rows
+                .iter()
+                .find(|r| r[opc_oid] == class)
+                .unwrap_or_else(|| panic!("indclass {class:?} has no pg_opclass row"));
+            assert_eq!(published[opc_method], Value::Oid(expected_am));
+        }
+        assert!(row[indexrelid] != Value::Oid(0));
+    }
+    Ok(())
+}
+
 /// The `pg_class` columns psql's `\d` reads carry their true PostgreSQL
 /// value, never a placeholder — `relchecks` counts the relation's CHECK
 /// constraints, so the `0` a table without any reports is what gates psql's
