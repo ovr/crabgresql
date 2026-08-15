@@ -87,3 +87,4 @@ test: pg_catalog_wave1
 test: pg_description
 test: pg_views_undeparsable
 test: pg_opclass
+test: with_ordinality

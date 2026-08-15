@@ -207,15 +207,94 @@ fn table_fn_argument_that_resolves_nowhere_keeps_its_own_error() -> anyhow::Resu
 #[test]
 fn unnest_in_from_rejects_unsupported_forms() -> anyhow::Result<()> {
     assert_eq!(
-        bind_err("SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY")?.message,
-        "WITH ORDINALITY is not supported yet"
-    );
-    assert_eq!(
         bind_err("SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4])")?.message,
         "unnest with multiple arrays is not supported yet"
     );
     // A non-array argument is still resolved by `resolve_unnest`.
     assert_eq!(bind_err("SELECT * FROM unnest(1)")?.code, "42883");
+    Ok(())
+}
+
+#[test]
+fn with_ordinality_appends_a_bigint_column() -> anyhow::Result<()> {
+    // Both FROM spellings of a function reach the same rowset: the `Table`
+    // factor with call arguments, and the parser's own `UNNEST` factor.
+    for sql in [
+        "SELECT * FROM generate_series(1, 3) WITH ORDINALITY",
+        "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY",
+    ] {
+        let TableFunctionPlan {
+            columns,
+            ordinality,
+            ..
+        } = bound_table_function(sql)?;
+        assert!(ordinality, "for `{sql}`");
+        assert_eq!(columns.len(), 2, "for `{sql}`");
+        assert_eq!(columns[1].name, "ordinality", "for `{sql}`");
+        assert_eq!(columns[1].ty, PgType::Int8, "for `{sql}`");
+    }
+    let TableFunctionPlan {
+        columns,
+        ordinality,
+        ..
+    } = bound_table_function("SELECT * FROM generate_series(1, 3)")?;
+    assert!(!ordinality);
+    assert_eq!(columns.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn with_ordinality_bare_alias_names_only_the_first_column() -> anyhow::Result<()> {
+    let TableFunctionPlan { columns, .. } =
+        bound_table_function("SELECT * FROM generate_series(1, 3) WITH ORDINALITY t")?;
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["t", "ordinality"]);
+    Ok(())
+}
+
+#[test]
+fn with_ordinality_alias_column_list_covers_the_ordinal() -> anyhow::Result<()> {
+    let TableFunctionPlan { columns, .. } =
+        bound_table_function("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS s(a, b)")?;
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+
+    let TableFunctionPlan { columns, .. } =
+        bound_table_function("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS s(a)")?;
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a", "ordinality"]);
+
+    let e = bind_err("SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS s(a, b, c)")?;
+    assert_eq!(e.code, "42P10");
+    Ok(())
+}
+
+#[test]
+fn with_ordinality_on_a_composite_function_keeps_the_row_type_names() -> anyhow::Result<()> {
+    let TableFunctionPlan { columns, .. } = bound_table_function(
+        "SELECT * FROM pg_input_error_info('1e400', 'float4') WITH ORDINALITY AS e",
+    )?;
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["message", "detail", "hint", "sql_error_code", "ordinality"]
+    );
+    Ok(())
+}
+
+#[test]
+fn with_ordinality_column_is_referenceable() -> anyhow::Result<()> {
+    // The shape psql's `\d` trigger footer uses: `… WITH ORDINALITY AS
+    // a(relid, depth) … ORDER BY a.depth` names the ordinal in the outer query.
+    let TableFunctionPlan {
+        columns, predicate, ..
+    } = bound_table_function(
+        "SELECT ordinality FROM generate_series(5, 9) WITH ORDINALITY WHERE ordinality = 2",
+    )?;
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].name, "ordinality");
+    assert_eq!(columns[0].ty, PgType::Int8);
+    assert!(predicate.is_some());
     Ok(())
 }
 

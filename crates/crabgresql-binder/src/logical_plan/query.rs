@@ -73,6 +73,7 @@ pub struct SubqueryPlan {
 pub struct TableFunctionPlan {
     pub func: TableFn,
     pub args: Vec<BoundExpr>,
+    pub ordinality: bool,
     pub columns: Vec<OutputColumn>,
     pub projections: Vec<BoundExpr>,
     pub predicate: Option<BoundExpr>,
