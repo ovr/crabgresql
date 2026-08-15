@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CrabgreSQL in the browser</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+      body {
+        margin: 0 auto;
+        max-width: 60rem;
+        padding: 2rem 1rem 4rem;
+        line-height: 1.5;
+      }
+      h1 {
+        font-size: 1.4rem;
+      }
+      p.hint {
+        opacity: 0.7;
+        font-size: 0.9rem;
+      }
+      textarea {
+        width: 100%;
+        min-height: 8rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.9rem;
+        padding: 0.6rem;
+        box-sizing: border-box;
+      }
+      button {
+        font: inherit;
+        padding: 0.4rem 1rem;
+        margin-top: 0.5rem;
+      }
+      table {
+        border-collapse: collapse;
+        margin: 1rem 0;
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+      }
+      th,
+      td {
+        border: 1px solid currentColor;
+        padding: 0.2rem 0.6rem;
+        text-align: left;
+      }
+      td.null {
+        opacity: 0.5;
+        font-style: italic;
+      }
+      .tag {
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+        opacity: 0.75;
+      }
+      .error {
+        font-family: ui-monospace, monospace;
+        white-space: pre-wrap;
+        color: #b00020;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>CrabgreSQL in the browser</h1>
+    <p class="hint">
+      The whole engine — parser, planner, executor, heap, WAL, recovery —
+      compiled to a WASI 0.2 component. The data directory is in memory, so it
+      lasts as long as this page does.
+    </p>
+    <textarea id="sql" spellcheck="false">
+create table events (id int, name text, at timestamp);
+insert into events values
+  (1, 'boot', '2026-01-01 09:00:00'),
+  (2, 'query', '2026-01-01 09:00:03'),
+  (3, 'checkpoint', null);
+select id, name, at from events order by id;</textarea
+    >
+    <button id="run">Run (⌘/Ctrl + Enter)</button>
+    <div id="out"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

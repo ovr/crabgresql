@@ -22,12 +22,12 @@
 //! log begins for the life of a cluster. [`recover`] resolves `Lsn::INVALID` to
 //! the oldest surviving segment before reading a byte.
 
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crabgresql_txn::{Clog, Xid};
 
 use crate::control::read_control;
+use crate::fsutil::FileExt;
 use crate::record::{Lsn, WalError, WalRecord};
 use crate::rmgr::{RedoContext, RmgrId, RmgrRegistry, XACT_ABORT, XACT_COMMIT, XLOG_PAD};
 use crate::segment::{SEGMENT_SIZE, segment_numbers, segment_of, segment_offset, wal_segment_path};
@@ -809,7 +809,6 @@ mod tests {
         // Corrupt the first record's payload, leaving its length intact so the
         // second record stays where it is.
         {
-            use std::os::unix::fs::FileExt;
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path_0(dir.path()))?;

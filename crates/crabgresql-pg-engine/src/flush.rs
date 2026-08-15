@@ -10,6 +10,8 @@
 //! Parquet and `fsync`s, and parking a runtime worker on that would stall
 //! connection handling on an unrelated socket.
 
+// Only the worker loop keeps per-relation ages, and it does not exist on wasm.
+#[cfg(not(target_family = "wasm"))]
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -188,6 +190,21 @@ impl FlushWorker {
     /// The handle is weak so the thread can never keep the engine (and its file
     /// descriptors) alive past shutdown: if the engine is dropped without
     /// `stop_and_join`, the next tick fails to upgrade and the thread exits.
+    ///
+    /// On wasm there is no worker at all: the target has no threads, so the
+    /// spawn is compiled out rather than left to fail at runtime. Buffered rows
+    /// are still WAL-durable — they are just written out by `VACUUM` and by the
+    /// shutdown checkpoint instead of on a tick.
+    #[cfg(target_family = "wasm")]
+    pub fn spawn(_engine: Weak<PgEngine>, _policy: BufferFlushPolicy) -> FlushWorker {
+        tracing::debug!("no threads on this target; buffers flush only at VACUUM and checkpoint");
+        FlushWorker {
+            stop: Arc::new((Mutex::new(false), Condvar::new())),
+            handle: None,
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub fn spawn(engine: Weak<PgEngine>, policy: BufferFlushPolicy) -> FlushWorker {
         let stop: Stop = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = Arc::clone(&stop);
@@ -236,6 +253,9 @@ impl FlushWorker {
     }
 }
 
+/// The worker loop, and the pass it runs — compiled out on wasm along with
+/// the thread that would drive them.
+#[cfg(not(target_family = "wasm"))]
 fn run(engine: Weak<PgEngine>, policy: BufferFlushPolicy, stop: Stop) {
     // When each relation's buffer was first seen non-empty, so a quiet relation
     // still flushes on age. Kept here rather than in the buffer so the storage
@@ -263,6 +283,7 @@ fn run(engine: Weak<PgEngine>, policy: BufferFlushPolicy, stop: Stop) {
 }
 
 /// One pass: flush every relation the policy says is due.
+#[cfg(not(target_family = "wasm"))]
 fn sweep(
     engine: &Arc<PgEngine>,
     policy: &BufferFlushPolicy,
@@ -321,6 +342,7 @@ fn sweep(
 /// to, so counting it would let one such table hold the global limit true
 /// forever — every Parquet relation force-flushed on every tick, and every
 /// writer waiting on a condition no flush can clear.
+#[cfg(not(target_family = "wasm"))]
 fn flushable_bytes(buffered: &[BufferedRelation]) -> usize {
     buffered
         .iter()

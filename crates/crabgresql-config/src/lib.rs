@@ -310,22 +310,26 @@ impl Quantity for usize {
     /// and `32m` all mean the same thing; a bare count is bytes.
     fn parse(raw: &str) -> Option<usize> {
         let (count, unit) = split_count(raw)?;
+        // The multipliers are `u64`, not `usize`: a terabyte does not fit in a
+        // 32-bit `usize`, and on wasm32 the table would not even compile. A
+        // value the target cannot hold has to fail like any other count that is
+        // too large — at parse time, per value — rather than at build time.
         let multiplier = match_unit(
             unit,
             &[
                 ("", 1),
                 ("b", 1),
-                ("k", KB),
-                ("kb", KB),
-                ("m", MB),
-                ("mb", MB),
-                ("g", GB),
-                ("gb", GB),
-                ("t", GB * KB),
-                ("tb", GB * KB),
+                ("k", KB as u64),
+                ("kb", KB as u64),
+                ("m", MB as u64),
+                ("mb", MB as u64),
+                ("g", GB as u64),
+                ("gb", GB as u64),
+                ("t", GB as u64 * KB as u64),
+                ("tb", GB as u64 * KB as u64),
             ],
         )?;
-        usize::try_from(count).ok()?.checked_mul(multiplier)
+        usize::try_from(count.checked_mul(multiplier)?).ok()
     }
 
     fn render(self) -> String {

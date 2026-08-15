@@ -138,6 +138,38 @@ ships no client — so probe the port from outside if you need one.
 
 Building it yourself: `docker build -t crabgresql .`
 
+## In the browser (WebAssembly)
+
+The engine also builds as a **WASI 0.2 component**, which runs in a browser tab
+with no server and no network: `crates/crabgresql-wasm` exports
+`exec(sql) -> json`, and `js/` transpiles it with
+[jco](https://github.com/bytecodealliance/jco) and wraps it in a small JS API.
+
+```console
+$ rustup target add wasm32-wasip2
+$ cd js && npm install
+$ npm run build          # cargo build --target wasm32-wasip2 + jco transpile
+$ npm run smoke          # drives the component under Node
+$ npm run demo           # a query console at http://localhost:5173
+```
+
+```js
+import { open } from './src/index.js';
+
+const db = open('/pgdata');
+db.query('create table t(a int)');
+db.query('insert into t values (1), (2)');
+db.rows('select sum(a) from t');   // [{ sum: '3' }]
+```
+
+The data directory lives in an in-memory filesystem (`js/src/host.js`), so a
+database lasts as long as the page does — WAL, recovery and checkpoints all run,
+they just have nowhere durable to run to. There are no threads and no sockets on
+this target, which means no background flush worker (call `db.checkpoint()`) and
+one session per database. See
+[docs/ARCHITECTURE.md §7](docs/ARCHITECTURE.md) for what else the target takes
+away.
+
 ## PostgreSQL regression tests
 
 The PostgreSQL regression corpus (`src/test/regress`, pinned to a master

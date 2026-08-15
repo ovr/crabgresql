@@ -880,6 +880,7 @@ crates/
   crabgresql-server-process  # start that binary as a child process, for the harnesses
   crabgresql-pg-regress      # pg_regress-style runner; diff tests against PG
   crabgresql-bench           # analytical benchmark harness (ClickBench, TPC-H)
+  crabgresql-wasm            # WASI 0.2 component: the engine in a browser tab
 ```
 
 ## 5. Compatibility verification strategy (this IS the product)
@@ -918,7 +919,45 @@ exception to the paragraph above:
   PostgreSQL-compatible surface is untouched: the divergence is reachable only
   from a `USING` clause that already names a non-PostgreSQL access method.
 
-## 7. Decisions made
+## 7. Browser build (`wasm32-wasip2`)
+
+The same engine compiles to a **WASI 0.2 component** — `crates/crabgresql-wasm`
+— which runs in a browser tab after `jco transpile`. It is the whole stack
+(parser, binder, planner, executor, heap, B-tree, WAL, recovery), not a subset:
+what is dropped is the *server*, not the database.
+
+**How a query gets in.** WASI 0.2 has no sockets, so there is no listener. But
+the protocol layer is where the behavior lives — statement analysis, transaction
+state, GUCs, error fields, command tags, the text encoding of every value — so
+the component does not reach past it into the executor. It drives a real session
+over an in-memory `tokio::io::duplex`: `crabgresql_server::handle_session` on one
+end (the same function the TCP server runs, minus the socket), pgwire frames on
+the other, decoded back into JSON by the component. The exported WIT is
+deliberately small — `exec(sql) -> result<string, string>` — because the
+component boundary is not where the API design belongs.
+
+**What the target takes away.**
+
+| Native | wasm | Why |
+|---|---|---|
+| TCP listener, session per connection | one embedded session | no sockets in WASI 0.2 |
+| Background flush worker (`FlushWorker`) | flush at `VACUUM`/checkpoint | no threads; the spawn is compiled out (`target_family = "wasm"`) rather than left to fail |
+| `std::os::unix::fs::FileExt` (`pread`/`pwrite`) | seek + read/write in `crabgresql-wal::fsutil` | std exposes WASI's positional I/O only behind the unstable `wasi_ext`; sound because the target is single-threaded |
+| errno table for "cannot fsync a directory" | its own WASI-numbered table | WASI numbers errnos alphabetically from scratch: unix's `EBADF` (9) is WASI's `EBADMSG` |
+| A terabyte-sized knob parses | fails as too large | `usize` is 32-bit |
+
+**The host is ours.** `js/src/host.js` implements `wasi:filesystem`,
+`wasi:io`, `wasi:cli`, `wasi:clocks` and `wasi:random` in about 500 lines,
+because `@bytecodealliance/preview2-shim` cannot host a storage engine: its
+browser filesystem accepts writes only at offset 0 and replaces the whole file,
+and `setSize`/`renameAt`/`unlinkFileAt` are stubs — which is precisely the WAL's
+write-at-offset, truncate-the-partial-record, publish-by-rename pattern. Its
+Node filesystem refuses `mutate-directory`, which wasi-libc requests on every
+read-write open. The tree is in RAM, so a database lives as long as the page
+does; that module is also the single seam where an OPFS-backed implementation
+would go.
+
+## 8. Decisions made
 
 | Question | Decision |
 |---|---|

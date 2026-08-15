@@ -1,0 +1,5 @@
+node_modules/
+# `dist/` is the transpiled component: generated from the .wasm by
+# `npm run build`, several megabytes of it, and never edited by hand.
+dist/
+demo/dist/

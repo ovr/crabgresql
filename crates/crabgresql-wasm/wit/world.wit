@@ -1,0 +1,42 @@
+package crabgresql:db@0.1.0;
+
+/// The database an embedder talks to.
+interface engine {
+    /// One session, holding its own transaction state, GUCs and prepared
+    /// statements — and, with it, one open data directory. Dropping it ends the
+    /// session; the directory outlives it for as long as the host's filesystem
+    /// does.
+    resource connection {
+        /// Open (and recover) a data directory, creating it if it is not there.
+        constructor(data-dir: string);
+
+        /// Run a simple query — one statement or several separated by `;` — and
+        /// return the results as JSON:
+        ///
+        ///   {"results":[{"columns":["one"],"rows":[["1"]],
+        ///                "command":"SELECT 1"}],
+        ///    "notices":[]}
+        ///
+        /// Every value is the same text encoding the wire protocol would carry,
+        /// or JSON `null` for SQL NULL. A failing statement comes back as the
+        /// error case, also JSON: {"sqlstate":"42P01","message":"…",
+        /// "detail":null,"hint":null,"position":null,"severity":"ERROR"}.
+        exec: func(sql: string) -> result<string, string>;
+
+        /// Write buffered pages and rows out to the data directory and record a
+        /// clean shutdown.
+        ///
+        /// There is no background flush worker on wasm — the target has no
+        /// threads — so this is how an embedder makes everything it has written
+        /// reachable by a plain read of the directory.
+        checkpoint: func() -> result<_, string>;
+    }
+}
+
+/// CrabgreSQL as a WASI 0.2 component: no sockets, no threads. The host
+/// supplies a filesystem (in the browser, jco's in-memory shim) and the
+/// component opens a data directory in it exactly as the native server would —
+/// WAL, recovery, checkpoints and all.
+world database {
+    export engine;
+}

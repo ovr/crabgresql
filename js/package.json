@@ -1,0 +1,25 @@
+{
+  "name": "@crabgresql/wasm",
+  "version": "0.0.2",
+  "private": true,
+  "type": "module",
+  "description": "CrabgreSQL as a WASI 0.2 component, for the browser and for Node",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build:wasm": "cargo build --manifest-path ../Cargo.toml -p crabgresql-wasm --target wasm32-wasip2 --profile wasm-release",
+    "build:js": "node transpile.mjs",
+    "build": "npm run build:wasm && npm run build:js",
+    "smoke": "node smoke.mjs",
+    "demo": "vite demo",
+    "build:demo": "vite build demo",
+    "preview": "vite preview demo"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.28.1",
+    "vite": "^7.1.0"
+  }
+}

@@ -16,7 +16,7 @@ clap.workspace = true
 crabgresql-server-process.workspace = true
 similar.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [dev-dependencies]
 anyhow.workspace = true
