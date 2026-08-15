@@ -23,7 +23,7 @@ use crate::catalogs::{
     description, extension, foreign, index, inherits, language, locks, misc_empty, namespace,
     opclass, operator, policy, prepared, proc, progress, publication, relviews, replication,
     rewrite, sequence, settings, stat_activity, stat_database, stat_indexes, stat_io, stat_tables,
-    statio, statistic, statistic_ext, timezone, trigger, types,
+    statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -912,6 +912,41 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         trigger::pg_trigger_schema,
         no_rows,
+    ),
+    rel(
+        "pg_ts_config",
+        3602,
+        PgCatalog,
+        textsearch::pg_ts_config_schema,
+        textsearch::pg_ts_config_rows,
+    ),
+    rel(
+        "pg_ts_config_map",
+        3603,
+        PgCatalog,
+        textsearch::pg_ts_config_map_schema,
+        textsearch::pg_ts_config_map_rows,
+    ),
+    rel(
+        "pg_ts_dict",
+        3600,
+        PgCatalog,
+        textsearch::pg_ts_dict_schema,
+        textsearch::pg_ts_dict_rows,
+    ),
+    rel(
+        "pg_ts_parser",
+        3601,
+        PgCatalog,
+        textsearch::pg_ts_parser_schema,
+        textsearch::pg_ts_parser_rows,
+    ),
+    rel(
+        "pg_ts_template",
+        3764,
+        PgCatalog,
+        textsearch::pg_ts_template_schema,
+        textsearch::pg_ts_template_rows,
     ),
     rel(
         "pg_type",

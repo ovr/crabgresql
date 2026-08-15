@@ -78,6 +78,10 @@ const PUBLISHED: &[Published] = &[
     ("pg_type", |_| true),
     ("pg_proc", |_| true),
     ("pg_operator", |_| true),
+    ("pg_ts_parser", |_| true),
+    ("pg_ts_template", |_| true),
+    ("pg_ts_dict", |_| true),
+    ("pg_ts_config", |_| true),
     ("pg_am", |oid| BUILTIN_AMS.iter().any(|(o, ..)| *o == oid)),
     ("pg_language", |oid| {
         BUILTIN_LANGUAGES.iter().any(|(o, ..)| *o == oid)
@@ -128,6 +132,15 @@ fn descriptions() -> &'static [Description] {
             rows.push((extension, PLPGSQL_EXTENSION_OID, 0, comment));
             rows.push((language, PLPGSQL_LANG_OID, 0, comment));
         }
+
+        // The snowball template, dictionaries and configurations, whose
+        // comments `initdb` writes with `COMMENT ON` rather than taking from a
+        // `.dat` — the same standing as the rows themselves.
+        rows.extend(
+            crate::catalogs::textsearch::snowball_descriptions()
+                .into_iter()
+                .map(|(catalog, objoid, description)| (classoid(catalog), objoid, 0, description)),
+        );
 
         let am = classoid("pg_am");
         rows.extend(

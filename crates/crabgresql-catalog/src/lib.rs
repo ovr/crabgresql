@@ -360,6 +360,57 @@ pub struct PgAmprocRow {
     pub amproc: ProcRef,
 }
 
+/// The five text-search catalogs' bootstrap rows, generated from the
+/// `pg_ts_*.dat` files. They describe the `default` parser, the four
+/// dictionary templates and the `simple` dictionary and configuration built
+/// from them; the twenty-nine snowball ones a stock PostgreSQL also publishes
+/// are added by [`catalogs::textsearch`], because `initdb` creates those from
+/// SQL rather than from any `.dat`.
+pub struct PgTsParserRow {
+    pub oid: u32,
+    pub prsname: &'static str,
+    pub prsstart: ProcRef,
+    pub prstoken: ProcRef,
+    pub prsend: ProcRef,
+    pub prsheadline: ProcRef,
+    pub prslextype: ProcRef,
+}
+
+/// See [`PgTsParserRow`].
+pub struct PgTsTemplateRow {
+    pub oid: u32,
+    pub tmplname: &'static str,
+    pub tmplinit: ProcRef,
+    pub tmpllexize: ProcRef,
+}
+
+/// See [`PgTsParserRow`]. `dictinitoption` carries the empty string for the
+/// column's NULL — a dictionary configured with an empty option string is not
+/// a thing PostgreSQL accepts, so the two cannot be confused.
+pub struct PgTsDictRow {
+    pub oid: u32,
+    pub dictname: &'static str,
+    pub dicttemplate: u32,
+    pub dictinitoption: &'static str,
+}
+
+/// See [`PgTsParserRow`].
+pub struct PgTsConfigRow {
+    pub oid: u32,
+    pub cfgname: &'static str,
+    pub cfgparser: u32,
+}
+
+/// See [`PgTsParserRow`]. This one has no `oid`: a row is keyed by
+/// `(mapcfg, maptokentype, mapseqno)`, and the sequence number is what orders
+/// the dictionaries a token is looked up in.
+pub struct PgTsConfigMapRow {
+    pub mapcfg: u32,
+    pub maptokentype: i32,
+    pub mapseqno: i32,
+    pub mapdict: u32,
+}
+
 /// A built-in `pg_description` row, generated from the `descr` fields of the
 /// vendored `.dat` files. `catalog` is the `pg_catalog` relation the described
 /// object lives in, by name: codegen has no business knowing the fixed relation
@@ -381,6 +432,11 @@ include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_operator_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_aggregate_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_parser_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_template_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_dict_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_config_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_config_map_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amop_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amproc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));

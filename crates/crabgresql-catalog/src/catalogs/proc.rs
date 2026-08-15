@@ -92,6 +92,42 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
             Value::Null,
         ]
     });
+    // The snowball dictionary's two C functions, which `pg_ts_template.snowball`
+    // points at. `initdb` creates them from `snowball_create.sql` rather than
+    // from a `.dat`, so codegen has nothing to emit and they are spelled out
+    // here — shaped as PostgreSQL's are: language `c`, volatile, strict,
+    // `internal` arguments and result, living in `$libdir/dict_snowball`.
+    let snowball = [(SNOWBALL_INIT_PROC, 1), (SNOWBALL_LEXIZE_PROC, 4)]
+        .into_iter()
+        .map(|(proc, nargs)| {
+            vec![
+                Value::Oid(proc.oid),
+                Value::Text(proc.name.to_string()),
+                Value::Oid(11),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(13),
+                Value::Float4(1.0),
+                Value::Float4(0.0),
+                Value::Oid(0),
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+                chr('f'),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(false),
+                chr('v'),
+                chr('u'),
+                Value::Int2(nargs),
+                Value::Int2(0),
+                Value::Oid(2281),
+                oidvector(std::iter::repeat_n(2281, nargs as usize)),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text(proc.name.to_string()),
+                Value::Text("$libdir/dict_snowball".to_string()),
+            ]
+        });
     PG_PROC_ROWS
         .iter()
         .map(|r| {
@@ -141,6 +177,7 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
             ]
         })
         .chain(own)
+        .chain(snowball)
         .collect()
 }
 

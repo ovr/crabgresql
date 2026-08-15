@@ -710,6 +710,211 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The five `pg_ts_*` relations, half generated from the `.dat` and half
+/// reconstructed from the snowball language list.
+///
+/// The reconstruction is where the risk is: the `.dat` half is checked by the
+/// same machinery every other generated catalog is, but the twenty-nine
+/// snowball configurations are built from a list transcribed here, so what
+/// keeps them honest is that they have to *join* like the generated half —
+/// every dictionary at the snowball template, every configuration at the
+/// default parser, and every configuration mapping the same nineteen token
+/// types the `simple` one does.
+///
+/// Nothing pins a snowball OID: those come from `initdb`'s counter rather than
+/// from vendored data. See `catalogs::textsearch`.
+#[test]
+fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (parser_schema, parser_rows) = build("pg_ts_parser")?;
+    let (template_schema, template_rows) = build("pg_ts_template")?;
+    let (dict_schema, dict_rows) = build("pg_ts_dict")?;
+    let (config_schema, config_rows) = build("pg_ts_config")?;
+    let (map_schema, map_rows) = build("pg_ts_config_map")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let name_at = |row: &[Value], i: usize| match row[i] {
+        Value::Text(ref name) => name.clone(),
+        ref other => panic!("expected a name, got {other:?}"),
+    };
+
+    // The counts a stock PostgreSQL 18.4 reports, which is the whole point of
+    // reconstructing the snowball half rather than serving the `.dat` alone.
+    assert_eq!(parser_rows.len(), 1);
+    assert_eq!(template_rows.len(), 5);
+    assert_eq!(dict_rows.len(), 30);
+    assert_eq!(config_rows.len(), 30);
+    assert_eq!(map_rows.len(), 570);
+
+    // Every reference lands. The parser's five functions and the templates'
+    // two come from `pg_proc`, including the snowball pair, which no `.dat`
+    // defines and `catalogs::proc` spells out.
+    let procs: std::collections::HashSet<u32> = proc_rows
+        .iter()
+        .map(|r| oid_at(r, at(&proc_schema, "oid")))
+        .collect();
+    let reg_at = |row: &[Value], i: usize| match row[i] {
+        Value::Reg(ref reg) => reg.oid,
+        ref other => panic!("expected a regproc, got {other:?}"),
+    };
+    for column in [
+        "prsstart",
+        "prstoken",
+        "prsend",
+        "prsheadline",
+        "prslextype",
+    ] {
+        let oid = reg_at(&parser_rows[0], at(&parser_schema, column));
+        assert!(procs.contains(&oid), "{column} {oid} dangles");
+    }
+    for row in &template_rows {
+        for column in ["tmplinit", "tmpllexize"] {
+            let oid = reg_at(row, at(&template_schema, column));
+            assert!(procs.contains(&oid), "{column} {oid} dangles");
+        }
+    }
+
+    let template_oids: std::collections::HashMap<u32, String> = template_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&template_schema, "oid")),
+                name_at(r, at(&template_schema, "tmplname")),
+            )
+        })
+        .collect();
+    let dicts: std::collections::HashMap<u32, String> = dict_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&dict_schema, "oid")),
+                name_at(r, at(&dict_schema, "dictname")),
+            )
+        })
+        .collect();
+    let configs: std::collections::HashMap<u32, String> = config_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&config_schema, "oid")),
+                name_at(r, at(&config_schema, "cfgname")),
+            )
+        })
+        .collect();
+    // Names are unique per relation: an OID collision between the generated
+    // band and the reconstructed one would show up here first.
+    assert_eq!(dicts.len(), dict_rows.len());
+    assert_eq!(configs.len(), config_rows.len());
+    // An OID is only required to be unique within its own catalog, but
+    // `initdb` hands these out from one counter, so no dictionary and
+    // configuration share a number. Reconstructing the pair with the same
+    // formula for both — the off-by-one that is easiest to write — would
+    // satisfy every other check here.
+    for (oid, name) in &dicts {
+        assert!(
+            !configs.contains_key(oid),
+            "{name} and configuration {} share an OID",
+            configs[oid]
+        );
+    }
+    for (oid, name) in &template_oids {
+        assert!(
+            !dicts.contains_key(oid) && !configs.contains_key(oid),
+            "template {name} shares an OID with a dictionary or configuration"
+        );
+    }
+
+    let parser_oid = oid_at(&parser_rows[0], at(&parser_schema, "oid"));
+    for row in &dict_rows {
+        let name = name_at(row, at(&dict_schema, "dictname"));
+        let template = oid_at(row, at(&dict_schema, "dicttemplate"));
+        let template = template_oids
+            .get(&template)
+            .unwrap_or_else(|| panic!("{name}'s template dangles"));
+        // `simple` is the `.dat`'s; everything else is a snowball stemmer, and
+        // says so both in its template and in its option string.
+        if name == "simple" {
+            assert_eq!(template, "simple");
+            assert_eq!(row[at(&dict_schema, "dictinitoption")], Value::Null);
+        } else {
+            assert_eq!(template, "snowball", "{name} is not a snowball dictionary");
+            let language = name.strip_suffix("_stem").expect("named <language>_stem");
+            let Value::Text(ref option) = row[at(&dict_schema, "dictinitoption")] else {
+                anyhow::bail!("{name} has no init option");
+            };
+            assert!(
+                option.starts_with(&format!("language = '{language}'")),
+                "{name} configures {option:?}"
+            );
+        }
+    }
+    for row in &config_rows {
+        // All thirty use the default parser: snowball supplies dictionaries,
+        // not a parser.
+        assert_eq!(oid_at(row, at(&config_schema, "cfgparser")), parser_oid);
+    }
+
+    // Every configuration maps the same nineteen token types, one dictionary
+    // each, and the token set is the `simple` configuration's.
+    let simple_config = config_rows
+        .iter()
+        .find(|r| name_at(r, at(&config_schema, "cfgname")) == "simple")
+        .map(|r| oid_at(r, at(&config_schema, "oid")))
+        .expect("the simple configuration");
+    let tokens_of = |cfg: u32| -> Vec<i32> {
+        let mut tokens: Vec<i32> = map_rows
+            .iter()
+            .filter(|r| oid_at(r, at(&map_schema, "mapcfg")) == cfg)
+            .map(|r| match r[at(&map_schema, "maptokentype")] {
+                Value::Int4(token) => token,
+                ref other => panic!("expected an int4, got {other:?}"),
+            })
+            .collect();
+        tokens.sort_unstable();
+        tokens
+    };
+    let expected_tokens = tokens_of(simple_config);
+    assert_eq!(expected_tokens.len(), 19);
+    for (&cfg, name) in &configs {
+        assert_eq!(tokens_of(cfg), expected_tokens, "the token map of {name}");
+    }
+    for row in &map_rows {
+        assert_eq!(row[at(&map_schema, "mapseqno")], Value::Int4(1));
+        let dict = oid_at(row, at(&map_schema, "mapdict"));
+        assert!(dicts.contains_key(&dict), "mapdict {dict} dangles");
+        let cfg = oid_at(row, at(&map_schema, "mapcfg"));
+        assert!(configs.contains_key(&cfg), "mapcfg {cfg} dangles");
+    }
+
+    // The split `snowball_create.sql` makes: a language configuration sends
+    // the six word-shaped token types to its own stemmer and the other
+    // thirteen to `simple`. Checked on `english`, the one anybody uses.
+    let english = *configs
+        .iter()
+        .find(|(_, name)| *name == "english")
+        .map(|(oid, _)| oid)
+        .expect("the english configuration");
+    let mut to_stemmer = 0;
+    let mut to_simple = 0;
+    for row in map_rows
+        .iter()
+        .filter(|r| oid_at(r, at(&map_schema, "mapcfg")) == english)
+    {
+        match dicts[&oid_at(row, at(&map_schema, "mapdict"))].as_str() {
+            "english_stem" => to_stemmer += 1,
+            "simple" => to_simple += 1,
+            other => panic!("english maps a token to {other}"),
+        }
+    }
+    assert_eq!((to_stemmer, to_simple), (6, 13));
+    Ok(())
+}
+
 /// `pg_aggregate` describes upstream's aggregates: the transition and final
 /// functions each one is built from, and the ordering operator `min`/`max` are
 /// equivalent to.
@@ -2455,7 +2660,15 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // `pg_aggregate`: a support function, an `oprcode` or a transition
             // function is a `pg_proc` row like any other, and its description
             // comes along.
-            ("pg_proc", 1242),
+            ("pg_proc", 1255),
+            // The `simple` configuration and dictionary and the default parser
+            // come from the `.dat`; the other 29 of each are snowball's, whose
+            // comments `initdb` writes with `COMMENT ON`.
+            ("pg_ts_config", 30),
+            ("pg_ts_dict", 30),
+            ("pg_ts_parser", 1),
+            // Four templates from the `.dat`, plus snowball.
+            ("pg_ts_template", 5),
             ("pg_type", 109),
         ])
     );

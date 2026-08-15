@@ -42,6 +42,7 @@ pub(crate) mod stat_tables;
 pub(crate) mod statio;
 pub(crate) mod statistic;
 pub(crate) mod statistic_ext;
+pub(crate) mod textsearch;
 pub(crate) mod timezone;
 pub(crate) mod trigger;
 pub(crate) mod types;
