@@ -1,6 +1,20 @@
 //! One module per `pg_catalog` relation family. Each publishes the pair the
 //! registry binds — a `*_schema()` and a `*_rows(&SystemCatalog)` — so adding a
 //! relation is a module here plus one line in [`crate::registry`].
+//!
+//! # Serving a relation is not yet running the `\d` metacommand for it
+//!
+//! Several modules note which psql metacommand reads their relation — `\do` for
+//! [`operator`], `\da` for [`aggregate`], `\dF` for [`textsearch`], `\dAo`/`\dAp`
+//! for [`amop`], `\dc` for [`conversion`]. That says what the relation is *for*,
+//! not that the metacommand runs here: every one of those queries also calls a
+//! `pg_<family>_is_visible(oid)` predicate, and this build has only
+//! `pg_table_is_visible`. `\da` additionally wants `pg_get_function_arguments`.
+//!
+//! So the relations answer a direct `SELECT` and every join between them — which
+//! is what the smoke suite exercises — and psql still refuses the shorthand with
+//! `function pg_operator_is_visible(oid) does not exist`. The remaining work is
+//! a family of scalar functions, not a catalog gap.
 
 pub(crate) mod acl;
 pub(crate) mod aggregate;
