@@ -8,9 +8,25 @@ use crate::symbols::SymbolTable;
 
 /// A generated array literal's elements, comma-separated. An absent field
 /// yields no elements, which the emitted row spells as an empty slice.
-fn list(values: Option<Vec<String>>, render: impl Fn(&str) -> String) -> String {
+///
+/// An entry writing `{}` is refused rather than emitted. PostgreSQL means "an
+/// array with no elements" by it, the generated rows spell NULL as an empty
+/// slice, and [`crate::dat::array_field`] keeps the two apart — but only up to
+/// here, since `crabgresql-catalog`'s `cols::optional_array` renders an empty
+/// slice as NULL. No entry in the vendored data writes one, so refusing is the
+/// same trade the `proargdefaults` check below makes: reject data codegen
+/// cannot represent instead of quietly representing it as something else.
+fn list(e: &Entry, key: &str, render: impl Fn(&str) -> String) -> String {
+    let Some(values) = array_field(e, key) else {
+        return String::new();
+    };
+    assert!(
+        !values.is_empty(),
+        "pg_proc entry {}: {key} is an empty array, which codegen cannot tell \
+         from NULL",
+        str_field(e, "proname", "")
+    );
     values
-        .unwrap_or_default()
         .iter()
         .map(|v| render(v))
         .collect::<Vec<_>>()
@@ -128,10 +144,9 @@ probin: {probin:?} }},\n",
             // of them declares `proallargtypes` and `proargmodes` together;
             // `proargnames` travels on its own, since a function may name plain
             // IN arguments.
-            allargs = list(array_field(e, "proallargtypes"), |t| type_oid(t)
-                .to_string()),
-            argmodes = list(array_field(e, "proargmodes"), |m| format!("{m:?}")),
-            argnames = list(array_field(e, "proargnames"), |n| format!("{n:?}")),
+            allargs = list(e, "proallargtypes", |t| type_oid(t).to_string()),
+            argmodes = list(e, "proargmodes", |m| format!("{m:?}")),
+            argnames = list(e, "proargnames", |n| format!("{n:?}")),
             prosrc = str_field(e, "prosrc", ""),
             // The shared library a conversion or other C function lives in.
             // Empty for the internal functions, which is what the catalog
@@ -234,6 +249,18 @@ mod tests {
         assert!(emitted.contains("probin: \"$libdir/thing\""));
         // `pronargs` still counts the declared arguments, not the OUT ones.
         assert!(emitted.contains("pronargs: 1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "codegen cannot tell from NULL")]
+    fn an_empty_array_column_is_refused() {
+        // `{}` is an array with no elements and `_null_` is no array at all;
+        // the generated rows spell only the second, so the first is refused
+        // rather than silently reported as NULL.
+        emit_one(
+            "[{ oid => '1', proname => 'f', prorettype => 'bool', \
+             proargnames => '{}' }]",
+        );
     }
 
     #[test]

@@ -212,7 +212,9 @@ mod tests {
             Some(vec!["acl".to_string(), "grantor".to_string()])
         );
         // `{}` is an array with no elements; `_null_` is no array at all. Only
-        // the second one means the column is NULL.
+        // the second one means the column is NULL. The scanner keeps them
+        // apart and no emitter can carry the difference, so `pg_proc::list`
+        // refuses the first rather than reporting it as the second.
         assert_eq!(array_field(e, "proargmodes"), Some(Vec::new()));
         assert_eq!(array_field(e, "proallargtypes"), None);
         assert_eq!(array_field(e, "nosuchfield"), None);
