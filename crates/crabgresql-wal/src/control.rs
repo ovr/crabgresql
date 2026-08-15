@@ -11,11 +11,20 @@
 //!
 //! A control file that is absent, truncated, of an unknown version, or fails its
 //! CRC reads as `None`, which the caller turns into a whole-stream replay. That
-//! is the fail-safe direction: replaying more than necessary is always correct,
-//! because redo is idempotent under the per-page LSN gate.
+//! is the fail-safe direction *as far as the log goes*: replaying more than
+//! necessary is always correct, because redo is idempotent under the per-page LSN
+//! gate.
 //!
-//! TODO: recycle WAL segments below the durable redo point — the other thing it
-//! unlocks, and nothing does it, so the stream grows without bound
+//! It stopped being a complete answer once the durable redo point started
+//! bounding `pg_wal` too — a checkpoint hands it to
+//! [`crate::remove_segments_below`] once this file names it, and everything wholly
+//! below is unlinked. So on a cluster that has retired segments, losing this file
+//! also loses the only surviving statement of the XID floor, and [`crate::recover`]
+//! refuses rather than replaying what is left: the log below the oldest surviving
+//! segment is named by nothing on disk. Whole-stream replay still means "the whole
+//! stream", but the stream now begins where retirement left it.
+//!
+//! Reusing a spent segment under a future name is still deferred
 //! (`docs/ARCHITECTURE.md §1.3`).
 
 use std::io::Write;

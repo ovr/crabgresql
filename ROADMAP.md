@@ -46,10 +46,13 @@ Two consequences worth stating plainly:
 - **A committed `INSERT` is durable before any file exists.** It is covered by
   the commit record's fsync and rebuilt from the WAL at startup, but nothing
   external should expect to see it under `parquet/<rel>/` until a flush.
-- **WAL volume now carries all Parquet data.** With no segment recycling and
-  whole-WAL replay at every boot, a large `COPY` grows both the log and every
-  subsequent startup. Checkpoint-bounded recovery is therefore a hard
-  prerequisite of step 3 below, not a deferred nicety.
+- **WAL volume now carries all Parquet data.** A checkpoint retires the segments
+  below the redo point it published, so the log no longer grows without bound —
+  but a relation with resident buffered rows is exactly what stops a checkpoint
+  bounding itself, and an unbounded one retires nothing. So for a large `COPY`
+  into a Parquet table the log still grows, and so does every subsequent startup,
+  until the rows reach fsynced chunks. Checkpoint-bounded recovery is therefore a
+  hard prerequisite of step 3 below, not a deferred nicety.
 
 The target design should land in compatibility-preserving slices:
 

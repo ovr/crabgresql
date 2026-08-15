@@ -96,6 +96,59 @@ pub fn wal_stream_len(dir: &Path) -> std::io::Result<u64> {
     Ok(last * SEGMENT_SIZE + len)
 }
 
+/// Unlink every segment lying wholly below `redo`, holding `keep_bytes` of them
+/// back, and return how many were removed.
+///
+/// This is what bounds `pg_wal`: [`crate::recover`] reads the stream from the
+/// redo point upwards, so a segment entirely below it is never opened again, and
+/// without this the log grows for the life of the cluster. `keep_bytes`
+/// (`CRABGRESQL_WAL_KEEP_SIZE`) holds a tail of that dead history back for
+/// forensics; nothing in the server reads it.
+///
+/// Three things about *when* and *in what order* this runs are load-bearing:
+///
+/// * The caller must have made `redo` durable in `pg_control` **first**. Removing
+///   a segment while the control file still names a lower redo point leaves a
+///   cluster that cannot start: recovery would resume at a segment that is gone.
+///   That is why this takes an [`Lsn`] rather than reading the control file
+///   itself — the ordering belongs to the checkpoint, and a function that could
+///   read the redo point for itself invites being called before the publish.
+/// * [`Lsn::INVALID`] removes nothing. It means "replay the whole stream" — a
+///   checkpoint that could not bound itself — and every segment is still needed.
+///   This is also what keeps a buffer table's rows safe, since their only durable
+///   trace is a WAL record and their presence is exactly what clamps the redo
+///   point to zero.
+/// * Ascending order, so an interrupted pass leaves a contiguous suffix rather
+///   than a hole. A crash between an unlink and the directory fsync can resurrect
+///   a segment below the redo point, which is harmless — `read_from` only
+///   requires contiguity from the segment it starts in upwards.
+///
+/// Takes no lock and needs none: the writer only ever creates segments at or
+/// above the one it is filling, and `segment_of(redo)` can never exceed that.
+pub fn remove_segments_below(dir: &Path, redo: Lsn, keep_bytes: u64) -> std::io::Result<usize> {
+    if !redo.is_valid() {
+        return Ok(0);
+    }
+    // The segment holding the redo point is still needed in full, so the floor is
+    // below it, never at it.
+    let floor = segment_of(redo).saturating_sub(keep_bytes.div_ceil(SEGMENT_SIZE));
+    let mut removed = 0;
+    // `segment_numbers` is sorted, so this walks them ascending.
+    for seg in segment_numbers(dir)?.into_iter().take_while(|s| *s < floor) {
+        match std::fs::remove_file(wal_segment_path(dir, seg)) {
+            Ok(()) => removed += 1,
+            // Already gone: an earlier pass that lost its directory fsync, or a
+            // second process. Nothing to undo.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed > 0 {
+        sync_dir(&wal_dir(dir))?;
+    }
+    Ok(removed)
+}
+
 /// The writer's end of the layout, moving to the next segment as the stream
 /// crosses a boundary.
 ///
@@ -292,6 +345,84 @@ mod tests {
             SEGMENT_SIZE,
             "the segment left behind must be full"
         );
+
+        Ok(())
+    }
+
+    /// Lay down segments `0..=last` as full files, so a test can ask which of
+    /// them a removal pass kept.
+    fn lay_out_segments(dir: &Path, last: u64) -> std::io::Result<()> {
+        std::fs::create_dir_all(wal_dir(dir))?;
+        for seg in 0..=last {
+            std::fs::write(wal_segment_path(dir, seg), [seg as u8])?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn removal_keeps_the_redo_segment_and_everything_above_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        lay_out_segments(dir.path(), 3)?;
+
+        // A redo point in the middle of segment 2 still needs segment 2 whole.
+        let redo = Lsn(2 * SEGMENT_SIZE + 17);
+        assert_eq!(remove_segments_below(dir.path(), redo, 0)?, 2);
+        assert_eq!(segment_numbers(dir.path())?, vec![2, 3]);
+        // Idempotent: nothing left below the floor to remove.
+        assert_eq!(remove_segments_below(dir.path(), redo, 0)?, 0);
+        assert_eq!(segment_numbers(dir.path())?, vec![2, 3]);
+
+        Ok(())
+    }
+
+    /// The retained tail is measured in bytes and rounds *up* to whole segments:
+    /// keeping a fraction of a segment means keeping the file.
+    #[test]
+    fn keep_bytes_holds_back_whole_segments() -> anyhow::Result<()> {
+        let redo = Lsn(3 * SEGMENT_SIZE);
+        for (keep, left) in [
+            (0, vec![3]),
+            (1, vec![2, 3]),
+            (SEGMENT_SIZE, vec![2, 3]),
+            (SEGMENT_SIZE + 1, vec![1, 2, 3]),
+            (2 * SEGMENT_SIZE, vec![1, 2, 3]),
+            (u64::MAX, vec![0, 1, 2, 3]),
+        ] {
+            let dir = tempfile::tempdir()?;
+            lay_out_segments(dir.path(), 3)?;
+            remove_segments_below(dir.path(), redo, keep)?;
+            assert_eq!(
+                segment_numbers(dir.path())?,
+                left,
+                "keeping {keep} bytes below {redo}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A checkpoint that could not bound replay publishes `Lsn::INVALID`, and
+    /// every segment is then still needed. Removing on that value would delete the
+    /// whole log — including the only durable copy of a buffer table's rows.
+    #[test]
+    fn an_unbounded_redo_point_removes_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        lay_out_segments(dir.path(), 3)?;
+        assert_eq!(remove_segments_below(dir.path(), Lsn::INVALID, 0)?, 0);
+        assert_eq!(segment_numbers(dir.path())?, vec![0, 1, 2, 3]);
+
+        Ok(())
+    }
+
+    /// A redo point inside segment 0 has nothing below it, and an absent `pg_wal`
+    /// is not an error — both are what a freshly started cluster looks like.
+    #[test]
+    fn removal_tolerates_nothing_to_remove() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(remove_segments_below(dir.path(), Lsn(64), 0)?, 0);
+        lay_out_segments(dir.path(), 0)?;
+        assert_eq!(remove_segments_below(dir.path(), Lsn(64), 0)?, 0);
+        assert_eq!(segment_numbers(dir.path())?, vec![0]);
 
         Ok(())
     }

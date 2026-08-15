@@ -914,6 +914,13 @@ fn an_unopenable_parquet_relation_does_not_block_startup() -> anyhow::Result<()>
     // degrade to "this one table is unavailable", not "the cluster will not
     // boot" — otherwise every heap table in the same data directory becomes
     // unreachable and the offender could never be dropped.
+    //
+    // With one exception, which is why nothing is inserted into `events` here:
+    // a relation holding rows that live only in the WAL *does* stop a startup,
+    // because coming up would let a checkpoint retire their only copy. See
+    // `a_relation_that_cannot_be_opened_blocks_startup_while_the_log_holds_its_rows`
+    // — the operator moves the directory aside and gets both the rows and this
+    // DROP back.
     let dir = tempfile::tempdir()?;
     let table_dir;
     {
@@ -923,10 +930,7 @@ fn an_unopenable_parquet_relation_does_not_block_startup() -> anyhow::Result<()>
         insert(&*heap, &tm.context(xid, CommandId::FIRST), 1, "kept");
         tm.commit(xid)?;
 
-        let events = engine.create_table(parquet_schema("events"))?;
-        let xid = tm.allocate_xid();
-        events.insert(vec![Value::Int4(9)], &tm.context(xid, CommandId::FIRST))?;
-        tm.commit(xid)?;
+        engine.create_table(parquet_schema("events"))?;
         table_dir = parquet_table_dir(dir.path());
     }
     // Leave behind a file the fragment-name parser rejects.
@@ -1949,3 +1953,203 @@ fn an_index_probe_surfaces_an_unreadable_chunk_store() -> anyhow::Result<()> {
     assert!(scanned.is_err(), "a seq scan errors on the same table");
     Ok(())
 }
+
+/// A checkpoint that cannot bound replay must retire nothing.
+///
+/// The redo point it publishes is `Lsn::INVALID` — "replay the whole stream" —
+/// so every segment is still needed, including the ones a *bounded* checkpoint
+/// at the same position would have retired. The distinction is invisible until
+/// the next start, at which point recovery reads from byte zero of a log whose
+/// prefix is gone.
+///
+/// Clamped here through the simplest of the reasons `redo_clamp` recognizes: an
+/// engine with no commit log. The others (a resident write buffer, an
+/// unreconciled TRUNCATE) publish the same `Lsn::INVALID` by the same path.
+#[test]
+fn an_unbounded_checkpoint_retires_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut reg = RmgrRegistry::new();
+    let wal = Arc::new(Wal::open(dir.path())?);
+    let engine = PgEngine::new_with_pool(
+        dir.path(),
+        Arc::clone(&wal),
+        &mut reg,
+        crabgresql_pg_engine::BufferPoolPolicy::minimal(),
+    )?;
+
+    // Two segments' worth of log, so a bounded checkpoint here would have had
+    // something to retire and this test could fail.
+    let payload = vec![7u8; 1 << 20];
+    while wal.current_lsn().0 < 2 * crabgresql_wal::SEGMENT_SIZE {
+        wal.append(
+            crabgresql_wal::RmgrId::XLOG,
+            crabgresql_wal::XLOG_PAD,
+            Xid::INVALID,
+            &payload,
+        );
+    }
+    wal.flush(wal.current_lsn())?;
+    let before = crabgresql_wal::segment_numbers(dir.path())?;
+    assert!(before.len() > 2, "segments to retire: {before:?}");
+
+    engine.checkpoint(Xid::FIRST_NORMAL)?;
+
+    let control = crabgresql_wal::read_control(dir.path())?.expect("a control file");
+    assert_eq!(
+        control.redo_lsn,
+        crabgresql_wal::Lsn::INVALID,
+        "an engine with no commit log cannot bound replay"
+    );
+    assert_eq!(
+        crabgresql_wal::segment_numbers(dir.path())?,
+        before,
+        "an unbounded checkpoint must leave every segment in place"
+    );
+
+    Ok(())
+}
+
+/// Concurrent checkpoints must publish their control files in the order they
+/// sampled their redo points.
+///
+/// Two can be in flight — `checkpoint_if_wal_grew` picks one winner among
+/// committers but excludes neither `shutdown` nor a second committer past the
+/// next `max_wal_size` — and out of order the loser publishes its *lower* redo
+/// point over the winner's. That used to cost a longer replay. Now the winner has
+/// already unlinked the segments below its own point, so the control file left
+/// behind names a segment that is gone: the next start cannot find it.
+///
+/// The invariant is checkable from outside without catching the race in the act:
+/// whatever `pg_control` names must still be on disk.
+#[test]
+fn concurrent_checkpoints_never_publish_below_what_was_retired() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, tm, wal) = common::open_from_with_wal(dir.path(), crabgresql_wal::Lsn::INVALID)?;
+    // A heap table, so nothing clamps the redo point and retirement really runs.
+    let table = engine.create_table(schema())?;
+    let x = tm.allocate_xid();
+    insert(&*table, &tm.context(x, CommandId::FIRST), 1, "row");
+    tm.commit(x)?;
+
+    let control_names_a_present_segment = |dir: &std::path::Path| -> anyhow::Result<()> {
+        let control = crabgresql_wal::read_control(dir)?.expect("a control file");
+        if control.redo_lsn == crabgresql_wal::Lsn::INVALID {
+            return Ok(()); // an unbounded checkpoint retires nothing
+        }
+        let segments = crabgresql_wal::segment_numbers(dir)?;
+        let named = crabgresql_wal::segment_of(control.redo_lsn);
+        anyhow::ensure!(
+            segments.contains(&named),
+            "pg_control resumes at {} — segment {named} — but only {segments:?} \
+             are on disk",
+            control.redo_lsn
+        );
+        Ok(())
+    };
+
+    // Each round carries the redo point past a segment boundary, so retirement
+    // has something to do every time.
+    const ROUNDS: usize = 4;
+    let filler = vec![0u8; crabgresql_wal::SEGMENT_SIZE as usize / 2];
+    let path = dir.path();
+    std::thread::scope(|scope| {
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let engine = Arc::clone(&engine);
+            let wal = Arc::clone(&wal);
+            let filler = &filler;
+            let control_names_a_present_segment = &control_names_a_present_segment;
+            threads.push(scope.spawn(move || -> anyhow::Result<()> {
+                for _ in 0..ROUNDS {
+                    let end = wal
+                        .append(
+                            crabgresql_wal::RmgrId::XLOG,
+                            crabgresql_wal::XLOG_PAD,
+                            Xid::INVALID,
+                            filler,
+                        )
+                        .end;
+                    wal.flush(end)?;
+                    engine.checkpoint(Xid::FIRST_NORMAL)?;
+                    control_names_a_present_segment(path)?;
+                }
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("checkpointer panicked"))??;
+        }
+        anyhow::Ok(())
+    })?;
+
+    control_names_a_present_segment(dir.path())?;
+    // And the data directory really does start from what was published.
+    drop(table);
+    drop(engine);
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("t")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1]);
+
+    Ok(())
+}
+
+/// A relation that cannot be opened stays out of the way — until the log is
+/// holding rows that exist nowhere else.
+///
+/// The relation is deliberately left unregistered so one unparseable filename
+/// cannot make every other table unreachable. But unregistered means invisible to
+/// `redo_clamp`, so the next checkpoint would bound itself as if nothing were
+/// pending and retire the segments those rows live in. Refuse instead, and leave
+/// every byte where it is.
+#[test]
+fn a_relation_that_cannot_be_opened_blocks_startup_while_the_log_holds_its_rows()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let (engine, tm) = open(dir.path())?;
+        let table = engine.create_table(parquet_schema("p"))?;
+        let x = tm.allocate_xid();
+        table.insert(vec![Value::Int4(1)], &tm.context(x, CommandId::FIRST))?;
+        tm.commit(x)?;
+        // Left in the write buffer on purpose: no flush worker is attached here,
+        // so the WAL is the only copy of that row.
+        TableEngine::shutdown(engine.as_ref());
+    }
+    let table_dir = parquet_table_dir(dir.path());
+    let junk = table_dir.join("not-a-fragment.parquet");
+    std::fs::write(&junk, b"")?;
+    let before = crabgresql_wal::wal_stream_len(dir.path())?;
+
+    let Err(error) = try_open(dir.path()) else {
+        anyhow::bail!("startup must refuse while the log holds the relation's rows");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("relation p "),
+        "must name the relation: {message}"
+    );
+    assert!(
+        message.contains("write-ahead log"),
+        "must say why: {message}"
+    );
+    assert_eq!(
+        crabgresql_wal::wal_stream_len(dir.path())?,
+        before,
+        "a refused startup must not touch the log"
+    );
+
+    // The way out the message describes: repair the directory, start again, and
+    // the row comes back out of the log.
+    std::fs::remove_file(&junk)?;
+    let (engine, tm) = open(dir.path())?;
+    let table = engine.open_table("p")?;
+    assert_eq!(visible_ids(&tm, &*table), vec![1]);
+
+    Ok(())
+}
+
+// The other half of this contract — the same broken directory with nothing
+// pending for it in the log, which must stay as lenient as it always was — is
+// `an_unopenable_parquet_relation_does_not_block_startup` above.

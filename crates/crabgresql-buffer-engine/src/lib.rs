@@ -747,6 +747,20 @@ impl BufferRedo {
             .remove(&rel)
     }
 
+    /// Whether replay collected any rows for `rel`, without taking them.
+    ///
+    /// For the one caller that has to ask about a relation it could *not* open, so
+    /// it can refuse to start rather than let a checkpoint retire the WAL those
+    /// rows exist only in. [`BufferRedo::take`] would answer the same question and
+    /// throw the rows away doing it, which is exactly the wrong thing to do with
+    /// something being declared irreplaceable.
+    pub fn holds(&self, rel: u32) -> bool {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .contains_key(&rel)
+    }
+
     /// Drop everything replay collected that nobody claimed.
     ///
     /// Rows logged under a relfilenode a committed TRUNCATE superseded, or under a

@@ -161,9 +161,17 @@ Contract with the core:
   correct-but-unoptimized without them: a *time*-based checkpointer (an idle
   cluster's last commit stays unbounded until it shuts down), full-page writes for
   torn-page protection beyond page
-  checksums, and WAL segment recycling — the log is cut into 32 MiB segment files
-  (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never straddles a
-  boundary, but a finished segment is neither reused nor removed.
+  checksums, and WAL segment *recycling* — the log is cut into 32 MiB segment
+  files (`pg_wal/<24 hex digits>`, PostgreSQL's naming) and a record never
+  straddles a boundary. A checkpoint **removes** the segments lying wholly below
+  the redo point it published (`CRABGRESQL_WAL_KEEP_SIZE` holds a tail of them
+  back), so `pg_wal` settles at roughly `max_wal_size`. What is still deferred is
+  reusing one under a future name: our segments are sparse and never
+  preallocated, so a rename would save a single directory operation and cost
+  three invariants — the insert position is derived from the highest segment
+  present, replay checks a record's self-declared LSN only at the redo point, and
+  the stream length is read off the last file. Recycling is worth doing together
+  with preallocation, and not before.
 - Syntactically, extensibility is exposed the standard PG way. Plain
   `CREATE TABLE` remains heap; `CREATE TABLE ... USING parquet ORDER BY (cols)`
   explicitly selects the columnar method and declares its layout order.
@@ -518,6 +526,14 @@ rows, and a bounded one only once every buffer is empty (`PgEngine::redo_floor`)
 Per-buffer minimum-LSN tracking, which would let a cluster with resident buffered
 rows still bound replay, is the refinement — and it is a change to that one
 function's body.
+
+That coarseness is also what makes an *unopenable* relation a startup refusal
+rather than a clamp: a relation the engine could not open is not in its table map,
+so it cannot be asked whether it holds rows, and a checkpoint would bound itself
+as if it held none — retiring the segments that are those rows' only copy.
+`PgEngine::refuse_if_unopenable_holds_rows` asks the replayed WAL directly instead
+and refuses to come up, naming the directory to repair. Both that refusal and the
+clamp are consequences of the same missing watermark, and both disappear with it.
 
 ### 2.5 Sorted flush and atomic publication
 
