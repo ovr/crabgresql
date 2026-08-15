@@ -65,8 +65,10 @@
 //! over the outer relation alone — up into the outer scan's filter, ahead of the
 //! division.
 //!
-//! We have no decorrelation, so that route is closed, and a pass that exists to
-//! make queries faster should not change which of them succeed. So a conjunct
+//! The logical optimizer's `DecorrelateSubqueries` now takes that route for the
+//! shapes it can prove, but not for all of them — the `EXISTS` above survives it
+//! whenever its correlation is not an equality — and a pass that exists to make
+//! queries faster should not change which of them succeed. So a conjunct
 //! only sinks past a neighbour that [`cannot_raise`] — a barrier that overrides
 //! the cost ordering, structurally what `security_level` is to PostgreSQL, with
 //! our own criterion. The motivating case is unaffected: `thousand = 1` is a

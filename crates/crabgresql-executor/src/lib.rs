@@ -564,7 +564,7 @@ pub fn optimize_and_plan_with(
 ) -> PhysicalPlan {
     crabgresql_optimizer::optimize(
         &mut logical,
-        &crabgresql_optimizer::OptimizerContext { fmt: fmt.clone() },
+        &crabgresql_optimizer::OptimizerContext::new(fmt.clone()),
     );
     crabgresql_planner::plan(logical, costs)
 }
@@ -5909,6 +5909,298 @@ mod tests {
                 vec![Value::Int4(3), Value::Null],
             ]
         );
+        Ok(())
+    }
+
+    /// Run `sql` twice — once through the logical optimizer, which rewrites a
+    /// correlated subquery into a join, and once with that rule turned off, which
+    /// leaves the executor's per-row path to answer it — and assert the two agree.
+    ///
+    /// The pair is the point: the per-row path is the definition of the right
+    /// answer here, and a decorrelation that quietly changes cardinality, NULL
+    /// handling or an empty group's value shows up as a difference and nowhere
+    /// else. Every query passed in orders its rows, so the comparison is on
+    /// content rather than on the order two different plans happen to produce.
+    fn same_decorrelated_or_not(engine: &Arc<dyn TableEngine>, sql: &str) -> Vec<Tuple> {
+        let decorrelated = run_optimized(engine, sql, true);
+        let per_row = run_optimized(engine, sql, false);
+        assert_eq!(decorrelated, per_row, "the two paths disagree on `{sql}`");
+        decorrelated
+    }
+
+    /// Bind, optimize (with the decorrelation rule on or off), plan and drain.
+    fn run_optimized(engine: &Arc<dyn TableEngine>, sql: &str, decorrelate: bool) -> Vec<Tuple> {
+        let stmts = test_ok(crabgresql_parser::parse(sql));
+        let crabgresql_parser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected a query");
+        };
+        let catalog: Arc<dyn crabgresql_storage_api::TypeCatalog> =
+            Arc::new(crabgresql_storage_api::EmptyTypeCatalog);
+        let mut logical = test_ok(crabgresql_binder::bind_query(engine, &catalog, query));
+        let mut ctx = crabgresql_optimizer::OptimizerContext::new(FmtCtx::utc_default());
+        ctx.decorrelate = decorrelate;
+        crabgresql_optimizer::optimize(&mut logical, &ctx);
+        let Execution::Rows { mut node, .. } = test_ok(execute(
+            crabgresql_planner::plan(logical, Default::default()),
+            &ExecContext::default(),
+            &rtxn(),
+        )) else {
+            panic!("expected rows");
+        };
+        let mut rows = Vec::new();
+        while let Some(tuple) = test_ok(node.next()) {
+            rows.push(tuple);
+        }
+        rows
+    }
+
+    /// A semi join must not multiply the outer row the way an inner join would:
+    /// `k = 1` matches three inner rows and still counts once. The inner NULL key
+    /// matches nothing, and `k = 4` has no inner row at all.
+    #[test]
+    fn a_decorrelated_exists_neither_duplicates_nor_invents_rows() -> anyhow::Result<()> {
+        let engine = exists_engine(
+            &[(1, 10), (2, 20), (4, 40)],
+            &[
+                (Some(1), 1),
+                (Some(1), 2),
+                (Some(1), 3),
+                (Some(2), 5),
+                (None, 9),
+            ],
+        )?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(2)]]);
+        Ok(())
+    }
+
+    /// TPC-H Q21's shape: the correlation is an equality *and* an inequality, the
+    /// second of which can only be a filter on the match test. Both `EXISTS` and
+    /// `NOT EXISTS` have to keep answering what they did — the inequality decides
+    /// which inner rows count as a match, so getting it lost would make every
+    /// outer row match, and dropping the wrong side of it would invert the anti
+    /// join.
+    #[test]
+    fn a_correlated_inequality_still_decides_the_match() -> anyhow::Result<()> {
+        let engine = exists_engine(
+            &[(1, 10), (2, 20), (3, 30)],
+            // k = 1 has a row that differs in `v` and one that does not; k = 2 has
+            // only the one that does; k = 3 has none at all.
+            &[(Some(1), 10), (Some(1), 99), (Some(2), 20)],
+        )?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v <> o.v) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)]]);
+
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.k AND i.v <> o.v) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]);
+        Ok(())
+    }
+
+    /// The complement, including the case an anti join has to get right on its
+    /// own: an outer row whose key is NULL matches nothing, so `NOT EXISTS` holds
+    /// for it. `o.v` is the key here precisely so one of them is NULL.
+    #[test]
+    fn a_decorrelated_not_exists_keeps_the_unmatched_rows() -> anyhow::Result<()> {
+        let engine = exists_engine(&[(1, 10), (2, 20), (3, 30)], &[(Some(10), 1), (None, 2)])?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.v AND i.v > 0) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(2)], vec![Value::Int4(3)]]);
+        Ok(())
+    }
+
+    /// `IN` puts the needle in the join condition beside the correlation key.
+    /// A NULL among the candidates changes nothing under a `WHERE`: the row is
+    /// dropped either way, which is what makes the semi join sound here (and
+    /// `NOT IN`, which is not, keeps the per-row path).
+    #[test]
+    fn a_decorrelated_in_matches_the_per_row_answer() -> anyhow::Result<()> {
+        let engine = exists_engine(
+            &[(1, 1), (2, 5), (3, 7)],
+            &[(Some(1), 1), (Some(2), 9), (Some(3), 7), (None, 7)],
+        )?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE o.v IN (SELECT i.v FROM i WHERE i.k = o.k) ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(1)], vec![Value::Int4(3)]]);
+        Ok(())
+    }
+
+    /// A scalar aggregate becomes a grouped left join, and the outer rows with no
+    /// group must come back with the value the aggregate has over no rows: NULL
+    /// for `avg`, which the join's own miss supplies.
+    #[test]
+    fn a_decorrelated_average_is_null_where_the_group_is_empty() -> anyhow::Result<()> {
+        let engine = exists_engine(
+            &[(1, 0), (2, 0), (4, 0)],
+            &[(Some(1), 2), (Some(1), 4), (Some(2), 5)],
+        )?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k, (SELECT avg(i.v) FROM i WHERE i.k = o.k) FROM o ORDER BY k",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int4(1),
+                    Value::Numeric(test_ok(crabgresql_types::Numeric::parse(
+                        "3.0000000000000000"
+                    )))
+                ],
+                vec![
+                    Value::Int4(2),
+                    Value::Numeric(test_ok(crabgresql_types::Numeric::parse(
+                        "5.0000000000000000"
+                    )))
+                ],
+                vec![Value::Int4(4), Value::Null],
+            ]
+        );
+        Ok(())
+    }
+
+    /// The count bug: `count` over an empty group is 0, while the left join
+    /// answers a missing group with NULL. `k = 4` matches nothing and must still
+    /// count 0 — both as a value and through the comparison that reads it.
+    #[test]
+    fn a_decorrelated_count_answers_zero_for_a_missing_group() -> anyhow::Result<()> {
+        let engine = exists_engine(&[(1, 0), (4, 0)], &[(Some(1), 2), (Some(1), 4)])?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k, (SELECT count(*) FROM i WHERE i.k = o.k) FROM o ORDER BY k",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int4(1), Value::Int8(2)],
+                vec![Value::Int4(4), Value::Int8(0)],
+            ]
+        );
+
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE (SELECT count(*) FROM i WHERE i.k = o.k) = 0 ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(4)]]);
+        Ok(())
+    }
+
+    /// The TPC-H Q17 shape: the aggregate arrives wrapped in arithmetic. The
+    /// wrapper rides along into the arm, and a missing group still reads NULL
+    /// because multiplication is strict.
+    #[test]
+    fn an_aggregate_under_arithmetic_still_decorrelates() -> anyhow::Result<()> {
+        let engine = exists_engine(&[(1, 3), (4, 0)], &[(Some(1), 10), (Some(1), 20)])?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE o.v < (SELECT avg(i.v) * 2 FROM i WHERE i.k = o.k) ORDER BY k",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Int4(1)]],
+            "k = 4 compares against NULL"
+        );
+        Ok(())
+    }
+
+    /// Several markers on one node, of both kinds, each becoming its own arm —
+    /// and each arm's columns landing past the previous one's.
+    #[test]
+    fn several_markers_on_one_node_all_decorrelate() -> anyhow::Result<()> {
+        let engine = exists_engine(
+            &[(1, 1), (2, 9), (3, 0)],
+            &[(Some(1), 5), (Some(2), 5), (Some(1), 7)],
+        )?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o \
+             WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) \
+               AND o.v < (SELECT sum(i.v) FROM i WHERE i.k = o.k) \
+             ORDER BY k",
+        );
+        // Each marker excludes a different row: `k = 3` has no inner row at all,
+        // and `k = 2`'s group sums to 5, which its `v = 9` is not below.
+        assert_eq!(rows, vec![vec![Value::Int4(1)]]);
+        Ok(())
+    }
+
+    /// `IN` over a float8 column and a numeric one compares as float8, but each
+    /// candidate is still a numeric: the per-row path casts them as it reaches
+    /// them, so the binder left no cast in the comparison itself. The join
+    /// condition has to carry that cast, since a hash key is hashed *as* the type
+    /// it declares — without it the build side hashes a numeric as a float8 and
+    /// the server panics rather than merely answering wrongly.
+    #[test]
+    fn a_candidate_the_per_row_path_casts_is_cast_in_the_join_too() -> anyhow::Result<()> {
+        let engine = crabgresql_pg_engine::ephemeral_engine();
+        let floats = engine.create_table(TableSchema::in_namespace(
+            "floats",
+            "public",
+            vec![Column::new("f", PgType::Float8)],
+        ))?;
+        let numerics = engine.create_table(TableSchema::in_namespace(
+            "numerics",
+            "public",
+            vec![Column::new("n", PgType::Numeric)],
+        ))?;
+        let txn = wtxn();
+        for f in [1.0_f64, 2.0, 3.0] {
+            floats.insert(vec![Value::Float8(f)], &txn)?;
+        }
+        for n in ["1", "1.000000000000000000001", "2"] {
+            numerics.insert(
+                vec![Value::Numeric(test_ok(crabgresql_types::Numeric::parse(n)))],
+                &txn,
+            )?;
+        }
+        let engine: Arc<dyn TableEngine> = engine;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT f FROM floats WHERE f IN (SELECT n FROM numerics) ORDER BY f",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Float8(1.0)], vec![Value::Float8(2.0)]]
+        );
+        Ok(())
+    }
+
+    /// A marker the rule refuses still has to answer, and answer the same:
+    /// `NOT IN` (three-valued), an `EXISTS` under an `OR`, and a non-aggregate
+    /// scalar subquery all keep the per-row path.
+    #[test]
+    fn the_refused_shapes_still_answer() -> anyhow::Result<()> {
+        let engine = exists_engine(&[(1, 1), (2, 2), (3, 3)], &[(Some(1), 1), (Some(2), 2)])?;
+        for sql in [
+            "SELECT k FROM o WHERE k NOT IN (SELECT i.k FROM i) ORDER BY k",
+            "SELECT k FROM o WHERE k = 3 OR EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY k",
+            "SELECT k FROM o WHERE o.v = (SELECT i.v FROM i WHERE i.k = o.k) ORDER BY k",
+            // Always true: an implicit group emits its row even for an outer key
+            // nothing matches, so this must not become a semi join on that key.
+            "SELECT k FROM o WHERE EXISTS (SELECT count(*) FROM i WHERE i.k = o.k) ORDER BY k",
+            // `coalesce` manufactures a value where the aggregate is NULL, so it
+            // does not agree with a left join's miss: for `k = 3` the subquery
+            // answers -1, while the arm has no row at all.
+            "SELECT k FROM o WHERE (SELECT coalesce(max(i.v), -1) FROM i WHERE i.k = o.k) < 0 \
+             ORDER BY k",
+        ] {
+            same_decorrelated_or_not(&engine, sql);
+        }
         Ok(())
     }
 

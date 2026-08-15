@@ -7,19 +7,27 @@
 //! knows about access paths, join algorithms or execution nodes, which is what
 //! keeps the crate below the planner and the executor in the dependency graph.
 //!
-//! Today the list holds one rule, [`SimplifyExpressions`]: constant folding plus
-//! the boolean simplifications it opens up. The payoff is more than a per-row
-//! addition saved. A folded key is a *literal*, and the planner reads a literal
-//! where it cannot read an expression: `key_selectivity` consults the column's
-//! distribution only through `const_of`, so `WHERE id = 2 + 3` is costed by
-//! PostgreSQL's generic `var_eq_non_const` guess until the arithmetic is folded
-//! away. A qual that folds to `TRUE` disappears from the scan entirely.
+//! Two rules today.
+//!
+//! [`SimplifyExpressions`] is constant folding plus the boolean simplifications
+//! it opens up. The payoff is more than a per-row addition saved. A folded key
+//! is a *literal*, and the planner reads a literal where it cannot read an
+//! expression: `key_selectivity` consults the column's distribution only through
+//! `const_of`, so `WHERE id = 2 + 3` is costed by PostgreSQL's generic
+//! `var_eq_non_const` guess until the arithmetic is folded away. A qual that
+//! folds to `TRUE` disappears from the scan entirely.
+//!
+//! [`DecorrelateSubqueries`] rewrites a correlated subquery into a join arm, so
+//! that what was a subplan run once per outer row becomes one the planner costs,
+//! indexes and hashes like any other relation.
 
 use crabgresql_binder::LogicalPlan;
 use crabgresql_types::FmtCtx;
 
+mod decorrelate;
 mod simplify_expressions;
 
+pub use decorrelate::DecorrelateSubqueries;
 pub use simplify_expressions::SimplifyExpressions;
 
 /// What a rule may read about the session it is optimizing for.
@@ -31,6 +39,23 @@ pub use simplify_expressions::SimplifyExpressions;
 /// settings cannot leak into another session's answer.
 pub struct OptimizerContext {
     pub fmt: FmtCtx,
+    /// Whether [`DecorrelateSubqueries`] may run.
+    ///
+    /// A rewrite that changes the *shape* of a plan rather than the value of an
+    /// expression, and the only way to compare its answer with the per-row path's
+    /// is to run the same statement both ways — which is what this switch is for.
+    /// Nothing in the server turns it off.
+    pub decorrelate: bool,
+}
+
+impl OptimizerContext {
+    /// The default rule configuration for a session formatting values as `fmt`.
+    pub fn new(fmt: FmtCtx) -> OptimizerContext {
+        OptimizerContext {
+            fmt,
+            decorrelate: true,
+        }
+    }
 }
 
 /// One logical rewrite.
@@ -57,7 +82,13 @@ pub struct Optimizer {
 impl Default for Optimizer {
     fn default() -> Self {
         Optimizer {
-            rules: vec![Box::new(SimplifyExpressions)],
+            // Folding first: a decorrelatable correlation is an equality
+            // between two expressions, and one of them may be constant
+            // arithmetic until this rule has run over it.
+            rules: vec![
+                Box::new(SimplifyExpressions),
+                Box::new(DecorrelateSubqueries),
+            ],
         }
     }
 }
