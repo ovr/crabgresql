@@ -335,9 +335,8 @@ pub(crate) fn bind_catalogs(
     (catalog, type_catalog, catalog_ops)
 }
 
-/// The relation a statement writes, and the mode PostgreSQL locks it in — what
-/// `pg_locks` reports for that one relation instead of the `AccessShareLock` a
-/// scan takes.
+/// The relation a statement writes, in the mode PostgreSQL locks it in rather
+/// than the `AccessShareLock` a scan takes.
 ///
 /// Only the three row-writing verbs have an arm. A mode reaches a client only
 /// through a statement that reads `pg_locks` while it writes (`INSERT INTO t
@@ -368,8 +367,8 @@ fn statement_lock_target(stmt: &ast::Statement) -> Option<(String, &'static str)
     Some((name, "RowExclusiveLock"))
 }
 
-/// The relation part of a possibly-qualified name, folded the way an unquoted
-/// identifier already was by the parser.
+/// The relation part of a possibly-qualified name; the parser has already
+/// case-folded an unquoted identifier.
 fn leaf_name(name: &ast::ObjectName) -> Option<String> {
     name.0.last().map(|part| part.to_string())
 }

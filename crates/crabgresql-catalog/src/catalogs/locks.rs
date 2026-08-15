@@ -49,13 +49,10 @@ pub(crate) fn pg_locks_schema() -> TableSchema {
 /// The locks the reading session holds: its transaction's, plus one `relation`
 /// row per relation the statement resolved.
 ///
-/// Those relation rows are what most clients came for — PostgreSQL's answer to a
-/// bare `SELECT * FROM pg_locks` under autocommit is exactly two rows, the
-/// reader's `virtualxid` lock and its `AccessShareLock` on `pg_locks` itself —
-/// and they are true statements about this build too: a scan holds a shared hold
-/// on the relation it reads for as long as its iterator lives.
+/// A relation row is a true statement about this build and not a stand-in: a
+/// scan holds a shared hold on what it reads for as long as its iterator lives.
 ///
-/// They also last as long as the *statement* rather than the transaction, which
+/// The rows last as long as the *statement* rather than the transaction, which
 /// is where this parts company with PostgreSQL: there a relation lock is held to
 /// the end of the transaction, so a block accumulates rows for everything it has
 /// touched. A shared hold here dies with the scan that took it, so the statement
@@ -72,8 +69,7 @@ pub(crate) fn pg_locks_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
 }
 
 /// One `pg_locks` row, or `None` for a relation lock naming something this
-/// snapshot cannot number. The lock's target decides which of the identity
-/// columns carries it and the rest stay NULL, exactly as PostgreSQL fills them.
+/// snapshot cannot number.
 fn lock_row(cat: &SystemCatalog, lock: &CatalogLock) -> Option<Vec<Value>> {
     let (locktype, database, relation, virtualxid, transactionid) = match &lock.target {
         CatalogLockTarget::Relation { namespace, name } => {

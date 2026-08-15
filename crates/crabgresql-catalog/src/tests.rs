@@ -2154,7 +2154,6 @@ fn pg_locks_fills_one_identity_column_per_lock_target() -> anyhow::Result<()> {
     // A `pg_catalog` relation carries PostgreSQL's own OID, not a snapshot one.
     assert_eq!(col(&rows[3], "relation")?, Value::Oid(locks_oid));
 
-    // The columns whose lock types this build never takes stay NULL on every row.
     for row in &rows {
         for name in ["page", "tuple", "classid", "objid", "objsubid"] {
             assert_eq!(col(row, name)?, Value::Null, "{name} should be NULL");

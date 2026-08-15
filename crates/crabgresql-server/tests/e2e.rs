@@ -14172,7 +14172,6 @@ async fn pg_locks_reports_the_reading_session_and_its_own_scan() -> anyhow::Resu
     // PostgreSQL's own OID for `pg_locks`, so a client that hard-codes it agrees.
     assert_eq!(relation.get::<_, &str>("rel"), "12073");
     assert_eq!(relation.get::<_, Option<&str>>("virtualxid"), None);
-    // A granted lock has never waited.
     assert_eq!(
         relation.get::<_, Option<std::time::SystemTime>>("waitstart"),
         None
@@ -14182,13 +14181,11 @@ async fn pg_locks_reports_the_reading_session_and_its_own_scan() -> anyhow::Resu
     assert_eq!(virtualxid.get::<_, &str>("locktype"), "virtualxid");
     assert_eq!(virtualxid.get::<_, &str>("mode"), "ExclusiveLock");
     assert_eq!(virtualxid.get::<_, Option<&str>>("rel"), None);
-    // The `virtualxid` column repeats the holder's virtual transaction.
     assert_eq!(
         virtualxid.get::<_, &str>("virtualxid"),
         virtualxid.get::<_, &str>("virtualtransaction")
     );
 
-    // One session, so one holder for both rows.
     assert_eq!(
         relation.get::<_, i32>("pid"),
         virtualxid.get::<_, i32>("pid")
@@ -14251,7 +14248,6 @@ async fn pg_locks_reports_a_writing_block_transactionid() -> anyhow::Result<()> 
         "an assigned XID, not a placeholder"
     );
 
-    // The block's virtual transaction is stable across its statements.
     let held: String = after.get("v");
     let again: String = client
         .query_one("SELECT virtualtransaction AS v FROM pg_locks LIMIT 1", &[])
@@ -14260,7 +14256,6 @@ async fn pg_locks_reports_a_writing_block_transactionid() -> anyhow::Result<()> 
     assert_eq!(held, again);
 
     client.batch_execute("COMMIT").await?;
-    // The XID lock is gone with the transaction that held it.
     assert_eq!(
         client
             .query_one(
@@ -14378,7 +14373,6 @@ async fn pg_locks_reports_the_write_target_as_row_exclusive() -> anyhow::Result<
             .get::<_, &str>("m"),
         "RowExclusiveLock"
     );
-    // A read of the same table in the next statement is back to a share lock.
     assert_eq!(
         client
             .query_one(
@@ -14412,8 +14406,6 @@ async fn pg_locks_reports_no_database_for_a_shared_catalog() -> anyhow::Result<(
     };
     // PostgreSQL's own OIDs: pg_database is shared, pg_locks is not.
     assert_eq!(database(1262), Some(0));
-    // A per-database relation names the database it belongs to, which is the
-    // one this server serves.
     let connected: u32 = client
         .query_one(
             "SELECT oid FROM pg_database WHERE datname = current_database()",

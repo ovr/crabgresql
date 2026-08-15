@@ -54,7 +54,7 @@ impl StaticTable {
         Arc::new(Self::new(schema, rows))
     }
 
-    /// A relation whose rows are built on first read; see [`Rows::Deferred`].
+    /// See [`Rows::Deferred`].
     pub fn deferred(
         schema: TableSchema,
         build: impl Fn() -> Vec<Tuple> + Send + Sync + 'static,
@@ -68,7 +68,6 @@ impl StaticTable {
         })
     }
 
-    /// The rows, building them if this is a deferred relation's first read.
     fn rows(&self) -> Arc<Vec<Tuple>> {
         match &self.rows {
             Rows::Ready(rows) => Arc::clone(rows),

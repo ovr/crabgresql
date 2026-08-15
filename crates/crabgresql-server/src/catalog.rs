@@ -36,12 +36,11 @@ use crate::session::Session;
 /// `pg_locks`, by which time binding has finished and the set is complete.
 #[derive(Default)]
 pub struct StatementRelations {
-    /// `(namespace, name)` of every relation resolved, as the *resolution*
-    /// spelled it rather than as the client wrote it — so a view's base tables
-    /// and a partition's leaves land here too, having gone through the same
-    /// engine. A set, because PostgreSQL also reports one lock per relation
-    /// however many times a statement names it, and because its order is what
-    /// makes the rows stable across runs.
+    /// Keyed as the *resolution* spelled it rather than as the client wrote it,
+    /// so a view's base tables and a partition's leaves land here too, having
+    /// gone through the same engine. A set because PostgreSQL also reports one
+    /// lock per relation however many times a statement names it, and an
+    /// ordered one because that is what keeps the rows stable across runs.
     resolved: Mutex<BTreeSet<(String, String)>>,
     /// The relation this statement writes and the mode PostgreSQL holds on it.
     /// Decided from the statement rather than from which engine method resolved
@@ -130,8 +129,6 @@ pub struct SessionCatalogSource {
     /// Eager for the same reason as `cursors`, and never more than two rows —
     /// see [`Session::locks`].
     locks: Vec<CatalogLock>,
-    /// The connection's backend id, behind `pg_backend_pid()` and the `pid` of
-    /// every row above.
     backend_pid: i32,
     /// The relations this statement resolved, read at `locks()` time rather than
     /// snapshotted here — the set is still being filled while this source is
@@ -644,7 +641,7 @@ impl SessionCatalog {
         }
     }
 
-    /// Record what this statement resolves into `relations`, for `pg_locks`.
+    /// Report what this statement resolves into `pg_locks`.
     pub fn recording(mut self, relations: Arc<StatementRelations>) -> Self {
         self.relations = Some(relations);
         self

@@ -313,10 +313,9 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
-    /// This connection's backend id, as `pg_backend_pid()` and `pg_locks.pid`
-    /// report it — see [`CatalogLock::pid`]. `0` for a snapshot with no session
-    /// behind it, which is the value PostgreSQL's own `pg_locks` never prints
-    /// and so cannot be mistaken for a live backend.
+    /// This connection's backend id; see [`CatalogLock::pid`]. `0` for a
+    /// snapshot with no session behind it — a value PostgreSQL's own `pg_locks`
+    /// never prints, so it cannot be mistaken for a live backend.
     fn backend_pid(&self) -> i32 {
         0
     }
@@ -537,7 +536,6 @@ pub enum CatalogLockTarget {
     /// by the snapshot itself (see [`crate::SystemCatalog::relation_oid_in`]),
     /// so the session that reports the lock has no OID to hand over and the row
     /// builder resolves the name against the same snapshot it is rendering.
-    /// `pg_locks.database` is filled too, as PostgreSQL does for a relation lock.
     Relation { namespace: String, name: String },
     /// The session's own virtual transaction, held for the transaction's life.
     /// The `virtualxid` column repeats `virtualtransaction`.
@@ -562,7 +560,6 @@ pub struct CatalogLock {
     /// same integer the client was handed in `BackendKeyData`, which is what a
     /// client uses the column for.
     pub pid: i32,
-    /// The lock mode's PostgreSQL name (`AccessShareLock`, `ExclusiveLock`, …).
     pub mode: &'static str,
     pub granted: bool,
     /// `pg_locks.fastpath`: whether PostgreSQL would have taken this one

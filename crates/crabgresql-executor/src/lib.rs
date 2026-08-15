@@ -208,10 +208,9 @@ pub trait CatalogOps: Send + Sync {
     /// `None` case.
     fn my_temp_schema(&self) -> Option<u32>;
 
-    /// This connection's backend id, as `pg_backend_pid()` and `pg_locks.pid`
-    /// report it. Every session is served from one OS process here, so it
-    /// identifies a connection rather than a process — which is what the
-    /// canonical `WHERE pid = pg_backend_pid()` reads it for.
+    /// This connection's backend id, behind `pg_backend_pid()`. It identifies a
+    /// connection rather than an OS process — every session here is served from
+    /// the same one — which is what `WHERE pid = pg_backend_pid()` needs of it.
     fn backend_pid(&self) -> i32;
 }
 

@@ -975,10 +975,9 @@ impl SystemCatalog {
     /// The schema and rows of the `pg_catalog` relation `name`, or `None` if
     /// this build serves no such relation.
     ///
-    /// For tests: [`SystemCatalog::open`] is what a query goes through, and it
-    /// wraps the same pair in the access method — so a test asserting on rows
-    /// takes them from here rather than scanning a table it would have to drive
-    /// a transaction to read.
+    /// For tests only: a query goes through [`SystemCatalog::open`], which wraps
+    /// the same pair in the access method — but asserting on rows through that
+    /// would mean driving a transaction to scan them.
     #[cfg(test)]
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         self.build(CatalogNamespace::PgCatalog, name)

@@ -417,9 +417,9 @@ pub struct Session {
     pub database: String,
     pub user: String,
     /// This connection's backend id — the integer handed to the client in
-    /// `BackendKeyData` and the one `pg_locks.pid` reports. Every session is
-    /// served from the same OS process here, so it identifies a connection, not
-    /// a process; that is what a client reads the column for.
+    /// `BackendKeyData`, and what `pg_backend_pid()` and `pg_locks.pid` report.
+    /// It identifies a connection, not an OS process: every session here runs in
+    /// the same one.
     pub backend_id: i32,
     /// The local part of this session's `virtualtransaction` (PostgreSQL's
     /// `backendID/localXID`), advanced once per transaction by
@@ -1006,13 +1006,11 @@ impl Session {
 
     /// The locks this session holds, as `pg_locks` reports them.
     ///
-    /// Two rows at most, and both are facts about the session rather than reads
-    /// of a lock table (there is none to read — see
-    /// [`crabgresql_catalog::CatalogSource::locks`]): the virtual transaction
-    /// every transaction holds exclusively, and the real XID lock that appears
-    /// once a transaction has written and been assigned one. A read-only
-    /// transaction has only the first, exactly as in PostgreSQL, where the XID
-    /// is allocated just as lazily.
+    /// Two rows at most, both read off the session rather than out of a lock
+    /// table (there is none — see [`crabgresql_catalog::CatalogSource::locks`]).
+    /// The XID row appears only once the transaction has written and been
+    /// assigned one, so a read-only transaction has just the virtual one —
+    /// PostgreSQL allocates the XID just as lazily.
     pub fn locks(&self) -> Vec<CatalogLock> {
         let virtualtransaction = self.virtual_transaction();
         let lock = |target: CatalogLockTarget| CatalogLock {
@@ -1023,10 +1021,8 @@ impl Session {
             target,
             virtualtransaction: virtualtransaction.clone(),
             pid: self.backend_id,
-            // Both transaction locks are held exclusively by their owner and
-            // granted at once: nothing conflicts with them until another
-            // session waits on the XID, which needs a lock table this build
-            // does not have.
+            // Nothing can conflict with either until a session waits on the
+            // XID, which would need a lock table this build does not have.
             mode: "ExclusiveLock",
             granted: true,
             waitstart: None,

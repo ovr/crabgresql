@@ -75,7 +75,7 @@ const fn rel(
     }
 }
 
-/// A relation whose rows are built on first read; see [`CatalogRelDef::deferred`].
+/// See [`CatalogRelDef::deferred`].
 const fn rel_deferred(
     name: &'static str,
     oid: u32,
