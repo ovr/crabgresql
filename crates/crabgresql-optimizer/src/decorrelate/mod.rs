@@ -541,7 +541,7 @@ fn empty_group_value(func: AggFn) -> Option<Value> {
     match func {
         AggFn::Count => Some(Value::Int8(0)),
         // `array_agg` is here rather than with `count`: an empty group is NULL,
-        // not the empty array — a group of one NULL row is what gives `{NULL}`.
+        // not the empty array (`{NULL}` is a group of one NULL *row*).
         AggFn::Min | AggFn::Max | AggFn::Sum | AggFn::Avg | AggFn::StringAgg | AggFn::ArrayAgg => {
             None
         }

@@ -262,8 +262,8 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
     let (elem, exprs) = unify_value_column(bindings, "ARRAY")?;
     // Reject an element type this build has no array type for — a user enum, or
     // an array, which is what makes a multi-dimensional constructor land here.
-    // Named through `type_label` rather than `PgType::name`, which renders every
-    // runtime-created type as the useless "user-defined".
+    // `type_label`, not `PgType::name`, which renders a runtime-created type as
+    // the useless "user-defined".
     // TODO: support multi-dimensional array constructors (`ARRAY[[1,2],[3,4]]`,
     // `ARRAY[ARRAY[…]]`).
     if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
@@ -764,11 +764,10 @@ pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindErr
     scalar_from_binding(bind_expr(expr, scope)?)
 }
 
-/// [`bind_scalar`]'s resolution half, for a caller that has to inspect the
-/// [`Binding`] before the unknown is settled — `bind_aggregate` does, because
-/// `array_agg` must report an *ambiguous* call rather than silently taking text.
-/// Splitting it here keeps that caller from binding the expression twice, and
-/// leaves one statement of what a leftover unknown becomes.
+/// [`bind_scalar`]'s resolution half, split out for a caller that has to inspect
+/// the [`Binding`] before the unknown is settled — `bind_aggregate` does,
+/// because `array_agg` must report an *ambiguous* call rather than silently
+/// taking text. Sharing it keeps that caller from binding the expression twice.
 pub(crate) fn scalar_from_binding(binding: Binding) -> Result<BoundExpr, BindError> {
     Ok(match binding {
         Binding::Typed(e) => e,

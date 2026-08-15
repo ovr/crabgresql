@@ -1434,9 +1434,10 @@ async fn correlated_subqueries_match_pg() -> anyhow::Result<()> {
 /// This is the only thing that can catch the array *binary* encoding: the smoke
 /// suite talks to psql, which asks for text, while `tokio-postgres` requests
 /// binary for every column — so a `Vec<T>` here decodes the bytes the server
-/// actually put on the wire. The shapes whose header differs are all present:
-/// an element type wider than the fixed-width case (text), a NULL element, and
-/// the empty array, which carries `ndim = 0` and no dimension header at all.
+/// actually put on the wire. It does not pin the layout, though: the `Vec<T>`
+/// impl ignores the dimension header's lower bound, so a wrong one still reads
+/// back correctly. `wire::tests::array_binary_layout_matches_pg` is what holds
+/// the bytes to PostgreSQL's.
 #[tokio::test]
 async fn array_agg_crosses_the_binary_wire() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -1457,7 +1458,6 @@ async fn array_agg_crosses_the_binary_wire() -> anyhow::Result<()> {
             &[],
         )
         .await?;
-    // NULL inputs are kept, so every element column decodes as `Option<T>`.
     assert_eq!(
         row.get::<_, Vec<Option<i32>>>("vals"),
         [Some(10), None, Some(5), Some(5)]
@@ -1471,7 +1471,6 @@ async fn array_agg_crosses_the_binary_wire() -> anyhow::Result<()> {
             Some("cherry".to_string()),
         ]
     );
-    // DISTINCT sorts ascending with NULLs last, as PostgreSQL does.
     assert_eq!(
         row.get::<_, Vec<Option<i32>>>("distinct_vals"),
         [Some(5), Some(10), None]
@@ -1480,21 +1479,20 @@ async fn array_agg_crosses_the_binary_wire() -> anyhow::Result<()> {
     assert_eq!(row.columns()[0].type_().oid(), 1007); // _int4
     assert_eq!(row.columns()[1].type_().oid(), 1009); // _text
 
-    // An empty group is a NULL array, not the empty one — the distinction the
-    // accumulator keeps and the wire has to preserve.
+    // An empty group is a NULL *field*, which the wire spells differently from
+    // an empty array — and the distinction survives the round trip only if both
+    // spellings are right.
     let row = client
         .query_one("SELECT array_agg(val) AS a FROM aggw WHERE false", &[])
         .await?;
     assert_eq!(row.get::<_, Option<Vec<Option<i32>>>>("a"), None);
 
-    // The empty array itself, which is the twelve-byte header.
     let row = client
         .query_one("SELECT ARRAY[]::int[] AS a, array_agg(1) AS b", &[])
         .await?;
     assert_eq!(row.get::<_, Vec<i32>>("a"), Vec::<i32>::new());
     assert_eq!(row.get::<_, Vec<i32>>("b"), [1]);
 
-    // Grouped, so more than one array crosses in one result set.
     let rows = client
         .query(
             "SELECT grp, array_agg(val) AS vals FROM aggw GROUP BY grp ORDER BY grp",
@@ -1554,9 +1552,7 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
     let msgs = client.simple_query("SELECT 2 = ANY('{1,2,3}')").await?;
     assert_eq!(rows(&msgs)[0].get("?column?"), Some("t"));
 
-    // --- Array *parameter* form: the array arrives in the binary wire format,
-    // which is the only path `types::wire`'s array decoder is on. NULLs and the
-    // empty array are the two shapes whose header differs.
+    // --- Array *parameter* form, the only path the binary array decoder is on.
     let row = client
         .query_one(
             "SELECT 2 = ANY($1) AS hit, 9 = ANY($1) AS miss, \
@@ -10909,10 +10905,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     // vector end to end. See `OidVectorBinary`.
     assert_eq!(row.get::<_, OidVectorBinary>("proargtypes").0, vec![23, 25]);
     assert_eq!(row.get::<_, u32>("argtype0"), 23);
-    // `text[]` decoded from the binary payload too — `tokio-postgres` has a
-    // built-in `FromSql` for `Vec<T>` over an array column, so nothing here has
-    // to know the layout (unlike `OidVectorBinary`, which exists because the
-    // vector types have no such impl).
+    // From the binary payload as well; `tokio-postgres` has a built-in `FromSql`
+    // for `Vec<T>`, which is what `OidVectorBinary` above exists for the lack of.
     assert_eq!(row.get::<_, Vec<String>>("argnames"), ["a", "b"]);
     assert!(row.get::<_, &str>("prosrc").contains("RETURN 1;"));
     assert_eq!(row.get::<_, &str>("nspname"), "public");

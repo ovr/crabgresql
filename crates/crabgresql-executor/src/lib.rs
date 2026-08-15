@@ -4835,8 +4835,6 @@ mod tests {
 
     #[test]
     fn array_agg_keeps_nulls_and_arrival_order() {
-        // The one aggregate that does not skip a NULL input: it becomes a NULL
-        // element, and the elements stay in the order the rows arrived.
         let (cols, rows) = run_rows("SELECT array_agg(x) FROM (VALUES (2), (NULL), (1)) t(x)");
         assert_eq!(cols[0].ty, PgType::Array(crabgresql_types::oid::INT4));
         assert_eq!(
@@ -4850,16 +4848,13 @@ mod tests {
 
     #[test]
     fn array_agg_over_empty_group_is_null() {
-        // NULL, not the empty array — a group of one NULL row is what gives
-        // `{NULL}`, which is why the accumulator distinguishes "no rows yet".
+        // Not the empty array: a group of one NULL row is what gives `{NULL}`.
         let (_c, rows) = run_rows("SELECT array_agg(x) FROM (VALUES (1)) t(x) WHERE false");
         assert_eq!(rows, vec![vec![Value::Null]]);
     }
 
     #[test]
     fn array_agg_distinct_sorts_with_nulls_last() {
-        // PG implements a DISTINCT aggregate as a sort plus an adjacent-dup
-        // collapse, and for array_agg that order is observable.
         let (_c, rows) =
             run_rows("SELECT array_agg(DISTINCT x) FROM (VALUES (3), (1), (NULL), (2), (1)) t(x)");
         assert_eq!(

@@ -278,10 +278,8 @@ enum AggState {
     /// NULLs included. `None` until the first row, which is what distinguishes
     /// the empty group (NULL) from a group of one NULL (`{NULL}`).
     ///
-    /// `distinct` is carried rather than applied per row because PostgreSQL
-    /// implements a DISTINCT aggregate as a sort followed by an adjacent-dup
-    /// collapse — and for this aggregate the resulting *order* is observable.
-    /// See [`Accumulator::finalize`].
+    /// `distinct` is carried rather than applied per row — see
+    /// [`Accumulator::finalize`] for why the dedup has to wait.
     ArrayAgg {
         elem: PgType,
         collation: u32,
@@ -465,9 +463,7 @@ impl Accumulator {
                     }
                 }
             }
-            // NULL reaches here for this aggregate alone (see
-            // `AggFn::skips_null_input`) and is appended like any other value.
-            // DISTINCT is not applied yet — `finalize` sorts and collapses.
+            // The one arm a NULL reaches (see `AggFn::skips_null_input`).
             AggState::ArrayAgg { elems, .. } => {
                 elems.get_or_insert_with(Vec::new).push(values[0].clone());
             }
@@ -533,11 +529,10 @@ impl Accumulator {
                 Some(elems) => {
                     let mut elems = elems.clone();
                     if *distinct {
-                        // PostgreSQL runs a DISTINCT aggregate through a sort and
-                        // collapses adjacent equals, so `array_agg(DISTINCT x)`
-                        // comes out ascending with NULLs last — an *observable*
-                        // order, which is why the hashed `DistinctValues` (which
-                        // keeps arrival order) is not used for this aggregate.
+                        // PostgreSQL dedups a DISTINCT aggregate by sorting, so
+                        // `array_agg(DISTINCT x)` comes out ascending with NULLs
+                        // last — an *observable* order, which the hashed
+                        // `DistinctValues` (first-seen order) cannot produce.
                         elems.sort_by(|a, b| compare_element(*elem, a, b, *collation));
                         elems.dedup_by(|a, b| {
                             compare_element(*elem, a, b, *collation) == Ordering::Equal
@@ -550,15 +545,13 @@ impl Accumulator {
     }
 }
 
-/// Order two array elements the way `array_agg(DISTINCT …)` needs them:
-/// ascending, NULLs last — PostgreSQL's default `ORDER BY` for the implicit
-/// sort behind a DISTINCT aggregate.
+/// Ascending with NULLs last — PostgreSQL's default `ORDER BY`, which is what
+/// the implicit sort behind a DISTINCT aggregate uses.
 ///
-/// The NULL placement is spelled out here rather than borrowed because
-/// `crate::node::sort::compare_rows` reads it off a `SortKey`, and this sort
-/// has no `SortKey` to read. The value comparison is the same
-/// `compare_values_collated` that one uses, so the two cannot order *values*
-/// differently.
+/// The NULL placement is spelled out rather than borrowed because
+/// `crate::node::sort::compare_rows` reads it off a `SortKey` and this sort has
+/// none. Values go through the same `compare_values_collated` that one uses, so
+/// only the NULL end can differ.
 fn compare_element(ty: PgType, a: &Value, b: &Value, collation: u32) -> Ordering {
     match (matches!(a, Value::Null), matches!(b, Value::Null)) {
         (true, true) => Ordering::Equal,
@@ -568,10 +561,10 @@ fn compare_element(ty: PgType, a: &Value, b: &Value, collation: u32) -> Ordering
     }
 }
 
-/// Whether this aggregate wants a [`DistinctValues`] set built for it — true for
-/// every `DISTINCT` aggregate but `array_agg`, which dedups by sorting at
-/// finalize instead (see [`Accumulator::finalize`]). Asked by the aggregate node
-/// so the rule lives next to the accumulator that depends on it.
+/// Whether this aggregate wants a [`DistinctValues`] set built for it.
+/// `array_agg` opts out because it dedups by sorting at finalize instead (see
+/// [`Accumulator::finalize`]). Asked by the aggregate node, so the rule lives
+/// next to the accumulator it is a statement about.
 pub fn wants_distinct_set(agg: &BoundAggregate) -> bool {
     agg.distinct && agg.func != AggFn::ArrayAgg
 }
@@ -598,9 +591,9 @@ pub fn feed(
     if matches!(values[0], Value::Null) && agg.func.skips_null_input() {
         return Ok(());
     }
-    // `seen` is `None` for `array_agg` even under DISTINCT (see
-    // `wants_distinct_set`), which is also what keeps a NULL — the one value
-    // `DistinctValues` has no encoding for — from ever reaching it.
+    // `array_agg` passes `seen: None` even under DISTINCT (see
+    // `wants_distinct_set`), which is what keeps the NULL that just got past the
+    // check above — a value `DistinctValues` has no encoding for — out of it.
     if !seen.is_none_or(|seen| seen.insert(&values[0])) {
         return Ok(());
     }

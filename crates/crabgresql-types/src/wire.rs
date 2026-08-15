@@ -120,12 +120,11 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
 /// `array_recv`, the mirror of the `Value::Array` arm of [`Value::encode_binary`]
 /// — see it for the layout.
 ///
-/// Every part of the header that is not the shape this build represents is
-/// rejected rather than reinterpreted: a foreign element OID, a lower bound
-/// other than 1, or a second dimension would each *silently* change the value if
-/// waved through. A multi-dimensional array is a `0A000` and not a malformed
-/// input, because PG sends it perfectly well — this build simply has nowhere to
-/// put it (`crate::array` is 1-D).
+/// A header this build cannot represent is rejected rather than reinterpreted,
+/// because a foreign element OID or an unexpected lower bound would each change
+/// the value *silently*. The second dimension is the one refused with `0A000`
+/// rather than as malformed input: PG sends it perfectly well, and only
+/// `crate::array`'s 1-D representation has nowhere to put it.
 fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError> {
     let be = |s: &[u8]| i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
     if b.len() < 12 {
@@ -138,8 +137,7 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
     if declared_elem != elem_oid as i32 {
         return Err(invalid_binary(ty));
     }
-    // An empty array stops at the element OID; `ndim = 0` is the only shape
-    // that legitimately carries no dimension header.
+    // `ndim = 0` is the only shape that legitimately carries no dimension header.
     if ndim == 0 {
         if b.len() != 12 {
             return Err(invalid_binary(ty));
@@ -178,8 +176,8 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
         elems.push(decode_binary(elem, &b[pos..pos + len])?);
         pos += len;
     }
-    // Trailing bytes mean the header and the payload disagree; the value is not
-    // the one the client sent, whichever half is right.
+    // Trailing bytes mean the header and the payload disagree, so whichever half
+    // is right, the decoded value is not the one the client sent.
     if pos != b.len() {
         return Err(invalid_binary(ty));
     }
@@ -283,14 +281,11 @@ impl Value {
                 }
                 out
             }
-            // `array_send` — the same layout as a vector, with three
-            // differences: the lower bound is 1, the has-nulls flag is computed
-            // rather than fixed at 0, and an element is a *recursive*
-            // `encode_binary` (a NULL element being a length of -1 and no
-            // payload). An empty array carries no dimension header at all: PG
-            // sends `ndim = 0` and stops after the element OID, twelve bytes.
-            // Probed against PostgreSQL 18.4 via `COPY … (FORMAT binary)`; the
-            // bytes are pinned by `array_binary_layout_matches_pg` below.
+            // `array_send` — a vector's layout (see `decode_vector`), except
+            // that an empty array carries no dimension header at all: PG stops
+            // after the element OID, twelve bytes. Probed against PostgreSQL
+            // 18.4 via `COPY … (FORMAT binary)` and pinned byte for byte by
+            // `array_binary_layout_matches_pg` below.
             Value::Array { elem, elems } => {
                 let mut out = Vec::with_capacity(20 + elems.len() * 8);
                 let empty = elems.is_empty();
@@ -303,9 +298,9 @@ impl Value {
                     out.extend_from_slice(&1i32.to_be_bytes()); // lower bound
                 }
                 for e in elems {
-                    // An element type with no binary form of its own propagates
-                    // its own `0A000` — the alternative is a well-formed buffer
-                    // holding bytes the client would decode as some other value.
+                    // `?`, so an element type with no binary form of its own
+                    // refuses the whole array rather than leaving a well-formed
+                    // buffer the client would decode as some other value.
                     match e.encode_binary()? {
                         None => out.extend_from_slice(&(-1i32).to_be_bytes()),
                         Some(payload) => {
@@ -471,12 +466,9 @@ mod tests {
 
     /// The exact bytes PostgreSQL 18.4 puts on the wire for an array, read out
     /// of `COPY (SELECT '{1,NULL}'::int[], '{}'::int[], '{ab,""}'::text[],
-    /// '{t,f}'::bool[]) TO STDOUT (FORMAT binary)` and transcribed here.
-    ///
-    /// The three things a hand-written encoder gets wrong are all pinned:
-    /// the lower bound is 1 (a vector's is 0), the has-nulls flag is set by the
-    /// *contents*, and an empty array has `ndim = 0` and no dimension header —
-    /// twelve bytes, not twenty.
+    /// '{t,f}'::bool[]) TO STDOUT (FORMAT binary)` and transcribed here — the
+    /// three places a hand-written encoder drifts from a vector's layout being
+    /// the lower bound, the has-nulls flag, and the empty array's header.
     #[test]
     fn array_binary_layout_matches_pg() -> anyhow::Result<()> {
         #[rustfmt::skip]
