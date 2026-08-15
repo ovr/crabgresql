@@ -20,8 +20,9 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     am, attribute, auth, class, collation, constraint, cursors, database, description, extension,
-    foreign, index, inherits, language, namespace, opclass, policy, prepared, proc, publication,
-    relviews, rewrite, sequence, settings, statistic, statistic_ext, timezone, trigger, types,
+    foreign, index, inherits, language, namespace, opclass, policy, prepared, proc, progress,
+    publication, relviews, rewrite, sequence, settings, statistic, statistic_ext, timezone,
+    trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -403,6 +404,48 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         auth::pg_shadow_schema,
         auth::pg_shadow_rows,
+    ),
+    rel(
+        "pg_stat_progress_analyze",
+        12309,
+        PgCatalog,
+        progress::pg_stat_progress_analyze_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_progress_basebackup",
+        12329,
+        PgCatalog,
+        progress::pg_stat_progress_basebackup_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_progress_cluster",
+        12319,
+        PgCatalog,
+        progress::pg_stat_progress_cluster_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_progress_copy",
+        12333,
+        PgCatalog,
+        progress::pg_stat_progress_copy_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_progress_create_index",
+        12324,
+        PgCatalog,
+        progress::pg_stat_progress_create_index_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_progress_vacuum",
+        12314,
+        PgCatalog,
+        progress::pg_stat_progress_vacuum_schema,
+        no_rows,
     ),
     rel(
         "pg_statistic",

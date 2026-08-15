@@ -21,6 +21,7 @@ pub(crate) mod opclass;
 pub(crate) mod policy;
 pub(crate) mod prepared;
 pub(crate) mod proc;
+pub(crate) mod progress;
 pub(crate) mod publication;
 pub(crate) mod relviews;
 pub(crate) mod rewrite;
