@@ -3911,7 +3911,7 @@ fn bound_table_fn_item(
         debug_assert_eq!(
             columns.len(),
             1 + usize::from(ordinality),
-            "a scalar table function must expose exactly one column"
+            "a scalar table function must expose its one column, plus the ordinal"
         );
         if let Some(col) = columns.first_mut() {
             // Same normalization `relation_qualifier` just applied, so the

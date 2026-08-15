@@ -35,8 +35,8 @@ SELECT * FROM unnest(ARRAY[1, NULL, 3]) WITH ORDINALITY AS u(elem, pos);
 -- A record-returning function keeps its row type's column names and gets the
 -- ordinal appended.
 SELECT * FROM pg_input_error_info('1e400', 'float4') WITH ORDINALITY;
--- In a join the function is a row source like any other, and the numbering
--- restarts for each outer row it is rescanned for.
+-- In a join the function is a row source like any other: the ordinal reaches the
+-- result and pairs with every outer row.
 CREATE TABLE letters (id integer, tag text);
 INSERT INTO letters VALUES (1, 'a'), (2, 'b');
 SELECT l.tag, s.n, s.ord

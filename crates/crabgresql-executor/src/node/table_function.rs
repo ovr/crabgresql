@@ -21,6 +21,12 @@ pub struct TableFunctionSource {
     /// The ordinal the next row gets. PG numbers from 1 and counts the rows the
     /// *function* produced, so it is bumped here rather than anywhere a filter
     /// above could skip it.
+    ///
+    /// It never restarts, because nothing rescans this node: [`ExecNode`] has no
+    /// rescan entry point, `NestedLoopJoin` drains its right input once at
+    /// construction, and a correlated subquery builds a fresh node per outer row.
+    /// TODO: restart the ordinal (and rebuild `state`) when a rescan API lands —
+    /// PG numbers each scan from 1.
     next_ordinal: i64,
     /// Iteration state, initialized lazily from the evaluated arguments.
     state: Option<TableFnState>,
