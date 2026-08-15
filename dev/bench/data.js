@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786783101265,
+  "lastUpdate": 1786783103111,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -31720,6 +31720,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 22115.300191,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2ece9738f2e3b7b65e8bbb38efab82863a3d066b",
+          "message": "feat(wal): retire spent segments at checkpoint, and close what that opened (#237)\n\npg_wal grew for the life of a cluster: recovery reads the stream from the\nredo point upwards, so a segment wholly below it is never opened again, but\nnothing removed it.\n\nA checkpoint now unlinks those segments — after `pg_control` names the new\nredo point, never before, or a crash would leave the still-current control\nfile resuming at a segment that is gone. An unbounded checkpoint (redo\n`Lsn::INVALID`, published when a resident write buffer or an unreconciled\nTRUNCATE stops replay being bounded) retires nothing, which is what keeps a\nbuffer table's WAL-only rows safe. `CRABGRESQL_WAL_KEEP_SIZE` holds a tail\nof the dead history back; zero by default, like PostgreSQL.\n\nRecycling — reusing a spent segment under a future name — stays deferred and\nthe reason is now written down in `docs/ARCHITECTURE.md §1.3`: our segments\nare sparse and never preallocated, so a rename would save a single directory\noperation while breaking three invariants (the insert position comes from the\nhighest segment present, replay checks a record's self-declared LSN only at\nthe redo point, and the stream length is read off the last file).",
+          "timestamp": "2026-08-15T07:47:40Z",
+          "tree_id": "667a6c808b6d13cb110c4b14828bb919a13bf007",
+          "url": "https://github.com/ovr/crabgresql/commit/2ece9738f2e3b7b65e8bbb38efab82863a3d066b"
+        },
+        "date": 1786783102994,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 358.086269,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 42774.382214,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
