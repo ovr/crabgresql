@@ -311,6 +311,7 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
             // Refusing keeps that binder bug from also relocating the conjunct.
             BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. }
             | BoundExpr::QuantifiedSubquery { .. }
             | BoundExpr::WindowFunc { .. } => true,

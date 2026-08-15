@@ -302,6 +302,16 @@ pub enum BoundExpr {
         subplan: Subplan,
         ty: PgType,
     },
+    /// `ARRAY(SELECT …)`: `subplan` yields exactly one column, whose values
+    /// become the elements of an array, in the order the subplan produces them
+    /// (so an `ORDER BY` inside is meaningful). Folded exactly like
+    /// [`BoundExpr::ScalarSubquery`], but to a `Value::Array` — and with no
+    /// cardinality limit: zero rows give the *empty* array, not NULL.
+    ArraySubquery {
+        subplan: Subplan,
+        elem: PgType,
+        ty: PgType,
+    },
     /// `[NOT] EXISTS (SELECT …)`: folds (in `resolve_subqueries`) to a bool
     /// `Const` — whether `subplan` yields any row, negated when `negated`.
     Exists {
@@ -563,7 +573,7 @@ impl BoundExpr {
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
             BoundExpr::WindowFunc { ret, .. } => *ret,
-            BoundExpr::ScalarSubquery { ty, .. } => *ty,
+            BoundExpr::ScalarSubquery { ty, .. } | BoundExpr::ArraySubquery { ty, .. } => *ty,
             BoundExpr::Exists { .. }
             | BoundExpr::QuantifiedSubquery { .. }
             | BoundExpr::QuantifiedArray { .. } => PgType::Bool,
@@ -613,6 +623,7 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. } => false,
         }
     }
@@ -651,9 +662,9 @@ impl BoundExpr {
                     condition.contains_routine() || result.contains_routine()
                 }) || else_.as_ref().is_some_and(|expr| expr.contains_routine())
             }
-            BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
-                crate::plan::plan_calls_routine(&subplan.plan)
-            }
+            BoundExpr::ScalarSubquery { subplan, .. }
+            | BoundExpr::ArraySubquery { subplan, .. }
+            | BoundExpr::Exists { subplan, .. } => crate::plan::plan_calls_routine(&subplan.plan),
             BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
                 cmp.contains_routine() || crate::plan::plan_calls_routine(&subplan.plan)
             }
@@ -719,7 +730,9 @@ impl BoundExpr {
             BoundExpr::QuantifiedArray { array, cmp, .. } => {
                 array.contains_aggregate() || cmp.contains_aggregate()
             }
-            BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => false,
+            BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
+            | BoundExpr::Exists { .. } => false,
         }
     }
 
@@ -742,6 +755,7 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. } => false,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
@@ -797,6 +811,7 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. } => None,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
@@ -924,12 +939,14 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. } => false,
         }
     }
 
     /// Whether this expression tree contains a subquery marker anywhere — a
-    /// scalar subquery, an `EXISTS`, or a quantified `op ANY/ALL (SELECT …)`.
+    /// scalar subquery, an `ARRAY(SELECT …)`, an `EXISTS`, or a quantified
+    /// `op ANY/ALL (SELECT …)`.
     ///
     /// Evaluating one runs a whole plan. A *correlated* one runs that plan again
     /// for every row the expression is applied to, so a conjunct containing one
@@ -939,6 +956,7 @@ impl BoundExpr {
     pub fn contains_subquery(&self) -> bool {
         match self {
             BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. }
             | BoundExpr::QuantifiedSubquery { .. } => true,
             BoundExpr::Unary { expr, .. }
@@ -1028,7 +1046,9 @@ impl BoundExpr {
             }
             // A validated scalar body carries no subquery; its params (if any)
             // live in a separate plan and are not this body's arguments.
-            BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => 0,
+            BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
+            | BoundExpr::Exists { .. } => 0,
         }
     }
 
@@ -1101,7 +1121,9 @@ impl BoundExpr {
                     fold(array, acc);
                     fold(cmp, acc);
                 }
-                BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
+                BoundExpr::ScalarSubquery { .. }
+                | BoundExpr::ArraySubquery { .. }
+                | BoundExpr::Exists { .. } => {}
             }
         }
         let mut acc = None;
@@ -1184,6 +1206,7 @@ impl BoundExpr {
             // results also live in slots this row does not have yet, so any
             // answer would be a lie about a row shape that no longer applies.
             BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. }
             | BoundExpr::QuantifiedSubquery { .. }
             | BoundExpr::WindowFunc { .. } => false,
@@ -1224,6 +1247,7 @@ impl BoundExpr {
             | BoundExpr::Param { .. }
             | BoundExpr::OuterColumnRef { .. }
             | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::ArraySubquery { .. }
             | BoundExpr::Exists { .. } => {}
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
@@ -1391,14 +1415,19 @@ mod collect_column_refs_tests {
 
     /// The load-bearing refusal: a correlated subplan body records its
     /// dependency on this row as an `OuterColumnRef` that no `BoundExpr` walk
-    /// reaches, so pruning on a partial set would read NULL. All three
-    /// subplan-carrying variants must decline.
+    /// reaches, so pruning on a partial set would read NULL. Every
+    /// subplan-carrying variant must decline.
     #[test]
     fn subplan_variants_refuse_to_report_a_set() {
         for expr in [
             BoundExpr::ScalarSubquery {
                 subplan: subplan(),
                 ty: PgType::Int4,
+            },
+            BoundExpr::ArraySubquery {
+                subplan: subplan(),
+                elem: PgType::Int4,
+                ty: PgType::Array(crabgresql_types::oid::INT4),
             },
             BoundExpr::Exists {
                 subplan: subplan(),

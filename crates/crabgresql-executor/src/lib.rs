@@ -1239,7 +1239,9 @@ fn resolve_expr(
                 **array = folded;
             }
         }
-        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::ArraySubquery { .. }
+        | BoundExpr::Exists { .. } => {}
     }
     // A correlated subquery cannot fold to a constant here — its value depends on
     // the outer row — so leave the marker for `eval` to fold per row. Only
@@ -1263,6 +1265,7 @@ fn resolve_expr(
 fn is_foldable_subquery(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::ArraySubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => {
             !crabgresql_binder::plan_has_outer_refs(&subplan.plan)
@@ -1282,6 +1285,13 @@ fn fold_subquery(
             let rows = run_subplan(*subplan.plan, ctx, txn)?;
             Ok(BoundExpr::Const {
                 value: scalar_subquery_value(rows, ty, ctx)?,
+                ty,
+            })
+        }
+        BoundExpr::ArraySubquery { subplan, elem, ty } => {
+            let rows = run_subplan(*subplan.plan, ctx, txn)?;
+            Ok(BoundExpr::Const {
+                value: array_subquery_value(rows, elem, ctx)?,
                 ty,
             })
         }
@@ -1392,9 +1402,29 @@ fn scalar_subquery_value(
     }
 }
 
+/// The array an `ARRAY(SELECT …)` folds to from its materialized `rows`.
+///
+/// The coercion is there for the reason [`scalar_subquery_value`] coerces: a
+/// set-op or promoted column can arrive narrower than the type the array was
+/// bound against. No row count is an error, and none means NULL — zero rows
+/// give `{}`, a divergence invisible until `array_to_string(array(…), ',')` of
+/// an empty set returns NULL instead of `''`.
+fn array_subquery_value(
+    rows: Vec<Tuple>,
+    elem: PgType,
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    let elems = subquery_column(rows)
+        .into_iter()
+        .map(|value| coerce_value(value, elem, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Array { elem, elems })
+}
+
 /// Evaluate a *correlated* subquery marker for one outer `row`: the per-row
 /// counterpart of `fold_subquery`. The value is a scalar subquery's single
-/// value, `EXISTS` as a bool, or a quantified `IN`/`op ANY`/`op ALL` as the
+/// value, an `ARRAY(SELECT …)`'s array, `EXISTS` as a bool, or a quantified
+/// `IN`/`op ANY`/`op ALL` as the
 /// comparison's answer for the outer needle (evaluated against `row`). Getting
 /// it need not run the subplan for this row: a hashed `EXISTS` probes a table
 /// built once for the whole statement, and a memo hit reuses the answer an
@@ -1418,6 +1448,7 @@ pub(crate) fn eval_correlated_subquery(
     // of the three paths below — hashed, memoized, re-run — starts from it.
     let subplan = match marker {
         BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::ArraySubquery { subplan, .. }
         | BoundExpr::Exists { subplan, .. }
         | BoundExpr::QuantifiedSubquery { subplan, .. } => subplan,
         // `eval` only calls this for a subquery marker.
@@ -1457,6 +1488,10 @@ pub(crate) fn eval_correlated_subquery(
             let rows = run_subplan(logical, ctx, txn)?;
             scalar_subquery_value(rows, *ty, ctx)?
         }
+        BoundExpr::ArraySubquery { elem, .. } => {
+            let rows = run_subplan(logical, ctx, txn)?;
+            array_subquery_value(rows, *elem, ctx)?
+        }
         BoundExpr::Exists { negated, .. } => {
             let exists = subplan_has_rows(logical, ctx, txn)?;
             Value::Bool(exists != *negated)
@@ -1467,7 +1502,7 @@ pub(crate) fn eval_correlated_subquery(
             // evaluated against `row` (needle once, then each candidate).
             eval_quantified(cmp, &subquery_column(rows), *all, row, ctx)?
         }
-        // Unreachable: `subplan` above already matched these three variants.
+        // Unreachable: `subplan` above already matched every one of these.
         _ => Value::Null,
     };
     if let Some(key) = memo {
@@ -4779,6 +4814,94 @@ mod tests {
                 Value::Null,
             ]]
         );
+    }
+
+    #[test]
+    fn array_subquery_collects_rows_in_subplan_order() {
+        // Both spellings of "the subplan decides": arms written 2, 1 stay 2, 1,
+        // and an inner ORDER BY reorders what the VALUES list fixed.
+        let (columns, rows) = run_rows(
+            "SELECT array(SELECT 2 UNION ALL SELECT 1), array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n)",
+        );
+        assert_eq!(columns[0].name, "array");
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Array {
+                    elem: PgType::Int4,
+                    elems: vec![Value::Int4(2), Value::Int4(1)],
+                },
+                Value::Array {
+                    elem: PgType::Int4,
+                    elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)],
+                },
+            ]]
+        );
+    }
+
+    #[test]
+    fn array_subquery_of_no_rows_is_the_empty_array_not_null() {
+        // The one place this differs from a scalar subquery, checked through
+        // `array_to_string` too, where a NULL would surface as a NULL row.
+        let (_c, rows) = run_rows(
+            "SELECT array(SELECT 1 WHERE false), array_to_string(array(SELECT 1 WHERE false), ',')",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Array {
+                    elem: PgType::Int4,
+                    elems: Vec::new(),
+                },
+                Value::Text(String::new()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn array_subquery_keeps_null_rows_as_null_elements() {
+        // Unlike a quantified subquery's candidate list, nothing here drops or
+        // dedups: a NULL row is a NULL element, and duplicates are kept.
+        let (_c, rows) =
+            run_rows("SELECT array(SELECT n FROM (VALUES (1), (NULL), (1), (2)) v(n))");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: vec![Value::Int4(1), Value::Null, Value::Int4(1), Value::Int4(2)],
+            }]]
+        );
+    }
+
+    #[test]
+    fn correlated_array_subquery_is_rebuilt_per_outer_row() -> anyhow::Result<()> {
+        // `i.v = o.k` correlates, so the marker survives `resolve_subqueries`
+        // and is folded against each outer row instead of once up front.
+        let engine = exists_engine(&[(1, 10), (2, 20)], &[(Some(7), 1), (Some(8), 1)])?;
+        let (_c, rows) = run_rows_on(
+            &engine,
+            "SELECT k, array(SELECT i.k FROM i WHERE i.v = o.k ORDER BY i.k) FROM o ORDER BY k",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Int4(1),
+                    Value::Array {
+                        elem: PgType::Int4,
+                        elems: vec![Value::Int4(7), Value::Int4(8)],
+                    },
+                ],
+                vec![
+                    Value::Int4(2),
+                    Value::Array {
+                        elem: PgType::Int4,
+                        elems: Vec::new(),
+                    },
+                ],
+            ]
+        );
+        Ok(())
     }
 
     #[test]

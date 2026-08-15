@@ -12,7 +12,7 @@
 //!
 //! - `ColumnRef` / `Param` / `OuterColumnRef` — runtime values, not constants.
 //! - `Aggregate` / `WindowFunc` / `Srf` — markers a plan node computes.
-//! - `ScalarSubquery` / `Exists` / `QuantifiedSubquery` — the executor's
+//! - `ScalarSubquery` / `ArraySubquery` / `Exists` / `QuantifiedSubquery` — the executor's
 //!   `resolve_subqueries` folds these once the statement runs, where a
 //!   transaction to run the subplan against exists.
 //! - `Routine` — a PL/pgSQL body is an imperative program needing the
@@ -77,7 +77,9 @@ fn fold_children(
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }
         | BoundExpr::OuterColumnRef { .. } => {}
-        BoundExpr::ScalarSubquery { subplan, .. } | BoundExpr::Exists { subplan, .. } => {
+        BoundExpr::ScalarSubquery { subplan, .. }
+        | BoundExpr::ArraySubquery { subplan, .. }
+        | BoundExpr::Exists { subplan, .. } => {
             changed |= on_subplan(subplan);
         }
         BoundExpr::Unary { expr, .. }
@@ -262,6 +264,7 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
         | BoundExpr::Aggregate { .. }
         | BoundExpr::WindowFunc { .. }
         | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::ArraySubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. }
         | BoundExpr::QuantifiedArray { .. } => None,

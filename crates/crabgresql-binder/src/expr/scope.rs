@@ -413,6 +413,7 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
         | BoundExpr::Aggregate { .. }
         | BoundExpr::WindowFunc { .. }
         | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::ArraySubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. }
         | BoundExpr::QuantifiedArray { .. } => expr.clone(),

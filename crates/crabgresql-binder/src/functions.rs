@@ -3395,6 +3395,24 @@ fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
     }
 }
 
+/// `ARRAY` written the one way PG's grammar admits the array-subquery
+/// constructor: as an **unqualified, unquoted** keyword — the same rule
+/// [`special_form`] applies to `COALESCE`/`NULLIF`, and for the same reason.
+///
+/// The shape, not the last part (what [`function_name`] returns): only the
+/// qualifier's presence separates `pg_catalog.array(SELECT 1)` from the bare
+/// form. The parser refuses to attach that qualifier at all, so this is the
+/// second gate — kept exact so the binder recognizes its own grammar without
+/// depending on the first.
+fn array_keyword(name: &ast::ObjectName) -> bool {
+    let [part] = name.0.as_slice() else {
+        return false;
+    };
+    part.as_ident()
+        .filter(|id| id.quote_style.is_none())
+        .is_some_and(|id| crate::expr::normalize_ident(id) == "array")
+}
+
 /// Bind `COALESCE(…)` / `NULLIF(…)`.
 ///
 /// PG's grammar gives these a bare expression list and nothing else, so every
@@ -3500,6 +3518,16 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             "function is not supported yet: {func}"
         )));
     };
+    // `ARRAY(SELECT …)` is grammar, not a call: the parser spells it as a
+    // function whose argument list *is* a query, a shape nothing else produces
+    // (a user's `array(1)` arrives as a positional list). Dispatched before the
+    // window and aggregate paths because none of their decorations are
+    // grammatical here.
+    if array_keyword(&func.name)
+        && let ast::FunctionArguments::Subquery(query) = &func.args
+    {
+        return crate::expr::bind_array_subquery(query, scope);
+    }
     // An `OVER` clause makes this a window call whatever the name resolves to,
     // so it is dispatched before the aggregate and scalar paths.
     if let Some(over) = &func.over {

@@ -1,0 +1,107 @@
+--
+-- ARRAY(subquery)
+-- The subquery form of the array constructor: every row of a one-column
+-- subquery becomes one element, in the order the subquery yields them. Unlike a
+-- scalar subquery there is no cardinality limit and no row count means NULL --
+-- zero rows give the empty array. Expected output taken from PostgreSQL.
+--
+-- elements arrive in the subquery's own order, so the inner ORDER BY decides
+SELECT array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n) AS sorted,
+       array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n DESC) AS reversed;
+ sorted  | reversed 
+---------+----------
+ {1,2,3} | {3,2,1}
+(1 row)
+
+-- the output column is named "array", like the bracket constructor
+SELECT array(SELECT 1);
+ array 
+-------
+ {1}
+(1 row)
+
+-- zero rows is the empty array, not NULL -- and array_to_string of it is ''
+SELECT array(SELECT 1 WHERE false) AS empty,
+       array(SELECT 1 WHERE false) IS NULL AS is_null,
+       array_to_string(array(SELECT 1 WHERE false), ',') AS joined;
+ empty | is_null | joined 
+-------+---------+--------
+ {}    | f       | 
+(1 row)
+
+-- NULL rows are kept as NULL elements and duplicates are not collapsed
+SELECT array(SELECT n FROM (VALUES (1), (NULL), (1), (2)) v(n));
+    array     
+--------------
+ {1,NULL,1,2}
+(1 row)
+
+-- the element type is the subquery column's; a text column gives text[]
+SELECT pg_typeof(array(SELECT 1)) AS ints,
+       pg_typeof(array(SELECT 'a')) AS texts,
+       pg_typeof(array(SELECT 1.5)) AS numerics;
+   ints    | texts  | numerics  
+-----------+--------+-----------
+ integer[] | text[] | numeric[]
+(1 row)
+
+-- LIMIT inside applies to the elements, not to the one row the array is
+SELECT array(SELECT n FROM (VALUES (1), (2), (3)) v(n) ORDER BY n LIMIT 2);
+ array 
+-------
+ {1,2}
+(1 row)
+
+-- a correlated subquery is rebuilt for each outer row
+CREATE TABLE array_sub_o (k int);
+CREATE TABLE array_sub_i (k int, owner int);
+INSERT INTO array_sub_o VALUES (1), (2), (3);
+INSERT INTO array_sub_i VALUES (7, 1), (8, 1), (9, 2);
+SELECT k, array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+ k | owned 
+---+-------
+ 1 | {7,8}
+ 2 | {9}
+ 3 | {}
+(3 rows)
+
+-- consuming the array a correlated subquery builds
+SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k), ',') AS joined
+  FROM array_sub_o o ORDER BY k;
+ k | joined 
+---+--------
+ 1 | 7,8
+ 2 | 9
+ 3 | 
+(3 rows)
+
+-- a correlated subquery *inside* the array's body: the decorrelation rule
+-- descends into an ARRAY(...) body but must never lift the array itself into a
+-- join arm, which would turn one value per outer row into rows
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE EXISTS (SELECT 1 FROM array_sub_o x WHERE x.k = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+ k |  owned  
+---+---------
+ 1 | {7,8,9}
+ 2 | {7,8,9}
+ 3 | {7,8,9}
+(3 rows)
+
+-- and one correlated to both levels at once
+SELECT k, array(SELECT i.k FROM array_sub_i i
+                 WHERE i.owner = o.k
+                   AND i.k > (SELECT min(y.k) FROM array_sub_i y WHERE y.owner = i.owner)
+                 ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+ k | owned 
+---+-------
+ 1 | {8}
+ 2 | {}
+ 3 | {}
+(3 rows)
+
+DROP TABLE array_sub_i;
+DROP TABLE array_sub_o;

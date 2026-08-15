@@ -382,6 +382,40 @@ fn bind_scalar_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, Bi
     }))
 }
 
+/// `ARRAY(SELECT …)` — the subquery form of the array constructor. Like
+/// [`bind_scalar_subquery`] the subquery must produce exactly one column, but
+/// every row it yields contributes an element (in the subplan's own order, so
+/// an `ORDER BY` inside is meaningful) instead of one row being the answer:
+/// there is no cardinality limit, and zero rows give the *empty* array, not
+/// NULL.
+///
+/// The element-type rule is [`bind_array_ctor`]'s, refusal included — and that
+/// refusal is what rejects an array-typed column: PG answers
+/// `ARRAY(SELECT ARRAY[…])` with a two-dimensional array, which this build has
+/// no representation for.
+pub(crate) fn bind_array_subquery(query: &ast::Query, scope: &Scope) -> Result<Binding, BindError> {
+    let (plan, columns) = bind_subquery_plan(query, scope)?;
+    let [col] = columns.as_slice() else {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "subquery must return only one column",
+        ));
+    };
+    let elem = col.ty;
+    // TODO: support the multi-dimensional result an array-typed column gives.
+    if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
+        return Err(BindError::feature_not_supported(format!(
+            "could not find array type for data type {}",
+            elem.name()
+        )));
+    }
+    Ok(Binding::Typed(BoundExpr::ArraySubquery {
+        subplan: Subplan::new(plan),
+        elem,
+        ty: PgType::Array(elem.oid()),
+    }))
+}
+
 /// `[NOT] EXISTS (SELECT …)` → a bool test on whether the subquery yields rows.
 /// The projected columns are irrelevant (PG ignores them), so the target list is
 /// replaced with a constant: the executor then only checks for a first row and

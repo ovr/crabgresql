@@ -1979,6 +1979,19 @@ impl<'a> Parser<'a> {
                 return parser_err!("expected function expression", root.span().start);
             };
 
+            // A query for an argument list is the `ARRAY(SELECT …)` constructor
+            // `parse_prefix` builds from the bare keyword — grammar, not a
+            // function, so it takes no qualifier. Flattening would forge
+            // `pg_catalog.array(SELECT 1)` into a node indistinguishable from
+            // the keyword; PostgreSQL, having no `array` function in any schema,
+            // reports a syntax error at the query instead.
+            if let FunctionArguments::Subquery(query) = &func.args {
+                return parser_err!(
+                    "the ARRAY(SELECT …) constructor cannot be schema-qualified",
+                    query.span().start
+                );
+            }
+
             let compound_func_name = [root]
                 .into_iter()
                 .chain(access_chain.into_iter().flat_map(|access| match access {
@@ -17959,6 +17972,31 @@ mod tests {
             "SELECT SUBSTR('a' SIMILAR 'b' ESCAPE '#')"
         )
         .is_err());
+    }
+
+    /// Without the guard a qualifier is silently absorbed: `parse_prefix` builds
+    /// the constructor for the bare keyword after the dot, and
+    /// `build_compound_expr` flattens it into a `Function` named
+    /// `pg_catalog.array` that nothing downstream can tell from the real thing.
+    /// The two accepted spellings are pinned alongside, since a guard that also
+    /// rejected them would pass a refusal-only test.
+    #[test]
+    fn parse_array_subquery_rejects_a_schema_qualifier() {
+        let dialects = all_dialects();
+        dialects.verified_stmt("SELECT ARRAY(SELECT 1)");
+        dialects.verified_stmt("SELECT pg_catalog.array_to_string(ARRAY[1], ',')");
+        for sql in [
+            "SELECT pg_catalog.array(SELECT 1)",
+            "SELECT a.b.array(SELECT 1)",
+            "SELECT pg_catalog.array(VALUES (1))",
+        ] {
+            let error = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                .expect_err("a qualified ARRAY(SELECT …) must not parse");
+            assert!(
+                format!("{error}").contains("cannot be schema-qualified"),
+                "{sql}: unexpected error {error}"
+            );
+        }
     }
 
     /// PostgreSQL writes a constant of any type as `<type name> '<literal>'`,
