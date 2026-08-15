@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
+use crabgresql_catalog::{CatalogLock, CatalogLockTarget};
 use crabgresql_executor::{
     CatalogOps, ExecContext, ExecError, ExecNode, GucOps, NoticeSink, OutputColumn, RoutineOps,
     SequenceOps,
@@ -415,6 +416,19 @@ pub struct Session {
     /// metadata.
     pub database: String,
     pub user: String,
+    /// This connection's backend id — the integer handed to the client in
+    /// `BackendKeyData`, and what `pg_backend_pid()` and `pg_locks.pid` report.
+    /// It identifies a connection, not an OS process: every session here runs in
+    /// the same one.
+    pub backend_id: i32,
+    /// The local part of this session's `virtualtransaction` (PostgreSQL's
+    /// `backendID/localXID`), advanced once per transaction by
+    /// [`Session::stamp_message`].
+    ///
+    /// PostgreSQL assigns a virtual XID to *every* transaction, whether or not
+    /// it writes and so whether or not it ever gets a real XID, and it is the
+    /// only identity a read-only transaction has in `pg_locks`.
+    pub vxid: u32,
     /// Concrete namespace assigned to this connection's temporary relations.
     pub temp_schema: String,
     /// Synthetic OID reflected for [`Session::temp_schema`] in `pg_namespace` and
@@ -753,6 +767,7 @@ impl Session {
         engine: Arc<dyn TableEngine>,
         database: impl Into<String>,
         user: impl Into<String>,
+        backend_id: i32,
         temp_schema: impl Into<String>,
         temp_namespace_oid: u32,
     ) -> Self {
@@ -760,6 +775,10 @@ impl Session {
         Self {
             database: database.into(),
             user: user.into(),
+            backend_id,
+            // The first transaction this session starts is 1, as PostgreSQL's
+            // per-backend counter also begins at its first transaction.
+            vxid: 0,
             temp_schema: temp_schema.into(),
             temp_namespace_oid,
             // PG's default since v12.
@@ -951,11 +970,70 @@ impl Session {
     /// already open, so every message up to the next `Sync` shares a
     /// transaction timestamp. PG starts it at the *first* of Parse/Bind/Execute,
     /// not at the first Execute, which is what `get_or_insert` reproduces.
+    ///
+    /// It is also where [`Session::vxid`] advances, because the message that
+    /// opens a transaction is the only event that reliably marks one starting:
+    /// under autocommit every simple query is its own transaction, an
+    /// extended-query batch's first message opens the implicit block the rest
+    /// share, and a message arriving inside an explicit block starts nothing —
+    /// so a `BEGIN` keeps the virtual XID it was given until its `COMMIT`, as
+    /// PostgreSQL does.
+    ///
+    /// Its granularity is therefore the message, not the statement: a
+    /// multi-statement simple query that ends a block and starts another
+    /// (`COMMIT; BEGIN;` in one string) reports one virtual XID across both,
+    /// where PostgreSQL reports two.
     pub fn stamp_message(&mut self, extended: bool) {
         self.stmt_start = crabgresql_types::tz::now_micros();
-        if extended && self.xact.is_none() {
-            self.implicit_xact_start.get_or_insert(self.stmt_start);
+        if self.xact.is_none() {
+            match extended {
+                true => {
+                    if self.implicit_xact_start.is_none() {
+                        self.implicit_xact_start = Some(self.stmt_start);
+                        self.vxid += 1;
+                    }
+                }
+                false => self.vxid += 1,
+            }
         }
+    }
+
+    /// This session's `virtualtransaction`, in PostgreSQL's `backendID/localXID`
+    /// spelling.
+    pub fn virtual_transaction(&self) -> String {
+        format!("{}/{}", self.backend_id, self.vxid)
+    }
+
+    /// The locks this session holds, as `pg_locks` reports them.
+    ///
+    /// Two rows at most, both read off the session rather than out of a lock
+    /// table (there is none — see [`crabgresql_catalog::CatalogSource::locks`]).
+    /// The XID row appears only once the transaction has written and been
+    /// assigned one, so a read-only transaction has just the virtual one —
+    /// PostgreSQL allocates the XID just as lazily.
+    pub fn locks(&self) -> Vec<CatalogLock> {
+        let virtualtransaction = self.virtual_transaction();
+        let lock = |target: CatalogLockTarget| CatalogLock {
+            // PostgreSQL's fast path covers weak *relation* locks only; a
+            // `virtualxid` lock is fast-path in a backend's own PGPROC, and a
+            // `transactionid` lock never is.
+            fastpath: matches!(target, CatalogLockTarget::VirtualXid),
+            target,
+            virtualtransaction: virtualtransaction.clone(),
+            pid: self.backend_id,
+            // Nothing can conflict with either until a session waits on the
+            // XID, which would need a lock table this build does not have.
+            mode: "ExclusiveLock",
+            granted: true,
+            waitstart: None,
+        };
+        let mut locks = vec![lock(CatalogLockTarget::VirtualXid)];
+        if let Some(xid) = self.xact.as_ref().and_then(|xact| xact.xid) {
+            // Narrowed to the 32 bits PostgreSQL's `xid` type carries, which is
+            // the same truncation its own counter wraps through.
+            locks.push(lock(CatalogLockTarget::TransactionId(xid.0 as u32)));
+        }
+        locks
     }
 
     /// End the implicit block: a `Sync`, or a simple query, which is its own.

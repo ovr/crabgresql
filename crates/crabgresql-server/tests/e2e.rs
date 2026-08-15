@@ -14143,3 +14143,276 @@ async fn an_extended_query_batch_shares_one_transaction_timestamp() -> anyhow::R
     assert_ne!(next[0], values[0], "a new batch starts a new transaction");
     Ok(())
 }
+
+/// `pg_locks` answers a bare `SELECT` the way PostgreSQL does under autocommit:
+/// the reading transaction's `virtualxid` lock and its own `AccessShareLock` on
+/// `pg_locks`, both attributed to the same backend and virtual transaction.
+///
+/// The two rows are what makes the relation worth serving — a monitoring query
+/// that joins `pg_locks` to itself, or filters `WHERE NOT granted`, binds and
+/// runs against this build unchanged.
+#[tokio::test]
+async fn pg_locks_reports_the_reading_session_and_its_own_scan() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let rows = client
+        .query(
+            "SELECT locktype, mode, granted, fastpath, pid, virtualtransaction, \
+             relation::text AS rel, virtualxid, transactionid::text AS xid, waitstart \
+             FROM pg_locks ORDER BY locktype",
+            &[],
+        )
+        .await?;
+    assert_eq!(rows.len(), 2);
+
+    let relation = &rows[0];
+    assert_eq!(relation.get::<_, &str>("locktype"), "relation");
+    assert_eq!(relation.get::<_, &str>("mode"), "AccessShareLock");
+    assert!(relation.get::<_, bool>("granted"));
+    assert!(relation.get::<_, bool>("fastpath"));
+    // PostgreSQL's own OID for `pg_locks`, so a client that hard-codes it agrees.
+    assert_eq!(relation.get::<_, &str>("rel"), "12073");
+    assert_eq!(relation.get::<_, Option<&str>>("virtualxid"), None);
+    assert_eq!(
+        relation.get::<_, Option<std::time::SystemTime>>("waitstart"),
+        None
+    );
+
+    let virtualxid = &rows[1];
+    assert_eq!(virtualxid.get::<_, &str>("locktype"), "virtualxid");
+    assert_eq!(virtualxid.get::<_, &str>("mode"), "ExclusiveLock");
+    assert_eq!(virtualxid.get::<_, Option<&str>>("rel"), None);
+    assert_eq!(
+        virtualxid.get::<_, &str>("virtualxid"),
+        virtualxid.get::<_, &str>("virtualtransaction")
+    );
+
+    assert_eq!(
+        relation.get::<_, i32>("pid"),
+        virtualxid.get::<_, i32>("pid")
+    );
+    let first = relation.get::<_, String>("virtualtransaction");
+    assert_eq!(first, virtualxid.get::<_, String>("virtualtransaction"));
+    // A read-only transaction is never assigned a real XID, here as in
+    // PostgreSQL, so it holds no `transactionid` lock.
+    assert_eq!(relation.get::<_, Option<&str>>("xid"), None);
+
+    // The next statement is the next transaction: same backend, new virtual XID.
+    let second: String = client
+        .query_one("SELECT virtualtransaction AS v FROM pg_locks LIMIT 1", &[])
+        .await?
+        .get("v");
+    assert_ne!(first, second);
+    let (backend, _) = first.split_once('/').expect("backendID/localXID");
+    assert_eq!(second.split_once('/').map(|(b, _)| b), Some(backend));
+    Ok(())
+}
+
+/// A transaction that has written holds a `transactionid` lock on the XID it was
+/// assigned, and keeps one virtual transaction for the whole block — the two
+/// facts a client reads `pg_locks` for when it wants to know what a session is
+/// sitting on.
+#[tokio::test]
+async fn pg_locks_reports_a_writing_block_transactionid() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client.batch_execute("BEGIN").await?;
+
+    // Before the write the block has no XID, exactly as in PostgreSQL.
+    let before = client
+        .query_one(
+            "SELECT count(*) AS n, max(virtualtransaction) AS v FROM pg_locks \
+             WHERE locktype = 'transactionid'",
+            &[],
+        )
+        .await?;
+    assert_eq!(before.get::<_, i64>("n"), 0);
+    assert_eq!(before.get::<_, Option<&str>>("v"), None);
+
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+    let after = client
+        .query_one(
+            "SELECT transactionid::text AS xid, mode, granted, fastpath, \
+             virtualtransaction AS v FROM pg_locks WHERE locktype = 'transactionid'",
+            &[],
+        )
+        .await?;
+    assert_eq!(after.get::<_, &str>("mode"), "ExclusiveLock");
+    assert!(after.get::<_, bool>("granted"));
+    // PostgreSQL's fast path covers weak relation locks only.
+    assert!(!after.get::<_, bool>("fastpath"));
+    assert!(
+        after
+            .get::<_, &str>("xid")
+            .parse::<u32>()
+            .is_ok_and(|xid| xid > 0),
+        "an assigned XID, not a placeholder"
+    );
+
+    let held: String = after.get("v");
+    let again: String = client
+        .query_one("SELECT virtualtransaction AS v FROM pg_locks LIMIT 1", &[])
+        .await?
+        .get("v");
+    assert_eq!(held, again);
+
+    client.batch_execute("COMMIT").await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) AS n FROM pg_locks WHERE locktype = 'transactionid'",
+                &[]
+            )
+            .await?
+            .get::<_, i64>("n"),
+        0
+    );
+    Ok(())
+}
+
+/// `pg_backend_pid()` names the same backend `pg_locks.pid` reports, so the
+/// canonical `WHERE pid = pg_backend_pid()` selects this session's locks and not
+/// the empty set.
+#[tokio::test]
+async fn pg_backend_pid_matches_the_sessions_lock_rows() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid() AS pid", &[])
+        .await?
+        .get("pid");
+    let mine = client
+        .query_one(
+            "SELECT count(*) AS n FROM pg_locks WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await?
+        .get::<_, i64>("n");
+    assert_eq!(mine, 2);
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) AS n FROM pg_locks", &[])
+            .await?
+            .get::<_, i64>("n"),
+        mine
+    );
+
+    // Stable for the life of a connection, and distinct across connections —
+    // the two properties a client joins on.
+    assert_eq!(
+        pid,
+        client
+            .query_one("SELECT pg_backend_pid() AS pid", &[])
+            .await?
+            .get::<_, i32>("pid")
+    );
+    let other = connect(port).await;
+    assert_ne!(
+        pid,
+        other
+            .query_one("SELECT pg_backend_pid() AS pid", &[])
+            .await?
+            .get::<_, i32>("pid")
+    );
+    Ok(())
+}
+
+/// `pg_locks` reports a `relation` row for every relation the statement
+/// resolved, not just for itself — the join `pg_locks JOIN pg_class ON relation
+/// = oid` that every monitoring query is built around.
+#[tokio::test]
+async fn pg_locks_lists_every_relation_the_statement_resolved() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+
+    let rows = client
+        .query(
+            "SELECT relation, mode, granted, fastpath FROM pg_locks, t \
+             WHERE locktype = 'relation' ORDER BY relation",
+            &[],
+        )
+        .await?;
+    let oids: Vec<u32> = rows
+        .iter()
+        .map(|row| row.get::<_, u32>("relation"))
+        .collect();
+    let expected: Vec<u32> = client
+        .query_one(
+            "SELECT 'pg_locks'::regclass::oid AS locks, 't'::regclass::oid AS t",
+            &[],
+        )
+        .await
+        .map(|row| vec![row.get::<_, u32>("locks"), row.get::<_, u32>("t")])?;
+    for oid in expected {
+        assert!(oids.contains(&oid), "{oid} missing from {oids:?}");
+    }
+    for row in &rows {
+        assert_eq!(row.get::<_, &str>("mode"), "AccessShareLock");
+        assert!(row.get::<_, bool>("granted"));
+        assert!(row.get::<_, bool>("fastpath"));
+    }
+    Ok(())
+}
+
+/// The relation a statement *writes* is reported in the mode PostgreSQL holds
+/// it in, not as the `AccessShareLock` a scan takes.
+///
+/// A writing statement returns no `pg_locks` rows to the client, so the only way
+/// to observe its own mode is to have it store one.
+#[tokio::test]
+async fn pg_locks_reports_the_write_target_as_row_exclusive() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE log (m text)").await?;
+    client
+        .batch_execute("INSERT INTO log SELECT mode FROM pg_locks WHERE relation = 'log'::regclass")
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT m FROM log", &[])
+            .await?
+            .get::<_, &str>("m"),
+        "RowExclusiveLock"
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT mode FROM pg_locks, log WHERE relation = 'log'::regclass",
+                &[]
+            )
+            .await?
+            .get::<_, &str>("mode"),
+        "AccessShareLock"
+    );
+    Ok(())
+}
+
+/// A lock on a shared catalog reports `database = 0`, as PostgreSQL does: one
+/// copy of `pg_database` serves the whole cluster, so naming a database would
+/// be wrong rather than merely uninformative.
+#[tokio::test]
+async fn pg_locks_reports_no_database_for_a_shared_catalog() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let rows = client
+        .query(
+            "SELECT relation, database FROM pg_locks, pg_database \
+             WHERE locktype = 'relation' ORDER BY relation",
+            &[],
+        )
+        .await?;
+    let database = |relation: u32| -> Option<u32> {
+        rows.iter()
+            .find(|row| row.get::<_, u32>("relation") == relation)
+            .and_then(|row| row.get::<_, Option<u32>>("database"))
+    };
+    // PostgreSQL's own OIDs: pg_database is shared, pg_locks is not.
+    assert_eq!(database(1262), Some(0));
+    let connected: u32 = client
+        .query_one(
+            "SELECT oid FROM pg_database WHERE datname = current_database()",
+            &[],
+        )
+        .await?
+        .get("oid");
+    assert_eq!(database(12073), Some(connected));
+    Ok(())
+}

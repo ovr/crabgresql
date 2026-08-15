@@ -49,8 +49,9 @@ pub use catalogs::extension::available_extensions;
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid};
 pub use source::{
-    CatalogCursor, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogSetting, CatalogSource, CatalogUserType, RelKind, StaticSource,
+    CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement, CatalogRelation,
+    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, RelKind,
+    StaticSource,
 };
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ use crabgresql_storage_api::{
     IndexConstraint, IndexMetadata, RelPersistence, RelStats, StorageError, TableAm, TableEngine,
     TableSchema,
 };
+#[cfg(test)]
 use crabgresql_types::Value;
 
 use crate::registry::CatalogNamespace;
@@ -328,6 +330,7 @@ pub struct SystemCatalog {
     cursors: OnceLock<Vec<CatalogCursor>>,
     prepared_statements: OnceLock<Vec<CatalogPreparedStatement>>,
     settings: OnceLock<Vec<CatalogSetting>>,
+    locks: OnceLock<Vec<CatalogLock>>,
     namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
 }
 
@@ -386,6 +389,7 @@ impl SystemCatalog {
             cursors: OnceLock::new(),
             prepared_statements: OnceLock::new(),
             settings: OnceLock::new(),
+            locks: OnceLock::new(),
             namespace_oids: OnceLock::new(),
         }
     }
@@ -422,6 +426,10 @@ impl SystemCatalog {
 
     fn settings(&self) -> &[CatalogSetting] {
         self.settings.get_or_init(|| self.source.settings())
+    }
+
+    fn locks(&self) -> &[CatalogLock] {
+        self.locks.get_or_init(|| self.source.locks())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each
@@ -966,11 +974,17 @@ impl SystemCatalog {
 
     /// The schema and rows of the `pg_catalog` relation `name`, or `None` if
     /// this build serves no such relation.
+    ///
+    /// For tests only: a query goes through [`SystemCatalog::open`], which wraps
+    /// the same pair in the access method — but asserting on rows through that
+    /// would mean driving a transaction to scan them.
+    #[cfg(test)]
     fn build_pg_catalog(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         self.build(CatalogNamespace::PgCatalog, name)
     }
 
     /// The `information_schema` counterpart of [`SystemCatalog::build_pg_catalog`].
+    #[cfg(test)]
     fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         self.build(CatalogNamespace::InformationSchema, name)
     }
@@ -979,11 +993,12 @@ impl SystemCatalog {
     ///
     /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
     /// relation twice and every scan of `pg_proc` rebuilds ~500 rows. The cache
-    /// belongs one level up, in `open_table`/`resolve`: both wrap this in a
-    /// [`StaticTable`], which already holds its schema and rows behind `Arc`s,
-    /// so caching the `Arc<dyn TableAm>` is a refcount bump where caching the
-    /// owned pair returned here would clone every row on each hit. Safe either
-    /// way — a `SystemCatalog` lives exactly one statement.
+    /// belongs one level up, in [`SystemCatalog::open`], which wraps this in a
+    /// [`StaticTable`] that already holds its schema and rows behind `Arc`s, so
+    /// caching the `Arc<dyn TableAm>` is a refcount bump where caching the owned
+    /// pair returned here would clone every row on each hit. Safe either way — a
+    /// `SystemCatalog` lives exactly one statement.
+    #[cfg(test)]
     fn build(
         &self,
         namespace: CatalogNamespace,
@@ -993,10 +1008,43 @@ impl SystemCatalog {
         Some(((def.schema)(), (def.rows)(self)))
     }
 
+    /// Open a served relation as a [`StaticTable`].
+    ///
+    /// A deferred relation ([`registry::CatalogRelDef::deferred`]) is handed a
+    /// builder rather than rows, and builds them against a snapshot of its own
+    /// when the scan first reads it. The second snapshot is what makes the
+    /// deferral possible at all — this one is behind a `&self` the builder
+    /// cannot outlive — and it costs one relation enumeration on a relation
+    /// nothing scans in a hot path. Both snapshots read the same source, so they
+    /// assign the same OIDs.
+    fn open(
+        &self,
+        namespace: CatalogNamespace,
+        name: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        let Some(def) = registry::lookup(namespace, name) else {
+            return Err(StorageError::TableNotFound(name.to_string()));
+        };
+        let schema = (def.schema)();
+        if !def.deferred {
+            return Ok(StaticTable::arc(schema, (def.rows)(self)));
+        }
+        let source = Arc::clone(&self.source);
+        let build = def.rows;
+        Ok(StaticTable::deferred(schema, move || {
+            build(&SystemCatalog::from_source(Arc::clone(&source)))
+        }))
+    }
+
     /// The instant the timezone relations resolve their offsets at; see
     /// [`CatalogSource::now`].
     pub(crate) fn now(&self) -> i64 {
         self.source.now()
+    }
+
+    /// This connection's backend id; see [`CatalogSource::backend_pid`].
+    pub fn backend_pid(&self) -> i32 {
+        self.source.backend_pid()
     }
 
     /// The reading session's `bytea_output`; see [`CatalogSource::bytea_output`].
@@ -1015,10 +1063,7 @@ impl TableEngine for SystemCatalog {
     }
 
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        match self.build_pg_catalog(name) {
-            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
-            None => Err(StorageError::TableNotFound(name.to_string())),
-        }
+        self.open(CatalogNamespace::PgCatalog, name)
     }
 
     fn resolve(
@@ -1026,14 +1071,10 @@ impl TableEngine for SystemCatalog {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Arc<dyn TableAm>, StorageError> {
-        let relation = match namespace {
-            None | Some("pg_catalog") => self.build_pg_catalog(name),
-            Some("information_schema") => self.build_information_schema(name),
-            Some(_) => None,
-        };
-        match relation {
-            Some((schema, rows)) => Ok(StaticTable::arc(schema, rows)),
-            None => Err(StorageError::TableNotFound(name.to_string())),
+        match namespace {
+            None | Some("pg_catalog") => self.open(CatalogNamespace::PgCatalog, name),
+            Some("information_schema") => self.open(CatalogNamespace::InformationSchema, name),
+            Some(_) => Err(StorageError::TableNotFound(name.to_string())),
         }
     }
 

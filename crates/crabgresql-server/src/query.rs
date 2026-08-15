@@ -32,7 +32,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::{FmtCtx, PgType, Value};
 
-use crate::catalog::{SessionCatalog, SessionCatalogOps, SessionCatalogSource};
+use crate::catalog::{SessionCatalog, SessionCatalogOps, SessionCatalogSource, StatementRelations};
 use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
@@ -287,30 +287,44 @@ pub(crate) fn partition_session_relations(
 /// The third view wraps the *same* `SystemCatalog` the first is built from, so
 /// `pg_table_is_visible(c.oid)` resolves the very OIDs the `pg_class` scan in
 /// the same statement emitted.
+///
+/// `stmt` is the statement about to be bound, and is only read to decide which
+/// relation `pg_locks` reports a write lock on (see [`statement_lock_target`]).
+/// `None` where there is no single statement behind the catalogs, which costs
+/// nothing but the lock mode.
 pub(crate) fn bind_catalogs(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     session: &Session,
+    stmt: Option<&ast::Statement>,
 ) -> (
     Arc<dyn TableEngine>,
     Arc<dyn TypeCatalog>,
     Arc<dyn CatalogOps>,
 ) {
+    // Shared by the two views below: the overlay writes what it resolves, the
+    // source reads it back when a query opens `pg_locks`.
+    let relations = Arc::new(StatementRelations::new(
+        stmt.and_then(statement_lock_target),
+    ));
     // The read-only system catalog (`pg_catalog`), rebuilt per statement so its
     // rows reflect current server state: live user relations (permanent + this
     // session's temp tables) are reflected into pg_class/pg_attribute. The
     // relation enumeration is lazy — only a query that actually opens
     // pg_class/pg_attribute pays for it. It sits behind temp + global on the
     // search path.
-    let system: Arc<crabgresql_catalog::SystemCatalog> =
-        Arc::new(crabgresql_catalog::SystemCatalog::from_source(Arc::new(
-            SessionCatalogSource::new(engine.clone(), global_catalog.clone(), session),
-        )));
-    let catalog: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
-        engine.clone(),
-        system.clone(),
-        session.temp_schema.clone(),
-    ));
+    let system: Arc<crabgresql_catalog::SystemCatalog> = Arc::new(
+        crabgresql_catalog::SystemCatalog::from_source(Arc::new(SessionCatalogSource::new(
+            engine.clone(),
+            global_catalog.clone(),
+            session,
+            Arc::clone(&relations),
+        ))),
+    );
+    let catalog: Arc<dyn TableEngine> = Arc::new(
+        SessionCatalog::new(engine.clone(), system.clone(), session.temp_schema.clone())
+            .recording(relations),
+    );
     // The global catalog is the binder's view of user-defined types and casts,
     // so an expression can cast to/from a `CREATE TYPE` name.
     let type_catalog: Arc<dyn TypeCatalog> = global_catalog.clone();
@@ -319,6 +333,44 @@ pub(crate) fn bind_catalogs(
             .with_relations(Arc::clone(&catalog)),
     );
     (catalog, type_catalog, catalog_ops)
+}
+
+/// The relation a statement writes, in the mode PostgreSQL locks it in rather
+/// than the `AccessShareLock` a scan takes.
+///
+/// Only the three row-writing verbs have an arm. A mode reaches a client only
+/// through a statement that reads `pg_locks` while it writes (`INSERT INTO t
+/// SELECT … FROM pg_locks`), and `TRUNCATE`/`COPY FROM` carry no query that
+/// could: an arm for them would be an untestable claim about a lock nobody can
+/// observe.
+///
+/// The bare relation name is enough to match: the recorder keys a lock by the
+/// name resolution landed on, and `t` and `public.t` land on the same one.
+fn statement_lock_target(stmt: &ast::Statement) -> Option<(String, &'static str)> {
+    let relation = |factor: &ast::TableFactor| match factor {
+        ast::TableFactor::Table { name, .. } => leaf_name(name),
+        _ => None,
+    };
+    let name = match stmt {
+        ast::Statement::Insert(insert) => match &insert.table {
+            ast::TableObject::TableName(name) => leaf_name(name),
+            _ => None,
+        },
+        ast::Statement::Update(update) => relation(&update.table.relation),
+        ast::Statement::Delete(delete) => {
+            let (ast::FromTable::WithFromKeyword(from) | ast::FromTable::WithoutKeyword(from)) =
+                &delete.from;
+            from.first().and_then(|table| relation(&table.relation))
+        }
+        _ => None,
+    }?;
+    Some((name, "RowExclusiveLock"))
+}
+
+/// The relation part of a possibly-qualified name; the parser has already
+/// case-folded an unquoted identifier.
+fn leaf_name(name: &ast::ObjectName) -> Option<String> {
+    name.0.last().map(|part| part.to_string())
 }
 
 /// A catalog routine as `pg_proc` reports it.
@@ -426,7 +478,7 @@ pub fn analyze_statement(
 ) -> Result<Analyzed, PgError> {
     // Describe binds but never executes, so the catalog handle is dropped here;
     // Execute re-enters `execute_statement`, which builds a fresh one.
-    let (catalog, type_catalog, _) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, _) = bind_catalogs(engine, global_catalog, session, Some(stmt));
     let ctx = param_ctx_extended(declared);
     let logical = match stmt {
         ast::Statement::Query(query) => {
@@ -765,7 +817,8 @@ pub(crate) fn execute_statement_with(
     // Resolution overlay: the session's temp catalog shadows the shared global
     // engine (PG's `pg_temp`-first search). CREATE routes temp vs global itself,
     // so it keeps the raw engine + session below.
-    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) =
+        bind_catalogs(engine, global_catalog, session, Some(stmt));
     let logical = match bind_dml_with_params(&catalog, &type_catalog, stmt, params)? {
         Some(logical) => logical,
         // EXPLAIN of a utility statement: error rather than falling through to
@@ -1474,7 +1527,8 @@ pub fn prepare_copy_from(
             "prepare_copy_from called with a non-COPY statement",
         ));
     };
-    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) =
+        bind_catalogs(engine, global_catalog, session, Some(stmt));
     let plan = bind_copy_from(
         &catalog,
         &type_catalog,
@@ -6858,7 +6912,7 @@ fn execute_do(
     }
     let body = string_literal(&ast::Expr::Value(block.body.clone()))?;
 
-    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session, None);
     let (routines, command_counter) =
         statement_runtime(&catalog, &type_catalog, global_catalog, session);
     // A DO block is opaque: nothing here can tell whether it writes, so it gets
@@ -6898,7 +6952,7 @@ fn execute_call(
     session: &mut Session,
 ) -> Result<QueryResult, PgError> {
     let name = single_object_name(&call.name, "procedure")?;
-    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session, None);
 
     let ast::FunctionArguments::List(list) = &call.args else {
         return Err(PgError::feature_not_supported(

@@ -87,6 +87,7 @@ pub async fn handle_connection(
         engine.clone(),
         database,
         user,
+        backend_id,
         format!("pg_temp_{backend_id}"),
         crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
     );

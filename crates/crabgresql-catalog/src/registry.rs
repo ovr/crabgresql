@@ -20,7 +20,7 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
-    extension, foreign, index, inherits, language, misc_empty, namespace, opclass, policy,
+    extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, policy,
     prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
     statistic, statistic_ext, timezone, trigger, types,
 };
@@ -51,6 +51,11 @@ pub(crate) struct CatalogRelDef {
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
     pub(crate) rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    /// Whether the rows are built when the relation is first *read* rather than
+    /// when the binder resolves its name. True for exactly one relation; see
+    /// [`crate::static_table::StaticTable::deferred`] for why `pg_locks` needs
+    /// it and why nothing else does.
+    pub(crate) deferred: bool,
 }
 
 const fn rel(
@@ -66,6 +71,25 @@ const fn rel(
         namespace,
         schema,
         rows,
+        deferred: false,
+    }
+}
+
+/// See [`CatalogRelDef::deferred`].
+const fn rel_deferred(
+    name: &'static str,
+    oid: u32,
+    namespace: CatalogNamespace,
+    schema: fn() -> TableSchema,
+    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+) -> CatalogRelDef {
+    CatalogRelDef {
+        name,
+        oid,
+        namespace,
+        schema,
+        rows,
+        deferred: true,
     }
 }
 
@@ -306,6 +330,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         misc_empty::pg_largeobject_metadata_schema,
         no_rows,
+    ),
+    rel_deferred(
+        "pg_locks",
+        12073,
+        PgCatalog,
+        locks::pg_locks_schema,
+        locks::pg_locks_rows,
     ),
     rel(
         "pg_matviews",

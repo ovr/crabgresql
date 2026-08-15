@@ -207,6 +207,11 @@ pub trait CatalogOps: Send + Sync {
     /// instantiated it. Backs `pg_my_temp_schema()`, which reports 0 for the
     /// `None` case.
     fn my_temp_schema(&self) -> Option<u32>;
+
+    /// This connection's backend id, behind `pg_backend_pid()`. It identifies a
+    /// connection rather than an OS process — every session here is served from
+    /// the same one — which is what `WHERE pid = pg_backend_pid()` needs of it.
+    fn backend_pid(&self) -> i32;
 }
 
 /// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering

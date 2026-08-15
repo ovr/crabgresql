@@ -60,6 +60,20 @@ pub(crate) const PG_CATALOG_NAMESPACE_OID: u32 = 11;
 /// starts.
 pub(crate) const DATABASE_OID: u32 = 16_002;
 
+/// The relations PostgreSQL marks `relisshared`: one copy serves the whole
+/// cluster rather than one per database. Of the ones it has, this build serves
+/// these four, and their OIDs are PostgreSQL's own.
+///
+/// It matters wherever a row has to say *which* database an object belongs to:
+/// PostgreSQL reports `pg_locks.database` as 0 for a lock on a shared relation,
+/// because the answer is "all of them". Probed from 18.4's own `relisshared`.
+pub(crate) const SHARED_RELATION_OIDS: [u32; 4] = [
+    1213, // pg_tablespace
+    1260, // pg_authid
+    1261, // pg_auth_members
+    1262, // pg_database
+];
+
 /// The `pg_proc` rows for crabgresql's own access-method handlers, which have no
 /// upstream function to point at. `pg_am.amhandler` is a reference into
 /// `pg_proc`, so leaving these at 0 would print `-` where PostgreSQL prints a
