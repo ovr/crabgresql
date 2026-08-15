@@ -49,26 +49,9 @@ fn array_subquery_keyword_is_case_and_space_insensitive() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// The constructor is a *keyword*, so only the unqualified spelling is it. The
-/// parser flattens `pg_catalog.array(SELECT 1)` into the same node shape, and PG
-/// — which has no `array` function in any schema — refuses that outright; it
-/// must not silently build an array here.
-///
-/// PG's own answer is `42601 syntax error at or near "SELECT"`. We refuse with
-/// the generic unsupported-argument-form error instead, because the token PG
-/// names comes from its grammar rather than from the AST we parsed: the same
-/// call with `VALUES` reports `"("`, not `"VALUES"`. What this test pins is that
-/// the statement *fails*, not the wording.
-#[test]
-fn a_qualified_array_call_is_not_the_array_constructor() -> anyhow::Result<()> {
-    let e = bind_err("SELECT pg_catalog.array(SELECT id FROM t)")?;
-    assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(
-        e.message,
-        "subquery function arguments are not supported yet"
-    );
-    Ok(())
-}
+// A *qualified* `pg_catalog.array(SELECT …)` never reaches the binder: the
+// parser refuses to attach a schema qualifier to the constructor, which is
+// pinned by `parse_array_subquery_rejects_a_schema_qualifier` there.
 
 /// PG answers an array-typed column with a two-dimensional array; this build has
 /// no representation for one, so it refuses exactly the way `ARRAY[[1,2]]` does.

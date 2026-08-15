@@ -3399,16 +3399,14 @@ fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
 /// constructor: as an **unqualified, unquoted** keyword — the same rule
 /// [`special_form`] applies to `COALESCE`/`NULLIF`, and for the same reason.
 ///
-/// The check is on the name's *shape*, not on its last part, because the parser
-/// flattens a qualified call: `pg_catalog.array(SELECT 1)` starts as the keyword
-/// arm, then `build_compound_expr` glues the qualifier back on, leaving a node
-/// nothing but the part count distinguishes from the bare spelling. PG has no
-/// `array` function in any schema, so it parses that as an ordinary call and
-/// stops at the query inside — a *syntax* error we deliberately do not
-/// reproduce: PG names the token its grammar choked on, which is not derivable
-/// from the AST we parsed (`pg_catalog.array(VALUES (1))` reports `"("`, not
-/// `"VALUES"`). Falling through to `positional_args` refuses it as an
-/// unsupported argument form instead, which at least does not invent a cursor.
+/// The check is on the name's *shape* rather than on its last part (what
+/// [`function_name`] returns), because a qualified spelling is otherwise
+/// indistinguishable: `pg_catalog.array(SELECT 1)` starts as the keyword arm and
+/// only the qualifier's presence separates it from the bare form.
+///
+/// The parser now refuses to attach that qualifier at all, so this is the second
+/// gate, not the only one. It stays exact anyway: a binder that recognizes its
+/// own grammar by the whole name owes nothing to how far away the first gate is.
 fn array_keyword(name: &ast::ObjectName) -> bool {
     let [part] = name.0.as_slice() else {
         return false;
