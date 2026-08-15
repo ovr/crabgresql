@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786785574099,
+  "lastUpdate": 1786785575684,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -32368,6 +32368,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 42774.382214,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8ef51429b93cc6c1d972723cd9b205d09fdf9975",
+          "message": "feat(execute): Support JoinKind::Semi and JoinKind::Anti (#238)",
+          "timestamp": "2026-08-15T08:07:37Z",
+          "tree_id": "c9aa998376c9c375bdf951e884748cd3a04dfb19",
+          "url": "https://github.com/ovr/crabgresql/commit/8ef51429b93cc6c1d972723cd9b205d09fdf9975"
+        },
+        "date": 1786785575562,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1295.26967,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19837.027465,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
