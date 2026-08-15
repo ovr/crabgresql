@@ -19,9 +19,11 @@ use crabgresql_types::Value;
 
 use crate::SystemCatalog;
 use crate::catalogs::{
-    am, attribute, auth, class, collation, constraint, cursors, database, index, inherits,
-    language, namespace, prepared, proc, sequence, settings, statistic, timezone, types,
+    am, attribute, auth, class, collation, constraint, cursors, database, description, extension,
+    foreign, index, inherits, language, namespace, policy, prepared, proc, publication, relviews,
+    rewrite, sequence, settings, statistic, statistic_ext, timezone, trigger, types,
 };
+use crate::cols::no_rows;
 use crate::views::information_schema;
 
 /// Which schema a served relation lives in. Ordered as declared, because
@@ -130,6 +132,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         auth::pg_authid_rows,
     ),
     rel(
+        "pg_available_extension_versions",
+        12085,
+        PgCatalog,
+        extension::pg_available_extension_versions_schema,
+        extension::pg_available_extension_versions_rows,
+    ),
+    rel(
+        "pg_available_extensions",
+        12081,
+        PgCatalog,
+        extension::pg_available_extensions_schema,
+        extension::pg_available_extensions_rows,
+    ),
+    rel(
         "pg_cast",
         2605,
         PgCatalog,
@@ -172,11 +188,46 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         database::pg_database_rows,
     ),
     rel(
+        "pg_description",
+        2609,
+        PgCatalog,
+        description::pg_description_schema,
+        description::pg_description_rows,
+    ),
+    rel(
         "pg_enum",
         3501,
         PgCatalog,
         types::pg_enum_schema,
         types::pg_enum_rows,
+    ),
+    rel(
+        "pg_extension",
+        3079,
+        PgCatalog,
+        extension::pg_extension_schema,
+        extension::pg_extension_rows,
+    ),
+    rel(
+        "pg_foreign_data_wrapper",
+        2328,
+        PgCatalog,
+        foreign::pg_foreign_data_wrapper_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_foreign_server",
+        1417,
+        PgCatalog,
+        foreign::pg_foreign_server_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_foreign_table",
+        3118,
+        PgCatalog,
+        foreign::pg_foreign_table_schema,
+        no_rows,
     ),
     rel(
         "pg_group",
@@ -193,6 +244,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         index::pg_index_rows,
     ),
     rel(
+        "pg_indexes",
+        12043,
+        PgCatalog,
+        relviews::pg_indexes_schema,
+        relviews::pg_indexes_rows,
+    ),
+    rel(
         "pg_inherits",
         2611,
         PgCatalog,
@@ -205,6 +263,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         language::pg_language_schema,
         language::pg_language_rows,
+    ),
+    rel(
+        "pg_matviews",
+        12038,
+        PgCatalog,
+        relviews::pg_matviews_schema,
+        no_rows,
     ),
     rel(
         "pg_namespace",
@@ -221,6 +286,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         inherits::pg_partitioned_table_rows,
     ),
     rel(
+        "pg_policies",
+        12018,
+        PgCatalog,
+        policy::pg_policies_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_policy",
+        3256,
+        PgCatalog,
+        policy::pg_policy_schema,
+        no_rows,
+    ),
+    rel(
         "pg_prepared_statements",
         12095,
         PgCatalog,
@@ -235,6 +314,41 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         proc::pg_proc_rows,
     ),
     rel(
+        "pg_publication",
+        6104,
+        PgCatalog,
+        publication::pg_publication_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_publication_namespace",
+        6237,
+        PgCatalog,
+        publication::pg_publication_namespace_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_publication_rel",
+        6106,
+        PgCatalog,
+        publication::pg_publication_rel_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_publication_tables",
+        12068,
+        PgCatalog,
+        publication::pg_publication_tables_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_rewrite",
+        2618,
+        PgCatalog,
+        rewrite::pg_rewrite_schema,
+        rewrite::pg_rewrite_rows,
+    ),
+    rel(
         "pg_roles",
         12000,
         PgCatalog,
@@ -242,11 +356,25 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         auth::pg_roles_rows,
     ),
     rel(
+        "pg_rules",
+        12023,
+        PgCatalog,
+        rewrite::pg_rules_schema,
+        no_rows,
+    ),
+    rel(
         "pg_sequence",
         2224,
         PgCatalog,
         sequence::pg_sequence_schema,
         sequence::pg_sequence_rows,
+    ),
+    rel(
+        "pg_sequences",
+        12048,
+        PgCatalog,
+        relviews::pg_sequences_schema,
+        relviews::pg_sequences_rows,
     ),
     rel(
         "pg_settings",
@@ -270,11 +398,46 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         statistic::pg_statistic_rows,
     ),
     rel(
+        "pg_statistic_ext",
+        3381,
+        PgCatalog,
+        statistic_ext::pg_statistic_ext_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_statistic_ext_data",
+        3429,
+        PgCatalog,
+        statistic_ext::pg_statistic_ext_data_schema,
+        no_rows,
+    ),
+    rel(
         "pg_stats",
         12053,
         PgCatalog,
         statistic::pg_stats_schema,
         statistic::pg_stats_rows,
+    ),
+    rel(
+        "pg_stats_ext",
+        12058,
+        PgCatalog,
+        statistic_ext::pg_stats_ext_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stats_ext_exprs",
+        12063,
+        PgCatalog,
+        statistic_ext::pg_stats_ext_exprs_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_tables",
+        12033,
+        PgCatalog,
+        relviews::pg_tables_schema,
+        relviews::pg_tables_rows,
     ),
     rel(
         "pg_tablespace",
@@ -298,6 +461,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         timezone::pg_timezone_names_rows,
     ),
     rel(
+        "pg_trigger",
+        2620,
+        PgCatalog,
+        trigger::pg_trigger_schema,
+        no_rows,
+    ),
+    rel(
         "pg_type",
         1247,
         PgCatalog,
@@ -310,6 +480,27 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         auth::pg_user_schema,
         auth::pg_user_rows,
+    ),
+    rel(
+        "pg_user_mapping",
+        1418,
+        PgCatalog,
+        foreign::pg_user_mapping_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_user_mappings",
+        12338,
+        PgCatalog,
+        foreign::pg_user_mappings_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_views",
+        12028,
+        PgCatalog,
+        relviews::pg_views_schema,
+        relviews::pg_views_rows,
     ),
 ];
 

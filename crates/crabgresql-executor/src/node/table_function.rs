@@ -1,7 +1,10 @@
 use crabgresql_binder::{BoundExpr, TableFn};
 use crabgresql_storage_api::Tuple;
 
-use super::series::{jsonb_path_query_series, pg_input_error_info_row, unnest_series};
+use super::series::{
+    jsonb_path_query_series, pg_available_extensions_rows, pg_input_error_info_row,
+    pg_partition_ancestors_series, unnest_series,
+};
 use crate::generate_series::Series;
 use crate::{ExecContext, ExecError, ExecNode, eval};
 
@@ -19,6 +22,9 @@ pub struct TableFunctionSource {
 enum TableFnState {
     /// `pg_input_error_info`: a single pending row, then exhausted.
     Single(Option<Tuple>),
+    /// `pg_available_extensions`: a materialized list of multi-column rows,
+    /// which a [`Series`] (one scalar per row) cannot carry.
+    Rows(std::vec::IntoIter<Tuple>),
     /// `generate_series`: a lazy integer range.
     Series(Series),
 }
@@ -50,6 +56,12 @@ impl TableFunctionSource {
                 }
                 TableFn::JsonbPathQuery => TableFnState::Series(jsonb_path_query_series(&values)?),
                 TableFn::Unnest(_) => TableFnState::Series(unnest_series(&values)),
+                TableFn::PgPartitionAncestors => {
+                    TableFnState::Series(pg_partition_ancestors_series(&values, &self.ctx))
+                }
+                TableFn::PgAvailableExtensions => {
+                    TableFnState::Rows(pg_available_extensions_rows(&self.ctx).into_iter())
+                }
             });
         }
         match self.state.as_mut() {
@@ -63,6 +75,7 @@ impl ExecNode for TableFunctionSource {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
         match self.init()? {
             TableFnState::Single(row) => Ok(row.take()),
+            TableFnState::Rows(rows) => Ok(rows.next()),
             TableFnState::Series(series) => Ok(series.next_value()?.map(|v| vec![v])),
         }
     }

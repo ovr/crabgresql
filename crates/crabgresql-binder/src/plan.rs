@@ -2729,7 +2729,11 @@ fn bind_from_item(
                 ));
             }
             reject_with_ordinality(*with_ordinality)?;
-            let fname = object_name_to_table_name(name)?;
+            // A *function* name, not a relation name: qualifiers are resolved by
+            // the same rule a scalar call uses, not rejected as they are for a
+            // relation.
+            let fname = crate::functions::function_name(name)
+                .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
             let (func, args) = bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings)?;
             bound_table_fn_item(func, args, &fname, alias)

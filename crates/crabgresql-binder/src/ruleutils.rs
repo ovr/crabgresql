@@ -46,6 +46,14 @@ use crabgresql_types::{FmtCtx, Numeric, PgType, Value, cast, interval, text, tim
 /// by one space, continuation lines of the select list by four, and each
 /// subsequent clause keyword is right-aligned under `SELECT` — three spaces for
 /// `FROM`, two for `ORDER BY`.
+///
+/// TODO: deparse set operations (`UNION`/`INTERSECT`/`EXCEPT`) and `VALUES`
+/// bodies. They are the whole of the `None` case in practice: such a view can be
+/// created and queried, but `pg_get_viewdef` raises `0A000` on it and
+/// `pg_views.definition` reports NULL, so a dump cannot reproduce it. Pinned by
+/// the `pg_views_undeparsable` smoke test — whose expected output is the only
+/// one in that suite not taken from a live PostgreSQL, because PostgreSQL has no
+/// such case to take it from.
 pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<String> {
     let query = parse_query(sql)?;
     let ast::SetExpr::Select(select) = query.body.as_ref() else {

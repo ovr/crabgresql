@@ -9,7 +9,7 @@ use crabgresql_catalog::{
     CatalogCursor, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
     CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
 };
-use crabgresql_executor::{CatalogOps, ConstraintDef};
+use crabgresql_executor::{CatalogOps, ConstraintDef, IndexDef};
 use crabgresql_storage_api::{
     CheckConstraint, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
     StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
@@ -161,15 +161,25 @@ impl CatalogSource for SessionCatalogSource {
         // Views reflect into pg_class as relkind='v' / pg_attribute columns /
         // information_schema.tables as VIEW.
         rels.extend(self.engine.views().into_iter().map(|view| {
-            CatalogRelation::view(TableSchema::in_namespace(
-                view.name,
-                view.namespace,
-                view.columns,
-            ))
+            // Deparsed here rather than in the catalog crate, which does not
+            // depend on the binder.
+            let column_names: Vec<_> = view.columns.iter().map(|c| c.name.clone()).collect();
+            let definition =
+                crabgresql_binder::ruleutils::view_definition(&view.sql, false, &column_names);
+            CatalogRelation::view(
+                TableSchema::in_namespace(view.name, view.namespace, view.columns),
+                definition,
+            )
         }));
         // Sequences reflect into pg_class as relkind='S' and feed
         // pg_catalog.pg_sequence.
         rels.extend(self.engine.sequences().into_iter().map(|seq| {
+            // The counter is only reportable once `is_called` — see
+            // `CatalogSequence::last_value`.
+            let last_value = self
+                .engine
+                .sequence_current(&seq.namespace, &seq.name)
+                .and_then(|(value, is_called)| is_called.then_some(value));
             CatalogRelation::sequence(
                 seq.name,
                 seq.namespace,
@@ -181,6 +191,7 @@ impl CatalogSource for SessionCatalogSource {
                     max: seq.max,
                     cache: seq.cache,
                     cycle: seq.cycle,
+                    last_value,
                 },
             )
         }));
@@ -405,6 +416,24 @@ impl CatalogOps for SessionCatalogOps {
             columns,
             expr,
         })
+    }
+
+    fn available_extensions(&self) -> Vec<(String, String, String)> {
+        crabgresql_catalog::available_extensions()
+            .iter()
+            .map(|(name, version, comment)| {
+                (name.to_string(), version.to_string(), comment.to_string())
+            })
+            .collect()
+    }
+
+    fn partition_ancestors(&self, oid: u32) -> Vec<u32> {
+        self.system.partition_ancestors(oid)
+    }
+
+    fn index_def(&self, oid: u32) -> Option<IndexDef> {
+        let (index, table) = self.system.index_def(oid)?;
+        Some(IndexDef { index, table })
     }
 
     fn current_database(&self) -> String {
@@ -779,6 +808,10 @@ impl TableEngine for SessionCatalog {
 
     fn sequences(&self) -> Vec<SequenceDefinition> {
         self.global.sequences()
+    }
+
+    fn sequence_current(&self, namespace: &str, name: &str) -> Option<(i64, bool)> {
+        self.global.sequence_current(namespace, name)
     }
 
     fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {

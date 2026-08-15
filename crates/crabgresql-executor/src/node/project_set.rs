@@ -47,7 +47,7 @@ impl ProjectSet {
                         .iter()
                         .map(|a| eval(a, &input, &self.ctx))
                         .collect::<Result<Vec<_>, _>>()?;
-                    series.push(Some(build_series(*func, &values)?));
+                    series.push(Some(build_series(*func, &values, &self.ctx)?));
                 }
                 _ => series.push(None),
             }

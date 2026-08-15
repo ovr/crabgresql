@@ -2638,6 +2638,10 @@ impl TableEngine for PgEngine {
         self.catalog.sequences()
     }
 
+    fn sequence_current(&self, namespace: &str, name: &str) -> Option<(i64, bool)> {
+        self.catalog.sequence_counter_in(namespace, name)
+    }
+
     fn sequence_nextval(&self, namespace: &str, name: &str) -> SequenceAdvance {
         self.catalog
             .advance_sequence_in(namespace, name)

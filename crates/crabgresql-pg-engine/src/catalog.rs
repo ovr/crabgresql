@@ -1096,6 +1096,20 @@ impl RelCatalog {
             .map(persist_sequence_to_definition)
     }
 
+    /// A sequence's counter as `(last_value, is_called)`, without advancing it.
+    /// `None` if there is no such sequence.
+    pub fn sequence_counter_in(&self, namespace: &str, name: &str) -> Option<(i64, bool)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .sequences
+            .iter()
+            .find(|s| s.namespace == namespace && s.name == name)
+            .map(|s| (s.last_value, s.is_called))
+    }
+
     /// Advance a sequence (`nextval`) in `namespace` and persist the new counter
     /// immediately — outside any transaction, so the advance survives `ROLLBACK`.
     /// Returns the new value, or `NotFound`/`Overflow`/`Underflow` without mutating.

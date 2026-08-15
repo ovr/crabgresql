@@ -1,7 +1,7 @@
 //! `pg_constraint`: not-null, check and index-backed constraints.
 
 use crabgresql_storage_api::TableSchema;
-use crabgresql_types::{PgType, Value};
+use crabgresql_types::{PgType, Value, oid};
 
 use crate::SystemCatalog;
 use crate::cols::*;
@@ -26,14 +26,32 @@ pub(crate) fn pg_constraint_schema() -> TableSchema {
             col("conindid", PgType::Oid),
             col("conparentid", PgType::Oid),
             col("confrelid", PgType::Oid),
+            // The three foreign-key action codes. A constraint that is not a
+            // foreign key carries a space in each, which is what PostgreSQL
+            // stores — not `\0`, and not NULL.
+            col("confupdtype", CHARLIKE),
+            col("confdeltype", CHARLIKE),
+            col("confmatchtype", CHARLIKE),
             col("conislocal", PgType::Bool),
             col("coninhcount", PgType::Int2),
             col("connoinherit", PgType::Bool),
+            // conperiod: `PERIOD` (temporal keys) has no production in the
+            // parser, so no constraint here is one.
+            col("conperiod", PgType::Bool),
             // TODO: `int2[]` upstream, rendered here as the text an array
             // prints as. `PgType::Array` exists now, so nothing blocks it —
             // the column and the value in `pg_constraint_rows` have to move
             // together.
             col("conkey", PgType::Text),
+            // The foreign-key and exclusion-constraint detail columns. Every one
+            // is NULL here because neither kind of constraint can be created —
+            // and NULL is what PostgreSQL stores for them on the kinds that can.
+            col("confkey", PgType::Array(oid::INT2)),
+            col("conpfeqop", PgType::Array(oid::OID)),
+            col("conppeqop", PgType::Array(oid::OID)),
+            col("conffeqop", PgType::Array(oid::OID)),
+            col("confdelsetcols", PgType::Array(oid::INT2)),
+            col("conexclop", PgType::Array(oid::OID)),
             // pg_node_tree in PostgreSQL, modelled as the stored SQL text the
             // same way `pg_class.relpartbound` is. `pg_get_expr` re-renders it
             // for the reader.
@@ -77,11 +95,17 @@ pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 // confrelid. TODO: foreign keys; `FOREIGN KEY` is refused at
                 // DDL, so no constraint here references another relation.
                 Value::Oid(0),
+                // confupdtype / confdeltype / confmatchtype.
+                chr(' '),
+                chr(' '),
+                chr(' '),
                 Value::Bool(c.islocal),
                 Value::Int2(c.inhcount),
                 // connoinherit. TODO: `NO INHERIT` constraints; the parser has
                 // no production for the clause, so nothing that exists here can
                 // be marked with it.
+                Value::Bool(false),
+                // conperiod.
                 Value::Bool(false),
                 // NULL, not an empty array, when the constraint reads no column
                 // — PostgreSQL stores NULL for a predicate like `CHECK (1 > 0)`,
@@ -98,6 +122,14 @@ pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                             .join(",")
                     )),
                 },
+                // confkey / conpfeqop / conppeqop / conffeqop / confdelsetcols /
+                // conexclop.
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
                 match &c.expr {
                     Some(expr) => Value::Text(expr.clone()),
                     None => Value::Null,

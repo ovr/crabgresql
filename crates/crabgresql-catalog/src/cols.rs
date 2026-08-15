@@ -23,6 +23,35 @@ pub(crate) fn col(name: &str, ty: PgType) -> Column {
     Column::new(name, ty)
 }
 
+/// The `rows` half of a relation this deployment has none of.
+///
+/// Shared by every catalog whose feature does not exist here — triggers, RLS
+/// policies, publications, extended statistics, foreign data. Empty is not a
+/// placeholder in those: PostgreSQL asked the same question on a database that
+/// never used the feature answers with zero rows too, so a client joining one
+/// gets the same result from both servers. A relation that later gains rows
+/// replaces this with its own builder and one line in [`crate::registry`].
+pub(crate) fn no_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
+    Vec::new()
+}
+
+/// A `pg_node_tree` column.
+///
+/// PostgreSQL stores a parsed expression tree here and only ever hands it back
+/// through `pg_get_expr`/`pg_get_viewdef`. crabgresql stores the already-deparsed
+/// SQL text instead and lets those functions echo it (see
+/// [`class::pg_class_schema`](crate::catalogs::class)'s `relpartbound` and
+/// `pg_constraint.conbin`), so the column is `text` — the declared type differs,
+/// what a client reads through the accessors does not.
+pub(crate) const NODE_TREE: PgType = PgType::Text;
+
+/// An `aclitem[]` column: the access-control list PostgreSQL attaches to an
+/// object. There is no `GRANT`/`REVOKE` here, so every one of these is NULL —
+/// which is also what PostgreSQL reports for an object whose privileges were
+/// never changed from the owner's defaults. Typed as `text` for want of an
+/// `aclitem` type; nothing renders a value.
+pub(crate) const ACLITEM_ARRAY: PgType = PgType::Text;
+
 /// A `"char"` datum from the single character the catalogs spell it with.
 pub(crate) fn chr(c: char) -> Value {
     Value::Char(c as u8)
@@ -79,27 +108,27 @@ pub(crate) fn reg_array_type(kind: RegKind) -> PgType {
 pub(crate) fn regtype_array(cat: &SystemCatalog, oids: &[u32]) -> Value {
     Value::Array {
         elem: PgType::Reg(RegKind::Type),
-        elems: oids
-            .iter()
-            .map(|&oid| {
-                let name = PgType::from_oid(oid)
-                    .map(|ty| ty.name().to_string())
-                    .or_else(|| crabgresql_types::pseudo_type_name(oid).map(str::to_string))
-                    .or_else(|| {
-                        cat.user_type_ref(oid)
-                            .map(|(_, name)| crabgresql_types::text::quote_ident(name))
-                    });
-                Value::Reg(match name {
-                    Some(name) => Reg {
-                        kind: RegKind::Type,
-                        oid,
-                        name,
-                    },
-                    None => Reg::unresolved(RegKind::Type, oid),
-                })
-            })
-            .collect(),
+        elems: oids.iter().map(|&oid| regtype_named(cat, oid)).collect(),
     }
+}
+
+/// One `regtype` datum, named the three-tier way [`regtype_array`] documents.
+pub(crate) fn regtype_named(cat: &SystemCatalog, oid: u32) -> Value {
+    let name = PgType::from_oid(oid)
+        .map(|ty| ty.name().to_string())
+        .or_else(|| crabgresql_types::pseudo_type_name(oid).map(str::to_string))
+        .or_else(|| {
+            cat.user_type_ref(oid)
+                .map(|(_, name)| crabgresql_types::text::quote_ident(name))
+        });
+    Value::Reg(match name {
+        Some(name) => Reg {
+            kind: RegKind::Type,
+            oid,
+            name,
+        },
+        None => Reg::unresolved(RegKind::Type, oid),
+    })
 }
 
 /// The `oidvector` and `int2vector` catalog column types. See
