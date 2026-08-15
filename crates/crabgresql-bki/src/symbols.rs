@@ -36,6 +36,16 @@ pub enum SymbolKind {
     /// the spelling `pg_opclass.opcfamily` references one by, because the bare
     /// name is shared across access methods.
     Opfamily,
+    /// An operator, named by signature alone (`=(int4,int8)`) — the `regoperator`
+    /// spelling `pg_amop.amopopr`, `pg_operator.oprcom`/`oprnegate` and
+    /// `pg_aggregate.aggsortop` all reference one by. There is no bare-name
+    /// form: `=` names some ninety different operators.
+    ///
+    /// A prefix operator writes its absent left operand as the type `0`, so
+    /// its key is `-(0,int8)`. Nothing in the vendored data references one,
+    /// but keying them the same way is what makes such a reference resolve
+    /// rather than silently dangle.
+    Operator,
 }
 
 #[derive(Default)]

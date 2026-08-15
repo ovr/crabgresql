@@ -2,9 +2,20 @@
 
 use std::fmt::Write as _;
 
-use crate::dat::{Entry, bool_field, get, oid_field, str_field};
+use crate::dat::{Entry, array_field, bool_field, get, oid_field, str_field};
 use crate::symbols::SymbolKind::{Proc, Type};
 use crate::symbols::SymbolTable;
+
+/// A generated array literal's elements, comma-separated. An absent field
+/// yields no elements, which the emitted row spells as an empty slice.
+fn list(values: Option<Vec<String>>, render: impl Fn(&str) -> String) -> String {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(|v| render(v))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Phase one: every function `pg_proc.dat` defines, under both spellings the
 /// other catalogs reference it by — bare name (`regproc`, as
@@ -48,15 +59,12 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
             continue;
         }
         let proname = str_field(e, "proname", "");
-        // The emitted subset is I/O, cast and handler functions, none of which
-        // take OUT parameters or defaults. Anything else would need those
-        // columns filled rather than left NULL, so refuse rather than lie.
-        for unsupported in [
-            "proallargtypes",
-            "proargmodes",
-            "proargnames",
-            "proargdefaults",
-        ] {
+        // An argument default is a serialized expression tree, and nothing here
+        // can render one: `pg_get_function_arguments` would have to print the
+        // expression back. No function the catalogs reference carries one, so
+        // refusing is exact rather than restrictive — and `pronargdefaults`
+        // stays 0 for the same reason.
+        for unsupported in ["proargdefaults", "pronargdefaults"] {
             assert!(
                 get(e, unsupported).is_none(),
                 "pg_proc entry {proname} carries {unsupported}, which codegen does not emit"
@@ -78,7 +86,9 @@ procost: {procost:?}, prorows: {prorows:?}, provariadic: {provariadic}, \
 prosupport: {prosupport}, prokind: {prokind:?}, prosecdef: false, \
 proleakproof: {proleakproof}, proisstrict: {proisstrict}, proretset: {retset}, \
 provolatile: {provolatile:?}, proparallel: {proparallel:?}, pronargs: {pronargs}, \
-prorettype: {prorettype}, proargtypes: &[{args}], prosrc: {prosrc:?} }},\n",
+prorettype: {prorettype}, proargtypes: &[{args}], proallargtypes: &[{allargs}], \
+proargmodes: &[{argmodes}], proargnames: &[{argnames}], prosrc: {prosrc:?}, \
+probin: {probin:?} }},\n",
             prolang = match str_field(e, "prolang", "internal") {
                 "c" => 13,
                 "sql" => 14,
@@ -111,7 +121,22 @@ prorettype: {prorettype}, proargtypes: &[{args}], prosrc: {prosrc:?} }},\n",
             proparallel = str_field(e, "proparallel", "s"),
             pronargs = argtypes.len(),
             prorettype = type_oid(str_field(e, "prorettype", "")),
+            // The three OUT-parameter columns. PostgreSQL leaves all three NULL
+            // unless a function has OUT or VARIADIC parameters, and an empty
+            // slice is how the generated rows spell that NULL — see
+            // `crabgresql-catalog`'s `PgProcRow`. A function that declares any
+            // of them declares `proallargtypes` and `proargmodes` together;
+            // `proargnames` travels on its own, since a function may name plain
+            // IN arguments.
+            allargs = list(array_field(e, "proallargtypes"), |t| type_oid(t)
+                .to_string()),
+            argmodes = list(array_field(e, "proargmodes"), |m| format!("{m:?}")),
+            argnames = list(array_field(e, "proargnames"), |n| format!("{n:?}")),
             prosrc = str_field(e, "prosrc", ""),
+            // The shared library a conversion or other C function lives in.
+            // Empty for the internal functions, which is what the catalog
+            // reports as NULL.
+            probin = str_field(e, "probin", ""),
         );
         rows.push((oid, row));
     }
@@ -170,17 +195,53 @@ mod tests {
         assert!(emitted.contains("prokind: \"f\""));
     }
 
-    #[test]
-    #[should_panic(expected = "which codegen does not emit")]
-    fn a_function_with_out_parameters_is_refused() {
-        let procs = parse_dat(
-            "[{ oid => '1', proname => 'f', prorettype => 'bool', \
-             proargnames => '{a}' }]",
-        );
+    /// Emit one entry, whatever it says, resolved against `bool`/`cstring`.
+    fn emit_one(dat: &str) -> String {
+        let procs = parse_dat(dat);
         let mut symbols = SymbolTable::default();
         symbols.define_name(Type, "bool", 16);
+        symbols.define_name(Type, "cstring", 2275);
         define_symbols(&procs, &mut symbols);
         symbols.resolve_name(Proc, "f");
-        emit(&procs, &symbols);
+        emit(&procs, &symbols)
+    }
+
+    #[test]
+    fn a_function_without_out_parameters_reports_the_three_columns_empty() {
+        let (procs, symbols) = fixture();
+        symbols.resolve_name(Proc, "boolin");
+        let emitted = emit(&procs, &symbols);
+        // Empty is the generated spelling of NULL, which is what PostgreSQL
+        // stores for a function that declares neither OUT parameters nor
+        // argument names.
+        assert!(emitted.contains("proallargtypes: &[], proargmodes: &[], proargnames: &[]"));
+        assert!(emitted.contains("probin: \"\""));
+    }
+
+    #[test]
+    fn out_parameters_and_argument_names_are_emitted() {
+        let emitted = emit_one(
+            "[{ oid => '1', proname => 'f', prorettype => 'bool', \
+             proargtypes => 'cstring', proallargtypes => '{cstring,bool}', \
+             proargmodes => '{i,o}', proargnames => '{arg,found}', \
+             probin => '$libdir/thing' }]",
+        );
+        // The type names resolve like any other reference; the modes and names
+        // travel as written.
+        assert!(emitted.contains("proallargtypes: &[2275, 16]"));
+        assert!(emitted.contains("proargmodes: &[\"i\", \"o\"]"));
+        assert!(emitted.contains("proargnames: &[\"arg\", \"found\"]"));
+        assert!(emitted.contains("probin: \"$libdir/thing\""));
+        // `pronargs` still counts the declared arguments, not the OUT ones.
+        assert!(emitted.contains("pronargs: 1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "which codegen does not emit")]
+    fn a_function_with_an_argument_default_is_refused() {
+        emit_one(
+            "[{ oid => '1', proname => 'f', prorettype => 'bool', \
+             proargdefaults => '{false}' }]",
+        );
     }
 }

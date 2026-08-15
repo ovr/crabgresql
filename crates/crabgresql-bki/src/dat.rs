@@ -129,6 +129,30 @@ pub fn oid_field(e: &Entry, key: &str) -> u32 {
     }
 }
 
+/// A `{a,b,c}` array field, as `proargnames`, `proargmodes` and
+/// `proallargtypes` spell an array of names. Absent (or `_null_`) reads as
+/// `None`, which is what PostgreSQL stores for "this function has none".
+///
+/// The elements of these three are catalog identifiers — no commas, no quoting —
+/// so splitting on `,` is exact. A quoted element belongs to the `proargdefaults`
+/// form (`{"{}",false}`), which is a serialized expression tree rather than a
+/// list of names; refusing it here keeps a caller from reading one as a name.
+pub fn array_field(e: &Entry, key: &str) -> Option<Vec<String>> {
+    let raw = get(e, key)?;
+    let inner = raw
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or_else(|| panic!("{key} is not a braced list: {raw:?}"));
+    assert!(
+        !inner.contains('"'),
+        "{key} carries a quoted element, which is not a list of names: {raw:?}"
+    );
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(inner.split(',').map(|v| v.trim().to_string()).collect())
+}
+
 /// A `t`/`f` field, falling back to the column's BKI default.
 pub fn bool_field(e: &Entry, key: &str, default: bool) -> bool {
     match get(e, key) {
@@ -174,6 +198,32 @@ mod tests {
         assert_eq!(get(e, "typdelim"), Some("'"));
         // An unquoted number is a value like any other.
         assert_eq!(oid_field(e, "oid"), 25);
+    }
+
+    #[test]
+    fn a_braced_list_reads_as_its_elements() {
+        let entries = parse_dat(
+            "[{ proargnames => '{acl,grantor}', proargmodes => '{}', \
+             proallargtypes => _null_ }]",
+        );
+        let e = &entries[0];
+        assert_eq!(
+            array_field(e, "proargnames"),
+            Some(vec!["acl".to_string(), "grantor".to_string()])
+        );
+        // `{}` is an array with no elements; `_null_` is no array at all. Only
+        // the second one means the column is NULL.
+        assert_eq!(array_field(e, "proargmodes"), Some(Vec::new()));
+        assert_eq!(array_field(e, "proallargtypes"), None);
+        assert_eq!(array_field(e, "nosuchfield"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a list of names")]
+    fn a_serialized_expression_is_not_read_as_a_list() {
+        // `proargdefaults` shares the braced spelling but holds expressions.
+        let entries = parse_dat("[{ proargdefaults => '{\"{}\",false}' }]");
+        array_field(&entries[0], "proargdefaults");
     }
 
     #[test]

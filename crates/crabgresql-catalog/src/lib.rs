@@ -237,7 +237,17 @@ pub struct PgProcRow {
     pub pronargs: i16,
     pub prorettype: u32,
     pub proargtypes: &'static [u32],
+    /// `proallargtypes`, `proargmodes` and `proargnames`: empty means the
+    /// column is NULL, which is what PostgreSQL stores for a function with no
+    /// OUT parameters and no declared argument names. An empty *array* is not a
+    /// value any of the three ever takes, so the two cannot be confused.
+    pub proallargtypes: &'static [u32],
+    pub proargmodes: &'static [&'static str],
+    pub proargnames: &'static [&'static str],
     pub prosrc: &'static str,
+    /// The shared library a C function lives in — the conversion functions are
+    /// the only referenced ones that have it. Empty reads as NULL.
+    pub probin: &'static str,
 }
 
 /// A built-in `pg_opclass` row, generated from `pg_opclass.dat`. `opcnamespace`
