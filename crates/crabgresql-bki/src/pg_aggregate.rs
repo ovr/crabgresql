@@ -28,15 +28,10 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
         // for all but a handful of them.
         let aggfnoid = crate::proc_ref_resolved(symbols, key)
             .unwrap_or_else(|| panic!("pg_aggregate: aggfnoid {key:?} names no pg_proc entry"));
-        let support = |column: &str| {
-            let reference = str_field(e, column, "-");
-            if reference == "-" {
-                return crate::proc_ref(symbols, "-");
-            }
-            crate::proc_ref_resolved(symbols, reference).unwrap_or_else(|| {
-                panic!("pg_aggregate {key}: {column} {reference:?} names no pg_proc entry")
-            })
-        };
+        // Every support function is optional except `aggtransfn`, and `-` is
+        // how the catalog spells an absent one — which is the rule
+        // [`crate::proc_ref`] already carries, panic on a real name included.
+        let support = |column: &str| crate::proc_ref(symbols, str_field(e, column, "-"));
         let type_oid = |column: &str| match get(e, column) {
             Some(name) => symbols.resolve_name(Type, name).unwrap_or_else(|| {
                 panic!("pg_aggregate {key}: {column} names type {name:?}, which pg_type.dat lacks")

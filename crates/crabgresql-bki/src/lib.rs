@@ -267,11 +267,25 @@ fn am_oid(name: &str) -> u32 {
 }
 
 /// A `regproc` column as the `ProcRef` expression the generated file carries:
-/// the name as written, plus the OID it resolves to. `-` is the catalog's
-/// spelling of "no function" and resolves to 0, which prints back as `-`.
+/// the name as written, plus the OID it resolves to.
+///
+/// `-` is the catalog's spelling of "no function", and it is the **only**
+/// source of a zero here: any other name that fails to resolve is a reference
+/// into a catalog this build claims to have generated, so it fails the build
+/// rather than emitting `ProcRef { oid: 0, name: "eqsel" }` — a row that names
+/// a function and points at nothing, which every reader would take at face
+/// value.
+///
+/// A name resolves to nothing in two ways, and neither is benign: `pg_proc.dat`
+/// does not define it, or it defines it twice and the bare name is ambiguous
+/// (see [`SymbolTable::define_name`]). The second is what a `.dat` bump can
+/// introduce silently.
 fn proc_ref(symbols: &SymbolTable, name: &str) -> String {
-    let oid = symbols.resolve_name(Proc, name).unwrap_or(0);
-    format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+    if name == "-" {
+        return format!("ProcRef {{ oid: 0, name: {name:?} }}");
+    }
+    proc_ref_resolved(symbols, name)
+        .unwrap_or_else(|| panic!("regproc reference {name:?} names no pg_proc entry"))
 }
 
 /// The `ProcRef` expression for a reference written in either spelling the

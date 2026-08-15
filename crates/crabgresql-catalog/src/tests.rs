@@ -848,6 +848,10 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
         Value::Reg(ref reg) => reg.oid,
         ref other => panic!("expected a regproc, got {other:?}"),
     };
+    // None of the seven may be zero: a parser with no tokenizer or a template
+    // with no lexizer is not one, and upstream's data never leaves them out —
+    // so a zero here would mean a reference that failed to resolve rather than
+    // an absent function.
     for column in [
         "prsstart",
         "prstoken",
@@ -856,11 +860,13 @@ fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result
         "prslextype",
     ] {
         let oid = reg_at(&parser_rows[0], at(&parser_schema, column));
+        assert_ne!(oid, 0, "the default parser has no {column}");
         assert!(procs.contains(&oid), "{column} {oid} dangles");
     }
     for row in &template_rows {
         for column in ["tmplinit", "tmpllexize"] {
             let oid = reg_at(row, at(&template_schema, column));
+            assert_ne!(oid, 0, "a template has no {column}");
             assert!(procs.contains(&oid), "{column} {oid} dangles");
         }
     }
@@ -1209,6 +1215,17 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
             let Value::Reg(ref proc) = row[at(&schema, column)] else {
                 anyhow::bail!("{column} is not a regproc");
             };
+            // A zero is only ever the catalog's "no function", which renders
+            // as `-`. Permitting a zero on its own would also permit a column
+            // that names a real function and points at nothing — which is
+            // exactly what an unresolved reference used to produce.
+            assert_eq!(
+                proc.oid == 0,
+                proc.name == "-",
+                "{column} reports oid {} as {:?}",
+                proc.oid,
+                proc.name
+            );
             assert!(
                 (!required && proc.oid == 0) || procs.contains(&proc.oid),
                 "{column} {} dangles",

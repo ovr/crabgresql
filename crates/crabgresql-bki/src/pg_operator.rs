@@ -149,4 +149,46 @@ mod tests {
         assert_eq!(symbols.resolve_signature(Operator, "-(0,int8)"), Some(484));
         assert_eq!(symbols.resolve_signature(Operator, "=(int4,int4)"), None);
     }
+
+    /// The selectivity estimators are the one pair of `regproc` columns an
+    /// entry may leave out, so they are where the difference between "the
+    /// catalog says there is none" and "the name did not resolve" is visible.
+    fn emit_one(dat: &str) -> String {
+        let ops = parse_dat(dat);
+        let mut symbols = SymbolTable::default();
+        symbols.define_name(Type, "int4", 23);
+        symbols.define_name(Type, "bool", 16);
+        crate::pg_proc::define_symbols(
+            &parse_dat(
+                "[{ oid => '65', proname => 'int4eq', proargtypes => 'int4 int4' },\n\
+                  { oid => '101', proname => 'eqsel', proargtypes => 'internal' }]",
+            ),
+            &mut symbols,
+        );
+        define_symbols(&ops, &mut symbols);
+        emit(&ops, &symbols)
+    }
+
+    #[test]
+    fn an_absent_estimator_is_the_catalogs_none() {
+        let emitted = emit_one(
+            "[{ oid => '96', oprname => '=', oprleft => 'int4', oprright => 'int4', \
+             oprresult => 'bool', oprcode => 'int4eq', oprrest => 'eqsel' }]",
+        );
+        assert!(emitted.contains("oprrest: ProcRef { oid: 101, name: \"eqsel\" }"));
+        // `oprjoin` is absent, and absent is the only thing that reads as 0.
+        assert!(emitted.contains("oprjoin: ProcRef { oid: 0, name: \"-\" }"));
+    }
+
+    #[test]
+    #[should_panic(expected = "names no pg_proc entry")]
+    fn an_unresolvable_estimator_fails_the_build() {
+        // Before this, the row was emitted as `ProcRef { oid: 0, name:
+        // "nosuchsel" }` — a column naming a function and pointing at nothing,
+        // which no test and no reader would have questioned.
+        emit_one(
+            "[{ oid => '96', oprname => '=', oprleft => 'int4', oprright => 'int4', \
+             oprresult => 'bool', oprcode => 'int4eq', oprrest => 'nosuchsel' }]",
+        );
+    }
 }
