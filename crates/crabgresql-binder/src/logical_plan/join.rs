@@ -48,9 +48,9 @@ pub enum JoinKind {
     /// membership test, not a source of columns. The node's own predicate and
     /// hash keys still address the concatenated `left || right` row.
     ///
-    /// TODO: nothing builds this kind yet — `EXISTS`/`IN` subqueries are still
-    /// evaluated per outer row, or once through the hashed-subplan path, rather
-    /// than being rewritten into a semi/anti join.
+    /// Built by the logical optimizer's `DecorrelateSubqueries` rule, out of an
+    /// `EXISTS` or `x op ANY (SELECT …)` in a `WHERE`. No SQL syntax binds to it
+    /// directly.
     Semi,
     /// The complement of [`JoinKind::Semi`]: emit each left row that matches no
     /// right row, again as the left row alone.

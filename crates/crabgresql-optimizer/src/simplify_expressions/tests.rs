@@ -11,9 +11,7 @@ use super::SimplifyExpressions;
 use crate::{OptimizerContext, OptimizerRule, optimize};
 
 fn ctx() -> OptimizerContext {
-    OptimizerContext {
-        fmt: FmtCtx::utc_default(),
-    }
+    OptimizerContext::new(FmtCtx::utc_default())
 }
 
 /// Fold and simplify one expression, the way the rule does inside a plan.

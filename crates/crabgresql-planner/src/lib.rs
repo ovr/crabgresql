@@ -2548,7 +2548,7 @@ mod tests {
 
     /// [`plan_sql_indexed`] stopping at the bound plan, for a test that wants to
     /// rewrite it before planning.
-    fn bind_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> LogicalPlan {
+    pub(super) fn bind_sql_indexed(sql: &str, index: Option<IndexMetadata>) -> LogicalPlan {
         bind_sql_full(sql, index, None, true)
     }
 
@@ -2623,9 +2623,7 @@ mod tests {
         );
         crabgresql_optimizer::optimize(
             &mut logical,
-            &crabgresql_optimizer::OptimizerContext {
-                fmt: crabgresql_types::FmtCtx::utc_default(),
-            },
+            &crabgresql_optimizer::OptimizerContext::new(crabgresql_types::FmtCtx::utc_default()),
         );
         assert_eq!(
             explain(&plan(logical, cost::CostSettings::default())),
@@ -2644,9 +2642,7 @@ mod tests {
         );
         crabgresql_optimizer::optimize(
             &mut logical,
-            &crabgresql_optimizer::OptimizerContext {
-                fmt: crabgresql_types::FmtCtx::utc_default(),
-            },
+            &crabgresql_optimizer::OptimizerContext::new(crabgresql_types::FmtCtx::utc_default()),
         );
         assert_eq!(
             explain(&plan(logical, cost::CostSettings::default())),
@@ -4619,5 +4615,267 @@ mod projection_tests {
             // construction (the executor passes `All` explicitly).
             let _ = plan_sql(sql);
         }
+    }
+}
+
+#[cfg(test)]
+mod decorrelate_tests {
+    //! What `crabgresql_optimizer::DecorrelateSubqueries` leaves for the planner
+    //! to plan. The fixture table is `t(id int4, big int8, name text)`, joined
+    //! against itself: a correlated subquery needs two relations and one is
+    //! enough to alias twice.
+
+    use super::tests::bind_sql_indexed;
+    use super::*;
+
+    /// Bind, optimize, plan, explain — the whole path a statement takes.
+    fn explain_optimized(sql: &str) -> Vec<String> {
+        let mut logical = bind_sql_indexed(sql, None);
+        crabgresql_optimizer::optimize(
+            &mut logical,
+            &crabgresql_optimizer::OptimizerContext::new(crabgresql_types::FmtCtx::utc_default()),
+        );
+        explain(&plan(logical, cost::CostSettings::default()))
+    }
+
+    /// The shape ① produces: `EXISTS` is a membership test, so it becomes a
+    /// semi join whose right side projects the stripped correlation key. The
+    /// residual (`b.big > 3`) stays inside that arm, where the planner sinks it
+    /// to the scan.
+    #[test]
+    fn exists_becomes_a_semi_join() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.id = a.id AND b.big > 3)"
+            ),
+            vec![
+                "Hash Semi Join",
+                "  Hash Cond: (id = $3)",
+                "  ->  Seq Scan on t",
+                "  ->  Hash",
+                "        ->  Seq Scan on t",
+                "              Filter: (big > 3)",
+            ]
+        );
+    }
+
+    /// `NOT EXISTS` is the same rewrite with the complementary kind — and no
+    /// `IS NULL` idiom to go with it, since an anti join emits a left row whose
+    /// key is NULL by itself.
+    #[test]
+    fn not_exists_becomes_an_anti_join() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE NOT EXISTS (SELECT 1 FROM t b WHERE b.id = a.id)"
+            )[0],
+            "Hash Anti Join"
+        );
+    }
+
+    /// `IN` is `= ANY`, and the needle joins the correlation keys as one more
+    /// condition — here `a.id = b.id` beside the correlation `a.big = b.big`.
+    /// Both become hash keys, which is the whole point of doing this before the
+    /// planner rather than inside the executor.
+    #[test]
+    fn a_correlated_in_becomes_a_semi_join_on_both() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE a.id IN (SELECT b.id FROM t b WHERE b.big = a.big)"
+            ),
+            vec![
+                "Hash Semi Join",
+                "  Hash Cond: (big = $3) AND (id = $4)",
+                "  ->  Seq Scan on t",
+                "  ->  Hash",
+                "        ->  Seq Scan on t",
+            ]
+        );
+    }
+
+    /// An *uncorrelated* `IN` is worth the same rewrite: the executor would
+    /// otherwise fold it to a list of candidates and scan that list once per
+    /// outer row.
+    #[test]
+    fn an_uncorrelated_in_becomes_a_semi_join_too() {
+        assert_eq!(
+            explain_optimized("SELECT a.id FROM t a WHERE a.id IN (SELECT b.id FROM t b)")[0],
+            "Hash Semi Join"
+        );
+    }
+
+    /// A correlated conjunct that is *not* an equality — TPC-H Q21's
+    /// `l2.l_suppkey <> l1.l_suppkey` — cannot be a hash key, but it can still be
+    /// part of the match test. It rides into the `ON` clause as a residual, and
+    /// the arm projects the column it reads so that it is there to be read.
+    #[test]
+    fn a_correlated_residual_rides_into_the_join_condition() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a \
+                 WHERE EXISTS (SELECT 1 FROM t b WHERE b.id = a.id AND b.big <> a.big)"
+            ),
+            vec![
+                "Hash Semi Join",
+                "  Hash Cond: (id = $3)",
+                "  Join Filter: ($4 <> big)",
+                "  ->  Seq Scan on t",
+                "  ->  Hash",
+                "        ->  Seq Scan on t",
+            ]
+        );
+    }
+
+    /// `NOT IN` binds as `<> ALL`, whose NULL semantics are not an anti join's.
+    /// It stays a per-row subquery — visible here as a plan with no join in it
+    /// at all.
+    #[test]
+    fn not_in_is_left_alone() {
+        assert_eq!(
+            explain_optimized("SELECT a.id FROM t a WHERE a.id NOT IN (SELECT b.id FROM t b)")[0],
+            "Seq Scan on t"
+        );
+    }
+
+    /// An `EXISTS` over an aggregate is *always* true — an implicit group emits
+    /// its row whether or not anything fell into it — so the semi join on the
+    /// correlation keys would wrongly drop the outer rows with no match.
+    #[test]
+    fn exists_over_an_aggregate_is_left_alone() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE EXISTS (SELECT count(*) FROM t b WHERE b.id = a.id)"
+            )[0],
+            "Seq Scan on t"
+        );
+    }
+
+    /// A marker under an `OR` is not a filter the join may apply: it decides one
+    /// operand of a boolean, not whether the row survives.
+    #[test]
+    fn a_marker_under_an_or_is_left_alone() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE a.big = 1 \
+                 OR EXISTS (SELECT 1 FROM t b WHERE b.id = a.id)"
+            )[0],
+            "Seq Scan on t"
+        );
+    }
+
+    /// The shape ② produces: the subquery becomes a grouped arm, joined on the
+    /// correlation and read as a column. The comparison that consumed it stays
+    /// above the join as an ordinary filter.
+    #[test]
+    fn a_scalar_aggregate_becomes_a_grouped_left_join() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE a.big < (SELECT avg(b.big) FROM t b WHERE b.id = a.id)"
+            ),
+            vec![
+                "Hash Left Join",
+                "  Hash Cond: (id = $3)",
+                "  Filter: (big < $4)",
+                "  ->  Seq Scan on t",
+                "  ->  Hash",
+                "        ->  Aggregate",
+            ]
+        );
+    }
+
+    /// A left join answers a missing group with NULL, which is what every
+    /// aggregate but `count` returns for an empty input. `count` returns 0, so
+    /// the substituted column is wrapped — without which an outer row with no
+    /// match would compare against NULL instead of 0.
+    #[test]
+    fn a_correlated_count_keeps_its_zero() {
+        let lines = explain_optimized(
+            "SELECT a.id FROM t a WHERE a.big < (SELECT count(*) FROM t b WHERE b.id = a.id)",
+        );
+        assert_eq!(lines[0], "Hash Left Join");
+        assert_eq!(
+            lines[2], "  Filter: (big < …)",
+            "the filter reads a COALESCE, which EXPLAIN abbreviates"
+        );
+    }
+
+    /// A scalar subquery that is *not* an aggregate keeps the per-row path: the
+    /// executor raises `21000` when such a subquery returns two rows for one
+    /// outer row, and a join would silently return both.
+    #[test]
+    fn a_non_aggregate_scalar_subquery_is_left_alone() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE a.big < (SELECT b.big FROM t b WHERE b.id = a.id)"
+            )[0],
+            "Seq Scan on t"
+        );
+    }
+
+    /// A correlation key with a subquery inside it is not a key this may lift:
+    /// the rebase that moves a conjunct into the join condition cannot reach into
+    /// a subquery's body, so the body's references would be left counting levels
+    /// from a query that is no longer there.
+    #[test]
+    fn a_key_holding_a_subquery_leaves_the_plan_alone() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE EXISTS ( \
+                   SELECT 1 FROM t b \
+                   WHERE (SELECT c.id FROM t c WHERE c.big = b.big LIMIT 1) = a.id)"
+            )[0],
+            "Seq Scan on t"
+        );
+    }
+
+    /// The rewrite happens below an aggregate as readily as below a scan: the
+    /// arm is added to the aggregate's own input, where its `WHERE` and grouping
+    /// keys keep addressing the same columns.
+    #[test]
+    fn a_semi_join_lands_under_an_aggregate() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT count(*) FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.id = a.id)"
+            ),
+            vec![
+                "Aggregate",
+                "  ->  Hash Semi Join",
+                "        Hash Cond: (id = $3)",
+                "        ->  Seq Scan on t",
+                "        ->  Hash",
+                "              ->  Seq Scan on t",
+            ]
+        );
+    }
+
+    /// Two markers, two arms. The second one's columns land past the first's,
+    /// which is what the rule's one-rewrite-at-a-time loop is for.
+    #[test]
+    fn two_markers_become_two_arms() {
+        let lines = explain_optimized(
+            "SELECT a.id FROM t a \
+             WHERE EXISTS (SELECT 1 FROM t b WHERE b.id = a.id) \
+               AND EXISTS (SELECT 1 FROM t c WHERE c.big = a.big)",
+        );
+        assert_eq!(lines[0], "Hash Semi Join");
+        assert!(
+            lines.iter().filter(|l| l.contains("Semi Join")).count() == 2,
+            "both markers became arms: {lines:?}"
+        );
+    }
+
+    /// Turning the rule off leaves the plan exactly as the binder built it —
+    /// the switch a differential test drives both paths with.
+    #[test]
+    fn the_rule_can_be_turned_off() {
+        let sql = "SELECT a.id FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.id = a.id)";
+        let mut logical = bind_sql_indexed(sql, None);
+        let mut ctx =
+            crabgresql_optimizer::OptimizerContext::new(crabgresql_types::FmtCtx::utc_default());
+        ctx.decorrelate = false;
+        crabgresql_optimizer::optimize(&mut logical, &ctx);
+        assert_eq!(
+            explain(&plan(logical, cost::CostSettings::default()))[0],
+            "Seq Scan on t"
+        );
     }
 }

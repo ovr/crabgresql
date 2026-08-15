@@ -541,6 +541,7 @@ name = "crabgresql-optimizer"
 version = "0.0.2"
 dependencies = [
  "crabgresql-binder",
+ "crabgresql-storage-api",
  "crabgresql-types",
 ]
 

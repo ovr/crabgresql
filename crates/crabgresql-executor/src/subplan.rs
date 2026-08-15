@@ -13,9 +13,16 @@
 //! that is 10 000 full scans of a 10 000-row table: 43 s, against roughly 10 ms
 //! in PostgreSQL, which turns the whole thing into a hash semi join.
 //!
-//! Rather than teach the planner semi joins, this module does what PostgreSQL's
-//! *hashed subplan* does when it cannot decorrelate. The correlation is almost
-//! always a plain equality between an inner expression and an outer column:
+//! This module does what PostgreSQL's *hashed subplan* does when it cannot
+//! decorrelate, and it is now reached in the same circumstances: the logical
+//! optimizer's `DecorrelateSubqueries` rule rewrites the shapes it can prove
+//! into semi/anti joins before the planner ever runs, and what it refuses —
+//! a marker under an `OR`, a correlation with no equality in it at all, a
+//! subplan with a `LIMIT` — arrives here. The two perform the same analysis, one
+//! layer apart.
+//!
+//! The correlation is almost always a plain equality between an inner
+//! expression and an outer column:
 //!
 //! ```text
 //! select 1 from tenk1 b where b.thousand = <outer.unique2> and <rest>
