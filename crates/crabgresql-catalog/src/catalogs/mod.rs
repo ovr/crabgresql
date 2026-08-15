@@ -2,6 +2,7 @@
 //! registry binds — a `*_schema()` and a `*_rows(&SystemCatalog)` — so adding a
 //! relation is a module here plus one line in [`crate::registry`].
 
+pub(crate) mod acl;
 pub(crate) mod am;
 pub(crate) mod attribute;
 pub(crate) mod auth;

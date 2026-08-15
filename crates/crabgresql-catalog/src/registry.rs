@@ -19,10 +19,10 @@ use crabgresql_types::Value;
 
 use crate::SystemCatalog;
 use crate::catalogs::{
-    am, attribute, auth, class, collation, constraint, cursors, database, description, extension,
-    foreign, index, inherits, language, namespace, opclass, policy, prepared, proc, progress,
-    publication, relviews, replication, rewrite, sequence, settings, statistic, statistic_ext,
-    timezone, trigger, types,
+    acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
+    extension, foreign, index, inherits, language, namespace, opclass, policy, prepared, proc,
+    progress, publication, relviews, replication, rewrite, sequence, settings, statistic,
+    statistic_ext, timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -189,6 +189,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         database::pg_database_rows,
     ),
     rel(
+        "pg_db_role_setting",
+        2964,
+        PgCatalog,
+        acl::pg_db_role_setting_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_default_acl",
+        826,
+        PgCatalog,
+        acl::pg_default_acl_schema,
+        no_rows,
+    ),
+    rel(
         "pg_description",
         2609,
         PgCatalog,
@@ -259,6 +273,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         inherits::pg_inherits_rows,
     ),
     rel(
+        "pg_init_privs",
+        3394,
+        PgCatalog,
+        acl::pg_init_privs_schema,
+        no_rows,
+    ),
+    rel(
         "pg_language",
         2612,
         PgCatalog,
@@ -292,6 +313,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         opclass::pg_opfamily_schema,
         opclass::pg_opfamily_rows,
+    ),
+    rel(
+        "pg_parameter_acl",
+        6243,
+        PgCatalog,
+        acl::pg_parameter_acl_schema,
+        no_rows,
     ),
     rel(
         "pg_partitioned_table",
@@ -399,6 +427,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         no_rows,
     ),
     rel(
+        "pg_seclabel",
+        3596,
+        PgCatalog,
+        acl::pg_seclabel_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_seclabels",
+        12099,
+        PgCatalog,
+        acl::pg_seclabels_schema,
+        no_rows,
+    ),
+    rel(
         "pg_sequence",
         2224,
         PgCatalog,
@@ -425,6 +467,27 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         auth::pg_shadow_schema,
         auth::pg_shadow_rows,
+    ),
+    rel(
+        "pg_shdepend",
+        1214,
+        PgCatalog,
+        acl::pg_shdepend_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_shdescription",
+        2396,
+        PgCatalog,
+        acl::pg_shdescription_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_shseclabel",
+        3592,
+        PgCatalog,
+        acl::pg_shseclabel_schema,
+        no_rows,
     ),
     rel(
         "pg_stat_progress_analyze",
