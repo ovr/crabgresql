@@ -710,6 +710,149 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_aggregate` describes upstream's aggregates: the transition and final
+/// functions each one is built from, and the ordering operator `min`/`max` are
+/// equivalent to.
+///
+/// # The direction this cannot check
+///
+/// The same one `pg_operator` has. The executor's accumulators are Rust, not
+/// these functions, so a row is a description rather than a plan. What is
+/// checkable is that every reference lands, that the key names a function
+/// `pg_proc` agrees is an aggregate, and that the six aggregates this server
+/// evaluates are all described.
+#[test]
+fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_aggregate")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let (type_schema, type_rows) = build("pg_type")?;
+    let (operator_schema, operator_rows) = build("pg_operator")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let types: std::collections::HashSet<u32> = type_rows
+        .iter()
+        .map(|r| oid_at(r, at(&type_schema, "oid")))
+        .collect();
+    let operators: std::collections::HashSet<u32> = operator_rows
+        .iter()
+        .map(|r| oid_at(r, at(&operator_schema, "oid")))
+        .collect();
+    // `pg_proc`, indexed by OID, so a row's key can be checked against what
+    // that function says about itself.
+    let procs: std::collections::HashMap<u32, (String, String)> = proc_rows
+        .iter()
+        .map(|r| {
+            let name = match r[at(&proc_schema, "proname")] {
+                Value::Text(ref name) => name.clone(),
+                ref other => panic!("expected a name, got {other:?}"),
+            };
+            let kind = match r[at(&proc_schema, "prokind")] {
+                Value::Char(c) => (c as char).to_string(),
+                ref other => panic!("expected a \"char\", got {other:?}"),
+            };
+            (oid_at(r, at(&proc_schema, "oid")), (name, kind))
+        })
+        .collect();
+
+    assert_eq!(rows.len(), PG_AGGREGATE_ROWS.len());
+    let reg_at = |row: &[Value], i: usize| match row[i] {
+        Value::Reg(ref reg) => reg.oid,
+        ref other => panic!("expected a regproc, got {other:?}"),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for row in &rows {
+        // The key is a function this build publishes, and that function says
+        // it is an aggregate. A `pg_aggregate` row over a plain function would
+        // be a claim `pg_proc` contradicts.
+        let key = reg_at(row, at(&schema, "aggfnoid"));
+        let (name, kind) = procs
+            .get(&key)
+            .unwrap_or_else(|| panic!("aggfnoid {key} names no pg_proc row"));
+        assert_eq!(kind, "a", "{name} is an aggregate here but not in pg_proc");
+        names.insert(name.clone());
+
+        // The transition function is required — an aggregate with nothing to
+        // fold rows with is not an aggregate — and the other eight are
+        // optional, spelled 0 when absent.
+        for (column, required) in [
+            ("aggtransfn", true),
+            ("aggfinalfn", false),
+            ("aggcombinefn", false),
+            ("aggserialfn", false),
+            ("aggdeserialfn", false),
+            ("aggmtransfn", false),
+            ("aggminvtransfn", false),
+            ("aggmfinalfn", false),
+        ] {
+            let oid = reg_at(row, at(&schema, column));
+            assert!(
+                (!required && oid == 0) || procs.contains_key(&oid),
+                "{column} {oid} of {name} dangles"
+            );
+        }
+        // The state types, and the ordering operator min/max stand for.
+        let transtype = oid_at(row, at(&schema, "aggtranstype"));
+        assert!(types.contains(&transtype), "aggtranstype of {name} dangles");
+        let mtranstype = oid_at(row, at(&schema, "aggmtranstype"));
+        assert!(
+            mtranstype == 0 || types.contains(&mtranstype),
+            "aggmtranstype of {name} dangles"
+        );
+        let sortop = oid_at(row, at(&schema, "aggsortop"));
+        assert!(
+            sortop == 0 || operators.contains(&sortop),
+            "aggsortop of {name} dangles"
+        );
+        // A moving-window aggregate names its transition function and its
+        // inverse together: one without the other is a frame that can add rows
+        // and never remove them.
+        assert_eq!(
+            reg_at(row, at(&schema, "aggmtransfn")) == 0,
+            reg_at(row, at(&schema, "aggminvtransfn")) == 0,
+            "{name} has half a moving-window aggregate"
+        );
+    }
+
+    // The aggregates this server evaluates — `crabgresql-binder`'s `lookup_agg`,
+    // which is a Rust match rather than a table, so the list is repeated here
+    // rather than read. That is also why the converse is not asserted: an
+    // aggregate added there and missing here would not fail this test, and the
+    // smoke suite is where the two are exercised together.
+    for aggregate in ["count", "min", "max", "sum", "avg", "string_agg"] {
+        assert!(names.contains(aggregate), "{aggregate} is not described");
+    }
+
+    // `max(int4)` in full: the shape a client reads out of \da, and the one
+    // row where every optional column is populated the interesting way.
+    let max_int4 = rows
+        .iter()
+        .find(|r| {
+            procs[&reg_at(r, at(&schema, "aggfnoid"))].0 == "max"
+                && oid_at(r, at(&schema, "aggtranstype")) == 23
+        })
+        .expect("max(int4) is described");
+    assert_eq!(
+        procs[&reg_at(max_int4, at(&schema, "aggtransfn"))].0,
+        "int4larger"
+    );
+    assert_eq!(max_int4[at(&schema, "aggkind")], crate::cols::chr('n'));
+    // Its sort operator is `>`: MAX is the last row of an ascending order.
+    let sortop = oid_at(max_int4, at(&schema, "aggsortop"));
+    assert_eq!(
+        operator_rows
+            .iter()
+            .find(|r| oid_at(r, at(&operator_schema, "oid")) == sortop)
+            .map(|r| r[at(&operator_schema, "oprname")].clone()),
+        Some(Value::Text(">".to_string()))
+    );
+    Ok(())
+}
+
 /// `pg_operator` describes upstream's operator set. Every reference out of it
 /// has to land somewhere — including the two that point back into itself, a
 /// commutator and a negator, which is the reference cycle codegen's two phases
@@ -2308,10 +2451,11 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // Every operator upstream ships; each one carries a `descr`.
             ("pg_operator", 805),
             // Every function the generated catalogs reference and upstream
-            // wrote a `descr` for. It grew with `pg_amproc` and `pg_operator`:
-            // a support function or an `oprcode` is a `pg_proc` row like any
-            // other, and its description comes along.
-            ("pg_proc", 888),
+            // wrote a `descr` for. It grew with `pg_amproc`, `pg_operator` and
+            // `pg_aggregate`: a support function, an `oprcode` or a transition
+            // function is a `pg_proc` row like any other, and its description
+            // comes along.
+            ("pg_proc", 1242),
             ("pg_type", 109),
         ])
     );

@@ -274,6 +274,42 @@ pub struct PgOpfamilyRow {
     pub opfname: &'static str,
 }
 
+/// A built-in `pg_aggregate` row, generated from `pg_aggregate.dat`.
+///
+/// There is no `oid`: an aggregate is identified by the `pg_proc` row it
+/// extends, so [`Self::aggfnoid`] is both the key and the reference.
+///
+/// `agginitval`/`aggminitval` carry the empty string for the column's NULL —
+/// no upstream entry has an initial state of `''`, so the two cannot be
+/// confused.
+pub struct PgAggregateRow {
+    pub aggfnoid: ProcRef,
+    /// `n` for a plain aggregate, `o` for an ordered-set one and `h` for a
+    /// hypothetical-set one. Only the latter two take direct arguments.
+    pub aggkind: &'static str,
+    pub aggnumdirectargs: i16,
+    pub aggtransfn: ProcRef,
+    pub aggfinalfn: ProcRef,
+    pub aggcombinefn: ProcRef,
+    pub aggserialfn: ProcRef,
+    pub aggdeserialfn: ProcRef,
+    pub aggmtransfn: ProcRef,
+    pub aggminvtransfn: ProcRef,
+    pub aggmfinalfn: ProcRef,
+    pub aggfinalextra: bool,
+    pub aggmfinalextra: bool,
+    pub aggfinalmodify: &'static str,
+    pub aggmfinalmodify: &'static str,
+    /// The ordering operator `MIN`/`MAX` are equivalent to, or 0.
+    pub aggsortop: u32,
+    pub aggtranstype: u32,
+    pub aggtransspace: i32,
+    pub aggmtranstype: u32,
+    pub aggmtransspace: i32,
+    pub agginitval: &'static str,
+    pub aggminitval: &'static str,
+}
+
 /// A built-in `pg_operator` row, generated from `pg_operator.dat`. Namespace
 /// and owner are not carried, for the reason [`PgOpclassRow`] gives.
 pub struct PgOperatorRow {
@@ -344,6 +380,7 @@ include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_operator_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_aggregate_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amop_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_amproc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));

@@ -21,6 +21,7 @@
 //! and generating from it is the sanctioned path; attribution is in `NOTICE`.
 
 pub mod dat;
+mod pg_aggregate;
 mod pg_amop;
 mod pg_amproc;
 mod pg_cast;
@@ -86,6 +87,7 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let opfamily_entries = read_dat(catalog_dir, "pg_opfamily.dat")?;
     let opclass_entries = read_dat(catalog_dir, "pg_opclass.dat")?;
     let operator_entries = read_dat(catalog_dir, "pg_operator.dat")?;
+    let aggregate_entries = read_dat(catalog_dir, "pg_aggregate.dat")?;
     let amop_entries = read_dat(catalog_dir, "pg_amop.dat")?;
     let amproc_entries = read_dat(catalog_dir, "pg_amproc.dat")?;
     let am_entries = read_dat(catalog_dir, "pg_am.dat")?;
@@ -119,6 +121,10 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::write(
         out_dir.join("pg_operator_rows.rs"),
         pg_operator::emit(&operator_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_aggregate_rows.rs"),
+        pg_aggregate::emit(&aggregate_entries, &symbols),
     )?;
     std::fs::write(
         out_dir.join("pg_amop_rows.rs"),

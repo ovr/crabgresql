@@ -92,3 +92,4 @@ test: with_ordinality
 test: array_subquery
 test: pg_amop
 test: pg_operator
+test: pg_aggregate

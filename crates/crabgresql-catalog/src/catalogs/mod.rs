@@ -3,6 +3,7 @@
 //! relation is a module here plus one line in [`crate::registry`].
 
 pub(crate) mod acl;
+pub(crate) mod aggregate;
 pub(crate) mod am;
 pub(crate) mod amop;
 pub(crate) mod attribute;
