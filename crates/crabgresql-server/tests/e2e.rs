@@ -14273,3 +14273,50 @@ async fn pg_locks_reports_a_writing_block_transactionid() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// `pg_backend_pid()` names the same backend `pg_locks.pid` reports, so the
+/// canonical `WHERE pid = pg_backend_pid()` selects this session's locks and not
+/// the empty set.
+#[tokio::test]
+async fn pg_backend_pid_matches_the_sessions_lock_rows() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid() AS pid", &[])
+        .await?
+        .get("pid");
+    let mine = client
+        .query_one(
+            "SELECT count(*) AS n FROM pg_locks WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await?
+        .get::<_, i64>("n");
+    assert_eq!(mine, 2);
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) AS n FROM pg_locks", &[])
+            .await?
+            .get::<_, i64>("n"),
+        mine
+    );
+
+    // Stable for the life of a connection, and distinct across connections —
+    // the two properties a client joins on.
+    assert_eq!(
+        pid,
+        client
+            .query_one("SELECT pg_backend_pid() AS pid", &[])
+            .await?
+            .get::<_, i32>("pid")
+    );
+    let other = connect(port).await;
+    assert_ne!(
+        pid,
+        other
+            .query_one("SELECT pg_backend_pid() AS pid", &[])
+            .await?
+            .get::<_, i32>("pid")
+    );
+    Ok(())
+}

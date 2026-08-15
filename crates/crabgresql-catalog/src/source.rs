@@ -313,6 +313,14 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
+    /// This connection's backend id, as `pg_backend_pid()` and `pg_locks.pid`
+    /// report it — see [`CatalogLock::pid`]. `0` for a snapshot with no session
+    /// behind it, which is the value PostgreSQL's own `pg_locks` never prints
+    /// and so cannot be mistaken for a live backend.
+    fn backend_pid(&self) -> i32 {
+        0
+    }
+
     /// The instant `pg_timezone_names`/`pg_timezone_abbrevs` resolve their
     /// offsets at, in `timestamptz` micros. PostgreSQL reports a zone's offset
     /// and DST flag as of *now*, so a session supplies its transaction

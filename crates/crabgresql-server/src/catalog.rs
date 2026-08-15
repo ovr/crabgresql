@@ -53,6 +53,9 @@ pub struct SessionCatalogSource {
     /// Eager for the same reason as `cursors`, and never more than two rows —
     /// see [`Session::locks`].
     locks: Vec<CatalogLock>,
+    /// The connection's backend id, behind `pg_backend_pid()` and the `pid` of
+    /// every row above.
+    backend_pid: i32,
     /// The transaction timestamp, so the timezone views resolve their offsets at
     /// the same instant `now()` reports. Not the *statement* timestamp: `now()`
     /// is `transaction_timestamp()` here as in PostgreSQL, and the two differ
@@ -135,6 +138,7 @@ impl SessionCatalogSource {
             prepared_statements,
             settings: crate::guc::catalog_settings(session),
             locks: session.locks(),
+            backend_pid: session.backend_id,
             now: session.xact_start(),
             bytea_output: session.bytea_output,
         }
@@ -253,6 +257,10 @@ impl CatalogSource for SessionCatalogSource {
 
     fn locks(&self) -> Vec<CatalogLock> {
         self.locks.clone()
+    }
+
+    fn backend_pid(&self) -> i32 {
+        self.backend_pid
     }
 
     fn settings(&self) -> Vec<CatalogSetting> {
@@ -504,6 +512,10 @@ impl CatalogOps for SessionCatalogOps {
         }
         out.push("public".to_string());
         out
+    }
+
+    fn backend_pid(&self) -> i32 {
+        self.system.backend_pid()
     }
 
     fn my_temp_schema(&self) -> Option<u32> {

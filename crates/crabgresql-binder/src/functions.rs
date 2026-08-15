@@ -637,6 +637,9 @@ pub enum ScalarFn {
     /// `pg_is_other_temp_schema(oid) -> bool`: whether the OID names *another*
     /// session's temp namespace.
     PgIsOtherTempSchema,
+    /// `pg_backend_pid() -> int4`: this connection's backend id, which is what
+    /// `pg_locks.pid` reports and what the client was given in `BackendKeyData`.
+    PgBackendPid,
     /// `pg_encoding_to_char(int4) -> name`: the name of the encoding numbered
     /// `n`, or the empty string past the end of PostgreSQL's fixed table.
     PgEncodingToChar,
@@ -2587,6 +2590,11 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::PgMyTempSchema,
             args: &[],
             ret: OID,
+        }],
+        "pg_backend_pid" => &[Signature {
+            func: ScalarFn::PgBackendPid,
+            args: &[],
+            ret: I4,
         }],
         "pg_is_other_temp_schema" => &[Signature {
             func: ScalarFn::PgIsOtherTempSchema,

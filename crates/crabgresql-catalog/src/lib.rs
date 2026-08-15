@@ -1006,6 +1006,11 @@ impl SystemCatalog {
         self.source.now()
     }
 
+    /// This connection's backend id; see [`CatalogSource::backend_pid`].
+    pub fn backend_pid(&self) -> i32 {
+        self.source.backend_pid()
+    }
+
     /// The reading session's `bytea_output`; see [`CatalogSource::bytea_output`].
     pub(crate) fn bytea_output(&self) -> crabgresql_types::ByteaOutput {
         self.source.bytea_output()

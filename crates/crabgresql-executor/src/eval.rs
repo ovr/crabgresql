@@ -734,6 +734,7 @@ fn eval_catalog_fn(
             | ScalarFn::SessionUser
             | ScalarFn::PgMyTempSchema
             | ScalarFn::PgIsOtherTempSchema
+            | ScalarFn::PgBackendPid
     ) {
         return None;
     }
@@ -779,6 +780,7 @@ fn eval_catalog_fn(
                 .next()
                 .map_or(Value::Null, Value::Text)));
         }
+        ScalarFn::PgBackendPid => return Some(Ok(Value::Int4(ops.backend_pid()))),
         // PG reports 0, not NULL, before the temp namespace is instantiated.
         ScalarFn::PgMyTempSchema => {
             return Some(Ok(Value::Oid(ops.my_temp_schema().unwrap_or(0))));
@@ -1586,6 +1588,9 @@ mod format_type_tests {
             }
             fn my_temp_schema(&self) -> Option<u32> {
                 None
+            }
+            fn backend_pid(&self) -> i32 {
+                1
             }
         }
 
