@@ -777,18 +777,11 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
     let hash = classes(&rows[1]);
     assert_ne!(hash[0], btree[0], "the hash class is not the btree one");
 
-    // Whatever the class, it is one `pg_opclass` really publishes — and under
-    // the index's own access method, which is the mistake a lookup ignoring
-    // `amoid` would make.
     let (opc_schema, opc_rows) = required(cat.build_pg_catalog("pg_opclass"), "pg_opclass")?;
     let (opc_oid, opc_method) = (
         opc_schema.column_index("oid").expect("oid"),
         opc_schema.column_index("opcmethod").expect("opcmethod"),
     );
-    // An array and an enum have no class of their own: both index under a
-    // polymorphic one. Asserted by name — those two rows carry no upstream OID
-    // of their own, so their numbers move when upstream inserts an entry above
-    // them.
     let opc_name = opc_schema.column_index("opcname").expect("opcname");
     let name_of = |class: &Value| {
         opc_rows
@@ -796,6 +789,11 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
             .find(|r| &r[opc_oid] == class)
             .map(|r| r[opc_name].clone())
     };
+    // The four keys below are asserted by name because none of their classes
+    // carries an upstream OID of its own. An array and an enum have no class
+    // of their own and index under a polymorphic one; `int2vector` joins them
+    // because PostgreSQL files it under `typcategory` A, while `oidvector` —
+    // also category A — has `oidvector_ops` and never gets that far.
     assert_eq!(
         name_of(&btree[2]),
         Some(Value::Text("array_ops".to_string()))
@@ -804,11 +802,6 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
         name_of(&btree[3]),
         Some(Value::Text("enum_ops".to_string()))
     );
-    // `int2vector` is one of those: PostgreSQL files it under `typcategory`
-    // `A`, so it indexes under the array class even though nothing about it is
-    // an array type here. `oidvector` does have a class of its own and never
-    // reaches the polymorphic tier — the pair is what separates "category A"
-    // from "spelled as an array".
     assert_eq!(
         name_of(&btree[4]),
         Some(Value::Text("array_ops".to_string()))
@@ -817,6 +810,8 @@ fn pg_index_indclass_names_each_keys_operator_class() -> anyhow::Result<()> {
         name_of(&btree[5]),
         Some(Value::Text("oidvector_ops".to_string()))
     );
+    // Every class is one the index's *own* access method publishes — the
+    // mistake a lookup ignoring `am_oid` would make.
     for (row, expected_am) in rows.iter().zip([403_u32, 405]) {
         for class in classes(row) {
             let published = opc_rows

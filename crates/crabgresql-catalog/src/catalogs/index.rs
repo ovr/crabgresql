@@ -96,10 +96,8 @@ pub(crate) fn pg_index_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 indkey,
                 indcollation,
-                // The operator class each key is built under. DDL takes no
-                // explicit class, so every key gets its type's default under
-                // the index's access method — see
-                // [`opclass::default_opclass`](crate::catalogs::opclass).
+                // DDL takes no explicit operator class, so every key reports
+                // its type's default under the index's access method.
                 oidvector(index.metadata.keys.iter().map(|key| {
                     index
                         .table_schema

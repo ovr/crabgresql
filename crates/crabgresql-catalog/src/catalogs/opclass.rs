@@ -6,7 +6,6 @@
 //! The catalog still has to name that default: `pg_index.indclass` is a
 //! reference into `pg_opclass`, and `\d`, `pg_dump` and `pg_get_indexdef` all
 //! read it to decide whether an index definition must spell an opclass out.
-//! [`default_opclass`] is where that choice is made.
 
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
@@ -76,8 +75,7 @@ pub(crate) fn pg_opfamily_schema() -> TableSchema {
 }
 
 /// The built-in operator families, generated from `pg_opfamily.dat`. Served
-/// because `pg_opclass.opcfamily` points here — a client following that
-/// reference is the reader this relation exists for.
+/// because `pg_opclass.opcfamily` points here.
 pub(crate) fn pg_opfamily_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     PG_OPFAMILY_ROWS
         .iter()

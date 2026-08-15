@@ -75,8 +75,6 @@ opckeytype: {opckeytype} }},",
                 )),
             opcintype = type_oid(str_field(e, "opcintype", "")),
             opcdefault = bool_field(e, "opcdefault", true),
-            // `opckeytype` is 0 unless the method stores something other than
-            // the indexed type, which most do not.
             opckeytype = get(e, "opckeytype").map_or(0, type_oid),
         );
     }
@@ -127,8 +125,8 @@ mod tests {
              opcfamily => 'btree/integer_ops', opcintype => 'int4' }]",
         );
         let emitted = emit(&classes, &symbols());
-        // An entry that says nothing is the type's default class and stores the
-        // indexed type itself.
+        // An entry that says nothing is its type's default class, storing that
+        // type itself.
         assert!(emitted.contains("opcdefault: true"));
         assert!(emitted.contains("opckeytype: 0"));
     }

@@ -13,9 +13,7 @@ use crate::symbols::SymbolKind::Opfamily;
 use crate::symbols::SymbolTable;
 
 /// Phase one: every family, under the `<method>/<name>` spelling
-/// `pg_opclass.opcfamily` references it by. The name alone is ambiguous —
-/// `array_ops` is a family under `btree`, `hash` and `gin` alike — which is
-/// exactly why upstream writes the method into the reference.
+/// `pg_opclass.opcfamily` references it by — see [`SymbolKind::Opfamily`].
 pub fn define_symbols(entries: &[Entry], symbols: &mut SymbolTable) {
     for e in entries {
         symbols.define_name(Opfamily, &family_key(e), oid_field(e, "oid"));
@@ -23,8 +21,7 @@ pub fn define_symbols(entries: &[Entry], symbols: &mut SymbolTable) {
 }
 
 /// Emit `PG_OPFAMILY_ROWS: &[PgOpfamilyRow]` from `pg_opfamily.dat`, in file
-/// order — the order upstream inserts the rows in, and so the order a client
-/// reading the relation without `ORDER BY` sees them.
+/// order for the reason [`pg_opclass::emit`](crate::pg_opclass::emit) is.
 ///
 /// Every entry carries an explicit `oid`, so unlike `pg_opclass` there is
 /// nothing to assign here.
@@ -49,7 +46,6 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
     out
 }
 
-/// The `<method>/<name>` key a family is defined and referenced under.
 fn family_key(e: &Entry) -> String {
     let method = get(e, "opfmethod").expect("pg_opfamily entry without opfmethod");
     let name = get(e, "opfname").expect("pg_opfamily entry without opfname");
