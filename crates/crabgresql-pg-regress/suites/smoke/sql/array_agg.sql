@@ -3,8 +3,10 @@
 -- The one aggregate that does not skip a NULL input: a NULL row becomes a NULL
 -- element, while a group with no rows at all is still NULL rather than the empty
 -- array. Covers the element types, GROUP BY / HAVING / ORDER BY, the DISTINCT
--- form (which PostgreSQL sorts, NULLs last), the window form, and the two shapes
--- this build refuses. Generated with psql -q -a against PostgreSQL 18.4.
+-- form (which PostgreSQL sorts, NULLs last), the window form, the calls that are
+-- errors in PostgreSQL too, and the shapes only this build refuses — each of
+-- those noted with the answer PostgreSQL gives.
+-- Generated with psql -q -a against PostgreSQL 18.4.
 --
 CREATE TABLE aa (id integer, grp integer, val integer, txt text);
 INSERT INTO aa VALUES
@@ -49,6 +51,24 @@ SELECT grp, count(*), sum(val), array_agg(val) FROM aa GROUP BY grp ORDER BY grp
 -- the window form: the default frame makes it a running array
 SELECT id, array_agg(val) OVER (ORDER BY id) FROM aa ORDER BY id;
 SELECT id, array_agg(txt) OVER (PARTITION BY grp ORDER BY id) FROM aa ORDER BY id;
+-- errors: an unknown argument cannot resolve. PostgreSQL declares array_agg over
+-- both anyarray and anynonarray, so an untyped literal fits neither better
+SELECT array_agg(NULL);
+SELECT array_agg('x');
+-- errors: DISTINCT sorts its input, so the type needs an ordering and not just
+-- an equality. xid is the one type with a hash opclass and no btree one; this is
+-- not array_agg's rule, as the count() line below shows
+SELECT array_agg(DISTINCT x) FROM (VALUES ('1'::xid)) t(x);
+SELECT count(DISTINCT x) FROM (VALUES ('1'::xid)) t(x);
+-- ... while a type with neither operator is refused on the equality first
+SELECT array_agg(DISTINCT x) FROM (VALUES ('1'::json)) t(x);
+-- an enum has no array type in this build, so array_agg over one is refused
+-- (PostgreSQL answers {ok,sad} here.)
+CREATE TYPE mood AS ENUM ('sad', 'ok');
+SELECT array_agg(x) FROM (VALUES ('ok'::mood), ('sad'::mood)) t(x);
+-- the ARRAY[] constructor refuses it the same way, and names the type
+-- (PostgreSQL answers {ok} here.)
+SELECT ARRAY['ok'::mood];
 -- an array argument would need a two-dimensional result, which this build has no
 -- representation for
 -- (PostgreSQL answers {{10},{NULL},{5},{5},{7}} here.)

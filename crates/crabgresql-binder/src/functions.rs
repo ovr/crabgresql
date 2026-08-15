@@ -1494,12 +1494,17 @@ pub(crate) fn agg_return_type(
         // `string_agg(text, text)` always returns text; `bind_aggregate` calls
         // this directly for the two-argument form's return type.
         AggFn::StringAgg => Ok(PgType::Text),
-        // `array_agg(x)` returns the array over the argument type. PostgreSQL
-        // also has the `anyarray` overload, which stacks arrays into a
-        // higher-dimensional one; this build's arrays are strictly 1-D (see
-        // `crabgresql_types::array`), so an array argument — and any element
-        // type with no array type in this build, such as a user enum — is the
-        // same honest `0A000` the `ARRAY[…]` constructor gives.
+        // `array_agg(x)` returns the array over the argument type — when this
+        // build has one. `array_oid_for_elem` is a table of the *built-in*
+        // element↔array pairs, so two arguments PostgreSQL accepts land in the
+        // same honest `0A000` the `ARRAY[…]` constructor gives:
+        //
+        //   - a user enum (or any other type created at runtime), because
+        //     `CREATE TYPE` here assigns no array type of its own — the common
+        //     casualty, since `array_agg(mood_col)` is an ordinary query;
+        //   - an array, which PostgreSQL stacks into a two-dimensional result
+        //     and this build has no representation for (arrays are strictly
+        //     1-D, see `crabgresql_types::array`).
         AggFn::ArrayAgg => match crabgresql_types::array::array_oid_for_elem(input_ty.oid()) {
             Some(_) => Ok(PgType::Array(input_ty.oid())),
             None => Err(BindError::feature_not_supported(format!(
@@ -4072,13 +4077,30 @@ fn bind_aggregate(
         });
     }
 
-    // Bind each argument (an unknown literal resolves to text, as in a bare
-    // projection) so a wrong-arity error can name the actual argument types, as
-    // PG does.
+    // Bind each argument so a wrong-arity error can name the actual argument
+    // types, as PG does. The still-unsettled `Binding` is kept for one step:
+    // `array_agg` is declared over `anyarray` *and* `anynonarray` in PG, and an
+    // `unknown` argument fits neither better than the other, so it can never
+    // resolve — `array_agg(NULL)` and `array_agg($1)` are both `42725` there,
+    // not the text array taking the default would produce. Every other
+    // aggregate here has a text overload that wins, so its unknown settles the
+    // usual way. (`sum(unknown)` is ambiguous in PG too, but for a reason that
+    // lives in its numeric overload set, not here.)
     let arg_exprs = positional_arg_exprs(&list.args)?;
-    let mut bound = arg_exprs
+    let bindings = arg_exprs
         .iter()
-        .map(|e| crate::expr::bind_scalar(e, scope))
+        .map(|e| crate::expr::bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    if agg == AggFn::ArrayAgg
+        && bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }))
+    {
+        return Err(ambiguous_function(name, &bindings));
+    }
+    let mut bound = bindings
+        .into_iter()
+        .map(crate::expr::scalar_from_binding)
         .collect::<Result<Vec<_>, _>>()?;
     let undefined_arity = || {
         let types = bound
@@ -4130,17 +4152,38 @@ fn bind_aggregate(
         arg = crate::expr::coerce_expr(arg, PgType::Text)?;
         input_ty = PgType::Text;
     }
-    // A DISTINCT aggregate must compare its inputs for equality; a type with no
-    // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
-    // PG's error rather than reaching the executor's comparison and panicking.
-    if distinct && !crate::expr::has_equality(input_ty, scope.catalog().as_ref()) {
-        return Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "could not identify an equality operator for type {}",
-                crate::expr::type_label(input_ty, scope.catalog().as_ref())
-            ),
-        ));
+    // A DISTINCT aggregate must be able to *sort* its inputs, because that is
+    // how PostgreSQL eliminates the duplicates — so both an equality and an
+    // ordering are required, and it reports them in that order. A type with
+    // neither (e.g. `point`/`lseg`, or `json`) gets the equality error; `xid`,
+    // the one type in the gap — hashable but with no btree opclass, see
+    // `has_equality` — gets the ordering one.
+    //
+    // The requirement is not `array_agg`'s alone even though its output makes it
+    // visible: `count(DISTINCT xid_col)` is the same error in PG.
+    if distinct {
+        let catalog = scope.catalog();
+        if !crate::expr::has_equality(input_ty, catalog.as_ref()) {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "could not identify an equality operator for type {}",
+                    crate::expr::type_label(input_ty, catalog.as_ref())
+                ),
+            ));
+        }
+        if !crate::expr::is_orderable(input_ty, catalog.as_ref()) {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "could not identify an ordering operator for type {}",
+                    crate::expr::type_label(input_ty, catalog.as_ref())
+                ),
+            )
+            .with_detail(Some(
+                "Aggregates with DISTINCT must be able to sort their inputs.".to_string(),
+            )));
+        }
     }
     let ret = agg_return_type(agg, input_ty, scope)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {

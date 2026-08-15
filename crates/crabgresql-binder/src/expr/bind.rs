@@ -260,14 +260,16 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
     let (elem, exprs) = unify_value_column(bindings, "ARRAY")?;
-    // Reject an element type this build has no array type for — this also
-    // rejects a multi-dimensional constructor (an array-typed element).
+    // Reject an element type this build has no array type for — a user enum, or
+    // an array, which is what makes a multi-dimensional constructor land here.
+    // Named through `type_label` rather than `PgType::name`, which renders every
+    // runtime-created type as the useless "user-defined".
     // TODO: support multi-dimensional array constructors (`ARRAY[[1,2],[3,4]]`,
     // `ARRAY[ARRAY[…]]`).
     if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
         return Err(BindError::feature_not_supported(format!(
             "could not find array type for data type {}",
-            elem.name()
+            crate::expr::type_label(elem, scope.catalog().as_ref())
         )));
     }
     if elem.is_collatable() {
@@ -759,7 +761,16 @@ fn bind_like_node(
 /// Bind at a spot with no surrounding type context (a SELECT-list item):
 /// a leftover unknown resolves to text, as PG does in a bare SELECT.
 pub fn bind_scalar(expr: &ast::Expr, scope: &Scope) -> Result<BoundExpr, BindError> {
-    Ok(match bind_expr(expr, scope)? {
+    scalar_from_binding(bind_expr(expr, scope)?)
+}
+
+/// [`bind_scalar`]'s resolution half, for a caller that has to inspect the
+/// [`Binding`] before the unknown is settled — `bind_aggregate` does, because
+/// `array_agg` must report an *ambiguous* call rather than silently taking text.
+/// Splitting it here keeps that caller from binding the expression twice, and
+/// leaves one statement of what a leftover unknown becomes.
+pub(crate) fn scalar_from_binding(binding: Binding) -> Result<BoundExpr, BindError> {
+    Ok(match binding {
         Binding::Typed(e) => e,
         // A bare untyped literal defaults to text; but a bind parameter with no
         // surrounding context has no type to take, so PG errors 42P18 rather

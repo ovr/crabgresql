@@ -351,8 +351,10 @@ impl Accumulator {
     }
 
     /// Fold one row's argument values into the running state. `values[0]` is the
-    /// value (already known non-null); `string_agg` also reads `values[1]` as the
-    /// per-row delimiter.
+    /// value, non-null for every aggregate that declares itself strict — which
+    /// is all of them but `array_agg`, the one arm that has to handle a NULL
+    /// (see [`AggFn::skips_null_input`]). `string_agg` also reads `values[1]` as
+    /// the per-row delimiter.
     pub fn accumulate(&mut self, values: &[Value]) -> Result<(), ExecError> {
         // Set by the register states when their `i128` runs out of room. The
         // switch happens after the borrow below ends.
