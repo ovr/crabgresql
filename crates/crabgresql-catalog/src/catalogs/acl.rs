@@ -20,7 +20,6 @@ use crabgresql_types::{PgType, oid};
 use crate::cols::*;
 
 /// `pg_default_acl` — the per-schema defaults `ALTER DEFAULT PRIVILEGES` sets.
-/// Empty in PostgreSQL too until someone runs that statement.
 pub(crate) fn pg_default_acl_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_default_acl",
@@ -61,8 +60,7 @@ pub(crate) fn pg_init_privs_schema() -> TableSchema {
     )
 }
 
-/// `pg_parameter_acl` — the GUCs someone has `GRANT SET`ed on. Empty in
-/// PostgreSQL as well until that happens.
+/// `pg_parameter_acl` — the GUCs someone has `GRANT SET`ed on.
 pub(crate) fn pg_parameter_acl_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_parameter_acl",
@@ -96,9 +94,9 @@ pub(crate) fn pg_shdepend_schema() -> TableSchema {
     )
 }
 
-/// `pg_seclabel` — labels `SECURITY LABEL` attached to local objects. There is
-/// no label provider here (none is loaded in a stock PostgreSQL either), so the
-/// statement could not succeed even if it parsed, and both are empty.
+/// `pg_seclabel` — labels `SECURITY LABEL` attached to local objects. No label
+/// provider is loaded here, nor in a stock PostgreSQL, where the statement
+/// fails without one.
 pub(crate) fn pg_seclabel_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_seclabel",
@@ -129,7 +127,7 @@ pub(crate) fn pg_shseclabel_schema() -> TableSchema {
 }
 
 /// `pg_seclabels` — the human-readable view over the two label catalogs, adding
-/// the object's type, schema and name. Empty because its inputs are.
+/// the object's type, schema and name.
 pub(crate) fn pg_seclabels_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_seclabels",
@@ -172,8 +170,7 @@ pub(crate) fn pg_shdescription_schema() -> TableSchema {
 /// `pg_db_role_setting` — the per-database and per-role GUC defaults
 /// `ALTER ROLE … SET` and `ALTER DATABASE … SET` write.
 ///
-/// Empty in PostgreSQL too until one of those runs. Neither is implemented
-/// here; when `ALTER ROLE … SET` arrives this stops being a stub and becomes a
+/// When `ALTER ROLE … SET` arrives this stops being a stub and becomes a
 /// projection over wherever those settings are kept, alongside
 /// [`crate::catalogs::settings`].
 pub(crate) fn pg_db_role_setting_schema() -> TableSchema {
