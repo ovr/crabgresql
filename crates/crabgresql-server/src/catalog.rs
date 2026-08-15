@@ -384,6 +384,28 @@ impl CatalogOps for SessionCatalogOps {
         self.system.proc_oid(namespace, name)
     }
 
+    /// The comments `pg_description` publishes. The session's own catalog has
+    /// nothing to add until `COMMENT ON` exists, so this reads the same list
+    /// the relation itself serves.
+    ///
+    /// A catalog *name* resolves the way PostgreSQL's `obj_description`
+    /// resolves it — in `pg_catalog` only, so a user table called `pg_type`
+    /// cannot answer for the real one — and a name that resolves to nothing
+    /// finds no comment rather than raising.
+    fn object_description(&self, objoid: u32, objsubid: i32, catalog: Option<&str>) -> Vec<String> {
+        let Some(catalog) = catalog else {
+            return crabgresql_catalog::object_descriptions_any_class(objoid, objsubid)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        };
+        crabgresql_catalog::builtin_relation_oid(catalog)
+            .and_then(|classoid| crabgresql_catalog::object_description(classoid, objoid, objsubid))
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    }
+
     fn namespace_name(&self, oid: u32) -> Option<String> {
         self.system.namespace_name(oid)
     }

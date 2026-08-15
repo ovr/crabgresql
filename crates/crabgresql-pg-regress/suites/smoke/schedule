@@ -84,5 +84,6 @@ test: timezone_views
 test: session_identity
 test: bytea_output
 test: pg_catalog_wave1
+test: pg_description
 test: pg_views_undeparsable
 test: pg_opclass

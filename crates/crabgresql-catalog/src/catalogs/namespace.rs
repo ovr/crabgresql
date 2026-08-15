@@ -22,9 +22,21 @@ pub(crate) fn pg_namespace_schema() -> TableSchema {
     )
 }
 
-/// The reserved catalog/toast schemas and `public`, then every schema
-/// `CREATE SCHEMA` made. The three fixed OIDs match PostgreSQL's stable
-/// assignments (`pg_catalog` = 11, `pg_toast` = 99, `public` = 2200).
+/// The reserved schemas this build publishes, as `(oid, nspname)`. The three
+/// fixed OIDs match PostgreSQL's stable assignments (`pg_catalog` = 11,
+/// `pg_toast` = 99, `public` = 2200).
+///
+/// A list rather than a literal inside [`pg_namespace_rows`] because
+/// [`crate::catalogs::description`] filters `pg_namespace.dat`'s descriptions
+/// against it — that file also describes the subscription conflict-log schema,
+/// which this build does not have.
+pub(crate) const BUILTIN_NAMESPACES: &[(u32, &str)] = &[
+    (PG_CATALOG_NAMESPACE_OID, "pg_catalog"),
+    (99, "pg_toast"),
+    (PUBLIC_NAMESPACE_OID, "public"),
+];
+
+/// The reserved schemas, then every schema `CREATE SCHEMA` made.
 /// `information_schema` has an initdb-assigned OID, so it remains absent here;
 /// its named discovery surface lives in `information_schema.schemata`. Owners
 /// are the bootstrap superuser — see `BOOTSTRAP_ROLE_OID` for why there is only
@@ -39,11 +51,10 @@ pub(crate) fn pg_namespace_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Null,
         ]
     };
-    let mut rows = vec![
-        row(PG_CATALOG_NAMESPACE_OID, "pg_catalog"),
-        row(99, "pg_toast"),
-        row(PUBLIC_NAMESPACE_OID, "public"),
-    ];
+    let mut rows: Vec<Vec<Value>> = BUILTIN_NAMESPACES
+        .iter()
+        .map(|(oid, name)| row(*oid, name))
+        .collect();
     for (name, oid) in user_schemas {
         rows.push(row(*oid, name));
     }

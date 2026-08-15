@@ -1916,3 +1916,147 @@ fn statistics_relations_report_what_analyze_measured() -> anyhow::Result<()> {
     assert_eq!(raw(&crows[1], "stavalues1"), Value::Text("{a,b}".into()));
     Ok(())
 }
+
+/// Nothing may describe an object that is not there. Every `pg_description`
+/// row is checked against the very relation its `classoid` names, built from
+/// the same snapshot — the guard that keeps a `.dat` resync from publishing a
+/// comment on a function this build does not have.
+#[test]
+fn every_description_names_a_row_that_exists() -> anyhow::Result<()> {
+    let cat = wide_fixture();
+    let (schema, rows) = required(
+        cat.build_pg_catalog("pg_description"),
+        "pg_description is missing",
+    )?;
+    let at =
+        |row: &[Value], col: &str| row[schema.column_index(col).expect("column exists")].clone();
+    assert!(!rows.is_empty());
+    // The described catalogs are built once each: `pg_proc` alone has hundreds
+    // of rows, and rebuilding it per description would be quadratic.
+    let mut described: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for row in &rows {
+        let (Value::Oid(classoid), Value::Oid(objoid)) = (at(row, "classoid"), at(row, "objoid"))
+        else {
+            anyhow::bail!("pg_description row {row:?} has a non-OID key");
+        };
+        // Bootstrap data describes whole objects only, as PostgreSQL's does.
+        assert_eq!(at(row, "objsubid"), Value::Int4(0));
+        let name = required(
+            builtin_relation_name(classoid),
+            "a description's classoid names no pg_catalog relation",
+        )?;
+        let oids = match described.entry(classoid) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let (cschema, crows) = required(cat.build_pg_catalog(name), name)?;
+                let oid = required(cschema.column_index("oid"), "oid column is missing")?;
+                e.insert(
+                    crows
+                        .iter()
+                        .filter_map(|r| match r[oid] {
+                            Value::Oid(oid) => Some(oid),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+        };
+        assert!(
+            oids.contains(&objoid),
+            "{name} has no row {objoid}, but something describes one"
+        );
+    }
+    Ok(())
+}
+
+/// The census, per catalog. A `.dat` resync that adds or drops a built-in shows
+/// up here rather than silently.
+#[test]
+fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow::Result<()> {
+    let cat = wide_fixture();
+    let (schema, rows) = required(
+        cat.build_pg_catalog("pg_description"),
+        "pg_description is missing",
+    )?;
+    let classoid = required(
+        schema.column_index("classoid"),
+        "classoid column is missing",
+    )?;
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for row in &rows {
+        let Value::Oid(oid) = row[classoid] else {
+            anyhow::bail!("a classoid is not an OID");
+        };
+        *counts
+            .entry(required(builtin_relation_name(oid), "unknown classoid")?)
+            .or_default() += 1;
+    }
+    assert_eq!(
+        counts,
+        std::collections::BTreeMap::from([
+            // The seven upstream access methods plus crabgresql's own two.
+            ("pg_am", 9),
+            ("pg_extension", 1),
+            // Three from the `.dat`, plus `plpgsql`.
+            ("pg_language", 4),
+            ("pg_namespace", 3),
+            ("pg_proc", 515),
+            ("pg_type", 109),
+        ])
+    );
+    Ok(())
+}
+
+/// `pg_namespace.dat` describes four schemas and this build serves three, so
+/// one generated description has to be dropped — the case that makes the
+/// `PUBLISHED` filter more than decoration.
+#[test]
+fn a_description_of_a_schema_this_build_lacks_is_dropped() -> anyhow::Result<()> {
+    let generated = PG_DESCRIPTION_ROWS
+        .iter()
+        .filter(|row| row.catalog == "pg_namespace")
+        .count();
+    assert_eq!(generated, 4);
+    let ns = required(
+        builtin_relation_oid("pg_namespace"),
+        "pg_namespace is not served",
+    )?;
+    let cat = wide_fixture();
+    let (schema, rows) = required(
+        cat.build_pg_catalog("pg_description"),
+        "pg_description is missing",
+    )?;
+    let classoid = required(
+        schema.column_index("classoid"),
+        "classoid column is missing",
+    )?;
+    let served = rows
+        .iter()
+        .filter(|row| row[classoid] == Value::Oid(ns))
+        .count();
+    assert_eq!(served, 3);
+    Ok(())
+}
+
+/// `obj_description` and a `SELECT` from `pg_description` read one list, so
+/// they cannot disagree — and the lookup answers nothing rather than raising
+/// for a class, an OID or a column number nobody described.
+#[test]
+fn the_description_lookup_matches_the_published_rows() -> anyhow::Result<()> {
+    let types = required(builtin_relation_oid("pg_type"), "pg_type is not served")?;
+    assert_eq!(
+        object_description(types, 23, 0),
+        Some("-2 billion to 2 billion integer, 4-byte storage")
+    );
+    // No column comments exist, here or in PostgreSQL's bootstrap data.
+    assert_eq!(object_description(types, 23, 1), None);
+    // A `classoid` of 0 is what an unresolvable catalog name comes to.
+    assert_eq!(object_description(0, 23, 0), None);
+    assert_eq!(object_description(types, 999_999, 0), None);
+    assert_eq!(
+        object_descriptions_any_class(23, 0),
+        vec!["-2 billion to 2 billion integer, 4-byte storage"]
+    );
+    assert!(object_descriptions_any_class(999_999, 0).is_empty());
+    Ok(())
+}

@@ -63,9 +63,10 @@ SELECT extname, extnamespace, extrelocatable, extversion FROM pg_extension;
 SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'plpgsql';
 SELECT name, version, installed, relocatable, schema FROM pg_available_extension_versions WHERE name = 'plpgsql';
 -- psql's \dx reads its Description column from pg_description, not from
--- pg_available_extensions.comment. The extension's row is the only one this
--- build has (PostgreSQL also carries ~5400 bootstrap rows describing its own
--- catalogs, which is why the relation is not counted here), and it matches.
+-- pg_available_extensions.comment. The extension's row is one of the ~640 this
+-- build publishes (PostgreSQL carries ~5400, the rest of them describing
+-- catalogs this build does not serve, which is why the relation is not counted
+-- here), and it matches.
 SELECT objsubid, description FROM pg_description
  WHERE classoid = 'pg_extension'::regclass
    AND objoid = (SELECT oid FROM pg_extension WHERE extname = 'plpgsql');

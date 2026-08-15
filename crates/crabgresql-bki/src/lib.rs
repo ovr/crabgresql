@@ -22,6 +22,7 @@
 
 pub mod dat;
 mod pg_cast;
+mod pg_description;
 mod pg_opclass;
 mod pg_opfamily;
 mod pg_proc;
@@ -67,15 +68,23 @@ const HANDWRITTEN_CATALOG_PROCS: &[&str] = &[
 /// Read the vendored `.dat` files in `catalog_dir` and write the generated row
 /// arrays into `out_dir` (cargo's `OUT_DIR`).
 ///
-/// `pg_proc` is emitted last on purpose: it emits exactly the functions the
-/// other catalogs turned out to reference, and [`SymbolTable::references`]
-/// enforces that ordering.
+/// `pg_proc` is emitted last of the row catalogs on purpose: it emits exactly
+/// the functions the other catalogs turned out to reference, and
+/// [`SymbolTable::references`] enforces that ordering. `pg_description` comes
+/// after even that, because it filters on the same census.
+///
+/// `pg_am.dat`, `pg_language.dat` and `pg_namespace.dat` are read for their
+/// `descr` fields alone — the rows of those three catalogs are hand-written in
+/// `crabgresql-catalog`.
 pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let type_entries = read_dat(catalog_dir, "pg_type.dat")?;
     let cast_entries = read_dat(catalog_dir, "pg_cast.dat")?;
     let proc_entries = read_dat(catalog_dir, "pg_proc.dat")?;
     let opfamily_entries = read_dat(catalog_dir, "pg_opfamily.dat")?;
     let opclass_entries = read_dat(catalog_dir, "pg_opclass.dat")?;
+    let am_entries = read_dat(catalog_dir, "pg_am.dat")?;
+    let language_entries = read_dat(catalog_dir, "pg_language.dat")?;
+    let namespace_entries = read_dat(catalog_dir, "pg_namespace.dat")?;
 
     // Phase one: define.
     let mut symbols = SymbolTable::default();
@@ -111,15 +120,49 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         out_dir.join("pg_proc_rows.rs"),
         pg_proc::emit(&proc_entries, &symbols),
     )?;
+    // Re-reading a sealed census is safe: the seal forbids resolving a *new*
+    // OID afterwards, not reading the same list twice.
+    let referenced_procs = symbols.references(Proc);
+    std::fs::write(
+        out_dir.join("pg_description_rows.rs"),
+        pg_description::emit(&[
+            pg_description::Source {
+                catalog: "pg_type",
+                entries: &type_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_proc",
+                entries: &proc_entries,
+                keep: Some(&referenced_procs),
+            },
+            pg_description::Source {
+                catalog: "pg_am",
+                entries: &am_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_language",
+                entries: &language_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_namespace",
+                entries: &namespace_entries,
+                keep: None,
+            },
+        ]),
+    )?;
     Ok(())
 }
 
 /// The `pg_am` OID of each index access method, by the name `pg_opclass.dat`
 /// and `pg_opfamily.dat` write in their `opcmethod`/`opfmethod` columns.
 ///
-/// No `pg_am.dat` is vendored — `crabgresql-catalog`'s `catalogs::am` publishes
-/// those rows by hand, seven of them — so the OIDs are repeated here rather
-/// than resolved through the symbol table. The two lists agreeing is checked
+/// `pg_am.dat` is vendored for its descriptions alone and defines no symbols —
+/// `crabgresql-catalog`'s `catalogs::am` publishes those rows by hand — so the
+/// OIDs are repeated here rather than resolved through the symbol table. The
+/// two lists agreeing is checked
 /// where it is observable: `crabgresql-catalog`'s tests join the served
 /// `pg_opclass.opcmethod` against the served `pg_am.oid`, which is the claim a
 /// client would find broken.

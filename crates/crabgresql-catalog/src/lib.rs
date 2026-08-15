@@ -44,6 +44,7 @@ mod source;
 mod static_table;
 pub(crate) mod views;
 
+pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::available_extensions;
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid};
@@ -260,11 +261,26 @@ pub struct PgOpfamilyRow {
     pub opfname: &'static str,
 }
 
+/// A built-in `pg_description` row, generated from the `descr` fields of the
+/// vendored `.dat` files. `catalog` is the `pg_catalog` relation the described
+/// object lives in, by name: codegen has no business knowing the fixed relation
+/// OIDs, which [`registry`] owns and [`catalogs::description`] resolves through.
+///
+/// There is no `objsubid`: PostgreSQL's own bootstrap data describes whole
+/// objects only — a fresh 18.4 has not one row with `objsubid > 0` — so the
+/// column is 0 for every row here.
+pub struct PgDescriptionRow {
+    pub catalog: &'static str,
+    pub objoid: u32,
+    pub description: &'static str,
+}
+
 include!(concat!(env!("OUT_DIR"), "/pg_type_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including
 /// types crabgresql recognizes but does not implement yet (for example

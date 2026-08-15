@@ -136,6 +136,17 @@ pub trait CatalogOps: Send + Sync {
     /// such function. `Some` only when the name is unambiguous, as `regprocin`
     /// requires. Backs `regproc` input.
     fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The comments on `objoid`, as `obj_description`/`col_description` read
+    /// them out of `pg_description`. `catalog` is the `pg_catalog` relation the
+    /// object lives in; `None` is the deprecated one-argument
+    /// `obj_description(oid)`, which searches every catalog at once.
+    ///
+    /// A **list**, not an `Option`: the any-catalog form can match twice (OIDs
+    /// are unique per catalog, not across them) and PostgreSQL raises there
+    /// rather than picking one. Which of the two is an error is the executor's
+    /// to decide, so an implementation never learns the SQL surface. A catalog
+    /// name that names no relation is empty, not an error.
+    fn object_description(&self, objoid: u32, objsubid: i32, catalog: Option<&str>) -> Vec<String>;
     /// The name of the schema `oid` identifies, and its inverse. Back
     /// `regnamespace`.
     fn namespace_name(&self, oid: u32) -> Option<String>;
