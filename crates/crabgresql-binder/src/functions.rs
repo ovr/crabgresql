@@ -676,6 +676,12 @@ pub enum ScalarFn {
     /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
     /// in PostgreSQL's canonical shape by [`crate::ruleutils`].
     PgGetViewdef,
+    /// `pg_get_indexdef(oid[, int4, bool]) -> text`: an index's `CREATE INDEX`
+    /// DDL, rendered by [`crabgresql_storage_api::index_definition`]. The
+    /// three-argument form is PostgreSQL's per-column one: a non-zero column
+    /// number yields that key alone rather than the whole statement. An OID no
+    /// index answers to is NULL, not an error.
+    PgGetIndexdef,
     /// `pg_get_constraintdef(oid[, bool]) -> text`: a constraint's DDL, as
     /// `CHECK ((x > 3))` / `PRIMARY KEY (a, b)` / `UNIQUE (a)`. The optional
     /// flag is PostgreSQL's `pretty`, which for a check drops the parentheses
@@ -1219,6 +1225,15 @@ pub enum TableFn {
     /// `unnest(array)` over a 1-D array whose element type is carried here. Yields
     /// one row per element (NULL elements included).
     Unnest(PgType),
+    /// `pg_available_extensions()` — one row per installable extension, as
+    /// `(name, default_version, comment)`. psql's `\dx` calls the function
+    /// rather than the view of the same name, so both have to exist.
+    PgAvailableExtensions,
+    /// `pg_partition_ancestors(regclass)` — the relation itself, then each
+    /// partitioned parent up to the root. A relation that is neither a partition
+    /// nor partitioned yields **no rows** (observed on 18.4), which is what
+    /// makes psql's `\d` footers join against it unconditionally.
+    PgPartitionAncestors,
 }
 
 impl TableFn {
@@ -1229,6 +1244,11 @@ impl TableFn {
     fn arg_types(self) -> &'static [PgType] {
         match self {
             TableFn::PgInputErrorInfo => &[PgType::Text, PgType::Text],
+            // `PgPartitionAncestors` accepts either `regclass` or `oid` and so
+            // resolves in `resolve_partition_ancestors`, like the polymorphic
+            // ones above.
+            TableFn::PgPartitionAncestors => &[],
+            TableFn::PgAvailableExtensions => &[],
             // `GenerateSeries`/`JsonbPathQuery`/`Unnest` are polymorphic/variadic
             // and resolve their own arguments in `bind_table_fn_call`.
             TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery | TableFn::Unnest(_) => &[],
@@ -1250,6 +1270,14 @@ impl TableFn {
                 vec![OutputColumn::new("jsonb_path_query", PgType::Jsonb)]
             }
             TableFn::Unnest(elem) => vec![OutputColumn::new("unnest", elem)],
+            TableFn::PgPartitionAncestors => {
+                vec![OutputColumn::new("relid", PgType::Reg(RegKind::Class))]
+            }
+            TableFn::PgAvailableExtensions => vec![
+                OutputColumn::new("name", PgType::Name),
+                OutputColumn::new("default_version", PgType::Text),
+                OutputColumn::new("comment", PgType::Text),
+            ],
         }
     }
 
@@ -1261,8 +1289,13 @@ impl TableFn {
     pub fn returns_scalar(self) -> bool {
         match self {
             // `pg_input_error_info` returns `record`.
-            TableFn::PgInputErrorInfo => false,
-            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery | TableFn::Unnest(_) => true,
+            // Both return a record: `pg_input_error_info` four columns,
+            // `pg_available_extensions` three.
+            TableFn::PgInputErrorInfo | TableFn::PgAvailableExtensions => false,
+            TableFn::GenerateSeries(_)
+            | TableFn::JsonbPathQuery
+            | TableFn::Unnest(_)
+            | TableFn::PgPartitionAncestors => true,
         }
     }
 }
@@ -1271,6 +1304,8 @@ impl TableFn {
 pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
     match name {
         "pg_input_error_info" => Some(TableFn::PgInputErrorInfo),
+        "pg_partition_ancestors" => Some(TableFn::PgPartitionAncestors),
+        "pg_available_extensions" => Some(TableFn::PgAvailableExtensions),
         _ => None,
     }
 }
@@ -1453,6 +1488,12 @@ pub(crate) fn bind_table_fn_call(
         let (elem, args) = resolve_unnest(&bindings)?;
         return Ok((TableFn::Unnest(elem), args));
     }
+    if name == "pg_partition_ancestors" {
+        return Ok((
+            TableFn::PgPartitionAncestors,
+            resolve_partition_ancestors(&bindings)?,
+        ));
+    }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
     };
@@ -1466,6 +1507,33 @@ pub(crate) fn bind_table_fn_call(
         Err(None) => Err(undefined_function(name, &bindings)),
         Err(Some(e)) => Err(e),
     }
+}
+
+/// Resolve `pg_partition_ancestors(regclass)`'s single argument, accepting
+/// either spelling of a relation reference.
+///
+/// PostgreSQL declares one parameter, `regclass`, and takes an `oid` argument
+/// anyway because the two types are binary-coercible there. Here they are not:
+/// `oid` → `regclass` needs the catalog to resolve the *name* the value renders
+/// as, so no pure cast can do it (`crabgresql_types::cast` has `Reg` → `Oid` and
+/// deliberately not the reverse). Both are accepted by trying two signatures.
+///
+/// Order matters. `regclass` first is what keeps an unadorned literal resolving
+/// **by name** — `pg_partition_ancestors('parts')` is the relation `parts`, as
+/// in PostgreSQL. Under an `oid` parameter that literal would go to
+/// `text_to_oid` and fail on the first non-digit.
+///
+/// Shared by FROM-position and target-list binding: psql writes this function
+/// both ways in `\d`'s footers.
+pub(crate) fn resolve_partition_ancestors(
+    bindings: &[Binding],
+) -> Result<Vec<BoundExpr>, BindError> {
+    for param in [PgType::Reg(RegKind::Class), PgType::Oid] {
+        if let Ok(args) = single_candidate_args(bindings, &[param]) {
+            return Ok(args);
+        }
+    }
+    Err(undefined_function("pg_partition_ancestors", bindings))
 }
 
 /// Resolve `unnest(array)` to its element type and single (array) argument.
@@ -2571,6 +2639,18 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TEXT,
             },
         ],
+        "pg_get_indexdef" => &[
+            Signature {
+                func: ScalarFn::PgGetIndexdef,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetIndexdef,
+                args: &[OID, I4, BOOL],
+                ret: TEXT,
+            },
+        ],
         "pg_get_constraintdef" => &[
             Signature {
                 func: ScalarFn::PgGetConstraintdef,
@@ -3243,7 +3323,13 @@ fn lookup(name: &str) -> &'static [Signature] {
 }
 
 /// The last part of a function name, lowercased (`pg_catalog.abs` → `abs`).
-fn function_name(name: &ast::ObjectName) -> Option<String> {
+///
+/// The qualifier is dropped rather than checked, which is what makes
+/// `pg_catalog.pg_get_expr(...)` bind — and, through
+/// [`bind_table_fn_call`]'s caller, `pg_catalog.pg_partition_ancestors(...)` in
+/// FROM position. Every function this build knows is a built-in living in
+/// `pg_catalog`, so there is no second candidate a qualifier could pick between.
+pub(crate) fn function_name(name: &ast::ObjectName) -> Option<String> {
     name.0
         .last()
         .and_then(|p| p.as_ident())
@@ -4392,7 +4478,11 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series" && name != "jsonb_path_query" && name != "unnest" {
+    if name != "generate_series"
+        && name != "jsonb_path_query"
+        && name != "unnest"
+        && name != "pg_partition_ancestors"
+    {
         return Ok(None);
     }
     let arg_exprs = positional_args(&func.args)?;
@@ -4400,6 +4490,15 @@ pub(crate) fn bind_srf_projection(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
+    // The target-list spelling psql's `\d` uses: `SELECT
+    // pg_partition_ancestors(oid) UNION ALL VALUES (oid)`.
+    if name == "pg_partition_ancestors" {
+        return Ok(Some(BoundExpr::Srf {
+            func: TableFn::PgPartitionAncestors,
+            ret: PgType::Reg(RegKind::Class),
+            args: resolve_partition_ancestors(&bindings)?,
+        }));
+    }
     if name == "jsonb_path_query" {
         let args = resolve_jsonb_path_query(&bindings)?;
         return Ok(Some(BoundExpr::Srf {

@@ -35,6 +35,11 @@ pub struct CatalogSequence {
     pub max: i64,
     pub cache: i64,
     pub cycle: bool,
+    /// The counter as `pg_sequences.last_value` reports it: `None` until the
+    /// sequence has been read from, which is how PostgreSQL distinguishes a
+    /// fresh sequence from one that has handed out its `start` value — the two
+    /// hold the same number and differ only in having been called.
+    pub last_value: Option<i64>,
 }
 
 /// A live relation exposed through the system catalogs.
@@ -56,6 +61,17 @@ pub struct CatalogRelation {
     /// has none. `Some` is what gives the relation a `pg_toast.pg_toast_<oid>`
     /// row and a non-zero `pg_class.reltoastrelid`.
     pub toast: Option<RelStats>,
+    /// A view's body, **already deparsed** into the canonical SQL PostgreSQL
+    /// prints — what `pg_views.definition` shows and what `pg_rewrite` stores as
+    /// the `_RETURN` rule's action. `None` for everything that is not a view,
+    /// and for a view whose body the deparser cannot render.
+    ///
+    /// Deparsed by the supplier rather than here: rendering lives in
+    /// `crabgresql-binder`, which this crate deliberately does not depend on.
+    /// A view that cannot be rendered must stay `None` rather than fall back to
+    /// the SQL as typed — the two are different strings, and a dump built from
+    /// the wrong one is wrong silently.
+    pub definition: Option<String>,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -84,6 +100,7 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            definition: None,
         }
     }
 
@@ -99,6 +116,7 @@ impl CatalogRelation {
             sequence: None,
             stats: metadata.stats,
             toast: metadata.toast,
+            definition: None,
         }
     }
 
@@ -114,11 +132,14 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            definition: None,
         }
     }
 
     /// A permanent view. Views have no indexes; its namespace rides on `schema`.
-    pub fn view(schema: TableSchema) -> Self {
+    ///
+    /// See [`CatalogRelation::definition`] for what `definition` must hold.
+    pub fn view(schema: TableSchema, definition: Option<String>) -> Self {
         let namespace = schema.namespace.clone();
         let stats = RelStats::unknown(&schema);
         Self {
@@ -130,6 +151,7 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            definition,
         }
     }
 
@@ -161,6 +183,7 @@ impl CatalogRelation {
             sequence: Some(params),
             stats,
             toast: None,
+            definition: None,
         }
     }
 }

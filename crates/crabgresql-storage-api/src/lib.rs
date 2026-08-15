@@ -339,6 +339,17 @@ pub enum IndexMethod {
     Hash,
 }
 
+impl IndexMethod {
+    /// The `pg_am.amname` this method is spelled with — the word `USING` takes
+    /// in DDL and `pg_get_indexdef` prints back.
+    pub fn name(self) -> &'static str {
+        match self {
+            IndexMethod::BTree => "btree",
+            IndexMethod::Hash => "hash",
+        }
+    }
+}
+
 /// A simple column key in an index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexKey {
@@ -367,6 +378,64 @@ pub struct IndexMetadata {
     /// `true` is PostgreSQL's default: a key containing NULL does not conflict.
     pub nulls_distinct: bool,
     pub constraint: Option<IndexConstraint>,
+}
+
+/// Reproduce an index's `CREATE INDEX` statement, as PostgreSQL's
+/// `pg_get_indexdef` prints it and `pg_indexes.indexdef` reports it.
+///
+/// Lives next to [`IndexMetadata`] rather than in the executor, where the rest
+/// of the SQL-surface rendering lives, because it has *two* readers that cannot
+/// see each other: `pg_get_indexdef` in `crabgresql-executor` and
+/// `pg_indexes.indexdef` in `crabgresql-catalog`, neither crate depending on the
+/// other. Two copies of this grammar would drift silently — a client comparing
+/// the function against the view would be the one to find out.
+///
+/// Observed from PostgreSQL 18.4: the table is always schema-qualified and the
+/// index never is; a sort direction prints only when it is `DESC`; a null
+/// placement prints only when it differs from the direction's default (`NULLS
+/// LAST` for ascending, `NULLS FIRST` for descending); `NULLS NOT DISTINCT`
+/// trails the whole key list.
+pub fn index_definition(index: &IndexMetadata, table: &TableSchema) -> String {
+    let mut out = String::from("CREATE ");
+    if index.unique {
+        out.push_str("UNIQUE ");
+    }
+    out.push_str("INDEX ");
+    out.push_str(&crabgresql_types::text::quote_ident(&index.name));
+    out.push_str(" ON ");
+    out.push_str(&crabgresql_types::text::quote_ident(&table.namespace));
+    out.push('.');
+    out.push_str(&crabgresql_types::text::quote_ident(&table.name));
+    out.push_str(" USING ");
+    out.push_str(index.method.name());
+    out.push_str(" (");
+    for (i, key) in index.keys.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        // `?column?` is PostgreSQL's own placeholder for a column it cannot
+        // name. A key never outruns the schema it was built from, so this
+        // stands for a corrupt pairing rather than for an expression key —
+        // which `IndexMetadata` cannot represent at all.
+        match table.columns.get(key.column) {
+            Some(column) => out.push_str(&crabgresql_types::text::quote_ident(&column.name)),
+            None => out.push_str("?column?"),
+        }
+        if key.descending {
+            out.push_str(" DESC");
+        }
+        if key.nulls_first != key.descending {
+            out.push_str(match key.nulls_first {
+                true => " NULLS FIRST",
+                false => " NULLS LAST",
+            });
+        }
+    }
+    out.push(')');
+    if !index.nulls_distinct {
+        out.push_str(" NULLS NOT DISTINCT");
+    }
+    out
 }
 
 /// The partitioning strategy of a partitioned (parent) table.
@@ -1708,6 +1777,15 @@ pub trait TableEngine: Send + Sync {
     /// The default is empty.
     fn sequences(&self) -> Vec<SequenceDefinition> {
         Vec::new()
+    }
+
+    /// A sequence's current counter as `(last_value, is_called)`, without
+    /// advancing it, or `None` if there is no such sequence. Read-only
+    /// counterpart to [`TableEngine::sequence_nextval`], for the catalog:
+    /// `pg_sequences.last_value` reports it, and reporting it must not have the
+    /// side effect of consuming a value. The default knows no sequences.
+    fn sequence_current(&self, _namespace: &str, _name: &str) -> Option<(i64, bool)> {
+        None
     }
 
     /// Advance a sequence and return its new value (`nextval`). This mutates

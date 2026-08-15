@@ -667,7 +667,7 @@ fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()
     let cat = SystemCatalog::with_catalog_relations("db", "owner", {
         vec![
             CatalogRelation::permanent(plain("tbl")),
-            CatalogRelation::view(plain("vw")),
+            CatalogRelation::view(plain("vw"), None),
             CatalogRelation::permanent(parent.clone()),
             CatalogRelation::permanent(leaf(
                 "part_hi",
@@ -1058,7 +1058,10 @@ fn wide_fixture() -> SystemCatalog {
             indexed,
             CatalogRelation::permanent(parent),
             CatalogRelation::permanent(leaf),
-            CatalogRelation::view(TableSchema::new("vw", vec![Column::new("a", PgType::Int4)])),
+            CatalogRelation::view(
+                TableSchema::new("vw", vec![Column::new("a", PgType::Int4)]),
+                Some("SELECT a FROM tbl".to_string()),
+            ),
             CatalogRelation::temporary(
                 TableSchema::new("tmp", vec![Column::new("a", PgType::Int4)]),
                 "pg_temp_3",
@@ -1074,6 +1077,7 @@ fn wide_fixture() -> SystemCatalog {
                     max: i64::MAX,
                     cache: 1,
                     cycle: false,
+                    last_value: Some(1),
                 },
             ),
         ])
@@ -1177,6 +1181,16 @@ fn the_wide_fixture_populates_every_derived_relation() {
         "pg_settings",
         "pg_proc",
         "pg_type",
+        // The per-relkind views over the same snapshot. Each one is fed by a
+        // different arm of the fixture — a table, a view, a sequence, an index —
+        // so an empty answer here means that arm stopped reaching the view.
+        "pg_tables",
+        "pg_views",
+        "pg_sequences",
+        "pg_indexes",
+        "pg_extension",
+        "pg_description",
+        "pg_rewrite",
     ] {
         let def = registry::lookup(CatalogNamespace::PgCatalog, name).expect(name);
         assert!(!(def.rows)(&cat).is_empty(), "{name} built no rows");
@@ -1431,7 +1445,10 @@ fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<
         vec![
             measured,
             indexed,
-            CatalogRelation::view(TableSchema::new("vw", vec![Column::new("a", PgType::Int4)])),
+            CatalogRelation::view(
+                TableSchema::new("vw", vec![Column::new("a", PgType::Int4)]),
+                Some("SELECT a FROM tbl".to_string()),
+            ),
             CatalogRelation::sequence(
                 "sq",
                 "public",
@@ -1443,6 +1460,7 @@ fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<
                     max: i64::MAX,
                     cache: 1,
                     cycle: false,
+                    last_value: Some(1),
                 },
             ),
         ]

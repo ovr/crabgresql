@@ -44,6 +44,11 @@ pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
 /// name reaches only after `pg_catalog`.
 pub(crate) const PUBLIC_NAMESPACE_OID: u32 = 2200;
 
+/// `pg_namespace.oid` of `pg_catalog`, PostgreSQL's fixed value. Every built-in
+/// object reports it as its namespace, which is why it is cross-referenced from
+/// more than the one relation that emits the row.
+pub(crate) const PG_CATALOG_NAMESPACE_OID: u32 = 11;
+
 /// OID of the one database a crabgresql server serves. PostgreSQL assigns a
 /// fresh OID per `CREATE DATABASE`, so there is no upstream value to reuse: this
 /// one is fixed here so `pg_database.oid` joins against itself consistently and
@@ -75,3 +80,10 @@ pub(crate) const GLOBAL_TABLESPACE_OID: u32 = 1664;
 /// The `pg_language` OID this build gives `plpgsql`. See [`crate::catalogs::language::pg_language_rows`]
 /// for why it is ours to choose.
 pub const PLPGSQL_LANG_OID: u32 = 13540;
+
+/// `pg_extension.oid` of the `plpgsql` extension, PostgreSQL 18.4's own
+/// assignment. Like the 12000-band view OIDs in [`crate::registry`], it comes
+/// from `initdb` rather than from a `.dat` file, so it is deterministic for a
+/// major version rather than fixed forever — and reusing it still beats
+/// inventing a number, because a client that hard-codes one hard-codes this.
+pub(crate) const PLPGSQL_EXTENSION_OID: u32 = 14049;

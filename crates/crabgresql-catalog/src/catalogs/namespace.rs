@@ -40,9 +40,9 @@ pub(crate) fn pg_namespace_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         ]
     };
     let mut rows = vec![
-        row(11, "pg_catalog"),
+        row(PG_CATALOG_NAMESPACE_OID, "pg_catalog"),
         row(99, "pg_toast"),
-        row(2200, "public"),
+        row(PUBLIC_NAMESPACE_OID, "public"),
     ];
     for (name, oid) in user_schemas {
         rows.push(row(*oid, name));

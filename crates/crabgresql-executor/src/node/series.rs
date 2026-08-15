@@ -4,7 +4,7 @@
 
 use crabgresql_binder::TableFn;
 use crabgresql_storage_api::Tuple;
-use crabgresql_types::Value;
+use crabgresql_types::{RegKind, Value};
 
 use crate::generate_series::Series;
 use crate::{ExecContext, ExecError, eval};
@@ -35,16 +35,68 @@ pub(crate) fn pg_input_error_info_row(
 
 /// Build the [`Series`] a target-list SRF (`generate_series`, `unnest` or
 /// `jsonb_path_query`) yields.
-pub(crate) fn build_series(func: TableFn, values: &[Value]) -> Result<Series, ExecError> {
+pub(crate) fn build_series(
+    func: TableFn,
+    values: &[Value],
+    ctx: &ExecContext,
+) -> Result<Series, ExecError> {
     match func {
         TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
         TableFn::JsonbPathQuery => jsonb_path_query_series(values),
         TableFn::Unnest(_) => Ok(unnest_series(values)),
-        TableFn::PgInputErrorInfo => Err(ExecError::new(
+        TableFn::PgPartitionAncestors => Ok(pg_partition_ancestors_series(values, ctx)),
+        // Both return a record, which a target list cannot expand into.
+        TableFn::PgInputErrorInfo | TableFn::PgAvailableExtensions => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
             "set-returning function is not supported in this context",
         )),
     }
+}
+
+/// The rows of `pg_partition_ancestors(regclass)`: the relation itself, then
+/// each partitioned parent up to the root, as `regclass` values.
+///
+/// A relation that is neither a partition nor partitioned yields no rows, and so
+/// does a NULL argument or an OID nothing answers to — PostgreSQL returns the
+/// empty set in every one of those cases rather than raising.
+///
+/// The argument arrives as either representation — the binder accepts `regclass`
+/// and `oid` both, for the reason `resolve_partition_ancestors` gives.
+pub(crate) fn pg_partition_ancestors_series(args: &[Value], ctx: &ExecContext) -> Series {
+    let oid = match args.first() {
+        Some(Value::Reg(reg)) => reg.oid,
+        Some(Value::Oid(oid)) => *oid,
+        _ => return Series::Empty,
+    };
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Series::Empty;
+    };
+    let rows: Vec<_> = catalog
+        .partition_ancestors(oid)
+        .into_iter()
+        .map(|oid| Value::Reg(crate::reg::from_oid(RegKind::Class, oid, catalog)))
+        .collect();
+    Series::Materialized(rows.into_iter())
+}
+
+/// The rows of `pg_available_extensions()`, as `(name, default_version,
+/// comment)`. Read through the catalog so the function and the view of the same
+/// name publish one list rather than two.
+pub(crate) fn pg_available_extensions_rows(ctx: &ExecContext) -> Vec<Tuple> {
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Vec::new();
+    };
+    catalog
+        .available_extensions()
+        .into_iter()
+        .map(|(name, version, comment)| {
+            vec![
+                Value::Text(name),
+                Value::Text(version),
+                Value::Text(comment),
+            ]
+        })
+        .collect()
 }
 
 /// Materialize `unnest(array)` into a [`Series`] of its elements (NULL elements

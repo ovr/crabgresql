@@ -915,6 +915,7 @@ fn eval_deparse_fn(
         ScalarFn::PgGetExpr => Some(Ok(eval_pg_get_expr(args, ctx))),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         ScalarFn::PgGetConstraintdef => Some(eval_pg_get_constraintdef(args, ctx)),
+        ScalarFn::PgGetIndexdef => Some(eval_pg_get_indexdef(args, ctx)),
         _ => None,
     }
 }
@@ -972,6 +973,62 @@ fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value,
         _ => return Ok(Value::Null),
     };
     Ok(Value::Text(text))
+}
+
+/// `pg_get_indexdef(oid[, column, pretty])`. Three outcomes, all observed on
+/// PostgreSQL 18.4: an OID no index answers to is NULL; a `column` of `0` (or
+/// the one-argument form) is the whole `CREATE INDEX` statement; a non-zero
+/// `column` is that key alone, bare — no `DESC`, no null placement — and a
+/// `column` past the end of the key list is the **empty string**, not NULL.
+///
+/// The statement itself is rendered by
+/// [`crabgresql_storage_api::index_definition`], shared with
+/// `pg_indexes.indexdef`; `pretty` changes only line breaking, which neither
+/// form produces.
+///
+/// Strict in every argument (`pg_proc.proisstrict` is true for both overloads on
+/// 18.4), which has to be said here rather than inherited: this is dispatched
+/// from [`eval`] alongside `format_type`, not from the STRICT `eval_scalar` path
+/// that short-circuits a NULL for its callers. Without it a NULL `column` would
+/// read as `0` and return the whole statement where PostgreSQL returns NULL.
+fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Value::Oid(oid) = &args[0] else {
+        return Ok(Value::Null);
+    };
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_indexdef evaluated without a catalog context",
+        ));
+    };
+    let Some(def) = catalog.index_def(*oid) else {
+        return Ok(Value::Null);
+    };
+    let column = match args.get(1) {
+        Some(Value::Int4(n)) => *n,
+        _ => 0,
+    };
+    if column == 0 {
+        return Ok(Value::Text(crabgresql_storage_api::index_definition(
+            &def.index, &def.table,
+        )));
+    }
+    // PostgreSQL numbers the key list from 1.
+    let key = usize::try_from(column)
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| def.index.keys.get(n));
+    let Some(key) = key else {
+        return Ok(Value::Text(String::new()));
+    };
+    let name = match def.table.columns.get(key.column) {
+        Some(column) => crabgresql_types::text::quote_ident(&column.name),
+        None => "?column?".to_string(),
+    };
+    Ok(Value::Text(name))
 }
 
 /// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
@@ -1457,6 +1514,15 @@ mod format_type_tests {
             }
             fn constraint_def(&self, _oid: u32) -> Option<crate::ConstraintDef> {
                 None
+            }
+            fn index_def(&self, _oid: u32) -> Option<crate::IndexDef> {
+                None
+            }
+            fn partition_ancestors(&self, _oid: u32) -> Vec<u32> {
+                Vec::new()
+            }
+            fn available_extensions(&self) -> Vec<(String, String, String)> {
+                Vec::new()
             }
             fn current_database(&self) -> String {
                 "postgres".to_string()

@@ -157,6 +157,24 @@ pub trait CatalogOps: Send + Sync {
     /// reverse of the numbering `pg_constraint`'s rows are built from.
     fn constraint_def(&self, oid: u32) -> Option<ConstraintDef>;
 
+    /// Every installable extension as `(name, default_version, comment)`, for
+    /// the `pg_available_extensions()` function. The same rows the view of that
+    /// name publishes — one source, so `\dx` and a direct read of the view
+    /// cannot disagree.
+    fn available_extensions(&self) -> Vec<(String, String, String)>;
+
+    /// The relation `oid` and each partitioned ancestor above it, innermost
+    /// first, as `pg_partition_ancestors` reports them. **Empty** for a relation
+    /// that is neither a partition nor partitioned — PostgreSQL returns no rows
+    /// there, not one row naming the relation itself.
+    fn partition_ancestors(&self, oid: u32) -> Vec<u32>;
+
+    /// The index `oid` identifies together with the table it indexes, or `None`
+    /// if this snapshot has no such index. Backs `pg_get_indexdef`, which
+    /// resolves by the index's *own* relation OID — the one `pg_class` gives the
+    /// index, not the one it gives the table.
+    fn index_def(&self, oid: u32) -> Option<IndexDef>;
+
     /// The database this connection was opened against — `current_database()`
     /// and `current_catalog`.
     fn current_database(&self) -> String;
@@ -192,6 +210,20 @@ pub struct ConstraintDef {
     pub columns: Vec<String>,
     /// The stored predicate of a check constraint; `None` for the rest.
     pub expr: Option<String>,
+}
+
+/// What `pg_get_indexdef` needs to reproduce an index's DDL: the index and the
+/// table it is defined on, since the statement names both and takes its column
+/// names from the second.
+///
+/// Unlike [`ConstraintDef`], the rendering this feeds does *not* live in the
+/// executor — [`crabgresql_storage_api::index_definition`] owns it, so that
+/// `pg_indexes.indexdef` in the catalog crate can print the same string. See
+/// that function for why.
+#[derive(Clone, Debug)]
+pub struct IndexDef {
+    pub index: IndexMetadata,
+    pub table: TableSchema,
 }
 
 /// Severity of a diagnostic produced during execution. `Debug` and `Log` reach

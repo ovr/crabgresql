@@ -44,6 +44,7 @@ mod source;
 mod static_table;
 pub(crate) mod views;
 
+pub use catalogs::extension::available_extensions;
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid};
 pub use source::{
@@ -89,6 +90,18 @@ struct CatalogIndex {
     table_oid: u32,
     table_schema: TableSchema,
     metadata: IndexMetadata,
+}
+
+/// One row of `pg_rewrite`: the `_RETURN` rule a view's body is stored as. The
+/// `catalogs::rewrite` module says why a view is the only thing that has one.
+#[derive(Clone)]
+pub struct CatalogRewrite {
+    pub oid: u32,
+    /// `ev_class`: the view the rule is attached to.
+    pub view_oid: u32,
+    /// The view's deparsed body, or `None` when the deparser could not render
+    /// it — see [`CatalogRelation::definition`].
+    pub definition: Option<String>,
 }
 
 /// One row of `pg_constraint`, resolved to an OID before anything renders it.
@@ -527,6 +540,77 @@ impl SystemCatalog {
         })
     }
 
+    /// The relation `oid` and every partitioned ancestor above it, innermost
+    /// first — what `pg_partition_ancestors` reports.
+    ///
+    /// Empty for a relation that is neither a partition nor partitioned: that is
+    /// PostgreSQL's answer (no rows), and it is what lets psql's `\d` join
+    /// against this for any relation at all. The walk is bounded by the number
+    /// of relations, so a parent chain that somehow cycles terminates instead of
+    /// hanging.
+    pub fn partition_ancestors(&self, oid: u32) -> Vec<u32> {
+        let relations = self.relation_oids();
+        let Some((_, schema)) = relations
+            .get(oid.wrapping_sub(FIRST_REL_OID) as usize)
+            .filter(|(stored, _)| *stored == oid)
+        else {
+            return Vec::new();
+        };
+        if schema.partition_scheme.is_none() && schema.partition_of.is_none() {
+            return Vec::new();
+        }
+        let mut out = vec![oid];
+        let mut current = schema;
+        while let Some(part) = &current.partition_of {
+            let Some((parent_oid, parent)) = relations
+                .iter()
+                .find(|(_, s)| s.name == part.parent_name && s.namespace == part.parent_namespace)
+            else {
+                break;
+            };
+            out.push(*parent_oid);
+            current = parent;
+            if out.len() > relations.len() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The `pg_rewrite` rules of this snapshot — one `_RETURN` per view —
+    /// assigned OIDs from a **fifth block** beginning after the constraints, for
+    /// the reason [`SystemCatalog::toast_oids`] gives: appending never moves an
+    /// OID that already existed.
+    ///
+    /// Not memoized, unlike the blocks above: only `pg_rewrite` reads it, and
+    /// nothing looks a rule up by OID.
+    pub(crate) fn rewrite_oids(&self) -> Vec<CatalogRewrite> {
+        let first = FIRST_REL_OID
+            + self.relation_oids().len() as u32
+            + self.index_oids().len() as u32
+            + self.toast_oids().len() as u32
+            + self.constraint_oids().len() as u32;
+        let mut relations = self.live_relations().to_vec();
+        // The same sort `relation_oids` uses, so `position` is the view's own
+        // `pg_class` OID rather than a number that happens to look like one.
+        relations.sort_by(|a, b| {
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.schema.name.cmp(&b.schema.name))
+        });
+        relations
+            .into_iter()
+            .enumerate()
+            .filter(|(_, relation)| relation.kind == RelKind::View)
+            .enumerate()
+            .map(|(slot, (position, relation))| CatalogRewrite {
+                oid: first + slot as u32,
+                view_oid: FIRST_REL_OID + position as u32,
+                definition: relation.definition,
+            })
+            .collect()
+    }
+
     /// The constraints of this snapshot, assigned OIDs from a **fourth block**
     /// beginning after the TOAST block — extending the invariant
     /// [`SystemCatalog::toast_oids`] documents by one more segment, for the same
@@ -612,6 +696,24 @@ impl SystemCatalog {
             }
             out
         })
+    }
+
+    /// The index `oid` identifies and the table it is defined on, resolved
+    /// against the same numbering [`SystemCatalog::index_oids`] hands out — so
+    /// `pg_get_indexdef` and the `pg_class`/`pg_index` rows agree by
+    /// construction.
+    ///
+    /// The OID is the *index's* own, from the block that follows the relations;
+    /// looking one up by the table's OID would find nothing. Indexed rather than
+    /// scanned, for the reason [`Self::constraint_def`] gives.
+    pub fn index_def(&self, oid: u32) -> Option<(IndexMetadata, TableSchema)> {
+        let indexes = self.index_oids();
+        let base = indexes.first()?.oid;
+        let index = indexes.get(oid.checked_sub(base)? as usize)?;
+        if index.oid != oid {
+            return None;
+        }
+        Some((index.metadata.clone(), index.table_schema.clone()))
     }
 
     /// The constraint `oid` identifies, resolved against the same numbering

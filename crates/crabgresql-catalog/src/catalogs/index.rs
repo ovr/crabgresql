@@ -4,6 +4,7 @@ use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
 use crate::SystemCatalog;
+use crate::catalogs::attribute;
 use crate::cols::*;
 use crabgresql_storage_api::IndexConstraint;
 
@@ -19,10 +20,20 @@ pub(crate) fn pg_index_schema() -> TableSchema {
             col("indisunique", PgType::Bool),
             col("indnullsnotdistinct", PgType::Bool),
             col("indisprimary", PgType::Bool),
+            col("indisexclusion", PgType::Bool),
             col("indimmediate", PgType::Bool),
+            col("indisclustered", PgType::Bool),
             col("indisvalid", PgType::Bool),
+            col("indcheckxmin", PgType::Bool),
+            col("indisready", PgType::Bool),
+            col("indislive", PgType::Bool),
+            col("indisreplident", PgType::Bool),
             col("indkey", INT2VECTOR),
+            col("indcollation", OIDVECTOR),
+            col("indclass", OIDVECTOR),
             col("indoption", INT2VECTOR),
+            col("indexprs", NODE_TREE),
+            col("indpred", NODE_TREE),
         ],
     )
 }
@@ -44,6 +55,16 @@ pub(crate) fn pg_index_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 }
                 option
             }));
+            // The collation each key sorts under, by the same rule
+            // `pg_attribute.attcollation` reports — `0` for a key whose type has
+            // no collation, which is most of them.
+            let indcollation = oidvector(index.metadata.keys.iter().map(|key| {
+                index
+                    .table_schema
+                    .columns
+                    .get(key.column)
+                    .map_or(0, attribute::attcollation_of)
+            }));
             vec![
                 Value::Oid(index.oid),
                 Value::Oid(index.table_oid),
@@ -52,10 +73,35 @@ pub(crate) fn pg_index_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(index.metadata.unique),
                 Value::Bool(!index.metadata.nulls_distinct),
                 Value::Bool(index.metadata.constraint == Some(IndexConstraint::PrimaryKey)),
+                // indisexclusion: there are no EXCLUDE constraints.
+                Value::Bool(false),
+                Value::Bool(true),
+                // indisclustered: nothing has been `CLUSTER`ed — PostgreSQL's
+                // answer too until someone runs the command.
+                Value::Bool(false),
+                Value::Bool(true),
+                // indcheckxmin: the index was never built by a transaction whose
+                // rows a reader must recheck.
+                Value::Bool(false),
+                // indisready / indislive: an index here is usable the moment it
+                // exists — there is no CONCURRENTLY that leaves one half-built.
                 Value::Bool(true),
                 Value::Bool(true),
+                // indisreplident: no `REPLICA IDENTITY USING INDEX`.
+                Value::Bool(false),
                 indkey,
+                indcollation,
+                // TODO: report real `pg_opclass` OIDs. There is no `pg_opclass`
+                // in this build (nothing chooses an operator class — the access
+                // methods are wired to the types directly), so every key reports
+                // `0`, PostgreSQL's "no such object" OID. This is the one column
+                // here whose constant is not also PostgreSQL's answer.
+                oidvector(index.metadata.keys.iter().map(|_| 0)),
                 indoption,
+                // indexprs / indpred: DDL rejects expression and partial
+                // indexes, so no index can carry either.
+                Value::Null,
+                Value::Null,
             ]
         })
         .collect()
