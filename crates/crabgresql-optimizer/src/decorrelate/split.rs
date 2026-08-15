@@ -32,6 +32,12 @@ use crabgresql_types::PgType;
 /// rebases the two lifted lists into the joined row's index space
 /// (`rebase_into_join`), and the third stays inside the arm, where it already
 /// addresses the right row.
+///
+/// This is a classification, not a promise: a conjunct in either of the first
+/// two lists is one that *would have to* move if the caller lifts anything, and
+/// whether it can is [`liftable_into_a_join`]'s question, asked by whoever does
+/// the lifting. The scalar-aggregate rewrite lifts neither list — it groups the
+/// keys' inner sides inside the arm instead — so it is not bound by that answer.
 pub(super) struct Split {
     /// `inner-expression = outer-column` conjuncts — the correlation proper, and
     /// what the join can hash on.
@@ -76,9 +82,6 @@ pub(super) fn split_correlation(plan: &LogicalPlan) -> Option<Split> {
         if is_correlation_key(conjunct) {
             keys.push(conjunct.clone());
         } else if names_an_outer_row(conjunct) {
-            if !liftable_into_a_join(conjunct) {
-                return None;
-            }
             outer_residual.push(conjunct.clone());
         } else {
             residual.push(conjunct.clone());
@@ -105,15 +108,20 @@ pub(super) fn split_correlation(plan: &LogicalPlan) -> Option<Split> {
     }
 }
 
-/// Whether a conjunct naming the enclosing row can be evaluated by the join node
-/// instead of inside the subplan.
+/// Whether a conjunct can be evaluated by the join node instead of inside the
+/// subplan — asked of **everything** that moves into the condition, a key as
+/// much as a residual.
 ///
 /// Two things have to hold. Every reference it makes must be to the immediately
 /// enclosing row — a deeper one belongs to a query further out, which this join
 /// is not, and `plan_outer_ref_slots` reports that as `None`. And it must hold no
 /// subquery of its own: that body addresses its own level, and rebasing this
 /// level's column indices cannot reach inside it to leave the two consistent.
-fn liftable_into_a_join(conjunct: &BoundExpr) -> bool {
+/// The body's level-1 references would go on meaning "one level out" while the
+/// level they counted from moved away, so they would read the enclosing query's
+/// row — and the columns they need would not be projected by the arm, which
+/// collects them with the same walk that stops at the body.
+pub(super) fn liftable_into_a_join(conjunct: &BoundExpr) -> bool {
     !conjunct.contains_subquery()
         && !conjunct.contains_volatile_fn()
         && plan_outer_ref_slots(&as_plan(conjunct)).is_some()

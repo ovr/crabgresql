@@ -287,6 +287,12 @@ struct Lifted {
 /// projected past them — it is the subquery's own output column, which only a
 /// quantified comparison needs.
 ///
+/// Both halves of that only work on a conjunct this walk can see all of, which
+/// is what [`split::liftable_into_a_join`] asks — of the keys as much as of the
+/// residual. A key is no more rewritable for being an equality: `where (select
+/// … where c.k = b.k) = outer.k` is one, and its inner side is a whole query
+/// level whose own references this cannot touch.
+///
 /// [`Split`]: split::Split
 fn lift(split: split::Split, left_width: usize, value: Option<BoundExpr>) -> Option<Lifted> {
     let mut lifted: Vec<BoundExpr> = split
@@ -295,6 +301,9 @@ fn lift(split: split::Split, left_width: usize, value: Option<BoundExpr>) -> Opt
         .chain(&split.outer_residual)
         .cloned()
         .collect();
+    if !lifted.iter().all(split::liftable_into_a_join) {
+        return None;
+    }
     // Deduplicated and in index order, so the arm projects each column once and
     // the slot a conjunct is rebased onto does not depend on which conjunct
     // mentioned it first.

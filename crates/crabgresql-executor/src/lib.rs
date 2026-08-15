@@ -6180,6 +6180,28 @@ mod tests {
         Ok(())
     }
 
+    /// A correlation key whose *inner* side holds a subquery of its own. The
+    /// conjunct cannot move into a join condition: the walk that rebases column
+    /// indices stops at a marker's body, so the body's own level-1 references
+    /// would keep meaning "one level out" while the level they counted from moved
+    /// away — they would then read the enclosing query's row instead of the one
+    /// they were written against, and the columns they need would not be
+    /// projected by the arm at all.
+    #[test]
+    fn a_key_holding_a_subquery_is_not_lifted_into_the_join() -> anyhow::Result<()> {
+        // `(select c.v … where c.k = b.k)` is 7 for b.k = 1 and 8 for b.k = 2, so
+        // the outer rows keyed 7 and 8 have a match and the one keyed 9 does not.
+        let engine = exists_engine(&[(7, 0), (8, 0), (9, 0)], &[(Some(1), 7), (Some(2), 8)])?;
+        let rows = same_decorrelated_or_not(
+            &engine,
+            "SELECT k FROM o WHERE EXISTS ( \
+               SELECT 1 FROM i b WHERE (SELECT c.v FROM i c WHERE c.k = b.k LIMIT 1) = o.k) \
+             ORDER BY k",
+        );
+        assert_eq!(rows, vec![vec![Value::Int4(7)], vec![Value::Int4(8)]]);
+        Ok(())
+    }
+
     /// A marker the rule refuses still has to answer, and answer the same:
     /// `NOT IN` (three-valued), an `EXISTS` under an `OR`, and a non-aggregate
     /// scalar subquery all keep the per-row path.

@@ -4811,6 +4811,22 @@ mod decorrelate_tests {
         );
     }
 
+    /// A correlation key with a subquery inside it is not a key this may lift:
+    /// the rebase that moves a conjunct into the join condition cannot reach into
+    /// a subquery's body, so the body's references would be left counting levels
+    /// from a query that is no longer there.
+    #[test]
+    fn a_key_holding_a_subquery_leaves_the_plan_alone() {
+        assert_eq!(
+            explain_optimized(
+                "SELECT a.id FROM t a WHERE EXISTS ( \
+                   SELECT 1 FROM t b \
+                   WHERE (SELECT c.id FROM t c WHERE c.big = b.big LIMIT 1) = a.id)"
+            )[0],
+            "Seq Scan on t"
+        );
+    }
+
     /// The rewrite happens below an aggregate as readily as below a scan: the
     /// arm is added to the aggregate's own input, where its `WHERE` and grouping
     /// keys keep addressing the same columns.
