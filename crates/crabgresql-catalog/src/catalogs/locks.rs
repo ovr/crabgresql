@@ -3,7 +3,7 @@
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
-use crate::oids::DATABASE_OID;
+use crate::oids::{DATABASE_OID, SHARED_RELATION_OIDS};
 use crate::registry::builtin_relation_oid;
 use crate::source::{CatalogLock, CatalogLockTarget};
 use crate::{SystemCatalog, cols::*};
@@ -76,13 +76,22 @@ pub(crate) fn pg_locks_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
 /// columns carries it and the rest stay NULL, exactly as PostgreSQL fills them.
 fn lock_row(cat: &SystemCatalog, lock: &CatalogLock) -> Option<Vec<Value>> {
     let (locktype, database, relation, virtualxid, transactionid) = match &lock.target {
-        CatalogLockTarget::Relation { namespace, name } => (
-            "relation",
-            Value::Oid(DATABASE_OID),
-            Value::Oid(relation_oid(cat, namespace, name)?),
-            Value::Null,
-            Value::Null,
-        ),
+        CatalogLockTarget::Relation { namespace, name } => {
+            let oid = relation_oid(cat, namespace, name)?;
+            // A shared catalog belongs to every database, and PostgreSQL says so
+            // with 0 rather than by naming one of them.
+            let database = match SHARED_RELATION_OIDS.contains(&oid) {
+                true => 0,
+                false => DATABASE_OID,
+            };
+            (
+                "relation",
+                Value::Oid(database),
+                Value::Oid(oid),
+                Value::Null,
+                Value::Null,
+            )
+        }
         // `database` is NULL for both transaction lock types: they are
         // cluster-wide in PostgreSQL, not per database.
         CatalogLockTarget::VirtualXid => (

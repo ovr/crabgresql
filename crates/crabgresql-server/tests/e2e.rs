@@ -14391,3 +14391,36 @@ async fn pg_locks_reports_the_write_target_as_row_exclusive() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// A lock on a shared catalog reports `database = 0`, as PostgreSQL does: one
+/// copy of `pg_database` serves the whole cluster, so naming a database would
+/// be wrong rather than merely uninformative.
+#[tokio::test]
+async fn pg_locks_reports_no_database_for_a_shared_catalog() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let rows = client
+        .query(
+            "SELECT relation, database FROM pg_locks, pg_database \
+             WHERE locktype = 'relation' ORDER BY relation",
+            &[],
+        )
+        .await?;
+    let database = |relation: u32| -> Option<u32> {
+        rows.iter()
+            .find(|row| row.get::<_, u32>("relation") == relation)
+            .and_then(|row| row.get::<_, Option<u32>>("database"))
+    };
+    // PostgreSQL's own OIDs: pg_database is shared, pg_locks is not.
+    assert_eq!(database(1262), Some(0));
+    // A per-database relation names the database it belongs to, which is the
+    // one this server serves.
+    let connected: u32 = client
+        .query_one(
+            "SELECT oid FROM pg_database WHERE datname = current_database()",
+            &[],
+        )
+        .await?
+        .get("oid");
+    assert_eq!(database(12073), Some(connected));
+    Ok(())
+}
