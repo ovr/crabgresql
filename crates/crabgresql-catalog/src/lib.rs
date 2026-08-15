@@ -237,7 +237,17 @@ pub struct PgProcRow {
     pub pronargs: i16,
     pub prorettype: u32,
     pub proargtypes: &'static [u32],
+    /// `proallargtypes`, `proargmodes` and `proargnames`: empty means the
+    /// column is NULL, which is what PostgreSQL stores for a function with no
+    /// OUT parameters and no declared argument names. An empty *array* is not a
+    /// value any of the three ever takes, so the two cannot be confused.
+    pub proallargtypes: &'static [u32],
+    pub proargmodes: &'static [&'static str],
+    pub proargnames: &'static [&'static str],
     pub prosrc: &'static str,
+    /// The shared library a C function lives in — the conversion functions are
+    /// the only referenced ones that have it. Empty reads as NULL.
+    pub probin: &'static str,
 }
 
 /// A built-in `pg_opclass` row, generated from `pg_opclass.dat`. `opcnamespace`
@@ -264,6 +274,157 @@ pub struct PgOpfamilyRow {
     pub opfname: &'static str,
 }
 
+/// A built-in `pg_aggregate` row, generated from `pg_aggregate.dat`.
+///
+/// There is no `oid`: an aggregate is identified by the `pg_proc` row it
+/// extends, so [`Self::aggfnoid`] is both the key and the reference.
+///
+/// `agginitval`/`aggminitval` carry the empty string for the column's NULL —
+/// no upstream entry has an initial state of `''`, so the two cannot be
+/// confused.
+pub struct PgAggregateRow {
+    pub aggfnoid: ProcRef,
+    /// `n` for a plain aggregate, `o` for an ordered-set one and `h` for a
+    /// hypothetical-set one. Only the latter two take direct arguments.
+    pub aggkind: &'static str,
+    pub aggnumdirectargs: i16,
+    pub aggtransfn: ProcRef,
+    pub aggfinalfn: ProcRef,
+    pub aggcombinefn: ProcRef,
+    pub aggserialfn: ProcRef,
+    pub aggdeserialfn: ProcRef,
+    pub aggmtransfn: ProcRef,
+    pub aggminvtransfn: ProcRef,
+    pub aggmfinalfn: ProcRef,
+    pub aggfinalextra: bool,
+    pub aggmfinalextra: bool,
+    pub aggfinalmodify: &'static str,
+    pub aggmfinalmodify: &'static str,
+    /// The ordering operator `MIN`/`MAX` are equivalent to, or 0.
+    pub aggsortop: u32,
+    pub aggtranstype: u32,
+    pub aggtransspace: i32,
+    pub aggmtranstype: u32,
+    pub aggmtransspace: i32,
+    pub agginitval: &'static str,
+    pub aggminitval: &'static str,
+}
+
+/// A built-in `pg_operator` row, generated from `pg_operator.dat`. Namespace
+/// and owner are not carried, for the reason [`PgOpclassRow`] gives.
+pub struct PgOperatorRow {
+    pub oid: u32,
+    pub oprname: &'static str,
+    /// `b` for an infix operator, `l` for a prefix one — whose
+    /// [`Self::oprleft`] is 0.
+    pub oprkind: &'static str,
+    pub oprcanmerge: bool,
+    pub oprcanhash: bool,
+    pub oprleft: u32,
+    pub oprright: u32,
+    pub oprresult: u32,
+    /// The commutator and negator, each an operator OID or 0 for none.
+    pub oprcom: u32,
+    pub oprnegate: u32,
+    pub oprcode: ProcRef,
+    /// The planner's restriction and join selectivity estimators, or the
+    /// catalog's `-` when upstream declares none.
+    pub oprrest: ProcRef,
+    pub oprjoin: ProcRef,
+}
+
+/// A built-in `pg_amop` row, generated from `pg_amop.dat`: the operator that
+/// implements one strategy of an operator family.
+pub struct PgAmopRow {
+    pub oid: u32,
+    pub amopfamily: u32,
+    pub amoplefttype: u32,
+    pub amoprighttype: u32,
+    pub amopstrategy: i16,
+    /// `s` for a search operator, `o` for an ordering one — the only kind that
+    /// also names an [`Self::amopsortfamily`].
+    pub amoppurpose: &'static str,
+    pub amopopr: u32,
+    pub amopmethod: u32,
+    pub amopsortfamily: u32,
+}
+
+/// A built-in `pg_amproc` row, generated from `pg_amproc.dat`: a support
+/// function an operator family gives its access method.
+pub struct PgAmprocRow {
+    pub oid: u32,
+    pub amprocfamily: u32,
+    pub amproclefttype: u32,
+    pub amprocrighttype: u32,
+    pub amprocnum: i16,
+    pub amproc: ProcRef,
+}
+
+/// A built-in `pg_conversion` row, generated from `pg_conversion.dat`.
+/// Namespace and owner are not carried, for the reason [`PgOpclassRow`] gives.
+pub struct PgConversionRow {
+    pub oid: u32,
+    pub conname: &'static str,
+    /// The two encodings, by **name** rather than by the number the column
+    /// stores. PostgreSQL's numbering lives in [`crabgresql_types::encoding`]
+    /// and [`catalogs::conversion`] resolves through it, so codegen needs no
+    /// second copy of that table — which is what a copy would be: one nothing
+    /// keeps in step.
+    pub conforencoding: &'static str,
+    pub contoencoding: &'static str,
+    pub conproc: ProcRef,
+    pub condefault: bool,
+}
+
+/// The five text-search catalogs' bootstrap rows, generated from the
+/// `pg_ts_*.dat` files. They describe the `default` parser, the four
+/// dictionary templates and the `simple` dictionary and configuration built
+/// from them; the twenty-nine snowball ones a stock PostgreSQL also publishes
+/// are added by [`catalogs::textsearch`], because `initdb` creates those from
+/// SQL rather than from any `.dat`.
+pub struct PgTsParserRow {
+    pub oid: u32,
+    pub prsname: &'static str,
+    pub prsstart: ProcRef,
+    pub prstoken: ProcRef,
+    pub prsend: ProcRef,
+    pub prsheadline: ProcRef,
+    pub prslextype: ProcRef,
+}
+
+pub struct PgTsTemplateRow {
+    pub oid: u32,
+    pub tmplname: &'static str,
+    pub tmplinit: ProcRef,
+    pub tmpllexize: ProcRef,
+}
+
+/// See [`PgTsParserRow`]. `dictinitoption` carries the empty string for the
+/// column's NULL — a dictionary configured with an empty option string is not
+/// a thing PostgreSQL accepts, so the two cannot be confused.
+pub struct PgTsDictRow {
+    pub oid: u32,
+    pub dictname: &'static str,
+    pub dicttemplate: u32,
+    pub dictinitoption: &'static str,
+}
+
+pub struct PgTsConfigRow {
+    pub oid: u32,
+    pub cfgname: &'static str,
+    pub cfgparser: u32,
+}
+
+/// See [`PgTsParserRow`]. This one has no `oid`: a row is keyed by
+/// `(mapcfg, maptokentype, mapseqno)`, and the sequence number is what orders
+/// the dictionaries a token is looked up in.
+pub struct PgTsConfigMapRow {
+    pub mapcfg: u32,
+    pub maptokentype: i32,
+    pub mapseqno: i32,
+    pub mapdict: u32,
+}
+
 /// A built-in `pg_description` row, generated from the `descr` fields of the
 /// vendored `.dat` files. `catalog` is the `pg_catalog` relation the described
 /// object lives in, by name: codegen has no business knowing the fixed relation
@@ -283,6 +444,16 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_operator_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_aggregate_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_conversion_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_parser_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_template_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_dict_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_config_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_ts_config_map_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_amop_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_amproc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including

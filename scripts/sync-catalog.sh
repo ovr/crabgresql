@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Syncs PostgreSQL's system-catalog *data* files (src/include/catalog/*.dat)
 # into vendor/postgres/catalog/. These BKI data files seed pg_catalog's built-in
-# rows (pg_type, pg_proc, pg_cast, pg_namespace, pg_opclass, pg_opfamily);
-# crabgresql-bki codegens from them at build time, and crabgresql-catalog
-# includes what it emits.
+# rows; crabgresql-bki codegens from them at build time, and crabgresql-catalog
+# includes what it emits. The list is in DATS below.
 #
 # Only the .dat DATA is vendored — never PostgreSQL source code or the Perl
 # Catalog.pm parser; see docs/ARCHITECTURE.md §7 and vendor/postgres/README.md.
@@ -27,7 +26,11 @@ trap 'rm -rf "$tmp"' EXIT
 # TODO: codegen pg_namespace's built-in rows from the vendored
 # pg_namespace.dat — crabgresql-bki reads that file for its descriptions only,
 # so crabgresql-catalog still spells the rows out by hand.
-DATS=(pg_type pg_proc pg_cast pg_namespace pg_opclass pg_opfamily pg_am pg_language)
+DATS=(
+    pg_type pg_proc pg_cast pg_namespace pg_opclass pg_opfamily pg_am pg_language
+    pg_amop pg_amproc pg_operator pg_aggregate pg_conversion
+    pg_ts_config pg_ts_config_map pg_ts_dict pg_ts_parser pg_ts_template
+)
 
 echo "Fetching postgres catalog data @$COMMIT ..."
 paths=()

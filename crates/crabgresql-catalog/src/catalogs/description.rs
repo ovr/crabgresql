@@ -20,10 +20,9 @@
 //! too.
 //!
 //! The count is smaller than PostgreSQL's ~5400 for a reason rather than a
-//! deferral: the bulk of the rest describes `pg_operator` and `pg_conversion`,
-//! which are not relations this build serves at all, and `pg_collation`, whose
-//! descriptions `initdb` writes from the locales it finds rather than from any
-//! `.dat`.
+//! deferral: most of the rest describes `pg_collation`, whose descriptions
+//! `initdb` writes from the locales it finds rather than from any `.dat`, and
+//! the `pg_proc` entries no served catalog references.
 //!
 //! Nothing may describe an object that is not there — the invariant
 //! [`PUBLISHED`] enforces for the catalogs codegen could not.
@@ -68,15 +67,22 @@ type Published = (&'static str, fn(u32) -> bool);
 
 /// The generated descriptions this build publishes, class by class.
 ///
-/// `pg_type` and `pg_proc` need no test — `catalogs::types` publishes every
-/// generated type row, and codegen already restricted the functions to the ones
-/// `catalogs::proc` publishes. The other three are hand-written, so the test is
+/// `pg_type`, `pg_proc` and `pg_operator` need no test — `catalogs::types` and
+/// `catalogs::operator` publish every generated row of theirs, and codegen
+/// already restricted the functions to the ones `catalogs::proc` publishes. The
+/// other three are hand-written, so the test is
 /// the list they are written from: `pg_namespace.dat`, for instance, also
 /// describes the subscription conflict-log schema, which this build has not
 /// got.
 const PUBLISHED: &[Published] = &[
     ("pg_type", |_| true),
     ("pg_proc", |_| true),
+    ("pg_operator", |_| true),
+    ("pg_conversion", |_| true),
+    ("pg_ts_parser", |_| true),
+    ("pg_ts_template", |_| true),
+    ("pg_ts_dict", |_| true),
+    ("pg_ts_config", |_| true),
     ("pg_am", |oid| BUILTIN_AMS.iter().any(|(o, ..)| *o == oid)),
     ("pg_language", |oid| {
         BUILTIN_LANGUAGES.iter().any(|(o, ..)| *o == oid)
@@ -127,6 +133,15 @@ fn descriptions() -> &'static [Description] {
             rows.push((extension, PLPGSQL_EXTENSION_OID, 0, comment));
             rows.push((language, PLPGSQL_LANG_OID, 0, comment));
         }
+
+        // The snowball template, dictionaries and configurations, whose
+        // comments `initdb` writes with `COMMENT ON` rather than taking from a
+        // `.dat` — the same standing as the rows themselves.
+        rows.extend(
+            crate::catalogs::textsearch::snowball_descriptions()
+                .into_iter()
+                .map(|(catalog, objoid, description)| (classoid(catalog), objoid, 0, description)),
+        );
 
         let am = classoid("pg_am");
         rows.extend(

@@ -101,3 +101,23 @@ pub const PLPGSQL_LANG_OID: u32 = 13540;
 /// major version rather than fixed forever — and reusing it still beats
 /// inventing a number, because a client that hard-codes one hard-codes this.
 pub(crate) const PLPGSQL_EXTENSION_OID: u32 = 14049;
+
+/// The objects `initdb` creates by running `snowball_create.sql`, which no
+/// `.dat` describes: the two C functions the snowball template calls, the
+/// template itself, and then a dictionary/configuration pair per language.
+///
+/// Like [`PLPGSQL_EXTENSION_OID`] these come from `initdb`'s running OID
+/// counter rather than from vendored data, so they were probed from PostgreSQL
+/// 18.4 — where they run 13638..13698 in one unbroken band, the pairs in the
+/// order `snowball_create.sql` creates them. See
+/// [`crate::catalogs::textsearch`] for the shape and for why no test pins them.
+pub(crate) const SNOWBALL_INIT_PROC: crate::ProcRef = crate::ProcRef {
+    oid: 13638,
+    name: "dsnowball_init",
+};
+pub(crate) const SNOWBALL_LEXIZE_PROC: crate::ProcRef = crate::ProcRef {
+    oid: 13639,
+    name: "dsnowball_lexize",
+};
+pub(crate) const SNOWBALL_TEMPLATE_OID: u32 = 13640;
+pub(crate) const SNOWBALL_FIRST_DICT_OID: u32 = 13641;

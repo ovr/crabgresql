@@ -109,6 +109,31 @@ pub(crate) fn regproc_by_name(name: &str) -> Value {
     }
 }
 
+/// An array column that is NULL rather than empty when there is nothing to
+/// report — the shape of `pg_proc.proargnames` and its two neighbours.
+/// PostgreSQL stores NULL there, and clients test for NULL, so an empty array
+/// would read as "declares zero argument names" instead of "declares none".
+pub(crate) fn optional_array(elem: PgType, values: Vec<Value>) -> Value {
+    if values.is_empty() {
+        Value::Null
+    } else {
+        Value::Array {
+            elem,
+            elems: values,
+        }
+    }
+}
+
+/// A `text` datum that is NULL when the generated row carries the empty
+/// string — how codegen spells "this column has no value".
+pub(crate) fn text_or_null(s: &str) -> Value {
+    if s.is_empty() {
+        Value::Null
+    } else {
+        Value::Text(s.to_string())
+    }
+}
+
 /// A `reg*[]` column of the given kind — `regtype[]` for the type-OID arrays
 /// `pg_prepared_statements` reports.
 pub(crate) fn reg_array_type(kind: RegKind) -> PgType {

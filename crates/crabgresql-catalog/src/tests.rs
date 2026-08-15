@@ -710,6 +710,748 @@ fn pg_opclass_reports_postgres_oids_and_joins_to_pg_am() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_conversion` describes upstream's encoding conversions. This server
+/// speaks UTF-8 and nothing else, so none of them can ever run — the widest
+/// deviation of the wave, and the reason it says so in its module docs.
+///
+/// The encoding *numbers* are the risk here: unlike everything else in these
+/// catalogs they are not in the vendored data. The generated rows carry the
+/// encoding's *name*, and [`crabgresql_types::encoding`] — the one table this
+/// build records the numbering in — turns it into an integer, so a name that
+/// answers to no encoding arrives as `pg_char_to_encoding`'s own miss
+/// sentinel, `-1`. Refusing that here is what replaces the build-time check
+/// codegen used to do against a second copy of the table.
+///
+/// A *wrong* number would still be silent — a conversion between two plausible
+/// encodings — so the second check is against the one number a client can name
+/// for itself, `UTF8`.
+#[test]
+fn pg_conversion_numbers_the_encodings_it_converts_between() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_conversion")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let procs: std::collections::HashSet<u32> = proc_rows
+        .iter()
+        .map(|r| match r[at(&proc_schema, "oid")] {
+            Value::Oid(oid) => oid,
+            ref other => panic!("expected an OID, got {other:?}"),
+        })
+        .collect();
+    let int_at = |row: &[Value], i: usize| match row[i] {
+        Value::Int4(n) => n,
+        ref other => panic!("expected an int4, got {other:?}"),
+    };
+
+    assert_eq!(rows.len(), PG_CONVERSION_ROWS.len());
+    for row in &rows {
+        let Value::Reg(ref proc) = row[at(&schema, "conproc")] else {
+            anyhow::bail!("conproc is not a regproc");
+        };
+        assert!(procs.contains(&proc.oid), "conproc {} dangles", proc.oid);
+        let (from, to) = (
+            int_at(row, at(&schema, "conforencoding")),
+            int_at(row, at(&schema, "contoencoding")),
+        );
+        assert_ne!(from, to, "a conversion from an encoding to itself");
+        for n in [from, to] {
+            // `-1` is what a name no encoding answers to resolves to, and an
+            // out-of-range number renders as the empty string; both mean the
+            // row names an encoding this build cannot number.
+            assert_ne!(n, -1, "an encoding this build cannot name");
+            assert!(
+                !crabgresql_types::encoding::encoding_to_char(n).is_empty(),
+                "encoding number {n} names nothing"
+            );
+        }
+        assert_eq!(row[at(&schema, "condefault")], Value::Bool(true));
+    }
+
+    // `UTF8` is 6 — the one encoding number this build can check against
+    // something other than the transcribed table, because it is the encoding
+    // every connection here is in. A shifted table would put a different
+    // encoding on both sides of every `*_to_utf8` conversion.
+    const UTF8: i32 = 6;
+    let name_at = |row: &[Value]| match row[at(&schema, "conname")] {
+        Value::Text(ref name) => name.clone(),
+        ref other => panic!("expected a name, got {other:?}"),
+    };
+    let mut checked = 0;
+    for row in &rows {
+        let name = name_at(row);
+        if let Some(source) = name.strip_suffix("_to_utf8") {
+            assert_eq!(
+                int_at(row, at(&schema, "contoencoding")),
+                UTF8,
+                "{name} does not convert to UTF8"
+            );
+            assert_ne!(int_at(row, at(&schema, "conforencoding")), UTF8);
+            assert!(!source.is_empty());
+            checked += 1;
+        } else if name.starts_with("utf8_to_") {
+            assert_eq!(
+                int_at(row, at(&schema, "conforencoding")),
+                UTF8,
+                "{name} does not convert from UTF8"
+            );
+            checked += 1;
+        }
+    }
+    // The conversions to and from UTF8 are the bulk of the relation; a table
+    // that matched none of them would pass every assertion above.
+    assert!(checked > 40, "only {checked} conversions name UTF8");
+    Ok(())
+}
+
+/// The five `pg_ts_*` relations, half generated from the `.dat` and half
+/// reconstructed from the snowball language list.
+///
+/// The reconstruction is where the risk is: the `.dat` half is checked by the
+/// same machinery every other generated catalog is, but the twenty-nine
+/// snowball configurations are built from a list transcribed here, so what
+/// keeps them honest is that they have to *join* like the generated half —
+/// every dictionary at the snowball template, every configuration at the
+/// default parser, and every configuration mapping the same nineteen token
+/// types the `simple` one does.
+///
+/// Nothing pins a snowball OID: those come from `initdb`'s counter rather than
+/// from vendored data. See `catalogs::textsearch`.
+#[test]
+fn pg_ts_relations_publish_the_bootstrap_and_snowball_halves() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (parser_schema, parser_rows) = build("pg_ts_parser")?;
+    let (template_schema, template_rows) = build("pg_ts_template")?;
+    let (dict_schema, dict_rows) = build("pg_ts_dict")?;
+    let (config_schema, config_rows) = build("pg_ts_config")?;
+    let (map_schema, map_rows) = build("pg_ts_config_map")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let name_at = |row: &[Value], i: usize| match row[i] {
+        Value::Text(ref name) => name.clone(),
+        ref other => panic!("expected a name, got {other:?}"),
+    };
+
+    // The counts a stock PostgreSQL 18.4 reports, which is the whole point of
+    // reconstructing the snowball half rather than serving the `.dat` alone.
+    assert_eq!(parser_rows.len(), 1);
+    assert_eq!(template_rows.len(), 5);
+    assert_eq!(dict_rows.len(), 30);
+    assert_eq!(config_rows.len(), 30);
+    assert_eq!(map_rows.len(), 570);
+
+    // The snowball pair among them is the one `pg_proc` half no `.dat`
+    // defines and `catalogs::proc` spells out.
+    let procs: std::collections::HashSet<u32> = proc_rows
+        .iter()
+        .map(|r| oid_at(r, at(&proc_schema, "oid")))
+        .collect();
+    let reg_at = |row: &[Value], i: usize| match row[i] {
+        Value::Reg(ref reg) => reg.oid,
+        ref other => panic!("expected a regproc, got {other:?}"),
+    };
+    // None of the seven may be zero: a parser with no tokenizer or a template
+    // with no lexizer is not one, and upstream's data never leaves them out —
+    // so a zero here would mean a reference that failed to resolve rather than
+    // an absent function.
+    for column in [
+        "prsstart",
+        "prstoken",
+        "prsend",
+        "prsheadline",
+        "prslextype",
+    ] {
+        let oid = reg_at(&parser_rows[0], at(&parser_schema, column));
+        assert_ne!(oid, 0, "the default parser has no {column}");
+        assert!(procs.contains(&oid), "{column} {oid} dangles");
+    }
+    for row in &template_rows {
+        for column in ["tmplinit", "tmpllexize"] {
+            let oid = reg_at(row, at(&template_schema, column));
+            assert_ne!(oid, 0, "a template has no {column}");
+            assert!(procs.contains(&oid), "{column} {oid} dangles");
+        }
+    }
+
+    let template_oids: std::collections::HashMap<u32, String> = template_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&template_schema, "oid")),
+                name_at(r, at(&template_schema, "tmplname")),
+            )
+        })
+        .collect();
+    let dicts: std::collections::HashMap<u32, String> = dict_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&dict_schema, "oid")),
+                name_at(r, at(&dict_schema, "dictname")),
+            )
+        })
+        .collect();
+    let configs: std::collections::HashMap<u32, String> = config_rows
+        .iter()
+        .map(|r| {
+            (
+                oid_at(r, at(&config_schema, "oid")),
+                name_at(r, at(&config_schema, "cfgname")),
+            )
+        })
+        .collect();
+    // Names are unique per relation: an OID collision between the generated
+    // band and the reconstructed one would show up here first.
+    assert_eq!(dicts.len(), dict_rows.len());
+    assert_eq!(configs.len(), config_rows.len());
+    // An OID is only required to be unique within its own catalog, but
+    // `initdb` hands these out from one counter, so no dictionary and
+    // configuration share a number. Reconstructing the pair with the same
+    // formula for both — the off-by-one that is easiest to write — would
+    // satisfy every other check here.
+    for (oid, name) in &dicts {
+        assert!(
+            !configs.contains_key(oid),
+            "{name} and configuration {} share an OID",
+            configs[oid]
+        );
+    }
+    for (oid, name) in &template_oids {
+        assert!(
+            !dicts.contains_key(oid) && !configs.contains_key(oid),
+            "template {name} shares an OID with a dictionary or configuration"
+        );
+    }
+
+    let parser_oid = oid_at(&parser_rows[0], at(&parser_schema, "oid"));
+    for row in &dict_rows {
+        let name = name_at(row, at(&dict_schema, "dictname"));
+        let template = oid_at(row, at(&dict_schema, "dicttemplate"));
+        let template = template_oids
+            .get(&template)
+            .unwrap_or_else(|| panic!("{name}'s template dangles"));
+        if name == "simple" {
+            assert_eq!(template, "simple");
+            assert_eq!(row[at(&dict_schema, "dictinitoption")], Value::Null);
+        } else {
+            assert_eq!(template, "snowball", "{name} is not a snowball dictionary");
+            let language = name.strip_suffix("_stem").expect("named <language>_stem");
+            let Value::Text(ref option) = row[at(&dict_schema, "dictinitoption")] else {
+                anyhow::bail!("{name} has no init option");
+            };
+            assert!(
+                option.starts_with(&format!("language = '{language}'")),
+                "{name} configures {option:?}"
+            );
+        }
+    }
+    for row in &config_rows {
+        assert_eq!(oid_at(row, at(&config_schema, "cfgparser")), parser_oid);
+    }
+
+    // The token set is not written out here either: it is whatever the
+    // `simple` configuration maps, which is where the `.dat` states it.
+    let simple_config = config_rows
+        .iter()
+        .find(|r| name_at(r, at(&config_schema, "cfgname")) == "simple")
+        .map(|r| oid_at(r, at(&config_schema, "oid")))
+        .expect("the simple configuration");
+    let tokens_of = |cfg: u32| -> Vec<i32> {
+        let mut tokens: Vec<i32> = map_rows
+            .iter()
+            .filter(|r| oid_at(r, at(&map_schema, "mapcfg")) == cfg)
+            .map(|r| match r[at(&map_schema, "maptokentype")] {
+                Value::Int4(token) => token,
+                ref other => panic!("expected an int4, got {other:?}"),
+            })
+            .collect();
+        tokens.sort_unstable();
+        tokens
+    };
+    let expected_tokens = tokens_of(simple_config);
+    assert_eq!(expected_tokens.len(), 19);
+    for (&cfg, name) in &configs {
+        assert_eq!(tokens_of(cfg), expected_tokens, "the token map of {name}");
+    }
+    for row in &map_rows {
+        assert_eq!(row[at(&map_schema, "mapseqno")], Value::Int4(1));
+        let dict = oid_at(row, at(&map_schema, "mapdict"));
+        assert!(dicts.contains_key(&dict), "mapdict {dict} dangles");
+        let cfg = oid_at(row, at(&map_schema, "mapcfg"));
+        assert!(configs.contains_key(&cfg), "mapcfg {cfg} dangles");
+    }
+
+    // The split `snowball_create.sql` makes: a language configuration sends
+    // the six word-shaped token types to its own stemmer and the other
+    // thirteen to `simple`. Checked on `english`, the one anybody uses.
+    let english = *configs
+        .iter()
+        .find(|(_, name)| *name == "english")
+        .map(|(oid, _)| oid)
+        .expect("the english configuration");
+    let mut to_stemmer = 0;
+    let mut to_simple = 0;
+    for row in map_rows
+        .iter()
+        .filter(|r| oid_at(r, at(&map_schema, "mapcfg")) == english)
+    {
+        match dicts[&oid_at(row, at(&map_schema, "mapdict"))].as_str() {
+            "english_stem" => to_stemmer += 1,
+            "simple" => to_simple += 1,
+            other => panic!("english maps a token to {other}"),
+        }
+    }
+    assert_eq!((to_stemmer, to_simple), (6, 13));
+    Ok(())
+}
+
+/// `pg_aggregate` describes upstream's aggregates: the transition and final
+/// functions each one is built from, and the ordering operator `min`/`max` are
+/// equivalent to.
+///
+/// # The direction this cannot check
+///
+/// The same one `pg_operator` has. The executor's accumulators are Rust, not
+/// these functions, so a row is a description rather than a plan. What is
+/// checkable is that every reference lands, that the key names a function
+/// `pg_proc` agrees is an aggregate, and that the six aggregates this server
+/// evaluates are all described.
+#[test]
+fn pg_aggregate_describes_upstreams_aggregates() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_aggregate")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let (type_schema, type_rows) = build("pg_type")?;
+    let (operator_schema, operator_rows) = build("pg_operator")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let types: std::collections::HashSet<u32> = type_rows
+        .iter()
+        .map(|r| oid_at(r, at(&type_schema, "oid")))
+        .collect();
+    let operators: std::collections::HashSet<u32> = operator_rows
+        .iter()
+        .map(|r| oid_at(r, at(&operator_schema, "oid")))
+        .collect();
+    let procs: std::collections::HashMap<u32, (String, String)> = proc_rows
+        .iter()
+        .map(|r| {
+            let name = match r[at(&proc_schema, "proname")] {
+                Value::Text(ref name) => name.clone(),
+                ref other => panic!("expected a name, got {other:?}"),
+            };
+            let kind = match r[at(&proc_schema, "prokind")] {
+                Value::Char(c) => (c as char).to_string(),
+                ref other => panic!("expected a \"char\", got {other:?}"),
+            };
+            (oid_at(r, at(&proc_schema, "oid")), (name, kind))
+        })
+        .collect();
+
+    assert_eq!(rows.len(), PG_AGGREGATE_ROWS.len());
+    let reg_at = |row: &[Value], i: usize| match row[i] {
+        Value::Reg(ref reg) => reg.oid,
+        ref other => panic!("expected a regproc, got {other:?}"),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for row in &rows {
+        // The key is a function this build publishes, and that function says
+        // it is an aggregate. A `pg_aggregate` row over a plain function would
+        // be a claim `pg_proc` contradicts.
+        let key = reg_at(row, at(&schema, "aggfnoid"));
+        let (name, kind) = procs
+            .get(&key)
+            .unwrap_or_else(|| panic!("aggfnoid {key} names no pg_proc row"));
+        assert_eq!(kind, "a", "{name} is an aggregate here but not in pg_proc");
+        names.insert(name.clone());
+
+        // An aggregate with nothing to fold rows with is not one; the other
+        // eight support functions genuinely may be absent.
+        for (column, required) in [
+            ("aggtransfn", true),
+            ("aggfinalfn", false),
+            ("aggcombinefn", false),
+            ("aggserialfn", false),
+            ("aggdeserialfn", false),
+            ("aggmtransfn", false),
+            ("aggminvtransfn", false),
+            ("aggmfinalfn", false),
+        ] {
+            let oid = reg_at(row, at(&schema, column));
+            assert!(
+                (!required && oid == 0) || procs.contains_key(&oid),
+                "{column} {oid} of {name} dangles"
+            );
+        }
+        let transtype = oid_at(row, at(&schema, "aggtranstype"));
+        assert!(types.contains(&transtype), "aggtranstype of {name} dangles");
+        let mtranstype = oid_at(row, at(&schema, "aggmtranstype"));
+        assert!(
+            mtranstype == 0 || types.contains(&mtranstype),
+            "aggmtranstype of {name} dangles"
+        );
+        let sortop = oid_at(row, at(&schema, "aggsortop"));
+        assert!(
+            sortop == 0 || operators.contains(&sortop),
+            "aggsortop of {name} dangles"
+        );
+        // A moving-window aggregate names its transition function and its
+        // inverse together: one without the other is a frame that can add rows
+        // and never remove them.
+        assert_eq!(
+            reg_at(row, at(&schema, "aggmtransfn")) == 0,
+            reg_at(row, at(&schema, "aggminvtransfn")) == 0,
+            "{name} has half a moving-window aggregate"
+        );
+    }
+
+    // The aggregates this server evaluates — `crabgresql-binder`'s `lookup_agg`,
+    // which is a Rust match rather than a table, so the list is repeated here
+    // rather than read. That is also why the converse is not asserted: an
+    // aggregate added there and missing here would not fail this test, and the
+    // smoke suite is where the two are exercised together.
+    for aggregate in ["count", "min", "max", "sum", "avg", "string_agg"] {
+        assert!(names.contains(aggregate), "{aggregate} is not described");
+    }
+
+    // `max(int4)` in full: the shape a client reads out of \da, and the one
+    // row where every optional column is populated the interesting way.
+    let max_int4 = rows
+        .iter()
+        .find(|r| {
+            procs[&reg_at(r, at(&schema, "aggfnoid"))].0 == "max"
+                && oid_at(r, at(&schema, "aggtranstype")) == 23
+        })
+        .expect("max(int4) is described");
+    assert_eq!(
+        procs[&reg_at(max_int4, at(&schema, "aggtransfn"))].0,
+        "int4larger"
+    );
+    assert_eq!(max_int4[at(&schema, "aggkind")], crate::cols::chr('n'));
+    // Its sort operator is `>`: MAX is the last row of an ascending order.
+    let sortop = oid_at(max_int4, at(&schema, "aggsortop"));
+    assert_eq!(
+        operator_rows
+            .iter()
+            .find(|r| oid_at(r, at(&operator_schema, "oid")) == sortop)
+            .map(|r| r[at(&operator_schema, "oprname")].clone()),
+        Some(Value::Text(">".to_string()))
+    );
+    Ok(())
+}
+
+/// `pg_operator` describes upstream's operator set. Every reference out of it
+/// has to land somewhere — including the two that point back into itself, a
+/// commutator and a negator, which is the reference cycle codegen's two phases
+/// exist for.
+///
+/// # The direction this cannot check
+///
+/// Operators are resolved by `crabgresql-binder`'s own code, not by reading
+/// this table, and that resolver has no enumerable registry — so nothing here
+/// can measure how much of the 805 rows this server actually evaluates. What
+/// it can do is pin, for a handful of operators the server demonstrably runs,
+/// that the row describing each one says the right thing. The converse — that
+/// some described operator is *not* implemented — is stated in
+/// `catalogs::operator`'s docs and shown end to end by the smoke suite.
+#[test]
+fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (schema, rows) = build("pg_operator")?;
+    let (type_schema, type_rows) = build("pg_type")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+    let oids = |rows: &[Vec<Value>], schema: &TableSchema| -> std::collections::HashSet<u32> {
+        let i = at(schema, "oid");
+        rows.iter().map(|r| oid_at(r, i)).collect()
+    };
+    let types = oids(&type_rows, &type_schema);
+    let procs = oids(&proc_rows, &proc_schema);
+    let operators = oids(&rows, &schema);
+
+    for row in &rows {
+        // A prefix operator has no left operand and writes 0 there; nothing
+        // has no right operand, since PostgreSQL 14 dropped postfix operators.
+        let (kind, left) = (
+            row[at(&schema, "oprkind")].clone(),
+            oid_at(row, at(&schema, "oprleft")),
+        );
+        assert_eq!(
+            left == 0,
+            kind == crate::cols::chr('l'),
+            "oprleft and oprkind disagree"
+        );
+        assert!(left == 0 || types.contains(&left), "oprleft {left} dangles");
+        for column in ["oprright", "oprresult"] {
+            let oid = oid_at(row, at(&schema, column));
+            assert!(types.contains(&oid), "{column} {oid} dangles");
+        }
+        for column in ["oprcom", "oprnegate"] {
+            let oid = oid_at(row, at(&schema, column));
+            assert!(
+                oid == 0 || operators.contains(&oid),
+                "{column} {oid} dangles"
+            );
+        }
+        // An operator nothing evaluates is not one; the two selectivity
+        // estimators are the pair upstream really does leave out.
+        for (column, required) in [("oprcode", true), ("oprrest", false), ("oprjoin", false)] {
+            let Value::Reg(ref proc) = row[at(&schema, column)] else {
+                anyhow::bail!("{column} is not a regproc");
+            };
+            // A zero is only ever the catalog's "no function", which renders
+            // as `-`. Permitting a zero on its own would also permit a column
+            // that names a real function and points at nothing — which is
+            // exactly what an unresolved reference used to produce.
+            assert_eq!(
+                proc.oid == 0,
+                proc.name == "-",
+                "{column} reports oid {} as {:?}",
+                proc.oid,
+                proc.name
+            );
+            assert!(
+                (!required && proc.oid == 0) || procs.contains(&proc.oid),
+                "{column} {} dangles",
+                proc.oid
+            );
+        }
+    }
+
+    // A commutator commutes: if A says B, B says A, and their operands are
+    // swapped. This is the property a wrong resolution would break while every
+    // universe check above still passed.
+    let by_oid: std::collections::HashMap<u32, &Vec<Value>> = rows
+        .iter()
+        .map(|r| (oid_at(r, at(&schema, "oid")), r))
+        .collect();
+    for row in &rows {
+        let com = oid_at(row, at(&schema, "oprcom"));
+        if com == 0 {
+            continue;
+        }
+        let other = by_oid[&com];
+        assert_eq!(
+            oid_at(other, at(&schema, "oprcom")),
+            oid_at(row, at(&schema, "oid")),
+            "a commutator that does not commute back"
+        );
+        assert_eq!(
+            oid_at(other, at(&schema, "oprleft")),
+            oid_at(row, at(&schema, "oprright"))
+        );
+        assert_eq!(
+            oid_at(other, at(&schema, "oprright")),
+            oid_at(row, at(&schema, "oprleft"))
+        );
+    }
+
+    // Operators this server evaluates, and what their rows say. Named, not
+    // OID-pinned: `pg_operator.dat` assigns these OIDs itself, but the name is
+    // what a client reads.
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    const BOOL: u32 = 16;
+    let described = |name: &str, left: u32, right: u32| {
+        rows.iter()
+            .find(|r| {
+                r[at(&schema, "oprname")] == Value::Text(name.to_string())
+                    && oid_at(r, at(&schema, "oprleft")) == left
+                    && oid_at(r, at(&schema, "oprright")) == right
+            })
+            .map(|r| {
+                let Value::Reg(ref code) = r[at(&schema, "oprcode")] else {
+                    panic!("oprcode is not a regproc");
+                };
+                (oid_at(r, at(&schema, "oprresult")), code.name.clone())
+            })
+    };
+    for (name, left, right, result, code) in [
+        ("=", INT4, INT4, BOOL, "int4eq"),
+        ("<>", INT4, INT4, BOOL, "int4ne"),
+        ("<", INT4, INT4, BOOL, "int4lt"),
+        ("+", INT4, INT4, INT4, "int4pl"),
+        ("*", INT4, INT4, INT4, "int4mul"),
+        ("||", TEXT, TEXT, TEXT, "textcat"),
+        ("~~", TEXT, TEXT, BOOL, "textlike"),
+        ("=", TEXT, TEXT, BOOL, "texteq"),
+    ] {
+        assert_eq!(
+            described(name, left, right),
+            Some((result, code.to_string())),
+            "the row for {name}({left},{right})"
+        );
+    }
+    assert_eq!(described("-", 0, INT4), Some((INT4, "int4um".to_string())));
+    Ok(())
+}
+
+/// `pg_amop` and `pg_amproc` finish the operator-class stack: every reference
+/// out of them has to land on a row that exists, or a client joining them —
+/// which is all `\dAo` and `\dAp` do — reads a dangling OID.
+///
+/// The OIDs of these two catalogs are generated by upstream's counter rather
+/// than written in the data, and the count drifts between major versions (18.4
+/// ships 945 `pg_amop` rows against 19devel's 951), so nothing here pins a raw
+/// OID. What it pins is the shape a join sees.
+#[test]
+fn pg_amop_and_pg_amproc_join_to_what_they_name() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let build = |name: &str| required(cat.build_pg_catalog(name), name);
+    let (amop_schema, amop_rows) = build("pg_amop")?;
+    let (amproc_schema, amproc_rows) = build("pg_amproc")?;
+    let (fam_schema, fam_rows) = build("pg_opfamily")?;
+    let (am_schema, am_rows) = build("pg_am")?;
+    let (type_schema, type_rows) = build("pg_type")?;
+    let (proc_schema, proc_rows) = build("pg_proc")?;
+
+    let at = |schema: &TableSchema, name: &str| schema.column_index(name).expect("column exists");
+    let oids = |rows: &[Vec<Value>], schema: &TableSchema| -> std::collections::HashSet<u32> {
+        let i = at(schema, "oid");
+        rows.iter()
+            .filter_map(|r| match r[i] {
+                Value::Oid(oid) => Some(oid),
+                _ => None,
+            })
+            .collect()
+    };
+    let (operator_schema, operator_rows) = build("pg_operator")?;
+    let operators = oids(&operator_rows, &operator_schema);
+    let families = oids(&fam_rows, &fam_schema);
+    let methods = oids(&am_rows, &am_schema);
+    let types = oids(&type_rows, &type_schema);
+    let procs = oids(&proc_rows, &proc_schema);
+    let oid_at = |row: &[Value], i: usize| match row[i] {
+        Value::Oid(oid) => oid,
+        ref other => panic!("expected an OID, got {other:?}"),
+    };
+
+    assert_eq!(amop_rows.len(), PG_AMOP_ROWS.len());
+    for row in &amop_rows {
+        for (column, universe) in [
+            ("amopfamily", &families),
+            ("amoplefttype", &types),
+            ("amoprighttype", &types),
+            ("amopmethod", &methods),
+        ] {
+            let oid = oid_at(row, at(&amop_schema, column));
+            assert!(universe.contains(&oid), "{column} {oid} dangles");
+        }
+        // Only an ordering operator names a sort family; a search one leaves
+        // the column 0, which is PostgreSQL's "no such object" and not a
+        // reference at all.
+        let sortfamily = oid_at(row, at(&amop_schema, "amopsortfamily"));
+        assert!(
+            sortfamily == 0 || families.contains(&sortfamily),
+            "amopsortfamily {sortfamily} dangles"
+        );
+        let opr = oid_at(row, at(&amop_schema, "amopopr"));
+        assert!(operators.contains(&opr), "amopopr {opr} dangles");
+    }
+
+    assert_eq!(amproc_rows.len(), PG_AMPROC_ROWS.len());
+    let amproc_family = at(&amproc_schema, "amprocfamily");
+    let amproc_col = at(&amproc_schema, "amproc");
+    for row in &amproc_rows {
+        for (column, universe) in [
+            ("amprocfamily", &families),
+            ("amproclefttype", &types),
+            ("amprocrighttype", &types),
+        ] {
+            let oid = oid_at(row, at(&amproc_schema, column));
+            assert!(universe.contains(&oid), "{column} {oid} dangles");
+        }
+        let Value::Reg(ref proc) = row[amproc_col] else {
+            anyhow::bail!("amproc is not a regproc");
+        };
+        assert!(procs.contains(&proc.oid), "amproc {} dangles", proc.oid);
+    }
+
+    // The point of the pair: a type whose default btree class this build
+    // already reported now also says which function does the comparing. A
+    // class with no support function 1 is a class btree could not use.
+    let name_at = |row: &[Value], i: usize| match row[i] {
+        Value::Text(ref name) => name.clone(),
+        ref other => panic!("expected a name, got {other:?}"),
+    };
+    let (opclass_schema, opclass_rows) = build("pg_opclass")?;
+    let (opc_family, opc_intype, opc_method, opc_default, opc_name) = (
+        at(&opclass_schema, "opcfamily"),
+        at(&opclass_schema, "opcintype"),
+        at(&opclass_schema, "opcmethod"),
+        at(&opclass_schema, "opcdefault"),
+        at(&opclass_schema, "opcname"),
+    );
+    const BTREE: u32 = 403;
+    for row in &opclass_rows {
+        if oid_at(row, opc_method) != BTREE || row[opc_default] != Value::Bool(true) {
+            continue;
+        }
+        let (family, intype) = (oid_at(row, opc_family), oid_at(row, opc_intype));
+        assert!(
+            amproc_rows.iter().any(|p| {
+                oid_at(p, amproc_family) == family
+                    && oid_at(p, at(&amproc_schema, "amproclefttype")) == intype
+                    && p[at(&amproc_schema, "amprocnum")] == Value::Int2(1)
+            }),
+            "btree class {} has no comparison support function",
+            name_at(row, opc_name)
+        );
+    }
+
+    // A universe check cannot tell `int4` from `int2` — both are types that
+    // exist — so pin what the rows actually say for one family per method.
+    // By name, not by OID: these two catalogs are numbered by upstream's
+    // counter and the numbers move between majors.
+    const INT4: u32 = 23;
+    let support = |family: u32, num: i16| {
+        amproc_rows
+            .iter()
+            .find(|p| {
+                oid_at(p, amproc_family) == family
+                    && oid_at(p, at(&amproc_schema, "amproclefttype")) == INT4
+                    && oid_at(p, at(&amproc_schema, "amprocrighttype")) == INT4
+                    && p[at(&amproc_schema, "amprocnum")] == Value::Int2(num)
+            })
+            .map(|p| match p[amproc_col] {
+                Value::Reg(ref proc) => proc.name.clone(),
+                ref other => panic!("expected a regproc, got {other:?}"),
+            })
+    };
+    const BTREE_INTEGER_OPS: u32 = 1976;
+    const HASH_INTEGER_OPS: u32 = 1977;
+    assert_eq!(support(BTREE_INTEGER_OPS, 1).as_deref(), Some("btint4cmp"));
+    assert_eq!(support(HASH_INTEGER_OPS, 1).as_deref(), Some("hashint4"));
+
+    // The join that names each strategy's operator is in the smoke suite.
+    let strategies: Vec<i16> = (1..=5)
+        .filter(|n| {
+            amop_rows.iter().any(|r| {
+                oid_at(r, at(&amop_schema, "amopfamily")) == BTREE_INTEGER_OPS
+                    && oid_at(r, at(&amop_schema, "amoplefttype")) == INT4
+                    && oid_at(r, at(&amop_schema, "amoprighttype")) == INT4
+                    && r[at(&amop_schema, "amopstrategy")] == Value::Int2(*n)
+            })
+        })
+        .collect();
+    assert_eq!(strategies, vec![1, 2, 3, 4, 5]);
+    Ok(())
+}
+
 /// `pg_index.indclass` names the operator class each key is really built
 /// under — the column whose every entry used to be `0`.
 ///
@@ -2006,11 +2748,27 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
         std::collections::BTreeMap::from([
             // The seven upstream access methods plus crabgresql's own two.
             ("pg_am", 9),
+            ("pg_conversion", 98),
             ("pg_extension", 1),
             // Three from the `.dat`, plus `plpgsql`.
             ("pg_language", 4),
             ("pg_namespace", 3),
-            ("pg_proc", 515),
+            // Every operator upstream ships; each one carries a `descr`.
+            ("pg_operator", 805),
+            // Every function the generated catalogs reference and upstream
+            // wrote a `descr` for. It grew with `pg_amproc`, `pg_operator` and
+            // `pg_aggregate`: a support function, an `oprcode` or a transition
+            // function is a `pg_proc` row like any other, and its description
+            // comes along.
+            ("pg_proc", 1309),
+            // The `simple` configuration and dictionary and the default parser
+            // come from the `.dat`; the other 29 of each are snowball's, whose
+            // comments `initdb` writes with `COMMENT ON`.
+            ("pg_ts_config", 30),
+            ("pg_ts_dict", 30),
+            ("pg_ts_parser", 1),
+            // Four templates from the `.dat`, plus snowball.
+            ("pg_ts_template", 5),
             ("pg_type", 109),
         ])
     );

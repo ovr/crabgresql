@@ -19,11 +19,11 @@ use crabgresql_types::Value;
 
 use crate::SystemCatalog;
 use crate::catalogs::{
-    acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
-    extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, policy,
-    prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
-    stat_activity, stat_database, stat_indexes, stat_io, stat_tables, statio, statistic,
-    statistic_ext, timezone, trigger, types,
+    acl, aggregate, am, amop, attribute, auth, class, collation, constraint, conversion, cursors,
+    database, description, extension, foreign, index, inherits, language, locks, misc_empty,
+    namespace, opclass, operator, policy, prepared, proc, progress, publication, relviews,
+    replication, rewrite, sequence, settings, stat_activity, stat_database, stat_indexes, stat_io,
+    stat_tables, statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -128,7 +128,28 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         information_schema::tables_schema,
         information_schema::tables_rows,
     ),
+    rel(
+        "pg_aggregate",
+        2600,
+        PgCatalog,
+        aggregate::pg_aggregate_schema,
+        aggregate::pg_aggregate_rows,
+    ),
     rel("pg_am", 2601, PgCatalog, am::pg_am_schema, am::pg_am_rows),
+    rel(
+        "pg_amop",
+        2602,
+        PgCatalog,
+        amop::pg_amop_schema,
+        amop::pg_amop_rows,
+    ),
+    rel(
+        "pg_amproc",
+        2603,
+        PgCatalog,
+        amop::pg_amproc_schema,
+        amop::pg_amproc_rows,
+    ),
     rel(
         "pg_attrdef",
         2604,
@@ -198,6 +219,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         constraint::pg_constraint_schema,
         constraint::pg_constraint_rows,
+    ),
+    rel(
+        "pg_conversion",
+        2607,
+        PgCatalog,
+        conversion::pg_conversion_schema,
+        conversion::pg_conversion_rows,
     ),
     rel(
         "pg_cursors",
@@ -359,6 +387,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         opclass::pg_opclass_schema,
         opclass::pg_opclass_rows,
+    ),
+    rel(
+        "pg_operator",
+        2617,
+        PgCatalog,
+        operator::pg_operator_schema,
+        operator::pg_operator_rows,
     ),
     rel(
         "pg_opfamily",
@@ -884,6 +919,41 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         trigger::pg_trigger_schema,
         no_rows,
+    ),
+    rel(
+        "pg_ts_config",
+        3602,
+        PgCatalog,
+        textsearch::pg_ts_config_schema,
+        textsearch::pg_ts_config_rows,
+    ),
+    rel(
+        "pg_ts_config_map",
+        3603,
+        PgCatalog,
+        textsearch::pg_ts_config_map_schema,
+        textsearch::pg_ts_config_map_rows,
+    ),
+    rel(
+        "pg_ts_dict",
+        3600,
+        PgCatalog,
+        textsearch::pg_ts_dict_schema,
+        textsearch::pg_ts_dict_rows,
+    ),
+    rel(
+        "pg_ts_parser",
+        3601,
+        PgCatalog,
+        textsearch::pg_ts_parser_schema,
+        textsearch::pg_ts_parser_rows,
+    ),
+    rel(
+        "pg_ts_template",
+        3764,
+        PgCatalog,
+        textsearch::pg_ts_template_schema,
+        textsearch::pg_ts_template_rows,
     ),
     rel(
         "pg_type",

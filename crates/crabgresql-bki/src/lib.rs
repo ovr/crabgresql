@@ -21,11 +21,17 @@
 //! and generating from it is the sanctioned path; attribution is in `NOTICE`.
 
 pub mod dat;
+mod pg_aggregate;
+mod pg_amop;
+mod pg_amproc;
 mod pg_cast;
+mod pg_conversion;
 mod pg_description;
 mod pg_opclass;
+mod pg_operator;
 mod pg_opfamily;
 mod pg_proc;
+mod pg_ts;
 mod pg_type;
 pub mod symbols;
 
@@ -82,6 +88,16 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let proc_entries = read_dat(catalog_dir, "pg_proc.dat")?;
     let opfamily_entries = read_dat(catalog_dir, "pg_opfamily.dat")?;
     let opclass_entries = read_dat(catalog_dir, "pg_opclass.dat")?;
+    let operator_entries = read_dat(catalog_dir, "pg_operator.dat")?;
+    let aggregate_entries = read_dat(catalog_dir, "pg_aggregate.dat")?;
+    let amop_entries = read_dat(catalog_dir, "pg_amop.dat")?;
+    let amproc_entries = read_dat(catalog_dir, "pg_amproc.dat")?;
+    let conversion_entries = read_dat(catalog_dir, "pg_conversion.dat")?;
+    let ts_parser_entries = read_dat(catalog_dir, "pg_ts_parser.dat")?;
+    let ts_template_entries = read_dat(catalog_dir, "pg_ts_template.dat")?;
+    let ts_dict_entries = read_dat(catalog_dir, "pg_ts_dict.dat")?;
+    let ts_config_entries = read_dat(catalog_dir, "pg_ts_config.dat")?;
+    let ts_config_map_entries = read_dat(catalog_dir, "pg_ts_config_map.dat")?;
     let am_entries = read_dat(catalog_dir, "pg_am.dat")?;
     let language_entries = read_dat(catalog_dir, "pg_language.dat")?;
     let namespace_entries = read_dat(catalog_dir, "pg_namespace.dat")?;
@@ -91,6 +107,7 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     pg_type::define_symbols(&type_entries, &mut symbols);
     pg_proc::define_symbols(&proc_entries, &mut symbols);
     pg_opfamily::define_symbols(&opfamily_entries, &mut symbols);
+    pg_operator::define_symbols(&operator_entries, &mut symbols);
 
     // Phase two: resolve and emit.
     std::fs::write(
@@ -109,6 +126,39 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
         out_dir.join("pg_opclass_rows.rs"),
         pg_opclass::emit(&opclass_entries, &symbols),
     )?;
+    std::fs::write(
+        out_dir.join("pg_operator_rows.rs"),
+        pg_operator::emit(&operator_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_aggregate_rows.rs"),
+        pg_aggregate::emit(&aggregate_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_amop_rows.rs"),
+        pg_amop::emit(&amop_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_amproc_rows.rs"),
+        pg_amproc::emit(&amproc_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_conversion_rows.rs"),
+        pg_conversion::emit(&conversion_entries, &symbols),
+    )?;
+    let ts = pg_ts::emit(
+        &ts_parser_entries,
+        &ts_template_entries,
+        &ts_dict_entries,
+        &ts_config_entries,
+        &ts_config_map_entries,
+        &symbols,
+    );
+    std::fs::write(out_dir.join("pg_ts_parser_rows.rs"), ts.parsers)?;
+    std::fs::write(out_dir.join("pg_ts_template_rows.rs"), ts.templates)?;
+    std::fs::write(out_dir.join("pg_ts_dict_rows.rs"), ts.dicts)?;
+    std::fs::write(out_dir.join("pg_ts_config_rows.rs"), ts.configs)?;
+    std::fs::write(out_dir.join("pg_ts_config_map_rows.rs"), ts.config_map)?;
     for name in HANDWRITTEN_CATALOG_PROCS {
         assert!(
             symbols.resolve_name(Proc, name).is_some(),
@@ -135,6 +185,36 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
                 catalog: "pg_proc",
                 entries: &proc_entries,
                 keep: Some(&referenced_procs),
+            },
+            pg_description::Source {
+                catalog: "pg_operator",
+                entries: &operator_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_conversion",
+                entries: &conversion_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_ts_parser",
+                entries: &ts_parser_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_ts_template",
+                entries: &ts_template_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_ts_dict",
+                entries: &ts_dict_entries,
+                keep: None,
+            },
+            pg_description::Source {
+                catalog: "pg_ts_config",
+                entries: &ts_config_entries,
+                keep: None,
             },
             pg_description::Source {
                 catalog: "pg_am",
@@ -187,9 +267,89 @@ fn am_oid(name: &str) -> u32 {
 }
 
 /// A `regproc` column as the `ProcRef` expression the generated file carries:
-/// the name as written, plus the OID it resolves to. `-` is the catalog's
-/// spelling of "no function" and resolves to 0, which prints back as `-`.
+/// the name as written, plus the OID it resolves to.
+///
+/// `-` is the catalog's spelling of "no function", and it is the **only**
+/// source of a zero here: any other name that fails to resolve is a reference
+/// into a catalog this build claims to have generated, so it fails the build
+/// rather than emitting `ProcRef { oid: 0, name: "eqsel" }`, which reads like
+/// an absent function and is not one.
+///
+/// A name resolves to nothing in two ways, and neither is benign: `pg_proc.dat`
+/// does not define it, or it defines it twice and the bare name is ambiguous
+/// (see [`SymbolTable::define_name`]). The second is what a `.dat` bump can
+/// introduce silently.
 fn proc_ref(symbols: &SymbolTable, name: &str) -> String {
-    let oid = symbols.resolve_name(Proc, name).unwrap_or(0);
-    format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+    if name == "-" {
+        return format!("ProcRef {{ oid: 0, name: {name:?} }}");
+    }
+    proc_ref_resolved(symbols, name)
+        .unwrap_or_else(|| panic!("regproc reference {name:?} names no pg_proc entry"))
+}
+
+/// The `ProcRef` expression for a reference written in either spelling the
+/// catalog data uses: a bare name where that is unambiguous, and a full
+/// signature (`tsquery_phrase(tsquery,tsquery)`) where the name alone names
+/// more than one function. `pg_amproc.amproc`, `pg_operator.oprcode` and
+/// `pg_cast.castfunc` all take both.
+///
+/// The printed name drops the argument list, because that is what `regproc`
+/// output renders — the signature is how the reference is *written*, not what
+/// the column shows. `None` when nothing of that name is defined, which every
+/// caller turns into its own build failure.
+fn proc_ref_resolved(symbols: &SymbolTable, reference: &str) -> Option<String> {
+    let oid = if reference.contains('(') {
+        symbols.resolve_signature(Proc, reference)
+    } else {
+        symbols.resolve_name(Proc, reference)
+    }?;
+    let name = reference.split('(').next().unwrap_or(reference);
+    Some(format!("ProcRef {{ oid: {oid}, name: {name:?} }}"))
+}
+
+/// Where upstream's generated OIDs begin. Below this sit the hand-assigned
+/// ones; PostgreSQL reserves the band for exactly this purpose.
+const FIRST_GENERATED_OID: u32 = 10000;
+
+/// The OID counter a catalog's unnumbered entries are numbered from.
+///
+/// # Where the OIDs come from
+///
+/// Most `.dat` files spell out an `oid` for only the entries upstream's C code
+/// names by symbol — `pg_opclass.dat` numbers 13 of 179, `pg_amop.dat` and
+/// `pg_amproc.dat` number none at all. The rest are numbered by upstream's own
+/// codegen, and the rule it follows is visible in the data:
+///
+/// > An entry's OID is its explicit `oid` if it has one; otherwise it is the
+/// > next value of a counter that starts at [`FIRST_GENERATED_OID`] and
+/// > advances **only** on entries without an explicit `oid`, in file order.
+/// > The counter is per catalog, which is why `pg_cast` starts at the same
+/// > number — an OID is unique within its catalog, not across catalogs.
+///
+/// That rule was checked against a PostgreSQL 18.4 install: reconstructing
+/// `pg_opclass` from that release's `.dat` reproduced all 177 rows the release
+/// ships, OID for OID. So the real OIDs are *derived from the vendored data*,
+/// not transcribed from a running server and not read out of upstream's
+/// source — the same clean-room path the rest of this crate takes.
+///
+/// The consequence for an emitter is the one that bites: [`Self::of`] must be
+/// called for every entry it passes, whether or not a row comes out. Skipping
+/// an entry *and* its number would shift every OID after it.
+#[derive(Default)]
+struct OidCounter {
+    next: Option<u32>,
+}
+
+impl OidCounter {
+    /// The OID of `e`, advancing the counter when the entry has none of its own.
+    fn of(&mut self, e: &dat::Entry) -> u32 {
+        match dat::oid_field(e, "oid") {
+            0 => {
+                let assigned = self.next.unwrap_or(FIRST_GENERATED_OID);
+                self.next = Some(assigned + 1);
+                assigned
+            }
+            explicit => explicit,
+        }
+    }
 }

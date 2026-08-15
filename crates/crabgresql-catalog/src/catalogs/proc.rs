@@ -52,9 +52,12 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
 /// module).
 /// Callers append the session's `CREATE FUNCTION` routines after these.
 ///
-/// `proallargtypes`/`proargmodes`/`proargnames` are NULL for every one: none of
-/// these take OUT parameters, and codegen refuses to emit an entry that does
-/// rather than drop the columns silently.
+/// `proallargtypes`/`proargmodes`/`proargnames` are filled for the few that
+/// declare OUT or VARIADIC parameters (`json_extract_path`, the ordered-set
+/// aggregate support functions) and NULL for the rest, which is what
+/// PostgreSQL stores. `pronargdefaults` is 0 for every one: codegen refuses an
+/// entry carrying an argument default, because nothing here can render the
+/// expression back.
 pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
     // crabgresql's own table-AM handlers, so `pg_am.amhandler` resolves for
     // every method this build ships rather than only the upstream ones. They
@@ -89,6 +92,42 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
             Value::Null,
         ]
     });
+    // The snowball dictionary's two C functions, which `pg_ts_template.snowball`
+    // points at. `initdb` creates them from `snowball_create.sql` rather than
+    // from a `.dat`, so codegen has nothing to emit and they are spelled out
+    // here — shaped as PostgreSQL's are: language `c`, volatile, strict,
+    // `internal` arguments and result, living in `$libdir/dict_snowball`.
+    let snowball = [(SNOWBALL_INIT_PROC, 1), (SNOWBALL_LEXIZE_PROC, 4)]
+        .into_iter()
+        .map(|(proc, nargs)| {
+            vec![
+                Value::Oid(proc.oid),
+                Value::Text(proc.name.to_string()),
+                Value::Oid(11),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(13),
+                Value::Float4(1.0),
+                Value::Float4(0.0),
+                Value::Oid(0),
+                Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+                chr('f'),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(false),
+                chr('v'),
+                chr('u'),
+                Value::Int2(nargs),
+                Value::Int2(0),
+                Value::Oid(2281),
+                oidvector(std::iter::repeat_n(2281, nargs as usize)),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text(proc.name.to_string()),
+                Value::Text("$libdir/dict_snowball".to_string()),
+            ]
+        });
     PG_PROC_ROWS
         .iter()
         .map(|r| {
@@ -115,14 +154,30 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Int2(0),
                 Value::Oid(r.prorettype),
                 oidvector(r.proargtypes.iter().copied()),
-                Value::Null,
-                Value::Null,
-                Value::Null,
+                optional_array(
+                    PgType::Oid,
+                    r.proallargtypes.iter().map(|t| Value::Oid(*t)).collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.proargmodes
+                        .iter()
+                        .map(|m| Value::Text((*m).to_string()))
+                        .collect(),
+                ),
+                optional_array(
+                    PgType::Text,
+                    r.proargnames
+                        .iter()
+                        .map(|n| Value::Text((*n).to_string()))
+                        .collect(),
+                ),
                 Value::Text(r.prosrc.to_string()),
-                Value::Null,
+                text_or_null(r.probin),
             ]
         })
         .chain(own)
+        .chain(snowball)
         .collect()
 }
 
@@ -156,18 +211,6 @@ fn user_rows(
     routines
         .iter()
         .map(|r| {
-            // PostgreSQL leaves these NULL rather than empty when there is
-            // nothing to report, and clients test for NULL.
-            let optional_array = |elem: PgType, values: Vec<Value>| {
-                if values.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Array {
-                        elem,
-                        elems: values,
-                    }
-                }
-            };
             vec![
                 Value::Oid(r.oid),
                 Value::Text(r.name.clone()),
