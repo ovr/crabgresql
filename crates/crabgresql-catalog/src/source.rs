@@ -290,6 +290,22 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
+    /// The locks to reflect into `pg_locks`.
+    ///
+    /// PostgreSQL answers this from the cluster-wide lock table, so a backend
+    /// sees every other backend's locks. There is no such table here: a
+    /// relation's lock (`crabgresql_txn::TableLock`) lives inside the access
+    /// method's open handle, reachable only through that table, and nothing
+    /// enumerates the holders. So a session reports the locks *it* holds and
+    /// this relation shows one session's share of what PostgreSQL would list.
+    ///
+    /// TODO: register the per-relation locks in one server-visible table so
+    /// this can report other sessions' holds — the same missing lock API the
+    /// `ALTER TABLE ADD CONSTRAINT` note in the server's `query.rs` needs.
+    fn locks(&self) -> Vec<CatalogLock> {
+        Vec::new()
+    }
+
     /// The configuration parameters, to reflect into `pg_settings`. The GUC
     /// table lives in the server, so this crate takes the rendered rows rather
     /// than depending on it.
@@ -333,6 +349,7 @@ pub struct StaticSource {
     cursors: Vec<CatalogCursor>,
     prepared_statements: Vec<CatalogPreparedStatement>,
     settings: Vec<CatalogSetting>,
+    locks: Vec<CatalogLock>,
 }
 
 impl Default for StaticSource {
@@ -349,6 +366,7 @@ impl Default for StaticSource {
             cursors: Vec::new(),
             prepared_statements: Vec::new(),
             settings: Vec::new(),
+            locks: Vec::new(),
         }
     }
 }
@@ -400,6 +418,11 @@ impl StaticSource {
         self.settings = settings;
         self
     }
+
+    pub fn locks(mut self, locks: Vec<CatalogLock>) -> Self {
+        self.locks = locks;
+        self
+    }
 }
 
 impl CatalogSource for StaticSource {
@@ -437,6 +460,10 @@ impl CatalogSource for StaticSource {
 
     fn settings(&self) -> Vec<CatalogSetting> {
         self.settings.clone()
+    }
+
+    fn locks(&self) -> Vec<CatalogLock> {
+        self.locks.clone()
     }
 }
 
@@ -487,6 +514,53 @@ pub struct CatalogCursor {
     pub is_scrollable: bool,
     /// When the cursor was declared, in `timestamptz` micros.
     pub creation_time: i64,
+}
+
+/// What a [`CatalogLock`] is a lock *on* — `pg_locks.locktype`, and with it
+/// which of the relation/virtualxid/transactionid identity columns is filled.
+///
+/// Only the three kinds this build can hold are modelled. PostgreSQL's other
+/// `locktype`s (`page`, `tuple`, `object`, `userlock`, `advisory`,
+/// `applytransaction`) name lock levels no code here takes, so a row of that
+/// kind would be an invented one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogLockTarget {
+    /// A whole relation, by OID. `pg_locks.database` is filled too, as
+    /// PostgreSQL does for every relation lock on a non-shared catalog.
+    Relation(u32),
+    /// The session's own virtual transaction, held for the transaction's life.
+    /// The `virtualxid` column repeats `virtualtransaction`.
+    VirtualXid,
+    /// A real, assigned XID. Only a transaction that has written holds one —
+    /// this build allocates an XID lazily, exactly as PostgreSQL does.
+    TransactionId(u32),
+}
+
+/// One row of `pg_locks`: a lock a session holds (or waits for) right now.
+///
+/// Built by the session rather than by a lock manager — see
+/// [`CatalogSource::locks`] for what that means for the rows a client sees.
+#[derive(Clone, Debug)]
+pub struct CatalogLock {
+    pub target: CatalogLockTarget,
+    /// `pg_locks.virtualtransaction`, PostgreSQL's `backendID/localXID`
+    /// spelling. Identifies the holder even when no real XID exists.
+    pub virtualtransaction: String,
+    /// `pg_locks.pid`: the holder's backend. This build serves every session
+    /// from one OS process, so it reports the connection's backend id — the
+    /// same integer the client was handed in `BackendKeyData`, which is what a
+    /// client uses the column for.
+    pub pid: i32,
+    /// The lock mode's PostgreSQL name (`AccessShareLock`, `ExclusiveLock`, …).
+    pub mode: &'static str,
+    pub granted: bool,
+    /// `pg_locks.fastpath`: whether PostgreSQL would have taken this one
+    /// through the per-backend fast path (a weak relation lock with no
+    /// conflicting holder) rather than the shared lock table.
+    pub fastpath: bool,
+    /// When the wait for an ungranted lock began, in `timestamptz` micros.
+    /// NULL for a granted lock, as in PostgreSQL.
+    pub waitstart: Option<i64>,
 }
 
 /// One prepared statement, as `pg_prepared_statements` shows it. Session-local

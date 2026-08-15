@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crabgresql_catalog::{
-    CatalogCursor, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
+    CatalogCursor, CatalogLock, CatalogPreparedStatement, CatalogRelation, CatalogRoutine,
+    CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
 };
 use crabgresql_executor::{CatalogOps, ConstraintDef, IndexDef};
 use crabgresql_storage_api::{
@@ -50,6 +50,9 @@ pub struct SessionCatalogSource {
     /// Eager for the same reason as `cursors`: every value is rendered from the
     /// session, which this source outlives.
     settings: Vec<CatalogSetting>,
+    /// Eager for the same reason as `cursors`, and never more than two rows —
+    /// see [`Session::locks`].
+    locks: Vec<CatalogLock>,
     /// The transaction timestamp, so the timezone views resolve their offsets at
     /// the same instant `now()` reports. Not the *statement* timestamp: `now()`
     /// is `transaction_timestamp()` here as in PostgreSQL, and the two differ
@@ -131,6 +134,7 @@ impl SessionCatalogSource {
             cursors,
             prepared_statements,
             settings: crate::guc::catalog_settings(session),
+            locks: session.locks(),
             now: session.xact_start(),
             bytea_output: session.bytea_output,
         }
@@ -245,6 +249,10 @@ impl CatalogSource for SessionCatalogSource {
 
     fn prepared_statements(&self) -> Vec<CatalogPreparedStatement> {
         self.prepared_statements.clone()
+    }
+
+    fn locks(&self) -> Vec<CatalogLock> {
+        self.locks.clone()
     }
 
     fn settings(&self) -> Vec<CatalogSetting> {

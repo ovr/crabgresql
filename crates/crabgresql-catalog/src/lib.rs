@@ -49,8 +49,9 @@ pub use catalogs::extension::available_extensions;
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid};
 pub use source::{
-    CatalogCursor, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogSetting, CatalogSource, CatalogUserType, RelKind, StaticSource,
+    CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement, CatalogRelation,
+    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, RelKind,
+    StaticSource,
 };
 
 #[cfg(test)]
@@ -328,6 +329,7 @@ pub struct SystemCatalog {
     cursors: OnceLock<Vec<CatalogCursor>>,
     prepared_statements: OnceLock<Vec<CatalogPreparedStatement>>,
     settings: OnceLock<Vec<CatalogSetting>>,
+    locks: OnceLock<Vec<CatalogLock>>,
     namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
 }
 
@@ -386,6 +388,7 @@ impl SystemCatalog {
             cursors: OnceLock::new(),
             prepared_statements: OnceLock::new(),
             settings: OnceLock::new(),
+            locks: OnceLock::new(),
             namespace_oids: OnceLock::new(),
         }
     }
@@ -422,6 +425,10 @@ impl SystemCatalog {
 
     fn settings(&self) -> &[CatalogSetting] {
         self.settings.get_or_init(|| self.source.settings())
+    }
+
+    fn locks(&self) -> &[CatalogLock] {
+        self.locks.get_or_init(|| self.source.locks())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each

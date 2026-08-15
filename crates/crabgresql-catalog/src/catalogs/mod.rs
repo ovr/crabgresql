@@ -17,6 +17,7 @@ pub(crate) mod foreign;
 pub(crate) mod index;
 pub(crate) mod inherits;
 pub(crate) mod language;
+pub(crate) mod locks;
 pub(crate) mod misc_empty;
 pub(crate) mod namespace;
 pub(crate) mod opclass;

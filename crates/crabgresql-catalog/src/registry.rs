@@ -20,7 +20,7 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
-    extension, foreign, index, inherits, language, misc_empty, namespace, opclass, policy,
+    extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, policy,
     prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
     statistic, statistic_ext, timezone, trigger, types,
 };
@@ -306,6 +306,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         misc_empty::pg_largeobject_metadata_schema,
         no_rows,
+    ),
+    rel(
+        "pg_locks",
+        12073,
+        PgCatalog,
+        locks::pg_locks_schema,
+        locks::pg_locks_rows,
     ),
     rel(
         "pg_matviews",
