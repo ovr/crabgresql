@@ -646,6 +646,17 @@ pub enum ScalarFn {
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
+    /// `obj_description(oid[, name]) -> text`: the comment on an object, from
+    /// `pg_description`. With the catalog name it looks only there; the
+    /// one-argument form is PostgreSQL's deprecated any-catalog search, which
+    /// raises `21000` if two catalogs both describe the OID. A catalog name no
+    /// `pg_catalog` relation answers to is NULL, not an error — upstream's body
+    /// finds the `classoid` with a sub-select, and a sub-select with no rows is
+    /// NULL.
+    ObjDescription,
+    /// `col_description(oid, int4) -> text`: the comment on one column of a
+    /// relation — the same lookup with a non-zero `objsubid`.
+    ColDescription,
     /// The `tableoid` system column: the OID of the relation a row came from.
     /// Its two arguments are the relation's namespace and name as text literals,
     /// resolved through the catalog at *execution* time rather than folded here
@@ -2604,6 +2615,23 @@ fn lookup(name: &str) -> &'static [Signature] {
             func: ScalarFn::PgTableIsVisible,
             args: &[OID],
             ret: BOOL,
+        }],
+        "obj_description" => &[
+            Signature {
+                func: ScalarFn::ObjDescription,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::ObjDescription,
+                args: &[OID, NAME],
+                ret: TEXT,
+            },
+        ],
+        "col_description" => &[Signature {
+            func: ScalarFn::ColDescription,
+            args: &[OID, I4],
+            ret: TEXT,
         }],
         // Type formatting / node-tree deparse. Dispatched by the executor's
         // `eval` (not `eval_scalar`): `format_type` must return non-NULL for a

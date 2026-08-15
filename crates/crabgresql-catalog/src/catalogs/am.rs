@@ -14,8 +14,10 @@ use crate::oids::*;
 ///
 /// Fidelity note (`AGENTS.md`): these rows are transcribed from the output of
 /// `SELECT oid, amname, amhandler, amtype FROM pg_am ORDER BY oid` on a stock
-/// PostgreSQL 18.4, not from upstream source. No `pg_am.dat` is vendored —
-/// seven rows do not justify codegen.
+/// PostgreSQL 18.4, not from upstream source. `pg_am.dat` *is* vendored, but
+/// only for its `descr` fields (see [`crate::catalogs::description`]): seven
+/// rows do not justify codegen, and two of the nine below — crabgresql's own
+/// `parquet` and `buffer` — have no upstream entry to be generated from.
 pub(crate) fn pg_am_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_am",
@@ -29,26 +31,36 @@ pub(crate) fn pg_am_schema() -> TableSchema {
     )
 }
 
-/// The fixed `pg_am` rows. `amtype` is `'t'` for a table access method and
-/// `'i'` for an index one.
+/// Every access method this build publishes, as `(oid, amname, amhandler,
+/// amtype)`. `amtype` is `'t'` for a table access method and `'i'` for an index
+/// one.
+///
+/// A list rather than a literal inside [`pg_am_rows`] because
+/// [`crate::catalogs::description`] filters `pg_am.dat`'s descriptions against
+/// it.
+pub(crate) const BUILTIN_AMS: &[(u32, &str, &str, char)] = &[
+    (HEAP_AM_OID, "heap", "heap_tableam_handler", 't'),
+    (BTREE_AM_OID, "btree", "bthandler", 'i'),
+    (HASH_AM_OID, "hash", "hashhandler", 'i'),
+    (783, "gist", "gisthandler", 'i'),
+    (2742, "gin", "ginhandler", 'i'),
+    (3580, "brin", "brinhandler", 'i'),
+    (4000, "spgist", "spghandler", 'i'),
+    (PARQUET_AM_OID, "parquet", "parquet_tableam_handler", 't'),
+    (BUFFER_AM_OID, "buffer", "buffer_tableam_handler", 't'),
+];
+
+/// The fixed `pg_am` rows.
 pub(crate) fn pg_am_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    let row = |oid: u32, amname: &str, amhandler: &str, amtype: char| {
-        vec![
-            Value::Oid(oid),
-            Value::Text(amname.to_string()),
-            regproc_by_name(amhandler),
-            chr(amtype),
-        ]
-    };
-    vec![
-        row(HEAP_AM_OID, "heap", "heap_tableam_handler", 't'),
-        row(BTREE_AM_OID, "btree", "bthandler", 'i'),
-        row(HASH_AM_OID, "hash", "hashhandler", 'i'),
-        row(783, "gist", "gisthandler", 'i'),
-        row(2742, "gin", "ginhandler", 'i'),
-        row(3580, "brin", "brinhandler", 'i'),
-        row(4000, "spgist", "spghandler", 'i'),
-        row(PARQUET_AM_OID, "parquet", "parquet_tableam_handler", 't'),
-        row(BUFFER_AM_OID, "buffer", "buffer_tableam_handler", 't'),
-    ]
+    BUILTIN_AMS
+        .iter()
+        .map(|(oid, amname, amhandler, amtype)| {
+            vec![
+                Value::Oid(*oid),
+                Value::Text((*amname).to_string()),
+                regproc_by_name(amhandler),
+                chr(*amtype),
+            ]
+        })
+        .collect()
 }

@@ -720,6 +720,8 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::ObjDescription
+            | ScalarFn::ColDescription
             | ScalarFn::TableOid
             | ScalarFn::RegIn(_)
             | ScalarFn::RegFromOid(_)
@@ -745,6 +747,15 @@ fn eval_catalog_fn(
     // would be a `matches!` — not exhaustive, so the next zero-arity function
     // added past it would index an empty slice and panic.
     if !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args.first(), Some(Value::Null)) {
+        return Some(Ok(Value::Null));
+    }
+    // The two description functions are the only ones here that are STRICT in an
+    // argument past the first, and `args.first()` above cannot see it:
+    // `col_description(oid, NULL)` is NULL, not the whole-object comment that a
+    // NULL read as column 0 would find.
+    if matches!(func, ScalarFn::ObjDescription | ScalarFn::ColDescription)
+        && args.iter().any(|arg| matches!(arg, Value::Null))
+    {
         return Some(Ok(Value::Null));
     }
     let Some(ops) = ctx.catalog.as_deref() else {
@@ -831,6 +842,34 @@ fn eval_catalog_fn(
                 unreachable!("tableoid arguments were {args:?}");
             };
             Value::Oid(ops.rel_oid(Some(namespace), name).unwrap_or(0))
+        }
+        // The one-argument form searches every catalog at once and so can match
+        // twice, where upstream's sub-select raises `21000` — so this raises it
+        // too rather than picking one of the two comments.
+        ScalarFn::ObjDescription => {
+            let catalog = match args.get(1) {
+                Some(Value::Text(name)) => Some(name.as_str()),
+                None => None,
+                other => unreachable!("obj_description catalog argument was {other:?}"),
+            };
+            let mut found = ops.object_description(oid, 0, catalog);
+            if found.len() > 1 {
+                return Some(Err(ExecError::new(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "more than one row returned by a subquery used as an expression",
+                )));
+            }
+            found.pop().map_or(Value::Null, Value::Text)
+        }
+        // A column comment hangs off `pg_class`: the relation's OID in
+        // `objoid`, the attribute number in `objsubid`.
+        ScalarFn::ColDescription => {
+            let Value::Int4(objsubid) = args[1] else {
+                unreachable!("col_description column argument was {:?}", args[1]);
+            };
+            ops.object_description(oid, objsubid, Some("pg_class"))
+                .pop()
+                .map_or(Value::Null, Value::Text)
         }
         // `'name'::reg*` must find the object; `oid::reg*` takes the OID as
         // given and only resolves how it renders, so it cannot fail.
@@ -1492,6 +1531,14 @@ mod format_type_tests {
             }
             fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
+            }
+            fn object_description(
+                &self,
+                _objoid: u32,
+                _objsubid: i32,
+                _catalog: Option<&str>,
+            ) -> Vec<String> {
+                Vec::new()
             }
             fn namespace_name(&self, _oid: u32) -> Option<String> {
                 None
