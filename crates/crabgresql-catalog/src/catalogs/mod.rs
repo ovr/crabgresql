@@ -24,6 +24,7 @@ pub(crate) mod proc;
 pub(crate) mod progress;
 pub(crate) mod publication;
 pub(crate) mod relviews;
+pub(crate) mod replication;
 pub(crate) mod rewrite;
 pub(crate) mod sequence;
 pub(crate) mod settings;

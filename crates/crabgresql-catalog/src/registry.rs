@@ -21,8 +21,8 @@ use crate::SystemCatalog;
 use crate::catalogs::{
     am, attribute, auth, class, collation, constraint, cursors, database, description, extension,
     foreign, index, inherits, language, namespace, opclass, policy, prepared, proc, progress,
-    publication, relviews, rewrite, sequence, settings, statistic, statistic_ext, timezone,
-    trigger, types,
+    publication, relviews, replication, rewrite, sequence, settings, statistic, statistic_ext,
+    timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -357,6 +357,27 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         no_rows,
     ),
     rel(
+        "pg_replication_origin",
+        6000,
+        PgCatalog,
+        replication::pg_replication_origin_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_replication_origin_status",
+        12343,
+        PgCatalog,
+        replication::pg_replication_origin_status_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_replication_slots",
+        12261,
+        PgCatalog,
+        replication::pg_replication_slots_schema,
+        no_rows,
+    ),
+    rel(
         "pg_rewrite",
         2618,
         PgCatalog,
@@ -448,6 +469,41 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         no_rows,
     ),
     rel(
+        "pg_stat_replication",
+        12231,
+        PgCatalog,
+        replication::pg_stat_replication_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_replication_slots",
+        12266,
+        PgCatalog,
+        replication::pg_stat_replication_slots_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_subscription",
+        12248,
+        PgCatalog,
+        replication::pg_stat_subscription_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_subscription_stats",
+        12347,
+        PgCatalog,
+        replication::pg_stat_subscription_stats_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_stat_wal_receiver",
+        12240,
+        PgCatalog,
+        replication::pg_stat_wal_receiver_schema,
+        no_rows,
+    ),
+    rel(
         "pg_statistic",
         2619,
         PgCatalog,
@@ -487,6 +543,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         12063,
         PgCatalog,
         statistic_ext::pg_stats_ext_exprs_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_subscription",
+        6100,
+        PgCatalog,
+        replication::pg_subscription_schema,
+        no_rows,
+    ),
+    rel(
+        "pg_subscription_rel",
+        6102,
+        PgCatalog,
+        replication::pg_subscription_rel_schema,
         no_rows,
     ),
     rel(
