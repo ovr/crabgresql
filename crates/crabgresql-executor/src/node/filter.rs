@@ -55,7 +55,12 @@ mod tests {
             int4(2),
         );
         let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+            Box::new(SeqScan::new(
+                &table,
+                &rtxn(),
+                &ColumnProjection::All,
+                &ExecContext::default(),
+            )),
             predicate,
             ExecContext::default(),
         );
@@ -75,7 +80,12 @@ mod tests {
             },
         );
         let mut node = Filter::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+            Box::new(SeqScan::new(
+                &table,
+                &rtxn(),
+                &ColumnProjection::All,
+                &ExecContext::default(),
+            )),
             predicate,
             ExecContext::default(),
         );

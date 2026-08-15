@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
-use crabgresql_catalog::{CatalogLock, CatalogLockTarget};
+use crabgresql_catalog::{CatalogBackend, CatalogLock, CatalogLockTarget};
 use crabgresql_executor::{
     CatalogOps, ExecContext, ExecError, ExecNode, GucOps, NoticeSink, OutputColumn, RoutineOps,
     SequenceOps,
@@ -20,6 +20,7 @@ use crate::query::RowTag;
 use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
+use crabgresql_storage_api::pgstat::PgStatCounters;
 use crabgresql_storage_api::{SequenceAdvance, TableEngine, Tuple, TypeCatalog};
 use crabgresql_txn::{
     CommandId, IsolationLevel, LockOwner, Snapshot, SnapshotGuard, TransactionManager, Xid,
@@ -429,6 +430,16 @@ pub struct Session {
     /// it writes and so whether or not it ever gets a real XID, and it is the
     /// only identity a read-only transaction has in `pg_locks`.
     pub vxid: u32,
+    /// `timestamptz` micros, for `pg_stat_activity`.
+    pub backend_start: i64,
+    /// Already through [`crate::guc::clean_application_name`], so every reader
+    /// gets the reportable form rather than repeating the cleaning.
+    pub application_name: String,
+    /// What `pg_stat_activity.query` reports. Stamped once per protocol
+    /// message, like [`Session::stmt_start`], so a multi-statement simple query
+    /// shows the whole message — as it does in PostgreSQL.
+    pub current_query: String,
+    pub stats: Arc<PgStatCounters>,
     /// Concrete namespace assigned to this connection's temporary relations.
     pub temp_schema: String,
     /// Synthetic OID reflected for [`Session::temp_schema`] in `pg_namespace` and
@@ -472,6 +483,13 @@ pub struct Session {
     /// TODO: run an extended-query batch under a single XID, so an error
     /// anywhere in it rolls back every statement of the batch.
     implicit_xact_start: Option<i64>,
+    /// Whether this protocol message owes `pg_stat_database` one implicit
+    /// transaction; see [`Session::count_statement`].
+    ///
+    /// Not folded into `implicit_xact_start`: that one is the extended-query
+    /// batch's clock and stays `None` for a simple query, which owes a
+    /// transaction just the same.
+    implicit_txn_pending: bool,
     /// `default_transaction_isolation` GUC — the isolation level a new block
     /// inherits when it names none. Set by `SET SESSION CHARACTERISTICS AS
     /// TRANSACTION …` or a plain `SET default_transaction_isolation = …`.
@@ -776,6 +794,13 @@ impl Session {
             database: database.into(),
             user: user.into(),
             backend_id,
+            backend_start: crabgresql_types::tz::now_micros(),
+            application_name: String::new(),
+            current_query: String::new(),
+            // A private set, so a session built outside a server (every unit
+            // test) needs none passed in; `sharing_stats` swaps in the shared
+            // one, which is what makes the counters cumulative.
+            stats: Arc::new(PgStatCounters::new(crabgresql_types::tz::now_micros())),
             // The first transaction this session starts is 1, as PostgreSQL's
             // per-backend counter also begins at its first transaction.
             vxid: 0,
@@ -793,6 +818,7 @@ impl Session {
             // never an invented instant even before the first one arrives.
             stmt_start: crabgresql_types::tz::now_micros(),
             implicit_xact_start: None,
+            implicit_txn_pending: false,
             saved_gucs: Vec::new(),
             explicitly_set: HashSet::new(),
             default_iso: IsolationLevel::ReadCommitted,
@@ -998,6 +1024,90 @@ impl Session {
         }
     }
 
+    /// Count into the server's shared counters instead of this session's own.
+    pub fn sharing_stats(mut self, stats: Arc<PgStatCounters>) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// Note a finished statement for `pg_stat_database`'s transaction counters.
+    ///
+    /// `block_end` is `Some(rolled_back)` for a `COMMIT`/`ROLLBACK`, whose block
+    /// is one transaction and is counted on the spot. Anything else only marks
+    /// the *message* as owing one, settled by
+    /// [`Session::end_message_transaction`]: PostgreSQL runs a whole message as
+    /// a single implicit transaction, so `SELECT 1; SELECT 2` in one simple
+    /// query is one commit there (verified against 18.4) and counting per
+    /// statement would report two.
+    pub fn count_statement(&mut self, block_end: Option<bool>) {
+        match block_end {
+            Some(true) => self.stats.xact_rollback(),
+            Some(false) => self.stats.xact_commit(),
+            None if self.tx_status == TransactionStatus::Idle => {
+                self.implicit_txn_pending = true;
+            }
+            None => {}
+        }
+    }
+
+    /// The message ended without an error, so the implicit transaction it ran —
+    /// if it ran one — committed.
+    pub fn end_message_transaction(&mut self) {
+        if std::mem::take(&mut self.implicit_txn_pending) {
+            self.stats.xact_commit();
+        }
+    }
+
+    /// The message failed, so its implicit transaction rolled back — whether it
+    /// had run a statement yet or not, since a message that dies on a syntax
+    /// error is a rolled-back transaction in PostgreSQL too.
+    ///
+    /// Clearing the pending mark is what keeps a statement that fails *after*
+    /// its rows started streaming from counting twice: the message owes one
+    /// transaction, and this is it.
+    ///
+    /// Inside an open block nothing is counted; the `ROLLBACK` that ends it is
+    /// the one transaction.
+    pub fn fail_message_transaction(&mut self) {
+        if self.tx_status != TransactionStatus::Idle {
+            return;
+        }
+        self.implicit_txn_pending = false;
+        self.stats.xact_rollback();
+    }
+
+    /// This session, as `pg_stat_activity` shows it.
+    ///
+    /// A session can only describe itself (see
+    /// [`crabgresql_catalog::CatalogSource::backends`]) and is by construction
+    /// running the query that reads the view, so `state` is `active` and
+    /// `state_change` is when this statement began.
+    pub fn backend(&self) -> CatalogBackend {
+        CatalogBackend {
+            pid: self.backend_id,
+            application_name: self.application_name.clone(),
+            backend_start: self.backend_start,
+            // NULL outside a block, as in PostgreSQL: an autocommit statement's
+            // own transaction is not reported here.
+            xact_start: self.xact.as_ref().map(|xact| xact.xact_start),
+            query_start: self.stmt_start,
+            state_change: self.stmt_start,
+            state: "active",
+            query: self.current_query.clone(),
+            // Narrowed to 32 bits like the `pg_locks` row above.
+            backend_xid: self
+                .xact
+                .as_ref()
+                .and_then(|xact| xact.xid)
+                .map(|xid| xid.0 as u32),
+            backend_xmin: self
+                .xact
+                .as_ref()
+                .and_then(|xact| xact.snapshot.as_ref())
+                .map(|(snapshot, _)| snapshot.xmin.0 as u32),
+        }
+    }
+
     /// This session's `virtualtransaction`, in PostgreSQL's `backendID/localXID`
     /// spelling.
     pub fn virtual_transaction(&self) -> String {
@@ -1102,6 +1212,7 @@ impl Session {
             // `execute` creates one per statement; a session-wide cache would
             // outlive the snapshot it was built against.
             subplans: None,
+            stats: Some(Arc::clone(&self.stats)),
         }
     }
 }
@@ -1114,6 +1225,8 @@ impl Drop for Session {
     /// at the statement boundary, so only an open block needs this.
     fn drop(&mut self) {
         if let Some(active) = self.xact.take() {
+            // A block the client walked away from ends as a rollback.
+            self.stats.xact_rollback();
             let xid = active.xid.unwrap_or(Xid::INVALID);
             if std::thread::panicking() {
                 // We're unwinding from a panic. The engine finalize hook takes
@@ -1134,11 +1247,20 @@ impl Drop for Session {
         // skipped cleanup, not a fatal double-panic abort.
         let engine = Arc::clone(&self.engine);
         let temp_schema = self.temp_schema.clone();
+        let stats = Arc::clone(&self.stats);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             // O(this session's temp tables), reading just their names — not a
             // deep clone of every schema in the cluster.
             for name in engine.relation_names_in(&temp_schema) {
                 let _ = engine.drop_table(&temp_schema, &name);
+                // Nothing else clears a `pg_temp_N` key and the namespace
+                // carries the backend id, so without this the counter table
+                // grows by an entry per temp relation for the server's life.
+                //
+                // Untested, and untestable: a stale entry is invisible to
+                // `pg_stat_all_tables`, which drops any relation the snapshot
+                // cannot number. This is a memory fix, not a reporting one.
+                stats.forget_relation(&temp_schema, &name);
             }
         }));
     }

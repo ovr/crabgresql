@@ -53,7 +53,12 @@ mod tests {
             int4(10),
         )];
         let mut node = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+            Box::new(SeqScan::new(
+                &table,
+                &rtxn(),
+                &ColumnProjection::All,
+                &ExecContext::default(),
+            )),
             exprs,
             ExecContext::default(),
         );

@@ -8,6 +8,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
+use crate::tally::ScanTally;
 use crate::{ExecContext, ExecError, ExecNode, compare_values, eval};
 
 /// Index scan: probes the engine's physical index for the key. When the engine
@@ -18,6 +19,9 @@ use crate::{ExecContext, ExecError, ExecNode, compare_values, eval};
 /// selects), so it needs no re-check. NULL matches no comparison at all.
 pub struct IndexScan {
     iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
+    /// Counted even when the probe fell back to a full scan: `idx_scan` records
+    /// the plan the executor ran, not how the access method served it.
+    tally: Option<ScanTally>,
 }
 
 impl IndexScan {
@@ -32,6 +36,7 @@ impl IndexScan {
         let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
         Ok(Self {
             iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
+            tally: ScanTally::index(ctx, table, index_name),
         })
     }
 }
@@ -149,7 +154,13 @@ impl KeyTest {
 
 impl ExecNode for IndexScan {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        self.iter.next().transpose().map_err(ExecError::from)
+        let row = self.iter.next().transpose().map_err(ExecError::from)?;
+        if row.is_some()
+            && let Some(tally) = &mut self.tally
+        {
+            tally.saw(1);
+        }
+        Ok(row)
     }
 }
 

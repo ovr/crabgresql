@@ -111,7 +111,12 @@ mod tests {
             },
         ];
         let projection = Projection::new(
-            Box::new(SeqScan::new(&table, &rtxn(), &ColumnProjection::All)),
+            Box::new(SeqScan::new(
+                &table,
+                &rtxn(),
+                &ColumnProjection::All,
+                &ExecContext::default(),
+            )),
             exprs,
             ExecContext::default(),
         );

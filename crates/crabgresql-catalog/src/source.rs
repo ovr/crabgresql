@@ -5,6 +5,7 @@
 //! is one-way — these types know nothing about how a relation is rendered, so
 //! new live state is added here without touching the snapshot machinery.
 
+use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
 use crabgresql_types::{ByteaOutput, PgType};
 
@@ -306,6 +307,40 @@ pub trait CatalogSource: Send + Sync {
         Vec::new()
     }
 
+    /// The database-wide counters, for `pg_stat_database`.
+    ///
+    /// The default renders as a row of zeros and a NULL `stats_reset` — what
+    /// PostgreSQL shows for counters nothing has touched.
+    fn database_stats(&self) -> DbStatSnapshot {
+        DbStatSnapshot::default()
+    }
+
+    /// The per-relation counters, for `pg_stat_all_tables`. Named rather than
+    /// numbered, and resolved by the reading snapshot — exactly as
+    /// [`CatalogLockTarget::Relation`] is, and for the same reason.
+    fn table_stats(&self) -> Vec<RelStatSnapshot> {
+        Vec::new()
+    }
+
+    /// The per-index counters, for `pg_stat_all_indexes`.
+    fn index_stats(&self) -> Vec<IndexStatSnapshot> {
+        Vec::new()
+    }
+
+    /// The backends, for `pg_stat_activity`.
+    ///
+    /// PostgreSQL answers from shared memory, so one backend sees every other.
+    /// Nothing enumerates the live connections here — the gap
+    /// [`CatalogSource::locks`] documents, and the one that leaves
+    /// `CancelRequest` unanswered — so a session reports itself and the view
+    /// shows one row where PostgreSQL shows the cluster.
+    ///
+    /// TODO: register every connection in one server-wide table, so this can
+    /// report the other backends and a cancel request can find its session.
+    fn backends(&self) -> Vec<CatalogBackend> {
+        Vec::new()
+    }
+
     /// The configuration parameters, to reflect into `pg_settings`. The GUC
     /// table lives in the server, so this crate takes the rendered rows rather
     /// than depending on it.
@@ -569,6 +604,36 @@ pub struct CatalogLock {
     /// When the wait for an ungranted lock began, in `timestamptz` micros.
     /// NULL for a granted lock, as in PostgreSQL.
     pub waitstart: Option<i64>,
+}
+
+/// One backend, as `pg_stat_activity` shows it. See [`CatalogSource::backends`]
+/// for why a session can only describe itself.
+///
+/// Only the columns this build can answer are fields; `wait_event*`,
+/// `query_id`, `leader_pid` and the client address are constants the row
+/// builder supplies, since no session could fill them differently.
+#[derive(Clone, Debug)]
+pub struct CatalogBackend {
+    /// The connection's backend id; see [`CatalogLock::pid`].
+    pub pid: i32,
+    /// Empty when the client named itself neither at startup nor with `SET`,
+    /// as in PostgreSQL.
+    pub application_name: String,
+    /// `timestamptz` micros, as are the three stamps below.
+    pub backend_start: i64,
+    /// `None` outside an explicit block.
+    pub xact_start: Option<i64>,
+    pub query_start: i64,
+    /// Equal to `query_start` for a backend running a query, which is the only
+    /// state a session can observe itself in.
+    pub state_change: i64,
+    /// PostgreSQL's `state` string, always `active` here for the reason above.
+    pub state: &'static str,
+    pub query: String,
+    /// `None` until the transaction writes and is assigned one.
+    pub backend_xid: Option<u32>,
+    /// The oldest XID this backend's snapshot still considers running.
+    pub backend_xmin: Option<u32>,
 }
 
 /// One prepared statement, as `pg_prepared_statements` shows it. Session-local

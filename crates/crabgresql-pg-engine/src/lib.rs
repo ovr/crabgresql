@@ -1868,6 +1868,17 @@ impl PgEngine {
 }
 
 impl TableEngine for PgEngine {
+    /// An extend is neither a hit nor a read: a page this engine created was
+    /// never a candidate for residency, and folding extends in would report a
+    /// bulk load as a cache problem (see [`bufpool::PoolStats`]).
+    fn buffer_stats(&self) -> Option<crabgresql_storage_api::BufferStats> {
+        let stats = self.inner.bufpool.hit_stats();
+        Some(crabgresql_storage_api::BufferStats {
+            hits: stats.hits,
+            reads: stats.misses,
+        })
+    }
+
     fn validate_schema(&self, schema: &TableSchema) -> Result<(), StorageError> {
         if schema.access_method.is_engine_managed() {
             validate_schema(schema)?;

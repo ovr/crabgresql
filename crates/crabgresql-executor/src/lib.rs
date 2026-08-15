@@ -22,6 +22,7 @@ pub mod reg;
 pub mod scalar_fns;
 mod special_fns;
 mod subplan;
+mod tally;
 #[cfg(test)]
 mod testutil;
 mod unique;
@@ -42,6 +43,7 @@ use crabgresql_planner::{
     PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, map_assigned_columns,
     update_needs_unique_snapshot,
 };
+use crabgresql_storage_api::pgstat::WriteKind;
 use crabgresql_storage_api::{
     ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
     TableSchema, Tid, Tuple, TypeCatalog,
@@ -60,6 +62,7 @@ pub use node::{
     Aggregate, Append, Concat, Distinct, Filter, HashJoin, IndexScan, Limit, MaterializedRows,
     NestedLoopJoin, ProjectSet, Projection, SeqScan, Sort, TableFunctionSource, Values, WindowAgg,
 };
+use tally::count_write;
 use unique::UniqueKeySet;
 
 /// Side-effecting sequence operations (`nextval`/`currval`/`setval`/`lastval`),
@@ -381,6 +384,10 @@ pub struct ExecContext {
     /// replaced, by the nested executions a correlated subquery drives — a cache
     /// scoped to a single outer row would never be hit.
     pub subplans: Option<Arc<subplan::SubplanCache>>,
+    /// Where the scan nodes report what they read. `None` in a context with no
+    /// server behind it — a unit test, an `EXPLAIN` — and then nothing is
+    /// counted at all, which is the truth for work that never ran.
+    pub stats: Option<Arc<crabgresql_storage_api::pgstat::PgStatCounters>>,
 }
 
 impl Default for ExecContext {
@@ -400,6 +407,7 @@ impl Default for ExecContext {
             call_depth: 0,
             command_counter: None,
             subplans: None,
+            stats: None,
         }
     }
 }
@@ -615,6 +623,7 @@ pub fn execute(
         call_depth: ctx.call_depth,
         command_counter: ctx.command_counter.clone(),
         subplans: Some(ctx.subplans.clone().unwrap_or_default()),
+        stats: ctx.stats.clone(),
     };
     // Fold every *non-correlated* subquery to a constant/comparison before any
     // node evaluates an expression.
@@ -648,7 +657,7 @@ pub fn execute(
             sort,
             distinct,
         } => project_pipeline(
-            scan_source(&table, txn, &projection),
+            scan_source(&table, txn, &projection, ctx),
             projections,
             predicate,
             sort,
@@ -826,7 +835,7 @@ pub fn execute(
             // FROM-less aggregate.
             let source: Box<dyn ExecNode> = match input {
                 PhysicalAggInput::Scan { table, projection } => {
-                    Box::new(SeqScan::new(&table, txn, &projection))
+                    Box::new(SeqScan::new(&table, txn, &projection, ctx))
                 }
                 PhysicalAggInput::Join(source) => build_join_expr(source, ctx, txn)?,
                 PhysicalAggInput::SingleRow => Box::new(Values::new(vec![vec![]], ctx.clone())),
@@ -1963,8 +1972,9 @@ fn scan_source(
     table: &Arc<dyn TableAm>,
     txn: &TxnContext,
     projection: &ColumnProjection,
+    ctx: &ExecContext,
 ) -> Source {
-    match vector::BatchScan::open(table, txn, projection) {
+    match vector::BatchScan::open(table, txn, projection, ctx) {
         Some(scan) => {
             let layout = vector::layout_of(&table.schema());
             let positions = scan_positions(projection, layout.len());
@@ -1974,7 +1984,7 @@ fn scan_source(
                 positions,
             }
         }
-        None => Source::Rows(Box::new(SeqScan::new(table, txn, projection))),
+        None => Source::Rows(Box::new(SeqScan::new(table, txn, projection, ctx))),
     }
 }
 
@@ -1996,7 +2006,7 @@ fn append_source(
     // arms is not a shape the planner emits.
     let first = arms.first();
     let layout = first.map(|arm| vector::layout_of(&arm.relation.table.schema()));
-    Ok(match (vector::BatchAppend::open(arms, txn), layout) {
+    Ok(match (vector::BatchAppend::open(arms, txn, ctx), layout) {
         (Some(append), Some(layout)) => {
             let positions = scan_positions(
                 &first.expect("layout implies an arm").projection,
@@ -2380,7 +2390,9 @@ fn insert_direct(
     // the projection above.
     generated.blank_virtual(&mut tuples);
     let frozen = write_context(freeze, txn);
+    let written = tuples.len() as u64;
     table.insert_many(tuples, frozen.as_ref().unwrap_or(txn))?;
+    count_write(ctx, table, WriteKind::Insert, written);
     finish_insert(returning, output, inserted)
 }
 
@@ -2505,7 +2517,9 @@ fn insert_routed(
     let frozen = write_context(freeze, txn);
     let write_txn = frozen.as_ref().unwrap_or(txn);
     for (leaf, tuples) in leaves.iter().zip(batches) {
+        let written = tuples.len() as u64;
         leaf.insert_many(tuples, write_txn)?;
+        count_write(ctx, leaf, WriteKind::Insert, written);
     }
     finish_insert(returning, output, inserted)
 }
@@ -2788,10 +2802,12 @@ fn update_inherited(
     let mut affected = 0u64;
     for (i, target) in targets.iter().enumerate() {
         generated[i].blank_virtual(pending[i].iter_mut().map(|(_, tuple)| tuple));
-        affected += target
+        let updated = target
             .relation
             .table
             .update_many(std::mem::take(&mut pending[i]), txn)?;
+        count_write(ctx, &target.relation.table, WriteKind::Update, updated);
+        affected += updated;
     }
     match (returning, output) {
         (Some(returning), Some(output)) => {
@@ -2920,6 +2936,7 @@ fn update_direct(
     };
     generated.blank_virtual(pending.iter_mut().map(|(_, tuple)| tuple));
     let updated = table.update_many(pending, txn)?;
+    count_write(ctx, table, WriteKind::Update, updated);
     match (returning, output) {
         (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
@@ -3161,9 +3178,18 @@ fn update_routed(
     for i in 0..leaves.len() {
         leaf_generated[i].blank_virtual(pending_update[i].iter_mut().map(|(_, tuple)| tuple));
         leaf_generated[i].blank_virtual(pending_insert[i].iter_mut());
-        affected += leaf_tables[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
-        affected += leaf_tables[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
-        leaf_tables[i].insert_many(std::mem::take(&mut pending_insert[i]), txn)?;
+        let updated = leaf_tables[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
+        let deleted = leaf_tables[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
+        let moved_in = std::mem::take(&mut pending_insert[i]);
+        let inserted = moved_in.len() as u64;
+        leaf_tables[i].insert_many(moved_in, txn)?;
+        // The per-relation counters report a moved row as both a delete and an
+        // insert, as PostgreSQL does, even though the UPDATE tag counts it once.
+        count_write(ctx, &leaf_tables[i], WriteKind::Update, updated);
+        count_write(ctx, &leaf_tables[i], WriteKind::Delete, deleted);
+        count_write(ctx, &leaf_tables[i], WriteKind::Insert, inserted);
+        affected += updated;
+        affected += deleted;
     }
     match (returning, output) {
         (Some(returning), Some(output)) => {
@@ -3421,10 +3447,12 @@ fn delete_inherited(
     };
     let mut affected = 0u64;
     for (i, target) in targets.iter().enumerate() {
-        affected += target
+        let deleted = target
             .relation
             .table
             .delete_many(std::mem::take(&mut pending[i]), txn)?;
+        count_write(ctx, &target.relation.table, WriteKind::Delete, deleted);
+        affected += deleted;
     }
     match (returning, output) {
         (Some(returning), Some(output)) => {
@@ -3477,10 +3505,15 @@ fn delete_direct(
             let oids = oid.map(|oid| vec![oid; deleted.len()]);
             let output =
                 project_returning(deleted.iter(), &returning.projections, oids.as_deref(), ctx)?;
-            table.delete_many(pending, txn)?;
+            let deleted = table.delete_many(pending, txn)?;
+            count_write(ctx, table, WriteKind::Delete, deleted);
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
-        None => Ok(Execution::Deleted(table.delete_many(pending, txn)?)),
+        None => {
+            let deleted = table.delete_many(pending, txn)?;
+            count_write(ctx, table, WriteKind::Delete, deleted);
+            Ok(Execution::Deleted(deleted))
+        }
     }
 }
 
@@ -3535,19 +3568,23 @@ fn delete_routed(
                 ctx,
             )?;
             for (i, leaf) in leaves.iter().enumerate() {
-                leaf.relation
+                let deleted = leaf
+                    .relation
                     .table
                     .delete_many(std::mem::take(&mut pending[i]), txn)?;
+                count_write(ctx, &leaf.relation.table, WriteKind::Delete, deleted);
             }
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
         }
         None => {
             let mut affected = 0u64;
             for (i, leaf) in leaves.iter().enumerate() {
-                affected += leaf
+                let deleted = leaf
                     .relation
                     .table
                     .delete_many(std::mem::take(&mut pending[i]), txn)?;
+                count_write(ctx, &leaf.relation.table, WriteKind::Delete, deleted);
+                affected += deleted;
             }
             Ok(Execution::Deleted(affected))
         }
@@ -3576,7 +3613,7 @@ fn build_join_source(
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
         PhysicalJoinInput::Scan { table, projection } => {
-            Box::new(SeqScan::new(&table, txn, &projection))
+            Box::new(SeqScan::new(&table, txn, &projection, ctx))
         }
         PhysicalJoinInput::TableFunction {
             func,

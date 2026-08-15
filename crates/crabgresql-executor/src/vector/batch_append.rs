@@ -3,7 +3,7 @@ use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_txn::TxnContext;
 
 use super::{BatchNode, BatchScan};
-use crate::ExecError;
+use crate::{ExecContext, ExecError};
 
 /// Concatenates several batch sources — the columnar [`crate::Append`].
 ///
@@ -35,7 +35,7 @@ impl BatchAppend {
     /// TODO: hand up batches for an arm that must append a `tableoid` slot.
     /// `arms_batch` does not test for that slot, so until then `EXPLAIN` calls
     /// such an `Append` columnar while it runs on rows.
-    pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext) -> Option<Self> {
+    pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext, ctx: &ExecContext) -> Option<Self> {
         let children = arms
             .iter()
             .map(|arm| {
@@ -44,7 +44,7 @@ impl BatchAppend {
                 if arm.relation.map.is_some() || arm.relation.tableoid.is_some() {
                     return None;
                 }
-                BatchScan::open(&arm.relation.table, txn, &arm.projection)
+                BatchScan::open(&arm.relation.table, txn, &arm.projection, ctx)
                     .map(|scan| Box::new(scan) as Box<dyn BatchNode>)
             })
             .collect::<Option<Vec<_>>>()?;
