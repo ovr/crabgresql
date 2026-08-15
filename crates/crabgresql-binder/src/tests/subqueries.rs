@@ -16,6 +16,44 @@ fn scalar_subquery_binds_with_column_type() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ARRAY(SELECT …)` reaches the binder as a *function* named `array` whose
+/// arguments are a query — a shape only this grammar produces — and binds to
+/// the array marker with the column's type as the element type.
+#[test]
+fn array_subquery_binds_with_the_column_element_type() -> anyhow::Result<()> {
+    let ValuesPlan { rows, .. } = bound_values("SELECT array(SELECT big FROM t)")?;
+    assert!(matches!(
+        rows[0][0],
+        BoundExpr::ArraySubquery {
+            elem: PgType::Int8,
+            ty: PgType::Array(crabgresql_types::oid::INT8),
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn array_subquery_multiple_columns_errors() -> anyhow::Result<()> {
+    let e = bind_err("SELECT array(SELECT id, big FROM t)")?;
+    assert_eq!(e.code, "42601");
+    assert_eq!(e.message, "subquery must return only one column");
+    Ok(())
+}
+
+/// PG answers an array-typed column with a two-dimensional array; this build has
+/// no representation for one, so it refuses exactly the way `ARRAY[[1,2]]` does.
+#[test]
+fn array_subquery_of_an_array_column_is_refused() -> anyhow::Result<()> {
+    let e = bind_err("SELECT array(SELECT ARRAY[id] FROM t)")?;
+    assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        e.message,
+        "could not find array type for data type integer[]"
+    );
+    Ok(())
+}
+
 #[test]
 fn exists_binds_to_marker() -> anyhow::Result<()> {
     let QueryPlan { predicate, .. } =

@@ -3500,6 +3500,16 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
             "function is not supported yet: {func}"
         )));
     };
+    // `ARRAY(SELECT …)` is grammar, not a call: the parser spells it as a
+    // function named `array` whose argument list *is* a query, a shape nothing
+    // else produces (a user's `array(1)` arrives as a positional list). So the
+    // interception is exact, and it happens before the window/aggregate paths
+    // because none of their decorations are grammatical here.
+    if name == "array"
+        && let ast::FunctionArguments::Subquery(query) = &func.args
+    {
+        return crate::expr::bind_array_subquery(query, scope);
+    }
     // An `OVER` clause makes this a window call whatever the name resolves to,
     // so it is dispatched before the aggregate and scalar paths.
     if let Some(over) = &func.over {

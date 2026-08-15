@@ -363,6 +363,7 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         // reaches here. A *correlated* one is left in place — its value depends on
         // the outer row — and folded now, against this row.
         BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::ArraySubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. } => crate::eval_correlated_subquery(expr, row, ctx),
         // `left op ANY/ALL(array)`: compare the needle (evaluated once) against

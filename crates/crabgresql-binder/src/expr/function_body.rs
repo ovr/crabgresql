@@ -385,6 +385,7 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
         },
         // Subqueries cannot appear in a validated scalar body; leave untouched.
         BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::ArraySubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::QuantifiedSubquery { .. } => expr,
     }

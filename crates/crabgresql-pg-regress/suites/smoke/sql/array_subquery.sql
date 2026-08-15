@@ -1,0 +1,37 @@
+--
+-- ARRAY(subquery)
+-- The subquery form of the array constructor: every row of a one-column
+-- subquery becomes one element, in the order the subquery yields them. Unlike a
+-- scalar subquery there is no cardinality limit and no row count means NULL --
+-- zero rows give the empty array. Expected output taken from PostgreSQL.
+--
+-- elements arrive in the subquery's own order, so the inner ORDER BY decides
+SELECT array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n) AS sorted,
+       array(SELECT n FROM (VALUES (3), (1), (2)) v(n) ORDER BY n DESC) AS reversed;
+-- the output column is named "array", like the bracket constructor
+SELECT array(SELECT 1);
+-- zero rows is the empty array, not NULL -- and array_to_string of it is ''
+SELECT array(SELECT 1 WHERE false) AS empty,
+       array(SELECT 1 WHERE false) IS NULL AS is_null,
+       array_to_string(array(SELECT 1 WHERE false), ',') AS joined;
+-- NULL rows are kept as NULL elements and duplicates are not collapsed
+SELECT array(SELECT n FROM (VALUES (1), (NULL), (1), (2)) v(n));
+-- the element type is the subquery column's; a text column gives text[]
+SELECT pg_typeof(array(SELECT 1)) AS ints,
+       pg_typeof(array(SELECT 'a')) AS texts,
+       pg_typeof(array(SELECT 1.5)) AS numerics;
+-- LIMIT inside applies to the elements, not to the one row the array is
+SELECT array(SELECT n FROM (VALUES (1), (2), (3)) v(n) ORDER BY n LIMIT 2);
+
+-- a correlated subquery is rebuilt for each outer row
+CREATE TABLE array_sub_o (k int);
+CREATE TABLE array_sub_i (k int, owner int);
+INSERT INTO array_sub_o VALUES (1), (2), (3);
+INSERT INTO array_sub_i VALUES (7, 1), (8, 1), (9, 2);
+SELECT k, array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k) AS owned
+  FROM array_sub_o o ORDER BY k;
+-- an aggregate over the array a correlated subquery builds
+SELECT k, array_to_string(array(SELECT i.k FROM array_sub_i i WHERE i.owner = o.k ORDER BY i.k), ',') AS joined
+  FROM array_sub_o o ORDER BY k;
+DROP TABLE array_sub_i;
+DROP TABLE array_sub_o;
