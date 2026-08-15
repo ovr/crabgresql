@@ -2072,50 +2072,56 @@ fn the_description_lookup_matches_the_published_rows() -> anyhow::Result<()> {
 }
 
 /// `pg_locks` renders each lock target into the identity column PostgreSQL
-/// fills for it and leaves the others NULL, and appends the reading scan's own
-/// `AccessShareLock` on `pg_locks`.
+/// fills for it and leaves the others NULL, numbering a relation lock from the
+/// same snapshot it is rendering.
 ///
 /// The three targets share one row builder, so the risk is a column that stays
 /// filled from the wrong arm — a `relation` OID surviving onto a `virtualxid`
 /// row would name a relation the lock has nothing to do with.
 #[test]
 fn pg_locks_fills_one_identity_column_per_lock_target() -> anyhow::Result<()> {
-    let cat = SystemCatalog::from_source(Arc::new(StaticSource::default().locks(vec![
-        CatalogLock {
-            target: CatalogLockTarget::VirtualXid,
-            virtualtransaction: "4/7".to_string(),
-            pid: 4,
-            mode: "ExclusiveLock",
-            granted: true,
-            fastpath: true,
-            waitstart: None,
-        },
-        CatalogLock {
-            target: CatalogLockTarget::TransactionId(31),
-            virtualtransaction: "4/7".to_string(),
-            pid: 4,
-            mode: "ExclusiveLock",
-            granted: true,
-            fastpath: false,
-            waitstart: None,
-        },
-        CatalogLock {
-            target: CatalogLockTarget::Relation(16_400),
-            virtualtransaction: "4/7".to_string(),
-            pid: 4,
-            mode: "AccessExclusiveLock",
-            granted: false,
-            fastpath: false,
-            waitstart: Some(42),
-        },
-    ])));
+    let lock = |target| CatalogLock {
+        target,
+        virtualtransaction: "4/7".to_string(),
+        pid: 4,
+        mode: "ExclusiveLock",
+        granted: true,
+        fastpath: true,
+        waitstart: None,
+    };
+    let relation = |namespace: &str, name: &str| CatalogLockTarget::Relation {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+    };
+    let cat = SystemCatalog::from_source(Arc::new(
+        StaticSource::new(vec![CatalogRelation::permanent(TableSchema::in_namespace(
+            "t",
+            "app",
+            vec![Column::new("a", PgType::Int4)],
+        ))])
+        .schemas(vec![("app".to_string(), 16_400)])
+        .locks(vec![
+            lock(CatalogLockTarget::VirtualXid),
+            lock(CatalogLockTarget::TransactionId(31)),
+            CatalogLock {
+                mode: "AccessExclusiveLock",
+                granted: false,
+                fastpath: false,
+                waitstart: Some(42),
+                ..lock(relation("app", "t"))
+            },
+            lock(relation("pg_catalog", "pg_locks")),
+            // A relation this snapshot cannot number: dropped rather than
+            // reported under an OID that names nothing.
+            lock(relation("app", "gone")),
+        ]),
+    ));
     let (schema, rows) = required(cat.build_pg_catalog("pg_locks"), "pg_locks is missing")?;
     let col = |row: &[Value], name: &str| -> anyhow::Result<Value> {
         Ok(row[required(schema.column_index(name), name)?].clone())
     };
-    let locks = required(builtin_relation_oid("pg_locks"), "pg_locks has no OID")?;
-    assert_eq!(locks, 12_073);
-    // Three reported locks plus the scan's own read lock.
+    let locks_oid = required(builtin_relation_oid("pg_locks"), "pg_locks has no OID")?;
+    assert_eq!(locks_oid, 12_073);
     assert_eq!(rows.len(), 4);
 
     assert_eq!(col(&rows[0], "locktype")?, Value::Text("virtualxid".into()));
@@ -2134,24 +2140,19 @@ fn pg_locks_fills_one_identity_column_per_lock_target() -> anyhow::Result<()> {
     assert_eq!(col(&rows[1], "virtualxid")?, Value::Null);
 
     assert_eq!(col(&rows[2], "locktype")?, Value::Text("relation".into()));
-    assert_eq!(col(&rows[2], "relation")?, Value::Oid(16_400));
+    assert_eq!(
+        col(&rows[2], "relation")?,
+        Value::Oid(required(
+            cat.relation_oid_in("app", "t"),
+            "app.t has no OID"
+        )?)
+    );
     assert_eq!(col(&rows[2], "database")?, Value::Oid(oids::DATABASE_OID));
     assert_eq!(col(&rows[2], "granted")?, Value::Bool(false));
     assert_eq!(col(&rows[2], "waitstart")?, Value::TimestampTz(42));
 
-    // The scan's own hold, attributed to the session that reported the rest.
-    assert_eq!(col(&rows[3], "locktype")?, Value::Text("relation".into()));
-    assert_eq!(col(&rows[3], "relation")?, Value::Oid(locks));
-    assert_eq!(
-        col(&rows[3], "mode")?,
-        Value::Text("AccessShareLock".into())
-    );
-    assert_eq!(col(&rows[3], "granted")?, Value::Bool(true));
-    assert_eq!(col(&rows[3], "waitstart")?, Value::Null);
-    assert_eq!(
-        col(&rows[3], "virtualtransaction")?,
-        Value::Text("4/7".into())
-    );
+    // A `pg_catalog` relation carries PostgreSQL's own OID, not a snapshot one.
+    assert_eq!(col(&rows[3], "relation")?, Value::Oid(locks_oid));
 
     // The columns whose lock types this build never takes stay NULL on every row.
     for row in &rows {

@@ -531,11 +531,14 @@ pub struct CatalogCursor {
 /// `locktype`s (`page`, `tuple`, `object`, `userlock`, `advisory`,
 /// `applytransaction`) name lock levels no code here takes, so a row of that
 /// kind would be an invented one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CatalogLockTarget {
-    /// A whole relation, by OID. `pg_locks.database` is filled too, as
-    /// PostgreSQL does for every relation lock on a non-shared catalog.
-    Relation(u32),
+    /// A whole relation, named rather than numbered: relation OIDs are assigned
+    /// by the snapshot itself (see [`crate::SystemCatalog::relation_oid_in`]),
+    /// so the session that reports the lock has no OID to hand over and the row
+    /// builder resolves the name against the same snapshot it is rendering.
+    /// `pg_locks.database` is filled too, as PostgreSQL does for a relation lock.
+    Relation { namespace: String, name: String },
     /// The session's own virtual transaction, held for the transaction's life.
     /// The `virtualxid` column repeats `virtualtransaction`.
     VirtualXid,

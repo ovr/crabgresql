@@ -1015,7 +1015,11 @@ impl Session {
     /// is allocated just as lazily.
     pub fn locks(&self) -> Vec<CatalogLock> {
         let virtualtransaction = self.virtual_transaction();
-        let lock = |target| CatalogLock {
+        let lock = |target: CatalogLockTarget| CatalogLock {
+            // PostgreSQL's fast path covers weak *relation* locks only; a
+            // `virtualxid` lock is fast-path in a backend's own PGPROC, and a
+            // `transactionid` lock never is.
+            fastpath: matches!(target, CatalogLockTarget::VirtualXid),
             target,
             virtualtransaction: virtualtransaction.clone(),
             pid: self.backend_id,
@@ -1025,10 +1029,6 @@ impl Session {
             // does not have.
             mode: "ExclusiveLock",
             granted: true,
-            // PostgreSQL's fast path covers weak *relation* locks only; a
-            // `virtualxid` lock is fast-path in a backend's own PGPROC, and a
-            // `transactionid` lock never is.
-            fastpath: matches!(target, CatalogLockTarget::VirtualXid),
             waitstart: None,
         };
         let mut locks = vec![lock(CatalogLockTarget::VirtualXid)];

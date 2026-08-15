@@ -51,6 +51,11 @@ pub(crate) struct CatalogRelDef {
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
     pub(crate) rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    /// Whether the rows are built when the relation is first *read* rather than
+    /// when the binder resolves its name. True for exactly one relation; see
+    /// [`crate::static_table::StaticTable::deferred`] for why `pg_locks` needs
+    /// it and why nothing else does.
+    pub(crate) deferred: bool,
 }
 
 const fn rel(
@@ -66,6 +71,25 @@ const fn rel(
         namespace,
         schema,
         rows,
+        deferred: false,
+    }
+}
+
+/// A relation whose rows are built on first read; see [`CatalogRelDef::deferred`].
+const fn rel_deferred(
+    name: &'static str,
+    oid: u32,
+    namespace: CatalogNamespace,
+    schema: fn() -> TableSchema,
+    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+) -> CatalogRelDef {
+    CatalogRelDef {
+        name,
+        oid,
+        namespace,
+        schema,
+        rows,
+        deferred: true,
     }
 }
 
@@ -307,7 +331,7 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         misc_empty::pg_largeobject_metadata_schema,
         no_rows,
     ),
-    rel(
+    rel_deferred(
         "pg_locks",
         12073,
         PgCatalog,

@@ -341,7 +341,7 @@ fn bind_arguments(
             args.len()
         )));
     }
-    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session);
+    let (catalog, type_catalog, catalog_ops) = bind_catalogs(engine, global_catalog, session, None);
     let param_ctx = crabgresql_binder::param_ctx_none();
     let scope = crabgresql_binder::Scope::empty(&type_catalog, &param_ctx);
     let mut bound = Vec::with_capacity(args.len());

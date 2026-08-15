@@ -14320,3 +14320,74 @@ async fn pg_backend_pid_matches_the_sessions_lock_rows() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `pg_locks` reports a `relation` row for every relation the statement
+/// resolved, not just for itself — the join `pg_locks JOIN pg_class ON relation
+/// = oid` that every monitoring query is built around.
+#[tokio::test]
+async fn pg_locks_lists_every_relation_the_statement_resolved() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (i int)").await?;
+    client.batch_execute("INSERT INTO t VALUES (1)").await?;
+
+    let rows = client
+        .query(
+            "SELECT relation, mode, granted, fastpath FROM pg_locks, t \
+             WHERE locktype = 'relation' ORDER BY relation",
+            &[],
+        )
+        .await?;
+    let oids: Vec<u32> = rows
+        .iter()
+        .map(|row| row.get::<_, u32>("relation"))
+        .collect();
+    let expected: Vec<u32> = client
+        .query_one(
+            "SELECT 'pg_locks'::regclass::oid AS locks, 't'::regclass::oid AS t",
+            &[],
+        )
+        .await
+        .map(|row| vec![row.get::<_, u32>("locks"), row.get::<_, u32>("t")])?;
+    for oid in expected {
+        assert!(oids.contains(&oid), "{oid} missing from {oids:?}");
+    }
+    for row in &rows {
+        assert_eq!(row.get::<_, &str>("mode"), "AccessShareLock");
+        assert!(row.get::<_, bool>("granted"));
+        assert!(row.get::<_, bool>("fastpath"));
+    }
+    Ok(())
+}
+
+/// The relation a statement *writes* is reported in the mode PostgreSQL holds
+/// it in, not as the `AccessShareLock` a scan takes.
+///
+/// A writing statement returns no `pg_locks` rows to the client, so the only way
+/// to observe its own mode is to have it store one.
+#[tokio::test]
+async fn pg_locks_reports_the_write_target_as_row_exclusive() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE log (m text)").await?;
+    client
+        .batch_execute("INSERT INTO log SELECT mode FROM pg_locks WHERE relation = 'log'::regclass")
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT m FROM log", &[])
+            .await?
+            .get::<_, &str>("m"),
+        "RowExclusiveLock"
+    );
+    // A read of the same table in the next statement is back to a share lock.
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT mode FROM pg_locks, log WHERE relation = 'log'::regclass",
+                &[]
+            )
+            .await?
+            .get::<_, &str>("mode"),
+        "AccessShareLock"
+    );
+    Ok(())
+}

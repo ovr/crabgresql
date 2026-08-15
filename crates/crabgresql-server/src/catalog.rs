@@ -3,11 +3,12 @@
 //! catalogs (`pg_catalog` and schema-qualified `information_schema`) sit behind
 //! both on the search path.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use crabgresql_catalog::{
-    CatalogCursor, CatalogLock, CatalogPreparedStatement, CatalogRelation, CatalogRoutine,
-    CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
+    CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement, CatalogRelation,
+    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType, SystemCatalog,
 };
 use crabgresql_executor::{CatalogOps, ConstraintDef, IndexDef};
 use crabgresql_storage_api::{
@@ -20,6 +21,82 @@ use crabgresql_types::ByteaOutput;
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{catalog_routine, partition_session_relations};
 use crate::session::Session;
+
+/// The relations one statement resolved, and the write it is going to perform.
+///
+/// PostgreSQL answers `pg_locks` from a cluster-wide lock table. There is none
+/// here — a relation's `TableLock` lives inside the access method's open handle
+/// — so the honest stand-in is the set of relations this statement's own name
+/// resolution reached: every one of them is about to be scanned or written, and
+/// a scan really does take a shared hold on the relation it reads.
+///
+/// Filled by [`SessionCatalog`] as it resolves names during binding and read by
+/// [`SessionCatalogSource::locks`] during execution — which works only because
+/// `SystemCatalog` calls `locks()` lazily, when a query actually opens
+/// `pg_locks`, by which time binding has finished and the set is complete.
+#[derive(Default)]
+pub struct StatementRelations {
+    /// `(namespace, name)` of every relation resolved, as the *resolution*
+    /// spelled it rather than as the client wrote it — so a view's base tables
+    /// and a partition's leaves land here too, having gone through the same
+    /// engine. A set, because PostgreSQL also reports one lock per relation
+    /// however many times a statement names it, and because its order is what
+    /// makes the rows stable across runs.
+    resolved: Mutex<BTreeSet<(String, String)>>,
+    /// The relation this statement writes and the mode PostgreSQL holds on it.
+    /// Decided from the statement rather than from which engine method resolved
+    /// the name: an unqualified write resolves through `open_table` but a
+    /// `public.`-qualified one through `resolve`, so the method proves nothing.
+    write_target: Option<(String, &'static str)>,
+}
+
+impl StatementRelations {
+    pub fn new(write_target: Option<(String, &'static str)>) -> Self {
+        Self {
+            resolved: Mutex::new(BTreeSet::new()),
+            write_target,
+        }
+    }
+
+    fn record(&self, namespace: &str, name: &str) {
+        if let Ok(mut resolved) = self.resolved.lock() {
+            resolved.insert((namespace.to_string(), name.to_string()));
+        }
+    }
+
+    /// One lock per resolved relation. `AccessShareLock` unless the statement
+    /// names the relation as its write target, which is the whole reason the
+    /// target is carried here.
+    fn locks(&self, holder: &CatalogLock) -> Vec<CatalogLock> {
+        let Ok(resolved) = self.resolved.lock() else {
+            return Vec::new();
+        };
+        resolved
+            .iter()
+            .map(|(namespace, name)| {
+                let mode = match &self.write_target {
+                    Some((target, mode)) if target == name => *mode,
+                    _ => "AccessShareLock",
+                };
+                CatalogLock {
+                    target: CatalogLockTarget::Relation {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                    },
+                    virtualtransaction: holder.virtualtransaction.clone(),
+                    pid: holder.pid,
+                    mode,
+                    granted: true,
+                    // PostgreSQL takes a weak relation lock with no conflicting
+                    // holder through the per-backend fast path; a lock strong
+                    // enough to conflict always goes through the lock table.
+                    fastpath: mode == "AccessShareLock",
+                    waitstart: None,
+                }
+            })
+            .collect()
+    }
+}
 
 /// The live server state one session's [`SystemCatalog`] snapshot reflects.
 ///
@@ -56,6 +133,10 @@ pub struct SessionCatalogSource {
     /// The connection's backend id, behind `pg_backend_pid()` and the `pid` of
     /// every row above.
     backend_pid: i32,
+    /// The relations this statement resolved, read at `locks()` time rather than
+    /// snapshotted here — the set is still being filled while this source is
+    /// built.
+    relations: Arc<StatementRelations>,
     /// The transaction timestamp, so the timezone views resolve their offsets at
     /// the same instant `now()` reports. Not the *statement* timestamp: `now()`
     /// is `transaction_timestamp()` here as in PostgreSQL, and the two differ
@@ -72,6 +153,7 @@ impl SessionCatalogSource {
         engine: Arc<dyn TableEngine>,
         global_catalog: Arc<GlobalCatalog>,
         session: &Session,
+        relations: Arc<StatementRelations>,
     ) -> Self {
         // Sorted so `SELECT * FROM pg_cursors` is stable across runs, where
         // PostgreSQL's hash order is not.
@@ -139,6 +221,7 @@ impl SessionCatalogSource {
             settings: crate::guc::catalog_settings(session),
             locks: session.locks(),
             backend_pid: session.backend_id,
+            relations,
             now: session.xact_start(),
             bytea_output: session.bytea_output,
         }
@@ -256,7 +339,13 @@ impl CatalogSource for SessionCatalogSource {
     }
 
     fn locks(&self) -> Vec<CatalogLock> {
-        self.locks.clone()
+        let mut locks = self.locks.clone();
+        // Attributed to the same transaction as the rows above; a source with no
+        // session behind it has no holder to name and reports nothing.
+        if let Some(holder) = locks.first().cloned() {
+            locks.extend(self.relations.locks(&holder));
+        }
+        locks
     }
 
     fn backend_pid(&self) -> i32 {
@@ -535,6 +624,10 @@ pub struct SessionCatalog {
     global: Arc<dyn TableEngine>,
     system: Arc<dyn TableEngine>,
     temp_schema: String,
+    /// Where every successful resolution is recorded for `pg_locks`. `None` in
+    /// tests and on paths with no statement behind them, which then report no
+    /// relation locks rather than a set from nowhere.
+    relations: Option<Arc<StatementRelations>>,
 }
 
 impl SessionCatalog {
@@ -547,7 +640,24 @@ impl SessionCatalog {
             global,
             system,
             temp_schema: temp_schema.into(),
+            relations: None,
         }
+    }
+
+    /// Record what this statement resolves into `relations`, for `pg_locks`.
+    pub fn recording(mut self, relations: Arc<StatementRelations>) -> Self {
+        self.relations = Some(relations);
+        self
+    }
+
+    /// Note a resolved relation under the name the *resolution* landed on, not
+    /// the one the client wrote.
+    fn record(&self, table: &Result<Arc<dyn TableAm>, StorageError>) {
+        let (Some(relations), Ok(table)) = (&self.relations, table) else {
+            return;
+        };
+        let schema = table.schema();
+        relations.record(&schema.namespace, &schema.name);
     }
 
     /// Resolve `name` in this session's temp namespace, if present there.
@@ -587,7 +697,9 @@ impl TableEngine for SessionCatalog {
     /// Unqualified, write-safe lookup: temp then global only. Writes resolve
     /// through this, so a mutation never reaches the read-only system catalog.
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        Self::or_else_not_found(self.open_temp(name), || self.global.open_table(name))
+        let table = Self::or_else_not_found(self.open_temp(name), || self.global.open_table(name));
+        self.record(&table);
+        table
     }
 
     /// Search-path-aware read resolution. An unqualified name searches temp →
@@ -596,7 +708,7 @@ impl TableEngine for SessionCatalog {
     /// relation in `public`, as in PG. A schema qualifier routes to exactly one
     /// namespace.
     fn resolve(&self, schema: Option<&str>, name: &str) -> Result<Arc<dyn TableAm>, StorageError> {
-        match schema {
+        let table = match schema {
             None => Self::or_else_not_found(self.open_temp(name), || {
                 Self::or_else_not_found(self.system.open_table(name), || {
                     self.global.open_table(name)
@@ -613,7 +725,9 @@ impl TableEngine for SessionCatalog {
             // Any other qualifier names a user schema; route it to the global
             // engine, which holds every user namespace.
             Some(namespace) => self.global.resolve(Some(namespace), name),
-        }
+        };
+        self.record(&table);
+        table
     }
 
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {

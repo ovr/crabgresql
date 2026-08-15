@@ -46,52 +46,40 @@ pub(crate) fn pg_locks_schema() -> TableSchema {
     )
 }
 
-/// The locks the reading session holds, in the order it reported them, followed
-/// by this scan's own `AccessShareLock` on `pg_locks`.
+/// The locks the reading session holds: its transaction's, plus one `relation`
+/// row per relation the statement resolved.
 ///
-/// That last row is what most clients came for — PostgreSQL's answer to a bare
-/// `SELECT * FROM pg_locks` under autocommit is exactly two rows, the reader's
-/// `virtualxid` lock and its `AccessShareLock` on `pg_locks` itself — and it is
-/// a true statement about this build too: a scan holds a shared hold on the
-/// relation it reads for the iterator's life, so a statement that reached this
-/// function does hold a read lock on `pg_locks`.
+/// Those relation rows are what most clients came for — PostgreSQL's answer to a
+/// bare `SELECT * FROM pg_locks` under autocommit is exactly two rows, the
+/// reader's `virtualxid` lock and its `AccessShareLock` on `pg_locks` itself —
+/// and they are true statements about this build too: a scan holds a shared hold
+/// on the relation it reads for as long as its iterator lives.
 ///
-/// What it is *not* is the whole set. Locks appear for the reading session only
-/// ([`crate::source::CatalogSource::locks`] says why), and the relation locks of
-/// a statement's *other* tables are missing: this builder learns of a relation
-/// by being asked for its rows, so `SELECT * FROM pg_locks, t` lists `pg_locks`
-/// and not `t`, where PostgreSQL lists both.
+/// They also last as long as the *statement* rather than the transaction, which
+/// is where this parts company with PostgreSQL: there a relation lock is held to
+/// the end of the transaction, so a block accumulates rows for everything it has
+/// touched. A shared hold here dies with the scan that took it, so the statement
+/// is the honest scope. [`crate::source::CatalogSource::locks`] says which
+/// sessions are missing.
+///
+/// A relation whose name this snapshot has no OID for is dropped rather than
+/// reported as OID 0, which names no relation in PostgreSQL either.
 pub(crate) fn pg_locks_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    let locks = cat.locks();
-    let mut rows: Vec<Vec<Value>> = locks.iter().map(lock_row).collect();
-    // This scan's own hold, attributed to the session that reported the locks
-    // above. A snapshot with no session behind it (a fixture catalog) reports
-    // no locks at all rather than inventing a holder for this one.
-    if let Some(holder) = locks.first() {
-        rows.push(lock_row(&CatalogLock {
-            target: CatalogLockTarget::Relation(builtin_relation_oid("pg_locks").unwrap_or(0)),
-            virtualtransaction: holder.virtualtransaction.clone(),
-            pid: holder.pid,
-            mode: "AccessShareLock",
-            granted: true,
-            // PostgreSQL takes a weak relation lock with no conflicting holder
-            // through the per-backend fast path; a catalog read is the
-            // canonical case of one.
-            fastpath: true,
-            waitstart: None,
-        }));
-    }
-    rows
+    cat.locks()
+        .iter()
+        .filter_map(|lock| lock_row(cat, lock))
+        .collect()
 }
 
-/// One `pg_locks` row. The lock's target decides which of the identity columns
-/// carries it and the rest stay NULL, exactly as PostgreSQL fills them.
-fn lock_row(lock: &CatalogLock) -> Vec<Value> {
-    let (locktype, database, relation, virtualxid, transactionid) = match lock.target {
-        CatalogLockTarget::Relation(oid) => (
+/// One `pg_locks` row, or `None` for a relation lock naming something this
+/// snapshot cannot number. The lock's target decides which of the identity
+/// columns carries it and the rest stay NULL, exactly as PostgreSQL fills them.
+fn lock_row(cat: &SystemCatalog, lock: &CatalogLock) -> Option<Vec<Value>> {
+    let (locktype, database, relation, virtualxid, transactionid) = match &lock.target {
+        CatalogLockTarget::Relation { namespace, name } => (
             "relation",
             Value::Oid(DATABASE_OID),
-            Value::Oid(oid),
+            Value::Oid(relation_oid(cat, namespace, name)?),
             Value::Null,
             Value::Null,
         ),
@@ -109,10 +97,10 @@ fn lock_row(lock: &CatalogLock) -> Vec<Value> {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Xid(xid),
+            Value::Xid(*xid),
         ),
     };
-    vec![
+    Some(vec![
         Value::Text(locktype.to_string()),
         database,
         relation,
@@ -132,5 +120,15 @@ fn lock_row(lock: &CatalogLock) -> Vec<Value> {
             Some(at) => Value::TimestampTz(at),
             None => Value::Null,
         },
-    ]
+    ])
+}
+
+/// The OID a `relation` row reports. A `pg_catalog` relation carries
+/// PostgreSQL's own fixed OID from the registry; everything else is numbered by
+/// this snapshot, which is why the lock travels as a name.
+fn relation_oid(cat: &SystemCatalog, namespace: &str, name: &str) -> Option<u32> {
+    match namespace {
+        "pg_catalog" | "information_schema" => builtin_relation_oid(name),
+        _ => cat.relation_oid_in(namespace, name),
+    }
 }
