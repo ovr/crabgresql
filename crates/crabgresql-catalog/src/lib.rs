@@ -274,6 +274,33 @@ pub struct PgOpfamilyRow {
     pub opfname: &'static str,
 }
 
+/// A built-in `pg_amop` row, generated from `pg_amop.dat`: the operator that
+/// implements one strategy of an operator family.
+pub struct PgAmopRow {
+    pub oid: u32,
+    pub amopfamily: u32,
+    pub amoplefttype: u32,
+    pub amoprighttype: u32,
+    pub amopstrategy: i16,
+    /// `s` for a search operator, `o` for an ordering one — the only kind that
+    /// also names an [`Self::amopsortfamily`].
+    pub amoppurpose: &'static str,
+    pub amopopr: u32,
+    pub amopmethod: u32,
+    pub amopsortfamily: u32,
+}
+
+/// A built-in `pg_amproc` row, generated from `pg_amproc.dat`: a support
+/// function an operator family gives its access method.
+pub struct PgAmprocRow {
+    pub oid: u32,
+    pub amprocfamily: u32,
+    pub amproclefttype: u32,
+    pub amprocrighttype: u32,
+    pub amprocnum: i16,
+    pub amproc: ProcRef,
+}
+
 /// A built-in `pg_description` row, generated from the `descr` fields of the
 /// vendored `.dat` files. `catalog` is the `pg_catalog` relation the described
 /// object lives in, by name: codegen has no business knowing the fixed relation
@@ -293,6 +320,8 @@ include!(concat!(env!("OUT_DIR"), "/pg_cast_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_proc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opfamily_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_opclass_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_amop_rows.rs"));
+include!(concat!(env!("OUT_DIR"), "/pg_amproc_rows.rs"));
 include!(concat!(env!("OUT_DIR"), "/pg_description_rows.rs"));
 
 /// Whether `name` is the catalog name of a PostgreSQL built-in type, including

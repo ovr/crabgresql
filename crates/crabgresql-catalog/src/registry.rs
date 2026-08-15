@@ -19,7 +19,7 @@ use crabgresql_types::Value;
 
 use crate::SystemCatalog;
 use crate::catalogs::{
-    acl, am, attribute, auth, class, collation, constraint, cursors, database, description,
+    acl, am, amop, attribute, auth, class, collation, constraint, cursors, database, description,
     extension, foreign, index, inherits, language, locks, misc_empty, namespace, opclass, policy,
     prepared, proc, progress, publication, relviews, replication, rewrite, sequence, settings,
     stat_activity, stat_database, stat_indexes, stat_io, stat_tables, statio, statistic,
@@ -129,6 +129,20 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         information_schema::tables_rows,
     ),
     rel("pg_am", 2601, PgCatalog, am::pg_am_schema, am::pg_am_rows),
+    rel(
+        "pg_amop",
+        2602,
+        PgCatalog,
+        amop::pg_amop_schema,
+        amop::pg_amop_rows,
+    ),
+    rel(
+        "pg_amproc",
+        2603,
+        PgCatalog,
+        amop::pg_amproc_schema,
+        amop::pg_amproc_rows,
+    ),
     rel(
         "pg_attrdef",
         2604,

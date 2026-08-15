@@ -21,9 +21,12 @@
 //! and generating from it is the sanctioned path; attribution is in `NOTICE`.
 
 pub mod dat;
+mod pg_amop;
+mod pg_amproc;
 mod pg_cast;
 mod pg_description;
 mod pg_opclass;
+mod pg_operator;
 mod pg_opfamily;
 mod pg_proc;
 mod pg_type;
@@ -82,6 +85,9 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     let proc_entries = read_dat(catalog_dir, "pg_proc.dat")?;
     let opfamily_entries = read_dat(catalog_dir, "pg_opfamily.dat")?;
     let opclass_entries = read_dat(catalog_dir, "pg_opclass.dat")?;
+    let operator_entries = read_dat(catalog_dir, "pg_operator.dat")?;
+    let amop_entries = read_dat(catalog_dir, "pg_amop.dat")?;
+    let amproc_entries = read_dat(catalog_dir, "pg_amproc.dat")?;
     let am_entries = read_dat(catalog_dir, "pg_am.dat")?;
     let language_entries = read_dat(catalog_dir, "pg_language.dat")?;
     let namespace_entries = read_dat(catalog_dir, "pg_namespace.dat")?;
@@ -91,6 +97,7 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     pg_type::define_symbols(&type_entries, &mut symbols);
     pg_proc::define_symbols(&proc_entries, &mut symbols);
     pg_opfamily::define_symbols(&opfamily_entries, &mut symbols);
+    pg_operator::define_symbols(&operator_entries, &mut symbols);
 
     // Phase two: resolve and emit.
     std::fs::write(
@@ -108,6 +115,14 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
     std::fs::write(
         out_dir.join("pg_opclass_rows.rs"),
         pg_opclass::emit(&opclass_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_amop_rows.rs"),
+        pg_amop::emit(&amop_entries, &symbols),
+    )?;
+    std::fs::write(
+        out_dir.join("pg_amproc_rows.rs"),
+        pg_amproc::emit(&amproc_entries, &symbols),
     )?;
     for name in HANDWRITTEN_CATALOG_PROCS {
         assert!(
@@ -192,4 +207,51 @@ fn am_oid(name: &str) -> u32 {
 fn proc_ref(symbols: &SymbolTable, name: &str) -> String {
     let oid = symbols.resolve_name(Proc, name).unwrap_or(0);
     format!("ProcRef {{ oid: {oid}, name: {name:?} }}")
+}
+
+/// Where upstream's generated OIDs begin. Below this sit the hand-assigned
+/// ones; PostgreSQL reserves the band for exactly this purpose.
+const FIRST_GENERATED_OID: u32 = 10000;
+
+/// The OID counter a catalog's unnumbered entries are numbered from.
+///
+/// # Where the OIDs come from
+///
+/// Most `.dat` files spell out an `oid` for only the entries upstream's C code
+/// names by symbol — `pg_opclass.dat` numbers 13 of 179, `pg_amop.dat` and
+/// `pg_amproc.dat` number none at all. The rest are numbered by upstream's own
+/// codegen, and the rule it follows is visible in the data:
+///
+/// > An entry's OID is its explicit `oid` if it has one; otherwise it is the
+/// > next value of a counter that starts at [`FIRST_GENERATED_OID`] and
+/// > advances **only** on entries without an explicit `oid`, in file order.
+/// > The counter is per catalog, which is why `pg_cast` starts at the same
+/// > number — an OID is unique within its catalog, not across catalogs.
+///
+/// That rule was checked against a PostgreSQL 18.4 install: reconstructing
+/// `pg_opclass` from that release's `.dat` reproduced all 177 rows the release
+/// ships, OID for OID. So the real OIDs are *derived from the vendored data*,
+/// not transcribed from a running server and not read out of upstream's
+/// source — the same clean-room path the rest of this crate takes.
+///
+/// The consequence for an emitter is the one that bites: [`Self::of`] must be
+/// called for every entry it passes, whether or not a row comes out. Skipping
+/// an entry *and* its number would shift every OID after it.
+#[derive(Default)]
+struct OidCounter {
+    next: Option<u32>,
+}
+
+impl OidCounter {
+    /// The OID of `e`, advancing the counter when the entry has none of its own.
+    fn of(&mut self, e: &dat::Entry) -> u32 {
+        match dat::oid_field(e, "oid") {
+            0 => {
+                let assigned = self.next.unwrap_or(FIRST_GENERATED_OID);
+                self.next = Some(assigned + 1);
+                assigned
+            }
+            explicit => explicit,
+        }
+    }
 }

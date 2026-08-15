@@ -4,6 +4,7 @@
 
 pub(crate) mod acl;
 pub(crate) mod am;
+pub(crate) mod amop;
 pub(crate) mod attribute;
 pub(crate) mod auth;
 pub(crate) mod class;

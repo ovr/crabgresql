@@ -90,3 +90,4 @@ test: pg_views_undeparsable
 test: pg_opclass
 test: with_ordinality
 test: array_subquery
+test: pg_amop
