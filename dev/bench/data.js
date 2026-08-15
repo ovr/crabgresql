@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786803016320,
+  "lastUpdate": 1786803017896,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -33664,6 +33664,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 21263.919412,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4c66f5a4014c5c6b8e2115040d60cd76eaaba90d",
+          "message": "perf(optimizer): decorrelate correlated subqueries into semi/anti/left joins (#241)\n\nTPC-H at 300k lineitem rows: Q21 183s → 0.47s (it used to time out at\n120s, so 21/22 becomes 22/22), Q20 21.3s → 0.16s, Q17 0.52s → 0.20s,\nQ2 0.14s → 0.05s; the whole query file through psql, 3m30s → 5.5s, with\nbyte-identical output.",
+          "timestamp": "2026-08-15T13:27:22Z",
+          "tree_id": "ba4d6337157062c1f40636ec7ed2a7bd1aa00eb1",
+          "url": "https://github.com/ovr/crabgresql/commit/4c66f5a4014c5c6b8e2115040d60cd76eaaba90d"
+        },
+        "date": 1786803017778,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 897.702437,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 41072.806496,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
