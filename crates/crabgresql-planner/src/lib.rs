@@ -85,6 +85,9 @@ pub enum PhysicalPlan {
     TableFunction {
         func: TableFn,
         args: Vec<BoundExpr>,
+        /// `WITH ORDINALITY`: the source appends a `bigint` ordinal to each row,
+        /// already accounted for by the last entry of `columns`.
+        ordinality: bool,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -370,6 +373,8 @@ pub enum PhysicalJoinInput {
     TableFunction {
         func: TableFn,
         args: Vec<BoundExpr>,
+        /// `WITH ORDINALITY`: see [`PhysicalPlan::TableFunction`].
+        ordinality: bool,
     },
 }
 
@@ -454,7 +459,15 @@ fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinI
             projection: ColumnProjection::All,
         },
         JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source, costs))),
-        JoinInput::TableFunction { func, args } => PhysicalJoinInput::TableFunction { func, args },
+        JoinInput::TableFunction {
+            func,
+            args,
+            ordinality,
+        } => PhysicalJoinInput::TableFunction {
+            func,
+            args,
+            ordinality,
+        },
     }
 }
 
@@ -846,6 +859,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
         LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
+            ordinality,
             columns,
             projections,
             predicate,
@@ -854,6 +868,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
         }) => PhysicalPlan::TableFunction {
             func,
             args,
+            ordinality,
             columns,
             projections,
             predicate,

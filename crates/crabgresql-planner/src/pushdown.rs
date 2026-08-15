@@ -409,6 +409,7 @@ mod tests {
             input: JoinInput::TableFunction {
                 func: TableFn::GenerateSeries(PgType::Int4),
                 args: Vec::new(),
+                ordinality: false,
             },
             width: 1,
         }

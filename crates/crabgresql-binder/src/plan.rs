@@ -2409,9 +2409,14 @@ fn finish_single_select(
             sort,
             distinct,
         }),
-        JoinInput::TableFunction { func, args } => LogicalPlan::TableFunction(TableFunctionPlan {
+        JoinInput::TableFunction {
             func,
             args,
+            ordinality,
+        } => LogicalPlan::TableFunction(TableFunctionPlan {
+            func,
+            args,
+            ordinality,
             columns,
             projections,
             predicate,
@@ -2728,7 +2733,6 @@ fn bind_from_item(
                     "table function SETTINGS are not supported yet",
                 ));
             }
-            reject_with_ordinality(*with_ordinality)?;
             // A *function* name, not a relation name: qualifiers are resolved by
             // the same rule a scalar call uses, not rejected as they are for a
             // relation.
@@ -2736,7 +2740,7 @@ fn bind_from_item(
                 .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
             let (func, args) = bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings)?;
-            bound_table_fn_item(func, args, &fname, alias)
+            bound_table_fn_item(func, args, &fname, alias, *with_ordinality)
         }
         // `unnest(array)` in FROM. Under the PostgreSQL dialect the parser gives
         // this its own factor rather than a `Table` with call arguments, but it
@@ -2748,7 +2752,6 @@ fn bind_from_item(
             with_offset_alias: _,
             with_ordinality,
         } => {
-            reject_with_ordinality(*with_ordinality)?;
             // `WITH OFFSET` is BigQuery syntax, not PostgreSQL's. The parser only
             // fills `with_offset_alias` when the flag is set, so the flag alone
             // decides.
@@ -2768,7 +2771,7 @@ fn bind_from_item(
             }
             let (func, args) =
                 bind_table_fn_args("unnest", array_exprs, catalog, params, siblings)?;
-            bound_table_fn_item(func, args, "unnest", alias)
+            bound_table_fn_item(func, args, "unnest", alias, *with_ordinality)
         }
         // `LATERAL f(…)` gets its own factor. Say what is actually missing, the
         // way the derived-table arm below does, instead of falling through to the
@@ -3782,12 +3785,14 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
+            ordinality,
             projections,
             predicate,
             ..
         }) if !has_srf(&projections) => LogicalPlan::TableFunction(TableFunctionPlan {
             func,
             args,
+            ordinality,
             columns: one_col(),
             projections: one_row(),
             predicate,
@@ -3837,20 +3842,6 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
-/// TODO: `WITH ORDINALITY`, which adds a trailing bigint column numbering the
-/// function's rows. It is rejected rather than silently dropped: dropping it
-/// would return the wrong number of columns, and would quietly defeat the
-/// single-column rename in [`bound_table_fn_item`]. Shared so every
-/// function-in-FROM spelling rejects it identically.
-fn reject_with_ordinality(with_ordinality: bool) -> Result<(), BindError> {
-    if with_ordinality {
-        return Err(BindError::feature_not_supported(
-            "WITH ORDINALITY is not supported yet",
-        ));
-    }
-    Ok(())
-}
-
 /// Bind a table function's arguments for a FROM item.
 ///
 /// The arguments bind in an empty scope, which is exactly what a *lateral*
@@ -3895,26 +3886,34 @@ fn bind_table_fn_args(
 /// `generate_series(1, 10) i` exposes a column `i` and not `generate_series`. An
 /// explicit alias column list (`s(g)`) still wins over the bare alias, and a
 /// composite-returning function keeps its row type's column names.
+///
+/// `WITH ORDINALITY` appends a trailing `bigint` column named `ordinality`, and
+/// it is part of the rowset from here on: an alias column list renames it like
+/// any other (`a(relid, depth)`), while a *bare* alias still names only the
+/// function's own first column — `generate_series(1, 3) WITH ORDINALITY t`
+/// exposes `t` and `ordinality`, as PG does.
 fn bound_table_fn_item(
     func: TableFn,
     args: Vec<BoundExpr>,
     default_name: &str,
     alias: &Option<ast::TableAlias>,
+    ordinality: bool,
 ) -> Result<BoundFromItem, BindError> {
     let qualifier = relation_qualifier(alias, default_name);
     let mut columns = func.columns();
+    if ordinality {
+        columns.push(OutputColumn::new("ordinality", PgType::Int8));
+    }
     if func.returns_scalar() && alias.is_some() {
-        // Every scalar function's rowset is exactly one column, so the rename
-        // below is total. `WITH ORDINALITY` would append a second column and
-        // silently turn the slice pattern into a no-op — assert rather than let
-        // that land as a wrong column name (it is rejected up front today, see
-        // `reject_with_ordinality`).
+        // A scalar function's rowset is its one column, plus the ordinal when
+        // `WITH ORDINALITY` asked for it — and the bare alias names the first of
+        // them only.
         debug_assert_eq!(
             columns.len(),
-            1,
+            1 + usize::from(ordinality),
             "a scalar table function must expose exactly one column"
         );
-        if let [col] = columns.as_mut_slice() {
+        if let Some(col) = columns.first_mut() {
             // Same normalization `relation_qualifier` just applied, so the
             // column and its qualifier can never disagree on spelling.
             col.name.clone_from(&qualifier);
@@ -3924,7 +3923,11 @@ fn bound_table_fn_item(
     Ok(BoundFromItem {
         qualifier,
         columns,
-        input: JoinInput::TableFunction { func, args },
+        input: JoinInput::TableFunction {
+            func,
+            args,
+            ordinality,
+        },
         system_slot: None,
     })
 }

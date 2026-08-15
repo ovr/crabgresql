@@ -31,7 +31,14 @@ pub struct JoinPlan {
 pub enum JoinInput {
     Scan(Arc<dyn TableAm>),
     Subplan(Box<LogicalPlan>),
-    TableFunction { func: TableFn, args: Vec<BoundExpr> },
+    TableFunction {
+        func: TableFn,
+        args: Vec<BoundExpr>,
+        /// `WITH ORDINALITY`: append a trailing `bigint` column numbering the
+        /// function's rows from 1. It is part of the rowset, so the item's
+        /// column list (and thus its width) already counts it.
+        ordinality: bool,
+    },
 }
 
 /// The SQL join semantics applied by one binary [`JoinExpr::Join`] node.

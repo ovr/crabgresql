@@ -1,5 +1,6 @@
 use crabgresql_binder::{BoundExpr, TableFn};
 use crabgresql_storage_api::Tuple;
+use crabgresql_types::Value;
 
 use super::series::{
     jsonb_path_query_series, pg_available_extensions_rows, pg_input_error_info_row,
@@ -15,6 +16,12 @@ pub struct TableFunctionSource {
     func: TableFn,
     args: Vec<BoundExpr>,
     ctx: ExecContext,
+    /// `WITH ORDINALITY`: append a `bigint` ordinal to every row emitted.
+    ordinality: bool,
+    /// The ordinal the next row gets. PG numbers from 1 and counts the rows the
+    /// *function* produced, so it is bumped here rather than anywhere a filter
+    /// above could skip it.
+    next_ordinal: i64,
     /// Iteration state, initialized lazily from the evaluated arguments.
     state: Option<TableFnState>,
 }
@@ -30,11 +37,13 @@ enum TableFnState {
 }
 
 impl TableFunctionSource {
-    pub fn new(func: TableFn, args: Vec<BoundExpr>, ctx: ExecContext) -> Self {
+    pub fn new(func: TableFn, args: Vec<BoundExpr>, ordinality: bool, ctx: ExecContext) -> Self {
         Self {
             func,
             args,
             ctx,
+            ordinality,
+            next_ordinal: 1,
             state: None,
         }
     }
@@ -73,10 +82,18 @@ impl TableFunctionSource {
 
 impl ExecNode for TableFunctionSource {
     fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
-        match self.init()? {
-            TableFnState::Single(row) => Ok(row.take()),
-            TableFnState::Rows(rows) => Ok(rows.next()),
-            TableFnState::Series(series) => Ok(series.next_value()?.map(|v| vec![v])),
+        let row = match self.init()? {
+            TableFnState::Single(row) => row.take(),
+            TableFnState::Rows(rows) => rows.next(),
+            TableFnState::Series(series) => series.next_value()?.map(|v| vec![v]),
+        };
+        match row {
+            Some(mut row) if self.ordinality => {
+                row.push(Value::Int8(self.next_ordinal));
+                self.next_ordinal += 1;
+                Ok(Some(row))
+            }
+            row => Ok(row),
         }
     }
 }

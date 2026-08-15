@@ -751,13 +751,19 @@ pub fn execute(
         PhysicalPlan::TableFunction {
             func,
             args,
+            ordinality,
             columns,
             projections,
             predicate,
             sort,
             distinct,
         } => project_pipeline(
-            Source::Rows(Box::new(TableFunctionSource::new(func, args, ctx.clone()))),
+            Source::Rows(Box::new(TableFunctionSource::new(
+                func,
+                args,
+                ordinality,
+                ctx.clone(),
+            ))),
             projections,
             predicate,
             sort,
@@ -3532,9 +3538,16 @@ fn build_join_source(
         PhysicalJoinInput::Scan { table, projection } => {
             Box::new(SeqScan::new(&table, txn, &projection))
         }
-        PhysicalJoinInput::TableFunction { func, args } => {
-            Box::new(TableFunctionSource::new(func, args, ctx.clone()))
-        }
+        PhysicalJoinInput::TableFunction {
+            func,
+            args,
+            ordinality,
+        } => Box::new(TableFunctionSource::new(
+            func,
+            args,
+            ordinality,
+            ctx.clone(),
+        )),
         PhysicalJoinInput::Subplan(source) => {
             let Execution::Rows { node, .. } = execute(*source, ctx, txn)? else {
                 return Err(ExecError::new(
