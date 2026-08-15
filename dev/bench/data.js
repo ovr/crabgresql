@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786812019592,
+  "lastUpdate": 1786812021235,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -35608,6 +35608,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20223.424117,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8faa77dd1768df842290e2e60ad0818b47f9f72",
+          "message": "feat(catalog): Support more tables in pg_catalog (31 empty-by-reality relations) (#247)",
+          "timestamp": "2026-08-15T15:19:31Z",
+          "tree_id": "7a5153c576cedb80e532f79bc882d46c3f752c99",
+          "url": "https://github.com/ovr/crabgresql/commit/f8faa77dd1768df842290e2e60ad0818b47f9f72"
+        },
+        "date": 1786812021142,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1270.839317,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21535.199293,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
