@@ -196,6 +196,21 @@ pub enum ScalarFn {
     /// Reads the live transaction counter, so it is dispatched from `eval.rs`
     /// rather than from the pure `eval_scalar`.
     AgeXid,
+    /// The current transaction's id: `txid_current()`, its modern spelling
+    /// `pg_current_xact_id()` (`xid8`), and the `_if_assigned` form of each.
+    ///
+    /// Only the plain form assigns an id when the transaction has none, which
+    /// is why [`crate::plan_needs_xid`] looks for it: the server allocates the
+    /// XID before execution starts.
+    CurrentXactId {
+        xid8: bool,
+        if_assigned: bool,
+    },
+    /// `pg_xact_status(xid8) -> text`: `committed`, `aborted` or `in progress`,
+    /// read out of the CLOG. NULL for an XID too old to have a status left.
+    PgXactStatus,
+    /// `pg_is_in_recovery() -> bool`: always false, see its arm in `eval.rs`.
+    PgIsInRecovery,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
     /// `to_char(timestamp, text) -> text`.
@@ -2692,6 +2707,50 @@ fn lookup(name: &str) -> &'static [Signature] {
         "pg_is_other_temp_schema" => &[Signature {
             func: ScalarFn::PgIsOtherTempSchema,
             args: &[OID],
+            ret: BOOL,
+        }],
+        // PG renamed `txid_*` to `pg_*_xact_id` in v13 and kept both. The old
+        // pair reports the same number as `int8` because it predates `xid8`.
+        "txid_current" => &[Signature {
+            func: ScalarFn::CurrentXactId {
+                xid8: false,
+                if_assigned: false,
+            },
+            args: &[],
+            ret: I8,
+        }],
+        "txid_current_if_assigned" => &[Signature {
+            func: ScalarFn::CurrentXactId {
+                xid8: false,
+                if_assigned: true,
+            },
+            args: &[],
+            ret: I8,
+        }],
+        "pg_current_xact_id" => &[Signature {
+            func: ScalarFn::CurrentXactId {
+                xid8: true,
+                if_assigned: false,
+            },
+            args: &[],
+            ret: XID8,
+        }],
+        "pg_current_xact_id_if_assigned" => &[Signature {
+            func: ScalarFn::CurrentXactId {
+                xid8: true,
+                if_assigned: true,
+            },
+            args: &[],
+            ret: XID8,
+        }],
+        "pg_xact_status" => &[Signature {
+            func: ScalarFn::PgXactStatus,
+            args: &[XID8],
+            ret: TEXT,
+        }],
+        "pg_is_in_recovery" => &[Signature {
+            func: ScalarFn::PgIsInRecovery,
+            args: &[],
             ret: BOOL,
         }],
         "pg_encoding_to_char" => &[Signature {

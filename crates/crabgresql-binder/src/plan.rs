@@ -27,7 +27,7 @@ use crate::expr::{
     reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
     view_expansion,
 };
-use crate::functions::{bind_table_fn_call, positional_arg_exprs};
+use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
     InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
@@ -1006,22 +1006,49 @@ fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
     found
 }
 
-/// Whether `plan` calls a user-defined routine anywhere.
-///
-/// A routine body may write, and the executor cannot tell before running it —
-/// so a statement that calls one has to be treated as a write: it needs an XID
-/// to stamp the body's versions with, and its result set has to be drained
-/// before the transaction is finalized rather than streamed after it.
-pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
+/// Whether any expression node anywhere in `plan` satisfies `pred`. See
+/// [`BoundExpr::any_node`] for why the walk takes the predicate rather than
+/// naming what it looks for.
+pub(crate) fn plan_any_expr_node(plan: &LogicalPlan, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
     let mut found = false;
-    // A routine anywhere makes the statement a write, however deeply nested, so
-    // this visitor ignores the depth.
+    // A match anywhere answers the question, however deeply nested, so this
+    // visitor ignores the depth.
     for_each_plan_expr(plan, 1, &mut |e, _| {
-        if e.contains_routine() {
-            found = true;
-        }
+        found = found || e.any_node(pred);
     });
     found
+}
+
+/// Whether `plan` must run with a transaction id assigned to it. Two kinds of
+/// node say so, for two different reasons.
+///
+/// A routine body may write, and the executor cannot tell before running it, so
+/// a statement that calls one is treated as a write: it needs an XID to stamp
+/// the body's versions with.
+///
+/// `txid_current()` / `pg_current_xact_id()` need one because the id *is* their
+/// answer, and PostgreSQL assigns one when the transaction has none. Their
+/// `_if_assigned` forms deliberately do not count: reporting NULL when there is
+/// no XID is their whole meaning.
+///
+/// One predicate and not two, because both reasons carry the same second
+/// requirement — the body runs, and the id is read, only while the transaction
+/// is still open, so such a result set must be drained before it is finalized
+/// rather than streamed after.
+pub fn plan_needs_xid(plan: &LogicalPlan) -> bool {
+    plan_any_expr_node(plan, &|e| {
+        matches!(
+            e,
+            BoundExpr::Routine { .. }
+                | BoundExpr::FuncCall {
+                    func: ScalarFn::CurrentXactId {
+                        if_assigned: false,
+                        ..
+                    },
+                    ..
+                }
+        )
+    })
 }
 
 /// Visit every top-level expression of `plan`, recursing through structural

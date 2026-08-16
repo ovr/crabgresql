@@ -14451,6 +14451,164 @@ async fn pg_backend_pid_matches_the_sessions_lock_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Inside a block every statement sees the *same* id, and it is the one
+/// `pg_stat_activity` publishes for this backend — so the two cannot disagree.
+#[tokio::test]
+async fn txid_current_is_the_blocks_id_and_pg_stat_activity_agrees() -> anyhow::Result<()> {
+    let mut client = connect(spawn_server().await).await;
+    let txn = client.transaction().await?;
+    let first: i64 = txn
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    assert!(first > 0);
+    let second: i64 = txn
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    assert_eq!(first, second, "the id must not move within a block");
+
+    let row = txn
+        .query_one(
+            "SELECT pg_current_xact_id()::text AS modern, \
+             (SELECT backend_xid::text FROM pg_stat_activity WHERE pid = pg_backend_pid()) AS published",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, String>("modern"), first.to_string());
+    assert_eq!(row.get::<_, String>("published"), first.to_string());
+
+    assert_eq!(
+        txn.query_one("SELECT pg_xact_status(pg_current_xact_id()) AS s", &[])
+            .await?
+            .get::<_, String>("s"),
+        "in progress"
+    );
+    txn.commit().await?;
+
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT pg_xact_status($1::text::xid8) AS s",
+                &[&first.to_string()],
+            )
+            .await?
+            .get::<_, String>("s"),
+        "committed"
+    );
+    Ok(())
+}
+
+/// Under autocommit each asking statement gets an id of its own and commits it,
+/// while a statement that does not ask consumes none. The `_if_assigned` forms
+/// are how "none" is observed.
+#[tokio::test]
+async fn txid_current_assigns_per_statement_under_autocommit() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert!(
+        client
+            .query_one(
+                "SELECT txid_current_if_assigned() IS NULL AS unassigned",
+                &[]
+            )
+            .await?
+            .get::<_, bool>("unassigned"),
+        "an autocommit statement that does not ask has no id"
+    );
+
+    let first: i64 = client
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    // A plain read in between consumes nothing, so the next asking statement
+    // gets the very next id.
+    client.query_one("SELECT 1 AS n", &[]).await?;
+    let second: i64 = client
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    assert_eq!(second, first + 1);
+
+    // An id left in flight would pin the snapshot horizon for the life of the
+    // process, so it is not enough that one was handed out.
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT pg_xact_status($1::text::xid8) AS s",
+                &[&first.to_string()],
+            )
+            .await?
+            .get::<_, String>("s"),
+        "committed"
+    );
+    Ok(())
+}
+
+/// A statement holding an XID has its rows produced while its own transaction is
+/// still open. Two answers a streamed result set gets wrong: the id would read
+/// as already committed, and a fault raised part-way through the rows would
+/// commit a transaction whose output never reached the client.
+#[tokio::test]
+async fn an_xid_holding_statement_produces_its_rows_before_it_commits() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert_eq!(
+        client
+            .query_one("SELECT pg_xact_status(pg_current_xact_id()) AS s", &[])
+            .await?
+            .get::<_, String>("s"),
+        "in progress"
+    );
+
+    client.batch_execute("CREATE TABLE zz (a int)").await?;
+    client.batch_execute("INSERT INTO zz VALUES (0)").await?;
+    let before: i64 = client
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    let err = client
+        .query("SELECT txid_current(), 1 / a FROM zz", &[])
+        .await
+        .expect_err("division by zero must reach the client");
+    assert_eq!(err.code().map(|c| c.code()), Some("22012"));
+
+    // Ids are handed out in order and this server has one session, so the
+    // statement that faulted took exactly the next one.
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT pg_xact_status($1::text::xid8) AS s",
+                &[&(before + 1).to_string()],
+            )
+            .await?
+            .get::<_, String>("s"),
+        "aborted"
+    );
+    Ok(())
+}
+
+/// A rolled-back block's id reads as aborted, and `pg_is_in_recovery()` — which
+/// clients ask on connect — answers false rather than failing to bind.
+#[tokio::test]
+async fn rolled_back_xact_id_reads_as_aborted() -> anyhow::Result<()> {
+    let mut client = connect(spawn_server().await).await;
+    let txn = client.transaction().await?;
+    let id: i64 = txn
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    txn.rollback().await?;
+
+    let row = client
+        .query_one(
+            "SELECT pg_xact_status($1::text::xid8) AS s, pg_is_in_recovery() AS recovering",
+            &[&id.to_string()],
+        )
+        .await?;
+    assert_eq!(row.get::<_, String>("s"), "aborted");
+    assert!(!row.get::<_, bool>("recovering"));
+    Ok(())
+}
+
 /// `pg_locks` reports a `relation` row for every relation the statement
 /// resolved, not just for itself — the join `pg_locks JOIN pg_class ON relation
 /// = oid` that every monitoring query is built around.

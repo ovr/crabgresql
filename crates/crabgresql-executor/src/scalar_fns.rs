@@ -256,6 +256,17 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 "uuid generator reached the pure scalar evaluator",
             ));
         }
+        // Likewise the transaction-state family, dispatched by `eval` because
+        // they read the transaction context and the CLOG. All but
+        // `pg_xact_status` are zero-arity, so — as with the clock functions
+        // above — without an arm here they would fall past every match below
+        // into a tail that indexes an empty argument slice.
+        ScalarFn::CurrentXactId { .. } | ScalarFn::PgXactStatus | ScalarFn::PgIsInRecovery => {
+            return Err(ExecError::new(
+                sqlstate::INTERNAL_ERROR,
+                "transaction-state function reached the pure scalar evaluator",
+            ));
+        }
         // --- tid accessors (STRICT) ---
         ScalarFn::TidBlock => {
             let (block, _) = tid(&args[0]);
