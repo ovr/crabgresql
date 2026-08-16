@@ -926,8 +926,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // Nullary, so it cannot reach the float8 tail — that path reads
         // `args[0]` unconditionally.
         ScalarFn::Pi => return Ok(Value::Float8(std::f64::consts::PI)),
-        // `abs(int2|int4|int8|float4)` keeps the argument's type. Shares the
-        // `@` operator's implementation, so the `checked_abs` overflow at each
+        // Shares the `@` operator's implementation, so the overflow at each
         // type's minimum is reported in exactly one place.
         ScalarFn::AbsExact => {
             return crabgresql_types::arith::eval_unary(
@@ -971,10 +970,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 (Value::Int8(a), Value::Int8(b)) => (i128::from(*a), i128::from(*b), PgType::Int8),
                 (a, b) => unreachable!("gcd/lcm(int) on {a:?}, {b:?}"),
             };
-            // Computed a width wider than the answer, then range-checked, so
-            // the one overflow condition is the one PG reports: a magnitude the
-            // *result* type cannot hold. That is why `gcd(0, -2147483648)` is an
-            // error (the answer is 2^31) while `gcd(-2147483648, 2)` is 2.
+            // The one overflow condition PG reports is a magnitude the *result*
+            // type cannot hold, which is why `gcd(0, -2147483648)` is an error
+            // (the answer is 2^31) while `gcd(-2147483648, 2)` is 2.
             let magnitude = if matches!(func, ScalarFn::GcdInt) {
                 int_gcd(a.abs(), b.abs())
             } else if a == 0 || b == 0 {
@@ -1620,9 +1618,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // not a domain error, so neither guards its input.
         ScalarFn::Atan => Ok(a.atan()),
         ScalarFn::Atan2 => Ok(a.atan2(f8(&args[1]))),
-        // Multiply/divide by the same constant PG does, through the checked
-        // float8 operators — `degrees(1e308)` overflows and `radians(1e-323)`
-        // underflows, both `22003`.
+        // The checked float8 operators, so `degrees(1e308)` overflows and
+        // `radians(1e-323)` underflows, both `22003`.
         ScalarFn::Degrees => float::f8_div(a, RADIANS_PER_DEGREE).map_err(float_err),
         ScalarFn::Radians => float::f8_mul(a, RADIANS_PER_DEGREE).map_err(float_err),
         ScalarFn::Sind => dsind(a),
@@ -1806,9 +1803,7 @@ fn int_gcd(mut a: i128, mut b: i128) -> i128 {
     a
 }
 
-/// Narrow a non-negative magnitude back to the integer type the overload
-/// returns, reporting PG's `smallint/integer/bigint out of range` if it does
-/// not fit.
+/// Narrow a magnitude back to the integer type the overload returns.
 fn int_in_range(magnitude: i128, ty: PgType) -> Result<Value, ExecError> {
     let too_wide = || crate::eval::out_of_range(ty);
     match ty {
@@ -1828,8 +1823,6 @@ fn int_in_range(magnitude: i128, ty: PgType) -> Result<Value, ExecError> {
 /// through as the answer, an infinity has no angle and is `22003`.
 fn finite_radians(x: f64) -> Result<f64, ExecError> {
     if x.is_nan() {
-        // sin(NaN) = NaN; returning the argument lets the caller apply the
-        // function to it, which is NaN either way.
         return Ok(x);
     }
     if x.is_infinite() {
@@ -3122,7 +3115,6 @@ mod tests {
         assert!(call(ScalarFn::Sign, -0.0).is_sign_negative());
     }
 
-    /// The SQLSTATE a one-argument float8 function rejects `x` with.
     fn call_err(f: ScalarFn, x: f64) -> String {
         eval_scalar(f, &[Value::Float8(x)], &FmtCtx::utc_default())
             .expect_err("this argument must be rejected")
@@ -3198,8 +3190,7 @@ mod tests {
         assert_eq!(call(ScalarFn::Radians, 1e-310), 1.745_329_251_995e-312);
     }
 
-    /// `gcd`/`lcm` over one integer width, as the wire would see them.
-    fn call_int2(f: ScalarFn, a: Value, b: Value) -> Result<Value, ExecError> {
+    fn call2(f: ScalarFn, a: Value, b: Value) -> Result<Value, ExecError> {
         eval_scalar(f, &[a, b], &FmtCtx::utc_default())
     }
 
@@ -3208,47 +3199,41 @@ mod tests {
         let i4 = |v: i32| Value::Int4(v);
         // Always non-negative, whatever the operands' signs.
         for (a, b) in [(6, 4), (-6, 4), (6, -4), (-6, -4)] {
-            assert_eq!(call_int2(ScalarFn::GcdInt, i4(a), i4(b)).unwrap(), i4(2));
-            assert_eq!(call_int2(ScalarFn::LcmInt, i4(a), i4(b)).unwrap(), i4(12));
+            assert_eq!(call2(ScalarFn::GcdInt, i4(a), i4(b)).unwrap(), i4(2));
+            assert_eq!(call2(ScalarFn::LcmInt, i4(a), i4(b)).unwrap(), i4(12));
         }
-        assert_eq!(call_int2(ScalarFn::GcdInt, i4(0), i4(0)).unwrap(), i4(0));
-        assert_eq!(call_int2(ScalarFn::GcdInt, i4(0), i4(-5)).unwrap(), i4(5));
-        assert_eq!(call_int2(ScalarFn::LcmInt, i4(0), i4(5)).unwrap(), i4(0));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(0)).unwrap(), i4(0));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(-5)).unwrap(), i4(5));
+        assert_eq!(call2(ScalarFn::LcmInt, i4(0), i4(5)).unwrap(), i4(0));
         // The overflow condition is a result the type cannot hold, so it is
         // symmetric in the arguments — |int4 min| does not fit either way.
         for (a, b) in [(i32::MIN, 0), (0, i32::MIN), (i32::MIN, i32::MIN)] {
             assert_eq!(
-                call_int2(ScalarFn::GcdInt, i4(a), i4(b))
+                call2(ScalarFn::GcdInt, i4(a), i4(b))
                     .expect_err("|int4 min| does not fit in int4")
                     .code,
                 "22003"
             );
         }
         // ...but only when it *is* the result: gcd(int4 min, 2) is 2.
-        assert_eq!(
-            call_int2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)).unwrap(),
-            i4(2)
-        );
+        assert_eq!(call2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)).unwrap(), i4(2));
         // A zero operand answers before anything is multiplied.
+        assert_eq!(call2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)).unwrap(), i4(0));
         assert_eq!(
-            call_int2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)).unwrap(),
-            i4(0)
-        );
-        assert_eq!(
-            call_int2(ScalarFn::LcmInt, i4(i32::MIN), i4(1))
+            call2(ScalarFn::LcmInt, i4(i32::MIN), i4(1))
                 .expect_err("|int4 min| does not fit in int4")
                 .code,
             "22003"
         );
         assert_eq!(
-            call_int2(ScalarFn::LcmInt, i4(i32::MAX), i4(i32::MAX - 1))
+            call2(ScalarFn::LcmInt, i4(i32::MAX), i4(i32::MAX - 1))
                 .expect_err("the product overflows int4")
                 .code,
             "22003"
         );
         // The same magnitude fits the wider overload, so it is not an error there.
         assert_eq!(
-            call_int2(
+            call2(
                 ScalarFn::GcdInt,
                 Value::Int8(i64::from(i32::MIN)),
                 Value::Int8(0)
@@ -3257,7 +3242,7 @@ mod tests {
             Value::Int8(2_147_483_648)
         );
         assert_eq!(
-            call_int2(ScalarFn::GcdInt, Value::Int8(i64::MIN), Value::Int8(0))
+            call2(ScalarFn::GcdInt, Value::Int8(i64::MIN), Value::Int8(0))
                 .expect_err("|int8 min| does not fit in int8")
                 .code,
             "22003"
@@ -3269,7 +3254,7 @@ mod tests {
         let n = |s: &str| Value::Numeric(crabgresql_types::numeric::Numeric::parse(s).unwrap());
         // The rendered text, not the value, is what pins the display scale —
         // 1.4 and 1.40 are the same number and different answers.
-        let rendered = |f: ScalarFn, a: &str, b: &str| match call_int2(f, n(a), n(b)).unwrap() {
+        let rendered = |f: ScalarFn, a: &str, b: &str| match call2(f, n(a), n(b)).unwrap() {
             Value::Numeric(v) => v.to_display(),
             other => panic!("expected numeric, got {other:?}"),
         };

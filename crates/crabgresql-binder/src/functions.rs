@@ -49,29 +49,16 @@ pub enum ScalarFn {
     Erfc,
     Gamma,
     Lgamma,
-    /// `sin(float8) -> float8`, the argument in radians. Unlike the degree tier
-    /// below, the radian functions are the platform's libm and nothing else:
-    /// PG returns `sin(radians(30)) = 0.49999999999999994`, not an exact 0.5.
     Sin,
-    /// `cos(float8) -> float8`, radians.
     Cos,
-    /// `tan(float8) -> float8`, radians.
     Tan,
-    /// `cot(float8) -> float8`, radians.
     Cot,
-    /// `asin(float8) -> float8`, in radians.
     Asin,
-    /// `acos(float8) -> float8`, in radians.
     Acos,
-    /// `atan(float8) -> float8`, in radians.
     Atan,
-    /// `atan2(float8, float8) -> float8`, in radians.
     Atan2,
-    /// `degrees(float8) -> float8` — radians to degrees.
     Degrees,
-    /// `radians(float8) -> float8` — degrees to radians.
     Radians,
-    /// `pi() -> float8`.
     Pi,
     Sind,
     Cosd,
@@ -2025,11 +2012,9 @@ fn lookup(name: &str) -> &'static [Signature] {
         "floor" => num_and_f8!(ScalarFn::NumFloor, ScalarFn::Floor),
         "sign" => num_and_f8!(ScalarFn::NumSign, ScalarFn::Sign),
         "sqrt" => num_and_f8!(ScalarFn::NumSqrt, ScalarFn::Sqrt),
-        // `abs` keeps the argument's own type: PG has one overload per numeric
-        // type (`int2abs` … `float4abs`), so `abs(-3::int4)` is an integer and
-        // not a numeric or a float8. Without the narrow entries an int2/int4/
-        // int8/float4 argument would land on float8, the category's preferred
-        // type — the exact match is what keeps it off that path.
+        // PG has one `abs` per numeric type. Without the narrow entries an
+        // int2/int4/int8/float4 argument would land on float8, the category's
+        // preferred type; the exact match is what keeps it off that path.
         "abs" => &[
             Signature {
                 func: ScalarFn::AbsExact,
@@ -4650,21 +4635,19 @@ pub(crate) fn resolve_call(
         if narrowed.len() > 1 && has_unknown {
             narrow_by_unknown_category(name, &bindings, narrowed)?
         } else {
-            // Every argument is typed and the type rules left more than one
-            // candidate standing: PG stops there rather than picking one, which
-            // is why `gcd(int2, int2)` is `42725` — smallint reaches the int4,
-            // int8 and numeric overloads alike and none of them is the numeric
-            // category's preferred type.
+            // With nothing left to separate typed candidates PG gives up
+            // rather than picking one, which is why `gcd(int2, int2)` is
+            // `42725`: smallint reaches the int4, int8 and numeric overloads
+            // alike and none of them is the numeric category's preferred type.
             //
-            // Counted through `typed_mismatch` rather than `narrowed.len()`
-            // because reachability here is `implicit_castable` while resolution
-            // below is `coerce_for_arg`; where the two disagree, the call is not
-            // actually ambiguous. `exact_only` is false because that is the pass
-            // that admits an implicit cast — with it true a widening argument
-            // reaches nothing and every such call would look unambiguous.
-            // A same-arity user routine suppresses the error outright: it is a
-            // candidate PG would have weighed, and a hard `42725` must not hide
-            // someone's own function.
+            // The survivors are recounted because reachability above is
+            // `implicit_castable` while resolution below is `coerce_for_arg`;
+            // where the two disagree the call is not actually ambiguous. That
+            // recount needs `exact_only = false` — the pass that admits an
+            // implicit cast — or a widening argument reaches nothing and every
+            // such call looks unambiguous. A same-arity user routine suppresses
+            // the error outright: it is a candidate PG would have weighed, and
+            // a hard `42725` must not hide someone's own function.
             if narrowed.len() > 1
                 && narrowed
                     .iter()

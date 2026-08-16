@@ -801,8 +801,6 @@ impl Numeric {
         let mut a = self.abs();
         let mut b = other.abs();
         while !b.is_zero() {
-            // `b` is non-zero, so the only error `modulo` can report cannot
-            // arise here.
             let r = match a.modulo(&b) {
                 Ok(r) => r,
                 Err(_) => unreachable!("gcd: modulo by a non-zero divisor"),
