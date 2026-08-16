@@ -13082,7 +13082,10 @@ async fn ctid_repeats_across_partitions_and_tableoid_separates_them() -> anyhow:
 async fn system_columns_are_refused_on_a_columnar_relation() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
     client
-        .simple_query("CREATE TABLE q (a int) USING parquet ORDER BY (a); INSERT INTO q VALUES (1)")
+        .simple_query(
+            "CREATE TABLE q (a int, b text) USING parquet ORDER BY (a); \
+             INSERT INTO q VALUES (1, 'x')",
+        )
         .await?;
 
     for column in ["ctid", "xmin", "cmin", "xmax", "cmax"] {
@@ -13103,6 +13106,29 @@ async fn system_columns_are_refused_on_a_columnar_relation() -> anyhow::Result<(
         "q",
         "`tableoid` is a fact about the relation, not about its storage",
     );
+
+    // The refusal is driven by a reference that actually resolved, not by the
+    // demand scan — which is a substring match over rendered SQL and so fires on
+    // a string literal, an alias, or a LIKE pattern. Every one of these is
+    // answered by PostgreSQL, and every one of them used to raise 0A000 here.
+    client
+        .simple_query("INSERT INTO q VALUES (2, 'xmin')")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM q WHERE b = 'xmin'").await,
+        "1",
+    );
+    assert_eq!(
+        scalar(&client, "SELECT a AS ctid FROM q WHERE a = 1").await,
+        "1"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM q WHERE b LIKE '%cmax%'").await,
+        "0",
+    );
+    client
+        .simple_query("CREATE VIEW vq AS SELECT a FROM q WHERE b = 'xmin'")
+        .await?;
     Ok(())
 }
 

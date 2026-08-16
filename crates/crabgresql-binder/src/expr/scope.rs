@@ -45,6 +45,34 @@ pub struct ScopeItem {
     /// itself — but they sit past every declared column, so `*` never reaches
     /// them. `None` for a FROM item that is not a relation scan.
     pub system_base: Option<usize>,
+    /// Set when this relation's access method cannot produce system columns, so
+    /// none were appended and a reference to one must be refused rather than
+    /// reported missing. See [`DeclinedSystem`].
+    pub declined_system: Option<DeclinedSystem>,
+}
+
+/// Why a relation carries no system-column slots: its access method stores
+/// column chunks rather than row versions, so there is no tid that addresses a
+/// row and no MVCC header to read.
+///
+/// Carried through name resolution rather than acted on when the FROM item is
+/// bound, because what the binder knows there is the *demanded* set — an
+/// over-approximation over rendered SQL, so a string literal spelling `xmin`
+/// lands in it. Only a reference that actually resolves deserves the error.
+#[derive(Clone, Debug)]
+pub struct DeclinedSystem {
+    pub access_method: &'static str,
+    pub relation: String,
+}
+
+impl DeclinedSystem {
+    /// The `0A000` a resolved reference to `column` raises.
+    fn refuse(&self, column: &str) -> BindError {
+        BindError::feature_not_supported(format!(
+            "access method \"{}\" does not support system column \"{column}\" on relation \"{}\"",
+            self.access_method, self.relation,
+        ))
+    }
 }
 
 impl ScopeItem {
@@ -67,6 +95,7 @@ pub struct ScopeRel {
     columns: Vec<Column>,
     offset: usize,
     system_base: Option<usize>,
+    declined_system: Option<DeclinedSystem>,
 }
 
 impl ScopeRel {
@@ -248,11 +277,30 @@ fn column_in_rel(rel: &ScopeRel, qualifier: &str, column: &str) -> Result<usize,
         }
     }
     local.ok_or_else(|| {
-        BindError::new(
-            sqlstate::UNDEFINED_COLUMN,
-            format!("column {qualifier}.{column} does not exist"),
-        )
+        declined_or_missing(rel, column, || {
+            BindError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column {qualifier}.{column} does not exist"),
+            )
+        })
     })
+}
+
+/// The error for a name `rel` does not expose: `0A000` when the name is a system
+/// column this relation's access method declines, `missing()` otherwise.
+///
+/// The two are worth telling apart. A relation that simply lacks the column is a
+/// typo; one whose storage cannot produce it is a capability the query has to be
+/// written around, and saying so names both the column and the access method.
+fn declined_or_missing(
+    rel: &ScopeRel,
+    column: &str,
+    missing: impl FnOnce() -> BindError,
+) -> BindError {
+    match &rel.declined_system {
+        Some(declined) if SysCol::ALL.iter().any(|c| c.name() == column) => declined.refuse(column),
+        _ => missing(),
+    }
 }
 
 /// A SELECT's `WINDOW w AS (…)` definitions, by normalized name.
@@ -549,6 +597,7 @@ impl Scope {
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
         system: &[SysCol],
+        declined_system: Option<DeclinedSystem>,
     ) -> Scope {
         let mut columns = schema.columns.clone();
         let system_base = (!system.is_empty()).then(|| {
@@ -562,6 +611,7 @@ impl Scope {
                 columns,
                 offset: 0,
                 system_base,
+                declined_system,
             }],
             visible: None,
             catalog: catalog.clone(),
@@ -604,6 +654,7 @@ impl Scope {
                 columns: item.columns,
                 offset,
                 system_base: item.system_base,
+                declined_system: item.declined_system,
             });
             offset += width;
         }
@@ -639,7 +690,7 @@ impl Scope {
     ) -> Scope {
         Scope {
             expand_generated: false,
-            ..Scope::table(schema, schema.name.clone(), catalog, params, &[])
+            ..Scope::table(schema, schema.name.clone(), catalog, params, &[], None)
         }
     }
 
@@ -860,6 +911,17 @@ impl Scope {
                 Some(Err(())) => return Err(ambiguous()),
                 None => continue,
             }
+        }
+        // A relation in scope whose access method declines system columns
+        // explains the miss better than "does not exist" does, and it is the
+        // only relation that could have exposed the name.
+        if let Some(rel) = self
+            .rels
+            .iter()
+            .find(|rel| rel.declined_system.is_some())
+            .filter(|_| SysCol::ALL.iter().any(|c| c.name() == name))
+        {
+            return Err(declined_or_missing(rel, name, || unreachable!("filtered")));
         }
         Err(BindError::new(
             sqlstate::UNDEFINED_COLUMN,

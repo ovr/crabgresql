@@ -19,9 +19,9 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::copy_rows::RowBatch;
 use crate::expr::{
-    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
-    WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
+    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, NamedWindows,
+    OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup,
+    WindowKind, WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
     merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
     reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
@@ -2580,6 +2580,8 @@ struct BoundFromItem {
     /// — a subquery, CTE, view or table function exposes no system columns, as
     /// upstream.
     system_base: Option<usize>,
+    /// See [`ScopeItem::declined_system`].
+    declined_system: Option<DeclinedSystem>,
 }
 
 /// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
@@ -2607,6 +2609,7 @@ impl BoundFromItem {
                 qualifier: self.qualifier,
                 columns: to_columns(&self.columns),
                 system_base: self.system_base,
+                declined_system: self.declined_system,
             }],
             visible: None,
         }
@@ -2843,6 +2846,7 @@ fn bind_from_item(
                     columns,
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
                     system_base: None,
+                    declined_system: None,
                 });
             }
             // Read resolution honors the search path: temp → pg_catalog →
@@ -2879,12 +2883,15 @@ fn bind_from_item(
                     // exposes no system columns — so a reference there is the
                     // same 42703 it is upstream, not an OID no relation answers
                     // to.
-                    let wanted: Arc<[SysCol]> =
-                        match table.schema().namespace == "information_schema" {
-                            true => Arc::from(&[][..]),
-                            false => without_declared(demand.wants(&qualifier), &table.schema()),
-                        };
-                    reject_unsupported_system_columns(&wanted, &table)?;
+                    let (wanted, declined_system) = match table.schema().namespace
+                        == "information_schema"
+                    {
+                        true => (Arc::from(&[][..]), None),
+                        false => supported_system_columns(
+                            without_declared(demand.wants(&qualifier), &table.schema()).to_vec(),
+                            &table,
+                        ),
+                    };
                     // A relation whose rows live in several places is read as a
                     // union scan. Bind it as a subplan wrapping an `Append` (raw
                     // relation columns), so the surrounding SELECT's
@@ -2929,6 +2936,7 @@ fn bind_from_item(
                         columns,
                         input,
                         system_base,
+                        declined_system,
                     })
                 }
                 Err(e) => {
@@ -2959,6 +2967,7 @@ fn bind_from_item(
                             // A view is expanded into its body, and PostgreSQL
                             // exposes no system columns on one either.
                             system_base: None,
+                            declined_system: None,
                         });
                     }
                     Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
@@ -3013,6 +3022,7 @@ fn bind_from_item(
                 columns,
                 input: JoinInput::Subplan(Box::new(inner)),
                 system_base: None,
+                declined_system: None,
             })
         }
         other => Err(BindError::feature_not_supported(format!(
@@ -3057,34 +3067,44 @@ fn without_declared(wanted: Vec<SysCol>, schema: &TableSchema) -> Arc<[SysCol]> 
     )
 }
 
-/// Refuse a reference to a system column the relation's access method cannot
-/// produce per row.
+/// The system columns of `wanted` that `table`'s access method can actually
+/// produce, plus what a reference to one of the others has to be refused with.
 ///
 /// The columnar engines store column chunks, not row versions: there is no tid
 /// that addresses a row and no MVCC header to read `xmin` off. Answering with a
 /// placeholder would be worse than refusing — a client that identifies rows by
-/// `ctid` would corrupt data with it — so this is the same `0A000` PostgreSQL
-/// raises for an operation an access method does not implement.
+/// `ctid` would corrupt data with it.
 ///
-/// `tableoid` is never rejected: every relation has an identity.
-fn reject_unsupported_system_columns(
-    wanted: &[SysCol],
+/// But the refusal cannot be driven from `wanted`. That set comes from
+/// [`SystemDemand`], a deliberate over-approximation over *rendered SQL*, so a
+/// string literal or an `AS` alias spelling one of six short words lands in it —
+/// and turning that into an error rejects `SELECT * FROM q WHERE label = 'xmin'`,
+/// which PostgreSQL answers. So the unsupported slots are dropped here, leaving
+/// the over-approximation harmless again, and the `0A000` is raised only where a
+/// reference actually resolves to one.
+///
+/// `tableoid` is never dropped: every relation has an identity, whatever it
+/// stores.
+fn supported_system_columns(
+    wanted: Vec<SysCol>,
     table: &Arc<dyn TableAm>,
-) -> Result<(), BindError> {
-    if wanted.iter().all(|c| !c.needs_storage_support()) || table.supports_system_columns() {
-        return Ok(());
+) -> (Arc<[SysCol]>, Option<DeclinedSystem>) {
+    if table.supports_system_columns() {
+        return (Arc::from(wanted), None);
     }
     let schema = table.schema();
-    let col = wanted
-        .iter()
-        .find(|c| c.needs_storage_support())
-        .expect("the all() above returned false, so one column needs support");
-    Err(BindError::feature_not_supported(format!(
-        "access method \"{}\" does not support system column \"{}\" on relation \"{}\"",
-        schema.access_method.as_str(),
-        col.name(),
-        schema.name,
-    )))
+    (
+        Arc::from(
+            wanted
+                .into_iter()
+                .filter(|c| !c.needs_storage_support())
+                .collect::<Vec<_>>(),
+        ),
+        Some(DeclinedSystem {
+            access_method: schema.access_method.as_str(),
+            relation: schema.name.clone(),
+        }),
+    )
 }
 
 /// A system column as a column of the row that carries it. The slots sit past
@@ -3164,6 +3184,11 @@ impl SystemDemand {
     /// a bind that already walks the same tree many times, and its only failure
     /// mode is the harmless one: a string literal spelling one of the names buys
     /// an unreferenced slot.
+    ///
+    /// That harmlessness is a standing obligation on every consumer of this set.
+    /// Nothing may *refuse* a statement because a column is in it — see
+    /// [`supported_system_columns`], which drops what an access method cannot
+    /// serve and leaves the error to whoever resolves a real reference.
     pub(crate) fn of_select(select: &ast::Select, order_by: &Option<ast::OrderBy>) -> Self {
         let mut demand = Self::of_order_by(order_by);
         demand.scan_rendered(&select.to_string());
@@ -4037,6 +4062,7 @@ fn bound_table_fn_item(
             ordinality,
         },
         system_base: None,
+        declined_system: None,
     })
 }
 
@@ -5857,14 +5883,17 @@ pub fn bind_insert_with_params(
     // needs a fresh table scope.
     // Only RETURNING can name a system column on an INSERT — there is no WHERE,
     // and the VALUES bound in the empty scope.
-    let system = without_declared(
-        SystemDemand::in_write(&None, &insert.returning, &[]),
-        &schema,
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&None, &insert.returning, &[]),
+            &schema,
+        )
+        .to_vec(),
+        &table,
     );
-    reject_unsupported_system_columns(&system, &table)?;
     let returning = bind_returning(
         &insert.returning,
-        &Scope::table(&schema, name, catalog, params, &system)
+        &Scope::table(&schema, name, catalog, params, &system, declined_system)
             .with_subqueries(engine, &CteEnv::new()),
     )?;
 
@@ -6699,17 +6728,27 @@ pub fn bind_update_with_params(
     } else {
         None
     };
-    let system = without_declared(
-        SystemDemand::in_write(&update.selection, &update.returning, &update.assignments),
-        &schema,
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&update.selection, &update.returning, &update.assignments),
+            &schema,
+        )
+        .to_vec(),
+        &table,
     );
-    reject_unsupported_system_columns(&system, &table)?;
     // An inheritance parent instead updates every descendant in place.
     let inherited = write_targets(engine, &table, only, &system)?;
     // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
     // so the CTE environment is empty.
-    let scope = Scope::table(&schema, qualifier, catalog, params, &system)
-        .with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(
+        &schema,
+        qualifier,
+        catalog,
+        params,
+        &system,
+        declined_system,
+    )
+    .with_subqueries(engine, &CteEnv::new());
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -6841,16 +6880,26 @@ pub fn bind_delete_with_params(
     // A write answers `tableoid` from the target the row actually lives in, so
     // WHERE reads it too — `DELETE FROM p WHERE tableoid = 'p1'::regclass` must
     // match exactly the rows of that partition.
-    let system = without_declared(
-        SystemDemand::in_write(&delete.selection, &delete.returning, &[]),
-        &schema,
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&delete.selection, &delete.returning, &[]),
+            &schema,
+        )
+        .to_vec(),
+        &table,
     );
-    reject_unsupported_system_columns(&system, &table)?;
     // An inheritance parent instead deletes from every descendant in place.
     let inherited = write_targets(engine, &table, only, &system)?;
     // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
-    let scope = Scope::table(&schema, qualifier, catalog, params, &system)
-        .with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(
+        &schema,
+        qualifier,
+        catalog,
+        params,
+        &system,
+        declined_system,
+    )
+    .with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
     if let Some(predicate) = &predicate {
         reject_agg_or_window(predicate, "WHERE")?;
