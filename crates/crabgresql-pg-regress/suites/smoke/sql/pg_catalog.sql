@@ -51,6 +51,11 @@ SELECT castsource, casttarget, castcontext
   FROM pg_cast
  WHERE castsource IN (20, 23) AND casttarget IN (20, 23)
  ORDER BY castsource, casttarget;
+-- the ACL columns are present and NULL everywhere: nothing here GRANTs, and
+-- NULL is what PostgreSQL reports for an object still on its owner's defaults
+SELECT count(*) AS with_acl FROM pg_class WHERE relacl IS NOT NULL;
+SELECT count(*) AS with_acl FROM pg_type WHERE typacl IS NOT NULL;
+SELECT count(*) AS with_acl FROM pg_proc WHERE proacl IS NOT NULL;
 -- a schema-qualified write reaches the permanent relation (INSERT accepts the
 -- public. qualifier symmetrically with SELECT/UPDATE)
 CREATE TABLE pgcat_pub (v int);

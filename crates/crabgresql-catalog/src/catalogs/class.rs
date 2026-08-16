@@ -19,7 +19,7 @@ use crate::{RelKind, TOAST_NAMESPACE};
 ///
 /// TODO: the storage, inheritance and ACL columns (`relfilenode`,
 /// `relallfrozen`, `relisshared`, `relhassubclass`, `relispopulated`,
-/// `relrewrite`, `relfrozenxid`, `relminmxid`, `relacl`, `reloptions`) are
+/// `relrewrite`, `relfrozenxid`, `relminmxid`, `reloptions`) are
 /// absent, so a query naming one fails with "column does not exist" rather than
 /// reading a value.
 ///
@@ -60,6 +60,8 @@ pub(crate) fn pg_class_schema() -> TableSchema {
             col("relforcerowsecurity", PgType::Bool),
             col("relreplident", CHARLIKE),
             col("relispartition", PgType::Bool),
+            // aclitem[]; represented as text and always NULL (default ACL) here.
+            col("relacl", ACLITEM_ARRAY),
             // pg_node_tree in PG; crabgresql stores the already-deparsed
             // `FOR VALUES …` text (see `pg_get_expr`, which just echoes it).
             col("relpartbound", PgType::Text),
@@ -248,6 +250,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 chr(relreplident),
                 Value::Bool(schema.partition_of.is_some()),
+                // relacl
+                Value::Null,
                 relpartbound,
             ]
         })
@@ -285,6 +289,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             // An index has no replica identity of its own.
             chr('n'),
             Value::Bool(false),
+            // relacl / relpartbound
+            Value::Null,
             Value::Null,
         ]
     }));
@@ -324,6 +330,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Bool(false),
             chr('n'),
             Value::Bool(false),
+            // relacl / relpartbound
+            Value::Null,
             Value::Null,
         ]
     }));
