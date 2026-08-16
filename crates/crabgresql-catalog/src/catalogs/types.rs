@@ -13,9 +13,9 @@ use crate::{CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
 /// query.
 ///
-/// TODO: the domain and ACL columns (`typnotnull`, `typtypmod`, `typndims`,
-/// `typdefaultbin`, `typdefault`, `typacl`) are absent, so a query naming one
-/// fails with "column does not exist" rather than reading a default.
+/// TODO: the domain columns (`typnotnull`, `typtypmod`, `typndims`,
+/// `typdefaultbin`, `typdefault`) are absent, so a query naming one fails with
+/// "column does not exist" rather than reading a default.
 pub(crate) fn pg_type_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_type",
@@ -47,6 +47,7 @@ pub(crate) fn pg_type_schema() -> TableSchema {
             col("typstorage", CHARLIKE),
             col("typbasetype", PgType::Oid),
             col("typcollation", PgType::Oid),
+            col("typacl", ACLITEM_ARRAY),
         ],
     )
 }
@@ -95,6 +96,7 @@ pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 // derived array row is not a domain either.
                 Value::Oid(0),
                 Value::Oid(r.typcollation),
+                Value::Null,
             ]
         })
         .collect()
@@ -150,6 +152,7 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
                 Value::Oid(0),
                 // An enum is not collatable.
                 Value::Oid(0),
+                Value::Null,
             ]
         })
         .collect()

@@ -11,9 +11,9 @@ use crate::oids::*;
 /// connected to. PostgreSQL lists every database in the cluster; a crabgresql
 /// server serves exactly one, so the connected database *is* the relation.
 ///
-/// `datacl` (`aclitem[]`) is omitted: no `GRANT` exists to populate it, and
-/// `aclitem` is not a type this build models. Same reasoning as `pg_type.typacl`
-/// in [`crate::catalogs::types`].
+/// `datacl` is NULL: no `GRANT` exists to populate it, which is also what
+/// PostgreSQL reports for a database whose privileges were never changed from
+/// the owner's defaults. See [`crate::cols::ACLITEM_ARRAY`] for the type.
 pub(crate) fn pg_database_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_database",
@@ -36,6 +36,7 @@ pub(crate) fn pg_database_schema() -> TableSchema {
             col("datlocale", PgType::Text),
             col("daticurules", PgType::Text),
             col("datcollversion", PgType::Text),
+            col("datacl", ACLITEM_ARRAY),
         ],
     )
 }
@@ -70,12 +71,12 @@ pub(crate) fn pg_database_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         Value::Null,
         Value::Null,
         Value::Null,
+        Value::Null,
     ]]
 }
 
 /// `pg_catalog.pg_tablespace` — the two bootstrap tablespaces, as in
-/// PostgreSQL. `spcacl` (`aclitem[]`) is omitted for the reason given on
-/// [`pg_database_schema`].
+/// PostgreSQL. `spcacl` is NULL for the reason given on [`pg_database_schema`].
 pub(crate) fn pg_tablespace_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_tablespace",
@@ -84,6 +85,7 @@ pub(crate) fn pg_tablespace_schema() -> TableSchema {
             col("oid", PgType::Oid),
             col("spcname", PgType::Name),
             col("spcowner", PgType::Oid),
+            col("spcacl", ACLITEM_ARRAY),
             col("spcoptions", PgType::Array(crabgresql_types::oid::TEXT)),
         ],
     )
@@ -95,6 +97,7 @@ pub(crate) fn pg_tablespace_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Oid(oid),
             Value::Text(name.to_string()),
             Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Null,
             Value::Null,
         ]
     };

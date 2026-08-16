@@ -19,6 +19,13 @@ SELECT datname = current_database() AS is_the_connected_one,
 SELECT pg_encoding_to_char(encoding) FROM pg_database;
 -- the two bootstrap tablespaces, as in PostgreSQL; nothing creates a third
 SELECT oid, spcname, spcowner, spcoptions FROM pg_tablespace ORDER BY oid;
+-- the ACL columns are NULL on both: no GRANT exists to populate them, which is
+-- also what PostgreSQL reports for the defaults these objects were created with
+SELECT spcname AS object, spcacl IS NULL AS acl_is_null
+  FROM pg_catalog.pg_tablespace
+UNION ALL
+SELECT datname, datacl IS NULL FROM pg_catalog.pg_database
+ ORDER BY object;
 -- one role, the bootstrap superuser, whose OID is PostgreSQL's own 10
 SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
        rolcanlogin, rolreplication, rolbypassrls, rolconnlimit

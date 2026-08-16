@@ -40,6 +40,20 @@ SELECT oid, spcname, spcowner, spcoptions FROM pg_tablespace ORDER BY oid;
  1664 | pg_global  |       10 | 
 (2 rows)
 
+-- the ACL columns are NULL on both: no GRANT exists to populate them, which is
+-- also what PostgreSQL reports for the defaults these objects were created with
+SELECT spcname AS object, spcacl IS NULL AS acl_is_null
+  FROM pg_catalog.pg_tablespace
+UNION ALL
+SELECT datname, datacl IS NULL FROM pg_catalog.pg_database
+ ORDER BY object;
+   object   | acl_is_null 
+------------+-------------
+ pg_default | t
+ pg_global  | t
+ regression | t
+(3 rows)
+
 -- one role, the bootstrap superuser, whose OID is PostgreSQL's own 10
 SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
        rolcanlogin, rolreplication, rolbypassrls, rolconnlimit

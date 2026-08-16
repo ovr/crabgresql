@@ -43,6 +43,7 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
             col("proargnames", PgType::Array(crabgresql_types::oid::TEXT)),
             col("prosrc", PgType::Text),
             col("probin", PgType::Text),
+            col("proacl", ACLITEM_ARRAY),
         ],
     )
 }
@@ -90,6 +91,7 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
             Value::Null,
             Value::Text((*name).to_string()),
             Value::Null,
+            Value::Null,
         ]
     });
     // The snowball dictionary's two C functions, which `pg_ts_template.snowball`
@@ -126,6 +128,7 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Null,
                 Value::Text(proc.name.to_string()),
                 Value::Text("$libdir/dict_snowball".to_string()),
+                Value::Null,
             ]
         });
     PG_PROC_ROWS
@@ -174,6 +177,7 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                 ),
                 Value::Text(r.prosrc.to_string()),
                 text_or_null(r.probin),
+                Value::Null,
             ]
         })
         .chain(own)
@@ -255,6 +259,7 @@ fn user_rows(
                     r.arg_names.iter().map(|n| Value::Text(n.clone())).collect(),
                 ),
                 Value::Text(r.src.clone()),
+                Value::Null,
                 Value::Null,
             ]
         })
