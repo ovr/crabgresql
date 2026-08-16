@@ -47,7 +47,6 @@ pub(crate) fn pg_type_schema() -> TableSchema {
             col("typstorage", CHARLIKE),
             col("typbasetype", PgType::Oid),
             col("typcollation", PgType::Oid),
-            // aclitem[]; represented as text and always NULL (default ACL) here.
             col("typacl", ACLITEM_ARRAY),
         ],
     )
@@ -97,7 +96,6 @@ pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 // derived array row is not a domain either.
                 Value::Oid(0),
                 Value::Oid(r.typcollation),
-                // typacl
                 Value::Null,
             ]
         })
@@ -154,7 +152,6 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
                 Value::Oid(0),
                 // An enum is not collatable.
                 Value::Oid(0),
-                // typacl
                 Value::Null,
             ]
         })

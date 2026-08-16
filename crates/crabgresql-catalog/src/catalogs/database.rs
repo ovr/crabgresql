@@ -36,7 +36,6 @@ pub(crate) fn pg_database_schema() -> TableSchema {
             col("datlocale", PgType::Text),
             col("daticurules", PgType::Text),
             col("datcollversion", PgType::Text),
-            // aclitem[]; represented as text and always NULL (default ACL) here.
             col("datacl", ACLITEM_ARRAY),
         ],
     )
@@ -72,7 +71,6 @@ pub(crate) fn pg_database_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         Value::Null,
         Value::Null,
         Value::Null,
-        // datacl
         Value::Null,
     ]]
 }
@@ -87,7 +85,6 @@ pub(crate) fn pg_tablespace_schema() -> TableSchema {
             col("oid", PgType::Oid),
             col("spcname", PgType::Name),
             col("spcowner", PgType::Oid),
-            // aclitem[]; represented as text and always NULL (default ACL) here.
             col("spcacl", ACLITEM_ARRAY),
             col("spcoptions", PgType::Array(crabgresql_types::oid::TEXT)),
         ],
@@ -100,7 +97,6 @@ pub(crate) fn pg_tablespace_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Oid(oid),
             Value::Text(name.to_string()),
             Value::Oid(BOOTSTRAP_ROLE_OID),
-            // spcacl / spcoptions
             Value::Null,
             Value::Null,
         ]
