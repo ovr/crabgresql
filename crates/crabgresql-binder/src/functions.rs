@@ -197,22 +197,11 @@ pub enum ScalarFn {
     /// rather than from the pure `eval_scalar`.
     AgeXid,
     /// The current transaction's id: `txid_current()`, its modern spelling
-    /// `pg_current_xact_id()`, and the `_if_assigned` form of each.
+    /// `pg_current_xact_id()` (`xid8`), and the `_if_assigned` form of each.
     ///
-    /// `xid8` picks the modern spelling — the same number returned as `xid8`
-    /// rather than as `int8`. One variant with two flags rather than four
-    /// variants: the four differ only in those two bits, and splitting them
-    /// would repeat one arm four times in every match that dispatches them.
-    ///
-    /// `if_assigned` is the form that reports NULL instead of assigning: the
-    /// plain form *must* have an XID, which is why
-    /// [`crate::plan_needs_xid`] reports a statement containing one as needing
-    /// one, so that the server allocates it before execution starts. The
-    /// `_if_assigned` form deliberately does not, which is the whole of its
-    /// meaning.
-    ///
-    /// `STABLE`, as in PostgreSQL: within one transaction every call answers
-    /// the same number, so duplicating the node is safe.
+    /// Only the plain form assigns an id when the transaction has none, which
+    /// is why [`crate::plan_needs_xid`] looks for it: the server allocates the
+    /// XID before execution starts.
     CurrentXactId {
         xid8: bool,
         if_assigned: bool,
@@ -220,9 +209,7 @@ pub enum ScalarFn {
     /// `pg_xact_status(xid8) -> text`: `committed`, `aborted` or `in progress`,
     /// read out of the CLOG. NULL for an XID too old to have a status left.
     PgXactStatus,
-    /// `pg_is_in_recovery() -> bool`: always false. crabgresql has no standby
-    /// mode, so there is no state in which it could answer otherwise; clients
-    /// ask it on connect and want the answer, not a bind error.
+    /// `pg_is_in_recovery() -> bool`: always false, see its arm in `eval.rs`.
     PgIsInRecovery,
     /// `to_char(interval, text) -> text`.
     ToCharInterval,
@@ -2722,9 +2709,8 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[OID],
             ret: BOOL,
         }],
-        // The transaction-id family. PG renamed `txid_*` to `pg_*_xact_id` in
-        // v13 and kept both, the old pair narrowed to `int8` because it predates
-        // the `xid8` type; the numbers they report are the same.
+        // PG renamed `txid_*` to `pg_*_xact_id` in v13 and kept both. The old
+        // pair reports the same number as `int8` because it predates `xid8`.
         "txid_current" => &[Signature {
             func: ScalarFn::CurrentXactId {
                 xid8: false,

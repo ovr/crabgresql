@@ -257,10 +257,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             ));
         }
         // Likewise the transaction-state family, dispatched by `eval` because
-        // they read the transaction context and the CLOG. Three of the four are
-        // zero-arity, so — as with the clock functions above — without an arm
-        // here they would fall past every match below into a tail that indexes
-        // an empty argument slice.
+        // they read the transaction context and the CLOG. All but
+        // `pg_xact_status` are zero-arity, so — as with the clock functions
+        // above — without an arm here they would fall past every match below
+        // into a tail that indexes an empty argument slice.
         ScalarFn::CurrentXactId { .. } | ScalarFn::PgXactStatus | ScalarFn::PgIsInRecovery => {
             return Err(ExecError::new(
                 sqlstate::INTERNAL_ERROR,

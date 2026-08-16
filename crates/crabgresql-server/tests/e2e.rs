@@ -14451,10 +14451,8 @@ async fn pg_backend_pid_matches_the_sessions_lock_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `txid_current()` reports the transaction's own id, and inside a block it is
-/// the *same* id every statement of the block sees — which is what makes it
-/// usable as a block identity at all. It is also the id `pg_stat_activity`
-/// publishes for this backend, so the two cannot disagree.
+/// Inside a block every statement sees the *same* id, and it is the one
+/// `pg_stat_activity` publishes for this backend — so the two cannot disagree.
 #[tokio::test]
 async fn txid_current_is_the_blocks_id_and_pg_stat_activity_agrees() -> anyhow::Result<()> {
     let mut client = connect(spawn_server().await).await;
@@ -14470,8 +14468,6 @@ async fn txid_current_is_the_blocks_id_and_pg_stat_activity_agrees() -> anyhow::
         .get("id");
     assert_eq!(first, second, "the id must not move within a block");
 
-    // The modern spelling is the same number, and `pg_stat_activity` publishes
-    // it for this backend narrowed to 32 bits.
     let row = txn
         .query_one(
             "SELECT pg_current_xact_id()::text AS modern, \
@@ -14482,8 +14478,6 @@ async fn txid_current_is_the_blocks_id_and_pg_stat_activity_agrees() -> anyhow::
     assert_eq!(row.get::<_, String>("modern"), first.to_string());
     assert_eq!(row.get::<_, String>("published"), first.to_string());
 
-    // Its own transaction is running, so it reads as neither committed nor
-    // aborted.
     assert_eq!(
         txn.query_one("SELECT pg_xact_status(pg_current_xact_id()) AS s", &[])
             .await?
@@ -14492,8 +14486,6 @@ async fn txid_current_is_the_blocks_id_and_pg_stat_activity_agrees() -> anyhow::
     );
     txn.commit().await?;
 
-    // Once the block ends the id is committed — the XID the statement consumed
-    // is retired rather than left in flight.
     assert_eq!(
         client
             .query_one(
@@ -14537,8 +14529,8 @@ async fn txid_current_assigns_per_statement_under_autocommit() -> anyhow::Result
         .get("id");
     assert_eq!(second, first + 1);
 
-    // And the first one really committed rather than staying in flight, which
-    // would pin the snapshot horizon for the life of the process.
+    // An id left in flight would pin the snapshot horizon for the life of the
+    // process, so it is not enough that one was handed out.
     assert_eq!(
         client
             .query_one(
@@ -14553,10 +14545,9 @@ async fn txid_current_assigns_per_statement_under_autocommit() -> anyhow::Result
 }
 
 /// A statement holding an XID has its rows produced while its own transaction is
-/// still open, which decides two answers a streamed result set would get wrong:
-/// the id reads as running rather than as already committed, and a fault raised
-/// part-way through the rows aborts the transaction instead of committing one
-/// whose output never reached the client.
+/// still open. Two answers a streamed result set gets wrong: the id would read
+/// as already committed, and a fault raised part-way through the rows would
+/// commit a transaction whose output never reached the client.
 #[tokio::test]
 async fn an_xid_holding_statement_produces_its_rows_before_it_commits() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;

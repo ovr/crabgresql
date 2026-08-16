@@ -634,10 +634,9 @@ impl BoundExpr {
     /// inside a subquery marker — a correlated subplan is executed per outer
     /// row, so a node in one still runs under this statement.
     ///
-    /// Takes the predicate rather than naming what it looks for so that a
-    /// second question of the same shape — [`crate::plan_needs_xid`] is the
-    /// first — is a one-line `matches!` and not another copy of this traversal
-    /// to keep in step with the `BoundExpr` variants.
+    /// Takes the predicate rather than naming what it looks for so that asking
+    /// something else of the same walk is a `matches!` and not another copy of
+    /// this traversal to keep in step with the `BoundExpr` variants.
     pub fn any_node(&self, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
         if pred(self) {
             return true;
@@ -882,12 +881,12 @@ impl BoundExpr {
     /// Whether this expression contains a volatile function call. The volatile
     /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
     /// side effects, `currval`/`lastval` read mutable session state),
-    /// `clock_timestamp`, which reads the wall clock afresh at every call,
-    /// the UUID generators, which draw fresh randomness, and
+    /// `clock_timestamp`, which reads the wall clock afresh at every call, the
+    /// UUID generators, which draw fresh randomness, and
     /// `pg_xact_status`/`pg_is_in_recovery`, which report live server state —
-    /// all marked `VOLATILE` by PostgreSQL. Any future volatile scalar
-    /// function (e.g. `random()`)
-    /// belongs in [`is_volatile_call`](Self::is_volatile_call), which this
+    /// all marked `VOLATILE` by PostgreSQL. Any future volatile scalar function
+    /// (e.g. `random()`) belongs in
+    /// [`is_volatile_call`](Self::is_volatile_call), which this
     /// delegates to. Used to refuse duplicating a volatile argument — when
     /// inlining a SQL function body, and when `NULLIF` places its left operand
     /// in the tree twice — and to keep such a call from being pushed down into
@@ -901,10 +900,9 @@ impl BoundExpr {
     /// real optimization — `WHERE ts > now() - interval '1 day'` could no
     /// longer be pushed to a leaf — for no change in the answer.
     ///
-    /// Nor is `txid_current()` and its family, which PG also marks `STABLE`:
-    /// assigning the transaction's XID is a side effect that happens *once*,
-    /// so every call in one transaction answers the same number and
-    /// duplicating the node changes nothing.
+    /// Nor is `txid_current()` and its family, `STABLE` in PG too despite
+    /// assigning an XID: that side effect happens once per transaction, so
+    /// every call in one answers the same number.
     ///
     /// Note this stops at a subquery marker: a subquery's body is a plan of its
     /// own. A caller that needs to see inside one wants

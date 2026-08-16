@@ -1027,17 +1027,14 @@ pub(crate) fn plan_any_expr_node(plan: &LogicalPlan, pred: &dyn Fn(&BoundExpr) -
 /// the body's versions with.
 ///
 /// `txid_current()` / `pg_current_xact_id()` need one because the id *is* their
-/// answer, and PostgreSQL assigns one when the transaction has none. The server
-/// allocates the XID before execution begins and commits it afterwards, so
-/// answering true here is what keeps such a statement from either reporting no
-/// id or leaving an in-flight one behind that no commit ever retires. Their
+/// answer, and PostgreSQL assigns one when the transaction has none. Their
 /// `_if_assigned` forms deliberately do not count: reporting NULL when there is
 /// no XID is their whole meaning.
 ///
-/// Both reasons also make the statement's result set one that has to be drained
-/// before its transaction is finalized rather than streamed after it — the body
-/// runs, and the id is read, while the transaction must still be open. That is
-/// why this is one predicate and not two.
+/// One predicate and not two, because both reasons carry the same second
+/// requirement — the body runs, and the id is read, only while the transaction
+/// is still open, so such a result set must be drained before it is finalized
+/// rather than streamed after.
 pub fn plan_needs_xid(plan: &LogicalPlan) -> bool {
     plan_any_expr_node(plan, &|e| {
         matches!(

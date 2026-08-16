@@ -1270,19 +1270,15 @@ pub(crate) fn execute_statement_with(
         }
     };
     // `finalize_statement` closes the statement's transaction, and a streamed
-    // result set is pulled *after* it returns. So a plan whose rows depend on
-    // the transaction still being open has to be drained here instead —
-    // which is exactly the plans that hold an XID, for both of the reasons they
-    // hold one. A routine called per row would run its body after its own
-    // transaction had already committed or aborted; and a `txid_current()` would
-    // report the state of a transaction that is no longer running, answering
-    // `committed` where PostgreSQL answers `in progress`.
+    // result set is pulled *after* it returns — so a plan holding an XID has to
+    // be drained here instead. A routine would run its body past its own commit,
+    // and a `txid_current()` would report a transaction that is no longer
+    // running, answering `committed` where PostgreSQL answers `in progress`.
     //
-    // Draining is also what puts a fault raised while producing a row — a
-    // `RAISE EXCEPTION` in a body, a division by zero in a projection — back on
-    // the abort path `execute` has above. Streamed, it surfaces after the commit
-    // has already been written, and the statement's XID is recorded as committed
-    // though its rows never reached the client.
+    // Draining is also what puts a fault raised while producing a row — a `RAISE
+    // EXCEPTION`, a division by zero in a projection — back on the abort path
+    // `execute` has above. Streamed, it surfaces after the commit is written and
+    // the XID is recorded as committed though its rows never reached the client.
     //
     // TODO: give portals their own transaction lifetimes, so such a plan can
     // stream instead of being buffered. PostgreSQL streams and holds the

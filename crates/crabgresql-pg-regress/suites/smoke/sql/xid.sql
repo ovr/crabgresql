@@ -146,8 +146,7 @@ select pg_is_in_recovery();
 select pg_typeof(txid_current()), pg_typeof(pg_current_xact_id()),
        pg_typeof(pg_is_in_recovery()), pg_typeof(pg_xact_status('2'::xid8));
 
--- under autocommit the statement that asks gets an id of its own; one that does
--- not ask has none, which is the whole of what `_if_assigned` reports
+-- an autocommit statement is assigned an id only if it asks for one
 select txid_current() > 0;
 select txid_current_if_assigned() is null;
 
@@ -160,17 +159,16 @@ select txid_current() = txid_current() as stable_within_one_statement;
 select txid_current()::text = txid_current_if_assigned()::text as assigned_now;
 select pg_current_xact_id() = id as stable_across_statements
   from xact_ids where label = 'block';
--- both spellings report the same number, one as int8 and one as xid8
+-- compared as text because the two spellings return int8 and xid8
 select txid_current()::text = pg_current_xact_id()::text as same_number;
 select pg_xact_status(pg_current_xact_id()) as own_status;
 commit;
 
--- and once the block ends, that same id reads as committed
 select pg_xact_status(id) from xact_ids where label = 'block';
 
 -- the same question under autocommit, where the id belongs to this one
--- statement: it is still running while its own rows are produced, so the answer
--- is not the `committed` a result set read after the commit would report
+-- statement: it is still running while its own rows are produced, so this is
+-- not the `committed` a result set read after the commit would report
 select pg_xact_status(pg_current_xact_id()) as own_status_autocommit;
 
 -- assigning an id is not a write, so a read-only block may still ask for one
@@ -186,9 +184,9 @@ select 1;
 select pg_current_xact_id()::text::int8 - id::text::int8 as ids_consumed
   from xact_ids where label = 'before reads';
 
--- pg_xact_status edges: the invalid id names no transaction, the two reserved
--- ids below the first normal one are permanently committed, and an id at or
--- above the next one to hand out has not started yet
+-- the invalid id names no transaction, the two reserved ids below the first
+-- normal one are permanently committed, and an id at or above the next one to
+-- hand out has not started yet
 select pg_xact_status('0'::xid8) is null as invalid_has_no_status;
 select pg_xact_status('1'::xid8), pg_xact_status('2'::xid8);
 select pg_xact_status(null::xid8) is null;
