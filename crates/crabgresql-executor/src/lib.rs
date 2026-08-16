@@ -37,7 +37,9 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 pub use crabgresql_binder::OutputColumn;
-use crabgresql_binder::{BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey};
+use crabgresql_binder::{
+    BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey, SysCol,
+};
 use crabgresql_planner::{
     DmlIndexProbe, DmlTarget, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
     PhysicalJoinExpr, PhysicalJoinInput, PhysicalPlan, map_assigned_columns,
@@ -45,10 +47,10 @@ use crabgresql_planner::{
 };
 use crabgresql_storage_api::pgstat::WriteKind;
 use crabgresql_storage_api::{
-    ColumnProjection, IndexMetadata, IndexProbe, PartitionBoundDatum, StorageError, TableAm,
-    TableSchema, Tid, Tuple, TypeCatalog,
+    ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
+    Tuple, TypeCatalog,
 };
-use crabgresql_txn::TxnContext;
+use crabgresql_txn::{TupleHeader, TxnContext};
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
 
 use checks::{CheckSet, NotNullSet};
@@ -57,11 +59,11 @@ pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
 };
 use generated::GeneratedSet;
-use node::index_probe_rows;
 pub use node::{
     Aggregate, Append, Concat, Distinct, Filter, HashJoin, IndexScan, Limit, MaterializedRows,
     NestedLoopJoin, ProjectSet, Projection, SeqScan, Sort, TableFunctionSource, Values, WindowAgg,
 };
+use node::{index_probe_rows, index_probe_system_rows};
 use tally::count_write;
 use unique::UniqueKeySet;
 
@@ -868,9 +870,9 @@ pub fn execute(
             returning,
             routing,
             freeze,
-            tableoid,
+            system,
         } => execute_insert(
-            &table, source, returning, routing, freeze, tableoid, ctx, txn,
+            &table, source, returning, routing, freeze, &system, ctx, txn,
         ),
         PhysicalPlan::Update {
             table,
@@ -880,7 +882,7 @@ pub fn execute(
             routing,
             inherited,
             probe,
-            tableoid,
+            system,
         } => execute_update(
             &table,
             &predicate,
@@ -889,7 +891,7 @@ pub fn execute(
             routing,
             inherited,
             probe.as_ref(),
-            tableoid,
+            &system,
             ctx,
             txn,
         ),
@@ -900,7 +902,7 @@ pub fn execute(
             routing,
             inherited,
             probe,
-            tableoid,
+            system,
         } => execute_delete(
             &table,
             &predicate,
@@ -908,7 +910,7 @@ pub fn execute(
             routing,
             inherited,
             probe.as_ref(),
-            tableoid,
+            &system,
             ctx,
             txn,
         ),
@@ -2005,13 +2007,37 @@ fn append_source(
     // relation's layout, so any of them describes the batch. `Append` over zero
     // arms is not a shape the planner emits.
     let first = arms.first();
-    let layout = first.map(|arm| vector::layout_of(&arm.relation.table.schema()));
+    // The batch is the relation's own columns plus whatever system slots the
+    // arms append, in that order — so the layout the shred decodes against has
+    // to be widened the same way, or it reads a row narrower than the projection
+    // above it indexes into. (`BatchAppend::open` admits `tableoid` and nothing
+    // else; the `map` below follows whatever it admits.)
+    let layout = first.map(|arm| {
+        let schema = arm.relation.table.schema();
+        let mut columns = schema.columns.clone();
+        columns.extend(
+            arm.relation
+                .system
+                .iter()
+                .flat_map(|emit| emit.cols.iter())
+                .map(|c| crabgresql_storage_api::Column::new(c.name(), c.ty())),
+        );
+        vector::layout_from(columns)
+    });
     Ok(match (vector::BatchAppend::open(arms, txn, ctx), layout) {
         (Some(append), Some(layout)) => {
-            let positions = scan_positions(
-                &first.expect("layout implies an arm").projection,
-                layout.len(),
-            );
+            let declared = first
+                .expect("layout implies an arm")
+                .relation
+                .table
+                .schema()
+                .columns
+                .len();
+            let mut positions =
+                scan_positions(&first.expect("layout implies an arm").projection, declared);
+            // A system slot is never in the scan's projection — that addresses
+            // stored columns — but it is always in the batch, and always read.
+            positions.extend(declared..layout.len());
             Source::Batches {
                 node: Box::new(append),
                 layout,
@@ -2121,27 +2147,26 @@ pub fn eval_row_free(expr: &BoundExpr, ctx: &ExecContext) -> Result<Value, ExecE
 /// write already committed. RETURNING is scalar one-in/one-out (the binder
 /// rejects aggregates and set-returning functions), so this is one output row
 /// per affected row.
-/// `tableoids`, when set, is the OID of the relation each affected row actually
-/// lives in, positionally aligned with `affected`. The binder put a `tableoid`
-/// slot past the target's declared columns, so the projection reads it as an
-/// ordinary column; widening happens here, per row, because *which* relation a
-/// row belongs to is only settled by routing or by the fan-out loop.
+/// `system`, when set, names the system columns the statement reads together
+/// with one [`SysSource`] per affected row, positionally aligned with
+/// `affected`. The binder put those slots past the target's declared columns, so
+/// the projection reads them as ordinary columns; widening happens here, per
+/// row, because *which* relation a row belongs to — and which version it was —
+/// is only settled by routing or by the fan-out loop.
 fn project_returning<'a>(
     affected: impl IntoIterator<Item = &'a Tuple>,
     projections: &[BoundExpr],
-    tableoids: Option<&[u32]>,
+    system: Option<(&[SysCol], &[SysSource])>,
     ctx: &ExecContext,
 ) -> Result<Vec<Tuple>, ExecError> {
     let mut out = Vec::new();
     for (i, row) in affected.into_iter().enumerate() {
-        // Only the statements that read `tableoid` pay for the widened copy.
+        // Only the statements that read a system column pay for the widened copy.
         let widened;
-        let row: &Tuple = match tableoids {
+        let row: &Tuple = match system {
             None => row,
-            Some(oids) => {
-                let mut wide = row.clone();
-                wide.push(Value::Oid(oids[i]));
-                widened = wide;
+            Some((cols, sources)) => {
+                widened = sources[i].widen(row, cols);
                 &widened
             }
         };
@@ -2155,6 +2180,36 @@ fn project_returning<'a>(
     Ok(out)
 }
 
+/// The per-row data a DML statement's system slots are filled from: which
+/// relation the row lives in, which version it is, and — for a statement reading
+/// `xmin`/`xmax`/`cmin`/`cmax` — that version's MVCC header.
+///
+/// The OID is resolved once per target and the rest comes off the scan, so
+/// building one costs a copy of a handful of integers.
+#[derive(Clone, Copy)]
+pub(crate) struct SysSource {
+    oid: Option<u32>,
+    tid: Tid,
+    hdr: Option<TupleHeader>,
+}
+
+impl SysSource {
+    /// A source for a row that is being formed rather than read — an INSERT's
+    /// new version, which has no tid until it is placed.
+    fn placed(oid: Option<u32>, tid: Tid, hdr: Option<TupleHeader>) -> Self {
+        SysSource { oid, tid, hdr }
+    }
+
+    /// `row` with the slots `cols` names appended — the widened copy a
+    /// predicate, a SET expression or a RETURNING projection binds against.
+    fn widen(&self, row: &[Value], cols: &[SysCol]) -> Tuple {
+        let mut wide = Vec::with_capacity(row.len() + cols.len());
+        wide.extend_from_slice(row);
+        push_system(&mut wide, cols, self.oid, self.tid, self.hdr.as_ref());
+        wide
+    }
+}
+
 /// Each DML target's own OID, resolved once per relation. `None` for a target
 /// whose statement never reads `tableoid`.
 fn target_oids(targets: &[DmlTarget], ctx: &ExecContext) -> Result<Vec<Option<u32>>, ExecError> {
@@ -2163,9 +2218,10 @@ fn target_oids(targets: &[DmlTarget], ctx: &ExecContext) -> Result<Vec<Option<u3
         .map(|target| {
             target
                 .relation
-                .tableoid
+                .system
                 .as_ref()
-                .map(|ident| resolve_tableoid(ident, ctx))
+                .filter(|emit| emit.cols.contains(&SysCol::TableOid))
+                .map(|emit| resolve_tableoid(&emit.ident, ctx))
                 .transpose()
         })
         .collect()
@@ -2199,7 +2255,7 @@ fn execute_insert(
     returning: Option<Returning>,
     routing: Option<Vec<Arc<dyn TableAm>>>,
     freeze: bool,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2213,9 +2269,7 @@ fn execute_insert(
         // its key and write there. `notnull_verified` indexes the parent's shape,
         // so it says nothing about the leaf a row is checked against — ignored
         // here, and empty by construction for the one source that builds it.
-        Some(leaves) => insert_routed(
-            table, tuples, returning, &leaves, freeze, tableoid, ctx, txn,
-        ),
+        Some(leaves) => insert_routed(table, tuples, returning, &leaves, freeze, system, ctx, txn),
         // Ordinary table: rows go straight to `table`.
         None => insert_direct(
             table,
@@ -2223,7 +2277,7 @@ fn execute_insert(
             returning,
             &notnull_verified,
             freeze,
-            tableoid,
+            system,
             ctx,
             txn,
         ),
@@ -2334,7 +2388,7 @@ fn insert_direct(
     returning: Option<Returning>,
     notnull_verified: &[u32],
     freeze: bool,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2366,34 +2420,66 @@ fn insert_direct(
         visible.record(tuple, None);
     }
     let inserted = tuples.len() as u64;
-    // RETURNING sees the fully-formed row (defaults filled in), in schema order.
-    // Project before inserting so a faulting RETURNING expression aborts the
-    // statement (nothing written); the tuples then move into `insert` uncloned.
     // One relation, so every row reports the same OID.
-    let oids = match tableoid {
-        true => Some(vec![
-            resolve_tableoid(&RelationIdent::of(&schema), ctx)?;
-            tuples.len()
-        ]),
-        false => None,
-    };
-    let output = match &returning {
-        Some(returning) => Some(project_returning(
-            &tuples,
-            &returning.projections,
-            oids.as_deref(),
-            ctx,
-        )?),
-        None => None,
-    };
-    // A virtual column stores nothing; its value existed only for the checks and
-    // the projection above.
-    generated.blank_virtual(&mut tuples);
+    let oid = system
+        .contains(&SysCol::TableOid)
+        .then(|| resolve_tableoid(&RelationIdent::of(&schema), ctx))
+        .transpose()?;
     let frozen = write_context(freeze, txn);
+    let write_txn = frozen.as_ref().unwrap_or(txn);
+    // `ctid` and the MVCC header exist only once the row has been placed, so a
+    // RETURNING that reads one has to project *after* the write. Otherwise the
+    // projection runs first, so a faulting RETURNING expression aborts the
+    // statement with nothing written and the tuples move into `insert` uncloned.
+    // Both orders are atomic — an error rolls the statement back either way —
+    // but only the first order avoids the copy, so it stays the default.
+    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let projected = match (&returning, after_write) {
+        (Some(returning), false) => {
+            let sources = vec![SysSource::placed(oid, Tid::new(0, 0), None); tuples.len()];
+            Some(project_returning(
+                &tuples,
+                &returning.projections,
+                (!system.is_empty()).then_some((system, sources.as_slice())),
+                ctx,
+            )?)
+        }
+        _ => None,
+    };
+    // Kept only for the after-write projection, which needs the row as it was
+    // before `blank_virtual` erased the virtual columns it may name.
+    let projection_rows = (returning.is_some() && after_write).then(|| tuples.clone());
+    // A virtual column stores nothing; its value existed only for the checks and
+    // the projection.
+    generated.blank_virtual(&mut tuples);
     let written = tuples.len() as u64;
-    table.insert_many(tuples, frozen.as_ref().unwrap_or(txn))?;
+    let tids = table.insert_many(tuples, write_txn)?;
     count_write(ctx, table, WriteKind::Insert, written);
+    let output = match (projected, projection_rows) {
+        (projected, None) => projected,
+        (_, Some(rows)) => {
+            let returning = returning.as_ref().expect("projection rows imply RETURNING");
+            let hdr = inserted_header(write_txn);
+            let sources: Vec<SysSource> = tids
+                .iter()
+                .map(|&tid| SysSource::placed(oid, tid, Some(hdr)))
+                .collect();
+            Some(project_returning(
+                &rows,
+                &returning.projections,
+                Some((system, &sources)),
+                ctx,
+            )?)
+        }
+    };
     finish_insert(returning, output, inserted)
+}
+
+/// The header a row this transaction just inserted carries, as the engines stamp
+/// it: `xmin` from the writing context (the frozen XID under `COPY … FREEZE`),
+/// `cmin` from its command id, and no deleter yet.
+fn inserted_header(txn: &TxnContext) -> TupleHeader {
+    TupleHeader::inserted(txn.insert_xid(), txn.cid)
 }
 
 /// Route each tuple to the leaf partition of `parent` that admits its key, then
@@ -2413,7 +2499,7 @@ fn insert_routed(
     returning: Option<Returning>,
     leaves: &[Arc<dyn TableAm>],
     freeze: bool,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -2485,26 +2571,41 @@ fn insert_routed(
     // Each row reports the leaf it routed to, which is the whole point of
     // `tableoid` on a partitioned target: `routes` is index-aligned with
     // `tuples`, so the answer is already in hand here.
-    let oids = match tableoid {
-        true => Some(
-            routes
+    let oids = match system.contains(&SysCol::TableOid) {
+        true => routes
+            .iter()
+            .map(|&leaf| {
+                resolve_tableoid(&RelationIdent::of(&leaves[leaf].schema()), ctx).map(Some)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        false => vec![None; routes.len()],
+    };
+    // As in `insert_direct`: `ctid` and the MVCC header only exist once the row
+    // is placed, so a RETURNING naming one projects after the write.
+    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let projected = match (&returning, after_write) {
+        (Some(returning), false) => {
+            let sources: Vec<SysSource> = oids
                 .iter()
-                .map(|&leaf| resolve_tableoid(&RelationIdent::of(&leaves[leaf].schema()), ctx))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        false => None,
+                .map(|&oid| SysSource::placed(oid, Tid::new(0, 0), None))
+                .collect();
+            Some(project_returning(
+                &tuples,
+                &returning.projections,
+                (!system.is_empty()).then_some((system, sources.as_slice())),
+                ctx,
+            )?)
+        }
+        _ => None,
     };
-    let output = match &returning {
-        Some(returning) => Some(project_returning(
-            &tuples,
-            &returning.projections,
-            oids.as_deref(),
-            ctx,
-        )?),
-        None => None,
-    };
+    // Which output row each (leaf, position-within-leaf) pair belongs to, so the
+    // tids `insert_many` hands back per leaf can be scattered into statement
+    // order — the order RETURNING must emit.
+    let projection_rows = (returning.is_some() && after_write).then(|| tuples.clone());
     let mut batches: Vec<Vec<Tuple>> = vec![Vec::new(); leaves.len()];
-    for (tuple, leaf) in tuples.into_iter().zip(routes) {
+    let mut origins: Vec<Vec<usize>> = vec![Vec::new(); leaves.len()];
+    for (i, (tuple, leaf)) in tuples.into_iter().zip(routes).enumerate() {
+        origins[leaf].push(i);
         batches[leaf].push(tuple);
     }
     // Each batch is blanked by its own leaf's set: the leaves of one parent
@@ -2516,11 +2617,32 @@ fn insert_routed(
     }
     let frozen = write_context(freeze, txn);
     let write_txn = frozen.as_ref().unwrap_or(txn);
-    for (leaf, tuples) in leaves.iter().zip(batches) {
+    let mut tids = vec![Tid::new(0, 0); inserted as usize];
+    for ((leaf, tuples), origin) in leaves.iter().zip(batches).zip(&origins) {
         let written = tuples.len() as u64;
-        leaf.insert_many(tuples, write_txn)?;
+        for (&at, tid) in origin.iter().zip(leaf.insert_many(tuples, write_txn)?) {
+            tids[at] = tid;
+        }
         count_write(ctx, leaf, WriteKind::Insert, written);
     }
+    let output = match (projected, projection_rows) {
+        (projected, None) => projected,
+        (_, Some(rows)) => {
+            let returning = returning.as_ref().expect("projection rows imply RETURNING");
+            let hdr = inserted_header(write_txn);
+            let sources: Vec<SysSource> = oids
+                .iter()
+                .zip(&tids)
+                .map(|(&oid, &tid)| SysSource::placed(oid, tid, Some(hdr)))
+                .collect();
+            Some(project_returning(
+                &rows,
+                &returning.projections,
+                Some((system, &sources)),
+                ctx,
+            )?)
+        }
+    };
     finish_insert(returning, output, inserted)
 }
 
@@ -2586,22 +2708,37 @@ fn execute_update(
     routing: Option<Vec<DmlTarget>>,
     inherited: Vec<DmlTarget>,
     probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
-        Some(leaves) => update_routed(table, &leaves, predicate, assignments, returning, ctx, txn),
-        None if !inherited.is_empty() => {
-            update_inherited(&inherited, predicate, assignments, returning, ctx, txn)
-        }
+        Some(leaves) => update_routed(
+            table,
+            &leaves,
+            predicate,
+            assignments,
+            returning,
+            system,
+            ctx,
+            txn,
+        ),
+        None if !inherited.is_empty() => update_inherited(
+            &inherited,
+            predicate,
+            assignments,
+            returning,
+            system,
+            ctx,
+            txn,
+        ),
         None => update_direct(
             table,
             predicate,
             assignments,
             returning,
             probe,
-            tableoid,
+            system,
             ctx,
             txn,
         ),
@@ -2628,17 +2765,25 @@ fn update_inherited(
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let needs_header = system.iter().any(|c| c.needs_header());
     // Read every target once up front, so the match set is fixed before any
     // write (Halloween-safe) and RETURNING can fault with nothing written.
-    let scans: Vec<Vec<(Tid, Tuple)>> = targets
+    let scans: Vec<Vec<SystemRow>> = targets
         .iter()
         .map(|target| {
-            dml_rows(&target.relation.table, target.probe.as_ref(), ctx, txn)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ExecError::from)
+            dml_rows(
+                &target.relation.table,
+                target.probe.as_ref(),
+                needs_header,
+                ctx,
+                txn,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ExecError::from)
         })
         .collect::<Result<_, _>>()?;
     // Each target's shape, once per target rather than per matched row. Eager
@@ -2679,7 +2824,7 @@ fn update_inherited(
                 return UniqueKeySet::none();
             }
             let mut set = UniqueKeySet::simulation(schema, indexes);
-            for (tid, tuple) in rows {
+            for (tid, _, tuple) in rows {
                 set.record(tuple, Some(*tid));
             }
             set
@@ -2711,21 +2856,25 @@ fn update_inherited(
     let target_oids = target_oids(&targets, ctx)?;
     let mut pending: Vec<Vec<(Tid, Tuple)>> = vec![Vec::new(); targets.len()];
     let mut new_rows: Vec<Tuple> = Vec::new();
-    let mut returned_oids: Vec<u32> = Vec::new();
+    // Which target and which pending slot each RETURNING row came from, so the
+    // NEW versions' tids can be scattered back into statement order after the
+    // write — `UPDATE … RETURNING ctid` reports the new version, as PG does.
+    let mut returned_at: Vec<(usize, usize)> = Vec::new();
+    let mut returned_sources: Vec<SysSource> = Vec::new();
     for (i, rows) in scans.iter().enumerate() {
         let target = &targets[i];
-        for (tid, old) in rows {
+        for (tid, hdr, old) in rows {
             let old_view = target.relation.view(old);
-            // WHERE and SET may read `tableoid`, and it answers for the child
-            // this row actually lives in. The slot is kept out of `new_view`,
-            // which `rebuild` turns back into a stored tuple.
+            // WHERE and SET read the system columns of the row as it is *now*,
+            // and they answer for the child this row actually lives in. The
+            // slots are kept out of `new_view`, which `rebuild` turns back into
+            // a stored tuple.
+            let source = SysSource::placed(target_oids[i], *tid, *hdr);
             let probe;
-            let old_probe: &[Value] = match target_oids[i] {
-                None => &old_view,
-                Some(oid) => {
-                    let mut wide = old_view.to_vec();
-                    wide.push(Value::Oid(oid));
-                    probe = wide;
+            let old_probe: &[Value] = match system.is_empty() {
+                true => &old_view,
+                false => {
+                    probe = source.widen(&old_view, system);
                     &probe
                 }
             };
@@ -2780,35 +2929,70 @@ fn update_inherited(
             }
             if let Some(view) = returned {
                 new_rows.push(view);
-                if let Some(oid) = target_oids[i] {
-                    returned_oids.push(oid);
-                }
+                returned_at.push((i, pending[i].len()));
+                returned_sources.push(source);
             }
             pending[i].push((*tid, new));
         }
     }
 
-    // Project RETURNING over every NEW row before any write, so a faulting
-    // expression aborts the statement with nothing written.
-    let output = match &returning {
-        Some(returning) => Some(project_returning(
+    // A RETURNING that names `ctid` or the MVCC header describes the NEW
+    // version, which does not exist until the write — so that case projects
+    // after it. Everything else projects first, so a faulting expression aborts
+    // the statement with nothing written.
+    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let projected = match (&returning, after_write) {
+        (Some(returning), false) => Some(project_returning(
             new_rows.iter(),
             &returning.projections,
-            (!returned_oids.is_empty()).then_some(returned_oids.as_slice()),
+            (!system.is_empty()).then_some((system, returned_sources.as_slice())),
             ctx,
         )?),
-        None => None,
+        _ => None,
     };
     let mut affected = 0u64;
+    let mut new_tids: Vec<Vec<Option<Tid>>> = vec![Vec::new(); targets.len()];
     for (i, target) in targets.iter().enumerate() {
         generated[i].blank_virtual(pending[i].iter_mut().map(|(_, tuple)| tuple));
-        let updated = target
-            .relation
-            .table
-            .update_many(std::mem::take(&mut pending[i]), txn)?;
+        let batch = std::mem::take(&mut pending[i]);
+        let updated = match after_write {
+            false => target.relation.table.update_many(batch, txn)?,
+            true => {
+                let tids = target.relation.table.update_many_tids(batch, txn)?;
+                let applied = tids.iter().filter(|tid| tid.is_some()).count() as u64;
+                new_tids[i] = tids;
+                applied
+            }
+        };
         count_write(ctx, &target.relation.table, WriteKind::Update, updated);
         affected += updated;
     }
+    let output = match (projected, after_write) {
+        (projected, false) => projected,
+        (_, true) => match &returning {
+            None => None,
+            Some(returning) => {
+                let hdr = inserted_header(txn);
+                let sources: Vec<SysSource> = returned_at
+                    .iter()
+                    .zip(&returned_sources)
+                    .map(|(&(target, at), source)| {
+                        SysSource::placed(
+                            source.oid,
+                            new_tids[target][at].unwrap_or(source.tid),
+                            Some(hdr),
+                        )
+                    })
+                    .collect();
+                Some(project_returning(
+                    new_rows.iter(),
+                    &returning.projections,
+                    Some((system, &sources)),
+                    ctx,
+                )?)
+            }
+        },
+    };
     match (returning, output) {
         (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
@@ -2832,12 +3016,13 @@ fn update_direct(
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
     probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let original: Vec<(Tid, Tuple)> =
-        dml_rows(table, probe, ctx, txn)?.collect::<Result<_, _>>()?;
+    let needs_header = system.iter().any(|c| c.needs_header());
+    let original: Vec<SystemRow> =
+        dml_rows(table, probe, needs_header, ctx, txn)?.collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
     // rows' new values. It is only needed when the statement actually writes a
     // unique key — otherwise every row keeps the key it had and no conflict can
@@ -2850,7 +3035,7 @@ fn update_direct(
     let has_unique = update_needs_unique_snapshot(&indexes, &assigned, false);
     let mut simulated = if has_unique {
         let mut set = UniqueKeySet::simulation(&schema, &indexes);
-        for (tid, tuple) in &original {
+        for (tid, _, tuple) in &original {
             set.record(tuple, Some(*tid));
         }
         set
@@ -2865,20 +3050,22 @@ fn update_direct(
     let notnull = NotNullSet::for_schema(&schema);
     let generated = GeneratedSet::for_schema(&schema, ctx)?;
     // One relation, so every row reports the same OID.
-    let oid = tableoid
+    let oid = system
+        .contains(&SysCol::TableOid)
         .then(|| resolve_tableoid(&RelationIdent::of(&schema), ctx))
         .transpose()?;
     let mut pending: Vec<(Tid, Tuple)> = Vec::new();
-    for (tid, old) in original {
-        // WHERE and SET may read `tableoid`; the slot stays out of `new`, which
-        // is the tuple that gets stored.
+    // One `SysSource` per pending row, index-aligned with it.
+    let mut sources: Vec<SysSource> = Vec::new();
+    for (tid, hdr, old) in original {
+        // WHERE and SET read the system columns of the row as it is *now*; the
+        // slots stay out of `new`, which is the tuple that gets stored.
+        let source = SysSource::placed(oid, tid, hdr);
         let probe_row;
-        let old_probe: &[Value] = match oid {
-            None => &old,
-            Some(oid) => {
-                let mut wide = old.clone();
-                wide.push(Value::Oid(oid));
-                probe_row = wide;
+        let old_probe: &[Value] = match system.is_empty() {
+            true => &old,
+            false => {
+                probe_row = source.widen(&old, system);
                 &probe_row
             }
         };
@@ -2918,25 +3105,58 @@ fn update_direct(
             )?;
         }
         pending.push((tid, new));
+        sources.push(source);
     }
     // With RETURNING, project the NEW rows (in schema order) before
     // `update_many` consumes `pending`, so a faulting expression aborts the
-    // statement before any row is written.
-    let output = match &returning {
-        Some(returning) => {
-            let oids = oid.map(|oid| vec![oid; pending.len()]);
+    // statement before any row is written. The exception is a RETURNING naming
+    // `ctid` or the MVCC header: those describe the NEW version, which does not
+    // exist until the write, so that case projects after it.
+    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let projected = match (&returning, after_write) {
+        (Some(returning), false) => Some(project_returning(
+            pending.iter().map(|(_, new)| new),
+            &returning.projections,
+            (!system.is_empty()).then_some((system, sources.as_slice())),
+            ctx,
+        )?),
+        _ => None,
+    };
+    let new_rows = (returning.is_some() && after_write).then(|| {
+        pending
+            .iter()
+            .map(|(_, new)| new.clone())
+            .collect::<Vec<_>>()
+    });
+    generated.blank_virtual(pending.iter_mut().map(|(_, tuple)| tuple));
+    let (updated, new_tids) = match after_write {
+        false => (table.update_many(pending, txn)?, Vec::new()),
+        true => {
+            let tids = table.update_many_tids(pending, txn)?;
+            (tids.iter().filter(|tid| tid.is_some()).count() as u64, tids)
+        }
+    };
+    count_write(ctx, table, WriteKind::Update, updated);
+    let output = match new_rows {
+        None => projected,
+        Some(rows) => {
+            let returning = returning.as_ref().expect("new_rows implies RETURNING");
+            let hdr = inserted_header(txn);
+            let sources: Vec<SysSource> = sources
+                .iter()
+                .zip(&new_tids)
+                .map(|(source, tid)| {
+                    SysSource::placed(source.oid, tid.unwrap_or(source.tid), Some(hdr))
+                })
+                .collect();
             Some(project_returning(
-                pending.iter().map(|(_, new)| new),
+                rows.iter(),
                 &returning.projections,
-                oids.as_deref(),
+                Some((system, &sources)),
                 ctx,
             )?)
         }
-        None => None,
     };
-    generated.blank_virtual(pending.iter_mut().map(|(_, tuple)| tuple));
-    let updated = table.update_many(pending, txn)?;
-    count_write(ctx, table, WriteKind::Update, updated);
     match (returning, output) {
         (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
@@ -2971,6 +3191,7 @@ fn update_routed(
     predicate: &Option<BoundExpr>,
     assignments: &[(usize, BoundExpr)],
     returning: Option<Returning>,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
@@ -3001,12 +3222,19 @@ fn update_routed(
     // drives the match loop and — for leaves with a unique index — seeds the
     // post-statement simulation, so a leaf is never read twice and the match set
     // is fixed before any write (Halloween-safe).
-    let scans: Vec<Vec<(Tid, Tuple)>> = leaves
+    let needs_header = system.iter().any(|c| c.needs_header());
+    let scans: Vec<Vec<SystemRow>> = leaves
         .iter()
         .map(|leaf| {
-            dml_rows(&leaf.relation.table, leaf.probe.as_ref(), ctx, txn)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ExecError::from)
+            dml_rows(
+                &leaf.relation.table,
+                leaf.probe.as_ref(),
+                needs_header,
+                ctx,
+                txn,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ExecError::from)
         })
         .collect::<Result<_, _>>()?;
     // Per-leaf simulation of the leaf's live rows after this statement, used only
@@ -3020,7 +3248,7 @@ fn update_routed(
                 return UniqueKeySet::none();
             }
             let mut set = UniqueKeySet::simulation(&leaf_shapes[i].0, &leaf_shapes[i].1);
-            for (tid, tuple) in rows {
+            for (tid, _, tuple) in rows {
                 set.record(tuple, Some(*tid));
             }
             set
@@ -3056,21 +3284,25 @@ fn update_routed(
     let mut new_rows: Vec<Tuple> = Vec::new();
     // Each leaf's own OID, resolved once per leaf.
     let leaf_oids = target_oids(leaves, ctx)?;
-    let mut returned_oids: Vec<u32> = Vec::new();
+    // Where each RETURNING row's NEW version will land, so the tids the writes
+    // report can be scattered back into scan order: `Ok` is an in-place update
+    // of leaf `l` at position `i` in its update batch, `Err` a move into leaf
+    // `l` at position `i` in its insert batch.
+    let mut returned_at: Vec<Result<(usize, usize), (usize, usize)>> = Vec::new();
+    let mut returned_oids: Vec<Option<u32>> = Vec::new();
 
     for (src, rows) in scans.iter().enumerate() {
-        for (tid, old) in rows {
+        for (tid, hdr, old) in rows {
             let tid = *tid;
-            // WHERE and SET read `tableoid` as the leaf the row is *currently*
-            // in — the row has not moved yet, and PostgreSQL matches on where it
-            // is, not where the update would put it.
+            // WHERE and SET read the system columns of the row as it is
+            // *currently* stored — the row has not moved yet, and PostgreSQL
+            // matches on where it is, not where the update would put it.
+            let source = SysSource::placed(leaf_oids[src], tid, *hdr);
             let probe_row;
-            let old_probe: &[Value] = match leaf_oids[src] {
-                None => old,
-                Some(oid) => {
-                    let mut wide = old.clone();
-                    wide.push(Value::Oid(oid));
-                    probe_row = wide;
+            let old_probe: &[Value] = match system.is_empty() {
+                true => old,
+                false => {
+                    probe_row = source.widen(old, system);
                     &probe_row
                 }
             };
@@ -3146,9 +3378,11 @@ fn update_routed(
                 new_rows.push(new.clone());
                 // RETURNING reports the NEW row, so it names the leaf the row
                 // ends up in.
-                if let Some(oid) = leaf_oids[dst] {
-                    returned_oids.push(oid);
-                }
+                returned_oids.push(leaf_oids[dst]);
+                returned_at.push(match src == dst {
+                    true => Ok((dst, pending_update[dst].len())),
+                    false => Err((dst, pending_insert[dst].len())),
+                });
             }
             if src == dst {
                 pending_update[src].push((tid, new));
@@ -3159,30 +3393,48 @@ fn update_routed(
         }
     }
 
-    // Project RETURNING over every NEW row before any write, so a faulting
-    // expression aborts the statement with nothing written.
-    let output = match &returning {
-        Some(returning) => Some(project_returning(
-            new_rows.iter(),
-            &returning.projections,
-            (!returned_oids.is_empty()).then_some(returned_oids.as_slice()),
-            ctx,
-        )?),
-        None => None,
+    // As in `update_direct`: project before any write unless the RETURNING names
+    // `ctid` or the MVCC header, which describe the NEW version.
+    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let projected = match (&returning, after_write) {
+        (Some(returning), false) => {
+            let sources: Vec<SysSource> = returned_oids
+                .iter()
+                .map(|&oid| SysSource::placed(oid, Tid::new(0, 0), None))
+                .collect();
+            Some(project_returning(
+                new_rows.iter(),
+                &returning.projections,
+                (!system.is_empty()).then_some((system, sources.as_slice())),
+                ctx,
+            )?)
+        }
+        _ => None,
     };
     // Apply per leaf. A moved row is counted once (via its source-leaf delete);
     // an in-place update once (via `update_many`); moved-in inserts are not
     // counted — so the total equals the number of matched rows, as PostgreSQL's
     // UPDATE tag reports.
     let mut affected = 0u64;
+    let mut updated_tids: Vec<Vec<Option<Tid>>> = vec![Vec::new(); leaves.len()];
+    let mut inserted_tids: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
     for i in 0..leaves.len() {
         leaf_generated[i].blank_virtual(pending_update[i].iter_mut().map(|(_, tuple)| tuple));
         leaf_generated[i].blank_virtual(pending_insert[i].iter_mut());
-        let updated = leaf_tables[i].update_many(std::mem::take(&mut pending_update[i]), txn)?;
+        let batch = std::mem::take(&mut pending_update[i]);
+        let updated = match after_write {
+            false => leaf_tables[i].update_many(batch, txn)?,
+            true => {
+                let tids = leaf_tables[i].update_many_tids(batch, txn)?;
+                let applied = tids.iter().filter(|tid| tid.is_some()).count() as u64;
+                updated_tids[i] = tids;
+                applied
+            }
+        };
         let deleted = leaf_tables[i].delete_many(std::mem::take(&mut pending_delete[i]), txn)?;
         let moved_in = std::mem::take(&mut pending_insert[i]);
         let inserted = moved_in.len() as u64;
-        leaf_tables[i].insert_many(moved_in, txn)?;
+        inserted_tids[i] = leaf_tables[i].insert_many(moved_in, txn)?;
         // The per-relation counters report a moved row as both a delete and an
         // insert, as PostgreSQL does, even though the UPDATE tag counts it once.
         count_write(ctx, &leaf_tables[i], WriteKind::Update, updated);
@@ -3191,6 +3443,32 @@ fn update_routed(
         affected += updated;
         affected += deleted;
     }
+    let output = match (projected, after_write) {
+        (projected, false) => projected,
+        (_, true) => match &returning {
+            None => None,
+            Some(returning) => {
+                let hdr = inserted_header(txn);
+                let sources: Vec<SysSource> = returned_at
+                    .iter()
+                    .zip(&returned_oids)
+                    .map(|(at, &oid)| {
+                        let tid = match at {
+                            Ok((leaf, i)) => updated_tids[*leaf][*i].unwrap_or(Tid::new(0, 0)),
+                            Err((leaf, i)) => inserted_tids[*leaf][*i],
+                        };
+                        SysSource::placed(oid, tid, Some(hdr))
+                    })
+                    .collect();
+                Some(project_returning(
+                    new_rows.iter(),
+                    &returning.projections,
+                    Some((system, &sources)),
+                    ctx,
+                )?)
+            }
+        },
+    };
     match (returning, output) {
         (Some(returning), Some(output)) => {
             Ok(returning_rows(output, returning.columns, DmlVerb::Update))
@@ -3379,17 +3657,29 @@ fn execute_delete(
     routing: Option<Vec<DmlTarget>>,
     inherited: Vec<DmlTarget>,
     probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
     match routing {
-        Some(leaves) => delete_routed(&leaves, predicate, returning, ctx, txn),
+        Some(leaves) => delete_routed(&leaves, predicate, returning, system, ctx, txn),
         None if !inherited.is_empty() => {
-            delete_inherited(&inherited, predicate, returning, ctx, txn)
+            delete_inherited(&inherited, predicate, returning, system, ctx, txn)
         }
-        None => delete_direct(table, predicate, returning, probe, tableoid, ctx, txn),
+        None => delete_direct(table, predicate, returning, probe, system, ctx, txn),
     }
+}
+
+/// The header a row this transaction just deleted carries: its own `xmin`/`cmin`
+/// untouched and the deleter stamped on — which is what `DELETE … RETURNING
+/// xmax` reports, as PostgreSQL does. Called after the predicate has matched but
+/// before the write, because the value does not depend on the write succeeding.
+fn deleted_header(hdr: Option<TupleHeader>, txn: &TxnContext) -> Option<TupleHeader> {
+    hdr.map(|hdr| TupleHeader {
+        xmax: txn.xid,
+        cmax: txn.cid,
+        ..hdr
+    })
 }
 
 /// DELETE through an inheritance parent: each matching row is removed from
@@ -3401,37 +3691,48 @@ fn delete_inherited(
     targets: &[DmlTarget],
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let needs_header = system.iter().any(|c| c.needs_header());
     let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); targets.len()];
     // RETURNING sees the deleted (OLD) rows as rows of the named relation, in
     // scan (target) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     // Each target's own OID, resolved once per relation.
     let target_oids = target_oids(targets, ctx)?;
-    let mut deleted_oids: Vec<u32> = Vec::new();
+    let mut deleted_sources: Vec<SysSource> = Vec::new();
     for (i, target) in targets.iter().enumerate() {
-        for row in dml_rows(&target.relation.table, target.probe.as_ref(), ctx, txn)? {
-            let (tid, tuple) = row?;
-            let mut view = target.relation.view(&tuple);
-            // WHERE reads `tableoid` as the child this row lives in, so
+        for row in dml_rows(
+            &target.relation.table,
+            target.probe.as_ref(),
+            needs_header,
+            ctx,
+            txn,
+        )? {
+            let (tid, hdr, tuple) = row?;
+            let view = target.relation.view(&tuple);
+            // WHERE reads the system columns of the child this row lives in, so
             // `DELETE FROM parent WHERE tableoid = 'child'::regclass` removes
-            // exactly that child's rows.
-            if let Some(oid) = target_oids[i] {
-                view.to_mut().push(Value::Oid(oid));
-            }
-            if predicate_holds(predicate, &view, ctx)? {
+            // exactly that child's rows. `xmax` already reports this deleter,
+            // as it does upstream.
+            let source = SysSource::placed(target_oids[i], tid, deleted_header(hdr, txn));
+            let probe_row;
+            let row_probe: &[Value] = match system.is_empty() {
+                true => &view,
+                false => {
+                    probe_row = source.widen(&view, system);
+                    &probe_row
+                }
+            };
+            if predicate_holds(predicate, row_probe, ctx)? {
                 pending[i].push(tid);
                 if returning.is_some() {
-                    let mut row = view.into_owned();
-                    // The slot is re-appended by `project_returning`, so drop
-                    // the copy carried through the predicate.
-                    if let Some(oid) = target_oids[i] {
-                        row.pop();
-                        deleted_oids.push(oid);
-                    }
-                    deleted.push(row);
+                    // The slots are re-appended by `project_returning`, so only
+                    // the declared columns are kept here.
+                    deleted.push(view.into_owned());
+                    deleted_sources.push(source);
                 }
             }
         }
@@ -3440,7 +3741,7 @@ fn delete_inherited(
         Some(returning) => Some(project_returning(
             deleted.iter(),
             &returning.projections,
-            (!deleted_oids.is_empty()).then_some(deleted_oids.as_slice()),
+            (!system.is_empty()).then_some((system, deleted_sources.as_slice())),
             ctx,
         )?),
         None => None,
@@ -3468,26 +3769,29 @@ fn delete_direct(
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
     probe: Option<&DmlIndexProbe>,
-    tableoid: bool,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let needs_header = system.iter().any(|c| c.needs_header());
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
+    let mut sources: Vec<SysSource> = Vec::new();
     // One relation, so every row reports the same OID.
-    let oid = tableoid
+    let oid = system
+        .contains(&SysCol::TableOid)
         .then(|| resolve_tableoid(&RelationIdent::of(&table.schema()), ctx))
         .transpose()?;
-    for row in dml_rows(table, probe, ctx, txn)? {
-        let (tid, tuple) = row?;
+    for row in dml_rows(table, probe, needs_header, ctx, txn)? {
+        let (tid, hdr, tuple) = row?;
+        // `xmax`/`cmax` already name this deleter, as upstream reports them.
+        let source = SysSource::placed(oid, tid, deleted_header(hdr, txn));
         let probe_row;
-        let row_probe: &[Value] = match oid {
-            None => &tuple,
-            Some(oid) => {
-                let mut wide = tuple.clone();
-                wide.push(Value::Oid(oid));
-                probe_row = wide;
+        let row_probe: &[Value] = match system.is_empty() {
+            true => &tuple,
+            false => {
+                probe_row = source.widen(&tuple, system);
                 &probe_row
             }
         };
@@ -3495,6 +3799,7 @@ fn delete_direct(
             pending.push(tid);
             if returning.is_some() {
                 deleted.push(tuple);
+                sources.push(source);
             }
         }
     }
@@ -3502,9 +3807,12 @@ fn delete_direct(
     // expression aborts the statement before any row is removed.
     match returning {
         Some(returning) => {
-            let oids = oid.map(|oid| vec![oid; deleted.len()]);
-            let output =
-                project_returning(deleted.iter(), &returning.projections, oids.as_deref(), ctx)?;
+            let output = project_returning(
+                deleted.iter(),
+                &returning.projections,
+                (!system.is_empty()).then_some((system, sources.as_slice())),
+                ctx,
+            )?;
             let deleted = table.delete_many(pending, txn)?;
             count_write(ctx, table, WriteKind::Delete, deleted);
             Ok(returning_rows(output, returning.columns, DmlVerb::Delete))
@@ -3525,26 +3833,33 @@ fn delete_routed(
     leaves: &[DmlTarget],
     predicate: &Option<BoundExpr>,
     returning: Option<Returning>,
+    system: &[SysCol],
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
+    let needs_header = system.iter().any(|c| c.needs_header());
     let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();
     // Each leaf's own OID, resolved once per leaf: `DELETE FROM p WHERE
     // tableoid = 'p1'::regclass` must remove exactly that partition's rows.
     let leaf_oids = target_oids(leaves, ctx)?;
-    let mut deleted_oids: Vec<u32> = Vec::new();
+    let mut sources: Vec<SysSource> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
-        for row in dml_rows(&leaf.relation.table, leaf.probe.as_ref(), ctx, txn)? {
-            let (tid, tuple) = row?;
+        for row in dml_rows(
+            &leaf.relation.table,
+            leaf.probe.as_ref(),
+            needs_header,
+            ctx,
+            txn,
+        )? {
+            let (tid, hdr, tuple) = row?;
+            let source = SysSource::placed(leaf_oids[i], tid, deleted_header(hdr, txn));
             let probe_row;
-            let row_probe: &[Value] = match leaf_oids[i] {
-                None => &tuple,
-                Some(oid) => {
-                    let mut wide = tuple.clone();
-                    wide.push(Value::Oid(oid));
-                    probe_row = wide;
+            let row_probe: &[Value] = match system.is_empty() {
+                true => &tuple,
+                false => {
+                    probe_row = source.widen(&tuple, system);
                     &probe_row
                 }
             };
@@ -3552,9 +3867,7 @@ fn delete_routed(
                 pending[i].push(tid);
                 if returning.is_some() {
                     deleted.push(tuple);
-                    if let Some(oid) = leaf_oids[i] {
-                        deleted_oids.push(oid);
-                    }
+                    sources.push(source);
                 }
             }
         }
@@ -3564,7 +3877,7 @@ fn delete_routed(
             let output = project_returning(
                 deleted.iter(),
                 &returning.projections,
-                (!deleted_oids.is_empty()).then_some(deleted_oids.as_slice()),
+                (!system.is_empty()).then_some((system, sources.as_slice())),
                 ctx,
             )?;
             for (i, leaf) in leaves.iter().enumerate() {
@@ -3732,6 +4045,49 @@ pub(crate) fn resolve_tableoid(ident: &RelationIdent, ctx: &ExecContext) -> Resu
         })
 }
 
+/// One scanned row with whatever system data its arm has to emit: the tid every
+/// scan yields, and the MVCC header only [`TableAm::scan_with_system`] does.
+pub(crate) type SystemRow = (Tid, Option<TupleHeader>, Tuple);
+
+/// Append the slots `cols` names to `row`, in `cols` order — the one place a
+/// [`SysCol`] becomes a [`Value`], shared by the read path and every DML path.
+///
+/// `oid` must be `Some` when `cols` contains [`SysCol::TableOid`] and `hdr` must
+/// be `Some` when any of them [needs one](SysCol::needs_header); both are
+/// settled per scan, not per row, so a mismatch is a wiring bug rather than
+/// anything a query can provoke.
+///
+/// PostgreSQL's `xid`/`cid` are 32-bit while ours are wider, so both narrow the
+/// way `age(xid)` narrows — a truncation, not a range check, which is what makes
+/// the two agree.
+pub(crate) fn push_system(
+    row: &mut Tuple,
+    cols: &[SysCol],
+    oid: Option<u32>,
+    tid: Tid,
+    hdr: Option<&TupleHeader>,
+) {
+    for col in cols {
+        row.push(match col {
+            SysCol::TableOid => Value::Oid(oid.expect("a tableoid slot without a resolved OID")),
+            SysCol::Ctid => Value::Tid {
+                block: tid.block,
+                offset: tid.offset,
+            },
+            _ => {
+                let hdr = hdr.expect("a header slot without a scanned header");
+                match col {
+                    SysCol::Xmin => Value::Xid(hdr.xmin.0 as u32),
+                    SysCol::Xmax => Value::Xid(hdr.xmax.0 as u32),
+                    SysCol::Cmin => Value::Cid(hdr.cmin.0),
+                    SysCol::Cmax => Value::Cid(hdr.cmax.0),
+                    SysCol::TableOid | SysCol::Ctid => unreachable!("handled above"),
+                }
+            }
+        });
+    }
+}
+
 /// The rows one `UPDATE`/`DELETE` target contributes: an index probe when the
 /// planner chose one for it, else the whole relation.
 ///
@@ -3748,30 +4104,60 @@ pub(crate) fn resolve_tableoid(ident: &RelationIdent, ctx: &ExecContext) -> Resu
 /// by swapping the indexes in lockstep. The filter stays as a barrier: it is
 /// cheap, and it is DML that would turn such a defect into wrong data rather
 /// than a wrong read.
+/// `needs_header` asks for each row's MVCC header. Both sources can produce one
+/// — `index_probe_system_rows` for a probe, `scan_with_system` otherwise — so
+/// reading `xmin` no longer costs the statement its index path.
 fn dml_rows(
     table: &Arc<dyn TableAm>,
     probe: Option<&DmlIndexProbe>,
+    needs_header: bool,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<IndexProbe, ExecError> {
+) -> Result<Box<dyn Iterator<Item = Result<SystemRow, StorageError>> + Send>, ExecError> {
     match probe {
         Some(probe) => {
-            let rows = index_probe_rows(
-                table,
-                &probe.index_name,
-                &probe.key,
-                ctx,
-                txn,
-                &ColumnProjection::All,
-            )?;
+            let rows = match needs_header {
+                false => index_probe_rows(
+                    table,
+                    &probe.index_name,
+                    &probe.key,
+                    ctx,
+                    txn,
+                    &ColumnProjection::All,
+                )
+                .map(|rows| -> Box<dyn Iterator<Item = _> + Send> {
+                    Box::new(rows.map(|row| row.map(|(tid, tuple)| (tid, None, tuple))))
+                })?,
+                true => index_probe_system_rows(
+                    table,
+                    &probe.index_name,
+                    &probe.key,
+                    ctx,
+                    txn,
+                    &ColumnProjection::All,
+                )?,
+            };
             let mut seen = HashSet::new();
             Ok(Box::new(rows.filter(move |row| match row {
-                Ok((tid, _)) => seen.insert(*tid),
+                Ok((tid, _, _)) => seen.insert(*tid),
                 // Errors pass through; only rows are deduplicated.
                 Err(_) => true,
             })))
         }
-        None => Ok(Box::new(table.scan(txn, &ColumnProjection::All))),
+        None if needs_header => Ok(Box::new(
+            table
+                .scan_with_system(txn, &ColumnProjection::All)
+                .expect(
+                    "the binder rejects a header system column the access method declines, \
+                     so a statement reaching here can produce one",
+                )
+                .map(|row| row.map(|(tid, hdr, tuple)| (tid, Some(hdr), tuple))),
+        )),
+        None => Ok(Box::new(
+            table
+                .scan(txn, &ColumnProjection::All)
+                .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+        )),
     }
 }
 
@@ -4341,7 +4727,7 @@ mod tests {
                 None,
                 Vec::new(),
                 probe.as_ref(),
-                false,
+                &[],
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -4378,7 +4764,7 @@ mod tests {
                 None,
                 Vec::new(),
                 probe.as_ref(),
-                false,
+                &[],
                 &ExecContext::default(),
                 &wtxn(),
             )) else {
@@ -4414,7 +4800,7 @@ mod tests {
             None,
             Vec::new(),
             probe_on_id("missing_index", 2).as_ref(),
-            false,
+            &[],
             &ExecContext::default(),
             &wtxn(),
         )) else {
@@ -4448,7 +4834,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            false,
+            &[],
             &ExecContext::default(),
             &wtxn(),
         )?
@@ -4497,7 +4883,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            false,
+            &[],
             &ExecContext::default(),
             &wtxn(),
         ) else {
@@ -4530,7 +4916,7 @@ mod tests {
             None,
             Vec::new(),
             None,
-            false,
+            &[],
             &ExecContext::default(),
             &wtxn(),
         )?

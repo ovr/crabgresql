@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use crabgresql_storage_api::{TableAm, TableSchema};
-use crabgresql_types::Value;
+use crabgresql_types::{PgType, Value};
 
 /// One relation a statement reaches through the name of another, with the
 /// permutation that puts its tuples into the *named* relation's layout — an arm
@@ -37,14 +37,104 @@ use crabgresql_types::Value;
 pub struct MappedRelation {
     pub table: Arc<dyn TableAm>,
     pub map: Option<Arc<[usize]>>,
-    /// Set when this relation's rows must carry a `tableoid` slot, appended
+    /// Set when this relation's rows must carry system-column slots, appended
     /// after `view` so `map` stays a pure gather and the write-back paths
     /// (`scatter`, `rebuild`) never see a column with nowhere to write.
     ///
     /// Each arm names *itself*, which is what makes `tableoid` report the
     /// partition or inheritance child a row actually came from rather than the
     /// relation the query named.
-    pub tableoid: Option<RelationIdent>,
+    pub system: Option<SystemEmit>,
+}
+
+/// The system columns one scan appends to every row it emits.
+///
+/// `cols` is in row order — the order the slots occupy past the relation's
+/// declared columns — and matches the order the binder appended the matching
+/// [`OutputColumn`](crate::OutputColumn)s in, which is what lets a reference
+/// resolve as an ordinary column of the row.
+///
+/// `ident` rides along even when `tableoid` is not among `cols`: it is two
+/// strings cloned once per arm at bind time, and carrying it unconditionally
+/// keeps the arm constructors from needing two shapes.
+#[derive(Clone, Debug)]
+pub struct SystemEmit {
+    pub cols: Arc<[SysCol]>,
+    pub ident: RelationIdent,
+}
+
+/// One of PostgreSQL's per-row system columns.
+///
+/// `oid` is absent because PostgreSQL 12 removed it. The order of the variants
+/// is the order slots are appended to a row in, so it is load-bearing: the
+/// binder pushes [`OutputColumn`](crate::OutputColumn)s and the executor pushes
+/// [`Value`]s by walking the same sorted list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SysCol {
+    /// The OID of the relation the row lives in. Answerable by every access
+    /// method: it is a fact about the relation, not about the row's storage.
+    TableOid,
+    /// The row version's physical address, PG's `ctid`.
+    Ctid,
+    /// The inserting transaction.
+    Xmin,
+    /// The command within [`SysCol::Xmin`] that inserted the row.
+    Cmin,
+    /// The deleting transaction, or `0` while the version is live.
+    Xmax,
+    /// The command within [`SysCol::Xmax`] that deleted the row.
+    Cmax,
+}
+
+impl SysCol {
+    /// Every system column, in row order.
+    pub const ALL: [SysCol; 6] = [
+        SysCol::TableOid,
+        SysCol::Ctid,
+        SysCol::Xmin,
+        SysCol::Cmin,
+        SysCol::Xmax,
+        SysCol::Cmax,
+    ];
+
+    /// The name a query addresses this column by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SysCol::TableOid => "tableoid",
+            SysCol::Ctid => "ctid",
+            SysCol::Xmin => "xmin",
+            SysCol::Cmin => "cmin",
+            SysCol::Xmax => "xmax",
+            SysCol::Cmax => "cmax",
+        }
+    }
+
+    /// The type the slot carries.
+    pub const fn ty(self) -> PgType {
+        match self {
+            SysCol::TableOid => PgType::Oid,
+            SysCol::Ctid => PgType::Tid,
+            SysCol::Xmin | SysCol::Xmax => PgType::Xid,
+            SysCol::Cmin | SysCol::Cmax => PgType::Cid,
+        }
+    }
+
+    /// Whether answering this needs the row version's MVCC header rather than
+    /// just its tid — the difference between
+    /// [`TableAm::scan`](crabgresql_storage_api::TableAm::scan) and
+    /// [`TableAm::scan_with_system`](crabgresql_storage_api::TableAm::scan_with_system).
+    pub const fn needs_header(self) -> bool {
+        matches!(
+            self,
+            SysCol::Xmin | SysCol::Cmin | SysCol::Xmax | SysCol::Cmax
+        )
+    }
+
+    /// Whether the access method has to be able to produce this per row. Only
+    /// `tableoid` does not: every relation has an identity, whatever it stores.
+    pub const fn needs_storage_support(self) -> bool {
+        !matches!(self, SysCol::TableOid)
+    }
 }
 
 /// The relation a scan answers `tableoid` with.

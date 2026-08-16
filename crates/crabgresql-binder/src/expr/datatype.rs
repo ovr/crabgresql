@@ -84,16 +84,22 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
 /// and the right gate for `=`/`<>` and for every dedup (GROUP BY, DISTINCT,
 /// UNION), which need equality but never an ordering.
 ///
-/// `xid` is the only type in the gap. PostgreSQL gives it a hash operator class
-/// but deliberately no btree one, because transaction ids compare with modular
-/// arithmetic — so `'1'::xid = '1'::xid` binds while `'1'::xid < '2'::xid` must
-/// still fail with `operator does not exist`, and ORDER BY / `min` / `max` on an
-/// `xid` must fail too. Those all stay gated on [`is_orderable`].
+/// `xid` and `cid` are the only types in the gap. PostgreSQL gives each a hash
+/// operator class but deliberately no btree one, because transaction and command
+/// ids compare with modular arithmetic — so `'1'::xid = '1'::xid` binds while
+/// `'1'::xid < '2'::xid` must still fail with `operator does not exist`, and
+/// ORDER BY / `min` / `max` on either must fail too. Those all stay gated on
+/// [`is_orderable`].
+///
+/// This admits `<>` on both, which is right for `xid` and one operator too many
+/// for `cid` — upstream gives `cid` only `=`. That last step is applied where
+/// the operator is resolved rather than here, because this predicate also gates
+/// GROUP BY / DISTINCT / UNION, and `cid` does belong in all three.
 pub(crate) fn has_equality(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
     if let PgType::Array(elem) = ty {
         return PgType::from_oid(elem).is_some_and(|e| has_equality(e, catalog));
     }
-    matches!(ty, PgType::Xid) || is_orderable(ty, catalog)
+    matches!(ty, PgType::Xid | PgType::Cid) || is_orderable(ty, catalog)
 }
 
 /// The built-in a type *spelling* denotes under PG's type-name grammar, or

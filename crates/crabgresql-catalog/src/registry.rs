@@ -57,6 +57,19 @@ pub(crate) struct CatalogRelDef {
     /// [`crate::static_table::StaticTable::deferred`] for why `pg_locks` needs
     /// it and why nothing else does.
     pub(crate) deferred: bool,
+    /// For a relation whose every row *describes another relation*: the column
+    /// holding that relation's OID. Set it and each row reports the described
+    /// relation's own DDL generation as its `xmin`, instead of the catalog-wide
+    /// one — so `CREATE TABLE b` stops looking like it changed `a`.
+    ///
+    /// `None` for a relation whose rows describe something else (a type, a
+    /// function, a setting): there is no per-object generation to report, and
+    /// those keep the catalog-wide value.
+    ///
+    /// Nothing checks the name against the schema at compile time, so a typo
+    /// silently degrades that relation to the catalog-wide generation — which
+    /// `xmin_columns_exist` in this crate's tests is here to catch.
+    pub(crate) xmin_column: Option<&'static str>,
 }
 
 const fn rel(
@@ -73,6 +86,23 @@ const fn rel(
         schema,
         rows,
         deferred: false,
+        xmin_column: None,
+    }
+}
+
+/// [`rel`] for a relation whose rows describe other relations; see
+/// [`CatalogRelDef::xmin_column`].
+const fn rel_of_relation(
+    name: &'static str,
+    oid: u32,
+    namespace: CatalogNamespace,
+    schema: fn() -> TableSchema,
+    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    xmin_column: &'static str,
+) -> CatalogRelDef {
+    CatalogRelDef {
+        xmin_column: Some(xmin_column),
+        ..rel(name, oid, namespace, schema, rows)
     }
 }
 
@@ -91,6 +121,7 @@ const fn rel_deferred(
         schema,
         rows,
         deferred: true,
+        xmin_column: None,
     }
 }
 
@@ -150,19 +181,21 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         amop::pg_amproc_schema,
         amop::pg_amproc_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_attrdef",
         2604,
         PgCatalog,
         attribute::pg_attrdef_schema,
         attribute::pg_attrdef_rows,
+        "adrelid",
     ),
-    rel(
+    rel_of_relation(
         "pg_attribute",
         1249,
         PgCatalog,
         attribute::pg_attribute_schema,
         attribute::pg_attribute_rows,
+        "attrelid",
     ),
     rel(
         "pg_auth_members",
@@ -199,12 +232,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         types::pg_cast_schema,
         types::pg_cast_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_class",
         1259,
         PgCatalog,
         class::pg_class_schema,
         class::pg_class_rows,
+        "oid",
     ),
     rel(
         "pg_collation",
@@ -213,12 +247,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         collation::pg_collation_schema,
         collation::pg_collation_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_constraint",
         2606,
         PgCatalog,
         constraint::pg_constraint_schema,
         constraint::pg_constraint_rows,
+        "conrelid",
     ),
     rel(
         "pg_conversion",
@@ -311,12 +346,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         auth::pg_group_schema,
         auth::pg_group_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_index",
         2610,
         PgCatalog,
         index::pg_index_schema,
         index::pg_index_rows,
+        "indrelid",
     ),
     rel(
         "pg_indexes",
@@ -325,12 +361,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         relviews::pg_indexes_schema,
         relviews::pg_indexes_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_inherits",
         2611,
         PgCatalog,
         inherits::pg_inherits_schema,
         inherits::pg_inherits_rows,
+        "inhrelid",
     ),
     rel(
         "pg_init_privs",
@@ -507,12 +544,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         replication::pg_replication_slots_schema,
         no_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_rewrite",
         2618,
         PgCatalog,
         rewrite::pg_rewrite_schema,
         rewrite::pg_rewrite_rows,
+        "ev_class",
     ),
     rel(
         "pg_roles",
@@ -913,12 +951,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         misc_empty::pg_transform_schema,
         no_rows,
     ),
-    rel(
+    rel_of_relation(
         "pg_trigger",
         2620,
         PgCatalog,
         trigger::pg_trigger_schema,
         no_rows,
+        "tgrelid",
     ),
     rel(
         "pg_ts_config",

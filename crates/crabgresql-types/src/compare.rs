@@ -89,6 +89,9 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // `keys_equal` routes grouping equality through `compare_values`.
         PgType::Xid => xid_of(l).cmp(&xid_of(r)),
         PgType::Xid8 => xid8_of(l).cmp(&xid8_of(r)),
+        // Only reached through `=`: `cid` has no btree opclass (see
+        // `has_default_btree_opclass`), so nothing orders by it.
+        PgType::Cid => cid_of(l).cmp(&cid_of(r)),
         // pg_lsn: the natural unsigned order of the 64-bit counter.
         PgType::PgLsn => lsn_of(l).cmp(&lsn_of(r)),
         // A reg* value orders by OID, never by the name it renders as — the
@@ -232,6 +235,13 @@ pub fn xid_of(v: &Value) -> u32 {
     match v {
         Value::Xid(x) => *x,
         other => unreachable!("expected xid, got {other:?}"),
+    }
+}
+
+pub fn cid_of(v: &Value) -> u32 {
+    match v {
+        Value::Cid(x) => *x,
+        other => unreachable!("expected cid, got {other:?}"),
     }
 }
 

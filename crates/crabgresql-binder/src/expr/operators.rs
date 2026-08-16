@@ -666,10 +666,14 @@ pub(crate) fn bind_binary_op(
             );
         numeric_arith && mod_ok
     } else if matches!(op, BinOp::Eq | BinOp::NotEq) {
-        // Equality reaches one type more than ordering does — `xid`, which has a
-        // hash opclass but no btree one. Every other comparison stays on
+        // Equality reaches two types ordering does not — `xid` and `cid`, which
+        // have a hash opclass but no btree one. Every other comparison stays on
         // `is_orderable`, so `'1'::xid < '2'::xid` still has no operator.
-        has_equality(arg_ty, catalog)
+        //
+        // `cid` is narrower still: PostgreSQL 18.4's operator catalog gives it
+        // `=` and nothing else, not even `<>`. Probed, not assumed — `pg_operator`
+        // lists one row for `(cid, cid)` against two for `(xid, xid)`.
+        has_equality(arg_ty, catalog) && !(arg_ty == PgType::Cid && op == BinOp::NotEq)
     } else {
         is_orderable(arg_ty, catalog)
     };

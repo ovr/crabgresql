@@ -171,6 +171,18 @@ pub fn xid_in(input: &str) -> Result<u32, XidError> {
     }
 }
 
+/// `cidin`: a 32-bit command id. Probing PostgreSQL 18.4 shows it accepts
+/// exactly what `xidin` accepts, down to the wrapping band and both error
+/// messages (`'-1'::cid` is `4294967295`, `'-2147483649'::cid` is out of
+/// range) — only the type name in the message differs.
+pub fn cid_in(input: &str) -> Result<u32, XidError> {
+    match scan(input) {
+        Ok(v) => wraps_into_u32(v).ok_or_else(|| out_of_range(input, "cid")),
+        Err(ScanError::Range) => Err(out_of_range(input, "cid")),
+        Err(ScanError::Syntax) => Err(invalid_syntax(input, "cid")),
+    }
+}
+
 /// `xid8in`: a 64-bit transaction id. Every scanned `u64` is in range, so the
 /// only rejections are malformed input and a magnitude wider than `u64`.
 pub fn xid8_in(input: &str) -> Result<u64, XidError> {

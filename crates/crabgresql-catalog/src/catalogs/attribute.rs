@@ -70,12 +70,56 @@ pub(crate) fn attcollation_of(column: &Column) -> u32 {
     }
 }
 
+/// The system attributes every relation carries, at the negative `attnum`
+/// PostgreSQL assigns each — read off a live PostgreSQL 18.4, where `ctid` is
+/// `-1` and the numbers run backwards from there to `tableoid` at `-6`. (`oid`
+/// no longer has one: PostgreSQL 12 removed the optional row OID, and with it
+/// the `-2` that used to hold the gap.)
+///
+/// A `pg_attribute` row is what makes a client's column list agree with what the
+/// server will actually answer, so these must stay in step with
+/// [`SysCol`](crabgresql_binder::SysCol) — the binder's list is what a query
+/// resolves against.
+const SYSTEM_ATTRIBUTES: &[(&str, PgType, i16)] = &[
+    ("ctid", PgType::Tid, -1),
+    ("xmin", PgType::Xid, -2),
+    ("cmin", PgType::Cid, -3),
+    ("xmax", PgType::Xid, -4),
+    ("cmax", PgType::Cid, -5),
+    ("tableoid", PgType::Oid, -6),
+];
+
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
-/// (user columns only), typed from the column's `PgType` (`atttypid`/`attlen`).
+/// (user columns only) plus the six system attributes at negative `attnum`,
+/// typed from the column's `PgType` (`atttypid`/`attlen`).
 pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (relations, indexes, toasts) = (cat.relation_oids(), cat.index_oids(), cat.toast_oids());
     let mut rows = Vec::new();
     for (oid, schema) in relations {
+        for (name, ty, attnum) in SYSTEM_ATTRIBUTES {
+            let (byval, align, storage) = attlayout_of(*ty);
+            rows.push(vec![
+                Value::Oid(*oid),
+                Value::Text((*name).to_string()),
+                Value::Oid(ty.oid()),
+                Value::Int2(ty.typlen()),
+                Value::Int2(*attnum),
+                Value::Int4(-1),
+                byval,
+                align,
+                storage,
+                // PostgreSQL marks every system attribute NOT NULL, even the
+                // ones an outer join reports as NULL: `attnotnull` describes the
+                // stored column, not what a query can produce from it.
+                Value::Bool(true),
+                Value::Bool(false),
+                chr('\0'),
+                chr('\0'),
+                Value::Bool(false),
+                Value::Oid(0),
+                Value::Null,
+            ]);
+        }
         for (i, c) in schema.columns.iter().enumerate() {
             let (byval, align, storage) = attlayout_of(c.ty);
             rows.push(vec![

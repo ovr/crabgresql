@@ -296,6 +296,18 @@ impl CatalogSource for SessionCatalogSource {
                 },
             )
         }));
+        // Stamp each relation with the generation of the DDL that last changed
+        // *it*, so its catalog rows carry a state number of their own. Applied
+        // here, after every kind of relation has been built, rather than in each
+        // of the four constructors above — one lookup per relation against a map
+        // the DDL path maintains (`GlobalCatalog::note_ddl_shapes`). A relation
+        // the map has never seen keeps `0` and falls back to the catalog-wide
+        // generation.
+        let ddl_xids = self.global_catalog.relation_ddl_xids();
+        for relation in &mut rels {
+            let key = (relation.namespace.clone(), relation.schema.name.clone());
+            relation.ddl_xid = ddl_xids.get(&key).copied().unwrap_or(0);
+        }
         rels
     }
 
@@ -360,6 +372,10 @@ impl CatalogSource for SessionCatalogSource {
 
     fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    fn catalog_xmin(&self) -> u64 {
+        self.global_catalog.ddl_xid()
     }
 
     /// The block columns come from the engine's buffer pool, whose totals are

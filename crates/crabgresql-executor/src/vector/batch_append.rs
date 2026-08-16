@@ -1,9 +1,13 @@
-use arrow_array::RecordBatch;
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow_schema::{DataType, Field, Schema};
+use crabgresql_binder::SysCol;
 use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_txn::TxnContext;
 
 use super::{BatchNode, BatchScan};
-use crate::{ExecContext, ExecError};
+use crate::{ExecContext, ExecError, resolve_tableoid};
 
 /// Concatenates several batch sources — the columnar [`crate::Append`].
 ///
@@ -21,36 +25,104 @@ pub struct BatchAppend {
 }
 
 impl BatchAppend {
-    /// `None` — stay on the row path — if any arm cannot hand up batches, if
-    /// any arm carries a column remap, or if any arm must append a `tableoid`.
-    /// A batch is in its own relation's column order and there is nowhere here
-    /// to permute one, so a remapped arm would concatenate mis-ordered columns
-    /// rather than fail loudly.
+    /// `None` — stay on the row path — if any arm cannot hand up batches, if any
+    /// arm carries a column remap, or if any arm must append a system column
+    /// other than `tableoid`. A batch is in its own relation's column order and
+    /// there is nowhere here to permute one, so a remapped arm would concatenate
+    /// mis-ordered columns rather than fail loudly.
     ///
     /// The remap branch is unreachable today: DDL refuses an engine-managed
     /// relation on either side of an inheritance link, so no remapped arm can be
-    /// batch-capable. The planner's `arms_batch` applies that same remap rule,
-    /// so a remapped arm never makes `EXPLAIN` disagree with what runs.
+    /// batch-capable. The planner's [`arms_batch`] applies the same rules, so
+    /// neither a remapped arm nor a system slot makes `EXPLAIN` disagree with
+    /// what runs.
     ///
-    /// TODO: hand up batches for an arm that must append a `tableoid` slot.
-    /// `arms_batch` does not test for that slot, so until then `EXPLAIN` calls
-    /// such an `Append` columnar while it runs on rows.
+    /// **`tableoid` is the only system column reachable here**, and not by
+    /// choice: the access methods that hand up batches are exactly the columnar
+    /// ones, and the binder refuses every other system column on those (they
+    /// keep no row versions). A [`BatchStream`] also carries no
+    /// [`Tid`](crabgresql_storage_api::Tid) — deliberately, see its docs — so
+    /// even `ctid` would have nothing to read. `tableoid` is a fact about the
+    /// relation, so it appends as a constant column and costs the batch path
+    /// nothing.
+    ///
+    /// [`arms_batch`]: crabgresql_planner::PhysicalPlan::vectorization
+    /// [`BatchStream`]: crabgresql_storage_api::BatchStream
     pub fn open(arms: &[PhysicalAppendArm], txn: &TxnContext, ctx: &ExecContext) -> Option<Self> {
         let children = arms
             .iter()
             .map(|arm| {
-                // A remapped arm, or one that must append a `tableoid`, changes
-                // the row shape the batch layout describes.
-                if arm.relation.map.is_some() || arm.relation.tableoid.is_some() {
+                // A remapped arm changes the row shape the batch layout
+                // describes; a system slot this cannot synthesize does too.
+                if arm.relation.map.is_some() || !batch_capable_system(arm) {
                     return None;
                 }
-                BatchScan::open(&arm.relation.table, txn, &arm.projection, ctx)
-                    .map(|scan| Box::new(scan) as Box<dyn BatchNode>)
+                let scan = BatchScan::open(&arm.relation.table, txn, &arm.projection, ctx)?;
+                match &arm.relation.system {
+                    None => Some(Box::new(scan) as Box<dyn BatchNode>),
+                    // Resolved once per arm, exactly as the row path does it:
+                    // the catalog snapshot is fixed within one statement, so a
+                    // prepared statement never freezes a positional OID.
+                    Some(emit) => {
+                        let oid = resolve_tableoid(&emit.ident, ctx).ok()?;
+                        Some(Box::new(WithTableOid { scan, oid }) as Box<dyn BatchNode>)
+                    }
+                }
             })
             .collect::<Option<Vec<_>>>()?;
         Some(BatchAppend {
             children,
             cursor: 0,
+        })
+    }
+}
+
+/// Whether this arm's system slots — if it has any — are ones the batch path can
+/// synthesize. Shared in spirit with the planner's `arms_batch`, which must
+/// answer the same question for `EXPLAIN`.
+fn batch_capable_system(arm: &PhysicalAppendArm) -> bool {
+    match &arm.relation.system {
+        None => true,
+        Some(emit) => emit.cols.as_ref() == [SysCol::TableOid],
+    }
+}
+
+/// A batch source with a constant `tableoid` column appended — the columnar
+/// twin of the row path's `push_system`.
+struct WithTableOid<S> {
+    scan: S,
+    oid: u32,
+}
+
+impl<S: BatchNode> BatchNode for WithTableOid<S> {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        let Some(batch) = self.scan.next_batch()? else {
+            return Ok(None);
+        };
+        let rows = batch.num_rows();
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (**f).clone())
+            .collect();
+        fields.push(Field::new("tableoid", DataType::UInt32, false));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(UInt32Array::from(vec![self.oid; rows])) as ArrayRef);
+        // `try_new_with_options` rather than `try_new`: a batch of zero rows
+        // carries its width in the schema alone, and the plain constructor
+        // cannot infer a row count from it.
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map(Some)
+        .map_err(|error| {
+            ExecError::new(
+                crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
+                format!("appending a tableoid column to a batch: {error}"),
+            )
         })
     }
 }

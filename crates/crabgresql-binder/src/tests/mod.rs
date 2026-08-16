@@ -18,7 +18,7 @@ mod outer_refs;
 mod params;
 mod setops;
 mod subqueries;
+mod system_columns;
 mod table_functions;
-mod tableoid;
 mod values_cte;
 mod window;

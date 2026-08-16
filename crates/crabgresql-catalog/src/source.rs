@@ -73,6 +73,15 @@ pub struct CatalogRelation {
     /// the SQL as typed — the two are different strings, and a dump built from
     /// the wrong one is wrong silently.
     pub definition: Option<String>,
+    /// The transaction id of the DDL that last changed this relation's
+    /// definition, or `0` when nothing has recorded one — after a restart, say,
+    /// since no durable record says when a definition last moved.
+    ///
+    /// This is what the relation's own catalog rows report as their `xmin`; `0`
+    /// falls back to [`CatalogSource::catalog_xmin`], the catalog-wide
+    /// generation. See [`crate::StaticTable::with_xmin`] for why a state number
+    /// is the honest answer here at all.
+    pub ddl_xid: u64,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -102,6 +111,7 @@ impl CatalogRelation {
             stats,
             toast: None,
             definition: None,
+            ddl_xid: 0,
         }
     }
 
@@ -118,6 +128,7 @@ impl CatalogRelation {
             stats: metadata.stats,
             toast: metadata.toast,
             definition: None,
+            ddl_xid: 0,
         }
     }
 
@@ -134,6 +145,7 @@ impl CatalogRelation {
             stats,
             toast: None,
             definition: None,
+            ddl_xid: 0,
         }
     }
 
@@ -153,6 +165,7 @@ impl CatalogRelation {
             stats,
             toast: None,
             definition,
+            ddl_xid: 0,
         }
     }
 
@@ -185,6 +198,7 @@ impl CatalogRelation {
             stats,
             toast: None,
             definition: None,
+            ddl_xid: 0,
         }
     }
 }
@@ -352,6 +366,21 @@ pub trait CatalogSource: Send + Sync {
     /// snapshot with no session behind it — a value PostgreSQL's own `pg_locks`
     /// never prints, so it cannot be mistaken for a live backend.
     fn backend_pid(&self) -> i32 {
+        0
+    }
+
+    /// The transaction id every row of this snapshot reports as its `xmin`:
+    /// the one that ran the most recent DDL.
+    ///
+    /// Catalog rows are derived from live server state per statement and carry
+    /// no version history, so there is no per-row xid to report. What a client
+    /// reads `xmin` off a catalog relation *for* is a state number — DataGrip
+    /// compares `age(xmin)` against a threshold to decide whether its cached
+    /// schema is stale — and the DDL generation answers that question exactly:
+    /// it moves when the schema moves and stands still otherwise.
+    ///
+    /// `0` (`InvalidTransactionId`) for a snapshot with no server behind it.
+    fn catalog_xmin(&self) -> u64 {
         0
     }
 

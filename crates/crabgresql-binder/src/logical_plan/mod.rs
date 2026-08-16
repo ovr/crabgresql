@@ -19,7 +19,7 @@ pub use dml::{DeletePlan, InsertPlan, InsertSource, Returning, UpdatePlan};
 pub use join::{JoinExpr, JoinInput, JoinKind, JoinPlan};
 pub use keys::{DistinctKey, SortKey};
 pub use query::{AppendPlan, LimitPlan, QueryPlan, SubqueryPlan, TableFunctionPlan, ValuesPlan};
-pub use relation::{MappedRelation, RelationIdent};
+pub use relation::{MappedRelation, RelationIdent, SysCol, SystemEmit};
 pub use setop::{SetOpArm, SetOpPlan};
 pub use visit::{ExprVisitor, walk_exprs_mut};
 pub use window::WindowPlan;

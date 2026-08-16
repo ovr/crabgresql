@@ -71,6 +71,7 @@ const T_CIRCLE: u8 = 42;
 const T_POLYGON: u8 = 43;
 const T_VECTOR: u8 = 44;
 const T_CHAR: u8 = 45;
+const T_CID: u8 = 46;
 
 // Tags at 200 and above are NOT value kinds. They are storage-layer markers that
 // an access method resolves before this codec is reached, and they live in their
@@ -202,6 +203,10 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         }
         Value::Xid8(v) => {
             out.push(T_XID8);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Cid(v) => {
+            out.push(T_CID);
             out.extend_from_slice(&v.to_le_bytes());
         }
         Value::PgLsn(v) => {
@@ -468,6 +473,7 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         }
         T_XID => Value::Xid(r.u32()),
         T_XID8 => Value::Xid8(r.u64()),
+        T_CID => Value::Cid(r.u32()),
         T_PG_LSN => Value::PgLsn(r.u64()),
         T_MACADDR => {
             let mut b = [0u8; 6];
@@ -646,7 +652,7 @@ pub fn skip_datum(buf: &[u8], pos: &mut usize) {
         T_INT2 => {
             r.take(2);
         }
-        T_INT4 | T_OID | T_FLOAT4 | T_DATE | T_XID => {
+        T_INT4 | T_OID | T_FLOAT4 | T_DATE | T_XID | T_CID => {
             r.take(4);
         }
         T_TID | T_MACADDR => {
@@ -949,6 +955,8 @@ mod tests {
         roundtrip(Value::Xid(0));
         roundtrip(Value::Xid(u32::MAX));
         roundtrip(Value::Xid8(u64::MAX));
+        roundtrip(Value::Cid(0));
+        roundtrip(Value::Cid(u32::MAX));
         roundtrip(Value::PgLsn(0));
         roundtrip(Value::PgLsn(u64::MAX));
         roundtrip(Value::Macaddr([0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]));

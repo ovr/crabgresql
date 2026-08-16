@@ -132,7 +132,7 @@ fn a_relation_without_storage_leaves_is_scanned_directly() -> anyhow::Result<()>
     let engine = engine_with_table()?;
     let table = SplitTable::new("solo", Vec::new());
     assert!(
-        scan_arms(&engine, &table, false, false)
+        scan_arms(&engine, &table, false, &Arc::from(&[][..]))
             .context("scan_arms must not fail on a plain relation")?
             .is_none(),
         "a monolithic relation must bind to a plain Scan, not a one-armed Append"
@@ -150,7 +150,7 @@ fn storage_leaves_become_the_append_arms() -> anyhow::Result<()> {
             SplitTable::new("split_buffer", Vec::new()),
         ],
     );
-    let arms = scan_arms(&engine, &table, false, true)
+    let arms = scan_arms(&engine, &table, false, &Arc::from(&[SysCol::TableOid][..]))
         .context("scan_arms must not fail")?
         .context("a relation reporting storage leaves must fan out")?;
     // Order is the access method's, not sorted: a leaf order carries meaning
@@ -164,7 +164,7 @@ fn storage_leaves_become_the_append_arms() -> anyhow::Result<()> {
     // reports the relation that owns them — not the leaf's own name.
     assert!(
         arms.iter()
-            .all(|a| a.tableoid.as_ref().is_some_and(|id| id.name == "split")),
+            .all(|a| a.system.as_ref().is_some_and(|s| s.ident.name == "split")),
         "a storage leaf must answer `tableoid` with its owning relation"
     );
     Ok(())

@@ -22,8 +22,8 @@ use crabgresql_binder::{
     AggInput, AggregatePlan, AppendPlan, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc,
     BoundWindowSpec, DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput,
     JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, OutputColumn, QueryPlan,
-    RelationIdent, Returning, SetOpPlan, SortKey, SubqueryPlan, TableFn, TableFunctionPlan,
-    UpdatePlan, ValuesPlan, WindowPlan,
+    RelationIdent, Returning, SetOpPlan, SortKey, SubqueryPlan, SysCol, SystemEmit, TableFn,
+    TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan,
 };
 use crabgresql_storage_api::{
     ColumnProjection, IndexConstraint, IndexMetadata, RelStats, TableAm, TableSchema, Tuple,
@@ -163,15 +163,15 @@ pub enum PhysicalPlan {
         /// `COPY … FREEZE` (see [`LogicalPlan::Insert`]): the executor freezes
         /// this target's write and nothing else.
         freeze: bool,
-        /// Whether each inserted row carries a trailing `tableoid` slot for
+        /// The system columns each inserted row carries as trailing slots for
         /// RETURNING to read (see [`LogicalPlan::Insert`]). The executor fills
-        /// it with the leaf the row was routed to.
-        tableoid: bool,
+        /// a `tableoid` with the leaf the row was routed to.
+        system: Arc<[SysCol]>,
     },
     Update {
-        /// Whether each row carries a trailing `tableoid` slot for WHERE, SET or
-        /// RETURNING to read (see [`LogicalPlan::Insert`]).
-        tableoid: bool,
+        /// The system columns each row carries as trailing slots for WHERE, SET
+        /// or RETURNING to read (see [`LogicalPlan::Insert`]).
+        system: Arc<[SysCol]>,
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         assignments: Vec<(usize, BoundExpr)>,
@@ -187,9 +187,9 @@ pub enum PhysicalPlan {
         probe: Option<DmlIndexProbe>,
     },
     Delete {
-        /// Whether each row carries a trailing `tableoid` slot for WHERE or
+        /// The system columns each row carries as trailing slots for WHERE or
         /// RETURNING to read (see [`LogicalPlan::Insert`]).
-        tableoid: bool,
+        system: Arc<[SysCol]>,
         table: Arc<dyn TableAm>,
         predicate: Option<BoundExpr>,
         returning: Option<Returning>,
@@ -948,9 +948,9 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             returning,
             routing,
             freeze,
-            tableoid,
+            system,
         }) => PhysicalPlan::Insert {
-            tableoid,
+            system,
             table,
             source: match source {
                 InsertSource::Values(rows) => PhysicalInsertSource::Values(rows),
@@ -979,7 +979,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             returning,
             routing,
             inherited,
-            tableoid,
+            system,
         }) => {
             // A target whose UNIQUE check needs the whole-relation snapshot has
             // to be scanned: see `update_needs_unique_snapshot`. Row movement is
@@ -1001,11 +1001,11 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                 inherited,
                 &predicate,
                 Some(&keep),
-                tableoid,
+                &system,
                 costs,
             );
             PhysicalPlan::Update {
-                tableoid,
+                system,
                 table,
                 predicate,
                 assignments,
@@ -1021,14 +1021,13 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             returning,
             routing,
             inherited,
-            tableoid,
+            system,
         }) => {
             // A DELETE removes rows outright, so no target needs a snapshot.
-            let (routing, inherited, probe) = dml_targets(
-                &table, routing, inherited, &predicate, None, tableoid, costs,
-            );
+            let (routing, inherited, probe) =
+                dml_targets(&table, routing, inherited, &predicate, None, &system, costs);
             PhysicalPlan::Delete {
-                tableoid,
+                system,
                 table,
                 predicate,
                 returning,
@@ -1339,10 +1338,10 @@ fn dml_targets(
     inherited: Vec<MappedRelation>,
     predicate: &Option<BoundExpr>,
     keep: Option<KeepProbe<'_>>,
-    // `tableoid`: whether each routed leaf must name itself for a `tableoid` the
-    // statement reads. Inherited targets already carry their own name from the
-    // binder.
-    tableoid: bool,
+    // The system columns the statement reads. Each routed leaf must name itself
+    // for a `tableoid` among them; inherited targets already carry their own
+    // name from the binder.
+    system: &Arc<[SysCol]>,
     costs: cost::CostSettings,
 ) -> (
     Option<Vec<DmlTarget>>,
@@ -1389,7 +1388,10 @@ fn dml_targets(
             .map(|leaf| DmlTarget {
                 probe: probe_for(&leaf, &None),
                 relation: MappedRelation {
-                    tableoid: tableoid.then(|| RelationIdent::of(&leaf.schema())),
+                    system: (!system.is_empty()).then(|| SystemEmit {
+                        cols: Arc::clone(system),
+                        ident: RelationIdent::of(&leaf.schema()),
+                    }),
                     table: leaf,
                     map: None,
                 },
@@ -1890,6 +1892,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             routing,
             inherited,
             probe,
+            system,
             ..
         } => {
             let mut lines = vec![format!("Update on {}", table.schema().name)];
@@ -1899,6 +1902,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
                 inherited,
                 probe,
                 predicate.as_ref(),
+                system,
             ));
             lines
         }
@@ -1908,6 +1912,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
             routing,
             inherited,
             probe,
+            system,
             ..
         } => {
             let mut lines = vec![format!("Delete on {}", table.schema().name)];
@@ -1917,6 +1922,7 @@ pub fn explain(plan: &PhysicalPlan) -> Vec<String> {
                 inherited,
                 probe,
                 predicate.as_ref(),
+                system,
             ));
             lines
         }
@@ -2007,10 +2013,12 @@ fn dml_child_lines(
     inherited: &[DmlTarget],
     probe: &Option<DmlIndexProbe>,
     predicate: Option<&BoundExpr>,
+    system: &[SysCol],
 ) -> Vec<String> {
     // The predicate is in the named relation's column space, whichever target
-    // ends up reading the rows.
-    let names = schema_names(&table.schema());
+    // ends up reading the rows — widened by the system slots, which live past
+    // that space and are what the predicate may also read.
+    let names = dml_names(&table.schema(), system);
     let mut lines = Vec::new();
     let mut push = |target: &Arc<dyn TableAm>, probe: &Option<DmlIndexProbe>| {
         let child = match probe {
@@ -2172,6 +2180,18 @@ fn schema_names(schema: &TableSchema) -> Vec<Option<String>> {
         .iter()
         .map(|c| Some(c.name.clone()))
         .collect()
+}
+
+/// [`schema_names`] plus the system-column slots the statement appended, in row
+/// order.
+///
+/// Without them a predicate reading one renders as `$N` — the ordinal falls past
+/// the declared columns, and a plan that prints `Filter: ($2 = 0)` says nothing
+/// about which column was tested. PostgreSQL names them, so this does too.
+fn dml_names(schema: &TableSchema, system: &[SysCol]) -> Vec<Option<String>> {
+    let mut names = schema_names(schema);
+    names.extend(system.iter().map(|c| Some(c.name().to_string())));
+    names
 }
 
 /// This window step's 1-based position in its chain, counting from the bottom —
@@ -2415,7 +2435,7 @@ mod tests {
             relation: MappedRelation {
                 table,
                 map: None,
-                tableoid: None,
+                system: None,
             },
             projection: ColumnProjection::All,
         }

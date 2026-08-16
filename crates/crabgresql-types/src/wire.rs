@@ -76,6 +76,7 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
         // Transaction ids and LSNs are bare unsigned counters on the wire.
         PgType::Xid => Value::Xid(u32::from_be_bytes(fixed(b, ty)?)),
         PgType::Xid8 => Value::Xid8(u64::from_be_bytes(fixed(b, ty)?)),
+        PgType::Cid => Value::Cid(u32::from_be_bytes(fixed(b, ty)?)),
         PgType::PgLsn => Value::PgLsn(u64::from_be_bytes(fixed(b, ty)?)),
         // `uuid_recv`: the 16 stored bytes, no punctuation.
         PgType::Uuid => Value::Uuid(fixed::<16>(b, ty)?),
@@ -243,6 +244,7 @@ impl Value {
             Value::Oid(v) => v.to_be_bytes().to_vec(),
             Value::Xid(v) => v.to_be_bytes().to_vec(),
             Value::Xid8(v) => v.to_be_bytes().to_vec(),
+            Value::Cid(v) => v.to_be_bytes().to_vec(),
             Value::PgLsn(v) => v.to_be_bytes().to_vec(),
             // `uuid_send`: the stored bytes, which are already the wire form.
             Value::Uuid(u) => u.to_vec(),

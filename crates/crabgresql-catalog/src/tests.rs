@@ -149,10 +149,22 @@ fn pg_class_and_pg_attribute_agree_on_relation_oids() -> anyhow::Result<()> {
         attr_schema.column_index("atttypid"),
         "atttypid column is missing",
     )?;
-    // alpha has two columns, in declared order, tied to alpha's OID.
-    let alpha_attrs: Vec<_> = attr
+    // alpha has two columns, in declared order, tied to alpha's OID — plus the
+    // six system attributes every relation carries, which sit at negative
+    // `attnum` and are filtered out here exactly as a client's column list
+    // filters them.
+    let all_alpha: Vec<_> = attr
         .iter()
         .filter(|r| r[arel] == Value::Oid(FIRST_REL_OID))
+        .collect();
+    assert_eq!(
+        all_alpha.len() - 2,
+        6,
+        "every relation carries the six system attributes"
+    );
+    let alpha_attrs: Vec<_> = all_alpha
+        .into_iter()
+        .filter(|r| matches!(r[anum], Value::Int2(n) if n > 0))
         .collect();
     assert_eq!(alpha_attrs.len(), 2);
     assert_eq!(alpha_attrs[0][aname], Value::Text("id".to_string()));
@@ -1853,7 +1865,14 @@ fn oversized_typmod_saturates_instead_of_panicking() -> anyhow::Result<()> {
         "pg_attribute is missing",
     )?;
     let i = required(schema.column_index("atttypmod"), "atttypmod is missing")?;
-    assert_eq!(rows[0][i], Value::Int4(i32::MAX));
+    let name = required(schema.column_index("attname"), "attname is missing")?;
+    // Not `rows[0]`: the system attributes lead every relation's rows.
+    let v = required(
+        rows.iter()
+            .find(|r| r[name] == Value::Text("v".to_string())),
+        "the declared column is missing",
+    )?;
+    assert_eq!(v[i], Value::Int4(i32::MAX));
 
     Ok(())
 }
@@ -1882,6 +1901,32 @@ fn the_registry_is_sorted_and_its_names_are_unique() {
 /// Every `pg_catalog` relation has a distinct, non-zero OID that round-trips,
 /// and none of them lands in a band some other OID space owns.
 ///
+/// `CatalogRelDef::xmin_column` names a column by string, so nothing but this
+/// keeps it in step with the schema it names. A typo does not fail: the relation
+/// quietly falls back to the catalog-wide generation, and every row of it starts
+/// reporting the same `xmin` again — the exact behavior the field exists to
+/// replace, with nothing to notice it by.
+#[test]
+fn xmin_columns_exist_and_are_oids() {
+    for def in registry::CATALOG_RELATIONS {
+        let Some(name) = def.xmin_column else {
+            continue;
+        };
+        let schema = (def.schema)();
+        let index = required(
+            schema.column_index(name),
+            &format!("{} has no column {name}", def.name),
+        )
+        .expect("the registry names a column its schema does not have");
+        assert_eq!(
+            schema.columns[index].ty,
+            crabgresql_types::PgType::Oid,
+            "{}.{name} must hold a relation OID",
+            def.name,
+        );
+    }
+}
+
 /// A hand-typed OID is the one thing in the registry no compiler checks. A
 /// digit slipped into a synthetic band would make `'pg_class'::regclass`
 /// name a user relation — or two catalogs answer to the same cast.

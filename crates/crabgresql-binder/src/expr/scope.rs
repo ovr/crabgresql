@@ -6,11 +6,11 @@ use std::sync::Arc;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableEngine, TableSchema, TypeCatalog};
-use crabgresql_types::{Numeric, PgType, Value};
+use crabgresql_types::{Numeric, Value};
 
 use crate::BindError;
 use crate::functions::ScalarFn;
-use crate::plan::TABLEOID;
+use crate::logical_plan::SysCol;
 
 use super::bound::BoundExpr;
 use super::datatype::declared_typmod;
@@ -39,19 +39,19 @@ pub enum Binding {
 pub struct ScopeItem {
     pub qualifier: String,
     pub columns: Vec<Column>,
-    /// Local index of the `tableoid` slot within `columns`, when the query asked
-    /// for one. It is a real column of the row — that is what lets an outer
-    /// join null-extend it and an `Append` arm answer for itself — but it sits
-    /// past every declared column, so `*` never reaches it. `None` for a FROM
-    /// item that is not a relation scan.
-    pub system_slot: Option<usize>,
+    /// Local index within `columns` where this item's system columns start,
+    /// when the query asked for any. They are real columns of the row — that is
+    /// what lets an outer join null-extend them and an `Append` arm answer for
+    /// itself — but they sit past every declared column, so `*` never reaches
+    /// them. `None` for a FROM item that is not a relation scan.
+    pub system_base: Option<usize>,
 }
 
 impl ScopeItem {
-    /// The columns `*` expands to: everything but the system slot.
+    /// The columns `*` expands to: everything before the system slots.
     pub fn declared(&self) -> &[Column] {
-        match self.system_slot {
-            Some(slot) => &self.columns[..slot],
+        match self.system_base {
+            Some(base) => &self.columns[..base],
             None => &self.columns,
         }
     }
@@ -66,15 +66,15 @@ pub struct ScopeRel {
     qualifier: String,
     columns: Vec<Column>,
     offset: usize,
-    system_slot: Option<usize>,
+    system_base: Option<usize>,
 }
 
 impl ScopeRel {
     /// This relation's declared columns — everything `*` expands to, which is
-    /// every column but the system slot.
+    /// every column before the system slots.
     fn declared(&self) -> &[Column] {
-        match self.system_slot {
-            Some(slot) => &self.columns[..slot],
+        match self.system_base {
+            Some(base) => &self.columns[..base],
             None => &self.columns,
         }
     }
@@ -538,29 +538,30 @@ impl Scope {
 
     /// A one-relation scope over `schema`.
     ///
-    /// `tableoid` says whether the row this scope describes carries the system
-    /// slot past its declared columns. The write paths set it when the statement
-    /// names `tableoid`, because there the value is appended per *target* — the
-    /// partition or child a row actually lives in, not the relation the
+    /// `system` lists the system columns the row this scope describes carries
+    /// past its declared ones, in row order. The write paths fill it from what
+    /// the statement names, because there the values are appended per *target*
+    /// — the partition or child a row actually lives in, not the relation the
     /// statement named.
     pub fn table(
         schema: &TableSchema,
         qualifier: String,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
-        tableoid: bool,
+        system: &[SysCol],
     ) -> Scope {
         let mut columns = schema.columns.clone();
-        let system_slot = tableoid.then(|| {
-            columns.push(Column::new(TABLEOID, PgType::Oid));
-            columns.len() - 1
+        let system_base = (!system.is_empty()).then(|| {
+            let base = columns.len();
+            columns.extend(system.iter().map(|c| Column::new(c.name(), c.ty())));
+            base
         });
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
                 columns,
                 offset: 0,
-                system_slot,
+                system_base,
             }],
             visible: None,
             catalog: catalog.clone(),
@@ -602,7 +603,7 @@ impl Scope {
                 qualifier: item.qualifier,
                 columns: item.columns,
                 offset,
-                system_slot: item.system_slot,
+                system_base: item.system_base,
             });
             offset += width;
         }
@@ -626,8 +627,9 @@ impl Scope {
     ///
     /// All three properties are the same decision seen from different sides: the
     /// expression is evaluated against a tuple, once per row, by whoever holds
-    /// it. A `tableoid` would mean a different relation per leaf it is re-bound
-    /// for; a subquery has no plan to run there; and a reference to a generated
+    /// it. A system column would mean a different relation — and a different
+    /// row version — per leaf it is re-bound for; a subquery has no plan to run
+    /// there; and a reference to a generated
     /// column must stay a reference, so that a CHECK can record its ordinal and
     /// a generation expression can *refuse* it.
     pub fn stored_row(
@@ -637,7 +639,7 @@ impl Scope {
     ) -> Scope {
         Scope {
             expand_generated: false,
-            ..Scope::table(schema, schema.name.clone(), catalog, params, false)
+            ..Scope::table(schema, schema.name.clone(), catalog, params, &[])
         }
     }
 

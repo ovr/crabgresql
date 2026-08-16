@@ -37,8 +37,8 @@ pub use functions::{
 pub use logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
     InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
-    QueryPlan, RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan,
-    TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan, walk_exprs_mut,
+    QueryPlan, RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan, SysCol,
+    SystemEmit, TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan, walk_exprs_mut,
 };
 pub use plan::{
     CopyFormat, CopyFromPlan, CopyFromSource, CopyHeader, bind_copy_from, bind_delete,

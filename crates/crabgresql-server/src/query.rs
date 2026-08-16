@@ -733,6 +733,49 @@ pub(crate) fn execute_statement_with(
     params: &BoundParams,
     force_materialize: bool,
 ) -> Result<QueryResult, PgError> {
+    let result = execute_statement_inner(
+        engine,
+        global_catalog,
+        txnmgr,
+        stmt,
+        session,
+        params,
+        force_materialize,
+    );
+    // The catalog's generation, which every `pg_catalog` row reports as its
+    // `xmin` (see `GlobalCatalog::note_ddl`). Bumped here, at the one point
+    // every schema-changing statement passes through, rather than at each of
+    // the two dozen DDL handlers — half of which mutate the storage engine and
+    // never touch `GlobalCatalog` at all.
+    //
+    // `read_only_prohibited_ddl` is exactly the classifier this needs: a
+    // statement PostgreSQL forbids in a read-only transaction is one that
+    // changes what the catalog would report.
+    if result.is_ok() && read_only_prohibited_ddl(stmt).is_some() {
+        global_catalog.note_ddl(txnmgr.clog().next_xid_floor().0);
+        // …and which relations this statement actually changed, so each one's
+        // catalog rows carry a generation of its own. Derived from the shapes
+        // rather than from the statement — see `note_ddl_shapes`.
+        //
+        // Stamped with the generation `note_ddl` just advanced to, not with the
+        // raw transaction counter: DDL allocates no XID, so the counter would
+        // hand consecutive statements the same value and a changed relation
+        // would look unchanged.
+        global_catalog.note_ddl_shapes(&engine.relation_metadata(), global_catalog.ddl_xid());
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_statement_inner(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    stmt: &ast::Statement,
+    session: &mut Session,
+    params: &BoundParams,
+    force_materialize: bool,
+) -> Result<QueryResult, PgError> {
     // In an aborted transaction block, PG rejects everything but COMMIT/ROLLBACK
     // until the block ends.
     if session.tx_status == TransactionStatus::Failed
@@ -4205,6 +4248,7 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
+        reject_system_column_name(&column_name)?;
         let typmod = crabgresql_binder::declared_typmod(ty, &col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
@@ -5691,9 +5735,14 @@ fn execute_create_table_as(
     }
 
     // A projected `reg*` cannot be stored, for the same reason a declared one
-    // cannot (see `reject_stored_reg_type`).
+    // cannot (see `reject_stored_reg_type`); and a projected column cannot be
+    // named after a system column, for the same reason a declared one cannot
+    // (see `reject_system_column_name`). Both apply to the output names, which
+    // is where an `AS` alias lands: `CREATE TABLE t AS SELECT 1 AS ctid` is the
+    // spelling upstream rejects.
     for c in &cols {
         reject_stored_reg_type(c.ty, &c.name)?;
+        reject_system_column_name(&c.name)?;
     }
     let mut schema = TableSchema {
         name: name.clone(),
@@ -5777,7 +5826,7 @@ fn execute_create_table_as(
         // transactional, so there would be no storage for a rollback to discard.
         freeze: false,
         // No RETURNING, so nothing reads a system column.
-        tableoid: false,
+        system: std::sync::Arc::from(&[][..]),
     });
 
     // Run the populate INSERT through the standard write tail. The DDL catalog
@@ -6287,6 +6336,41 @@ fn fresh_local_name(taken: impl Fn(&str) -> bool, base: &str) -> String {
 /// on the type name mapping.
 fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
     crabgresql_binder::map_data_type(dt).map_err(PgError::from)
+}
+
+/// Refuse to name a stored column after a system column.
+///
+/// Every relation already carries `ctid`, `xmin`, `cmin`, `xmax`, `cmax` and
+/// `tableoid` past its declared columns, so a declared column of the same name
+/// would shadow one — a reference resolves to the declared column and the system
+/// slot becomes unreachable. PostgreSQL forbids the collision outright rather
+/// than pick a winner, and this is that rule:
+///
+/// ```text
+/// ERROR:  42701: column name "ctid" conflicts with a system column name
+/// ```
+///
+/// **A view is deliberately exempt**, here as upstream: `CREATE VIEW v AS SELECT
+/// 1 AS ctid` is legal, because a view exposes no system columns for the name to
+/// collide with. That is the same distinction `without_declared` in the binder
+/// draws from the other side, and removing this exemption would reject SQL
+/// PostgreSQL accepts.
+///
+/// Only the two `CREATE TABLE` paths call this: `ALTER TABLE ADD COLUMN` and
+/// `ALTER TABLE RENAME COLUMN` — which upstream checks too — have no handler in
+/// this build yet, so there is nowhere to put the third and fourth call.
+fn reject_system_column_name(column: &str) -> Result<(), PgError> {
+    // From the binder's own list, so the two can never name different columns.
+    match crabgresql_binder::SysCol::ALL
+        .iter()
+        .any(|c| c.name() == column)
+    {
+        false => Ok(()),
+        true => Err(PgError::new(
+            sqlstate::DUPLICATE_COLUMN,
+            format!("column name \"{column}\" conflicts with a system column name"),
+        )),
+    }
 }
 
 /// Refuse to give a stored column a `reg*` type.

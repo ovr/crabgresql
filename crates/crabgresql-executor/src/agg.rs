@@ -136,6 +136,7 @@ pub(crate) fn key_encoding(ty: PgType) -> KeyEncoding {
         | PgType::Oid
         | PgType::Xid
         | PgType::Xid8
+        | PgType::Cid
         | PgType::PgLsn
         | PgType::Money
         | PgType::Date
@@ -205,6 +206,7 @@ pub(crate) fn scalar_code(ty: PgType, v: &Value) -> u64 {
         (PgType::Float8, Value::Float8(x)) => canonical_f64(*x).to_bits(),
         (PgType::Oid, Value::Oid(o)) => *o as u64,
         (PgType::Xid, Value::Xid(x)) => *x as u64,
+        (PgType::Cid, Value::Cid(x)) => *x as u64,
         (PgType::Xid8, Value::Xid8(x)) => *x,
         (PgType::PgLsn, Value::PgLsn(x)) => *x,
         (PgType::Money, Value::Money(m)) => *m as u64,
