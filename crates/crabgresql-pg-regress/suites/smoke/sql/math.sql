@@ -30,11 +30,29 @@ SELECT degrees(1e-310::float8), radians(1e-310::float8);
 -- sin / cos / tan / cot: the platform's libm, with no exactness correction
 --
 SELECT sin(0.0::float8), cos(0.0::float8), tan(0.0::float8);
-SELECT sin(1.0::float8), cos(1.0::float8), tan(1.0::float8), cot(1.0::float8);
-SELECT sin(radians(30.0::float8)) AS sin30, cos(radians(60.0::float8)) AS cos60;
+-- Away from the exact points these are libm's digits, and libm's last bit is
+-- not the same on every platform (glibc and Darwin disagree on tan(1) and
+-- acos(0.5)). So this checks the value to within an ulp and the identities
+-- between the four, the way float8.sql checks the degree tier with `IN` rather
+-- than with digits.
+SELECT abs(sin(1.0::float8) - 0.8414709848078965) < 1e-15 AS sin1,
+       abs(cos(1.0::float8) - 0.5403023058681398) < 1e-15 AS cos1,
+       abs(tan(1.0::float8) - 1.5574077246549023) < 1e-15 AS tan1,
+       abs(cot(1.0::float8) - 0.6420926159343306) < 1e-15 AS cot1;
+-- cot is 1/tan by construction, so this holds whatever libm rounds tan to.
+-- `tan = sin/cos` is deliberately *not* asserted: glibc rounds tan correctly
+-- and the naive quotient does not, so that identity is false there and true
+-- on Darwin.
+SELECT cot(1.0::float8) = 1.0::float8 / tan(1.0::float8) AS cot_is_one_over_tan;
+-- the radian tier applies no exactness correction, which is the whole
+-- difference between it and the degree tier
+SELECT sind(30.0::float8) = 0.5 AS degree_tier_exact,
+       sin(radians(30.0::float8)) = 0.5 AS radian_tier_exact;
 -- cot is 1/tan, so the denominator's signed zero picks the sign of the pole
 SELECT cot(0.0::float8) AS pos_zero, cot('-0'::float8) AS neg_zero;
-SELECT tan(pi()/2) AS near_pole;
+-- no pole in float8: pi()/2 is not exactly pi/2, so tan is merely huge
+SELECT tan(pi()/2) > 1e15 AS near_pole,
+       tan(pi()/2) < 'infinity'::float8 AS still_finite;
 -- NaN passes through; an infinite angle has no value and is an error
 SELECT sin('nan'::float8), cos('nan'::float8), tan('nan'::float8),
        cot('nan'::float8);
@@ -48,7 +66,9 @@ SELECT cot('infinity'::float8);
 --
 SELECT asin(0.0::float8), asin(1.0::float8), asin(-1.0::float8);
 SELECT acos(0.0::float8), acos(1.0::float8), acos(-1.0::float8);
-SELECT asin(0.5::float8), acos(0.5::float8);
+-- libm's digits again, so to within an ulp (see sin/cos/tan/cot above)
+SELECT abs(asin(0.5::float8) - 0.5235987755982989) < 1e-15 AS asin_half,
+       abs(acos(0.5::float8) - 1.0471975511965979) < 1e-15 AS acos_half;
 -- outside [-1, 1] — including the infinities — is a domain error
 SELECT asin(1.5::float8);
 SELECT acos(-1.5::float8);

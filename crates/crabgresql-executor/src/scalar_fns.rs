@@ -3124,12 +3124,12 @@ mod tests {
 
     #[test]
     fn radian_trig_is_libm_with_pg_domain_guards() {
-        // No exactness correction, unlike the degree tier above: this is the
-        // value PG prints, digit for digit.
-        assert_eq!(
-            call(ScalarFn::Sin, std::f64::consts::PI / 6.0),
-            0.499_999_999_999_999_94
-        );
+        // No exactness correction, unlike the degree tier above — asserted as
+        // the claim rather than as digits, since libm's last bit is a platform
+        // property (glibc and Darwin disagree on tan(1) and acos(0.5)).
+        let sin30 = call(ScalarFn::Sin, std::f64::consts::PI / 6.0);
+        assert_ne!(sin30, 0.5);
+        assert!((sin30 - 0.5).abs() < 1e-15);
         assert_eq!(call(ScalarFn::Sin, 0.0), 0.0);
         assert_eq!(call(ScalarFn::Cos, 0.0), 1.0);
         assert_eq!(call(ScalarFn::Tan, 0.0), 0.0);
