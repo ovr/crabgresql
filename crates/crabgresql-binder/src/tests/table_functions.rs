@@ -417,8 +417,7 @@ fn generate_subscripts_in_target_list_is_srf_projection() -> anyhow::Result<()> 
 #[test]
 fn generate_subscripts_rejects_other_signatures() -> anyhow::Result<()> {
     // PG resolves `generate_subscripts(anyarray, int)` and `(anyarray, int,
-    // bool)` only: a missing dimension, a bigint or numeric dimension, a
-    // non-array first argument and a fourth argument are all 42883 there.
+    // bool)` only; everything else below is 42883 there.
     for (sql, message) in [
         (
             "SELECT * FROM generate_subscripts(ARRAY['a'])",

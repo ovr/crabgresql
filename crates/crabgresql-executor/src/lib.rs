@@ -5392,7 +5392,6 @@ mod tests {
         assert_eq!(columns[0].ty, PgType::Int4);
         assert_eq!(series_col(&rows), [1, 2, 3].map(Value::Int4));
 
-        // `reverse` yields them descending; an explicit `false` does not.
         let (_c, rows) = run_rows("SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, true)");
         assert_eq!(series_col(&rows), [3, 2, 1].map(Value::Int4));
         let (_c, rows) = run_rows("SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, false)");
@@ -5432,7 +5431,6 @@ mod tests {
             "SELECT generate_subscripts(ARRAY['a', 'b'], 0)",
             "SELECT generate_subscripts(ARRAY['a', 'b'], 2)",
             "SELECT generate_subscripts(ARRAY['a', 'b'], -1)",
-            // An empty array has no subscripts at all.
             "SELECT generate_subscripts('{}'::text[], 1)",
             // STRICT: a NULL in any argument yields the empty set, not an error.
             "SELECT generate_subscripts(NULL::text[], 1)",

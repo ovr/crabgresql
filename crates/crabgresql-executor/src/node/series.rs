@@ -128,8 +128,6 @@ pub(crate) fn generate_subscripts_series(values: &[Value]) -> Series {
         Some(Value::Vector { elems, .. }) => (elems.len(), 0i64),
         _ => return Series::Empty,
     };
-    // Only `dim = 1` exists for a one-dimensional value; 0, a negative
-    // dimension, and anything past the first all yield the empty set.
     if !matches!(values.get(1), Some(Value::Int4(1))) {
         return Series::Empty;
     }
@@ -139,7 +137,6 @@ pub(crate) fn generate_subscripts_series(values: &[Value]) -> Series {
         // A NULL `reverse` (or anything else) is the strict case.
         _ => return Series::Empty,
     };
-    // An empty array has no subscripts at all.
     if len == 0 {
         return Series::Empty;
     }

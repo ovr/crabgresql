@@ -1268,8 +1268,7 @@ impl TableFn {
             // ones above.
             TableFn::PgPartitionAncestors => &[],
             TableFn::PgAvailableExtensions => &[],
-            // `GenerateSeries`/`JsonbPathQuery`/`Unnest`/`GenerateSubscripts` are
-            // polymorphic/variadic and resolve their own arguments in
+            // The polymorphic/variadic ones resolve their own arguments in
             // `bind_table_fn_call`.
             TableFn::GenerateSeries(_)
             | TableFn::JsonbPathQuery
