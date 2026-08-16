@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
 use crabgresql_types::{Interval, PgType, Value, arith, cast};
 
@@ -470,22 +471,49 @@ fn eval_array_ctor_fn(
 /// Dispatch the transaction-state functions. Returns `None` for any other
 /// function (the caller falls back to the pure `eval_scalar`).
 ///
-/// `age(xid)` is how many transactions have started since `xid`. It answers
-/// from the *live* counter, not from the statement's snapshot: inside one
-/// repeatable-read transaction PG's answer grows as other sessions allocate
-/// XIDs, while the snapshot stands still. `Clog::next_xid_floor` is that
-/// counter — it is bumped at allocation — and unlike `TxnContext::xid` it is
-/// meaningful in a read-only transaction, which never allocates an XID at all.
+/// What they have in common is that they read the transaction machinery —
+/// this transaction's id, or the CLOG behind it — which the pure `eval_scalar`
+/// has no handle to. `pg_is_in_recovery` needs nothing at all, and is here
+/// because it answers with server state rather than with its arguments, exactly
+/// as the rest of the family does.
 fn eval_txn_fn(
     func: ScalarFn,
     args: &[Value],
     ctx: &ExecContext,
 ) -> Option<Result<Value, ExecError>> {
-    if func != ScalarFn::AgeXid {
-        return None;
-    }
+    Some(match func {
+        ScalarFn::AgeXid => eval_age_xid(args, ctx),
+        ScalarFn::CurrentXactId { xid8, if_assigned } => {
+            eval_current_xact_id(xid8, if_assigned, ctx)
+        }
+        ScalarFn::PgXactStatus => eval_xact_status(args, ctx),
+        // Always false: crabgresql has no standby mode, so there is no state in
+        // which it could answer otherwise.
+        ScalarFn::PgIsInRecovery => Ok(Value::Bool(false)),
+        _ => return None,
+    })
+}
+
+/// The transaction the statement runs under, or the wiring error that says a
+/// transaction-state function reached a context without one.
+fn txn_of<'a>(func: &str, ctx: &'a ExecContext) -> Result<&'a TxnContext, ExecError> {
+    ctx.txn.as_ref().ok_or_else(|| {
+        ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("{func} evaluated without a transaction context"),
+        )
+    })
+}
+
+/// `age(xid)`: how many transactions have started since `xid`. It answers from
+/// the *live* counter, not from the statement's snapshot: inside one
+/// repeatable-read transaction PG's answer grows as other sessions allocate
+/// XIDs, while the snapshot stands still. `Clog::next_xid_floor` is that
+/// counter — it is bumped at allocation — and unlike `TxnContext::xid` it is
+/// meaningful in a read-only transaction, which never allocates an XID at all.
+fn eval_age_xid(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let xid = match &args[0] {
-        Value::Null => return Some(Ok(Value::Null)),
+        Value::Null => return Ok(Value::Null),
         Value::Xid(x) => *x,
         other => unreachable!("expected an xid arg, got {other:?}"),
     };
@@ -493,20 +521,97 @@ fn eval_txn_fn(
     // infinitely old rather than as a difference: `age('0'::xid)`,
     // `age('1'::xid)` and `age('2'::xid)` are all `2147483647`.
     if u64::from(xid) < crabgresql_txn::Xid::FIRST_NORMAL.0 {
-        return Some(Ok(Value::Int4(i32::MAX)));
+        return Ok(Value::Int4(i32::MAX));
     }
-    let Some(txn) = ctx.txn.as_ref() else {
-        return Some(Err(ExecError::new(
-            sqlstate::INTERNAL_ERROR,
-            "age(xid) evaluated without a transaction context",
-        )));
-    };
+    let txn = txn_of("age(xid)", ctx)?;
     // Our XIDs are 64-bit and never wrap; the SQL `xid` type is 32-bit and PG's
     // answer is a 32-bit wrapping difference reinterpreted as a signed integer.
     // That is what makes `age('4294967295'::xid)` one *more* than the counter,
     // and an xid ahead of it negative.
     let next = txn.clog.next_xid_floor().0 as u32;
-    Some(Ok(Value::Int4(next.wrapping_sub(xid) as i32)))
+    Ok(Value::Int4(next.wrapping_sub(xid) as i32))
+}
+
+/// `txid_current()` / `pg_current_xact_id()` and their `_if_assigned` forms.
+///
+/// The XID is not allocated here. The server decides before execution starts
+/// that this statement needs one (see `crabgresql_binder::plan_needs_xid`) and
+/// allocates it with the rest of the transaction, which is what makes the id
+/// stable across an explicit block and commits the one an autocommit statement
+/// consumed. So this only reports what the transaction already holds.
+fn eval_current_xact_id(
+    xid8: bool,
+    if_assigned: bool,
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    let name = match (xid8, if_assigned) {
+        (false, false) => "txid_current()",
+        (false, true) => "txid_current_if_assigned()",
+        (true, false) => "pg_current_xact_id()",
+        (true, true) => "pg_current_xact_id_if_assigned()",
+    };
+    let xid = txn_of(name, ctx)?.xid;
+    if !xid.is_valid() {
+        // The `_if_assigned` forms exist to report exactly this.
+        if if_assigned {
+            return Ok(Value::Null);
+        }
+        // Not a user-facing case: `plan_needs_xid` reports a statement calling
+        // the assigning form, and the server allocates an XID for it. Reaching
+        // here means those two have drifted apart, which would otherwise show up
+        // as a silent `0` rather than as a bug.
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("{name} evaluated with no transaction id assigned"),
+        ));
+    }
+    Ok(match xid8 {
+        true => Value::Xid8(xid.0),
+        // `txid_current` predates the `xid8` type and reports the same number as
+        // `int8`. Our XIDs never reach the top bit, so the cast is exact.
+        false => Value::Int8(xid.0 as i64),
+    })
+}
+
+/// `pg_xact_status(xid8)`: whether that transaction committed, aborted, or is
+/// still running.
+fn eval_xact_status(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let xid = match &args[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Xid8(x) => crabgresql_txn::Xid(*x),
+        other => unreachable!("expected an xid8 arg, got {other:?}"),
+    };
+    // The invalid XID names no transaction, so there is no status to report. PG
+    // answers NULL rather than raising — the same answer it gives for an XID too
+    // old to have a status left.
+    if !xid.is_valid() {
+        return Ok(Value::Null);
+    }
+    let txn = txn_of("pg_xact_status", ctx)?;
+    // The reserved XIDs below the first normal one are permanently committed and
+    // carry no CLOG entry of their own, so they are answered before the lookup —
+    // the CLOG would report them as never recorded, i.e. in progress.
+    if xid < crabgresql_txn::Xid::FIRST_NORMAL {
+        return Ok(Value::Text("committed".into()));
+    }
+    // An XID at or above the next one to hand out has not started. PG refuses to
+    // guess for it rather than calling it in progress.
+    if xid >= txn.clog.next_xid_floor() {
+        return Err(ExecError::new(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            format!("transaction ID {} is in the future", xid.0),
+        ));
+    }
+    Ok(Value::Text(
+        match txn.clog.status(xid) {
+            XactStatus::Committed => "committed",
+            XactStatus::Aborted => "aborted",
+            // A subtransaction that committed to a parent which has not is still
+            // in progress as far as anyone outside it is concerned.
+            XactStatus::InProgress | XactStatus::SubCommitted => "in progress",
+        }
+        .to_string(),
+    ))
 }
 
 /// Dispatch the side-effecting sequence functions. Returns `None` for any other

@@ -630,49 +630,52 @@ impl BoundExpr {
         }
     }
 
-    /// Whether this expression tree calls a user-defined routine anywhere,
-    /// including inside a subquery marker — a correlated subplan is executed
-    /// per outer row, so a routine in one still runs under this statement.
-    pub fn contains_routine(&self) -> bool {
+    /// Whether any node of this expression tree satisfies `pred`, including
+    /// inside a subquery marker — a correlated subplan is executed per outer
+    /// row, so a node in one still runs under this statement.
+    ///
+    /// Takes the predicate rather than naming what it looks for because two
+    /// callers ask two different questions of the same walk (see
+    /// [`crate::plan_calls_routine`] and [`crate::plan_needs_xid`]), and a copy
+    /// of this traversal per question is a copy that drifts.
+    pub fn any_node(&self, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
+        if pred(self) {
+            return true;
+        }
+        let any = |e: &BoundExpr| e.any_node(pred);
         match self {
-            BoundExpr::Routine { .. } => true,
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.contains_routine(),
-            BoundExpr::Binary { left, right, .. } => {
-                left.contains_routine() || right.contains_routine()
-            }
-            BoundExpr::FuncCall { args, .. } | BoundExpr::Srf { args, .. } => {
-                args.iter().any(BoundExpr::contains_routine)
-            }
-            BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
-                args.iter().any(BoundExpr::contains_routine)
-            }
+            | BoundExpr::Reinterpret { expr, .. } => any(expr),
+            BoundExpr::Binary { left, right, .. } => any(left) || any(right),
+            BoundExpr::FuncCall { args, .. }
+            | BoundExpr::Routine { args, .. }
+            | BoundExpr::Srf { args, .. }
+            | BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. } => args.iter().any(any),
             BoundExpr::WindowFunc { kind, spec, .. } => {
-                kind.args().iter().any(BoundExpr::contains_routine)
-                    || spec.exprs().any(BoundExpr::contains_routine)
+                kind.args().iter().any(any) || spec.exprs().any(any)
             }
-            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_routine),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_routine() || index.contains_routine()
-            }
+            BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(any),
+            BoundExpr::Subscript { base, index, .. } => any(base) || any(index),
             BoundExpr::Case { whens, else_, .. } => {
-                whens.iter().any(|(condition, result)| {
-                    condition.contains_routine() || result.contains_routine()
-                }) || else_.as_ref().is_some_and(|expr| expr.contains_routine())
+                whens
+                    .iter()
+                    .any(|(condition, result)| any(condition) || any(result))
+                    || else_.as_deref().is_some_and(any)
             }
             BoundExpr::ScalarSubquery { subplan, .. }
             | BoundExpr::ArraySubquery { subplan, .. }
-            | BoundExpr::Exists { subplan, .. } => crate::plan::plan_calls_routine(&subplan.plan),
+            | BoundExpr::Exists { subplan, .. } => {
+                crate::plan::plan_any_expr_node(&subplan.plan, pred)
+            }
             BoundExpr::QuantifiedSubquery { subplan, cmp, .. } => {
-                cmp.contains_routine() || crate::plan::plan_calls_routine(&subplan.plan)
+                any(cmp) || crate::plan::plan_any_expr_node(&subplan.plan, pred)
             }
-            BoundExpr::QuantifiedArray { array, cmp, .. } => {
-                array.contains_routine() || cmp.contains_routine()
-            }
+            BoundExpr::QuantifiedArray { array, cmp, .. } => any(array) || any(cmp),
             BoundExpr::Const { .. }
             | BoundExpr::ColumnRef { .. }
             | BoundExpr::Param { .. }
@@ -868,6 +871,8 @@ impl BoundExpr {
                     | ScalarFn::GenRandomUuid
                     | ScalarFn::UuidV7
                     | ScalarFn::UuidV7Shift
+                    | ScalarFn::PgXactStatus
+                    | ScalarFn::PgIsInRecovery
             ),
             BoundExpr::Routine { .. } => true,
             _ => false,
@@ -877,9 +882,11 @@ impl BoundExpr {
     /// Whether this expression contains a volatile function call. The volatile
     /// [`ScalarFn`]s today are the sequence functions (`nextval`/`setval` have
     /// side effects, `currval`/`lastval` read mutable session state),
-    /// `clock_timestamp`, which reads the wall clock afresh at every call, and
-    /// the UUID generators, which draw fresh randomness — all marked `VOLATILE`
-    /// by PostgreSQL. Any future volatile scalar function (e.g. `random()`)
+    /// `clock_timestamp`, which reads the wall clock afresh at every call,
+    /// the UUID generators, which draw fresh randomness, and
+    /// `pg_xact_status`/`pg_is_in_recovery`, which report live server state —
+    /// all marked `VOLATILE` by PostgreSQL. Any future volatile scalar
+    /// function (e.g. `random()`)
     /// belongs in [`is_volatile_call`](Self::is_volatile_call), which this
     /// delegates to. Used to refuse duplicating a volatile argument — when
     /// inlining a SQL function body, and when `NULLIF` places its left operand
@@ -893,6 +900,11 @@ impl BoundExpr {
     /// marks them `STABLE`, and they are. Calling them volatile would cost a
     /// real optimization — `WHERE ts > now() - interval '1 day'` could no
     /// longer be pushed to a leaf — for no change in the answer.
+    ///
+    /// Nor is `txid_current()` and its family, which PG also marks `STABLE`:
+    /// assigning the transaction's XID is a side effect that happens *once*,
+    /// so every call in one transaction answers the same number and
+    /// duplicating the node changes nothing.
     ///
     /// Note this stops at a subquery marker: a subquery's body is a plan of its
     /// own. A caller that needs to see inside one wants

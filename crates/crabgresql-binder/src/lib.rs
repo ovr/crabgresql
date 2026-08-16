@@ -46,7 +46,7 @@ pub use plan::{
     bind_query_with_params, bind_update, bind_update_with_params,
     expr_contains_correlated_subquery, expr_contains_volatile_fn, inheritance_descendants,
     output_columns_of, plan_calls_routine, plan_contains_volatile_fn, plan_has_outer_refs,
-    plan_outer_ref_slots, substitute_outer, substitute_params,
+    plan_needs_xid, plan_outer_ref_slots, substitute_outer, substitute_params,
 };
 pub use soft_input::{SoftError, TypeSpec, soft_input};
 

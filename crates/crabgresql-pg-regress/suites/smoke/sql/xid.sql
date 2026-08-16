@@ -11,10 +11,11 @@
 -- and gets the full set. The negative half of that split is the part upstream
 -- does not test, so it is covered here.
 --
--- The first half is ported from vendor/postgres/regress/sql/xid.sql; the rest
--- of that file is entirely `pg_snapshot`, `pg_current_xact_id*`,
--- `pg_xact_status` and `\gset`, none of which are modeled -- so upstream `xid`
--- is not on the promotion list in suites/upstream_must_pass.txt.
+-- The first half is ported from vendor/postgres/regress/sql/xid.sql. What
+-- remains unmodeled of that file is `pg_snapshot` and its visibility functions,
+-- so upstream `xid` is not on the promotion list in
+-- suites/upstream_must_pass.txt; `pg_current_xact_id*` and `pg_xact_status` are
+-- covered by the last section here, in a shape that does not need `\gset`.
 --
 -- `operator does not exist` now carries PG's full report — the `LINE n: ... ^`
 -- caret under the operator, the DETAIL, and the HINT. `function ... does not
@@ -134,3 +135,58 @@ drop table xid_t1;
 
 -- a btree-keyed column of type xid is rejected at DDL time for the same reason
 create table xid_pk (x xid primary key);
+
+--
+-- The transaction-id functions, and pg_is_in_recovery beside them. Every id is
+-- different on every run, so nothing below prints one: the answers are all
+-- predicates over them, and the one arithmetic check is a difference.
+--
+
+select pg_is_in_recovery();
+select pg_typeof(txid_current()), pg_typeof(pg_current_xact_id()),
+       pg_typeof(pg_is_in_recovery()), pg_typeof(pg_xact_status('2'::xid8));
+
+-- under autocommit the statement that asks gets an id of its own; one that does
+-- not ask has none, which is the whole of what `_if_assigned` reports
+select txid_current() > 0;
+select txid_current_if_assigned() is null;
+
+create table xact_ids (label text, id xid8);
+
+-- inside a block the id is assigned once and every later statement sees it
+begin;
+insert into xact_ids values ('block', pg_current_xact_id());
+select txid_current() = txid_current() as stable_within_one_statement;
+select txid_current()::text = txid_current_if_assigned()::text as assigned_now;
+select pg_current_xact_id() = id as stable_across_statements
+  from xact_ids where label = 'block';
+-- both spellings report the same number, one as int8 and one as xid8
+select txid_current()::text = pg_current_xact_id()::text as same_number;
+select pg_xact_status(pg_current_xact_id()) as own_status;
+commit;
+
+-- and once the block ends, that same id reads as committed
+select pg_xact_status(id) from xact_ids where label = 'block';
+
+-- assigning an id is not a write, so a read-only block may still ask for one
+begin read only;
+select txid_current() > 0 as allowed_in_a_read_only_block;
+commit;
+
+-- only a statement that asks consumes an id: the two plain reads between these
+-- two lines consume none, so the difference is exactly one
+insert into xact_ids values ('before reads', pg_current_xact_id());
+select 1;
+select 1;
+select pg_current_xact_id()::text::int8 - id::text::int8 as ids_consumed
+  from xact_ids where label = 'before reads';
+
+-- pg_xact_status edges: the invalid id names no transaction, the two reserved
+-- ids below the first normal one are permanently committed, and an id at or
+-- above the next one to hand out has not started yet
+select pg_xact_status('0'::xid8) is null as invalid_has_no_status;
+select pg_xact_status('1'::xid8), pg_xact_status('2'::xid8);
+select pg_xact_status(null::xid8) is null;
+select pg_xact_status('18446744073709551615'::xid8);
+
+drop table xact_ids;

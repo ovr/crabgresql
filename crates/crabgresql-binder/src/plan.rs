@@ -27,7 +27,7 @@ use crate::expr::{
     reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
     view_expansion,
 };
-use crate::functions::{bind_table_fn_call, positional_arg_exprs};
+use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
     InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
@@ -1006,6 +1006,19 @@ fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
     found
 }
 
+/// Whether any expression node anywhere in `plan` satisfies `pred`. The two
+/// predicates below are the callers; see [`BoundExpr::any_node`] for why the
+/// walk is shared rather than written out per question.
+pub(crate) fn plan_any_expr_node(plan: &LogicalPlan, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
+    let mut found = false;
+    // A match anywhere answers the question, however deeply nested, so this
+    // visitor ignores the depth.
+    for_each_plan_expr(plan, 1, &mut |e, _| {
+        found = found || e.any_node(pred);
+    });
+    found
+}
+
 /// Whether `plan` calls a user-defined routine anywhere.
 ///
 /// A routine body may write, and the executor cannot tell before running it —
@@ -1013,15 +1026,33 @@ fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
 /// to stamp the body's versions with, and its result set has to be drained
 /// before the transaction is finalized rather than streamed after it.
 pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
-    let mut found = false;
-    // A routine anywhere makes the statement a write, however deeply nested, so
-    // this visitor ignores the depth.
-    for_each_plan_expr(plan, 1, &mut |e, _| {
-        if e.contains_routine() {
-            found = true;
-        }
-    });
-    found
+    plan_any_expr_node(plan, &|e| matches!(e, BoundExpr::Routine { .. }))
+}
+
+/// Whether `plan` must run with a transaction id assigned to it.
+///
+/// A routine call is one reason — see [`plan_calls_routine`].
+/// `txid_current()` / `pg_current_xact_id()` are the other, for a different
+/// reason: the id *is* their answer, and PostgreSQL assigns one when the
+/// transaction has none. The server allocates the XID before execution begins
+/// and commits it afterwards, so answering true here is what keeps such a
+/// statement from either reporting no id or leaving an in-flight one behind
+/// that no commit ever retires. Their `_if_assigned` forms deliberately do not
+/// count: reporting NULL when there is no XID is their whole meaning.
+pub fn plan_needs_xid(plan: &LogicalPlan) -> bool {
+    plan_any_expr_node(plan, &|e| {
+        matches!(
+            e,
+            BoundExpr::Routine { .. }
+                | BoundExpr::FuncCall {
+                    func: ScalarFn::CurrentXactId {
+                        if_assigned: false,
+                        ..
+                    },
+                    ..
+                }
+        )
+    })
 }
 
 /// Visit every top-level expression of `plan`, recursing through structural

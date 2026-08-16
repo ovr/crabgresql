@@ -1135,7 +1135,15 @@ pub(crate) fn execute_statement_with(
     // a statement that calls one is treated as a write: it needs an XID to stamp
     // the body's versions with. Conservative — a pure routine burns an XID — and
     // observably harmless, since PostgreSQL defaults routines to VOLATILE anyway.
+    // `txid_current()` joins it for a different reason: the XID *is* its answer,
+    // so it must be allocated here and committed by `finalize_statement` rather
+    // than left in flight with nothing to retire it.
+    //
+    // The two are asked separately because only the routine reason also forces
+    // the result set to be materialized below — a `txid_current()` in the select
+    // list runs no body and can stream like any other expression.
     let calls_routine = crabgresql_binder::plan_calls_routine(&logical);
+    let needs_xid = crabgresql_binder::plan_needs_xid(&logical);
     let dml_verb = match logical {
         LogicalPlan::Insert(InsertPlan { .. }) => Some("INSERT"),
         LogicalPlan::Update(UpdatePlan { .. }) => Some("UPDATE"),
@@ -1147,7 +1155,7 @@ pub(crate) fn execute_statement_with(
     // makes the statement run for real. That covers a routine call too — plain
     // `EXPLAIN SELECT f()` plans without ever entering the body.
     let runs = explain.is_none_or(|opts| opts.analyze);
-    let is_write = (calls_routine || dml_verb.is_some()) && runs;
+    let is_write = (needs_xid || dml_verb.is_some()) && runs;
     // A write in a READ ONLY transaction (or under the read-only session default)
     // is rejected before it stamps any version, matching PG's 25006.
     //
