@@ -14,7 +14,7 @@
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.
 
-use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, SysCol, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, SystemEmit, UnaryOp};
 use crabgresql_types::{PgType, collation};
 
 use crate::{PhysicalAppendArm, PhysicalPlan};
@@ -280,7 +280,7 @@ fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
                     .relation
                     .system
                     .as_ref()
-                    .is_none_or(|emit| emit.cols.as_ref() == [SysCol::TableOid])
+                    .is_none_or(SystemEmit::is_batchable)
         })
 }
 

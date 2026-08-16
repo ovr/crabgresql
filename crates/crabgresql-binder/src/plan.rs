@@ -195,6 +195,7 @@ pub(crate) fn scan_arms(
             let leaf_ident = ident(&leaf.schema());
             push_storage_leaves(&mut arms, leaf, None, leaf_ident);
         }
+        reject_declining_arms(&arms)?;
         return Ok(Some(arms));
     }
     if !only {
@@ -209,15 +210,56 @@ pub(crate) fn scan_arms(
                 let child_ident = ident(&child_schema);
                 push_storage_leaves(&mut arms, child, map, child_ident);
             }
+            reject_declining_arms(&arms)?;
             return Ok(Some(arms));
         }
     }
-    Ok(table.storage_leaves().map(|leaves| {
+    let leaves = table.storage_leaves().map(|leaves| {
         leaves
             .into_iter()
             .map(|t| arm(t, None, ident(&schema)))
-            .collect()
-    }))
+            .collect::<Vec<_>>()
+    });
+    match leaves {
+        None => Ok(None),
+        Some(arms) => {
+            reject_declining_arms(&arms)?;
+            Ok(Some(arms))
+        }
+    }
+}
+
+/// Refuse a fan-out whose *leaf* cannot produce the system columns the named
+/// relation promised.
+///
+/// The capability was checked against the relation the statement named, but the
+/// arms are its partition leaves, inheritance children and storage leaves — and
+/// nothing makes a leaf's access method agree with its parent's. Today DDL
+/// happens to forbid the mismatch, in a different crate and for unrelated
+/// reasons; without this the executor's `scan_with_system` would meet a `None`
+/// and panic the session rather than raise.
+fn reject_declining_arms(arms: &[MappedRelation]) -> Result<(), BindError> {
+    for arm in arms {
+        let Some(emit) = &arm.system else { continue };
+        if emit.cols.iter().all(|c| !c.needs_storage_support())
+            || arm.table.supports_system_columns()
+        {
+            continue;
+        }
+        let schema = arm.table.schema();
+        let col = emit
+            .cols
+            .iter()
+            .find(|c| c.needs_storage_support())
+            .expect("the all() above returned false, so one column needs support");
+        return Err(BindError::feature_not_supported(format!(
+            "access method \"{}\" does not support system column \"{}\" on relation \"{}\"",
+            schema.access_method.as_str(),
+            col.name(),
+            schema.name,
+        )));
+    }
+    Ok(())
 }
 
 fn arm(
@@ -270,6 +312,7 @@ fn write_targets(
         let child_ident = ident(&child_schema);
         targets.push(arm(child, map, child_ident));
     }
+    reject_declining_arms(&targets)?;
     Ok(targets)
 }
 

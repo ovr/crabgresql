@@ -1,6 +1,6 @@
 //! `pg_attribute` and `pg_attrdef`: the columns and their defaults.
 
-use crabgresql_storage_api::TableSchema;
+use crabgresql_storage_api::{SysCol, TableSchema};
 use crabgresql_types::{PgType, Value};
 
 use crate::cols::*;
@@ -67,37 +67,23 @@ pub(crate) fn attcollation_of(column: &Column) -> u32 {
     }
 }
 
-/// The system attributes every relation carries, at the negative `attnum`
-/// PostgreSQL assigns each — read off a live PostgreSQL 18.4, where `ctid` is
-/// `-1` and the numbers run backwards from there to `tableoid` at `-6`. (`oid`
-/// no longer has one: PostgreSQL 12 removed the optional row OID, and with it
-/// the `-2` that used to hold the gap.)
-///
-/// A `pg_attribute` row is what makes a client's column list agree with what the
-/// server will actually answer, so these must stay in step with
-/// [`SysCol`](crabgresql_binder::SysCol) — the binder's list is what a query
-/// resolves against.
-const SYSTEM_ATTRIBUTES: &[(&str, PgType, i16)] = &[
-    ("ctid", PgType::Tid, -1),
-    ("xmin", PgType::Xid, -2),
-    ("cmin", PgType::Cid, -3),
-    ("xmax", PgType::Xid, -4),
-    ("cmax", PgType::Cid, -5),
-    ("tableoid", PgType::Oid, -6),
-];
-
 /// The six system-attribute rows for the relation `oid` names.
+/// Taken from [`SysCol`] rather than restated: the binder's list is what a query
+/// actually resolves against, and a `pg_attribute` row exists to make a client's
+/// column list agree with what the server will answer. A second copy here could
+/// drift into advertising a column the server refuses, or omitting one it serves.
 fn system_attribute_rows(oid: u32) -> Vec<Vec<Value>> {
-    SYSTEM_ATTRIBUTES
+    SysCol::ALL
         .iter()
-        .map(|(name, ty, attnum)| {
+        .map(|col| {
+            let ty = &col.ty();
             let (byval, align, storage) = attlayout_of(*ty);
             vec![
                 Value::Oid(oid),
-                Value::Text((*name).to_string()),
+                Value::Text(col.name().to_string()),
                 Value::Oid(ty.oid()),
                 Value::Int2(ty.typlen()),
-                Value::Int2(*attnum),
+                Value::Int2(col.attnum()),
                 Value::Int4(-1),
                 byval,
                 align,

@@ -39,6 +39,7 @@ use rustc_hash::FxHashMap;
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
     BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey, SysCol, SystemEmit,
+    needs_header, projects_after_write,
 };
 use crabgresql_planner::{
     DmlIndexProbe, DmlTarget, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
@@ -2444,7 +2445,7 @@ fn insert_direct(
     // statement with nothing written and the tuples move into `insert` uncloned.
     // Both orders are atomic — an error rolls the statement back either way —
     // but only the first order avoids the copy, so it stays the default.
-    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let after_write = projects_after_write(system);
     let projected = match (&returning, after_write) {
         (Some(returning), false) => {
             let sources = vec![SysSource::placed(oid, Tid::new(0, 0), None); tuples.len()];
@@ -2593,7 +2594,7 @@ fn insert_routed(
     };
     // As in `insert_direct`: `ctid` and the MVCC header only exist once the row
     // is placed, so a RETURNING naming one projects after the write.
-    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let after_write = projects_after_write(system);
     let projected = match (&returning, after_write) {
         (Some(returning), false) => {
             let sources: Vec<SysSource> = oids
@@ -2780,7 +2781,7 @@ fn update_inherited(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     // Read every target once up front, so the match set is fixed before any
     // write (Halloween-safe) and RETURNING can fault with nothing written.
     let scans: Vec<Vec<SystemRow>> = targets
@@ -2951,7 +2952,7 @@ fn update_inherited(
     // version, which does not exist until the write — so that case projects
     // after it. Everything else projects first, so a faulting expression aborts
     // the statement with nothing written.
-    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let after_write = projects_after_write(system);
     let projected = match (&returning, after_write) {
         (Some(returning), false) => Some(project_returning(
             new_rows.iter(),
@@ -2996,7 +2997,7 @@ fn update_inherited(
                     })
                     .unzip();
                 Some(project_returning(
-                    rows.into_iter(),
+                    rows,
                     &returning.projections,
                     Some((system, &sources)),
                     ctx,
@@ -3031,7 +3032,7 @@ fn update_direct(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     let original: Vec<SystemRow> =
         dml_rows(table, probe, needs_header, ctx, txn)?.collect::<Result<_, _>>()?;
     // `simulated` mirrors the post-update table so a UNIQUE check sees other
@@ -3123,7 +3124,7 @@ fn update_direct(
     // statement before any row is written. The exception is a RETURNING naming
     // `ctid` or the MVCC header: those describe the NEW version, which does not
     // exist until the write, so that case projects after it.
-    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let after_write = projects_after_write(system);
     let projected = match (&returning, after_write) {
         (Some(returning), false) => Some(project_returning(
             pending.iter().map(|(_, new)| new),
@@ -3166,7 +3167,7 @@ fn update_direct(
                 })
                 .unzip();
             Some(project_returning(
-                rows.into_iter(),
+                rows,
                 &returning.projections,
                 Some((system, &sources)),
                 ctx,
@@ -3238,7 +3239,7 @@ fn update_routed(
     // drives the match loop and — for leaves with a unique index — seeds the
     // post-statement simulation, so a leaf is never read twice and the match set
     // is fixed before any write (Halloween-safe).
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     let scans: Vec<Vec<SystemRow>> = leaves
         .iter()
         .map(|leaf| {
@@ -3411,7 +3412,7 @@ fn update_routed(
 
     // As in `update_direct`: project before any write unless the RETURNING names
     // `ctid` or the MVCC header, which describe the NEW version.
-    let after_write = system.iter().any(|c| *c != SysCol::TableOid);
+    let after_write = projects_after_write(system);
     let projected = match (&returning, after_write) {
         (Some(returning), false) => {
             let sources: Vec<SysSource> = returned_oids
@@ -3481,7 +3482,7 @@ fn update_routed(
                     })
                     .unzip();
                 Some(project_returning(
-                    rows.into_iter(),
+                    rows,
                     &returning.projections,
                     Some((system, &sources)),
                     ctx,
@@ -3715,7 +3716,7 @@ fn delete_inherited(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); targets.len()];
     // RETURNING sees the deleted (OLD) rows as rows of the named relation, in
     // scan (target) order.
@@ -3797,7 +3798,7 @@ fn delete_direct(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     let mut pending: Vec<Tid> = Vec::new();
     // RETURNING sees the deleted (OLD) rows; capture them alongside the tids.
     let mut deleted: Vec<Tuple> = Vec::new();
@@ -3867,7 +3868,7 @@ fn delete_routed(
     ctx: &ExecContext,
     txn: &TxnContext,
 ) -> Result<Execution, ExecError> {
-    let needs_header = system.iter().any(|c| c.needs_header());
+    let needs_header = needs_header(system);
     let mut pending: Vec<Vec<Tid>> = vec![Vec::new(); leaves.len()];
     // RETURNING sees the deleted (OLD) rows, in scan (leaf) order.
     let mut deleted: Vec<Tuple> = Vec::new();

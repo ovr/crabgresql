@@ -77,6 +77,95 @@ impl<'a> IndexProbeKey<'a> {
     }
 }
 
+/// One of PostgreSQL's per-row system columns.
+///
+/// `oid` is absent because PostgreSQL 12 removed it. The order of the variants
+/// is the order slots are appended to a row in, so it is load-bearing: the
+/// binder pushes [`OutputColumn`](crate::OutputColumn)s and the executor pushes
+/// [`Value`]s by walking the same sorted list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SysCol {
+    /// The OID of the relation the row lives in. Answerable by every access
+    /// method: it is a fact about the relation, not about the row's storage.
+    TableOid,
+    /// The row version's physical address, PG's `ctid`.
+    Ctid,
+    /// The inserting transaction.
+    Xmin,
+    /// The command within [`SysCol::Xmin`] that inserted the row.
+    Cmin,
+    /// The deleting transaction, or `0` while the version is live.
+    Xmax,
+    /// The command within [`SysCol::Xmax`] that deleted the row.
+    Cmax,
+}
+
+impl SysCol {
+    /// Every system column, in row order.
+    pub const ALL: [SysCol; 6] = [
+        SysCol::TableOid,
+        SysCol::Ctid,
+        SysCol::Xmin,
+        SysCol::Cmin,
+        SysCol::Xmax,
+        SysCol::Cmax,
+    ];
+
+    /// The name a query addresses this column by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SysCol::TableOid => "tableoid",
+            SysCol::Ctid => "ctid",
+            SysCol::Xmin => "xmin",
+            SysCol::Cmin => "cmin",
+            SysCol::Xmax => "xmax",
+            SysCol::Cmax => "cmax",
+        }
+    }
+
+    /// The type the slot carries.
+    pub const fn ty(self) -> PgType {
+        match self {
+            SysCol::TableOid => PgType::Oid,
+            SysCol::Ctid => PgType::Tid,
+            SysCol::Xmin | SysCol::Xmax => PgType::Xid,
+            SysCol::Cmin | SysCol::Cmax => PgType::Cid,
+        }
+    }
+
+    /// Whether answering this needs the row version's MVCC header rather than
+    /// just its tid — the difference between
+    /// [`TableAm::scan`](crabgresql_storage_api::TableAm::scan) and
+    /// [`TableAm::scan_with_system`](crabgresql_storage_api::TableAm::scan_with_system).
+    pub const fn needs_header(self) -> bool {
+        matches!(
+            self,
+            SysCol::Xmin | SysCol::Cmin | SysCol::Xmax | SysCol::Cmax
+        )
+    }
+
+    /// Whether the access method has to be able to produce this per row. Only
+    /// `tableoid` does not: every relation has an identity, whatever it stores.
+    pub const fn needs_storage_support(self) -> bool {
+        !matches!(self, SysCol::TableOid)
+    }
+
+    /// The negative `attnum` `pg_attribute` lists this column at, read off a
+    /// live PostgreSQL 18.4 — `ctid` is `-1` and the numbers run backwards to
+    /// `tableoid` at `-6`. (`oid` no longer has one: PostgreSQL 12 removed the
+    /// optional row OID, and with it the `-2` that used to hold the gap.)
+    pub const fn attnum(self) -> i16 {
+        match self {
+            SysCol::Ctid => -1,
+            SysCol::Xmin => -2,
+            SysCol::Cmin => -3,
+            SysCol::Xmax => -4,
+            SysCol::Cmax => -5,
+            SysCol::TableOid => -6,
+        }
+    }
+}
+
 /// A materialized row. Always as wide as the table schema, with column order
 /// matching it. A scan restricted by a [`ColumnProjection`] still returns a
 /// full-width tuple; only the values at unselected positions are unspecified.
@@ -1276,11 +1365,11 @@ pub trait TableAm: Send + Sync {
     /// row versions, and have no header to surface. A reference to a system
     /// column on such a relation is rejected at bind time.
     ///
-    /// **A delegating wrapper must forward this, [`TableAm::scan_with_system`]
-    /// and [`TableAm::index_lookup_with_system`]** — the same trap
-    /// [`TableAm::scan_batches`] carries, and with the same silent failure:
-    /// forgetting them compiles, and a leaf that *does* keep headers quietly
-    /// stops answering.
+    /// **A delegating wrapper must forward this, [`TableAm::scan_with_system`],
+    /// [`TableAm::index_lookup_with_system`] and [`TableAm::update_many_tids`]**
+    /// — the same trap [`TableAm::scan_batches`] carries, and with the same
+    /// silent failure: forgetting one compiles, and a leaf that *does* keep
+    /// headers quietly stops answering.
     fn supports_system_columns(&self) -> bool {
         false
     }

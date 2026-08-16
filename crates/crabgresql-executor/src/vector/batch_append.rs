@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
-use crabgresql_binder::SysCol;
 use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_txn::TxnContext;
 
@@ -33,9 +32,10 @@ impl BatchAppend {
     ///
     /// The remap branch is unreachable today: DDL refuses an engine-managed
     /// relation on either side of an inheritance link, so no remapped arm can be
-    /// batch-capable. The planner's [`arms_batch`] applies the same rules, so
-    /// neither a remapped arm nor a system slot makes `EXPLAIN` disagree with
-    /// what runs.
+    /// batch-capable. The planner asks the *same* predicate
+    /// ([`SystemEmit::is_batchable`](crabgresql_binder::SystemEmit::is_batchable))
+    /// for its `EXPLAIN` annotation, so neither a remapped arm nor a system slot
+    /// can make the annotation disagree with what runs.
     ///
     /// **`tableoid` is the only system column reachable here**, and not by
     /// choice: the access methods that hand up batches are exactly the columnar
@@ -54,7 +54,13 @@ impl BatchAppend {
             .map(|arm| {
                 // A remapped arm changes the row shape the batch layout
                 // describes; a system slot this cannot synthesize does too.
-                if arm.relation.map.is_some() || !batch_capable_system(arm) {
+                if arm.relation.map.is_some()
+                    || arm
+                        .relation
+                        .system
+                        .as_ref()
+                        .is_some_and(|e| !e.is_batchable())
+                {
                     return None;
                 }
                 let scan = BatchScan::open(&arm.relation.table, txn, &arm.projection, ctx)?;
@@ -74,16 +80,6 @@ impl BatchAppend {
             children,
             cursor: 0,
         })
-    }
-}
-
-/// Whether this arm's system slots — if it has any — are ones the batch path can
-/// synthesize. Shared in spirit with the planner's `arms_batch`, which must
-/// answer the same question for `EXPLAIN`.
-fn batch_capable_system(arm: &PhysicalAppendArm) -> bool {
-    match &arm.relation.system {
-        None => true,
-        Some(emit) => emit.cols.as_ref() == [SysCol::TableOid],
     }
 }
 

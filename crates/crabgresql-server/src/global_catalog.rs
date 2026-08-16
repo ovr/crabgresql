@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    EnumInfo, RelationMetadata, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig,
-    TypeCatalog, UserCast, UserType,
+    EnumInfo, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig, TypeCatalog, UserCast,
+    UserType,
 };
 use crabgresql_types::PgType;
 

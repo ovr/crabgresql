@@ -309,6 +309,14 @@ impl TableAm for ManagedTable {
         self.as_am().update_many(updates, txn)
     }
 
+    fn update_many_tids(
+        &self,
+        updates: Vec<(Tid, Tuple)>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Option<Tid>>, StorageError> {
+        self.as_am().update_many_tids(updates, txn)
+    }
+
     fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {
         self.as_am().delete_many(tids, txn)
     }

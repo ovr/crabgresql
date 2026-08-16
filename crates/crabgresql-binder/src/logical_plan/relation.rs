@@ -5,8 +5,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crabgresql_storage_api::{TableAm, TableSchema};
-use crabgresql_types::{PgType, Value};
+use crabgresql_storage_api::{SysCol, TableAm, TableSchema};
+use crabgresql_types::Value;
 
 /// One relation a statement reaches through the name of another, with the
 /// permutation that puts its tuples into the *named* relation's layout — an arm
@@ -63,78 +63,45 @@ pub struct SystemEmit {
     pub ident: RelationIdent,
 }
 
-/// One of PostgreSQL's per-row system columns.
-///
-/// `oid` is absent because PostgreSQL 12 removed it. The order of the variants
-/// is the order slots are appended to a row in, so it is load-bearing: the
-/// binder pushes [`OutputColumn`](crate::OutputColumn)s and the executor pushes
-/// [`Value`]s by walking the same sorted list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SysCol {
-    /// The OID of the relation the row lives in. Answerable by every access
-    /// method: it is a fact about the relation, not about the row's storage.
-    TableOid,
-    /// The row version's physical address, PG's `ctid`.
-    Ctid,
-    /// The inserting transaction.
-    Xmin,
-    /// The command within [`SysCol::Xmin`] that inserted the row.
-    Cmin,
-    /// The deleting transaction, or `0` while the version is live.
-    Xmax,
-    /// The command within [`SysCol::Xmax`] that deleted the row.
-    Cmax,
+impl SystemEmit {
+    /// Whether the columnar path can synthesize these slots onto a batch.
+    ///
+    /// Only `tableoid` — a fact about the relation, so a constant column. A
+    /// [`BatchStream`](crabgresql_storage_api::BatchStream) carries no
+    /// [`Tid`](crabgresql_storage_api::Tid), deliberately, so `ctid` has nothing
+    /// to read; and the access methods that hand up batches keep no row version,
+    /// so the header columns are refused before reaching here anyway.
+    ///
+    /// Asked by both the executor's batch node and the planner's `EXPLAIN`
+    /// annotation, which must agree — an annotation the executor disagrees with
+    /// reports work that never happened.
+    pub fn is_batchable(&self) -> bool {
+        self.cols.as_ref() == [SysCol::TableOid]
+    }
+
+    /// Whether these slots need the row version's MVCC header, rather than just
+    /// its tid and the relation's identity.
+    pub fn needs_header(&self) -> bool {
+        self.cols.iter().any(|c| c.needs_header())
+    }
+
+    /// Whether a `RETURNING` over these slots must be projected *after* the
+    /// write: `ctid` and the header describe a version that does not exist until
+    /// the row is placed, while `tableoid` is known up front.
+    pub fn projects_after_write(&self) -> bool {
+        self.cols.iter().any(|c| c.needs_storage_support())
+    }
 }
 
-impl SysCol {
-    /// Every system column, in row order.
-    pub const ALL: [SysCol; 6] = [
-        SysCol::TableOid,
-        SysCol::Ctid,
-        SysCol::Xmin,
-        SysCol::Cmin,
-        SysCol::Xmax,
-        SysCol::Cmax,
-    ];
+/// [`SystemEmit::needs_header`] for a bare slot list, which is how the DML
+/// paths carry it.
+pub fn needs_header(cols: &[SysCol]) -> bool {
+    cols.iter().any(|c| c.needs_header())
+}
 
-    /// The name a query addresses this column by.
-    pub const fn name(self) -> &'static str {
-        match self {
-            SysCol::TableOid => "tableoid",
-            SysCol::Ctid => "ctid",
-            SysCol::Xmin => "xmin",
-            SysCol::Cmin => "cmin",
-            SysCol::Xmax => "xmax",
-            SysCol::Cmax => "cmax",
-        }
-    }
-
-    /// The type the slot carries.
-    pub const fn ty(self) -> PgType {
-        match self {
-            SysCol::TableOid => PgType::Oid,
-            SysCol::Ctid => PgType::Tid,
-            SysCol::Xmin | SysCol::Xmax => PgType::Xid,
-            SysCol::Cmin | SysCol::Cmax => PgType::Cid,
-        }
-    }
-
-    /// Whether answering this needs the row version's MVCC header rather than
-    /// just its tid — the difference between
-    /// [`TableAm::scan`](crabgresql_storage_api::TableAm::scan) and
-    /// [`TableAm::scan_with_system`](crabgresql_storage_api::TableAm::scan_with_system).
-    pub const fn needs_header(self) -> bool {
-        matches!(
-            self,
-            SysCol::Xmin | SysCol::Cmin | SysCol::Xmax | SysCol::Cmax
-        )
-    }
-
-    /// Whether the access method has to be able to produce this per row. Only
-    /// `tableoid` does not: every relation has an identity, whatever it stores.
-    pub const fn needs_storage_support(self) -> bool {
-        !matches!(self, SysCol::TableOid)
-    }
+/// [`SystemEmit::projects_after_write`] for a bare slot list.
+pub fn projects_after_write(cols: &[SysCol]) -> bool {
+    cols.iter().any(|c| c.needs_storage_support())
 }
 
 /// The relation a scan answers `tableoid` with.
