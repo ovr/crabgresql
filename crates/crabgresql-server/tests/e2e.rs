@@ -12854,6 +12854,61 @@ async fn system_columns_on_a_heap_relation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `cmin` and `cmax` report one number, and the command counter that produces
+/// it moves the way PostgreSQL's does.
+///
+/// Upstream keeps the two in a single field, so a row's `cmin` and `cmax` always
+/// agree; and the counter advances only for a command that *used* its id, so a
+/// `SELECT` between two `INSERT`s does not push the second row's `cmin` along.
+/// A DDL statement does use one — upstream stamps catalog tuples with it — which
+/// is why the first row inserted after a `CREATE TABLE` in the same block reads
+/// `1`, not `0`. Every value below is pinned against PostgreSQL 18.4.
+#[tokio::test]
+async fn cmin_and_cmax_track_postgresqls_command_counter() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "BEGIN; CREATE TABLE t (a int); \
+             INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)",
+        )
+        .await?;
+    let read = client
+        .simple_query("SELECT a, cmin::text, cmax::text FROM t ORDER BY a")
+        .await?;
+    let read = rows(&read);
+    for (i, row) in read.iter().enumerate() {
+        let expected = (i + 1).to_string();
+        assert_eq!(
+            (row.get(1), row.get(2)),
+            (Some(expected.as_str()), Some(expected.as_str())),
+            "row {} must report one command id for both",
+            i + 1,
+        );
+    }
+
+    // A read-only statement uses no command id, so the next insert keeps the
+    // one it would have had.
+    client.simple_query("SELECT 1").await?;
+    client.simple_query("INSERT INTO t VALUES (4)").await?;
+    assert_eq!(
+        scalar(&client, "SELECT cmin::text FROM t WHERE a = 4").await,
+        "4",
+    );
+    client.simple_query("COMMIT").await?;
+
+    // Once there is a deleter, both report *its* command id.
+    let deleted = client
+        .simple_query("DELETE FROM t WHERE a = 1 RETURNING cmin::text, cmax::text")
+        .await?;
+    let deleted = rows(&deleted);
+    assert_eq!(
+        (deleted[0].get(0), deleted[0].get(1)),
+        (Some("0"), Some("0"))
+    );
+    Ok(())
+}
+
 /// A `DELETE`'s `WHERE` reads the row as it is **stored**, not as the delete
 /// will leave it.
 ///

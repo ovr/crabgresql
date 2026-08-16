@@ -752,6 +752,12 @@ pub(crate) fn execute_statement_with(
     // statement PostgreSQL forbids in a read-only transaction is one that
     // changes what the catalog would report.
     if result.is_ok() && read_only_prohibited_ddl(stmt).is_some() {
+        // DDL uses a command id: upstream stamps catalog tuples with it, which
+        // is why `BEGIN; CREATE TABLE t(…); INSERT …` reports the inserted
+        // row's `cmin` as 1 rather than 0. Nothing here writes an MVCC catalog
+        // row, so the counter is advanced directly rather than as a side effect
+        // of a write.
+        advance_command_counter(session);
         global_catalog.note_ddl(txnmgr.clog().next_xid_floor().0);
         // …and which relations this statement actually changed, so each one's
         // catalog rows carry a generation of its own. Derived from the shapes
@@ -1514,7 +1520,8 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
 /// commits (or aborts on error) immediately — its effects are meant to persist
 /// at the statement boundary. Inside a block nothing is finalized here; the XID
 /// lives until `COMMIT`/`ROLLBACK`. The command counter advances so the next
-/// statement in a block sees this one's writes.
+/// statement in a block sees this one's writes — but only if this one *used*
+/// its command id; see [`advance_command_counter`].
 fn finalize_statement(
     txnmgr: &TransactionManager,
     session: &mut Session,
@@ -1543,10 +1550,16 @@ fn finalize_statement(
             // Read the counter back rather than adding one: a routine body may
             // have advanced it several times, and reusing an id it already
             // stamped rows with would hide those rows from the next statement.
-            let used = command_counter.map_or(active.cid.0, |c| {
+            let routine = command_counter.map_or(active.cid.0, |c| {
                 c.load(std::sync::atomic::Ordering::Acquire)
             });
-            active.cid = CommandId(used.max(active.cid.0) + 1);
+            // A statement that stamped nothing leaves the counter where it is,
+            // as upstream's `currentCommandIdUsed` does — otherwise a `SELECT`
+            // between two `INSERT`s pushes the second row's `cmin` a command
+            // past what PostgreSQL reports for it.
+            if is_write || routine > active.cid.0 {
+                active.cid = CommandId(routine.max(active.cid.0) + 1);
+            }
         }
     }
     Ok(())
@@ -1927,6 +1940,18 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::DropCast { .. } => "DROP CAST",
         _ => return None,
     })
+}
+
+/// Move the block's command counter on, for a statement that used its command
+/// id without going through [`finalize_statement`] — a DDL statement, which
+/// returns from its own handler.
+///
+/// A no-op under autocommit: the counter is per block, and a statement outside
+/// one has no successor to hide its writes from.
+fn advance_command_counter(session: &mut Session) {
+    if let Some(active) = session.xact.as_mut() {
+        active.cid = CommandId(active.cid.0 + 1);
+    }
 }
 
 /// `BEGIN` / `START TRANSACTION`. Enters the transaction block, seeding its

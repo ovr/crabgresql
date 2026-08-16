@@ -4104,8 +4104,18 @@ pub(crate) fn push_system(
                 match col {
                     SysCol::Xmin => Value::Xid(hdr.xmin.0 as u32),
                     SysCol::Xmax => Value::Xid(hdr.xmax.0 as u32),
-                    SysCol::Cmin => Value::Cid(hdr.cmin.0),
-                    SysCol::Cmax => Value::Cid(hdr.cmax.0),
+                    // One number for both, which is what upstream shows:
+                    // PostgreSQL keeps the two in a single field and the system
+                    // columns read it raw, so `cmin` and `cmax` always agree on
+                    // a row. The storage here does keep them apart — visibility
+                    // needs to judge an own insert and an own delete
+                    // independently, which upstream buys with combo cids — so
+                    // the field to report is the one that was last written:
+                    // the deleter's once there is a deleter.
+                    SysCol::Cmin | SysCol::Cmax => Value::Cid(match hdr.xmax.is_valid() {
+                        true => hdr.cmax.0,
+                        false => hdr.cmin.0,
+                    }),
                     SysCol::TableOid | SysCol::Ctid => unreachable!("handled above"),
                 }
             }
