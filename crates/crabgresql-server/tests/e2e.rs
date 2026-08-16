@@ -14552,6 +14552,49 @@ async fn txid_current_assigns_per_statement_under_autocommit() -> anyhow::Result
     Ok(())
 }
 
+/// A statement holding an XID has its rows produced while its own transaction is
+/// still open, which decides two answers a streamed result set would get wrong:
+/// the id reads as running rather than as already committed, and a fault raised
+/// part-way through the rows aborts the transaction instead of committing one
+/// whose output never reached the client.
+#[tokio::test]
+async fn an_xid_holding_statement_produces_its_rows_before_it_commits() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    assert_eq!(
+        client
+            .query_one("SELECT pg_xact_status(pg_current_xact_id()) AS s", &[])
+            .await?
+            .get::<_, String>("s"),
+        "in progress"
+    );
+
+    client.batch_execute("CREATE TABLE zz (a int)").await?;
+    client.batch_execute("INSERT INTO zz VALUES (0)").await?;
+    let before: i64 = client
+        .query_one("SELECT txid_current() AS id", &[])
+        .await?
+        .get("id");
+    let err = client
+        .query("SELECT txid_current(), 1 / a FROM zz", &[])
+        .await
+        .expect_err("division by zero must reach the client");
+    assert_eq!(err.code().map(|c| c.code()), Some("22012"));
+
+    // Ids are handed out in order and this server has one session, so the
+    // statement that faulted took exactly the next one.
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT pg_xact_status($1::text::xid8) AS s",
+                &[&(before + 1).to_string()],
+            )
+            .await?
+            .get::<_, String>("s"),
+        "aborted"
+    );
+    Ok(())
+}
+
 /// A rolled-back block's id reads as aborted, and `pg_is_in_recovery()` — which
 /// clients ask on connect — answers false rather than failing to bind.
 #[tokio::test]

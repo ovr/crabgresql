@@ -1138,11 +1138,6 @@ pub(crate) fn execute_statement_with(
     // `txid_current()` joins it for a different reason: the XID *is* its answer,
     // so it must be allocated here and committed by `finalize_statement` rather
     // than left in flight with nothing to retire it.
-    //
-    // The two are asked separately because only the routine reason also forces
-    // the result set to be materialized below — a `txid_current()` in the select
-    // list runs no body and can stream like any other expression.
-    let calls_routine = crabgresql_binder::plan_calls_routine(&logical);
     let needs_xid = crabgresql_binder::plan_needs_xid(&logical);
     let dml_verb = match logical {
         LogicalPlan::Insert(InsertPlan { .. }) => Some("INSERT"),
@@ -1275,24 +1270,30 @@ pub(crate) fn execute_statement_with(
         }
     };
     // `finalize_statement` closes the statement's transaction, and a streamed
-    // result set is pulled *after* it returns — so a routine called per row
-    // would run its body after its own transaction had already committed or
-    // aborted. Drain the rows here instead when a routine is in the plan.
+    // result set is pulled *after* it returns. So a plan whose rows depend on
+    // the transaction still being open has to be drained here instead —
+    // which is exactly the plans that hold an XID, for both of the reasons they
+    // hold one. A routine called per row would run its body after its own
+    // transaction had already committed or aborted; and a `txid_current()` would
+    // report the state of a transaction that is no longer running, answering
+    // `committed` where PostgreSQL answers `in progress`.
     //
-    // TODO: give portals their own transaction lifetimes, so a plan that calls a
-    // routine can stream instead of being buffered. PostgreSQL streams and holds
-    // the transaction open until the portal closes; the cost of buffering here is
-    // the result set's memory, paid only by statements that call a routine.
+    // Draining is also what puts a fault raised while producing a row — a
+    // `RAISE EXCEPTION` in a body, a division by zero in a projection — back on
+    // the abort path `execute` has above. Streamed, it surfaces after the commit
+    // has already been written, and the statement's XID is recorded as committed
+    // though its rows never reached the client.
+    //
+    // TODO: give portals their own transaction lifetimes, so such a plan can
+    // stream instead of being buffered. PostgreSQL streams and holds the
+    // transaction open until the portal closes; the cost of buffering here is
+    // the result set's memory, paid by any statement holding an XID — including
+    // a `SELECT txid_current() FROM <large table>`.
     //
     // `force_materialize` is the same need from the other direction: `DECLARE …
     // CURSOR` keeps its rows past the end of this statement, so they have to be
     // read while the transaction is still open.
-    //
-    // Draining is where a routine body actually runs, so it is also where a
-    // `RAISE EXCEPTION` surfaces — it needs the same abort path `execute` has
-    // above, or the statement's XID is never marked aborted and stays in the
-    // in-flight set, pinning the snapshot horizon for the life of the process.
-    let exec = if calls_routine || force_materialize {
+    let exec = if needs_xid || force_materialize {
         match materialize(exec) {
             Ok(exec) => exec,
             Err(e) => {

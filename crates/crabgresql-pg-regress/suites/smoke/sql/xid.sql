@@ -168,6 +168,11 @@ commit;
 -- and once the block ends, that same id reads as committed
 select pg_xact_status(id) from xact_ids where label = 'block';
 
+-- the same question under autocommit, where the id belongs to this one
+-- statement: it is still running while its own rows are produced, so the answer
+-- is not the `committed` a result set read after the commit would report
+select pg_xact_status(pg_current_xact_id()) as own_status_autocommit;
+
 -- assigning an id is not a write, so a read-only block may still ask for one
 begin read only;
 select txid_current() > 0 as allowed_in_a_read_only_block;

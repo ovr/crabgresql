@@ -634,10 +634,10 @@ impl BoundExpr {
     /// inside a subquery marker — a correlated subplan is executed per outer
     /// row, so a node in one still runs under this statement.
     ///
-    /// Takes the predicate rather than naming what it looks for because two
-    /// callers ask two different questions of the same walk (see
-    /// [`crate::plan_calls_routine`] and [`crate::plan_needs_xid`]), and a copy
-    /// of this traversal per question is a copy that drifts.
+    /// Takes the predicate rather than naming what it looks for so that a
+    /// second question of the same shape — [`crate::plan_needs_xid`] is the
+    /// first — is a one-line `matches!` and not another copy of this traversal
+    /// to keep in step with the `BoundExpr` variants.
     pub fn any_node(&self, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
         if pred(self) {
             return true;

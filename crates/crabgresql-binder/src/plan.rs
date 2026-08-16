@@ -1006,9 +1006,9 @@ fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
     found
 }
 
-/// Whether any expression node anywhere in `plan` satisfies `pred`. The two
-/// predicates below are the callers; see [`BoundExpr::any_node`] for why the
-/// walk is shared rather than written out per question.
+/// Whether any expression node anywhere in `plan` satisfies `pred`. See
+/// [`BoundExpr::any_node`] for why the walk takes the predicate rather than
+/// naming what it looks for.
 pub(crate) fn plan_any_expr_node(plan: &LogicalPlan, pred: &dyn Fn(&BoundExpr) -> bool) -> bool {
     let mut found = false;
     // A match anywhere answers the question, however deeply nested, so this
@@ -1019,26 +1019,25 @@ pub(crate) fn plan_any_expr_node(plan: &LogicalPlan, pred: &dyn Fn(&BoundExpr) -
     found
 }
 
-/// Whether `plan` calls a user-defined routine anywhere.
+/// Whether `plan` must run with a transaction id assigned to it. Two kinds of
+/// node say so, for two different reasons.
 ///
-/// A routine body may write, and the executor cannot tell before running it —
-/// so a statement that calls one has to be treated as a write: it needs an XID
-/// to stamp the body's versions with, and its result set has to be drained
-/// before the transaction is finalized rather than streamed after it.
-pub fn plan_calls_routine(plan: &LogicalPlan) -> bool {
-    plan_any_expr_node(plan, &|e| matches!(e, BoundExpr::Routine { .. }))
-}
-
-/// Whether `plan` must run with a transaction id assigned to it.
+/// A routine body may write, and the executor cannot tell before running it, so
+/// a statement that calls one is treated as a write: it needs an XID to stamp
+/// the body's versions with.
 ///
-/// A routine call is one reason — see [`plan_calls_routine`].
-/// `txid_current()` / `pg_current_xact_id()` are the other, for a different
-/// reason: the id *is* their answer, and PostgreSQL assigns one when the
-/// transaction has none. The server allocates the XID before execution begins
-/// and commits it afterwards, so answering true here is what keeps such a
-/// statement from either reporting no id or leaving an in-flight one behind
-/// that no commit ever retires. Their `_if_assigned` forms deliberately do not
-/// count: reporting NULL when there is no XID is their whole meaning.
+/// `txid_current()` / `pg_current_xact_id()` need one because the id *is* their
+/// answer, and PostgreSQL assigns one when the transaction has none. The server
+/// allocates the XID before execution begins and commits it afterwards, so
+/// answering true here is what keeps such a statement from either reporting no
+/// id or leaving an in-flight one behind that no commit ever retires. Their
+/// `_if_assigned` forms deliberately do not count: reporting NULL when there is
+/// no XID is their whole meaning.
+///
+/// Both reasons also make the statement's result set one that has to be drained
+/// before its transaction is finalized rather than streamed after it — the body
+/// runs, and the id is read, while the transaction must still be open. That is
+/// why this is one predicate and not two.
 pub fn plan_needs_xid(plan: &LogicalPlan) -> bool {
     plan_any_expr_node(plan, &|e| {
         matches!(
