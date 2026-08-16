@@ -783,6 +783,60 @@ impl Numeric {
         Ok(r)
     }
 
+    /// `gcd(x, y)`, always non-negative, with `dscale = max(scale_x, scale_y)`.
+    ///
+    /// NaN *and* the infinities answer NaN: an infinity has no finite divisor,
+    /// and PG reports that as NaN rather than an error (unlike the integer
+    /// overloads, which raise on an unrepresentable magnitude).
+    ///
+    /// Euclid runs on the decimals directly. It terminates because both
+    /// operands are whole multiples of `10^-dscale`, so the remainders are a
+    /// strictly decreasing sequence of such multiples — the same argument that
+    /// makes integer Euclid terminate, one grid finer.
+    pub fn gcd(&self, other: &Numeric) -> Numeric {
+        if self.is_special() || other.is_special() {
+            return Numeric::nan();
+        }
+        let dscale = self.dscale.max(other.dscale);
+        let mut a = self.abs();
+        let mut b = other.abs();
+        while !b.is_zero() {
+            // `b` is non-zero, so the only error `modulo` can report cannot
+            // arise here.
+            let r = match a.modulo(&b) {
+                Ok(r) => r,
+                Err(_) => unreachable!("gcd: modulo by a non-zero divisor"),
+            };
+            a = b;
+            b = r;
+        }
+        a.round(dscale)
+    }
+
+    /// `lcm(x, y)`, always non-negative, with `dscale = max(scale_x, scale_y)`.
+    ///
+    /// A zero operand answers zero before anything is divided, matching PG —
+    /// `lcm(0, x)` is 0 even where `x` would make the product overflow.
+    ///
+    /// Rounding to `dscale` at the end never loses a digit: the result is a
+    /// whole multiple of each operand, so it needs no more fractional digits
+    /// than the operand with the fewer of them.
+    pub fn lcm(&self, other: &Numeric) -> Result<Numeric, NumErr> {
+        if self.is_special() || other.is_special() {
+            return Ok(Numeric::nan());
+        }
+        let dscale = self.dscale.max(other.dscale);
+        if self.is_zero() || other.is_zero() {
+            return Ok(Numeric::zero(dscale));
+        }
+        let g = self.gcd(other);
+        // `self / g` is exact — `g` divides `self` — so the division introduces
+        // no rounding of its own, and dividing before multiplying keeps the
+        // intermediate as small as PG keeps it.
+        let q = self.div(&g)?;
+        Ok(q.mul(other).abs().round(dscale))
+    }
+
     // ---- rounding / truncation -------------------------------------------
 
     /// `round(x, s)`: round-half-away-from-zero to `s` fractional digits (`s`

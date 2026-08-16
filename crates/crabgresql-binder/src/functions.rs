@@ -49,6 +49,30 @@ pub enum ScalarFn {
     Erfc,
     Gamma,
     Lgamma,
+    /// `sin(float8) -> float8`, the argument in radians. Unlike the degree tier
+    /// below, the radian functions are the platform's libm and nothing else:
+    /// PG returns `sin(radians(30)) = 0.49999999999999994`, not an exact 0.5.
+    Sin,
+    /// `cos(float8) -> float8`, radians.
+    Cos,
+    /// `tan(float8) -> float8`, radians.
+    Tan,
+    /// `cot(float8) -> float8`, radians.
+    Cot,
+    /// `asin(float8) -> float8`, in radians.
+    Asin,
+    /// `acos(float8) -> float8`, in radians.
+    Acos,
+    /// `atan(float8) -> float8`, in radians.
+    Atan,
+    /// `atan2(float8, float8) -> float8`, in radians.
+    Atan2,
+    /// `degrees(float8) -> float8` — radians to degrees.
+    Degrees,
+    /// `radians(float8) -> float8` — degrees to radians.
+    Radians,
+    /// `pi() -> float8`.
+    Pi,
     Sind,
     Cosd,
     Tand,
@@ -419,6 +443,14 @@ pub enum ScalarFn {
     Log10F8,
     /// `mod(intN, intN) -> intN` (dispatches on the operand's integer width).
     ModInt,
+    /// `gcd(intN, intN) -> intN` (dispatches on the operand's integer width).
+    GcdInt,
+    /// `lcm(intN, intN) -> intN` (dispatches on the operand's integer width).
+    LcmInt,
+    /// `gcd(numeric, numeric) -> numeric`.
+    NumGcd,
+    /// `lcm(numeric, numeric) -> numeric`.
+    NumLcm,
 
     // --- string functions (see `crabgresql_types::text`) ----
     /// `text || text -> text` (the `||` operator / `textcat`).
@@ -2028,6 +2060,43 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: NUM,
             },
         ],
+        // gcd/lcm have no smallint overload in PG: a smallint argument widens to
+        // int4. The numeric entry is last for the same reason `mod`'s is — an
+        // integer argument must keep its own width rather than drift to numeric.
+        "gcd" => &[
+            Signature {
+                func: ScalarFn::GcdInt,
+                args: &[I4, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::GcdInt,
+                args: &[PgType::Int8, PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::NumGcd,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
+        ],
+        "lcm" => &[
+            Signature {
+                func: ScalarFn::LcmInt,
+                args: &[I4, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::LcmInt,
+                args: &[PgType::Int8, PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::NumLcm,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
+        ],
         // money helper functions.
         "cash_words" => &[Signature {
             func: ScalarFn::CashWords,
@@ -2077,6 +2146,25 @@ fn lookup(name: &str) -> &'static [Signature] {
         "erfc" => unary_f8!(ScalarFn::Erfc),
         "gamma" => unary_f8!(ScalarFn::Gamma),
         "lgamma" => unary_f8!(ScalarFn::Lgamma),
+        "sin" => unary_f8!(ScalarFn::Sin),
+        "cos" => unary_f8!(ScalarFn::Cos),
+        "tan" => unary_f8!(ScalarFn::Tan),
+        "cot" => unary_f8!(ScalarFn::Cot),
+        "asin" => unary_f8!(ScalarFn::Asin),
+        "acos" => unary_f8!(ScalarFn::Acos),
+        "atan" => unary_f8!(ScalarFn::Atan),
+        "atan2" => &[Signature {
+            func: ScalarFn::Atan2,
+            args: &[F8, F8],
+            ret: F8,
+        }],
+        "degrees" => unary_f8!(ScalarFn::Degrees),
+        "radians" => unary_f8!(ScalarFn::Radians),
+        "pi" => &[Signature {
+            func: ScalarFn::Pi,
+            args: &[],
+            ret: F8,
+        }],
         "sind" => unary_f8!(ScalarFn::Sind),
         "cosd" => unary_f8!(ScalarFn::Cosd),
         "tand" => unary_f8!(ScalarFn::Tand),

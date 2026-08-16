@@ -9,6 +9,7 @@ comments
 float4
 float8
 int2
+int4
 line
 lseg
 macaddr
