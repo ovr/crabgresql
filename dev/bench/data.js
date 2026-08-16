@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786898226477,
+  "lastUpdate": 1786898228365,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -40144,6 +40144,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 38588.809243,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0a05b46596eff4b8f8da5b8864d4927d7a004f1f",
+          "message": "feat(catalog): Add ACL columns (as NULL instead of omitting them) (#255)",
+          "timestamp": "2026-08-16T17:47:48+02:00",
+          "tree_id": "13e6acd9f04419db09bee3d4cd105052932237d6",
+          "url": "https://github.com/ovr/crabgresql/commit/0a05b46596eff4b8f8da5b8864d4927d7a004f1f"
+        },
+        "date": 1786898228236,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 786.077963,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 27008.218778,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
