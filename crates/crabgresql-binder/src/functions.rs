@@ -1239,6 +1239,11 @@ pub enum TableFn {
     /// `unnest(array)` over a 1-D array whose element type is carried here. Yields
     /// one row per element (NULL elements included).
     Unnest(PgType),
+    /// `generate_subscripts(array, dim [, reverse])` — the valid subscripts of
+    /// the array's `dim`th dimension, as `int4`. `reverse` yields them
+    /// descending. A dimension the array does not have (and any NULL argument)
+    /// yields no rows rather than an error.
+    GenerateSubscripts,
     /// `pg_available_extensions()` — one row per installable extension, as
     /// `(name, default_version, comment)`. psql's `\dx` calls the function
     /// rather than the view of the same name, so both have to exist.
@@ -1263,9 +1268,13 @@ impl TableFn {
             // ones above.
             TableFn::PgPartitionAncestors => &[],
             TableFn::PgAvailableExtensions => &[],
-            // `GenerateSeries`/`JsonbPathQuery`/`Unnest` are polymorphic/variadic
-            // and resolve their own arguments in `bind_table_fn_call`.
-            TableFn::GenerateSeries(_) | TableFn::JsonbPathQuery | TableFn::Unnest(_) => &[],
+            // `GenerateSeries`/`JsonbPathQuery`/`Unnest`/`GenerateSubscripts` are
+            // polymorphic/variadic and resolve their own arguments in
+            // `bind_table_fn_call`.
+            TableFn::GenerateSeries(_)
+            | TableFn::JsonbPathQuery
+            | TableFn::Unnest(_)
+            | TableFn::GenerateSubscripts => &[],
         }
     }
 
@@ -1284,6 +1293,9 @@ impl TableFn {
                 vec![OutputColumn::new("jsonb_path_query", PgType::Jsonb)]
             }
             TableFn::Unnest(elem) => vec![OutputColumn::new("unnest", elem)],
+            TableFn::GenerateSubscripts => {
+                vec![OutputColumn::new("generate_subscripts", PgType::Int4)]
+            }
             TableFn::PgPartitionAncestors => {
                 vec![OutputColumn::new("relid", PgType::Reg(RegKind::Class))]
             }
@@ -1309,6 +1321,7 @@ impl TableFn {
             TableFn::GenerateSeries(_)
             | TableFn::JsonbPathQuery
             | TableFn::Unnest(_)
+            | TableFn::GenerateSubscripts
             | TableFn::PgPartitionAncestors => true,
         }
     }
@@ -1537,6 +1550,12 @@ pub(crate) fn bind_table_fn_call(
         let (elem, args) = resolve_unnest(&bindings)?;
         return Ok((TableFn::Unnest(elem), args));
     }
+    if name == "generate_subscripts" {
+        return Ok((
+            TableFn::GenerateSubscripts,
+            resolve_generate_subscripts(&bindings)?,
+        ));
+    }
     if name == "pg_partition_ancestors" {
         return Ok((
             TableFn::PgPartitionAncestors,
@@ -1605,6 +1624,46 @@ pub(crate) fn resolve_unnest(bindings: &[Binding]) -> Result<(PgType, Vec<BoundE
         }
     }
     Err(undefined_function("unnest", bindings))
+}
+
+/// Resolve `generate_subscripts(array, dim [, reverse])` to its coerced
+/// arguments. Shared by FROM-position and target-list binding.
+///
+/// The array parameter is `anyarray` in PG, so it is checked structurally here
+/// (as [`resolve_unnest`] does) rather than through the fixed-signature table;
+/// the remaining arguments are ordinary `int4`/`bool` parameters. Note the
+/// deviation `unnest` already has: an *unknown* first argument is `42883` here
+/// where PG reports `42804 could not determine polymorphic type`.
+pub(crate) fn resolve_generate_subscripts(
+    bindings: &[Binding],
+) -> Result<Vec<BoundExpr>, BindError> {
+    let fail = || undefined_function("generate_subscripts", bindings);
+    let params: &[PgType] = match bindings.len() {
+        2 => &[PgType::Int4],
+        3 => &[PgType::Int4, PgType::Bool],
+        _ => return Err(fail()),
+    };
+    let Some(Binding::Typed(array)) = bindings.first() else {
+        return Err(fail());
+    };
+    // `oidvector`/`int2vector` carry a `typelem` in PG too, so they are
+    // subscriptable — with a lower bound of 0, which the executor applies.
+    if !matches!(array.ty(), PgType::Array(_) | PgType::Vector(_)) {
+        return Err(fail());
+    }
+    // The array argument has already pinned the only candidate signature, so a
+    // literal the `int4`/`bool` input function rejects is reported as PG reports
+    // it (`22P02`) rather than hidden behind a `42883`. `dim` accepts int2 by
+    // implicit widening but not int8, like PG's overload rules.
+    match single_candidate_args(&bindings[1..], params) {
+        Ok(rest) => {
+            let mut args = vec![array.clone()];
+            args.extend(rest);
+            Ok(args)
+        }
+        Err(None) => Err(fail()),
+        Err(Some(e)) => Err(e),
+    }
 }
 
 /// Resolve a `generate_series(start, stop [, step])` call to its element type
@@ -4612,6 +4671,7 @@ pub(crate) fn bind_srf_projection(
     if name != "generate_series"
         && name != "jsonb_path_query"
         && name != "unnest"
+        && name != "generate_subscripts"
         && name != "pg_partition_ancestors"
     {
         return Ok(None);
@@ -4644,6 +4704,13 @@ pub(crate) fn bind_srf_projection(
             func: TableFn::Unnest(elem),
             ret: elem,
             args,
+        }));
+    }
+    if name == "generate_subscripts" {
+        return Ok(Some(BoundExpr::Srf {
+            func: TableFn::GenerateSubscripts,
+            ret: PgType::Int4,
+            args: resolve_generate_subscripts(&bindings)?,
         }));
     }
     let (elem, args) = resolve_generate_series(&bindings)?;

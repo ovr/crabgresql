@@ -14190,6 +14190,47 @@ async fn soft_input_reads_array_elements_with_the_session() -> anyhow::Result<()
     Ok(())
 }
 
+/// `generate_subscripts` over a real socket, in both positions a set-returning
+/// function can take: FROM (where its bare alias names the column, so the array
+/// can be subscripted by it) and the target list.
+#[tokio::test]
+async fn generate_subscripts_over_the_wire() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE arr (id int, a text[])")
+        .await?;
+    client
+        .simple_query("INSERT INTO arr VALUES (1, ARRAY['x', 'y', 'z'])")
+        .await?;
+
+    // The idiom the function exists for: subscript alongside element.
+    let msgs = client
+        .simple_query(
+            "SELECT i, (ARRAY['x', 'y', 'z'])[i] AS v \
+             FROM generate_subscripts(ARRAY['x', 'y', 'z'], 1) i ORDER BY i",
+        )
+        .await?;
+    let pairs = rows(&msgs);
+    assert_eq!(pairs.len(), 3);
+    assert_eq!(pairs[0].get("i"), Some("1"));
+    assert_eq!(pairs[0].get("v"), Some("x"));
+    assert_eq!(pairs[2].get("v"), Some("z"));
+
+    // Target-list form, descending, over a stored array.
+    let msgs = client
+        .simple_query("SELECT generate_subscripts(a, 1, true) AS s FROM arr")
+        .await?;
+    let subs: Vec<Option<&str>> = rows(&msgs).iter().map(|r| r.get("s")).collect();
+    assert_eq!(subs, [Some("3"), Some("2"), Some("1")]);
+
+    // A dimension the array does not have yields no rows rather than an error.
+    let msgs = client
+        .simple_query("SELECT generate_subscripts(a, 2) AS s FROM arr")
+        .await?;
+    assert!(rows(&msgs).is_empty());
+    Ok(())
+}
+
 /// An extended-query batch is one implicit transaction block, so every message
 /// up to `Sync` shares a transaction timestamp.
 ///

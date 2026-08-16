@@ -4,7 +4,7 @@
 
 use crabgresql_binder::TableFn;
 use crabgresql_storage_api::Tuple;
-use crabgresql_types::{RegKind, Value};
+use crabgresql_types::{PgType, RegKind, Value};
 
 use crate::generate_series::Series;
 use crate::{ExecContext, ExecError, eval};
@@ -44,6 +44,7 @@ pub(crate) fn build_series(
         TableFn::GenerateSeries(elem) => Series::from_args(elem, values),
         TableFn::JsonbPathQuery => jsonb_path_query_series(values),
         TableFn::Unnest(_) => Ok(unnest_series(values)),
+        TableFn::GenerateSubscripts => Ok(generate_subscripts_series(values)),
         TableFn::PgPartitionAncestors => Ok(pg_partition_ancestors_series(values, ctx)),
         // Both return a record, which a target list cannot expand into.
         TableFn::PgInputErrorInfo | TableFn::PgAvailableExtensions => Err(ExecError::new(
@@ -109,6 +110,52 @@ pub(crate) fn unnest_series(values: &[Value]) -> Series {
             Series::Materialized(elems.clone().into_iter())
         }
         _ => Series::Empty,
+    }
+}
+
+/// The rows of `generate_subscripts(array, dim [, reverse])`: the valid
+/// subscripts of the array's `dim`th dimension, ascending (or descending when
+/// `reverse` is true).
+///
+/// The function is STRICT, so a NULL argument yields no rows, and so does a
+/// dimension the value does not have — including every `dim` other than 1 here,
+/// since the engine's arrays are one-dimensional. An array's lower bound is 1;
+/// `oidvector`/`int2vector` are stored from 0, the same convention subscripting
+/// follows (see `eval`'s `Subscript` arm).
+pub(crate) fn generate_subscripts_series(values: &[Value]) -> Series {
+    let (len, lower) = match values.first() {
+        Some(Value::Array { elems, .. }) => (elems.len(), 1i64),
+        Some(Value::Vector { elems, .. }) => (elems.len(), 0i64),
+        _ => return Series::Empty,
+    };
+    // Only `dim = 1` exists for a one-dimensional value; 0, a negative
+    // dimension, and anything past the first all yield the empty set.
+    if !matches!(values.get(1), Some(Value::Int4(1))) {
+        return Series::Empty;
+    }
+    let reverse = match values.get(2) {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        // A NULL `reverse` (or anything else) is the strict case.
+        _ => return Series::Empty,
+    };
+    // An empty array has no subscripts at all.
+    if len == 0 {
+        return Series::Empty;
+    }
+    let last = lower + len as i64 - 1;
+    let (cur, stop, step) = if reverse {
+        (last, lower, -1)
+    } else {
+        (lower, last, 1)
+    };
+    Series::Int {
+        cur,
+        stop,
+        step,
+        forward: !reverse,
+        elem: PgType::Int4,
+        done: false,
     }
 }
 
