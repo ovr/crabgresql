@@ -1337,6 +1337,10 @@ pub enum AggFn {
     /// `string_agg(value text, delimiter text) -> text`: concatenates the
     /// non-NULL values of a group, separated by the (per-row) delimiter.
     StringAgg,
+    /// `array_agg(value) -> value[]`: collects the group's inputs into a
+    /// one-dimensional array. Alone among the aggregates it keeps NULL inputs,
+    /// as NULL elements — while an empty group is still NULL and not `{}`.
+    ArrayAgg,
 }
 
 impl AggFn {
@@ -1349,6 +1353,23 @@ impl AggFn {
             AggFn::Sum => "sum",
             AggFn::Avg => "avg",
             AggFn::StringAgg => "string_agg",
+            AggFn::ArrayAgg => "array_agg",
+        }
+    }
+
+    /// Whether a row whose first argument is NULL is dropped before the
+    /// aggregate sees it — PostgreSQL's `strict` flag, which every aggregate
+    /// here carries but `array_agg`, whose whole job is to preserve the group's
+    /// values *including* its NULLs.
+    ///
+    /// Asked by the executor's `feed`, so the grouped and windowed drivers
+    /// cannot drift on it.
+    pub fn skips_null_input(self) -> bool {
+        match self {
+            AggFn::Count | AggFn::Min | AggFn::Max | AggFn::Sum | AggFn::Avg | AggFn::StringAgg => {
+                true
+            }
+            AggFn::ArrayAgg => false,
         }
     }
 }
@@ -1411,6 +1432,7 @@ pub fn lookup_agg(name: &str) -> Option<AggFn> {
         "sum" => Some(AggFn::Sum),
         "avg" => Some(AggFn::Avg),
         "string_agg" => Some(AggFn::StringAgg),
+        "array_agg" => Some(AggFn::ArrayAgg),
         _ => None,
     }
 }
@@ -1471,6 +1493,19 @@ pub(crate) fn agg_return_type(
         // `string_agg(text, text)` always returns text; `bind_aggregate` calls
         // this directly for the two-argument form's return type.
         AggFn::StringAgg => Ok(PgType::Text),
+        // `array_oid_for_elem` knows only the *built-in* element↔array pairs, so
+        // two arguments PostgreSQL accepts land in the same `0A000` the
+        // `ARRAY[…]` constructor gives: a user enum, since `CREATE TYPE` here
+        // assigns no array type of its own — the common casualty, an ordinary
+        // `array_agg(mood_col)` — and an array, which PostgreSQL would stack
+        // into the two-dimensional result `crabgresql_types::array` cannot hold.
+        AggFn::ArrayAgg => match crabgresql_types::array::array_oid_for_elem(input_ty.oid()) {
+            Some(_) => Ok(PgType::Array(input_ty.oid())),
+            None => Err(BindError::feature_not_supported(format!(
+                "could not find array type for data type {}",
+                crate::expr::type_label(input_ty, scope.catalog().as_ref())
+            ))),
+        },
     }
 }
 
@@ -4036,13 +4071,27 @@ fn bind_aggregate(
         });
     }
 
-    // Bind each argument (an unknown literal resolves to text, as in a bare
-    // projection) so a wrong-arity error can name the actual argument types, as
-    // PG does.
+    // Bind each argument so a wrong-arity error can name the actual argument
+    // types, as PG does. The `Binding` is kept unsettled for one step because
+    // `array_agg` is declared over `anyarray` *and* `anynonarray` in PG: an
+    // `unknown` fits neither better, so it never resolves, and both
+    // `array_agg(NULL)` and `array_agg($1)` are `42725` rather than the text
+    // array the default would reach.
     let arg_exprs = positional_arg_exprs(&list.args)?;
-    let mut bound = arg_exprs
+    let bindings = arg_exprs
         .iter()
-        .map(|e| crate::expr::bind_scalar(e, scope))
+        .map(|e| crate::expr::bind_expr(e, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    if agg == AggFn::ArrayAgg
+        && bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }))
+    {
+        return Err(ambiguous_function(name, &bindings));
+    }
+    let mut bound = bindings
+        .into_iter()
+        .map(crate::expr::scalar_from_binding)
         .collect::<Result<Vec<_>, _>>()?;
     let undefined_arity = || {
         let types = bound
@@ -4094,17 +4143,35 @@ fn bind_aggregate(
         arg = crate::expr::coerce_expr(arg, PgType::Text)?;
         input_ty = PgType::Text;
     }
-    // A DISTINCT aggregate must compare its inputs for equality; a type with no
-    // usable equality (e.g. `point`/`lseg`, which are not orderable) reports
-    // PG's error rather than reaching the executor's comparison and panicking.
-    if distinct && !crate::expr::has_equality(input_ty, scope.catalog().as_ref()) {
-        return Err(BindError::new(
-            sqlstate::UNDEFINED_FUNCTION,
-            format!(
-                "could not identify an equality operator for type {}",
-                crate::expr::type_label(input_ty, scope.catalog().as_ref())
-            ),
-        ));
+    // PostgreSQL eliminates a DISTINCT aggregate's duplicates by *sorting*, so
+    // an ordering is required and not only an equality — for every aggregate,
+    // not just the one whose output makes it visible: `count(DISTINCT xid_col)`
+    // is this same error. The two checks are in PG's order, which is what
+    // decides the message for a type that has neither (`point`, `json`) versus
+    // `xid`, the one type in the gap (see `has_equality`).
+    if distinct {
+        let catalog = scope.catalog();
+        if !crate::expr::has_equality(input_ty, catalog.as_ref()) {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "could not identify an equality operator for type {}",
+                    crate::expr::type_label(input_ty, catalog.as_ref())
+                ),
+            ));
+        }
+        if !crate::expr::is_orderable(input_ty, catalog.as_ref()) {
+            return Err(BindError::new(
+                sqlstate::UNDEFINED_FUNCTION,
+                format!(
+                    "could not identify an ordering operator for type {}",
+                    crate::expr::type_label(input_ty, catalog.as_ref())
+                ),
+            )
+            .with_detail(Some(
+                "Aggregates with DISTINCT must be able to sort their inputs.".to_string(),
+            )));
+        }
     }
     let ret = agg_return_type(agg, input_ty, scope)?;
     Ok(Binding::Typed(BoundExpr::Aggregate {

@@ -3,15 +3,18 @@
 //!
 //! Text I/O routes through the shared [`crate::cast`] input functions so a
 //! text-format parameter parses exactly like the same literal in SQL. Binary
-//! I/O is implemented for the common fixed-width scalars and the string/`bytea`
-//! types; a binary request for any other type is an honest `0A000`, matching a
-//! server that lacks that type's `send`/`recv` function. Layouts follow the
-//! documented binary formats (network byte order), not PG's C source.
+//! I/O is implemented for the common fixed-width scalars, the string/`bytea`
+//! types, and the two container types — arrays and the vectors — over any
+//! element that has a binary form itself; a binary request for any other type
+//! is an honest `0A000`, matching a server that lacks that type's
+//! `send`/`recv` function. Layouts follow the documented binary formats
+//! (network byte order), not PG's C source.
 //!
 //! TODO: binary encode/decode for the types that fall through to `no_binary`
 //! here — `numeric`, `money`, the date/time types, `bit`/`varbit`, the network
-//! and geometric types, `json`/`jsonb`/`jsonpath`, `tsvector`/`tsquery` and
-//! arrays — all of which PG has a `send`/`recv` pair for.
+//! and geometric types, `json`/`jsonb`/`jsonpath` and `tsvector`/`tsquery` —
+//! all of which PG has a `send`/`recv` pair for. Each one also unblocks the
+//! *array* over it, which today shares its refusal.
 
 use crate::cast::{self, CastError};
 use crate::{FmtCtx, PgType, Value, VectorKind};
@@ -109,8 +112,76 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
             kind,
             elems: decode_vector(b, kind)?,
         },
+        PgType::Array(elem) => decode_array(b, ty, elem)?,
         other => return Err(no_binary(other)),
     })
+}
+
+/// `array_recv`, the mirror of the `Value::Array` arm of [`Value::encode_binary`]
+/// — see it for the layout.
+///
+/// A header this build cannot represent is rejected rather than reinterpreted,
+/// because a foreign element OID or an unexpected lower bound would each change
+/// the value *silently*. The second dimension is the one refused with `0A000`
+/// rather than as malformed input: PG sends it perfectly well, and only
+/// `crate::array`'s 1-D representation has nowhere to put it.
+fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError> {
+    let be = |s: &[u8]| i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+    if b.len() < 12 {
+        return Err(invalid_binary(ty));
+    }
+    let (ndim, declared_elem) = (be(&b[0..4]), be(&b[8..12]));
+    let Some(elem) = PgType::from_oid(elem_oid) else {
+        return Err(no_binary(ty));
+    };
+    if declared_elem != elem_oid as i32 {
+        return Err(invalid_binary(ty));
+    }
+    // `ndim = 0` is the only shape that legitimately carries no dimension header.
+    if ndim == 0 {
+        if b.len() != 12 {
+            return Err(invalid_binary(ty));
+        }
+        return Ok(Value::Array {
+            elem,
+            elems: Vec::new(),
+        });
+    }
+    if ndim != 1 {
+        return Err(no_binary(ty));
+    }
+    if b.len() < 20 {
+        return Err(invalid_binary(ty));
+    }
+    let (count, lower) = (be(&b[12..16]), be(&b[16..20]));
+    if count < 0 || lower != 1 {
+        return Err(invalid_binary(ty));
+    }
+    let mut elems = Vec::with_capacity(count as usize);
+    let mut pos = 20;
+    for _ in 0..count {
+        if pos + 4 > b.len() {
+            return Err(invalid_binary(ty));
+        }
+        let len = be(&b[pos..pos + 4]);
+        pos += 4;
+        if len == -1 {
+            elems.push(Value::Null);
+            continue;
+        }
+        let len = usize::try_from(len).map_err(|_| invalid_binary(ty))?;
+        if pos + len > b.len() {
+            return Err(invalid_binary(ty));
+        }
+        elems.push(decode_binary(elem, &b[pos..pos + len])?);
+        pos += len;
+    }
+    // Trailing bytes mean the header and the payload disagree, so whichever half
+    // is right, the decoded value is not the one the client sent.
+    if pos != b.len() {
+        return Err(invalid_binary(ty));
+    }
+    Ok(Value::Array { elem, elems })
 }
 
 /// `oidvectorrecv`/`int2vectorrecv`: PG sends these in the ordinary array binary
@@ -210,6 +281,36 @@ impl Value {
                 }
                 out
             }
+            // `array_send` — a vector's layout (see `decode_vector`), except
+            // that an empty array carries no dimension header at all: PG stops
+            // after the element OID, twelve bytes. Probed against PostgreSQL
+            // 18.4 via `COPY … (FORMAT binary)` and pinned byte for byte by
+            // `array_binary_layout_matches_pg` below.
+            Value::Array { elem, elems } => {
+                let mut out = Vec::with_capacity(20 + elems.len() * 8);
+                let empty = elems.is_empty();
+                let has_nulls = elems.iter().any(|e| matches!(e, Value::Null));
+                out.extend_from_slice(&i32::from(!empty).to_be_bytes()); // ndim
+                out.extend_from_slice(&i32::from(has_nulls).to_be_bytes());
+                out.extend_from_slice(&elem.oid().to_be_bytes());
+                if !empty {
+                    out.extend_from_slice(&(elems.len() as i32).to_be_bytes());
+                    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+                }
+                for e in elems {
+                    // `?`, so an element type with no binary form of its own
+                    // refuses the whole array rather than leaving a well-formed
+                    // buffer the client would decode as some other value.
+                    match e.encode_binary()? {
+                        None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                        Some(payload) => {
+                            out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+                            out.extend_from_slice(&payload);
+                        }
+                    }
+                }
+                out
+            }
             other => {
                 let ty = other.pg_type().unwrap_or(PgType::Text);
                 return Err(no_binary(ty));
@@ -221,6 +322,7 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oid;
 
     #[test]
     fn int4_binary_round_trips() -> anyhow::Result<()> {
@@ -358,6 +460,128 @@ mod tests {
                 "22P03"
             );
         }
+
+        Ok(())
+    }
+
+    /// The exact bytes PostgreSQL 18.4 puts on the wire for an array, read out
+    /// of `COPY (SELECT '{1,NULL}'::int[], '{}'::int[], '{ab,""}'::text[],
+    /// '{t,f}'::bool[]) TO STDOUT (FORMAT binary)` and transcribed here — the
+    /// three places a hand-written encoder drifts from a vector's layout being
+    /// the lower bound, the has-nulls flag, and the empty array's header.
+    #[test]
+    fn array_binary_layout_matches_pg() -> anyhow::Result<()> {
+        #[rustfmt::skip]
+        let cases = [
+            (
+                Value::Array { elem: PgType::Int4, elems: vec![Value::Int4(1), Value::Null] },
+                PgType::Array(oid::INT4),
+                vec![
+                    0, 0, 0, 1,     // ndim
+                    0, 0, 0, 1,     // has nulls
+                    0, 0, 0, 23,    // element type = int4
+                    0, 0, 0, 2,     // dim[0]
+                    0, 0, 0, 1,     // lower bound
+                    0, 0, 0, 4, 0, 0, 0, 1,
+                    0xff, 0xff, 0xff, 0xff,     // a NULL element is length -1, no payload
+                ],
+            ),
+            (
+                Value::Array { elem: PgType::Int4, elems: vec![] },
+                PgType::Array(oid::INT4),
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23],
+            ),
+            (
+                Value::Array {
+                    elem: PgType::Text,
+                    elems: vec![Value::Text("ab".into()), Value::Text(String::new())],
+                },
+                PgType::Array(oid::TEXT),
+                vec![
+                    0, 0, 0, 1,
+                    0, 0, 0, 0,
+                    0, 0, 0, 25,    // element type = text
+                    0, 0, 0, 2,
+                    0, 0, 0, 1,
+                    0, 0, 0, 2, b'a', b'b',
+                    0, 0, 0, 0,     // the empty string is length 0, not NULL
+                ],
+            ),
+            (
+                Value::Array { elem: PgType::Bool, elems: vec![Value::Bool(true), Value::Bool(false)] },
+                PgType::Array(oid::BOOL),
+                vec![
+                    0, 0, 0, 1,
+                    0, 0, 0, 0,
+                    0, 0, 0, 16,    // element type = bool
+                    0, 0, 0, 2,
+                    0, 0, 0, 1,
+                    0, 0, 0, 1, 1,
+                    0, 0, 0, 1, 0,
+                ],
+            ),
+        ];
+        for (value, ty, expected) in cases {
+            let bytes = value
+                .encode_binary()?
+                .ok_or_else(|| anyhow::anyhow!("{ty:?} encoded as NULL"))?;
+            assert_eq!(bytes, expected, "{ty:?} wire layout");
+            assert_eq!(decode_binary(ty, &bytes)?, value, "{ty:?} round trip");
+        }
+
+        // Shapes that are not what PG sends are 22P03 rather than a panic or a
+        // silently different value.
+        let ia = PgType::Array(oid::INT4);
+        for bad in [
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1], // count 1, no element
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0], // lower bound 0
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0, 1], // element type text
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0],                      // ndim 0 with a tail
+            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23],                         // 1-D, no dim header
+            vec![0, 0, 0, 1],                                                  // short header
+            // A well-formed element followed by bytes the header does not claim.
+            vec![
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0,
+                1, 9,
+            ],
+        ] {
+            assert_eq!(
+                decode_binary(ia, &bad)
+                    .expect_err("not a valid int4[] payload")
+                    .sqlstate,
+                "22P03",
+                "{bad:?}"
+            );
+        }
+
+        // A second dimension is `0A000`, not malformed input: PG sends it
+        // perfectly well and this build has nowhere to put it.
+        #[rustfmt::skip]
+        let two_d = vec![
+            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 23,
+            0, 0, 0, 1, 0, 0, 0, 1,
+            0, 0, 0, 1, 0, 0, 0, 1,
+            0, 0, 0, 4, 0, 0, 0, 7,
+        ];
+        assert_eq!(
+            decode_binary(ia, &two_d)
+                .expect_err("two-dimensional")
+                .sqlstate,
+            "0A000"
+        );
+
+        // An element type with no binary form of its own propagates that error
+        // rather than emitting a buffer the client would misread.
+        assert_eq!(
+            Value::Array {
+                elem: PgType::Numeric,
+                elems: vec![Value::Numeric(crate::Numeric::from_i128(1))],
+            }
+            .encode_binary()
+            .expect_err("numeric has no binary form")
+            .sqlstate,
+            "0A000"
+        );
 
         Ok(())
     }

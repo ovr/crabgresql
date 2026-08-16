@@ -4834,6 +4834,51 @@ mod tests {
     }
 
     #[test]
+    fn array_agg_keeps_nulls_and_arrival_order() {
+        let (cols, rows) = run_rows("SELECT array_agg(x) FROM (VALUES (2), (NULL), (1)) t(x)");
+        assert_eq!(cols[0].ty, PgType::Array(crabgresql_types::oid::INT4));
+        assert_eq!(
+            rows,
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: vec![Value::Int4(2), Value::Null, Value::Int4(1)],
+            }]]
+        );
+    }
+
+    #[test]
+    fn array_agg_over_empty_group_is_null() {
+        // Not the empty array: a group of one NULL row is what gives `{NULL}`.
+        let (_c, rows) = run_rows("SELECT array_agg(x) FROM (VALUES (1)) t(x) WHERE false");
+        assert_eq!(rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn array_agg_distinct_sorts_with_nulls_last() {
+        let (_c, rows) =
+            run_rows("SELECT array_agg(DISTINCT x) FROM (VALUES (3), (1), (NULL), (2), (1)) t(x)");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null,],
+            }]]
+        );
+    }
+
+    #[test]
+    fn array_agg_renders_as_an_array_literal() {
+        // The quoting rules are `array_out`'s: an element with a comma or the
+        // literal word NULL is quoted, a plain one is not.
+        let (_c, rows) =
+            run_rows("SELECT array_agg(x)::text FROM (VALUES ('a'), (NULL), ('b, c')) t(x)");
+        assert_eq!(
+            rows,
+            vec![vec![Value::Text("{a,NULL,\"b, c\"}".to_string())]]
+        );
+    }
+
+    #[test]
     fn array_upper_matches_length_on_dimension_one() {
         let (_c, rows) = run_rows(
             "SELECT array_upper(ARRAY[10, 20, 30], 1), array_upper('{}'::int[], 1), array_upper(ARRAY[1], 2)",

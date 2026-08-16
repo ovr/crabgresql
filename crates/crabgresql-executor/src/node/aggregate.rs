@@ -59,7 +59,9 @@ impl Aggregate {
             distinct_values: if any_distinct {
                 self.aggregates
                     .iter()
-                    .map(|agg| agg.distinct.then(|| agg::DistinctValues::new(agg.input_ty)))
+                    .map(|agg| {
+                        agg::wants_distinct_set(agg).then(|| agg::DistinctValues::new(agg.input_ty))
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -70,7 +72,7 @@ impl Aggregate {
     /// Drain the child, accumulate per group, and materialize the output rows.
     fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
         let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
-        let any_distinct = self.aggregates.iter().any(|agg| agg.distinct);
+        let any_distinct = self.aggregates.iter().any(agg::wants_distinct_set);
         let mut groups: Vec<AggGroup> = Vec::new();
         // Each group's key → its index in `groups`, so a row finds its group in
         // ~O(1). Groups stay in first-seen order (accumulation follows scan

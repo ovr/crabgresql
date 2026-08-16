@@ -25,6 +25,7 @@ pub use assign::{
     bind_stored_generation, coerce_to_column, coerce_to_param, const_type_label,
     deparse_literal_default, parse_stored_expr, subquery_in_execute_param,
 };
+pub(crate) use bind::scalar_from_binding;
 pub use bind::{bind_expr, bind_scalar};
 pub use bound::{
     BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, Subplan, SubplanId,
