@@ -5385,6 +5385,64 @@ mod tests {
     }
 
     #[test]
+    fn generate_subscripts_yields_the_valid_subscripts() {
+        let (columns, rows) =
+            run_rows("SELECT * FROM generate_subscripts(ARRAY['a', 'b', 'c'], 1)");
+        assert_eq!(columns[0].name, "generate_subscripts");
+        assert_eq!(columns[0].ty, PgType::Int4);
+        assert_eq!(series_col(&rows), [1, 2, 3].map(Value::Int4));
+
+        let (_c, rows) = run_rows("SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, true)");
+        assert_eq!(series_col(&rows), [3, 2, 1].map(Value::Int4));
+        let (_c, rows) = run_rows("SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, false)");
+        assert_eq!(series_col(&rows), [1, 2, 3].map(Value::Int4));
+    }
+
+    #[test]
+    fn generate_subscripts_pairs_with_a_subscripted_array() {
+        // The idiom the function exists for: index and element side by side.
+        let (_c, rows) = run_rows(
+            "SELECT i, (ARRAY['x', 'y'])[i] FROM generate_subscripts(ARRAY['x', 'y'], 1) i",
+        );
+        let pairs: Vec<(Value, Value)> =
+            rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Value::Int4(1), Value::Text("x".into())),
+                (Value::Int4(2), Value::Text("y".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_subscripts_on_a_vector_is_zero_based() {
+        // `oidvector`/`int2vector` are stored from 0, which is what their
+        // subscripts are — `('11 22 33'::oidvector)[0]` is the first element.
+        let (_c, rows) = run_rows("SELECT generate_subscripts('11 22 33'::oidvector, 1)");
+        assert_eq!(series_col(&rows), [0, 1, 2].map(Value::Int4));
+    }
+
+    #[test]
+    fn generate_subscripts_empty_cases_yield_no_rows() {
+        for sql in [
+            // A dimension the array does not have (the engine's arrays are 1-D,
+            // so everything but 1 is absent), and a non-positive one.
+            "SELECT generate_subscripts(ARRAY['a', 'b'], 0)",
+            "SELECT generate_subscripts(ARRAY['a', 'b'], 2)",
+            "SELECT generate_subscripts(ARRAY['a', 'b'], -1)",
+            "SELECT generate_subscripts('{}'::text[], 1)",
+            // STRICT: a NULL in any argument yields the empty set, not an error.
+            "SELECT generate_subscripts(NULL::text[], 1)",
+            "SELECT generate_subscripts(ARRAY['a', 'b'], NULL)",
+            "SELECT generate_subscripts(ARRAY['a', 'b'], 1, NULL)",
+        ] {
+            let (_c, rows) = run_rows(sql);
+            assert!(rows.is_empty(), "expected no rows for: {sql}");
+        }
+    }
+
+    #[test]
     fn generate_series_target_list_yields_rows() {
         let (columns, rows) = run_rows("SELECT generate_series(1, 5)");
         assert_eq!(columns[0].name, "generate_series");

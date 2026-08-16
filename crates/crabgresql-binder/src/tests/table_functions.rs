@@ -361,6 +361,96 @@ fn generate_series_timestamptz_overload_binds() -> anyhow::Result<()> {
 }
 
 #[test]
+fn generate_subscripts_in_from_binds_int4_column() -> anyhow::Result<()> {
+    for sql in [
+        "SELECT * FROM generate_subscripts(ARRAY['a', 'b'], 1)",
+        "SELECT * FROM generate_subscripts(ARRAY['a', 'b'], 1, true)",
+    ] {
+        let (func, columns) = table_fn(sql)?;
+        assert_eq!(func, crate::TableFn::GenerateSubscripts, "for `{sql}`");
+        assert_eq!(columns.len(), 1, "for `{sql}`");
+        assert_eq!(columns[0].name, "generate_subscripts", "for `{sql}`");
+        assert_eq!(columns[0].ty, PgType::Int4, "for `{sql}`");
+    }
+
+    // A bare alias renames the one column, like any other scalar SRF; an alias
+    // column list wins over it.
+    let (_func, columns) = table_fn("SELECT * FROM generate_subscripts(ARRAY[1, 2], 1) g")?;
+    assert_eq!(columns[0].name, "g");
+    let (_func, columns) = table_fn("SELECT * FROM generate_subscripts(ARRAY[1, 2], 1) g(s)")?;
+    assert_eq!(columns[0].name, "s");
+
+    // `oidvector` is subscriptable in PG too, so it resolves here as it does
+    // for `unnest`.
+    let (func, _columns) = table_fn("SELECT * FROM generate_subscripts('1 2 3'::oidvector, 1)")?;
+    assert_eq!(func, crate::TableFn::GenerateSubscripts);
+    Ok(())
+}
+
+#[test]
+fn generate_subscripts_with_ordinality_appends_the_ordinal() -> anyhow::Result<()> {
+    let TableFunctionPlan {
+        columns,
+        ordinality,
+        ..
+    } = bound_table_function("SELECT * FROM generate_subscripts(ARRAY[1, 2], 1) WITH ORDINALITY")?;
+    assert!(ordinality);
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["generate_subscripts", "ordinality"]);
+    Ok(())
+}
+
+#[test]
+fn generate_subscripts_in_target_list_is_srf_projection() -> anyhow::Result<()> {
+    let SubqueryPlan {
+        columns,
+        projections,
+        ..
+    } = bound_subquery("SELECT generate_subscripts(ARRAY['a', 'b'], 1)")?;
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].name, "generate_subscripts");
+    assert_eq!(columns[0].ty, PgType::Int4);
+    assert!(matches!(projections[0], BoundExpr::Srf { .. }));
+    Ok(())
+}
+
+#[test]
+fn generate_subscripts_rejects_other_signatures() -> anyhow::Result<()> {
+    // PG resolves `generate_subscripts(anyarray, int)` and `(anyarray, int,
+    // bool)` only; everything else below is 42883 there.
+    for (sql, message) in [
+        (
+            "SELECT * FROM generate_subscripts(ARRAY['a'])",
+            "function generate_subscripts(text[]) does not exist",
+        ),
+        (
+            "SELECT * FROM generate_subscripts(ARRAY['a'], 1::bigint)",
+            "function generate_subscripts(text[], bigint) does not exist",
+        ),
+        (
+            "SELECT * FROM generate_subscripts(ARRAY['a'], 1.5)",
+            "function generate_subscripts(text[], numeric) does not exist",
+        ),
+        (
+            "SELECT * FROM generate_subscripts(1, 1)",
+            "function generate_subscripts(integer, integer) does not exist",
+        ),
+        (
+            "SELECT * FROM generate_subscripts(ARRAY['a'], 1, true, 4)",
+            "function generate_subscripts(text[], integer, boolean, integer) does not exist",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, "42883", "for `{sql}`");
+        assert_eq!(e.message, message, "for `{sql}`");
+    }
+    // A `smallint` dimension implicitly widens to int4 and binds, as in PG.
+    let (func, _columns) = table_fn("SELECT * FROM generate_subscripts(ARRAY['a'], 1::smallint)")?;
+    assert_eq!(func, crate::TableFn::GenerateSubscripts);
+    Ok(())
+}
+
+#[test]
 fn generate_series_timestamp_requires_three_args() -> anyhow::Result<()> {
     // The timestamp overload has no 2-arg form: PG rejects it as 42883.
     let e =
