@@ -9,7 +9,11 @@ use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
 use crate::tally::ScanTally;
-use crate::{ExecContext, ExecError, ExecNode, compare_values, eval};
+use crabgresql_binder::{SysCol, SystemEmit};
+
+use crate::{
+    ExecContext, ExecError, ExecNode, compare_values, eval, push_system, resolve_tableoid,
+};
 
 /// Index scan: probes the engine's physical index for the key. When the engine
 /// cannot serve it (a columnar engine, an index whose key type it cannot
@@ -25,18 +29,47 @@ pub struct IndexScan {
 }
 
 impl IndexScan {
+    /// `system`, when set, names the slots each row carries past the relation's
+    /// declared columns — the same widening an `Append` arm applies, done here
+    /// so a statement that reads `ctid` keeps its index path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: &Arc<dyn TableAm>,
         index_name: &str,
         key: IndexProbeSpec,
+        system: Option<SystemEmit>,
         ctx: &ExecContext,
         txn: &TxnContext,
         projection: &ColumnProjection,
     ) -> Result<Self, ExecError> {
-        let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+        let tally = ScanTally::index(ctx, table, index_name);
+        let Some(emit) = system else {
+            let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+            return Ok(Self {
+                iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
+                tally,
+            });
+        };
+        let cols = Arc::clone(&emit.cols);
+        let oid = match cols.contains(&SysCol::TableOid) {
+            true => Some(resolve_tableoid(&emit.ident, ctx)?),
+            false => None,
+        };
+        let rows = match cols.iter().any(|c| c.needs_header()) {
+            false => Box::new(
+                index_probe_rows(table, index_name, &key, ctx, txn, projection)?
+                    .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+            ) as SystemProbe,
+            true => index_probe_system_rows(table, index_name, &key, ctx, txn, projection)?,
+        };
         Ok(Self {
-            iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
-            tally: ScanTally::index(ctx, table, index_name),
+            iter: Box::new(rows.map(move |row| {
+                row.map(|(tid, hdr, mut tuple)| {
+                    push_system(&mut tuple, &cols, oid, tid, hdr.as_ref());
+                    tuple
+                })
+            })),
+            tally,
         })
     }
 }
@@ -250,6 +283,7 @@ mod tests {
             &table,
             "t_id_key",
             IndexProbeSpec::equality(vec![(0, int4(2))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -269,6 +303,7 @@ mod tests {
             &table,
             "missing_index",
             IndexProbeSpec::equality(vec![(0, int4(2))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -312,6 +347,7 @@ mod tests {
                     lower: bound(lower.clone()),
                     upper: bound(upper.clone()),
                 },
+                None,
                 &ExecContext::default(),
                 &rtxn(),
                 &ColumnProjection::All,
@@ -327,6 +363,7 @@ mod tests {
             &table,
             "t_id_key",
             IndexProbeSpec::equality(vec![(0, int4(99))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,

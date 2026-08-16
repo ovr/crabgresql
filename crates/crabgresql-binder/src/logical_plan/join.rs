@@ -7,7 +7,7 @@ use crabgresql_storage_api::TableAm;
 use crate::expr::BoundExpr;
 use crate::{OutputColumn, TableFn};
 
-use super::{DistinctKey, LogicalPlan, SortKey};
+use super::{DistinctKey, LogicalPlan, SortKey, SystemEmit};
 
 /// [`LogicalPlan::Join`]: leaf rows are laid out left-to-right in the combined
 /// row; the same projection/predicate/sort pipeline as [`QueryPlan`] runs on
@@ -29,7 +29,14 @@ pub struct JoinPlan {
 /// set-returning function.
 #[derive(Clone)]
 pub enum JoinInput {
-    Scan(Arc<dyn TableAm>),
+    Scan {
+        table: Arc<dyn TableAm>,
+        /// The system columns this scan appends past the relation's declared
+        /// ones, when the query named any. Carried here rather than forcing a
+        /// one-armed `Append` so a monolithic relation stays monolithic and the
+        /// planner can still choose an index probe for it.
+        system: Option<SystemEmit>,
+    },
     Subplan(Box<LogicalPlan>),
     TableFunction {
         func: TableFn,

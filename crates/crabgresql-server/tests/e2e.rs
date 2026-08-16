@@ -13246,6 +13246,27 @@ async fn reading_the_mvcc_header_keeps_the_index_path() -> anyhow::Result<()> {
         );
     }
 
+    // The read path keeps the index too. It is the same relation and the same
+    // key, so only the plan can tell the difference — and a silent fall back to
+    // a full scan is exactly what a monolithic relation wrapped in a one-armed
+    // `Append` would do.
+    for column in ["ctid", "xmin", "cmin"] {
+        let plan = client
+            .simple_query(&format!("EXPLAIN SELECT {column}, a FROM t WHERE pk = 7"))
+            .await?;
+        assert!(
+            rows(&plan)
+                .iter()
+                .any(|r| r.get(0).unwrap_or("").contains("Index Scan using t_pkey")),
+            "reading {column} must not cost the SELECT its index path",
+        );
+    }
+    assert_eq!(
+        scalar(&client, "SELECT a FROM t WHERE pk = 7").await,
+        scalar(&client, "SELECT a FROM t WHERE pk = 7 AND ctid IS NOT NULL").await,
+        "and the rows are the same either way",
+    );
+
     // And the statement still touches exactly the row the key selects.
     let updated = client
         .simple_query("UPDATE t SET a = -1 WHERE pk = 7 AND xmin <> '0'::xid RETURNING pk")

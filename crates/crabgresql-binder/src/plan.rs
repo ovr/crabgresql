@@ -852,7 +852,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
 fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
     match join {
         JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
+            JoinInput::Scan { .. } => {}
             // Same depth. A FROM subquery binds with an empty outer scope, so
             // no `OuterColumnRef` inside it can *escape* it — see the
             // `debug_assert!` in `bind_from_item`'s Derived arm. (It may well
@@ -1221,7 +1221,7 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
 fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match join {
         JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
+            JoinInput::Scan { .. } => {}
             JoinInput::Subplan(plan) => for_each_plan_expr(plan, depth, &mut *f),
             JoinInput::TableFunction { args, .. } => args.iter().for_each(|e| f(e, depth)),
         },
@@ -2325,8 +2325,15 @@ fn build_query_block(
 ) -> LogicalPlan {
     if let Some(agg) = aggregation {
         let input = match source {
+            // A scan that appends system slots keeps the general join leaf:
+            // `AggInput::Scan` describes a relation by its schema alone, and the
+            // slots live past it.
             JoinExpr::Input {
-                input: JoinInput::Scan(table),
+                input:
+                    JoinInput::Scan {
+                        table,
+                        system: None,
+                    },
                 ..
             } => AggInput::Scan(table),
             // A derived table, CTE reference, `VALUES` in FROM, or set-returning
@@ -2433,8 +2440,9 @@ fn finish_single_select(
     distinct: Option<Vec<DistinctKey>>,
 ) -> LogicalPlan {
     match input {
-        JoinInput::Scan(table) => LogicalPlan::Query(QueryPlan {
+        JoinInput::Scan { table, system } => LogicalPlan::Query(QueryPlan {
             table,
+            system,
             columns,
             projections,
             predicate,
@@ -2899,27 +2907,22 @@ fn bind_from_item(
                     // apply through the existing subplan machinery.
                     let mut arm_columns = columns.clone();
                     arm_columns.extend(wanted.iter().map(|c| system_column(*c)));
-                    let arms = match scan_arms(engine, &table, *only, &wanted)? {
-                        Some(arms) => Some(arms),
-                        // A monolithic relation is scanned directly — unless it
-                        // has to produce system columns, which only an `Append`
-                        // arm knows how to emit. One arm is the whole cost, and
-                        // it buys one emit path instead of two.
-                        None if !wanted.is_empty() => Some(vec![arm(
-                            Arc::clone(&table),
-                            None,
-                            system_emit(&wanted, &table.schema()),
-                        )]),
-                        None => None,
-                    };
-                    let input = match arms {
+                    // A monolithic relation is scanned directly and carries its
+                    // own slots. Wrapping it in a one-armed `Append` for the
+                    // sake of the emit would cost it the index path: an `Append`
+                    // arm has no probe, so `WHERE pk = …` would read the whole
+                    // relation.
+                    let input = match scan_arms(engine, &table, *only, &wanted)? {
                         Some(arms) => {
                             JoinInput::Subplan(Box::new(LogicalPlan::Append(AppendPlan {
                                 arms,
                                 columns: arm_columns,
                             })))
                         }
-                        None => JoinInput::Scan(Arc::clone(&table)),
+                        None => JoinInput::Scan {
+                            table: Arc::clone(&table),
+                            system: system_emit(&wanted, &table.schema()),
+                        },
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
                     // Appended *after* the alias list is applied: `t(a, b)` counts
@@ -3882,11 +3885,17 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Query(QueryPlan {
             table,
+            system,
             projections,
             predicate,
             ..
         }) if !has_srf(&projections) => LogicalPlan::Query(QueryPlan {
             table,
+            // The projection becomes a constant, but the predicate is kept — and
+            // it may read a system slot, whose `ColumnRef` indexes past the
+            // relation's declared columns. Dropping the slots here would make it
+            // index past the end of the row.
+            system,
             columns: one_col(),
             projections: one_row(),
             predicate,

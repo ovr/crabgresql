@@ -5,7 +5,7 @@ use crabgresql_planner::PhysicalAppendArm;
 use crabgresql_storage_api::{StorageError, Tuple};
 use crabgresql_txn::TxnContext;
 
-use crate::{ExecContext, ExecError, ExecNode, SystemRow, push_system, resolve_tableoid};
+use crate::{ExecContext, ExecError, ExecNode, push_system, resolve_tableoid, system_scan};
 
 /// Union scan over the relations one FROM item named: concatenates each arm's
 /// snapshot scan into one row stream, in arm order (see
@@ -42,25 +42,12 @@ impl Append {
                 Some(emit) => Some(resolve_tableoid(&emit.ident, ctx)?),
                 None => None,
             };
-            let rows: Box<dyn Iterator<Item = Result<SystemRow, StorageError>> + Send> =
-                match cols.iter().any(|c| c.needs_header()) {
-                    false => Box::new(
-                        arm.relation
-                            .table
-                            .scan(txn, &arm.projection)
-                            .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
-                    ),
-                    true => Box::new(
-                        arm.relation
-                            .table
-                            .scan_with_system(txn, &arm.projection)
-                            .expect(
-                                "the binder rejects a system column the access method declines, \
-                                 so an arm reaching here can produce a header",
-                            )
-                            .map(|row| row.map(|(tid, hdr, tuple)| (tid, Some(hdr), tuple))),
-                    ),
-                };
+            let rows = system_scan(
+                &arm.relation.table,
+                &arm.projection,
+                cols.iter().any(|c| c.needs_header()),
+                txn,
+            );
             let map = arm.relation.map.is_some().then(|| arm.relation.clone());
             let cols: Arc<[SysCol]> = Arc::from(cols);
             scans.push(Box::new(rows.map(move |row| {

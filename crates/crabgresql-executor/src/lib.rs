@@ -38,7 +38,7 @@ use rustc_hash::FxHashMap;
 
 pub use crabgresql_binder::OutputColumn;
 use crabgresql_binder::{
-    BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey, SysCol,
+    BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey, SysCol, SystemEmit,
 };
 use crabgresql_planner::{
     DmlIndexProbe, DmlTarget, PhysicalAggInput, PhysicalAppendArm, PhysicalInsertSource,
@@ -653,13 +653,14 @@ pub fn execute(
         PhysicalPlan::Select {
             table,
             projection,
+            system,
             columns,
             projections,
             predicate,
             sort,
             distinct,
         } => project_pipeline(
-            scan_source(&table, txn, &projection, ctx),
+            scan_source(&table, txn, &projection, system.as_ref(), ctx)?,
             projections,
             predicate,
             sort,
@@ -709,6 +710,7 @@ pub fn execute(
         PhysicalPlan::IndexScan {
             table,
             projection,
+            system,
             index_name,
             key,
             columns,
@@ -717,7 +719,7 @@ pub fn execute(
             sort,
             distinct,
         } => {
-            let source = IndexScan::new(&table, &index_name, key, ctx, txn, &projection)?;
+            let source = IndexScan::new(&table, &index_name, key, system, ctx, txn, &projection)?;
             project_pipeline(
                 Source::Rows(Box::new(source)),
                 projections,
@@ -1974,9 +1976,18 @@ fn scan_source(
     table: &Arc<dyn TableAm>,
     txn: &TxnContext,
     projection: &ColumnProjection,
+    system: Option<&SystemEmit>,
     ctx: &ExecContext,
-) -> Source {
-    match vector::BatchScan::open(table, txn, projection, ctx) {
+) -> Result<Source, ExecError> {
+    // A scan that appends slots stays on the row path: the batch layout is the
+    // relation's schema, and the only batch-capable access methods reach the
+    // executor as an `Append` over their storage leaves anyway.
+    if let Some(emit) = system {
+        return Ok(Source::Rows(scan_with_slots(
+            table, emit, projection, ctx, txn,
+        )?));
+    }
+    Ok(match vector::BatchScan::open(table, txn, projection, ctx) {
         Some(scan) => {
             let layout = vector::layout_of(&table.schema());
             let positions = scan_positions(projection, layout.len());
@@ -1987,7 +1998,7 @@ fn scan_source(
             }
         }
         None => Source::Rows(Box::new(SeqScan::new(table, txn, projection, ctx))),
-    }
+    })
 }
 
 /// The source for an `Append` over its arms — a partitioned parent, an
@@ -3950,9 +3961,14 @@ fn build_join_source(
     txn: &TxnContext,
 ) -> Result<Box<dyn ExecNode>, ExecError> {
     Ok(match input {
-        PhysicalJoinInput::Scan { table, projection } => {
-            Box::new(SeqScan::new(&table, txn, &projection, ctx))
-        }
+        PhysicalJoinInput::Scan {
+            table,
+            projection,
+            system,
+        } => match &system {
+            None => Box::new(SeqScan::new(&table, txn, &projection, ctx)),
+            Some(emit) => scan_with_slots(&table, emit, &projection, ctx, txn)?,
+        },
         PhysicalJoinInput::TableFunction {
             func,
             args,
@@ -4123,6 +4139,81 @@ pub(crate) fn push_system(
     }
 }
 
+/// A relation's rows with the tid every scan yields and, when `needs_header`,
+/// the MVCC header only [`TableAm::scan_with_system`] does.
+///
+/// The one place that decides between the two scans. The binder has already
+/// refused a header column on an access method that declines it, so the `expect`
+/// below is a wiring invariant rather than anything a query can reach.
+pub(crate) fn system_scan(
+    table: &Arc<dyn TableAm>,
+    projection: &ColumnProjection,
+    needs_header: bool,
+    txn: &TxnContext,
+) -> Box<dyn Iterator<Item = Result<SystemRow, StorageError>> + Send> {
+    match needs_header {
+        false => Box::new(
+            table
+                .scan(txn, projection)
+                .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+        ),
+        true => Box::new(
+            table
+                .scan_with_system(txn, projection)
+                .expect(
+                    "the binder rejects a header system column the access method declines, \
+                     so a statement reaching here can produce one",
+                )
+                .map(|row| row.map(|(tid, hdr, tuple)| (tid, Some(hdr), tuple))),
+        ),
+    }
+}
+
+/// A scan of one relation that appends `emit`'s system slots to every row — the
+/// single-relation twin of what an [`Append`] arm does.
+///
+/// This is why a relation that emits system columns is *not* wrapped in a
+/// one-armed `Append`: an `Append` arm carries no index probe, so doing that
+/// would cost `SELECT ctid … WHERE pk = …` its index path.
+fn scan_with_slots(
+    table: &Arc<dyn TableAm>,
+    emit: &SystemEmit,
+    projection: &ColumnProjection,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+) -> Result<Box<dyn ExecNode>, ExecError> {
+    let cols = Arc::clone(&emit.cols);
+    let oid = match cols.contains(&SysCol::TableOid) {
+        true => Some(resolve_tableoid(&emit.ident, ctx)?),
+        false => None,
+    };
+    let rows = system_scan(
+        table,
+        projection,
+        cols.iter().any(|c| c.needs_header()),
+        txn,
+    );
+    Ok(Box::new(MappedScan {
+        iter: Box::new(rows.map(move |row| {
+            row.map(|(tid, hdr, mut tuple)| {
+                push_system(&mut tuple, &cols, oid, tid, hdr.as_ref());
+                tuple
+            })
+        })),
+    }))
+}
+
+/// A row source that is already a plain tuple iterator.
+struct MappedScan {
+    iter: Box<dyn Iterator<Item = Result<Tuple, StorageError>> + Send>,
+}
+
+impl ExecNode for MappedScan {
+    fn next(&mut self) -> Result<Option<Tuple>, ExecError> {
+        self.iter.next().transpose().map_err(ExecError::from)
+    }
+}
+
 /// The rows one `UPDATE`/`DELETE` target contributes: an index probe when the
 /// planner chose one for it, else the whole relation.
 ///
@@ -4179,19 +4270,11 @@ fn dml_rows(
                 Err(_) => true,
             })))
         }
-        None if needs_header => Ok(Box::new(
-            table
-                .scan_with_system(txn, &ColumnProjection::All)
-                .expect(
-                    "the binder rejects a header system column the access method declines, \
-                     so a statement reaching here can produce one",
-                )
-                .map(|row| row.map(|(tid, hdr, tuple)| (tid, Some(hdr), tuple))),
-        )),
-        None => Ok(Box::new(
-            table
-                .scan(txn, &ColumnProjection::All)
-                .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+        None => Ok(system_scan(
+            table,
+            &ColumnProjection::All,
+            needs_header,
+            txn,
         )),
     }
 }

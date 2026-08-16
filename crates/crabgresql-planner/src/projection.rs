@@ -330,8 +330,24 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
                 other => other,
             };
             match input {
-                PhysicalJoinInput::Scan { table, projection } => {
-                    *projection = resolve(demand, &table.schema());
+                PhysicalJoinInput::Scan {
+                    table,
+                    projection,
+                    system,
+                } => {
+                    let schema = table.schema();
+                    // A system slot sits past the declared columns and is
+                    // synthesized, not read, so it names no stored column to
+                    // project. Dropping those indices keeps `resolve` in the
+                    // schema's space; the slots are appended regardless.
+                    let declared = schema.columns.len();
+                    let demand = match system {
+                        None => demand,
+                        Some(_) => {
+                            demand.map(|d| d.into_iter().filter(|i| *i < declared).collect())
+                        }
+                    };
+                    *projection = resolve(demand, &schema);
                 }
                 PhysicalJoinInput::Subplan(source) => push(source, demand),
                 PhysicalJoinInput::TableFunction { .. } => {}

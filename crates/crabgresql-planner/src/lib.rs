@@ -46,6 +46,9 @@ pub enum PhysicalPlan {
         /// The columns this scan's own expressions read, for engines that can
         /// skip the rest (see [`projection`]). Rows stay full width regardless.
         projection: ColumnProjection,
+        /// The system columns this scan appends past the relation's declared
+        /// ones; see [`JoinInput::Scan`](crabgresql_binder::JoinInput::Scan).
+        system: Option<SystemEmit>,
         columns: Vec<OutputColumn>,
         projections: Vec<BoundExpr>,
         predicate: Option<BoundExpr>,
@@ -64,6 +67,8 @@ pub enum PhysicalPlan {
         /// As for [`Self::Select`], and additionally always covering every
         /// `key` column: the executor's scan fallback re-checks the key per row.
         projection: ColumnProjection,
+        /// As for [`Self::Select`].
+        system: Option<SystemEmit>,
         index_name: String,
         /// What to search for. The value expressions are row-constant and
         /// evaluated once.
@@ -366,6 +371,9 @@ pub enum PhysicalJoinInput {
         /// The columns this leaf's own row supplies to the join tree above it,
         /// in the leaf's base-0 space (see [`projection`]).
         projection: ColumnProjection,
+        /// The system columns the leaf appends past the relation's declared
+        /// ones. They are not in `projection`, which addresses stored columns.
+        system: Option<SystemEmit>,
     },
     Subplan(Box<PhysicalPlan>),
     TableFunction {
@@ -451,9 +459,10 @@ pub enum PhysicalAggInput {
 
 fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinInput {
     match input {
-        JoinInput::Scan(table) => PhysicalJoinInput::Scan {
+        JoinInput::Scan { table, system } => PhysicalJoinInput::Scan {
             table,
             projection: ColumnProjection::All,
+            system,
         },
         JoinInput::Subplan(source) => PhysicalJoinInput::Subplan(Box::new(lower(*source, costs))),
         JoinInput::TableFunction {
@@ -761,6 +770,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
         // scans the whole table when it does not.
         LogicalPlan::Query(QueryPlan {
             table,
+            system,
             columns,
             projections,
             predicate,
@@ -778,6 +788,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             } => PhysicalPlan::IndexScan {
                 table,
                 projection: ColumnProjection::All,
+                system,
                 index_name,
                 key,
                 columns,
@@ -789,6 +800,7 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
             AccessPath::Scan { predicate } => PhysicalPlan::Select {
                 table,
                 projection: ColumnProjection::All,
+                system,
                 columns,
                 projections,
                 predicate,

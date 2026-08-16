@@ -190,7 +190,7 @@ fn walk_returning(returning: &mut Option<Returning>, v: &mut dyn ExprVisitor) {
 fn walk_join(join: &mut JoinExpr, v: &mut dyn ExprVisitor) {
     match join {
         JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
+            JoinInput::Scan { .. } => {}
             JoinInput::Subplan(plan) => walk_exprs_mut(plan, v),
             JoinInput::TableFunction { args, .. } => walk_all(args, v),
         },
