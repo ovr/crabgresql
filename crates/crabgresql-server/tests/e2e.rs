@@ -13306,9 +13306,29 @@ async fn cid_has_equality_and_nothing_else() -> anyhow::Result<()> {
         "equality is all a dedup needs",
     );
 
+    // An array of them is constructible, and hashes to distinct buckets so a
+    // join on one is not quietly quadratic — both were missed when the type was
+    // added, and neither fails loudly.
+    assert_eq!(
+        scalar(&client, "SELECT array['1'::cid, '2'::cid]::text").await,
+        "{1,2}",
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM t WHERE cmin = ANY (array['0'::cid])"
+        )
+        .await,
+        "2",
+    );
+
     for (sql, code) in [
         ("SELECT count(*) FROM t WHERE cmin <> '0'::cid", "42883"),
         ("SELECT cmin FROM t ORDER BY cmin", "42883"),
+        // A DISTINCT aggregate sorts its inputs upstream, so it needs an
+        // ordering — a stricter gate than the bare DISTINCT two lines up, which
+        // needs only equality and is legal.
+        ("SELECT count(DISTINCT cmin) FROM t", "42883"),
     ] {
         let error = client
             .simple_query(sql)

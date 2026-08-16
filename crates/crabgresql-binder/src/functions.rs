@@ -4935,6 +4935,7 @@ fn category(ty: PgType) -> Category {
         | PgType::Tid
         | PgType::Xid
         | PgType::Xid8
+        | PgType::Cid
         | PgType::PgLsn => Category::UserDefined,
         other => Category::Other(other.oid()),
     }

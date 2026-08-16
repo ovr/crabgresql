@@ -705,6 +705,15 @@ pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
                     x.hash(&mut h);
                 }
             }
+            // Both are in `hashes_distinctly`, so the planner will choose a hash
+            // join on one; without an arm here every value would land in the
+            // same bucket and the join would run quadratic while `EXPLAIN` still
+            // called it a hash join.
+            PgType::Cid => {
+                if let Value::Cid(x) = v {
+                    x.hash(&mut h);
+                }
+            }
             PgType::Xid8 => {
                 if let Value::Xid8(x) = v {
                     x.hash(&mut h);
