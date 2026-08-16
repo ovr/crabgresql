@@ -443,6 +443,10 @@ pub enum ScalarFn {
     Log10F8,
     /// `mod(intN, intN) -> intN` (dispatches on the operand's integer width).
     ModInt,
+    /// `abs(int2|int4|int8|float4)` returning the argument's own type
+    /// (dispatches on the operand's width, as [`ScalarFn::ModInt`] does).
+    /// `abs(numeric)` and `abs(float8)` have their own entries above.
+    AbsExact,
     /// `gcd(intN, intN) -> intN` (dispatches on the operand's integer width).
     GcdInt,
     /// `lcm(intN, intN) -> intN` (dispatches on the operand's integer width).
@@ -2021,10 +2025,32 @@ fn lookup(name: &str) -> &'static [Signature] {
         "floor" => num_and_f8!(ScalarFn::NumFloor, ScalarFn::Floor),
         "sign" => num_and_f8!(ScalarFn::NumSign, ScalarFn::Sign),
         "sqrt" => num_and_f8!(ScalarFn::NumSqrt, ScalarFn::Sqrt),
-        // numeric first: an integer argument keeps its exact value through
-        // int -> numeric (PG's abs(int) is exact too); a float argument binds
-        // the float8 overload.
+        // `abs` keeps the argument's own type: PG has one overload per numeric
+        // type (`int2abs` … `float4abs`), so `abs(-3::int4)` is an integer and
+        // not a numeric or a float8. Without the narrow entries an int2/int4/
+        // int8/float4 argument would land on float8, the category's preferred
+        // type — the exact match is what keeps it off that path.
         "abs" => &[
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Int2],
+                ret: PgType::Int2,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Float4],
+                ret: PgType::Float4,
+            },
             Signature {
                 func: ScalarFn::NumAbs,
                 args: &[NUM],
@@ -2060,9 +2086,10 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: NUM,
             },
         ],
-        // gcd/lcm have no smallint overload in PG: a smallint argument widens to
-        // int4. The numeric entry is last for the same reason `mod`'s is — an
-        // integer argument must keep its own width rather than drift to numeric.
+        // gcd/lcm have no smallint overload in PG, and — unlike `abs` below —
+        // none of the three they do have is the numeric category's preferred
+        // type, so a smallint argument reaches all three and separates none:
+        // `gcd(6::int2, 4::int2)` is `42725`, not a widening to int4.
         "gcd" => &[
             Signature {
                 func: ScalarFn::GcdInt,
@@ -4598,8 +4625,9 @@ pub(crate) fn resolve_call(
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
     // so `power(numeric, int)` prefers `power(numeric, numeric)` over the float8
-    // overload, as PG's preferred-type resolution does. Ties keep list order
-    // (float8 listed first, the preferred numeric-category type).
+    // overload — and then the ones converting to their category's preferred
+    // type, which is how `abs(int4)` reaches the exact int4 overload rather than
+    // the float8 one.
     // PG chooses an overload from the argument *types*, never from an untyped
     // literal's contents, so the unknown-argument rule below considers every
     // same-arity signature — not just the ones whose literal happens to parse.
@@ -4607,11 +4635,7 @@ pub(crate) fn resolve_call(
         .iter()
         .filter(|sig| sig.args.len() == bindings.len())
         .collect();
-    let candidates = if arity.len() > 1
-        && bindings
-            .iter()
-            .any(|b| matches!(b, Binding::Unknown { .. }))
-    {
+    let candidates = if arity.len() > 1 {
         // The typed arguments get the first and last word: PG discards the
         // candidates they cannot reach and keeps the most exact matches among
         // them (rules 4.a/4.b) *before* consulting the unknown positions (4.e).
@@ -4620,9 +4644,40 @@ pub(crate) fn resolve_call(
         // singled out — `overlay(bit, unknown, int4)` would lose its `bit`
         // overload to the `text` one.
         let narrowed = narrow_by_typed_args(&bindings, arity);
-        if narrowed.len() > 1 {
+        let has_unknown = bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }));
+        if narrowed.len() > 1 && has_unknown {
             narrow_by_unknown_category(name, &bindings, narrowed)?
         } else {
+            // Every argument is typed and the type rules left more than one
+            // candidate standing: PG stops there rather than picking one, which
+            // is why `gcd(int2, int2)` is `42725` — smallint reaches the int4,
+            // int8 and numeric overloads alike and none of them is the numeric
+            // category's preferred type.
+            //
+            // Counted through `typed_mismatch` rather than `narrowed.len()`
+            // because reachability here is `implicit_castable` while resolution
+            // below is `coerce_for_arg`; where the two disagree, the call is not
+            // actually ambiguous. `exact_only` is false because that is the pass
+            // that admits an implicit cast — with it true a widening argument
+            // reaches nothing and every such call would look unambiguous.
+            // A same-arity user routine suppresses the error outright: it is a
+            // candidate PG would have weighed, and a hard `42725` must not hide
+            // someone's own function.
+            if narrowed.len() > 1
+                && narrowed
+                    .iter()
+                    .filter(|sig| !typed_mismatch(&bindings, sig.args, false))
+                    .count()
+                    > 1
+                && !catalog
+                    .routines(name)
+                    .iter()
+                    .any(|r| r.arg_types.len() == bindings.len())
+            {
+                return Err(ambiguous_function(name, &bindings));
+            }
             narrowed
         }
     } else {

@@ -334,6 +334,60 @@ SELECT pg_typeof(gcd(6, 4)), pg_typeof(gcd(6.0, 4.0)), pg_typeof(lcm(6, 4));
 (1 row)
 
 --
+-- abs has one overload per numeric type, so it keeps the argument's own type
+-- rather than drifting to float8, the category's preferred type
+--
+SELECT abs(-3::int2) AS v, pg_typeof(abs(-3::int2)) AS t;
+ v |    t     
+---+----------
+ 3 | smallint
+(1 row)
+
+SELECT abs(-3::int4) AS v, pg_typeof(abs(-3::int4)) AS t;
+ v |    t    
+---+---------
+ 3 | integer
+(1 row)
+
+SELECT abs(-3::int8) AS v, pg_typeof(abs(-3::int8)) AS t;
+ v |   t    
+---+--------
+ 3 | bigint
+(1 row)
+
+SELECT abs(-3.5::float4) AS v, pg_typeof(abs(-3.5::float4)) AS t;
+  v  |  t   
+-----+------
+ 3.5 | real
+(1 row)
+
+SELECT abs(-3.5::float8) AS v, pg_typeof(abs(-3.5::float8)) AS t;
+  v  |        t         
+-----+------------------
+ 3.5 | double precision
+(1 row)
+
+SELECT abs(-3.50::numeric) AS v, pg_typeof(abs(-3.50::numeric)) AS t;
+  v   |    t    
+------+---------
+ 3.50 | numeric
+(1 row)
+
+-- the magnitude of each type's minimum is not representable in it
+SELECT abs((-32768)::int2);
+ERROR:  smallint out of range
+SELECT abs((-2147483648)::int4);
+ERROR:  integer out of range
+SELECT abs((-9223372036854775808)::int8);
+ERROR:  bigint out of range
+-- and the `@` prefix operator answers the same way
+SELECT @ (-3::int4) AS v, pg_typeof(@ (-3::int4)) AS t;
+ v |    t    
+---+---------
+ 3 | integer
+(1 row)
+
+--
 -- NULL is NULL throughout (every function here is strict)
 --
 SELECT sin(NULL::float8), degrees(NULL::float8), atan2(NULL::float8, 1.0::float8);

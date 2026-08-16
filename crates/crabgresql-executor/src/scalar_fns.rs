@@ -923,11 +923,21 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Numeric)
                 .map_err(num_err);
         }
-        // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
-        // division by zero is 22012 — same semantics as the `%` operator.
         // Nullary, so it cannot reach the float8 tail — that path reads
         // `args[0]` unconditionally.
         ScalarFn::Pi => return Ok(Value::Float8(std::f64::consts::PI)),
+        // `abs(int2|int4|int8|float4)` keeps the argument's type. Shares the
+        // `@` operator's implementation, so the `checked_abs` overflow at each
+        // type's minimum is reported in exactly one place.
+        ScalarFn::AbsExact => {
+            return crabgresql_types::arith::eval_unary(
+                crabgresql_types::arith::UnaryArithOp::Abs,
+                args[0].clone(),
+            )
+            .map_err(crate::eval::arith_error);
+        }
+        // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
+        // division by zero is 22012 — same semantics as the `%` operator.
         ScalarFn::ModInt => {
             let zero = || err(sqlstate::DIVISION_BY_ZERO, "division by zero");
             return match (&args[0], &args[1]) {

@@ -110,6 +110,23 @@ SELECT lcm(9999999999999999999999::numeric, 9999999999999999999998::numeric);
 SELECT pg_typeof(gcd(6, 4)), pg_typeof(gcd(6.0, 4.0)), pg_typeof(lcm(6, 4));
 
 --
+-- abs has one overload per numeric type, so it keeps the argument's own type
+-- rather than drifting to float8, the category's preferred type
+--
+SELECT abs(-3::int2) AS v, pg_typeof(abs(-3::int2)) AS t;
+SELECT abs(-3::int4) AS v, pg_typeof(abs(-3::int4)) AS t;
+SELECT abs(-3::int8) AS v, pg_typeof(abs(-3::int8)) AS t;
+SELECT abs(-3.5::float4) AS v, pg_typeof(abs(-3.5::float4)) AS t;
+SELECT abs(-3.5::float8) AS v, pg_typeof(abs(-3.5::float8)) AS t;
+SELECT abs(-3.50::numeric) AS v, pg_typeof(abs(-3.50::numeric)) AS t;
+-- the magnitude of each type's minimum is not representable in it
+SELECT abs((-32768)::int2);
+SELECT abs((-2147483648)::int4);
+SELECT abs((-9223372036854775808)::int8);
+-- and the `@` prefix operator answers the same way
+SELECT @ (-3::int4) AS v, pg_typeof(@ (-3::int4)) AS t;
+
+--
 -- NULL is NULL throughout (every function here is strict)
 --
 SELECT sin(NULL::float8), degrees(NULL::float8), atan2(NULL::float8, 1.0::float8);

@@ -493,6 +493,67 @@ fn typed_argument_mismatch_outranks_a_bad_literal() -> anyhow::Result<()> {
 }
 
 #[test]
+fn typed_arguments_that_separate_nothing_are_ambiguous_42725() -> anyhow::Result<()> {
+    // `gcd`/`lcm` have int4, int8 and numeric overloads and no smallint one.
+    // A smallint reaches all three by implicit cast, none of them is the
+    // numeric category's preferred type (float8 is, and is not a candidate),
+    // and nothing else separates them — so PG gives up rather than widening to
+    // int4, and so do we. Unlike the operator form, the function form puts the
+    // whole sentence in HINT and has no DETAIL.
+    for (sql, message) in [
+        (
+            "SELECT gcd(6::int2, 4::int2)",
+            "function gcd(smallint, smallint) is not unique",
+        ),
+        (
+            "SELECT lcm(6::int2, 4::int2)",
+            "function lcm(smallint, smallint) is not unique",
+        ),
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, "42725", "{sql}");
+        assert_eq!(e.message, message, "{sql}");
+        assert_eq!(e.detail.as_deref(), None, "{sql}");
+        assert_eq!(
+            e.hint.as_deref(),
+            Some(
+                "Could not choose a best candidate function. \
+                 You might need to add explicit type casts."
+            ),
+            "{sql}"
+        );
+    }
+    // The widths that *do* have an overload are unaffected.
+    assert_eq!(
+        one_projection("SELECT gcd(6::int4, 4::int4)")?.ty(),
+        PgType::Int4
+    );
+    assert_eq!(
+        one_projection("SELECT gcd(6::int8, 4::int8)")?.ty(),
+        PgType::Int8
+    );
+    Ok(())
+}
+
+#[test]
+fn abs_keeps_the_argument_type() -> anyhow::Result<()> {
+    // PG has one `abs` per numeric type, so the exact match wins over float8 —
+    // the category's preferred type, which is what an argument with no exact
+    // overload would otherwise land on.
+    for (sql, ty) in [
+        ("SELECT abs(-3::int2)", PgType::Int2),
+        ("SELECT abs(-3::int4)", PgType::Int4),
+        ("SELECT abs(-3::int8)", PgType::Int8),
+        ("SELECT abs(-3::float4)", PgType::Float4),
+        ("SELECT abs(-3::float8)", PgType::Float8),
+        ("SELECT abs(-3::numeric)", PgType::Numeric),
+    ] {
+        assert_eq!(one_projection(sql)?.ty(), ty, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
 fn output_column_names_follow_pg() -> anyhow::Result<()> {
     let QueryPlan { columns, .. } =
         bound_query("SELECT id, (name), id + 1 AS next, id + 1, true FROM t")?;
