@@ -35,6 +35,7 @@ test: numeric
 test: join
 test: join_pushdown
 test: generate_series
+test: generate_subscripts
 test: string
 test: hash
 test: uuid

@@ -1,0 +1,184 @@
+--
+-- GENERATE_SUBSCRIPTS
+-- The set-returning function generate_subscripts over an array's dimension, in
+-- both the target list and FROM position. Output hand-checked against
+-- PostgreSQL's aligned format.
+--
+-- target-list form: one row per valid subscript, the column named after the
+-- function
+SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1);
+ generate_subscripts 
+---------------------
+                   1
+                   2
+                   3
+(3 rows)
+
+SELECT pg_typeof(s) FROM generate_subscripts(ARRAY['a'], 1) s;
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+-- FROM position
+SELECT * FROM generate_subscripts(ARRAY['a', 'b', 'c'], 1);
+ generate_subscripts 
+---------------------
+                   1
+                   2
+                   3
+(3 rows)
+
+-- reverse yields them descending; an explicit false does not
+SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, true);
+ generate_subscripts 
+---------------------
+                   3
+                   2
+                   1
+(3 rows)
+
+SELECT generate_subscripts(ARRAY['a', 'b', 'c'], 1, false);
+ generate_subscripts 
+---------------------
+                   1
+                   2
+                   3
+(3 rows)
+
+-- a bare alias renames the single column, and a column list wins over it
+SELECT g FROM generate_subscripts(ARRAY[10, 20], 1) g;
+ g 
+---
+ 1
+ 2
+(2 rows)
+
+SELECT s FROM generate_subscripts(ARRAY[10, 20], 1) g(s);
+ s 
+---
+ 1
+ 2
+(2 rows)
+
+-- WITH ORDINALITY appends the ordinal, as it does for any set-returning
+-- function
+SELECT * FROM generate_subscripts(ARRAY['x', 'y'], 1) WITH ORDINALITY;
+ generate_subscripts | ordinality 
+---------------------+------------
+                   1 |          1
+                   2 |          2
+(2 rows)
+
+-- the idiom the function exists for: subscript alongside element
+CREATE TABLE arr (id int, a text[]);
+INSERT INTO arr VALUES (1, ARRAY['x', 'y', 'z']), (2, ARRAY['p']);
+SELECT id, i, a[i] AS v FROM arr, generate_subscripts(ARRAY['x', 'y', 'z'], 1) i
+  WHERE id = 1 ORDER BY i;
+ id | i | v 
+----+---+---
+  1 | 1 | x
+  1 | 2 | y
+  1 | 3 | z
+(3 rows)
+
+-- over a stored array in the target list, both directions
+SELECT id, generate_subscripts(a, 1) AS s FROM arr ORDER BY id, s;
+ id | s 
+----+---
+  1 | 1
+  1 | 2
+  1 | 3
+  2 | 1
+(4 rows)
+
+SELECT id, generate_subscripts(a, 1, true) AS s FROM arr ORDER BY id, s DESC;
+ id | s 
+----+---
+  1 | 3
+  1 | 2
+  1 | 1
+  2 | 1
+(4 rows)
+
+-- a dimension the array does not have yields no rows rather than an error;
+-- the engine's arrays are one-dimensional, so that is every dimension but 1
+SELECT generate_subscripts(ARRAY['a', 'b'], 0);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+SELECT generate_subscripts(ARRAY['a', 'b'], 2);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+SELECT generate_subscripts(ARRAY['a', 'b'], -1);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+-- an empty array has no subscripts at all
+SELECT generate_subscripts('{}'::text[], 1);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+-- the function is strict: a NULL in any argument yields no rows
+SELECT generate_subscripts(NULL::text[], 1);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+SELECT generate_subscripts(ARRAY['a', 'b'], NULL);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+SELECT generate_subscripts(ARRAY['a', 'b'], 1, NULL);
+ generate_subscripts 
+---------------------
+(0 rows)
+
+-- oidvector/int2vector are subscripted from 0, so their subscripts start there
+SELECT generate_subscripts('11 22 33'::oidvector, 1);
+ generate_subscripts 
+---------------------
+                   0
+                   1
+                   2
+(3 rows)
+
+SELECT generate_subscripts('11 22'::int2vector, 1);
+ generate_subscripts 
+---------------------
+                   0
+                   1
+(2 rows)
+
+-- a smallint dimension widens to int4 and binds
+SELECT generate_subscripts(ARRAY['a', 'b'], 1::smallint);
+ generate_subscripts 
+---------------------
+                   1
+                   2
+(2 rows)
+
+-- only (anyarray, int) and (anyarray, int, boolean) resolve
+SELECT generate_subscripts(ARRAY['a', 'b']);
+ERROR:  function generate_subscripts(text[]) does not exist
+SELECT generate_subscripts(ARRAY['a', 'b'], 1::bigint);
+ERROR:  function generate_subscripts(text[], bigint) does not exist
+SELECT generate_subscripts(ARRAY['a', 'b'], 1.5);
+ERROR:  function generate_subscripts(text[], numeric) does not exist
+SELECT generate_subscripts(1, 1);
+ERROR:  function generate_subscripts(integer, integer) does not exist
+SELECT generate_subscripts(ARRAY['a', 'b'], 1, true, 4);
+ERROR:  function generate_subscripts(text[], integer, boolean, integer) does not exist
+-- the dimension is an int4, so a literal its input function rejects is a
+-- value error and not an overload one
+SELECT generate_subscripts(ARRAY['a', 'b'], 'x');
+ERROR:  invalid input syntax for type integer: "x"
+LINE 1: SELECT generate_subscripts(ARRAY['a', 'b'], 'x');
+                                                    ^
+DROP TABLE arr;
