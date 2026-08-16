@@ -12854,6 +12854,51 @@ async fn system_columns_on_a_heap_relation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `DELETE`'s `WHERE` reads the row as it is **stored**, not as the delete
+/// will leave it.
+///
+/// `xmax` is invalid on a live row, so `WHERE xmax = '0'::xid` matches every row
+/// and its negation matches none. Evaluating the qual against a header already
+/// stamped with this deleter inverts both, which is a silent wrong answer rather
+/// than an error: the rows go away. Pinned against PostgreSQL 18.4, and pinned
+/// alongside the equivalent SELECT, because the read and write paths reading one
+/// predicate differently is the shape the defect took.
+#[tokio::test]
+async fn a_delete_qual_reads_the_stored_row_not_the_deleted_one() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t WHERE xmax <> '0'::xid").await,
+        "0",
+        "no live row has a deleter",
+    );
+    client
+        .simple_query("DELETE FROM t WHERE xmax <> '0'::xid")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t").await,
+        "3",
+        "the DELETE must match exactly what the SELECT matched",
+    );
+
+    // The complement removes everything, and RETURNING — unlike the qual — does
+    // describe the row after the delete.
+    let deleted = client
+        .simple_query("DELETE FROM t WHERE xmax = '0'::xid RETURNING a, xmax <> '0'::xid")
+        .await?;
+    let deleted = rows(&deleted);
+    assert_eq!(deleted.len(), 3);
+    assert!(
+        deleted.iter().all(|r| r.get(1) == Some("t")),
+        "RETURNING names this deleter",
+    );
+    assert_eq!(scalar(&client, "SELECT count(*) FROM t").await, "0");
+    Ok(())
+}
+
 /// What `RETURNING` reports for each verb, which is not the same row in each
 /// case and is pinned against PostgreSQL 18.4:
 ///

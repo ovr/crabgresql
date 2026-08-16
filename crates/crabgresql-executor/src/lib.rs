@@ -2973,19 +2973,19 @@ fn update_inherited(
             None => None,
             Some(returning) => {
                 let hdr = inserted_header(txn);
-                let sources: Vec<SysSource> = returned_at
+                // A row the write did not apply to gets no RETURNING row at
+                // all, as upstream — see `update_direct`.
+                let (rows, sources): (Vec<&Tuple>, Vec<SysSource>) = new_rows
                     .iter()
+                    .zip(&returned_at)
                     .zip(&returned_sources)
-                    .map(|(&(target, at), source)| {
-                        SysSource::placed(
-                            source.oid,
-                            new_tids[target][at].unwrap_or(source.tid),
-                            Some(hdr),
-                        )
+                    .filter_map(|((row, &(target, at)), source)| {
+                        new_tids[target][at]
+                            .map(|tid| (row, SysSource::placed(source.oid, tid, Some(hdr))))
                     })
-                    .collect();
+                    .unzip();
                 Some(project_returning(
-                    new_rows.iter(),
+                    rows.into_iter(),
                     &returning.projections,
                     Some((system, &sources)),
                     ctx,
@@ -3142,15 +3142,20 @@ fn update_direct(
         Some(rows) => {
             let returning = returning.as_ref().expect("new_rows implies RETURNING");
             let hdr = inserted_header(txn);
-            let sources: Vec<SysSource> = sources
+            // A `None` tid is a row that was gone by the time the write reached
+            // it. PostgreSQL emits no RETURNING row for one, so neither does
+            // this — inventing an address for a version that was never written
+            // is what a client's `WHERE ctid = …` follow-up would then chase.
+            let (rows, sources): (Vec<&Tuple>, Vec<SysSource>) = rows
                 .iter()
+                .zip(&sources)
                 .zip(&new_tids)
-                .map(|(source, tid)| {
-                    SysSource::placed(source.oid, tid.unwrap_or(source.tid), Some(hdr))
+                .filter_map(|((row, source), tid)| {
+                    tid.map(|tid| (row, SysSource::placed(source.oid, tid, Some(hdr))))
                 })
-                .collect();
+                .unzip();
             Some(project_returning(
-                rows.iter(),
+                rows.into_iter(),
                 &returning.projections,
                 Some((system, &sources)),
                 ctx,
@@ -3449,19 +3454,23 @@ fn update_routed(
             None => None,
             Some(returning) => {
                 let hdr = inserted_header(txn);
-                let sources: Vec<SysSource> = returned_at
+                // An in-place update the write did not apply to gets no
+                // RETURNING row, as upstream — see `update_direct`. A moved row
+                // always has one: it was written as an insert.
+                let (rows, sources): (Vec<&Tuple>, Vec<SysSource>) = new_rows
                     .iter()
+                    .zip(&returned_at)
                     .zip(&returned_oids)
-                    .map(|(at, &oid)| {
+                    .filter_map(|((row, at), &oid)| {
                         let tid = match at {
-                            Ok((leaf, i)) => updated_tids[*leaf][*i].unwrap_or(Tid::new(0, 0)),
+                            Ok((leaf, i)) => updated_tids[*leaf][*i]?,
                             Err((leaf, i)) => inserted_tids[*leaf][*i],
                         };
-                        SysSource::placed(oid, tid, Some(hdr))
+                        Some((row, SysSource::placed(oid, tid, Some(hdr))))
                     })
-                    .collect();
+                    .unzip();
                 Some(project_returning(
-                    new_rows.iter(),
+                    rows.into_iter(),
                     &returning.projections,
                     Some((system, &sources)),
                     ctx,
@@ -3715,14 +3724,14 @@ fn delete_inherited(
             let view = target.relation.view(&tuple);
             // WHERE reads the system columns of the child this row lives in, so
             // `DELETE FROM parent WHERE tableoid = 'child'::regclass` removes
-            // exactly that child's rows. `xmax` already reports this deleter,
-            // as it does upstream.
-            let source = SysSource::placed(target_oids[i], tid, deleted_header(hdr, txn));
+            // exactly that child's rows — and it reads them as the row is
+            // *stored*, see `delete_direct`.
+            let matched = SysSource::placed(target_oids[i], tid, hdr);
             let probe_row;
             let row_probe: &[Value] = match system.is_empty() {
                 true => &view,
                 false => {
-                    probe_row = source.widen(&view, system);
+                    probe_row = matched.widen(&view, system);
                     &probe_row
                 }
             };
@@ -3732,7 +3741,11 @@ fn delete_inherited(
                     // The slots are re-appended by `project_returning`, so only
                     // the declared columns are kept here.
                     deleted.push(view.into_owned());
-                    deleted_sources.push(source);
+                    deleted_sources.push(SysSource::placed(
+                        target_oids[i],
+                        tid,
+                        deleted_header(hdr, txn),
+                    ));
                 }
             }
         }
@@ -3785,13 +3798,17 @@ fn delete_direct(
         .transpose()?;
     for row in dml_rows(table, probe, needs_header, ctx, txn)? {
         let (tid, hdr, tuple) = row?;
-        // `xmax`/`cmax` already name this deleter, as upstream reports them.
-        let source = SysSource::placed(oid, tid, deleted_header(hdr, txn));
+        // The WHERE clause reads the row as it is *stored*: `xmax` is still
+        // invalid on a live row, so `WHERE xmax = '0'::xid` matches every row
+        // and its negation matches none, as upstream. Stamping the deleter in
+        // first would make the predicate answer about a row state this very
+        // statement is about to create.
+        let matched = SysSource::placed(oid, tid, hdr);
         let probe_row;
         let row_probe: &[Value] = match system.is_empty() {
             true => &tuple,
             false => {
-                probe_row = source.widen(&tuple, system);
+                probe_row = matched.widen(&tuple, system);
                 &probe_row
             }
         };
@@ -3799,7 +3816,9 @@ fn delete_direct(
             pending.push(tid);
             if returning.is_some() {
                 deleted.push(tuple);
-                sources.push(source);
+                // RETURNING *does* describe the row after the delete: `xmax`
+                // and `cmax` name this deleter, as upstream reports them.
+                sources.push(SysSource::placed(oid, tid, deleted_header(hdr, txn)));
             }
         }
     }
@@ -3854,12 +3873,14 @@ fn delete_routed(
             txn,
         )? {
             let (tid, hdr, tuple) = row?;
-            let source = SysSource::placed(leaf_oids[i], tid, deleted_header(hdr, txn));
+            // Stored state for the predicate, post-delete state for RETURNING
+            // — see `delete_direct`.
+            let matched = SysSource::placed(leaf_oids[i], tid, hdr);
             let probe_row;
             let row_probe: &[Value] = match system.is_empty() {
                 true => &tuple,
                 false => {
-                    probe_row = source.widen(&tuple, system);
+                    probe_row = matched.widen(&tuple, system);
                     &probe_row
                 }
             };
@@ -3867,7 +3888,11 @@ fn delete_routed(
                 pending[i].push(tid);
                 if returning.is_some() {
                     deleted.push(tuple);
-                    sources.push(source);
+                    sources.push(SysSource::placed(
+                        leaf_oids[i],
+                        tid,
+                        deleted_header(hdr, txn),
+                    ));
                 }
             }
         }
