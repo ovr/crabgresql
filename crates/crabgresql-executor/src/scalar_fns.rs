@@ -3190,8 +3190,19 @@ mod tests {
         assert_eq!(call(ScalarFn::Radians, 1e-310), 1.745_329_251_995e-312);
     }
 
-    fn call2(f: ScalarFn, a: Value, b: Value) -> Result<Value, ExecError> {
-        eval_scalar(f, &[a, b], &FmtCtx::utc_default())
+    fn call2(f: ScalarFn, a: Value, b: Value) -> Value {
+        match eval_scalar(f, &[a, b], &FmtCtx::utc_default()) {
+            Ok(value) => value,
+            Err(error) => panic!("scalar-function test fixture failed: {error}"),
+        }
+    }
+
+    /// The SQLSTATE a two-argument function rejects `a`, `b` with.
+    fn call2_err(f: ScalarFn, a: Value, b: Value) -> String {
+        match eval_scalar(f, &[a, b], &FmtCtx::utc_default()) {
+            Ok(value) => panic!("these arguments must be rejected, got {value:?}"),
+            Err(error) => error.code.to_string(),
+        }
     }
 
     #[test]
@@ -3199,36 +3210,24 @@ mod tests {
         let i4 = |v: i32| Value::Int4(v);
         // Always non-negative, whatever the operands' signs.
         for (a, b) in [(6, 4), (-6, 4), (6, -4), (-6, -4)] {
-            assert_eq!(call2(ScalarFn::GcdInt, i4(a), i4(b)).unwrap(), i4(2));
-            assert_eq!(call2(ScalarFn::LcmInt, i4(a), i4(b)).unwrap(), i4(12));
+            assert_eq!(call2(ScalarFn::GcdInt, i4(a), i4(b)), i4(2));
+            assert_eq!(call2(ScalarFn::LcmInt, i4(a), i4(b)), i4(12));
         }
-        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(0)).unwrap(), i4(0));
-        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(-5)).unwrap(), i4(5));
-        assert_eq!(call2(ScalarFn::LcmInt, i4(0), i4(5)).unwrap(), i4(0));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(0)), i4(0));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(-5)), i4(5));
+        assert_eq!(call2(ScalarFn::LcmInt, i4(0), i4(5)), i4(0));
         // The overflow condition is a result the type cannot hold, so it is
         // symmetric in the arguments — |int4 min| does not fit either way.
         for (a, b) in [(i32::MIN, 0), (0, i32::MIN), (i32::MIN, i32::MIN)] {
-            assert_eq!(
-                call2(ScalarFn::GcdInt, i4(a), i4(b))
-                    .expect_err("|int4 min| does not fit in int4")
-                    .code,
-                "22003"
-            );
+            assert_eq!(call2_err(ScalarFn::GcdInt, i4(a), i4(b)), "22003");
         }
         // ...but only when it *is* the result: gcd(int4 min, 2) is 2.
-        assert_eq!(call2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)).unwrap(), i4(2));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)), i4(2));
         // A zero operand answers before anything is multiplied.
-        assert_eq!(call2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)).unwrap(), i4(0));
+        assert_eq!(call2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)), i4(0));
+        assert_eq!(call2_err(ScalarFn::LcmInt, i4(i32::MIN), i4(1)), "22003");
         assert_eq!(
-            call2(ScalarFn::LcmInt, i4(i32::MIN), i4(1))
-                .expect_err("|int4 min| does not fit in int4")
-                .code,
-            "22003"
-        );
-        assert_eq!(
-            call2(ScalarFn::LcmInt, i4(i32::MAX), i4(i32::MAX - 1))
-                .expect_err("the product overflows int4")
-                .code,
+            call2_err(ScalarFn::LcmInt, i4(i32::MAX), i4(i32::MAX - 1)),
             "22003"
         );
         // The same magnitude fits the wider overload, so it is not an error there.
@@ -3237,24 +3236,25 @@ mod tests {
                 ScalarFn::GcdInt,
                 Value::Int8(i64::from(i32::MIN)),
                 Value::Int8(0)
-            )
-            .unwrap(),
+            ),
             Value::Int8(2_147_483_648)
         );
         assert_eq!(
-            call2(ScalarFn::GcdInt, Value::Int8(i64::MIN), Value::Int8(0))
-                .expect_err("|int8 min| does not fit in int8")
-                .code,
+            call2_err(ScalarFn::GcdInt, Value::Int8(i64::MIN), Value::Int8(0)),
             "22003"
         );
     }
 
     #[test]
     fn numeric_gcd_lcm_scale_and_specials() {
-        let n = |s: &str| Value::Numeric(crabgresql_types::numeric::Numeric::parse(s).unwrap());
+        let n = |s: &str| {
+            Value::Numeric(
+                crabgresql_types::numeric::Numeric::parse(s).expect("test fixture is a numeric"),
+            )
+        };
         // The rendered text, not the value, is what pins the display scale —
         // 1.4 and 1.40 are the same number and different answers.
-        let rendered = |f: ScalarFn, a: &str, b: &str| match call2(f, n(a), n(b)).unwrap() {
+        let rendered = |f: ScalarFn, a: &str, b: &str| match call2(f, n(a), n(b)) {
             Value::Numeric(v) => v.to_display(),
             other => panic!("expected numeric, got {other:?}"),
         };
