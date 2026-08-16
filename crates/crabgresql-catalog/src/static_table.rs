@@ -17,6 +17,16 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{CommandId, Infomask, TupleHeader, Xid};
 use crabgresql_types::Value;
 
+/// The tid of the `i`th catalog row, and its inverse. Offsets start at 1: see
+/// [`StaticTable::scan`].
+fn row_tid(i: usize) -> Tid {
+    Tid::from_packed(i as u64 + 1)
+}
+
+fn row_index(tid: Tid) -> Option<usize> {
+    (tid.packed() as usize).checked_sub(1)
+}
+
 /// Where a [`StaticTable`]'s rows come from: built already, or built on the
 /// first read.
 enum Rows {
@@ -108,20 +118,21 @@ impl StaticTable {
         self
     }
 
-    /// See [`Rows::Deferred`].
+    /// See [`Rows::Deferred`]. The caller sets the `xmin` afterwards, exactly as
+    /// for a ready relation — a deferred one is no less entitled to a
+    /// per-relation generation.
     pub fn deferred(
         schema: TableSchema,
-        xmin: Xid,
         build: impl Fn() -> Vec<Tuple> + Send + Sync + 'static,
-    ) -> Arc<dyn TableAm> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             schema: Arc::new(schema),
             rows: Rows::Deferred {
                 build: Box::new(build),
                 built: OnceLock::new(),
             },
-            xmin: CatalogXmin::Snapshot(xmin),
-        })
+            xmin: CatalogXmin::Snapshot(Xid::INVALID),
+        }
     }
 
     /// The header `row` reports; see [`CatalogXmin`]. A catalog row is never
@@ -198,11 +209,12 @@ impl TableAm for StaticTable {
     /// exactly as the heap's projected scan leaves them.
     fn scan(&self, _txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
+        // Numbered from 1, because offset 0 is `InvalidOffsetNumber` upstream —
+        // PostgreSQL's line pointers start at 1, so a `ctid` of `(0,0)` is a
+        // value no relation ever hands out and a client is entitled to reject.
         let rows = self.rows();
         let ColumnProjection::Some(wanted) = projection else {
-            return Box::new(
-                (0..rows.len()).map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))),
-            );
+            return Box::new((0..rows.len()).map(move |i| Ok((row_tid(i), rows[i].clone()))));
         };
         let wanted = Arc::clone(wanted);
         Box::new((0..rows.len()).map(move |i| {
@@ -217,12 +229,12 @@ impl TableAm for StaticTable {
                     out[column] = value.clone();
                 }
             }
-            Ok((Tid::from_packed(i as u64), out))
+            Ok((row_tid(i), out))
         }))
     }
 
     fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
-        Ok(self.rows().get(tid.packed() as usize).cloned())
+        Ok(row_index(tid).and_then(|i| self.rows().get(i).cloned()))
     }
 
     /// A catalog relation answers all of them. The tids are synthetic but
@@ -247,7 +259,10 @@ impl TableAm for StaticTable {
         // lookup below is total.
         let rows = self.scan(txn, projection);
         Some(Box::new(rows.map(move |row| {
-            row.map(|(tid, tuple)| (tid, headers[tid.packed() as usize], tuple))
+            row.map(|(tid, tuple)| {
+                let i = row_index(tid).expect("a tid this scan minted");
+                (tid, headers[i], tuple)
+            })
         })))
     }
 

@@ -87,6 +87,13 @@ pub async fn serve_with(
     copy_files: CopyFileAccess,
 ) -> std::io::Result<()> {
     let catalog = Arc::new(GlobalCatalog::with_copy_files(copy_files));
+    // Nothing durably records when a definition last changed, so the catalog's
+    // generation starts wherever the transaction counter does — "as far as this
+    // server knows, everything is as of now". Left at zero it would be
+    // `InvalidTransactionId`, which `age()` answers with 2147483647, so a client
+    // testing `age(xmin) < threshold` would see no relation as fresh at exactly
+    // the moment it first caches a schema.
+    catalog.seed_ddl_generation(txnmgr.clog().next_xid_floor().0);
     // One server, one set of counters, for every connection and for as long as
     // the server runs. `stats_reset` is stamped now because nothing reads a
     // statistics file back (see `crabgresql_storage_api::pgstat`).

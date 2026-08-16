@@ -2586,15 +2586,27 @@ fn a_toast_relation_is_published_and_its_parent_points_at_it() -> anyhow::Result
     )?;
     let attrelid = required(aschema.column_index("attrelid"), "attrelid")?;
     let attname = required(aschema.column_index("attname"), "attname")?;
+    let attnum = required(aschema.column_index("attnum"), "attnum")?;
+    // Declared columns only: a TOAST relation is an ordinary heap upstream, so
+    // it also publishes the six system attributes at negative `attnum`.
     let names: Vec<String> = arows
         .iter()
         .filter(|r| r[attrelid] == Value::Oid(toast_oid))
+        .filter(|r| matches!(r[attnum], Value::Int2(n) if n > 0))
         .map(|r| match &r[attname] {
             Value::Text(s) => s.clone(),
             other => format!("{other:?}"),
         })
         .collect();
     assert_eq!(names, vec!["chunk_id", "chunk_seq", "chunk_data"]);
+    assert_eq!(
+        arows
+            .iter()
+            .filter(|r| r[attrelid] == Value::Oid(toast_oid))
+            .filter(|r| matches!(r[attnum], Value::Int2(n) if n < 0))
+            .count(),
+        6,
+    );
 
     // A toast relation is not a user relation: it must not be reachable by an
     // unqualified name, which is why it never enters `live_relations`.

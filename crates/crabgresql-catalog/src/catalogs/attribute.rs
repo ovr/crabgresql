@@ -3,8 +3,8 @@
 use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
-use crate::SystemCatalog;
 use crate::cols::*;
+use crate::{RelKind, SystemCatalog};
 use crabgresql_storage_api::Column;
 
 use crate::PG_TYPE_ROWS;
@@ -13,9 +13,6 @@ use crate::catalogs::collation::typcollation_of;
 
 /// `pg_catalog.pg_attribute` — a curated subset of columns for user relations'
 /// columns.
-///
-/// TODO: emit the system columns PostgreSQL also lists here — `ctid`, `xmin`,
-/// `cmin`, `xmax`, `cmax` and `tableoid`, at negative `attnum`.
 pub(crate) fn pg_attribute_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_attribute",
@@ -89,17 +86,14 @@ const SYSTEM_ATTRIBUTES: &[(&str, PgType, i16)] = &[
     ("tableoid", PgType::Oid, -6),
 ];
 
-/// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
-/// (user columns only) plus the six system attributes at negative `attnum`,
-/// typed from the column's `PgType` (`atttypid`/`attlen`).
-pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    let (relations, indexes, toasts) = (cat.relation_oids(), cat.index_oids(), cat.toast_oids());
-    let mut rows = Vec::new();
-    for (oid, schema) in relations {
-        for (name, ty, attnum) in SYSTEM_ATTRIBUTES {
+/// The six system-attribute rows for the relation `oid` names.
+fn system_attribute_rows(oid: u32) -> Vec<Vec<Value>> {
+    SYSTEM_ATTRIBUTES
+        .iter()
+        .map(|(name, ty, attnum)| {
             let (byval, align, storage) = attlayout_of(*ty);
-            rows.push(vec![
-                Value::Oid(*oid),
+            vec![
+                Value::Oid(oid),
                 Value::Text((*name).to_string()),
                 Value::Oid(ty.oid()),
                 Value::Int2(ty.typlen()),
@@ -118,7 +112,24 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 Value::Oid(0),
                 Value::Null,
-            ]);
+            ]
+        })
+        .collect()
+}
+
+/// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
+/// (user columns only) plus the six system attributes at negative `attnum`,
+/// typed from the column's `PgType` (`atttypid`/`attlen`).
+pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
+    let (relations, indexes, toasts) = (cat.relation_oids(), cat.index_oids(), cat.toast_oids());
+    let mut rows = Vec::new();
+    for ((oid, schema), kind) in relations.iter().zip(cat.relation_kinds()) {
+        // A view has no system attributes upstream, because it has no rows of
+        // its own for one to describe — the same reason the binder exposes no
+        // system column on one. Probed against PostgreSQL 18.4: `r`/`p`/`S`/`m`
+        // and a TOAST table publish all six, `v` and `i` publish none.
+        if *kind != RelKind::View {
+            rows.extend(system_attribute_rows(*oid));
         }
         for (i, c) in schema.columns.iter().enumerate() {
             let (byval, align, storage) = attlayout_of(c.ty);
@@ -175,7 +186,9 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         }
     }
     // A TOAST relation's columns, so its `pg_class.relnatts` has rows to join.
+    // It is an ordinary heap upstream, so it carries the system attributes too.
     for toast in toasts {
+        rows.extend(system_attribute_rows(toast.oid));
         for (i, (name, ty)) in TOAST_COLUMNS.iter().enumerate() {
             let (byval, align, storage) = attlayout_of(*ty);
             rows.push(vec![

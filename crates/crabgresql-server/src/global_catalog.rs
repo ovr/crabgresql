@@ -513,17 +513,31 @@ pub struct GlobalCatalog {
     relation_shapes: RwLock<HashMap<(String, String), RelationShape>>,
 }
 
-/// A hash of everything the catalog reports about a relation's definition.
+/// A hash of everything the catalog reports about one object's definition.
 ///
 /// Taken off the `Debug` rendering rather than field by field on purpose: a
-/// field added to `TableSchema` or `IndexMetadata` joins the fingerprint by
-/// itself, where an explicit list would silently stop covering it. Only the
-/// definition is hashed — `stats` and `toast` are sizes, and they move with
-/// ordinary DML.
-fn relation_fingerprint(relation: &RelationMetadata) -> u64 {
-    use std::hash::{Hash, Hasher};
+/// field added to `TableSchema`, `IndexMetadata` or `ViewDefinition` joins the
+/// fingerprint by itself, where an explicit list would silently stop covering
+/// it. Hash the *definition* only — a relation's size estimates move with
+/// ordinary DML and would make the next unrelated DDL look like it touched
+/// everything.
+///
+/// Written through the hasher rather than into a `String` first: this runs over
+/// every object on every DDL statement, and a schema's `Debug` is kilobytes.
+pub fn definition_fingerprint(definition: &impl std::fmt::Debug) -> u64 {
+    use std::fmt::Write as _;
+    use std::hash::Hasher;
+
+    struct HashWrite<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for HashWrite<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{:?}{:?}", relation.schema, relation.indexes).hash(&mut hasher);
+    let _ = write!(HashWrite(&mut hasher), "{definition:?}");
     hasher.finish()
 }
 
@@ -577,22 +591,45 @@ impl GlobalCatalog {
     /// a generation that stood still with it would make two consecutive
     /// `ALTER TABLE`s indistinguishable, which is the one question the value
     /// exists to answer. PostgreSQL spends an XID on every DDL statement, so
-    /// counting them in the same space is the closer reading; the cost is that
-    /// after a burst of DDL with no intervening write the generation leads the
-    /// live counter, and `age()` on those rows reads as a small negative number
-    /// until writes catch up.
-    pub fn note_ddl(&self, xid: u64) {
-        let _ = self
+    /// counting them in the same space is the closer reading.
+    ///
+    /// The caller must publish the returned generation back to the commit log
+    /// (`Clog::observe_next_xid`), or the generation outruns the counter
+    /// `age(xid)` subtracts from and those rows report a negative age. That
+    /// publication is what makes DDL spend XID *numbers* the way upstream spends
+    /// whole transactions — it only raises a lower bound on the next allocation,
+    /// never lowers one.
+    pub fn note_ddl(&self, xid: u64) -> u64 {
+        // The value *this* call installed, not a second load: two sessions
+        // running DDL concurrently would otherwise both read the later one and
+        // stamp their relations with it, which is exactly the collision the
+        // strict increase exists to prevent.
+        match self
             .ddl_xid
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(xid.max(current + 1))
-            });
+            }) {
+            Ok(previous) => xid.max(previous + 1),
+            Err(current) => current,
+        }
     }
 
-    /// The catalog's generation; see [`GlobalCatalog::note_ddl`] and
-    /// `CatalogSource::catalog_xmin`.
+    /// The catalog's generation; see [`GlobalCatalog::note_ddl`].
     pub fn ddl_xid(&self) -> u64 {
         self.ddl_xid.load(Ordering::Relaxed)
+    }
+
+    /// Start the generation at the transaction counter rather than at zero.
+    ///
+    /// Nothing durably records when a definition last changed, so a fresh server
+    /// has no generation to report. Zero is `InvalidTransactionId`, which
+    /// PostgreSQL never puts on a live tuple and which `age()` answers with
+    /// `2147483647` — so a client testing `age(xmin) < threshold` sees *no*
+    /// relation as fresh at exactly the moment it first caches a schema. The
+    /// live counter is the honest stand-in: "as far as this server knows,
+    /// everything is as of now".
+    pub fn seed_ddl_generation(&self, live: u64) {
+        self.ddl_xid.fetch_max(live, Ordering::Relaxed);
     }
 
     /// Record which relations `xid`'s DDL actually changed, so each one's
@@ -616,18 +653,17 @@ impl GlobalCatalog {
     ///
     /// Runs once per DDL statement, not per query, so its `O(relations)` pass is
     /// paid on the rare path.
-    pub fn note_ddl_shapes(&self, relations: &[RelationMetadata], xid: u64) {
+    pub fn note_ddl_shapes(
+        &self,
+        objects: impl IntoIterator<Item = ((String, String), u64)>,
+        xid: u64,
+    ) {
         let mut shapes = self
             .relation_shapes
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let mut live = HashSet::with_capacity(relations.len());
-        for relation in relations {
-            let key = (
-                relation.schema.namespace.clone(),
-                relation.schema.name.clone(),
-            );
-            let fingerprint = relation_fingerprint(relation);
+        let mut live = HashSet::new();
+        for (key, fingerprint) in objects {
             match shapes.get_mut(&key) {
                 // Unchanged: keep the generation it already had, which is the
                 // whole point — an unrelated DDL must not move it.

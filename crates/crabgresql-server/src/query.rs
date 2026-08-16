@@ -37,7 +37,7 @@ use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
-    RoutineDefinition, RoutineKind, TypeRef, Volatility,
+    RoutineDefinition, RoutineKind, TypeRef, Volatility, definition_fingerprint,
 };
 use crate::guc;
 use crate::routines::{RoutineDispatch, SessionNotices};
@@ -758,16 +758,23 @@ pub(crate) fn execute_statement_with(
         // row, so the counter is advanced directly rather than as a side effect
         // of a write.
         advance_command_counter(session);
-        global_catalog.note_ddl(txnmgr.clog().next_xid_floor().0);
-        // …and which relations this statement actually changed, so each one's
+        let generation = global_catalog.note_ddl(txnmgr.clog().next_xid_floor().0);
+        // Spend the XID numbers the generation just consumed, so the counter
+        // `age(xid)` subtracts from keeps up with it. Only a lower bound is
+        // raised — the allocator skips numbers, exactly as it does after a
+        // crash, and nothing reissues one already stamped on a tuple.
+        txnmgr
+            .clog()
+            .observe_next_xid(crabgresql_txn::Xid(generation + 1));
+        // …and which objects this statement actually changed, so each one's
         // catalog rows carry a generation of its own. Derived from the shapes
         // rather than from the statement — see `note_ddl_shapes`.
         //
-        // Stamped with the generation `note_ddl` just advanced to, not with the
-        // raw transaction counter: DDL allocates no XID, so the counter would
-        // hand consecutive statements the same value and a changed relation
-        // would look unchanged.
-        global_catalog.note_ddl_shapes(&engine.relation_metadata(), global_catalog.ddl_xid());
+        // Stamped with the generation `note_ddl` just installed, not with a
+        // second read of it: DDL allocates no XID, so the transaction counter
+        // would hand consecutive statements the same value, and re-reading the
+        // atomic would hand a concurrent session's.
+        global_catalog.note_ddl_shapes(catalog_object_shapes(engine), generation);
     }
     result
 }
@@ -1940,6 +1947,37 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::DropCast { .. } => "DROP CAST",
         _ => return None,
     })
+}
+
+/// Every object the catalog reflects, keyed the way `SessionCatalogSource`
+/// keys it, with a fingerprint of its definition.
+///
+/// All four kinds, not just stored tables: a view or a sequence is a `pg_class`
+/// row like any other, and one left out of the fingerprint map has no
+/// generation of its own — so its `xmin` would move on every DDL anywhere in
+/// the server, which is the behavior the per-relation generation replaced.
+fn catalog_object_shapes(
+    engine: &Arc<dyn TableEngine>,
+) -> impl IntoIterator<Item = ((String, String), u64)> {
+    let tables = engine.relation_metadata().into_iter().map(|r| {
+        (
+            (r.schema.namespace.clone(), r.schema.name.clone()),
+            definition_fingerprint(&(&r.schema, &r.indexes)),
+        )
+    });
+    let views = engine.views().into_iter().map(|v| {
+        (
+            (v.namespace.clone(), v.name.clone()),
+            definition_fingerprint(&v),
+        )
+    });
+    let sequences = engine.sequences().into_iter().map(|s| {
+        (
+            (s.namespace.clone(), s.name.clone()),
+            definition_fingerprint(&s),
+        )
+    });
+    tables.chain(views).chain(sequences).collect::<Vec<_>>()
 }
 
 /// Move the block's command counter on, for a statement that used its command

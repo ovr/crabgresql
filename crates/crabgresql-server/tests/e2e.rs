@@ -13452,6 +13452,80 @@ async fn catalog_xmin_tracks_each_relations_own_ddl() -> anyhow::Result<()> {
     };
     assert_eq!(attr("t").await, t1);
     assert_eq!(attr("u").await, u0);
+
+    // A view is a `pg_class` row like any other and gets a generation of its
+    // own; a source that only fingerprinted stored tables would leave it
+    // drifting on every DDL anywhere in the server.
+    client
+        .simple_query("CREATE VIEW vgen AS SELECT 1 AS z")
+        .await?;
+    let v0 = generation("vgen").await;
+    client.simple_query("CREATE TABLE w (a int)").await?;
+    assert_eq!(
+        generation("vgen").await,
+        v0,
+        "an untouched view stands still"
+    );
+
+    // `age()` is the shape the question is asked in, and it can never read as
+    // negative: the generation is published back to the counter it subtracts
+    // from.
+    let ages = client
+        .simple_query("SELECT age(xmin) FROM pg_class")
+        .await?;
+    for row in rows(&ages) {
+        assert!(
+            row.get(0).unwrap_or("-1").parse::<i32>()? >= 0,
+            "age(xmin) must never be negative",
+        );
+    }
+    Ok(())
+}
+
+/// `pg_attribute` lists the six system attributes for the relations that have
+/// them and for no others.
+///
+/// Probed by relkind against PostgreSQL 18.4: an ordinary table, a partitioned
+/// parent, a sequence and a TOAST relation publish all six; a view and an index
+/// publish none. A view having none is the same fact the binder acts on when it
+/// exposes no system column there — a catalog that advertised six would describe
+/// columns the server refuses to serve.
+#[tokio::test]
+async fn pg_attribute_lists_system_attributes_only_where_they_exist() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE t (a int, b text); CREATE VIEW v AS SELECT a FROM t;              CREATE INDEX t_a ON t (a)",
+        )
+        .await?;
+
+    let sysattrs = |relation: &'static str| {
+        let client = &client;
+        async move {
+            scalar(
+                client,
+                &format!(
+                    "SELECT count(*) FROM pg_attribute                      WHERE attrelid = '{relation}'::regclass AND attnum < 0"
+                ),
+            )
+            .await
+        }
+    };
+    assert_eq!(sysattrs("t").await, "6");
+    assert_eq!(sysattrs("v").await, "0", "a view has no rows of its own");
+    assert_eq!(sysattrs("t_a").await, "0", "nor does an index");
+
+    // The first row of a catalog relation is addressable: offset 0 is
+    // `InvalidOffsetNumber` upstream, where line pointers start at 1.
+    let first = scalar(
+        &client,
+        "SELECT ctid::text FROM pg_class ORDER BY relname LIMIT 1",
+    )
+    .await;
+    assert!(
+        !first.ends_with(",0)"),
+        "a catalog ctid must not use offset 0, got {first}",
+    );
     Ok(())
 }
 
