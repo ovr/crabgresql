@@ -259,7 +259,7 @@ fn user_rows(
                     r.arg_names.iter().map(|n| Value::Text(n.clone())).collect(),
                 ),
                 Value::Text(r.src.clone()),
-                    Value::Null,
+                Value::Null,
                 Value::Null,
             ]
         })
