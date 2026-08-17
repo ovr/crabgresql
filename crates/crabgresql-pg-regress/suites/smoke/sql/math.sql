@@ -126,8 +126,11 @@ SELECT gcd(0::numeric, '-infinity'::numeric), lcm('nan'::numeric, 'infinity'::nu
 -- wider than either integer type
 SELECT gcd(12345678901234567890123::numeric, 123::numeric);
 SELECT lcm(9999999999999999999999::numeric, 9999999999999999999998::numeric);
--- ...but not past the format: this product would need 140001 integer digits
-SELECT lcm((1e70000 + 3)::numeric, 1e70000::numeric);
+-- ...but not past the format. Both operands are one significant digit with a
+-- huge weight, so this costs nothing: a case built from wide coefficients
+-- instead would spend its time in the gcd's long division, not the overflow.
+SELECT lcm(3e131071::numeric, 1e131071::numeric) = 3e131071 AS lcm_fits;
+SELECT lcm(7e131071::numeric, 3e131071::numeric);
 -- a numeric argument binds the numeric overload exactly; an integer one does not
 SELECT pg_typeof(gcd(6, 4)), pg_typeof(gcd(6.0, 4.0)), pg_typeof(lcm(6, 4));
 
