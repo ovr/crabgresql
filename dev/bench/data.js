@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787010568057,
+  "lastUpdate": 1787010569705,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -42700,6 +42700,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 33662.676363,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4fbc55084aa4b213571d6b90d48da15844467354",
+          "message": "feat: Support radian trigonometric, pi/degrees/radians, gcd/lcm (#251)",
+          "timestamp": "2026-08-17T22:33:59Z",
+          "tree_id": "f8ebdbd60c923313986879d6e2880cbd8e5ab4e8",
+          "url": "https://github.com/ovr/crabgresql/commit/4fbc55084aa4b213571d6b90d48da15844467354"
+        },
+        "date": 1787010569575,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1240.351571,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20382.942258,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
