@@ -102,8 +102,7 @@ pub(crate) fn pg_available_extensions_rows(ctx: &ExecContext) -> Vec<Tuple> {
         .collect()
 }
 
-/// The rows of `pg_available_extension_versions()`, as `(name, version,
-/// superuser, trusted, relocatable, schema, requires, comment)`.
+/// The rows of `pg_available_extension_versions()`.
 ///
 /// Eight columns where the view of this name has nine: `installed` is the view's
 /// own, computed from `pg_extension` rather than published by the function.

@@ -200,12 +200,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // The two bootstrap tablespaces live *inside* the data directory, so
         // PostgreSQL reports no location for them; every other OID sends it
         // looking for a symlink under `pg_tblspc/` and it raises what the failing
-        // `stat` said. That is the whole function — `pg_tablespace` is never
-        // consulted — and since `CREATE TABLESPACE` does not exist here, no OID
-        // can ever reach the first case that PostgreSQL would answer for.
-        //
-        // OID 0 answers the empty string as well, verified against PostgreSQL
-        // 18.4 alongside 1663, 1664, and the raising 1, 100, 2200 and 16384.
+        // `stat` said. `pg_tablespace` is never consulted, and with no `CREATE
+        // TABLESPACE` here no OID can reach the case PostgreSQL answers with a
+        // real path. OID 0 answers the empty string as well — verified on
+        // PostgreSQL 18.4 alongside 1663, 1664 and the raising 1, 100 and 16384.
         ScalarFn::PgTablespaceLocation => {
             const DEFAULT_TABLESPACE_OID: u32 = 1663;
             const GLOBAL_TABLESPACE_OID: u32 = 1664;
@@ -348,13 +346,11 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             return Ok(Value::Bool(array_contains(&args[1], &args[0])));
         }
         ScalarFn::ArrayOverlap => return Ok(Value::Bool(array_overlap(&args[0], &args[1]))),
-        // `oidvector`/`int2vector` report their size too, and they differ from an
-        // array in both bounds: the lower one is 0, and the dimension exists even
-        // when it is empty. So `array_length('', 1)` is 0 where `array_length(
-        // '{}'::int[], 1)` is NULL, `array_upper` is one less than the length,
-        // and `array_upper('', 1)` is -1 — PostgreSQL 18.4 prints
-        // `array_dims(''::oidvector)` as `[0:-1]`. `array_elems` panics on a
-        // vector, so this arm has to come first.
+        // `oidvector`/`int2vector` report their size too, and differ from an array
+        // in both bounds: the lower one is 0, and the dimension exists even when
+        // it is empty — PostgreSQL 18.4 prints `array_dims(''::oidvector)` as
+        // `[0:-1]`, so an empty vector's length is 0 where an empty array's is
+        // NULL. `array_elems` panics on a vector, so this arm has to come first.
         ScalarFn::ArrayLength | ScalarFn::ArrayUpper | ScalarFn::Cardinality
             if matches!(&args[0], Value::Vector { .. }) =>
         {

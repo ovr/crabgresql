@@ -1362,9 +1362,7 @@ impl TableFn {
     /// and a bare alias there names only the relation.
     pub fn returns_scalar(self) -> bool {
         match self {
-            // All three return a record: `pg_input_error_info` four columns,
-            // `pg_available_extensions` three,
-            // `pg_available_extension_versions` eight.
+            // All three return a record.
             TableFn::PgInputErrorInfo
             | TableFn::PgAvailableExtensions
             | TableFn::PgAvailableExtensionVersions => false,
@@ -3806,9 +3804,8 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return Ok(binding);
     }
 
-    // The two index-property functions take a relation reference, which arrives
-    // as either `regclass` or `oid`; they resolve their own arguments for the
-    // reason `resolve_index_property` gives.
+    // The two index-property functions take a relation reference in either
+    // spelling, so they resolve outside the overload table too.
     if let Some(binding) = resolve_index_property(&name, &bindings)? {
         return Ok(binding);
     }

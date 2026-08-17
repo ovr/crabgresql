@@ -13,15 +13,14 @@
 
 use crabgresql_storage_api::{IndexKey, IndexMethod};
 
-/// OIDs of PostgreSQL's index access methods, as `pg_am` publishes them (the
-/// same numbers `crabgresql-catalog`'s `BUILTIN_AMS` carries — restated here
-/// because the executor does not depend on the catalog crate).
+/// OIDs of PostgreSQL's index access methods, as `pg_am` publishes them — the
+/// same numbers `crabgresql-catalog`'s `BUILTIN_AMS` carries, restated because
+/// the executor does not depend on the catalog crate.
 ///
-/// Only index AMs are listed: a *table* AM's OID — `heap`, or crabgresql's own
-/// `parquet` and `buffer` — answers NULL for every property, which is what
-/// PostgreSQL reports for it, and which falling off the end of this table
-/// already gives. There is no `CREATE ACCESS METHOD` here, so nothing can be
-/// added to `pg_am` at run time either.
+/// Index AMs only. A *table* AM's OID (`heap`, or crabgresql's own `parquet` and
+/// `buffer`) answers NULL for every property on PostgreSQL, which is what falling
+/// off the end of this table already gives; and with no `CREATE ACCESS METHOD`
+/// nothing can join `pg_am` at run time either.
 const BTREE: u32 = 403;
 const HASH: u32 = 405;
 const GIST: u32 = 783;
@@ -29,7 +28,7 @@ const GIN: u32 = 2742;
 const BRIN: u32 = 3580;
 const SPGIST: u32 = 4000;
 
-/// `pg_indexam_has_property(am, prop)`: the five AM-level properties, as
+/// The five AM-level properties in the order
 /// `(can_order, can_unique, can_multi_col, can_exclude, can_include)`.
 const AM_PROPERTIES: &[(u32, [bool; 5])] = &[
     (BTREE, [true, true, true, true, true]),
@@ -65,7 +64,6 @@ pub(crate) fn indexam_property(am_oid: u32, prop: &str) -> Option<bool> {
 /// `gist` index cannot be reached through this function at all.
 pub(crate) fn index_property(method: IndexMethod, prop: &str) -> Option<bool> {
     let props = match method {
-        // clusterable, index_scan, bitmap_scan, backward_scan
         IndexMethod::BTree => [true, true, true, true],
         IndexMethod::Hash => [false, true, true, true],
     };

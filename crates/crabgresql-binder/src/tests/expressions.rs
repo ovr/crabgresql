@@ -503,10 +503,9 @@ fn output_column_names_follow_pg() -> anyhow::Result<()> {
 
 #[test]
 fn index_property_functions_take_regclass_or_oid() -> anyhow::Result<()> {
-    // The index argument resolves in either spelling. Two entries in the
-    // signature table could not do it — an unknown literal would fit both and
-    // raise 42725 — so the two parameter types are tried in order, `regclass`
-    // first, which is also what keeps a bare literal resolving by *name*.
+    // Two entries in the signature table could not accept both spellings — an
+    // unknown literal would fit both and raise 42725 — so the parameter types are
+    // tried in order, `regclass` first, which keeps a literal resolving by *name*.
     for (sql, want) in [
         (
             "SELECT pg_index_has_property('t_pkey', 'index_scan')",
@@ -530,7 +529,7 @@ fn index_property_functions_take_regclass_or_oid() -> anyhow::Result<()> {
         assert_eq!(args[0].ty(), want, "for `{sql}`");
         assert_eq!(args[1].ty(), PgType::Text, "for `{sql}`");
     }
-    // The three-argument sibling resolves the same way, column in between.
+    // The three-argument sibling resolves the same way.
     let ValuesPlan { rows, .. } =
         bound_values("SELECT pg_index_column_has_property(16384::oid, 1, 'asc')")?;
     let BoundExpr::FuncCall { func, args, .. } = &rows[0][0] else {

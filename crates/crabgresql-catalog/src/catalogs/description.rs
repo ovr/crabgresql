@@ -123,9 +123,8 @@ fn descriptions() -> &'static [Description] {
             .map(|row| (classoid(row.catalog), row.objoid, 0, row.description))
             .collect();
 
-        // Each extension's comment, and the copy of it that the language the
-        // extension installs carries — both written by `CREATE EXTENSION` on
-        // PostgreSQL rather than taken from any `.dat`.
+        // The comments `CREATE EXTENSION` writes rather than any `.dat`; see
+        // `extension_descriptions` for which objects carry them.
         rows.extend(
             crate::catalogs::extension::extension_descriptions()
                 .into_iter()

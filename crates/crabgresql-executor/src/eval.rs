@@ -935,11 +935,9 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
-        // The index property functions. Everything unanswerable is NULL and
-        // nothing raises: an OID that is no index (a table's own, or one naming
-        // nothing at all), a property the level does not own, and — for the
-        // column form — a column number outside the key list, all verified
-        // against PostgreSQL 18.4.
+        // The index property functions. Nothing here raises: an OID that is no
+        // index, a property the level does not own and a column outside the key
+        // list are all NULL, verified against PostgreSQL 18.4.
         ScalarFn::PgIndexHasProperty => {
             let Value::Text(prop) = &args[1] else {
                 unreachable!("pg_index_has_property property was {:?}", args[1]);

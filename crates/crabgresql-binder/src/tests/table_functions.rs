@@ -480,7 +480,7 @@ fn available_extension_versions_binds_eight_columns() -> anyhow::Result<()> {
     );
     assert_eq!(columns[0].ty, PgType::Name);
     assert_eq!(columns[2].ty, PgType::Bool);
-    // A composite-returning function takes no argument and no bare-alias rename.
+    // There is no argument-taking form.
     let e = bind_err("SELECT * FROM pg_available_extension_versions(1)")?;
     assert_eq!(e.code, "42883");
     Ok(())

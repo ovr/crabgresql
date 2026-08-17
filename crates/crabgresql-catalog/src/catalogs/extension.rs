@@ -30,8 +30,6 @@ const COMMENT: &str = "PL/pgSQL procedural language";
 ///
 /// The flags are the ones PostgreSQL 18.4 reports for `plpgsql` 1.0.
 pub struct AvailableExtension {
-    /// The extension's own OID, which `pg_extension` and its `pg_description`
-    /// row are keyed by.
     pub oid: u32,
     pub name: &'static str,
     /// The extension's only version, and therefore also its `default_version`.
@@ -76,9 +74,8 @@ pub fn available_extensions() -> &'static [AvailableExtension] {
 /// The comments `CREATE EXTENSION` writes rather than any `.dat` file: the
 /// extension's own, and a copy of it on the language the extension installs.
 ///
-/// Shaped like [`crate::catalogs::textsearch::snowball_descriptions`] —
-/// `(catalog, objoid, description)` — so [`crate::catalogs::description`]
-/// assembles both the same way.
+/// Shaped like [`crate::catalogs::textsearch::snowball_descriptions`] so
+/// [`crate::catalogs::description`] assembles both the same way.
 pub(crate) fn extension_descriptions() -> Vec<(&'static str, u32, &'static str)> {
     let mut rows = Vec::new();
     for ext in available_extensions() {
