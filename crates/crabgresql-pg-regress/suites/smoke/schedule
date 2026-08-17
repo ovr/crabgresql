@@ -97,3 +97,4 @@ test: pg_aggregate
 test: pg_ts
 test: pg_conversion
 test: array_agg
+test: am_properties

@@ -35,12 +35,17 @@
 //!   (`cannot cast type oid[] to oidvector`, `array is not a valid oidvector`),
 //!   and stay errors here.
 //! * PostgreSQL's polymorphic `anyarray` functions and operators accept these
-//!   types, because `typelem` is set and `typlen` is -1 — so `cardinality`,
-//!   `array_length`, `@>`, `<@` and `&&` all work on an `oidvector` there.
-//!   Here they are gated on [`crate::PgType::Array`] and raise `42883`.
-//!   `unnest` and subscripting are wired up individually and do work.
-//!   TODO: accept `oidvector`/`int2vector` in the polymorphic `anyarray`
-//!   functions and operators (`cardinality`, `array_length`, `@>`, `<@`, `&&`).
+//!   types, because `typelem` is set and `typlen` is -1. Here the ones that only
+//!   *count* elements do — `cardinality`, `array_length`, `array_upper`, plus
+//!   `unnest`, `generate_subscripts` and subscripting — and the rest are gated on
+//!   [`crate::PgType::Array`] and raise `42883`.
+//!   TODO: accept `oidvector`/`int2vector` in the remaining polymorphic
+//!   operators (`@>`, `<@`, `&&`).
+//!
+//!   Note the bounds a vector reports, which are not an array's: `array_length`
+//!   of an *empty* vector is 0 rather than NULL, and `array_upper` is one less
+//!   than the length, because the dimension exists and starts at 0
+//!   (`array_dims(''::oidvector)` is `[0:-1]`).
 //!
 //! Note that *subscripting* is 0-based, unlike a real array:
 //! `('11 22 33'::oidvector)[0]` is `11`. That is handled in the executor's

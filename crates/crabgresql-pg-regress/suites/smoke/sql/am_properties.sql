@@ -1,0 +1,86 @@
+--
+-- Index access-method properties: pg_indexam_has_property,
+-- pg_index_has_property and pg_index_column_has_property.
+--
+-- Every query here answers identically on PostgreSQL, so this file's expected
+-- output was generated with psql -q -a against PostgreSQL 18.4 and holds for
+-- both servers. The AM matrix is filtered to amtype = 'i', which is what makes
+-- it portable: crabgresql publishes the same six index access methods as
+-- PostgreSQL, and its two extra rows (parquet, buffer) are *table* methods.
+--
+-- A property belongs to exactly one of the three levels, and asking the wrong
+-- level yields NULL rather than false — so `can_order` is NULL for an index and
+-- `asc` is NULL for an access method. Every unrecognized name is NULL too.
+--
+CREATE TABLE amp (f1 int, f2 int, f3 int, f4 int);
+CREATE INDEX amp_btree ON amp (f1 DESC, f2 ASC, f3 NULLS FIRST, f4 NULLS LAST);
+CREATE INDEX amp_hash ON amp USING hash (f1);
+
+-- The AM-level matrix, one row per (index method, property).
+SELECT amname, prop, pg_indexam_has_property(a.oid, prop) AS p
+  FROM pg_am a,
+       unnest(ARRAY['can_order', 'can_unique', 'can_multi_col',
+                    'can_exclude', 'can_include', 'bogus']::text[])
+         WITH ORDINALITY AS u(prop, ord)
+ WHERE amtype = 'i'
+ ORDER BY amname, ord;
+-- A table access method has no index properties, and neither has an OID that
+-- names nothing. Property names are matched case-insensitively.
+SELECT pg_indexam_has_property(a.oid, 'can_order') AS heap
+  FROM pg_am a WHERE amname = 'heap';
+SELECT pg_indexam_has_property(999999, 'can_order') AS unknown_oid,
+       pg_indexam_has_property(403, NULL) AS strict,
+       pg_indexam_has_property(403, 'CAN_ORDER') AS upper_case,
+       pg_indexam_has_property(403, 'index_scan') AS wrong_level;
+
+-- The whole-index properties, which follow the index's access method.
+SELECT prop,
+       pg_index_has_property('amp_btree', prop) AS btree,
+       pg_index_has_property('amp_hash', prop) AS hash
+  FROM unnest(ARRAY['clusterable', 'index_scan', 'bitmap_scan',
+                    'backward_scan', 'bogus']::text[])
+         WITH ORDINALITY AS u(prop, ord)
+ ORDER BY ord;
+-- Anything that is not an index is NULL, not an error.
+SELECT pg_index_has_property('amp', 'index_scan') AS on_table,
+       pg_index_has_property(999999, 'index_scan') AS unknown_oid,
+       pg_index_has_property('amp_btree', NULL) AS strict,
+       pg_index_has_property('amp_btree', 'can_order') AS wrong_level;
+
+-- The per-column properties of a btree index carry that column's own sort
+-- options: DESC implies NULLS FIRST and ASC implies NULLS LAST, which is why
+-- column 1 and column 3 differ in nulls_first while both are orderable.
+SELECT col, prop, pg_index_column_has_property('amp_btree', col, prop)
+  FROM (VALUES (1, 'orderable'), (2, 'asc'), (3, 'desc'),
+               (4, 'nulls_first'), (5, 'nulls_last'),
+               (6, 'distance_orderable'), (7, 'returnable'),
+               (8, 'search_array'), (9, 'search_nulls'),
+               (10, 'bogus')) v(idx, prop),
+       generate_series(1, 4) col
+ ORDER BY col, idx;
+-- A hash index orders nothing, so it answers false — not NULL — to all nine.
+SELECT prop, pg_index_column_has_property('amp_hash', 1, prop) AS hash
+  FROM unnest(ARRAY['asc', 'desc', 'nulls_first', 'nulls_last', 'orderable',
+                    'distance_orderable', 'returnable', 'search_array',
+                    'search_nulls', 'bogus']::text[])
+         WITH ORDINALITY AS u(prop, ord)
+ ORDER BY ord;
+-- A column number outside the key list is NULL, and so is a non-index relation.
+SELECT pg_index_column_has_property('amp_btree', 0, 'asc') AS col0,
+       pg_index_column_has_property('amp_btree', 5, 'asc') AS past_end,
+       pg_index_column_has_property('amp_btree', -1, 'asc') AS negative,
+       pg_index_column_has_property('amp', 1, 'asc') AS on_table,
+       pg_index_column_has_property('amp_btree', 1, NULL) AS strict;
+
+-- Both functions take the index as `regclass` or as an `oid`, which is how a
+-- generated query reaches them: joined against pg_index rather than written out.
+SELECT c.relname,
+       pg_index_has_property(i.indexrelid, 'clusterable') AS clusterable,
+       pg_index_column_has_property(i.indexrelid, 1, 'desc') AS first_desc
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+ WHERE c.relname IN ('amp_btree', 'amp_hash')
+ ORDER BY c.relname;
+-- (A name no relation answers to raises the regclass input's own error rather
+-- than answering NULL. Not pinned here: PostgreSQL decorates that one with a
+-- LINE/caret this build does not carry — see the regcast suite.)
+DROP TABLE amp;

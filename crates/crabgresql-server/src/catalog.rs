@@ -11,7 +11,7 @@ use crabgresql_catalog::{
     CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
     CatalogUserType, SystemCatalog,
 };
-use crabgresql_executor::{CatalogOps, ConstraintDef, IndexDef};
+use crabgresql_executor::{CatalogOps, ConstraintDef, ExtensionVersion, IndexDef};
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
 };
@@ -596,11 +596,17 @@ impl CatalogOps for SessionCatalogOps {
         })
     }
 
-    fn available_extensions(&self) -> Vec<(String, String, String)> {
+    fn available_extensions(&self) -> Vec<ExtensionVersion> {
         crabgresql_catalog::available_extensions()
             .iter()
-            .map(|(name, version, comment)| {
-                (name.to_string(), version.to_string(), comment.to_string())
+            .map(|ext| ExtensionVersion {
+                name: ext.name.to_string(),
+                version: ext.version.to_string(),
+                superuser: ext.superuser,
+                trusted: ext.trusted,
+                relocatable: ext.relocatable,
+                schema: ext.schema.to_string(),
+                comment: ext.comment.to_string(),
             })
             .collect()
     }

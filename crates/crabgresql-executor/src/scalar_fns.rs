@@ -197,6 +197,36 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 text(&args[0]),
             )));
         }
+        // The two bootstrap tablespaces live *inside* the data directory, so
+        // PostgreSQL reports no location for them; every other OID sends it
+        // looking for a symlink under `pg_tblspc/` and it raises what the failing
+        // `stat` said. `pg_tablespace` is never consulted, and with no `CREATE
+        // TABLESPACE` here no OID can reach the case PostgreSQL answers with a
+        // real path. OID 0 answers the empty string as well — verified on
+        // PostgreSQL 18.4 alongside 1663, 1664 and the raising 1, 100 and 16384.
+        ScalarFn::PgTablespaceLocation => {
+            const DEFAULT_TABLESPACE_OID: u32 = 1663;
+            const GLOBAL_TABLESPACE_OID: u32 = 1664;
+            let oid = crabgresql_types::compare::oid_of(&args[0]);
+            return match oid {
+                0 | DEFAULT_TABLESPACE_OID | GLOBAL_TABLESPACE_OID => {
+                    Ok(Value::Text(String::new()))
+                }
+                _ => Err(ExecError::new(
+                    sqlstate::UNDEFINED_FILE,
+                    format!("could not stat file \"pg_tblspc/{oid}\": No such file or directory"),
+                )),
+            };
+        }
+        // The AM property table is a compile-time constant, so this one is pure;
+        // its two siblings take an index and are dispatched by `eval`.
+        ScalarFn::PgIndexamHasProperty => {
+            return Ok(crate::index_props::indexam_property(
+                crabgresql_types::compare::oid_of(&args[0]),
+                text(&args[1]),
+            )
+            .map_or(Value::Null, Value::Bool));
+        }
         // Sequence functions are side-effecting and are dispatched by `eval`
         // (which has the session's SequenceOps handle) before it ever reaches
         // this pure evaluator; seeing one here is an internal wiring error.
@@ -212,6 +242,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // it is not STRICT, so the NULL short-circuit above would be wrong for it.
         ScalarFn::PgGetUserById
         | ScalarFn::PgTableIsVisible
+        | ScalarFn::PgIndexHasProperty
+        | ScalarFn::PgIndexColumnHasProperty
         | ScalarFn::ObjDescription
         | ScalarFn::ColDescription
         | ScalarFn::TableOid
@@ -314,6 +346,25 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             return Ok(Value::Bool(array_contains(&args[1], &args[0])));
         }
         ScalarFn::ArrayOverlap => return Ok(Value::Bool(array_overlap(&args[0], &args[1]))),
+        // `oidvector`/`int2vector` report their size too, and differ from an array
+        // in both bounds: the lower one is 0, and the dimension exists even when
+        // it is empty — PostgreSQL 18.4 prints `array_dims(''::oidvector)` as
+        // `[0:-1]`, so an empty vector's length is 0 where an empty array's is
+        // NULL. `array_elems` panics on a vector, so this arm has to come first.
+        ScalarFn::ArrayLength | ScalarFn::ArrayUpper | ScalarFn::Cardinality
+            if matches!(&args[0], Value::Vector { .. }) =>
+        {
+            let Value::Vector { elems, .. } = &args[0] else {
+                unreachable!("guarded by the match above");
+            };
+            let len = elems.len() as i32;
+            return Ok(match func {
+                ScalarFn::Cardinality => Value::Int4(len),
+                _ if i4(&args[1]) != 1 => Value::Null,
+                ScalarFn::ArrayUpper => Value::Int4(len - 1),
+                _ => Value::Int4(len),
+            });
+        }
         ScalarFn::ArrayLength | ScalarFn::ArrayUpper => {
             // `array_length(arr, dim)` / `array_upper(arr, dim)`: for a
             // one-dimensional value the 1-based upper bound of dimension 1 is

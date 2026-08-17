@@ -661,6 +661,25 @@ pub enum ScalarFn {
     /// `pg_char_to_encoding(name) -> int4`: the inverse, `-1` for a name no
     /// encoding answers to.
     PgCharToEncoding,
+    /// `pg_tablespace_location(oid) -> text`: where a tablespace's directory
+    /// lives. The empty string for the two bootstrap tablespaces (which sit
+    /// inside the data directory rather than beside it), and an error for every
+    /// other OID — PostgreSQL stats `pg_tblspc/<oid>` and reports what it finds,
+    /// so this never consults `pg_tablespace`.
+    PgTablespaceLocation,
+    /// `pg_indexam_has_property(oid, text) -> bool`: whether an index access
+    /// method supports a capability (`can_order`, `can_unique`, ...). NULL for a
+    /// property the AM level does not answer for, and for an OID that is not an
+    /// index AM.
+    PgIndexamHasProperty,
+    /// `pg_index_has_property(regclass, text) -> bool`: the same question about a
+    /// whole index (`clusterable`, `index_scan`, ...). NULL for anything that is
+    /// not an index.
+    PgIndexHasProperty,
+    /// `pg_index_column_has_property(regclass, int4, text) -> bool`: the same
+    /// about one key column of an index (`asc`, `nulls_first`, `returnable`,
+    /// ...), numbered from 1. NULL past the end of the key list.
+    PgIndexColumnHasProperty,
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
@@ -1263,6 +1282,11 @@ pub enum TableFn {
     /// `(name, default_version, comment)`. psql's `\dx` calls the function
     /// rather than the view of the same name, so both have to exist.
     PgAvailableExtensions,
+    /// `pg_available_extension_versions()` — one row per installable
+    /// *(extension, version)* pair, with the flags that version would be
+    /// installed under. Nine columns in the view of this name, eight here: the
+    /// function does not report `installed`, which the view computes.
+    PgAvailableExtensionVersions,
     /// `pg_partition_ancestors(regclass)` — the relation itself, then each
     /// partitioned parent up to the root. A relation that is neither a partition
     /// nor partitioned yields **no rows** (observed on 18.4), which is what
@@ -1282,7 +1306,7 @@ impl TableFn {
             // resolves in `resolve_partition_ancestors`, like the polymorphic
             // ones above.
             TableFn::PgPartitionAncestors => &[],
-            TableFn::PgAvailableExtensions => &[],
+            TableFn::PgAvailableExtensions | TableFn::PgAvailableExtensionVersions => &[],
             // The polymorphic/variadic ones resolve their own arguments in
             // `bind_table_fn_call`.
             TableFn::GenerateSeries(_)
@@ -1318,6 +1342,16 @@ impl TableFn {
                 OutputColumn::new("default_version", PgType::Text),
                 OutputColumn::new("comment", PgType::Text),
             ],
+            TableFn::PgAvailableExtensionVersions => vec![
+                OutputColumn::new("name", PgType::Name),
+                OutputColumn::new("version", PgType::Text),
+                OutputColumn::new("superuser", PgType::Bool),
+                OutputColumn::new("trusted", PgType::Bool),
+                OutputColumn::new("relocatable", PgType::Bool),
+                OutputColumn::new("schema", PgType::Name),
+                OutputColumn::new("requires", PgType::Array(crabgresql_types::oid::NAME)),
+                OutputColumn::new("comment", PgType::Text),
+            ],
         }
     }
 
@@ -1328,10 +1362,10 @@ impl TableFn {
     /// and a bare alias there names only the relation.
     pub fn returns_scalar(self) -> bool {
         match self {
-            // `pg_input_error_info` returns `record`.
-            // Both return a record: `pg_input_error_info` four columns,
-            // `pg_available_extensions` three.
-            TableFn::PgInputErrorInfo | TableFn::PgAvailableExtensions => false,
+            // All three return a record.
+            TableFn::PgInputErrorInfo
+            | TableFn::PgAvailableExtensions
+            | TableFn::PgAvailableExtensionVersions => false,
             TableFn::GenerateSeries(_)
             | TableFn::JsonbPathQuery
             | TableFn::Unnest(_)
@@ -1347,6 +1381,7 @@ pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
         "pg_input_error_info" => Some(TableFn::PgInputErrorInfo),
         "pg_partition_ancestors" => Some(TableFn::PgPartitionAncestors),
         "pg_available_extensions" => Some(TableFn::PgAvailableExtensions),
+        "pg_available_extension_versions" => Some(TableFn::PgAvailableExtensionVersions),
         _ => None,
     }
 }
@@ -2763,6 +2798,22 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[NAME],
             ret: I4,
         }],
+        // The access-method property functions. `pg_indexam_has_property` needs
+        // nothing but its OID and is answered by the pure `eval_scalar`; the two
+        // that take an index read the catalog, so `eval` dispatches them — and
+        // they are absent from this table entirely, resolving their own arguments
+        // in `resolve_index_property` because their index parameter is spelled
+        // either `regclass` or `oid`.
+        "pg_indexam_has_property" => &[Signature {
+            func: ScalarFn::PgIndexamHasProperty,
+            args: &[OID, TEXT],
+            ret: BOOL,
+        }],
+        "pg_tablespace_location" => &[Signature {
+            func: ScalarFn::PgTablespaceLocation,
+            args: &[OID],
+            ret: TEXT,
+        }],
         // Catalog lookups. `int -> oid` is implicit, so an OID written as an
         // integer literal resolves too. Dispatched by the executor's `eval`
         // (not `eval_scalar`), which holds the session's catalog snapshot.
@@ -3753,6 +3804,12 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return Ok(binding);
     }
 
+    // The two index-property functions take a relation reference in either
+    // spelling, so they resolve outside the overload table too.
+    if let Some(binding) = resolve_index_property(&name, &bindings)? {
+        return Ok(binding);
+    }
+
     // `pg_typeof(any)` accepts every type, so it has no fixed signature either.
     // Only the unary form is ours; any other arity falls through, so a
     // user-defined overload of this name stays reachable.
@@ -4404,6 +4461,39 @@ fn finish_func_call(
         )?;
     }
     Ok(Binding::Typed(BoundExpr::FuncCall { func, ret, args }))
+}
+
+/// Resolve `pg_index_has_property(index, prop)` and
+/// `pg_index_column_has_property(index, column, prop)`, or `Ok(None)` for any
+/// other name so the caller falls through to ordinary resolution.
+///
+/// PostgreSQL declares the index parameter `regclass` and accepts an `oid`
+/// argument anyway, the two types being binary-coercible there; here they are not
+/// (see [`resolve_partition_ancestors`] for why). Both spellings have to work —
+/// a client writes `'i'::regclass` in a hand-typed query and
+/// `pg_index.indexrelid` in a generated one — and two entries in the signature
+/// table would not do it: an unadorned `pg_index_has_property('i', 'index_scan')`
+/// would then be `42725 is not unique`, since an unknown literal fits both
+/// candidates equally well. So the two parameter types are *tried in order*,
+/// which also keeps a bare literal resolving **by name** rather than through
+/// `text_to_oid`.
+fn resolve_index_property(name: &str, bindings: &[Binding]) -> Result<Option<Binding>, BindError> {
+    let tail: &[PgType] = match (name, bindings.len()) {
+        ("pg_index_has_property", 2) => &[TEXT],
+        ("pg_index_column_has_property", 3) => &[I4, TEXT],
+        _ => return Ok(None),
+    };
+    let func = match name {
+        "pg_index_has_property" => ScalarFn::PgIndexHasProperty,
+        _ => ScalarFn::PgIndexColumnHasProperty,
+    };
+    for first in [REGCLASS, OID] {
+        let params: Vec<PgType> = std::iter::once(first).chain(tail.iter().copied()).collect();
+        if let Ok(args) = single_candidate_args(bindings, &params) {
+            return finish_func_call(func, BOOL, args).map(Some);
+        }
+    }
+    Err(undefined_function(name, bindings))
 }
 
 pub(crate) fn resolve_call(
