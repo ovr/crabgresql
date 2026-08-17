@@ -521,6 +521,51 @@ fn cat_pair(pair: Option<(String, String)>) -> Option<String> {
     pair.map(|(namespace, name)| format!("{namespace}.{name}"))
 }
 
+/// A routine an unqualified name does not reach takes no part in resolution.
+///
+/// `CREATE FUNCTION s.now()` must leave `'now'::regproc` naming the built-in,
+/// which is what PostgreSQL does, because `s` is not on the search path.
+#[test]
+fn a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows() {
+    let routine = |oid: u32, name: &str, namespace: &str| CatalogRoutine {
+        oid,
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        kind: 'f',
+        lang: PLPGSQL_LANG_OID,
+        arg_types: Vec::new(),
+        all_arg_types: Vec::new(),
+        arg_modes: Vec::new(),
+        arg_names: Vec::new(),
+        ret_type: PgType::Int4.oid(),
+        retset: false,
+        volatile: 'v',
+        strict: false,
+        secdef: false,
+        src: "begin return 1; end".to_string(),
+    };
+    let cat = SystemCatalog::from_source(Arc::new(
+        StaticSource::new(Vec::new())
+            .schemas(vec![("s".to_string(), 16_400)])
+            .routines(vec![
+                routine(16_600, "now", "s"),
+                routine(16_601, "s_only", "s"),
+                routine(16_602, "reachable", "public"),
+            ]),
+    ));
+
+    // `s.now` is invisible to an unqualified name, so the built-in stays the only
+    // candidate: it neither wins the name nor makes it ambiguous. The executor
+    // reads that same list to decide the rendering, so `1299` still prints bare
+    // and `16_600` prints `s.now`.
+    assert_eq!(cat.proc_oids(None, "now"), [1299]);
+    assert_eq!(cat.proc_oids(Some("s"), "now"), [16_600]);
+    assert!(cat.proc_oids(None, "s_only").is_empty());
+    assert_eq!(cat.proc_oids(Some("s"), "s_only"), [16_601]);
+    // `public` is reachable, so this one takes part in the unqualified case.
+    assert_eq!(cat.proc_oids(None, "reachable"), [16_602]);
+}
+
 /// Every `regproc`/`regprocedure` reference the catalogs publish resolves to
 /// a `pg_proc` row this build actually emits.
 ///
@@ -2893,7 +2938,7 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // `pg_proc` row like any other, and its description comes along —
             // and again with the implemented-name manifest, which publishes the
             // SQL surface no catalog references.
-            ("pg_proc", 1660),
+            ("pg_proc", 1689),
             // The `simple` configuration and dictionary and the default parser
             // come from the `.dat`; the other 29 of each are snowball's, whose
             // comments `initdb` writes with `COMMENT ON`.

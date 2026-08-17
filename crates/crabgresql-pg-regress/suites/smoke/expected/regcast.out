@@ -397,6 +397,16 @@ SELECT 'row_number'::regproc AS window_fn, 'initcap'::regproc AS scalar_fn;
  row_number | initcap
 (1 row)
 
+-- a variadic text function and a polymorphic array one: both are resolved ahead
+-- of the signature table, and both are published
+SELECT 'concat'::regproc AS variadic, 'cardinality'::regproc AS polymorphic;
+ variadic | polymorphic 
+----------+-------------
+ concat   | cardinality
+(1 row)
+
+SELECT 'format'::regproc;
+ERROR:  more than one function named "format"
 SELECT 'upper'::regproc;
 ERROR:  more than one function named "upper"
 SELECT 'pg_catalog.upper'::regproc;

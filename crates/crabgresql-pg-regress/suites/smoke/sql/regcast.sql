@@ -160,6 +160,10 @@ SELECT 2287::regtype::text::regtype AS roundtrip;
 -- on input names none of them at all.
 SELECT 'now'::regproc AS unique_name, 'pg_catalog.now'::regproc AS qualified_input;
 SELECT 'row_number'::regproc AS window_fn, 'initcap'::regproc AS scalar_fn;
+-- a variadic text function and a polymorphic array one: both are resolved ahead
+-- of the signature table, and both are published
+SELECT 'concat'::regproc AS variadic, 'cardinality'::regproc AS polymorphic;
+SELECT 'format'::regproc;
 SELECT 'upper'::regproc;
 SELECT 'pg_catalog.upper'::regproc;
 SELECT 871::regproc AS overloaded, 0::regproc AS zero, 4294967000::regproc AS unknown_oid;

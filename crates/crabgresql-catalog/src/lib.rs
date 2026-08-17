@@ -483,7 +483,7 @@ pub fn builtin_proc_oids(name: &str) -> Vec<u32> {
 }
 
 /// The name of the built-in function `oid`, the inverse of
-/// [`builtin_proc_oid`].
+/// [`builtin_proc_oids`].
 pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
     PG_PROC_ROWS
         .iter()

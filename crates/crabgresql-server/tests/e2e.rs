@@ -11263,7 +11263,9 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
         .query_one(
             "SELECT 'now'::regproc::text AS now, 'initcap'::regproc::oid AS initcap, \
                     'row_number'::regproc::text AS window_fn, \
-                    'pg_catalog.now'::regproc::text AS qualified",
+                    'pg_catalog.now'::regproc::text AS qualified, \
+                    'concat'::regproc::text AS variadic, \
+                    'cardinality'::regproc::text AS polymorphic",
             &[],
         )
         .await?;
@@ -11273,13 +11275,20 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
     // resolves it by name the same way.
     assert_eq!(row.get::<_, &str>("window_fn"), "row_number");
     assert_eq!(row.get::<_, &str>("qualified"), "now");
+    // The two families the binder resolves ahead of its signature table: a
+    // variadic text function and a polymorphic array one. Both are implemented,
+    // so both are published.
+    assert_eq!(row.get::<_, &str>("variadic"), "concat");
+    assert_eq!(row.get::<_, &str>("polymorphic"), "cardinality");
 
     // An overloaded name names none of them: PG reports `42725` rather than
-    // choosing, quoting the input as it was written.
+    // choosing, quoting the input as it was written. `format` is overloaded
+    // upstream (`format(text)` and the variadic form), so it lands here too.
     for (input, quoted) in [
         ("'upper'::regproc", "upper"),
         ("'pg_catalog.upper'::regproc", "pg_catalog.upper"),
         ("'abs'::regproc", "abs"),
+        ("'format'::regproc", "format"),
     ] {
         let e = client
             .simple_query(&format!("SELECT {input}"))
@@ -11361,6 +11370,25 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
         .await?;
     let names: Vec<&str> = rows.iter().map(|r| r.get("name")).collect();
     assert_eq!(names, ["public.regp", "public.regp"]);
+
+    // A routine named after a built-in shares the name with it, and a routine in
+    // `public` is reachable unqualified just as the built-in is — so a bare `now`
+    // names neither. (The other half of the rule, a routine in a schema an
+    // unqualified name does not reach, is `crabgresql-catalog`'s
+    // `a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows`:
+    // `CREATE FUNCTION s.f()` is still `0A000` here, so that case is only
+    // reachable at the catalog API.)
+    client
+        .batch_execute("CREATE FUNCTION now(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
+        .await?;
+    let e = client
+        .simple_query("SELECT 'now'::regproc")
+        .await
+        .expect_err("a routine in public joins the built-in under one name");
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::AMBIGUOUS_FUNCTION
+    );
 
     Ok(())
 }

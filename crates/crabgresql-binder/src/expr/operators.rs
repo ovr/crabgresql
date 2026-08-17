@@ -2663,11 +2663,26 @@ fn bind_array_concat(lb: Binding, rb: Binding) -> Result<Binding, BindError> {
     }
 }
 
-/// Bind a polymorphic array function whose overload can't live in the
-/// fixed-signature table: `cardinality`, `array_length`, `array_upper`,
-/// `array_append`, `array_prepend`, `array_cat`, `array_to_string`. Returns
-/// `Ok(None)` if `name` is not one of them, so the caller falls through to
-/// ordinary resolution.
+/// The array functions [`bind_array_function`] answers for, whose overloads
+/// cannot live in the fixed-signature table because their argument and result
+/// types follow the array's element type.
+///
+/// The list is the gate `bind_function` gates on and the set
+/// `crabgresql_binder::implements_function` reports as implemented — the second
+/// is what puts them in `pg_proc`, so a name handled below but missing here is
+/// invisible to `regproc` and to every client that introspects.
+pub(crate) const ARRAY_FUNCTION_NAMES: &[&str] = &[
+    "array_append",
+    "array_cat",
+    "array_length",
+    "array_prepend",
+    "array_to_string",
+    "array_upper",
+    "cardinality",
+];
+
+/// Bind one of [`ARRAY_FUNCTION_NAMES`]. Returns `Ok(None)` if `name` is not one
+/// of them, so the caller falls through to ordinary resolution.
 pub(crate) fn bind_array_function(
     name: &str,
     bindings: &[Binding],
@@ -2792,7 +2807,16 @@ pub(crate) fn bind_array_function(
                 vec![resolve_operand(a, arr)?, resolve_operand(b, arr)?],
             )
         }
-        _ => Ok(None),
+        // A listed name reaching here would fall through to the signature table,
+        // which has no entry for it — so it would raise `42883` while `pg_proc`
+        // published a row saying it exists.
+        _ => {
+            debug_assert!(
+                !ARRAY_FUNCTION_NAMES.contains(&name),
+                "{name} is in ARRAY_FUNCTION_NAMES but this match does not handle it"
+            );
+            Ok(None)
+        }
     }
 }
 
