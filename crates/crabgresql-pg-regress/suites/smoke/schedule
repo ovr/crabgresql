@@ -32,6 +32,7 @@ test: in
 test: between
 test: transactions
 test: numeric
+test: math
 test: join
 test: join_pushdown
 test: generate_series

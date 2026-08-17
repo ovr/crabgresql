@@ -67,7 +67,9 @@ fn accumulation(c: &mut Criterion) {
         b.iter(|| {
             let mut sum = Numeric::from_i128(0);
             for _ in 0..100 {
-                sum = sum.add(black_box(&x));
+                sum = sum
+                    .add(black_box(&x))
+                    .expect("the accumulator stays inside the format");
             }
             sum
         })

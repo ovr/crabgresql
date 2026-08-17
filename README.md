@@ -151,7 +151,7 @@ against `expected/*.out`:
 $ cargo build -p crabgresql-server --bin crabgresql           # the server under test
 $ cargo run -p crabgresql-pg-regress --bin regress            # full schedule (compat %)
 $ cargo run -p crabgresql-pg-regress --bin regress -- --tests boolean,int4
-20 of 245 tests passed (8%).
+21 of 245 tests passed (8%).
 See target/regress/regression.diffs for details.
 ```
 

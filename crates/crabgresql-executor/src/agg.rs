@@ -428,7 +428,7 @@ impl Accumulator {
                 let x = as_numeric(&values[0]);
                 *acc = Some(match acc {
                     None => x,
-                    Some(a) => a.add(&x),
+                    Some(a) => a.add(&x).map_err(numeric_error)?,
                 });
             }
             AggState::AvgI128 { sum, count } => {
@@ -439,7 +439,7 @@ impl Accumulator {
                 *count += 1;
             }
             AggState::AvgNumeric { sum, count } => {
-                *sum = sum.add(&as_numeric(&values[0]));
+                *sum = sum.add(&as_numeric(&values[0])).map_err(numeric_error)?;
                 *count += 1;
             }
             AggState::AvgFloat { sum, count } => {
@@ -475,8 +475,13 @@ impl Accumulator {
         // — so resuming in `Numeric` from here is the same running sum
         // `SumNumeric` would be holding, and finalize is unchanged.
         if let Some((sum, x)) = promote {
-            self.state =
-                AggState::SumNumeric(Some(Numeric::from_i128(sum).add(&Numeric::from_i128(x))));
+            // Both operands came from an `i128`, so their sum is nowhere near
+            // the format's limit.
+            self.state = AggState::SumNumeric(Some(
+                Numeric::from_i128(sum)
+                    .add(&Numeric::from_i128(x))
+                    .map_err(numeric_error)?,
+            ));
         }
         Ok(())
     }
@@ -1277,4 +1282,9 @@ mod tests {
 
 fn float_error(e: float::FloatError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
+}
+
+/// A running `sum`/`avg` can carry its accumulator past what `numeric` stores.
+fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
+    ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }

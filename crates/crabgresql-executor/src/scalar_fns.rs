@@ -923,6 +923,18 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 .map(Value::Numeric)
                 .map_err(num_err);
         }
+        // Nullary, so it cannot reach the float8 tail — that path reads
+        // `args[0]` unconditionally.
+        ScalarFn::Pi => return Ok(Value::Float8(std::f64::consts::PI)),
+        // Shares the `@` operator's implementation, so the overflow at each
+        // type's minimum is reported in exactly one place.
+        ScalarFn::AbsExact => {
+            return crabgresql_types::arith::eval_unary(
+                crabgresql_types::arith::UnaryArithOp::Abs,
+                args[0].clone(),
+            )
+            .map_err(crate::eval::arith_error);
+        }
         // `mod(intN, intN)`: remainder truncated toward zero (`MIN % -1 = 0`),
         // division by zero is 22012 — same semantics as the `%` operator.
         ScalarFn::ModInt => {
@@ -951,6 +963,35 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 }
                 (a, b) => unreachable!("mod(int) on {a:?}, {b:?}"),
             };
+        }
+        ScalarFn::GcdInt | ScalarFn::LcmInt => {
+            let (a, b, ty) = match (&args[0], &args[1]) {
+                (Value::Int4(a), Value::Int4(b)) => (i128::from(*a), i128::from(*b), PgType::Int4),
+                (Value::Int8(a), Value::Int8(b)) => (i128::from(*a), i128::from(*b), PgType::Int8),
+                (a, b) => unreachable!("gcd/lcm(int) on {a:?}, {b:?}"),
+            };
+            // The one overflow condition PG reports is a magnitude the *result*
+            // type cannot hold, which is why `gcd(0, -2147483648)` is an error
+            // (the answer is 2^31) while `gcd(-2147483648, 2)` is 2.
+            let magnitude = if matches!(func, ScalarFn::GcdInt) {
+                int_gcd(a.abs(), b.abs())
+            } else if a == 0 || b == 0 {
+                // Zero short-circuits ahead of any multiplication, so
+                // `lcm(-2147483648, 0)` is 0 rather than an overflow.
+                0
+            } else {
+                (a.abs() / int_gcd(a.abs(), b.abs())) * b.abs()
+            };
+            return int_in_range(magnitude, ty);
+        }
+        ScalarFn::NumGcd => {
+            return Ok(Value::Numeric(num(&args[0]).gcd(num(&args[1]))));
+        }
+        ScalarFn::NumLcm => {
+            return num(&args[0])
+                .lcm(num(&args[1]))
+                .map(Value::Numeric)
+                .map_err(num_err);
         }
         ScalarFn::NumSqrt => {
             return num(&args[0]).sqrt().map(Value::Numeric).map_err(num_err);
@@ -1561,6 +1602,26 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         ScalarFn::Erfc => Ok(crate::special_fns::erfc(a)),
         ScalarFn::Gamma => dgamma(a),
         ScalarFn::Lgamma => dlgamma(a),
+        // The radian tier is the platform's libm and nothing more: PG applies no
+        // exactness correction here, so `sin(radians(30))` is
+        // 0.49999999999999994 rather than 0.5 — the degree tier below is where
+        // the exact quadrant values live.
+        ScalarFn::Sin => finite_radians(a).map(f64::sin),
+        ScalarFn::Cos => finite_radians(a).map(f64::cos),
+        ScalarFn::Tan => finite_radians(a).map(f64::tan),
+        // 1/tan rather than a cot of its own, so the denominator's signed zero
+        // survives: cot(0) = 1/+0 = Infinity and cot(-0) = 1/-0 = -Infinity.
+        ScalarFn::Cot => finite_radians(a).map(|x| 1.0 / x.tan()),
+        ScalarFn::Asin => unit_interval(a).map(f64::asin),
+        ScalarFn::Acos => unit_interval(a).map(f64::acos),
+        // atan/atan2 are total on the reals: an infinite argument is a limit,
+        // not a domain error, so neither guards its input.
+        ScalarFn::Atan => Ok(a.atan()),
+        ScalarFn::Atan2 => Ok(a.atan2(f8(&args[1]))),
+        // The checked float8 operators, so `degrees(1e308)` overflows and
+        // `radians(1e-323)` underflows, both `22003`.
+        ScalarFn::Degrees => float::f8_div(a, RADIANS_PER_DEGREE).map_err(float_err),
+        ScalarFn::Radians => float::f8_mul(a, RADIANS_PER_DEGREE).map_err(float_err),
         ScalarFn::Sind => dsind(a),
         ScalarFn::Cosd => dcosd(a),
         ScalarFn::Tand => dtand(a),
@@ -1728,6 +1789,58 @@ fn dlgamma(x: f64) -> Result<f64, ExecError> {
         return Err(overflow());
     }
     Ok(r)
+}
+
+// --- integer gcd/lcm -------------------------------------------------------
+
+/// Euclid on two non-negative magnitudes.
+fn int_gcd(mut a: i128, mut b: i128) -> i128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Narrow a magnitude back to the integer type the overload returns.
+fn int_in_range(magnitude: i128, ty: PgType) -> Result<Value, ExecError> {
+    let too_wide = || crate::eval::out_of_range(ty);
+    match ty {
+        PgType::Int4 => i32::try_from(magnitude)
+            .map(Value::Int4)
+            .map_err(|_| too_wide()),
+        PgType::Int8 => i64::try_from(magnitude)
+            .map(Value::Int8)
+            .map_err(|_| too_wide()),
+        other => unreachable!("gcd/lcm(int) returning {other:?}"),
+    }
+}
+
+// --- radian trig guards ----------------------------------------------------
+
+/// The argument shared by `sin`/`cos`/`tan`/`cot`: a NaN passes straight
+/// through as the answer, an infinity has no angle and is `22003`.
+fn finite_radians(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(x);
+    }
+    if x.is_infinite() {
+        return Err(out_of_range_input());
+    }
+    Ok(x)
+}
+
+/// The argument shared by `asin`/`acos`. The range check also rejects the
+/// infinities, so they need no separate arm.
+fn unit_interval(x: f64) -> Result<f64, ExecError> {
+    if x.is_nan() {
+        return Ok(x);
+    }
+    if !(-1.0..=1.0).contains(&x) {
+        return Err(out_of_range_input());
+    }
+    Ok(x)
 }
 
 // --- degree-based trig -----------------------------------------------------
@@ -3000,5 +3113,186 @@ mod tests {
         assert!(call(ScalarFn::Sign, f64::NAN).is_nan());
         // sign(-0.0) keeps the negative zero.
         assert!(call(ScalarFn::Sign, -0.0).is_sign_negative());
+    }
+
+    fn call_err(f: ScalarFn, x: f64) -> String {
+        eval_scalar(f, &[Value::Float8(x)], &FmtCtx::utc_default())
+            .expect_err("this argument must be rejected")
+            .code
+            .to_string()
+    }
+
+    #[test]
+    fn radian_trig_is_libm_with_pg_domain_guards() {
+        // No exactness correction, unlike the degree tier above — asserted as
+        // the claim rather than as digits, since libm's last bit is a platform
+        // property (glibc and Darwin disagree on tan(1) and acos(0.5)).
+        let sin30 = call(ScalarFn::Sin, std::f64::consts::PI / 6.0);
+        assert_ne!(sin30, 0.5);
+        assert!((sin30 - 0.5).abs() < 1e-15);
+        assert_eq!(call(ScalarFn::Sin, 0.0), 0.0);
+        assert_eq!(call(ScalarFn::Cos, 0.0), 1.0);
+        assert_eq!(call(ScalarFn::Tan, 0.0), 0.0);
+        // cot is 1/tan, so each side of the pole keeps its own infinity.
+        assert_eq!(call(ScalarFn::Cot, 0.0), f64::INFINITY);
+        assert_eq!(call(ScalarFn::Cot, -0.0), f64::NEG_INFINITY);
+        // NaN passes through all four; an infinite angle is a domain error.
+        for f in [ScalarFn::Sin, ScalarFn::Cos, ScalarFn::Tan, ScalarFn::Cot] {
+            assert!(call(f, f64::NAN).is_nan());
+            assert_eq!(call_err(f, f64::INFINITY), "22003");
+            assert_eq!(call_err(f, f64::NEG_INFINITY), "22003");
+        }
+    }
+
+    #[test]
+    fn inverse_trig_domains() {
+        assert_eq!(call(ScalarFn::Acos, 1.0), 0.0);
+        assert_eq!(call(ScalarFn::Asin, 1.0), std::f64::consts::FRAC_PI_2);
+        assert_eq!(call(ScalarFn::Acos, 0.0), std::f64::consts::FRAC_PI_2);
+        for f in [ScalarFn::Asin, ScalarFn::Acos] {
+            assert!(call(f, f64::NAN).is_nan());
+            // The range check rejects the infinities too, so they need no arm.
+            assert_eq!(call_err(f, 1.5), "22003");
+            assert_eq!(call_err(f, -1.5), "22003");
+            assert_eq!(call_err(f, f64::INFINITY), "22003");
+            assert_eq!(call_err(f, f64::NEG_INFINITY), "22003");
+        }
+        // atan is total: an infinity is the limit, not an error.
+        assert_eq!(
+            call(ScalarFn::Atan, f64::INFINITY),
+            std::f64::consts::FRAC_PI_2
+        );
+        assert_eq!(
+            call(ScalarFn::Atan, f64::NEG_INFINITY),
+            -std::f64::consts::FRAC_PI_2
+        );
+        assert!(call(ScalarFn::Atan, f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn angle_conversions_and_pi() {
+        assert_eq!(
+            eval_scalar(ScalarFn::Pi, &[], &FmtCtx::utc_default()).expect("pi() takes no argument"),
+            Value::Float8(std::f64::consts::PI)
+        );
+        assert_eq!(call(ScalarFn::Degrees, 1.0), 57.295_779_513_082_32);
+        assert_eq!(call(ScalarFn::Radians, 180.0), std::f64::consts::PI);
+        // Total on the infinities, but the product/quotient is still checked.
+        assert_eq!(
+            call(ScalarFn::Degrees, f64::NEG_INFINITY),
+            f64::NEG_INFINITY
+        );
+        assert!(call(ScalarFn::Degrees, f64::NAN).is_nan());
+        assert!(call(ScalarFn::Radians, f64::NAN).is_nan());
+        assert_eq!(call_err(ScalarFn::Degrees, 1e308), "22003");
+        // A flush to zero is an underflow; a subnormal result is not.
+        assert_eq!(call_err(ScalarFn::Radians, 1e-323), "22003");
+        assert_eq!(call(ScalarFn::Radians, 1e-310), 1.745_329_251_995e-312);
+    }
+
+    fn call2(f: ScalarFn, a: Value, b: Value) -> Value {
+        match eval_scalar(f, &[a, b], &FmtCtx::utc_default()) {
+            Ok(value) => value,
+            Err(error) => panic!("scalar-function test fixture failed: {error}"),
+        }
+    }
+
+    fn call2_err(f: ScalarFn, a: Value, b: Value) -> String {
+        match eval_scalar(f, &[a, b], &FmtCtx::utc_default()) {
+            Ok(value) => panic!("these arguments must be rejected, got {value:?}"),
+            Err(error) => error.code.to_string(),
+        }
+    }
+
+    #[test]
+    fn integer_gcd_lcm_signs_zeros_and_overflow() {
+        let i4 = |v: i32| Value::Int4(v);
+        // Always non-negative, whatever the operands' signs.
+        for (a, b) in [(6, 4), (-6, 4), (6, -4), (-6, -4)] {
+            assert_eq!(call2(ScalarFn::GcdInt, i4(a), i4(b)), i4(2));
+            assert_eq!(call2(ScalarFn::LcmInt, i4(a), i4(b)), i4(12));
+        }
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(0)), i4(0));
+        assert_eq!(call2(ScalarFn::GcdInt, i4(0), i4(-5)), i4(5));
+        assert_eq!(call2(ScalarFn::LcmInt, i4(0), i4(5)), i4(0));
+        // The overflow condition is a result the type cannot hold, so it is
+        // symmetric in the arguments — |int4 min| does not fit either way.
+        for (a, b) in [(i32::MIN, 0), (0, i32::MIN), (i32::MIN, i32::MIN)] {
+            assert_eq!(call2_err(ScalarFn::GcdInt, i4(a), i4(b)), "22003");
+        }
+        // ...but only when it *is* the result.
+        assert_eq!(call2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)), i4(2));
+        // A zero operand answers before anything is multiplied.
+        assert_eq!(call2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)), i4(0));
+        assert_eq!(call2_err(ScalarFn::LcmInt, i4(i32::MIN), i4(1)), "22003");
+        assert_eq!(
+            call2_err(ScalarFn::LcmInt, i4(i32::MAX), i4(i32::MAX - 1)),
+            "22003"
+        );
+        // The same magnitude fits the wider overload, so it is not an error there.
+        assert_eq!(
+            call2(
+                ScalarFn::GcdInt,
+                Value::Int8(i64::from(i32::MIN)),
+                Value::Int8(0)
+            ),
+            Value::Int8(2_147_483_648)
+        );
+        assert_eq!(
+            call2_err(ScalarFn::GcdInt, Value::Int8(i64::MIN), Value::Int8(0)),
+            "22003"
+        );
+    }
+
+    #[test]
+    fn numeric_gcd_lcm_scale_and_specials() {
+        let n = |s: &str| {
+            Value::Numeric(
+                crabgresql_types::numeric::Numeric::parse(s).expect("test fixture is a numeric"),
+            )
+        };
+        // The rendered text, not the value, is what pins the display scale —
+        // 1.4 and 1.40 are the same number and different answers.
+        let rendered = |f: ScalarFn, a: &str, b: &str| match call2(f, n(a), n(b)) {
+            Value::Numeric(v) => v.to_display(),
+            other => panic!("expected numeric, got {other:?}"),
+        };
+        assert_eq!(rendered(ScalarFn::NumGcd, "4.2", "2.8"), "1.4");
+        assert_eq!(rendered(ScalarFn::NumLcm, "4.2", "2.8"), "8.4");
+        // dscale = max(scale(x), scale(y)) for both.
+        assert_eq!(rendered(ScalarFn::NumGcd, "2.0", "4.000"), "2.000");
+        assert_eq!(rendered(ScalarFn::NumLcm, "2.0", "4.000"), "4.000");
+        assert_eq!(rendered(ScalarFn::NumGcd, "0.30", "0.2"), "0.10");
+        assert_eq!(rendered(ScalarFn::NumLcm, "0.30", "0.2"), "0.60");
+        assert_eq!(rendered(ScalarFn::NumGcd, "0", "0.00"), "0.00");
+        assert_eq!(rendered(ScalarFn::NumLcm, "0", "0.00"), "0.00");
+        assert_eq!(rendered(ScalarFn::NumLcm, "3", "0.5"), "3.0");
+        // Both answer a magnitude, whatever the operands' signs.
+        for (a, b) in [("-4.2", "2.8"), ("4.2", "-2.8"), ("-4.2", "-2.8")] {
+            assert_eq!(rendered(ScalarFn::NumGcd, a, b), "1.4");
+            assert_eq!(rendered(ScalarFn::NumLcm, a, b), "8.4");
+        }
+        assert_eq!(rendered(ScalarFn::NumGcd, "-4.20", "0"), "4.20");
+        assert_eq!(rendered(ScalarFn::NumLcm, "-3", "0.5"), "3.0");
+        // Wider than either integer overload, and exact.
+        assert_eq!(
+            rendered(
+                ScalarFn::NumLcm,
+                "9999999999999999999999",
+                "9999999999999999999998"
+            ),
+            "99999999999999999999970000000000000000000002"
+        );
+        // Unlike the integer overloads, a magnitude with no finite divisor is
+        // NaN rather than an error.
+        for (a, b) in [
+            ("nan", "1"),
+            ("infinity", "1"),
+            ("-infinity", "0"),
+            ("nan", "infinity"),
+        ] {
+            assert_eq!(rendered(ScalarFn::NumGcd, a, b), "NaN");
+            assert_eq!(rendered(ScalarFn::NumLcm, a, b), "NaN");
+        }
     }
 }

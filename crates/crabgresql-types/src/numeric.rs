@@ -563,9 +563,31 @@ impl Numeric {
         }
     }
 
+    /// Reject a value whose integer part has outgrown the `numeric` format.
+    ///
+    /// The bound is `parse`'s, so a computed value and a literal agree on where
+    /// the format ends. Only the *weight* is checked: an out-of-range display
+    /// scale is not an error but a clamp — see [`Numeric::mul_raw`].
+    fn check_format(self) -> Result<Numeric, NumErr> {
+        if !self.is_special() && floor_div(self.weight as i64, 4) > MAX_NBASE_WEIGHT {
+            return Err(NumErr::new("22003", "value overflows numeric format"));
+        }
+        Ok(self)
+    }
+
     // ---- addition / subtraction ------------------------------------------
 
-    pub fn add(&self, other: &Numeric) -> Numeric {
+    pub fn add(&self, other: &Numeric) -> Result<Numeric, NumErr> {
+        self.add_raw(other).check_format()
+    }
+
+    pub fn sub(&self, other: &Numeric) -> Result<Numeric, NumErr> {
+        self.sub_raw(other).check_format()
+    }
+
+    /// [`Numeric::add`] without the range check, for the callers whose result
+    /// is bounded by an operand and so cannot leave the format.
+    pub(crate) fn add_raw(&self, other: &Numeric) -> Numeric {
         if let Some(s) = self.special_add(other) {
             return s;
         }
@@ -578,8 +600,8 @@ impl Numeric {
         }
     }
 
-    pub fn sub(&self, other: &Numeric) -> Numeric {
-        self.add(&other.neg())
+    pub(crate) fn sub_raw(&self, other: &Numeric) -> Numeric {
+        self.add_raw(&other.neg())
     }
 
     /// Add/subtract when operands have opposite sign (or `sub` of same sign):
@@ -613,17 +635,32 @@ impl Numeric {
 
     // ---- multiplication ---------------------------------------------------
 
-    pub fn mul(&self, other: &Numeric) -> Numeric {
+    pub fn mul(&self, other: &Numeric) -> Result<Numeric, NumErr> {
+        self.mul_raw(other).check_format()
+    }
+
+    /// [`Numeric::mul`] without the range check.
+    ///
+    /// The product's scale is the sum of the operands', which can exceed what
+    /// the format stores. PG *clamps* that rather than raising — `1e-16383 *
+    /// 1e-16383` is zero at scale 16383, and `1e-16383 * 1.5` rounds up to
+    /// `2e-16383` — so the excess is rounded away half-away-from-zero here.
+    /// Only the weight overflowing is an error.
+    pub(crate) fn mul_raw(&self, other: &Numeric) -> Numeric {
         if let Some(s) = self.special_mul(other) {
             return s;
         }
         let neg = self.is_neg() != other.is_neg();
         let dscale = self.dscale + other.dscale;
         if self.is_zero() || other.is_zero() {
-            return Numeric::zero(dscale);
+            return Numeric::zero(dscale.min(MAX_DSCALE as i32));
         }
         let (digits, low) = mul_mag(self, other);
-        Numeric::from_coeff(neg, digits, low, dscale)
+        let product = Numeric::from_coeff(neg, digits, low, dscale);
+        if dscale > MAX_DSCALE as i32 {
+            return product.round(MAX_DSCALE as i32);
+        }
+        product
     }
 
     fn special_mul(&self, other: &Numeric) -> Option<Numeric> {
@@ -777,10 +814,62 @@ impl Numeric {
         let dscale = self.dscale.max(other.dscale);
         // q = trunc(x/y) toward zero (scale 0), then r = x - q*y.
         let q = self.div_to_scale(other, 0, false);
-        let mut r = self.sub(&q.mul(other));
+        let mut r = self.sub_raw(&q.mul_raw(other));
         r.dscale = dscale;
         r.normalize();
         Ok(r)
+    }
+
+    /// `gcd(x, y)`, always non-negative, with `dscale = max(scale_x, scale_y)`.
+    ///
+    /// NaN *and* the infinities answer NaN: an infinity has no finite divisor,
+    /// and PG reports that as NaN rather than an error (unlike the integer
+    /// overloads, which raise on an unrepresentable magnitude).
+    ///
+    /// Euclid runs on the decimals directly. It terminates because both
+    /// operands are whole multiples of `10^-dscale`, so the remainders are a
+    /// strictly decreasing sequence of such multiples — the same argument that
+    /// makes integer Euclid terminate, one grid finer.
+    pub fn gcd(&self, other: &Numeric) -> Numeric {
+        if self.is_special() || other.is_special() {
+            return Numeric::nan();
+        }
+        let dscale = self.dscale.max(other.dscale);
+        let mut a = self.abs();
+        let mut b = other.abs();
+        while !b.is_zero() {
+            let r = match a.modulo(&b) {
+                Ok(r) => r,
+                Err(_) => unreachable!("gcd: modulo by a non-zero divisor"),
+            };
+            a = b;
+            b = r;
+        }
+        a.round(dscale)
+    }
+
+    /// `lcm(x, y)`, always non-negative, with `dscale = max(scale_x, scale_y)`.
+    ///
+    /// A zero operand answers zero before anything is divided, matching PG —
+    /// `lcm(0, x)` is 0 even where `x` would make the product overflow.
+    ///
+    /// Rounding to `dscale` at the end never loses a digit: the result is a
+    /// whole multiple of each operand, so it needs no more fractional digits
+    /// than the operand with the fewer of them.
+    pub fn lcm(&self, other: &Numeric) -> Result<Numeric, NumErr> {
+        if self.is_special() || other.is_special() {
+            return Ok(Numeric::nan());
+        }
+        let dscale = self.dscale.max(other.dscale);
+        if self.is_zero() || other.is_zero() {
+            return Ok(Numeric::zero(dscale));
+        }
+        let g = self.gcd(other);
+        // `self / g` is exact — `g` divides `self` — so the division introduces
+        // no rounding of its own, and dividing before multiplying keeps the
+        // intermediate as small as PG keeps it.
+        let q = self.div(&g)?;
+        q.mul(other)?.abs().round(dscale).check_format()
     }
 
     // ---- rounding / truncation -------------------------------------------
@@ -845,7 +934,7 @@ impl Numeric {
         }
         let t = self.trunc(0);
         if !self.is_neg() && self.cmp(&t) == std::cmp::Ordering::Greater {
-            t.add(&Numeric::from_i128(1))
+            t.add_raw(&Numeric::from_i128(1))
         } else {
             t
         }
@@ -858,7 +947,7 @@ impl Numeric {
         }
         let t = self.trunc(0);
         if self.is_neg() && self.cmp(&t) == std::cmp::Ordering::Less {
-            t.sub(&Numeric::from_i128(1))
+            t.sub_raw(&Numeric::from_i128(1))
         } else {
             t
         }
@@ -1362,7 +1451,7 @@ impl Numeric {
         }
         // x > 0, non-integer y: exp(y * ln x).
         let guard = rscale + 24;
-        let prod = y.mul(&self.ln_internal(guard));
+        let prod = y.mul_raw(&self.ln_internal(guard));
         let val = prod.exp_internal(guard)?;
         Ok(val.round(rscale))
     }
@@ -1408,14 +1497,14 @@ impl Numeric {
         let mut acc = Numeric::from_i128(1);
         while exp > 0 {
             if exp & 1 == 1 {
-                acc = acc.mul(&base).round_sig(prec);
+                acc = acc.mul_raw(&base).round_sig(prec);
                 if acc.nbase_weight() > MAX_NBASE_WEIGHT {
                     return Err(NumErr::new("22003", "value overflows numeric format"));
                 }
             }
             exp >>= 1;
             if exp > 0 {
-                base = base.mul(&base).round_sig(prec);
+                base = base.mul_raw(&base).round_sig(prec);
                 if base.nbase_weight() > MAX_NBASE_WEIGHT {
                     return Err(NumErr::new("22003", "value overflows numeric format"));
                 }
@@ -1487,7 +1576,7 @@ impl Numeric {
         );
         mantissa
             .ln_near_one(guard)
-            .add(&Numeric::from_i128(self.weight as i128).mul(&ln10(work)))
+            .add_raw(&Numeric::from_i128(self.weight as i128).mul_raw(&ln10(work)))
             .round(guard)
     }
 
@@ -1525,25 +1614,25 @@ impl Numeric {
         }
         // ln(t) = 2 * (w + w^3/3 + w^5/5 + ...), w = (t-1)/(t+1).
         let one = Numeric::from_i128(1);
-        let w = t.sub(&one).div_guard(&t.add(&one), work);
-        let w2 = w.mul(&w).round(work);
+        let w = t.sub_raw(&one).div_guard(&t.add_raw(&one), work);
+        let w2 = w.mul_raw(&w).round(work);
         let mut term = w.clone();
         let mut sum = w.clone();
         let mut k: i64 = 3;
         loop {
-            term = term.mul(&w2).round(work);
+            term = term.mul_raw(&w2).round(work);
             let piece = term.div_guard(&Numeric::from_i128(k as i128), work);
             if piece.is_zero_to_scale(guard) {
                 break;
             }
-            sum = sum.add(&piece);
+            sum = sum.add_raw(&piece);
             k += 2;
             if k > 100_000 {
                 break;
             }
         }
-        let ln_t = sum.mul(&Numeric::from_i128(2));
-        ln_t.mul(&Numeric::from_i128(1i128 << s)).round(guard)
+        let ln_t = sum.mul_raw(&Numeric::from_i128(2));
+        ln_t.mul_raw(&Numeric::from_i128(1i128 << s)).round(guard)
     }
 
     /// e^x to `guard` fractional digits, by range-reducing x = m·ln10 + r and
@@ -1559,7 +1648,7 @@ impl Numeric {
         if m.unsigned_abs() > MAX_NBASE_WEIGHT as u128 {
             return Err(NumErr::new("22003", "value overflows numeric format"));
         }
-        let r = self.sub(&Numeric::from_i128(m).mul(&ln10));
+        let r = self.sub_raw(&Numeric::from_i128(m).mul_raw(&ln10));
         // Halve r until small, then Taylor, then square back.
         let mut p: u32 = 0;
         let mut rr = r.clone();
@@ -1581,12 +1670,12 @@ impl Numeric {
         let mut n: i64 = 1;
         loop {
             term = term
-                .mul(&rr)
+                .mul_raw(&rr)
                 .div_guard(&Numeric::from_i128(n as i128), work);
             if term.is_zero_to_scale(guard) {
                 break;
             }
-            sum = sum.add(&term);
+            sum = sum.add_raw(&term);
             n += 1;
             if n > 1000 {
                 break;
@@ -1594,7 +1683,7 @@ impl Numeric {
         }
         // Square p times, multiply by 10^m.
         for _ in 0..p {
-            sum = sum.mul(&sum).round(work);
+            sum = sum.mul_raw(&sum).round(work);
         }
         let scale10 = Numeric {
             sign: Sign::Pos,
@@ -1602,7 +1691,7 @@ impl Numeric {
             dscale: 0,
             digits: vec![1],
         };
-        Ok(sum.mul(&scale10).round(guard))
+        Ok(sum.mul_raw(&scale10).round(guard))
     }
 
     /// Whether the value rounds to zero at `scale` fractional digits (loop
@@ -2137,12 +2226,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arithmetic_reports_a_weight_past_the_format() {
+        // The format ends where `parse` says it does: 131072 integer digits.
+        let big = n("1e131071");
+        let nine = n("9e131071");
+        let err = |r: Result<Numeric, NumErr>| match r {
+            Ok(v) => panic!("expected an overflow, got {}", v.to_display()),
+            Err(e) => (e.sqlstate, e.message),
+        };
+        let overflow = ("22003", "value overflows numeric format".to_string());
+        assert_eq!(err(big.mul(&n("10"))), overflow);
+        assert_eq!(err(nine.mul(&n("2"))), overflow);
+        assert_eq!(err(big.mul(&big)), overflow);
+        // Addition and subtraction reach it too, when the carry grows the weight.
+        assert_eq!(err(nine.add(&nine)), overflow);
+        assert_eq!(err(n("5e131071").add(&n("5e131071"))), overflow);
+        assert_eq!(err(nine.neg().sub(&nine)), overflow);
+        // ...and do not when it stays put.
+        assert_eq!(
+            arith("1e131071", '+', "1e131071"),
+            n("2e131071").to_display()
+        );
+        assert_eq!(
+            arith("-1e131071", '-', "1e131071"),
+            n("-2e131071").to_display()
+        );
+        let scaled = match n("1e131071").mul(&n("1.0")) {
+            Ok(v) => v,
+            Err(e) => panic!("multiplying by 1.0 cannot overflow: {e:?}"),
+        };
+        assert_eq!(scaled.display_scale(), 1);
+        assert_eq!(scaled.cmp(&n("1e131071")), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn multiplication_clamps_a_scale_past_the_format() {
+        // Unlike the weight, an out-of-range scale is not an error: PG rounds
+        // the excess away, half away from zero.
+        let tiny = n("1e-16383");
+        let clamped = |a: &Numeric, b: &Numeric| match a.mul(b) {
+            Ok(v) => v,
+            Err(e) => panic!("a shrinking product cannot overflow: {e:?}"),
+        };
+        let zero = clamped(&tiny, &tiny);
+        assert_eq!(zero.display_scale(), MAX_DSCALE as i32);
+        assert_eq!(zero.to_display().len(), 2 + MAX_DSCALE as usize);
+        assert!(
+            !zero
+                .to_display()
+                .contains(['1', '2', '3', '4', '5', '6', '7', '8', '9'])
+        );
+        assert_eq!(
+            clamped(&tiny, &n("1.5")).cmp(&n("2e-16383")),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            clamped(&tiny, &n("1.4")).cmp(&n("1e-16383")),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(clamped(&tiny, &n("1.0")).display_scale(), MAX_DSCALE as i32);
+    }
+
     fn arith(a: &str, op: char, b: &str) -> String {
         let (x, y) = (n(a), n(b));
         match op {
-            '+' => x.add(&y),
-            '-' => x.sub(&y),
-            '*' => x.mul(&y),
+            '+' => match x.add(&y) {
+                Ok(value) => value,
+                Err(error) => panic!("numeric addition fixture failed: {error:?}"),
+            },
+            '-' => match x.sub(&y) {
+                Ok(value) => value,
+                Err(error) => panic!("numeric subtraction fixture failed: {error:?}"),
+            },
+            '*' => match x.mul(&y) {
+                Ok(value) => value,
+                Err(error) => panic!("numeric multiplication fixture failed: {error:?}"),
+            },
             '/' => match x.div(&y) {
                 Ok(value) => value,
                 Err(error) => panic!("numeric division fixture failed: {error:?}"),

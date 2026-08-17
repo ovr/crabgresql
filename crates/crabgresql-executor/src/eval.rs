@@ -1411,7 +1411,7 @@ fn arith_op(op: BinOp) -> arith::ArithOp {
     }
 }
 
-fn arith_error(e: arith::ArithError) -> ExecError {
+pub(crate) fn arith_error(e: arith::ArithError) -> ExecError {
     ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }
 

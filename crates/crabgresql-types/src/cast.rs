@@ -946,6 +946,7 @@ fn numeric_to_money(n: &Numeric) -> Result<Value, CastError> {
     }
     let cents = n
         .mul(&Numeric::from_i128(100))
+        .map_err(|_| out_of_range(PgType::Money))?
         .round(0)
         .to_i128()
         .ok_or_else(|| out_of_range(PgType::Money))?;

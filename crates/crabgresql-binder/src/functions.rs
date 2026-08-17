@@ -49,6 +49,17 @@ pub enum ScalarFn {
     Erfc,
     Gamma,
     Lgamma,
+    Sin,
+    Cos,
+    Tan,
+    Cot,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Degrees,
+    Radians,
+    Pi,
     Sind,
     Cosd,
     Tand,
@@ -419,6 +430,18 @@ pub enum ScalarFn {
     Log10F8,
     /// `mod(intN, intN) -> intN` (dispatches on the operand's integer width).
     ModInt,
+    /// `abs(int2|int4|int8|float4)` returning the argument's own type
+    /// (dispatches on the operand's width, as [`ScalarFn::ModInt`] does).
+    /// `abs(numeric)` and `abs(float8)` have their own entries above.
+    AbsExact,
+    /// `gcd(intN, intN) -> intN` (dispatches on the operand's integer width).
+    GcdInt,
+    /// `lcm(intN, intN) -> intN` (dispatches on the operand's integer width).
+    LcmInt,
+    /// `gcd(numeric, numeric) -> numeric`.
+    NumGcd,
+    /// `lcm(numeric, numeric) -> numeric`.
+    NumLcm,
 
     // --- string functions (see `crabgresql_types::text`) ----
     /// `text || text -> text` (the `||` operator / `textcat`).
@@ -1989,10 +2012,30 @@ fn lookup(name: &str) -> &'static [Signature] {
         "floor" => num_and_f8!(ScalarFn::NumFloor, ScalarFn::Floor),
         "sign" => num_and_f8!(ScalarFn::NumSign, ScalarFn::Sign),
         "sqrt" => num_and_f8!(ScalarFn::NumSqrt, ScalarFn::Sqrt),
-        // numeric first: an integer argument keeps its exact value through
-        // int -> numeric (PG's abs(int) is exact too); a float argument binds
-        // the float8 overload.
+        // PG has one `abs` per numeric type. Without the narrow entries an
+        // int2/int4/int8/float4 argument would land on float8, the category's
+        // preferred type; the exact match is what keeps it off that path.
         "abs" => &[
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Int2],
+                ret: PgType::Int2,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::AbsExact,
+                args: &[PgType::Float4],
+                ret: PgType::Float4,
+            },
             Signature {
                 func: ScalarFn::NumAbs,
                 args: &[NUM],
@@ -2024,6 +2067,44 @@ fn lookup(name: &str) -> &'static [Signature] {
             },
             Signature {
                 func: ScalarFn::NumMod,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
+        ],
+        // gcd/lcm have no smallint overload in PG, and — unlike `abs` below —
+        // none of the three they do have is the numeric category's preferred
+        // type, so a smallint argument reaches all three and separates none:
+        // `gcd(6::int2, 4::int2)` is `42725`, not a widening to int4.
+        "gcd" => &[
+            Signature {
+                func: ScalarFn::GcdInt,
+                args: &[I4, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::GcdInt,
+                args: &[PgType::Int8, PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::NumGcd,
+                args: &[NUM, NUM],
+                ret: NUM,
+            },
+        ],
+        "lcm" => &[
+            Signature {
+                func: ScalarFn::LcmInt,
+                args: &[I4, I4],
+                ret: I4,
+            },
+            Signature {
+                func: ScalarFn::LcmInt,
+                args: &[PgType::Int8, PgType::Int8],
+                ret: PgType::Int8,
+            },
+            Signature {
+                func: ScalarFn::NumLcm,
                 args: &[NUM, NUM],
                 ret: NUM,
             },
@@ -2077,6 +2158,25 @@ fn lookup(name: &str) -> &'static [Signature] {
         "erfc" => unary_f8!(ScalarFn::Erfc),
         "gamma" => unary_f8!(ScalarFn::Gamma),
         "lgamma" => unary_f8!(ScalarFn::Lgamma),
+        "sin" => unary_f8!(ScalarFn::Sin),
+        "cos" => unary_f8!(ScalarFn::Cos),
+        "tan" => unary_f8!(ScalarFn::Tan),
+        "cot" => unary_f8!(ScalarFn::Cot),
+        "asin" => unary_f8!(ScalarFn::Asin),
+        "acos" => unary_f8!(ScalarFn::Acos),
+        "atan" => unary_f8!(ScalarFn::Atan),
+        "atan2" => &[Signature {
+            func: ScalarFn::Atan2,
+            args: &[F8, F8],
+            ret: F8,
+        }],
+        "degrees" => unary_f8!(ScalarFn::Degrees),
+        "radians" => unary_f8!(ScalarFn::Radians),
+        "pi" => &[Signature {
+            func: ScalarFn::Pi,
+            args: &[],
+            ret: F8,
+        }],
         "sind" => unary_f8!(ScalarFn::Sind),
         "cosd" => unary_f8!(ScalarFn::Cosd),
         "tand" => unary_f8!(ScalarFn::Tand),
@@ -4510,8 +4610,9 @@ pub(crate) fn resolve_call(
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
     // so `power(numeric, int)` prefers `power(numeric, numeric)` over the float8
-    // overload, as PG's preferred-type resolution does. Ties keep list order
-    // (float8 listed first, the preferred numeric-category type).
+    // overload — and then the ones converting to their category's preferred
+    // type, which is how `abs(int4)` reaches the exact int4 overload rather than
+    // the float8 one.
     // PG chooses an overload from the argument *types*, never from an untyped
     // literal's contents, so the unknown-argument rule below considers every
     // same-arity signature — not just the ones whose literal happens to parse.
@@ -4519,11 +4620,7 @@ pub(crate) fn resolve_call(
         .iter()
         .filter(|sig| sig.args.len() == bindings.len())
         .collect();
-    let candidates = if arity.len() > 1
-        && bindings
-            .iter()
-            .any(|b| matches!(b, Binding::Unknown { .. }))
-    {
+    let candidates = if arity.len() > 1 {
         // The typed arguments get the first and last word: PG discards the
         // candidates they cannot reach and keeps the most exact matches among
         // them (rules 4.a/4.b) *before* consulting the unknown positions (4.e).
@@ -4532,9 +4629,34 @@ pub(crate) fn resolve_call(
         // singled out — `overlay(bit, unknown, int4)` would lose its `bit`
         // overload to the `text` one.
         let narrowed = narrow_by_typed_args(&bindings, arity);
-        if narrowed.len() > 1 {
+        let has_unknown = bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Unknown { .. }));
+        if narrowed.len() > 1 && has_unknown {
             narrow_by_unknown_category(name, &bindings, narrowed)?
         } else {
+            // With nothing left to separate typed candidates PG gives up
+            // rather than picking one: `gcd(int2, int2)` is `42725` because
+            // smallint reaches the int4, int8 and numeric overloads alike and
+            // none of them is the numeric category's preferred type.
+            //
+            // `exact_only` is false throughout — it is the pass that admits an
+            // implicit cast, and with it true a widening argument reaches
+            // nothing and every such call would look unambiguous.
+            let reachable = |args: &[PgType]| !typed_mismatch(&bindings, args, false);
+            // Recounted rather than taken from `narrowed`, whose reachability
+            // is `implicit_castable` where resolution below is
+            // `coerce_for_arg`: if the two disagree there is only one candidate
+            // and no ambiguity.
+            let survivors = narrowed.iter().filter(|sig| reachable(sig.args)).count();
+            // A routine PG would have weighed suppresses the error.
+            let user_candidate = catalog
+                .routines(name)
+                .iter()
+                .any(|r| r.arg_types.len() == bindings.len() && reachable(&r.arg_types));
+            if survivors > 1 && !user_candidate {
+                return Err(ambiguous_function(name, &bindings));
+            }
             narrowed
         }
     } else {
