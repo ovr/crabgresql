@@ -1696,16 +1696,13 @@ mod tests {
     use super::*;
     use deepsize::DeepSizeOf;
 
-    /// `regoperout` spells `InvalidOid` as `0` where every other `reg*` output
-    /// function spells it `-`, because `-` is itself a legal operator name and
-    /// would read back as one. Probed against PostgreSQL 18.4:
-    /// `SELECT 0::regproc, 0::regoper` gives `-` and `0`.
+    /// The `regoper` exception documented on [`Reg::unresolved`].
     #[test]
     fn regoper_spells_the_invalid_oid_as_zero() {
         assert_eq!(Reg::unresolved(RegKind::Oper, 0).name, "0");
         assert_eq!(Reg::unresolved(RegKind::Proc, 0).name, "-");
         assert_eq!(Reg::unresolved(RegKind::Class, 0).name, "-");
-        // Only OID 0 is special; anything else is its bare digits either way.
+        // Only OID 0 is special.
         assert_eq!(Reg::unresolved(RegKind::Oper, 999_999).name, "999999");
     }
 

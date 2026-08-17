@@ -1268,11 +1268,8 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
             "pg_get_viewdef evaluated without a catalog context",
         ));
     };
-    // The same identifier rules every other name-taking catalog function uses:
-    // an unquoted part folds to lower case, a `"quoted"` one keeps its spelling.
     // Shared with `regclass` input, because upstream both reach the same
-    // `makeRangeVarFromNameList` and so raise the same errors for a name that
-    // does not parse.
+    // `makeRangeVarFromNameList`.
     let (namespace, relation) = crate::reg::relation_name(name, catalog)?;
     let (namespace, relation) = (namespace.as_deref(), relation.as_str());
     if catalog.rel_oid(namespace, relation).is_none() {

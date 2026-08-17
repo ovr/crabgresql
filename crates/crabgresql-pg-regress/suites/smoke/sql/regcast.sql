@@ -45,8 +45,7 @@ SELECT '||/'::regoper = 597::regoper AS same_operator,
 --
 -- reg* NAME PARSING
 -- a built-in whose SQL spelling is several words is one *type name*, not
--- several identifiers, so regtype reads its argument with the type grammar
--- before anything tries to split it on dots
+-- several identifiers, and regtype reads it as such
 SELECT 'character varying'::regtype AS vc, 'double precision'::regtype AS f8,
        'timestamp with time zone'::regtype AS tstz;
 -- a string that does not parse as a name at all is a syntax error, not a miss
@@ -60,7 +59,7 @@ SELECT '""'::regclass;
 -- session is connected to, and rejected otherwise
 SELECT (current_database() || '.public.rc_t')::regclass AS db_qualified;
 SELECT 'rc_nosuchdb.public.rc_t'::regclass;
--- past three parts nothing can qualify it, and the wording is per kind
+-- the wording is per kind, and past three parts nothing qualifies a name at all
 SELECT 'a.b.c.d'::regclass;
 SELECT 'a.b.c'::regproc;
 SELECT 'a.b.c.d'::regtype;

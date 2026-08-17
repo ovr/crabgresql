@@ -89,10 +89,10 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     {
         return Ok(from_oid(kind, oid, ops));
     }
-    // `regtypein` reads its argument with the *type-name grammar*, and the
-    // identifier splitter below cannot stand in for it: `character varying` and
-    // `timestamp with time zone` are one type name each, not two identifiers,
-    // so splitting first would reject them before they were ever looked up.
+    // Ahead of the splitter, because `regtypein` reads its argument with the
+    // *type-name grammar* and the splitter cannot stand in for it:
+    // `character varying` is one type name, not two identifiers, and splitting
+    // first rejects it before anything looks it up.
     //
     // TODO: a spelling the grammar rejects reports `invalid name syntax` here,
     // where PG reports the grammar's own error (`invalid type name ""`,
@@ -105,9 +105,8 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     }
     let parts = split_qualified_name(trimmed).ok_or_else(invalid_name_syntax)?;
     let (namespace, name) = qualify(kind, &parts, || ops.current_database())?;
-    // `regoperin` resolves by name alone and has a *third* answer the others do
-    // not: a name several operators carry is an error rather than a miss, so the
-    // candidate list is what comes back and the count decides.
+    // `regoperin` has a *third* answer the others do not: a name several
+    // operators carry is an error rather than a miss.
     if kind == RegKind::Oper {
         return match ops.oper_oids(namespace.as_deref(), &name).as_slice() {
             [] => Err(not_found(kind, s, &parts)),
@@ -122,12 +121,10 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
         RegKind::Oper => unreachable!("returned above: an operator name is not one-or-nothing"),
         RegKind::Proc => ops.proc_oid(namespace.as_deref(), &name),
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
-        // The grammar ran above; what is left is a name only the catalog knows.
         RegKind::Type => builtin_type_oid(namespace.as_deref(), &name)
             .or_else(|| pseudo_type_oid(namespace.as_deref(), &name))
             .or_else(|| ops.user_type_oid(namespace.as_deref(), &name)),
-        // `qualify` has already rejected a qualified schema name, so this is
-        // the bare one `regnamespacein` takes.
+        // `qualify` has already rejected a qualified schema name.
         RegKind::Namespace => ops.namespace_oid(&name),
     }
     .ok_or_else(|| not_found(kind, s, &parts))?;
@@ -171,14 +168,11 @@ fn pseudo_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
 /// PG's "does not exist" error for a name that parsed but named nothing:
 /// `relation "nosuchtable" does not exist`.
 ///
-/// Which spelling of the name it echoes is per kind, and both halves were
-/// probed against PostgreSQL 18.4. `regprocin` and `regoperin` hand their raw
-/// argument to the message — `'  NoSuch  '::regproc` reports `function
-/// "  NoSuch  "`, spaces and capitals intact — while the others report the
-/// *parsed* name, folded and unquoted and rejoined with dots: `'PUB.NoSuch'`
-/// becomes `relation "pub.nosuch"`. `regoperin` also words it the other way
-/// round and does not quote, an operator name being punctuation rather than an
-/// identifier.
+/// Which spelling of the name it echoes is per kind (probed against PG 18.4):
+/// `regprocin` and `regoperin` pass their raw argument through, so
+/// `'  NoSuch  '::regproc` reports `function "  NoSuch  "` with the spaces and
+/// capitals intact, while the others report the *parsed* name —
+/// `'PUB.NoSuch'::regclass` reports `relation "pub.nosuch"`.
 fn not_found(kind: RegKind, raw: &str, parts: &[String]) -> ExecError {
     let state = match kind {
         RegKind::Proc | RegKind::Oper => sqlstate::UNDEFINED_FUNCTION,
@@ -198,9 +192,9 @@ fn not_found(kind: RegKind, raw: &str, parts: &[String]) -> ExecError {
     ExecError::new(state, message)
 }
 
-/// PG's `invalid name syntax`, which every `reg*` input function raises for a
-/// name [`split_qualified_name`] cannot take apart. A *syntax* error, not a
-/// miss: the string never named anything to look up.
+/// What every `reg*` input function raises for a name [`split_qualified_name`]
+/// cannot take apart. A *syntax* error, not a miss: the string never named
+/// anything to look up.
 fn invalid_name_syntax() -> ExecError {
     ExecError::new(sqlstate::INVALID_NAME, "invalid name syntax")
 }
@@ -214,18 +208,17 @@ fn invalid_name_syntax() -> ExecError {
 /// quotes the whole dotted name and calls it a *relation* name, while the rest
 /// go through `DeconstructQualifiedName`, which quotes nothing and calls it a
 /// *qualified* name.
+///
 /// `current_database` is a thunk because only the three-part arm reads it, and
-/// that arm is the rare one — an ordinary `'pg_class'::regclass` should not pay
-/// for a database-name lookup.
+/// an ordinary `'pg_class'::regclass` should not pay for a database lookup.
 fn qualify(
     kind: RegKind,
     parts: &[String],
     current_database: impl FnOnce() -> String,
 ) -> Result<(Option<String>, String), ExecError> {
     // A schema name is never itself qualified, and `regnamespacein` calls
-    // anything else a syntax error rather than looking for a miss — so
-    // `'a.b'::regnamespace` is `invalid name syntax` where
-    // `'a.b'::regclass` is a relation that does not exist.
+    // anything else a syntax error rather than looking for a miss: `'a.b'` is
+    // `invalid name syntax` here where for `regclass` it is a plain miss.
     if kind == RegKind::Namespace {
         return match parts {
             [name] => Ok((None, name.clone())),
@@ -236,9 +229,8 @@ fn qualify(
     match parts {
         [name] => Ok((None, name.clone())),
         [schema, name] => Ok((Some(schema.clone()), name.clone())),
-        // A three-part name carries a database, and PG accepts it when it names
-        // the one you are connected to — the part is then simply dropped, so
-        // `'regression.public.t'::regclass` resolves like `'public.t'`.
+        // The database part is simply dropped, so `'regression.public.t'`
+        // resolves like `'public.t'` for a session connected to `regression`.
         [database, schema, name] if *database == current_database() => {
             Ok((Some(schema.clone()), name.clone()))
         }
@@ -271,10 +263,9 @@ fn qualify(
     }
 }
 
-/// The `(namespace, name)` a *relation* name denotes, or the error PG raises
-/// for one it cannot parse. `regclass` input and `pg_get_viewdef(text)` reach
-/// the same `makeRangeVarFromNameList`/`RangeVarGetRelid` pair upstream, so
-/// they share this rather than each deciding what a malformed name means.
+/// `regclass` input and `pg_get_viewdef(text)` reach the same
+/// `makeRangeVarFromNameList`/`RangeVarGetRelid` pair upstream, so they share
+/// this rather than each deciding what a malformed relation name means.
 pub(crate) fn relation_name(
     s: &str,
     ops: &dyn CatalogOps,
@@ -327,8 +318,8 @@ fn take_ident(s: &str) -> Option<(String, &str)> {
                     chars.next();
                 }
                 _ => {
-                    // `""` is a legal (empty) part, unlike an empty unquoted
-                    // one: PG reads `'""'::regclass` as a relation named `""`.
+                    // No emptiness check: a quoted empty part is legal, unlike
+                    // an unquoted one — see [`split_qualified_name`].
                     let tail = &body[i + 1..];
                     return Some((out, tail.trim_start()));
                 }
@@ -377,7 +368,7 @@ mod tests {
     }
 
     /// The parts a name splits into, joined by `|` so an assertion reads as one
-    /// string. No identifier below contains a `|`, so the boundaries are exact.
+    /// string. No identifier below contains a `|`.
     fn split(s: &str) -> Option<String> {
         split_qualified_name(s).map(|parts| parts.join("|"))
     }
@@ -391,20 +382,16 @@ mod tests {
         assert_eq!(split("\"RS\".\"T\"").as_deref(), Some("RS|T"));
         // An embedded `""` is one literal quote.
         assert_eq!(split("\"a\"\"b\"").as_deref(), Some("a\"b"));
-        // How many parts are allowed is `qualify`'s call, so a three-part name
-        // splits here and is rejected there.
         assert_eq!(split("a.b.c").as_deref(), Some("a|b|c"));
-        // A quoted empty part is a name, not a malformation: PG reads
-        // `'""'::regclass` as a relation named `""` that does not exist.
+        // A quoted empty part is a name, not a malformation.
         assert_eq!(split("\"\"").as_deref(), Some(""));
         assert_eq!(split("rs.\"\"").as_deref(), Some("rs|"));
     }
 
+    /// Everything here is `invalid name syntax` upstream — a string that never
+    /// named anything, rather than a name that found nothing.
     #[test]
     fn malformed_names_are_rejected() {
-        // An unterminated quote, an empty *unquoted* part, trailing text after
-        // a closing quote, and a space inside an unquoted part are all
-        // `invalid name syntax` upstream rather than a name to look up.
         assert_eq!(split("\"unterminated"), None);
         assert_eq!(split(""), None);
         assert_eq!(split("   "), None);
@@ -415,10 +402,8 @@ mod tests {
         assert_eq!(split("a b"), None);
     }
 
-    /// A three-part name is not automatically an error: PostgreSQL accepts one
-    /// whose first part names the database you are connected to and then drops
-    /// it, so `'regression.public.t'::regclass` resolves like `'public.t'`
-    /// while `'nosuchdb.public.t'` does not.
+    /// A three-part name is not automatically an error, and past three parts
+    /// nothing saves it. Both wordings differ per kind.
     #[test]
     fn a_database_qualifier_resolves_only_for_the_connected_database() {
         let connected = || "regression".to_string();
@@ -433,8 +418,7 @@ mod tests {
             err.message,
             "cross-database references are not implemented: \"nosuchdb.public.t\""
         );
-        // The wording is per kind: only `regclass` quotes the dotted name and
-        // calls it a relation name.
+        // Only `regclass` quotes the dotted name and calls it a relation name.
         let err = q(RegKind::Proc, "nosuchdb.public.f").expect_err("another database");
         assert_eq!(
             err.message,
@@ -451,7 +435,7 @@ mod tests {
             err.message,
             "improper qualified name (too many dotted names): a.b.c.d"
         );
-        // A schema name is never qualified at all, at any length.
+        // A schema name is never qualified at all.
         let err = q(RegKind::Namespace, "a.b").expect_err("qualified schema");
         assert_eq!(err.code, sqlstate::INVALID_NAME);
         assert_eq!(err.message, "invalid name syntax");

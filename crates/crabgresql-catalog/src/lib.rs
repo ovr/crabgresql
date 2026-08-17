@@ -484,8 +484,8 @@ pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
         .map(|row| row.proname)
 }
 
-/// The name of the built-in operator `oid`, or `None` for an OID `pg_operator`
-/// has no row for.
+/// The name of the built-in operator `oid`, the inverse of
+/// [`builtin_oper_oids`].
 pub fn builtin_oper_name(oid: u32) -> Option<&'static str> {
     PG_OPERATOR_ROWS
         .iter()
@@ -1099,21 +1099,17 @@ impl SystemCatalog {
         matched.next().is_none().then_some(first)
     }
 
-    /// The `(namespace, name)` of the operator `oid` identifies, or `None` if
-    /// `pg_operator` has no such row. Backs `regoper` output.
-    ///
-    /// Every operator this build publishes is a built-in, so the namespace is
-    /// always `pg_catalog` — `CREATE OPERATOR` is not implemented, and when it
-    /// is this reads the user rows the same way [`SystemCatalog::proc_name`]
-    /// reads `CREATE FUNCTION`'s.
+    /// Backs `regoper` output. Every operator this build publishes is a
+    /// built-in, so the namespace is always `pg_catalog` — `CREATE OPERATOR` is
+    /// not implemented, and when it is this reads the user rows the same way
+    /// [`SystemCatalog::proc_name`] reads `CREATE FUNCTION`'s.
     pub fn oper_name(&self, oid: u32) -> Option<(String, String)> {
         builtin_oper_name(oid).map(|name| ("pg_catalog".to_string(), name.to_string()))
     }
 
-    /// The OIDs of every operator `namespace.name` names — the whole list,
-    /// because `regoper` needs the count on both sides (see `CatalogOps` in
-    /// `crabgresql-executor`). Built-ins all live in `pg_catalog`, so any other
-    /// qualifier names nothing.
+    /// Built-ins all live in `pg_catalog`, so any other qualifier names
+    /// nothing. Why the whole list comes back: `CatalogOps` in
+    /// `crabgresql-executor`.
     pub fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32> {
         if matches!(namespace, Some(ns) if ns != "pg_catalog") {
             return Vec::new();
