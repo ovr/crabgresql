@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786987968363,
+  "lastUpdate": 1787007604431,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -18430,6 +18430,294 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q43",
             "value": 15.934,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "00294734ba229cbfd419a85e2cd8ad485c17357e",
+          "message": "feat: Support pg_available_extension_versions, pg_tablespace_location and the index AM property functions (#259)",
+          "timestamp": "2026-08-17T22:11:36Z",
+          "tree_id": "b4e772920f6943af812a7a4b8fe0a8e92251f064",
+          "url": "https://github.com/ovr/crabgresql/commit/00294734ba229cbfd419a85e2cd8ad485c17357e"
+        },
+        "date": 1787007604234,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 251.132,
+            "unit": "s",
+            "extra": "dataset load — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 13.58,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 14.151,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 14.432,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 13.795,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 14.181,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 14.834,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 14.173,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 14.164,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 15.541,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 16.555,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 14.296,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 14.504,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 15.976,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 16.725,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 16.429,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 16.523,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 19.625,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 18.08,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 32.397,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 0.346,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 14.952,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 15.66,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q23",
+            "value": 18.509,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q24",
+            "value": 44.796,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q25",
+            "value": 1.465,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q26",
+            "value": 1.752,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q27",
+            "value": 1.577,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q28",
+            "value": 18.785,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q29",
+            "value": 34.093,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q30",
+            "value": 76.03,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q31",
+            "value": 17.358,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q32",
+            "value": 17.855,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q33",
+            "value": 36.711,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q34",
+            "value": 22.518,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q35",
+            "value": 22.559,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q36",
+            "value": 19.585,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q37",
+            "value": 16.462,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q38",
+            "value": 17.468,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q39",
+            "value": 16.155,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q40",
+            "value": 18.669,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q41",
+            "value": 15.491,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q42",
+            "value": 15.625,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 10000000 rows"
+          },
+          {
+            "name": "Q43",
+            "value": 15.314,
             "unit": "s",
             "extra": "best of the timed runs — parquet, 10000000 rows"
           }
