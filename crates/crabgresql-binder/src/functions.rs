@@ -4636,31 +4636,25 @@ pub(crate) fn resolve_call(
             narrow_by_unknown_category(name, &bindings, narrowed)?
         } else {
             // With nothing left to separate typed candidates PG gives up
-            // rather than picking one, which is why `gcd(int2, int2)` is
-            // `42725`: smallint reaches the int4, int8 and numeric overloads
-            // alike and none of them is the numeric category's preferred type.
+            // rather than picking one: `gcd(int2, int2)` is `42725` because
+            // smallint reaches the int4, int8 and numeric overloads alike and
+            // none of them is the numeric category's preferred type.
             //
-            // The survivors are recounted because reachability above is
-            // `implicit_castable` while resolution below is `coerce_for_arg`;
-            // where the two disagree the call is not actually ambiguous. That
-            // recount needs `exact_only = false` — the pass that admits an
-            // implicit cast — or a widening argument reaches nothing and every
-            // such call looks unambiguous. A user routine these arguments can
-            // *reach* suppresses the error outright: it is a candidate PG would
-            // have weighed, and a hard `42725` must not hide someone's own
-            // function. Matching arity alone is not enough — a `gcd(text,text)`
-            // no int2 argument can reach would otherwise mask the ambiguity.
-            if narrowed.len() > 1
-                && narrowed
-                    .iter()
-                    .filter(|sig| !typed_mismatch(&bindings, sig.args, false))
-                    .count()
-                    > 1
-                && !catalog.routines(name).iter().any(|r| {
-                    r.arg_types.len() == bindings.len()
-                        && !typed_mismatch(&bindings, &r.arg_types, false)
-                })
-            {
+            // `exact_only` is false throughout — it is the pass that admits an
+            // implicit cast, and with it true a widening argument reaches
+            // nothing and every such call would look unambiguous.
+            let reachable = |args: &[PgType]| !typed_mismatch(&bindings, args, false);
+            // Recounted rather than taken from `narrowed`, whose reachability
+            // is `implicit_castable` where resolution below is
+            // `coerce_for_arg`: if the two disagree there is only one candidate
+            // and no ambiguity.
+            let survivors = narrowed.iter().filter(|sig| reachable(sig.args)).count();
+            // A routine PG would have weighed suppresses the error.
+            let user_candidate = catalog
+                .routines(name)
+                .iter()
+                .any(|r| r.arg_types.len() == bindings.len() && reachable(&r.arg_types));
+            if survivors > 1 && !user_candidate {
                 return Err(ambiguous_function(name, &bindings));
             }
             narrowed

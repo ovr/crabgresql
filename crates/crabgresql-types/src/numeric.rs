@@ -2252,7 +2252,6 @@ mod tests {
             arith("-1e131071", '-', "1e131071"),
             n("-2e131071").to_display()
         );
-        // Multiplying by 1.0 leaves the weight alone and takes the scale to 1.
         let scaled = match n("1e131071").mul(&n("1.0")) {
             Ok(v) => v,
             Err(e) => panic!("multiplying by 1.0 cannot overflow: {e:?}"),
@@ -2278,7 +2277,6 @@ mod tests {
                 .to_display()
                 .contains(['1', '2', '3', '4', '5', '6', '7', '8', '9'])
         );
-        // 1.5e-16384 rounds up to 2e-16383, 1.4e-16384 down to 1e-16383.
         assert_eq!(
             clamped(&tiny, &n("1.5")).cmp(&n("2e-16383")),
             std::cmp::Ordering::Equal

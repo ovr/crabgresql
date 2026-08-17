@@ -1284,8 +1284,7 @@ fn float_error(e: float::FloatError) -> ExecError {
     ExecError::new(e.sqlstate, e.message)
 }
 
-/// A running `sum`/`avg` can carry its accumulator past what `numeric` stores,
-/// which PG reports from the accumulation rather than at finalize.
+/// A running `sum`/`avg` can carry its accumulator past what `numeric` stores.
 fn numeric_error(e: crabgresql_types::numeric::NumErr) -> ExecError {
     ExecError::new(e.sqlstate, e.message).with_detail(e.detail)
 }

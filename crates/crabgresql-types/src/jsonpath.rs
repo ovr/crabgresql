@@ -199,8 +199,6 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> JsonError {
     }
 }
 
-/// `jsonpath` arithmetic reports a value that has left the `numeric` format
-/// with the arithmetic layer's own SQLSTATE and message.
 fn numeric_overflow(e: crate::numeric::NumErr) -> JsonError {
     err(e.sqlstate, e.message)
 }

@@ -3197,7 +3197,6 @@ mod tests {
         }
     }
 
-    /// The SQLSTATE a two-argument function rejects `a`, `b` with.
     fn call2_err(f: ScalarFn, a: Value, b: Value) -> String {
         match eval_scalar(f, &[a, b], &FmtCtx::utc_default()) {
             Ok(value) => panic!("these arguments must be rejected, got {value:?}"),
@@ -3221,7 +3220,7 @@ mod tests {
         for (a, b) in [(i32::MIN, 0), (0, i32::MIN), (i32::MIN, i32::MIN)] {
             assert_eq!(call2_err(ScalarFn::GcdInt, i4(a), i4(b)), "22003");
         }
-        // ...but only when it *is* the result: gcd(int4 min, 2) is 2.
+        // ...but only when it *is* the result.
         assert_eq!(call2(ScalarFn::GcdInt, i4(i32::MIN), i4(2)), i4(2));
         // A zero operand answers before anything is multiplied.
         assert_eq!(call2(ScalarFn::LcmInt, i4(i32::MIN), i4(0)), i4(0));

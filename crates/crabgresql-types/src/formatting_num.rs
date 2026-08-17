@@ -38,8 +38,7 @@ fn syntax(message: &str) -> FormatError {
     }
 }
 
-/// A `V` shift can carry the value past what `numeric` stores; the format
-/// layer reports that with the arithmetic layer's own SQLSTATE and message.
+/// A `V` shift can carry the value past what `numeric` stores.
 fn numeric_error(e: crate::numeric::NumErr) -> FormatError {
     FormatError {
         sqlstate: e.sqlstate,
