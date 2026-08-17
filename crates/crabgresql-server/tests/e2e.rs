@@ -3518,6 +3518,316 @@ async fn set_transaction_isolation_after_ddl_errors_25001() -> anyhow::Result<()
     Ok(())
 }
 
+/// `SHOW TRANSACTION ISOLATION LEVEL` is a grammar production of its own in
+/// PostgreSQL, spelling the parameter `transaction_isolation` — which is what
+/// JDBC's `getTransactionIsolation()` issues. It reports the *current*
+/// transaction: the session default outside a block, the block's own level
+/// inside one.
+#[tokio::test]
+async fn show_transaction_isolation_level_reports_the_current_transaction() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    // The column is titled with the parameter, not with the words as written.
+    let rows = client
+        .simple_query("SHOW TRANSACTION ISOLATION LEVEL")
+        .await?;
+    let row = rows
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("a row");
+    assert_eq!(row.columns()[0].name(), "transaction_isolation");
+    assert_eq!(row.get(0), Some("read committed"));
+    assert_eq!(
+        scalar(&client, "SHOW transaction_isolation").await,
+        "read committed"
+    );
+
+    // Outside a block it follows the default a new transaction would inherit.
+    client
+        .simple_query("SET default_transaction_isolation = 'repeatable read'")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SHOW TRANSACTION ISOLATION LEVEL").await,
+        "repeatable read"
+    );
+    client
+        .simple_query("RESET default_transaction_isolation")
+        .await?;
+
+    // Inside one it is the block's.
+    client
+        .simple_query("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SHOW TRANSACTION ISOLATION LEVEL").await,
+        "serializable"
+    );
+    assert_eq!(scalar(&client, "SHOW transaction_read_only").await, "on");
+    // `current_setting()` reads the same table, so it cannot disagree.
+    assert_eq!(
+        scalar(&client, "SELECT current_setting('transaction_isolation')").await,
+        "serializable"
+    );
+    client.simple_query("COMMIT").await?;
+    assert_eq!(
+        scalar(&client, "SHOW TRANSACTION ISOLATION LEVEL").await,
+        "read committed"
+    );
+    assert_eq!(scalar(&client, "SHOW transaction_read_only").await, "off");
+
+    Ok(())
+}
+
+/// `SET transaction_isolation = …` is the parameter spelling of `SET TRANSACTION
+/// ISOLATION LEVEL …`: it retargets the open block, snapshot gate included.
+#[tokio::test]
+async fn setting_transaction_isolation_as_a_parameter_retargets_the_block() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let a = connect(port).await;
+    let b = connect(port).await;
+    a.simple_query("CREATE TABLE t (id integer)").await?;
+    a.simple_query("INSERT INTO t VALUES (1)").await?;
+
+    a.simple_query("BEGIN").await?;
+    a.simple_query("SET transaction_isolation = 'repeatable read'")
+        .await?;
+    assert_eq!(
+        scalar(&a, "SHOW transaction_isolation").await,
+        "repeatable read"
+    );
+    assert_eq!(row_count(&a, "t").await, 1); // freezes the snapshot
+    b.simple_query("INSERT INTO t VALUES (2)").await?;
+    assert_eq!(row_count(&a, "t").await, 1); // RR: still frozen
+    a.simple_query("COMMIT").await?;
+    // The level belonged to the block, so it is gone with it.
+    assert_eq!(
+        scalar(&a, "SHOW transaction_isolation").await,
+        "read committed"
+    );
+
+    // Outside a block PG accepts the assignment silently — no 25P01 warning, and
+    // no effect on the next transaction — where the statement spelling warns.
+    a.simple_query("SET transaction_isolation = 'serializable'")
+        .await?;
+    assert_eq!(
+        scalar(&a, "SHOW transaction_isolation").await,
+        "read committed"
+    );
+
+    Ok(())
+}
+
+/// The two `25001` gates PostgreSQL puts on a block that has already run a
+/// query: the isolation level may not *change*, and a read-only block may not
+/// become read-write. Both spellings share them.
+#[tokio::test]
+async fn transaction_parameters_are_snapshot_gated() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SELECT 1").await?;
+    // Re-asserting the level the block already runs at is accepted, in both
+    // spellings — PG gates the change, not the assignment.
+    client
+        .simple_query("SET transaction_isolation = 'read committed'")
+        .await
+        .expect("re-asserting the current level after a query is accepted");
+    client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("...in the statement spelling too");
+    let err = client
+        .simple_query("SET transaction_isolation = 'serializable'")
+        .await
+        .expect_err("changing the level after a query must be rejected");
+    let db = err.as_db_error().expect("server error");
+    assert_eq!(db.code(), &SqlState::ACTIVE_SQL_TRANSACTION);
+    assert_eq!(
+        db.message(),
+        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+    );
+    client.simple_query("ROLLBACK").await?;
+
+    // Going read-only is unrestricted; leaving a read-only block is not.
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SELECT 1").await?;
+    client
+        .simple_query("SET transaction_read_only = on")
+        .await
+        .expect("a block may go read-only at any point");
+    assert_eq!(scalar(&client, "SHOW transaction_read_only").await, "on");
+    client.simple_query("ROLLBACK").await?;
+
+    for sql in [
+        "SET transaction_read_only = off",
+        "SET TRANSACTION READ WRITE",
+    ] {
+        client.simple_query("BEGIN READ ONLY").await?;
+        client.simple_query("SELECT 1").await?;
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err(&format!("`{sql}` after a query must be rejected"));
+        let err = err.as_db_error().expect("server error");
+        assert_eq!(err.code(), &SqlState::ACTIVE_SQL_TRANSACTION, "for `{sql}`");
+        assert_eq!(
+            err.message(),
+            "transaction read-write mode must be set before any query",
+            "for `{sql}`"
+        );
+        client.simple_query("ROLLBACK").await?;
+    }
+
+    Ok(())
+}
+
+/// `SHOW` reads session state and takes no snapshot, so it does not close the
+/// window the two gates above live in — verified against PostgreSQL 18.4, where
+/// `BEGIN; SHOW TimeZone; SET TRANSACTION ISOLATION LEVEL …` is accepted.
+#[tokio::test]
+async fn show_does_not_count_as_the_blocks_first_query() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("BEGIN").await?;
+    client.simple_query("SHOW TimeZone").await?;
+    client.simple_query("SHOW ALL").await?;
+    client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("SHOW takes no snapshot, so the level can still change");
+    assert_eq!(
+        scalar(&client, "SHOW TRANSACTION ISOLATION LEVEL").await,
+        "serializable"
+    );
+    client.simple_query("COMMIT").await?;
+    Ok(())
+}
+
+/// The transaction-scoped parameters cannot be reset: PostgreSQL flags them
+/// `GUC_NO_RESET`, so `RESET <name>` and `SET <name> = DEFAULT` both raise
+/// `0A000` while `RESET ALL` skips them.
+#[tokio::test]
+async fn transaction_parameters_cannot_be_reset() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    for sql in [
+        "RESET transaction_isolation",
+        "SET transaction_isolation = DEFAULT",
+        "RESET transaction_read_only",
+        "SET transaction_read_only = DEFAULT",
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err(&format!("`{sql}` must be rejected"));
+        let err = err.as_db_error().expect("server error");
+        assert_eq!(err.code(), &SqlState::FEATURE_NOT_SUPPORTED, "for `{sql}`");
+        let name = sql.split_whitespace().nth(1).expect("the parameter name");
+        assert_eq!(
+            err.message(),
+            format!("parameter \"{name}\" cannot be reset"),
+            "for `{sql}`"
+        );
+    }
+
+    client
+        .simple_query("RESET ALL")
+        .await
+        .expect("RESET ALL skips a parameter it cannot reset");
+    assert_eq!(
+        scalar(&client, "SHOW transaction_isolation").await,
+        "read committed"
+    );
+
+    Ok(())
+}
+
+/// An unusable value is `22023` in both parameters' own words, and the enum one
+/// carries PG's HINT listing the four accepted spellings.
+#[tokio::test]
+async fn transaction_parameters_reject_what_postgresql_rejects() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    let err = client
+        .simple_query("SET transaction_isolation = 'bogus'")
+        .await
+        .expect_err("an unknown isolation level must be rejected");
+    let db = err.as_db_error().expect("server error");
+    assert_eq!(db.code(), &SqlState::INVALID_PARAMETER_VALUE);
+    assert_eq!(
+        db.message(),
+        "invalid value for parameter \"transaction_isolation\": \"bogus\""
+    );
+    assert_eq!(
+        db.hint(),
+        Some("Available values: serializable, repeatable read, read committed, read uncommitted.")
+    );
+
+    let err = client
+        .simple_query("SET transaction_read_only = 'bogus'")
+        .await
+        .expect_err("a non-boolean access mode must be rejected");
+    let db = err.as_db_error().expect("server error");
+    assert_eq!(db.code(), &SqlState::INVALID_PARAMETER_VALUE);
+    assert_eq!(
+        db.message(),
+        "parameter \"transaction_read_only\" requires a Boolean value"
+    );
+
+    Ok(())
+}
+
+/// `pg_settings.source` for a transaction-scoped parameter reads `override`
+/// until a statement names it — and then follows PostgreSQL through the block's
+/// end: a `SET TRANSACTION`'s mark survives `COMMIT`, a `BEGIN`'s does not, and
+/// `ROLLBACK` discards both.
+#[tokio::test]
+async fn transaction_parameter_source_follows_the_block() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let source = "SELECT source FROM pg_settings WHERE name = 'transaction_isolation'";
+
+    assert_eq!(scalar(&client, source).await, "override");
+
+    // A mode named by BEGIN is block-local in PG: reported inside, gone after.
+    client
+        .simple_query("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await?;
+    assert_eq!(scalar(&client, source).await, "session");
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, source).await, "override");
+
+    // A plain SET's mark is kept by COMMIT, as for any other parameter.
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await?;
+    assert_eq!(scalar(&client, source).await, "session");
+    client.simple_query("COMMIT").await?;
+    assert_eq!(scalar(&client, source).await, "session");
+    // ...even though the value itself belonged to the block.
+    assert_eq!(
+        scalar(&client, "SHOW transaction_isolation").await,
+        "read committed"
+    );
+
+    // A fresh session, since the mark above is not one a ROLLBACK could clear.
+    let client = connect(spawn_server().await).await;
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query("SET transaction_isolation = 'serializable'")
+        .await?;
+    assert_eq!(scalar(&client, source).await, "session");
+    client.simple_query("ROLLBACK").await?;
+    assert_eq!(scalar(&client, source).await, "override");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn set_guc_to_default_resets_it() {
     let client = connect(spawn_server().await).await;

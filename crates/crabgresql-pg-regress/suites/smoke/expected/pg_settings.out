@@ -355,3 +355,128 @@ SELECT name, setting, source FROM pg_settings
  default_transaction_read_only | off            | default
 (2 rows)
 
+--
+-- transaction_isolation and transaction_read_only live in the transaction
+--
+-- PostgreSQL's two transaction-scoped parameters: the value is the open block's
+-- rather than the session's, which is why `source` starts at `override`, `RESET`
+-- is refused, and what `SHOW` prints follows the block. Every statement below
+-- was diffed against PostgreSQL 18.4.
+--
+SELECT name, setting, category, short_desc, context, vartype, source,
+       enumvals, boot_val, reset_val
+  FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+         name          |    setting     |                    category                     |                    short_desc                    | context | vartype |  source  |                               enumvals                               |    boot_val    |   reset_val    
+-----------------------+----------------+-------------------------------------------------+--------------------------------------------------+---------+---------+----------+----------------------------------------------------------------------+----------------+----------------
+ transaction_isolation | read committed | Client Connection Defaults / Statement Behavior | Sets the current transaction's isolation level.  | user    | enum    | override | {serializable,"repeatable read","read committed","read uncommitted"} | read committed | read committed
+ transaction_read_only | off            | Client Connection Defaults / Statement Behavior | Sets the current transaction's read-only status. | user    | bool    | override |                                                                      | off            | off
+(2 rows)
+
+-- the grammar's own spelling of the first one, column name included
+SHOW TRANSACTION ISOLATION LEVEL;
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+SHOW transaction_isolation;
+ transaction_isolation 
+-----------------------
+ read committed
+(1 row)
+
+SHOW transaction_read_only;
+ transaction_read_only 
+-----------------------
+ off
+(1 row)
+
+-- outside a block both follow the defaults a new transaction would inherit
+SET default_transaction_isolation = 'repeatable read';
+SHOW TRANSACTION ISOLATION LEVEL;
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+RESET default_transaction_isolation;
+-- a mode a BEGIN names is 'session' while the block lasts and 'override' after
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY;
+SHOW TRANSACTION ISOLATION LEVEL;
+ transaction_isolation 
+-----------------------
+ serializable
+(1 row)
+
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+         name          |   setting    | source  
+-----------------------+--------------+---------
+ transaction_isolation | serializable | session
+ transaction_read_only | on           | session
+(2 rows)
+
+COMMIT;
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+         name          |    setting     |  source  
+-----------------------+----------------+----------
+ transaction_isolation | read committed | override
+ transaction_read_only | off            | override
+(2 rows)
+
+-- ...where a SET TRANSACTION's mark survives the COMMIT, as any plain SET's does
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT name, setting, source FROM pg_settings
+ WHERE name = 'transaction_isolation';
+         name          |   setting    | source  
+-----------------------+--------------+---------
+ transaction_isolation | serializable | session
+(1 row)
+
+COMMIT;
+-- the value went with the block; only the source stayed behind
+SELECT name, setting, source FROM pg_settings
+ WHERE name = 'transaction_isolation';
+         name          |    setting     | source  
+-----------------------+----------------+---------
+ transaction_isolation | read committed | session
+(1 row)
+
+-- ...and a ROLLBACK takes the source back too
+BEGIN;
+SET transaction_read_only = on;
+SELECT name, setting, source FROM pg_settings WHERE name = 'transaction_read_only';
+         name          | setting | source  
+-----------------------+---------+---------
+ transaction_read_only | on      | session
+(1 row)
+
+ROLLBACK;
+SELECT name, setting, source FROM pg_settings WHERE name = 'transaction_read_only';
+         name          | setting |  source  
+-----------------------+---------+----------
+ transaction_read_only | off     | override
+(1 row)
+
+-- neither can be reset: PostgreSQL flags them GUC_NO_RESET
+RESET transaction_isolation;
+ERROR:  parameter "transaction_isolation" cannot be reset
+SET transaction_read_only = DEFAULT;
+ERROR:  parameter "transaction_read_only" cannot be reset
+-- ...but RESET ALL skips them rather than raising
+RESET ALL;
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+         name          |    setting     |  source  
+-----------------------+----------------+----------
+ transaction_isolation | read committed | session
+ transaction_read_only | off            | override
+(2 rows)
+

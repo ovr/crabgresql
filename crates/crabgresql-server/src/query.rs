@@ -1894,6 +1894,10 @@ pub(crate) fn read_only_active(session: &Session) -> bool {
 /// back at its `DECLARE`. `DECLARE` is where that snapshot is taken, and `CLOSE`
 /// counts as a query in PostgreSQL — `BEGIN; CLOSE ALL; SET TRANSACTION
 /// ISOLATION LEVEL …` raises 25001 there. Both therefore keep the default.
+///
+/// `SHOW` reads session state, not tables, and PostgreSQL takes no snapshot for
+/// it either: `BEGIN; SHOW TimeZone; SET TRANSACTION ISOLATION LEVEL …` is
+/// accepted there (verified against 18.4, `SHOW ALL` included).
 fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
     !matches!(
         stmt,
@@ -1902,6 +1906,7 @@ fn statement_takes_snapshot(stmt: &ast::Statement) -> bool {
             | ast::Statement::Rollback { .. }
             | ast::Statement::Set(_)
             | ast::Statement::Reset(_)
+            | ast::Statement::ShowVariable { .. }
             | ast::Statement::Fetch { .. }
             | ast::Statement::Move { .. }
     )
@@ -2040,6 +2045,12 @@ fn begin_transaction(
     // start rather than opening a new one, as in PostgreSQL; outside one,
     // `xact_start()` is this message's own stamp.
     session.xact = Some(ActiveTxn::new(iso, read_only, session.xact_start()));
+    // Recorded only now, because the save stack the modes go on needs the block
+    // to be open — and recorded as *local*, because a `BEGIN`'s mark is
+    // transient in a way a `SET TRANSACTION`'s is not: `BEGIN ISOLATION LEVEL
+    // SERIALIZABLE` reports `source = override` again after its `COMMIT`, where
+    // a `SET TRANSACTION ISOLATION LEVEL` stays `session`.
+    assign_transaction_modes(session, mode_iso, mode_read_only, true)?;
     Ok(QueryResult::command(tag))
 }
 
@@ -3746,8 +3757,9 @@ fn apply_set_transaction(
     }
     // Current transaction. Outside a block PG only WARNs and still succeeds; a
     // failed block is already rejected upstream (25P02), so the non-block case
-    // reaching here is Idle.
-    let Some(active) = session.xact.as_mut() else {
+    // reaching here is Idle. (The `SET transaction_isolation = …` spelling is
+    // silent there instead — its setter, not this warning, is what runs.)
+    if session.xact.is_none() {
         return Ok(QueryResult::Command {
             tag: "SET".into(),
             notices: vec![Notice::warning(
@@ -3755,23 +3767,44 @@ fn apply_set_transaction(
                 "SET TRANSACTION can only be used in transaction blocks",
             )],
         });
-    };
-    // Only the isolation level is snapshot-gated: PG rejects a post-query
-    // ISOLATION LEVEL change with 25001 but still lets READ ONLY/WRITE change any
-    // time in the block.
-    if iso.is_some() && active.has_run_query {
-        return Err(PgError::new(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-        ));
     }
+    assign_transaction_modes(session, iso, read_only, false)?;
+    Ok(QueryResult::command("SET"))
+}
+
+/// Record the transaction modes a statement named against the parameters they
+/// *are* — `transaction_isolation` and `transaction_read_only`.
+///
+/// Every spelling that retargets the open block routes through here: `BEGIN …
+/// ISOLATION LEVEL …`, `SET TRANSACTION …`, and (via the parameters' own
+/// setters) `SET transaction_isolation = …`. One place, so the snapshot gates
+/// (`25001`) cannot differ between spellings and `pg_settings.source` moves to
+/// `session` for all of them, as in PostgreSQL.
+///
+/// `local` separates a `BEGIN`'s modes from a `SET TRANSACTION`'s: PG keeps the
+/// latter's `source = session` past the block's `COMMIT` and drops the former's,
+/// which is exactly the two-level save stack's `SET LOCAL` rule.
+fn assign_transaction_modes(
+    session: &mut Session,
+    iso: Option<IsolationLevel>,
+    read_only: Option<bool>,
+    local: bool,
+) -> Result<(), PgError> {
     if let Some(iso) = iso {
-        active.iso = iso;
+        let def = guc::lookup("transaction_isolation")
+            .ok_or_else(|| guc::unrecognized("transaction_isolation"))?;
+        session.assign_guc_with(def, local, true, |s| {
+            guc::apply_transaction_isolation(s, iso)
+        })?;
     }
     if let Some(read_only) = read_only {
-        active.read_only = read_only;
+        let def = guc::lookup("transaction_read_only")
+            .ok_or_else(|| guc::unrecognized("transaction_read_only"))?;
+        session.assign_guc_with(def, local, true, |s| {
+            guc::apply_transaction_read_only(s, read_only)
+        })?;
     }
-    Ok(QueryResult::command("SET"))
+    Ok(())
 }
 
 /// Whether a `SET var = value` names the literal `DEFAULT` keyword, which resets
@@ -3822,10 +3855,12 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
         ast::Reset::ALL => {
             for def in guc::GUCS {
                 // `RESET ALL` silently skips a read-only parameter where
-                // `RESET <name>` on the same one raises 55P02. Skipping it here
-                // rather than inside the setter also keeps it out of the save
-                // stack, where it could neither change nor ever be a `session`.
-                if def.is_read_only() {
+                // `RESET <name>` on the same one raises 55P02 — and the
+                // transaction-scoped pair, where it raises 0A000. Skipping them
+                // here rather than inside the setter also keeps a read-only
+                // parameter out of the save stack, where it could neither change
+                // nor ever be a `session`.
+                if def.is_read_only() || def.is_transaction_scoped() {
                     continue;
                 }
                 session.assign_guc(def, guc::GucValue::Default, false)?;
@@ -3902,12 +3937,21 @@ fn is_show_all(variable: &[ast::Ident]) -> bool {
 
 /// `SHOW TIME ZONE` arrives as two identifiers, so the parts are joined before
 /// lookup; a single identifier is itself.
+///
+/// A spelling that is its own grammar production in PostgreSQL rather than a
+/// parameter name — `SHOW TRANSACTION ISOLATION LEVEL` — resolves through
+/// [`guc::show_alias`] here, where Describe and Execute both arrive and so
+/// cannot disagree about the column title.
 fn join_show_name(variable: &[ast::Ident]) -> String {
-    variable
+    let joined = variable
         .iter()
         .map(|i| i.value.as_str())
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    match guc::show_alias(&joined) {
+        Some(name) => name.to_string(),
+        None => joined,
+    }
 }
 
 /// A materialized `SHOW` result set. Every column is `text`, and the command tag
