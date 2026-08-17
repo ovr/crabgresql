@@ -1699,6 +1699,12 @@ mod format_type_tests {
             fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
             }
+            fn oper_name(&self, _oid: u32) -> Option<(String, String)> {
+                None
+            }
+            fn oper_oids(&self, _namespace: Option<&str>, _name: &str) -> Vec<u32> {
+                Vec::new()
+            }
             fn object_description(
                 &self,
                 _objoid: u32,

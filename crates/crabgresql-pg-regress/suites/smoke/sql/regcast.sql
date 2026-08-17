@@ -26,6 +26,22 @@ SELECT 'integer'::regtype AS sql_spelling, 'int4'::regtype AS catalog_spelling;
 SELECT 0::regtype AS zero_type;
 -- regnamespace names a schema
 SELECT 'rcs'::regnamespace AS by_name, 'public'::regnamespace AS pub;
+-- regoper names an operator. Operator OIDs are upstream's own, so unlike the
+-- relation OIDs above they are printable here.
+SELECT '||/'::regoper AS by_name, 597::regoper AS by_oid;
+-- a name is shared by every operand combination it is defined for, so a bare
+-- one resolves only when exactly one operator carries it
+SELECT '+'::regoper;
+-- output applies the same rule from the other side: an operator whose bare name
+-- would not read back as itself prints schema-qualified
+SELECT 551::regoper AS shared_name, 'pg_catalog.||/'::regoper AS qualified_in;
+-- regoper spells the invalid OID `0` where every other reg* type spells it `-`,
+-- because `-` is itself an operator name
+SELECT 0::regoper AS zero, 999999::regoper AS unknown_oid;
+SELECT 'rc_nosuchoperator'::regoper;
+-- equality is by OID, and the round trip through oid and text preserves it
+SELECT '||/'::regoper = 597::regoper AS same_operator,
+       '||/'::regoper::oid AS as_oid, '||/'::regoper::text AS as_text;
 -- casting to text goes through the rendered name, not the OID
 SELECT 'rc_t'::regclass::text AS as_text, length('rc_t'::regclass::text) AS len;
 -- the round trip through oid preserves the value

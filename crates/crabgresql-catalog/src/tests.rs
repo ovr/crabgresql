@@ -194,6 +194,7 @@ fn pg_type_rows_agree_with_pgtype_for_modeled_types() {
         ("varbit", PgType::Varbit),
         ("macaddr", PgType::Macaddr),
         ("macaddr8", PgType::Macaddr8),
+        ("regoper", PgType::Reg(crabgresql_types::RegKind::Oper)),
         ("regclass", PgType::Reg(crabgresql_types::RegKind::Class)),
         ("regtype", PgType::Reg(crabgresql_types::RegKind::Type)),
         (
@@ -1318,6 +1319,36 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
     }
     assert_eq!(described("-", 0, INT4), Some((INT4, "int4um".to_string())));
     Ok(())
+}
+
+/// The `regoper` lookups read the same rows, and the plural return is the whole
+/// point: a bare operator name is shared by every operand combination it is
+/// defined for, so `regoperin` can only resolve one that exactly one operator
+/// carries. Probed against PostgreSQL 18.4: `'||/'::regoper` is 597, while
+/// `'+'::regoper` raises "more than one operator named +".
+#[test]
+fn operator_lookups_report_how_many_share_a_name() {
+    assert_eq!(builtin_oper_oids("||/"), vec![597]);
+    assert_eq!(builtin_oper_name(597), Some("||/"));
+    assert!(
+        builtin_oper_oids("+").len() > 1,
+        "`+` names one operator per operand pair"
+    );
+    assert!(builtin_oper_oids("+").contains(&551), "int4pl is `+`");
+    // A name no operator carries, and an OID no row has.
+    assert_eq!(builtin_oper_oids("nosuchoperator"), Vec::<u32>::new());
+    assert_eq!(builtin_oper_name(0), None);
+    assert_eq!(builtin_oper_name(999_999), None);
+
+    // Built-ins live in `pg_catalog`, so any other qualifier names nothing —
+    // `SELECT 'public.+'::regoper` errors upstream rather than resolving.
+    let cat = SystemCatalog::new();
+    assert_eq!(cat.oper_oids(Some("pg_catalog"), "||/"), vec![597]);
+    assert_eq!(cat.oper_oids(Some("public"), "||/"), Vec::<u32>::new());
+    assert_eq!(
+        cat.oper_name(597),
+        Some(("pg_catalog".to_string(), "||/".to_string()))
+    );
 }
 
 /// `pg_amop` and `pg_amproc` finish the operator-class stack: every reference

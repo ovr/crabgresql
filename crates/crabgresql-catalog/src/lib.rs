@@ -484,6 +484,26 @@ pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
         .map(|row| row.proname)
 }
 
+/// The name of the built-in operator `oid`, or `None` for an OID `pg_operator`
+/// has no row for.
+pub fn builtin_oper_name(oid: u32) -> Option<&'static str> {
+    PG_OPERATOR_ROWS
+        .iter()
+        .find(|row| row.oid == oid)
+        .map(|row| row.oprname)
+}
+
+/// The OIDs of every built-in operator named `name`, in `pg_operator` order.
+/// Plural where [`builtin_proc_oid`] is singular: an operator name is shared by
+/// every operand-type combination it is defined for, so `=` has some ninety.
+pub fn builtin_oper_oids(name: &str) -> Vec<u32> {
+    PG_OPERATOR_ROWS
+        .iter()
+        .filter(|row| row.oprname == name)
+        .map(|row| row.oid)
+        .collect()
+}
+
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
 /// its rows reflect current server state; the live state comes from a
 /// [`CatalogSource`] whose every method is invoked at most once, and only when
@@ -1077,6 +1097,28 @@ impl SystemCatalog {
             .map(|r| r.oid);
         let first = matched.next()?;
         matched.next().is_none().then_some(first)
+    }
+
+    /// The `(namespace, name)` of the operator `oid` identifies, or `None` if
+    /// `pg_operator` has no such row. Backs `regoper` output.
+    ///
+    /// Every operator this build publishes is a built-in, so the namespace is
+    /// always `pg_catalog` — `CREATE OPERATOR` is not implemented, and when it
+    /// is this reads the user rows the same way [`SystemCatalog::proc_name`]
+    /// reads `CREATE FUNCTION`'s.
+    pub fn oper_name(&self, oid: u32) -> Option<(String, String)> {
+        builtin_oper_name(oid).map(|name| ("pg_catalog".to_string(), name.to_string()))
+    }
+
+    /// The OIDs of every operator `namespace.name` names — the whole list,
+    /// because `regoper` needs the count on both sides (see `CatalogOps` in
+    /// `crabgresql-executor`). Built-ins all live in `pg_catalog`, so any other
+    /// qualifier names nothing.
+    pub fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32> {
+        if matches!(namespace, Some(ns) if ns != "pg_catalog") {
+            return Vec::new();
+        }
+        builtin_oper_oids(name)
     }
 
     fn routine_by_oid(&self, oid: u32) -> Option<CatalogRoutine> {

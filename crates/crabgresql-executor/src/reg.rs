@@ -34,6 +34,19 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         // TODO: schema-qualify a regproc name the session's search path does
         // not reach.
         RegKind::Proc => ops.proc_name(oid),
+        // An operator prints bare only when its bare name would read *back* as
+        // this same operator — the round trip `regoperin` would make. `=` names
+        // some ninety operators, so most of them print schema-qualified even
+        // though `pg_catalog` is always on the search path.
+        RegKind::Oper => {
+            let (namespace, name) = ops.oper_name(oid)?;
+            Some(match ops.oper_oids(None, &name).as_slice() {
+                [only] if *only == oid => name,
+                // An operator name is punctuation, never an identifier, so only
+                // the schema is quoted: `pg_catalog.+`.
+                _ => format!("{}.{}", quote_ident(&namespace), name),
+            })
+        }
         // A relation is printed bare when an unqualified name reaches it, and
         // schema-qualified when it does not — the same reachability rule
         // `pg_table_is_visible` answers, so the two can never disagree.
@@ -76,7 +89,21 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
         }
     }
     let (namespace, name) = split_qualified_name(trimmed).ok_or_else(|| not_found(kind, s))?;
+    // `regoperin` resolves by name alone and has a *third* answer the others do
+    // not: a name several operators carry is an error rather than a miss, so the
+    // candidate list is what comes back and the count decides.
+    if kind == RegKind::Oper {
+        return match ops.oper_oids(namespace.as_deref(), &name).as_slice() {
+            [] => Err(not_found(kind, s)),
+            [only] => Ok(from_oid(kind, *only, ops)),
+            _ => Err(ExecError::new(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                format!("more than one operator named {s}"),
+            )),
+        };
+    }
     let oid = match kind {
+        RegKind::Oper => unreachable!("returned above: an operator name is not one-or-nothing"),
         RegKind::Proc => ops.proc_oid(namespace.as_deref(), &name),
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
         RegKind::Type => builtin_type_oid_from_syntax(trimmed)
@@ -129,17 +156,22 @@ fn pseudo_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
 
 /// PG's "does not exist" error for a name that resolved to nothing, quoting the
 /// input as written: `relation "nosuchtable" does not exist`.
+///
+/// `regoperin` words it the other way round and does not quote — an operator
+/// name is punctuation, not an identifier — and echoes the input exactly as
+/// written, spaces included: `operator does not exist:  + `.
 fn not_found(kind: RegKind, s: &str) -> ExecError {
     let state = match kind {
-        RegKind::Proc => sqlstate::UNDEFINED_FUNCTION,
+        RegKind::Proc | RegKind::Oper => sqlstate::UNDEFINED_FUNCTION,
         RegKind::Class => sqlstate::UNDEFINED_TABLE,
         RegKind::Type => sqlstate::UNDEFINED_OBJECT,
         RegKind::Namespace => sqlstate::INVALID_SCHEMA_NAME,
     };
-    ExecError::new(
-        state,
-        format!("{} \"{}\" does not exist", kind.object_noun(), s.trim()),
-    )
+    let message = match kind {
+        RegKind::Oper => format!("operator does not exist: {s}"),
+        _ => format!("{} \"{}\" does not exist", kind.object_noun(), s.trim()),
+    };
+    ExecError::new(state, message)
 }
 
 /// Split an object name into an optional schema and a name, applying SQL's

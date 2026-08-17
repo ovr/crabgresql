@@ -143,6 +143,20 @@ pub trait CatalogOps: Send + Sync {
     /// such function. `Some` only when the name is unambiguous, as `regprocin`
     /// requires. Backs `regproc` input.
     fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The `(namespace, name)` of the operator `oid` identifies, or `None` if
+    /// there is no such operator. Backs `regoper` output, which needs the
+    /// namespace to qualify a name several operators share.
+    fn oper_name(&self, oid: u32) -> Option<(String, String)>;
+    /// The OIDs of every operator `namespace.name` names. `None` for
+    /// `namespace` searches the unqualified path.
+    ///
+    /// A **list**, not an `Option`, because both halves of `regoper` need the
+    /// count rather than a winner: input raises "more than one operator named"
+    /// where `regproc` would simply miss, and output schema-qualifies exactly
+    /// when the bare name would not read back as this operator. Which of those
+    /// is an error is the executor's to decide, so an implementation never
+    /// learns the SQL surface.
+    fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32>;
     /// The comments on `objoid`, as `obj_description`/`col_description` read
     /// them out of `pg_description`. `catalog` is the `pg_catalog` relation the
     /// object lives in; `None` is the deprecated one-argument

@@ -540,6 +540,14 @@ impl CatalogOps for SessionCatalogOps {
         self.system.proc_oid(namespace, name)
     }
 
+    fn oper_name(&self, oid: u32) -> Option<(String, String)> {
+        self.system.oper_name(oid)
+    }
+
+    fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32> {
+        self.system.oper_oids(namespace, name)
+    }
+
     /// The comments `pg_description` publishes. The session's own catalog has
     /// nothing to add until `COMMENT ON` exists, so this reads the same list
     /// the relation itself serves.
