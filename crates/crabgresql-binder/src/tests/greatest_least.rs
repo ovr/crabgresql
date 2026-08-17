@@ -39,8 +39,6 @@ fn the_default_column_name_is_the_keyword() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The result type is resolved over the whole list, exactly as `COALESCE`'s is,
-/// with a `Coerce` on every argument that is not already there.
 #[test]
 fn arguments_promote_to_the_common_type() -> anyhow::Result<()> {
     let (col, expr) = first_column("SELECT GREATEST(id, big) FROM t")?;
@@ -161,8 +159,28 @@ fn a_decorated_call_is_a_syntax_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Two explicit `COLLATE` clauses that disagree are `42P22`, as they are
-/// wherever more than one collatable input combines.
+/// In PG a bare `*` is a grammar error while `t.*` is a whole-row reference
+/// yielding a `record`, which this engine cannot represent. `COALESCE` is here
+/// because the check it exercises is shared by every special form.
+#[test]
+fn a_bare_star_is_a_syntax_error_and_a_row_wildcard_is_unsupported() -> anyhow::Result<()> {
+    for sql in ["SELECT GREATEST(*) FROM t", "SELECT LEAST(*) FROM t"] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::SYNTAX_ERROR, "{sql}");
+        assert_eq!(e.message, "syntax error at or near \"*\"");
+    }
+    for sql in [
+        "SELECT GREATEST(t.*) FROM t",
+        "SELECT LEAST(t.*, t.*) FROM t",
+        "SELECT COALESCE(t.*) FROM t",
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED, "{sql}");
+        assert_eq!(e.message, "whole-row references are not supported yet");
+    }
+    Ok(())
+}
+
 #[test]
 fn conflicting_explicit_collations_are_42p22() -> anyhow::Result<()> {
     let e = bind_err("SELECT GREATEST(name COLLATE \"C\", name COLLATE \"POSIX\") FROM t")?;
@@ -174,8 +192,8 @@ fn conflicting_explicit_collations_are_42p22() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The node carries the collation its comparison runs under, so an explicit
-/// `COLLATE` on any argument decides the ordering.
+/// The ordering runs under the collation, so an argument's `COLLATE` has to reach
+/// the node rather than stop at the argument.
 #[test]
 fn the_node_carries_the_derived_collation() -> anyhow::Result<()> {
     let (_, expr) = first_column("SELECT GREATEST(name, name COLLATE \"C\") FROM t")?;

@@ -932,27 +932,17 @@ pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError
     Ok(Binding::Typed(BoundExpr::Coalesce { args, ty }))
 }
 
-/// `GREATEST(a, b, …)` / `LEAST(a, b, …)`: the largest (smallest) argument,
-/// skipping NULLs.
-///
-/// The result type is resolved exactly as `COALESCE`'s is, so the error text is
-/// the same shape under a different label (`GREATEST types integer and text
-/// cannot be matched`). What `COALESCE` does not need is an *ordering*: PG
-/// refuses a type with no comparison function for the resolved type, which is
-/// what `is_orderable` answers here.
-///
-/// PG raises that refusal when it initializes the expression rather than when it
-/// parses one, so `CREATE VIEW v AS SELECT greatest('{}'::json, '{}')` is
-/// accepted there and fails only on `SELECT * FROM v`. Rejecting it at bind time
-/// is deliberate: the executor's `compare_values` has no arm for such a type, and
-/// it is the same trade-off already made for `DISTINCT` aggregates.
+/// PG refuses a type with no comparison function when it *initializes* the
+/// expression, so `CREATE VIEW v AS SELECT greatest('{}'::json, '{}')` is
+/// accepted there and fails only on `SELECT * FROM v`. Refusing it at bind time
+/// instead is deliberate: the executor's `compare_values` has no arm for such a
+/// type, and it is the trade-off `DISTINCT` aggregates already make.
 pub(crate) fn bind_min_max(
     kind: MinMaxKind,
     bindings: Vec<Binding>,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    // Like `COALESCE()`, an empty list is a grammar error in PG; this parser
-    // accepts it for any call, so the refusal happens here (without PG's cursor).
+    // PG's grammar rejects an empty list; this parser accepts one for any call.
     if bindings.is_empty() {
         return Err(BindError::new(
             sqlstate::SYNTAX_ERROR,

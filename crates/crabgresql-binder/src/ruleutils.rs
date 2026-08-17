@@ -293,17 +293,12 @@ fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<V
         crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
             Some(args.iter().map(|a| a.ty()).collect())
         }
-        // `COALESCE` coerces every argument to the one type it resolved, so that
-        // is the label each literal argument carries: PG prints
+        // `COALESCE`/`GREATEST`/`LEAST` coerce every argument to the one type they
+        // resolved, so that is the label each literal argument carries: PG prints
         // `COALESCE(NULL::text, 'z'::text)`.
-        crate::Binding::Typed(crate::BoundExpr::Coalesce { args, ty }) => {
-            Some(vec![ty; args.len()])
-        }
-        // `GREATEST`/`LEAST` coerce their arguments the same way, and PG labels
-        // them the same way: `GREATEST(1, a, NULL::integer)`.
-        crate::Binding::Typed(crate::BoundExpr::MinMax { args, ty, .. }) => {
-            Some(vec![ty; args.len()])
-        }
+        crate::Binding::Typed(
+            crate::BoundExpr::Coalesce { args, ty } | crate::BoundExpr::MinMax { args, ty, .. },
+        ) => Some(vec![ty; args.len()]),
         // `NULLIF` binds to the `CASE` it is shorthand for, and both its
         // arguments were coerced to that expression's type — the one the `=`
         // operator settled on. PG prints `NULLIF('a'::text, 'b'::text)`.

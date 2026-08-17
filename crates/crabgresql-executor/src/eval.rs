@@ -338,12 +338,9 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             }
             Ok(Value::Null)
         }
-        // GREATEST/LEAST, unlike COALESCE, evaluate every argument —
-        // `greatest(1, 1/0)` is a division-by-zero error in PG — and skip the NULL
-        // ones, so an all-NULL list is NULL. The ordering is the type's btree
-        // ordering under the derived collation, which is the comparison PG
-        // resolves here (and not `compare_values_for_aggregate`: `GREATEST` and
-        // `max()` disagree on `oidvector`).
+        // The btree ordering, deliberately not `compare_values_for_aggregate`:
+        // PG resolves `GREATEST` through the type's own operator class, which for
+        // `oidvector` is not what `max()` compares by.
         BoundExpr::MinMax {
             kind,
             args,
@@ -1912,8 +1909,7 @@ mod min_max_tests {
         );
     }
 
-    /// PG's total order puts NaN above every number, so it wins GREATEST and
-    /// never wins LEAST.
+    /// PG's total order puts NaN above every number.
     #[test]
     fn nan_is_the_greatest_float() {
         let floats = [Value::Float8(f64::NAN), Value::Float8(1.0)];
@@ -1938,9 +1934,8 @@ mod min_max_tests {
         );
     }
 
-    /// The one type where GREATEST and `max()` disagree in PG: `oidvector` has
-    /// its own operator class, which compares the element *count* first, and
-    /// GREATEST resolves the comparison through it.
+    /// `oidvector`'s own operator class compares the element *count* first, which
+    /// is why PG's `GREATEST` and `max()` disagree on it.
     #[test]
     fn oidvector_compares_by_the_btree_order() {
         let vectors = [
@@ -1958,9 +1953,8 @@ mod min_max_tests {
         assert_eq!(pick(MinMaxKind::Least, ty, &vectors), vectors[0]);
     }
 
-    /// Strings compare under the collation the node carries, which moves the
-    /// answer: byte order puts `'a'` (0x61) above `'B'` (0x42), while a
-    /// linguistic collation puts `'B'` on top.
+    /// Both cases are needed: byte order puts `'a'` (0x61) above `'B'` (0x42),
+    /// while a linguistic collation puts `'B'` on top.
     #[test]
     fn strings_compare_under_the_nodes_collation() {
         let strings = [Value::Text("B".into()), Value::Text("a".into())];
@@ -1979,8 +1973,6 @@ mod min_max_tests {
         }
     }
 
-    /// Every argument is evaluated, unlike COALESCE's — `greatest(1, 1/0)` is a
-    /// division-by-zero error in PG.
     #[test]
     fn every_argument_is_evaluated() {
         let divide_by_zero = BoundExpr::Binary {

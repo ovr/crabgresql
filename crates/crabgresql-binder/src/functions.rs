@@ -3764,9 +3764,24 @@ fn bind_special_form(
                 | ast::FunctionArg::ExprNamed { operator, .. } => {
                     return syntax_error(&operator.to_string());
                 }
-                // `coalesce(*)` / `coalesce(t.*)`: PG's grammar has no wildcard in
-                // an expression list either, and reports the star.
-                ast::FunctionArg::Unnamed(_) => return syntax_error("*"),
+                // PG's grammar has no bare wildcard in an expression list either,
+                // and its cursor stops at the star — including for the Snowflake
+                // `* EXCLUDE(…)` this parser accepts.
+                ast::FunctionArg::Unnamed(
+                    ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::WildcardWithOptions(_),
+                ) => {
+                    return syntax_error("*");
+                }
+                // `t.*` is no syntax error in PG: it is a whole-row reference, and
+                // `greatest(t.*)` over `(1,2)` hands back the `record` `(1,2)`.
+                //
+                // TODO: whole-row references, which need a composite/`record` type
+                // in `PgType` before an expression can carry one.
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::QualifiedWildcard(_)) => {
+                    return Err(BindError::feature_not_supported(
+                        "whole-row references are not supported yet",
+                    ));
+                }
             }
         }
     }

@@ -251,16 +251,13 @@ pub enum BoundExpr {
         ty: PgType,
     },
     /// `GREATEST(a, b, …)` / `LEAST(a, b, …)`: the largest (smallest) argument,
-    /// skipping NULLs, or NULL when every argument is NULL. Every argument is
-    /// evaluated — unlike `COALESCE`, `greatest(1, 1/0)` is a division-by-zero
-    /// error — and every one is already coerced to `ty`, the type
-    /// [`crate::expr::coerce::unify_value_column`] resolved for the whole list.
-    /// Never empty: the grammar requires at least one argument.
+    /// skipping NULLs, or NULL when they all are. Nothing short-circuits, so
+    /// `greatest(1, 1/0)` is an error where `coalesce(1, 1/0)` is `1`.
     ///
-    /// The ordering is the type's *btree* ordering under `collation`, which is
-    /// how PG resolves the comparison here: `greatest('9 8'::oidvector, '1 1 1')`
-    /// is `1 1 1`, while `max()` over the same two values is `9 8` (see the
-    /// executor's `compare_values_for_aggregate`).
+    /// `args` are coerced to `ty` and never empty, as `Coalesce`'s are. The
+    /// ordering is `ty`'s *btree* ordering under `collation`, which for some
+    /// types is not the one `min`/`max` use — see the executor's
+    /// `compare_values_for_aggregate`.
     MinMax {
         kind: MinMaxKind,
         args: Vec<BoundExpr>,
@@ -495,7 +492,6 @@ pub struct WindowSortKey {
     pub nulls_first: bool,
 }
 
-/// Which end of the ordering a [`BoundExpr::MinMax`] picks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinMaxKind {
     Greatest,
@@ -503,8 +499,9 @@ pub enum MinMaxKind {
 }
 
 impl MinMaxKind {
-    /// The keyword, as PG spells it in error messages (`GREATEST types integer
-    /// and text cannot be matched`) and in deparsed SQL.
+    /// The label for `GREATEST types integer and text cannot be matched`. Deparse
+    /// does not come through here: `ruleutils::call_name` reads the AST, so that
+    /// the type-blind `pg_get_expr` path spells the keyword too.
     pub fn keyword(self) -> &'static str {
         match self {
             MinMaxKind::Greatest => "GREATEST",

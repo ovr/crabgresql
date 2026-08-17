@@ -1163,10 +1163,9 @@ pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
                 .chain(else_.as_deref());
             common_typmod(arms.map(|arm| expr_typmod(arm, scope)))
         }
-        // `COALESCE` resolves its modifier by the same rule over its arguments:
-        // `coalesce(varchar(3), varchar(3))` is `varchar(3)`, while
-        // `coalesce(varchar(3), varchar(5))` is bare `varchar`. `GREATEST`/`LEAST`
-        // resolve theirs the same way.
+        // `COALESCE` and `GREATEST`/`LEAST` resolve their modifier by the same
+        // rule over their arguments: `coalesce(varchar(3), varchar(3))` is
+        // `varchar(3)`, while `coalesce(varchar(3), varchar(5))` is bare `varchar`.
         BoundExpr::Coalesce { args, .. } | BoundExpr::MinMax { args, .. } => {
             common_typmod(args.iter().map(|arg| expr_typmod(arg, scope)))
         }

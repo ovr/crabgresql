@@ -258,9 +258,8 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
             }
             Some(Value::Null)
         }
-        // Not lazy, unlike COALESCE: every argument has to evaluate, so
-        // `greatest(1, 1/0)` folds to nothing and stays for the executor to fail
-        // on. NULL arguments are skipped; all-NULL is NULL.
+        // Nothing short-circuits, so `greatest(1, 1/0)` folds to nothing and
+        // stays for the executor to fail on.
         BoundExpr::MinMax {
             kind,
             args,
