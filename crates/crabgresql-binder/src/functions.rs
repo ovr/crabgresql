@@ -1409,6 +1409,43 @@ pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
     }
 }
 
+/// The set-returning functions [`lookup_table_fn`] cannot answer for: each is
+/// polymorphic or has several arities, so it resolves through its own function
+/// rather than through a fixed signature. Both call sites that gate on the name
+/// — `FROM` position ([`bind_table_fn_call`]) and target-list position
+/// ([`bind_srf_in_target_list`]) — read this list, so a new one cannot reach
+/// only one of them.
+pub const POLYMORPHIC_TABLE_FN_NAMES: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "jsonb_path_query",
+    "pg_partition_ancestors",
+    "unnest",
+];
+
+/// Whether this build resolves `name` (already lowercased) as a function of any
+/// kind: scalar, aggregate, window, or set-returning.
+///
+/// This is what makes a `pg_proc` row honest, and `crabgresql-bki`'s
+/// `IMPLEMENTED_PRONAMES` — the list codegen filters `pg_proc.dat` by — is
+/// checked against it in both directions by `crabgresql-server`'s
+/// `pg_proc_surface` test.
+///
+/// `current_catalog`, `current_role` and `user` answer `true` and have no
+/// `pg_proc` row: PostgreSQL's grammar spells them as keywords and publishes no
+/// function under either name. The test never asks about them, since it walks
+/// the names `pg_proc.dat` defines.
+pub fn implements_function(name: &str) -> bool {
+    !lookup(name).is_empty()
+        // `pg_typeof(any)` accepts every type, so it has no fixed signature and
+        // is bound outside the table (see `bind_scalar_call`).
+        || name == "pg_typeof"
+        || lookup_agg(name).is_some()
+        || lookup_window_fn(name).is_some()
+        || lookup_table_fn(name).is_some()
+        || POLYMORPHIC_TABLE_FN_NAMES.contains(&name)
+}
+
 /// An aggregate function the executor accumulates over the rows of a group.
 /// `COUNT(*)` and `COUNT(expr)` are both [`AggFn::Count`]; they differ only in
 /// whether an argument expression is present (see [`crate::BoundAggregate`]).
@@ -4958,12 +4995,7 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series"
-        && name != "jsonb_path_query"
-        && name != "unnest"
-        && name != "generate_subscripts"
-        && name != "pg_partition_ancestors"
-    {
+    if !POLYMORPHIC_TABLE_FN_NAMES.contains(&name.as_str()) {
         return Ok(None);
     }
     let arg_exprs = positional_args(&func.args)?;

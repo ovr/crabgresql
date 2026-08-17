@@ -236,6 +236,10 @@ pub struct PgProcRow {
     pub provolatile: &'static str,
     pub proparallel: &'static str,
     pub pronargs: i16,
+    /// How many trailing arguments the call may omit. The default expressions
+    /// themselves are not published (`pg_proc` here has no `proargdefaults`
+    /// column), so this is a count and nothing more.
+    pub pronargdefaults: i16,
     pub prorettype: u32,
     pub proargtypes: &'static [u32],
     /// `proallargtypes`, `proargmodes` and `proargnames`: empty means the
@@ -465,14 +469,17 @@ pub fn is_builtin_type_name(name: &str) -> bool {
     PG_TYPE_ROWS.iter().any(|row| row.typname == name)
 }
 
-/// The OID of the built-in function `name`, or `None` if this build publishes
-/// no `pg_proc` row for it. Only the functions the other catalogs reference are
-/// published, so a name that is real upstream can still be absent here.
-pub fn builtin_proc_oid(name: &str) -> Option<u32> {
+/// The OIDs of every built-in function named `name`, in `pg_proc` order. Plural
+/// because a name is not a function's identity: `abs` names six. Empty for a
+/// name this build publishes no row for — a name that is real upstream can be
+/// absent, since only the functions the catalogs reference and the names this
+/// build implements are published (see `crabgresql-bki`'s `implemented` module).
+pub fn builtin_proc_oids(name: &str) -> Vec<u32> {
     PG_PROC_ROWS
         .iter()
-        .find(|row| row.proname == name)
+        .filter(|row| row.proname == name)
         .map(|row| row.oid)
+        .collect()
 }
 
 /// The name of the built-in function `oid`, the inverse of
@@ -494,8 +501,9 @@ pub fn builtin_oper_name(oid: u32) -> Option<&'static str> {
 }
 
 /// The OIDs of every built-in operator named `name`, in `pg_operator` order.
-/// Plural where [`builtin_proc_oid`] is singular: an operator name is shared by
-/// every operand-type combination it is defined for, so `=` has some ninety.
+/// Plural for the same reason [`builtin_proc_oids`] is: an operator name is
+/// shared by every operand-type combination it is defined for, so `=` has some
+/// ninety.
 pub fn builtin_oper_oids(name: &str) -> Vec<u32> {
     PG_OPERATOR_ROWS
         .iter()
@@ -1071,32 +1079,62 @@ impl SystemCatalog {
         (oid == oids::BOOTSTRAP_ROLE_OID).then_some(self.source.owner())
     }
 
-    /// The name of the function `oid` identifies, or `None` if this snapshot
-    /// has none. Backs `regproc` output: built-in rows first, then this
-    /// session's `CREATE FUNCTION` routines.
-    pub fn proc_name(&self, oid: u32) -> Option<String> {
-        builtin_proc_name(oid)
-            .map(str::to_string)
-            .or_else(|| self.routine_by_oid(oid).map(|r| r.name.clone()))
+    /// The `(namespace, name)` of the function `oid` identifies, or `None` if
+    /// this snapshot has none: built-in rows first, then this session's
+    /// `CREATE FUNCTION` routines. Backs `regproc` output.
+    pub fn proc_name(&self, oid: u32) -> Option<(String, String)> {
+        match builtin_proc_name(oid) {
+            // Every published built-in lives in `pg_catalog`.
+            Some(name) => Some(("pg_catalog".to_string(), name.to_string())),
+            None => self
+                .routine_by_oid(oid)
+                .map(|r| (r.namespace.clone(), r.name.clone())),
+        }
     }
 
-    /// The OID of the function `namespace.name` names, or `None` when there is
-    /// no such function *or* the name is carried by more than one — `regprocin`
-    /// resolves a bare name, so an overloaded one is not resolvable this way.
-    pub fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
+    /// Every function `namespace.name` names — built-ins and this session's
+    /// routines together, since a routine named after a built-in joins it under
+    /// the one name. Why the whole list comes back: `CatalogOps` in
+    /// `crabgresql-executor`.
+    ///
+    /// `None` for `namespace` is an unqualified name, which reaches only the
+    /// schemas [`Self::namespace_is_reachable`] lists.
+    pub fn proc_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32> {
         // Built-ins all live in `pg_catalog`, so any other qualifier names a
         // user routine instead.
-        let in_catalog = !matches!(namespace, Some(ns) if ns != "pg_catalog");
-        if let Some(oid) = builtin_proc_oid(name).filter(|_| in_catalog) {
-            return Some(oid);
-        }
-        let mut matched = self
-            .routines()
-            .iter()
-            .filter(|r| r.name == name && namespace.is_none_or(|ns| ns == r.namespace))
-            .map(|r| r.oid);
-        let first = matched.next()?;
-        matched.next().is_none().then_some(first)
+        let mut oids = match namespace {
+            Some(ns) if ns != "pg_catalog" => Vec::new(),
+            _ => builtin_proc_oids(name),
+        };
+        oids.extend(
+            self.routines()
+                .iter()
+                .filter(|r| {
+                    r.name == name
+                        && match namespace {
+                            Some(ns) => ns == r.namespace,
+                            None => Self::namespace_is_reachable(&r.namespace),
+                        }
+                })
+                .map(|r| r.oid),
+        );
+        oids
+    }
+
+    /// Whether an unqualified function name reaches `namespace`.
+    ///
+    /// The same convention the relation side uses (`SessionCatalog::rel_oid`
+    /// resolves temp schema, then `pg_catalog`, then `public`), minus the temp
+    /// schema, which no `CREATE FUNCTION` can name. `search_path` is the standing
+    /// divergence, and this is the one place it would be honoured.
+    ///
+    /// Every routine is in `public` today, since `CREATE FUNCTION` rejects a
+    /// schema-qualified name (`0A000`, `query::single_object_name`), so nothing
+    /// yet reaches the `false` branch. Without it, `CREATE FUNCTION s.now()`
+    /// would make `'now'::regproc` ambiguous and print the built-in as
+    /// `pg_catalog.now`, neither of which PostgreSQL does.
+    fn namespace_is_reachable(namespace: &str) -> bool {
+        matches!(namespace, "pg_catalog" | "public")
     }
 
     /// Backs `regoper` output. Every operator this build publishes is a

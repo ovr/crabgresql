@@ -99,7 +99,14 @@ pub(crate) fn regproc_by_name(name: &str) -> Value {
         .iter()
         .find(|(_, handler)| *handler == name)
         .map(|(oid, _)| *oid);
-    match own.or_else(|| crate::builtin_proc_oid(name)) {
+    // Every name reaching here — an access-method handler, snowball's two, the
+    // enum I/O functions — is carried by one function, so the ambiguous case is
+    // unreachable rather than approximated by `0`.
+    let builtin = match crate::builtin_proc_oids(name).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    };
+    match own.or(builtin) {
         Some(oid) => Value::Reg(Reg {
             kind: RegKind::Proc,
             oid,

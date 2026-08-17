@@ -28,12 +28,16 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         return None;
     }
     match kind {
-        // A function prints under its bare name. PG schema-qualifies one that
-        // an unqualified name would not reach; built-ins live in `pg_catalog`
-        // and every `CREATE FUNCTION` routine lands in `public`.
-        // TODO: schema-qualify a regproc name the session's search path does
-        // not reach.
-        RegKind::Proc => ops.proc_name(oid),
+        // A function prints bare only when its bare name would read *back* as
+        // this same function — the round trip `regprocin` would make. `abs`
+        // names six, so all six print schema-qualified.
+        RegKind::Proc => {
+            let (namespace, name) = ops.proc_name(oid)?;
+            Some(match ops.proc_oids(None, &name).as_slice() {
+                [only] if *only == oid => quote_ident(&name),
+                _ => format!("{}.{}", quote_ident(&namespace), quote_ident(&name)),
+            })
+        }
         // An operator prints bare only when its bare name would read *back* as
         // this same operator — the round trip `regoperin` would make. `=` names
         // some ninety operators, so most of them print schema-qualified even
@@ -105,21 +109,24 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     }
     let parts = split_qualified_name(trimmed).ok_or_else(invalid_name_syntax)?;
     let (namespace, name) = qualify(kind, &parts, || ops.current_database())?;
-    // `regoperin` has a *third* answer the others do not: a name several
-    // operators carry is an error rather than a miss.
-    if kind == RegKind::Oper {
-        return match ops.oper_oids(namespace.as_deref(), &name).as_slice() {
+    // `regprocin` and `regoperin` have a *third* answer the others do not: a
+    // name several functions or operators carry is an error rather than a miss.
+    let shared_name = match kind {
+        RegKind::Proc => Some(ops.proc_oids(namespace.as_deref(), &name)),
+        RegKind::Oper => Some(ops.oper_oids(namespace.as_deref(), &name)),
+        _ => None,
+    };
+    if let Some(oids) = shared_name {
+        return match oids.as_slice() {
             [] => Err(not_found(kind, s, &parts)),
             [only] => Ok(from_oid(kind, *only, ops)),
-            _ => Err(ExecError::new(
-                sqlstate::AMBIGUOUS_FUNCTION,
-                format!("more than one operator named {s}"),
-            )),
+            _ => Err(ambiguous_name(kind, s)),
         };
     }
     let oid = match kind {
-        RegKind::Oper => unreachable!("returned above: an operator name is not one-or-nothing"),
-        RegKind::Proc => ops.proc_oid(namespace.as_deref(), &name),
+        RegKind::Proc | RegKind::Oper => {
+            unreachable!("returned above: neither name is one-or-nothing")
+        }
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
         RegKind::Type => builtin_type_oid(namespace.as_deref(), &name)
             .or_else(|| pseudo_type_oid(namespace.as_deref(), &name))
@@ -190,6 +197,17 @@ fn not_found(kind: RegKind, raw: &str, parts: &[String]) -> ExecError {
         ),
     };
     ExecError::new(state, message)
+}
+
+/// PG's "more than one" error for a name several objects carry, which only
+/// `regprocin` and `regoperin` raise. Both echo the raw argument — spaces and
+/// all — and only the function form quotes it (probed against PG 18.4).
+fn ambiguous_name(kind: RegKind, raw: &str) -> ExecError {
+    let message = match kind {
+        RegKind::Proc => format!("more than one function named \"{raw}\""),
+        _ => format!("more than one operator named {raw}"),
+    };
+    ExecError::new(sqlstate::AMBIGUOUS_FUNCTION, message)
 }
 
 /// What every `reg*` input function raises for a name [`split_qualified_name`]
