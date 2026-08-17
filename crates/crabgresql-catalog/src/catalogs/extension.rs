@@ -25,31 +25,43 @@ use crate::oids::*;
 const NAME: &str = "plpgsql";
 const COMMENT: &str = "PL/pgSQL procedural language";
 
-/// One installable extension version: what `pg_available_extension_versions`
-/// publishes about it, minus the `installed` flag that view computes.
+/// One installable extension: what `pg_available_extension_versions` publishes
+/// about it, minus the `installed` flag that view computes.
 ///
 /// The flags are the ones PostgreSQL 18.4 reports for `plpgsql` 1.0.
 pub struct AvailableExtension {
+    /// The extension's own OID, which `pg_extension` and its `pg_description`
+    /// row are keyed by.
+    pub oid: u32,
     pub name: &'static str,
+    /// The extension's only version, and therefore also its `default_version`.
     pub version: &'static str,
     pub superuser: bool,
     pub trusted: bool,
     pub relocatable: bool,
     pub schema: &'static str,
     pub comment: &'static str,
+    /// The `pg_language` this extension installs, if it installs one. PostgreSQL
+    /// gives that language a copy of the extension's comment, both written by
+    /// `CREATE EXTENSION`; see [`extension_descriptions`].
+    pub language_oid: Option<u32>,
 }
 
-/// Every installable extension version, for the four readers that must not
-/// disagree about them: the two views here, and — across a crate boundary — the
+/// Every installable extension, for the four readers that must not disagree
+/// about them: the two views here, and — across a crate boundary — the
 /// set-returning `pg_available_extensions()` and
 /// `pg_available_extension_versions()` in the executor, which psql's `\dx` calls
 /// instead of the views of those names.
 ///
-/// One row per `(extension, version)`. The one extension here offers exactly one
-/// version, so that row is also its *default* version — which is what lets
-/// `pg_available_extensions.default_version` read this same list.
+/// One entry per *extension*, carrying the one version it offers. Should an
+/// extension ever offer two, they belong in a list **inside** the entry rather
+/// than in a second entry here: `pg_extension`, `pg_available_extensions` and
+/// `pg_description` are all one row per extension, and only
+/// `pg_available_extension_versions` fans a single extension out across its
+/// versions.
 pub fn available_extensions() -> &'static [AvailableExtension] {
     &[AvailableExtension {
+        oid: PLPGSQL_EXTENSION_OID,
         name: NAME,
         version: "1.0",
         superuser: true,
@@ -57,7 +69,25 @@ pub fn available_extensions() -> &'static [AvailableExtension] {
         relocatable: false,
         schema: "pg_catalog",
         comment: COMMENT,
+        language_oid: Some(PLPGSQL_LANG_OID),
     }]
+}
+
+/// The comments `CREATE EXTENSION` writes rather than any `.dat` file: the
+/// extension's own, and a copy of it on the language the extension installs.
+///
+/// Shaped like [`crate::catalogs::textsearch::snowball_descriptions`] —
+/// `(catalog, objoid, description)` — so [`crate::catalogs::description`]
+/// assembles both the same way.
+pub(crate) fn extension_descriptions() -> Vec<(&'static str, u32, &'static str)> {
+    let mut rows = Vec::new();
+    for ext in available_extensions() {
+        rows.push(("pg_extension", ext.oid, ext.comment));
+        if let Some(language) = ext.language_oid {
+            rows.push(("pg_language", language, ext.comment));
+        }
+    }
+    rows
 }
 
 pub(crate) fn pg_extension_schema() -> TableSchema {
@@ -83,7 +113,7 @@ pub(crate) fn pg_extension_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
         .iter()
         .map(|ext| {
             vec![
-                Value::Oid(PLPGSQL_EXTENSION_OID),
+                Value::Oid(ext.oid),
                 Value::Text(ext.name.to_string()),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(PG_CATALOG_NAMESPACE_OID),

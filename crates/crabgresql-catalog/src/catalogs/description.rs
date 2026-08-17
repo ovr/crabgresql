@@ -36,7 +36,6 @@ use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
 use crate::catalogs::am::BUILTIN_AMS;
-use crate::catalogs::extension::available_extensions;
 use crate::catalogs::language::BUILTIN_LANGUAGES;
 use crate::catalogs::namespace::BUILTIN_NAMESPACES;
 use crate::cols::*;
@@ -124,15 +123,14 @@ fn descriptions() -> &'static [Description] {
             .map(|row| (classoid(row.catalog), row.objoid, 0, row.description))
             .collect();
 
-        let extension = classoid("pg_extension");
-        let language = classoid("pg_language");
-        for ext in available_extensions() {
-            // The extension and the language it installs carry the same comment
-            // on PostgreSQL, both written by `CREATE EXTENSION` rather than by
-            // any `.dat`.
-            rows.push((extension, PLPGSQL_EXTENSION_OID, 0, ext.comment));
-            rows.push((language, PLPGSQL_LANG_OID, 0, ext.comment));
-        }
+        // Each extension's comment, and the copy of it that the language the
+        // extension installs carries — both written by `CREATE EXTENSION` on
+        // PostgreSQL rather than taken from any `.dat`.
+        rows.extend(
+            crate::catalogs::extension::extension_descriptions()
+                .into_iter()
+                .map(|(catalog, objoid, description)| (classoid(catalog), objoid, 0, description)),
+        );
 
         // The snowball template, dictionaries and configurations, whose
         // comments `initdb` writes with `COMMENT ON` rather than taking from a

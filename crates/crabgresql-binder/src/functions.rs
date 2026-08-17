@@ -2802,16 +2802,15 @@ fn lookup(name: &str) -> &'static [Signature] {
         }],
         // The access-method property functions. `pg_indexam_has_property` needs
         // nothing but its OID and is answered by the pure `eval_scalar`; the two
-        // that take an index read the catalog, so `eval` dispatches them.
+        // that take an index read the catalog, so `eval` dispatches them — and
+        // they are absent from this table entirely, resolving their own arguments
+        // in `resolve_index_property` because their index parameter is spelled
+        // either `regclass` or `oid`.
         "pg_indexam_has_property" => &[Signature {
             func: ScalarFn::PgIndexamHasProperty,
             args: &[OID, TEXT],
             ret: BOOL,
         }],
-        // `pg_index_has_property` and `pg_index_column_has_property` take a
-        // relation reference in either spelling and so resolve outside this table,
-        // in `resolve_index_property` — two overloads here would make an
-        // unadorned `pg_index_has_property('i', 'index_scan')` ambiguous.
         "pg_tablespace_location" => &[Signature {
             func: ScalarFn::PgTablespaceLocation,
             args: &[OID],
@@ -4454,6 +4453,19 @@ fn keyword_precision(args: &ast::FunctionArguments) -> Result<Option<i32>, BindE
 /// clauses among `args` first (`concat('a' COLLATE x, 'b' COLLATE y)` is
 /// `42P22` the same way `a COLLATE x = b COLLATE y` is). Shared by every
 /// `FuncCall` construction site so the check isn't duplicated at each one.
+fn finish_func_call(
+    func: ScalarFn,
+    ret: PgType,
+    args: Vec<BoundExpr>,
+) -> Result<Binding, BindError> {
+    if ret.is_collatable() || args.iter().any(|a| a.ty().is_collatable()) {
+        crate::collation::check_explicit_conflict(
+            args.iter().map(crate::collation::expr_collation),
+        )?;
+    }
+    Ok(Binding::Typed(BoundExpr::FuncCall { func, ret, args }))
+}
+
 /// Resolve `pg_index_has_property(index, prop)` and
 /// `pg_index_column_has_property(index, column, prop)`, or `Ok(None)` for any
 /// other name so the caller falls through to ordinary resolution.
@@ -4485,19 +4497,6 @@ fn resolve_index_property(name: &str, bindings: &[Binding]) -> Result<Option<Bin
         }
     }
     Err(undefined_function(name, bindings))
-}
-
-fn finish_func_call(
-    func: ScalarFn,
-    ret: PgType,
-    args: Vec<BoundExpr>,
-) -> Result<Binding, BindError> {
-    if ret.is_collatable() || args.iter().any(|a| a.ty().is_collatable()) {
-        crate::collation::check_explicit_conflict(
-            args.iter().map(crate::collation::expr_collation),
-        )?;
-    }
-    Ok(Binding::Typed(BoundExpr::FuncCall { func, ret, args }))
 }
 
 pub(crate) fn resolve_call(
