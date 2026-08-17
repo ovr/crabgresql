@@ -10,7 +10,7 @@ use crabgresql_types::{PgType, Value};
 use crate::BindError;
 use crate::functions::{bind_function, bind_srf_projection};
 
-use super::bound::{BinOp, BoundExpr, Subplan};
+use super::bound::{BinOp, BoundExpr, MinMaxKind, Subplan};
 use super::coerce::{
     bind_cast, bind_typed_string, coerce_expr, merge_types, resolve_unknown, to_bool_operand,
     unify_value_column,
@@ -930,6 +930,58 @@ pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError
         )?;
     }
     Ok(Binding::Typed(BoundExpr::Coalesce { args, ty }))
+}
+
+/// `GREATEST(a, b, …)` / `LEAST(a, b, …)`: the largest (smallest) argument,
+/// skipping NULLs.
+///
+/// The result type is resolved exactly as `COALESCE`'s is, so the error text is
+/// the same shape under a different label (`GREATEST types integer and text
+/// cannot be matched`). What `COALESCE` does not need is an *ordering*: PG
+/// refuses a type with no comparison function for the resolved type, which is
+/// what `is_orderable` answers here.
+///
+/// PG raises that refusal when it initializes the expression rather than when it
+/// parses one, so `CREATE VIEW v AS SELECT greatest('{}'::json, '{}')` is
+/// accepted there and fails only on `SELECT * FROM v`. Rejecting it at bind time
+/// is deliberate: the executor's `compare_values` has no arm for such a type, and
+/// it is the same trade-off already made for `DISTINCT` aggregates.
+pub(crate) fn bind_min_max(
+    kind: MinMaxKind,
+    bindings: Vec<Binding>,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    // Like `COALESCE()`, an empty list is a grammar error in PG; this parser
+    // accepts it for any call, so the refusal happens here (without PG's cursor).
+    if bindings.is_empty() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "syntax error at or near \")\"",
+        ));
+    }
+    let (ty, args) = unify_value_column(bindings, kind.keyword())?;
+    if ty.is_collatable() {
+        crate::collation::check_explicit_conflict(
+            args.iter().map(crate::collation::expr_collation),
+        )?;
+    }
+    let catalog = scope.catalog();
+    if !crate::expr::is_orderable(ty, catalog.as_ref()) {
+        return Err(BindError::new(
+            sqlstate::UNDEFINED_FUNCTION,
+            format!(
+                "could not identify a comparison function for type {}",
+                crate::expr::type_label(ty, catalog.as_ref())
+            ),
+        ));
+    }
+    let collation = crate::collation::combine_all(&args).collation;
+    Ok(Binding::Typed(BoundExpr::MinMax {
+        kind,
+        args,
+        ty,
+        collation,
+    }))
 }
 
 /// `NULLIF(a, b)`: NULL when the two are equal, `a` otherwise — the standard's

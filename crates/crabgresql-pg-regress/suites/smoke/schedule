@@ -27,6 +27,7 @@ test: interval
 test: case
 test: coalesce
 test: nullif
+test: greatest_least
 test: bool_test
 test: in
 test: between

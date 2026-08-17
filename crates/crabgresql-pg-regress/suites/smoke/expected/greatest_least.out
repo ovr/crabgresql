@@ -1,0 +1,238 @@
+--
+-- GREATEST / LEAST
+-- The largest (smallest) argument, skipping NULLs: result-type resolution over
+-- any arity, the type's own ordering, and the error cases.
+--
+-- the default column name is the keyword
+SELECT GREATEST(1, 2, 3);
+ greatest 
+----------
+        3
+(1 row)
+
+SELECT LEAST(1, 2, 3) AS smallest;
+ smallest 
+----------
+        1
+(1 row)
+
+-- NULL arguments do not participate; every argument NULL yields NULL (renders
+-- empty), and an all-untyped list resolves to text as it does for COALESCE
+SELECT GREATEST(1, NULL, 3) AS skips_null, LEAST(NULL, 2, NULL) AS also_skips;
+ skips_null | also_skips 
+------------+------------
+          3 |          2
+(1 row)
+
+SELECT LEAST(NULL, NULL) AS none, pg_typeof(LEAST(NULL, NULL)) AS ty;
+ none |  ty  
+------+------
+      | text
+(1 row)
+
+-- one argument is legal, and is just that argument
+SELECT GREATEST(7) AS single;
+ single 
+--------
+      7
+(1 row)
+
+-- arguments of differing numeric types resolve to the common type
+SELECT GREATEST(1, 2.5) AS promoted, pg_typeof(GREATEST(1, 2.5)) AS ty;
+ promoted |   ty    
+----------+---------
+      2.5 | numeric
+(1 row)
+
+SELECT pg_typeof(LEAST(1::int2, 2::bigint)) AS ty;
+   ty   
+--------
+ bigint
+(1 row)
+
+-- an untyped literal adapts to the resolved type per argument
+SELECT GREATEST(NULL::int, '42') + 1 AS added;
+ added 
+-------
+    43
+(1 row)
+
+-- every argument is evaluated, unlike COALESCE's: nothing is skipped because an
+-- earlier one already decided the answer
+SELECT GREATEST(1, 1/0);
+ERROR:  division by zero
+-- the ordering is the type's own. float8 puts NaN above every number, and bool
+-- has false < true
+SELECT GREATEST('nan'::float8, 1) AS nan_wins, LEAST('nan'::float8, 1) AS number_wins;
+ nan_wins | number_wins 
+----------+-------------
+      NaN |           1
+(1 row)
+
+SELECT GREATEST(false, true) AS t, LEAST('\x01'::bytea, '\x00') AS zero;
+ t | zero 
+---+------
+ t | \x00
+(1 row)
+
+-- a string compares under the collation the arguments derive, so the answer
+-- moves with it: byte order (C) puts 'a' (0x61) above 'B' (0x42), a linguistic
+-- one does not
+SELECT GREATEST('B', 'a' COLLATE "C") AS c_order,
+       GREATEST('B', 'a' COLLATE "en-US-x-icu") AS icu_order,
+       LEAST('B', 'a' COLLATE "en-US-x-icu") AS icu_min;
+ c_order | icu_order | icu_min 
+---------+-----------+---------
+ a       | B         | a
+(1 row)
+
+-- "char" is a byte with its own unsigned ordering, and stays a byte -- unlike
+-- min()/max(), which resolve through text
+SELECT GREATEST('Z'::"char", '\377'::"char") AS high_byte,
+       pg_typeof(GREATEST('Z'::"char", 'a'::"char")) AS ty;
+ high_byte |   ty   
+-----------+--------
+ \377      | "char"
+(1 row)
+
+-- timestamps, dates and intervals order naturally
+SELECT GREATEST('2024-03-01'::date, '2024-01-01'::date) AS later,
+       LEAST('1 day'::interval, '2 hours'::interval) AS shorter;
+   later    | shorter  
+------------+----------
+ 2024-03-01 | 02:00:00
+(1 row)
+
+-- over a table column, once per row; in a WHERE predicate, under an aggregate,
+-- and as a GROUP BY key
+CREATE TABLE readings (station text, low integer, high integer, tag varchar(3),
+                       other_tag varchar(3), long_tag varchar(5));
+INSERT INTO readings VALUES ('a', 3, 12, 'ab', 'zz', 'ab'),
+                            ('b', NULL, 7, 'cd', 'aa', 'cd'),
+                            ('c', -3, NULL, 'ef', 'mm', 'ef');
+SELECT station, GREATEST(low, high) AS hi, LEAST(low, high) AS lo
+  FROM readings ORDER BY station;
+ station | hi | lo 
+---------+----+----
+ a       | 12 |  3
+ b       |  7 |  7
+ c       | -3 | -3
+(3 rows)
+
+SELECT station FROM readings WHERE GREATEST(low, high) > 7 ORDER BY station;
+ station 
+---------
+ a
+(1 row)
+
+SELECT sum(LEAST(low, high, 0)) AS total FROM readings;
+ total 
+-------
+    -3
+(1 row)
+
+SELECT GREATEST(low, high) AS hi, count(*) AS n
+  FROM readings GROUP BY GREATEST(low, high) ORDER BY 1;
+ hi | n 
+----+---
+ -3 | 1
+  7 | 1
+ 12 | 1
+(3 rows)
+
+-- error: incompatible concrete argument types cannot be matched, reported under
+-- the keyword. Known gap: PG also prints a `LINE 1: ... ^` cursor under the
+-- offending argument, which the result-type unifier does not carry a span for
+SELECT GREATEST(1, 'abc'::text);
+ERROR:  GREATEST types integer and text cannot be matched
+SELECT LEAST(1, 'abc'::text);
+ERROR:  LEAST types integer and text cannot be matched
+-- error: an untyped argument that does not fit the resolved type
+SELECT GREATEST(1, 'x');
+ERROR:  invalid input syntax for type integer: "x"
+LINE 1: SELECT GREATEST(1, 'x');
+                           ^
+-- error: the resolved type has no ordering at all (json), or has equality
+-- without one (xid). Divergence: PG raises this when it initializes the
+-- expression, so `CREATE VIEW v AS SELECT greatest('{}'::json, '{}')` is
+-- accepted there and fails on `SELECT * FROM v`; here it is refused at bind time
+SELECT GREATEST('{}'::json, '{}'::json);
+ERROR:  could not identify a comparison function for type json
+SELECT LEAST('1'::xid, '2'::xid);
+ERROR:  could not identify a comparison function for type xid
+-- error: at least one argument is required. PG rejects this in the grammar and
+-- prints the same message, with a cursor under the paren
+SELECT GREATEST();
+ERROR:  syntax error at or near ")"
+-- error: two explicit collations that disagree (PG prints a cursor here too)
+SELECT LEAST('a' COLLATE "C", 'b' COLLATE "POSIX");
+ERROR:  collation mismatch between explicit collations "C" and "POSIX"
+-- both are keywords, so they are spelled in any case ...
+SELECT GrEaTeSt(1, 2) AS keyword_case;
+ keyword_case 
+--------------
+            2
+(1 row)
+
+-- ... but only bare: a quoted or schema-qualified name is an ordinary function
+-- lookup, and no schema holds a function by that name. Known gap: for the
+-- qualified form PG names the missing function `pg_catalog.greatest(integer,
+-- integer)`, and both add a cursor and a HINT
+SELECT pg_catalog.greatest(1, 2);
+ERROR:  function greatest(integer, integer) does not exist
+SELECT "least"(1, 2);
+ERROR:  function least(integer, integer) does not exist
+-- every decoration a function call may carry is a syntax error in PG's grammar.
+-- Known gap: PG echoes the token as written, ours always in lower case
+SELECT GREATEST(1, 2) OVER ();
+ERROR:  syntax error at or near "over"
+SELECT GREATEST(DISTINCT 1, 2);
+ERROR:  syntax error at or near "distinct"
+SELECT LEAST(1, 2) FILTER (WHERE true);
+ERROR:  syntax error at or near "filter"
+-- deparse: PG prints the keyword in upper case and labels every literal
+-- argument with the type the list resolved to
+CREATE TABLE defaults (x integer DEFAULT GREATEST(1, NULL),
+                       y text DEFAULT LEAST('b', 'a'));
+SELECT pg_get_expr(adbin, adrelid) AS deparsed
+  FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid
+ WHERE c.relname = 'defaults' ORDER BY adnum;
+          deparsed           
+-----------------------------
+ GREATEST(1, NULL::integer)
+ LEAST('b'::text, 'a'::text)
+(2 rows)
+
+DROP TABLE defaults;
+-- a view keeps the same spelling. Known gap: on this path the literal arguments
+-- are not type-labelled (`NULL` rather than `NULL::integer`), which COALESCE
+-- shares. A type modifier survives only when every argument agrees on it -- read
+-- off a column reference, since a *folded* constant loses the cast that carried
+-- it, another gap COALESCE shares
+CREATE VIEW v AS
+  SELECT GREATEST(1, low, NULL) AS g, LEAST('b'::text, 'a') AS l,
+         GREATEST(tag, other_tag) AS same_typmod,
+         GREATEST(tag, long_tag) AS mixed_typmod
+    FROM readings;
+SELECT pg_get_viewdef('v', true);
+                pg_get_viewdef                
+----------------------------------------------
+  SELECT GREATEST(1, low, NULL) AS g,        +
+     LEAST('b'::text, 'a'::text) AS l,       +
+     GREATEST(tag, other_tag) AS same_typmod,+
+     GREATEST(tag, long_tag) AS mixed_typmod +
+    FROM readings;
+(1 row)
+
+SELECT attname, format_type(atttypid, atttypmod) AS spelling
+  FROM pg_attribute WHERE attrelid = 'v'::regclass AND attnum > 0 ORDER BY attnum;
+   attname    |       spelling       
+--------------+----------------------
+ g            | integer
+ l            | text
+ same_typmod  | character varying(3)
+ mixed_typmod | character varying
+(4 rows)
+
+DROP VIEW v;
+DROP TABLE readings;

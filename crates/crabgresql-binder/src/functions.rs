@@ -17,8 +17,8 @@ use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
-    ArgFail, Binding, BoundExpr, BoundWindowSpec, Scope, WindowKind, WindowSortKey, bind_expr,
-    bind_sql_function_body, coerce_for_arg, inline_params,
+    ArgFail, Binding, BoundExpr, BoundWindowSpec, MinMaxKind, Scope, WindowKind, WindowSortKey,
+    bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
 };
 use crate::{BindError, BoundAggregate, OutputColumn};
 
@@ -3675,20 +3675,21 @@ pub(crate) fn function_name(name: &ast::ObjectName) -> Option<String> {
         .map(crate::expr::normalize_ident)
 }
 
-/// The two shorthands PostgreSQL implements in its grammar rather than in
-/// `pg_proc`. Neither is polymorphic enough for the overload table: `COALESCE`
-/// is variadic and lazy, and takes its result type from the one type its whole
-/// argument list unifies to; `NULLIF` hands back its left argument, so its
-/// result type is that argument's, as the `=` it resolves takes it — neither is
-/// a fixed signature.
+/// The shorthands PostgreSQL implements in its grammar rather than in
+/// `pg_proc`. None is polymorphic enough for the overload table: `COALESCE` and
+/// `GREATEST`/`LEAST` are variadic and take their result type from the one type
+/// their whole argument list unifies to; `NULLIF` hands back its left argument,
+/// so its result type is that argument's, as the `=` it resolves takes it —
+/// none is a fixed signature.
 #[derive(Clone, Copy)]
 enum SpecialForm {
     Coalesce,
     NullIf,
+    MinMax(MinMaxKind),
 }
 
-/// `COALESCE`/`NULLIF` written the one way PG's grammar admits them: as an
-/// **unqualified, unquoted** keyword.
+/// `COALESCE`/`NULLIF`/`GREATEST`/`LEAST` written the one way PG's grammar
+/// admits them: as an **unqualified, unquoted** keyword.
 ///
 /// Both other spellings are ordinary function-name lookups in PG, and no schema
 /// holds a function by either name — so `pg_catalog.coalesce(1, 2)` and
@@ -3702,6 +3703,8 @@ fn special_form(name: &ast::ObjectName) -> Option<SpecialForm> {
     match crate::expr::normalize_ident(ident).as_str() {
         "coalesce" => Some(SpecialForm::Coalesce),
         "nullif" => Some(SpecialForm::NullIf),
+        "greatest" => Some(SpecialForm::MinMax(MinMaxKind::Greatest)),
+        "least" => Some(SpecialForm::MinMax(MinMaxKind::Least)),
         _ => None,
     }
 }
@@ -3724,7 +3727,7 @@ fn array_keyword(name: &ast::ObjectName) -> bool {
         .is_some_and(|id| crate::expr::normalize_ident(id) == "array")
 }
 
-/// Bind `COALESCE(…)` / `NULLIF(…)`.
+/// Bind `COALESCE(…)` / `NULLIF(…)` / `GREATEST(…)` / `LEAST(…)`.
 ///
 /// PG's grammar gives these a bare expression list and nothing else, so every
 /// decoration an aggregate or window call may carry is a *syntax* error there. This
@@ -3786,6 +3789,7 @@ fn bind_special_form(
     match form {
         SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings),
         SpecialForm::NullIf => crate::expr::bind_nullif(bindings, scope),
+        SpecialForm::MinMax(kind) => crate::expr::bind_min_max(kind, bindings, scope),
     }
 }
 
@@ -3813,9 +3817,10 @@ fn null_treatment_token(treatment: ast::NullTreatment) -> &'static str {
 }
 
 pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Binding, BindError> {
-    // `COALESCE`/`NULLIF` are grammar constructs, so they are recognized before
-    // anything else a *function* call can carry: every decoration below is a syntax
-    // error in PG's grammar, not an unsupported function form.
+    // `COALESCE`/`NULLIF`/`GREATEST`/`LEAST` are grammar constructs, so they are
+    // recognized before anything else a *function* call can carry: every
+    // decoration below is a syntax error in PG's grammar, not an unsupported
+    // function form.
     if let Some(form) = special_form(&func.name) {
         return bind_special_form(form, func, scope);
     }

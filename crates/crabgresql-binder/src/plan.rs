@@ -616,7 +616,8 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
-        | BoundExpr::Coalesce { args, .. } => subst_exprs(args, params),
+        | BoundExpr::Coalesce { args, .. }
+        | BoundExpr::MinMax { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
         BoundExpr::Subscript { base, index, .. } => {
             subst_expr(base, params);
@@ -956,7 +957,8 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
-        | BoundExpr::Coalesce { args, .. } => {
+        | BoundExpr::Coalesce { args, .. }
+        | BoundExpr::MinMax { args, .. } => {
             for a in args.iter_mut() {
                 subst_outer_expr(a, outer, depth);
             }
@@ -1334,7 +1336,8 @@ pub(crate) fn for_each_subexpr(
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
         | BoundExpr::Aggregate { args, .. }
-        | BoundExpr::Coalesce { args, .. } => {
+        | BoundExpr::Coalesce { args, .. }
+        | BoundExpr::MinMax { args, .. } => {
             args.iter().for_each(|e| for_each_subexpr(e, depth, f));
         }
         BoundExpr::ArrayCtor { elems, .. } => {
@@ -5154,6 +5157,17 @@ fn rewrite_over_window(
             args: rewrite_all_over_window(args, input_width, groups)?,
             ty,
         }),
+        BoundExpr::MinMax {
+            kind,
+            args,
+            ty,
+            collation,
+        } => Ok(BoundExpr::MinMax {
+            kind,
+            args: rewrite_all_over_window(args, input_width, groups)?,
+            ty,
+            collation,
+        }),
         BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
             base: Box::new(rewrite_over_window(*base, input_width, groups)?),
             index: Box::new(rewrite_over_window(*index, input_width, groups)?),
@@ -5547,6 +5561,23 @@ fn rewrite_over_aggregate(
                 .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(BoundExpr::Coalesce { args, ty })
+        }
+        BoundExpr::MinMax {
+            kind,
+            args,
+            ty,
+            collation,
+        } => {
+            let args = args
+                .into_iter()
+                .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::MinMax {
+                kind,
+                args,
+                ty,
+                collation,
+            })
         }
         BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
             base: Box::new(rewrite_over_aggregate(
