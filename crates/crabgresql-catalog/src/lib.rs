@@ -64,6 +64,7 @@ use crabgresql_storage_api::{
     IndexConstraint, IndexMetadata, RelPersistence, RelStats, StorageError, TableAm, TableEngine,
     TableSchema,
 };
+use crabgresql_txn::Xid;
 #[cfg(test)]
 use crabgresql_types::Value;
 
@@ -492,6 +493,8 @@ pub struct SystemCatalog {
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     kinds: OnceLock<Vec<RelKind>>,
+    ddl_xids: OnceLock<Vec<Xid>>,
+    xmin_by_oid: OnceLock<Arc<std::collections::HashMap<u32, Xid>>>,
     stats: OnceLock<Vec<RelStats>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     toast_oids: OnceLock<Vec<CatalogToast>>,
@@ -555,6 +558,8 @@ impl SystemCatalog {
             live_relations: OnceLock::new(),
             oids: OnceLock::new(),
             kinds: OnceLock::new(),
+            ddl_xids: OnceLock::new(),
+            xmin_by_oid: OnceLock::new(),
             stats: OnceLock::new(),
             index_oids: OnceLock::new(),
             toast_oids: OnceLock::new(),
@@ -667,6 +672,40 @@ impl SystemCatalog {
                 .map(|(i, r)| (FIRST_REL_OID + i as u32, r.schema))
                 .collect()
         })
+    }
+
+    /// The DDL generation for each entry of [`SystemCatalog::relation_oids`], in
+    /// the same sorted order — the `xmin` that relation's own catalog rows
+    /// report. `0` (nothing recorded) falls back to the catalog-wide generation
+    /// here rather than at the reader, so a consumer never has to know about the
+    /// sentinel.
+    pub(crate) fn relation_ddl_xids(&self) -> &[Xid] {
+        self.ddl_xids.get_or_init(|| {
+            let fallback = self.source.catalog_xmin();
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter()
+                .map(|r| Xid(if r.ddl_xid == 0 { fallback } else { r.ddl_xid }))
+                .collect()
+        })
+    }
+
+    /// `oid -> xmin` over [`SystemCatalog::relation_ddl_xids`], for a relation
+    /// whose rows carry the OID of the relation they describe.
+    pub(crate) fn relation_xmin_by_oid(&self) -> Arc<std::collections::HashMap<u32, Xid>> {
+        Arc::clone(self.xmin_by_oid.get_or_init(|| {
+            Arc::new(
+                self.relation_oids()
+                    .iter()
+                    .zip(self.relation_ddl_xids())
+                    .map(|((oid, _), xid)| (*oid, *xid))
+                    .collect(),
+            )
+        }))
     }
 
     /// The relation kind for each entry of [`SystemCatalog::relation_oids`], in
@@ -1238,14 +1277,44 @@ impl SystemCatalog {
             return Err(StorageError::TableNotFound(name.to_string()));
         };
         let schema = (def.schema)();
+        let xmin = Xid(self.source.catalog_xmin());
         if !def.deferred {
-            return Ok(StaticTable::arc(schema, (def.rows)(self)));
+            // A relation whose rows describe other relations reports each row's
+            // own generation; everything else reports the catalog-wide one.
+            // A named column the schema does not have degrades to the latter
+            // rather than failing the scan — `xmin_columns_exist` is the test
+            // that keeps the registry honest.
+            let table = StaticTable::new(schema, (def.rows)(self));
+            return Ok(Arc::new(self.with_catalog_xmin(table, def, xmin)));
         }
         let source = Arc::clone(&self.source);
         let build = def.rows;
-        Ok(StaticTable::deferred(schema, move || {
+        let deferred = StaticTable::deferred(schema, move || {
             build(&SystemCatalog::from_source(Arc::clone(&source)))
-        }))
+        });
+        Ok(Arc::new(self.with_catalog_xmin(deferred, def, xmin)))
+    }
+
+    /// Give `table` the `xmin` its registry entry asks for: the described
+    /// relation's own DDL generation when the entry names the column holding
+    /// that relation's OID, else the catalog-wide one.
+    ///
+    /// A named column the schema does not have degrades to the catalog-wide
+    /// value rather than failing the scan; `xmin_columns_exist_and_are_oids` is
+    /// the test that keeps the registry honest.
+    fn with_catalog_xmin(
+        &self,
+        table: StaticTable,
+        def: &registry::CatalogRelDef,
+        xmin: Xid,
+    ) -> StaticTable {
+        match def
+            .xmin_column
+            .and_then(|name| table.schema().column_index(name))
+        {
+            None => table.with_xmin(xmin),
+            Some(column) => table.with_relation_xmin(column, self.relation_xmin_by_oid(), xmin),
+        }
     }
 
     /// The instant the timezone relations resolve their offsets at; see

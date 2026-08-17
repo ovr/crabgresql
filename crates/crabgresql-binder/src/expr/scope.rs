@@ -6,11 +6,11 @@ use std::sync::Arc;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{Column, TableEngine, TableSchema, TypeCatalog};
-use crabgresql_types::{Numeric, PgType, Value};
+use crabgresql_types::{Numeric, Value};
 
 use crate::BindError;
 use crate::functions::ScalarFn;
-use crate::plan::TABLEOID;
+use crate::logical_plan::SysCol;
 
 use super::bound::BoundExpr;
 use super::datatype::declared_typmod;
@@ -39,19 +39,47 @@ pub enum Binding {
 pub struct ScopeItem {
     pub qualifier: String,
     pub columns: Vec<Column>,
-    /// Local index of the `tableoid` slot within `columns`, when the query asked
-    /// for one. It is a real column of the row — that is what lets an outer
-    /// join null-extend it and an `Append` arm answer for itself — but it sits
-    /// past every declared column, so `*` never reaches it. `None` for a FROM
-    /// item that is not a relation scan.
-    pub system_slot: Option<usize>,
+    /// Local index within `columns` where this item's system columns start,
+    /// when the query asked for any. They are real columns of the row — that is
+    /// what lets an outer join null-extend them and an `Append` arm answer for
+    /// itself — but they sit past every declared column, so `*` never reaches
+    /// them. `None` for a FROM item that is not a relation scan.
+    pub system_base: Option<usize>,
+    /// Set when this relation's access method cannot produce system columns, so
+    /// none were appended and a reference to one must be refused rather than
+    /// reported missing. See [`DeclinedSystem`].
+    pub declined_system: Option<DeclinedSystem>,
+}
+
+/// Why a relation carries no system-column slots: its access method stores
+/// column chunks rather than row versions, so there is no tid that addresses a
+/// row and no MVCC header to read.
+///
+/// Carried through name resolution rather than acted on when the FROM item is
+/// bound, because what the binder knows there is the *demanded* set — an
+/// over-approximation over rendered SQL, so a string literal spelling `xmin`
+/// lands in it. Only a reference that actually resolves deserves the error.
+#[derive(Clone, Debug)]
+pub struct DeclinedSystem {
+    pub access_method: &'static str,
+    pub relation: String,
+}
+
+impl DeclinedSystem {
+    /// The `0A000` a resolved reference to `column` raises.
+    fn refuse(&self, column: &str) -> BindError {
+        BindError::feature_not_supported(format!(
+            "access method \"{}\" does not support system column \"{column}\" on relation \"{}\"",
+            self.access_method, self.relation,
+        ))
+    }
 }
 
 impl ScopeItem {
-    /// The columns `*` expands to: everything but the system slot.
+    /// The columns `*` expands to: everything before the system slots.
     pub fn declared(&self) -> &[Column] {
-        match self.system_slot {
-            Some(slot) => &self.columns[..slot],
+        match self.system_base {
+            Some(base) => &self.columns[..base],
             None => &self.columns,
         }
     }
@@ -66,15 +94,16 @@ pub struct ScopeRel {
     qualifier: String,
     columns: Vec<Column>,
     offset: usize,
-    system_slot: Option<usize>,
+    system_base: Option<usize>,
+    declined_system: Option<DeclinedSystem>,
 }
 
 impl ScopeRel {
     /// This relation's declared columns — everything `*` expands to, which is
-    /// every column but the system slot.
+    /// every column before the system slots.
     fn declared(&self) -> &[Column] {
-        match self.system_slot {
-            Some(slot) => &self.columns[..slot],
+        match self.system_base {
+            Some(base) => &self.columns[..base],
             None => &self.columns,
         }
     }
@@ -248,11 +277,30 @@ fn column_in_rel(rel: &ScopeRel, qualifier: &str, column: &str) -> Result<usize,
         }
     }
     local.ok_or_else(|| {
-        BindError::new(
-            sqlstate::UNDEFINED_COLUMN,
-            format!("column {qualifier}.{column} does not exist"),
-        )
+        declined_or_missing(rel, column, || {
+            BindError::new(
+                sqlstate::UNDEFINED_COLUMN,
+                format!("column {qualifier}.{column} does not exist"),
+            )
+        })
     })
+}
+
+/// The error for a name `rel` does not expose: `0A000` when the name is a system
+/// column this relation's access method declines, `missing()` otherwise.
+///
+/// The two are worth telling apart. A relation that simply lacks the column is a
+/// typo; one whose storage cannot produce it is a capability the query has to be
+/// written around, and saying so names both the column and the access method.
+fn declined_or_missing(
+    rel: &ScopeRel,
+    column: &str,
+    missing: impl FnOnce() -> BindError,
+) -> BindError {
+    match &rel.declined_system {
+        Some(declined) if SysCol::ALL.iter().any(|c| c.name() == column) => declined.refuse(column),
+        _ => missing(),
+    }
 }
 
 /// A SELECT's `WINDOW w AS (…)` definitions, by normalized name.
@@ -538,29 +586,32 @@ impl Scope {
 
     /// A one-relation scope over `schema`.
     ///
-    /// `tableoid` says whether the row this scope describes carries the system
-    /// slot past its declared columns. The write paths set it when the statement
-    /// names `tableoid`, because there the value is appended per *target* — the
-    /// partition or child a row actually lives in, not the relation the
+    /// `system` lists the system columns the row this scope describes carries
+    /// past its declared ones, in row order. The write paths fill it from what
+    /// the statement names, because there the values are appended per *target*
+    /// — the partition or child a row actually lives in, not the relation the
     /// statement named.
     pub fn table(
         schema: &TableSchema,
         qualifier: String,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
-        tableoid: bool,
+        system: &[SysCol],
+        declined_system: Option<DeclinedSystem>,
     ) -> Scope {
         let mut columns = schema.columns.clone();
-        let system_slot = tableoid.then(|| {
-            columns.push(Column::new(TABLEOID, PgType::Oid));
-            columns.len() - 1
+        let system_base = (!system.is_empty()).then(|| {
+            let base = columns.len();
+            columns.extend(system.iter().map(|c| Column::new(c.name(), c.ty())));
+            base
         });
         Scope {
             rels: vec![ScopeRel {
                 qualifier,
                 columns,
                 offset: 0,
-                system_slot,
+                system_base,
+                declined_system,
             }],
             visible: None,
             catalog: catalog.clone(),
@@ -602,7 +653,8 @@ impl Scope {
                 qualifier: item.qualifier,
                 columns: item.columns,
                 offset,
-                system_slot: item.system_slot,
+                system_base: item.system_base,
+                declined_system: item.declined_system,
             });
             offset += width;
         }
@@ -626,8 +678,9 @@ impl Scope {
     ///
     /// All three properties are the same decision seen from different sides: the
     /// expression is evaluated against a tuple, once per row, by whoever holds
-    /// it. A `tableoid` would mean a different relation per leaf it is re-bound
-    /// for; a subquery has no plan to run there; and a reference to a generated
+    /// it. A system column would mean a different relation — and a different
+    /// row version — per leaf it is re-bound for; a subquery has no plan to run
+    /// there; and a reference to a generated
     /// column must stay a reference, so that a CHECK can record its ordinal and
     /// a generation expression can *refuse* it.
     pub fn stored_row(
@@ -637,7 +690,7 @@ impl Scope {
     ) -> Scope {
         Scope {
             expand_generated: false,
-            ..Scope::table(schema, schema.name.clone(), catalog, params, false)
+            ..Scope::table(schema, schema.name.clone(), catalog, params, &[], None)
         }
     }
 
@@ -858,6 +911,17 @@ impl Scope {
                 Some(Err(())) => return Err(ambiguous()),
                 None => continue,
             }
+        }
+        // A relation in scope whose access method declines system columns
+        // explains the miss better than "does not exist" does, and it is the
+        // only relation that could have exposed the name.
+        if let Some(rel) = self
+            .rels
+            .iter()
+            .find(|rel| rel.declined_system.is_some())
+            .filter(|_| SysCol::ALL.iter().any(|c| c.name() == name))
+        {
+            return Err(declined_or_missing(rel, name, || unreachable!("filtered")));
         }
         Err(BindError::new(
             sqlstate::UNDEFINED_COLUMN,

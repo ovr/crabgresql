@@ -19,9 +19,9 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::copy_rows::RowBatch;
 use crate::expr::{
-    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, NamedWindows, OuterLevel,
-    ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup, WindowKind,
-    WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
+    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, NamedWindows,
+    OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup,
+    WindowKind, WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
     merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
     reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
@@ -31,8 +31,8 @@ use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
     InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
-    QueryPlan, RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan,
-    TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan, walk_exprs_mut,
+    QueryPlan, RelationIdent, Returning, SetOpArm, SetOpPlan, SortKey, SubqueryPlan, SysCol,
+    SystemEmit, TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan, walk_exprs_mut,
 };
 use crate::{BindError, BoundAggregate, OutputColumn, TableFn};
 
@@ -174,19 +174,20 @@ fn resolve_write_table(
 /// still expands to the leaves. A silently empty result is the worse surprise of
 /// the two, and nothing in the corpus asks for it; revisit if `DETACH PARTITION`
 /// ever lands, which is what makes PG's answer meaningful.
-/// `tableoid` — when the query asked for it — is stamped on each arm as the arm's
-/// *own* relation, which is what makes a partitioned or inherited read report the
-/// child a row came from. An access method's storage leaves are the exception
-/// handled by [`push_storage_leaves`]: they are pieces of one relation, not
-/// relations, so they all carry the name of the relation that owns them.
+/// System columns — the ones the query asked for — are stamped on each arm as
+/// the arm's *own* relation, which is what makes a partitioned or inherited read
+/// report the child a row came from. An access method's storage leaves are the
+/// exception handled by [`push_storage_leaves`]: they are pieces of one
+/// relation, not relations, so they all carry the name of the relation that owns
+/// them.
 pub(crate) fn scan_arms(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
     only: bool,
-    tableoid: bool,
+    system: &Arc<[SysCol]>,
 ) -> Result<Option<Vec<MappedRelation>>, BindError> {
     let schema = table.schema();
-    let ident = |schema: &TableSchema| tableoid.then(|| RelationIdent::of(schema));
+    let ident = |schema: &TableSchema| system_emit(system, schema);
     if schema.partition_scheme.is_some() {
         let mut arms = Vec::new();
         for leaf in partition_leaves(engine, &schema)? {
@@ -194,6 +195,7 @@ pub(crate) fn scan_arms(
             let leaf_ident = ident(&leaf.schema());
             push_storage_leaves(&mut arms, leaf, None, leaf_ident);
         }
+        reject_declining_arms(&arms)?;
         return Ok(Some(arms));
     }
     if !only {
@@ -208,27 +210,73 @@ pub(crate) fn scan_arms(
                 let child_ident = ident(&child_schema);
                 push_storage_leaves(&mut arms, child, map, child_ident);
             }
+            reject_declining_arms(&arms)?;
             return Ok(Some(arms));
         }
     }
-    Ok(table.storage_leaves().map(|leaves| {
+    let leaves = table.storage_leaves().map(|leaves| {
         leaves
             .into_iter()
             .map(|t| arm(t, None, ident(&schema)))
-            .collect()
-    }))
+            .collect::<Vec<_>>()
+    });
+    match leaves {
+        None => Ok(None),
+        Some(arms) => {
+            reject_declining_arms(&arms)?;
+            Ok(Some(arms))
+        }
+    }
+}
+
+/// Refuse a fan-out whose *leaf* cannot produce the system columns the named
+/// relation promised.
+///
+/// The capability was checked against the relation the statement named, but the
+/// arms are its partition leaves, inheritance children and storage leaves — and
+/// nothing makes a leaf's access method agree with its parent's. Today DDL
+/// happens to forbid the mismatch, in a different crate and for unrelated
+/// reasons; without this the executor's `scan_with_system` would meet a `None`
+/// and panic the session rather than raise.
+fn reject_declining_arms(arms: &[MappedRelation]) -> Result<(), BindError> {
+    for arm in arms {
+        let Some(emit) = &arm.system else { continue };
+        if emit.cols.iter().all(|c| !c.needs_storage_support())
+            || arm.table.supports_system_columns()
+        {
+            continue;
+        }
+        let schema = arm.table.schema();
+        let col = emit
+            .cols
+            .iter()
+            .find(|c| c.needs_storage_support())
+            .expect("the all() above returned false, so one column needs support");
+        return Err(BindError::feature_not_supported(format!(
+            "access method \"{}\" does not support system column \"{}\" on relation \"{}\"",
+            schema.access_method.as_str(),
+            col.name(),
+            schema.name,
+        )));
+    }
+    Ok(())
 }
 
 fn arm(
     table: Arc<dyn TableAm>,
     map: Option<Arc<[usize]>>,
-    tableoid: Option<RelationIdent>,
+    system: Option<SystemEmit>,
 ) -> MappedRelation {
-    MappedRelation {
-        table,
-        map,
-        tableoid,
-    }
+    MappedRelation { table, map, system }
+}
+
+/// The [`SystemEmit`] for an arm naming `schema`, or `None` when the statement
+/// asked for no system column at all — which is nearly every statement.
+fn system_emit(cols: &Arc<[SysCol]>, schema: &TableSchema) -> Option<SystemEmit> {
+    (!cols.is_empty()).then(|| SystemEmit {
+        cols: Arc::clone(cols),
+        ident: RelationIdent::of(schema),
+    })
 }
 
 /// The relations an `UPDATE`/`DELETE` naming `table` must touch, or empty when
@@ -243,7 +291,7 @@ fn write_targets(
     engine: &Arc<dyn TableEngine>,
     table: &Arc<dyn TableAm>,
     only: bool,
-    tableoid: bool,
+    system: &Arc<[SysCol]>,
 ) -> Result<Vec<MappedRelation>, BindError> {
     if only {
         return Ok(Vec::new());
@@ -253,7 +301,7 @@ fn write_targets(
     if descendants.is_empty() {
         return Ok(Vec::new());
     }
-    let ident = |schema: &TableSchema| tableoid.then(|| RelationIdent::of(schema));
+    let ident = |schema: &TableSchema| system_emit(system, schema);
     // Each target names itself, so a RETURNING or WHERE that reads `tableoid`
     // sees the child the row actually lives in — not the relation the statement
     // named.
@@ -264,6 +312,7 @@ fn write_targets(
         let child_ident = ident(&child_schema);
         targets.push(arm(child, map, child_ident));
     }
+    reject_declining_arms(&targets)?;
     Ok(targets)
 }
 
@@ -274,7 +323,7 @@ fn push_storage_leaves(
     arms: &mut Vec<MappedRelation>,
     table: Arc<dyn TableAm>,
     map: Option<Arc<[usize]>>,
-    tableoid: Option<RelationIdent>,
+    system: Option<SystemEmit>,
 ) {
     match table.storage_leaves() {
         // Every leaf carries the *owning* relation's name: an access method
@@ -284,9 +333,9 @@ fn push_storage_leaves(
         Some(inner) => arms.extend(
             inner
                 .into_iter()
-                .map(|t| arm(t, map.clone(), tableoid.clone())),
+                .map(|t| arm(t, map.clone(), system.clone())),
         ),
-        None => arms.push(arm(table, map, tableoid)),
+        None => arms.push(arm(table, map, system)),
     }
 }
 
@@ -846,7 +895,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
 fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
     match join {
         JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
+            JoinInput::Scan { .. } => {}
             // Same depth. A FROM subquery binds with an empty outer scope, so
             // no `OuterColumnRef` inside it can *escape* it — see the
             // `debug_assert!` in `bind_from_item`'s Derived arm. (It may well
@@ -1215,7 +1264,7 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
 fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match join {
         JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan(_) => {}
+            JoinInput::Scan { .. } => {}
             JoinInput::Subplan(plan) => for_each_plan_expr(plan, depth, &mut *f),
             JoinInput::TableFunction { args, .. } => args.iter().for_each(|e| f(e, depth)),
         },
@@ -2256,7 +2305,7 @@ fn bind_select(
         ctes,
         outer_scope,
         &windows,
-        &TableoidDemand::of_select(select, order_by),
+        &SystemDemand::of_select(select, order_by),
     )?;
     let scope = Scope::relations_with_visible(relations, visible, catalog, params)
         .with_subqueries(engine, ctes)
@@ -2319,8 +2368,15 @@ fn build_query_block(
 ) -> LogicalPlan {
     if let Some(agg) = aggregation {
         let input = match source {
+            // A scan that appends system slots keeps the general join leaf:
+            // `AggInput::Scan` describes a relation by its schema alone, and the
+            // slots live past it.
             JoinExpr::Input {
-                input: JoinInput::Scan(table),
+                input:
+                    JoinInput::Scan {
+                        table,
+                        system: None,
+                    },
                 ..
             } => AggInput::Scan(table),
             // A derived table, CTE reference, `VALUES` in FROM, or set-returning
@@ -2427,8 +2483,9 @@ fn finish_single_select(
     distinct: Option<Vec<DistinctKey>>,
 ) -> LogicalPlan {
     match input {
-        JoinInput::Scan(table) => LogicalPlan::Query(QueryPlan {
+        JoinInput::Scan { table, system } => LogicalPlan::Query(QueryPlan {
             table,
+            system,
             columns,
             projections,
             predicate,
@@ -2491,7 +2548,7 @@ fn bind_table_query(
     };
     // `TABLE t` has no projection list to name a system column; only its ORDER
     // BY can (`TABLE t ORDER BY tableoid`).
-    let demand = TableoidDemand::of_order_by(order_by);
+    let demand = SystemDemand::of_order_by(order_by);
     let BoundFrom {
         source,
         relations,
@@ -2568,10 +2625,14 @@ struct BoundFromItem {
     qualifier: String,
     columns: Vec<OutputColumn>,
     input: JoinInput,
-    /// Where this item's `tableoid` sits in its own row, when the query asked
-    /// for it. `None` for everything that is not a relation scan — a subquery,
-    /// CTE, view or table function exposes no system columns, as upstream.
-    system_slot: Option<usize>,
+    /// Where this item's system columns start in its own row, when the query
+    /// asked for any. Everything from that index on is a system slot, in
+    /// [`SysCol::ALL`] order. `None` for everything that is not a relation scan
+    /// — a subquery, CTE, view or table function exposes no system columns, as
+    /// upstream.
+    system_base: Option<usize>,
+    /// See [`ScopeItem::declined_system`].
+    declined_system: Option<DeclinedSystem>,
 }
 
 /// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
@@ -2598,7 +2659,8 @@ impl BoundFromItem {
             relations: vec![ScopeItem {
                 qualifier: self.qualifier,
                 columns: to_columns(&self.columns),
-                system_slot: self.system_slot,
+                system_base: self.system_base,
+                declined_system: self.declined_system,
             }],
             visible: None,
         }
@@ -2751,7 +2813,7 @@ fn bind_from_item(
     relation: &ast::TableFactor,
     ctes: &CteEnv,
     siblings: &[ScopeItem],
-    demand: &TableoidDemand,
+    demand: &SystemDemand,
 ) -> Result<BoundFromItem, BindError> {
     match relation {
         // A `Table` factor carrying call arguments is a set-returning function.
@@ -2834,7 +2896,8 @@ fn bind_from_item(
                     qualifier,
                     columns,
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
-                    system_slot: None,
+                    system_base: None,
+                    declined_system: None,
                 });
             }
             // Read resolution honors the search path: temp → pg_catalog →
@@ -2871,53 +2934,55 @@ fn bind_from_item(
                     // exposes no system columns — so a reference there is the
                     // same 42703 it is upstream, not an OID no relation answers
                     // to.
-                    let wants_tableoid = demand.wants(&qualifier)
-                        && table.schema().namespace != "information_schema";
+                    let (wanted, declined_system) = match table.schema().namespace
+                        == "information_schema"
+                    {
+                        true => (Arc::from(&[][..]), None),
+                        false => supported_system_columns(
+                            without_declared(demand.wants(&qualifier), &table.schema()).to_vec(),
+                            &table,
+                        ),
+                    };
                     // A relation whose rows live in several places is read as a
                     // union scan. Bind it as a subplan wrapping an `Append` (raw
                     // relation columns), so the surrounding SELECT's
                     // projection/WHERE/ORDER BY — and any join or aggregate —
                     // apply through the existing subplan machinery.
                     let mut arm_columns = columns.clone();
-                    if wants_tableoid {
-                        arm_columns.push(tableoid_column());
-                    }
-                    let arms = match scan_arms(engine, &table, *only, wants_tableoid)? {
-                        Some(arms) => Some(arms),
-                        // A monolithic relation is scanned directly — unless it
-                        // has to produce a `tableoid`, which only an `Append` arm
-                        // knows how to emit. One arm is the whole cost, and it
-                        // buys one emit path instead of two.
-                        None if wants_tableoid => Some(vec![arm(
-                            Arc::clone(&table),
-                            None,
-                            Some(RelationIdent::of(&table.schema())),
-                        )]),
-                        None => None,
-                    };
-                    let input = match arms {
+                    arm_columns.extend(wanted.iter().map(|c| system_column(*c)));
+                    // A monolithic relation is scanned directly and carries its
+                    // own slots. Wrapping it in a one-armed `Append` for the
+                    // sake of the emit would cost it the index path: an `Append`
+                    // arm has no probe, so `WHERE pk = …` would read the whole
+                    // relation.
+                    let input = match scan_arms(engine, &table, *only, &wanted)? {
                         Some(arms) => {
                             JoinInput::Subplan(Box::new(LogicalPlan::Append(AppendPlan {
                                 arms,
                                 columns: arm_columns,
                             })))
                         }
-                        None => JoinInput::Scan(Arc::clone(&table)),
+                        None => JoinInput::Scan {
+                            table: Arc::clone(&table),
+                            system: system_emit(&wanted, &table.schema()),
+                        },
                     };
                     apply_relation_alias_columns(&mut columns, alias, &table_subject(&qualifier))?;
                     // Appended *after* the alias list is applied: `t(a, b)` counts
                     // the relation's own columns, and PG's "table t has 2 columns
                     // available but 3 columns specified" must not learn about a
                     // system column.
-                    let system_slot = wants_tableoid.then(|| {
-                        columns.push(tableoid_column());
-                        columns.len() - 1
+                    let system_base = (!wanted.is_empty()).then(|| {
+                        let base = columns.len();
+                        columns.extend(wanted.iter().map(|c| system_column(*c)));
+                        base
                     });
                     Ok(BoundFromItem {
                         qualifier,
                         columns,
                         input,
-                        system_slot,
+                        system_base,
+                        declined_system,
                     })
                 }
                 Err(e) => {
@@ -2947,7 +3012,8 @@ fn bind_from_item(
                             input: JoinInput::Subplan(Box::new(inner)),
                             // A view is expanded into its body, and PostgreSQL
                             // exposes no system columns on one either.
-                            system_slot: None,
+                            system_base: None,
+                            declined_system: None,
                         });
                     }
                     Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
@@ -3001,7 +3067,8 @@ fn bind_from_item(
                 qualifier,
                 columns,
                 input: JoinInput::Subplan(Box::new(inner)),
-                system_slot: None,
+                system_base: None,
+                declined_system: None,
             })
         }
         other => Err(BindError::feature_not_supported(format!(
@@ -3030,52 +3097,126 @@ fn aliased_qualifier(
     }
 }
 
-/// The name of the one system column this build resolves.
+/// Drop from `wanted` every system column `schema` declares under that name.
 ///
-/// TODO: ctid, xmin, xmax, cmin and cmax. `ctid` needs the scan to stop
-/// discarding the `Tid` it already yields; the transaction ids need the storage
-/// API's `Tuple` to surface the on-page header they live in.
-pub(crate) const TABLEOID: &str = "tableoid";
-
-/// The `tableoid` slot as a column of the row that carries it. It sits past
-/// every declared column of the relation, so `*` — which expands the declared
-/// ones — never reaches it, exactly as a negative `attnum` is skipped upstream.
-fn tableoid_column() -> OutputColumn {
-    OutputColumn::new(TABLEOID, PgType::Oid)
+/// The declared column is what the name resolves to, and adding a slot beside
+/// it would make the reference ambiguous. PostgreSQL keeps the two apart by
+/// refusing to create such a column at all; this build's own catalog relations
+/// have several (`pg_replication_slots.xmin`), because upstream serves them as
+/// views — which expose no system columns either.
+fn without_declared(wanted: Vec<SysCol>, schema: &TableSchema) -> Arc<[SysCol]> {
+    Arc::from(
+        wanted
+            .into_iter()
+            .filter(|c| schema.column_index(c.name()).is_none())
+            .collect::<Vec<_>>(),
+    )
 }
 
-/// Which FROM items of one query block must carry a `tableoid` slot.
+/// The system columns of `wanted` that `table`'s access method can actually
+/// produce, plus what a reference to one of the others has to be refused with.
 ///
-/// `tableoid` is a value *in* the row rather than an expression over it — that
-/// is what makes an outer join's null-extended side report NULL and each
+/// The columnar engines store column chunks, not row versions: there is no tid
+/// that addresses a row and no MVCC header to read `xmin` off. Answering with a
+/// placeholder would be worse than refusing — a client that identifies rows by
+/// `ctid` would corrupt data with it.
+///
+/// But the refusal cannot be driven from `wanted`. That set comes from
+/// [`SystemDemand`], a deliberate over-approximation over *rendered SQL*, so a
+/// string literal or an `AS` alias spelling one of six short words lands in it —
+/// and turning that into an error rejects `SELECT * FROM q WHERE label = 'xmin'`,
+/// which PostgreSQL answers. So the unsupported slots are dropped here, leaving
+/// the over-approximation harmless again, and the `0A000` is raised only where a
+/// reference actually resolves to one.
+///
+/// `tableoid` is never dropped: every relation has an identity, whatever it
+/// stores.
+fn supported_system_columns(
+    wanted: Vec<SysCol>,
+    table: &Arc<dyn TableAm>,
+) -> (Arc<[SysCol]>, Option<DeclinedSystem>) {
+    if table.supports_system_columns() {
+        return (Arc::from(wanted), None);
+    }
+    let schema = table.schema();
+    (
+        Arc::from(
+            wanted
+                .into_iter()
+                .filter(|c| !c.needs_storage_support())
+                .collect::<Vec<_>>(),
+        ),
+        Some(DeclinedSystem {
+            access_method: schema.access_method.as_str(),
+            relation: schema.name.clone(),
+        }),
+    )
+}
+
+/// A system column as a column of the row that carries it. The slots sit past
+/// every declared column of the relation, so `*` — which expands the declared
+/// ones — never reaches them, exactly as a negative `attnum` is skipped
+/// upstream.
+fn system_column(col: SysCol) -> OutputColumn {
+    OutputColumn::new(col.name(), col.ty())
+}
+
+/// Which system columns each FROM item of one query block must carry.
+///
+/// A system column is a value *in* the row rather than an expression over it —
+/// that is what makes an outer join's null-extended side report NULL and each
 /// `Append` arm report itself — so every FROM item's width has to be settled
-/// before any expression binds, while a reference to it is only resolved
+/// before any expression binds, while a reference to one is only resolved
 /// afterwards. This walks the block's expressions first and records the
-/// qualifiers that name it.
+/// qualifiers that name each column.
 ///
 /// Deliberately an over-approximation. A slot nobody references costs one
-/// `Value::Oid` per row and is dropped by the projection above it, whereas a
+/// `Value` per row and is dropped by the projection above it, whereas a
 /// *missed* reference is a 42703 on a query PostgreSQL answers.
 #[derive(Default)]
-pub(crate) struct TableoidDemand {
-    /// An unqualified `tableoid` was named, and any relation in scope might be
-    /// the one that owns it.
-    pub(crate) bare: bool,
-    /// Qualifiers naming it explicitly (`t.tableoid`), normalized the way
-    /// [`relation_qualifier`] normalizes the names they are matched against.
-    pub(crate) qualified: HashSet<String>,
+pub(crate) struct SystemDemand {
+    /// Per [`SysCol`] (indexed by its position in [`SysCol::ALL`]): whether it
+    /// was named unqualified, in which case any relation in scope might be the
+    /// one that owns the reference.
+    bare: [bool; SysCol::ALL.len()],
+    /// Per [`SysCol`]: the qualifiers naming it explicitly (`t.ctid`),
+    /// normalized the way [`relation_qualifier`] normalizes the names they are
+    /// matched against.
+    qualified: [HashSet<String>; SysCol::ALL.len()],
 }
 
-impl TableoidDemand {
-    /// Whether the FROM item addressed by `qualifier` needs the slot.
-    fn wants(&self, qualifier: &str) -> bool {
-        self.bare || self.qualified.contains(qualifier)
+impl SystemDemand {
+    /// Whether `col` was named without a qualifier, so every relation in scope
+    /// might be the one that owns the reference.
+    ///
+    /// Only the tests read this directly: binding goes through [`Self::wants`],
+    /// which folds the bare and qualified cases together.
+    #[cfg(test)]
+    pub(crate) fn is_bare(&self, col: SysCol) -> bool {
+        self.bare[SysCol::ALL.iter().position(|c| *c == col).expect("in ALL")]
     }
 
-    /// Whether anything at all named it — the fast path out for the queries
-    /// that do not, which is nearly all of them.
-    fn any(&self) -> bool {
-        self.bare || !self.qualified.is_empty()
+    /// The system columns the FROM item addressed by `qualifier` must carry, in
+    /// row order.
+    pub(crate) fn wants(&self, qualifier: &str) -> Vec<SysCol> {
+        SysCol::ALL
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.bare[*i] || self.qualified[*i].contains(qualifier))
+            .map(|(_, col)| *col)
+            .collect()
+    }
+
+    /// Every system column named anywhere in the block, whatever the qualifier
+    /// — what a write statement needs, since there the slot is appended per
+    /// *target* rather than per named relation.
+    fn all_named(&self) -> Vec<SysCol> {
+        SysCol::ALL
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.bare[*i] || !self.qualified[*i].is_empty())
+            .map(|(_, col)| *col)
+            .collect()
     }
 
     /// The demand of one query block: everything its SELECT and ORDER BY name.
@@ -3087,8 +3228,13 @@ impl TableoidDemand {
     /// one of them would cost a 42703 on a query PostgreSQL answers. Rendering
     /// cannot miss a position. It costs one `to_string` per bound block against
     /// a bind that already walks the same tree many times, and its only failure
-    /// mode is the harmless one: a string literal spelling the word buys an
-    /// unreferenced slot.
+    /// mode is the harmless one: a string literal spelling one of the names buys
+    /// an unreferenced slot.
+    ///
+    /// That harmlessness is a standing obligation on every consumer of this set.
+    /// Nothing may *refuse* a statement because a column is in it — see
+    /// [`supported_system_columns`], which drops what an access method cannot
+    /// serve and leaves the error to whoever resolves a real reference.
     pub(crate) fn of_select(select: &ast::Select, order_by: &Option<ast::OrderBy>) -> Self {
         let mut demand = Self::of_order_by(order_by);
         demand.scan_rendered(&select.to_string());
@@ -3104,17 +3250,17 @@ impl TableoidDemand {
         demand
     }
 
-    /// Whether a write statement names `tableoid` anywhere it could read one:
+    /// The system columns a write statement names anywhere it could read one:
     /// its WHERE, its RETURNING list, and (for UPDATE) its SET expressions.
     ///
-    /// A write answers from the target the row actually lives in, so this only
-    /// decides whether the slot exists at all; *which* relation it names is
+    /// A write answers from the target the row actually lives in, so the
+    /// qualifier is not consulted here; *which* relation a `tableoid` names is
     /// settled per target at execution.
     fn in_write(
         selection: &Option<ast::Expr>,
         returning: &Option<Vec<ast::SelectItem>>,
         assignments: &[ast::Assignment],
-    ) -> bool {
+    ) -> Vec<SysCol> {
         let mut demand = Self::default();
         if let Some(selection) = selection {
             demand.scan_rendered(&selection.to_string());
@@ -3125,36 +3271,39 @@ impl TableoidDemand {
         for assignment in assignments {
             demand.scan_rendered(&assignment.to_string());
         }
-        demand.any()
+        demand.all_named()
     }
 
-    /// Find `tableoid` in rendered SQL, taking the qualifier before it when it
-    /// has one. Quoting is honored on both halves: the parser re-quotes an
-    /// identifier that needs it, and `"tableoid"` names the system column just
-    /// as the bare spelling does.
+    /// Find each system column's name in rendered SQL, taking the qualifier
+    /// before it when it has one. Quoting is honored on both halves: the parser
+    /// re-quotes an identifier that needs it, and `"ctid"` names the system
+    /// column just as the bare spelling does.
     fn scan_rendered(&mut self, text: &str) {
         let lower = text.to_ascii_lowercase();
         let bytes = lower.as_bytes();
         let part_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-        for (at, _) in lower.match_indices(TABLEOID) {
-            let end = at + TABLEOID.len();
-            // A longer identifier that merely contains the word is not it.
-            if bytes.get(end).is_some_and(|b| part_char(*b))
-                || at.checked_sub(1).is_some_and(|i| part_char(bytes[i]))
-            {
-                continue;
-            }
-            match qualifier_before(text, &lower, at) {
-                Some(qualifier) => {
-                    self.qualified.insert(qualifier);
+        for (i, col) in SysCol::ALL.iter().enumerate() {
+            let name = col.name();
+            for (at, _) in lower.match_indices(name) {
+                let end = at + name.len();
+                // A longer identifier that merely contains the word is not it.
+                if bytes.get(end).is_some_and(|b| part_char(*b))
+                    || at.checked_sub(1).is_some_and(|i| part_char(bytes[i]))
+                {
+                    continue;
                 }
-                None => self.bare = true,
+                match qualifier_before(text, &lower, at) {
+                    Some(qualifier) => {
+                        self.qualified[i].insert(qualifier);
+                    }
+                    None => self.bare[i] = true,
+                }
             }
         }
     }
 }
 
-/// The `q` of a rendered `q.tableoid`, or `None` when the reference is bare.
+/// The `q` of a rendered `q.ctid`, or `None` when the reference is bare.
 ///
 /// `at` is the offset of the column name in `lower`, possibly preceded by its
 /// own quote. `text` is the same string with its original case: only an ASCII
@@ -3199,7 +3348,7 @@ fn bind_from_clause(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
-    demand: &TableoidDemand,
+    demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
     let mut combined: Option<JoinExpr> = None;
     let mut relations: Vec<ScopeItem> = Vec::new();
@@ -3284,7 +3433,7 @@ fn bind_table_with_joins(
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
     siblings: &[ScopeItem],
-    demand: &TableoidDemand,
+    demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
     let mut bound = bind_from_item(
         engine,
@@ -3779,11 +3928,17 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Query(QueryPlan {
             table,
+            system,
             projections,
             predicate,
             ..
         }) if !has_srf(&projections) => LogicalPlan::Query(QueryPlan {
             table,
+            // The projection becomes a constant, but the predicate is kept — and
+            // it may read a system slot, whose `ColumnRef` indexes past the
+            // relation's declared columns. Dropping the slots here would make it
+            // index past the end of the row.
+            system,
             columns: one_col(),
             projections: one_row(),
             predicate,
@@ -3958,7 +4113,8 @@ fn bound_table_fn_item(
             args,
             ordinality,
         },
-        system_slot: None,
+        system_base: None,
+        declined_system: None,
     })
 }
 
@@ -5777,12 +5933,19 @@ pub fn bind_insert_with_params(
     // RETURNING references the inserted row's columns, addressed by the table
     // name (INSERT takes no alias). Its VALUES bound in the empty scope, so this
     // needs a fresh table scope.
-    // Only RETURNING can name `tableoid` on an INSERT — there is no WHERE, and
-    // the VALUES bound in the empty scope.
-    let tableoid = TableoidDemand::in_write(&None, &insert.returning, &[]);
+    // Only RETURNING can name a system column on an INSERT — there is no WHERE,
+    // and the VALUES bound in the empty scope.
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&None, &insert.returning, &[]),
+            &schema,
+        )
+        .to_vec(),
+        &table,
+    );
     let returning = bind_returning(
         &insert.returning,
-        &Scope::table(&schema, name, catalog, params, tableoid)
+        &Scope::table(&schema, name, catalog, params, &system, declined_system)
             .with_subqueries(engine, &CteEnv::new()),
     )?;
 
@@ -5793,7 +5956,7 @@ pub fn bind_insert_with_params(
         routing,
         // Only COPY can freeze; there is no `INSERT … FREEZE` in PostgreSQL.
         freeze: false,
-        tableoid,
+        system,
     }))
 }
 
@@ -6099,7 +6262,7 @@ impl CopyFromPlan {
             // target (it needs a transaction, which binding has no access to).
             freeze: self.freeze,
             // COPY has no RETURNING, so nothing can read a system column.
-            tableoid: false,
+            system: Arc::from(&[][..]),
         }))
     }
 
@@ -6617,14 +6780,27 @@ pub fn bind_update_with_params(
     } else {
         None
     };
-    let tableoid =
-        TableoidDemand::in_write(&update.selection, &update.returning, &update.assignments);
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&update.selection, &update.returning, &update.assignments),
+            &schema,
+        )
+        .to_vec(),
+        &table,
+    );
     // An inheritance parent instead updates every descendant in place.
-    let inherited = write_targets(engine, &table, only, tableoid)?;
+    let inherited = write_targets(engine, &table, only, &system)?;
     // SET / WHERE / RETURNING may all contain subqueries; UPDATE takes no WITH,
     // so the CTE environment is empty.
-    let scope = Scope::table(&schema, qualifier, catalog, params, tableoid)
-        .with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(
+        &schema,
+        qualifier,
+        catalog,
+        params,
+        &system,
+        declined_system,
+    )
+    .with_subqueries(engine, &CteEnv::new());
 
     // SET expressions bind against the table schema: they all see the OLD
     // row, so `SET a = b, b = a` swaps.
@@ -6639,6 +6815,17 @@ pub fn bind_update_with_params(
             }
         };
         let column = object_name_to_table_name(target)?;
+        // A system column is not a target: PostgreSQL says so with its own
+        // message rather than "does not exist", because the name *does* resolve
+        // — it is the assignment that has nowhere to go. (An INSERT column list
+        // is different, and does report 42703: there the name is looked up
+        // among the declared columns only.)
+        if let Some(col) = SysCol::ALL.iter().find(|c| c.name() == column) {
+            return Err(BindError::feature_not_supported(format!(
+                "cannot assign to system column \"{}\"",
+                col.name()
+            )));
+        }
         let idx = schema.column_index(&column).ok_or_else(|| {
             BindError::new(
                 sqlstate::UNDEFINED_COLUMN,
@@ -6678,7 +6865,7 @@ pub fn bind_update_with_params(
     // in schema order — the same scope the SET/WHERE clauses bound against.
     let returning = bind_returning(&update.returning, &scope)?;
     Ok(LogicalPlan::Update(UpdatePlan {
-        tableoid,
+        system,
         table,
         predicate,
         assignments,
@@ -6745,12 +6932,26 @@ pub fn bind_delete_with_params(
     // A write answers `tableoid` from the target the row actually lives in, so
     // WHERE reads it too — `DELETE FROM p WHERE tableoid = 'p1'::regclass` must
     // match exactly the rows of that partition.
-    let tableoid = TableoidDemand::in_write(&delete.selection, &delete.returning, &[]);
+    let (system, declined_system) = supported_system_columns(
+        without_declared(
+            SystemDemand::in_write(&delete.selection, &delete.returning, &[]),
+            &schema,
+        )
+        .to_vec(),
+        &table,
+    );
     // An inheritance parent instead deletes from every descendant in place.
-    let inherited = write_targets(engine, &table, only, tableoid)?;
+    let inherited = write_targets(engine, &table, only, &system)?;
     // WHERE / RETURNING may contain subqueries; DELETE takes no WITH.
-    let scope = Scope::table(&schema, qualifier, catalog, params, tableoid)
-        .with_subqueries(engine, &CteEnv::new());
+    let scope = Scope::table(
+        &schema,
+        qualifier,
+        catalog,
+        params,
+        &system,
+        declined_system,
+    )
+    .with_subqueries(engine, &CteEnv::new());
     let predicate = bind_where(&delete.selection, &scope)?;
     if let Some(predicate) = &predicate {
         reject_agg_or_window(predicate, "WHERE")?;
@@ -6758,7 +6959,7 @@ pub fn bind_delete_with_params(
     // RETURNING references the deleted (OLD) row, which the executor feeds.
     let returning = bind_returning(&delete.returning, &scope)?;
     Ok(LogicalPlan::Delete(DeletePlan {
-        tableoid,
+        system,
         table,
         predicate,
         returning,

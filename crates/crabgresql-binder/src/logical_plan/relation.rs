@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crabgresql_storage_api::{TableAm, TableSchema};
+use crabgresql_storage_api::{SysCol, TableAm, TableSchema};
 use crabgresql_types::Value;
 
 /// One relation a statement reaches through the name of another, with the
@@ -37,14 +37,71 @@ use crabgresql_types::Value;
 pub struct MappedRelation {
     pub table: Arc<dyn TableAm>,
     pub map: Option<Arc<[usize]>>,
-    /// Set when this relation's rows must carry a `tableoid` slot, appended
+    /// Set when this relation's rows must carry system-column slots, appended
     /// after `view` so `map` stays a pure gather and the write-back paths
     /// (`scatter`, `rebuild`) never see a column with nowhere to write.
     ///
     /// Each arm names *itself*, which is what makes `tableoid` report the
     /// partition or inheritance child a row actually came from rather than the
     /// relation the query named.
-    pub tableoid: Option<RelationIdent>,
+    pub system: Option<SystemEmit>,
+}
+
+/// The system columns one scan appends to every row it emits.
+///
+/// `cols` is in row order — the order the slots occupy past the relation's
+/// declared columns — and matches the order the binder appended the matching
+/// [`OutputColumn`](crate::OutputColumn)s in, which is what lets a reference
+/// resolve as an ordinary column of the row.
+///
+/// `ident` rides along even when `tableoid` is not among `cols`: it is two
+/// strings cloned once per arm at bind time, and carrying it unconditionally
+/// keeps the arm constructors from needing two shapes.
+#[derive(Clone, Debug)]
+pub struct SystemEmit {
+    pub cols: Arc<[SysCol]>,
+    pub ident: RelationIdent,
+}
+
+impl SystemEmit {
+    /// Whether the columnar path can synthesize these slots onto a batch.
+    ///
+    /// Only `tableoid` — a fact about the relation, so a constant column. A
+    /// [`BatchStream`](crabgresql_storage_api::BatchStream) carries no
+    /// [`Tid`](crabgresql_storage_api::Tid), deliberately, so `ctid` has nothing
+    /// to read; and the access methods that hand up batches keep no row version,
+    /// so the header columns are refused before reaching here anyway.
+    ///
+    /// Asked by both the executor's batch node and the planner's `EXPLAIN`
+    /// annotation, which must agree — an annotation the executor disagrees with
+    /// reports work that never happened.
+    pub fn is_batchable(&self) -> bool {
+        self.cols.as_ref() == [SysCol::TableOid]
+    }
+
+    /// Whether these slots need the row version's MVCC header, rather than just
+    /// its tid and the relation's identity.
+    pub fn needs_header(&self) -> bool {
+        self.cols.iter().any(|c| c.needs_header())
+    }
+
+    /// Whether a `RETURNING` over these slots must be projected *after* the
+    /// write: `ctid` and the header describe a version that does not exist until
+    /// the row is placed, while `tableoid` is known up front.
+    pub fn projects_after_write(&self) -> bool {
+        self.cols.iter().any(|c| c.needs_storage_support())
+    }
+}
+
+/// [`SystemEmit::needs_header`] for a bare slot list, which is how the DML
+/// paths carry it.
+pub fn needs_header(cols: &[SysCol]) -> bool {
+    cols.iter().any(|c| c.needs_header())
+}
+
+/// [`SystemEmit::projects_after_write`] for a bare slot list.
+pub fn projects_after_write(cols: &[SysCol]) -> bool {
+    cols.iter().any(|c| c.needs_storage_support())
 }
 
 /// The relation a scan answers `tableoid` with.

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use crabgresql_txn::{Clog, TxnContext, Xid};
+use crabgresql_txn::{Clog, TupleHeader, TxnContext, Xid};
 use crabgresql_types::{PgType, Value};
 
 pub use crabgresql_txn as txn;
@@ -73,6 +73,95 @@ impl<'a> IndexProbeKey<'a> {
             eq,
             lower: None,
             upper: None,
+        }
+    }
+}
+
+/// One of PostgreSQL's per-row system columns.
+///
+/// `oid` is absent because PostgreSQL 12 removed it. The order of the variants
+/// is the order slots are appended to a row in, so it is load-bearing: the
+/// binder pushes [`OutputColumn`](crate::OutputColumn)s and the executor pushes
+/// [`Value`]s by walking the same sorted list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SysCol {
+    /// The OID of the relation the row lives in. Answerable by every access
+    /// method: it is a fact about the relation, not about the row's storage.
+    TableOid,
+    /// The row version's physical address, PG's `ctid`.
+    Ctid,
+    /// The inserting transaction.
+    Xmin,
+    /// The command within [`SysCol::Xmin`] that inserted the row.
+    Cmin,
+    /// The deleting transaction, or `0` while the version is live.
+    Xmax,
+    /// The command within [`SysCol::Xmax`] that deleted the row.
+    Cmax,
+}
+
+impl SysCol {
+    /// Every system column, in row order.
+    pub const ALL: [SysCol; 6] = [
+        SysCol::TableOid,
+        SysCol::Ctid,
+        SysCol::Xmin,
+        SysCol::Cmin,
+        SysCol::Xmax,
+        SysCol::Cmax,
+    ];
+
+    /// The name a query addresses this column by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SysCol::TableOid => "tableoid",
+            SysCol::Ctid => "ctid",
+            SysCol::Xmin => "xmin",
+            SysCol::Cmin => "cmin",
+            SysCol::Xmax => "xmax",
+            SysCol::Cmax => "cmax",
+        }
+    }
+
+    /// The type the slot carries.
+    pub const fn ty(self) -> PgType {
+        match self {
+            SysCol::TableOid => PgType::Oid,
+            SysCol::Ctid => PgType::Tid,
+            SysCol::Xmin | SysCol::Xmax => PgType::Xid,
+            SysCol::Cmin | SysCol::Cmax => PgType::Cid,
+        }
+    }
+
+    /// Whether answering this needs the row version's MVCC header rather than
+    /// just its tid — the difference between
+    /// [`TableAm::scan`](crabgresql_storage_api::TableAm::scan) and
+    /// [`TableAm::scan_with_system`](crabgresql_storage_api::TableAm::scan_with_system).
+    pub const fn needs_header(self) -> bool {
+        matches!(
+            self,
+            SysCol::Xmin | SysCol::Cmin | SysCol::Xmax | SysCol::Cmax
+        )
+    }
+
+    /// Whether the access method has to be able to produce this per row. Only
+    /// `tableoid` does not: every relation has an identity, whatever it stores.
+    pub const fn needs_storage_support(self) -> bool {
+        !matches!(self, SysCol::TableOid)
+    }
+
+    /// The negative `attnum` `pg_attribute` lists this column at, read off a
+    /// live PostgreSQL 18.4 — `ctid` is `-1` and the numbers run backwards to
+    /// `tableoid` at `-6`. (`oid` no longer has one: PostgreSQL 12 removed the
+    /// optional row OID, and with it the `-2` that used to hold the gap.)
+    pub const fn attnum(self) -> i16 {
+        match self {
+            SysCol::Ctid => -1,
+            SysCol::Xmin => -2,
+            SysCol::Cmin => -3,
+            SysCol::Xmax => -4,
+            SysCol::Cmax => -5,
+            SysCol::TableOid => -6,
         }
     }
 }
@@ -980,9 +1069,15 @@ impl StorageError {
 /// isolation levels can raise a serialization failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateResult {
-    Updated,
+    /// Applied, with the [`Tid`] the **new** version landed at — what
+    /// `UPDATE … RETURNING ctid` reports, and never the tid that was passed in:
+    /// an MVCC update writes a new version and leaves the old one to vacuum.
+    Updated(Tid),
     NotFound,
-    Conflict { updater: Xid, latest: Option<Tid> },
+    Conflict {
+        updater: Xid,
+        latest: Option<Tid>,
+    },
 }
 
 /// Outcome of `TableAm::delete`, mirroring [`UpdateResult`].
@@ -1022,6 +1117,12 @@ impl TableCapabilities {
 /// (for example while opening the next Parquet fragment), so errors travel as
 /// iterator items instead of being collapsed into an eager open result.
 pub type TupleStream = Box<dyn Iterator<Item = Result<(Tid, Tuple), StorageError>> + Send>;
+
+/// A [`TupleStream`] that also carries each version's MVCC header — what the
+/// `xmin`, `xmax`, `cmin` and `cmax` system columns read. Produced by
+/// [`TableAm::scan_with_system`]; see there for who can produce one.
+pub type SystemTupleStream =
+    Box<dyn Iterator<Item = Result<(Tid, TupleHeader, Tuple), StorageError>> + Send>;
 
 /// A fallible stream of Arrow batches — the columnar twin of [`TupleStream`],
 /// with the same reason for carrying errors as items.
@@ -1249,6 +1350,49 @@ pub trait TableAm: Send + Sync {
     /// EvalPlanQual needs after a conflict, and a point lookup for indexes.
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError>;
 
+    /// Whether this access method can answer PostgreSQL's per-row system
+    /// columns — `ctid`, `xmin`, `xmax`, `cmin`, `cmax`. An engine that says
+    /// yes **must** return `Some` from [`TableAm::scan_with_system`], and its
+    /// [`Tid`]s must address rows the way `ctid` promises.
+    ///
+    /// All five travel together deliberately. An engine either keeps a version
+    /// header per row or it does not; one that answered `ctid` while raising on
+    /// `xmin` would make `select ctid, xmin from t` fail for a reason nothing
+    /// in the query explains. `tableoid` is not gated here at all — it is a
+    /// fact about the *relation*, which every access method has.
+    ///
+    /// The default is `false`: the columnar engines store column chunks, not
+    /// row versions, and have no header to surface. A reference to a system
+    /// column on such a relation is rejected at bind time.
+    ///
+    /// **A delegating wrapper must forward this, [`TableAm::scan_with_system`],
+    /// [`TableAm::index_lookup_with_system`] and [`TableAm::update_many_tids`]**
+    /// — the same trap [`TableAm::scan_batches`] carries, and with the same
+    /// silent failure: forgetting one compiles, and a leaf that *does* keep
+    /// headers quietly stops answering.
+    fn supports_system_columns(&self) -> bool {
+        false
+    }
+
+    /// [`TableAm::scan`] with each version's MVCC header attached.
+    ///
+    /// `None` means the engine keeps no header, and then
+    /// [`TableAm::supports_system_columns`] must be `false`. Separate from
+    /// `scan` rather than folded into it because carrying the header costs a
+    /// copy per row, and nearly every scan wants none: only a statement that
+    /// names `xmin`/`xmax`/`cmin`/`cmax` reaches this. A statement naming only
+    /// `ctid` uses the ordinary `scan` and keeps the [`Tid`] it already yields.
+    ///
+    /// Same projection contract as [`TableAm::scan`]: full-width tuples, values
+    /// outside `projection` unspecified.
+    fn scan_with_system(
+        &self,
+        _txn: &TxnContext,
+        _projection: &ColumnProjection,
+    ) -> Option<SystemTupleStream> {
+        None
+    }
+
     /// Whether the engine can serve [`TableAm::scan_batches`]. The planner
     /// consults this to decide whether a read can run vectorized, so it must
     /// agree with what `scan_batches` actually does — the same discipline
@@ -1375,6 +1519,25 @@ pub trait TableAm: Send + Sync {
         None
     }
 
+    /// [`TableAm::index_lookup`] with each version's MVCC header attached — the
+    /// probe's counterpart to [`TableAm::scan_with_system`], with the same
+    /// contract: `None` declines the probe and sends the caller to a scan.
+    ///
+    /// An engine that answers [`TableAm::supports_system_columns`] must answer
+    /// this wherever it answers `index_lookup`, or a statement reading `xmin`
+    /// off an index-probed relation has nowhere to get it. Declining here is
+    /// still *correct* — the caller falls back to a scan — so the cost of
+    /// forgetting is a plan, not an error, which is why the promise is stated
+    /// rather than enforced.
+    fn index_lookup_with_system(
+        &self,
+        _index_name: &str,
+        _key: &IndexProbeKey<'_>,
+        _txn: &TxnContext,
+    ) -> Option<SystemTupleStream> {
+        None
+    }
+
     /// Insert a new version stamped with `txn`'s XID. The tuple must have
     /// exactly `schema().columns.len()` values in schema order — executors index
     /// tuples by schema position and rely on this.
@@ -1412,13 +1575,34 @@ pub trait TableAm: Send + Sync {
         updates: Vec<(Tid, Tuple)>,
         txn: &TxnContext,
     ) -> Result<u64, StorageError> {
-        let mut applied = 0;
-        for (tid, tuple) in updates {
-            if self.update(tid, tuple, txn)? == UpdateResult::Updated {
-                applied += 1;
-            }
-        }
-        Ok(applied)
+        Ok(self
+            .update_many_tids(updates, txn)?
+            .iter()
+            .filter(|tid| tid.is_some())
+            .count() as u64)
+    }
+
+    /// [`TableAm::update_many`] reporting where each new version landed, in
+    /// input order: `None` for a row that was gone by the time it was reached.
+    ///
+    /// Separate from `update_many` because the count is all a plain `UPDATE`
+    /// needs, and an engine that batches its writes has nothing to gain from
+    /// materializing the tids. Only `RETURNING ctid` reaches this, and only
+    /// through the row-at-a-time path.
+    fn update_many_tids(
+        &self,
+        updates: Vec<(Tid, Tuple)>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Option<Tid>>, StorageError> {
+        updates
+            .into_iter()
+            .map(|(tid, tuple)| {
+                Ok(match self.update(tid, tuple, txn)? {
+                    UpdateResult::Updated(new) => Some(new),
+                    _ => None,
+                })
+            })
+            .collect()
     }
 
     /// Batch counterpart of [`TableAm::delete`], mirroring

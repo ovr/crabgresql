@@ -364,6 +364,7 @@ fn analyze(plan: &LogicalPlan) -> Option<Spec> {
         .collect();
     Some(Spec {
         plan: LogicalPlan::Query(QueryPlan {
+            system: None,
             table: Arc::clone(table),
             columns,
             projections: inner_keys,

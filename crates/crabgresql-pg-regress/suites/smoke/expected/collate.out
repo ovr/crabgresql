@@ -272,11 +272,17 @@ SELECT a.attname, a.attcollation = (SELECT oid FROM pg_collation WHERE collname 
   FROM pg_attribute a
   WHERE a.attrelid = (SELECT oid FROM pg_class WHERE relname = 'coll_c')
   ORDER BY a.attnum;
- attname | is_de | is_default 
----------+-------+------------
- a       | t     | f
- b       | f     | t
-(2 rows)
+ attname  | is_de | is_default 
+----------+-------+------------
+ tableoid | f     | f
+ cmax     | f     | f
+ xmax     | f     | f
+ cmin     | f     | f
+ xmin     | f     | f
+ ctid     | f     | f
+ a        | t     | f
+ b        | f     | t
+(8 rows)
 
 -- information_schema reports a collation only when it is not the default
 SELECT column_name, collation_schema, collation_name FROM information_schema.columns

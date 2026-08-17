@@ -213,10 +213,10 @@ fn update_makes_new_version_visible_old_dead() -> anyhow::Result<()> {
     );
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    assert_eq!(
+    assert!(matches!(
         table.update(tid, vec![Value::Int4(1), Value::Text("uno".into())], &txn)?,
-        UpdateResult::Updated
-    );
+        UpdateResult::Updated(_)
+    ));
     h.tm.commit(xid)?;
     let rows: Vec<_> = scan_rows(&*table, &read(&h.tm))
         .into_iter()
@@ -1261,10 +1261,10 @@ fn a_toasted_row_survives_an_update_of_another_column() -> anyhow::Result<()> {
 
     let xid = h.tm.allocate_xid();
     let txn = h.tm.context(xid, CommandId::FIRST);
-    assert_eq!(
+    assert!(matches!(
         table.update(tid, vec![Value::Int4(2), big.clone()], &txn)?,
-        UpdateResult::Updated
-    );
+        UpdateResult::Updated(_)
+    ));
     h.tm.commit(xid)?;
 
     let rows = scan_rows(&*table, &read(&h.tm));

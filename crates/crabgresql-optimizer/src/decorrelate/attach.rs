@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crabgresql_binder::{
     AggInput, AggregatePlan, BoundExpr, JoinExpr, JoinInput, JoinKind, JoinPlan, LogicalPlan,
-    QueryPlan, ValuesPlan,
+    QueryPlan, SystemEmit, ValuesPlan,
 };
 use crabgresql_storage_api::TableAm;
 
@@ -38,10 +38,12 @@ pub(super) struct Arm {
 /// [`attach_arm`] accepts.
 pub(super) fn source_width(node: &LogicalPlan) -> Option<usize> {
     match node {
-        LogicalPlan::Query(QueryPlan { table, .. }) => Some(scan_width(table)),
+        LogicalPlan::Query(QueryPlan { table, system, .. }) => {
+            Some(scan_width(table, system.as_ref()))
+        }
         LogicalPlan::Join(JoinPlan { source, .. }) => Some(source.width()),
         LogicalPlan::Aggregate(AggregatePlan { input, .. }) => match input {
-            AggInput::Scan(table) => Some(scan_width(table)),
+            AggInput::Scan(table) => Some(scan_width(table, None)),
             AggInput::Join(source) => Some(source.width()),
             // A FROM-less aggregate has no row source to join against.
             AggInput::SingleRow => None,
@@ -50,14 +52,14 @@ pub(super) fn source_width(node: &LogicalPlan) -> Option<usize> {
     }
 }
 
-/// The width of a base-relation scan's row.
+/// The width of a base-relation scan's row: the relation's stored columns plus
+/// whatever system slots the scan appends past them.
 ///
-/// Exactly the relation's stored columns: the binder reaches for
-/// `JoinInput::Scan` only when the FROM item needs no system column, and routes
-/// a scan that must emit `tableoid` through an `Append` arm instead — so no
-/// scan reachable here carries a trailing slot the schema does not describe.
-fn scan_width(table: &Arc<dyn TableAm>) -> usize {
-    table.schema().columns.len()
+/// The slots have to be counted. A `JoinExpr::Input`'s width is what every index
+/// above it is rebased against, so a width short by one silently shifts every
+/// column of the right-hand side of the join this attaches.
+fn scan_width(table: &Arc<dyn TableAm>, system: Option<&SystemEmit>) -> usize {
+    table.schema().columns.len() + system.map_or(0, |emit| emit.cols.len())
 }
 
 /// Join `arm` onto the right of `node`'s row source. Returns whether the node
@@ -90,6 +92,7 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
         LogicalPlan::Query(_) => {
             let LogicalPlan::Query(QueryPlan {
                 table,
+                system,
                 columns,
                 projections,
                 predicate,
@@ -99,10 +102,10 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
             else {
                 unreachable!("matched as a Query above");
             };
-            let width = scan_width(&table);
+            let width = scan_width(&table, system.as_ref());
             *node = LogicalPlan::Join(JoinPlan {
                 source: join(JoinExpr::Input {
-                    input: JoinInput::Scan(table),
+                    input: JoinInput::Scan { table, system },
                     width,
                 }),
                 columns,
@@ -120,10 +123,15 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
         }
         LogicalPlan::Aggregate(AggregatePlan { input, .. }) => {
             let left = match std::mem::replace(input, AggInput::SingleRow) {
+                // `AggInput::Scan` is only built for a scan with no system
+                // slots (see `finish_single_select`), so there is none to carry.
                 AggInput::Scan(table) => {
-                    let width = scan_width(&table);
+                    let width = scan_width(&table, None);
                     JoinExpr::Input {
-                        input: JoinInput::Scan(table),
+                        input: JoinInput::Scan {
+                            table,
+                            system: None,
+                        },
                         width,
                     }
                 }

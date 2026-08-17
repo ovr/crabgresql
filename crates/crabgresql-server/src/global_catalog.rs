@@ -8,8 +8,9 @@
 //! internal` I/O functions, `CREATE CAST`, and `DROP TYPE ... CASCADE` with the
 //! right NOTICE/DETAIL), not full query-time evaluation over user types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
@@ -498,6 +499,57 @@ pub struct GlobalCatalog {
     /// the server-lifetime object every statement can reach; PG likewise reaches
     /// its data directory through a global rather than a statement argument.
     copy_files: CopyFileAccess,
+    /// The transaction id of the most recent DDL statement — the catalog's
+    /// generation, and the `xmin` every `pg_catalog` row reports. See
+    /// [`GlobalCatalog::note_ddl`].
+    ///
+    /// Here rather than in `inner` because it is written by DDL that never
+    /// touches `inner` at all (`CREATE TABLE` lives in the storage engine),
+    /// and read by every statement that scans a catalog relation — a plain
+    /// atomic keeps that read off the `RwLock` entirely.
+    ddl_xid: AtomicU64,
+    /// Per relation: the shape it had when it was last looked at, and the xid of
+    /// the DDL that gave it that shape. See [`GlobalCatalog::note_ddl_shapes`].
+    relation_shapes: RwLock<HashMap<(String, String), RelationShape>>,
+}
+
+/// A hash of everything the catalog reports about one object's definition.
+///
+/// Taken off the `Debug` rendering rather than field by field on purpose: a
+/// field added to `TableSchema`, `IndexMetadata` or `ViewDefinition` joins the
+/// fingerprint by itself, where an explicit list would silently stop covering
+/// it. Hash the *definition* only — a relation's size estimates move with
+/// ordinary DML and would make the next unrelated DDL look like it touched
+/// everything.
+///
+/// Written through the hasher rather than into a `String` first: this runs over
+/// every object on every DDL statement, and a schema's `Debug` is kilobytes.
+pub fn definition_fingerprint(definition: &impl std::fmt::Debug) -> u64 {
+    use std::fmt::Write as _;
+    use std::hash::Hasher;
+
+    struct HashWrite<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+    impl std::fmt::Write for HashWrite<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let _ = write!(HashWrite(&mut hasher), "{definition:?}");
+    hasher.finish()
+}
+
+/// What [`GlobalCatalog::note_ddl_shapes`] remembers about one relation.
+#[derive(Clone, Copy)]
+struct RelationShape {
+    /// A hash of everything the catalog reports about the relation's
+    /// *definition*. Compared, never interpreted.
+    fingerprint: u64,
+    /// The generation the definition last changed at — what the relation's
+    /// catalog rows report as their `xmin`.
+    xid: u64,
 }
 
 impl Default for GlobalCatalog {
@@ -521,7 +573,126 @@ impl GlobalCatalog {
                 ..Default::default()
             }),
             copy_files,
+            ddl_xid: AtomicU64::new(0),
+            relation_shapes: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Record that a DDL statement ran under `xid`, moving the catalog's
+    /// generation forward.
+    ///
+    /// `xid` is the *current* transaction counter rather than the DDL's own
+    /// XID: a DDL statement in a read-only-so-far transaction may not have
+    /// allocated one, and what readers need is a value that moves, not the
+    /// identity of the writer.
+    ///
+    /// **Strictly increasing**, not merely `max`. DDL here allocates no XID, so
+    /// the transaction counter stands still across a run of DDL statements — and
+    /// a generation that stood still with it would make two consecutive
+    /// `ALTER TABLE`s indistinguishable, which is the one question the value
+    /// exists to answer. PostgreSQL spends an XID on every DDL statement, so
+    /// counting them in the same space is the closer reading.
+    ///
+    /// The caller must publish the returned generation back to the commit log
+    /// (`Clog::observe_next_xid`), or the generation outruns the counter
+    /// `age(xid)` subtracts from and those rows report a negative age. That
+    /// publication is what makes DDL spend XID *numbers* the way upstream spends
+    /// whole transactions — it only raises a lower bound on the next allocation,
+    /// never lowers one.
+    pub fn note_ddl(&self, xid: u64) -> u64 {
+        // The value *this* call installed, not a second load: two sessions
+        // running DDL concurrently would otherwise both read the later one and
+        // stamp their relations with it, which is exactly the collision the
+        // strict increase exists to prevent.
+        match self
+            .ddl_xid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(xid.max(current + 1))
+            }) {
+            Ok(previous) => xid.max(previous + 1),
+            Err(current) => current,
+        }
+    }
+
+    /// The catalog's generation; see [`GlobalCatalog::note_ddl`].
+    pub fn ddl_xid(&self) -> u64 {
+        self.ddl_xid.load(Ordering::Relaxed)
+    }
+
+    /// Start the generation at the transaction counter rather than at zero.
+    ///
+    /// Nothing durably records when a definition last changed, so a fresh server
+    /// has no generation to report. Zero is `InvalidTransactionId`, which
+    /// PostgreSQL never puts on a live tuple and which `age()` answers with
+    /// `2147483647` — so a client testing `age(xmin) < threshold` sees *no*
+    /// relation as fresh at exactly the moment it first caches a schema. The
+    /// live counter is the honest stand-in: "as far as this server knows,
+    /// everything is as of now".
+    pub fn seed_ddl_generation(&self, live: u64) {
+        self.ddl_xid.fetch_max(live, Ordering::Relaxed);
+    }
+
+    /// Record which relations `xid`'s DDL actually changed, so each one's
+    /// catalog rows can report a `xmin` of its own rather than the whole
+    /// catalog moving whenever anything does.
+    ///
+    /// **Derived by comparing shapes, not by reading the statement.** Taking the
+    /// target off the AST would need one arm per DDL spelling *and* the name
+    /// resolution each handler does for itself (search path, `pg_temp`), and it
+    /// would still miss the relations a statement changes without naming — every
+    /// leaf of `ALTER TABLE <partitioned parent>`, for one. A shape comparison
+    /// has neither problem: `relations` is already resolved, and a leaf that
+    /// changed looks changed.
+    ///
+    /// The fingerprint covers the relation's **definition** — its schema and its
+    /// indexes — and deliberately not its size estimates, which drift with plain
+    /// DML and would make the next unrelated DDL look like it touched
+    /// everything. Two definitions colliding on a 64-bit hash would leave a
+    /// relation's `xmin` stale; that is the only failure mode, and it costs a
+    /// client one missed cache invalidation rather than a wrong answer.
+    ///
+    /// Runs once per DDL statement, not per query, so its `O(relations)` pass is
+    /// paid on the rare path.
+    pub fn note_ddl_shapes(
+        &self,
+        objects: impl IntoIterator<Item = ((String, String), u64)>,
+        xid: u64,
+    ) {
+        let mut shapes = self
+            .relation_shapes
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let mut live = HashSet::new();
+        for (key, fingerprint) in objects {
+            match shapes.get_mut(&key) {
+                // Unchanged: keep the generation it already had, which is the
+                // whole point — an unrelated DDL must not move it.
+                Some(shape) if shape.fingerprint == fingerprint => {}
+                Some(shape) => *shape = RelationShape { fingerprint, xid },
+                None => {
+                    shapes.insert(key.clone(), RelationShape { fingerprint, xid });
+                }
+            }
+            live.insert(key);
+        }
+        // A dropped relation's entry has to go, or a table re-created under the
+        // same name would inherit the *older* generation and read as staler than
+        // it is.
+        shapes.retain(|key, _| live.contains(key));
+    }
+
+    /// The generation each relation's own catalog rows report as their `xmin`,
+    /// keyed by `(namespace, name)`. A relation this has never seen change is
+    /// absent, and its rows fall back to the catalog-wide generation — which is
+    /// every relation right after startup, since nothing durably records when a
+    /// definition last changed.
+    pub fn relation_ddl_xids(&self) -> HashMap<(String, String), u64> {
+        self.relation_shapes
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .iter()
+            .map(|(key, shape)| (key.clone(), shape.xid))
+            .collect()
     }
 
     /// The server's COPY file-access policy.

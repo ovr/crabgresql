@@ -1,10 +1,10 @@
 //! `pg_attribute` and `pg_attrdef`: the columns and their defaults.
 
-use crabgresql_storage_api::TableSchema;
+use crabgresql_storage_api::{SysCol, TableSchema};
 use crabgresql_types::{PgType, Value};
 
-use crate::SystemCatalog;
 use crate::cols::*;
+use crate::{RelKind, SystemCatalog};
 use crabgresql_storage_api::Column;
 
 use crate::PG_TYPE_ROWS;
@@ -13,9 +13,6 @@ use crate::catalogs::collation::typcollation_of;
 
 /// `pg_catalog.pg_attribute` — a curated subset of columns for user relations'
 /// columns.
-///
-/// TODO: emit the system columns PostgreSQL also lists here — `ctid`, `xmin`,
-/// `cmin`, `xmax`, `cmax` and `tableoid`, at negative `attnum`.
 pub(crate) fn pg_attribute_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_attribute",
@@ -70,12 +67,56 @@ pub(crate) fn attcollation_of(column: &Column) -> u32 {
     }
 }
 
+/// The six system-attribute rows for the relation `oid` names.
+/// Taken from [`SysCol`] rather than restated: the binder's list is what a query
+/// actually resolves against, and a `pg_attribute` row exists to make a client's
+/// column list agree with what the server will answer. A second copy here could
+/// drift into advertising a column the server refuses, or omitting one it serves.
+fn system_attribute_rows(oid: u32) -> Vec<Vec<Value>> {
+    SysCol::ALL
+        .iter()
+        .map(|col| {
+            let ty = &col.ty();
+            let (byval, align, storage) = attlayout_of(*ty);
+            vec![
+                Value::Oid(oid),
+                Value::Text(col.name().to_string()),
+                Value::Oid(ty.oid()),
+                Value::Int2(ty.typlen()),
+                Value::Int2(col.attnum()),
+                Value::Int4(-1),
+                byval,
+                align,
+                storage,
+                // PostgreSQL marks every system attribute NOT NULL, even the
+                // ones an outer join reports as NULL: `attnotnull` describes the
+                // stored column, not what a query can produce from it.
+                Value::Bool(true),
+                Value::Bool(false),
+                chr('\0'),
+                chr('\0'),
+                Value::Bool(false),
+                Value::Oid(0),
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
 /// Build `pg_attribute` rows: one per column of each relation, `attnum` 1-based
-/// (user columns only), typed from the column's `PgType` (`atttypid`/`attlen`).
+/// (user columns only) plus the six system attributes at negative `attnum`,
+/// typed from the column's `PgType` (`atttypid`/`attlen`).
 pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (relations, indexes, toasts) = (cat.relation_oids(), cat.index_oids(), cat.toast_oids());
     let mut rows = Vec::new();
-    for (oid, schema) in relations {
+    for ((oid, schema), kind) in relations.iter().zip(cat.relation_kinds()) {
+        // A view has no system attributes upstream, because it has no rows of
+        // its own for one to describe — the same reason the binder exposes no
+        // system column on one. Probed against PostgreSQL 18.4: `r`/`p`/`S`/`m`
+        // and a TOAST table publish all six, `v` and `i` publish none.
+        if *kind != RelKind::View {
+            rows.extend(system_attribute_rows(*oid));
+        }
         for (i, c) in schema.columns.iter().enumerate() {
             let (byval, align, storage) = attlayout_of(c.ty);
             rows.push(vec![
@@ -131,7 +172,9 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         }
     }
     // A TOAST relation's columns, so its `pg_class.relnatts` has rows to join.
+    // It is an ordinary heap upstream, so it carries the system attributes too.
     for toast in toasts {
+        rows.extend(system_attribute_rows(toast.oid));
         for (i, (name, ty)) in TOAST_COLUMNS.iter().enumerate() {
             let (byval, align, storage) = attlayout_of(*ty);
             rows.push(vec![

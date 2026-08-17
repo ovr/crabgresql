@@ -939,6 +939,9 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
         PgType::Xid8 => crabgresql_types::xid::xid8_in(s)
             .map(Value::Xid8)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Cid => crabgresql_types::xid::cid_in(s)
+            .map(Value::Cid)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         PgType::PgLsn => crabgresql_types::pg_lsn::parse(s)
             .map(Value::PgLsn)
             .map_err(|e| BindError::new(e.sqlstate, e.message)),

@@ -989,8 +989,10 @@ impl TableAm for BufferTable {
         }
         let mut tuple = vec![tuple];
         self.numeric.normalize(&self.schema, &mut tuple)?;
-        self.append(rel, tuple, txn)?;
-        Ok(UpdateResult::Updated)
+        let placed = self.append(rel, tuple, txn)?;
+        Ok(UpdateResult::Updated(
+            *placed.first().expect("a one-row append placed no row"),
+        ))
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
@@ -1269,10 +1271,10 @@ mod tests {
 
         let updater = tm.allocate_xid();
         let txn = tm.context(updater, CommandId::FIRST);
-        assert_eq!(
+        assert!(matches!(
             table.update(tids[0], row(9, "nine"), &txn)?,
-            UpdateResult::Updated
-        );
+            UpdateResult::Updated(_)
+        ));
         // A second update of the same version finds it already stamped.
         assert_eq!(
             table.update(tids[0], row(8, "eight"), &txn)?,

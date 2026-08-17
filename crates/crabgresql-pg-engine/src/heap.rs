@@ -14,8 +14,8 @@ use std::sync::{Arc, RwLock};
 
 use crabgresql_storage_api::{
     CheckConstraint, ColumnProjection, DeleteResult, IndexBound, IndexKey, IndexMetadata,
-    IndexProbe, IndexProbeKey, RelPersistence, RelStats, StorageError, TableAm, TableSchema, Tid,
-    Tuple, TupleStream, UpdateResult,
+    IndexProbe, IndexProbeKey, RelPersistence, RelStats, StorageError, SystemTupleStream, TableAm,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult,
 };
 use crabgresql_txn::{
     Clog, LockOwner, SharedGuard, TableLock, TupleHeader, TxnContext, XactStatus, Xid,
@@ -1477,7 +1477,7 @@ struct IndexProbeIter {
 }
 
 impl Iterator for IndexProbeIter {
-    type Item = Result<(Tid, Tuple), StorageError>;
+    type Item = Result<(Tid, TupleHeader, Tuple), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         for tid in self.tids.by_ref() {
@@ -1493,7 +1493,7 @@ impl Iterator for IndexProbeIter {
                 // answer rather than a missing row. One encode plus a compare per
                 // returned row turns that whole class of defect into rows quietly
                 // absent, which a probe-versus-scan test catches.
-                Ok(Some(tuple))
+                Ok(Some((hdr, tuple)))
                     if btkey::encode_row_into(
                         &self.schema,
                         &self.index_keys,
@@ -1501,7 +1501,7 @@ impl Iterator for IndexProbeIter {
                         &mut self.key_buf,
                     ) && self.range.contains(&self.key_buf) =>
                 {
-                    return Some(Ok((tid, tuple)));
+                    return Some(Ok((tid, hdr, tuple)));
                 }
                 // Either not visible to this snapshot or not actually a match:
                 // neither is an error, and neither ends the probe.
@@ -1513,19 +1513,38 @@ impl Iterator for IndexProbeIter {
     }
 }
 
+/// [`IndexProbeIter`] as the plain `(tid, tuple)` stream [`TableAm::index_lookup`]
+/// promises — the header dropped for the callers that never asked for one.
+struct PlainProbeIter(IndexProbeIter);
+
+impl Iterator for PlainProbeIter {
+    type Item = Result<(Tid, Tuple), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0
+            .next()
+            .map(|row| row.map(|(tid, _, tuple)| (tid, tuple)))
+    }
+}
+
 /// One version by tid from `rel`, if `txn`'s snapshot can see it.
 ///
 /// Free-standing rather than a method so a probe's iterator can fetch rows
 /// lazily: it owns the pieces this needs ([`EngineInner`], the relfilenode, the
 /// block count, the snapshot) without borrowing the table. [`TableAm::fetch`] is
 /// this plus the table lock and the relfilenode a truncating transaction sees.
+///
+/// The MVCC header comes back alongside the tuple because this already decodes
+/// it to judge visibility — dropping it here is what used to make a `RETURNING
+/// xmin` on an index-probed statement impossible. Callers that do not want it
+/// ignore it; nothing is read twice either way.
 fn fetch_at(
     engine: &EngineInner,
     rel: RelFileNode,
     nblocks: u32,
     tid: Tid,
     txn: &TxnContext,
-) -> Result<Option<Tuple>, StorageError> {
+) -> Result<Option<(TupleHeader, Tuple)>, StorageError> {
     // Bounds-check before pinning: `pin` *extends* the relation to cover an
     // out-of-range block. `nblocks` is the caller's, because asking the storage
     // manager costs a lock pair and an `fstat` — per row, for a caller in a
@@ -1541,11 +1560,133 @@ fn fetch_at(
         let bytes = page::get_item(pg, tid.offset)?;
         let head = tuple::decode_header(bytes);
         satisfies_mvcc(&head.hdr, &txn.snapshot, &txn.clog, txn.xid, txn.cid)
-            .then(|| tuple::decode_raw(bytes))
+            .then(|| (head.hdr, tuple::decode_raw(bytes)))
     });
     match raw {
-        Some(raw) => Ok(Some(raw?.resolve(|p| detoast(engine, p))?)),
+        Some((hdr, raw)) => Ok(Some((hdr, raw?.resolve(|p| detoast(engine, p))?))),
         None => Ok(None),
+    }
+}
+
+impl HeapTable {
+    /// The scan both [`TableAm::scan`] and [`TableAm::scan_with_system`] open.
+    ///
+    /// `want_headers` is the only difference between them: the shared table
+    /// lock, the relfilenode resolution and the block count are identical, and
+    /// splitting them would leave two places for a concurrent TRUNCATE to slip
+    /// between the lock and the `nblocks` read.
+    fn open_scan(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+        want_headers: bool,
+    ) -> HeapScan {
+        // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
+        // cannot unlink the file this scan is reading.
+        let guard = self.lock.acquire_shared(txn.lock_owner);
+        let rel = self.effective_rel(txn.xid);
+        let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
+        HeapScan {
+            engine: Arc::clone(&self.engine),
+            rel,
+            txn: txn.clone(),
+            nblocks,
+            cur_block: 0,
+            projection: match projection {
+                ColumnProjection::All => None,
+                ColumnProjection::Some(wanted) => Some(Arc::clone(wanted)),
+            },
+            buffer: Vec::new(),
+            headers: Vec::new(),
+            want_headers,
+            buf_idx: 0,
+            _guard: guard,
+        }
+    }
+
+    /// The probe both [`TableAm::index_lookup`] and
+    /// [`TableAm::index_lookup_with_system`] open, before either decides what to
+    /// hand back.
+    ///
+    /// Two levels of `Option` because the two "nothing" answers are different
+    /// and only one of them is a refusal: the outer `None` declines the probe
+    /// entirely (no such index, not physical, a key this encoding cannot
+    /// represent) and sends the caller to a scan, while `Some(None)` is a probe
+    /// that ran and matched no row.
+    fn open_probe(
+        &self,
+        index_name: &str,
+        key: &IndexProbeKey<'_>,
+        txn: &TxnContext,
+    ) -> Option<Option<IndexProbeIter>> {
+        // Hold the table's shared lock across the tree descent, exactly as `scan`
+        // and `fetch` do. Without it a committing TRUNCATE — whose
+        // `acquire_exclusive` waits only on *foreign shared* holds, so nothing
+        // would make it wait for this probe — unlinks the index file mid-descent;
+        // `smgr` then reopens it with `create(true)`, and the descent panics on a
+        // zeroed meta page.
+        //
+        // Safe for the truncating transaction's own probe: `acquire_shared` grants
+        // immediately when the exclusive holder is this same owner, and the holds
+        // taken underneath are refcounted per owner. The returned iterator keeps
+        // reading heap pages, so — exactly as in `scan` — the guard moves into it
+        // and lives for the whole iteration rather than for this call.
+        let guard = self.lock.acquire_shared(txn.lock_owner);
+        // Bound before the index guard: the filter and the key encoding below
+        // must agree on `columns`.
+        let schema = self.snap();
+        let (rel, latch, index_keys) = {
+            let indexes = self
+                .indexes
+                .read()
+                .unwrap_or_else(|_| panic!("rwlock poisoned"));
+            let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
+            if !entry.is_physical(&schema) {
+                return None;
+            }
+            (
+                // The staged tree when `txn` is the truncating transaction, so a
+                // probe agrees with a scan of the file it reads.
+                self.effective_index_rel(entry, txn.xid),
+                Arc::clone(&entry.latch),
+                entry.meta.keys.clone(),
+            )
+        };
+        let range = match encode_probe(&schema, &index_keys, key) {
+            ProbeBytes::Search(range) => range,
+            // A NULL somewhere in the key: served, no match.
+            ProbeBytes::NoMatch => return Some(None),
+            // A value this encoding cannot represent: the tree knows nothing
+            // about it, so decline and let the caller scan.
+            ProbeBytes::Decline => return None,
+        };
+        let tids = BTree::open(
+            Arc::clone(&self.engine),
+            rel,
+            latch,
+            self.persistence.is_unlogged(),
+        )
+        .search_range(&range);
+        // Nothing matched: hand back an empty iterator rather than the machinery
+        // for walking one. This is the ordinary outcome of the `UNIQUE` check,
+        // which probes once per inserted row, and it is the one place where the
+        // snapshot clone and the guard below would be pure overhead.
+        if tids.is_empty() {
+            return Some(None);
+        }
+        let heap = self.effective_rel(txn.xid);
+        Some(Some(IndexProbeIter {
+            nblocks: Self::io(self.engine.bufpool.smgr().nblocks(heap)),
+            engine: Arc::clone(&self.engine),
+            heap,
+            txn: txn.clone(),
+            schema,
+            index_keys,
+            range,
+            tids: tids.into_iter(),
+            key_buf: Vec::new(),
+            _guard: guard,
+        }))
     }
 }
 
@@ -1662,76 +1803,30 @@ impl TableAm for HeapTable {
         key: &IndexProbeKey<'_>,
         txn: &TxnContext,
     ) -> Option<IndexProbe> {
-        // Hold the table's shared lock across the tree descent, exactly as `scan`
-        // and `fetch` do. Without it a committing TRUNCATE — whose
-        // `acquire_exclusive` waits only on *foreign shared* holds, so nothing
-        // would make it wait for this probe — unlinks the index file mid-descent;
-        // `smgr` then reopens it with `create(true)`, and the descent panics on a
-        // zeroed meta page.
-        //
-        // Safe for the truncating transaction's own probe: `acquire_shared` grants
-        // immediately when the exclusive holder is this same owner, and the holds
-        // taken underneath are refcounted per owner. The returned iterator keeps
-        // reading heap pages, so — exactly as in `scan` — the guard moves into it
-        // and lives for the whole iteration rather than for this call.
-        let guard = self.lock.acquire_shared(txn.lock_owner);
-        // Bound before the index guard: the filter and the key encoding below
-        // must agree on `columns`.
-        let schema = self.snap();
-        let (rel, latch, index_keys) = {
-            let indexes = self
-                .indexes
-                .read()
-                .unwrap_or_else(|_| panic!("rwlock poisoned"));
-            let entry = indexes.iter().find(|e| e.meta.name == index_name)?;
-            if !entry.is_physical(&schema) {
-                return None;
-            }
-            (
-                // The staged tree when `txn` is the truncating transaction, so a
-                // probe agrees with a scan of the file it reads.
-                self.effective_index_rel(entry, txn.xid),
-                Arc::clone(&entry.latch),
-                entry.meta.keys.clone(),
-            )
-        };
-        let range = match encode_probe(&schema, &index_keys, key) {
-            ProbeBytes::Search(range) => range,
-            // A NULL somewhere in the key: served, no match.
-            ProbeBytes::NoMatch => return Some(Box::new(std::iter::empty())),
-            // A value this encoding cannot represent: the tree knows nothing
-            // about it, so decline and let the caller scan.
-            ProbeBytes::Decline => return None,
-        };
-        let tids = BTree::open(
-            Arc::clone(&self.engine),
-            rel,
-            latch,
-            self.persistence.is_unlogged(),
-        )
-        .search_range(&range);
-        // Nothing matched: hand back an empty iterator rather than the machinery
-        // for walking one. This is the ordinary outcome of the `UNIQUE` check,
-        // which probes once per inserted row, and it is the one place where the
-        // snapshot clone and the guard below would be pure overhead.
-        if tids.is_empty() {
-            return Some(Box::new(std::iter::empty()));
-        }
-        let heap = self.effective_rel(txn.xid);
-        Some(Box::new(IndexProbeIter {
-            nblocks: Self::io(self.engine.bufpool.smgr().nblocks(heap)),
-            engine: Arc::clone(&self.engine),
-            heap,
-            txn: txn.clone(),
-            schema,
-            index_keys,
-            range,
-            tids: tids.into_iter(),
-            key_buf: Vec::new(),
-            _guard: guard,
-        }))
+        let probe = self.open_probe(index_name, key, txn)?;
+        Some(match probe {
+            // An empty probe carries no header either; both wrappers would
+            // yield nothing, so the cheaper one stands in.
+            None => Box::new(std::iter::empty()),
+            Some(iter) => Box::new(PlainProbeIter(iter)),
+        })
     }
 
+    /// The heap re-fetches every probed row through the page it lives on, and
+    /// that fetch decodes the MVCC header anyway — so this costs the copy and
+    /// nothing else. See [`TableAm::index_lookup_with_system`].
+    fn index_lookup_with_system(
+        &self,
+        index_name: &str,
+        key: &IndexProbeKey<'_>,
+        txn: &TxnContext,
+    ) -> Option<SystemTupleStream> {
+        let probe = self.open_probe(index_name, key, txn)?;
+        Some(match probe {
+            None => Box::new(std::iter::empty()),
+            Some(iter) => Box::new(iter),
+        })
+    }
     /// The heap stores whole tuples per page, so a projection saves no I/O — the
     /// page is read either way. What it does save is everything after the read:
     /// a skipped attribute is not decoded, allocates nothing, and — the part
@@ -1741,32 +1836,31 @@ impl TableAm for HeapTable {
     /// Skipped attributes come back as `Value::Null` in a full-width row, which
     /// is what the scan contract asks for.
     fn scan(&self, txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
-        // Hold a shared lock for the whole iterator life so a concurrent TRUNCATE
-        // cannot unlink the file this scan is reading.
-        let guard = self.lock.acquire_shared(txn.lock_owner);
-        let rel = self.effective_rel(txn.xid);
-        let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
-        Box::new(HeapScan {
-            engine: Arc::clone(&self.engine),
-            rel,
-            txn: txn.clone(),
-            nblocks,
-            cur_block: 0,
-            projection: match projection {
-                ColumnProjection::All => None,
-                ColumnProjection::Some(wanted) => Some(Arc::clone(wanted)),
-            },
-            buffer: Vec::new(),
-            buf_idx: 0,
-            _guard: guard,
-        })
+        Box::new(self.open_scan(txn, projection, false))
+    }
+
+    /// The heap stores the MVCC header on the page and already decodes it once
+    /// per row to judge visibility, so this costs the copy into the buffer and
+    /// nothing else.
+    fn supports_system_columns(&self) -> bool {
+        true
+    }
+
+    fn scan_with_system(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Option<SystemTupleStream> {
+        Some(Box::new(HeapSystemScan(
+            self.open_scan(txn, projection, true),
+        )))
     }
 
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         let _guard = self.lock.acquire_shared(txn.lock_owner);
         let rel = self.effective_rel(txn.xid);
         let nblocks = Self::io(self.engine.bufpool.smgr().nblocks(rel));
-        fetch_at(&self.engine, rel, nblocks, tid, txn)
+        Ok(fetch_at(&self.engine, rel, nblocks, tid, txn)?.map(|(_, tuple)| tuple))
     }
 
     fn insert(&self, tuple: Tuple, txn: &TxnContext) -> Result<Tid, StorageError> {
@@ -1834,7 +1928,7 @@ impl TableAm for HeapTable {
         let new_bytes = self.write_planned(&tuple, &hdr, planned, txn)?;
         let new_tid = self.place(rel, txn.xid, &new_bytes);
         self.maintain_insert(&tuple, new_tid, txn.xid)?;
-        Ok(UpdateResult::Updated)
+        Ok(UpdateResult::Updated(new_tid))
     }
 
     fn delete(&self, tid: Tid, txn: &TxnContext) -> Result<DeleteResult, StorageError> {
@@ -2154,10 +2248,31 @@ struct HeapScan {
     /// straight out of [`ColumnProjection::Some`].
     projection: Option<Arc<[usize]>>,
     buffer: Vec<(Tid, Tuple)>,
+    /// Each buffered row's MVCC header, index-aligned with `buffer` — filled
+    /// only when the caller asked for it (see [`HeapTable::scan_with_system`]),
+    /// and left empty otherwise so an ordinary scan writes nothing extra per
+    /// row.
+    headers: Vec<TupleHeader>,
+    want_headers: bool,
     buf_idx: usize,
     /// Shared table-lock hold kept for the iterator's whole life, so a concurrent
     /// TRUNCATE cannot unlink `rel` mid-scan.
     _guard: SharedGuard,
+}
+
+/// [`HeapScan`] as the header-carrying stream [`TableAm::scan_with_system`]
+/// promises. A thin wrapper rather than a second scan: `next` refills both
+/// buffers together and advances one index across them, so the header of the
+/// row it just yielded is the one at the position it just left.
+struct HeapSystemScan(HeapScan);
+
+impl Iterator for HeapSystemScan {
+    type Item = Result<(Tid, TupleHeader, Tuple), StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.0.next()?;
+        Some(row.map(|(tid, tuple)| (tid, self.0.headers[self.0.buf_idx - 1], tuple)))
+    }
 }
 
 impl Iterator for HeapScan {
@@ -2182,8 +2297,11 @@ impl Iterator for HeapScan {
             let block = self.cur_block;
             self.cur_block += 1;
             self.buffer.clear();
+            self.headers.clear();
             self.buf_idx = 0;
             let page = HeapTable::io(self.engine.bufpool.pin(self.rel, block));
+            let want_headers = self.want_headers;
+            let mut hdrs: Vec<TupleHeader> = Vec::new();
             let raw: Vec<(Tid, Result<tuple::RawTuple, StorageError>)> = page.read(|pg| {
                 let max_off = page::max_offset(pg);
                 // Sized up front so the growth ladder does not run inside the
@@ -2206,6 +2324,9 @@ impl Iterator for HeapScan {
                                 Some(wanted) => tuple::decode_raw_projected(bytes, wanted),
                                 None => tuple::decode_raw(bytes),
                             };
+                            if want_headers {
+                                hdrs.push(head.hdr);
+                            }
                             out.push((Tid { block, offset: off }, raw));
                         }
                     }
@@ -2214,6 +2335,7 @@ impl Iterator for HeapScan {
             });
             // Detoast only after the frame lock is released — the scan already
             // buffers a whole block before yielding, so this costs no extra pass.
+            self.headers = hdrs;
             self.buffer.reserve(raw.len());
             for (tid, t) in raw {
                 match t.and_then(|t| t.resolve(|p| detoast(&self.engine, p))) {

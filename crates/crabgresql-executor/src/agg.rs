@@ -136,6 +136,7 @@ pub(crate) fn key_encoding(ty: PgType) -> KeyEncoding {
         | PgType::Oid
         | PgType::Xid
         | PgType::Xid8
+        | PgType::Cid
         | PgType::PgLsn
         | PgType::Money
         | PgType::Date
@@ -205,6 +206,7 @@ pub(crate) fn scalar_code(ty: PgType, v: &Value) -> u64 {
         (PgType::Float8, Value::Float8(x)) => canonical_f64(*x).to_bits(),
         (PgType::Oid, Value::Oid(o)) => *o as u64,
         (PgType::Xid, Value::Xid(x)) => *x as u64,
+        (PgType::Cid, Value::Cid(x)) => *x as u64,
         (PgType::Xid8, Value::Xid8(x)) => *x,
         (PgType::PgLsn, Value::PgLsn(x)) => *x,
         (PgType::Money, Value::Money(m)) => *m as u64,
@@ -700,6 +702,15 @@ pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
             }
             PgType::Xid => {
                 if let Value::Xid(x) = v {
+                    x.hash(&mut h);
+                }
+            }
+            // Both are in `hashes_distinctly`, so the planner will choose a hash
+            // join on one; without an arm here every value would land in the
+            // same bucket and the join would run quadratic while `EXPLAIN` still
+            // called it a hash join.
+            PgType::Cid => {
+                if let Value::Cid(x) = v {
                     x.hash(&mut h);
                 }
             }

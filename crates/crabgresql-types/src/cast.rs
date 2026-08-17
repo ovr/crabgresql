@@ -720,6 +720,17 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 })
         }
 
+        // ---- text → cid (cidin) ----
+        (Value::Text(s), PgType::Cid) => {
+            crate::xid::cid_in(s)
+                .map(Value::Cid)
+                .map_err(|e| CastError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                    detail: None,
+                })
+        }
+
         // ---- xid8 → xid: PG's only declared cast for either type. It
         // truncates to the low 32 bits rather than range-checking. ----
         (Value::Xid8(v), PgType::Xid) => Ok(Value::Xid(*v as u32)),

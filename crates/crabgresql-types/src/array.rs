@@ -94,6 +94,7 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::TID, oid::TID_ARRAY),
     (oid::XID, oid::XID_ARRAY),
     (oid::XID8, oid::XID8_ARRAY),
+    (oid::CID, oid::CID_ARRAY),
     (oid::PG_LSN, oid::PG_LSN_ARRAY),
     (oid::FLOAT4, oid::FLOAT4_ARRAY),
     (oid::FLOAT8, oid::FLOAT8_ARRAY),

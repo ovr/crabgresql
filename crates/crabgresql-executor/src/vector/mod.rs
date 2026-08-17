@@ -73,6 +73,12 @@ pub fn layout_of(schema: &TableSchema) -> BatchLayout {
     Arc::from(schema.columns.clone())
 }
 
+/// [`layout_of`] for a column list assembled by the caller — an `Append` whose
+/// arms append system-column slots past the relation's own columns.
+pub fn layout_from(columns: Vec<Column>) -> BatchLayout {
+    Arc::from(columns)
+}
+
 /// A columnar node that met a state its compile step promised to rule out — a
 /// kernel that failed, a column that is not there, an operand of the wrong
 /// type. The nodes decline anything they cannot run, so reaching one of these

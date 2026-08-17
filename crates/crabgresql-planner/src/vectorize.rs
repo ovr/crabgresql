@@ -14,7 +14,7 @@
 //! Everything is a pure function of the plan, so no Arrow dependency is needed
 //! at this layer.
 
-use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, DistinctKey, SortKey, SystemEmit, UnaryOp};
 use crabgresql_types::{PgType, collation};
 
 use crate::{PhysicalAppendArm, PhysicalPlan};
@@ -265,11 +265,23 @@ fn tail_vectorization(scan: bool, width: usize, tail: Tail<'_>) -> Vectorization
 /// *either* side of an inheritance link, so no hierarchy can contain a
 /// batch-capable relation at all. That is what makes the all-or-none rule free
 /// rather than a silent de-optimization of the parent.
+///
+/// System slots are the third rule, and the one this exists to keep honest: the
+/// executor's `BatchAppend::open` can synthesize a constant `tableoid` column
+/// and nothing else, so an arm asking for any other system column runs on rows.
+/// Omitting the test here would print `EXPLAIN` output claiming a columnar scan
+/// for a node that does not run as one.
 fn arms_batch(arms: &[PhysicalAppendArm]) -> bool {
     !arms.is_empty()
-        && arms
-            .iter()
-            .all(|arm| arm.relation.map.is_none() && arm.relation.table.supports_batch_scan())
+        && arms.iter().all(|arm| {
+            arm.relation.map.is_none()
+                && arm.relation.table.supports_batch_scan()
+                && arm
+                    .relation
+                    .system
+                    .as_ref()
+                    .is_none_or(SystemEmit::is_batchable)
+        })
 }
 
 impl PhysicalPlan {

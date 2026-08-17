@@ -42,7 +42,7 @@ pub use params::{
     ParamCtx, ParamState, param_ctx_capped, param_ctx_extended, param_ctx_none, param_types,
     require_all_resolved,
 };
-pub use scope::{Binding, Scope, reject_agg_or_window};
+pub use scope::{Binding, DeclinedSystem, Scope, reject_agg_or_window};
 
 pub(crate) use bind::{
     bind_array_subquery, bind_coalesce, bind_nullif, bind_projection, output_name,

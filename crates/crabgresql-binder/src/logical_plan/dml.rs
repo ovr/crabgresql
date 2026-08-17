@@ -8,7 +8,7 @@ use crabgresql_storage_api::{TableAm, Tuple};
 use crate::OutputColumn;
 use crate::expr::BoundExpr;
 
-use super::{LogicalPlan, MappedRelation};
+use super::{LogicalPlan, MappedRelation, SysCol};
 
 /// [`LogicalPlan::Insert`]: rows come from a `VALUES` list (full-width, schema
 /// order, each cell already coerced), from already-formed values (a COPY load),
@@ -35,12 +35,12 @@ pub struct InsertPlan {
     /// the statement happens to do — see
     /// [`crabgresql_txn::TxnContext::freeze_inserts`].
     pub freeze: bool,
-    /// Whether every row this statement forms carries a trailing `tableoid`
-    /// slot, because a WHERE, SET or RETURNING named it. The executor
-    /// appends the OID of the target the row actually lives in — the
-    /// partition or inheritance child, not the relation the statement
-    /// named.
-    pub tableoid: bool,
+    /// The system columns every row this statement forms carries as trailing
+    /// slots, in row order, because a WHERE, SET or RETURNING named them. The
+    /// executor fills them from the target the row actually lives in — the
+    /// partition or inheritance child, not the relation the statement named.
+    /// Empty for the statements that name none, which is nearly all of them.
+    pub system: Arc<[SysCol]>,
 }
 
 /// [`LogicalPlan::Update`].
@@ -70,9 +70,9 @@ pub struct UpdatePlan {
     /// notion — every row is updated where it lies, in its own relation, and
     /// nothing ever moves.
     pub inherited: Vec<MappedRelation>,
-    /// Whether every row this statement forms carries a trailing `tableoid`
-    /// slot; see the same field on [`InsertPlan`].
-    pub tableoid: bool,
+    /// The system columns every row this statement forms carries as trailing
+    /// slots; see the same field on [`InsertPlan`].
+    pub system: Arc<[SysCol]>,
 }
 
 /// [`LogicalPlan::Delete`].
@@ -91,9 +91,9 @@ pub struct DeletePlan {
     /// Inheritance fan-out, as on [`UpdatePlan`]: rows are deleted from
     /// whichever descendant holds them.
     pub inherited: Vec<MappedRelation>,
-    /// Whether every row this statement forms carries a trailing `tableoid`
-    /// slot; see the same field on [`InsertPlan`].
-    pub tableoid: bool,
+    /// The system columns every row this statement forms carries as trailing
+    /// slots; see the same field on [`InsertPlan`].
+    pub system: Arc<[SysCol]>,
 }
 
 /// A bound `RETURNING` target list: the output column shape plus one expression

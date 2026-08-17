@@ -37,7 +37,7 @@ use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
     ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
-    RoutineDefinition, RoutineKind, TypeRef, Volatility,
+    RoutineDefinition, RoutineKind, TypeRef, Volatility, definition_fingerprint,
 };
 use crate::guc;
 use crate::routines::{RoutineDispatch, SessionNotices};
@@ -725,6 +725,62 @@ pub fn execute_statement(
 /// that calls a routine already gets. `DECLARE` needs it because the rows
 /// outlive the statement that produced them.
 pub(crate) fn execute_statement_with(
+    engine: &Arc<dyn TableEngine>,
+    global_catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    stmt: &ast::Statement,
+    session: &mut Session,
+    params: &BoundParams,
+    force_materialize: bool,
+) -> Result<QueryResult, PgError> {
+    let result = execute_statement_inner(
+        engine,
+        global_catalog,
+        txnmgr,
+        stmt,
+        session,
+        params,
+        force_materialize,
+    );
+    // The catalog's generation, which every `pg_catalog` row reports as its
+    // `xmin` (see `GlobalCatalog::note_ddl`). Bumped here, at the one point
+    // every schema-changing statement passes through, rather than at each of
+    // the two dozen DDL handlers — half of which mutate the storage engine and
+    // never touch `GlobalCatalog` at all.
+    //
+    // `read_only_prohibited_ddl` is exactly the classifier this needs: a
+    // statement PostgreSQL forbids in a read-only transaction is one that
+    // changes what the catalog would report.
+    if result.is_ok() && read_only_prohibited_ddl(stmt).is_some() {
+        // DDL uses a command id: upstream stamps catalog tuples with it, which
+        // is why `BEGIN; CREATE TABLE t(…); INSERT …` reports the inserted
+        // row's `cmin` as 1 rather than 0. Nothing here writes an MVCC catalog
+        // row, so the counter is advanced directly rather than as a side effect
+        // of a write.
+        advance_command_counter(session);
+        let generation = global_catalog.note_ddl(txnmgr.clog().next_xid_floor().0);
+        // Spend the XID numbers the generation just consumed, so the counter
+        // `age(xid)` subtracts from keeps up with it. Only a lower bound is
+        // raised — the allocator skips numbers, exactly as it does after a
+        // crash, and nothing reissues one already stamped on a tuple.
+        txnmgr
+            .clog()
+            .observe_next_xid(crabgresql_txn::Xid(generation + 1));
+        // …and which objects this statement actually changed, so each one's
+        // catalog rows carry a generation of its own. Derived from the shapes
+        // rather than from the statement — see `note_ddl_shapes`.
+        //
+        // Stamped with the generation `note_ddl` just installed, not with a
+        // second read of it: DDL allocates no XID, so the transaction counter
+        // would hand consecutive statements the same value, and re-reading the
+        // atomic would hand a concurrent session's.
+        global_catalog.note_ddl_shapes(catalog_object_shapes(engine), generation);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_statement_inner(
     engine: &Arc<dyn TableEngine>,
     global_catalog: &Arc<GlobalCatalog>,
     txnmgr: &Arc<TransactionManager>,
@@ -1471,7 +1527,8 @@ fn build_txn(txnmgr: &TransactionManager, session: &mut Session, is_write: bool)
 /// commits (or aborts on error) immediately — its effects are meant to persist
 /// at the statement boundary. Inside a block nothing is finalized here; the XID
 /// lives until `COMMIT`/`ROLLBACK`. The command counter advances so the next
-/// statement in a block sees this one's writes.
+/// statement in a block sees this one's writes — but only if this one *used*
+/// its command id; see [`advance_command_counter`].
 fn finalize_statement(
     txnmgr: &TransactionManager,
     session: &mut Session,
@@ -1500,10 +1557,16 @@ fn finalize_statement(
             // Read the counter back rather than adding one: a routine body may
             // have advanced it several times, and reusing an id it already
             // stamped rows with would hide those rows from the next statement.
-            let used = command_counter.map_or(active.cid.0, |c| {
+            let routine = command_counter.map_or(active.cid.0, |c| {
                 c.load(std::sync::atomic::Ordering::Acquire)
             });
-            active.cid = CommandId(used.max(active.cid.0) + 1);
+            // A statement that stamped nothing leaves the counter where it is,
+            // as upstream's `currentCommandIdUsed` does — otherwise a `SELECT`
+            // between two `INSERT`s pushes the second row's `cmin` a command
+            // past what PostgreSQL reports for it.
+            if is_write || routine > active.cid.0 {
+                active.cid = CommandId(routine.max(active.cid.0) + 1);
+            }
         }
     }
     Ok(())
@@ -1884,6 +1947,49 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::DropCast { .. } => "DROP CAST",
         _ => return None,
     })
+}
+
+/// Every object the catalog reflects, keyed the way `SessionCatalogSource`
+/// keys it, with a fingerprint of its definition.
+///
+/// All four kinds, not just stored tables: a view or a sequence is a `pg_class`
+/// row like any other, and one left out of the fingerprint map has no
+/// generation of its own — so its `xmin` would move on every DDL anywhere in
+/// the server, which is the behavior the per-relation generation replaced.
+fn catalog_object_shapes(
+    engine: &Arc<dyn TableEngine>,
+) -> impl IntoIterator<Item = ((String, String), u64)> {
+    let tables = engine.relation_metadata().into_iter().map(|r| {
+        (
+            (r.schema.namespace.clone(), r.schema.name.clone()),
+            definition_fingerprint(&(&r.schema, &r.indexes)),
+        )
+    });
+    let views = engine.views().into_iter().map(|v| {
+        (
+            (v.namespace.clone(), v.name.clone()),
+            definition_fingerprint(&v),
+        )
+    });
+    let sequences = engine.sequences().into_iter().map(|s| {
+        (
+            (s.namespace.clone(), s.name.clone()),
+            definition_fingerprint(&s),
+        )
+    });
+    tables.chain(views).chain(sequences).collect::<Vec<_>>()
+}
+
+/// Move the block's command counter on, for a statement that used its command
+/// id without going through [`finalize_statement`] — a DDL statement, which
+/// returns from its own handler.
+///
+/// A no-op under autocommit: the counter is per block, and a statement outside
+/// one has no successor to hide its writes from.
+fn advance_command_counter(session: &mut Session) {
+    if let Some(active) = session.xact.as_mut() {
+        active.cid = CommandId(active.cid.0 + 1);
+    }
 }
 
 /// `BEGIN` / `START TRANSACTION`. Enters the transaction block, seeding its
@@ -4205,6 +4311,7 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
+        reject_system_column_name(&column_name)?;
         let typmod = crabgresql_binder::declared_typmod(ty, &col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
         if let Some(base) = serial_base {
@@ -5691,9 +5798,14 @@ fn execute_create_table_as(
     }
 
     // A projected `reg*` cannot be stored, for the same reason a declared one
-    // cannot (see `reject_stored_reg_type`).
+    // cannot (see `reject_stored_reg_type`); and a projected column cannot be
+    // named after a system column, for the same reason a declared one cannot
+    // (see `reject_system_column_name`). Both apply to the output names, which
+    // is where an `AS` alias lands: `CREATE TABLE t AS SELECT 1 AS ctid` is the
+    // spelling upstream rejects.
     for c in &cols {
         reject_stored_reg_type(c.ty, &c.name)?;
+        reject_system_column_name(&c.name)?;
     }
     let mut schema = TableSchema {
         name: name.clone(),
@@ -5777,7 +5889,7 @@ fn execute_create_table_as(
         // transactional, so there would be no storage for a rollback to discard.
         freeze: false,
         // No RETURNING, so nothing reads a system column.
-        tableoid: false,
+        system: std::sync::Arc::from(&[][..]),
     });
 
     // Run the populate INSERT through the standard write tail. The DDL catalog
@@ -6287,6 +6399,41 @@ fn fresh_local_name(taken: impl Fn(&str) -> bool, base: &str) -> String {
 /// on the type name mapping.
 fn map_data_type(dt: &ast::DataType) -> Result<PgType, PgError> {
     crabgresql_binder::map_data_type(dt).map_err(PgError::from)
+}
+
+/// Refuse to name a stored column after a system column.
+///
+/// Every relation already carries `ctid`, `xmin`, `cmin`, `xmax`, `cmax` and
+/// `tableoid` past its declared columns, so a declared column of the same name
+/// would shadow one — a reference resolves to the declared column and the system
+/// slot becomes unreachable. PostgreSQL forbids the collision outright rather
+/// than pick a winner, and this is that rule:
+///
+/// ```text
+/// ERROR:  42701: column name "ctid" conflicts with a system column name
+/// ```
+///
+/// **A view is deliberately exempt**, here as upstream: `CREATE VIEW v AS SELECT
+/// 1 AS ctid` is legal, because a view exposes no system columns for the name to
+/// collide with. That is the same distinction `without_declared` in the binder
+/// draws from the other side, and removing this exemption would reject SQL
+/// PostgreSQL accepts.
+///
+/// Only the two `CREATE TABLE` paths call this: `ALTER TABLE ADD COLUMN` and
+/// `ALTER TABLE RENAME COLUMN` — which upstream checks too — have no handler in
+/// this build yet, so there is nowhere to put the third and fourth call.
+fn reject_system_column_name(column: &str) -> Result<(), PgError> {
+    // From the binder's own list, so the two can never name different columns.
+    match crabgresql_binder::SysCol::ALL
+        .iter()
+        .any(|c| c.name() == column)
+    {
+        false => Ok(()),
+        true => Err(PgError::new(
+            sqlstate::DUPLICATE_COLUMN,
+            format!("column name \"{column}\" conflicts with a system column name"),
+        )),
+    }
 }
 
 /// Refuse to give a stored column a `reg*` type.

@@ -11,11 +11,21 @@
 use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::{
-    ColumnProjection, DeleteResult, RelStats, StorageError, TableAm, TableSchema, Tid, Tuple,
-    TupleStream, UpdateResult, txn::TxnContext,
+    ColumnProjection, DeleteResult, RelStats, StorageError, SystemTupleStream, TableAm,
+    TableSchema, Tid, Tuple, TupleStream, UpdateResult, txn::TxnContext,
 };
-use crabgresql_txn::Xid;
+use crabgresql_txn::{CommandId, Infomask, TupleHeader, Xid};
 use crabgresql_types::Value;
+
+/// The tid of the `i`th catalog row, and its inverse. Offsets start at 1: see
+/// [`StaticTable::scan`].
+fn row_tid(i: usize) -> Tid {
+    Tid::from_packed(i as u64 + 1)
+}
+
+fn row_index(tid: Tid) -> Option<usize> {
+    (tid.packed() as usize).checked_sub(1)
+}
 
 /// Where a [`StaticTable`]'s rows come from: built already, or built on the
 /// first read.
@@ -35,10 +45,38 @@ enum Rows {
     },
 }
 
+/// Where a catalog row's `xmin` comes from.
+///
+/// Catalog rows have no version history of their own: they are derived afresh
+/// from live server state on every statement, so there is no per-row xid to
+/// report. What callers actually read `xmin` off a catalog relation for is a
+/// *state number* — a value that changes exactly when the thing described does —
+/// and a DDL generation is that value.
+#[derive(Clone)]
+enum CatalogXmin {
+    /// One generation for every row: the catalog-wide one. What a relation whose
+    /// rows describe types, functions or settings reports, since there is no
+    /// finer generation to hand out.
+    Snapshot(Xid),
+    /// Per row, keyed by the OID of the relation the row describes — see
+    /// [`crate::registry::CatalogRelDef::xmin_column`]. This is what keeps
+    /// `CREATE TABLE b` from looking like it changed `a`.
+    PerRelation {
+        /// Ordinal of the column holding that OID.
+        column: usize,
+        by_oid: Arc<std::collections::HashMap<u32, Xid>>,
+        /// For a row whose OID names no live relation — a built-in that
+        /// describes nothing, or a row built before the map was.
+        default: Xid,
+    },
+}
+
 /// One `pg_catalog` relation: its schema plus its rows.
 pub struct StaticTable {
     schema: Arc<TableSchema>,
     rows: Rows,
+    /// Where each row's `xmin` comes from — see [`CatalogXmin`].
+    xmin: CatalogXmin,
 }
 
 impl StaticTable {
@@ -46,6 +84,7 @@ impl StaticTable {
         Self {
             schema: Arc::new(schema),
             rows: Rows::Ready(Arc::new(rows)),
+            xmin: CatalogXmin::Snapshot(Xid::INVALID),
         }
     }
 
@@ -54,18 +93,73 @@ impl StaticTable {
         Arc::new(Self::new(schema, rows))
     }
 
-    /// See [`Rows::Deferred`].
+    /// Report `xmin` from the catalog-wide DDL generation — see [`CatalogXmin`].
+    #[must_use]
+    pub fn with_xmin(mut self, xmin: Xid) -> Self {
+        self.xmin = CatalogXmin::Snapshot(xmin);
+        self
+    }
+
+    /// Report `xmin` per row, from the generation of the relation each row
+    /// describes — see [`CatalogXmin::PerRelation`]. `column` is the ordinal of
+    /// the column holding that relation's OID.
+    #[must_use]
+    pub fn with_relation_xmin(
+        mut self,
+        column: usize,
+        by_oid: Arc<std::collections::HashMap<u32, Xid>>,
+        default: Xid,
+    ) -> Self {
+        self.xmin = CatalogXmin::PerRelation {
+            column,
+            by_oid,
+            default,
+        };
+        self
+    }
+
+    /// See [`Rows::Deferred`]. The caller sets the `xmin` afterwards, exactly as
+    /// for a ready relation — a deferred one is no less entitled to a
+    /// per-relation generation.
     pub fn deferred(
         schema: TableSchema,
         build: impl Fn() -> Vec<Tuple> + Send + Sync + 'static,
-    ) -> Arc<dyn TableAm> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             schema: Arc::new(schema),
             rows: Rows::Deferred {
                 build: Box::new(build),
                 built: OnceLock::new(),
             },
-        })
+            xmin: CatalogXmin::Snapshot(Xid::INVALID),
+        }
+    }
+
+    /// The header `row` reports; see [`CatalogXmin`]. A catalog row is never
+    /// deleted in place, so `xmax` is always invalid and both command ids are
+    /// the first one.
+    fn header(&self, row: &[Value]) -> TupleHeader {
+        let xmin = match &self.xmin {
+            CatalogXmin::Snapshot(xmin) => *xmin,
+            CatalogXmin::PerRelation {
+                column,
+                by_oid,
+                default,
+            } => match row.get(*column) {
+                // A row built to a different width, or an OID naming nothing
+                // live: neither is worth failing a scan over, and the
+                // catalog-wide generation is the honest fallback.
+                Some(Value::Oid(oid)) => by_oid.get(oid).copied().unwrap_or(*default),
+                _ => *default,
+            },
+        };
+        TupleHeader {
+            xmin,
+            xmax: Xid::INVALID,
+            cmin: CommandId::FIRST,
+            cmax: CommandId::FIRST,
+            infomask: Infomask::default(),
+        }
     }
 
     fn rows(&self) -> Arc<Vec<Tuple>> {
@@ -115,11 +209,12 @@ impl TableAm for StaticTable {
     /// exactly as the heap's projected scan leaves them.
     fn scan(&self, _txn: &TxnContext, projection: &ColumnProjection) -> TupleStream {
         // Synthetic tids from the row index; catalog rows are always visible.
+        // Numbered from 1, because offset 0 is `InvalidOffsetNumber` upstream —
+        // PostgreSQL's line pointers start at 1, so a `ctid` of `(0,0)` is a
+        // value no relation ever hands out and a client is entitled to reject.
         let rows = self.rows();
         let ColumnProjection::Some(wanted) = projection else {
-            return Box::new(
-                (0..rows.len()).map(move |i| Ok((Tid::from_packed(i as u64), rows[i].clone()))),
-            );
+            return Box::new((0..rows.len()).map(move |i| Ok((row_tid(i), rows[i].clone()))));
         };
         let wanted = Arc::clone(wanted);
         Box::new((0..rows.len()).map(move |i| {
@@ -134,12 +229,41 @@ impl TableAm for StaticTable {
                     out[column] = value.clone();
                 }
             }
-            Ok((Tid::from_packed(i as u64), out))
+            Ok((row_tid(i), out))
         }))
     }
 
     fn fetch(&self, tid: Tid, _txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
-        Ok(self.rows().get(tid.packed() as usize).cloned())
+        Ok(row_index(tid).and_then(|i| self.rows().get(i).cloned()))
+    }
+
+    /// A catalog relation answers all of them. The tids are synthetic but
+    /// stable within a statement, which is all `ctid` promises here, and the
+    /// header is the snapshot-wide one described on [`StaticTable::with_xmin`].
+    fn supports_system_columns(&self) -> bool {
+        true
+    }
+
+    fn scan_with_system(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Option<SystemTupleStream> {
+        // Headers come off the **unprojected** rows: a per-relation `xmin` reads
+        // the OID column, which the projection is free to have left as a
+        // placeholder. They are computed up front rather than per yielded row so
+        // the closure below borrows nothing.
+        let headers: Vec<TupleHeader> = self.rows().iter().map(|row| self.header(row)).collect();
+        // Both this and `scan` number rows by the same index, and `rows()`
+        // memoizes a deferred build, so the two see the same vector and the
+        // lookup below is total.
+        let rows = self.scan(txn, projection);
+        Some(Box::new(rows.map(move |row| {
+            row.map(|(tid, tuple)| {
+                let i = row_index(tid).expect("a tid this scan minted");
+                (tid, headers[i], tuple)
+            })
+        })))
     }
 
     fn insert(&self, _tuple: Tuple, _txn: &TxnContext) -> Result<Tid, StorageError> {

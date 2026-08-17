@@ -44,7 +44,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, StructArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, new_null_array,
+    Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, UInt32Array, new_null_array,
 };
 use arrow_buffer::i256;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
@@ -320,6 +320,10 @@ pub fn arrow_type(ty: PgType, typmod: i32) -> DataType {
         PgType::Char => DataType::UInt8,
         PgType::Int2 => DataType::Int16,
         PgType::Int4 => DataType::Int32,
+        // Not in `supports_type`, so no relation stores one — this exists for
+        // the `tableoid` column an `Append` arm synthesizes onto each batch,
+        // which is a value the scan produces rather than one it reads.
+        PgType::Oid => DataType::UInt32,
         PgType::Int8 => DataType::Int64,
         PgType::Float4 => DataType::Float32,
         PgType::Float8 => DataType::Float64,
@@ -741,6 +745,8 @@ pub fn decode_value(column: &Column, array: &dyn Array, row: usize) -> Result<Va
         PgType::Char => primitive!(UInt8Array, Value::Char),
         PgType::Int2 => primitive!(Int16Array, Value::Int2),
         PgType::Int4 => primitive!(Int32Array, Value::Int4),
+        // See the `arrow_type` arm: a synthesized `tableoid`, never storage.
+        PgType::Oid => primitive!(UInt32Array, Value::Oid),
         PgType::Int8 => primitive!(Int64Array, Value::Int8),
         PgType::Float4 => primitive!(Float32Array, Value::Float4),
         PgType::Float8 => primitive!(Float64Array, Value::Float8),

@@ -45,4 +45,4 @@ pub use values::Values;
 pub use window_agg::WindowAgg;
 
 /// The DML paths build their row source from the same probe [`IndexScan`] does.
-pub(crate) use index_scan::index_probe_rows;
+pub(crate) use index_scan::{index_probe_rows, index_probe_system_rows};

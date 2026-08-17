@@ -12782,6 +12782,773 @@ async fn tableoid_names_the_leaf_a_row_lives_in() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The five system columns beyond `tableoid`, read off a plain heap relation.
+///
+/// Values are not pinned — a tid and a transaction id are both allocation
+/// results — so what is asserted is the *shape*: the declared types, that `*`
+/// leaves them alone, that `ctid` addresses the row it came from, and that a
+/// live version reports no deleter.
+#[tokio::test]
+async fn system_columns_on_a_heap_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2)")
+        .await?;
+
+    // The types PostgreSQL 18.4 declares: `tid`, `xid`, `cid`, `xid`, `cid`.
+    let types = client
+        .simple_query(
+            "SELECT pg_typeof(ctid)::text, pg_typeof(xmin)::text, pg_typeof(cmin)::text, \
+             pg_typeof(xmax)::text, pg_typeof(cmax)::text FROM t LIMIT 1",
+        )
+        .await?;
+    let types = rows(&types);
+    assert_eq!(
+        (
+            types[0].get(0),
+            types[0].get(1),
+            types[0].get(2),
+            types[0].get(3),
+            types[0].get(4)
+        ),
+        (
+            Some("tid"),
+            Some("xid"),
+            Some("cid"),
+            Some("xid"),
+            Some("cid")
+        ),
+    );
+
+    // `*` expands the declared columns only, exactly as a negative `attnum` is
+    // skipped upstream.
+    let star = client.simple_query("SELECT * FROM t").await?;
+    assert_eq!(
+        rows(&star)[0].len(),
+        1,
+        "`*` must not reach a system column"
+    );
+
+    // A live version has no deleter, so `xmax` is the invalid xid — printed as
+    // `0`, as upstream prints it.
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t WHERE xmax = '0'::xid").await,
+        "2",
+    );
+
+    // `ctid` addresses the row it came from: the round trip must find it and
+    // nothing else. This is the identity a client's editable grid rests on.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT a FROM t WHERE ctid = (SELECT ctid FROM t WHERE a = 2)",
+        )
+        .await,
+        "2",
+    );
+    assert_eq!(
+        scalar(&client, "SELECT count(DISTINCT ctid) FROM t").await,
+        "2",
+        "a tid names exactly one version",
+    );
+    Ok(())
+}
+
+/// `cmin` and `cmax` report one number, and the command counter that produces
+/// it moves the way PostgreSQL's does.
+///
+/// Upstream keeps the two in a single field, so a row's `cmin` and `cmax` always
+/// agree; and the counter advances only for a command that *used* its id, so a
+/// `SELECT` between two `INSERT`s does not push the second row's `cmin` along.
+/// A DDL statement does use one — upstream stamps catalog tuples with it — which
+/// is why the first row inserted after a `CREATE TABLE` in the same block reads
+/// `1`, not `0`. Every value below is pinned against PostgreSQL 18.4.
+#[tokio::test]
+async fn cmin_and_cmax_track_postgresqls_command_counter() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    client
+        .simple_query(
+            "BEGIN; CREATE TABLE t (a int); \
+             INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)",
+        )
+        .await?;
+    let read = client
+        .simple_query("SELECT a, cmin::text, cmax::text FROM t ORDER BY a")
+        .await?;
+    let read = rows(&read);
+    for (i, row) in read.iter().enumerate() {
+        let expected = (i + 1).to_string();
+        assert_eq!(
+            (row.get(1), row.get(2)),
+            (Some(expected.as_str()), Some(expected.as_str())),
+            "row {} must report one command id for both",
+            i + 1,
+        );
+    }
+
+    // A read-only statement uses no command id, so the next insert keeps the
+    // one it would have had.
+    client.simple_query("SELECT 1").await?;
+    client.simple_query("INSERT INTO t VALUES (4)").await?;
+    assert_eq!(
+        scalar(&client, "SELECT cmin::text FROM t WHERE a = 4").await,
+        "4",
+    );
+    client.simple_query("COMMIT").await?;
+
+    // Once there is a deleter, both report *its* command id.
+    let deleted = client
+        .simple_query("DELETE FROM t WHERE a = 1 RETURNING cmin::text, cmax::text")
+        .await?;
+    let deleted = rows(&deleted);
+    assert_eq!(
+        (deleted[0].get(0), deleted[0].get(1)),
+        (Some("0"), Some("0"))
+    );
+    Ok(())
+}
+
+/// A `DELETE`'s `WHERE` reads the row as it is **stored**, not as the delete
+/// will leave it.
+///
+/// `xmax` is invalid on a live row, so `WHERE xmax = '0'::xid` matches every row
+/// and its negation matches none. Evaluating the qual against a header already
+/// stamped with this deleter inverts both, which is a silent wrong answer rather
+/// than an error: the rows go away. Pinned against PostgreSQL 18.4, and pinned
+/// alongside the equivalent SELECT, because the read and write paths reading one
+/// predicate differently is the shape the defect took.
+#[tokio::test]
+async fn a_delete_qual_reads_the_stored_row_not_the_deleted_one() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t WHERE xmax <> '0'::xid").await,
+        "0",
+        "no live row has a deleter",
+    );
+    client
+        .simple_query("DELETE FROM t WHERE xmax <> '0'::xid")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t").await,
+        "3",
+        "the DELETE must match exactly what the SELECT matched",
+    );
+
+    // The complement removes everything, and RETURNING — unlike the qual — does
+    // describe the row after the delete.
+    let deleted = client
+        .simple_query("DELETE FROM t WHERE xmax = '0'::xid RETURNING a, xmax <> '0'::xid")
+        .await?;
+    let deleted = rows(&deleted);
+    assert_eq!(deleted.len(), 3);
+    assert!(
+        deleted.iter().all(|r| r.get(1) == Some("t")),
+        "RETURNING names this deleter",
+    );
+    assert_eq!(scalar(&client, "SELECT count(*) FROM t").await, "0");
+    Ok(())
+}
+
+/// What `RETURNING` reports for each verb, which is not the same row in each
+/// case and is pinned against PostgreSQL 18.4:
+///
+///  * INSERT and UPDATE describe the **new** version — so its `ctid` is one the
+///    statement created, and `xmin` is this transaction;
+///  * DELETE describes the row it removed, with `xmax` already naming this
+///    transaction as the deleter.
+///
+/// The UPDATE case is the one a projection run before the write cannot answer:
+/// the new version has no address until it is placed.
+#[tokio::test]
+async fn returning_reports_the_version_each_verb_produces() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int)").await?;
+
+    let inserted = client
+        .simple_query("INSERT INTO t VALUES (1) RETURNING ctid::text, xmax::text")
+        .await?;
+    let inserted = rows(&inserted);
+    let insert_ctid = inserted[0].get(0).expect("a ctid").to_string();
+    assert_eq!(inserted[0].get(1), Some("0"), "a fresh row has no deleter");
+    assert_eq!(
+        scalar(&client, "SELECT ctid::text FROM t").await,
+        insert_ctid,
+        "RETURNING must report the address the row actually landed at",
+    );
+
+    // UPDATE reports the NEW version, which lives somewhere else.
+    let updated = client
+        .simple_query("UPDATE t SET a = 2 RETURNING ctid::text")
+        .await?;
+    let update_ctid = rows(&updated)[0].get(0).expect("a ctid").to_string();
+    assert_ne!(
+        update_ctid, insert_ctid,
+        "an MVCC update writes a new version",
+    );
+    assert_eq!(
+        scalar(&client, "SELECT ctid::text FROM t").await,
+        update_ctid,
+    );
+
+    // DELETE reports the row it removed, stamped with this deleter.
+    let deleted = client
+        .simple_query("DELETE FROM t RETURNING ctid::text, xmin = xmax AS self_deleted")
+        .await?;
+    let deleted = rows(&deleted);
+    assert_eq!(deleted[0].get(0), Some(update_ctid.as_str()));
+    assert_eq!(
+        deleted[0].get(1),
+        Some("f"),
+        "the inserter and the deleter are different transactions here",
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM (SELECT 1) s WHERE 't'::regclass IS NOT NULL",
+        )
+        .await,
+        "1",
+    );
+    Ok(())
+}
+
+/// A `ctid` handed back by a SELECT addresses the row for a later write — the
+/// idiom every editable result grid uses on a relation with no primary key.
+#[tokio::test]
+async fn ctid_addresses_a_row_for_a_later_write() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2), (3)")
+        .await?;
+    let ctid = scalar(&client, "SELECT ctid::text FROM t WHERE a = 2").await;
+
+    client
+        .simple_query(&format!("UPDATE t SET a = 20 WHERE ctid = '{ctid}'"))
+        .await?;
+    let read = client.simple_query("SELECT a FROM t ORDER BY a").await?;
+    assert_eq!(
+        rows(&read)
+            .iter()
+            .map(|r| r.get(0).unwrap_or("").to_string())
+            .collect::<Vec<_>>(),
+        vec!["1", "3", "20"],
+        "exactly the addressed row moved",
+    );
+    Ok(())
+}
+
+/// A partitioned read gives each leaf its own tid space, so `ctid` alone does
+/// not identify a row of the parent — `(tableoid, ctid)` does, which is the pair
+/// PostgreSQL documents for exactly this reason.
+#[tokio::test]
+async fn ctid_repeats_across_partitions_and_tableoid_separates_them() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a); \
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10); \
+             CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20); \
+             INSERT INTO p VALUES (1), (11)",
+        )
+        .await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(DISTINCT ctid) FROM p").await,
+        "1",
+        "the first row of each leaf shares an address",
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM (SELECT DISTINCT tableoid, ctid FROM p) s",
+        )
+        .await,
+        "2",
+        "the pair is what identifies a row of the parent",
+    );
+    Ok(())
+}
+
+/// A columnar access method stores column chunks, not row versions: there is no
+/// tid that addresses a row and no MVCC header to read. Answering with a
+/// placeholder would be worse than refusing — a client identifying rows by
+/// `ctid` would corrupt data with it — so the reference is a `0A000` at bind
+/// time. `tableoid` is unaffected: every relation has an identity.
+#[tokio::test]
+async fn system_columns_are_refused_on_a_columnar_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE q (a int, b text) USING parquet ORDER BY (a); \
+             INSERT INTO q VALUES (1, 'x')",
+        )
+        .await?;
+
+    for column in ["ctid", "xmin", "cmin", "xmax", "cmax"] {
+        let error = client
+            .simple_query(&format!("SELECT {column} FROM q"))
+            .await
+            .expect_err("a columnar relation has no row versions to report");
+        let error = error.as_db_error().expect("a server error");
+        assert_eq!(error.code().code(), "0A000", "reading {column}");
+        assert!(
+            error.message().contains(column) && error.message().contains("parquet"),
+            "the message must name both the column and the access method: {}",
+            error.message(),
+        );
+    }
+    assert_eq!(
+        scalar(&client, "SELECT tableoid::regclass::text FROM q").await,
+        "q",
+        "`tableoid` is a fact about the relation, not about its storage",
+    );
+
+    // The refusal is driven by a reference that actually resolved, not by the
+    // demand scan — which is a substring match over rendered SQL and so fires on
+    // a string literal, an alias, or a LIKE pattern. Every one of these is
+    // answered by PostgreSQL, and every one of them used to raise 0A000 here.
+    client
+        .simple_query("INSERT INTO q VALUES (2, 'xmin')")
+        .await?;
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM q WHERE b = 'xmin'").await,
+        "1",
+    );
+    assert_eq!(
+        scalar(&client, "SELECT a AS ctid FROM q WHERE a = 1").await,
+        "1"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM q WHERE b LIKE '%cmax%'").await,
+        "0",
+    );
+    client
+        .simple_query("CREATE VIEW vq AS SELECT a FROM q WHERE b = 'xmin'")
+        .await?;
+    Ok(())
+}
+
+/// Assigning to a system column is not a missing-column error: the name
+/// resolves, and it is the assignment that has nowhere to go. PostgreSQL says so
+/// with `0A000 cannot assign to system column`, which is the text pinned here.
+#[tokio::test]
+async fn a_system_column_cannot_be_assigned_to() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (a int)").await?;
+
+    let error = client
+        .simple_query("UPDATE t SET ctid = '(0,1)'")
+        .await
+        .expect_err("a system column is not an assignment target");
+    let error = error.as_db_error().expect("a server error");
+    assert_eq!(error.code().code(), "0A000");
+    assert_eq!(error.message(), "cannot assign to system column \"ctid\"");
+
+    // An INSERT column list is different, and reports 42703 as upstream does:
+    // there the name is looked up among the declared columns only.
+    let error = client
+        .simple_query("INSERT INTO t (ctid) VALUES ('(0,1)')")
+        .await
+        .expect_err("a system column is not an insert target");
+    let error = error.as_db_error().expect("a server error");
+    assert_eq!(error.code().code(), "42703");
+    assert_eq!(
+        error.message(),
+        "column \"ctid\" of relation \"t\" does not exist"
+    );
+    Ok(())
+}
+
+/// A table cannot declare a column named after a system column: the declared one
+/// would shadow the slot, and a reference would resolve to whichever the binder
+/// happened to look at first. PostgreSQL forbids the collision outright.
+///
+/// A **view** is exempt, here as upstream — it exposes no system columns, so
+/// there is nothing for the name to collide with. That exemption is the half
+/// worth pinning: rejecting it too would refuse SQL PostgreSQL accepts.
+#[tokio::test]
+async fn a_table_cannot_declare_a_system_column_name() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    for column in ["ctid", "xmin", "cmin", "xmax", "cmax", "tableoid"] {
+        let error = client
+            .simple_query(&format!("CREATE TABLE bad_{column} ({column} int)"))
+            .await
+            .expect_err("a system column name is not available");
+        let error = error.as_db_error().expect("a server error");
+        assert_eq!(error.code().code(), "42701", "declaring {column}");
+        assert_eq!(
+            error.message(),
+            format!("column name \"{column}\" conflicts with a system column name"),
+        );
+    }
+
+    // `CREATE TABLE AS` names its columns from the query's output list, so the
+    // same rule has to reach an `AS` alias.
+    let error = client
+        .simple_query("CREATE TABLE bad_ctas AS SELECT 1 AS xmin")
+        .await
+        .expect_err("an output name is a column name too");
+    assert_eq!(
+        error.as_db_error().expect("a server error").code().code(),
+        "42701",
+    );
+
+    // A view has no system columns, so nothing collides.
+    client
+        .simple_query("CREATE VIEW ok_view AS SELECT 1 AS ctid, 2 AS xmin")
+        .await?;
+    assert_eq!(scalar(&client, "SELECT ctid FROM ok_view").await, "1");
+    Ok(())
+}
+
+/// Reading `xmin` must not cost the statement its index path.
+///
+/// The MVCC header lives on the heap page the probe already re-reads, so the
+/// only thing that ever stood in the way was the probe API dropping it. Asserted
+/// through `EXPLAIN`, because that is the sole observable difference: the rows
+/// are the same either way, which is exactly why a silent fallback to a full
+/// scan could sit here unnoticed.
+#[tokio::test]
+async fn reading_the_mvcc_header_keeps_the_index_path() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE t (pk int PRIMARY KEY, a int); \
+             INSERT INTO t SELECT g, g FROM generate_series(1, 200) g",
+        )
+        .await?;
+
+    for statement in [
+        "UPDATE t SET a = 1 WHERE pk = 7 AND xmin <> '0'::xid",
+        "DELETE FROM t WHERE pk = 9 AND cmin = '0'::cid",
+    ] {
+        let plan = client.simple_query(&format!("EXPLAIN {statement}")).await?;
+        let plan: Vec<String> = rows(&plan)
+            .iter()
+            .map(|r| r.get(0).unwrap_or("").to_string())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("Index Scan using t_pkey")),
+            "reading a system column must not withhold the probe: {plan:?}",
+        );
+        // The system column is named, not printed as a bare ordinal — a plan
+        // that says `$2` describes nothing a reader can act on.
+        assert!(
+            plan.iter().any(|line| line.contains("Filter: (xmin"))
+                || plan.iter().any(|line| line.contains("Filter: (cmin")),
+            "the filter must name the system column: {plan:?}",
+        );
+    }
+
+    // The read path keeps the index too. It is the same relation and the same
+    // key, so only the plan can tell the difference — and a silent fall back to
+    // a full scan is exactly what a monolithic relation wrapped in a one-armed
+    // `Append` would do.
+    for column in ["ctid", "xmin", "cmin"] {
+        let plan = client
+            .simple_query(&format!("EXPLAIN SELECT {column}, a FROM t WHERE pk = 7"))
+            .await?;
+        assert!(
+            rows(&plan)
+                .iter()
+                .any(|r| r.get(0).unwrap_or("").contains("Index Scan using t_pkey")),
+            "reading {column} must not cost the SELECT its index path",
+        );
+    }
+    assert_eq!(
+        scalar(&client, "SELECT a FROM t WHERE pk = 7").await,
+        scalar(&client, "SELECT a FROM t WHERE pk = 7 AND ctid IS NOT NULL").await,
+        "and the rows are the same either way",
+    );
+
+    // And the statement still touches exactly the row the key selects.
+    let updated = client
+        .simple_query("UPDATE t SET a = -1 WHERE pk = 7 AND xmin <> '0'::xid RETURNING pk")
+        .await?;
+    let updated = rows(&updated);
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].get(0), Some("7"));
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t WHERE a = -1").await,
+        "1",
+        "exactly the row the key selected",
+    );
+    Ok(())
+}
+
+/// `cid` carries exactly the operators PostgreSQL gives it, which is fewer than
+/// `xid`'s: `=` and nothing else — not even `<>`, and no ordering. It does
+/// belong in GROUP BY / DISTINCT, which need equality rather than an order.
+#[tokio::test]
+async fn cid_has_equality_and_nothing_else() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2)")
+        .await?;
+
+    assert_eq!(
+        scalar(&client, "SELECT count(*) FROM t WHERE cmin = '0'::cid").await,
+        "2",
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM (SELECT DISTINCT cmin FROM t) s"
+        )
+        .await,
+        "1",
+        "equality is all a dedup needs",
+    );
+
+    // An array of them is constructible, and hashes to distinct buckets so a
+    // join on one is not quietly quadratic — both were missed when the type was
+    // added, and neither fails loudly.
+    assert_eq!(
+        scalar(&client, "SELECT array['1'::cid, '2'::cid]::text").await,
+        "{1,2}",
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM t WHERE cmin = ANY (array['0'::cid])"
+        )
+        .await,
+        "2",
+    );
+
+    for (sql, code) in [
+        ("SELECT count(*) FROM t WHERE cmin <> '0'::cid", "42883"),
+        ("SELECT cmin FROM t ORDER BY cmin", "42883"),
+        // A DISTINCT aggregate sorts its inputs upstream, so it needs an
+        // ordering — a stricter gate than the bare DISTINCT two lines up, which
+        // needs only equality and is legal.
+        ("SELECT count(DISTINCT cmin) FROM t", "42883"),
+    ] {
+        let error = client
+            .simple_query(sql)
+            .await
+            .expect_err("cid has neither <> nor an ordering");
+        assert_eq!(
+            error.as_db_error().expect("a server error").code().code(),
+            code,
+            "{sql}",
+        );
+    }
+    Ok(())
+}
+
+/// A columnar relation reads as an `Append` over its chunk store and its write
+/// buffer, and `tableoid` is the one system column those access methods can
+/// answer — so it must not knock the node off the batch path.
+///
+/// The width is what this really pins. The batch gains a column the relation's
+/// schema does not have, and a shred that decoded against the schema alone would
+/// hand up rows one column short: every projection past that point would read
+/// the wrong column, or index past the end. That is a silent wrong answer in the
+/// best case, so it is asserted against the row path's answer directly.
+#[tokio::test]
+async fn tableoid_stays_on_the_batch_path_for_a_columnar_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE q (a int, b text) USING parquet ORDER BY (a); \
+             INSERT INTO q VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+        )
+        .await?;
+
+    let plan = client
+        .simple_query("EXPLAIN SELECT tableoid, a, b FROM q WHERE a > 1")
+        .await?;
+    assert!(
+        rows(&plan)
+            .iter()
+            .any(|r| r.get(0).unwrap_or("").contains("columnar: scan")),
+        "a `tableoid` slot must not put the Append back on the row path",
+    );
+
+    // Full width, a projected subset, and an empty result all have to come back
+    // with the columns in the right places.
+    let read = client
+        .simple_query("SELECT tableoid::regclass::text, a, b FROM q ORDER BY a")
+        .await?;
+    let read = rows(&read);
+    assert_eq!(read.len(), 3);
+    assert_eq!(
+        (read[0].get(0), read[0].get(1), read[0].get(2)),
+        (Some("q"), Some("1"), Some("x")),
+    );
+    let narrow = client
+        .simple_query("SELECT tableoid::regclass::text, a FROM q ORDER BY a")
+        .await?;
+    assert_eq!(
+        rows(&narrow)[2].get(1),
+        Some("3"),
+        "a pruned column must not shift the rest"
+    );
+    let empty = client
+        .simple_query("SELECT tableoid::regclass::text, a FROM q WHERE a > 100")
+        .await?;
+    assert!(rows(&empty).is_empty());
+    Ok(())
+}
+
+/// A catalog row has no version history of its own — it is derived from live
+/// server state on every statement — so its `xmin` reports a DDL generation
+/// instead. What clients read it for is a state number: DataGrip compares
+/// `age(xmin)` against a threshold to decide whether its cached schema is stale.
+///
+/// The property that makes it useful is *per relation*: a row describing `t`
+/// must move when `t` changes and stand still when anything else does.
+/// Otherwise one `CREATE TABLE` invalidates a client's whole cached schema, and
+/// the value carries no more information than a global clock would.
+#[tokio::test]
+async fn catalog_xmin_tracks_each_relations_own_ddl() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let generation = |relation: &'static str| {
+        let client = &client;
+        async move {
+            scalar(
+                client,
+                &format!("SELECT xmin::text FROM pg_class WHERE relname = '{relation}'"),
+            )
+            .await
+        }
+    };
+
+    client
+        .simple_query("CREATE TABLE t (a int); CREATE TABLE u (a int)")
+        .await?;
+    let (t0, u0) = (generation("t").await, generation("u").await);
+    assert_ne!(
+        t0, u0,
+        "two relations created by two statements have two generations",
+    );
+
+    // DML changes no definition, so nothing moves.
+    client.simple_query("INSERT INTO t VALUES (1)").await?;
+    assert_eq!(generation("t").await, t0, "DML changes no schema");
+    assert_eq!(generation("u").await, u0);
+
+    // DDL on `t` moves `t` and leaves `u` alone — the whole point.
+    client
+        .simple_query("ALTER TABLE t ADD CONSTRAINT t_chk CHECK (a > 0)")
+        .await?;
+    let t1 = generation("t").await;
+    assert!(
+        t1.parse::<u64>()? > t0.parse::<u64>()?,
+        "a changed relation's generation only ever moves forward",
+    );
+    assert_eq!(
+        generation("u").await,
+        u0,
+        "an untouched relation stands still"
+    );
+
+    // Creating an unrelated relation moves neither.
+    client.simple_query("CREATE TABLE v (a int)").await?;
+    assert_eq!(generation("t").await, t1);
+    assert_eq!(generation("u").await, u0);
+
+    // `pg_attribute` describes relations too, so its rows follow the relation
+    // they belong to rather than the catalog as a whole.
+    let attr = |relation: &'static str| {
+        let client = &client;
+        async move {
+            scalar(
+                client,
+                &format!(
+                    "SELECT DISTINCT xmin::text FROM pg_attribute \
+                     WHERE attrelid = '{relation}'::regclass"
+                ),
+            )
+            .await
+        }
+    };
+    assert_eq!(attr("t").await, t1);
+    assert_eq!(attr("u").await, u0);
+
+    // A view is a `pg_class` row like any other and gets a generation of its
+    // own; a source that only fingerprinted stored tables would leave it
+    // drifting on every DDL anywhere in the server.
+    client
+        .simple_query("CREATE VIEW vgen AS SELECT 1 AS z")
+        .await?;
+    let v0 = generation("vgen").await;
+    client.simple_query("CREATE TABLE w (a int)").await?;
+    assert_eq!(
+        generation("vgen").await,
+        v0,
+        "an untouched view stands still"
+    );
+
+    // `age()` is the shape the question is asked in, and it can never read as
+    // negative: the generation is published back to the counter it subtracts
+    // from.
+    let ages = client
+        .simple_query("SELECT age(xmin) FROM pg_class")
+        .await?;
+    for row in rows(&ages) {
+        assert!(
+            row.get(0).unwrap_or("-1").parse::<i32>()? >= 0,
+            "age(xmin) must never be negative",
+        );
+    }
+    Ok(())
+}
+
+/// `pg_attribute` lists the six system attributes for the relations that have
+/// them and for no others.
+///
+/// Probed by relkind against PostgreSQL 18.4: an ordinary table, a partitioned
+/// parent, a sequence and a TOAST relation publish all six; a view and an index
+/// publish none. A view having none is the same fact the binder acts on when it
+/// exposes no system column there — a catalog that advertised six would describe
+/// columns the server refuses to serve.
+#[tokio::test]
+async fn pg_attribute_lists_system_attributes_only_where_they_exist() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE t (a int, b text); CREATE VIEW v AS SELECT a FROM t;              CREATE INDEX t_a ON t (a)",
+        )
+        .await?;
+
+    let sysattrs = |relation: &'static str| {
+        let client = &client;
+        async move {
+            scalar(
+                client,
+                &format!(
+                    "SELECT count(*) FROM pg_attribute                      WHERE attrelid = '{relation}'::regclass AND attnum < 0"
+                ),
+            )
+            .await
+        }
+    };
+    assert_eq!(sysattrs("t").await, "6");
+    assert_eq!(sysattrs("v").await, "0", "a view has no rows of its own");
+    assert_eq!(sysattrs("t_a").await, "0", "nor does an index");
+
+    // The first row of a catalog relation is addressable: offset 0 is
+    // `InvalidOffsetNumber` upstream, where line pointers start at 1.
+    let first = scalar(
+        &client,
+        "SELECT ctid::text FROM pg_class ORDER BY relname LIMIT 1",
+    )
+    .await;
+    assert!(
+        !first.ends_with(",0)"),
+        "a catalog ctid must not use offset 0, got {first}",
+    );
+    Ok(())
+}
+
 /// `pg_attribute.attacl` exists and is uniformly NULL — which is the truth, not
 /// a placeholder: there is no `GRANT` in this build, so no column carries an
 /// ACL. `pg_dump` asks exactly this question to decide whether to emit any
@@ -12799,10 +13566,23 @@ async fn pg_attribute_reports_no_column_acls() -> anyhow::Result<()> {
     assert_eq!(
         scalar(
             &client,
-            "SELECT count(*) FROM pg_attribute WHERE attrelid = 't'::regclass AND attacl IS NULL",
+            "SELECT count(*) FROM pg_attribute \
+             WHERE attrelid = 't'::regclass AND attnum > 0 AND attacl IS NULL",
         )
         .await,
         "2",
+    );
+    // The six system attributes carry no ACL either, and are counted apart
+    // because upstream lists them here too — at negative `attnum`, which is what
+    // a client filters on to get the declared columns alone.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT count(*) FROM pg_attribute \
+             WHERE attrelid = 't'::regclass AND attnum < 0 AND attacl IS NULL",
+        )
+        .await,
+        "6",
     );
     Ok(())
 }

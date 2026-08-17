@@ -9,7 +9,7 @@ use crabgresql_storage_api::TableAm;
 use crate::expr::BoundExpr;
 use crate::{OutputColumn, TableFn};
 
-use super::{DistinctKey, LogicalPlan, MappedRelation, SortKey};
+use super::{DistinctKey, LogicalPlan, MappedRelation, SortKey, SystemEmit};
 
 /// [`LogicalPlan::Values`]: one or more constant rows. A predicate (`SELECT 1
 /// WHERE false`) contains no column references — it bound in the empty scope.
@@ -26,6 +26,9 @@ pub struct ValuesPlan {
 #[derive(Clone)]
 pub struct QueryPlan {
     pub table: Arc<dyn TableAm>,
+    /// The system columns this scan appends past the relation's declared ones;
+    /// see [`JoinInput::Scan`](super::JoinInput::Scan).
+    pub system: Option<SystemEmit>,
     pub columns: Vec<OutputColumn>,
     pub projections: Vec<BoundExpr>,
     pub predicate: Option<BoundExpr>,

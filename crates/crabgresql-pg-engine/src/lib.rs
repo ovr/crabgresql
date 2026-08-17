@@ -53,8 +53,9 @@ use crabgresql_parquet_engine::{
 use crabgresql_storage_api::{
     BatchStream, CheckConstraint, ColumnProjection, DeleteResult, IndexMetadata, IndexProbe,
     IndexProbeKey, RelStats, RelationMetadata, RelfilenodeAllocator, SequenceAdvance,
-    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableCapabilities, TableEngine,
-    TableSchema, Tid, Tuple, TupleStream, UpdateResult, ViewDefinition,
+    SequenceDefinition, StorageError, SystemTupleStream, TableAccessMethod, TableAm,
+    TableCapabilities, TableEngine, TableSchema, Tid, Tuple, TupleStream, UpdateResult,
+    ViewDefinition,
 };
 use crabgresql_txn::{Clog, TransactionManager, TxnContext, TxnFinalize, Xid};
 use crabgresql_wal::{
@@ -241,6 +242,27 @@ impl TableAm for ManagedTable {
         self.as_am().scan_batches(txn, projection)
     }
 
+    fn supports_system_columns(&self) -> bool {
+        self.as_am().supports_system_columns()
+    }
+
+    fn scan_with_system(
+        &self,
+        txn: &TxnContext,
+        projection: &ColumnProjection,
+    ) -> Option<SystemTupleStream> {
+        self.as_am().scan_with_system(txn, projection)
+    }
+
+    fn index_lookup_with_system(
+        &self,
+        index_name: &str,
+        key: &IndexProbeKey<'_>,
+        txn: &TxnContext,
+    ) -> Option<SystemTupleStream> {
+        self.as_am().index_lookup_with_system(index_name, key, txn)
+    }
+
     fn fetch(&self, tid: Tid, txn: &TxnContext) -> Result<Option<Tuple>, StorageError> {
         self.as_am().fetch(tid, txn)
     }
@@ -285,6 +307,14 @@ impl TableAm for ManagedTable {
         txn: &TxnContext,
     ) -> Result<u64, StorageError> {
         self.as_am().update_many(updates, txn)
+    }
+
+    fn update_many_tids(
+        &self,
+        updates: Vec<(Tid, Tuple)>,
+        txn: &TxnContext,
+    ) -> Result<Vec<Option<Tid>>, StorageError> {
+        self.as_am().update_many_tids(updates, txn)
     }
 
     fn delete_many(&self, tids: Vec<Tid>, txn: &TxnContext) -> Result<u64, StorageError> {

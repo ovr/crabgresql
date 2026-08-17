@@ -9,7 +9,11 @@ use crabgresql_txn::TxnContext;
 use crabgresql_types::{PgType, Value};
 
 use crate::tally::ScanTally;
-use crate::{ExecContext, ExecError, ExecNode, compare_values, eval};
+use crabgresql_binder::{SysCol, SystemEmit};
+
+use crate::{
+    ExecContext, ExecError, ExecNode, compare_values, eval, push_system, resolve_tableoid,
+};
 
 /// Index scan: probes the engine's physical index for the key. When the engine
 /// cannot serve it (a columnar engine, an index whose key type it cannot
@@ -25,18 +29,47 @@ pub struct IndexScan {
 }
 
 impl IndexScan {
+    /// `system`, when set, names the slots each row carries past the relation's
+    /// declared columns — the same widening an `Append` arm applies, done here
+    /// so a statement that reads `ctid` keeps its index path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table: &Arc<dyn TableAm>,
         index_name: &str,
         key: IndexProbeSpec,
+        system: Option<SystemEmit>,
         ctx: &ExecContext,
         txn: &TxnContext,
         projection: &ColumnProjection,
     ) -> Result<Self, ExecError> {
-        let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+        let tally = ScanTally::index(ctx, table, index_name);
+        let Some(emit) = system else {
+            let rows = index_probe_rows(table, index_name, &key, ctx, txn, projection)?;
+            return Ok(Self {
+                iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
+                tally,
+            });
+        };
+        let cols = Arc::clone(&emit.cols);
+        let oid = match cols.contains(&SysCol::TableOid) {
+            true => Some(resolve_tableoid(&emit.ident, ctx)?),
+            false => None,
+        };
+        let rows = match cols.iter().any(|c| c.needs_header()) {
+            false => Box::new(
+                index_probe_rows(table, index_name, &key, ctx, txn, projection)?
+                    .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+            ) as SystemProbe,
+            true => index_probe_system_rows(table, index_name, &key, ctx, txn, projection)?,
+        };
         Ok(Self {
-            iter: Box::new(rows.map(|row| row.map(|(_, tuple)| tuple))),
-            tally: ScanTally::index(ctx, table, index_name),
+            iter: Box::new(rows.map(move |row| {
+                row.map(|(tid, hdr, mut tuple)| {
+                    push_system(&mut tuple, &cols, oid, tid, hdr.as_ref());
+                    tuple
+                })
+            })),
+            tally,
         })
     }
 }
@@ -55,6 +88,42 @@ pub(crate) fn index_probe_rows(
     txn: &TxnContext,
     projection: &ColumnProjection,
 ) -> Result<IndexProbe, ExecError> {
+    Ok(Box::new(
+        probe_rows(table, index_name, key, false, ctx, txn, projection)?
+            .map(|row| row.map(|(tid, _, tuple)| (tid, tuple))),
+    ))
+}
+
+/// [`index_probe_rows`] carrying each version's MVCC header — what a statement
+/// reading `xmin`/`xmax`/`cmin`/`cmax` off an index-probed relation needs.
+///
+/// Both paths widen, not just the engine's: the fallback is a full scan, and a
+/// scan that dropped the header would silently answer those columns with a
+/// placeholder on exactly the access methods that decline a probe.
+pub(crate) fn index_probe_system_rows(
+    table: &Arc<dyn TableAm>,
+    index_name: &str,
+    key: &IndexProbeSpec,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Result<SystemProbe, ExecError> {
+    probe_rows(table, index_name, key, true, ctx, txn, projection)
+}
+
+/// The rows both of the above yield. `with_header` picks the header-carrying
+/// half of each path; the key evaluation, the probe key and the fallback's
+/// re-check are shared, so the two can never disagree about which rows match.
+#[allow(clippy::too_many_arguments)]
+fn probe_rows(
+    table: &Arc<dyn TableAm>,
+    index_name: &str,
+    key: &IndexProbeSpec,
+    with_header: bool,
+    ctx: &ExecContext,
+    txn: &TxnContext,
+    projection: &ColumnProjection,
+) -> Result<SystemProbe, ExecError> {
     // The key value expressions are row-constant (the planner guarantees it), so
     // they evaluate once against an empty row.
     let eq: Vec<Value> = key
@@ -83,10 +152,23 @@ pub(crate) fn index_probe_rows(
             inclusive: b.inclusive,
         }),
     };
-    if let Some(rows) = table.index_lookup(index_name, &probe, txn) {
-        // Exact path: the engine already returned only the selected,
-        // MVCC-visible rows.
-        return Ok(rows);
+    // Exact path: the engine already returned only the selected, MVCC-visible
+    // rows. An engine that serves `index_lookup` but declines the header
+    // variant falls through to the scan below, which is correct but slower —
+    // see `TableAm::index_lookup_with_system`.
+    match with_header {
+        true => {
+            if let Some(rows) = table.index_lookup_with_system(index_name, &probe, txn) {
+                return Ok(Box::new(
+                    rows.map(|row| row.map(|(t, h, v)| (t, Some(h), v))),
+                ));
+            }
+        }
+        false => {
+            if let Some(rows) = table.index_lookup(index_name, &probe, txn) {
+                return Ok(Box::new(rows.map(|row| row.map(|(t, v)| (t, None, v)))));
+            }
+        }
     }
     // Fallback path: a full scan, so re-check the whole key per row — the bounds
     // as well as the equalities, or the scan would return every row past the
@@ -113,18 +195,37 @@ pub(crate) fn index_probe_rows(
         .collect();
     // The planner folds every key column into `projection` precisely so this
     // re-check can read them.
-    Ok(Box::new(table.scan(txn, projection).filter_map(
-        move |row| {
-            match row {
-                Ok((tid, tuple)) => tests
-                    .iter()
-                    .all(|test| test.holds(&tuple))
-                    .then_some(Ok((tid, tuple))),
-                Err(error) => Some(Err(error)),
-            }
-        },
-    )))
+    let rows: SystemProbe = match with_header {
+        false => Box::new(
+            table
+                .scan(txn, projection)
+                .map(|row| row.map(|(tid, tuple)| (tid, None, tuple))),
+        ),
+        true => Box::new(
+            table
+                .scan_with_system(txn, projection)
+                .expect(
+                    "the binder rejects a header system column the access method declines, \
+                     so a statement reaching here can produce one",
+                )
+                .map(|row| row.map(|(tid, hdr, tuple)| (tid, Some(hdr), tuple))),
+        ),
+    };
+    Ok(Box::new(rows.filter_map(move |row| {
+        match row {
+            Ok((tid, hdr, tuple)) => tests
+                .iter()
+                .all(|test| test.holds(&tuple))
+                .then_some(Ok((tid, hdr, tuple))),
+            Err(error) => Some(Err(error)),
+        }
+    })))
 }
+
+/// The stream [`probe_rows`] hands back: [`crate::SystemRow`]s, fallible for the
+/// same reason a scan's are.
+pub(crate) type SystemProbe =
+    Box<dyn Iterator<Item = Result<crate::SystemRow, StorageError>> + Send>;
 
 /// One key column's test, as the scan fallback re-checks it per row.
 struct KeyTest {
@@ -182,6 +283,7 @@ mod tests {
             &table,
             "t_id_key",
             IndexProbeSpec::equality(vec![(0, int4(2))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -201,6 +303,7 @@ mod tests {
             &table,
             "missing_index",
             IndexProbeSpec::equality(vec![(0, int4(2))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,
@@ -244,6 +347,7 @@ mod tests {
                     lower: bound(lower.clone()),
                     upper: bound(upper.clone()),
                 },
+                None,
                 &ExecContext::default(),
                 &rtxn(),
                 &ColumnProjection::All,
@@ -259,6 +363,7 @@ mod tests {
             &table,
             "t_id_key",
             IndexProbeSpec::equality(vec![(0, int4(99))]),
+            None,
             &ExecContext::default(),
             &rtxn(),
             &ColumnProjection::All,

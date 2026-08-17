@@ -97,11 +97,17 @@ SELECT a.attname, a.atttypid, a.attlen, a.attnum
   FROM pg_class c, pg_attribute a
  WHERE a.attrelid = c.oid AND c.relname = 'pgcat_reflect'
  ORDER BY a.attnum;
- attname | atttypid | attlen | attnum 
----------+----------+--------+--------
- id      |       23 |      4 |      1
- label   |       25 |     -1 |      2
-(2 rows)
+ attname  | atttypid | attlen | attnum 
+----------+----------+--------+--------
+ tableoid |       26 |      4 |     -6
+ cmax     |       29 |      4 |     -5
+ xmax     |       28 |      4 |     -4
+ cmin     |       29 |      4 |     -3
+ xmin     |       28 |      4 |     -2
+ ctid     |       27 |      6 |     -1
+ id       |       23 |      4 |      1
+ label    |       25 |     -1 |      2
+(8 rows)
 
 -- pg_cast: int4 -> int8 is an implicit cast, int8 -> int4 is assignment-only
 SELECT castsource, casttarget, castcontext

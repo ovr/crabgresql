@@ -333,6 +333,17 @@ impl TableAm for BufferedParquetTable {
         self.chunks.supports_batch_scan() && self.buffer.supports_batch_scan()
     }
 
+    /// Both leaves or neither, for the same reason `supports_batch_scan` above
+    /// takes the conjunction: this relation is read as an `Append` over the two,
+    /// and an arm that cannot answer would panic the one that can.
+    ///
+    /// Both decline today — a column chunk is not a row version — so this is
+    /// `false`, arrived at rather than assumed. Forwarding it is what keeps that
+    /// true if either leaf ever gains a header.
+    fn supports_system_columns(&self) -> bool {
+        self.chunks.supports_system_columns() && self.buffer.supports_system_columns()
+    }
+
     /// Both leaves, chained, exactly as [`Self::scan`] chains their rows — and
     /// under one `TxnContext` for the same exactly-once reason.
     ///
