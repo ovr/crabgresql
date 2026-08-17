@@ -16333,3 +16333,45 @@ async fn application_name_is_settable_and_cleaned() -> anyhow::Result<()> {
     assert_eq!(restored, "caf\\xc3\\xa9");
     Ok(())
 }
+
+/// A user routine only suppresses the built-in ambiguity error when the
+/// arguments can actually reach it. `gcd` has int4, int8 and numeric overloads
+/// and no smallint one; a smallint reaches all three and separates none, so the
+/// call is `42725` — and a `gcd(text, text)` no smallint argument can reach
+/// must not turn that into a silent widening to int4.
+#[tokio::test]
+async fn an_unreachable_user_routine_does_not_mask_overload_ambiguity() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    async fn assert_ambiguous(client: &tokio_postgres::Client) {
+        let err = client
+            .simple_query("SELECT gcd(6::int2, 4::int2)")
+            .await
+            .expect_err("smallint separates none of gcd's overloads");
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(err.code(), &SqlState::AMBIGUOUS_FUNCTION);
+        assert_eq!(
+            err.message(),
+            "function gcd(smallint, smallint) is not unique"
+        );
+    }
+
+    let client = connect(spawn_server().await).await;
+    assert_ambiguous(&client).await;
+    client
+        .simple_query(
+            "CREATE FUNCTION gcd(text, text) RETURNS text LANGUAGE SQL AS $$ SELECT $1 $$",
+        )
+        .await?;
+    assert_ambiguous(&client).await;
+
+    // One the arguments *can* reach is a candidate PG would have weighed, so it
+    // suppresses the error rather than being reported over.
+    client
+        .simple_query(
+            "CREATE FUNCTION gcd(int2, int2) RETURNS int2 LANGUAGE SQL AS $$ SELECT $1 $$",
+        )
+        .await?;
+    client.simple_query("SELECT gcd(6::int2, 4::int2)").await?;
+    Ok(())
+}

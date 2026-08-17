@@ -4645,19 +4645,21 @@ pub(crate) fn resolve_call(
             // where the two disagree the call is not actually ambiguous. That
             // recount needs `exact_only = false` — the pass that admits an
             // implicit cast — or a widening argument reaches nothing and every
-            // such call looks unambiguous. A same-arity user routine suppresses
-            // the error outright: it is a candidate PG would have weighed, and
-            // a hard `42725` must not hide someone's own function.
+            // such call looks unambiguous. A user routine these arguments can
+            // *reach* suppresses the error outright: it is a candidate PG would
+            // have weighed, and a hard `42725` must not hide someone's own
+            // function. Matching arity alone is not enough — a `gcd(text,text)`
+            // no int2 argument can reach would otherwise mask the ambiguity.
             if narrowed.len() > 1
                 && narrowed
                     .iter()
                     .filter(|sig| !typed_mismatch(&bindings, sig.args, false))
                     .count()
                     > 1
-                && !catalog
-                    .routines(name)
-                    .iter()
-                    .any(|r| r.arg_types.len() == bindings.len())
+                && !catalog.routines(name).iter().any(|r| {
+                    r.arg_types.len() == bindings.len()
+                        && !typed_mismatch(&bindings, &r.arg_types, false)
+                })
             {
                 return Err(ambiguous_function(name, &bindings));
             }
