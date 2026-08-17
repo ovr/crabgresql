@@ -41,6 +41,24 @@ SELECT -(3.5) AS neg, @ (-3.5) AS at_abs, abs(-1.50) AS abs_fn;
 -- division / modulo by zero
 SELECT 1.0 / 0;
 SELECT 1.0 % 0;
+-- the format ends at 131072 integer digits; a result past it has no
+-- representation, and addition reaches that as readily as multiplication
+SELECT 1e131071 * 10;
+SELECT 9e131071 * 2;
+SELECT 1e131071 * 1e131071;
+SELECT 9e131071 + 9e131071;
+SELECT (-9e131071) - 9e131071;
+-- ...while a result whose weight does not grow is fine
+SELECT 1e131071 + 1e131071 = 2e131071 AS sum_fits,
+       (-1e131071) - 1e131071 = -2e131071 AS difference_fits,
+       (1e131071 * 1.0)::text LIKE '%.0' AS product_keeps_its_scale;
+-- an out-of-range *scale*, unlike a weight, is clamped rather than raised,
+-- rounding half away from zero (the fractional digit count stands in for
+-- scale(), which is not implemented yet)
+SELECT length(split_part((1e-16383 * 1e-16383)::text, '.', 2)) AS clamped,
+       1e-16383 * 1e-16383 = 0 AS rounds_to_zero,
+       1e-16383 * 1.5 = 2e-16383 AS rounds_up,
+       1e-16383 * 1.4 = 1e-16383 AS rounds_down;
 
 -- comparisons drive WHERE and ORDER BY; mixing numeric with int promotes to
 -- numeric

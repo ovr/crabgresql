@@ -199,6 +199,12 @@ fn err(sqlstate: &'static str, message: impl Into<String>) -> JsonError {
     }
 }
 
+/// `jsonpath` arithmetic reports a value that has left the `numeric` format
+/// with the arithmetic layer's own SQLSTATE and message.
+fn numeric_overflow(e: crate::numeric::NumErr) -> JsonError {
+    err(e.sqlstate, e.message)
+}
+
 fn syntax(message: impl Into<String>) -> JsonError {
     err(SYNTAX_ERROR, message)
 }
@@ -2359,9 +2365,9 @@ fn is_predicate(node: &Node) -> bool {
 
 fn arith(op: ArithOp, a: &Numeric, b: &Numeric) -> Result<Numeric, JsonError> {
     Ok(match op {
-        ArithOp::Add => a.add(b),
-        ArithOp::Sub => a.sub(b),
-        ArithOp::Mul => a.mul(b),
+        ArithOp::Add => a.add(b).map_err(numeric_overflow)?,
+        ArithOp::Sub => a.sub(b).map_err(numeric_overflow)?,
+        ArithOp::Mul => a.mul(b).map_err(numeric_overflow)?,
         ArithOp::Div => a
             .div(b)
             .map_err(|_| err(DIVISION_BY_ZERO, "division by zero"))?,

@@ -38,6 +38,17 @@ fn syntax(message: &str) -> FormatError {
     }
 }
 
+/// A `V` shift can carry the value past what `numeric` stores; the format
+/// layer reports that with the arithmetic layer's own SQLSTATE and message.
+fn numeric_error(e: crate::numeric::NumErr) -> FormatError {
+    FormatError {
+        sqlstate: e.sqlstate,
+        message: e.message,
+        detail: e.detail,
+        hint: None,
+    }
+}
+
 fn bad_number(raw: &str) -> FormatError {
     FormatError {
         sqlstate: INVALID_TEXT_REPRESENTATION,
@@ -344,7 +355,7 @@ fn render(n: &Numeric, fmt: &str, sig_cap: Option<usize>) -> Result<String, Form
     // `V` is a decimal shift, applied before anything is measured.
     let scaled;
     let n = if f.v_shift > 0 {
-        scaled = n.mul(&pow10(f.v_shift));
+        scaled = n.mul(&pow10(f.v_shift)).map_err(numeric_error)?;
         &scaled
     } else {
         n
@@ -615,7 +626,7 @@ fn scientific(n: &Numeric, f: &NumFormat) -> String {
     // Rounding can carry into a second integer digit (9.99 -> 10.0).
     if mantissa.to_display().trim_start_matches('-').len() > 1 + usize::from(f.post > 0) + f.post {
         mantissa = mantissa
-            .mul(&Numeric::parse("0.1").unwrap_or_else(|_| Numeric::from_i128(1)))
+            .mul_raw(&Numeric::parse("0.1").unwrap_or_else(|_| Numeric::from_i128(1)))
             .round(f.post as i32);
         exp += 1;
     }

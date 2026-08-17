@@ -249,9 +249,9 @@ fn arith_f8(op: ArithOp, a: f64, b: f64) -> Result<Value, ArithError> {
 
 fn arith_numeric(op: ArithOp, a: &Numeric, b: &Numeric) -> Result<Value, ArithError> {
     let r = match op {
-        ArithOp::Add => a.add(b),
-        ArithOp::Sub => a.sub(b),
-        ArithOp::Mul => a.mul(b),
+        ArithOp::Add => a.add(b).map_err(numeric_error)?,
+        ArithOp::Sub => a.sub(b).map_err(numeric_error)?,
+        ArithOp::Mul => a.mul(b).map_err(numeric_error)?,
         ArithOp::Div => a.div(b).map_err(numeric_error)?,
         ArithOp::Mod => a.modulo(b).map_err(numeric_error)?,
         other => unreachable!("numeric arithmetic {other:?}"),

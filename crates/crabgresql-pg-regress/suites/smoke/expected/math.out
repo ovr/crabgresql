@@ -351,6 +351,9 @@ SELECT lcm(9999999999999999999999::numeric, 9999999999999999999998::numeric);
  99999999999999999999970000000000000000000002
 (1 row)
 
+-- ...but not past the format: this product would need 140001 integer digits
+SELECT lcm((1e70000 + 3)::numeric, 1e70000::numeric);
+ERROR:  value overflows numeric format
 -- a numeric argument binds the numeric overload exactly; an integer one does not
 SELECT pg_typeof(gcd(6, 4)), pg_typeof(gcd(6.0, 4.0)), pg_typeof(lcm(6, 4));
  pg_typeof | pg_typeof | pg_typeof 

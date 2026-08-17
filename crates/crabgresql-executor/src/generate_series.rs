@@ -141,7 +141,9 @@ impl Series {
                     return Ok(None);
                 }
                 let value = Value::Numeric(cur.clone());
-                *cur = cur.add(step);
+                *cur = cur
+                    .add(step)
+                    .map_err(|e| ExecError::new(e.sqlstate, e.message))?;
                 Ok(Some(value))
             }
             Series::Timestamp {

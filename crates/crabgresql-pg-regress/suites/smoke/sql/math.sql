@@ -126,6 +126,8 @@ SELECT gcd(0::numeric, '-infinity'::numeric), lcm('nan'::numeric, 'infinity'::nu
 -- wider than either integer type
 SELECT gcd(12345678901234567890123::numeric, 123::numeric);
 SELECT lcm(9999999999999999999999::numeric, 9999999999999999999998::numeric);
+-- ...but not past the format: this product would need 140001 integer digits
+SELECT lcm((1e70000 + 3)::numeric, 1e70000::numeric);
 -- a numeric argument binds the numeric overload exactly; an integer one does not
 SELECT pg_typeof(gcd(6, 4)), pg_typeof(gcd(6.0, 4.0)), pg_typeof(lcm(6, 4));
 
