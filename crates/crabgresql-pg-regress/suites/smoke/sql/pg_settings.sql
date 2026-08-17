@@ -172,3 +172,57 @@ SELECT name, setting, source FROM pg_settings
 RESET ALL;
 SELECT name, setting, source FROM pg_settings
  WHERE name LIKE 'default_transaction%' ORDER BY name COLLATE "C";
+--
+-- transaction_isolation and transaction_read_only live in the transaction
+--
+-- PostgreSQL's two transaction-scoped parameters: the value is the open block's
+-- rather than the session's, which is why `source` starts at `override`, `RESET`
+-- is refused, and what `SHOW` prints follows the block. Every statement below
+-- was diffed against PostgreSQL 18.4.
+--
+SELECT name, setting, category, short_desc, context, vartype, source,
+       enumvals, boot_val, reset_val
+  FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+-- the grammar's own spelling of the first one, column name included
+SHOW TRANSACTION ISOLATION LEVEL;
+SHOW transaction_isolation;
+SHOW transaction_read_only;
+-- outside a block both follow the defaults a new transaction would inherit
+SET default_transaction_isolation = 'repeatable read';
+SHOW TRANSACTION ISOLATION LEVEL;
+RESET default_transaction_isolation;
+-- a mode a BEGIN names is 'session' while the block lasts and 'override' after
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY;
+SHOW TRANSACTION ISOLATION LEVEL;
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+COMMIT;
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";
+-- ...where a SET TRANSACTION's mark survives the COMMIT, as any plain SET's does
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SELECT name, setting, source FROM pg_settings
+ WHERE name = 'transaction_isolation';
+COMMIT;
+-- the value went with the block; only the source stayed behind
+SELECT name, setting, source FROM pg_settings
+ WHERE name = 'transaction_isolation';
+-- ...and a ROLLBACK takes the source back too
+BEGIN;
+SET transaction_read_only = on;
+SELECT name, setting, source FROM pg_settings WHERE name = 'transaction_read_only';
+ROLLBACK;
+SELECT name, setting, source FROM pg_settings WHERE name = 'transaction_read_only';
+-- neither can be reset: PostgreSQL flags them GUC_NO_RESET
+RESET transaction_isolation;
+SET transaction_read_only = DEFAULT;
+-- ...but RESET ALL skips them rather than raising
+RESET ALL;
+SELECT name, setting, source FROM pg_settings
+ WHERE name IN ('transaction_isolation', 'transaction_read_only')
+ ORDER BY name COLLATE "C";

@@ -77,6 +77,17 @@ pub enum GucKind {
         capture: fn(&Session) -> SavedValue,
         restore: fn(&mut Session, SavedValue),
     },
+    /// Backed by the open transaction block rather than by session state:
+    /// PostgreSQL's `transaction_isolation` and `transaction_read_only`.
+    ///
+    /// No `capture`/`restore` pair, because the value lives in the
+    /// [`crate::session::ActiveTxn`] and dies with the block. What the save
+    /// stack still does for these is roll the *explicitly set* flag back, which
+    /// is what makes `pg_settings.source` follow PostgreSQL through `COMMIT`,
+    /// `ROLLBACK` and `SET LOCAL`.
+    TransactionScoped {
+        set: fn(&mut Session, GucValue) -> Result<(), PgError>,
+    },
     /// Accepted and ignored. These are `PGC_USERSET` in PostgreSQL and appear in
     /// every `pg_dump` preamble (`SET client_encoding = 'UTF8';`), but we model
     /// only the one value we implement, so assigning them is a no-op rather than
@@ -137,6 +148,12 @@ impl GucDef {
     pub fn set(&self, session: &mut Session, value: GucValue) -> Result<(), PgError> {
         match self.kind {
             GucKind::Settable { set, .. } => set(session, value),
+            // PostgreSQL flags these `GUC_NO_RESET`: there is no value to go
+            // back to, since the block's own level *is* the value.
+            GucKind::TransactionScoped { set } => match value {
+                GucValue::Default => Err(cannot_be_reset(self.name)),
+                value => set(session, value),
+            },
             GucKind::AcceptedAndIgnored => Ok(()),
             GucKind::ReadOnly => Err(cannot_be_changed(self.name)),
         }
@@ -161,7 +178,17 @@ impl GucDef {
     /// snapshotting for the transactional save stack and the ParameterStatus
     /// diff.
     pub fn is_mutable(&self) -> bool {
-        matches!(self.kind, GucKind::Settable { .. })
+        matches!(
+            self.kind,
+            GucKind::Settable { .. } | GucKind::TransactionScoped { .. }
+        )
+    }
+
+    /// Whether the value belongs to the open block rather than to the session —
+    /// see [`GucKind::TransactionScoped`], whose callers are `RESET ALL` and the
+    /// `pg_settings.source` column.
+    pub fn is_transaction_scoped(&self) -> bool {
+        matches!(self.kind, GucKind::TransactionScoped { .. })
     }
 
     /// Whether assigning this parameter raises `55P02`. `RESET <name>` on one
@@ -179,6 +206,16 @@ const STATEMENT: &str = "Client Connection Defaults / Statement Behavior";
 const PRESET: &str = "Preset Options";
 const PLANNER_COST: &str = "Query Tuning / Planner Cost Constants";
 const COMPAT: &str = "Version and Platform Compatibility / Previous PostgreSQL Versions";
+
+/// The isolation levels `pg_settings.enumvals` publishes, in PostgreSQL's
+/// declaration order — and, joined with `", "`, the HINT `invalid_enum_value`
+/// builds. One list, as in PostgreSQL, for both parameters that take a level.
+const ISOLATION_LEVELS: &[&str] = &[
+    "serializable",
+    "repeatable read",
+    "read committed",
+    "read uncommitted",
+];
 
 /// Every parameter this server models, **sorted by name case-insensitively** —
 /// the order PostgreSQL's `pg_show_all_settings` returns, and therefore the
@@ -296,15 +333,7 @@ pub static GUCS: &[GucDef] = &[
         vartype: "enum",
         min_val: None,
         max_val: None,
-        // PostgreSQL's declaration order, which is what `enumvals` prints.
-        // `read uncommitted` is accepted and behaves as `read committed`, as in
-        // PostgreSQL.
-        enumvals: Some(&[
-            "serializable",
-            "repeatable read",
-            "read committed",
-            "read uncommitted",
-        ]),
+        enumvals: Some(ISOLATION_LEVELS),
         boot_val: "read committed",
         show: |s| isolation_name(s.default_iso).to_string(),
         kind: GucKind::Settable {
@@ -589,12 +618,64 @@ pub static GUCS: &[GucDef] = &[
             },
         },
     },
+    GucDef {
+        key: "transaction_isolation",
+        name: "transaction_isolation",
+        description: "Sets the current transaction's isolation level.",
+        extra_desc: None,
+        report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "enum",
+        min_val: None,
+        max_val: None,
+        enumvals: Some(ISOLATION_LEVELS),
+        boot_val: "read committed",
+        // Outside a block the level reported is the one the statement's own
+        // implicit transaction runs at, which is the session default.
+        show: |s| isolation_name(s.xact.as_ref().map_or(s.default_iso, |x| x.iso)).to_string(),
+        kind: GucKind::TransactionScoped {
+            set: set_transaction_isolation,
+        },
+    },
+    GucDef {
+        key: "transaction_read_only",
+        name: "transaction_read_only",
+        description: "Sets the current transaction's read-only status.",
+        extra_desc: None,
+        report: false,
+        show_all: true,
+        category: STATEMENT,
+        context: "user",
+        vartype: "bool",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "off",
+        show: |s| on_off(s.xact.as_ref().map_or(s.default_read_only, |x| x.read_only)),
+        kind: GucKind::TransactionScoped {
+            set: set_transaction_read_only,
+        },
+    },
 ];
 
 /// Look a parameter up by name, case-insensitively.
 pub fn lookup(name: &str) -> Option<&'static GucDef> {
     let key = name.to_ascii_lowercase();
     GUCS.iter().find(|g| g.key == key)
+}
+
+/// The multi-word `SHOW` spellings PostgreSQL's grammar maps onto a parameter
+/// name, keyed on the words joined with nothing between them (which is how
+/// [`crate::query`] hands a `SHOW` name over).
+///
+/// `SHOW TIME ZONE` needs no entry — joining its words already spells the key.
+pub fn show_alias(joined: &str) -> Option<&'static str> {
+    match joined.to_ascii_lowercase().as_str() {
+        "transactionisolationlevel" => Some("transaction_isolation"),
+        _ => None,
+    }
 }
 
 /// Every parameter's current value, keyed by lowercase name — the snapshot
@@ -639,10 +720,16 @@ pub fn catalog_settings(session: &Session) -> Vec<crabgresql_catalog::CatalogSet
                 extra_desc: def.extra_desc,
                 context: def.context,
                 vartype: def.vartype,
-                source: if session.guc_is_explicitly_set(def.key) {
-                    "session"
-                } else {
-                    "default"
+                // A transaction-scoped parameter has no session-level value to
+                // have come from a default, so PostgreSQL reports `override`
+                // for it until a `SET` (in either spelling) marks it `session`.
+                source: match (
+                    session.guc_is_explicitly_set(def.key),
+                    def.is_transaction_scoped(),
+                ) {
+                    (true, _) => "session",
+                    (false, true) => "override",
+                    (false, false) => "default",
                 },
                 min_val: def.min_val,
                 max_val: def.max_val,
@@ -682,6 +769,34 @@ pub fn cannot_be_changed(name: &str) -> PgError {
     PgError::new(
         sqlstate::CANT_CHANGE_RUNTIME_PARAM,
         format!("parameter \"{name}\" cannot be changed"),
+    )
+}
+
+/// PG's `0A000` for a parameter it flags `GUC_NO_RESET`. `RESET ALL` skips such
+/// a parameter instead of raising this.
+pub fn cannot_be_reset(name: &str) -> PgError {
+    PgError::new(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        format!("parameter \"{name}\" cannot be reset"),
+    )
+}
+
+/// PG's `25001` for an isolation level changed after the transaction's first
+/// query. Shared by the two spellings that can change it: `SET TRANSACTION
+/// ISOLATION LEVEL …` and `SET transaction_isolation = …`.
+pub fn isolation_after_query() -> PgError {
+    PgError::new(
+        sqlstate::ACTIVE_SQL_TRANSACTION,
+        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+    )
+}
+
+/// PG's `25001` for a read-only transaction turned read-write after its first
+/// query.
+pub fn read_write_after_query() -> PgError {
+    PgError::new(
+        sqlstate::ACTIVE_SQL_TRANSACTION,
+        "transaction read-write mode must be set before any query",
     )
 }
 
@@ -907,19 +1022,83 @@ fn set_bytea_output(session: &mut Session, value: GucValue) -> Result<(), PgErro
 }
 
 fn set_default_isolation(session: &mut Session, value: GucValue) -> Result<(), PgError> {
-    session.default_iso = match value {
-        GucValue::Default => IsolationLevel::ReadCommitted,
-        GucValue::OffsetSecondsEast(_) => {
-            return Err(invalid_value("default_transaction_isolation", "<number>"));
-        }
-        GucValue::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
-            // `read uncommitted` is an alias: PG never permits dirty reads.
-            "read committed" | "read uncommitted" => IsolationLevel::ReadCommitted,
-            "repeatable read" => IsolationLevel::RepeatableRead,
-            "serializable" => IsolationLevel::Serializable,
-            _ => return Err(invalid_value("default_transaction_isolation", &s)),
-        },
+    session.default_iso = parse_isolation("default_transaction_isolation", value)?;
+    Ok(())
+}
+
+/// Decode an isolation-level assignment for either parameter that takes one.
+///
+/// `read uncommitted` is an alias of `read committed`: PostgreSQL never permits
+/// dirty reads either, but it does keep the two apart for display, so a `SHOW`
+/// here prints `read committed` where PostgreSQL echoes back what was written.
+/// That divergence is [`IsolationLevel`]'s three-variant shape, not this
+/// function's, and it predates both parameters.
+fn parse_isolation(param: &str, value: GucValue) -> Result<IsolationLevel, PgError> {
+    let written = match value {
+        GucValue::Default => return Ok(IsolationLevel::ReadCommitted),
+        GucValue::OffsetSecondsEast(secs) => secs.to_string(),
+        GucValue::Str(s) => s,
     };
+    match written.trim().to_ascii_lowercase().as_str() {
+        "read committed" | "read uncommitted" => Ok(IsolationLevel::ReadCommitted),
+        "repeatable read" => Ok(IsolationLevel::RepeatableRead),
+        "serializable" => Ok(IsolationLevel::Serializable),
+        _ => Err(invalid_enum_value(param, &written)),
+    }
+}
+
+fn set_transaction_isolation(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    apply_transaction_isolation(session, parse_isolation("transaction_isolation", value)?)
+}
+
+/// Retarget the open block's isolation level. The `SET TRANSACTION ISOLATION
+/// LEVEL` statement enters here too, having decoded the level from its own
+/// grammar rather than from a parameter value.
+///
+/// Outside a block there is nothing to retarget, and PostgreSQL accepts the
+/// assignment anyway: the single-statement transaction it would have applied to
+/// is over before the next statement runs.
+pub(crate) fn apply_transaction_isolation(
+    session: &mut Session,
+    level: IsolationLevel,
+) -> Result<(), PgError> {
+    let Some(active) = session.xact.as_mut() else {
+        return Ok(());
+    };
+    // Only a *change* is gated: PostgreSQL lets a block re-assert the level it
+    // is already running at after its first query.
+    if active.has_run_query && active.iso != level {
+        return Err(isolation_after_query());
+    }
+    active.iso = level;
+    Ok(())
+}
+
+fn set_transaction_read_only(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let read_only = match value {
+        GucValue::Default => false,
+        GucValue::OffsetSecondsEast(_) => return Err(requires_boolean("transaction_read_only")),
+        GucValue::Str(s) => crabgresql_types::parse_bool(&s)
+            .ok_or_else(|| requires_boolean("transaction_read_only"))?,
+    };
+    apply_transaction_read_only(session, read_only)
+}
+
+/// Retarget the open block's access mode, for both the `SET TRANSACTION READ
+/// ONLY`/`READ WRITE` statement and the parameter above.
+pub(crate) fn apply_transaction_read_only(
+    session: &mut Session,
+    read_only: bool,
+) -> Result<(), PgError> {
+    let Some(active) = session.xact.as_mut() else {
+        return Ok(());
+    };
+    // Only one direction is gated: a block may go read-only at any point, but
+    // may not leave read-only once it has run a query.
+    if !read_only && active.read_only && active.has_run_query {
+        return Err(read_write_after_query());
+    }
+    active.read_only = read_only;
     Ok(())
 }
 
@@ -980,13 +1159,40 @@ mod tests {
     /// a live error message and nothing else would notice.
     #[test]
     fn every_enum_guc_resolves_its_own_key() {
-        for key in ["bytea_output", "intervalstyle"] {
+        for key in [
+            "bytea_output",
+            "intervalstyle",
+            "default_transaction_isolation",
+            "transaction_isolation",
+        ] {
             let def = lookup(key).unwrap_or_else(|| panic!("{key} is in GUCS"));
             assert_eq!(def.vartype, "enum", "{key}");
             assert!(
                 def.enumvals.is_some_and(|v| !v.is_empty()),
                 "{key} needs enumvals for its HINT"
             );
+        }
+    }
+
+    /// Two parameters live in the transaction rather than in the session, and
+    /// both behave unlike every other row in the table. Pinning the set means a
+    /// careless `kind` edit — which would quietly make `RESET
+    /// transaction_isolation` restore a boot value PostgreSQL refuses to
+    /// restore — fails at the definition site rather than in a client.
+    #[test]
+    fn only_the_two_transaction_parameters_are_transaction_scoped() {
+        let scoped: Vec<&str> = GUCS
+            .iter()
+            .filter(|def| def.is_transaction_scoped())
+            .map(|def| def.key)
+            .collect();
+        assert_eq!(scoped, ["transaction_isolation", "transaction_read_only"]);
+        for key in scoped {
+            let def = lookup(key).unwrap_or_else(|| panic!("{key} is in GUCS"));
+            // Mutable is what makes `pg_settings.reset_val` read off `boot_val`,
+            // which is what PostgreSQL publishes for these two.
+            assert!(def.is_mutable(), "{key}");
+            assert!(!def.is_read_only(), "{key}");
         }
     }
 
