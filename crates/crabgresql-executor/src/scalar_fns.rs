@@ -1251,10 +1251,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             return Ok(Value::Bool(iv(&args[0]).is_finite()));
         }
         ScalarFn::MakeInterval => {
-            // An argument the call stopped short of is zero — the default every
-            // one of them carries upstream. A *missing* argument is not a NULL
-            // one, so strictness is unaffected: `make_interval(NULL)` still
-            // reaches the NULL check ahead of this match.
+            // An argument the call stopped short of is zero — upstream's default
+            // for every one of them. A *missing* argument is not a NULL one, so
+            // strictness is unaffected: `make_interval(NULL)` never gets here.
             let field = |n: usize| args.get(n).map_or(0, |v| i4(v) as i64);
             return interval::make_interval(
                 field(0),

@@ -1,12 +1,9 @@
 //! `pg_proc` publishes exactly the function names this build resolves.
 //!
-//! Codegen filters `pg_proc.dat` by two justifications (see
-//! `crabgresql-bki`'s `pg_proc` module): an inbound reference from another
-//! catalog, or `crabgresql-bki`'s `IMPLEMENTED_PRONAMES` — the SQL surface
-//! nothing in the vendored data points at. That manifest duplicates what the
-//! binder's registry already knows, and this is where the duplication is
-//! checked instead of trusted: the two crates cannot see each other (the
-//! catalog is below the binder), but this one sees both.
+//! `crabgresql-bki`'s `IMPLEMENTED_PRONAMES` duplicates what the binder's
+//! registry already knows, because the catalog sits below the binder and the two
+//! cannot see each other. This crate sees both, so this is where the duplication
+//! is checked instead of trusted.
 //!
 //! Why both directions matter:
 //!
@@ -28,7 +25,6 @@ use crabgresql_bki::dat::{Entry, get, parse_dat};
 use crabgresql_bki::implemented::IMPLEMENTED_PRONAMES;
 use crabgresql_catalog::PG_PROC_ROWS;
 
-/// Every `proname` `pg_proc.dat` defines, deduplicated.
 fn upstream_pronames() -> Vec<String> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/postgres/catalog/pg_proc.dat");
@@ -81,8 +77,8 @@ fn every_manifest_name_resolves() {
         unimplemented.is_empty(),
         "IMPLEMENTED_PRONAMES claims functions the binder does not resolve: {unimplemented:?}"
     );
-    // And each is actually published — the manifest is a filter, so a name that
-    // reached it and no row would mean codegen dropped it.
+    // The manifest is a filter, so a listed name with no row means codegen
+    // dropped it — the `pg_proc.dat` resync no one noticed.
     for name in IMPLEMENTED_PRONAMES {
         assert!(
             publishes(name),

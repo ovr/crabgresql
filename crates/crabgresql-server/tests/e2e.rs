@@ -11249,8 +11249,8 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `::regproc` names a function, now that `pg_proc` publishes the surface this
-/// build implements rather than only the functions other catalogs reference.
+/// `::regproc` names any function this build implements, not only the ones other
+/// catalogs reference.
 ///
 /// Every expectation below was probed against PostgreSQL 18.4.
 #[tokio::test]
@@ -11276,8 +11276,7 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
     assert_eq!(row.get::<_, &str>("window_fn"), "row_number");
     assert_eq!(row.get::<_, &str>("qualified"), "now");
     // The two families the binder resolves ahead of its signature table: a
-    // variadic text function and a polymorphic array one. Both are implemented,
-    // so both are published.
+    // variadic text function and a polymorphic array one.
     assert_eq!(row.get::<_, &str>("variadic"), "concat");
     assert_eq!(row.get::<_, &str>("polymorphic"), "cardinality");
 
@@ -11332,8 +11331,7 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
     );
     assert!(rows.iter().all(|r| r.get::<_, &str>("typname") == "text"));
 
-    // A session routine takes part in the same resolution: one is unique, and a
-    // second overload makes the name ambiguous for both spellings.
+    // A session routine takes part in the same resolution as a built-in.
     client
         .batch_execute(
             "CREATE FUNCTION regp(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a; END $$",
@@ -11360,7 +11358,7 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
         e.as_db_error().expect("database error").code(),
         &SqlState::AMBIGUOUS_FUNCTION
     );
-    // And both now print qualified, under the schema they were created in.
+    // And both print qualified, under the schema they were created in.
     let rows = client
         .query(
             "SELECT oid::regproc::text AS name FROM pg_catalog.pg_proc \
@@ -11371,13 +11369,12 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
     let names: Vec<&str> = rows.iter().map(|r| r.get("name")).collect();
     assert_eq!(names, ["public.regp", "public.regp"]);
 
-    // A routine named after a built-in shares the name with it, and a routine in
-    // `public` is reachable unqualified just as the built-in is — so a bare `now`
-    // names neither. (The other half of the rule, a routine in a schema an
-    // unqualified name does not reach, is `crabgresql-catalog`'s
-    // `a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows`:
-    // `CREATE FUNCTION s.f()` is still `0A000` here, so that case is only
-    // reachable at the catalog API.)
+    // A routine in `public` is reachable unqualified just as a built-in is, so
+    // one named `now` leaves a bare `now` naming neither. The other half of that
+    // rule — a routine in a schema an unqualified name does not reach — is
+    // `crabgresql-catalog`'s
+    // `a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows`,
+    // since `CREATE FUNCTION s.f()` is still `0A000` here.
     client
         .batch_execute("CREATE FUNCTION now(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
         .await?;

@@ -8,11 +8,6 @@ use crate::symbols::SymbolKind::{Proc, Type};
 use crate::symbols::SymbolTable;
 
 /// What [`emit`] produces: the generated source, and the OIDs it published.
-///
-/// The published set is wider than the reference census, so `pg_description`
-/// cannot reuse the census to decide which `pg_proc` comments to keep — a
-/// comment on a row this build publishes belongs in the catalog, and one on a
-/// row it does not would describe nothing.
 pub struct Emitted {
     pub code: String,
     /// Ascending, as `pg_description`'s filter expects.
@@ -172,12 +167,10 @@ probin: {probin:?} }},\n",
             provolatile = str_field(e, "provolatile", "i"),
             proparallel = str_field(e, "proparallel", "s"),
             pronargs = argtypes.len(),
-            // How many trailing arguments a call may omit. The default
-            // *expressions* are not carried: `pg_proc` here publishes no
-            // `proargdefaults` column, so there is nothing to render them from
-            // — but the count is what a client reads to know the minimum arity,
-            // and reporting 0 would claim `make_interval()` needs seven
-            // arguments.
+            // The default *expressions* go unpublished — this `pg_proc` has no
+            // `proargdefaults` column to render them from — but the count must
+            // not: a client reads it as the minimum arity, and 0 would claim
+            // `make_interval()` needs seven arguments.
             pronargdefaults = braced_list_len(e, "proargdefaults").unwrap_or(0),
             prorettype = type_oid(str_field(e, "prorettype", "")),
             // The three OUT-parameter columns. PostgreSQL leaves all three NULL
@@ -220,8 +213,6 @@ mod tests {
           { oid => '1243', proname => 'boolout', prorettype => 'cstring', \
          proargtypes => 'bool' }]";
 
-    /// The generated source alone: every test below reads the code, not the
-    /// published census.
     fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
         super::emit(entries, symbols).code
     }
@@ -249,9 +240,9 @@ mod tests {
         assert!(emitted.contains("pronargs: 1"));
     }
 
-    /// The second justification for a row: nothing references the entry, but
-    /// the binder resolves the name, so a client can find it. `booleq` is in
-    /// the manifest and `boolout` is not, which is the whole difference here.
+    /// The second justification for a row: nothing references the entry, but the
+    /// binder resolves the name. `booleq` is in the manifest and `boolout` is
+    /// not, which is the whole difference between these two entries.
     #[test]
     fn emits_the_functions_this_build_implements() {
         let procs = parse_dat(
@@ -269,13 +260,11 @@ mod tests {
         let emitted = super::emit(&procs, &symbols);
         assert!(emitted.code.contains("proname: \"booleq\""));
         assert!(!emitted.code.contains("proname: \"boolout\""));
-        // The published census is what `pg_description` keeps its comments by,
-        // so it must carry the implemented row too, not only referenced ones.
+        // `pg_description` filters by this census, so it has to carry the
+        // implemented row and not only the referenced ones.
         assert_eq!(emitted.published, vec![60]);
     }
 
-    /// A manifest name upstream does not define cannot publish a row, so
-    /// codegen refuses the build rather than emit nothing.
     #[test]
     #[should_panic(expected = "which pg_proc.dat defines no entry for")]
     fn a_manifest_name_the_dat_lacks_fails_the_build() {
@@ -346,10 +335,8 @@ mod tests {
         );
     }
 
-    /// An argument default is counted, not read: `pronargdefaults` is how many
-    /// trailing arguments a call may omit, and the expressions themselves have
-    /// no column to live in here. A quoted element carrying a comma (as
-    /// `jsonb_path_exists`'s `'{"{}",false}'` does) is still one default.
+    /// An argument default is counted, not read — and a quoted element carrying a
+    /// comma (as `jsonb_path_exists`'s `'{"{}",false}'` does) is one default.
     #[test]
     fn argument_defaults_are_counted() {
         let emitted = emit_one(
@@ -359,8 +346,6 @@ mod tests {
         assert!(emitted.contains("pronargs: 2, pronargdefaults: 2"));
     }
 
-    /// `pronargdefaults` is derived from that list, so an entry spelling it out
-    /// would be data codegen ignores.
     #[test]
     #[should_panic(expected = "carries pronargdefaults, which codegen derives")]
     fn a_spelled_out_default_count_is_refused() {

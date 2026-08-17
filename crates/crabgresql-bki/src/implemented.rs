@@ -1,21 +1,17 @@
 //! `IMPLEMENTED_PRONAMES`: the function names this build actually resolves.
 //!
-//! A `pg_proc` row is a claim that the function exists. Most rows are justified
-//! by an inbound reference from another catalog (`pg_type.typinput`,
-//! `pg_operator.oprcode`, `pg_aggregate.aggfnoid`, …) — that census is what
-//! [`crate::symbols::SymbolTable::references`] hands [`crate::pg_proc`]. The
-//! rest of the SQL surface has no such reference: nothing in the vendored data
-//! points at `upper`, `to_char` or `row_number`, yet a client that cannot find
-//! them in `pg_proc` cannot introspect this server at all — `'upper'::regproc`
-//! fails and `\df` comes back empty.
+//! Most `pg_proc` rows are justified by an inbound reference from another
+//! catalog, which [`crate::pg_proc`] documents. Nothing in the vendored data
+//! points at `upper`, `to_char` or `row_number`, and a client that cannot find
+//! those in `pg_proc` cannot introspect this server at all — `'upper'::regproc`
+//! fails and `\df` comes back empty. Hence this second justification: the names
+//! `crabgresql-binder` resolves as a function of some kind.
 //!
-//! So this list is the second justification: the names `crabgresql-binder`
-//! resolves as a function of some kind. It is duplicated data, and the
-//! duplication is checked rather than trusted —
-//! `crabgresql-server`'s `pg_proc_surface` test walks every `proname` in
-//! `pg_proc.dat` and compares this list against
-//! `crabgresql_binder::implements_function` in both directions, so a function
-//! added to the binder without a name here (or the reverse) fails the suite.
+//! Duplicated data, checked rather than trusted — `crabgresql-server`'s
+//! `pg_proc_surface` test walks every `proname` in `pg_proc.dat` and compares
+//! this list against `crabgresql_binder::implements_function` in both
+//! directions, so a function added to the binder without a name here (or the
+//! reverse) fails the suite.
 //!
 //! Selection is by **name**, not by signature: a listed name publishes every
 //! overload `pg_proc.dat` gives it, under upstream's OIDs. That is what makes
@@ -283,8 +279,7 @@ pub static IMPLEMENTED_PRONAMES: &[&str] = &[
 mod tests {
     use super::IMPLEMENTED_PRONAMES;
 
-    /// Sorted and duplicate-free: the membership test is a binary search, and a
-    /// name listed twice would read as two claims about one function.
+    /// A name listed twice would read as two claims about one function.
     #[test]
     fn the_manifest_is_sorted_and_unique() {
         for pair in IMPLEMENTED_PRONAMES.windows(2) {

@@ -1432,9 +1432,9 @@ pub const POLYMORPHIC_TABLE_FN_NAMES: &[&str] = &[
 /// `pg_proc_surface` test.
 ///
 /// One term per name-resolving path in [`bind_function`] and
-/// [`bind_table_fn_call`], reusing each path's own predicate rather than
-/// restating it — a path answered by a private `match` here and a copy of that
-/// match there is exactly how the `concat`/array families went unpublished.
+/// [`bind_table_fn_call`], each reusing that path's own predicate: a term that
+/// restates a dispatch instead of calling it drifts from it, and a name it then
+/// misses is a function nothing can introspect.
 ///
 /// The paths deliberately absent are the ones PostgreSQL has no `pg_proc` row
 /// for either: `COALESCE`/`NULLIF` and `ARRAY(SELECT …)` are grammar, and so is
@@ -1444,13 +1444,9 @@ pub const POLYMORPHIC_TABLE_FN_NAMES: &[&str] = &[
 /// about them, since it walks the names `pg_proc.dat` defines.
 pub fn implements_function(name: &str) -> bool {
     !lookup(name).is_empty()
-        // `concat`/`concat_ws`/`format` are variadic, and the array family is
-        // polymorphic; neither fits the fixed-signature table, so both resolve
-        // ahead of it in `bind_function`.
         || variadic_text_fn(name).is_some()
         || crate::expr::ARRAY_FUNCTION_NAMES.contains(&name)
-        // `pg_typeof(any)` accepts every type, so it has no fixed signature and
-        // is bound outside the table as well.
+        // `pg_typeof(any)` accepts every type, so it has no fixed signature.
         || name == "pg_typeof"
         || lookup_agg(name).is_some()
         || lookup_window_fn(name).is_some()
@@ -1458,10 +1454,8 @@ pub fn implements_function(name: &str) -> bool {
         || POLYMORPHIC_TABLE_FN_NAMES.contains(&name)
 }
 
-/// The variadic text functions, which take any number of arguments of any type
-/// and coerce each to `text` — so they have no fixed-arity signature to live in
-/// [`lookup`]'s table. Read by [`bind_function`] to dispatch and by
-/// [`implements_function`] to answer for the same three names.
+/// The functions taking any number of arguments of any type, each coerced to
+/// `text` — so they have no fixed-arity signature to live in [`lookup`]'s table.
 fn variadic_text_fn(name: &str) -> Option<ScalarFn> {
     match name {
         "concat" => Some(ScalarFn::Concat),
@@ -1688,17 +1682,14 @@ pub(crate) fn bind_table_fn_call(
 
 /// Resolve one of [`POLYMORPHIC_TABLE_FN_NAMES`] against already-bound arguments.
 ///
-/// The single dispatch for both positions a set-returning call can appear in:
-/// `FROM` ([`bind_table_fn_call`]) and a target list ([`bind_srf_projection`]).
-/// They differ only in what they build from the result, so neither restates the
-/// per-name resolution — which is what let the two lists drift apart.
+/// The one dispatch for both positions such a call can appear in — `FROM`
+/// ([`bind_table_fn_call`]) and a target list ([`bind_srf_projection`]) — which
+/// differ only in what they build from the result.
 fn bind_polymorphic_table_fn(
     name: &str,
     bindings: &[Binding],
 ) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
     match name {
-        // `generate_series` is polymorphic on its element type and has two
-        // arities, so it resolves outside the fixed-signature table.
         "generate_series" => {
             let (elem, args) = resolve_generate_series(bindings)?;
             Ok((TableFn::GenerateSeries(elem), args))
@@ -2404,14 +2395,13 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[I4, I4, I4, I4, I4, F8],
             ret: TS,
         }],
-        // Every argument has a default of zero upstream, so a call may stop
-        // after any of them: `make_interval(1)` is a year and `make_interval()`
-        // is `00:00:00`. PG spells that as one signature plus seven defaults,
-        // which `pg_proc.pronargdefaults` reports; here it is one arity per
-        // prefix, and the executor reads the absent ones as zero.
+        // Every argument defaults to zero upstream, so a call may stop after any
+        // of them: `make_interval(1)` is a year. PG spells that as one signature
+        // plus seven defaults — which is what `pg_proc.pronargdefaults` reports —
+        // and this spells it as one arity per prefix.
         //
-        // The named-argument spelling (`make_interval(days => 3)`) is a separate
-        // gap: nothing here accepts `=>` in an argument list.
+        // The named-argument form (`make_interval(days => 3)`) is a separate gap:
+        // nothing here accepts `=>` in an argument list.
         "make_interval" => arity_sigs!(
             ScalarFn::MakeInterval,
             IV,
@@ -5042,13 +5032,12 @@ pub(crate) fn bind_srf_projection(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    // The same resolution `FROM` position does — the target-list spelling psql's
-    // `\d` uses is `SELECT pg_partition_ancestors(oid) UNION ALL VALUES (oid)`,
-    // not a different function.
+    // The same resolution `FROM` position does: psql's `\d` writes one of these
+    // as `SELECT pg_partition_ancestors(oid) UNION ALL VALUES (oid)`, and that is
+    // the same function, not a target-list variant of it.
     let (func, args) = bind_polymorphic_table_fn(&name, &bindings)?;
-    // Every one of these yields a bare scalar, so the expression's type is that
-    // single output column's — the rowset's own answer, rather than a second copy
-    // of it per name.
+    // The expression's type is the rowset's own single column, so nothing here
+    // keeps a second copy of it per name.
     debug_assert!(func.returns_scalar(), "{name} returns a composite row");
     let columns = func.columns();
     let [column] = columns.as_slice() else {

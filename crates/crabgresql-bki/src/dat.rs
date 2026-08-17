@@ -157,12 +157,9 @@ pub fn array_field(e: &Entry, key: &str) -> Option<Vec<String>> {
 ///
 /// [`array_field`] refuses a quoted element, because a list of *names* never has
 /// one. `pg_proc.proargdefaults` does — `'{"{}",false}'` is `jsonb_path_exists`'s
-/// pair of defaults — and its elements are literals this codegen cannot render
-/// back anyway. The count is still meaningful on its own: it is
-/// `pg_proc.pronargdefaults`, the number of trailing arguments a call may omit.
-///
-/// Commas inside a quoted element do not separate elements, so quoting is
-/// tracked; a `""` escape inside one is irrelevant to the count either way.
+/// pair of defaults — and nothing here can render those literals back. The count
+/// alone is still `pg_proc.pronargdefaults`: how many trailing arguments a call
+/// may omit.
 pub fn braced_list_len(e: &Entry, key: &str) -> Option<usize> {
     let raw = get(e, key)?;
     let inner = raw
