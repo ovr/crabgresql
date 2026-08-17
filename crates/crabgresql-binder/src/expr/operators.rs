@@ -2492,6 +2492,22 @@ fn array_arg_type(b: &Binding) -> Option<(PgType, PgType)> {
     }
 }
 
+/// The argument type of the three size-reporting functions — `cardinality`,
+/// `array_length`, `array_upper` — which read only how many elements a value has
+/// and so accept `oidvector`/`int2vector` as well as a real array.
+///
+/// Deliberately *not* folded into [`array_arg_type`]. PostgreSQL gives the
+/// vectors a `typelem`, so every `anyarray` function accepts them there; here
+/// only these three do, and widening the shared helper would make
+/// `array_append('1 2'::oidvector, 3)` fail inside coercion (there is no
+/// `oidvector` → `oid[]` cast) instead of reporting PG's `42883`.
+fn size_arg_type(b: &Binding) -> Option<PgType> {
+    match binding_typed_ty(b) {
+        Some(PgType::Vector(kind)) => Some(PgType::Vector(kind)),
+        _ => array_arg_type(b).map(|(arr_ty, _)| arr_ty),
+    }
+}
+
 /// Array containment / overlap operators (`@>`, `<@`, `&&`) → the array
 /// `ScalarFn`s. Both operands are arrays (an untyped literal adopts the other's
 /// array type); a typed non-array operand yields PG's `operator does not exist`.
@@ -2681,37 +2697,27 @@ pub(crate) fn bind_array_function(
             let [b] = bindings else {
                 return Err(undefined());
             };
-            let (arr_ty, _) = array_arg_type(b).ok_or_else(undefined)?;
+            let arg_ty = size_arg_type(b).ok_or_else(undefined)?;
             call(
                 ScalarFn::Cardinality,
                 PgType::Int4,
-                vec![resolve_operand(b, arr_ty)?],
+                vec![resolve_operand(b, arg_ty)?],
             )
         }
-        "array_length" => {
+        "array_length" | "array_upper" => {
             let [a, dim] = bindings else {
                 return Err(undefined());
             };
-            let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
-            call(
-                ScalarFn::ArrayLength,
-                PgType::Int4,
-                vec![
-                    resolve_operand(a, arr_ty)?,
-                    resolve_operand(dim, PgType::Int4)?,
-                ],
-            )
-        }
-        "array_upper" => {
-            let [a, dim] = bindings else {
-                return Err(undefined());
+            let func = match name {
+                "array_length" => ScalarFn::ArrayLength,
+                _ => ScalarFn::ArrayUpper,
             };
-            let (arr_ty, _) = array_arg_type(a).ok_or_else(undefined)?;
+            let arg_ty = size_arg_type(a).ok_or_else(undefined)?;
             call(
-                ScalarFn::ArrayUpper,
+                func,
                 PgType::Int4,
                 vec![
-                    resolve_operand(a, arr_ty)?,
+                    resolve_operand(a, arg_ty)?,
                     resolve_operand(dim, PgType::Int4)?,
                 ],
             )

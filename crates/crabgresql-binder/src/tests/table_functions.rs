@@ -458,3 +458,30 @@ fn generate_series_timestamp_requires_three_args() -> anyhow::Result<()> {
     assert_eq!(e.code, "42883");
     Ok(())
 }
+
+#[test]
+fn available_extension_versions_binds_eight_columns() -> anyhow::Result<()> {
+    // Eight, not the view's nine: the function does not report `installed`.
+    let (func, columns) = table_fn("SELECT * FROM pg_available_extension_versions()")?;
+    assert_eq!(func, crate::TableFn::PgAvailableExtensionVersions);
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "name",
+            "version",
+            "superuser",
+            "trusted",
+            "relocatable",
+            "schema",
+            "requires",
+            "comment"
+        ]
+    );
+    assert_eq!(columns[0].ty, PgType::Name);
+    assert_eq!(columns[2].ty, PgType::Bool);
+    // A composite-returning function takes no argument and no bare-alias rename.
+    let e = bind_err("SELECT * FROM pg_available_extension_versions(1)")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}

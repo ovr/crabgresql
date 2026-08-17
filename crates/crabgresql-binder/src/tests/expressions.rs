@@ -500,3 +500,46 @@ fn output_column_names_follow_pg() -> anyhow::Result<()> {
     assert_eq!(names, vec!["id", "name", "next", "?column?", "bool"]);
     Ok(())
 }
+
+#[test]
+fn index_property_functions_take_regclass_or_oid() -> anyhow::Result<()> {
+    // The index argument resolves in either spelling. Two entries in the
+    // signature table could not do it — an unknown literal would fit both and
+    // raise 42725 — so the two parameter types are tried in order, `regclass`
+    // first, which is also what keeps a bare literal resolving by *name*.
+    for (sql, want) in [
+        (
+            "SELECT pg_index_has_property('t_pkey', 'index_scan')",
+            PgType::Reg(crabgresql_types::RegKind::Class),
+        ),
+        (
+            "SELECT pg_index_has_property('t_pkey'::regclass, 'index_scan')",
+            PgType::Reg(crabgresql_types::RegKind::Class),
+        ),
+        (
+            "SELECT pg_index_has_property(16384::oid, 'index_scan')",
+            PgType::Oid,
+        ),
+    ] {
+        let ValuesPlan { rows, .. } = bound_values(sql)?;
+        let BoundExpr::FuncCall { func, ret, args } = &rows[0][0] else {
+            bail!("expected a function call for `{sql}`");
+        };
+        assert_eq!(*func, crate::ScalarFn::PgIndexHasProperty, "for `{sql}`");
+        assert_eq!(*ret, PgType::Bool, "for `{sql}`");
+        assert_eq!(args[0].ty(), want, "for `{sql}`");
+        assert_eq!(args[1].ty(), PgType::Text, "for `{sql}`");
+    }
+    // The three-argument sibling resolves the same way, column in between.
+    let ValuesPlan { rows, .. } =
+        bound_values("SELECT pg_index_column_has_property(16384::oid, 1, 'asc')")?;
+    let BoundExpr::FuncCall { func, args, .. } = &rows[0][0] else {
+        bail!("expected a function call");
+    };
+    assert_eq!(*func, crate::ScalarFn::PgIndexColumnHasProperty);
+    assert_eq!(args[1].ty(), PgType::Int4);
+    // A wrong arity is still 42883 rather than a mis-resolved overload.
+    let e = bind_err("SELECT pg_index_has_property('t_pkey')")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}

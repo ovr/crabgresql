@@ -46,8 +46,10 @@ pub(crate) fn build_series(
         TableFn::Unnest(_) => Ok(unnest_series(values)),
         TableFn::GenerateSubscripts => Ok(generate_subscripts_series(values)),
         TableFn::PgPartitionAncestors => Ok(pg_partition_ancestors_series(values, ctx)),
-        // Both return a record, which a target list cannot expand into.
-        TableFn::PgInputErrorInfo | TableFn::PgAvailableExtensions => Err(ExecError::new(
+        // These return a record, which a target list cannot expand into.
+        TableFn::PgInputErrorInfo
+        | TableFn::PgAvailableExtensions
+        | TableFn::PgAvailableExtensionVersions => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
             "set-returning function is not supported in this context",
         )),
@@ -90,11 +92,39 @@ pub(crate) fn pg_available_extensions_rows(ctx: &ExecContext) -> Vec<Tuple> {
     catalog
         .available_extensions()
         .into_iter()
-        .map(|(name, version, comment)| {
+        .map(|ext| {
             vec![
-                Value::Text(name),
-                Value::Text(version),
-                Value::Text(comment),
+                Value::Text(ext.name),
+                Value::Text(ext.version),
+                Value::Text(ext.comment),
+            ]
+        })
+        .collect()
+}
+
+/// The rows of `pg_available_extension_versions()`, as `(name, version,
+/// superuser, trusted, relocatable, schema, requires, comment)`.
+///
+/// Eight columns where the view of this name has nine: `installed` is the view's
+/// own, computed from `pg_extension` rather than published by the function.
+/// `requires` is NULL — nothing offered here depends on another extension.
+pub(crate) fn pg_available_extension_versions_rows(ctx: &ExecContext) -> Vec<Tuple> {
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Vec::new();
+    };
+    catalog
+        .available_extensions()
+        .into_iter()
+        .map(|ext| {
+            vec![
+                Value::Text(ext.name),
+                Value::Text(ext.version),
+                Value::Bool(ext.superuser),
+                Value::Bool(ext.trusted),
+                Value::Bool(ext.relocatable),
+                Value::Text(ext.schema),
+                Value::Null,
+                Value::Text(ext.comment),
             ]
         })
         .collect()

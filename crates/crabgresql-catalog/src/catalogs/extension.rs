@@ -20,18 +20,44 @@ use crate::SystemCatalog;
 use crate::cols::*;
 use crate::oids::*;
 
-/// The one extension name, version and description, shared by all three
-/// relations so they cannot disagree about it.
+/// The one extension name and description, shared by all three relations so
+/// they cannot disagree about it.
 const NAME: &str = "plpgsql";
-const VERSION: &str = "1.0";
 const COMMENT: &str = "PL/pgSQL procedural language";
 
-/// Every installable extension, for the three readers that must not disagree
-/// about them: the two views here, and — across a crate boundary — the
-/// set-returning `pg_available_extensions()` in the executor, which psql's `\dx`
-/// calls instead of the view of that name.
-pub fn available_extensions() -> &'static [(&'static str, &'static str, &'static str)] {
-    &[(NAME, VERSION, COMMENT)]
+/// One installable extension version: what `pg_available_extension_versions`
+/// publishes about it, minus the `installed` flag that view computes.
+///
+/// The flags are the ones PostgreSQL 18.4 reports for `plpgsql` 1.0.
+pub struct AvailableExtension {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub superuser: bool,
+    pub trusted: bool,
+    pub relocatable: bool,
+    pub schema: &'static str,
+    pub comment: &'static str,
+}
+
+/// Every installable extension version, for the four readers that must not
+/// disagree about them: the two views here, and — across a crate boundary — the
+/// set-returning `pg_available_extensions()` and
+/// `pg_available_extension_versions()` in the executor, which psql's `\dx` calls
+/// instead of the views of those names.
+///
+/// One row per `(extension, version)`. The one extension here offers exactly one
+/// version, so that row is also its *default* version — which is what lets
+/// `pg_available_extensions.default_version` read this same list.
+pub fn available_extensions() -> &'static [AvailableExtension] {
+    &[AvailableExtension {
+        name: NAME,
+        version: "1.0",
+        superuser: true,
+        trusted: true,
+        relocatable: false,
+        schema: "pg_catalog",
+        comment: COMMENT,
+    }]
 }
 
 pub(crate) fn pg_extension_schema() -> TableSchema {
@@ -53,16 +79,21 @@ pub(crate) fn pg_extension_schema() -> TableSchema {
 
 /// The `plpgsql` row, column for column as PostgreSQL 18.4 reports it.
 pub(crate) fn pg_extension_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    vec![vec![
-        Value::Oid(PLPGSQL_EXTENSION_OID),
-        Value::Text(NAME.to_string()),
-        Value::Oid(BOOTSTRAP_ROLE_OID),
-        Value::Oid(PG_CATALOG_NAMESPACE_OID),
-        Value::Bool(false),
-        Value::Text(VERSION.to_string()),
-        Value::Null,
-        Value::Null,
-    ]]
+    available_extensions()
+        .iter()
+        .map(|ext| {
+            vec![
+                Value::Oid(PLPGSQL_EXTENSION_OID),
+                Value::Text(ext.name.to_string()),
+                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(PG_CATALOG_NAMESPACE_OID),
+                Value::Bool(ext.relocatable),
+                Value::Text(ext.version.to_string()),
+                Value::Null,
+                Value::Null,
+            ]
+        })
+        .collect()
 }
 
 pub(crate) fn pg_available_extensions_schema() -> TableSchema {
@@ -83,12 +114,12 @@ pub(crate) fn pg_available_extensions_schema() -> TableSchema {
 pub(crate) fn pg_available_extensions_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
     available_extensions()
         .iter()
-        .map(|(name, version, comment)| {
+        .map(|ext| {
             vec![
-                Value::Text(name.to_string()),
-                Value::Text(version.to_string()),
-                Value::Text(version.to_string()),
-                Value::Text(comment.to_string()),
+                Value::Text(ext.name.to_string()),
+                Value::Text(ext.version.to_string()),
+                Value::Text(ext.version.to_string()),
+                Value::Text(ext.comment.to_string()),
             ]
         })
         .collect()
@@ -112,17 +143,24 @@ pub(crate) fn pg_available_extension_versions_schema() -> TableSchema {
     )
 }
 
-/// The flags PostgreSQL 18.4 reports for `plpgsql` 1.0.
+/// `installed` is `true` for every row: the one extension is always installed,
+/// so no version of it is offered and not present. `requires` is NULL, as
+/// PostgreSQL reports for an extension that depends on nothing.
 pub(crate) fn pg_available_extension_versions_rows(_cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    vec![vec![
-        Value::Text(NAME.to_string()),
-        Value::Text(VERSION.to_string()),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(false),
-        Value::Text("pg_catalog".to_string()),
-        Value::Null,
-        Value::Text(COMMENT.to_string()),
-    ]]
+    available_extensions()
+        .iter()
+        .map(|ext| {
+            vec![
+                Value::Text(ext.name.to_string()),
+                Value::Text(ext.version.to_string()),
+                Value::Bool(true),
+                Value::Bool(ext.superuser),
+                Value::Bool(ext.trusted),
+                Value::Bool(ext.relocatable),
+                Value::Text(ext.schema.to_string()),
+                Value::Null,
+                Value::Text(ext.comment.to_string()),
+            ]
+        })
+        .collect()
 }

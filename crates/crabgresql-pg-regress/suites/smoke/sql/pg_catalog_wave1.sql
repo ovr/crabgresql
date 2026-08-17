@@ -62,6 +62,19 @@ SELECT extname, extnamespace, extrelocatable, extversion FROM pg_extension;
 -- in SHAREDIR/extension, and there is no such directory here.
 SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'plpgsql';
 SELECT name, version, installed, relocatable, schema FROM pg_available_extension_versions WHERE name = 'plpgsql';
+-- The set-returning functions psql calls instead of those two views. The
+-- versions one has eight columns where the view has nine: `installed` is the
+-- view's own, computed from pg_extension rather than reported by the function.
+SELECT * FROM pg_available_extensions() WHERE name = 'plpgsql';
+SELECT * FROM pg_available_extension_versions() WHERE name = 'plpgsql';
+-- pg_tablespace_location: the empty string for the bootstrap tablespaces, which
+-- live inside the data directory. It never reads pg_tablespace — an OID with no
+-- pg_tblspc entry is the failing stat, not NULL — and OID 0 answers the empty
+-- string as well.
+SELECT spcname, pg_tablespace_location(oid) = '' AS no_location
+  FROM pg_tablespace ORDER BY oid;
+SELECT pg_tablespace_location(0) = '' AS zero, pg_tablespace_location(NULL) IS NULL AS strict;
+SELECT pg_tablespace_location(16384);           -- error
 -- psql's \dx reads its Description column from pg_description, not from
 -- pg_available_extensions.comment. The extension's row is one of the ~640 this
 -- build publishes (PostgreSQL carries ~5400, the rest of them describing

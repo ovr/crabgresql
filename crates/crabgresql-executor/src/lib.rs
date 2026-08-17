@@ -15,6 +15,7 @@ pub mod eval;
 mod generate_series;
 pub mod generated;
 mod hash;
+mod index_props;
 mod keyindex;
 mod md5;
 mod node;
@@ -174,11 +175,11 @@ pub trait CatalogOps: Send + Sync {
     /// reverse of the numbering `pg_constraint`'s rows are built from.
     fn constraint_def(&self, oid: u32) -> Option<ConstraintDef>;
 
-    /// Every installable extension as `(name, default_version, comment)`, for
-    /// the `pg_available_extensions()` function. The same rows the view of that
-    /// name publishes — one source, so `\dx` and a direct read of the view
+    /// Every installable extension version, for the `pg_available_extensions()`
+    /// and `pg_available_extension_versions()` functions. The same rows the views
+    /// of those names publish — one source, so `\dx` and a direct read of a view
     /// cannot disagree.
-    fn available_extensions(&self) -> Vec<(String, String, String)>;
+    fn available_extensions(&self) -> Vec<ExtensionVersion>;
 
     /// The relation `oid` and each partitioned ancestor above it, innermost
     /// first, as `pg_partition_ancestors` reports them. **Empty** for a relation
@@ -218,6 +219,25 @@ pub trait CatalogOps: Send + Sync {
     /// connection rather than an OS process — every session here is served from
     /// the same one — which is what `WHERE pid = pg_backend_pid()` needs of it.
     fn backend_pid(&self) -> i32;
+}
+
+/// One installable extension version, as [`CatalogOps::available_extensions`]
+/// reports it: everything `pg_available_extension_versions()` publishes.
+///
+/// `pg_available_extensions()` reads the same rows and shows three of the fields;
+/// `installed` is not carried because the *view* computes it, not the function.
+/// Neither is `requires`, which is NULL for every extension here.
+#[derive(Clone, Debug)]
+pub struct ExtensionVersion {
+    pub name: String,
+    /// The version, which is also the extension's `default_version`: each one
+    /// here offers exactly one.
+    pub version: String,
+    pub superuser: bool,
+    pub trusted: bool,
+    pub relocatable: bool,
+    pub schema: String,
+    pub comment: String,
 }
 
 /// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering

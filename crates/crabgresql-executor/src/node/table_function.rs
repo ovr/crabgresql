@@ -3,8 +3,9 @@ use crabgresql_storage_api::Tuple;
 use crabgresql_types::Value;
 
 use super::series::{
-    generate_subscripts_series, jsonb_path_query_series, pg_available_extensions_rows,
-    pg_input_error_info_row, pg_partition_ancestors_series, unnest_series,
+    generate_subscripts_series, jsonb_path_query_series, pg_available_extension_versions_rows,
+    pg_available_extensions_rows, pg_input_error_info_row, pg_partition_ancestors_series,
+    unnest_series,
 };
 use crate::generate_series::Series;
 use crate::{ExecContext, ExecError, ExecNode, eval};
@@ -73,6 +74,9 @@ impl TableFunctionSource {
                 }
                 TableFn::PgAvailableExtensions => {
                     TableFnState::Rows(pg_available_extensions_rows(&self.ctx).into_iter())
+                }
+                TableFn::PgAvailableExtensionVersions => {
+                    TableFnState::Rows(pg_available_extension_versions_rows(&self.ctx).into_iter())
                 }
             });
         }

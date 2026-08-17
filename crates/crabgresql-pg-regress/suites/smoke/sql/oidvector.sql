@@ -114,6 +114,31 @@ SELECT (NULL::oidvector)[0] IS NULL;
 SELECT unnest('11 22 33'::oidvector);
 SELECT unnest('11 22 33'::int2vector);
 
+-- The size-reporting anyarray functions accept a vector, and report the bounds
+-- of a dimension that starts at 0: array_upper is one less than the length, and
+-- an empty vector still *has* the dimension, so its length is 0 rather than the
+-- NULL an empty array answers.
+SELECT array_length('11 22 33'::oidvector, 1),
+       array_upper('11 22 33'::oidvector, 1),
+       cardinality('11 22 33'::oidvector);
+SELECT array_length('1 2'::int2vector, 1),
+       array_upper('1 2'::int2vector, 1),
+       cardinality('1 2'::int2vector);
+SELECT array_length(''::oidvector, 1),
+       array_upper(''::oidvector, 1),
+       cardinality(''::int2vector);
+SELECT array_length('{}'::int[], 1) AS empty_array_is_null;
+-- Vectors are one-dimensional, so no other dimension answers; and all three are
+-- STRICT.
+SELECT array_length('11 22'::oidvector, 2) IS NULL AS dim2,
+       array_upper('11 22'::oidvector, 0) IS NULL AS dim0,
+       array_length(NULL::oidvector, 1) IS NULL AS null_vector,
+       array_length('11 22'::oidvector, NULL) IS NULL AS null_dim,
+       cardinality(NULL::int2vector) IS NULL AS null_cardinality;
+-- The catalog's own vector columns, which is where a client meets these.
+SELECT proname, array_length(proargtypes, 1), array_upper(proargtypes, 1)
+  FROM pg_proc WHERE proname IN ('bthandler', 'array_agg_transfn') ORDER BY proname;
+
 -- Ordering. At equal length both kinds compare element-wise, and a common
 -- prefix puts the shorter one first.
 SELECT '1 2'::oidvector = '1 2'::oidvector;

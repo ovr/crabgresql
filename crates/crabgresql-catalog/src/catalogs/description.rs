@@ -126,12 +126,12 @@ fn descriptions() -> &'static [Description] {
 
         let extension = classoid("pg_extension");
         let language = classoid("pg_language");
-        for (_, _, comment) in available_extensions() {
+        for ext in available_extensions() {
             // The extension and the language it installs carry the same comment
             // on PostgreSQL, both written by `CREATE EXTENSION` rather than by
             // any `.dat`.
-            rows.push((extension, PLPGSQL_EXTENSION_OID, 0, comment));
-            rows.push((language, PLPGSQL_LANG_OID, 0, comment));
+            rows.push((extension, PLPGSQL_EXTENSION_OID, 0, ext.comment));
+            rows.push((language, PLPGSQL_LANG_OID, 0, ext.comment));
         }
 
         // The snowball template, dictionaries and configurations, whose

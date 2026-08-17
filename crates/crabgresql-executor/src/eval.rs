@@ -819,6 +819,8 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::PgIndexHasProperty
+            | ScalarFn::PgIndexColumnHasProperty
             | ScalarFn::ObjDescription
             | ScalarFn::ColDescription
             | ScalarFn::TableOid
@@ -849,12 +851,17 @@ fn eval_catalog_fn(
     if !matches!(func, ScalarFn::PgTypeof(_)) && matches!(args.first(), Some(Value::Null)) {
         return Some(Ok(Value::Null));
     }
-    // The two description functions are the only ones here that are STRICT in an
-    // argument past the first, and `args.first()` above cannot see it:
-    // `col_description(oid, NULL)` is NULL, not the whole-object comment that a
-    // NULL read as column 0 would find.
-    if matches!(func, ScalarFn::ObjDescription | ScalarFn::ColDescription)
-        && args.iter().any(|arg| matches!(arg, Value::Null))
+    // These are the functions here that are STRICT in an argument past the first,
+    // which `args.first()` above cannot see: `col_description(oid, NULL)` is
+    // NULL, not the whole-object comment that a NULL read as column 0 would find,
+    // and a NULL property name is NULL rather than an unknown property.
+    if matches!(
+        func,
+        ScalarFn::ObjDescription
+            | ScalarFn::ColDescription
+            | ScalarFn::PgIndexHasProperty
+            | ScalarFn::PgIndexColumnHasProperty
+    ) && args.iter().any(|arg| matches!(arg, Value::Null))
     {
         return Some(Ok(Value::Null));
     }
@@ -912,10 +919,13 @@ fn eval_catalog_fn(
     // The binder declares the OID-taking arguments as `oid` and inserts the
     // coercion, so the value has already arrived as one — including the
     // reinterpret-not-clamp of a negative (PG prints `pg_get_userbyid(-1)` as
-    // `unknown (OID=…4295)`), which `cast` owns. `RegIn` alone takes text.
-    let oid = match args[0] {
+    // `unknown (OID=…4295)`), which `cast` owns. `RegIn` alone takes text, and
+    // the functions with a `regclass` overload arrive holding the resolved
+    // reference (`oid_of` panics on one).
+    let oid = match &args[0] {
         Value::Text(_) => 0,
-        _ => oid_of(&args[0]),
+        Value::Reg(reg) => reg.oid,
+        other => oid_of(other),
     };
     let value = match func {
         // PG never returns NULL here: an unresolvable OID prints a placeholder.
@@ -925,6 +935,37 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // The index property functions. Everything unanswerable is NULL and
+        // nothing raises: an OID that is no index (a table's own, or one naming
+        // nothing at all), a property the level does not own, and — for the
+        // column form — a column number outside the key list, all verified
+        // against PostgreSQL 18.4.
+        ScalarFn::PgIndexHasProperty => {
+            let Value::Text(prop) = &args[1] else {
+                unreachable!("pg_index_has_property property was {:?}", args[1]);
+            };
+            ops.index_def(oid)
+                .and_then(|def| crate::index_props::index_property(def.index.method, prop))
+                .map_or(Value::Null, Value::Bool)
+        }
+        ScalarFn::PgIndexColumnHasProperty => {
+            let (Value::Int4(column), Value::Text(prop)) = (&args[1], &args[2]) else {
+                unreachable!(
+                    "pg_index_column_has_property arguments were {:?}",
+                    &args[1..]
+                );
+            };
+            ops.index_def(oid)
+                .and_then(|def| {
+                    // PostgreSQL numbers an index's columns from 1.
+                    let key = usize::try_from(*column)
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .and_then(|n| def.index.keys.get(n))?;
+                    crate::index_props::index_column_property(def.index.method, key, prop)
+                })
+                .map_or(Value::Null, Value::Bool)
+        }
         // "Other" means a temp namespace that is not this session's. An OID
         // naming nothing is `false`, not NULL — verified against PG 18.4 for 0,
         // 2200 and 999999 — and so is this session's own.
@@ -1669,7 +1710,7 @@ mod format_type_tests {
             fn partition_ancestors(&self, _oid: u32) -> Vec<u32> {
                 Vec::new()
             }
-            fn available_extensions(&self) -> Vec<(String, String, String)> {
+            fn available_extensions(&self) -> Vec<crate::ExtensionVersion> {
                 Vec::new()
             }
             fn current_database(&self) -> String {
