@@ -20,6 +20,9 @@ pub const INVALID_ROW_COUNT_IN_LIMIT_CLAUSE: &str = "2201W";
 pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE: &str = "2201X";
 pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
 pub const SYNTAX_ERROR: &str = "42601";
+/// `42602` — a string that has to parse as an object name does not, e.g. an
+/// unterminated quote or an empty part in a `reg*` input value.
+pub const INVALID_NAME: &str = "42602";
 pub const DUPLICATE_ALIAS: &str = "42712";
 pub const UNDEFINED_COLUMN: &str = "42703";
 pub const AMBIGUOUS_COLUMN: &str = "42702";

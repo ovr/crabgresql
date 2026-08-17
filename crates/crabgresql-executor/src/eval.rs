@@ -1270,12 +1270,10 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
     };
     // The same identifier rules every other name-taking catalog function uses:
     // an unquoted part folds to lower case, a `"quoted"` one keeps its spelling.
-    let Some((namespace, relation)) = crate::reg::split_qualified_name(name) else {
-        return Err(ExecError::new(
-            sqlstate::UNDEFINED_TABLE,
-            format!("relation \"{name}\" does not exist"),
-        ));
-    };
+    // Shared with `regclass` input, because upstream both reach the same
+    // `makeRangeVarFromNameList` and so raise the same errors for a name that
+    // does not parse.
+    let (namespace, relation) = crate::reg::relation_name(name, catalog)?;
     let (namespace, relation) = (namespace.as_deref(), relation.as_str());
     if catalog.rel_oid(namespace, relation).is_none() {
         return Err(ExecError::new(

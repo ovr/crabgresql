@@ -42,6 +42,35 @@ SELECT 'rc_nosuchoperator'::regoper;
 -- equality is by OID, and the round trip through oid and text preserves it
 SELECT '||/'::regoper = 597::regoper AS same_operator,
        '||/'::regoper::oid AS as_oid, '||/'::regoper::text AS as_text;
+--
+-- reg* NAME PARSING
+-- a built-in whose SQL spelling is several words is one *type name*, not
+-- several identifiers, so regtype reads its argument with the type grammar
+-- before anything tries to split it on dots
+SELECT 'character varying'::regtype AS vc, 'double precision'::regtype AS f8,
+       'timestamp with time zone'::regtype AS tstz;
+-- a string that does not parse as a name at all is a syntax error, not a miss
+SELECT ''::regclass;
+SELECT '"unterminated'::regclass;
+SELECT 'rc_t.'::regclass;
+SELECT 'rc t'::regclass;
+-- ... but an explicitly quoted empty part is a name, and merely names nothing
+SELECT '""'::regclass;
+-- a three-part name carries a database: accepted when it names the one this
+-- session is connected to, and rejected otherwise
+SELECT (current_database() || '.public.rc_t')::regclass AS db_qualified;
+SELECT 'rc_nosuchdb.public.rc_t'::regclass;
+-- past three parts nothing can qualify it, and the wording is per kind
+SELECT 'a.b.c.d'::regclass;
+SELECT 'a.b.c'::regproc;
+SELECT 'a.b.c.d'::regtype;
+-- a schema name is never qualified at all, which makes a dotted one a syntax
+-- error where the same string would be a plain miss for the other kinds
+SELECT 'a.b'::regnamespace;
+-- the "does not exist" text echoes the *parsed* name, except for regproc and
+-- regoper, which echo the argument exactly as written
+SELECT 'PUB.RcNoSuch'::regclass;
+SELECT 'PUB.RcNoSuch'::regproc;
 -- casting to text goes through the rendered name, not the OID
 SELECT 'rc_t'::regclass::text AS as_text, length('rc_t'::regclass::text) AS len;
 -- the round trip through oid preserves the value
