@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787007608262,
+  "lastUpdate": 1787007610101,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -42052,6 +42052,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18100.057321,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "00294734ba229cbfd419a85e2cd8ad485c17357e",
+          "message": "feat: Support pg_available_extension_versions, pg_tablespace_location and the index AM property functions (#259)",
+          "timestamp": "2026-08-17T22:11:36Z",
+          "tree_id": "b4e772920f6943af812a7a4b8fe0a8e92251f064",
+          "url": "https://github.com/ovr/crabgresql/commit/00294734ba229cbfd419a85e2cd8ad485c17357e"
+        },
+        "date": 1787007609974,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 335.094357,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 33662.676363,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
