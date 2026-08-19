@@ -176,6 +176,37 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
 }
 
 #[test]
+fn table_fn_argument_may_reference_an_enclosing_query() -> anyhow::Result<()> {
+    // Not a LATERAL: the argument names the *enclosing* query, which PG resolves
+    // without the keyword (the FROM item to correlate to is one level out, not a
+    // sibling). Bound in a scope with no outer levels this was a spurious 42703.
+    let plan = bound("SELECT id, ARRAY(SELECT g FROM generate_series(1, t.id) g) FROM t")?;
+    let LogicalPlan::Query(QueryPlan { projections, .. }) = &plan else {
+        bail!("expected a Query plan");
+    };
+    let Some(BoundExpr::ArraySubquery { subplan, .. }) = projections.get(1) else {
+        bail!("expected an ARRAY subquery in the target list");
+    };
+    let LogicalPlan::TableFunction(TableFunctionPlan { args, .. }) = subplan.plan.as_ref() else {
+        bail!("expected the subquery to be a table-function scan");
+    };
+    // `id` is the test table's first column, and the enclosing query is level 1.
+    assert!(
+        matches!(
+            args[1],
+            BoundExpr::OuterColumnRef {
+                level: 1,
+                index: 0,
+                ..
+            }
+        ),
+        "the upper bound should be an outer reference, got {:?}",
+        args[1]
+    );
+    Ok(())
+}
+
+#[test]
 fn lateral_argument_that_resolves_but_has_no_overload_reports_the_overload() -> anyhow::Result<()> {
     // `t.name` is text, so even with LATERAL there is no `unnest(text)`. The
     // argument resolves against the left side, so the misleading 42P01 is

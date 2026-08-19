@@ -61,6 +61,22 @@ fn a_self_contained_subquery_over_an_aggregate_is_not_rejected() -> anyhow::Resu
     Ok(())
 }
 
+/// An outer reference in a *table function's arguments* escapes its subplan
+/// like any other, so the marker above it is executed per outer row (with
+/// `substitute_outer` filling the arguments) rather than folded once.
+#[test]
+fn an_outer_reference_in_a_table_fn_argument_escapes() -> anyhow::Result<()> {
+    let plan = bound("SELECT id, ARRAY(SELECT g FROM generate_series(1, t.id) g) FROM t")?;
+    let LogicalPlan::Query(QueryPlan { projections, .. }) = &plan else {
+        bail!("expected a Query plan");
+    };
+    let Some(BoundExpr::ArraySubquery { subplan, .. }) = projections.get(1) else {
+        bail!("expected an ARRAY subquery in the target list");
+    };
+    assert!(plan_has_outer_refs(&subplan.plan));
+    Ok(())
+}
+
 /// A FROM subquery is bound with an empty outer scope, so a parsed LATERAL
 /// cannot mean what it says. Report the missing feature rather than the
 /// `42703` that falls out of binding it as a plain derived table.

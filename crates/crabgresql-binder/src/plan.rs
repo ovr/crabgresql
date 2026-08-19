@@ -2556,7 +2556,8 @@ fn bind_table_query(
         source,
         relations,
         visible,
-    } = bind_from_item(engine, catalog, params, &relation, ctes, &[], &demand)?.into_bound_from();
+    } = bind_from_item(engine, catalog, params, &relation, ctes, &[], &[], &demand)?
+        .into_bound_from();
     let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let mut columns = Vec::new();
     let mut projections = Vec::new();
@@ -2809,6 +2810,9 @@ fn view_output_columns(
 /// `siblings` are the FROM items already bound to this item's left, used only to
 /// tell an implicitly-lateral table-function argument from a genuinely unknown
 /// column (see [`bind_table_fn_args`]); it is empty for the leftmost item.
+/// `outer_scope` carries the enclosing queries' relations, which a table
+/// function's arguments — and only they, among FROM items — may reference.
+#[allow(clippy::too_many_arguments)]
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
     catalog: &Arc<dyn TypeCatalog>,
@@ -2816,6 +2820,7 @@ fn bind_from_item(
     relation: &ast::TableFactor,
     ctes: &CteEnv,
     siblings: &[ScopeItem],
+    outer_scope: &[OuterLevel],
     demand: &SystemDemand,
 ) -> Result<BoundFromItem, BindError> {
     match relation {
@@ -2838,7 +2843,8 @@ fn bind_from_item(
             let fname = crate::functions::function_name(name)
                 .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
             let arg_exprs = positional_arg_exprs(&fn_args.args)?;
-            let (func, args) = bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings)?;
+            let (func, args) =
+                bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings, outer_scope)?;
             bound_table_fn_item(func, args, &fname, alias, *with_ordinality)
         }
         // `unnest(array)` in FROM. Under the PostgreSQL dialect the parser gives
@@ -2868,8 +2874,14 @@ fn bind_from_item(
                     "unnest with multiple arrays is not supported yet",
                 ));
             }
-            let (func, args) =
-                bind_table_fn_args("unnest", array_exprs, catalog, params, siblings)?;
+            let (func, args) = bind_table_fn_args(
+                "unnest",
+                array_exprs,
+                catalog,
+                params,
+                siblings,
+                outer_scope,
+            )?;
             bound_table_fn_item(func, args, "unnest", alias, *with_ordinality)
         }
         // `LATERAL f(…)` gets its own factor. Say what is actually missing, the
@@ -3445,6 +3457,7 @@ fn bind_table_with_joins(
         &table.relation,
         ctes,
         siblings,
+        outer_scope,
         demand,
     )?
     .into_bound_from();
@@ -3483,6 +3496,7 @@ fn bind_table_with_joins(
             &join.relation,
             ctes,
             &left_relations,
+            outer_scope,
             demand,
         )?
         .into_bound_from();
@@ -4036,11 +4050,17 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
 
 /// Bind a table function's arguments for a FROM item.
 ///
-/// The arguments bind in an empty scope, which is exactly what a *lateral*
-/// reference is not: in PostgreSQL a function FROM item is implicitly LATERAL, so
-/// `FROM t, unnest(t.arr)` is legal there and resolves `t`. Left to fall through,
-/// that query would fail with a misleading `42P01 missing FROM-clause entry for
-/// table "t"` — blaming the user for a FROM clause that plainly lists `t`. So on
+/// The arguments see no relation of their own FROM clause, but they do see the
+/// *enclosing* queries': `SELECT (SELECT … FROM unnest(t.arr)) FROM t` is an
+/// ordinary correlated reference, legal in PostgreSQL without LATERAL — so
+/// `outer_scope` is in scope here, and a reference it resolves becomes an
+/// [`BoundExpr::OuterColumnRef`] filled per outer row by [`substitute_outer`].
+///
+/// A *lateral* reference is the other thing, and it is what this scope is not:
+/// in PostgreSQL a function FROM item is implicitly LATERAL, so `FROM t,
+/// unnest(t.arr)` is legal there and resolves `t`. Left to fall through, that
+/// query would fail with a misleading `42P01 missing FROM-clause entry for table
+/// "t"` — blaming the user for a FROM clause that plainly lists `t`. So on
 /// failure, retry against the FROM items already bound to this side.
 ///
 /// The retry asks whether the *arguments* resolve there, not whether the whole
@@ -4048,14 +4068,24 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
 /// and the only thing missing is LATERAL itself, while `unnest(t.name)` on a text
 /// column reports the `42883` PostgreSQL reports. A name that resolves nowhere
 /// keeps its original 42703/42P01, also matching PostgreSQL.
+///
+/// The two scopes are tried outer-first, which is the one case where this
+/// diverges from PostgreSQL: a name visible *both* in a sibling FROM item and in
+/// an enclosing query resolves to the sibling there (the implicit LATERAL is the
+/// nearer scope) and outward here. Trying siblings first is not an option while
+/// LATERAL is unimplemented — every constant argument resolves in any scope, so
+/// `FROM t, generate_series(1, 5)` would report a LATERAL that is not there.
+/// The divergence goes away with LATERAL itself.
 fn bind_table_fn_args(
     name: &str,
     arg_exprs: &[ast::Expr],
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
     siblings: &[ScopeItem],
+    outer_scope: &[OuterLevel],
 ) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
-    let error = match bind_table_fn_call(name, arg_exprs, &Scope::empty(catalog, params)) {
+    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
+    let error = match bind_table_fn_call(name, arg_exprs, &scope) {
         Ok(bound) => return Ok(bound),
         Err(error) => error,
     };

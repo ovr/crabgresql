@@ -13812,6 +13812,73 @@ async fn catalog_xmin_tracks_each_relations_own_ddl() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DataGrip's extension list, verbatim from its query log.
+///
+/// Worth carrying whole rather than as its parts: what it asks for is a join
+/// over three relations *and* a correlated `unnest` — the array of available
+/// versions comes from a LEFT JOIN, and the subquery that filters it names a
+/// column of the enclosing query from inside a FROM item. That last piece is not
+/// LATERAL (the correlation is one level out, which PostgreSQL resolves without
+/// the keyword), and binding those arguments with no outer scope answered the
+/// whole query with `42703 column "available_versions" does not exist`.
+///
+/// The one extension is installed at its only version, so `available_updates` is
+/// the empty array — and the LEFT JOIN's unmatched side would give the same
+/// answer, which is why the join's `V.name` is checked too.
+#[tokio::test]
+async fn datagrip_extension_list_query() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let listed = client
+        .simple_query(
+            "select E.oid        as id, \
+                    E.xmin       as state_number, \
+                    extname      as name, \
+                    extversion   as version, \
+                    extnamespace as schema_id, \
+                    nspname      as schema_name, \
+                    array(select unnest \
+                          from unnest(available_versions) \
+                          where unnest > extversion) as available_updates \
+             from pg_catalog.pg_extension E \
+                    join pg_namespace N on E.extnamespace = N.oid \
+                    left join (select name, array_agg(version) as available_versions \
+                               from pg_available_extension_versions() \
+                               group by name) V on E.extname = V.name",
+        )
+        .await?;
+    let listed = rows(&listed);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].get("name"), Some("plpgsql"));
+    assert_eq!(listed[0].get("version"), Some("1.0"));
+    assert_eq!(listed[0].get("schema_name"), Some("pg_catalog"));
+    assert_eq!(
+        listed[0].get("available_updates"),
+        Some("{}"),
+        "the installed version is the only one offered"
+    );
+
+    // The LEFT JOIN did find its row: an unmatched one would leave
+    // `available_versions` NULL and reach the same empty array by accident.
+    let versions = scalar(
+        &client,
+        "select array_agg(version)::text from pg_available_extension_versions() \
+         where name = 'plpgsql'",
+    )
+    .await;
+    assert_eq!(versions, "{1.0}");
+
+    // And the correlated filter really does filter: with a lower installed
+    // version the same shape reports the newer one as an update.
+    let updates = scalar(
+        &client,
+        "select array(select unnest from unnest(available_versions) where unnest > extversion)::text \
+         from (values ('0.9', ARRAY['0.9', '1.0'])) e(extversion, available_versions)",
+    )
+    .await;
+    assert_eq!(updates, "{1.0}");
+    Ok(())
+}
+
 /// `pg_attribute` lists the six system attributes for the relations that have
 /// them and for no others.
 ///
