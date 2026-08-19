@@ -2837,15 +2837,16 @@ fn bind_from_item(
                     "table function SETTINGS are not supported yet",
                 ));
             }
-            // A *function* name, not a relation name: qualifiers are resolved by
-            // the same rule a scalar call uses, not rejected as they are for a
-            // relation.
-            let fname = crate::functions::function_name(name)
-                .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
-            let arg_exprs = positional_arg_exprs(&fn_args.args)?;
-            let (func, args) =
-                bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings, outer_scope)?;
-            bound_table_fn_item(func, args, &fname, alias, *with_ordinality)
+            bind_function_from_item(
+                name,
+                &fn_args.args,
+                alias,
+                *with_ordinality,
+                catalog,
+                params,
+                siblings,
+                outer_scope,
+            )
         }
         // `unnest(array)` in FROM. Under the PostgreSQL dialect the parser gives
         // this its own factor rather than a `Table` with call arguments, but it
@@ -2884,12 +2885,28 @@ fn bind_from_item(
             )?;
             bound_table_fn_item(func, args, "unnest", alias, *with_ordinality)
         }
-        // `LATERAL f(…)` gets its own factor. Say what is actually missing, the
-        // way the derived-table arm below does, instead of falling through to the
-        // catch-all's opaque "FROM item is not supported yet".
-        ast::TableFactor::Function { lateral: true, .. } => Err(BindError::feature_not_supported(
-            "LATERAL is not supported yet",
-        )),
+        // `LATERAL f(…)` gets its own factor, and binds exactly like the `f(…)`
+        // above: a function FROM item is implicitly LATERAL in PostgreSQL, so the
+        // keyword adds nothing there and cannot decide anything here either. What
+        // it may reference is settled by `bind_table_fn_args` for both spellings
+        // — an enclosing query's column resolves, a sibling FROM item is the
+        // LATERAL gap and is reported as one.
+        ast::TableFactor::Function {
+            name,
+            args,
+            with_ordinality,
+            alias,
+            ..
+        } => bind_function_from_item(
+            name,
+            args,
+            alias,
+            *with_ordinality,
+            catalog,
+            params,
+            siblings,
+            outer_scope,
+        ),
         // A bare name may resolve to a CTE (which shadows a real table).
         ast::TableFactor::Table {
             name,
@@ -4048,34 +4065,58 @@ pub(crate) fn strip_to_existence(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
+/// Bind a set-returning function FROM item, whichever factor the parser gave it:
+/// `f(…)`, `LATERAL f(…)`, and (via its caller) `unnest(…)` all end up here.
+#[allow(clippy::too_many_arguments)]
+fn bind_function_from_item(
+    name: &ast::ObjectName,
+    args: &[ast::FunctionArg],
+    alias: &Option<ast::TableAlias>,
+    with_ordinality: bool,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    siblings: &[ScopeItem],
+    outer_scope: &[OuterLevel],
+) -> Result<BoundFromItem, BindError> {
+    // A *function* name, not a relation name: qualifiers are resolved by the
+    // same rule a scalar call uses, not rejected as they are for a relation.
+    let fname = crate::functions::function_name(name)
+        .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
+    let arg_exprs = positional_arg_exprs(args)?;
+    let (func, bound_args) =
+        bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings, outer_scope)?;
+    bound_table_fn_item(func, bound_args, &fname, alias, with_ordinality)
+}
+
 /// Bind a table function's arguments for a FROM item.
 ///
-/// The arguments see no relation of their own FROM clause, but they do see the
-/// *enclosing* queries': `SELECT (SELECT … FROM unnest(t.arr)) FROM t` is an
-/// ordinary correlated reference, legal in PostgreSQL without LATERAL — so
-/// `outer_scope` is in scope here, and a reference it resolves becomes an
-/// [`BoundExpr::OuterColumnRef`] filled per outer row by [`substitute_outer`].
+/// Two scopes can answer them, and PostgreSQL consults them in this order:
 ///
-/// A *lateral* reference is the other thing, and it is what this scope is not:
-/// in PostgreSQL a function FROM item is implicitly LATERAL, so `FROM t,
-/// unnest(t.arr)` is legal there and resolves `t`. Left to fall through, that
-/// query would fail with a misleading `42P01 missing FROM-clause entry for table
-/// "t"` — blaming the user for a FROM clause that plainly lists `t`. So on
-/// failure, retry against the FROM items already bound to this side.
+/// 1. The FROM items already bound to this one's left. A function FROM item is
+///    implicitly LATERAL there, so `FROM t, unnest(t.arr)` resolves `t` — and
+///    that is the one thing this build cannot do. It is reported as the missing
+///    feature it is rather than resolved somewhere else: binding such a name
+///    outward instead would silently answer a *different* query.
+/// 2. The enclosing queries. `SELECT (SELECT … FROM unnest(t.arr)) FROM t` is an
+///    ordinary correlated reference, legal in PostgreSQL without LATERAL, and it
+///    binds to an [`BoundExpr::OuterColumnRef`] filled per outer row by
+///    [`substitute_outer`].
 ///
-/// The retry asks whether the *arguments* resolve there, not whether the whole
-/// call does, so the two gaps stay distinct: `unnest(t.arr)` resolves completely
-/// and the only thing missing is LATERAL itself, while `unnest(t.name)` on a text
-/// column reports the `42883` PostgreSQL reports. A name that resolves nowhere
-/// keeps its original 42703/42P01, also matching PostgreSQL.
+/// The order only matters for a name both scopes could answer, and there it is
+/// the whole point: PostgreSQL takes the sibling, so this reports the LATERAL
+/// gap rather than quietly reaching one level further out.
 ///
-/// The two scopes are tried outer-first, which is the one case where this
-/// diverges from PostgreSQL: a name visible *both* in a sibling FROM item and in
-/// an enclosing query resolves to the sibling there (the implicit LATERAL is the
-/// nearer scope) and outward here. Trying siblings first is not an option while
-/// LATERAL is unimplemented — every constant argument resolves in any scope, so
-/// `FROM t, generate_series(1, 5)` would report a LATERAL that is not there.
-/// The divergence goes away with LATERAL itself.
+/// A sibling *could* answer an argument when the argument needs more than
+/// constants — it does not bind with nothing at all in scope — and the siblings
+/// satisfy it. That first half is what keeps `FROM t, generate_series(1, 5)` out
+/// of the LATERAL branch: a constant binds in every scope, siblings included.
+///
+/// The probe asks whether the *arguments* resolve against the siblings, not
+/// whether the whole call does, so the two gaps stay distinct: `unnest(t.arr)`
+/// resolves completely and the only thing missing is LATERAL itself, while
+/// `unnest(t.name)` on a text column reports the `42883` PostgreSQL reports. A
+/// name that resolves in neither scope keeps its own 42703/42P01, also matching
+/// PostgreSQL.
 fn bind_table_fn_args(
     name: &str,
     arg_exprs: &[ast::Expr],
@@ -4084,21 +4125,21 @@ fn bind_table_fn_args(
     siblings: &[ScopeItem],
     outer_scope: &[OuterLevel],
 ) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
-    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
-    let error = match bind_table_fn_call(name, arg_exprs, &scope) {
-        Ok(bound) => return Ok(bound),
-        Err(error) => error,
-    };
     if !siblings.is_empty() {
+        let bare = Scope::empty(catalog, params);
         let lateral = Scope::relations(siblings.to_vec(), catalog, params);
-        if arg_exprs.iter().all(|e| bind_expr(e, &lateral).is_ok()) {
+        let needs_a_sibling = arg_exprs
+            .iter()
+            .any(|e| bind_expr(e, &bare).is_err() && bind_expr(e, &lateral).is_ok());
+        if needs_a_sibling {
             return Err(match bind_table_fn_call(name, arg_exprs, &lateral) {
                 Ok(_) => BindError::feature_not_supported("LATERAL is not supported yet"),
                 Err(call_error) => call_error,
             });
         }
     }
-    Err(error)
+    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
+    bind_table_fn_call(name, arg_exprs, &scope)
 }
 
 /// Assemble the FROM item for an already-resolved table function. `default_name`

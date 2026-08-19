@@ -13879,6 +13879,71 @@ async fn datagrip_extension_list_query() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Which scope a table function's arguments are resolved in, over the wire.
+///
+/// Three answers, and the order between the first two is the whole rule —
+/// PostgreSQL 18.4 was asked all of them:
+///
+/// * an enclosing query's column resolves (an ordinary correlation), with or
+///   without the `LATERAL` keyword, which is a no-op on a function FROM item;
+/// * a *sibling* FROM item that could answer the same name wins over that
+///   enclosing query, and binding it laterally is the unimplemented half — so
+///   the answer is the missing feature, not a silent reach one level further out
+///   that would answer a different question;
+/// * a name neither can answer stays `42703`.
+#[tokio::test]
+async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() -> anyhow::Result<()>
+{
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t (id int, arr text[]); \
+             CREATE TABLE u (id int, arr text[]); \
+             INSERT INTO t VALUES (1, ARRAY['a', 'b', 'c']), (2, ARRAY['x']); \
+             INSERT INTO u VALUES (10, ARRAY['p', 'q'])",
+        )
+        .await?;
+
+    // PG answers 3 then 1 for both spellings.
+    for sql in [
+        "SELECT id, (SELECT count(*) FROM unnest(t.arr)) AS n FROM t ORDER BY id",
+        "SELECT id, (SELECT count(*) FROM LATERAL unnest(t.arr)) AS n FROM t ORDER BY id",
+    ] {
+        let counted = client.simple_query(sql).await?;
+        let counted = rows(&counted);
+        assert_eq!(
+            counted.iter().map(|r| r.get("n")).collect::<Vec<_>>(),
+            [Some("3"), Some("1")],
+            "for `{sql}`"
+        );
+    }
+
+    // `arr` is a column of the sibling `u` *and* of the enclosing `t`. PG binds
+    // the sibling (counting `u`'s two elements); that is the LATERAL this build
+    // does not have, and answering from `t` instead would be a wrong answer
+    // dressed as a right one.
+    let err = client
+        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) FROM t")
+        .await
+        .expect_err("a sibling reference is the LATERAL gap");
+    let err = err.as_db_error().expect("a database error");
+    assert_eq!(err.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(err.message(), "LATERAL is not supported yet");
+
+    // Neither scope has it: still the plain missing-column error.
+    let err = client
+        .simple_query("SELECT (SELECT count(*) FROM unnest(nosucharr)) FROM t")
+        .await
+        .expect_err("no scope can answer `nosucharr`");
+    assert_eq!(
+        err.as_db_error().map(|e| e.code()),
+        Some(&SqlState::UNDEFINED_COLUMN)
+    );
+    Ok(())
+}
+
 /// `pg_attribute` lists the six system attributes for the relations that have
 /// them and for no others.
 ///
