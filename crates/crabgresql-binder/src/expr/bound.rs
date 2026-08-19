@@ -250,6 +250,20 @@ pub enum BoundExpr {
         args: Vec<BoundExpr>,
         ty: PgType,
     },
+    /// `GREATEST(a, b, …)` / `LEAST(a, b, …)`: the largest (smallest) argument,
+    /// skipping NULLs, or NULL when they all are. Nothing short-circuits, so
+    /// `greatest(1, 1/0)` is an error where `coalesce(1, 1/0)` is `1`.
+    ///
+    /// `args` are coerced to `ty` and never empty, as `Coalesce`'s are. The
+    /// ordering is `ty`'s *btree* ordering under `collation`, which for some
+    /// types is not the one `min`/`max` use — see the executor's
+    /// `compare_values_for_aggregate`.
+    MinMax {
+        kind: MinMaxKind,
+        args: Vec<BoundExpr>,
+        ty: PgType,
+        collation: u32,
+    },
     /// A set-returning function in the SELECT target list; `ret` is the element
     /// (per-row output) type. This is a marker that is only legal at the top
     /// level of a projection: the `ProjectSet` executor node expands it into
@@ -479,6 +493,24 @@ pub struct WindowSortKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinMaxKind {
+    Greatest,
+    Least,
+}
+
+impl MinMaxKind {
+    /// The label for `GREATEST types integer and text cannot be matched`. Deparse
+    /// does not come through here: `ruleutils::call_name` reads the AST, so that
+    /// the type-blind `pg_get_expr` path spells the keyword too.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            MinMaxKind::Greatest => "GREATEST",
+            MinMaxKind::Least => "LEAST",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     Not,
     Neg,
@@ -571,7 +603,7 @@ impl BoundExpr {
             BoundExpr::ArrayCtor { ty, .. } => *ty,
             BoundExpr::Subscript { ty, .. } => *ty,
             BoundExpr::Case { ty, .. } => *ty,
-            BoundExpr::Coalesce { ty, .. } => *ty,
+            BoundExpr::Coalesce { ty, .. } | BoundExpr::MinMax { ty, .. } => *ty,
             BoundExpr::Srf { ret, .. } => *ret,
             BoundExpr::Aggregate { ret, .. } => *ret,
             BoundExpr::WindowFunc { ret, .. } => *ret,
@@ -601,7 +633,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_srf),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_srf)
                     || spec.exprs().any(BoundExpr::contains_srf)
@@ -654,7 +687,8 @@ impl BoundExpr {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(any),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(any),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(any) || spec.exprs().any(any)
             }
@@ -708,7 +742,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_aggregate() || index.contains_aggregate()
@@ -774,7 +809,8 @@ impl BoundExpr {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_window),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_window),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_window() || index.contains_window()
@@ -829,7 +865,8 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Coalesce { args, .. } => first(args),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => first(args),
             BoundExpr::ArrayCtor { elems, .. } => first(elems),
             BoundExpr::Subscript { base, index, .. } => base
                 .first_agg_or_window()
@@ -913,9 +950,9 @@ impl BoundExpr {
                 self.is_volatile_call() || args.iter().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::Routine { .. } => true,
-            BoundExpr::Srf { args, .. } | BoundExpr::Coalesce { args, .. } => {
-                args.iter().any(BoundExpr::contains_volatile_fn)
-            }
+            BoundExpr::Srf { args, .. }
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_volatile_fn),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_volatile_fn)
                     || spec.exprs().any(BoundExpr::contains_volatile_fn)
@@ -984,7 +1021,8 @@ impl BoundExpr {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(BoundExpr::contains_subquery),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_subquery),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_subquery)
                     || spec.exprs().any(BoundExpr::contains_subquery)
@@ -1043,7 +1081,9 @@ impl BoundExpr {
                     .sum::<usize>()
                     + else_.as_ref().map_or(0, |e| e.count_param_refs(index))
             }
-            BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            BoundExpr::Aggregate { args, .. }
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
             }
             BoundExpr::WindowFunc { kind, spec, .. } => kind
@@ -1113,7 +1153,9 @@ impl BoundExpr {
                         fold(e, acc);
                     }
                 }
-                BoundExpr::Aggregate { args, .. } | BoundExpr::Coalesce { args, .. } => {
+                BoundExpr::Aggregate { args, .. }
+                | BoundExpr::Coalesce { args, .. }
+                | BoundExpr::MinMax { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
                 }
                 // The arguments and the OVER clause both read this row, so both
@@ -1191,7 +1233,8 @@ impl BoundExpr {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => Self::collect_all(args, out),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => Self::collect_all(args, out),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
             BoundExpr::Subscript { base, index, .. } => {
                 base.collect_column_refs(out) && index.collect_column_refs(out)
@@ -1276,7 +1319,8 @@ impl BoundExpr {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => {
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => {
                 args.iter_mut().for_each(|a| a.shift_column_refs(delta));
             }
             // Mirrors `column_ref_bounds`: the arguments and the OVER clause

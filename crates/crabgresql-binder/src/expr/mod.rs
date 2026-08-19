@@ -28,8 +28,8 @@ pub use assign::{
 pub(crate) use bind::scalar_from_binding;
 pub use bind::{bind_expr, bind_scalar};
 pub use bound::{
-    BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, Subplan, SubplanId,
-    UnaryOp, WindowKind, WindowSortKey,
+    BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, MinMaxKind, Subplan,
+    SubplanId, UnaryOp, WindowKind, WindowSortKey,
 };
 pub use datatype::{
     builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod, datetime_precision,
@@ -45,7 +45,7 @@ pub use params::{
 pub use scope::{Binding, DeclinedSystem, Scope, reject_agg_or_window};
 
 pub(crate) use bind::{
-    bind_array_subquery, bind_coalesce, bind_nullif, bind_projection, output_name,
+    bind_array_subquery, bind_coalesce, bind_min_max, bind_nullif, bind_projection, output_name,
 };
 pub(crate) use coerce::{
     ArgFail, binding_type_label, coerce_expr, coerce_for_arg, enum_value, implicit_castable,

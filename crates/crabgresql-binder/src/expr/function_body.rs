@@ -314,6 +314,20 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
                 .collect(),
             ty,
         },
+        BoundExpr::MinMax {
+            kind,
+            args: min_max_args,
+            ty,
+            collation,
+        } => BoundExpr::MinMax {
+            kind,
+            args: min_max_args
+                .into_iter()
+                .map(|a| inline_params(a, args))
+                .collect(),
+            ty,
+            collation,
+        },
         BoundExpr::Aggregate {
             func,
             distinct,

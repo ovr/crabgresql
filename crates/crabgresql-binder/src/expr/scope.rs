@@ -455,6 +455,17 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             args: args.iter().map(|a| outerize_columns(a, level)).collect(),
             ty: *ty,
         },
+        BoundExpr::MinMax {
+            kind,
+            args,
+            ty,
+            collation,
+        } => BoundExpr::MinMax {
+            kind: *kind,
+            args: args.iter().map(|a| outerize_columns(a, level)).collect(),
+            ty: *ty,
+            collation: *collation,
+        },
         // A merged-join visible column expression is only ever a ColumnRef or a
         // COALESCE/CASE over ColumnRefs; these never appear, so clone defensively.
         BoundExpr::Srf { .. }
@@ -1152,10 +1163,10 @@ pub(super) fn expr_typmod(expr: &BoundExpr, scope: &Scope) -> i32 {
                 .chain(else_.as_deref());
             common_typmod(arms.map(|arm| expr_typmod(arm, scope)))
         }
-        // `COALESCE` resolves its modifier by the same rule over its arguments:
-        // `coalesce(varchar(3), varchar(3))` is `varchar(3)`, while
-        // `coalesce(varchar(3), varchar(5))` is bare `varchar`.
-        BoundExpr::Coalesce { args, .. } => {
+        // `COALESCE` and `GREATEST`/`LEAST` resolve their modifier by the same
+        // rule over their arguments: `coalesce(varchar(3), varchar(3))` is
+        // `varchar(3)`, while `coalesce(varchar(3), varchar(5))` is bare `varchar`.
+        BoundExpr::Coalesce { args, .. } | BoundExpr::MinMax { args, .. } => {
             common_typmod(args.iter().map(|arg| expr_typmod(arg, scope)))
         }
         // A scalar subquery reports its single output column's modifier.

@@ -115,9 +115,7 @@ pub fn expr_collation(expr: &BoundExpr) -> Derived {
             derived
         }
         BoundExpr::ArrayCtor { elems, .. } => combine_all(elems),
-        // Whichever argument answers non-NULL is the result, so every one of
-        // them contributes — as in a CASE's result branches.
-        BoundExpr::Coalesce { args, .. } => combine_all(args),
+        BoundExpr::Coalesce { args, .. } | BoundExpr::MinMax { args, .. } => combine_all(args),
         BoundExpr::Subscript { base, .. } => expr_collation(base),
         // Literals and parameters carry a string value but assert no collation
         // of their own, so they adapt to whatever they are compared against.
@@ -149,7 +147,7 @@ impl Derived {
     }
 }
 
-fn combine_all(exprs: &[BoundExpr]) -> Derived {
+pub(crate) fn combine_all(exprs: &[BoundExpr]) -> Derived {
     exprs
         .iter()
         .map(expr_collation)

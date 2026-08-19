@@ -329,7 +329,8 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
             | BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. } => args.iter().any(opaque),
+            | BoundExpr::Coalesce { args, .. }
+            | BoundExpr::MinMax { args, .. } => args.iter().any(opaque),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(opaque),
             BoundExpr::Subscript { base, index, .. } => opaque(base) || opaque(index),
             BoundExpr::Case { whens, else_, .. } => {

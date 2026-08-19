@@ -33,7 +33,9 @@
 //! unfolded `1/0` makes its parent non-constant, so the AND is never folded
 //! either.
 
-use crabgresql_binder::{BinOp, BoundExpr, Subplan, UnaryOp};
+use std::cmp::Ordering;
+
+use crabgresql_binder::{BinOp, BoundExpr, MinMaxKind, Subplan, UnaryOp};
 use crabgresql_types::compare::{compare_values, compare_values_collated};
 use crabgresql_types::{FmtCtx, PgType, Value, arith, cast};
 
@@ -96,6 +98,7 @@ fn fold_children(
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
         | BoundExpr::Coalesce { args, .. }
+        | BoundExpr::MinMax { args, .. }
         | BoundExpr::Aggregate { args, .. } => {
             for arg in args {
                 changed |= fold(arg, fmt, on_subplan);
@@ -171,6 +174,7 @@ fn foldable(expr: &BoundExpr) -> bool {
             | BoundExpr::ArrayCtor { .. }
             | BoundExpr::Case { .. }
             | BoundExpr::Coalesce { .. }
+            | BoundExpr::MinMax { .. }
     )
 }
 
@@ -253,6 +257,32 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
                 }
             }
             Some(Value::Null)
+        }
+        // Nothing short-circuits, so `greatest(1, 1/0)` folds to nothing and
+        // stays for the executor to fail on.
+        BoundExpr::MinMax {
+            kind,
+            args,
+            ty,
+            collation,
+        } => {
+            let want = match kind {
+                MinMaxKind::Greatest => Ordering::Greater,
+                MinMaxKind::Least => Ordering::Less,
+            };
+            let mut best = Value::Null;
+            for arg in args {
+                let value = eval_const(arg, fmt)?;
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                if matches!(best, Value::Null)
+                    || compare_values_collated(*ty, &value, &best, *collation) == want
+                {
+                    best = value;
+                }
+            }
+            Some(best)
         }
         BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }

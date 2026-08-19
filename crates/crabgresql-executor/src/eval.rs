@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 
-use crabgresql_binder::{BinOp, BoundExpr, ScalarFn, UnaryOp};
+use crabgresql_binder::{BinOp, BoundExpr, MinMaxKind, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
@@ -337,6 +337,33 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 }
             }
             Ok(Value::Null)
+        }
+        // The btree ordering, deliberately not `compare_values_for_aggregate`:
+        // PG resolves `GREATEST` through the type's own operator class, which for
+        // `oidvector` is not what `max()` compares by.
+        BoundExpr::MinMax {
+            kind,
+            args,
+            ty,
+            collation,
+        } => {
+            let want = match kind {
+                MinMaxKind::Greatest => Ordering::Greater,
+                MinMaxKind::Least => Ordering::Less,
+            };
+            let mut best = Value::Null;
+            for arg in args {
+                let value = eval(arg, row, ctx)?;
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                if matches!(best, Value::Null)
+                    || compare_values_collated(*ty, &value, &best, *collation) == want
+                {
+                    best = value;
+                }
+            }
+            Ok(best)
         }
         // An SRF marker only expands via the `ProjectSet` node; reaching scalar
         // evaluation means it appeared where a set is not allowed (WHERE, an
@@ -1829,5 +1856,151 @@ mod arg_ref_tests {
         ] {
             assert_eq!(arg_ref(&expr, &row), None, "{label} must not borrow");
         }
+    }
+}
+
+#[cfg(test)]
+mod min_max_tests {
+    use crabgresql_binder::{BoundExpr, MinMaxKind};
+    use crabgresql_types::collation::DEFAULT_COLLATION_OID;
+    use crabgresql_types::{PgType, Value, VectorKind};
+
+    use crate::testutil::eval_const;
+
+    fn min_max(kind: MinMaxKind, ty: PgType, values: &[Value], collation: u32) -> BoundExpr {
+        BoundExpr::MinMax {
+            kind,
+            args: values
+                .iter()
+                .map(|value| BoundExpr::Const {
+                    value: value.clone(),
+                    ty,
+                })
+                .collect(),
+            ty,
+            collation,
+        }
+    }
+
+    fn pick(kind: MinMaxKind, ty: PgType, values: &[Value]) -> Value {
+        crate::testutil::test_ok(eval_const(&min_max(
+            kind,
+            ty,
+            values,
+            DEFAULT_COLLATION_OID,
+        )))
+    }
+
+    #[test]
+    fn nulls_are_skipped_and_an_all_null_list_is_null() {
+        let ints = [Value::Null, Value::Int4(3), Value::Null, Value::Int4(1)];
+        assert_eq!(
+            pick(MinMaxKind::Greatest, PgType::Int4, &ints),
+            Value::Int4(3)
+        );
+        assert_eq!(pick(MinMaxKind::Least, PgType::Int4, &ints), Value::Int4(1));
+        assert_eq!(
+            pick(
+                MinMaxKind::Greatest,
+                PgType::Int4,
+                &[Value::Null, Value::Null]
+            ),
+            Value::Null
+        );
+    }
+
+    /// PG's total order puts NaN above every number.
+    #[test]
+    fn nan_is_the_greatest_float() {
+        let floats = [Value::Float8(f64::NAN), Value::Float8(1.0)];
+        assert!(matches!(
+            pick(MinMaxKind::Greatest, PgType::Float8, &floats),
+            Value::Float8(v) if v.is_nan()
+        ));
+        assert_eq!(
+            pick(MinMaxKind::Least, PgType::Float8, &floats),
+            Value::Float8(1.0)
+        );
+    }
+
+    /// `"char"` orders unsigned (PG's `btcharcmp`), so `'\377' > 'Z'` — and
+    /// unlike `min`/`max`, which resolve through `text`, the value stays a byte.
+    #[test]
+    fn char_orders_unsigned() {
+        let bytes = [Value::Char(b'Z'), Value::Char(0o377)];
+        assert_eq!(
+            pick(MinMaxKind::Greatest, PgType::Char, &bytes),
+            Value::Char(0o377)
+        );
+    }
+
+    /// `oidvector`'s own operator class compares the element *count* first, which
+    /// is why PG's `GREATEST` and `max()` disagree on it.
+    #[test]
+    fn oidvector_compares_by_the_btree_order() {
+        let vectors = [
+            Value::Vector {
+                kind: VectorKind::Oid,
+                elems: vec![Value::Oid(9), Value::Oid(8)],
+            },
+            Value::Vector {
+                kind: VectorKind::Oid,
+                elems: vec![Value::Oid(1), Value::Oid(1), Value::Oid(1)],
+            },
+        ];
+        let ty = PgType::Vector(VectorKind::Oid);
+        assert_eq!(pick(MinMaxKind::Greatest, ty, &vectors), vectors[1]);
+        assert_eq!(pick(MinMaxKind::Least, ty, &vectors), vectors[0]);
+    }
+
+    /// Both cases are needed: byte order puts `'a'` (0x61) above `'B'` (0x42),
+    /// while a linguistic collation puts `'B'` on top.
+    #[test]
+    fn strings_compare_under_the_nodes_collation() {
+        let strings = [Value::Text("B".into()), Value::Text("a".into())];
+        let by_name = |name: &str| {
+            crabgresql_types::collation::lookup_by_name(name)
+                .unwrap_or_else(|| panic!("{name} is a built-in collation"))
+                .oid
+        };
+        for (collation, winner) in [(by_name("C"), "a"), (by_name("en-US-x-icu"), "B")] {
+            let expr = min_max(MinMaxKind::Greatest, PgType::Text, &strings, collation);
+            assert_eq!(
+                crate::testutil::test_ok(eval_const(&expr)),
+                Value::Text(winner.into()),
+                "collation {collation}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_argument_is_evaluated() {
+        let divide_by_zero = BoundExpr::Binary {
+            op: crabgresql_binder::BinOp::Div,
+            arg_ty: PgType::Int4,
+            collation: DEFAULT_COLLATION_OID,
+            left: Box::new(BoundExpr::Const {
+                value: Value::Int4(1),
+                ty: PgType::Int4,
+            }),
+            right: Box::new(BoundExpr::Const {
+                value: Value::Int4(0),
+                ty: PgType::Int4,
+            }),
+        };
+        let expr = BoundExpr::MinMax {
+            kind: MinMaxKind::Greatest,
+            args: vec![
+                BoundExpr::Const {
+                    value: Value::Int4(1),
+                    ty: PgType::Int4,
+                },
+                divide_by_zero,
+            ],
+            ty: PgType::Int4,
+            collation: DEFAULT_COLLATION_OID,
+        };
+        let e = eval_const(&expr).expect_err("the second argument must be evaluated");
+        assert_eq!(e.code, crabgresql_pg_wire::sqlstate::DIVISION_BY_ZERO);
     }
 }

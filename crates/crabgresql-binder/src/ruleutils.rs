@@ -293,12 +293,12 @@ fn call_arg_types(f: &ast::Function, catalog: &Arc<dyn TypeCatalog>) -> Option<V
         crate::Binding::Typed(crate::BoundExpr::FuncCall { args, .. }) => {
             Some(args.iter().map(|a| a.ty()).collect())
         }
-        // `COALESCE` coerces every argument to the one type it resolved, so that
-        // is the label each literal argument carries: PG prints
+        // `COALESCE`/`GREATEST`/`LEAST` coerce every argument to the one type they
+        // resolved, so that is the label each literal argument carries: PG prints
         // `COALESCE(NULL::text, 'z'::text)`.
-        crate::Binding::Typed(crate::BoundExpr::Coalesce { args, ty }) => {
-            Some(vec![ty; args.len()])
-        }
+        crate::Binding::Typed(
+            crate::BoundExpr::Coalesce { args, ty } | crate::BoundExpr::MinMax { args, ty, .. },
+        ) => Some(vec![ty; args.len()]),
         // `NULLIF` binds to the `CASE` it is shorthand for, and both its
         // arguments were coerced to that expression's type — the one the `=`
         // operator settled on. PG prints `NULLIF('a'::text, 'b'::text)`.
@@ -594,12 +594,15 @@ fn function(f: &ast::Function, cx: Cx) -> String {
     format!("{}({args})", call_name(f))
 }
 
-/// How PG spells a call back. `COALESCE` and `NULLIF` are grammar constructs, not
-/// functions, and PG prints them in upper case (`COALESCE(1, 2)`) — everything
-/// else is a real function name and keeps its own spelling. Keyed on the name so
-/// this holds on the type-blind `pg_get_expr` path too.
+/// How PG spells a call back. `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` are
+/// grammar constructs, not functions, and PG prints them in upper case
+/// (`COALESCE(1, 2)`) — everything else is a real function name and keeps its own
+/// spelling. Keyed on the name so this holds on the type-blind `pg_get_expr` path
+/// too.
 fn call_name(f: &ast::Function) -> String {
-    if (is_named(f, "coalesce") || is_named(f, "nullif"))
+    if ["coalesce", "nullif", "greatest", "least"]
+        .iter()
+        .any(|name| is_named(f, name))
         && let Some(ident) = f.name.0.last().and_then(|p| p.as_ident())
     {
         return ident.value.to_ascii_uppercase();
