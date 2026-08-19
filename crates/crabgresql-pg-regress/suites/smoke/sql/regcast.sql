@@ -26,6 +26,50 @@ SELECT 'integer'::regtype AS sql_spelling, 'int4'::regtype AS catalog_spelling;
 SELECT 0::regtype AS zero_type;
 -- regnamespace names a schema
 SELECT 'rcs'::regnamespace AS by_name, 'public'::regnamespace AS pub;
+-- regoper names an operator. Operator OIDs are upstream's own, so unlike the
+-- relation OIDs above they are printable here.
+SELECT '||/'::regoper AS by_name, 597::regoper AS by_oid;
+-- a name is shared by every operand combination it is defined for, so a bare
+-- one resolves only when exactly one operator carries it
+SELECT '+'::regoper;
+-- output applies the same rule from the other side: an operator whose bare name
+-- would not read back as itself prints schema-qualified
+SELECT 551::regoper AS shared_name, 'pg_catalog.||/'::regoper AS qualified_in;
+-- regoper spells the invalid OID `0` where every other reg* type spells it `-`,
+-- because `-` is itself an operator name
+SELECT 0::regoper AS zero, 999999::regoper AS unknown_oid;
+SELECT 'rc_nosuchoperator'::regoper;
+-- equality is by OID, and the round trip through oid and text preserves it
+SELECT '||/'::regoper = 597::regoper AS same_operator,
+       '||/'::regoper::oid AS as_oid, '||/'::regoper::text AS as_text;
+--
+-- reg* NAME PARSING
+-- a built-in whose SQL spelling is several words is one *type name*, not
+-- several identifiers, and regtype reads it as such
+SELECT 'character varying'::regtype AS vc, 'double precision'::regtype AS f8,
+       'timestamp with time zone'::regtype AS tstz;
+-- a string that does not parse as a name at all is a syntax error, not a miss
+SELECT ''::regclass;
+SELECT '"unterminated'::regclass;
+SELECT 'rc_t.'::regclass;
+SELECT 'rc t'::regclass;
+-- ... but an explicitly quoted empty part is a name, and merely names nothing
+SELECT '""'::regclass;
+-- a three-part name carries a database: accepted when it names the one this
+-- session is connected to, and rejected otherwise
+SELECT (current_database() || '.public.rc_t')::regclass AS db_qualified;
+SELECT 'rc_nosuchdb.public.rc_t'::regclass;
+-- the wording is per kind, and past three parts nothing qualifies a name at all
+SELECT 'a.b.c.d'::regclass;
+SELECT 'a.b.c'::regproc;
+SELECT 'a.b.c.d'::regtype;
+-- a schema name is never qualified at all, which makes a dotted one a syntax
+-- error where the same string would be a plain miss for the other kinds
+SELECT 'a.b'::regnamespace;
+-- the "does not exist" text echoes the *parsed* name, except for regproc and
+-- regoper, which echo the argument exactly as written
+SELECT 'PUB.RcNoSuch'::regclass;
+SELECT 'PUB.RcNoSuch'::regproc;
 -- casting to text goes through the rendered name, not the OID
 SELECT 'rc_t'::regclass::text AS as_text, length('rc_t'::regclass::text) AS len;
 -- the round trip through oid preserves the value

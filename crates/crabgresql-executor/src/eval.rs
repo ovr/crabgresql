@@ -1268,14 +1268,9 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
             "pg_get_viewdef evaluated without a catalog context",
         ));
     };
-    // The same identifier rules every other name-taking catalog function uses:
-    // an unquoted part folds to lower case, a `"quoted"` one keeps its spelling.
-    let Some((namespace, relation)) = crate::reg::split_qualified_name(name) else {
-        return Err(ExecError::new(
-            sqlstate::UNDEFINED_TABLE,
-            format!("relation \"{name}\" does not exist"),
-        ));
-    };
+    // Shared with `regclass` input, because upstream both reach the same
+    // `makeRangeVarFromNameList`.
+    let (namespace, relation) = crate::reg::relation_name(name, catalog)?;
     let (namespace, relation) = (namespace.as_deref(), relation.as_str());
     if catalog.rel_oid(namespace, relation).is_none() {
         return Err(ExecError::new(
@@ -1698,6 +1693,12 @@ mod format_type_tests {
             }
             fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
+            }
+            fn oper_name(&self, _oid: u32) -> Option<(String, String)> {
+                None
+            }
+            fn oper_oids(&self, _namespace: Option<&str>, _name: &str) -> Vec<u32> {
+                Vec::new()
             }
             fn object_description(
                 &self,

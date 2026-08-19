@@ -71,6 +71,94 @@ SELECT 'rcs'::regnamespace AS by_name, 'public'::regnamespace AS pub;
  rcs     | public
 (1 row)
 
+-- regoper names an operator. Operator OIDs are upstream's own, so unlike the
+-- relation OIDs above they are printable here.
+SELECT '||/'::regoper AS by_name, 597::regoper AS by_oid;
+ by_name | by_oid 
+---------+--------
+ ||/     | ||/
+(1 row)
+
+-- a name is shared by every operand combination it is defined for, so a bare
+-- one resolves only when exactly one operator carries it
+SELECT '+'::regoper;
+ERROR:  more than one operator named +
+-- output applies the same rule from the other side: an operator whose bare name
+-- would not read back as itself prints schema-qualified
+SELECT 551::regoper AS shared_name, 'pg_catalog.||/'::regoper AS qualified_in;
+ shared_name  | qualified_in 
+--------------+--------------
+ pg_catalog.+ | ||/
+(1 row)
+
+-- regoper spells the invalid OID `0` where every other reg* type spells it `-`,
+-- because `-` is itself an operator name
+SELECT 0::regoper AS zero, 999999::regoper AS unknown_oid;
+ zero | unknown_oid 
+------+-------------
+ 0    | 999999
+(1 row)
+
+SELECT 'rc_nosuchoperator'::regoper;
+ERROR:  operator does not exist: rc_nosuchoperator
+-- equality is by OID, and the round trip through oid and text preserves it
+SELECT '||/'::regoper = 597::regoper AS same_operator,
+       '||/'::regoper::oid AS as_oid, '||/'::regoper::text AS as_text;
+ same_operator | as_oid | as_text 
+---------------+--------+---------
+ t             |    597 | ||/
+(1 row)
+
+--
+-- reg* NAME PARSING
+-- a built-in whose SQL spelling is several words is one *type name*, not
+-- several identifiers, and regtype reads it as such
+SELECT 'character varying'::regtype AS vc, 'double precision'::regtype AS f8,
+       'timestamp with time zone'::regtype AS tstz;
+        vc         |        f8        |           tstz           
+-------------------+------------------+--------------------------
+ character varying | double precision | timestamp with time zone
+(1 row)
+
+-- a string that does not parse as a name at all is a syntax error, not a miss
+SELECT ''::regclass;
+ERROR:  invalid name syntax
+SELECT '"unterminated'::regclass;
+ERROR:  invalid name syntax
+SELECT 'rc_t.'::regclass;
+ERROR:  invalid name syntax
+SELECT 'rc t'::regclass;
+ERROR:  invalid name syntax
+-- ... but an explicitly quoted empty part is a name, and merely names nothing
+SELECT '""'::regclass;
+ERROR:  relation "" does not exist
+-- a three-part name carries a database: accepted when it names the one this
+-- session is connected to, and rejected otherwise
+SELECT (current_database() || '.public.rc_t')::regclass AS db_qualified;
+ db_qualified 
+--------------
+ rc_t
+(1 row)
+
+SELECT 'rc_nosuchdb.public.rc_t'::regclass;
+ERROR:  cross-database references are not implemented: "rc_nosuchdb.public.rc_t"
+-- the wording is per kind, and past three parts nothing qualifies a name at all
+SELECT 'a.b.c.d'::regclass;
+ERROR:  improper relation name (too many dotted names): a.b.c.d
+SELECT 'a.b.c'::regproc;
+ERROR:  cross-database references are not implemented: a.b.c
+SELECT 'a.b.c.d'::regtype;
+ERROR:  improper qualified name (too many dotted names): a.b.c.d
+-- a schema name is never qualified at all, which makes a dotted one a syntax
+-- error where the same string would be a plain miss for the other kinds
+SELECT 'a.b'::regnamespace;
+ERROR:  invalid name syntax
+-- the "does not exist" text echoes the *parsed* name, except for regproc and
+-- regoper, which echo the argument exactly as written
+SELECT 'PUB.RcNoSuch'::regclass;
+ERROR:  relation "pub.rcnosuch" does not exist
+SELECT 'PUB.RcNoSuch'::regproc;
+ERROR:  function "PUB.RcNoSuch" does not exist
 -- casting to text goes through the rendered name, not the OID
 SELECT 'rc_t'::regclass::text AS as_text, length('rc_t'::regclass::text) AS len;
  as_text | len 
