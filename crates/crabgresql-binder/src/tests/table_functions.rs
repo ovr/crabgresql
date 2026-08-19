@@ -166,13 +166,10 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
         "SELECT * FROM t, generate_series(1, id) g",
         "SELECT * FROM t CROSS JOIN generate_series(1, t.id) g",
         "SELECT * FROM t JOIN generate_series(1, t.id) g ON true",
-        // Spelling the implicit LATERAL out changes nothing — for PG either,
-        // where the keyword on a function FROM item is a no-op.
         "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
-        // A sibling reference wins over an enclosing query that could also
-        // answer the name, so this is the LATERAL gap and not a correlated
-        // reference to the outer `t`. Resolving it outward would answer a
-        // different query: PG counts the *inner* `t`'s rows here.
+        // `id` is visible in the sibling `u` and in the enclosing query alike.
+        // PG takes the sibling, so resolving it outward instead would answer a
+        // different question — a wrong answer where this is a stated gap.
         "SELECT id, (SELECT count(*) FROM t u, generate_series(1, id)) FROM t",
     ] {
         let e = bind_err(sql)?;
@@ -217,7 +214,7 @@ fn table_fn_argument_may_reference_an_enclosing_query() -> anyhow::Result<()> {
 fn the_lateral_keyword_decides_nothing_for_a_function_from_item() -> anyhow::Result<()> {
     // PG treats `LATERAL f(…)` and `f(…)` identically — a function FROM item is
     // implicitly lateral — so the keyword must not turn a query that binds into
-    // an unsupported one. Both spellings reach the same outer reference.
+    // an unsupported one.
     for sql in [
         "SELECT id, ARRAY(SELECT g FROM generate_series(1, t.id) g) FROM t",
         "SELECT id, ARRAY(SELECT g FROM LATERAL generate_series(1, t.id) g) FROM t",

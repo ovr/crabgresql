@@ -2887,10 +2887,7 @@ fn bind_from_item(
         }
         // `LATERAL f(…)` gets its own factor, and binds exactly like the `f(…)`
         // above: a function FROM item is implicitly LATERAL in PostgreSQL, so the
-        // keyword adds nothing there and cannot decide anything here either. What
-        // it may reference is settled by `bind_table_fn_args` for both spellings
-        // — an enclosing query's column resolves, a sibling FROM item is the
-        // LATERAL gap and is reported as one.
+        // keyword adds nothing there and cannot decide anything here either.
         ast::TableFactor::Function {
             name,
             args,
@@ -4102,14 +4099,10 @@ fn bind_function_from_item(
 ///    binds to an [`BoundExpr::OuterColumnRef`] filled per outer row by
 ///    [`substitute_outer`].
 ///
-/// The order only matters for a name both scopes could answer, and there it is
-/// the whole point: PostgreSQL takes the sibling, so this reports the LATERAL
-/// gap rather than quietly reaching one level further out.
-///
-/// A sibling *could* answer an argument when the argument needs more than
-/// constants — it does not bind with nothing at all in scope — and the siblings
-/// satisfy it. That first half is what keeps `FROM t, generate_series(1, 5)` out
-/// of the LATERAL branch: a constant binds in every scope, siblings included.
+/// The sibling probe leads with "does this argument need more than constants?"
+/// because a constant binds in *every* scope, siblings included — asking the
+/// siblings alone would report `FROM t, generate_series(1, 5)` as a lateral
+/// reference.
 ///
 /// The probe asks whether the *arguments* resolve against the siblings, not
 /// whether the whole call does, so the two gaps stay distinct: `unnest(t.arr)`
