@@ -13812,6 +13812,126 @@ async fn catalog_xmin_tracks_each_relations_own_ddl() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DataGrip's extension list, verbatim from its query log.
+///
+/// Worth carrying whole rather than as its parts: what it asks for is a join
+/// over three relations *and* a correlated `unnest` — the array of available
+/// versions comes from a LEFT JOIN, and the subquery that filters it names a
+/// column of the enclosing query from inside a FROM item. That last piece is not
+/// LATERAL (the correlation is one level out, which PostgreSQL resolves without
+/// the keyword), and binding those arguments with no outer scope answered the
+/// whole query with `42703 column "available_versions" does not exist`.
+#[tokio::test]
+async fn datagrip_extension_list_query() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let listed = client
+        .simple_query(
+            "select E.oid        as id, \
+                    E.xmin       as state_number, \
+                    extname      as name, \
+                    extversion   as version, \
+                    extnamespace as schema_id, \
+                    nspname      as schema_name, \
+                    array(select unnest \
+                          from unnest(available_versions) \
+                          where unnest > extversion) as available_updates \
+             from pg_catalog.pg_extension E \
+                    join pg_namespace N on E.extnamespace = N.oid \
+                    left join (select name, array_agg(version) as available_versions \
+                               from pg_available_extension_versions() \
+                               group by name) V on E.extname = V.name",
+        )
+        .await?;
+    let listed = rows(&listed);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].get("name"), Some("plpgsql"));
+    assert_eq!(listed[0].get("version"), Some("1.0"));
+    assert_eq!(listed[0].get("schema_name"), Some("pg_catalog"));
+    assert_eq!(
+        listed[0].get("available_updates"),
+        Some("{}"),
+        "the installed version is the only one offered"
+    );
+
+    // The LEFT JOIN did find its row: an unmatched one would leave
+    // `available_versions` NULL and reach the same empty array by accident.
+    let versions = scalar(
+        &client,
+        "select array_agg(version)::text from pg_available_extension_versions() \
+         where name = 'plpgsql'",
+    )
+    .await;
+    assert_eq!(versions, "{1.0}");
+
+    // And the correlated filter really does filter: with a lower installed
+    // version the same shape reports the newer one as an update.
+    let updates = scalar(
+        &client,
+        "select array(select unnest from unnest(available_versions) where unnest > extversion)::text \
+         from (values ('0.9', ARRAY['0.9', '1.0'])) e(extversion, available_versions)",
+    )
+    .await;
+    assert_eq!(updates, "{1.0}");
+    Ok(())
+}
+
+/// Which scope a table function's arguments are resolved in, over the wire.
+///
+/// PostgreSQL consults the sibling FROM items first and the enclosing queries
+/// second; every expectation below was probed against 18.4.
+#[tokio::test]
+async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() -> anyhow::Result<()>
+{
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t (id int, arr text[]); \
+             CREATE TABLE u (id int, arr text[]); \
+             INSERT INTO t VALUES (1, ARRAY['a', 'b', 'c']), (2, ARRAY['x']); \
+             INSERT INTO u VALUES (10, ARRAY['p', 'q'])",
+        )
+        .await?;
+
+    // PG answers 3 then 1 for both spellings.
+    for sql in [
+        "SELECT id, (SELECT count(*) FROM unnest(t.arr)) AS n FROM t ORDER BY id",
+        "SELECT id, (SELECT count(*) FROM LATERAL unnest(t.arr)) AS n FROM t ORDER BY id",
+    ] {
+        let counted = client.simple_query(sql).await?;
+        let counted = rows(&counted);
+        assert_eq!(
+            counted.iter().map(|r| r.get("n")).collect::<Vec<_>>(),
+            [Some("3"), Some("1")],
+            "for `{sql}`"
+        );
+    }
+
+    // `arr` is a column of the sibling `u` *and* of the enclosing `t`. PG binds
+    // the sibling (counting `u`'s two elements); that is the LATERAL this build
+    // does not have, so answering from `t` instead would be a wrong answer
+    // dressed as a right one.
+    let err = client
+        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) FROM t")
+        .await
+        .expect_err("a sibling reference is the LATERAL gap");
+    let err = err.as_db_error().expect("a database error");
+    assert_eq!(err.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(err.message(), "LATERAL is not supported yet");
+
+    // Neither scope has it: the LATERAL branch must not swallow the honest 42703.
+    let err = client
+        .simple_query("SELECT (SELECT count(*) FROM unnest(nosucharr)) FROM t")
+        .await
+        .expect_err("no scope can answer `nosucharr`");
+    assert_eq!(
+        err.as_db_error().map(|e| e.code()),
+        Some(&SqlState::UNDEFINED_COLUMN)
+    );
+    Ok(())
+}
+
 /// `pg_attribute` lists the six system attributes for the relations that have
 /// them and for no others.
 ///

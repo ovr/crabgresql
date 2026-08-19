@@ -166,7 +166,11 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
         "SELECT * FROM t, generate_series(1, id) g",
         "SELECT * FROM t CROSS JOIN generate_series(1, t.id) g",
         "SELECT * FROM t JOIN generate_series(1, t.id) g ON true",
-        "SELECT * FROM t CROSS JOIN LATERAL unnest(t.name) u",
+        "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
+        // `id` is visible in the sibling `u` and in the enclosing query alike.
+        // PG takes the sibling, so resolving it outward instead would answer a
+        // different question — a wrong answer where this is a stated gap.
+        "SELECT id, (SELECT count(*) FROM t u, generate_series(1, id)) FROM t",
     ] {
         let e = bind_err(sql)?;
         assert_eq!(e.code, "0A000", "for `{sql}`");
@@ -176,13 +180,88 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
 }
 
 #[test]
+fn table_fn_argument_may_reference_an_enclosing_query() -> anyhow::Result<()> {
+    // Not a LATERAL: the argument names the *enclosing* query, which PG resolves
+    // without the keyword (the FROM item to correlate to is one level out, not a
+    // sibling). Bound in a scope with no outer levels this was a spurious 42703.
+    let plan = bound("SELECT id, ARRAY(SELECT g FROM generate_series(1, t.id) g) FROM t")?;
+    let LogicalPlan::Query(QueryPlan { projections, .. }) = &plan else {
+        bail!("expected a Query plan");
+    };
+    let Some(BoundExpr::ArraySubquery { subplan, .. }) = projections.get(1) else {
+        bail!("expected an ARRAY subquery in the target list");
+    };
+    let LogicalPlan::TableFunction(TableFunctionPlan { args, .. }) = subplan.plan.as_ref() else {
+        bail!("expected the subquery to be a table-function scan");
+    };
+    // `id` is the test table's first column, and the enclosing query is level 1.
+    assert!(
+        matches!(
+            args[1],
+            BoundExpr::OuterColumnRef {
+                level: 1,
+                index: 0,
+                ..
+            }
+        ),
+        "the upper bound should be an outer reference, got {:?}",
+        args[1]
+    );
+    Ok(())
+}
+
+#[test]
+fn the_lateral_keyword_decides_nothing_for_a_function_from_item() -> anyhow::Result<()> {
+    // PG treats `LATERAL f(…)` and `f(…)` identically — a function FROM item is
+    // implicitly lateral — so the keyword must not turn a query that binds into
+    // an unsupported one.
+    for sql in [
+        "SELECT id, ARRAY(SELECT g FROM generate_series(1, t.id) g) FROM t",
+        "SELECT id, ARRAY(SELECT g FROM LATERAL generate_series(1, t.id) g) FROM t",
+    ] {
+        let plan = bound(sql)?;
+        let LogicalPlan::Query(QueryPlan { projections, .. }) = &plan else {
+            bail!("expected a Query plan for `{sql}`");
+        };
+        let Some(BoundExpr::ArraySubquery { subplan, .. }) = projections.get(1) else {
+            bail!("expected an ARRAY subquery in the target list of `{sql}`");
+        };
+        let LogicalPlan::TableFunction(TableFunctionPlan { args, .. }) = subplan.plan.as_ref()
+        else {
+            bail!("expected a table-function scan for `{sql}`");
+        };
+        assert!(
+            matches!(
+                args[1],
+                BoundExpr::OuterColumnRef {
+                    level: 1,
+                    index: 0,
+                    ..
+                }
+            ),
+            "for `{sql}`"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn lateral_argument_that_resolves_but_has_no_overload_reports_the_overload() -> anyhow::Result<()> {
     // `t.name` is text, so even with LATERAL there is no `unnest(text)`. The
     // argument resolves against the left side, so the misleading 42P01 is
-    // gone, but the honest answer is PG's 42883 — not a LATERAL gap.
-    let e = bind_err("SELECT * FROM t, unnest(t.name) u")?;
-    assert_eq!(e.code, "42883");
-    assert_eq!(e.message, "function unnest(text) does not exist");
+    // gone, but the honest answer is PG's 42883 — not a LATERAL gap. Probed
+    // against PostgreSQL 18.4, which answers both spellings the same way.
+    for sql in [
+        "SELECT * FROM t, unnest(t.name) u",
+        "SELECT * FROM t CROSS JOIN LATERAL unnest(t.name) u",
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, "42883", "for `{sql}`");
+        assert_eq!(
+            e.message, "function unnest(text) does not exist",
+            "for `{sql}`"
+        );
+    }
     Ok(())
 }
 

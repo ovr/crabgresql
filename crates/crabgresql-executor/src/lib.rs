@@ -5911,6 +5911,27 @@ mod tests {
     }
 
     #[test]
+    fn unnest_of_an_outer_column_is_re_evaluated_per_row() {
+        // The array is a column of the enclosing query, so the marker cannot be
+        // folded once: each outer row substitutes its own array into the
+        // function's argument. A NULL array yields no rows, and `ARRAY(SELECT …)`
+        // over no rows is the empty array — not NULL.
+        let (_c, rows) = run_rows(
+            "SELECT ARRAY(SELECT u FROM unnest(a) u WHERE u > 'a')::text \
+             FROM (VALUES (1, ARRAY['a', 'b', 'c']), (2, ARRAY['a']), (3, NULL::text[])) t(x, a) \
+             ORDER BY x",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("{b,c}".to_string())],
+                vec![Value::Text("{}".to_string())],
+                vec![Value::Text("{}".to_string())],
+            ]
+        );
+    }
+
+    #[test]
     fn generate_subscripts_yields_the_valid_subscripts() {
         let (columns, rows) =
             run_rows("SELECT * FROM generate_subscripts(ARRAY['a', 'b', 'c'], 1)");
