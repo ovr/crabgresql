@@ -17,7 +17,11 @@ crabgresql-catalog.workspace = true
 crabgresql-config.workspace = true
 crabgresql-executor.workspace = true
 crabgresql-planner.workspace = true
-crabgresql-parser.workspace = true
+# `visitor` for the AST walk behind a view's dependency set: a relation read
+# from an expression subquery has to be found wherever the grammar allows one,
+# and upstream's derived visitor is the only walk that stays complete as the
+# grammar grows.
+crabgresql-parser = { workspace = true, features = ["visitor"] }
 crabgresql-pg-engine.workspace = true
 crabgresql-pg-wire.workspace = true
 crabgresql-plpgsql.workspace = true

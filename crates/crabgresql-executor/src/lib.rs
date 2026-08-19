@@ -207,6 +207,12 @@ pub trait CatalogOps: Send + Sync {
     /// index, not the one it gives the table.
     fn index_def(&self, oid: u32) -> Option<IndexDef>;
 
+    /// The sequence column `column` of relation `oid` owns, behind
+    /// `pg_get_serial_sequence`. The column name is matched exactly, as
+    /// PostgreSQL matches it; see [`SerialSequence`] for why the misses are
+    /// distinguished.
+    fn serial_sequence(&self, oid: u32, column: &str) -> SerialSequence;
+
     /// The database this connection was opened against — `current_database()`
     /// and `current_catalog`.
     fn current_database(&self) -> String;
@@ -252,6 +258,21 @@ pub struct ExtensionVersion {
     pub relocatable: bool,
     pub schema: String,
     pub comment: String,
+}
+
+/// What [`CatalogOps::serial_sequence`] found.
+///
+/// The three misses are separate because PostgreSQL renders each differently: a
+/// column that owns no sequence is NULL, a missing column is a `42703` naming
+/// the relation, and a relation that vanished between the name lookup and this
+/// call is NULL rather than a second `42P01` (the name lookup already raised
+/// one for a name that never resolved).
+#[derive(Clone, Debug)]
+pub enum SerialSequence {
+    Owned { namespace: String, name: String },
+    Unowned,
+    NoColumn { relation: String },
+    NoRelation,
 }
 
 /// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering

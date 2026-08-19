@@ -22,7 +22,7 @@ pub(crate) use crabgresql_types::compare::{array_elems, uuid_of, vector_elems};
 use crabgresql_types::compare::{compare_elementwise, int8, oid_of};
 pub use crabgresql_types::compare::{compare_values, compare_values_collated};
 
-use crate::{CatalogOps, ExecContext, ExecError};
+use crate::{CatalogOps, ExecContext, ExecError, SerialSequence};
 
 /// The value an argument already *is*, when evaluating it would only copy it.
 /// A parameter placeholder is substituted into a `Const` before the portal
@@ -1122,7 +1122,51 @@ fn eval_deparse_fn(
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         ScalarFn::PgGetConstraintdef => Some(eval_pg_get_constraintdef(args, ctx)),
         ScalarFn::PgGetIndexdef => Some(eval_pg_get_indexdef(args, ctx)),
+        ScalarFn::PgGetSerialSequence => Some(eval_pg_get_serial_sequence(args, ctx)),
         _ => None,
+    }
+}
+
+/// `pg_get_serial_sequence(relation, column)`: the sequence that column owns,
+/// schema-qualified and quoted the way PostgreSQL prints it
+/// (`dp2."MixT_id_seq"`).
+///
+/// The relation argument is a *name*, resolved by
+/// [`crate::reg::resolve_relation`] — which is also where the `42P01`/`3F000`
+/// wording lives, and why `pg_get_serial_sequence('123', …)` reports a missing
+/// relation rather than reading 123 as an OID.
+///
+/// The **column** argument is matched literally: `'ColX'` finds a column named
+/// `"ColX"` and `'colx'` raises `42703`, as observed on PostgreSQL 18.4. A
+/// column that owns no sequence is NULL, not an error.
+///
+/// Strict, stated here rather than inherited for the reason
+/// [`eval_pg_get_indexdef`] gives.
+fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let (Value::Text(relation), Value::Text(column)) = (&args[0], &args[1]) else {
+        return Ok(Value::Null);
+    };
+    let Some(ops) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_serial_sequence evaluated without a catalog context",
+        ));
+    };
+    let (relation, ..) = crate::reg::resolve_relation(relation, ops)?;
+    match ops.serial_sequence(relation, column) {
+        SerialSequence::Owned { namespace, name } => Ok(Value::Text(format!(
+            "{}.{}",
+            quote_ident(&namespace),
+            quote_ident(&name)
+        ))),
+        SerialSequence::Unowned | SerialSequence::NoRelation => Ok(Value::Null),
+        SerialSequence::NoColumn { relation } => Err(ExecError::new(
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{column}\" of relation \"{relation}\" does not exist"),
+        )),
     }
 }
 
@@ -1268,16 +1312,11 @@ fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
             "pg_get_viewdef evaluated without a catalog context",
         ));
     };
-    // Shared with `regclass` input, because upstream both reach the same
-    // `makeRangeVarFromNameList`.
-    let (namespace, relation) = crate::reg::relation_name(name, catalog)?;
+    // Resolved through the one relation-name resolver, so this and
+    // `pg_get_serial_sequence` report a missing schema and a missing relation
+    // in the same words.
+    let (_, namespace, relation) = crate::reg::resolve_relation(name, catalog)?;
     let (namespace, relation) = (namespace.as_deref(), relation.as_str());
-    if catalog.rel_oid(namespace, relation).is_none() {
-        return Err(ExecError::new(
-            sqlstate::UNDEFINED_TABLE,
-            format!("relation \"{name}\" does not exist"),
-        ));
-    }
     let Some((sql, columns)) = catalog.view_sql(namespace, relation) else {
         // The relation exists but is not a view — PG answers with the empty
         // string rather than an error.
@@ -1735,6 +1774,9 @@ mod format_type_tests {
             }
             fn partition_ancestors(&self, _oid: u32) -> Vec<u32> {
                 Vec::new()
+            }
+            fn serial_sequence(&self, _oid: u32, _column: &str) -> crate::SerialSequence {
+                crate::SerialSequence::NoRelation
             }
             fn available_extensions(&self) -> Vec<crate::ExtensionVersion> {
                 Vec::new()

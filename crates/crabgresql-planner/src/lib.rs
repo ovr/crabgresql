@@ -746,6 +746,86 @@ pub fn plan(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
     physical
 }
 
+/// Every relation `plan` scans, with the columns the projection pass proved
+/// that scan reads.
+///
+/// Written for `pg_depend`, which records a view's dependency on the columns
+/// its query actually reads: planning the view's query and reading the stamped
+/// projections is what recovers that set, and doing it here keeps the match
+/// over [`PhysicalPlan`]'s arms next to the enum rather than in a caller that
+/// would silently miss a new one.
+///
+/// A relation scanned more than once appears once per scan; the caller decides
+/// how to merge them. [`ColumnProjection::All`] is the pass's fail-safe answer
+/// and means "assume every column".
+pub fn scan_projections(plan: &PhysicalPlan) -> Vec<(Arc<TableSchema>, ColumnProjection)> {
+    let mut out = Vec::new();
+    collect_scans(plan, &mut out);
+    out
+}
+
+fn collect_scans(plan: &PhysicalPlan, out: &mut Vec<(Arc<TableSchema>, ColumnProjection)>) {
+    match plan {
+        PhysicalPlan::Select {
+            table, projection, ..
+        }
+        | PhysicalPlan::IndexScan {
+            table, projection, ..
+        } => out.push((table.schema(), projection.clone())),
+        PhysicalPlan::Subquery { source, .. } => collect_scans(source, out),
+        PhysicalPlan::Window { source, .. } => collect_scans(source, out),
+        PhysicalPlan::Limit { source, .. } => collect_scans(source, out),
+        PhysicalPlan::Join { source, .. } => collect_join_scans(source, out),
+        PhysicalPlan::Aggregate { input, .. } => match input {
+            PhysicalAggInput::Scan { table, projection } => {
+                out.push((table.schema(), projection.clone()))
+            }
+            PhysicalAggInput::Join(join) => collect_join_scans(join, out),
+            PhysicalAggInput::SingleRow => {}
+        },
+        PhysicalPlan::Append { arms, .. } => {
+            for arm in arms {
+                out.push((arm.relation.table.schema(), arm.projection.clone()));
+            }
+        }
+        PhysicalPlan::SetOp { arms, .. } => {
+            for arm in arms {
+                collect_scans(&arm.plan, out);
+            }
+        }
+        PhysicalPlan::Insert { source, .. } => {
+            if let PhysicalInsertSource::Query { input, .. } = source {
+                collect_scans(input, out);
+            }
+        }
+        // A table function reads no relation, and the three remaining DML nodes
+        // name their target rather than scanning a source plan.
+        PhysicalPlan::Values { .. }
+        | PhysicalPlan::TableFunction { .. }
+        | PhysicalPlan::Update { .. }
+        | PhysicalPlan::Delete { .. } => {}
+    }
+}
+
+fn collect_join_scans(
+    join: &PhysicalJoinExpr,
+    out: &mut Vec<(Arc<TableSchema>, ColumnProjection)>,
+) {
+    match join {
+        PhysicalJoinExpr::Input { input, .. } => match input {
+            PhysicalJoinInput::Scan {
+                table, projection, ..
+            } => out.push((table.schema(), projection.clone())),
+            PhysicalJoinInput::Subplan(plan) => collect_scans(plan, out),
+            PhysicalJoinInput::TableFunction { .. } => {}
+        },
+        PhysicalJoinExpr::Join { left, right, .. } => {
+            collect_join_scans(left, out);
+            collect_join_scans(right, out);
+        }
+    }
+}
+
 /// Lower one logical node, recursing into subplans. Split from [`plan`] so the
 /// projection pass runs exactly once, over the finished tree.
 fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {

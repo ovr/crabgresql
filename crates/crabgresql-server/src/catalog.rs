@@ -9,15 +9,16 @@ use std::sync::{Arc, Mutex};
 use crabgresql_catalog::{
     CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
     CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
-    CatalogUserType, SystemCatalog,
+    CatalogUserType, CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
-use crabgresql_executor::{CatalogOps, ConstraintDef, ExtensionVersion, IndexDef};
+use crabgresql_executor::{CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, SerialSequence};
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
 };
 use crabgresql_storage_api::{
-    CheckConstraint, IndexMetadata, RelationMetadata, SequenceAdvance, SequenceDefinition,
-    StorageError, TableAm, TableEngine, TableSchema, ViewDefinition,
+    CheckConstraint, ColumnProjection, IndexMetadata, RelationMetadata, SequenceAdvance,
+    SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
+    ViewDefinition,
 };
 use crabgresql_txn::{TxnContext, Xid};
 use crabgresql_types::ByteaOutput;
@@ -108,6 +109,7 @@ impl StatementRelations {
 /// when called, which is what keeps a `SELECT 1` from enumerating the database:
 /// `SystemCatalog` invokes each at most once, and only when the relation it
 /// feeds is opened.
+#[derive(Clone)]
 pub struct SessionCatalogSource {
     /// Backs `relations` and `schemas`: relation metadata, views, sequences and
     /// the temp-namespace instantiation check all come from here.
@@ -154,6 +156,10 @@ pub struct SessionCatalogSource {
     /// Eager like `cursors`, and for the same reason: this source outlives the
     /// `&Session` it is built from.
     backend: CatalogBackend,
+    /// Whether this source is the one [`SessionCatalogSource::view_dependencies`]
+    /// binds *through* rather than the one a statement reads. It answers that
+    /// method with nothing; see there for what it is a backstop against.
+    nested: bool,
 }
 
 impl SessionCatalogSource {
@@ -234,8 +240,85 @@ impl SessionCatalogSource {
             bytea_output: session.bytea_output,
             stats: Arc::clone(&session.stats),
             backend: session.backend(),
+            nested: false,
         }
     }
+}
+
+/// The relations one view's stored query reads, each with the columns it reads;
+/// see [`SessionCatalogSource::view_dependencies`] for the rules.
+///
+/// Planned rather than merely bound: the projection pass runs inside
+/// [`crabgresql_planner::plan`], and it is that pass which computes what a scan
+/// leaf actually reads.
+fn view_reads(
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    view: &ViewDefinition,
+) -> Vec<ViewDepRelation> {
+    let whole = |namespace: &str, name: &str| ViewDepRelation {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        columns: None,
+    };
+    let mut reads: Vec<ViewDepRelation> = view
+        .depends_on
+        .iter()
+        .map(|key| {
+            let (namespace, name) = key.split_once('.').unwrap_or(("public", key));
+            whole(namespace, name)
+        })
+        .collect();
+    let Some(columns) = view_scan_columns(engine, type_catalog, &view.sql) else {
+        return reads;
+    };
+    for read in &mut reads {
+        if let Some(names) = columns.get(&(read.namespace.clone(), read.name.clone())) {
+            read.columns = Some(names.clone());
+        }
+    }
+    reads
+}
+
+/// Plan `sql` and report, per scanned relation, the column names its scan
+/// reads.
+///
+/// [`ColumnProjection::All`] is read as *every* column rather than as "unknown".
+/// That is what it literally means for the common shape — `SELECT * FROM t`
+/// narrows to nothing precisely because the scan reads the whole row, and
+/// PostgreSQL records one edge per column there — and where it is instead the
+/// pass's fail-safe answer, claiming every column errs toward too many edges
+/// rather than too few. The wrong direction would be to under-report: a client
+/// reading these rows would conclude a column has no dependent when it has one.
+fn view_scan_columns(
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    sql: &str,
+) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+    let statements = crabgresql_parser::parse(sql).ok()?;
+    let query = statements.iter().find_map(|stmt| match stmt {
+        crabgresql_parser::ast::Statement::Query(query) => Some(query),
+        _ => None,
+    })?;
+    let logical = crabgresql_binder::bind_query(engine, type_catalog, query).ok()?;
+    let physical = crabgresql_planner::plan(logical, Default::default());
+    let mut out: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for (schema, projection) in crabgresql_planner::scan_projections(&physical) {
+        let key = (schema.namespace.clone(), schema.name.clone());
+        let read: Vec<String> = match &projection {
+            ColumnProjection::All => schema.columns.iter().map(|c| c.name.clone()).collect(),
+            ColumnProjection::Some(ordinals) => ordinals
+                .iter()
+                .filter_map(|i| schema.columns.get(*i).map(|c| c.name.clone()))
+                .collect(),
+        };
+        let names = out.entry(key).or_default();
+        names.extend(read);
+        names.sort();
+        names.dedup();
+    }
+    Some(out)
 }
 
 impl CatalogSource for SessionCatalogSource {
@@ -293,6 +376,7 @@ impl CatalogSource for SessionCatalogSource {
                     cache: seq.cache,
                     cycle: seq.cycle,
                     last_value,
+                    owned_by: seq.owned_by,
                 },
             )
         }));
@@ -336,6 +420,64 @@ impl CatalogSource for SessionCatalogSource {
             .functions()
             .iter()
             .map(catalog_routine)
+            .collect()
+    }
+
+    /// What each stored view reads, at column granularity, for `pg_depend`.
+    ///
+    /// Two sources are crossed, because neither alone is right. The relation
+    /// list is [`ViewDefinition::depends_on`], computed from the view's SQL
+    /// *before* views are expanded — so a view over another view keeps naming
+    /// that view, which is the edge PostgreSQL records. The columns come from
+    /// planning the view's query and reading each scan leaf's stamped
+    /// projection, which only exists *after* expansion. A dependency with no
+    /// matching leaf (a view, or a relation read only from an expression
+    /// subquery) keeps `columns: None` — the whole-relation edge, which is a
+    /// shape PostgreSQL stores too.
+    ///
+    /// Never fails: a view whose SQL no longer binds (its base table was
+    /// dropped from under it) contributes relation-granular edges rather than
+    /// an error, because a broken view must not make `pg_depend` unreadable.
+    ///
+    /// One divergence to know about: a view that reads *no* column of a
+    /// relation (`SELECT count(*) FROM t`) records the edge on the single
+    /// column the projection pass narrows an empty demand to
+    /// ([`ColumnProjection::of`] turns an empty demand into the narrowest
+    /// column rather than none), where PostgreSQL records the relation as a
+    /// whole. That column is a cost artifact, not a read: adding a narrower
+    /// column to the relation moves the recorded edge without the view
+    /// changing. TODO: have the projection pass report the demand it computed,
+    /// so an empty one can be told from a one-column one.
+    fn view_dependencies(&self) -> Vec<CatalogViewDependency> {
+        // A view whose body reads `pg_depend` would have this method binding a
+        // query that reaches `pg_depend` again. What actually stops it is that
+        // the relation is registered **deferred**: binding resolves its name and
+        // schema without building its rows, so this method is never re-entered
+        // and the snapshot's `OnceLock` never sees a second visit. `nested` is
+        // the backstop for the day that registration changes — the nested source
+        // answers with no view edges, so the recursion terminates one level down
+        // instead of deadlocking. Covered by
+        // `e2e::a_view_over_pg_depend_is_readable`.
+        if self.nested {
+            return Vec::new();
+        }
+        let mut nested = self.clone();
+        nested.nested = true;
+        let system: Arc<dyn TableEngine> = Arc::new(SystemCatalog::from_source(Arc::new(nested)));
+        let engine: Arc<dyn TableEngine> = Arc::new(SessionCatalog::new(
+            Arc::clone(&self.engine),
+            system,
+            self.temp_schema.clone(),
+        ));
+        let type_catalog: Arc<dyn TypeCatalog> = Arc::clone(&self.global_catalog) as _;
+        self.engine
+            .views()
+            .into_iter()
+            .map(|view| CatalogViewDependency {
+                reads: view_reads(&engine, &type_catalog, &view),
+                namespace: view.namespace,
+                name: view.name,
+            })
             .collect()
     }
 
@@ -626,6 +768,17 @@ impl CatalogOps for SessionCatalogOps {
     fn index_def(&self, oid: u32) -> Option<IndexDef> {
         let (index, table) = self.system.index_def(oid)?;
         Some(IndexDef { index, table })
+    }
+
+    fn serial_sequence(&self, oid: u32, column: &str) -> SerialSequence {
+        match self.system.serial_sequence(oid, column) {
+            SerialSequenceLookup::Owned { namespace, name } => {
+                SerialSequence::Owned { namespace, name }
+            }
+            SerialSequenceLookup::Unowned => SerialSequence::Unowned,
+            SerialSequenceLookup::NoColumn { relation } => SerialSequence::NoColumn { relation },
+            SerialSequenceLookup::NoRelation => SerialSequence::NoRelation,
+        }
     }
 
     fn current_database(&self) -> String {

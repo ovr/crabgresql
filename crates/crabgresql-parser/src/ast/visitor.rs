@@ -960,49 +960,16 @@ mod tests {
                     "POST: STATEMENT: SELECT * FROM t1 WHERE EXISTS (SELECT column FROM t2) UNION SELECT * FROM t3",
                 ],
             ),
+            // Upstream's `PIVOT` case is gone: this fork's dialect does not
+            // parse the clause, so the statement it produced was a different
+            // one and the trace below it described nothing.
             (
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
-                vec![
-                    "PRE: STATEMENT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "PRE: QUERY: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "PRE: SELECT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: TABLE FACTOR: monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: TABLE FACTOR: monthly_sales",
-                    "PRE: RELATION: monthly_sales",
-                    "POST: RELATION: monthly_sales",
-                    "POST: TABLE FACTOR: monthly_sales",
-                    "PRE: EXPR: SUM(a.amount)",
-                    "PRE: EXPR: a.amount",
-                    "POST: EXPR: a.amount",
-                    "POST: EXPR: SUM(a.amount)",
-                    "PRE: EXPR: a.MONTH",
-                    "POST: EXPR: a.MONTH",
-                    "PRE: EXPR: 'JAN'",
-                    "POST: EXPR: 'JAN'",
-                    "PRE: EXPR: 'FEB'",
-                    "POST: EXPR: 'FEB'",
-                    "PRE: EXPR: 'MAR'",
-                    "POST: EXPR: 'MAR'",
-                    "PRE: EXPR: 'APR'",
-                    "POST: EXPR: 'APR'",
-                    "POST: TABLE FACTOR: monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "POST: SELECT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d)",
-                    "PRE: EXPR: EMPID",
-                    "POST: EXPR: EMPID",
-                    "POST: QUERY: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                    "POST: STATEMENT: SELECT * FROM monthly_sales PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ORDER BY EMPID",
-                ]
-            ),
-            (
+                // No `RELATION` visit: this fork parses the statement's target
+                // as a show option rather than as an `ObjectName`, so there is
+                // no relation node for the visitor to reach.
                 "SHOW COLUMNS FROM t1",
                 vec![
                     "PRE: STATEMENT: SHOW COLUMNS FROM t1",
-                    "PRE: RELATION: t1",
-                    "POST: RELATION: t1",
                     "POST: STATEMENT: SHOW COLUMNS FROM t1",
                 ],
             ),
@@ -1088,20 +1055,21 @@ mod visit_mut_tests {
 
     #[test]
     fn test_value_redact() {
-        let tests = vec![
-            (
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('JAN', 'FEB', 'MAR', 'APR')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
-                concat!(
-                    "SELECT * FROM monthly_sales ",
-                    "PIVOT(SUM(a.amount) FOR a.MONTH IN ('REDACTED_1', 'REDACTED_2', 'REDACTED_3', 'REDACTED_4')) AS p (c, d) ",
-                    "ORDER BY EMPID"
-                ),
+        // Upstream drives this with a `PIVOT` statement, which this fork's
+        // dialect does not parse; the literals it redacts are what the test is
+        // about, so they moved to a statement the fork does parse.
+        let tests = vec![(
+            concat!(
+                "SELECT SUM(a.amount) FROM monthly_sales AS a ",
+                "WHERE a.month IN ('JAN', 'FEB', 'MAR', 'APR') ",
+                "ORDER BY EMPID"
             ),
-        ];
+            concat!(
+                "SELECT SUM(a.amount) FROM monthly_sales AS a ",
+                "WHERE a.month IN ('REDACTED_1', 'REDACTED_2', 'REDACTED_3', 'REDACTED_4') ",
+                "ORDER BY EMPID"
+            ),
+        )];
 
         for (sql, expected) in tests {
             let mut visitor = MutatorVisitor::default();

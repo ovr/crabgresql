@@ -30,6 +30,7 @@ use crabgresql_storage_api::{
     TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
+use crabgresql_types::text::{quote_ident, quote_sql_literal};
 use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::catalog::{SessionCatalog, SessionCatalogOps, SessionCatalogSource, StatementRelations};
@@ -4368,17 +4369,7 @@ fn execute_create_table(
                 &taken,
                 &format!("{name}_{column_name}_seq"),
             );
-            // A qualified table's serial default must reference the sequence by
-            // its schema too, so `nextval` resolves it in the same namespace.
-            let seq_ref = if namespace == "public" {
-                seq_name.clone()
-            } else {
-                format!("{namespace}.{seq_name}")
-            };
-            // Written the way PG's deparse prints it — `nextval` takes a
-            // `regclass`, and the cast is what a re-parse of this text needs to
-            // resolve the name.
-            column.default = Some(format!("nextval('{seq_ref}'::regclass)"));
+            column.default = Some(nextval_default(&namespace, &seq_name));
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
                 namespace: namespace.clone(),
@@ -7384,7 +7375,7 @@ fn execute_create_view(
             col
         })
         .collect();
-    let depends_on = referenced_relations(&create.query);
+    let depends_on = dependency_keys(catalog, referenced_relations(&create.query));
     let sql = create.query.to_string();
 
     let existing_table = catalog.resolve(Some(&namespace), &name).is_ok();
@@ -7462,13 +7453,16 @@ fn check_view_replace_compatible(old: &ViewDefinition, new: &[Column]) -> Result
     Ok(())
 }
 
-/// The surface relation names a query references in FROM position (including
-/// joins, derived tables, nested joins, set operations, and CTE bodies), minus
-/// the names bound by the query's own `WITH` clauses. A view over another view
-/// records the *view* name — the dependency edge `DROP ... CASCADE` walks.
-/// TODO: also trace subqueries embedded in expressions (e.g. a scalar subquery
-/// in the SELECT list); only FROM-position references are collected.
-fn referenced_relations(query: &ast::Query) -> Vec<String> {
+/// A relation as a query names it: the schema is `None` when none was written,
+/// and resolving it is [`dependency_keys`]'s job.
+type RelationRef = (Option<String>, String);
+
+/// The relations a query references, as written. FROM position and expression
+/// subqueries alike, minus the names bound by the query's own `WITH` clauses.
+///
+/// A view over another view records the *view* name — the dependency edge
+/// `DROP ... CASCADE` walks, and the one PostgreSQL records too.
+fn referenced_relations(query: &ast::Query) -> Vec<RelationRef> {
     let mut names = Vec::new();
     // The CTE names currently in scope, as a stack: a query's `WITH` names shadow
     // like-named base tables only within that query (and its nested scopes), so
@@ -7482,7 +7476,43 @@ fn referenced_relations(query: &ast::Query) -> Vec<String> {
         .collect()
 }
 
-fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, scope: &mut Vec<String>) {
+/// The dependency keys a view stores, resolved the way its query resolved.
+///
+/// An unqualified reference is *not* `public` by construction: name resolution
+/// searches the session's temp namespace and `pg_catalog` first, so a view over
+/// a temp table or over a catalog relation depends on the relation it actually
+/// reads rather than on a same-named one in `public`. A name that resolves to
+/// nothing is keyed as written — the view is being created over a relation the
+/// binder is about to reject anyway.
+///
+/// TODO: make a view over a temp relation a temporary view. PostgreSQL turns it
+/// into one with a notice; this build has no temporary views, so the view
+/// outlives the relation it reads.
+fn dependency_keys(catalog: &Arc<dyn TableEngine>, references: Vec<RelationRef>) -> Vec<String> {
+    references
+        .into_iter()
+        .map(|(schema, name)| {
+            let namespace = schema.unwrap_or_else(|| resolved_namespace(catalog, &name));
+            dep_key(&namespace, &name)
+        })
+        .collect()
+}
+
+fn resolved_namespace(catalog: &Arc<dyn TableEngine>, name: &str) -> String {
+    if let Ok(table) = catalog.resolve(None, name) {
+        return table.schema().namespace.clone();
+    }
+    match catalog.resolve_view(None, name) {
+        Some(view) => view.namespace,
+        None => "public".to_string(),
+    }
+}
+
+fn collect_query_relations(
+    query: &ast::Query,
+    names: &mut Vec<RelationRef>,
+    scope: &mut Vec<String>,
+) {
     let pushed = query.with.as_ref().map_or(0, |with| {
         for cte in &with.cte_tables {
             scope.push(normalize_ident(&cte.alias.name));
@@ -7500,7 +7530,7 @@ fn collect_query_relations(query: &ast::Query, names: &mut Vec<String>, scope: &
 
 fn collect_setexpr_relations(
     body: &ast::SetExpr,
-    names: &mut Vec<String>,
+    names: &mut Vec<RelationRef>,
     scope: &mut Vec<String>,
 ) {
     match body {
@@ -7511,6 +7541,7 @@ fn collect_setexpr_relations(
                     collect_factor_relations(&join.relation, names, scope);
                 }
             }
+            collect_expression_relations(select.as_ref(), names, scope);
         }
         ast::SetExpr::Query(query) => collect_query_relations(query, names, scope),
         ast::SetExpr::SetOperation { left, right, .. } => {
@@ -7521,9 +7552,44 @@ fn collect_setexpr_relations(
     }
 }
 
+/// The relations a query's *expressions* read — a scalar subquery, an `EXISTS`,
+/// an `IN (SELECT …)`, wherever the grammar allows one.
+///
+/// A relation read only from here is read by the view all the same: dropping it
+/// breaks the view, and a dump that restores it after the view fails. Walking
+/// the whole node rather than naming each clause is what keeps a clause added
+/// to the grammar later from silently going unwatched.
+///
+/// Slightly over-approximating: a CTE declared *inside* one of these subqueries
+/// shadows a base relation only within it, and this walk sees the nested
+/// subquery both on its own and through its parent, so such a name can be
+/// recorded as a dependency it is not. An extra edge costs a refused `DROP`; a
+/// missing one costs a broken view.
+fn collect_expression_relations(
+    select: &ast::Select,
+    names: &mut Vec<RelationRef>,
+    scope: &mut Vec<String>,
+) {
+    let _: std::ops::ControlFlow<()> = ast::visit_expressions(select, |expr| {
+        match expr {
+            ast::Expr::Subquery(query)
+            | ast::Expr::InSubquery {
+                subquery: query, ..
+            }
+            | ast::Expr::Exists {
+                subquery: query, ..
+            } => {
+                collect_query_relations(query, names, scope);
+            }
+            _ => {}
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+}
+
 fn collect_factor_relations(
     factor: &ast::TableFactor,
-    names: &mut Vec<String>,
+    names: &mut Vec<RelationRef>,
     scope: &mut Vec<String>,
 ) {
     match factor {
@@ -7549,8 +7615,7 @@ fn collect_factor_relations(
                 if schema.is_none() && scope.contains(&rel) {
                     return;
                 }
-                let namespace = schema.unwrap_or_else(|| "public".to_string());
-                names.push(format!("{namespace}.{rel}"));
+                names.push((schema, rel));
             }
         }
         ast::TableFactor::Derived { subquery, .. } => {
@@ -7877,6 +7942,35 @@ fn seq_type_name(ty: PgType) -> &'static str {
     }
 }
 
+fn names_no_owner(owner: &ast::ObjectName) -> bool {
+    match owner.0.as_slice() {
+        [part] => part.to_string().eq_ignore_ascii_case("none"),
+        _ => false,
+    }
+}
+
+/// The default a `serial` column carries, written the way PostgreSQL's deparse
+/// prints it: `nextval('t_id_seq'::regclass)`, the cast being what a re-parse of
+/// the text needs to resolve the name.
+///
+/// The reference is quoted twice over, as PostgreSQL 18.4 was observed to quote
+/// it: by identifier rules first, so a `"MixT"` table's sequence reads
+/// `nextval('"MixT_id_seq"'::regclass)` rather than folding to lower case when
+/// the text is read back, and then as a string literal, so a table named
+/// `it's` reads `nextval('"it''s_id_seq"'::regclass)` and still parses.
+///
+/// Only a non-`public` schema is named, again as PostgreSQL prints it; the
+/// sequence always lives in its table's namespace, so `nextval` resolves it
+/// there.
+fn nextval_default(namespace: &str, sequence: &str) -> String {
+    let sequence = quote_ident(sequence);
+    let reference = match namespace {
+        "public" => sequence,
+        namespace => format!("{}.{sequence}", quote_ident(namespace)),
+    };
+    format!("nextval({}::regclass)", quote_sql_literal(&reference))
+}
+
 /// Pick a relation name not already used by a table, view, index, or sequence
 /// (nor by `extra`, names reserved earlier in the same statement), appending a
 /// numeric suffix as PostgreSQL does for auto-named serial sequences.
@@ -8050,8 +8144,11 @@ fn build_sequence_definition(
 
 /// `CREATE SEQUENCE [IF NOT EXISTS] name [AS type] [options]`.
 ///
-/// TODO: record the `OWNED BY` dependency — it is parsed and ignored, so only
-/// the sequences a `serial` column creates are tracked.
+/// TODO: record an `OWNED BY` link. The clause is refused rather than ignored:
+/// the ownership a sequence *can* have here is the one a `serial` column
+/// records, and `pg_depend`'s auto edge and `pg_get_serial_sequence` both answer
+/// from that. Accepting the clause and dropping it would make those two report
+/// no owner for a sequence the statement said had one.
 /// TODO: support `CREATE TEMPORARY SEQUENCE`.
 #[allow(clippy::too_many_arguments)]
 fn execute_create_sequence(
@@ -8061,11 +8158,22 @@ fn execute_create_sequence(
     name: &ast::ObjectName,
     data_type: &Option<ast::DataType>,
     options: &[ast::SequenceOptions],
-    _owned_by: &Option<ast::ObjectName>,
+    owned_by: &Option<ast::ObjectName>,
 ) -> Result<QueryResult, PgError> {
     if temporary {
         return Err(PgError::feature_not_supported(
             "temporary sequences are not supported yet",
+        ));
+    }
+    // `OWNED BY NONE` is PostgreSQL's default spelled out, so it is accepted and
+    // records nothing. A one-part name can only be that spelling — a real owner
+    // is `table.column` — so matching on the single ident is exact.
+    if owned_by
+        .as_ref()
+        .is_some_and(|owner| !names_no_owner(owner))
+    {
+        return Err(PgError::feature_not_supported(
+            "CREATE SEQUENCE ... OWNED BY is not supported yet",
         ));
     }
     let (schema_qual, seq_name) = split_object_name(name, "relation")?;
@@ -8165,6 +8273,9 @@ fn execute_drop_sequence(
             let Ok(table) = catalog.open_table(owner) else {
                 continue;
             };
+            // Both halves have to match: a default naming `app.s` belongs to
+            // that sequence, not to the `public.s` being dropped. Same parser
+            // and same rule as `pg_depend`'s auto edge.
             let column = table
                 .schema()
                 .columns
@@ -8172,7 +8283,10 @@ fn execute_drop_sequence(
                 .find(|c| {
                     c.default
                         .as_deref()
-                        .is_some_and(|d| d.contains(&format!("nextval('{name}')")))
+                        .and_then(crabgresql_catalog::nextval_target)
+                        .is_some_and(|(namespace, sequence)| {
+                            sequence == *name && namespace.is_none_or(|ns| ns == "public")
+                        })
                 })
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
@@ -9095,26 +9209,33 @@ mod tests {
         );
     }
 
-    /// The referenced relations of the query in a `SELECT` statement.
+    /// The referenced relations of the query in a `SELECT` statement, rendered
+    /// as `schema.name` with an unqualified reference left bare — resolving the
+    /// missing schema needs a catalog, and is `dependency_keys`' job.
     fn deps(sql: &str) -> Vec<String> {
         let stmts = crabgresql_parser::parse(sql).expect("parse");
-        match &stmts[0] {
+        let refs = match &stmts[0] {
             ast::Statement::Query(query) => referenced_relations(query),
             other => panic!("expected a query, got {other:?}"),
-        }
+        };
+        refs.into_iter()
+            .map(|(schema, name)| match schema {
+                Some(schema) => format!("{schema}.{name}"),
+                None => name,
+            })
+            .collect()
     }
 
     #[test]
     fn referenced_relations_excludes_cte_names_but_keeps_their_bodies() {
         // A CTE name is not a dependency; the base table inside its body is.
-        // Dependencies are recorded as qualified `namespace.name` keys.
         assert_eq!(
             deps("WITH c AS (SELECT 1) SELECT * FROM c"),
             Vec::<String>::new()
         );
         assert_eq!(
             deps("WITH c AS (SELECT * FROM t) SELECT * FROM c"),
-            vec!["public.t"]
+            vec!["t"]
         );
         // A schema-qualified reference keeps its schema.
         assert_eq!(deps("SELECT * FROM app.t"), vec!["app.t"]);
@@ -9126,7 +9247,33 @@ mod tests {
         // outer `c` is the real relation and must remain a dependency.
         assert_eq!(
             deps("SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) d, c"),
-            vec!["public.c"]
+            vec!["c"]
+        );
+    }
+
+    /// A relation a query reads only from an expression subquery is a
+    /// dependency all the same: dropping it breaks the view, and a dump that
+    /// restores it after the view fails.
+    #[test]
+    fn referenced_relations_finds_expression_subqueries() {
+        assert_eq!(deps("SELECT (SELECT max(b) FROM u) FROM t"), vec!["t", "u"]);
+        assert_eq!(
+            deps("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u)"),
+            vec!["t", "u"]
+        );
+        assert_eq!(
+            deps("SELECT a FROM t WHERE a IN (SELECT b FROM u)"),
+            vec!["t", "u"]
+        );
+        // Inside a CASE, inside a function call, and in a HAVING — anywhere the
+        // grammar allows an expression.
+        assert_eq!(
+            deps("SELECT CASE WHEN a > 0 THEN (SELECT b FROM u) END FROM t"),
+            vec!["t", "u"]
+        );
+        assert_eq!(
+            deps("SELECT count(*) FROM t GROUP BY a HAVING count(*) > (SELECT b FROM u)"),
+            vec!["t", "u"]
         );
     }
 

@@ -20,8 +20,9 @@ recursive = { version = "0.1.1", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1.0", optional = true }
 bigdecimal = { version = "0.4.1", features = ["serde"], optional = true }
-# Only pulled in by the `visitor` / `derive-dialect` features, which CrabgreSQL
-# does not enable; kept declared so the source's cfg_attrs resolve without edits.
+# Pulled in by the `visitor` feature, which the server enables to walk a view's
+# expressions for its dependency set, and by `derive-dialect`, which nothing
+# enables.
 sqlparser_derive = { version = "0.5.0", optional = true }
 thiserror.workspace = true
 
