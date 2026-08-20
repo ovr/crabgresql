@@ -772,6 +772,11 @@ pub enum ScalarFn {
     /// number yields that key alone rather than the whole statement. An OID no
     /// index answers to is NULL, not an error.
     PgGetIndexdef,
+    /// `pg_get_partkeydef(oid) -> text`: the argument of a partitioned table's
+    /// `PARTITION BY` clause, as `RANGE (sales_date)`. An OID that names no
+    /// partitioned relation — including one that names nothing at all — is
+    /// NULL, not an error.
+    PgGetPartkeydef,
     /// `pg_get_constraintdef(oid[, bool]) -> text`: a constraint's DDL, as
     /// `CHECK ((x > 3))` / `PRIMARY KEY (a, b)` / `UNIQUE (a)`. The optional
     /// flag is PostgreSQL's `pretty`, which for a check drops the parentheses
@@ -3032,6 +3037,11 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TEXT,
             },
         ],
+        "pg_get_partkeydef" => &[Signature {
+            func: ScalarFn::PgGetPartkeydef,
+            args: &[OID],
+            ret: TEXT,
+        }],
         "pg_get_serial_sequence" => &[Signature {
             func: ScalarFn::PgGetSerialSequence,
             args: &[TEXT, TEXT],

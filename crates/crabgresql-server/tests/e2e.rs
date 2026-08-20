@@ -14334,6 +14334,42 @@ async fn partition_bounds_fold_session_identity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_get_partkeydef` renders the `PARTITION BY` argument of a partitioned
+/// parent and NULL for everything else — a plain table, a leaf partition, and an
+/// OID no relation answers to. Values verified against PostgreSQL 18.4, quoting
+/// included: a key column needing quotes gets them.
+#[tokio::test]
+async fn pg_get_partkeydef_renders_the_partition_key() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE TABLE parted (a int, \"Odd Col\" text) PARTITION BY RANGE (\"Odd Col\")",
+        )
+        .await?;
+    client
+        .simple_query("CREATE TABLE parted1 PARTITION OF parted FOR VALUES FROM ('a') TO ('z')")
+        .await?;
+    client.simple_query("CREATE TABLE plain (a int)").await?;
+
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT pg_catalog.pg_get_partkeydef('parted'::regclass)"
+        )
+        .await,
+        "RANGE (\"Odd Col\")"
+    );
+    // A leaf is a partition, not a partitioned table: it has no key of its own.
+    for sql in [
+        "SELECT coalesce(pg_get_partkeydef('parted1'::regclass), 'NULL')",
+        "SELECT coalesce(pg_get_partkeydef('plain'::regclass), 'NULL')",
+        "SELECT coalesce(pg_get_partkeydef(0), 'NULL')",
+    ] {
+        assert_eq!(scalar(&client, sql).await, "NULL", "{sql}");
+    }
+    Ok(())
+}
+
 /// `SHOW` returns rows, so Describe must answer with a RowDescription. The
 /// utility catch-all reported NoData and Execute then streamed DataRows the
 /// client had been told not to expect.

@@ -62,8 +62,8 @@ use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
-    IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationFilenodes, StorageError,
-    TableAm, TableEngine, TableSchema,
+    IndexConstraint, IndexMetadata, PartitionStrategy, RelPersistence, RelStats, RelationFilenodes,
+    StorageError, TableAm, TableEngine, TableSchema,
 };
 use crabgresql_txn::Xid;
 #[cfg(test)]
@@ -1224,6 +1224,33 @@ impl SystemCatalog {
             return None;
         }
         Some((index.metadata.clone(), index.table_schema.clone()))
+    }
+
+    /// The partition key of the relation `oid` identifies: its strategy and the
+    /// key columns' *names*, in key order — what `pg_get_partkeydef` renders.
+    ///
+    /// `None` covers both misses PostgreSQL reports as NULL: an OID no relation
+    /// answers to, and a relation that is not partitioned. Column names rather
+    /// than positions, for the reason [`Self::constraint_def`] gives — the
+    /// caller renders DDL and holds no schema.
+    pub fn partition_key_def(&self, oid: u32) -> Option<(PartitionStrategy, Vec<String>)> {
+        let relations = self.relation_oids();
+        let (stored, schema) = relations.get(oid.checked_sub(FIRST_REL_OID)? as usize)?;
+        if *stored != oid {
+            return None;
+        }
+        let scheme = schema.partition_scheme.as_ref()?;
+        let columns = scheme
+            .key_columns
+            .iter()
+            .map(|i| {
+                schema
+                    .columns
+                    .get(*i)
+                    .map_or_else(|| "?column?".to_string(), |c| c.name.clone())
+            })
+            .collect();
+        Some((scheme.strategy, columns))
     }
 
     /// The constraint `oid` identifies, resolved against the same numbering

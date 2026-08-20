@@ -49,8 +49,8 @@ use crabgresql_planner::{
 };
 use crabgresql_storage_api::pgstat::WriteKind;
 use crabgresql_storage_api::{
-    ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
-    Tuple, TypeCatalog,
+    ColumnProjection, IndexMetadata, PartitionBoundDatum, PartitionStrategy, StorageError, TableAm,
+    TableSchema, Tid, Tuple, TypeCatalog,
 };
 use crabgresql_txn::{TupleHeader, TxnContext};
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
@@ -207,6 +207,12 @@ pub trait CatalogOps: Send + Sync {
     /// index, not the one it gives the table.
     fn index_def(&self, oid: u32) -> Option<IndexDef>;
 
+    /// The partition key of the relation `oid` identifies, behind
+    /// `pg_get_partkeydef`. `None` both for an OID no relation answers to and
+    /// for a relation that is not partitioned — PostgreSQL reports NULL for
+    /// either, so the two need not be told apart.
+    fn partition_key_def(&self, oid: u32) -> Option<PartitionKeyDef>;
+
     /// The sequence column `column` of relation `oid` owns, behind
     /// `pg_get_serial_sequence`. The column name is matched exactly, as
     /// PostgreSQL matches it; see [`SerialSequence`] for why the misses are
@@ -323,6 +329,16 @@ pub struct ConstraintDef {
 pub struct IndexDef {
     pub index: IndexMetadata,
     pub table: TableSchema,
+}
+
+/// What `pg_get_partkeydef` needs to reproduce a `PARTITION BY` clause: the
+/// strategy and the key columns' names, in key order. Rendering lives in the
+/// executor, so an implementation never learns the SQL surface — the same split
+/// [`ConstraintDef`] makes.
+#[derive(Clone, Debug)]
+pub struct PartitionKeyDef {
+    pub strategy: PartitionStrategy,
+    pub columns: Vec<String>,
 }
 
 /// Severity of a diagnostic produced during execution. `Debug` and `Log` reach
