@@ -12,8 +12,8 @@ use crabgresql_catalog::{
     CatalogUserType, CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
 use crabgresql_executor::{
-    CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, RelationSize,
-    SerialSequence,
+    CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, PartitionKeyDef,
+    RelationSize, SerialSequence,
 };
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
@@ -815,6 +815,11 @@ impl CatalogOps for SessionCatalogOps {
     fn index_def(&self, oid: u32) -> Option<IndexDef> {
         let (index, table) = self.system.index_def(oid)?;
         Some(IndexDef { index, table })
+    }
+
+    fn partition_key_def(&self, oid: u32) -> Option<PartitionKeyDef> {
+        let (strategy, columns) = self.system.partition_key_def(oid)?;
+        Some(PartitionKeyDef { strategy, columns })
     }
 
     fn serial_sequence(&self, oid: u32, column: &str) -> SerialSequence {
