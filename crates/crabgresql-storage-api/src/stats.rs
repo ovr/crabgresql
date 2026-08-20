@@ -19,6 +19,11 @@ use crabgresql_types::Value;
 
 use crate::TableSchema;
 
+/// The unit [`RelStats::relpages`] counts in. Every access method reports its
+/// size in these, whatever its storage actually looks like, so this is what
+/// turns a page count back into the bytes `pg_relation_size` answers with.
+pub const PAGE_BYTES: u64 = 8192;
+
 /// Bytes of a heap page available to tuples, after the page header and the
 /// per-tuple line pointer and header overhead. Used only to turn a page count
 /// into a row estimate, so an approximation is the point rather than a

@@ -846,6 +846,10 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::PgRelationSize
+            | ScalarFn::PgTableSize
+            | ScalarFn::PgIndexesSize
+            | ScalarFn::PgTotalRelationSize
             | ScalarFn::PgIndexHasProperty
             | ScalarFn::PgIndexColumnHasProperty
             | ScalarFn::ObjDescription
@@ -881,13 +885,15 @@ fn eval_catalog_fn(
     // These are the functions here that are STRICT in an argument past the first,
     // which `args.first()` above cannot see: `col_description(oid, NULL)` is
     // NULL, not the whole-object comment that a NULL read as column 0 would find,
-    // and a NULL property name is NULL rather than an unknown property.
+    // a NULL property name is NULL rather than an unknown property, and a NULL
+    // fork name is NULL rather than the `22023` an unrecognized one raises.
     if matches!(
         func,
         ScalarFn::ObjDescription
             | ScalarFn::ColDescription
             | ScalarFn::PgIndexHasProperty
             | ScalarFn::PgIndexColumnHasProperty
+            | ScalarFn::PgRelationSize
     ) && args.iter().any(|arg| matches!(arg, Value::Null))
     {
         return Some(Ok(Value::Null));
@@ -962,6 +968,55 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // The four size functions. Each sums a different part of the same
+        // measurement, so they share one catalog call; an OID naming no relation
+        // is NULL for all of them, which is distinct from the zero a view (no
+        // storage of its own) reports.
+        ScalarFn::PgRelationSize
+        | ScalarFn::PgTableSize
+        | ScalarFn::PgIndexesSize
+        | ScalarFn::PgTotalRelationSize => {
+            // The relation is looked up **before** the fork name is read, as
+            // PostgreSQL does: it opens the relation first, so
+            // `pg_relation_size(999999, 'bogus')` is NULL rather than the
+            // `22023` the same fork name raises for a relation that exists.
+            let Some(size) = ops.relation_size(oid) else {
+                return Some(Ok(Value::Null));
+            };
+            if let Some(fork) = args.get(1) {
+                let Value::Text(fork) = fork else {
+                    unreachable!("pg_relation_size fork argument was {fork:?}");
+                };
+                match fork.as_str() {
+                    "main" => {}
+                    // crabgresql keeps no free-space or visibility map and has no
+                    // `init` fork, so the three non-main forks are legitimately
+                    // empty rather than unimplemented.
+                    "fsm" | "vm" | "init" => return Some(Ok(Value::Int8(0))),
+                    // Case-sensitive, as PostgreSQL is: `'MAIN'` raises too.
+                    _ => {
+                        return Some(Err(ExecError::new(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "invalid fork name",
+                        )
+                        .with_hint(Some(
+                            "Valid fork names are \"main\", \"fsm\", \"vm\", and \"init\"."
+                                .to_string(),
+                        ))));
+                    }
+                }
+            }
+            let bytes = match func {
+                ScalarFn::PgRelationSize => size.main,
+                ScalarFn::PgTableSize => size.main + size.toast,
+                ScalarFn::PgIndexesSize => size.indexes,
+                _ => size.main + size.toast + size.indexes,
+            };
+            // No relation can approach `i64::MAX` bytes, so the cast cannot
+            // wrap; `try_into` keeps that a compile-time-checked claim rather
+            // than an `as` that would silently go negative if it ever did.
+            Value::Int8(bytes.try_into().unwrap_or(i64::MAX))
+        }
         // The index property functions. Nothing here raises: an OID that is no
         // index, a property the level does not own and a column outside the key
         // list are all NULL, verified against PostgreSQL 18.4.
@@ -1719,6 +1774,9 @@ mod format_type_tests {
                 None
             }
             fn table_is_visible(&self, _oid: u32) -> Option<bool> {
+                None
+            }
+            fn relation_size(&self, _oid: u32) -> Option<crate::RelationSize> {
                 None
             }
             fn rel_name(&self, _oid: u32) -> Option<(String, String)> {

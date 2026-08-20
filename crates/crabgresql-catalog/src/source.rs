@@ -76,6 +76,11 @@ pub struct CatalogRelation {
     /// has none. `Some` is what gives the relation a `pg_toast.pg_toast_<oid>`
     /// row and a non-zero `pg_class.reltoastrelid`.
     pub toast: Option<RelStats>,
+    /// Each index's own size, keyed by index name — see
+    /// [`crabgresql_storage_api::RelationMetadata::index_stats`] for why it is
+    /// keyed rather than parallel to `indexes`. Feeds `pg_relation_size` on an
+    /// index OID; an index missing from the map has no size anyone can report.
+    pub index_stats: Vec<(String, RelStats)>,
     /// A view's body, **already deparsed** into the canonical SQL PostgreSQL
     /// prints — what `pg_views.definition` shows and what `pg_rewrite` stores as
     /// the `_RETURN` rule's action. `None` for everything that is not a view,
@@ -128,6 +133,7 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
             filenodes: RelationFilenodes::default(),
@@ -146,6 +152,7 @@ impl CatalogRelation {
             sequence: None,
             stats: metadata.stats,
             toast: metadata.toast,
+            index_stats: metadata.index_stats,
             definition: None,
             ddl_xid: 0,
             filenodes: metadata.filenodes,
@@ -164,6 +171,7 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
             filenodes: RelationFilenodes::default(),
@@ -185,6 +193,7 @@ impl CatalogRelation {
             sequence: None,
             stats,
             toast: None,
+            index_stats: Vec::new(),
             definition,
             ddl_xid: 0,
             filenodes: RelationFilenodes::default(),
@@ -219,6 +228,7 @@ impl CatalogRelation {
             sequence: Some(params),
             stats,
             toast: None,
+            index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
             filenodes: RelationFilenodes::default(),

@@ -21,7 +21,7 @@ pub mod pgstat;
 pub mod sort;
 
 mod stats;
-pub use stats::{ColStats, RelStats};
+pub use stats::{ColStats, PAGE_BYTES, RelStats};
 
 /// What an engine's buffer pool reports about the blocks it served. See
 /// [`TableEngine::buffer_stats`].
@@ -647,6 +647,15 @@ pub struct RelationMetadata {
     /// The physical file numbers `pg_class.relfilenode` reports for this
     /// relation and everything hanging off it.
     pub filenodes: RelationFilenodes,
+    /// What [`TableAm::index_statistics`] reported for each index, **keyed by
+    /// index name** — the source of `pg_relation_size` on an index OID.
+    ///
+    /// Keyed rather than parallel to `indexes`: a lookup that misses then means
+    /// "this engine cannot size that index", which is what an index it holds as
+    /// metadata only really is, where a positional list that drifted would hand
+    /// out another index's size instead. An engine that sizes nothing leaves it
+    /// empty.
+    pub index_stats: Vec<(String, RelStats)>,
 }
 
 /// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
@@ -1976,6 +1985,7 @@ pub trait TableEngine: Send + Sync {
                 indexes: Vec::new(),
                 toast: None,
                 filenodes: RelationFilenodes::default(),
+                index_stats: Vec::new(),
             })
             .collect()
     }

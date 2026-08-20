@@ -218,6 +218,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 )),
             };
         }
+        // Formatting a byte count reads nothing but the count, so this one is
+        // pure even though the sizes it usually formats come from the catalog.
+        ScalarFn::PgSizePretty => return Ok(Value::Text(size_pretty(&args[0]))),
         // The AM property table is a compile-time constant, so this one is pure;
         // its two siblings take an index and are dispatched by `eval`.
         ScalarFn::PgIndexamHasProperty => {
@@ -242,6 +245,10 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // it is not STRICT, so the NULL short-circuit above would be wrong for it.
         ScalarFn::PgGetUserById
         | ScalarFn::PgTableIsVisible
+        | ScalarFn::PgRelationSize
+        | ScalarFn::PgTableSize
+        | ScalarFn::PgIndexesSize
+        | ScalarFn::PgTotalRelationSize
         | ScalarFn::PgIndexHasProperty
         | ScalarFn::PgIndexColumnHasProperty
         | ScalarFn::ObjDescription
@@ -2789,6 +2796,98 @@ fn text(v: &Value) -> &str {
     }
 }
 
+/// The units `pg_size_pretty` counts in, smallest first.
+const SIZE_UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+
+/// PostgreSQL moves to the next unit only once the count reaches **ten** of the
+/// current one, not one: `10239` still prints as bytes, `10240` as `10 kB`, and
+/// `1048576` as `1024 kB` rather than `1 MB` (observed on PostgreSQL 18.4).
+const SIZE_UNIT_LIMIT: i128 = 10 * 1024;
+
+/// One over [`SIZE_UNIT_STEP`], exactly: 1024 is a power of two, so its
+/// reciprocal is a terminating decimal and a `numeric` *multiplication* by it
+/// loses nothing. That is why the `numeric` arm below multiplies rather than
+/// divides — `Numeric::div` picks a result scale, and this needs all of them.
+const SIZE_UNIT_RECIPROCAL: &str = "0.0009765625";
+
+/// The divisor between two units.
+const SIZE_UNIT_STEP: i128 = 1024;
+
+/// `pg_size_pretty`, for both the `int8` and the `numeric` argument.
+///
+/// The rounding — **half away from zero** — is applied to the threshold and to
+/// what is printed, and is never carried into the next division: each step
+/// divides the *original* value by a larger power of 1024. Dividing the rounded
+/// figure instead rounds twice, and the second one can go the wrong way:
+/// 11009536 is 10.4995 MB, which PostgreSQL prints as `10 MB`, while rounding
+/// it to 10752 kB on the way there and halving that gives `11 MB`.
+///
+/// The threshold does read the *rounded* figure, though, which is what puts
+/// 10485248 (10239.5 kB, a hair under the limit) into MB.
+///
+/// A value that never reaches the limit is printed as it came in, so a
+/// `numeric` keeps its fraction (`1536.4 bytes`) and its trailing zeros
+/// (`1024.00 bytes`) — those are only lost to a division. Every expectation
+/// here was measured against PostgreSQL 18.4.
+///
+/// The integer arithmetic runs in `i128` because `2 * i64::MIN` appears in the
+/// rounding below, and PostgreSQL prints `i64::MIN` as `-8192 PB` rather than
+/// raising.
+fn size_pretty(value: &Value) -> String {
+    match value {
+        Value::Int8(bytes) => {
+            let bytes = i128::from(*bytes);
+            if bytes.abs() < SIZE_UNIT_LIMIT {
+                return format!("{bytes} {}", SIZE_UNITS[0]);
+            }
+            // `divisor` is 1024^k for the unit at index k, so the value shown is
+            // always `bytes` itself divided once.
+            let mut divisor = 1;
+            let mut size = bytes;
+            for unit in &SIZE_UNITS[1..] {
+                divisor *= SIZE_UNIT_STEP;
+                // Half away from zero: `(2v + sign * d) / 2d` truncating toward
+                // zero, which is what Rust's integer division does.
+                size = (2 * bytes + bytes.signum() * divisor) / (2 * divisor);
+                if size.abs() < SIZE_UNIT_LIMIT {
+                    return format!("{size} {unit}");
+                }
+            }
+            format!("{size} {}", SIZE_UNITS[SIZE_UNITS.len() - 1])
+        }
+        Value::Numeric(n) => {
+            let last = SIZE_UNITS[SIZE_UNITS.len() - 1];
+            // NaN and the infinities never fall under the limit and cannot be
+            // divided into anything smaller, so they land in the last unit —
+            // `NaN PB`, as PostgreSQL prints it.
+            if n.is_nan() || n.is_infinite() {
+                return format!("{} {last}", n.to_display());
+            }
+            let limit = Numeric::from_i128(SIZE_UNIT_LIMIT);
+            if n.abs().cmp(&limit).is_lt() {
+                return format!("{} {}", n.to_display(), SIZE_UNITS[0]);
+            }
+            let step = Numeric::parse(SIZE_UNIT_RECIPROCAL).expect("a numeric literal");
+            let mut exact = n.clone();
+            let mut size = exact.clone();
+            for unit in &SIZE_UNITS[1..] {
+                // Exact, so nothing is carried into the next step but the value
+                // itself. A multiplication of two finite values by a factor
+                // below one cannot leave the numeric format; stopping here is
+                // the honest answer if it somehow does.
+                let Ok(divided) = exact.mul(&step) else { break };
+                exact = divided;
+                size = exact.round(0);
+                if size.abs().cmp(&limit).is_lt() {
+                    return format!("{} {unit}", size.to_display());
+                }
+            }
+            format!("{} {last}", size.to_display())
+        }
+        other => unreachable!("expected int8 or numeric arg, got {other:?}"),
+    }
+}
+
 fn ts(v: &Value) -> i64 {
     match v {
         Value::Timestamp(t) => *t,
@@ -3293,6 +3392,81 @@ mod tests {
         ] {
             assert_eq!(rendered(ScalarFn::NumGcd, a, b), "NaN");
             assert_eq!(rendered(ScalarFn::NumLcm, a, b), "NaN");
+        }
+    }
+
+    /// `pg_size_pretty`'s two arguments, at every boundary the unit rule and the
+    /// half-away-from-zero rounding turn on. Every expectation was read off
+    /// PostgreSQL 18.4.
+    #[test]
+    fn size_pretty_matches_pg_at_the_unit_boundaries() {
+        let pretty =
+            |v: Value| match eval_scalar(ScalarFn::PgSizePretty, &[v], &FmtCtx::utc_default()) {
+                Ok(Value::Text(s)) => s,
+                other => panic!("pg_size_pretty returned {other:?}"),
+            };
+        for (bytes, want) in [
+            (0, "0 bytes"),
+            (1, "1 bytes"),
+            (1023, "1023 bytes"),
+            // The unit changes at ten of the current one, not one — so 1024 is
+            // still bytes and 1048576 is `1024 kB`, not `1 MB`.
+            (1024, "1024 bytes"),
+            (10239, "10239 bytes"),
+            (10240, "10 kB"),
+            // Half away from zero, in both directions.
+            (10751, "10 kB"),
+            (10752, "11 kB"),
+            (-10751, "-10 kB"),
+            (-10752, "-11 kB"),
+            (1048576, "1024 kB"),
+            (1572864, "1536 kB"),
+            (1073741824, "1024 MB"),
+            (1099511627776, "1024 GB"),
+            // The rounding is applied to the threshold and to what is printed,
+            // never carried into the next division: 11009536 is 10.4995 MB, so
+            // rounding it to 10752 kB on the way and dividing *that* would
+            // print 11 MB.
+            (11009536, "10 MB"),
+            (-11009536, "-10 MB"),
+            // ... while the threshold itself does read the rounded value:
+            // 10485248 is 10239.5 kB, which rounds up to the limit and so takes
+            // one more step, and one byte less does not.
+            (10485248, "10 MB"),
+            (10485247, "10239 kB"),
+            // The extremes, which are why the arithmetic runs in i128:
+            // half-adjusting i64::MIN would overflow.
+            (i64::MAX, "8192 PB"),
+            (i64::MIN, "-8192 PB"),
+        ] {
+            assert_eq!(pretty(Value::Int8(bytes)), want, "for {bytes}");
+        }
+        for (input, want) in [
+            // Undivided, so whatever fraction came in survives — including one
+            // that would have rounded up to the limit. The threshold reads the
+            // rounded value only *after* a division has happened.
+            ("1536.4", "1536.4 bytes"),
+            ("0.5", "0.5 bytes"),
+            ("10239.5", "10239.5 bytes"),
+            ("1024.00", "1024.00 bytes"),
+            // Every division rounds to a whole number, trailing zeros included.
+            ("10240.00", "10 kB"),
+            ("10240.5", "10 kB"),
+            ("10752.5", "11 kB"),
+            ("1234567.891", "1206 kB"),
+            ("-10752.6", "-11 kB"),
+            // The same two thresholds the int8 form is checked at.
+            ("10485248.0", "10 MB"),
+            ("10485247.9", "10239 kB"),
+            ("11009536", "10 MB"),
+            // The specials never fall under the limit, so they land in the last
+            // unit rather than looping or being divided.
+            ("NaN", "NaN PB"),
+            ("Infinity", "Infinity PB"),
+            ("-Infinity", "-Infinity PB"),
+        ] {
+            let value = Value::Numeric(Numeric::parse(input).expect("a numeric literal"));
+            assert_eq!(pretty(value), want, "for {input}");
         }
     }
 }

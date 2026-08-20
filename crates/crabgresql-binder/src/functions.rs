@@ -706,6 +706,25 @@ pub enum ScalarFn {
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
+    /// `pg_relation_size(regclass[, text]) -> int8`: the relation's own storage
+    /// in bytes. The second argument names a fork (`main`, `fsm`, `vm`, `init`)
+    /// and defaults to `main`; anything else is `22023`. NULL for an OID no
+    /// relation has, and **zero** for a relation with no storage of its own — a
+    /// view or a partitioned parent.
+    PgRelationSize,
+    /// `pg_table_size(regclass) -> int8`: the relation plus its out-of-line
+    /// storage, but not its indexes.
+    PgTableSize,
+    /// `pg_indexes_size(regclass) -> int8`: every index on the relation, summed.
+    /// Zero for a relation that is itself an index.
+    PgIndexesSize,
+    /// `pg_total_relation_size(regclass) -> int8`: the relation, its out-of-line
+    /// storage and its indexes together.
+    PgTotalRelationSize,
+    /// `pg_size_pretty(int8|numeric) -> text`: a byte count in the largest unit
+    /// that leaves it under `10 * 1024` — `bytes`, `kB`, `MB`, `GB`, `TB`, `PB`.
+    /// Pure: it reads no catalog, only its argument.
+    PgSizePretty,
     /// `obj_description(oid[, name]) -> text`: the comment on an object, from
     /// `pg_description`. With the catalog name it looks only there; the
     /// one-argument form is PostgreSQL's deprecated any-catalog search, which
@@ -2919,6 +2938,24 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[OID],
             ret: TEXT,
         }],
+        // The four *size* functions resolve in `resolve_relation_size` (their
+        // relation parameter is spelled either way), but this one takes a plain
+        // number and belongs in the table. Two overloads with nothing to choose
+        // between them for an integer argument is the point: PostgreSQL answers
+        // `pg_size_pretty(1024)` with `42725 is not unique`, which the tie rule
+        // in `resolve_call` reproduces.
+        "pg_size_pretty" => &[
+            Signature {
+                func: ScalarFn::PgSizePretty,
+                args: &[I8],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgSizePretty,
+                args: &[NUM],
+                ret: TEXT,
+            },
+        ],
         // Catalog lookups. `int -> oid` is implicit, so an OID written as an
         // integer literal resolves too. Dispatched by the executor's `eval`
         // (not `eval_scalar`), which holds the session's catalog snapshot.
@@ -3940,6 +3977,11 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return Ok(binding);
     }
 
+    // The size functions take one for the same reason.
+    if let Some(binding) = resolve_relation_size(&name, &bindings)? {
+        return Ok(binding);
+    }
+
     // `pg_typeof(any)` accepts every type, so it has no fixed signature either.
     // Only the unary form is ours; any other arity falls through, so a
     // user-defined overload of this name stays reachable.
@@ -4621,6 +4663,39 @@ fn resolve_index_property(name: &str, bindings: &[Binding]) -> Result<Option<Bin
         let params: Vec<PgType> = std::iter::once(first).chain(tail.iter().copied()).collect();
         if let Ok(args) = single_candidate_args(bindings, &params) {
             return finish_func_call(func, BOOL, args).map(Some);
+        }
+    }
+    Err(undefined_function(name, bindings))
+}
+
+/// Resolve the four relation-size functions, or `Ok(None)` for any other name.
+///
+/// Their relation parameter is spelled `regclass` or `oid` for exactly the
+/// reason [`resolve_index_property`] documents — a client writes
+/// `pg_relation_size('t')` by hand and `pg_relation_size(c.oid)` in a query over
+/// `pg_class`, and two signature-table entries would make the first `42725`.
+///
+/// `pg_size_pretty` is deliberately *not* here: its two overloads take a number
+/// rather than a relation, and PostgreSQL really does raise `42725` for
+/// `pg_size_pretty(1024)`, which the ordinary table gives for free.
+fn resolve_relation_size(name: &str, bindings: &[Binding]) -> Result<Option<Binding>, BindError> {
+    let tail: &[PgType] = match (name, bindings.len()) {
+        ("pg_relation_size", 1) => &[],
+        // The fork name: `main`, `fsm`, `vm` or `init`.
+        ("pg_relation_size", 2) => &[TEXT],
+        ("pg_table_size" | "pg_indexes_size" | "pg_total_relation_size", 1) => &[],
+        _ => return Ok(None),
+    };
+    let func = match name {
+        "pg_relation_size" => ScalarFn::PgRelationSize,
+        "pg_table_size" => ScalarFn::PgTableSize,
+        "pg_indexes_size" => ScalarFn::PgIndexesSize,
+        _ => ScalarFn::PgTotalRelationSize,
+    };
+    for first in [REGCLASS, OID] {
+        let params: Vec<PgType> = std::iter::once(first).chain(tail.iter().copied()).collect();
+        if let Ok(args) = single_candidate_args(bindings, &params) {
+            return finish_func_call(func, I8, args).map(Some);
         }
     }
     Err(undefined_function(name, bindings))
