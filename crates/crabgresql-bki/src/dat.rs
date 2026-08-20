@@ -153,6 +153,35 @@ pub fn array_field(e: &Entry, key: &str) -> Option<Vec<String>> {
     Some(inner.split(',').map(|v| v.trim().to_string()).collect())
 }
 
+/// How many elements a braced list holds, without reading them.
+///
+/// [`array_field`] refuses a quoted element, because a list of *names* never has
+/// one. `pg_proc.proargdefaults` does — `'{"{}",false}'` is `jsonb_path_exists`'s
+/// pair of defaults — and nothing here can render those literals back. The count
+/// alone is still `pg_proc.pronargdefaults`: how many trailing arguments a call
+/// may omit.
+pub fn braced_list_len(e: &Entry, key: &str) -> Option<usize> {
+    let raw = get(e, key)?;
+    let inner = raw
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or_else(|| panic!("{key} is not a braced list: {raw:?}"));
+    if inner.is_empty() {
+        return Some(0);
+    }
+    let mut quoted = false;
+    let mut elements = 1;
+    for c in inner.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => elements += 1,
+            _ => {}
+        }
+    }
+    assert!(!quoted, "{key} has an unterminated quote: {raw:?}");
+    Some(elements)
+}
+
 /// A `t`/`f` field, falling back to the column's BKI default.
 pub fn bool_field(e: &Entry, key: &str, default: bool) -> bool {
     match get(e, key) {

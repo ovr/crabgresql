@@ -1433,6 +1433,62 @@ pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
     }
 }
 
+/// The set-returning functions [`lookup_table_fn`] cannot answer for: each is
+/// polymorphic or has several arities, so it resolves through its own function
+/// rather than through a fixed signature. Both positions a call can appear in —
+/// `FROM` ([`bind_table_fn_call`]) and a target list ([`bind_srf_projection`]) —
+/// gate on this list and dispatch through [`bind_polymorphic_table_fn`], so a
+/// new one cannot reach only one of them.
+pub const POLYMORPHIC_TABLE_FN_NAMES: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "jsonb_path_query",
+    "pg_partition_ancestors",
+    "unnest",
+];
+
+/// Whether this build resolves `name` (already lowercased) as a function of any
+/// kind: scalar, aggregate, window, or set-returning.
+///
+/// This is what makes a `pg_proc` row honest, and `crabgresql-bki`'s
+/// `IMPLEMENTED_PRONAMES` — the list codegen filters `pg_proc.dat` by — is
+/// checked against it in both directions by `crabgresql-server`'s
+/// `pg_proc_surface` test.
+///
+/// One term per name-resolving path in [`bind_function`] and
+/// [`bind_table_fn_call`], each reusing that path's own predicate: a term that
+/// restates a dispatch instead of calling it drifts from it, and a name it then
+/// misses is a function nothing can introspect.
+///
+/// The paths deliberately absent are the ones PostgreSQL has no `pg_proc` row
+/// for either: `COALESCE`/`NULLIF` and `ARRAY(SELECT …)` are grammar, and so is
+/// the `CURRENT_TIMESTAMP` family ([`bind_current_datetime`]). `current_catalog`,
+/// `current_role` and `user` do answer `true` here — they are ordinary
+/// [`lookup`] entries — and have no row for the same reason; the test never asks
+/// about them, since it walks the names `pg_proc.dat` defines.
+pub fn implements_function(name: &str) -> bool {
+    !lookup(name).is_empty()
+        || variadic_text_fn(name).is_some()
+        || crate::expr::ARRAY_FUNCTION_NAMES.contains(&name)
+        // `pg_typeof(any)` accepts every type, so it has no fixed signature.
+        || name == "pg_typeof"
+        || lookup_agg(name).is_some()
+        || lookup_window_fn(name).is_some()
+        || lookup_table_fn(name).is_some()
+        || POLYMORPHIC_TABLE_FN_NAMES.contains(&name)
+}
+
+/// The functions taking any number of arguments of any type, each coerced to
+/// `text` — so they have no fixed-arity signature to live in [`lookup`]'s table.
+fn variadic_text_fn(name: &str) -> Option<ScalarFn> {
+    match name {
+        "concat" => Some(ScalarFn::Concat),
+        "concat_ws" => Some(ScalarFn::ConcatWs),
+        "format" => Some(ScalarFn::Format),
+        _ => None,
+    }
+}
+
 /// An aggregate function the executor accumulates over the rows of a group.
 /// `COUNT(*)` and `COUNT(expr)` are both [`AggFn::Count`]; they differ only in
 /// whether an argument expression is present (see [`crate::BoundAggregate`]).
@@ -1630,33 +1686,8 @@ pub(crate) fn bind_table_fn_call(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    // `generate_series` is polymorphic on its integer element type and has two
-    // arities, so it resolves outside the fixed-signature table below.
-    if name == "generate_series" {
-        let (elem, args) = resolve_generate_series(&bindings)?;
-        return Ok((TableFn::GenerateSeries(elem), args));
-    }
-    if name == "jsonb_path_query" {
-        return Ok((
-            TableFn::JsonbPathQuery,
-            resolve_jsonb_path_query(&bindings)?,
-        ));
-    }
-    if name == "unnest" {
-        let (elem, args) = resolve_unnest(&bindings)?;
-        return Ok((TableFn::Unnest(elem), args));
-    }
-    if name == "generate_subscripts" {
-        return Ok((
-            TableFn::GenerateSubscripts,
-            resolve_generate_subscripts(&bindings)?,
-        ));
-    }
-    if name == "pg_partition_ancestors" {
-        return Ok((
-            TableFn::PgPartitionAncestors,
-            resolve_partition_ancestors(&bindings)?,
-        ));
+    if POLYMORPHIC_TABLE_FN_NAMES.contains(&name) {
+        return bind_polymorphic_table_fn(name, &bindings);
     }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
@@ -1670,6 +1701,40 @@ pub(crate) fn bind_table_fn_call(
         Ok(args) => Ok((func, args)),
         Err(None) => Err(undefined_function(name, &bindings)),
         Err(Some(e)) => Err(e),
+    }
+}
+
+/// Resolve one of [`POLYMORPHIC_TABLE_FN_NAMES`] against already-bound arguments.
+///
+/// The one dispatch for both positions such a call can appear in — `FROM`
+/// ([`bind_table_fn_call`]) and a target list ([`bind_srf_projection`]) — which
+/// differ only in what they build from the result.
+fn bind_polymorphic_table_fn(
+    name: &str,
+    bindings: &[Binding],
+) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
+    match name {
+        "generate_series" => {
+            let (elem, args) = resolve_generate_series(bindings)?;
+            Ok((TableFn::GenerateSeries(elem), args))
+        }
+        "jsonb_path_query" => Ok((TableFn::JsonbPathQuery, resolve_jsonb_path_query(bindings)?)),
+        "unnest" => {
+            let (elem, args) = resolve_unnest(bindings)?;
+            Ok((TableFn::Unnest(elem), args))
+        }
+        "generate_subscripts" => Ok((
+            TableFn::GenerateSubscripts,
+            resolve_generate_subscripts(bindings)?,
+        )),
+        "pg_partition_ancestors" => Ok((
+            TableFn::PgPartitionAncestors,
+            resolve_partition_ancestors(bindings)?,
+        )),
+        other => unreachable!(
+            "{other} is in POLYMORPHIC_TABLE_FN_NAMES but has no arm here — the list is the \
+             gate both call sites use, so the two must agree"
+        ),
     }
 }
 
@@ -2354,11 +2419,25 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[I4, I4, I4, I4, I4, F8],
             ret: TS,
         }],
-        "make_interval" => &[Signature {
-            func: ScalarFn::MakeInterval,
-            args: &[I4, I4, I4, I4, I4, I4, F8],
-            ret: IV,
-        }],
+        // Every argument defaults to zero upstream, so a call may stop after any
+        // of them: `make_interval(1)` is a year. PG spells that as one signature
+        // plus seven defaults — which is what `pg_proc.pronargdefaults` reports —
+        // and this spells it as one arity per prefix.
+        //
+        // The named-argument form (`make_interval(days => 3)`) is a separate gap:
+        // nothing here accepts `=>` in an argument list.
+        "make_interval" => arity_sigs!(
+            ScalarFn::MakeInterval,
+            IV,
+            &[],
+            &[I4],
+            &[I4, I4],
+            &[I4, I4, I4],
+            &[I4, I4, I4, I4],
+            &[I4, I4, I4, I4, I4],
+            &[I4, I4, I4, I4, I4, I4],
+            &[I4, I4, I4, I4, I4, I4, F8],
+        ),
         "justify_days" => &[Signature {
             func: ScalarFn::JustifyDays,
             args: &[IV],
@@ -3942,12 +4021,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     // `concat`/`concat_ws`/`format` are variadic and non-strict; they don't fit
     // the fixed-arity overload table, so every argument is coerced to text and a
     // single variadic `FuncCall` is built directly.
-    if let Some(func) = match name.as_str() {
-        "concat" => Some(ScalarFn::Concat),
-        "concat_ws" => Some(ScalarFn::ConcatWs),
-        "format" => Some(ScalarFn::Format),
-        _ => None,
-    } {
+    if let Some(func) = variadic_text_fn(&name) {
         let args = bindings
             .into_iter()
             .map(crate::expr::to_concat_operand)
@@ -3957,16 +4031,8 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
 
     // Polymorphic array functions can't live in the fixed-signature overload
     // table (their argument/result types depend on the array's element type).
-    if matches!(
-        name.as_str(),
-        "cardinality"
-            | "array_length"
-            | "array_upper"
-            | "array_append"
-            | "array_prepend"
-            | "array_cat"
-            | "array_to_string"
-    ) && let Some(binding) = crate::expr::bind_array_function(&name, &bindings)?
+    if crate::expr::ARRAY_FUNCTION_NAMES.contains(&name.as_str())
+        && let Some(binding) = crate::expr::bind_array_function(&name, &bindings)?
     {
         return Ok(binding);
     }
@@ -5043,12 +5109,7 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series"
-        && name != "jsonb_path_query"
-        && name != "unnest"
-        && name != "generate_subscripts"
-        && name != "pg_partition_ancestors"
-    {
+    if !POLYMORPHIC_TABLE_FN_NAMES.contains(&name.as_str()) {
         return Ok(None);
     }
     let arg_exprs = positional_args(&func.args)?;
@@ -5056,42 +5117,20 @@ pub(crate) fn bind_srf_projection(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    // The target-list spelling psql's `\d` uses: `SELECT
-    // pg_partition_ancestors(oid) UNION ALL VALUES (oid)`.
-    if name == "pg_partition_ancestors" {
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::PgPartitionAncestors,
-            ret: PgType::Reg(RegKind::Class),
-            args: resolve_partition_ancestors(&bindings)?,
-        }));
-    }
-    if name == "jsonb_path_query" {
-        let args = resolve_jsonb_path_query(&bindings)?;
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::JsonbPathQuery,
-            ret: PgType::Jsonb,
-            args,
-        }));
-    }
-    if name == "unnest" {
-        let (elem, args) = resolve_unnest(&bindings)?;
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::Unnest(elem),
-            ret: elem,
-            args,
-        }));
-    }
-    if name == "generate_subscripts" {
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::GenerateSubscripts,
-            ret: PgType::Int4,
-            args: resolve_generate_subscripts(&bindings)?,
-        }));
-    }
-    let (elem, args) = resolve_generate_series(&bindings)?;
+    // The same resolution `FROM` position does: psql's `\d` writes one of these
+    // as `SELECT pg_partition_ancestors(oid) UNION ALL VALUES (oid)`, and that is
+    // the same function, not a target-list variant of it.
+    let (func, args) = bind_polymorphic_table_fn(&name, &bindings)?;
+    // The expression's type is the rowset's own single column, so nothing here
+    // keeps a second copy of it per name.
+    debug_assert!(func.returns_scalar(), "{name} returns a composite row");
+    let columns = func.columns();
+    let [column] = columns.as_slice() else {
+        unreachable!("{name} returns a scalar, so it has exactly one output column")
+    };
     Ok(Some(BoundExpr::Srf {
-        func: TableFn::GenerateSeries(elem),
-        ret: elem,
+        func,
+        ret: column.ty,
         args,
     }))
 }

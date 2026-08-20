@@ -382,3 +382,56 @@ SELECT 2287::regtype::text::regtype AS roundtrip;
  record[]
 (1 row)
 
+-- regproc names a function. It prints bare only when regprocin would find that
+-- one function by the name, so an overloaded name prints schema-qualified -- and
+-- on input names none of them at all.
+SELECT 'now'::regproc AS unique_name, 'pg_catalog.now'::regproc AS qualified_input;
+ unique_name | qualified_input 
+-------------+-----------------
+ now         | now
+(1 row)
+
+SELECT 'row_number'::regproc AS window_fn, 'initcap'::regproc AS scalar_fn;
+ window_fn  | scalar_fn 
+------------+-----------
+ row_number | initcap
+(1 row)
+
+-- a variadic text function and a polymorphic array one: both are resolved ahead
+-- of the signature table, and both are published
+SELECT 'concat'::regproc AS variadic, 'cardinality'::regproc AS polymorphic;
+ variadic | polymorphic 
+----------+-------------
+ concat   | cardinality
+(1 row)
+
+SELECT 'format'::regproc;
+ERROR:  more than one function named "format"
+SELECT 'upper'::regproc;
+ERROR:  more than one function named "upper"
+SELECT 'pg_catalog.upper'::regproc;
+ERROR:  more than one function named "pg_catalog.upper"
+SELECT 871::regproc AS overloaded, 0::regproc AS zero, 4294967000::regproc AS unknown_oid;
+    overloaded    | zero | unknown_oid 
+------------------+------+-------------
+ pg_catalog.upper | -    | 4294967000
+(1 row)
+
+SELECT 'no_such_function'::regproc;
+ERROR:  function "no_such_function" does not exist
+-- equality is by OID, so two spellings of one function are equal
+SELECT 'now'::regproc = 'pg_catalog.now'::regproc AS same_function;
+ same_function 
+---------------
+ t
+(1 row)
+
+-- a CREATE FUNCTION routine resolves the same way
+CREATE FUNCTION rp_f(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+SELECT 'rp_f'::regproc AS by_name, 'public.rp_f'::regproc AS qualified;
+ by_name | qualified 
+---------+-----------
+ rp_f    | rp_f
+(1 row)
+
+DROP FUNCTION rp_f(int);

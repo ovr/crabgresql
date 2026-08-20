@@ -172,6 +172,21 @@ SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5) AS made, make_interval(0, 0, 0, 0, 0
  1 year 2 mons 25 days 05:06:07.5 | 00:00:00
 (1 row)
 
+-- every make_interval argument defaults to zero, so a call may stop after any of
+-- them (this is what pg_proc.pronargdefaults = 7 reports)
+SELECT make_interval() AS none, make_interval(1) AS years, make_interval(0, 1) AS months,
+       make_interval(0, 0, 0, 0, 0, 0, 1.5) AS secs_only;
+   none   | years  | months | secs_only  
+----------+--------+--------+------------
+ 00:00:00 | 1 year | 1 mon  | 00:00:01.5
+(1 row)
+
+SELECT make_interval(1, 2, 3) AS three_fields;
+     three_fields      
+-----------------------
+ 1 year 2 mons 21 days
+(1 row)
+
 SELECT age(timestamp '2001-04-10', timestamp '1957-06-13') AS age1,
        age(timestamp '2010-01-01', timestamp '2009-03-15') AS age2;
           age1           |      age2      

@@ -11374,6 +11374,166 @@ async fn routines_are_visible_in_pg_proc() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `::regproc` names any function this build implements, not only the ones other
+/// catalogs reference.
+///
+/// Every expectation below was probed against PostgreSQL 18.4.
+#[tokio::test]
+async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+
+    // A name exactly one function carries resolves and renders bare.
+    let row = client
+        .query_one(
+            "SELECT 'now'::regproc::text AS now, 'initcap'::regproc::oid AS initcap, \
+                    'row_number'::regproc::text AS window_fn, \
+                    'pg_catalog.now'::regproc::text AS qualified, \
+                    'concat'::regproc::text AS variadic, \
+                    'cardinality'::regproc::text AS polymorphic",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("now"), "now");
+    assert_eq!(row.get::<_, u32>("initcap"), 872);
+    // A window function is a `pg_proc` row like any other, and `regprocin`
+    // resolves it by name the same way.
+    assert_eq!(row.get::<_, &str>("window_fn"), "row_number");
+    assert_eq!(row.get::<_, &str>("qualified"), "now");
+    // The two families the binder resolves ahead of its signature table: a
+    // variadic text function and a polymorphic array one.
+    assert_eq!(row.get::<_, &str>("variadic"), "concat");
+    assert_eq!(row.get::<_, &str>("polymorphic"), "cardinality");
+
+    // An overloaded name names none of them: PG reports `42725` rather than
+    // choosing, quoting the input as it was written. `format` is overloaded
+    // upstream (`format(text)` and the variadic form), so it lands here too.
+    for (input, quoted) in [
+        ("'upper'::regproc", "upper"),
+        ("'pg_catalog.upper'::regproc", "pg_catalog.upper"),
+        ("'abs'::regproc", "abs"),
+        ("'format'::regproc", "format"),
+        // The raw argument, spaces and all, not the parsed name.
+        ("'  upper  '::regproc", "  upper  "),
+    ] {
+        let e = client
+            .simple_query(&format!("SELECT {input}"))
+            .await
+            .expect_err("an overloaded name must not resolve");
+        let db = e.as_db_error().expect("database error");
+        assert_eq!(db.code(), &SqlState::AMBIGUOUS_FUNCTION, "{input}");
+        assert_eq!(
+            db.message(),
+            format!("more than one function named \"{quoted}\"")
+        );
+    }
+
+    // Output follows the same rule from the other side: a name more than one
+    // function carries prints schema-qualified, since a bare one would not read
+    // back as this function.
+    let row = client
+        .query_one(
+            "SELECT 871::regproc::text AS upper, 0::regproc::text AS zero, \
+                    4294967000::regproc::text AS unknown",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>("upper"), "pg_catalog.upper");
+    assert_eq!(row.get::<_, &str>("zero"), "-");
+    assert_eq!(row.get::<_, &str>("unknown"), "4294967000");
+
+    // Both halves quote a name that needs it, the way every other `reg*` output
+    // does — `regprocout` renders through `quote_identifier`.
+    client
+        .batch_execute(r#"CREATE FUNCTION "MixedFn"() RETURNS int LANGUAGE sql AS 'SELECT 1'"#)
+        .await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT oid::regproc::text AS name FROM pg_catalog.pg_proc \
+                 WHERE proname = 'MixedFn'",
+                &[]
+            )
+            .await?
+            .get::<_, &str>("name"),
+        "\"MixedFn\""
+    );
+
+    // The rows themselves are upstream's, so a client reads the whole overload
+    // family with its own OIDs and argument types.
+    let rows = client
+        .query(
+            "SELECT p.oid, p.pronargs, p.proargtypes::text AS args, t.typname \
+             FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_type t ON t.oid = p.prorettype \
+             WHERE p.proname = 'to_char' ORDER BY p.oid",
+            &[],
+        )
+        .await?;
+    assert!(
+        rows.len() > 1,
+        "to_char is overloaded upstream, so more than one row must be published"
+    );
+    assert!(rows.iter().all(|r| r.get::<_, &str>("typname") == "text"));
+
+    // A session routine takes part in the same resolution as a built-in.
+    client
+        .batch_execute(
+            "CREATE FUNCTION regp(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a; END $$",
+        )
+        .await?;
+    assert_eq!(
+        client
+            .query_one("SELECT 'regp'::regproc::text AS name", &[])
+            .await?
+            .get::<_, &str>("name"),
+        "regp"
+    );
+    client
+        .batch_execute(
+            "CREATE FUNCTION regp(a int, b int) RETURNS int LANGUAGE plpgsql \
+             AS $$ BEGIN RETURN a + b; END $$",
+        )
+        .await?;
+    let e = client
+        .simple_query("SELECT 'regp'::regproc")
+        .await
+        .expect_err("two routines share the name");
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::AMBIGUOUS_FUNCTION
+    );
+    // And both print qualified, under the schema they were created in.
+    let rows = client
+        .query(
+            "SELECT oid::regproc::text AS name FROM pg_catalog.pg_proc \
+             WHERE proname = 'regp' ORDER BY pronargs",
+            &[],
+        )
+        .await?;
+    let names: Vec<&str> = rows.iter().map(|r| r.get("name")).collect();
+    assert_eq!(names, ["public.regp", "public.regp"]);
+
+    // A routine in `public` is reachable unqualified just as a built-in is, so
+    // one named `now` leaves a bare `now` naming neither. The other half of that
+    // rule — a routine in a schema an unqualified name does not reach — is
+    // `crabgresql-catalog`'s
+    // `a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows`,
+    // since `CREATE FUNCTION s.f()` is still `0A000` here.
+    client
+        .batch_execute("CREATE FUNCTION now(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
+        .await?;
+    let e = client
+        .simple_query("SELECT 'now'::regproc")
+        .await
+        .expect_err("a routine in public joins the built-in under one name");
+    assert_eq!(
+        e.as_db_error().expect("database error").code(),
+        &SqlState::AMBIGUOUS_FUNCTION
+    );
+
+    Ok(())
+}
+
 /// A READ ONLY transaction rejects DML no matter what its expressions call.
 /// The routine itself is only *treated* as a write so it has an XID to stamp
 /// with — that exemption must not leak onto the outer statement, which writes

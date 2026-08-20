@@ -21,6 +21,7 @@
 //! and generating from it is the sanctioned path; attribution is in `NOTICE`.
 
 pub mod dat;
+pub mod implemented;
 mod pg_aggregate;
 mod pg_amop;
 mod pg_amproc;
@@ -166,13 +167,9 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
              defines no unique entry for it"
         );
     }
-    std::fs::write(
-        out_dir.join("pg_proc_rows.rs"),
-        pg_proc::emit(&proc_entries, &symbols),
-    )?;
-    // Re-reading a sealed census is safe: the seal forbids resolving a *new*
-    // OID afterwards, not reading the same list twice.
-    let referenced_procs = symbols.references(Proc);
+    pg_proc::check_manifest(&proc_entries);
+    let procs = pg_proc::emit(&proc_entries, &symbols);
+    std::fs::write(out_dir.join("pg_proc_rows.rs"), &procs.code)?;
     std::fs::write(
         out_dir.join("pg_description_rows.rs"),
         pg_description::emit(&[
@@ -184,7 +181,11 @@ pub fn generate(catalog_dir: &Path, out_dir: &Path) -> std::io::Result<()> {
             pg_description::Source {
                 catalog: "pg_proc",
                 entries: &proc_entries,
-                keep: Some(&referenced_procs),
+                // The rows `pg_proc` published, not the reference census: the
+                // published set is the wider of the two (see `pg_proc::emit`),
+                // and a comment belongs in the catalog exactly when the row it
+                // describes is there.
+                keep: Some(&procs.published),
             },
             pg_description::Source {
                 catalog: "pg_operator",

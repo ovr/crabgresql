@@ -57,7 +57,7 @@ pub(crate) use datatype::{
     numeric_typmod, text_column_value,
 };
 pub(crate) use operators::{
-    bind_array_function, bind_binary_op, is_text_family, to_concat_operand,
+    ARRAY_FUNCTION_NAMES, bind_array_function, bind_binary_op, is_text_family, to_concat_operand,
 };
 pub(crate) use params::{ViewExpansion, param_ctx_view_body, view_expansion};
 pub(crate) use scope::column_value;

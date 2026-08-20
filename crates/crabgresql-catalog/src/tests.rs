@@ -481,6 +481,91 @@ fn pg_cast_resolves_type_names_to_oids() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A bare function name is not a function's identity — `upper` names the text
+/// function and the two range accessors — so the whole candidate list comes back
+/// and the executor decides which of "unique", "ambiguous" and "miss" it is
+/// (probed on 18.4: `'upper'::regproc` is `42725`).
+#[test]
+fn a_function_name_resolves_to_every_function_carrying_it() {
+    let cat = wide_fixture();
+    // One `pg_proc` row carries `now`.
+    assert_eq!(cat.proc_oids(None, "now"), [1299]);
+    assert_eq!(cat.proc_oids(Some("pg_catalog"), "now"), [1299]);
+    // Several carry `upper`, `abs` and `length`.
+    for overloaded in ["upper", "abs", "length"] {
+        assert!(
+            cat.proc_oids(None, overloaded).len() > 1,
+            "{overloaded} is carried by more than one function"
+        );
+    }
+    // A built-in is only in `pg_catalog`, so another qualifier reaches none.
+    assert!(cat.proc_oids(Some("public"), "now").is_empty());
+    assert!(cat.proc_oids(None, "no_such_function").is_empty());
+    assert_eq!(cat.proc_oids(None, "f"), [16_600]);
+    assert_eq!(cat.proc_oids(Some("public"), "f"), [16_600]);
+    assert!(cat.proc_oids(Some("app"), "f").is_empty());
+}
+
+/// The pair `regprocout` renders from: the schema is what it prints when a bare
+/// name would not read back as this function.
+#[test]
+fn a_function_oid_names_its_schema_and_name() {
+    let name = |oid| cat_pair(wide_fixture().proc_name(oid));
+    assert_eq!(name(1299).as_deref(), Some("pg_catalog.now"));
+    assert_eq!(name(16_600).as_deref(), Some("public.f"));
+    assert_eq!(name(4_294_967_000).as_deref(), None);
+}
+
+/// `namespace.name`, for the assertions above.
+fn cat_pair(pair: Option<(String, String)>) -> Option<String> {
+    pair.map(|(namespace, name)| format!("{namespace}.{name}"))
+}
+
+/// A routine an unqualified name does not reach takes no part in resolution.
+///
+/// `CREATE FUNCTION s.now()` must leave `'now'::regproc` naming the built-in,
+/// which is what PostgreSQL does, because `s` is not on the search path.
+#[test]
+fn a_routine_outside_the_reachable_schemas_neither_resolves_nor_shadows() {
+    let routine = |oid: u32, name: &str, namespace: &str| CatalogRoutine {
+        oid,
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        kind: 'f',
+        lang: PLPGSQL_LANG_OID,
+        arg_types: Vec::new(),
+        all_arg_types: Vec::new(),
+        arg_modes: Vec::new(),
+        arg_names: Vec::new(),
+        ret_type: PgType::Int4.oid(),
+        retset: false,
+        volatile: 'v',
+        strict: false,
+        secdef: false,
+        src: "begin return 1; end".to_string(),
+    };
+    let cat = SystemCatalog::from_source(Arc::new(
+        StaticSource::new(Vec::new())
+            .schemas(vec![("s".to_string(), 16_400)])
+            .routines(vec![
+                routine(16_600, "now", "s"),
+                routine(16_601, "s_only", "s"),
+                routine(16_602, "reachable", "public"),
+            ]),
+    ));
+
+    // `s.now` is invisible to an unqualified name, so the built-in stays the only
+    // candidate: it neither wins the name nor makes it ambiguous. The executor
+    // reads that same list to decide the rendering, so `1299` still prints bare
+    // and `16_600` prints `s.now`.
+    assert_eq!(cat.proc_oids(None, "now"), [1299]);
+    assert_eq!(cat.proc_oids(Some("s"), "now"), [16_600]);
+    assert!(cat.proc_oids(None, "s_only").is_empty());
+    assert_eq!(cat.proc_oids(Some("s"), "s_only"), [16_601]);
+    // `public` is reachable, so this one takes part in the unqualified case.
+    assert_eq!(cat.proc_oids(None, "reachable"), [16_602]);
+}
+
 /// Every `regproc`/`regprocedure` reference the catalogs publish resolves to
 /// a `pg_proc` row this build actually emits.
 ///
@@ -3009,12 +3094,13 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             ("pg_namespace", 3),
             // Every operator upstream ships; each one carries a `descr`.
             ("pg_operator", 805),
-            // Every function the generated catalogs reference and upstream
-            // wrote a `descr` for. It grew with `pg_amproc`, `pg_operator` and
-            // `pg_aggregate`: a support function, an `oprcode` or a transition
-            // function is a `pg_proc` row like any other, and its description
-            // comes along.
-            ("pg_proc", 1309),
+            // Every function this build publishes that upstream wrote a `descr`
+            // for. It grew with `pg_amproc`, `pg_operator` and `pg_aggregate` —
+            // a support function, an `oprcode` or a transition function is a
+            // `pg_proc` row like any other, and its description comes along —
+            // and again with the implemented-name manifest, which publishes the
+            // SQL surface no catalog references.
+            ("pg_proc", 1689),
             // The `simple` configuration and dictionary and the default parser
             // come from the `.dat`; the other 29 of each are snowball's, whose
             // comments `initdb` writes with `COMMENT ON`.

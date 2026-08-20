@@ -155,3 +155,22 @@ DROP SCHEMA rcs;
 -- always something regtype can read back
 SELECT '_record'::regtype AS typname_spelling, 'record[]'::regtype AS rendered_spelling;
 SELECT 2287::regtype::text::regtype AS roundtrip;
+-- regproc names a function. It prints bare only when regprocin would find that
+-- one function by the name, so an overloaded name prints schema-qualified -- and
+-- on input names none of them at all.
+SELECT 'now'::regproc AS unique_name, 'pg_catalog.now'::regproc AS qualified_input;
+SELECT 'row_number'::regproc AS window_fn, 'initcap'::regproc AS scalar_fn;
+-- a variadic text function and a polymorphic array one: both are resolved ahead
+-- of the signature table, and both are published
+SELECT 'concat'::regproc AS variadic, 'cardinality'::regproc AS polymorphic;
+SELECT 'format'::regproc;
+SELECT 'upper'::regproc;
+SELECT 'pg_catalog.upper'::regproc;
+SELECT 871::regproc AS overloaded, 0::regproc AS zero, 4294967000::regproc AS unknown_oid;
+SELECT 'no_such_function'::regproc;
+-- equality is by OID, so two spellings of one function are equal
+SELECT 'now'::regproc = 'pg_catalog.now'::regproc AS same_function;
+-- a CREATE FUNCTION routine resolves the same way
+CREATE FUNCTION rp_f(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+SELECT 'rp_f'::regproc AS by_name, 'public.rp_f'::regproc AS qualified;
+DROP FUNCTION rp_f(int);

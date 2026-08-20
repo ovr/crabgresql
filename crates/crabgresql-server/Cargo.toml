@@ -38,6 +38,9 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+# The `pg_proc_surface` test reads `pg_proc.dat` with codegen's own scanner and
+# compares its manifest against the binder's registry.
+crabgresql-bki.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true
 tokio-postgres.workspace = true

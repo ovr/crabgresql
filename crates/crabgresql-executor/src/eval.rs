@@ -1785,11 +1785,11 @@ mod format_type_tests {
             fn rel_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
             }
-            fn proc_name(&self, _oid: u32) -> Option<String> {
+            fn proc_name(&self, _oid: u32) -> Option<(String, String)> {
                 None
             }
-            fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
-                None
+            fn proc_oids(&self, _namespace: Option<&str>, _name: &str) -> Vec<u32> {
+                Vec::new()
             }
             fn oper_name(&self, _oid: u32) -> Option<(String, String)> {
                 None

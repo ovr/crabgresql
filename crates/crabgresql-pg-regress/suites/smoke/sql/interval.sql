@@ -58,6 +58,11 @@ SELECT justify_days(interval '35 days') AS jdays,
 
 -- make_interval and age
 SELECT make_interval(1, 2, 3, 4, 5, 6, 7.5) AS made, make_interval(0, 0, 0, 0, 0, 0, 0) AS zero;
+-- every make_interval argument defaults to zero, so a call may stop after any of
+-- them (this is what pg_proc.pronargdefaults = 7 reports)
+SELECT make_interval() AS none, make_interval(1) AS years, make_interval(0, 1) AS months,
+       make_interval(0, 0, 0, 0, 0, 0, 1.5) AS secs_only;
+SELECT make_interval(1, 2, 3) AS three_fields;
 SELECT age(timestamp '2001-04-10', timestamp '1957-06-13') AS age1,
        age(timestamp '2010-01-01', timestamp '2009-03-15') AS age2;
 

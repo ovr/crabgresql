@@ -653,6 +653,7 @@ dependencies = [
  "bytes",
  "clap",
  "crabgresql-binder",
+ "crabgresql-bki",
  "crabgresql-catalog",
  "crabgresql-config",
  "crabgresql-executor",

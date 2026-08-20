@@ -56,9 +56,10 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
 /// `proallargtypes`/`proargmodes`/`proargnames` are filled for the few that
 /// declare OUT or VARIADIC parameters (`json_extract_path`, the ordered-set
 /// aggregate support functions) and NULL for the rest, which is what
-/// PostgreSQL stores. `pronargdefaults` is 0 for every one: codegen refuses an
-/// entry carrying an argument default, because nothing here can render the
-/// expression back.
+/// PostgreSQL stores. `pronargdefaults` carries what upstream's data implies —
+/// the number of trailing arguments a call may omit — while the default
+/// expressions themselves are absent, since this `pg_proc` publishes no
+/// `proargdefaults` column to render them from.
 pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
     // crabgresql's own table-AM handlers, so `pg_am.amhandler` resolves for
     // every method this build ships rather than only the upstream ones. They
@@ -154,7 +155,7 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                 str_char(r.provolatile),
                 str_char(r.proparallel),
                 Value::Int2(r.pronargs),
-                Value::Int2(0),
+                Value::Int2(r.pronargdefaults),
                 Value::Oid(r.prorettype),
                 oidvector(r.proargtypes.iter().copied()),
                 optional_array(

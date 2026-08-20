@@ -2,9 +2,17 @@
 
 use std::fmt::Write as _;
 
-use crate::dat::{Entry, array_field, bool_field, get, oid_field, str_field};
+use crate::dat::{Entry, array_field, bool_field, braced_list_len, get, oid_field, str_field};
+use crate::implemented::IMPLEMENTED_PRONAMES;
 use crate::symbols::SymbolKind::{Proc, Type};
 use crate::symbols::SymbolTable;
+
+/// What [`emit`] produces: the generated source, and the OIDs it published.
+pub struct Emitted {
+    pub code: String,
+    /// Ascending, as `pg_description`'s filter expects.
+    pub published: Vec<u32>,
+}
 
 /// A generated array literal's elements, comma-separated. An absent field
 /// yields no elements, which the emitted row spells as an empty slice.
@@ -33,6 +41,21 @@ fn list(e: &Entry, key: &str, render: impl Fn(&str) -> String) -> String {
         .join(", ")
 }
 
+/// Every name the manifest claims is defined by `pg_proc.dat`. A name that is
+/// not is a typo, or a function upstream has renamed: either way the claim can
+/// publish no row, so say so rather than emit nothing.
+///
+/// Runs over the real data from [`crate::generate`], not from [`emit`], so a
+/// test may emit any fixture it likes.
+pub fn check_manifest(entries: &[Entry]) {
+    for name in IMPLEMENTED_PRONAMES {
+        assert!(
+            entries.iter().any(|e| get(e, "proname") == Some(name)),
+            "IMPLEMENTED_PRONAMES lists {name:?}, which pg_proc.dat defines no entry for"
+        );
+    }
+}
+
 /// Phase one: every function `pg_proc.dat` defines, under both spellings the
 /// other catalogs reference it by — bare name (`regproc`, as
 /// `pg_type.typinput` writes it) and full signature (`regprocedure`, as
@@ -48,17 +71,26 @@ pub fn define_symbols(entries: &[Entry], symbols: &mut SymbolTable) {
     }
 }
 
-/// Emit `PG_PROC_ROWS: &[PgProcRow]` for the functions the catalogs emitted
-/// before this one point at — [`SymbolTable::references`] is that census. The
-/// rest of `pg_proc.dat` is deliberately left out: a `pg_proc` row is a claim
-/// that the function exists, and this build implements its SQL surface from its
-/// own registry, not from upstream's list. Every row emitted here is justified
-/// by an inbound reference that would otherwise dangle — which is why this
-/// catalog must be emitted **last**, and why the census seals itself when read.
+/// Emit `PG_PROC_ROWS: &[PgProcRow]`, plus the OIDs it published — the census
+/// `pg_description` filters its `pg_proc` comments by.
+///
+/// A `pg_proc` row is a claim that the function exists, so every row needs a
+/// justification and there are exactly two:
+///
+///   - an **inbound reference** from a catalog emitted before this one
+///     ([`SymbolTable::references`] is that census) — which would otherwise
+///     dangle, and is why this catalog is emitted **last** and why the census
+///     seals itself when read;
+///   - the binder **implements the name**
+///     ([`crate::implemented::IMPLEMENTED_PRONAMES`]) — the SQL surface no
+///     vendored reference points at.
+///
+/// The rest of `pg_proc.dat` stays out: this build serves its own function
+/// registry, not upstream's list.
 ///
 /// Omitted fields fall back to PostgreSQL's `pg_proc` BKI defaults (authored
 /// from the public catalog docs and checked against a running 18.4).
-pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
+pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> Emitted {
     let referenced = symbols.references(Proc);
     let type_oid = |name: &str| {
         symbols
@@ -71,21 +103,19 @@ pub fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
     let mut rows: Vec<(u32, String)> = Vec::new();
     for e in entries {
         let oid = oid_field(e, "oid");
-        if referenced.binary_search(&oid).is_err() {
+        let proname = str_field(e, "proname", "");
+        if referenced.binary_search(&oid).is_err()
+            && IMPLEMENTED_PRONAMES.binary_search(&proname).is_err()
+        {
             continue;
         }
-        let proname = str_field(e, "proname", "");
-        // An argument default is a serialized expression tree, and nothing here
-        // can render one: `pg_get_function_arguments` would have to print the
-        // expression back. No function the catalogs reference carries one, so
-        // refusing is exact rather than restrictive — and `pronargdefaults`
-        // stays 0 for the same reason.
-        for unsupported in ["proargdefaults", "pronargdefaults"] {
-            assert!(
-                get(e, unsupported).is_none(),
-                "pg_proc entry {proname} carries {unsupported}, which codegen does not emit"
-            );
-        }
+        // `pronargdefaults` is derived, never written: PostgreSQL counts the
+        // `proargdefaults` list rather than storing the count twice, so an entry
+        // spelling it out would be data this codegen does not read.
+        assert!(
+            get(e, "pronargdefaults").is_none(),
+            "pg_proc entry {proname} carries pronargdefaults, which codegen derives"
+        );
         let argtypes: Vec<u32> = str_field(e, "proargtypes", "")
             .split_whitespace()
             .map(type_oid)
@@ -102,6 +132,7 @@ procost: {procost:?}, prorows: {prorows:?}, provariadic: {provariadic}, \
 prosupport: {prosupport}, prokind: {prokind:?}, prosecdef: false, \
 proleakproof: {proleakproof}, proisstrict: {proisstrict}, proretset: {retset}, \
 provolatile: {provolatile:?}, proparallel: {proparallel:?}, pronargs: {pronargs}, \
+pronargdefaults: {pronargdefaults}, \
 prorettype: {prorettype}, proargtypes: &[{args}], proallargtypes: &[{allargs}], \
 proargmodes: &[{argmodes}], proargnames: &[{argnames}], prosrc: {prosrc:?}, \
 probin: {probin:?} }},\n",
@@ -136,6 +167,11 @@ probin: {probin:?} }},\n",
             provolatile = str_field(e, "provolatile", "i"),
             proparallel = str_field(e, "proparallel", "s"),
             pronargs = argtypes.len(),
+            // The default *expressions* go unpublished — this `pg_proc` has no
+            // `proargdefaults` column to render them from — but the count must
+            // not: a client reads it as the minimum arity, and 0 would claim
+            // `make_interval()` needs seven arguments.
+            pronargdefaults = braced_list_len(e, "proargdefaults").unwrap_or(0),
             prorettype = type_oid(str_field(e, "prorettype", "")),
             // The three OUT-parameter columns. PostgreSQL leaves all three NULL
             // unless a function has OUT or VARIADIC parameters, and an empty
@@ -161,7 +197,10 @@ probin: {probin:?} }},\n",
     }
     out.push_str("];\n");
     let _ = writeln!(out);
-    out
+    Emitted {
+        code: out,
+        published: rows.iter().map(|(oid, _)| *oid).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +212,10 @@ mod tests {
          proargtypes => 'cstring', provolatile => 'i' },\n\
           { oid => '1243', proname => 'boolout', prorettype => 'cstring', \
          proargtypes => 'bool' }]";
+
+    fn emit(entries: &[Entry], symbols: &SymbolTable) -> String {
+        super::emit(entries, symbols).code
+    }
 
     fn fixture() -> (Vec<Entry>, SymbolTable) {
         let procs = parse_dat(PROCS);
@@ -195,6 +238,37 @@ mod tests {
         assert!(emitted.contains("prorettype: 16"));
         assert!(emitted.contains("proargtypes: &[2275]"));
         assert!(emitted.contains("pronargs: 1"));
+    }
+
+    /// The second justification for a row: nothing references the entry, but the
+    /// binder resolves the name. `booleq` is in the manifest and `boolout` is
+    /// not, which is the whole difference between these two entries.
+    #[test]
+    fn emits_the_functions_this_build_implements() {
+        let procs = parse_dat(
+            "[{ oid => '60', proname => 'booleq', prorettype => 'bool', \
+             proargtypes => 'bool bool' },\n\
+              { oid => '1243', proname => 'boolout', prorettype => 'cstring', \
+             proargtypes => 'bool' }]",
+        );
+        let mut symbols = SymbolTable::default();
+        symbols.define_name(Type, "bool", 16);
+        symbols.define_name(Type, "cstring", 2275);
+        define_symbols(&procs, &mut symbols);
+        assert!(IMPLEMENTED_PRONAMES.binary_search(&"booleq").is_ok());
+        assert!(IMPLEMENTED_PRONAMES.binary_search(&"boolout").is_err());
+        let emitted = super::emit(&procs, &symbols);
+        assert!(emitted.code.contains("proname: \"booleq\""));
+        assert!(!emitted.code.contains("proname: \"boolout\""));
+        // `pg_description` filters by this census, so it has to carry the
+        // implemented row and not only the referenced ones.
+        assert_eq!(emitted.published, vec![60]);
+    }
+
+    #[test]
+    #[should_panic(expected = "which pg_proc.dat defines no entry for")]
+    fn a_manifest_name_the_dat_lacks_fails_the_build() {
+        check_manifest(&parse_dat("[{ oid => '1', proname => 'f' }]"));
     }
 
     #[test]
@@ -261,12 +335,23 @@ mod tests {
         );
     }
 
+    /// An argument default is counted, not read — and a quoted element carrying a
+    /// comma (as `jsonb_path_exists`'s `'{"{}",false}'` does) is one default.
     #[test]
-    #[should_panic(expected = "which codegen does not emit")]
-    fn a_function_with_an_argument_default_is_refused() {
+    fn argument_defaults_are_counted() {
+        let emitted = emit_one(
+            "[{ oid => '1', proname => 'f', prorettype => 'bool', \
+             proargtypes => 'bool bool', proargdefaults => '{\"{}\",false}' }]",
+        );
+        assert!(emitted.contains("pronargs: 2, pronargdefaults: 2"));
+    }
+
+    #[test]
+    #[should_panic(expected = "carries pronargdefaults, which codegen derives")]
+    fn a_spelled_out_default_count_is_refused() {
         emit_one(
             "[{ oid => '1', proname => 'f', prorettype => 'bool', \
-             proargdefaults => '{false}' }]",
+             pronargdefaults => '1' }]",
         );
     }
 }
