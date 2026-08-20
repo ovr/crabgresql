@@ -1835,6 +1835,7 @@ fn pg_class_relfilenode_is_zero_exactly_for_relations_without_storage() -> anyho
             cache: 1,
             cycle: false,
             last_value: None,
+            owned_by: None,
         },
     );
     sq.filenodes.rel = 45;
