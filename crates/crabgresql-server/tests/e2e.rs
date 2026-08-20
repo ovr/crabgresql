@@ -4853,6 +4853,62 @@ async fn pg_class_relfilenode_follows_truncate_and_is_zero_without_storage() -> 
     Ok(())
 }
 
+/// A TOAST relation names its chunk store whether or not its parent is durable.
+///
+/// A temporary table's chunk store is never recorded in the relation catalog —
+/// nothing about a temp relation is — so reading the relfilenode from there gave
+/// its `relkind = 't'` row a `0`, which is the value that means "no storage at
+/// all". The table handle knows the number for both persistences, and this is
+/// also what fails if `ManagedTable` stops forwarding `toast_relfilenode`: the
+/// trait default would quietly answer `0` for every relation, permanent included.
+#[tokio::test]
+async fn a_temp_tables_toast_relation_names_its_chunk_store() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    let toast_filenodes = async || -> anyhow::Result<Vec<String>> {
+        let msgs = client
+            .simple_query(
+                "SELECT c.relfilenode FROM pg_class c \
+                 JOIN pg_class p ON p.reltoastrelid = c.oid \
+                 WHERE c.relkind = 't' ORDER BY p.relname",
+            )
+            .await?;
+        Ok(rows(&msgs)
+            .iter()
+            .filter_map(|r| r.get(0).map(str::to_string))
+            .collect())
+    };
+
+    // A value too wide for a page forces the chunk store into existence.
+    client
+        .simple_query("CREATE TEMP TABLE tmp (id integer, body text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO tmp VALUES (1, repeat('x', 40000))")
+        .await?;
+    client
+        .simple_query("CREATE TABLE perm (id integer, body text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO perm VALUES (1, repeat('y', 40000))")
+        .await?;
+
+    let nodes = toast_filenodes().await?;
+    assert_eq!(nodes.len(), 2, "both tables toasted: {nodes:?}");
+    assert!(
+        nodes.iter().all(|n| n != "0"),
+        "a TOAST relation with a live chunk store must name its file: {nodes:?}"
+    );
+    // Two distinct chunk stores, not one number reported twice.
+    assert_ne!(nodes[0], nodes[1]);
+
+    // The rows are actually out of line, so the numbers above are not vacuous.
+    let msgs = client.simple_query("SELECT length(body) FROM tmp").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("40000"));
+
+    Ok(())
+}
+
 /// TRUNCATE swaps the table's indexes along with its heap file. Only at this
 /// level does the executor's Index Scan run, and on the physical path it
 /// re-checks nothing — so a carried-over index would answer `WHERE id = 1` with

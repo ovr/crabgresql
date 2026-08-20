@@ -300,7 +300,9 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 IndexMethod::BTree => BTREE_AM_OID,
                 IndexMethod::Hash => HASH_AM_OID,
             }),
-            // relfilenode: 0 for a metadata-only index, which has no file.
+            // relfilenode: 0 only for an index with no file at all. An index the
+            // planner refuses to read but whose file exists still names it —
+            // `relfilenode` is storage, not readability.
             Value::Oid(index.relfilenode),
             Value::Oid(0),
             // TODO: report an index's own relpages/reltuples — per-index size

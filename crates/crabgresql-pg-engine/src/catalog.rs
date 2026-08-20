@@ -7,6 +7,7 @@
 //! TODO: make catalog changes MVCC/crash-transactional by storing relation
 //! metadata in real `pg_class`/`pg_attribute` relations instead of this file.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -715,15 +716,30 @@ impl RelCatalog {
             .unwrap_or_default()
     }
 
-    /// Every file number `table` owns, for catalog reflection: its heap file, its
-    /// out-of-line chunk store (`0` when it has none), and **every** index as
-    /// `(name, relfilenode)`.
+    /// Every relation's file numbers, keyed by `(namespace, name)`, for catalog
+    /// reflection: its heap file and **every** index as `(name, relfilenode)`.
+    ///
+    /// One locked pass over the whole catalog rather than a lookup per relation,
+    /// like [`RelCatalog::schemas`]: `pg_class` is rebuilt once per statement and
+    /// names every relation, so a per-relation lookup would make that quadratic.
     ///
     /// Unlike [`RelCatalog::index_relfilenodes`] this keeps metadata-only indexes,
     /// reporting them as `0`: a reader building `pg_class` needs a row for each
     /// index whether or not it has a file, and `0` is the answer for one that does
-    /// not. All zeros when the relation is absent.
-    pub fn filenodes_in(&self, namespace: &str, table: &str) -> RelationFilenodes {
+    /// not.
+    ///
+    /// An index reports `rel`, **not** [`PersistIndex::usable_rel`]. The two differ
+    /// for an index demoted to metadata-only by an unreadable key encoding, and
+    /// there the file still exists — [`RelCatalog::live_relfilenodes`] keeps it
+    /// alive and `DROP INDEX` unlinks it, both by `rel`. `relfilenode` names
+    /// storage, not readability, so reporting `0` would be the one view of that
+    /// index that disagrees with the others.
+    ///
+    /// `RelationFilenodes::toast` is deliberately left at `0` here: a temporary
+    /// relation's chunk store never reaches this catalog at all (see
+    /// `HeapTable::ensure_toast_rel`), so the table handle is the only place that
+    /// answers for both persistences. See `TableAm::toast_relfilenode`.
+    pub fn all_filenodes(&self) -> HashMap<(String, String), RelationFilenodes> {
         let state = self
             .state
             .lock()
@@ -731,17 +747,21 @@ impl RelCatalog {
         state
             .rels
             .iter()
-            .find(|r| r.namespace == namespace && r.name == table)
-            .map(|r| RelationFilenodes {
-                rel: r.rel,
-                toast: r.toast_rel,
-                indexes: r
-                    .indexes
-                    .iter()
-                    .map(|i| (i.meta.name.clone(), i.usable_rel()))
-                    .collect(),
+            .map(|r| {
+                (
+                    (r.namespace.clone(), r.name.clone()),
+                    RelationFilenodes {
+                        rel: r.rel,
+                        toast: 0,
+                        indexes: r
+                            .indexes
+                            .iter()
+                            .map(|i| (i.meta.name.clone(), i.rel))
+                            .collect(),
+                    },
+                )
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// The relfilenode of the sequence `name` in `namespace`, or `0` if there is
@@ -2531,7 +2551,58 @@ mod tests {
         // An ascending index is unaffected: its stored order never depended on
         // the change, so demoting it too would cost every old index its speed.
         assert_eq!(rel_of(&legacy, "t_asc"), Some(RelFileNode(43)));
+
+        // But the demoted index's *file* still exists: the orphan sweep keeps it
+        // and DROP unlinks it, both by `rel`. So `all_filenodes`, which feeds
+        // `pg_class.relfilenode`, must name it too — reporting 0 there would make
+        // `pg_class` the one view of this index that disagrees with the others.
+        let filenodes = filenodes_of(&legacy, "t")?;
+        assert_eq!(filenodes.index("t_desc"), 42);
+        assert_eq!(filenodes.index("t_asc"), 43);
+        assert!(legacy.live_relfilenodes().contains(&42));
+
         Ok(())
+    }
+
+    /// An index that never had a file reports `0`, which is the one case where
+    /// `pg_class.relfilenode` and "the planner will not read this" agree.
+    #[test]
+    fn a_metadata_only_index_has_no_filenode() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new("t", vec![Column::new("a", PgType::Int4)]))?;
+        catalog.add_index_in(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_meta".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+            RelFileNode(0),
+        )?;
+
+        assert_eq!(filenodes_of(&catalog, "t")?.index("t_meta"), 0);
+        // And `0` must never reach the orphan sweep, which compares that list
+        // against real file names.
+        assert!(!catalog.live_relfilenodes().contains(&0));
+
+        Ok(())
+    }
+
+    /// One relation's entry from [`RelCatalog::all_filenodes`], in `public`.
+    fn filenodes_of(catalog: &RelCatalog, name: &str) -> anyhow::Result<RelationFilenodes> {
+        catalog
+            .all_filenodes()
+            .remove(&("public".to_string(), name.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("{name} is missing from the filenode map"))
     }
 
     #[test]

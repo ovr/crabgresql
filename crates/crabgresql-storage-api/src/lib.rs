@@ -1343,6 +1343,17 @@ pub trait TableAm: Send + Sync {
         None
     }
 
+    /// The relfilenode of this relation's out-of-line chunk store, or `0` when it
+    /// has none. Same contract as [`TableAm::toast_statistics`], and the source of
+    /// the chunk store's own `pg_class.relfilenode`.
+    ///
+    /// Answered by the table handle rather than by an engine's catalog because a
+    /// **temporary** relation's chunk store is never recorded in one — it holds no
+    /// durable definition at all — while the handle knows it either way.
+    fn toast_relfilenode(&self) -> u32 {
+        0
+    }
+
     /// The size of one index's physical storage, or `None` for an engine that
     /// keeps the index as metadata only. Same cost contract as
     /// [`TableAm::statistics`]: cheap enough for the planner to ask per plan, so

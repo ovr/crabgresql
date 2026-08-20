@@ -1744,6 +1744,14 @@ impl TableAm for HeapTable {
     /// The chunk store's size, or `None` until a row has needed one. Only the
     /// page count is meaningful: chunks are not rows, so reporting a tuple count
     /// would invite it to be read as one.
+    /// The `TableAm` view of the inherent [`HeapTable::toast_relfilenode`]: the
+    /// same number, with `0` in place of `None`. Both read the atomic that
+    /// `ensure_toast_rel` sets for **every** persistence, which is the point —
+    /// the relation catalog only ever learns a permanent table's.
+    fn toast_relfilenode(&self) -> u32 {
+        self.toast_rel.load(Ordering::Acquire)
+    }
+
     fn toast_statistics(&self) -> Option<RelStats> {
         let rel = self.toast_relfilenode()?;
         let relpages = self.engine.bufpool.smgr().nblocks(rel).unwrap_or(0);

@@ -96,8 +96,8 @@ struct CatalogIndex {
     table_oid: u32,
     table_schema: TableSchema,
     metadata: IndexMetadata,
-    /// The index's own physical file, or `0` when it is metadata-only — an index
-    /// the planner may use but that has no B-tree file behind it.
+    /// The index's own physical file, or `0` when it has none — an index the
+    /// planner may use but that is backed by no B-tree file at all.
     relfilenode: u32,
 }
 
