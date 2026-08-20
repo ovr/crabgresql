@@ -11288,6 +11288,8 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
         ("'pg_catalog.upper'::regproc", "pg_catalog.upper"),
         ("'abs'::regproc", "abs"),
         ("'format'::regproc", "format"),
+        // The raw argument, spaces and all, not the parsed name.
+        ("'  upper  '::regproc", "  upper  "),
     ] {
         let e = client
             .simple_query(&format!("SELECT {input}"))
@@ -11314,6 +11316,23 @@ async fn regproc_names_the_implemented_functions() -> anyhow::Result<()> {
     assert_eq!(row.get::<_, &str>("upper"), "pg_catalog.upper");
     assert_eq!(row.get::<_, &str>("zero"), "-");
     assert_eq!(row.get::<_, &str>("unknown"), "4294967000");
+
+    // Both halves quote a name that needs it, the way every other `reg*` output
+    // does — `regprocout` renders through `quote_identifier`.
+    client
+        .batch_execute(r#"CREATE FUNCTION "MixedFn"() RETURNS int LANGUAGE sql AS 'SELECT 1'"#)
+        .await?;
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT oid::regproc::text AS name FROM pg_catalog.pg_proc \
+                 WHERE proname = 'MixedFn'",
+                &[]
+            )
+            .await?
+            .get::<_, &str>("name"),
+        "\"MixedFn\""
+    );
 
     // The rows themselves are upstream's, so a client reads the whole overload
     // family with its own OIDs and argument types.
