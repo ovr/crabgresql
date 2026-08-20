@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787268632386,
+  "lastUpdate": 1787268634146,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -46552,6 +46552,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18448.81309,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "88c177329773e804cb95444d1a31d49a5e8818d6",
+          "message": "feat: Support pg_relation_size and the other relation-size functions (#264)",
+          "timestamp": "2026-08-20T22:41:54Z",
+          "tree_id": "f4ac903a8a955ff7c24d9167ec730837b1a09f2b",
+          "url": "https://github.com/ovr/crabgresql/commit/88c177329773e804cb95444d1a31d49a5e8818d6"
+        },
+        "date": 1787268634017,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1243.376915,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 26066.464456,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
