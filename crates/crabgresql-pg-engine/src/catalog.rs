@@ -7,6 +7,7 @@
 //! TODO: make catalog changes MVCC/crash-transactional by storing relation
 //! metadata in real `pg_class`/`pg_attribute` relations instead of this file.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,8 +15,8 @@ use std::sync::Mutex;
 use crabgresql_storage_api::{
     CheckConstraint, Column, GeneratedColumn, Generation, IndexConstraint, IndexKey, IndexMetadata,
     IndexMethod, InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
-    PartitionStrategy, RelPersistence, RelStats, SequenceAdvance, SequenceDefinition,
-    TableAccessMethod, TableSchema, ViewDefinition,
+    PartitionStrategy, RelPersistence, RelStats, RelationFilenodes, SequenceAdvance,
+    SequenceDefinition, TableAccessMethod, TableSchema, ViewDefinition,
 };
 use crabgresql_types::PgType;
 
@@ -132,6 +133,13 @@ const GEN_MAGIC: &[u8; 4] = b"GEN1";
 /// which is what every file written before this tail actually holds; see
 /// [`PersistIndex::usable_rel`] for what that costs a `DESC` index.
 const IKEY_MAGIC: &[u8; 4] = b"IKV1";
+/// Marks the sequence-relfilenode section, appended after the [`IKEY_MAGIC`]
+/// block — a seventeenth backward-compatible tail carrying one relfilenode per
+/// sequence, in `sequences` order. A reader that predates it stops above and
+/// decodes every sequence with `0`, which [`RelCatalog::load`] then back-fills:
+/// the number has to exist for `pg_class.relfilenode`, and a database written
+/// before this tail would otherwise report `0` for a sequence forever.
+const SQREL_MAGIC: &[u8; 4] = b"SQR1";
 struct PersistCol {
     name: String,
     oid: u32,
@@ -246,10 +254,20 @@ struct PersistView {
 /// A persisted sequence: its immutable definition plus its live, **non-
 /// transactional** counter (`last_value`/`is_called`), which is rewritten to disk
 /// on every `nextval`/`setval` — independent of transaction commit, so it
-/// survives `ROLLBACK`. Sequences hold no relfilenode and no heap storage.
+/// survives `ROLLBACK`. A sequence holds no heap storage: its counter lives in
+/// this file, not in a one-page relation file as in PostgreSQL.
 struct PersistSequence {
     name: String,
     namespace: String,
+    /// The sequence's relfilenode, persisted in the [`SQREL_MAGIC`] tail.
+    ///
+    /// It names no file — the counter above *is* the sequence's storage — but
+    /// PostgreSQL reports a `relkind = 'S'` relation as having one, and
+    /// `pg_class.relfilenode` has to answer with something stable rather than
+    /// with the `0` that means "no storage". Drawn from the same monotonic
+    /// counter as every table's, so it can never alias a real file, and never
+    /// reused after a `DROP SEQUENCE` for the same reason `rels` are not.
+    rel: u32,
     type_oid: u32,
     start: i64,
     increment: i64,
@@ -296,10 +314,41 @@ impl RelCatalog {
             },
             Err(e) => return Err(e),
         };
-        Ok(RelCatalog {
+        let catalog = RelCatalog {
             path,
             state: Mutex::new(state),
-        })
+        };
+        catalog.backfill_sequence_relfilenodes()?;
+        Ok(catalog)
+    }
+
+    /// Hand a relfilenode to every sequence written before the [`SQREL_MAGIC`]
+    /// tail existed, then persist once.
+    ///
+    /// Without this a database created by an older build would report
+    /// `pg_class.relfilenode = 0` for its sequences forever — indistinguishable
+    /// from the view/partitioned-parent `0` that means "this relation has no
+    /// storage at all". Runs at load, before any new number can be issued, so the
+    /// back-filled ones come from the same monotonic counter and alias nothing.
+    fn backfill_sequence_relfilenodes(&self) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        let mut assigned = false;
+        for i in 0..state.sequences.len() {
+            if state.sequences[i].rel != 0 {
+                continue;
+            }
+            let rel = state.next;
+            state.next += 1;
+            state.sequences[i].rel = rel;
+            assigned = true;
+        }
+        if assigned {
+            self.persist(&state)?;
+        }
+        Ok(())
     }
 
     /// Every relation's `(name, relfilenode, toast relfilenode, schema, indexes)`
@@ -667,12 +716,76 @@ impl RelCatalog {
             .unwrap_or_default()
     }
 
+    /// Every relation's file numbers, keyed by `(namespace, name)`, for catalog
+    /// reflection: its heap file and **every** index as `(name, relfilenode)`.
+    ///
+    /// One locked pass over the whole catalog rather than a lookup per relation,
+    /// like [`RelCatalog::schemas`]: `pg_class` is rebuilt once per statement and
+    /// names every relation, so a per-relation lookup would make that quadratic.
+    ///
+    /// Every index appears, unlike in [`RelCatalog::index_relfilenodes`]: a reader
+    /// building `pg_class` needs a row for each one whether or not it has a file.
+    /// It reports `rel`, **not** [`PersistIndex::usable_rel`] — the two differ for
+    /// an index demoted by an unreadable key encoding, and there the file still
+    /// exists, kept alive by [`RelCatalog::live_relfilenodes`] and unlinked by
+    /// `DROP INDEX`, both by `rel`. `relfilenode` names storage, not readability,
+    /// so `0` would be the one view of that index disagreeing with the others.
+    ///
+    /// `RelationFilenodes::toast` is deliberately left at `0` here: a temporary
+    /// relation's chunk store never reaches this catalog at all (see
+    /// `HeapTable::ensure_toast_rel`), so the table handle is the only place that
+    /// answers for both persistences. See `TableAm::toast_relfilenode`.
+    pub fn all_filenodes(&self) -> HashMap<(String, String), RelationFilenodes> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .rels
+            .iter()
+            .map(|r| {
+                (
+                    (r.namespace.clone(), r.name.clone()),
+                    RelationFilenodes {
+                        rel: r.rel,
+                        toast: 0,
+                        indexes: r
+                            .indexes
+                            .iter()
+                            .map(|i| (i.meta.name.clone(), i.rel))
+                            .collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The relfilenode of the sequence `name` in `namespace`, or `0` if there is
+    /// no such sequence. See [`PersistSequence::rel`] for why a sequence carries
+    /// one at all when it owns no file.
+    pub fn sequence_relfilenode(&self, namespace: &str, name: &str) -> u32 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"));
+        state
+            .sequences
+            .iter()
+            .find(|s| s.namespace == namespace && s.name == name)
+            .map_or(0, |s| s.rel)
+    }
+
     /// Every live relfilenode in the catalog — each table's heap file, each
     /// index's physical B-tree file, **and** each table's out-of-line chunk store
     /// — for the startup orphan-file GC. Every one of those must be included or
     /// `gc_orphan_relfiles` would delete it on the next restart: for a toast
     /// relation that would leave every out-of-line attribute in the table
     /// pointing at a file that no longer exists.
+    ///
+    /// Sequence relfilenodes are included too. Nothing on disk is named by one
+    /// today, so the GC has nothing to spare — but a number handed out is a number
+    /// claimed, and a list that says otherwise would be wrong the moment a
+    /// sequence grows a file.
     pub fn live_relfilenodes(&self) -> Vec<u32> {
         let state = self
             .state
@@ -685,8 +798,9 @@ impl RelCatalog {
                 std::iter::once(r.rel)
                     .chain(std::iter::once(r.toast_rel))
                     .chain(r.indexes.iter().map(|i| i.rel))
-                    .filter(|&rel| rel != 0)
             })
+            .chain(state.sequences.iter().map(|s| s.rel))
+            .filter(|&rel| rel != 0)
             .collect()
     }
 
@@ -1032,9 +1146,12 @@ impl RelCatalog {
         {
             return Ok(false);
         }
+        let rel = state.next;
+        state.next += 1;
         state.sequences.push(PersistSequence {
             name: def.name.clone(),
             namespace: def.namespace.clone(),
+            rel,
             type_oid: def.data_type.oid(),
             start: def.start,
             increment: def.increment,
@@ -1508,6 +1625,14 @@ fn encode(state: &State) -> Vec<u8> {
             out.push(pi.key_encoding);
         }
     }
+    // Sequence relfilenodes: a seventeenth backward-compatible tail, one per
+    // sequence in `state.sequences` order — the same order the `CSQ1` block
+    // above writes, so a reader zips the two back together.
+    out.extend_from_slice(SQREL_MAGIC);
+    out.extend_from_slice(&(state.sequences.len() as u32).to_le_bytes());
+    for s in &state.sequences {
+        out.extend_from_slice(&s.rel.to_le_bytes());
+    }
     out
 }
 
@@ -1822,6 +1947,9 @@ fn decode(bytes: &[u8]) -> State {
                 owned_by,
                 last_value,
                 is_called,
+                // Filled from the `SQR1` tail below; `0` when the file predates
+                // it, which `RelCatalog::load` back-fills.
+                rel: 0,
             });
         }
     }
@@ -2070,6 +2198,15 @@ fn decode(bytes: &[u8]) -> State {
                     index.key_encoding = encoding;
                 }
             }
+        }
+    }
+    // Sequence-relfilenode tail: absent means no sequence was ever given one, so
+    // they all stay at `0` for `RelCatalog::load` to back-fill.
+    if d.remaining().starts_with(SQREL_MAGIC) {
+        d.p += SQREL_MAGIC.len();
+        let nseqs = d.u32();
+        for s in sequences.iter_mut().take(nseqs as usize) {
+            s.rel = d.u32();
         }
     }
     State {
@@ -2408,7 +2545,58 @@ mod tests {
         // An ascending index is unaffected: its stored order never depended on
         // the change, so demoting it too would cost every old index its speed.
         assert_eq!(rel_of(&legacy, "t_asc"), Some(RelFileNode(43)));
+
+        // But the demoted index's *file* still exists: the orphan sweep keeps it
+        // and DROP unlinks it, both by `rel`. So `all_filenodes`, which feeds
+        // `pg_class.relfilenode`, must name it too — reporting 0 there would make
+        // `pg_class` the one view of this index that disagrees with the others.
+        let filenodes = filenodes_of(&legacy, "t")?;
+        assert_eq!(filenodes.index("t_desc"), 42);
+        assert_eq!(filenodes.index("t_asc"), 43);
+        assert!(legacy.live_relfilenodes().contains(&42));
+
         Ok(())
+    }
+
+    /// An index that never had a file reports `0`, which is the one case where
+    /// `pg_class.relfilenode` and "the planner will not read this" agree.
+    #[test]
+    fn a_metadata_only_index_has_no_filenode() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new("t", vec![Column::new("a", PgType::Int4)]))?;
+        catalog.add_index_in(
+            "public",
+            "t",
+            IndexMetadata {
+                name: "t_meta".into(),
+                method: IndexMethod::BTree,
+                keys: vec![IndexKey {
+                    column: 0,
+                    descending: false,
+                    nulls_first: false,
+                }],
+                unique: false,
+                nulls_distinct: true,
+                constraint: None,
+            },
+            RelFileNode(0),
+        )?;
+
+        assert_eq!(filenodes_of(&catalog, "t")?.index("t_meta"), 0);
+        // And `0` must never reach the orphan sweep, which compares that list
+        // against real file names.
+        assert!(!catalog.live_relfilenodes().contains(&0));
+
+        Ok(())
+    }
+
+    /// One relation's entry from [`RelCatalog::all_filenodes`], in `public`.
+    fn filenodes_of(catalog: &RelCatalog, name: &str) -> anyhow::Result<RelationFilenodes> {
+        catalog
+            .all_filenodes()
+            .remove(&("public".to_string(), name.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("{name} is missing from the filenode map"))
     }
 
     #[test]
@@ -3161,6 +3349,87 @@ mod tests {
         assert_eq!(reopened.stats_in("public", "other"), Some((3, 9.0)));
 
         Ok(())
+    }
+
+    /// A sequence carries a relfilenode that survives a reopen, and a catalog
+    /// written before the `SQR1` tail existed has one back-filled on load.
+    ///
+    /// The back-fill matters because `0` is not a neutral value in `pg_class`: it
+    /// is what a view and a partitioned parent report to say they have no storage
+    /// at all. A sequence stuck at `0` would be claiming the same thing.
+    #[test]
+    fn sequence_relfilenodes_persist_and_are_backfilled_for_an_older_catalog() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let catalog = RelCatalog::load(dir.path())?;
+        catalog.create(&TableSchema::new(
+            "t",
+            vec![Column::new("id", PgType::Int4)],
+        ))?;
+        assert!(catalog.create_sequence(&sequence("s1"))?);
+        assert!(catalog.create_sequence(&sequence("s2"))?);
+
+        let (first, second) = (
+            catalog.sequence_relfilenode("public", "s1"),
+            catalog.sequence_relfilenode("public", "s2"),
+        );
+        assert!(first != 0 && second != 0 && first != second);
+        // Drawn from the same counter as the table's file, so nothing aliases.
+        let table = catalog
+            .current_relfilenode("public", "t")
+            .ok_or_else(|| anyhow::anyhow!("t is missing"))?;
+        assert!([first, second].iter().all(|&rel| rel != table.0));
+        assert!(catalog.sequence_relfilenode("public", "nosuch") == 0);
+        drop(catalog);
+
+        let reopened = RelCatalog::load(dir.path())?;
+        assert_eq!(reopened.sequence_relfilenode("public", "s1"), first);
+        assert_eq!(reopened.sequence_relfilenode("public", "s2"), second);
+        drop(reopened);
+
+        // A catalog written before the tail: every sequence decodes with `0` and
+        // is handed a fresh number, which then persists like any other.
+        let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
+        let bytes = std::fs::read(&path)?;
+        let tail = bytes
+            .windows(SQREL_MAGIC.len())
+            .position(|w| w == SQREL_MAGIC)
+            .ok_or_else(|| anyhow::anyhow!("sequence relfilenode marker is missing"))?;
+        std::fs::write(&path, &bytes[..tail])?;
+
+        let legacy = RelCatalog::load(dir.path())?;
+        let backfilled = legacy.sequence_relfilenode("public", "s1");
+        assert!(backfilled != 0);
+        assert!(legacy.sequence_relfilenode("public", "s2") != 0);
+        // Everything the earlier tails carry still decodes.
+        assert_eq!(legacy.sequences().len(), 2);
+        assert_eq!(legacy.schemas().len(), 1);
+        drop(legacy);
+
+        let after_backfill = RelCatalog::load(dir.path())?;
+        assert_eq!(
+            after_backfill.sequence_relfilenode("public", "s1"),
+            backfilled,
+            "the back-filled number was persisted, not re-drawn every load"
+        );
+
+        Ok(())
+    }
+
+    /// A minimal `CREATE SEQUENCE` definition in `public`.
+    fn sequence(name: &str) -> SequenceDefinition {
+        SequenceDefinition {
+            name: name.to_string(),
+            namespace: "public".to_string(),
+            data_type: PgType::Int8,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+        }
     }
 
     /// An `ANALYZE` result as this catalog stores one: the relation-level

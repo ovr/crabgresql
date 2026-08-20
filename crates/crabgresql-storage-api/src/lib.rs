@@ -603,6 +603,35 @@ pub struct InheritParent {
     pub name: String,
 }
 
+/// The physical file numbers behind one relation — PostgreSQL's `relfilenode`,
+/// the source of `pg_class.relfilenode` for the relation, its out-of-line chunk
+/// store, and each of its indexes.
+///
+/// `0` everywhere means "no file", which is a real state rather than a gap: an
+/// index can be metadata-only, and a relation only grows a chunk store once a
+/// row first needs one. An engine that keeps no per-relation files at all leaves
+/// the whole struct at its default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelationFilenodes {
+    pub rel: u32,
+    pub toast: u32,
+    /// Keyed by index *name* rather than by position: the order of
+    /// [`RelationMetadata::indexes`] is the table handle's, and the catalog is
+    /// free to keep its own.
+    pub indexes: Vec<(String, u32)>,
+}
+
+impl RelationFilenodes {
+    /// The file number of the index named `name`, or `0` if it has none (or is
+    /// not in this snapshot).
+    pub fn index(&self, name: &str) -> u32 {
+        self.indexes
+            .iter()
+            .find(|(index, _)| index == name)
+            .map_or(0, |(_, rel)| *rel)
+    }
+}
+
 /// A user relation together with its mutable index metadata and size estimates.
 #[derive(Clone, Debug)]
 pub struct RelationMetadata {
@@ -615,6 +644,9 @@ pub struct RelationMetadata {
     /// Feeds the `pg_class` row of the TOAST relation and the parent's
     /// `reltoastrelid`; see [`TableAm::toast_statistics`].
     pub toast: Option<RelStats>,
+    /// The physical file numbers `pg_class.relfilenode` reports for this
+    /// relation and everything hanging off it.
+    pub filenodes: RelationFilenodes,
 }
 
 /// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
@@ -1309,6 +1341,17 @@ pub trait TableAm: Send + Sync {
         None
     }
 
+    /// The relfilenode of this relation's out-of-line chunk store, or `0` when it
+    /// has none. Same contract as [`TableAm::toast_statistics`], and the source of
+    /// the chunk store's own `pg_class.relfilenode`.
+    ///
+    /// Answered by the table handle rather than by an engine's catalog because a
+    /// **temporary** relation's chunk store is never recorded in one — it holds no
+    /// durable definition at all — while the handle knows it either way.
+    fn toast_relfilenode(&self) -> u32 {
+        0
+    }
+
     /// The size of one index's physical storage, or `None` for an engine that
     /// keeps the index as metadata only. Same cost contract as
     /// [`TableAm::statistics`]: cheap enough for the planner to ask per plan, so
@@ -1932,6 +1975,7 @@ pub trait TableEngine: Send + Sync {
                 schema,
                 indexes: Vec::new(),
                 toast: None,
+                filenodes: RelationFilenodes::default(),
             })
             .collect()
     }
@@ -1994,6 +2038,17 @@ pub trait TableEngine: Send + Sync {
     /// side effect of consuming a value. The default knows no sequences.
     fn sequence_current(&self, _namespace: &str, _name: &str) -> Option<(i64, bool)> {
         None
+    }
+
+    /// A sequence's `relfilenode`, or `0` when the engine assigns none.
+    ///
+    /// A sequence is a relation with storage in PostgreSQL, so `pg_class` has to
+    /// report a file number for it like it does for a table. Ours keeps its
+    /// counter in the relation catalog rather than in a one-page file, so the
+    /// number names no file today; it is still allocated from the same monotonic
+    /// counter as every table's, so it can never alias one.
+    fn sequence_relfilenode(&self, _namespace: &str, _name: &str) -> u32 {
+        0
     }
 
     /// Advance a sequence and return its new value (`nextval`). This mutates

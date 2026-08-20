@@ -6,7 +6,9 @@
 //! new live state is added here without touching the snapshot machinery.
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
-use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
+use crabgresql_storage_api::{
+    Column, IndexMetadata, RelStats, RelationFilenodes, RelationMetadata, TableSchema,
+};
 use crabgresql_types::{ByteaOutput, PgType};
 
 /// The relation kind reflected into `pg_class.relkind` / `information_schema`.
@@ -94,6 +96,10 @@ pub struct CatalogRelation {
     /// generation. See [`crate::StaticTable::with_xmin`] for why a state number
     /// is the honest answer here at all.
     pub ddl_xid: u64,
+    /// What the storage engine really allocated, which is not always what
+    /// `pg_class.relfilenode` reports — a partitioned parent holds a heap file
+    /// here and still reports `0`. See `pg_class_rows` for that decision.
+    pub filenodes: RelationFilenodes,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -124,6 +130,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -141,6 +148,7 @@ impl CatalogRelation {
             toast: metadata.toast,
             definition: None,
             ddl_xid: 0,
+            filenodes: metadata.filenodes,
         }
     }
 
@@ -158,6 +166,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -178,6 +187,7 @@ impl CatalogRelation {
             toast: None,
             definition,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -211,6 +221,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 }

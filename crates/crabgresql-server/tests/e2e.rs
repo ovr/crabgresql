@@ -4783,6 +4783,131 @@ async fn truncate_empties_tables() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_class.relfilenode` names the relation's real file, so a TRUNCATE — which
+/// this engine implements as a relfilenode swap — is visible there, and no
+/// relation PostgreSQL gives no storage reports one.
+///
+/// The second assertion is upstream's `sanity_check` predicate verbatim. It is
+/// the one that would catch a regression on the path that matters: our engine
+/// hands a partitioned parent a heap file like any other table, so `pg_class`
+/// has to decide to report `0` rather than inherit it.
+#[tokio::test]
+async fn pg_class_relfilenode_follows_truncate_and_is_zero_without_storage() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.simple_query("CREATE TABLE t (id integer)").await?;
+    client.simple_query("CREATE INDEX t_idx ON t (id)").await?;
+    client.simple_query("INSERT INTO t VALUES (1), (2)").await?;
+
+    let filenode = async |relname: &str| -> anyhow::Result<String> {
+        let msgs = client
+            .simple_query(&format!(
+                "SELECT relfilenode FROM pg_class WHERE relname = '{relname}'"
+            ))
+            .await?;
+        let out = rows(&msgs);
+        assert_eq!(out.len(), 1, "{relname}");
+        Ok(out[0].get(0).context("relfilenode is null")?.to_string())
+    };
+
+    let (heap, index) = (filenode("t").await?, filenode("t_idx").await?);
+    assert_ne!(heap, "0", "a table names its heap file");
+    assert_ne!(index, "0", "an index names its own file");
+
+    client.simple_query("TRUNCATE t").await?;
+    assert_ne!(
+        filenode("t").await?,
+        heap,
+        "TRUNCATE swaps the heap file, so pg_class must report the new one"
+    );
+    assert_ne!(filenode("t_idx").await?, index, "and the index's too");
+
+    client
+        .simple_query("CREATE VIEW v AS SELECT 1 AS a")
+        .await?;
+    client
+        .simple_query("CREATE TABLE p (k integer) PARTITION BY RANGE (k)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE p_lo PARTITION OF p FOR VALUES FROM (0) TO (10)")
+        .await?;
+    client.simple_query("CREATE SEQUENCE s").await?;
+    assert_ne!(filenode("p_lo").await?, "0", "a leaf partition holds rows");
+    assert_ne!(filenode("s").await?, "0");
+
+    let msgs = client
+        .simple_query(
+            "SELECT relname FROM pg_class \
+             WHERE relkind IN ('v', 'c', 'f', 'p', 'I') AND relfilenode <> 0",
+        )
+        .await?;
+    let offenders: Vec<_> = rows(&msgs)
+        .iter()
+        .filter_map(|r| r.get(0).map(str::to_string))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "relations without storage must not have a relfilenode: {offenders:?}"
+    );
+
+    Ok(())
+}
+
+/// A TOAST relation names its chunk store whether or not its parent is durable.
+///
+/// A temporary table's chunk store is never recorded in the relation catalog —
+/// nothing about a temp relation is — so reading the relfilenode from there gave
+/// its `relkind = 't'` row a `0`, which is the value that means "no storage at
+/// all". The table handle knows the number for both persistences, and this is
+/// also what fails if `ManagedTable` stops forwarding `toast_relfilenode`: the
+/// trait default would quietly answer `0` for every relation, permanent included.
+#[tokio::test]
+async fn a_temp_tables_toast_relation_names_its_chunk_store() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+
+    let toast_filenodes = async || -> anyhow::Result<Vec<String>> {
+        let msgs = client
+            .simple_query(
+                "SELECT c.relfilenode FROM pg_class c \
+                 JOIN pg_class p ON p.reltoastrelid = c.oid \
+                 WHERE c.relkind = 't' ORDER BY p.relname",
+            )
+            .await?;
+        Ok(rows(&msgs)
+            .iter()
+            .filter_map(|r| r.get(0).map(str::to_string))
+            .collect())
+    };
+
+    // A value too wide for a page forces the chunk store into existence.
+    client
+        .simple_query("CREATE TEMP TABLE tmp (id integer, body text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO tmp VALUES (1, repeat('x', 40000))")
+        .await?;
+    client
+        .simple_query("CREATE TABLE perm (id integer, body text)")
+        .await?;
+    client
+        .simple_query("INSERT INTO perm VALUES (1, repeat('y', 40000))")
+        .await?;
+
+    let nodes = toast_filenodes().await?;
+    assert_eq!(nodes.len(), 2, "both tables toasted: {nodes:?}");
+    assert!(
+        nodes.iter().all(|n| n != "0"),
+        "a TOAST relation with a live chunk store must name its file: {nodes:?}"
+    );
+    // Two distinct chunk stores, not one number reported twice.
+    assert_ne!(nodes[0], nodes[1]);
+
+    // The rows are actually out of line, so the numbers above are not vacuous.
+    let msgs = client.simple_query("SELECT length(body) FROM tmp").await?;
+    assert_eq!(rows(&msgs)[0].get(0), Some("40000"));
+
+    Ok(())
+}
+
 /// TRUNCATE swaps the table's indexes along with its heap file. Only at this
 /// level does the executor's Index Scan run, and on the physical path it
 /// re-checks nothing — so a carried-over index would answer `WHERE id = 1` with

@@ -218,6 +218,10 @@ impl TableAm for ManagedTable {
         self.as_am().toast_statistics()
     }
 
+    fn toast_relfilenode(&self) -> u32 {
+        self.as_am().toast_relfilenode()
+    }
+
     fn index_statistics(&self, index_name: &str) -> Option<RelStats> {
         self.as_am().index_statistics(index_name)
     }
@@ -2582,17 +2586,40 @@ impl TableEngine for PgEngine {
     }
 
     fn relation_metadata(&self) -> Vec<RelationMetadata> {
-        self.tables
+        let tables = self
+            .tables
             .read()
-            .unwrap_or_else(|_| panic!("rwlock poisoned"))
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        // The relation catalog, not the table handle, is where a heap or index
+        // relfilenode is authoritative: a TRUNCATE's swap lands there on commit,
+        // so reading it here is what makes `pg_class` report the new file rather
+        // than the one the handle was opened on. Taken under the tables lock
+        // already held, keeping the tables → catalog order every DDL path uses.
+        let filenodes = self.catalog.all_filenodes();
+        tables
             .values()
-            .map(|t| RelationMetadata {
-                schema: (*t.schema()).clone(),
-                indexes: t.indexes(),
-                stats: t.statistics(),
-                toast: t.toast_statistics(),
+            .map(|t| {
+                let schema = (*t.schema()).clone();
+                let mut filenodes = filenodes
+                    .get(&(schema.namespace.clone(), schema.name.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                // The chunk store is the one number the catalog cannot answer for
+                // a temporary relation; see `TableAm::toast_relfilenode`.
+                filenodes.toast = t.toast_relfilenode();
+                RelationMetadata {
+                    indexes: t.indexes(),
+                    stats: t.statistics(),
+                    toast: t.toast_statistics(),
+                    filenodes,
+                    schema,
+                }
             })
             .collect()
+    }
+
+    fn sequence_relfilenode(&self, namespace: &str, name: &str) -> u32 {
+        self.catalog.sequence_relfilenode(namespace, name)
     }
 
     fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {
