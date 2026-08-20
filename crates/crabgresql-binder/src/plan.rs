@@ -19,9 +19,9 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::copy_rows::RowBatch;
 use crate::expr::{
-    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, NamedWindows,
-    OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn, VisibleLookup,
-    WindowKind, WindowSortKey, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
+    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, ExprSortKey,
+    NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn,
+    VisibleLookup, WindowKind, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
     bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
     merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
     reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
@@ -632,8 +632,15 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
                 subst_expr(e, params);
             }
         }
-        BoundExpr::Aggregate { args, .. } => {
-            for arg in args {
+        // A `$n` can appear in an argument or in the aggregate's own ORDER BY
+        // (`array_agg(x ORDER BY $1)`), so both are substituted.
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            for arg in agg_args
+                .iter_mut()
+                .chain(order_by.iter_mut().map(|k| &mut k.expr))
+            {
                 subst_expr(arg, params);
             }
         }
@@ -815,7 +822,7 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
                 subst_outer_expr(e, outer, depth);
             }
             for agg in aggregates {
-                for arg in agg.args.iter_mut() {
+                for arg in agg.exprs_mut() {
                     subst_outer_expr(arg, outer, depth);
                 }
             }
@@ -981,8 +988,13 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
                 subst_outer_expr(e, outer, depth);
             }
         }
-        BoundExpr::Aggregate { args, .. } => {
-            for a in args {
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            for a in agg_args
+                .iter_mut()
+                .chain(order_by.iter_mut().map(|k| &mut k.expr))
+            {
                 subst_outer_expr(a, outer, depth);
             }
         }
@@ -1206,7 +1218,7 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
             }
             group_exprs.iter().for_each(|e| f(e, depth));
             for agg in aggregates {
-                for arg in agg.args.iter() {
+                for arg in agg.exprs() {
                     f(arg, depth);
                 }
             }
@@ -1335,10 +1347,17 @@ pub(crate) fn for_each_subexpr(
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
-        | BoundExpr::Aggregate { args, .. }
         | BoundExpr::Coalesce { args, .. }
         | BoundExpr::MinMax { args, .. } => {
             args.iter().for_each(|e| for_each_subexpr(e, depth, f));
+        }
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            agg_args
+                .iter()
+                .chain(order_by.iter().map(|k| &k.expr))
+                .for_each(|e| for_each_subexpr(e, depth, f));
         }
         BoundExpr::ArrayCtor { elems, .. } => {
             elems.iter().for_each(|e| for_each_subexpr(e, depth, f));
@@ -5398,7 +5417,8 @@ fn rewrite_over_aggregate(
         BoundExpr::Aggregate {
             func,
             distinct,
-            args,
+            agg_args: args,
+            order_by,
             input_ty,
             ret,
         } => {
@@ -5422,10 +5442,14 @@ fn rewrite_over_aggregate(
             let collation = args.first().map_or(DEFAULT_COLLATION_OID, |a| {
                 crate::collation::expr_collation(a).collation
             });
+            // `args` and `order_by` both index the *source* row, so neither is
+            // rebased here — they travel into the aggregate node unchanged,
+            // while the marker itself becomes a `ColumnRef` into its output.
             aggregates.push(BoundAggregate {
                 func,
                 distinct,
                 args,
+                order_by,
                 input_ty,
                 ret,
                 collation,
@@ -5466,7 +5490,7 @@ fn rewrite_over_aggregate(
                     .order_by
                     .into_iter()
                     .map(|key| {
-                        Ok(WindowSortKey {
+                        Ok(ExprSortKey {
                             expr: rewrite_over_aggregate(key.expr, group_exprs, aggregates, scope)?,
                             ..key
                         })

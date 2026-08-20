@@ -126,7 +126,9 @@ pub fn walk_exprs_mut(plan: &mut LogicalPlan, v: &mut dyn ExprVisitor) {
             v.predicate(predicate);
             walk_all(group_exprs, v);
             for agg in aggregates {
-                walk_all(&mut agg.args, v);
+                for expr in agg.exprs_mut() {
+                    v.expr(expr);
+                }
             }
             // HAVING is a qual over the grouped row, but removing it is not the
             // same rewrite as removing a scan's WHERE (the aggregate node owns

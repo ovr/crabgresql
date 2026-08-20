@@ -72,9 +72,20 @@ pub(super) fn for_each_node_mut(expr: &mut BoundExpr, f: &mut dyn FnMut(&mut Bou
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
         | BoundExpr::Coalesce { args, .. }
-        | BoundExpr::MinMax { args, .. }
-        | BoundExpr::Aggregate { args, .. } => {
+        | BoundExpr::MinMax { args, .. } => {
             for arg in args {
+                for_each_node_mut(arg, f);
+            }
+        }
+        // The aggregate's own ORDER BY reads the same row as its arguments, so
+        // a marker hiding in a key has to be found too.
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            for arg in agg_args
+                .iter_mut()
+                .chain(order_by.iter_mut().map(|k| &mut k.expr))
+            {
                 for_each_node_mut(arg, f);
             }
         }

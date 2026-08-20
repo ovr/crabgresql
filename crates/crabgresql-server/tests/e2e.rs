@@ -14370,6 +14370,97 @@ async fn pg_get_partkeydef_renders_the_partition_key() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The relation-list query DataGrip issues when it introspects a schema. It is
+/// the shape that matters: `reloptions`, `pg_get_partkeydef` and the
+/// `array_agg(… ORDER BY …)` inside a correlated scalar subquery all have to
+/// resolve at once, and the inheritance columns have to report the partitions.
+#[tokio::test]
+async fn datagrip_lists_a_schemas_relations() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE TABLE parted (a int) PARTITION BY RANGE (a)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE parted1 PARTITION OF parted FOR VALUES FROM (0) TO (10)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE parted2 PARTITION OF parted FOR VALUES FROM (10) TO (20)")
+        .await?;
+    client
+        .simple_query("CREATE VIEW v AS SELECT 1 AS x")
+        .await?;
+
+    const SQL: &str = "\
+select T.relkind as table_kind,
+       T.relname as table_name,
+       T.oid as table_id,
+       T.xmin as table_state_number,
+       false /* T.relhasoids */ as table_with_oids,
+       T.reltablespace as tablespace_id,
+       T.reloptions as options,
+       T.relpersistence as persistence,
+       (select pg_catalog.array_agg(inhparent::bigint order by inhseqno)::varchar \
+          from pg_catalog.pg_inherits where T.oid = inhrelid) as ancestors,
+       (select pg_catalog.array_agg(inhrelid::bigint order by inhrelid)::varchar \
+          from pg_catalog.pg_inherits where T.oid = inhparent) as successors,
+       T.relispartition /* false */ as is_partition,
+       pg_catalog.pg_get_partkeydef(T.oid) /* null */ as partition_key,
+       pg_catalog.pg_get_expr(T.relpartbound, T.oid) /* null */ as partition_expression,
+       T.relam am_id,
+       pg_catalog.pg_get_userbyid(T.relowner) as \"owner\"
+from pg_catalog.pg_class T
+where relnamespace = $1::oid
+       and relkind in ('r', 'm', 'v', 'f', 'p')
+order by table_kind, table_id";
+
+    let namespace: u32 = client
+        .query_one("SELECT oid FROM pg_namespace WHERE nspname = 'public'", &[])
+        .await?
+        .get(0);
+    let rows = client.query(SQL, &[&namespace]).await?;
+
+    let named = |name: &str| {
+        rows.iter()
+            .find(|r| r.get::<_, &str>("table_name") == name)
+            .unwrap_or_else(|| panic!("{name} is missing from the relation list"))
+    };
+    // Ordered by relkind then OID: 'p' (parted) precedes 'r' precedes 'v'.
+    let names: Vec<&str> = rows.iter().map(|r| r.get("table_name")).collect();
+    assert_eq!(names, vec!["parted", "parted1", "parted2", "v"]);
+
+    let parent = named("parted");
+    // `reloptions` is a text[], NULL for a relation with no storage parameters.
+    assert_eq!(parent.get::<_, Option<Vec<String>>>("options"), None);
+    assert_eq!(
+        parent.get::<_, Option<&str>>("partition_key"),
+        Some("RANGE (a)")
+    );
+    assert_eq!(parent.get::<_, Option<&str>>("ancestors"), None);
+    assert!(!parent.get::<_, bool>("is_partition"));
+    // The parent's successors are its two partitions, ordered by their OIDs.
+    let successors = parent
+        .get::<_, Option<&str>>("successors")
+        .expect("a partitioned parent has successors");
+    let leaves: Vec<i64> = ["parted1", "parted2"]
+        .iter()
+        .map(|n| named(n).get::<_, u32>("table_id") as i64)
+        .collect();
+    assert_eq!(successors, format!("{{{},{}}}", leaves[0], leaves[1]));
+
+    let leaf = named("parted1");
+    assert!(leaf.get::<_, bool>("is_partition"));
+    assert_eq!(
+        leaf.get::<_, Option<&str>>("partition_expression"),
+        Some("FOR VALUES FROM (0) TO (10)")
+    );
+    assert_eq!(
+        leaf.get::<_, Option<&str>>("ancestors"),
+        Some(format!("{{{}}}", parent.get::<_, u32>("table_id")).as_str())
+    );
+    assert_eq!(leaf.get::<_, Option<&str>>("partition_key"), None);
+    Ok(())
+}
+
 /// `SHOW` returns rows, so Describe must answer with a RowDescription. The
 /// utility catch-all reported NoData and Execute then streamed DataRows the
 /// client had been told not to expect.

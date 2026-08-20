@@ -180,7 +180,9 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             let demand = aggregates
                 .iter()
                 .fold(demand, |demand, agg: &BoundAggregate| {
-                    add_exprs(demand, agg.args.iter())
+                    // An aggregate's own ORDER BY reads the source row too, so
+                    // dropping its column would leave the key unevaluable.
+                    add_exprs(demand, agg.exprs())
                 });
             match input {
                 PhysicalAggInput::Scan { table, projection } => {
