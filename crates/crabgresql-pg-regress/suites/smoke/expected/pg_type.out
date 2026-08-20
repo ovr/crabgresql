@@ -1,0 +1,102 @@
+--
+-- pg_type's domain columns, as a client's type list reads them.
+--
+-- The query this file is built around is DataGrip's schema-type list. It names
+-- four of the columns a build without CREATE DOMAIN still has to answer, at
+-- PostgreSQL's BKI defaults, or the whole statement fails on the first of them.
+--
+-- Three things here are per-cluster and so never printed: xmin (a transaction
+-- counter), a user type's OID (assigned per snapshot), and the owner's name
+-- (whoever installed the cluster). Each is reduced to a property that holds on
+-- both servers. The pg_catalog pass is narrowed to a fixed list of type names,
+-- since the set of built-in types this build serves is smaller than
+-- PostgreSQL's — and narrowed by schema too, because a name alone does not
+-- identify a type: qualified_types creates `public.int4` to show that
+-- pg_catalog wins an unqualified reference, and nothing here should depend on
+-- whether some earlier test cleaned up after itself. Generated with psql -q -a
+-- against PostgreSQL 18.4, and holds for both servers.
+--
+CREATE TYPE dg_mood AS ENUM ('sad', 'ok', 'happy');
+-- DataGrip's predicate verbatim, parameter and all — the point is that this
+-- text parses, plans and runs. Only the row count is compared, since the list
+-- of built-in types differs between the two servers.
+PREPARE datagrip_types(oid) AS
+SELECT count(*) > 0 AS pg_catalog_has_types
+FROM (
+select T.oid as type_id,
+       T.xmin as type_state_number,
+       T.typname as type_name,
+       T.typtype as type_sub_kind,
+       T.typcategory as type_category,
+       T.typrelid as class_id,
+       T.typbasetype as base_type_id,
+       case when T.typtype in ('c','e') then null
+            else pg_catalog.format_type(T.typbasetype, T.typtypmod) end as type_def,
+       T.typndims as dimensions_number,
+       T.typdefault as default_expression,
+       T.typnotnull as mandatory,
+       pg_catalog.pg_get_userbyid(T.typowner) as "owner"
+from pg_catalog.pg_type T
+         left outer join pg_catalog.pg_class C
+             on T.typrelid = C.oid
+where T.typnamespace = $1::oid
+  and (T.typtype in ('d','e') or
+       C.relkind = 'c'::"char" or
+       (T.typtype = 'b' and (T.typelem = 0 OR T.typcategory <> 'A')) or
+       T.typtype = 'p' and not T.typisdefined)
+order by 1
+) q;
+EXECUTE datagrip_types(11);
+ pg_catalog_has_types 
+----------------------
+ t
+(1 row)
+
+DEALLOCATE datagrip_types;
+-- The same shape, restricted to types both servers have. A base type's
+-- type_def is format_type(0, -1), which is `-`; the CASE blanks an enum's;
+-- _int4 must not appear at all, since a derived array row is exactly what
+-- `typelem = 0 OR typcategory <> 'A'` excludes.
+SELECT T.xmin IS NOT NULL AS state_number_readable,
+       T.typname AS type_name,
+       T.typtype AS type_sub_kind,
+       T.typcategory AS type_category,
+       T.typrelid AS class_id,
+       T.typbasetype AS base_type_id,
+       CASE WHEN T.typtype IN ('c','e') THEN NULL
+            ELSE pg_catalog.format_type(T.typbasetype, T.typtypmod) END AS type_def,
+       T.typndims AS dimensions_number,
+       T.typdefault AS default_expression,
+       T.typnotnull AS mandatory,
+       pg_catalog.pg_get_userbyid(T.typowner) IS NOT NULL AS has_owner
+FROM pg_catalog.pg_type T
+     LEFT OUTER JOIN pg_catalog.pg_class C ON T.typrelid = C.oid
+WHERE T.typname IN ('int4', '_int4', 'text', 'bool', 'dg_mood')
+  AND (T.typnamespace = 'pg_catalog'::regnamespace OR T.typname = 'dg_mood')
+  AND (T.typtype IN ('d','e') OR
+       C.relkind = 'c'::"char" OR
+       (T.typtype = 'b' AND (T.typelem = 0 OR T.typcategory <> 'A')) OR
+       T.typtype = 'p' AND NOT T.typisdefined)
+ORDER BY 2;
+ state_number_readable | type_name | type_sub_kind | type_category | class_id | base_type_id | type_def | dimensions_number | default_expression | mandatory | has_owner 
+-----------------------+-----------+---------------+---------------+----------+--------------+----------+-------------------+--------------------+-----------+-----------
+ t                     | bool      | b             | B             |        0 |            0 | -        |                 0 |                    | f         | t
+ t                     | dg_mood   | e             | E             |        0 |            0 |          |                 0 |                    | f         | t
+ t                     | int4      | b             | N             |        0 |            0 | -        |                 0 |                    | f         | t
+ t                     | text      | b             | S             |        0 |            0 | -        |                 0 |                    | f         | t
+(4 rows)
+
+-- Nothing in this build is a domain, so both rows carry the BKI defaults.
+SELECT typname, typnotnull, typbasetype, typtypmod, typndims,
+       typdefaultbin, typdefault
+FROM pg_catalog.pg_type
+WHERE typname IN ('int4', 'dg_mood')
+  AND (typnamespace = 'pg_catalog'::regnamespace OR typname = 'dg_mood')
+ORDER BY typname;
+ typname | typnotnull | typbasetype | typtypmod | typndims | typdefaultbin | typdefault 
+---------+------------+-------------+-----------+----------+---------------+------------
+ dg_mood | f          |           0 |        -1 |        0 |               | 
+ int4    | f          |           0 |        -1 |        0 |               | 
+(2 rows)
+
+DROP TYPE dg_mood;

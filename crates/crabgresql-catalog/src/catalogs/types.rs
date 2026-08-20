@@ -13,9 +13,12 @@ use crate::{CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
 /// query.
 ///
-/// TODO: the domain columns (`typnotnull`, `typtypmod`, `typndims`,
-/// `typdefaultbin`, `typdefault`) are absent, so a query naming one fails with
-/// "column does not exist" rather than reading a default.
+/// Every row spells the domain columns out at PostgreSQL's BKI defaults,
+/// because nothing here can be a domain: `pg_type.dat` defines none (every entry
+/// in it is a base or pseudo type, and a derived array row is not a domain
+/// either), and `CREATE DOMAIN` never reaches the catalog — the parser accepts
+/// it, the binder rejects it. The day domains land, the row builders below have
+/// to read those six off the type.
 pub(crate) fn pg_type_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_type",
@@ -45,8 +48,13 @@ pub(crate) fn pg_type_schema() -> TableSchema {
             col("typanalyze", REGPROC),
             col("typalign", CHARLIKE),
             col("typstorage", CHARLIKE),
+            col("typnotnull", PgType::Bool),
             col("typbasetype", PgType::Oid),
+            col("typtypmod", PgType::Int4),
+            col("typndims", PgType::Int4),
             col("typcollation", PgType::Oid),
+            col("typdefaultbin", NODE_TREE),
+            col("typdefault", PgType::Text),
             col("typacl", ACLITEM_ARRAY),
         ],
     )
@@ -91,11 +99,18 @@ pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
                 regproc(r.typanalyze),
                 str_char(r.typalign),
                 str_char(r.typstorage),
-                // typbasetype: nonzero only for a domain, and `pg_type.dat` has
-                // none — every entry in it is a base or pseudo type, and a
-                // derived array row is not a domain either.
+                // typnotnull / typbasetype
+                Value::Bool(false),
                 Value::Oid(0),
+                // typtypmod: `format_type` renders the pair (0, -1) as `-`,
+                // which is what a client reading a definition expects.
+                Value::Int4(-1),
+                // typndims: nonzero only on a domain over an array.
+                Value::Int4(0),
                 Value::Oid(r.typcollation),
+                // typdefaultbin / typdefault / typacl
+                Value::Null,
+                Value::Null,
                 Value::Null,
             ]
         })
@@ -148,10 +163,16 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
                 Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
                 chr('i'),
                 chr('p'),
-                // typbasetype: an enum is not a domain.
+                // typnotnull / typbasetype / typtypmod / typndims
+                Value::Bool(false),
                 Value::Oid(0),
+                Value::Int4(-1),
+                Value::Int4(0),
                 // An enum is not collatable.
                 Value::Oid(0),
+                // typdefaultbin / typdefault / typacl
+                Value::Null,
+                Value::Null,
                 Value::Null,
             ]
         })
