@@ -613,9 +613,7 @@ pub struct InheritParent {
 /// the whole struct at its default.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RelationFilenodes {
-    /// The relation's own heap file.
     pub rel: u32,
-    /// The relation's out-of-line chunk store, or `0` when it has none.
     pub toast: u32,
     /// Keyed by index *name* rather than by position: the order of
     /// [`RelationMetadata::indexes`] is the table handle's, and the catalog is

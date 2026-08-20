@@ -22,10 +22,6 @@ use crate::{RelKind, TOAST_NAMESPACE};
 /// `relminmxid`, `reloptions`) are absent, so a query naming one fails with
 /// "column does not exist" rather than reading a value.
 ///
-/// `relfilenode` is the relation's physical file, taken from the storage engine
-/// rather than mirrored off the OID — see [`pg_class_rows`] for the two places
-/// it deviates from PostgreSQL.
-///
 /// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
 /// measurement — matching PostgreSQL, where a relation that has never been
 /// analyzed or vacuumed reports `relpages = 0` and `reltuples = -1` however
@@ -234,8 +230,6 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 RelKind::Sequence => (Value::Int4(1), Value::Float4(1.0)),
                 _ => analyzed_size(stats),
             };
-            // A relation PostgreSQL gives no storage reports 0 whatever the
-            // engine allocated for it; see this function's doc comment.
             let relfilenode = match kind {
                 RelKind::Table | RelKind::Sequence => filenodes.rel,
                 RelKind::PartitionedTable | RelKind::View => 0,

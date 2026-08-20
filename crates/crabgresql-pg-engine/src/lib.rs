@@ -2593,9 +2593,8 @@ impl TableEngine for PgEngine {
         // The relation catalog, not the table handle, is where a heap or index
         // relfilenode is authoritative: a TRUNCATE's swap lands there on commit,
         // so reading it here is what makes `pg_class` report the new file rather
-        // than the one the handle was opened on. Taken in one pass, under the
-        // tables lock already held — the same tables → catalog order every DDL
-        // path uses, and one mutex acquisition instead of one per relation.
+        // than the one the handle was opened on. Taken under the tables lock
+        // already held, keeping the tables → catalog order every DDL path uses.
         let filenodes = self.catalog.all_filenodes();
         tables
             .values()

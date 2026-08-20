@@ -1870,8 +1870,8 @@ fn pg_class_relfilenode_is_zero_exactly_for_relations_without_storage() -> anyho
         Value::Oid(0),
         "a metadata-only index has no file"
     );
-    // The chunk store is named after its parent's (positional) OID, so find it
-    // by relkind rather than by spelling that number out here.
+    // Found by relkind: its name carries the parent's positional OID, which this
+    // test has no business predicting.
     let toast = required(
         rows.iter()
             .find(|r| r[relkind] == Value::Char(b't'))

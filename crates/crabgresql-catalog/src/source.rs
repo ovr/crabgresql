@@ -96,14 +96,9 @@ pub struct CatalogRelation {
     /// generation. See [`crate::StaticTable::with_xmin`] for why a state number
     /// is the honest answer here at all.
     pub ddl_xid: u64,
-    /// The physical file numbers behind this relation, feeding
-    /// `pg_class.relfilenode` for it, its TOAST relation, and its indexes.
-    ///
-    /// All zeros for a supplier that keeps no files, and for a view — which is
-    /// the right answer for a view either way. A **partitioned parent** is the
-    /// one case where this is non-zero and `pg_class` must still report `0`: our
-    /// engine gives one a heap file it never stores a row in, while PostgreSQL
-    /// gives it no storage at all. See `pg_class_rows`.
+    /// What the storage engine really allocated, which is not always what
+    /// `pg_class.relfilenode` reports — a partitioned parent holds a heap file
+    /// here and still reports `0`. See `pg_class_rows` for that decision.
     pub filenodes: RelationFilenodes,
 }
 

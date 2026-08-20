@@ -184,7 +184,6 @@ struct CatalogToast {
     /// Mirrors the parent's, as PostgreSQL's does.
     persistence: RelPersistence,
     stats: RelStats,
-    /// The chunk store's own physical file.
     relfilenode: u32,
 }
 
@@ -853,8 +852,6 @@ impl SystemCatalog {
             for (position, relation) in relations.into_iter().enumerate() {
                 let table_oid = FIRST_REL_OID + position as u32;
                 for index in relation.indexes {
-                    // Keyed by name: the supplier is free to order its index
-                    // metadata differently from its file numbers.
                     let relfilenode = relation.filenodes.index(&index.name);
                     pending.push((table_oid, relation.schema.clone(), index, relfilenode));
                 }

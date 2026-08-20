@@ -4821,7 +4821,6 @@ async fn pg_class_relfilenode_follows_truncate_and_is_zero_without_storage() -> 
     );
     assert_ne!(filenode("t_idx").await?, index, "and the index's too");
 
-    // A view and a partitioned parent hold no storage; a sequence does.
     client
         .simple_query("CREATE VIEW v AS SELECT 1 AS a")
         .await?;

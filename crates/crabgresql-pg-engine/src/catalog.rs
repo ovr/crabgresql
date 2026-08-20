@@ -723,17 +723,13 @@ impl RelCatalog {
     /// like [`RelCatalog::schemas`]: `pg_class` is rebuilt once per statement and
     /// names every relation, so a per-relation lookup would make that quadratic.
     ///
-    /// Unlike [`RelCatalog::index_relfilenodes`] this keeps metadata-only indexes,
-    /// reporting them as `0`: a reader building `pg_class` needs a row for each
-    /// index whether or not it has a file, and `0` is the answer for one that does
-    /// not.
-    ///
-    /// An index reports `rel`, **not** [`PersistIndex::usable_rel`]. The two differ
-    /// for an index demoted to metadata-only by an unreadable key encoding, and
-    /// there the file still exists — [`RelCatalog::live_relfilenodes`] keeps it
-    /// alive and `DROP INDEX` unlinks it, both by `rel`. `relfilenode` names
-    /// storage, not readability, so reporting `0` would be the one view of that
-    /// index that disagrees with the others.
+    /// Every index appears, unlike in [`RelCatalog::index_relfilenodes`]: a reader
+    /// building `pg_class` needs a row for each one whether or not it has a file.
+    /// It reports `rel`, **not** [`PersistIndex::usable_rel`] — the two differ for
+    /// an index demoted by an unreadable key encoding, and there the file still
+    /// exists, kept alive by [`RelCatalog::live_relfilenodes`] and unlinked by
+    /// `DROP INDEX`, both by `rel`. `relfilenode` names storage, not readability,
+    /// so `0` would be the one view of that index disagreeing with the others.
     ///
     /// `RelationFilenodes::toast` is deliberately left at `0` here: a temporary
     /// relation's chunk store never reaches this catalog at all (see
@@ -1150,8 +1146,6 @@ impl RelCatalog {
         {
             return Ok(false);
         }
-        // Drawn from the same counter as a table's heap file, so a sequence's
-        // relfilenode can never collide with one that names real bytes.
         let rel = state.next;
         state.next += 1;
         state.sequences.push(PersistSequence {

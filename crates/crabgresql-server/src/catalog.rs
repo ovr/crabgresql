@@ -336,13 +336,10 @@ impl CatalogSource for SessionCatalogSource {
                 CatalogRelation::temporary(metadata.schema, self.temp_schema.clone());
             relation.indexes = metadata.indexes;
             relation.stats = metadata.stats;
-            // A temp table toasts like any other, so its chunk store must reach
-            // `pg_class` too — the constructor defaults this to `None`, so it
-            // has to be carried across explicitly like the two fields above.
+            // A temp table toasts and is numbered like any other, so both must
+            // reach `pg_class` too — the constructor defaults them, so they have
+            // to be carried across explicitly like the two fields above.
             relation.toast = metadata.toast;
-            // A temp relation's files are the memory store's rather than the
-            // filesystem's, but the engine numbers them the same way and
-            // `pg_class.relfilenode` reports them the same way.
             relation.filenodes = metadata.filenodes;
             relation
         }));
