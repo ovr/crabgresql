@@ -102,3 +102,4 @@ test: array_agg
 test: am_properties
 test: pg_depend
 test: relation_size
+test: pg_type

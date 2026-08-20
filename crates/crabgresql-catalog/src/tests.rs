@@ -367,6 +367,64 @@ fn array_rows_are_derived_from_their_element() {
     assert_eq!(col("record", "typarray"), Value::Oid(2287));
 }
 
+/// Nothing in this build can be a domain — there is no `CREATE DOMAIN` — so
+/// every row carries the BKI defaults.
+///
+/// Position matters as much as presence: a client issuing `SELECT *` reads the
+/// columns by ordinal, and DataGrip's type list reads `typtypmod` through
+/// `format_type(typbasetype, typtypmod)` — a `-1` in the wrong slot renders the
+/// wrong definition rather than failing. The ordinals below are `pg_attribute`'s
+/// on a live PostgreSQL 18.4 (`attnum` 25–32).
+#[test]
+fn pg_type_carries_the_domain_columns_where_postgres_does() {
+    let schema = catalogs::types::pg_type_schema();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        &names[24..],
+        &[
+            "typnotnull",
+            "typbasetype",
+            "typtypmod",
+            "typndims",
+            "typcollation",
+            "typdefaultbin",
+            "typdefault",
+            "typacl",
+        ]
+    );
+
+    // Both row builders, since each spells the columns out separately.
+    let enum_rows = catalogs::types::pg_type_user_rows(&[CatalogUserType {
+        oid: 20000,
+        name: "mood".to_string(),
+        enum_labels: Some(vec!["ok".to_string()]),
+    }]);
+    let int4 = catalogs::types::pg_type_builtin_rows()
+        .into_iter()
+        .find(|r| type_col(r, &schema, "typname") == Value::Text("int4".to_string()))
+        .expect("int4 row present");
+    for row in [&int4, &enum_rows[0]] {
+        assert_eq!(type_col(row, &schema, "typnotnull"), Value::Bool(false));
+        assert_eq!(type_col(row, &schema, "typbasetype"), Value::Oid(0));
+        assert_eq!(type_col(row, &schema, "typtypmod"), Value::Int4(-1));
+        assert_eq!(type_col(row, &schema, "typndims"), Value::Int4(0));
+        assert_eq!(type_col(row, &schema, "typdefaultbin"), Value::Null);
+        assert_eq!(type_col(row, &schema, "typdefault"), Value::Null);
+    }
+    // typcollation sits in the middle of the six and still comes from the row
+    // itself, so a collatable type keeps reporting its collation.
+    let text = catalogs::types::pg_type_builtin_rows()
+        .into_iter()
+        .find(|r| type_col(r, &schema, "typname") == Value::Text("text".to_string()))
+        .expect("text row present");
+    assert_eq!(type_col(&text, &schema, "typcollation"), Value::Oid(100));
+    assert_eq!(type_col(&int4, &schema, "typcollation"), Value::Oid(0));
+    assert_eq!(
+        type_col(&enum_rows[0], &schema, "typcollation"),
+        Value::Oid(0)
+    );
+}
+
 /// `pg_type.typcollation` comes from the vendored data; `pg_attribute.
 /// attcollation` is computed at runtime by `catalogs::collation::typcollation_of`. psql's
 /// `\d` compares the two literally (`a.attcollation <> t.typcollation`) to
