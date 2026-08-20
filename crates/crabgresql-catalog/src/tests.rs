@@ -1748,6 +1748,164 @@ fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()
     Ok(())
 }
 
+/// `pg_class.relfilenode` reports the storage engine's real file number, and
+/// reports `0` for exactly the relations PostgreSQL gives no storage.
+///
+/// The second half is what upstream's `sanity_check` checks (`relkind IN ('v',
+/// 'c', 'f', 'p', 'I') AND relfilenode <> 0` must find nothing), and it is not
+/// automatic here: our engine creates a partitioned parent through the same path
+/// as any other table, so it *does* hold a file number — the parent below is
+/// given one deliberately, so a change that simply forwarded whatever the engine
+/// said would fail this test rather than the regress suite.
+#[test]
+fn pg_class_relfilenode_is_zero_exactly_for_relations_without_storage() -> anyhow::Result<()> {
+    use crabgresql_storage_api::{
+        Column, IndexConstraint, IndexKey, IndexMetadata, IndexMethod, PartitionScheme,
+        PartitionStrategy, RelStats, RelationFilenodes, TableSchema,
+    };
+    use crabgresql_types::PgType;
+
+    let plain = |name: &str| TableSchema::new(name, vec![Column::new("a", PgType::Int4)]);
+
+    let mut tbl = CatalogRelation::permanent(plain("tbl"));
+    tbl.indexes = vec![
+        IndexMetadata {
+            name: "tbl_pkey".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending: false,
+                nulls_first: false,
+            }],
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        },
+        // A metadata-only index: the planner may use it, but it has no file.
+        IndexMetadata {
+            name: "tbl_meta".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![IndexKey {
+                column: 0,
+                descending: true,
+                nulls_first: false,
+            }],
+            unique: false,
+            nulls_distinct: true,
+            constraint: None,
+        },
+    ];
+    tbl.toast = Some(RelStats {
+        relpages: 3,
+        reltuples: 0.0,
+        analyzed: false,
+        curpages: Some(3),
+        columns: std::sync::Arc::from([]),
+    });
+    tbl.filenodes = RelationFilenodes {
+        rel: 41,
+        toast: 42,
+        indexes: vec![("tbl_pkey".to_string(), 43), ("tbl_meta".to_string(), 0)],
+    };
+
+    let mut parent_schema = plain("part");
+    parent_schema.partition_scheme = Some(PartitionScheme {
+        strategy: PartitionStrategy::Range,
+        key_columns: vec![0],
+    });
+    let mut parent = CatalogRelation::permanent(parent_schema);
+    // The file our engine really gives a partitioned parent, and never writes to.
+    parent.filenodes = RelationFilenodes {
+        rel: 44,
+        ..RelationFilenodes::default()
+    };
+
+    let mut vw = CatalogRelation::view(plain("vw"), None);
+    vw.filenodes = RelationFilenodes::default();
+
+    let mut sq = CatalogRelation::sequence(
+        "sq",
+        "public",
+        CatalogSequence {
+            type_oid: PgType::Int8.oid(),
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            cache: 1,
+            cycle: false,
+            last_value: None,
+        },
+    );
+    sq.filenodes.rel = 45;
+
+    let cat =
+        SystemCatalog::with_catalog_relations("db", "owner", vec![tbl, parent, vw, sq.clone()]);
+    let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+    assert!(rows.iter().all(|r| r.len() == schema.columns.len()));
+
+    // PostgreSQL's attnum 8: straight after `relam`, before `reltablespace`.
+    let relfilenode = required(schema.column_index("relfilenode"), "relfilenode is missing")?;
+    assert_eq!(relfilenode, 7, "relfilenode must sit at PG's attnum 8");
+    assert_eq!(
+        required(schema.column_index("relam"), "relam is missing")?,
+        relfilenode - 1
+    );
+
+    let relname = required(schema.column_index("relname"), "relname is missing")?;
+    let relkind = required(schema.column_index("relkind"), "relkind is missing")?;
+    let node = |name: &str| -> anyhow::Result<Value> {
+        required(
+            rows.iter()
+                .find(|r| r[relname] == Value::Text(name.to_string()))
+                .map(|r| r[relfilenode].clone()),
+            name,
+        )
+    };
+
+    assert_eq!(node("tbl")?, Value::Oid(41), "a table names its heap file");
+    assert_eq!(node("tbl_pkey")?, Value::Oid(43), "an index names its own");
+    assert_eq!(
+        node("tbl_meta")?,
+        Value::Oid(0),
+        "a metadata-only index has no file"
+    );
+    // The chunk store is named after its parent's (positional) OID, so find it
+    // by relkind rather than by spelling that number out here.
+    let toast = required(
+        rows.iter()
+            .find(|r| r[relkind] == Value::Char(b't'))
+            .map(|r| r[relfilenode].clone()),
+        "no TOAST relation",
+    )?;
+    assert_eq!(toast, Value::Oid(42));
+    assert_eq!(
+        node("sq")?,
+        Value::Oid(45),
+        "a sequence is a relation with storage in PG, so 0 would be wrong"
+    );
+    assert_eq!(
+        node("part")?,
+        Value::Oid(0),
+        "a partitioned parent has no storage, whatever file the engine gave it"
+    );
+    assert_eq!(node("vw")?, Value::Oid(0));
+
+    // The upstream `sanity_check` predicate itself, evaluated over every row.
+    let without_storage: Vec<_> = rows
+        .iter()
+        .filter(|r| matches!(&r[relkind], Value::Char(k) if b"vcfpI".contains(k)))
+        .filter(|r| r[relfilenode] != Value::Oid(0))
+        .map(|r| r[relname].clone())
+        .collect();
+    assert!(
+        without_storage.is_empty(),
+        "relations without storage must not have a relfilenode: {without_storage:?}"
+    );
+
+    Ok(())
+}
+
 /// A generated column reports its kind in `attgenerated`, is flagged
 /// `atthasdef`, and keeps its expression in `pg_attrdef` — the same three
 /// places PostgreSQL puts it, which is what lets psql's `\d` find it through the

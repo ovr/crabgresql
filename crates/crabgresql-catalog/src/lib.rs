@@ -62,8 +62,8 @@ use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
-    IndexConstraint, IndexMetadata, RelPersistence, RelStats, StorageError, TableAm, TableEngine,
-    TableSchema,
+    IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationFilenodes, StorageError,
+    TableAm, TableEngine, TableSchema,
 };
 use crabgresql_txn::Xid;
 #[cfg(test)]
@@ -96,6 +96,9 @@ struct CatalogIndex {
     table_oid: u32,
     table_schema: TableSchema,
     metadata: IndexMetadata,
+    /// The index's own physical file, or `0` when it is metadata-only — an index
+    /// the planner may use but that has no B-tree file behind it.
+    relfilenode: u32,
 }
 
 /// One row of `pg_rewrite`: the `_RETURN` rule a view's body is stored as. The
@@ -181,6 +184,8 @@ struct CatalogToast {
     /// Mirrors the parent's, as PostgreSQL's does.
     persistence: RelPersistence,
     stats: RelStats,
+    /// The chunk store's own physical file.
+    relfilenode: u32,
 }
 
 /// What [`SystemCatalog::serial_sequence`] found. The three non-answers are
@@ -553,6 +558,7 @@ pub struct SystemCatalog {
     ddl_xids: OnceLock<Vec<Xid>>,
     xmin_by_oid: OnceLock<Arc<std::collections::HashMap<u32, Xid>>>,
     stats: OnceLock<Vec<RelStats>>,
+    filenodes: OnceLock<Vec<RelationFilenodes>>,
     index_oids: OnceLock<Vec<CatalogIndex>>,
     toast_oids: OnceLock<Vec<CatalogToast>>,
     constraint_oids: OnceLock<Vec<CatalogConstraint>>,
@@ -620,6 +626,7 @@ impl SystemCatalog {
             ddl_xids: OnceLock::new(),
             xmin_by_oid: OnceLock::new(),
             stats: OnceLock::new(),
+            filenodes: OnceLock::new(),
             index_oids: OnceLock::new(),
             toast_oids: OnceLock::new(),
             constraint_oids: OnceLock::new(),
@@ -802,6 +809,21 @@ impl SystemCatalog {
         })
     }
 
+    /// The physical file numbers for each entry of
+    /// [`SystemCatalog::relation_oids`], in the same sorted order, feeding
+    /// `pg_class.relfilenode`.
+    pub(crate) fn relation_filenodes(&self) -> &[RelationFilenodes] {
+        self.filenodes.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter().map(|r| r.filenodes).collect()
+        })
+    }
+
     /// The `(pg_class OID, params)` of each sequence, for `pg_sequence`. The OID
     /// matches the one [`SystemCatalog::relation_oids`] assigns (same sort), so
     /// `pg_sequence.seqrelid` joins `pg_class.oid`.
@@ -831,7 +853,10 @@ impl SystemCatalog {
             for (position, relation) in relations.into_iter().enumerate() {
                 let table_oid = FIRST_REL_OID + position as u32;
                 for index in relation.indexes {
-                    pending.push((table_oid, relation.schema.clone(), index));
+                    // Keyed by name: the supplier is free to order its index
+                    // metadata differently from its file numbers.
+                    let relfilenode = relation.filenodes.index(&index.name);
+                    pending.push((table_oid, relation.schema.clone(), index, relfilenode));
                 }
             }
             pending.sort_by(|a, b| a.2.name.cmp(&b.2.name));
@@ -839,11 +864,12 @@ impl SystemCatalog {
                 .into_iter()
                 .enumerate()
                 .map(
-                    |(position, (table_oid, table_schema, metadata))| CatalogIndex {
+                    |(position, (table_oid, table_schema, metadata, relfilenode))| CatalogIndex {
                         oid: first_index_oid + position as u32,
                         table_oid,
                         table_schema,
                         metadata,
+                        relfilenode,
                     },
                 )
                 .collect()
@@ -875,19 +901,23 @@ impl SystemCatalog {
                 .enumerate()
                 .filter_map(|(position, relation)| {
                     let table_oid = FIRST_REL_OID + position as u32;
+                    let relfilenode = relation.filenodes.toast;
                     relation
                         .toast
-                        .map(|stats| (table_oid, relation.schema, stats))
+                        .map(|stats| (table_oid, relation.schema, stats, relfilenode))
                 })
                 .enumerate()
-                .map(|(slot, (table_oid, schema, stats))| CatalogToast {
-                    oid: first_toast_oid + slot as u32,
-                    table_oid,
-                    // PostgreSQL names it after the parent's OID.
-                    name: format!("pg_toast_{table_oid}"),
-                    persistence: schema.persistence,
-                    stats,
-                })
+                .map(
+                    |(slot, (table_oid, schema, stats, relfilenode))| CatalogToast {
+                        oid: first_toast_oid + slot as u32,
+                        table_oid,
+                        // PostgreSQL names it after the parent's OID.
+                        name: format!("pg_toast_{table_oid}"),
+                        persistence: schema.persistence,
+                        stats,
+                        relfilenode,
+                    },
+                )
                 .collect()
         })
     }

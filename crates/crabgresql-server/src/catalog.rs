@@ -340,6 +340,10 @@ impl CatalogSource for SessionCatalogSource {
             // `pg_class` too — the constructor defaults this to `None`, so it
             // has to be carried across explicitly like the two fields above.
             relation.toast = metadata.toast;
+            // A temp relation's files are the memory store's rather than the
+            // filesystem's, but the engine numbers them the same way and
+            // `pg_class.relfilenode` reports them the same way.
+            relation.filenodes = metadata.filenodes;
             relation
         }));
         // Views reflect into pg_class as relkind='v' / pg_attribute columns /
@@ -364,7 +368,8 @@ impl CatalogSource for SessionCatalogSource {
                 .engine
                 .sequence_current(&seq.namespace, &seq.name)
                 .and_then(|(value, is_called)| is_called.then_some(value));
-            CatalogRelation::sequence(
+            let relfilenode = self.engine.sequence_relfilenode(&seq.namespace, &seq.name);
+            let mut relation = CatalogRelation::sequence(
                 seq.name,
                 seq.namespace,
                 CatalogSequence {
@@ -378,7 +383,9 @@ impl CatalogSource for SessionCatalogSource {
                     last_value,
                     owned_by: seq.owned_by,
                 },
-            )
+            );
+            relation.filenodes.rel = relfilenode;
+            relation
         }));
         // Stamp each relation with the generation of the DDL that last changed
         // *it*, so its catalog rows carry a state number of their own. Applied

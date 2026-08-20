@@ -2586,13 +2586,26 @@ impl TableEngine for PgEngine {
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .values()
-            .map(|t| RelationMetadata {
-                schema: (*t.schema()).clone(),
-                indexes: t.indexes(),
-                stats: t.statistics(),
-                toast: t.toast_statistics(),
+            .map(|t| {
+                let schema = (*t.schema()).clone();
+                // The relation catalog, not the table handle, is where a
+                // relfilenode is authoritative: a TRUNCATE's swap lands there on
+                // commit, so reading it here is what makes `pg_class` report the
+                // new file rather than the one the handle was opened on.
+                let filenodes = self.catalog.filenodes_in(&schema.namespace, &schema.name);
+                RelationMetadata {
+                    indexes: t.indexes(),
+                    stats: t.statistics(),
+                    toast: t.toast_statistics(),
+                    filenodes,
+                    schema,
+                }
             })
             .collect()
+    }
+
+    fn sequence_relfilenode(&self, namespace: &str, name: &str) -> u32 {
+        self.catalog.sequence_relfilenode(namespace, name)
     }
 
     fn create_view(&self, def: ViewDefinition) -> Result<(), StorageError> {

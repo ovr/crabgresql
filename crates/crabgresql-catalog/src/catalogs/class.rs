@@ -17,10 +17,14 @@ use crate::{RelKind, TOAST_NAMESPACE};
 /// emitted with their true constant so a client's `\d` predicates evaluate as on
 /// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*).
 ///
-/// TODO: the storage and inheritance columns (`relfilenode`, `relallfrozen`,
-/// `relisshared`, `relhassubclass`, `relispopulated`, `relrewrite`,
-/// `relfrozenxid`, `relminmxid`, `reloptions`) are absent, so a query naming
-/// one fails with "column does not exist" rather than reading a value.
+/// TODO: the storage and inheritance columns (`relallfrozen`, `relisshared`,
+/// `relhassubclass`, `relispopulated`, `relrewrite`, `relfrozenxid`,
+/// `relminmxid`, `reloptions`) are absent, so a query naming one fails with
+/// "column does not exist" rather than reading a value.
+///
+/// `relfilenode` is the relation's physical file, taken from the storage engine
+/// rather than mirrored off the OID — see [`pg_class_rows`] for the two places
+/// it deviates from PostgreSQL.
 ///
 /// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
 /// measurement — matching PostgreSQL, where a relation that has never been
@@ -43,6 +47,7 @@ pub(crate) fn pg_class_schema() -> TableSchema {
             col("reloftype", PgType::Oid),
             col("relowner", PgType::Oid),
             col("relam", PgType::Oid),
+            col("relfilenode", PgType::Oid),
             col("reltablespace", PgType::Oid),
             col("relpages", PgType::Int4),
             col("reltuples", PgType::Float4),
@@ -160,12 +165,33 @@ fn analyzed_size(stats: &RelStats) -> (Value, Value) {
 /// (`relreplident = 'd'`); views, sequences, and indexes have none (`'n'`).
 ///
 /// `stats` is parallel to `relations`; see [`analyzed_size`] for how it renders.
+///
+/// `relfilenode` is the engine's real file number, not the OID — crabgresql
+/// implements TRUNCATE as a relfilenode swap, so mirroring the OID here would be
+/// a lie the very next `TRUNCATE` exposes. Two deviations remain:
+///
+/// * A **partitioned parent** reports `0`, the PostgreSQL answer for a relation
+///   with no storage, even though our engine did give it a heap file. The file
+///   exists as an artifact of creating every table the same way and never holds
+///   a row: routing sends every tuple to a leaf. Reporting the number instead
+///   would claim storage that is not there — and it is exactly what upstream's
+///   `sanity_check` checks for.
+/// * A **TRUNCATE in an open transaction** still reports the old number until it
+///   commits, because the swap lands in the relation catalog at `TxnFinalize`.
+///   PostgreSQL shows the new one from inside the transaction.
+///
+/// A **sequence** reports a number that names no file: its counter lives in the
+/// relation catalog rather than in a one-page relation as in PostgreSQL. The
+/// number is real and stable — allocated from the same monotonic counter as
+/// every table's — so it is `0`, meaning "no storage at all", that would be the
+/// wrong answer for a `relkind = 'S'` row.
 pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (relations, kinds, stats) = (
         cat.relation_oids(),
         cat.relation_kinds(),
         cat.relation_stats(),
     );
+    let filenodes = cat.relation_filenodes();
     let (indexes, toasts, namespace_oids) =
         (cat.index_oids(), cat.toast_oids(), cat.namespace_oids());
     // Resolve a relation's namespace OID, defaulting to `public` (2200) for any
@@ -175,7 +201,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         .iter()
         .zip(kinds)
         .zip(stats)
-        .map(|(((oid, schema), kind), stats)| {
+        .zip(filenodes)
+        .map(|((((oid, schema), kind), stats), filenodes)| {
             // A partitioned parent has no access method (`relam = 0`) and holds no
             // storage of its own.
             let (relam, relkind) = match kind {
@@ -207,6 +234,12 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 RelKind::Sequence => (Value::Int4(1), Value::Float4(1.0)),
                 _ => analyzed_size(stats),
             };
+            // A relation PostgreSQL gives no storage reports 0 whatever the
+            // engine allocated for it; see this function's doc comment.
+            let relfilenode = match kind {
+                RelKind::Table | RelKind::Sequence => filenodes.rel,
+                RelKind::PartitionedTable | RelKind::View => 0,
+            };
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
@@ -216,6 +249,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Oid(0),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(relam),
+                Value::Oid(relfilenode),
                 // reltablespace: default tablespace.
                 Value::Oid(0),
                 relpages,
@@ -266,6 +300,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 IndexMethod::BTree => BTREE_AM_OID,
                 IndexMethod::Hash => HASH_AM_OID,
             }),
+            // relfilenode: 0 for a metadata-only index, which has no file.
+            Value::Oid(index.relfilenode),
             Value::Oid(0),
             // TODO: report an index's own relpages/reltuples — per-index size
             // is not tracked, so an index keeps the never-analyzed sentinel
@@ -303,6 +339,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Oid(0),
             Value::Oid(BOOTSTRAP_ROLE_OID),
             Value::Oid(HEAP_AM_OID),
+            Value::Oid(toast.relfilenode),
             Value::Oid(0),
             Value::Int4(toast.stats.relpages as i32),
             // reltuples: chunks are not rows, so a count here would invite being

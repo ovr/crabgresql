@@ -6,7 +6,9 @@
 //! new live state is added here without touching the snapshot machinery.
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
-use crabgresql_storage_api::{Column, IndexMetadata, RelStats, RelationMetadata, TableSchema};
+use crabgresql_storage_api::{
+    Column, IndexMetadata, RelStats, RelationFilenodes, RelationMetadata, TableSchema,
+};
 use crabgresql_types::{ByteaOutput, PgType};
 
 /// The relation kind reflected into `pg_class.relkind` / `information_schema`.
@@ -94,6 +96,15 @@ pub struct CatalogRelation {
     /// generation. See [`crate::StaticTable::with_xmin`] for why a state number
     /// is the honest answer here at all.
     pub ddl_xid: u64,
+    /// The physical file numbers behind this relation, feeding
+    /// `pg_class.relfilenode` for it, its TOAST relation, and its indexes.
+    ///
+    /// All zeros for a supplier that keeps no files, and for a view — which is
+    /// the right answer for a view either way. A **partitioned parent** is the
+    /// one case where this is non-zero and `pg_class` must still report `0`: our
+    /// engine gives one a heap file it never stores a row in, while PostgreSQL
+    /// gives it no storage at all. See `pg_class_rows`.
+    pub filenodes: RelationFilenodes,
 }
 
 /// The relkind of a stored user relation: a partitioned parent (carrying a
@@ -124,6 +135,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -141,6 +153,7 @@ impl CatalogRelation {
             toast: metadata.toast,
             definition: None,
             ddl_xid: 0,
+            filenodes: metadata.filenodes,
         }
     }
 
@@ -158,6 +171,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -178,6 +192,7 @@ impl CatalogRelation {
             toast: None,
             definition,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 
@@ -211,6 +226,7 @@ impl CatalogRelation {
             toast: None,
             definition: None,
             ddl_xid: 0,
+            filenodes: RelationFilenodes::default(),
         }
     }
 }
