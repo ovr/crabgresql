@@ -39,6 +39,10 @@ enum Rows {
     /// statement resolved, and half of them have not been resolved yet at the
     /// moment its own name is. Deferring to the scan puts the build after
     /// binding, which is also when PostgreSQL's `pg_lock_status()` runs.
+    ///
+    /// `pg_depend` defers for a different reason: building its rows binds every
+    /// stored view, so a statement that merely *mentions* the relation — or a
+    /// view whose own body reads it — must not pay for that, or recurse into it.
     Deferred {
         build: Box<dyn Fn() -> Vec<Tuple> + Send + Sync>,
         built: OnceLock<Arc<Vec<Tuple>>>,

@@ -100,3 +100,4 @@ test: pg_ts
 test: pg_conversion
 test: array_agg
 test: am_properties
+test: pg_depend

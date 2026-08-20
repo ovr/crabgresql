@@ -6,6 +6,20 @@
 //! the server's `FIRST_USER_OID`. Scattered across the modules that emit them,
 //! two could quietly take the same number.
 
+/// The OIDs of the catalogs themselves, as `pg_depend.classid`/`refclassid`
+/// name them: an object is identified by the catalog it lives in plus its OID
+/// there, so a dependency row is unreadable without these. PostgreSQL's own
+/// values, and the same ones [`crate::registry::CATALOG_RELATIONS`] publishes
+/// as those relations' `pg_class.oid` — a client that resolves
+/// `classid::regclass` gets the name back.
+pub(crate) const PG_TYPE_CLASS_OID: u32 = 1247;
+pub(crate) const PG_PROC_CLASS_OID: u32 = 1255;
+pub(crate) const PG_CLASS_CLASS_OID: u32 = 1259;
+pub(crate) const PG_ATTRDEF_CLASS_OID: u32 = 2604;
+pub(crate) const PG_CONSTRAINT_CLASS_OID: u32 = 2606;
+pub(crate) const PG_NAMESPACE_CLASS_OID: u32 = 2615;
+pub(crate) const PG_REWRITE_CLASS_OID: u32 = 2618;
+
 /// Synthetic OID base for `pg_enum` rows (one per enum label). Chosen above the
 /// built-in ranges so a per-label OID never collides with a type/relation OID.
 pub(crate) const FIRST_ENUM_OID: u32 = 0x8000_0000;

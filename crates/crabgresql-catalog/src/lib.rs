@@ -44,6 +44,7 @@ mod source;
 mod static_table;
 pub(crate) mod views;
 
+pub use catalogs::depend::nextval_target;
 pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::{AvailableExtension, available_extensions};
 pub use oids::PLPGSQL_LANG_OID;
@@ -51,7 +52,7 @@ pub use registry::{builtin_relation_name, builtin_relation_oid};
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
     CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
-    CatalogUserType, RelKind, StaticSource,
+    CatalogUserType, CatalogViewDependency, RelKind, StaticSource, ViewDepRelation,
 };
 
 #[cfg(test)]
@@ -109,6 +110,25 @@ pub struct CatalogRewrite {
     pub definition: Option<String>,
 }
 
+/// One row of `pg_attrdef`: a column default (or a generated column's
+/// expression), numbered before anything renders it.
+///
+/// Numbered separately from the rendering for the reason [`CatalogConstraint`]
+/// gives, plus one of its own: `pg_depend` names an `attrdef` row as the
+/// *dependent* object, so the OID in that edge and the OID `pg_attrdef` prints
+/// have to come from the same place.
+#[derive(Clone)]
+pub(crate) struct CatalogAttrDef {
+    pub(crate) oid: u32,
+    /// `adrelid`: the relation the column belongs to.
+    pub(crate) table_oid: u32,
+    /// `adnum`: the column's one-based position.
+    pub(crate) attnum: i16,
+    /// `adbin` as this build stores it — the canonical SQL text, which
+    /// `pg_get_expr` echoes.
+    pub(crate) expr: String,
+}
+
 /// One row of `pg_constraint`, resolved to an OID before anything renders it.
 ///
 /// The rows used to be built and numbered in the same pass, from a counter local
@@ -161,6 +181,23 @@ struct CatalogToast {
     /// Mirrors the parent's, as PostgreSQL's does.
     persistence: RelPersistence,
     stats: RelStats,
+}
+
+/// What [`SystemCatalog::serial_sequence`] found. The three non-answers are
+/// distinct because PostgreSQL renders each differently: a missing relation and
+/// a missing column are errors with different SQLSTATEs, and a column that owns
+/// no sequence is a NULL.
+pub enum SerialSequenceLookup {
+    Owned {
+        namespace: String,
+        name: String,
+    },
+    Unowned,
+    /// Carries the relation's name, which PostgreSQL's message quotes.
+    NoColumn {
+        relation: String,
+    },
+    NoRelation,
 }
 
 /// A `regproc` reference: the function's OID and the name it prints as.
@@ -519,6 +556,7 @@ pub struct SystemCatalog {
     index_oids: OnceLock<Vec<CatalogIndex>>,
     toast_oids: OnceLock<Vec<CatalogToast>>,
     constraint_oids: OnceLock<Vec<CatalogConstraint>>,
+    attrdef_oids: OnceLock<Vec<CatalogAttrDef>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
@@ -530,6 +568,7 @@ pub struct SystemCatalog {
     table_stats: OnceLock<Vec<RelStatSnapshot>>,
     index_stats: OnceLock<Vec<IndexStatSnapshot>>,
     backends: OnceLock<Vec<CatalogBackend>>,
+    view_dependencies: OnceLock<Vec<CatalogViewDependency>>,
     namespace_oids: OnceLock<std::collections::HashMap<String, u32>>,
 }
 
@@ -584,6 +623,7 @@ impl SystemCatalog {
             index_oids: OnceLock::new(),
             toast_oids: OnceLock::new(),
             constraint_oids: OnceLock::new(),
+            attrdef_oids: OnceLock::new(),
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
@@ -595,6 +635,7 @@ impl SystemCatalog {
             table_stats: OnceLock::new(),
             index_stats: OnceLock::new(),
             backends: OnceLock::new(),
+            view_dependencies: OnceLock::new(),
             namespace_oids: OnceLock::new(),
         }
     }
@@ -652,6 +693,11 @@ impl SystemCatalog {
 
     fn backends(&self) -> &[CatalogBackend] {
         self.backends.get_or_init(|| self.source.backends())
+    }
+
+    pub(crate) fn view_dependencies(&self) -> &[CatalogViewDependency] {
+        self.view_dependencies
+            .get_or_init(|| self.source.view_dependencies())
     }
 
     /// Map every namespace name to its OID: the built-in namespaces plus each
@@ -1002,6 +1048,105 @@ impl SystemCatalog {
             }
             out
         })
+    }
+
+    /// The column defaults of this snapshot, assigned OIDs from a **sixth
+    /// block** beginning after the rewrite rules — the same appending rule
+    /// [`SystemCatalog::toast_oids`] states, one segment further along.
+    ///
+    /// A generated column's expression is an `attrdef` row too: PostgreSQL keeps
+    /// it in the same catalog and tells the two apart by `attgenerated`, which
+    /// is why [`crate::catalogs::attribute`] reads one list for both.
+    pub(crate) fn attrdef_oids(&self) -> &[CatalogAttrDef] {
+        self.attrdef_oids.get_or_init(|| {
+            let first = FIRST_REL_OID
+                + self.relation_oids().len() as u32
+                + self.index_oids().len() as u32
+                + self.toast_oids().len() as u32
+                + self.constraint_oids().len() as u32
+                + self.rewrite_oids().len() as u32;
+            let mut out = Vec::new();
+            for (table_oid, schema) in self.relation_oids() {
+                for (position, column) in schema.columns.iter().enumerate() {
+                    let Some(expr) = column
+                        .default
+                        .as_ref()
+                        .or(column.generated.as_ref().map(|g| &g.expr))
+                    else {
+                        continue;
+                    };
+                    out.push(CatalogAttrDef {
+                        oid: first + out.len() as u32,
+                        table_oid: *table_oid,
+                        attnum: (position + 1) as i16,
+                        expr: expr.clone(),
+                    });
+                }
+            }
+            out
+        })
+    }
+
+    /// The sequence column `column` of relation `oid` owns — what
+    /// `pg_get_serial_sequence` reports.
+    ///
+    /// The column name is matched **exactly**: PostgreSQL takes this argument
+    /// literally rather than folding it, so `pg_get_serial_sequence('t',
+    /// 'ColX')` finds a column `"ColX"` and `'colx'` does not.
+    ///
+    /// Answers from [`catalogs::depend::owned_sequences`], the same rule
+    /// `pg_depend`'s auto edge is built from.
+    ///
+    /// A `pg_catalog` relation answers too: nothing there owns a sequence, but
+    /// its columns still exist, and PostgreSQL distinguishes
+    /// `pg_get_serial_sequence('pg_class', 'relname')` (NULL) from
+    /// `('pg_class', 'nosuchcol')` (`42703`). Name resolution hands over the
+    /// catalog's own OID for those, so without this they would all collapse to
+    /// the NULL.
+    pub fn serial_sequence(&self, oid: u32, column: &str) -> SerialSequenceLookup {
+        let Some((_, schema)) = self.relation_oids().iter().find(|(rel, _)| *rel == oid) else {
+            return self.catalog_relation_column(oid, column);
+        };
+        let Some(position) = schema.column_index(column) else {
+            return SerialSequenceLookup::NoColumn {
+                relation: schema.name.clone(),
+            };
+        };
+        let owned = catalogs::depend::owned_sequences(self)
+            .into_iter()
+            .find(|owned| owned.table_oid == oid && owned.column == position);
+        let Some(owned) = owned else {
+            return SerialSequenceLookup::Unowned;
+        };
+        match self
+            .relation_oids()
+            .iter()
+            .find(|(rel, _)| *rel == owned.sequence_oid)
+        {
+            Some((_, sequence)) => SerialSequenceLookup::Owned {
+                namespace: sequence.namespace.clone(),
+                name: sequence.name.clone(),
+            },
+            None => SerialSequenceLookup::Unowned,
+        }
+    }
+
+    /// [`SystemCatalog::serial_sequence`] for an OID that is not a live user
+    /// relation: a served `pg_catalog` relation reports whether it has the
+    /// column, anything else reports nothing at all.
+    fn catalog_relation_column(&self, oid: u32, column: &str) -> SerialSequenceLookup {
+        let Some(name) = registry::builtin_relation_name(oid) else {
+            return SerialSequenceLookup::NoRelation;
+        };
+        let Some(def) = registry::lookup(CatalogNamespace::PgCatalog, name) else {
+            return SerialSequenceLookup::NoRelation;
+        };
+        match (def.schema)().column_index(column) {
+            Some(_) => SerialSequenceLookup::Unowned,
+            None => SerialSequenceLookup::NoColumn {
+                relation: name.to_string(),
+            },
+        }
     }
 
     /// The index `oid` identifies and the table it is defined on, resolved

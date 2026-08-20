@@ -2100,6 +2100,7 @@ fn wide_fixture() -> SystemCatalog {
                     cache: 1,
                     cycle: false,
                     last_value: Some(1),
+                    owned_by: None,
                 },
             ),
         ])
@@ -2202,6 +2203,7 @@ fn the_wide_fixture_populates_every_derived_relation() {
         "pg_attribute",
         "pg_attrdef",
         "pg_constraint",
+        "pg_depend",
         "pg_index",
         "pg_inherits",
         "pg_partitioned_table",
@@ -2493,6 +2495,7 @@ fn pg_class_size_columns_report_the_never_analyzed_sentinel() -> anyhow::Result<
                     cache: 1,
                     cycle: false,
                     last_value: Some(1),
+                    owned_by: None,
                 },
             ),
         ]
@@ -3021,5 +3024,355 @@ fn pg_locks_is_empty_without_a_session() -> anyhow::Result<()> {
         "pg_locks is missing",
     )?;
     assert!(rows.is_empty());
+    Ok(())
+}
+
+/// Which sequence a stored default names — the one link between a `serial`
+/// column and its sequence, so a miss here silently costs two `pg_depend`
+/// edges, `pg_get_serial_sequence`, and `DROP SEQUENCE`'s DETAIL.
+#[test]
+fn nextval_target_reads_the_call_and_not_the_word() {
+    let target = |sql: &str| nextval_target(sql).map(|(ns, name)| (ns.unwrap_or_default(), name));
+    let unqualified = |name: &str| Some((String::new(), name.to_string()));
+
+    assert_eq!(
+        target("nextval('t_id_seq'::regclass)"),
+        unqualified("t_id_seq")
+    );
+    assert_eq!(
+        target("nextval('app.t_id_seq'::regclass)"),
+        Some(("app".to_string(), "t_id_seq".to_string()))
+    );
+    // Quoting is what keeps a mixed-case sequence findable; an unquoted part
+    // folds, because that is what re-parsing the text would do to it.
+    assert_eq!(
+        target("nextval('\"MixT_Id_seq\"'::regclass)"),
+        unqualified("MixT_Id_seq")
+    );
+    assert_eq!(
+        target("nextval('T_ID_SEQ'::regclass)"),
+        unqualified("t_id_seq")
+    );
+    // A doubled quote inside the literal is one quote in the name.
+    assert_eq!(
+        target("nextval('\"it''s_id_seq\"'::regclass)"),
+        unqualified("it's_id_seq")
+    );
+    // PostgreSQL's own function, however it is spelled.
+    assert_eq!(
+        target("pg_catalog.nextval('s'::regclass)"),
+        unqualified("s")
+    );
+
+    // A different function whose name merely ends in `nextval`.
+    assert_eq!(target("my_nextval('s'::regclass)"), None);
+    assert_eq!(target("app.nextval('s'::regclass)"), None);
+    // The word inside a string constant names nothing.
+    assert_eq!(target("('nextval' || substr('abc', 1, 2))"), None);
+    assert_eq!(target("'nextval(''s'')'::text"), None);
+    // Neither does a call with a non-literal argument, or an unterminated one.
+    assert_eq!(target("nextval(seq_of(x))"), None);
+    assert_eq!(target("nextval('unterminated"), None);
+}
+
+/// The class OIDs `pg_depend` labels an object with are the OIDs those
+/// relations are actually served under, so `classid::regclass` round-trips to
+/// the catalog's name — which is how every query in the smoke suite (and
+/// `pg_dump`) reads a dependency row.
+#[test]
+fn depend_class_oids_are_the_relations_they_name() {
+    for (oid, name) in [
+        (oids::PG_TYPE_CLASS_OID, "pg_type"),
+        (oids::PG_PROC_CLASS_OID, "pg_proc"),
+        (oids::PG_CLASS_CLASS_OID, "pg_class"),
+        (oids::PG_ATTRDEF_CLASS_OID, "pg_attrdef"),
+        (oids::PG_CONSTRAINT_CLASS_OID, "pg_constraint"),
+        (oids::PG_NAMESPACE_CLASS_OID, "pg_namespace"),
+        (oids::PG_REWRITE_CLASS_OID, "pg_rewrite"),
+    ] {
+        assert_eq!(builtin_relation_oid(name), Some(oid), "{name}");
+    }
+}
+
+/// A snapshot holding one of every shape that produces a `pg_depend` edge.
+///
+/// Modelled on a fixture built on PostgreSQL 18.4 to read its answer off a live
+/// server: `CREATE TYPE mood AS ENUM …; CREATE TABLE t (id serial PRIMARY KEY,
+/// x text DEFAULT 'q', m mood, y int CHECK (y > 0)); CREATE VIEW v AS SELECT
+/// id, x FROM t; CREATE TABLE child () INHERITS (t)`, with `t` large enough to
+/// have a TOAST relation.
+fn depend_fixture() -> SystemCatalog {
+    use crabgresql_storage_api::{CheckConstraint, IndexKey, IndexMethod, InheritParent};
+
+    const MOOD_OID: u32 = 16_500;
+    let mut t = TableSchema::new(
+        "t",
+        vec![
+            Column::new("id", PgType::Int4),
+            Column::new("x", PgType::Text),
+            Column::new("m", PgType::User(MOOD_OID)),
+            Column::new("y", PgType::Int4),
+        ],
+    );
+    t.columns[0].default = Some("nextval('t_id_seq'::regclass)".to_string());
+    t.columns[1].default = Some("'q'::text".to_string());
+    t.checks = vec![CheckConstraint {
+        name: "t_y_check".to_string(),
+        expr: "(y > 0)".to_string(),
+        columns: vec![3],
+        validated: true,
+        islocal: true,
+        inhcount: 0,
+    }];
+    let key = |column: usize| IndexKey {
+        column,
+        descending: false,
+        nulls_first: false,
+    };
+    let mut table = CatalogRelation::permanent(t);
+    table.indexes = vec![
+        IndexMetadata {
+            name: "t_pkey".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![key(0)],
+            unique: true,
+            nulls_distinct: true,
+            constraint: Some(IndexConstraint::PrimaryKey),
+        },
+        // Keyed on the same column twice, which PostgreSQL accepts and records
+        // one dependency for.
+        IndexMetadata {
+            name: "t_x_idx".to_string(),
+            method: IndexMethod::BTree,
+            keys: vec![key(1), key(1)],
+            unique: false,
+            nulls_distinct: true,
+            constraint: None,
+        },
+    ];
+    table.toast = Some(RelStats {
+        relpages: 1,
+        reltuples: 0.0,
+        analyzed: false,
+        curpages: Some(1),
+        columns: std::sync::Arc::from([]),
+    });
+
+    let mut child = TableSchema::new("child", vec![Column::new("id", PgType::Int4)]);
+    child.inherits = vec![InheritParent {
+        namespace: "public".to_string(),
+        name: "t".to_string(),
+    }];
+
+    SystemCatalog::from_source(Arc::new(
+        StaticSource::new(vec![
+            table,
+            CatalogRelation::permanent(child),
+            CatalogRelation::view(
+                TableSchema::new(
+                    "v",
+                    vec![
+                        Column::new("id", PgType::Int4),
+                        Column::new("x", PgType::Text),
+                    ],
+                ),
+                Some("SELECT t.id, t.x FROM t".to_string()),
+            ),
+            CatalogRelation::sequence(
+                "t_id_seq",
+                "public",
+                CatalogSequence {
+                    type_oid: PgType::Int8.oid(),
+                    start: 1,
+                    increment: 1,
+                    min: 1,
+                    max: i64::MAX,
+                    cache: 1,
+                    cycle: false,
+                    last_value: None,
+                    owned_by: Some("t".to_string()),
+                },
+            ),
+        ])
+        .user_types(vec![CatalogUserType {
+            oid: MOOD_OID,
+            name: "mood".to_string(),
+            enum_labels: Some(vec!["sad".to_string(), "ok".to_string()]),
+        }])
+        .view_dependencies(vec![CatalogViewDependency {
+            namespace: "public".to_string(),
+            name: "v".to_string(),
+            reads: vec![ViewDepRelation {
+                namespace: "public".to_string(),
+                name: "t".to_string(),
+                columns: Some(vec!["id".to_string(), "x".to_string()]),
+            }],
+        }]),
+    ))
+}
+
+/// `pg_depend` records the same graph PostgreSQL records for the same schema.
+///
+/// Asserted as *named* edges rather than OIDs: the numbers are assigned per
+/// snapshot (see [`SystemCatalog::relation_oids`]), so pinning them would test
+/// the numbering rather than the graph, and a named edge is also what the
+/// PostgreSQL 18.4 output this list was read off looks like.
+#[test]
+fn pg_depend_records_the_graph_postgres_records() -> anyhow::Result<()> {
+    let cat = depend_fixture();
+    let (schema, rows) = required(cat.build_pg_catalog("pg_depend"), "pg_depend is missing")?;
+    let col = |row: &[Value], name: &str| -> anyhow::Result<Value> {
+        Ok(row[required(schema.column_index(name), name)?].clone())
+    };
+
+    // Name every object the graph can point at, so an edge reads as text.
+    let mut names: std::collections::HashMap<(u32, u32), String> = std::collections::HashMap::new();
+    for (class, relation, key, label) in [
+        (oids::PG_CLASS_CLASS_OID, "pg_class", "oid", "relname"),
+        (
+            oids::PG_CONSTRAINT_CLASS_OID,
+            "pg_constraint",
+            "oid",
+            "conname",
+        ),
+        (
+            oids::PG_NAMESPACE_CLASS_OID,
+            "pg_namespace",
+            "oid",
+            "nspname",
+        ),
+        (oids::PG_TYPE_CLASS_OID, "pg_type", "oid", "typname"),
+    ] {
+        let (s, rows) = required(cat.build_pg_catalog(relation), relation)?;
+        let (oid, label) = (
+            required(s.column_index(key), key)?,
+            required(s.column_index(label), label)?,
+        );
+        for row in rows {
+            if let (Value::Oid(o), Value::Text(name)) = (&row[oid], &row[label]) {
+                names.insert((class, *o), name.clone());
+            }
+        }
+    }
+    // The two catalogs whose rows have no name of their own are labelled by
+    // what they belong to, which is how a reader identifies them anyway.
+    let (s, attrdefs) = required(cat.build_pg_catalog("pg_attrdef"), "pg_attrdef")?;
+    for row in attrdefs {
+        let oid = required(s.column_index("oid"), "oid")?;
+        let adrelid = required(s.column_index("adrelid"), "adrelid")?;
+        let adnum = required(s.column_index("adnum"), "adnum")?;
+        if let (Value::Oid(o), Value::Oid(rel), Value::Int2(num)) =
+            (&row[oid], &row[adrelid], &row[adnum])
+        {
+            let table = names
+                .get(&(oids::PG_CLASS_CLASS_OID, *rel))
+                .cloned()
+                .unwrap_or_default();
+            names.insert(
+                (oids::PG_ATTRDEF_CLASS_OID, *o),
+                format!("default({table}.{num})"),
+            );
+        }
+    }
+    let (s, rules) = required(cat.build_pg_catalog("pg_rewrite"), "pg_rewrite")?;
+    for row in rules {
+        let oid = required(s.column_index("oid"), "oid")?;
+        let ev_class = required(s.column_index("ev_class"), "ev_class")?;
+        if let (Value::Oid(o), Value::Oid(view)) = (&row[oid], &row[ev_class]) {
+            let view = names
+                .get(&(oids::PG_CLASS_CLASS_OID, *view))
+                .cloned()
+                .unwrap_or_default();
+            names.insert((oids::PG_REWRITE_CLASS_OID, *o), format!("_RETURN({view})"));
+        }
+    }
+
+    let object = |class: &Value, oid: &Value, sub: &Value| -> String {
+        let (Value::Oid(class), Value::Oid(oid), Value::Int4(sub)) = (class, oid, sub) else {
+            return "?".to_string();
+        };
+        let name = names
+            .get(&(*class, *oid))
+            .cloned()
+            .unwrap_or_else(|| format!("oid {oid}"));
+        match sub {
+            0 => name,
+            n => format!("{name}.{n}"),
+        }
+    };
+    let mut edges = Vec::new();
+    for row in &rows {
+        let deptype = match col(row, "deptype")? {
+            Value::Char(c) => c as char,
+            other => anyhow::bail!("deptype is {other:?}"),
+        };
+        edges.push(format!(
+            "{} -> {} {deptype}",
+            object(
+                &col(row, "classid")?,
+                &col(row, "objid")?,
+                &col(row, "objsubid")?
+            ),
+            object(
+                &col(row, "refclassid")?,
+                &col(row, "refobjid")?,
+                &col(row, "refobjsubid")?
+            ),
+        ));
+    }
+    edges.sort();
+
+    // The TOAST relation is named after its table's OID, which this test does
+    // not pin, so its name is read back from `pg_class`.
+    let toast = required(
+        names
+            .iter()
+            .find(|((class, _), name)| {
+                *class == oids::PG_CLASS_CLASS_OID && name.starts_with("pg_toast_")
+            })
+            .map(|(_, name)| name.clone()),
+        "no TOAST relation in the fixture",
+    )?;
+    let mut expected: Vec<String> = [
+        // Every relation belongs to its schema; an index and a TOAST relation
+        // do not carry the edge, as in PostgreSQL.
+        "t -> public n",
+        "child -> public n",
+        "v -> public n",
+        "t_id_seq -> public n",
+        "mood -> public n",
+        // The inheritance child is *not* dropped with its parent, so `n`.
+        "child -> t n",
+        // A user type is depended on; `text` and `int4` are pinned and are not.
+        "t.3 -> mood n",
+        // The index backs a constraint, so it depends on the constraint; the
+        // constraint depends on the column.
+        "t_pkey -> t_pkey i",
+        "t_pkey -> t.1 a",
+        // A plain index depends on the column it keys — once, however many times
+        // the key list names it.
+        "t_x_idx -> t.2 a",
+        // A CHECK contributes both rows per column it reads.
+        "t_y_check -> t.4 a",
+        "t_y_check -> t.4 n",
+        // The `serial` pair: the sequence onto the column, the default onto the
+        // sequence. Plus the ordinary default edge of the second column.
+        "t_id_seq -> t.1 a",
+        "default(t.1) -> t.1 a",
+        "default(t.1) -> t_id_seq n",
+        "default(t.2) -> t.2 a",
+        // The TOAST relation has no life apart from its table.
+        "<toast> -> t i",
+        // The view's rule: internally on the view, by column on what it reads.
+        "_RETURN(v) -> v i",
+        "_RETURN(v) -> t.1 n",
+        "_RETURN(v) -> t.2 n",
+    ]
+    .iter()
+    .map(|edge| edge.replace("<toast>", &toast))
+    .collect();
+    expected.sort();
+
+    assert_eq!(edges, expected);
     Ok(())
 }

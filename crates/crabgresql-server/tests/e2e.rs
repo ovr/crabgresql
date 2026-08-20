@@ -16495,3 +16495,335 @@ async fn an_unreachable_user_routine_does_not_mask_overload_ambiguity() -> anyho
     client.simple_query("SELECT gcd(6::int2, 4::int2)").await?;
     Ok(())
 }
+
+/// A view over `pg_depend` is readable rather than a hang.
+///
+/// `pg_depend`'s view edges are recovered by binding every stored view, through
+/// a catalog that serves `pg_depend` itself — so a view whose body reads it
+/// describes a circle. It terminates because the relation is registered
+/// deferred: binding resolves the name without building the rows. This test is
+/// what says so out loud, since nothing in the registry line does.
+#[tokio::test]
+async fn a_view_over_pg_depend_is_readable() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE dt (id serial PRIMARY KEY, x text);
+             CREATE VIEW dv AS SELECT * FROM pg_depend;
+             CREATE VIEW dv2 AS SELECT id FROM dt",
+        )
+        .await?;
+    let rows = client.query("SELECT count(*) FROM dv", &[]).await?;
+    assert_eq!(rows.len(), 1);
+    let columns: Vec<i32> = client
+        .query(
+            "SELECT d.refobjsubid FROM pg_depend d
+               JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+               JOIN pg_class v ON v.oid = r.ev_class
+               JOIN pg_class t ON t.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+              WHERE v.relname = 'dv2' AND t.relname = 'dt'
+              ORDER BY 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(columns, vec![1], "dv2 reads only dt.id");
+    Ok(())
+}
+
+/// `pg_get_serial_sequence` answers from the same `OWNED BY` link `pg_depend`'s
+/// auto edge is built from: a `serial` column owns its sequence, a hand-written
+/// `DEFAULT nextval(...)` does not, and the two error cases are PostgreSQL's.
+#[tokio::test]
+async fn pg_get_serial_sequence_reports_the_owned_sequence() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE SEQUENCE s;
+             CREATE TABLE t (id serial PRIMARY KEY, plain int DEFAULT nextval('s'), x text)",
+        )
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_serial_sequence('t', 'id') AS owned,
+                    pg_get_serial_sequence('t', 'plain') AS plain,
+                    pg_get_serial_sequence('public.t', 'x') AS none",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, Option<&str>>("owned"), Some("public.t_id_seq"));
+    // A default that calls a sequence does not own it — PostgreSQL reports NULL
+    // for this column too.
+    assert_eq!(row.get::<_, Option<&str>>("plain"), None);
+    assert_eq!(row.get::<_, Option<&str>>("none"), None);
+
+    let e = client
+        .query_one("SELECT pg_get_serial_sequence('nosuch', 'id')", &[])
+        .await
+        .expect_err("no such relation");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::UNDEFINED_TABLE);
+    assert_eq!(db.message(), "relation \"nosuch\" does not exist");
+
+    let e = client
+        .query_one("SELECT pg_get_serial_sequence('t', 'nope')", &[])
+        .await
+        .expect_err("no such column");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::UNDEFINED_COLUMN);
+    assert_eq!(
+        db.message(),
+        "column \"nope\" of relation \"t\" does not exist"
+    );
+    Ok(())
+}
+
+/// A `serial` column of a quoted, mixed-case table keeps its link to the
+/// sequence.
+///
+/// The link is written down in one place only — the default's `nextval` text —
+/// so an unquoted reference there folds to lower case on the way back in and
+/// silently loses both the sequence's `pg_depend` edge and
+/// `pg_get_serial_sequence`. All three strings below were probed against
+/// PostgreSQL 18.4.
+#[tokio::test]
+async fn a_mixed_case_serial_keeps_its_sequence_link() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE \"MixT\" (\"Id\" serial)")
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_serial_sequence('\"MixT\"', 'Id') AS owned,
+                    (SELECT pg_get_expr(ad.adbin, ad.adrelid) FROM pg_attrdef ad
+                       JOIN pg_class c ON c.oid = ad.adrelid
+                      WHERE c.relname = 'MixT') AS default,
+                    (SELECT count(*) FROM pg_depend d
+                       JOIN pg_class s ON s.oid = d.objid
+                      WHERE s.relname = 'MixT_Id_seq' AND d.deptype = 'a') AS auto_edges",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        row.get::<_, Option<&str>>("owned"),
+        Some("public.\"MixT_Id_seq\"")
+    );
+    assert_eq!(
+        row.get::<_, Option<&str>>("default"),
+        Some("nextval('\"MixT_Id_seq\"'::regclass)")
+    );
+    assert_eq!(row.get::<_, i64>("auto_edges"), 1);
+    Ok(())
+}
+
+/// `CREATE SEQUENCE … OWNED BY` is refused rather than accepted-and-dropped.
+///
+/// A `serial` column is the only ownership this build records, and both
+/// `pg_depend`'s auto edge and `pg_get_serial_sequence` answer from it — so a
+/// statement whose `OWNED BY` went nowhere would leave those two reporting no
+/// owner for a sequence that was told it had one.
+#[tokio::test]
+async fn create_sequence_owned_by_is_refused() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE t (id int)").await?;
+    let e = client
+        .batch_execute("CREATE SEQUENCE s OWNED BY t.id")
+        .await
+        .expect_err("OWNED BY is not supported");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        db.message(),
+        "CREATE SEQUENCE ... OWNED BY is not supported yet"
+    );
+    Ok(())
+}
+
+/// `DROP SEQUENCE` names the dependent column in its DETAIL, as PostgreSQL 18.4
+/// does. It reads the same `nextval` text `pg_depend` does, so the two agree on
+/// which default belongs to which sequence.
+#[tokio::test]
+async fn drop_sequence_detail_names_the_owning_column() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client.batch_execute("CREATE TABLE lc (id serial)").await?;
+    let e = client
+        .batch_execute("DROP SEQUENCE lc_id_seq")
+        .await
+        .expect_err("the serial default depends on it");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(
+        db.detail(),
+        Some("default value for column id of table lc depends on sequence lc_id_seq")
+    );
+    Ok(())
+}
+
+/// An apostrophe in a table name survives the round trip through the stored
+/// `serial` default.
+///
+/// The default is SQL text that is re-parsed on every insert, so the sequence
+/// reference has to be quoted as a literal as well as as an identifier. All
+/// three strings below were probed against PostgreSQL 18.4.
+#[tokio::test]
+async fn an_apostrophe_in_a_table_name_keeps_its_serial_working() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE \"it's\" (id serial)")
+        .await?;
+    client
+        .batch_execute("INSERT INTO \"it's\" DEFAULT VALUES")
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT (SELECT pg_get_expr(ad.adbin, ad.adrelid) FROM pg_attrdef ad
+                       JOIN pg_class c ON c.oid = ad.adrelid
+                      WHERE c.relname = 'it''s') AS default,
+                    pg_get_serial_sequence('\"it''s\"', 'id') AS owned,
+                    (SELECT count(*) FROM pg_depend d
+                       JOIN pg_class s ON s.oid = d.objid
+                      WHERE s.relname = 'it''s_id_seq' AND d.deptype = 'a') AS auto_edges",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        row.get::<_, Option<&str>>("default"),
+        Some("nextval('\"it''s_id_seq\"'::regclass)")
+    );
+    assert_eq!(
+        row.get::<_, Option<&str>>("owned"),
+        Some("public.\"it's_id_seq\"")
+    );
+    assert_eq!(row.get::<_, i64>("auto_edges"), 1);
+    Ok(())
+}
+
+/// A function whose name merely ends in `nextval` does not own the sequence a
+/// `serial` column created, and the word inside a string constant names no
+/// sequence at all.
+#[tokio::test]
+async fn only_a_real_nextval_call_owns_a_sequence() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION my_nextval(text) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE TABLE t (z int DEFAULT my_nextval('t_id_seq'), id serial)",
+        )
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_serial_sequence('t', 'z') AS impostor,
+                    pg_get_serial_sequence('t', 'id') AS owner",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, Option<&str>>("impostor"), None);
+    assert_eq!(row.get::<_, Option<&str>>("owner"), Some("public.t_id_seq"));
+    Ok(())
+}
+
+/// `OWNED BY NONE` is PostgreSQL's default spelled out and is accepted; a real
+/// owner is still refused, because nothing would record it.
+#[tokio::test]
+async fn owned_by_none_is_accepted_and_a_real_owner_is_not() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE t (id int); CREATE SEQUENCE s OWNED BY NONE")
+        .await?;
+    let e = client
+        .batch_execute("CREATE SEQUENCE s2 OWNED BY t.id")
+        .await
+        .expect_err("a real owner is not recorded");
+    assert_eq!(
+        e.as_db_error().context("missing error details")?.code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    Ok(())
+}
+
+/// `pg_get_serial_sequence` takes a relation *name*, so digits are a name and a
+/// missing schema is reported before the relation — both probed against
+/// PostgreSQL 18.4, and both shared with `pg_get_viewdef`.
+#[tokio::test]
+async fn pg_get_serial_sequence_resolves_a_name_not_an_oid() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    let fails = async |sql: &str, state: &SqlState, message: &str| -> anyhow::Result<()> {
+        let e = client
+            .query_one(sql, &[])
+            .await
+            .expect_err("resolution fails");
+        let db = e.as_db_error().context("missing error details")?;
+        assert_eq!(db.code(), state, "{sql}");
+        assert_eq!(db.message(), message, "{sql}");
+        Ok(())
+    };
+    fails(
+        "SELECT pg_get_serial_sequence('123', 'id')",
+        &SqlState::UNDEFINED_TABLE,
+        "relation \"123\" does not exist",
+    )
+    .await?;
+    fails(
+        "SELECT pg_get_serial_sequence('PUB.NoSuch', 'id')",
+        &SqlState::INVALID_SCHEMA_NAME,
+        "schema \"pub\" does not exist",
+    )
+    .await?;
+    fails(
+        "SELECT pg_get_serial_sequence('public.NoSuch', 'id')",
+        &SqlState::UNDEFINED_TABLE,
+        "relation \"public.nosuch\" does not exist",
+    )
+    .await?;
+    fails(
+        "SELECT pg_get_viewdef('public.NoSuchV')",
+        &SqlState::UNDEFINED_TABLE,
+        "relation \"public.nosuchv\" does not exist",
+    )
+    .await?;
+    Ok(())
+}
+
+/// A relation a view reads only from an expression subquery is a dependency:
+/// `pg_depend` records the edge, and `DROP` refuses to strand the view.
+#[tokio::test]
+async fn a_view_depends_on_what_its_subqueries_read() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE d1 (a int);
+             CREATE TABLE d2 (b int);
+             CREATE VIEW dv AS SELECT a, (SELECT max(b) FROM d2) AS m FROM d1",
+        )
+        .await?;
+    let reads: Vec<String> = client
+        .query(
+            "SELECT ref.relname FROM pg_depend d
+               JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+               JOIN pg_class v ON v.oid = r.ev_class
+               JOIN pg_class ref ON ref.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+              WHERE v.relname = 'dv' AND ref.relname <> 'dv'
+              ORDER BY 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(reads, vec!["d1", "d2"]);
+
+    let e = client
+        .batch_execute("DROP TABLE d2")
+        .await
+        .expect_err("the view reads it");
+    let db = e.as_db_error().context("missing error details")?;
+    assert_eq!(db.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(db.detail(), Some("view dv depends on table d2"));
+    Ok(())
+}

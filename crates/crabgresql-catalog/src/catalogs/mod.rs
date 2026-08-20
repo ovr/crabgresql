@@ -28,6 +28,7 @@ pub(crate) mod constraint;
 pub(crate) mod conversion;
 pub(crate) mod cursors;
 pub(crate) mod database;
+pub(crate) mod depend;
 pub(crate) mod description;
 pub(crate) mod extension;
 pub(crate) mod foreign;

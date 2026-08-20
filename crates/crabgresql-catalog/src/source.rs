@@ -27,7 +27,7 @@ pub enum RelKind {
 /// A sequence's parameters, reflected into `pg_sequence`. Carried on the
 /// [`CatalogRelation`] whose [`RelKind::Sequence`] entry it belongs to, so the
 /// sequence's `pg_class` OID (assigned positionally) can be reused as `seqrelid`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogSequence {
     pub type_oid: u32,
     pub start: i64,
@@ -41,6 +41,18 @@ pub struct CatalogSequence {
     /// fresh sequence from one that has handed out its `start` value — the two
     /// hold the same number and differ only in having been called.
     pub last_value: Option<i64>,
+    /// The table this sequence is owned by (PostgreSQL's `OWNED BY`). A
+    /// `serial` column is the only thing that sets it — the standalone clause is
+    /// refused at DDL — so an owned sequence always lives in its table's
+    /// namespace, which is why the name here is unqualified.
+    ///
+    /// It is what makes the sequence's `pg_depend` edge an *auto* dependency on
+    /// the owning column rather than nothing at all — a plain
+    /// `DEFAULT nextval('s')` records the reverse edge only (from the default),
+    /// and PostgreSQL was observed to keep the two cases exactly that far apart.
+    /// The column itself is not carried: it is recovered from the owning table's
+    /// defaults, which is the only place the link is written down.
+    pub owned_by: Option<String>,
 }
 
 /// A live relation exposed through the system catalogs.
@@ -203,6 +215,36 @@ impl CatalogRelation {
     }
 }
 
+/// What a view's stored query reads, for the `pg_depend` edges of its `_RETURN`
+/// rule.
+///
+/// Supplied by the server rather than derived here: recovering it means binding
+/// the view's SQL, and this crate depends on neither the parser nor the binder —
+/// the same division [`CatalogRelation::definition`] draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogViewDependency {
+    pub namespace: String,
+    pub name: String,
+    pub reads: Vec<ViewDepRelation>,
+}
+
+/// One relation a view reads, and how precisely the read is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewDepRelation {
+    pub namespace: String,
+    pub name: String,
+    /// The columns read, by name, or `None` for "the relation as a whole"
+    /// (`refobjsubid = 0`).
+    ///
+    /// PostgreSQL stores the coarse form only for a query that names a relation
+    /// without reading a column of it; here it also stands for a read this
+    /// build cannot resolve to columns — another view, or a relation reached
+    /// only from an expression subquery. Coarse under-reports what depends on a
+    /// *column*, which is the direction that costs a client a false "nothing
+    /// depends on it".
+    pub columns: Option<Vec<String>>,
+}
+
 /// A user-defined type reflected into `pg_type` (and, for enums, `pg_enum`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogUserType {
@@ -285,6 +327,15 @@ pub trait CatalogSource: Send + Sync {
 
     /// The user-defined routines to reflect into `pg_proc`.
     fn routines(&self) -> Vec<CatalogRoutine> {
+        Vec::new()
+    }
+
+    /// What each view's query reads, for `pg_depend`.
+    ///
+    /// Asked for by `pg_depend` alone, which is why that relation is registered
+    /// as deferred: answering this binds every stored view, and a `SELECT` that
+    /// merely touches `pg_class` must not pay for it.
+    fn view_dependencies(&self) -> Vec<CatalogViewDependency> {
         Vec::new()
     }
 
@@ -421,6 +472,7 @@ pub struct StaticSource {
     prepared_statements: Vec<CatalogPreparedStatement>,
     settings: Vec<CatalogSetting>,
     locks: Vec<CatalogLock>,
+    view_dependencies: Vec<CatalogViewDependency>,
 }
 
 impl Default for StaticSource {
@@ -438,6 +490,7 @@ impl Default for StaticSource {
             prepared_statements: Vec::new(),
             settings: Vec::new(),
             locks: Vec::new(),
+            view_dependencies: Vec::new(),
         }
     }
 }
@@ -494,6 +547,11 @@ impl StaticSource {
         self.locks = locks;
         self
     }
+
+    pub fn view_dependencies(mut self, deps: Vec<CatalogViewDependency>) -> Self {
+        self.view_dependencies = deps;
+        self
+    }
 }
 
 impl CatalogSource for StaticSource {
@@ -535,6 +593,10 @@ impl CatalogSource for StaticSource {
 
     fn locks(&self) -> Vec<CatalogLock> {
         self.locks.clone()
+    }
+
+    fn view_dependencies(&self) -> Vec<CatalogViewDependency> {
+        self.view_dependencies.clone()
     }
 }
 

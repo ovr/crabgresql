@@ -263,6 +263,52 @@ fn qualify(
     }
 }
 
+/// The relation a function argument names, or the error PostgreSQL raises for
+/// it — what `pg_get_viewdef(text)` and `pg_get_serial_sequence(text, text)`
+/// both take.
+///
+/// Three outcomes, each probed against PostgreSQL 18.4:
+///
+/// ```text
+/// pg_get_serial_sequence('123','id')         42P01 relation "123" does not exist
+/// pg_get_serial_sequence('PUB.NoSuch','id')  3F000 schema "pub" does not exist
+/// pg_get_serial_sequence('public.NoSuch',…)  42P01 relation "public.nosuch" does not exist
+/// ```
+///
+/// A missing *schema* is reported before the relation, and both messages quote
+/// the parsed spelling rather than the argument as written. Unlike
+/// [`from_text`], all digits is a relation named `123` rather than an OID: these
+/// functions take a name, and only a `reg*` cast takes the numeric form.
+///
+/// Returns the relation's OID together with the parsed name, since a caller
+/// that looks the relation up again should look it up under the spelling that
+/// resolved.
+pub(crate) fn resolve_relation(
+    s: &str,
+    ops: &dyn CatalogOps,
+) -> Result<(u32, Option<String>, String), ExecError> {
+    let (namespace, name) = relation_name(s, ops)?;
+    if let Some(namespace) = &namespace
+        && ops.namespace_oid(namespace).is_none()
+    {
+        return Err(ExecError::new(
+            sqlstate::INVALID_SCHEMA_NAME,
+            format!("schema \"{namespace}\" does not exist"),
+        ));
+    }
+    let oid = ops.rel_oid(namespace.as_deref(), &name).ok_or_else(|| {
+        let qualified = match &namespace {
+            Some(namespace) => format!("{namespace}.{name}"),
+            None => name.clone(),
+        };
+        ExecError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("relation \"{qualified}\" does not exist"),
+        )
+    })?;
+    Ok((oid, namespace, name))
+}
+
 /// `regclass` input and `pg_get_viewdef(text)` reach the same
 /// `makeRangeVarFromNameList`/`RangeVarGetRelid` pair upstream, so they share
 /// this rather than each deciding what a malformed relation name means.

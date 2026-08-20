@@ -2537,6 +2537,19 @@ pub fn quote_literal(s: &str) -> String {
     }
 }
 
+/// A string literal for SQL this build *writes* — a stored default, a
+/// deparsed expression — doubling embedded quotes and nothing else.
+///
+/// Not [`quote_literal`], which is the SQL function of that name: it escapes a
+/// backslash into an `E'…'` string, and PostgreSQL's deparse does not. Probed
+/// on 18.4: a `serial` on a table named `a\b` stores
+/// `nextval('bsprobe."a\b_id_seq"'::regclass)`, one backslash, no `E`. Under
+/// `standard_conforming_strings` (on since 9.1, and the only setting here) a
+/// backslash in a literal is already itself.
+pub fn quote_sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// `quote_nullable`: `quote_literal`, or the literal `NULL` for a NULL input.
 pub fn quote_nullable(s: Option<&str>) -> String {
     match s {

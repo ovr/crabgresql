@@ -214,29 +214,22 @@ pub(crate) fn pg_attrdef_schema() -> TableSchema {
     )
 }
 
+/// Render the defaults [`crate::SystemCatalog::attrdef_oids`] already numbered.
+/// Pure, for the reason [`crate::catalogs::constraint::pg_constraint_rows`] is:
+/// the OID a row prints is the one `pg_depend` names as the dependent object.
+///
+/// A generated column's expression is a row here too — `pg_get_expr(adbin,
+/// adrelid)` reads both back, and `attgenerated` is what tells them apart.
 pub(crate) fn pg_attrdef_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    let relations = cat.relation_oids();
-    let mut next_oid = 30000_u32;
-    let mut rows = Vec::new();
-    for (table_oid, schema) in relations {
-        for (position, column) in schema.columns.iter().enumerate() {
-            // A generated column's expression lives here too, exactly as a
-            // default does — `pg_get_expr(adbin, adrelid)` is how both are read
-            // back, and `attgenerated` is what tells them apart.
-            let expr = column
-                .default
-                .as_ref()
-                .or(column.generated.as_ref().map(|g| &g.expr));
-            if let Some(expr) = expr {
-                rows.push(vec![
-                    Value::Oid(next_oid),
-                    Value::Oid(*table_oid),
-                    Value::Int2((position + 1) as i16),
-                    Value::Text(expr.clone()),
-                ]);
-                next_oid += 1;
-            }
-        }
-    }
-    rows
+    cat.attrdef_oids()
+        .iter()
+        .map(|d| {
+            vec![
+                Value::Oid(d.oid),
+                Value::Oid(d.table_oid),
+                Value::Int2(d.attnum),
+                Value::Text(d.expr.clone()),
+            ]
+        })
+        .collect()
 }

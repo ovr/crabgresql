@@ -759,6 +759,11 @@ pub enum ScalarFn {
     /// `pg_get_expr` adds. An OID no constraint answers to is NULL, not an
     /// error.
     PgGetConstraintdef,
+    /// `pg_get_serial_sequence(text, text) -> text`: the sequence a `serial`
+    /// column owns, schema-qualified, or NULL when the column owns none. The
+    /// relation argument is a possibly-qualified relation *name*; the column
+    /// argument is taken literally, as PostgreSQL takes it.
+    PgGetSerialSequence,
     // --- jsonpath (jsonb @ jsonpath) ---
     /// A `jsonb_path_*` function / `@?` / `@@` operator. Args are
     /// `[jsonb, jsonpath]` optionally followed by `[vars jsonb, silent bool]`;
@@ -2990,6 +2995,11 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TEXT,
             },
         ],
+        "pg_get_serial_sequence" => &[Signature {
+            func: ScalarFn::PgGetSerialSequence,
+            args: &[TEXT, TEXT],
+            ret: TEXT,
+        }],
         "pg_get_constraintdef" => &[
             Signature {
                 func: ScalarFn::PgGetConstraintdef,

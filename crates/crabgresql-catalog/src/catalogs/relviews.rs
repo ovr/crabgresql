@@ -156,7 +156,7 @@ pub(crate) fn pg_sequences_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     relations_of(cat, &[RelKind::Sequence])
         .into_iter()
         .filter_map(|relation| {
-            let params = relation.sequence?;
+            let params = relation.sequence.as_ref()?;
             Some(vec![
                 Value::Text(relation.schema.namespace.clone()),
                 Value::Text(relation.schema.name.clone()),

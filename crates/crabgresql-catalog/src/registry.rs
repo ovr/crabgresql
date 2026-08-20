@@ -20,10 +20,10 @@ use crabgresql_types::Value;
 use crate::SystemCatalog;
 use crate::catalogs::{
     acl, aggregate, am, amop, attribute, auth, class, collation, constraint, conversion, cursors,
-    database, description, extension, foreign, index, inherits, language, locks, misc_empty,
-    namespace, opclass, operator, policy, prepared, proc, progress, publication, relviews,
-    replication, rewrite, sequence, settings, stat_activity, stat_database, stat_indexes, stat_io,
-    stat_tables, statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
+    database, depend, description, extension, foreign, index, inherits, language, locks,
+    misc_empty, namespace, opclass, operator, policy, prepared, proc, progress, publication,
+    relviews, replication, rewrite, sequence, settings, stat_activity, stat_database, stat_indexes,
+    stat_io, stat_tables, statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -53,9 +53,9 @@ pub(crate) struct CatalogRelDef {
     pub(crate) schema: fn() -> TableSchema,
     pub(crate) rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
     /// Whether the rows are built when the relation is first *read* rather than
-    /// when the binder resolves its name. True for exactly one relation; see
-    /// [`crate::static_table::StaticTable::deferred`] for why `pg_locks` needs
-    /// it and why nothing else does.
+    /// when the binder resolves its name. True for `pg_locks` and `pg_depend`,
+    /// for two different reasons; see
+    /// [`crate::static_table::StaticTable::deferred`].
     pub(crate) deferred: bool,
     /// For a relation whose every row *describes another relation*: the column
     /// holding that relation's OID. Set it and each row reports the described
@@ -289,6 +289,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         acl::pg_default_acl_schema,
         no_rows,
+    ),
+    rel_deferred(
+        "pg_depend",
+        2608,
+        PgCatalog,
+        depend::pg_depend_schema,
+        depend::pg_depend_rows,
     ),
     rel(
         "pg_description",
