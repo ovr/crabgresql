@@ -98,9 +98,18 @@ fn fold_children(
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
         | BoundExpr::Coalesce { args, .. }
-        | BoundExpr::MinMax { args, .. }
-        | BoundExpr::Aggregate { args, .. } => {
+        | BoundExpr::MinMax { args, .. } => {
             for arg in args {
+                changed |= fold(arg, fmt, on_subplan);
+            }
+        }
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            for arg in agg_args
+                .iter_mut()
+                .chain(order_by.iter_mut().map(|k| &mut k.expr))
+            {
                 changed |= fold(arg, fmt, on_subplan);
             }
         }

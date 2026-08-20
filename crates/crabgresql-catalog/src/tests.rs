@@ -1745,6 +1745,12 @@ fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()
         Value::Text("FOR VALUES FROM ('-10') TO (0)".to_string())
     );
 
+    // No relation carries `WITH (…)` storage parameters, and PostgreSQL stores
+    // NULL — not the empty array — for one whose options were never set.
+    for rel in ["tbl", "vw", "part", "part_hi"] {
+        assert_eq!(cell(rel, "reloptions")?, Value::Null, "{rel}");
+    }
+
     Ok(())
 }
 

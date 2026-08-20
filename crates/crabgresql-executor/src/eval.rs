@@ -1177,6 +1177,7 @@ fn eval_deparse_fn(
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         ScalarFn::PgGetConstraintdef => Some(eval_pg_get_constraintdef(args, ctx)),
         ScalarFn::PgGetIndexdef => Some(eval_pg_get_indexdef(args, ctx)),
+        ScalarFn::PgGetPartkeydef => Some(eval_pg_get_partkeydef(args, ctx)),
         ScalarFn::PgGetSerialSequence => Some(eval_pg_get_serial_sequence(args, ctx)),
         _ => None,
     }
@@ -1334,6 +1335,43 @@ fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, Exec
         None => "?column?".to_string(),
     };
     Ok(Value::Text(name))
+}
+
+/// `pg_get_partkeydef(oid)`: the `PARTITION BY` clause's argument, as
+/// `RANGE (sales_date)` — the strategy in upper case and the key columns
+/// parenthesised, quoted only where a bare name would not read back
+/// (`vendor/postgres/regress/expected/partition_merge.out`).
+///
+/// NULL for anything that is not a partitioned relation, which covers an OID no
+/// relation answers to as well: `pg_get_partkeydef(0)` is NULL on PostgreSQL
+/// (`vendor/postgres/regress/expected/rules.out`), not an error.
+///
+/// Strict in its argument, said here rather than inherited for the reason
+/// [`eval_pg_get_indexdef`] gives: this is dispatched from [`eval`], not from
+/// the STRICT `eval_scalar` path.
+fn eval_pg_get_partkeydef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Value::Oid(oid) = &args[0] else {
+        return Ok(Value::Null);
+    };
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_partkeydef evaluated without a catalog context",
+        ));
+    };
+    let Some(def) = catalog.partition_key_def(*oid) else {
+        return Ok(Value::Null);
+    };
+    let strategy = match def.strategy {
+        crabgresql_storage_api::PartitionStrategy::Range => "RANGE",
+    };
+    let columns = def
+        .columns
+        .iter()
+        .map(|name| crabgresql_types::text::quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Value::Text(format!("{strategy} ({columns})")))
 }
 
 /// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
@@ -1828,6 +1866,9 @@ mod format_type_tests {
                 None
             }
             fn index_def(&self, _oid: u32) -> Option<crate::IndexDef> {
+                None
+            }
+            fn partition_key_def(&self, _oid: u32) -> Option<crate::PartitionKeyDef> {
                 None
             }
             fn partition_ancestors(&self, _oid: u32) -> Vec<u32> {

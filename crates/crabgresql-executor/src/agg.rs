@@ -916,6 +916,7 @@ mod tests {
             func,
             distinct: false,
             args: Vec::new(),
+            order_by: Vec::new(),
             input_ty,
             ret: PgType::Numeric,
             collation: 0,
