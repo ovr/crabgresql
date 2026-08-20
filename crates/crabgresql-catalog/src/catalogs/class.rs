@@ -19,7 +19,7 @@ use crate::{RelKind, TOAST_NAMESPACE};
 ///
 /// TODO: the storage and inheritance columns (`relallfrozen`, `relisshared`,
 /// `relhassubclass`, `relispopulated`, `relrewrite`, `relfrozenxid`,
-/// `relminmxid`, `reloptions`) are absent, so a query naming one fails with
+/// `relminmxid`) are absent, so a query naming one fails with
 /// "column does not exist" rather than reading a value.
 ///
 /// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
@@ -61,6 +61,11 @@ pub(crate) fn pg_class_schema() -> TableSchema {
             col("relreplident", CHARLIKE),
             col("relispartition", PgType::Bool),
             col("relacl", ACLITEM_ARRAY),
+            // `WITH (…)` storage parameters. There is no relation-level option
+            // here, so every row is NULL — which is also what PostgreSQL
+            // reports for a relation whose options were never set (it stores
+            // NULL there, not the empty array).
+            col("reloptions", PgType::Array(crabgresql_types::oid::TEXT)),
             // pg_node_tree in PG; crabgresql stores the already-deparsed
             // `FOR VALUES …` text (see `pg_get_expr`, which just echoes it).
             col("relpartbound", PgType::Text),
@@ -276,6 +281,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(false),
                 chr(relreplident),
                 Value::Bool(schema.partition_of.is_some()),
+                // relacl / reloptions: no GRANT and no storage parameters.
+                Value::Null,
                 Value::Null,
                 relpartbound,
             ]
@@ -318,6 +325,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             // An index has no replica identity of its own.
             chr('n'),
             Value::Bool(false),
+            // relacl / reloptions / relpartbound.
+            Value::Null,
             Value::Null,
             Value::Null,
         ]
@@ -359,6 +368,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Bool(false),
             chr('n'),
             Value::Bool(false),
+            // relacl / reloptions / relpartbound.
+            Value::Null,
             Value::Null,
             Value::Null,
         ]
