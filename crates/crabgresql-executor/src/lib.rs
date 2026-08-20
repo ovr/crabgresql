@@ -1176,7 +1176,7 @@ fn resolve_subqueries(
             resolve_opt(predicate, ctx, txn)?;
             resolve_exprs(group_exprs, ctx, txn)?;
             for agg in aggregates.iter_mut() {
-                for arg in agg.args.iter_mut() {
+                for arg in agg.exprs_mut() {
                     resolve_expr(arg, ctx, txn)?;
                 }
             }
@@ -1375,8 +1375,10 @@ fn resolve_expr(
                 resolve_expr(e, ctx, txn)?;
             }
         }
-        BoundExpr::Aggregate { args, .. } => {
-            for a in args {
+        BoundExpr::Aggregate {
+            agg_args, order_by, ..
+        } => {
+            for a in BoundExpr::agg_exprs_mut(agg_args, order_by) {
                 resolve_expr(a, ctx, txn)?;
             }
         }
@@ -5591,6 +5593,86 @@ mod tests {
             vec![vec![Value::Array {
                 elem: PgType::Int4,
                 elems: vec![Value::Int4(2), Value::Null, Value::Int4(1)],
+            }]]
+        );
+    }
+
+    /// An aggregate's own `ORDER BY` decides the order its inputs are folded in
+    /// — the whole point of the clause for `array_agg`. Values verified against
+    /// PostgreSQL 18.4.
+    #[test]
+    fn array_agg_follows_its_own_order_by() {
+        let ints = |ns: [i32; 3]| {
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: ns.into_iter().map(Value::Int4).collect(),
+            }]]
+        };
+        let rows = "(VALUES (1, 3), (2, 1), (3, 2)) t(x, y)";
+        assert_eq!(
+            run_rows(&format!("SELECT array_agg(x ORDER BY y) FROM {rows}")).1,
+            ints([2, 3, 1])
+        );
+        assert_eq!(
+            run_rows(&format!("SELECT array_agg(x ORDER BY y DESC) FROM {rows}")).1,
+            ints([1, 3, 2])
+        );
+    }
+
+    /// NULL placement follows the key's `NULLS FIRST`/`LAST`, defaulting to
+    /// last for ASC — the same rule the query's own ORDER BY uses.
+    #[test]
+    fn aggregate_order_by_places_nulls_by_the_key() {
+        let rows = "(VALUES (1, 3), (2, NULL), (3, 2)) t(x, y)";
+        let ints = |ns: [i32; 3]| {
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: ns.into_iter().map(Value::Int4).collect(),
+            }]]
+        };
+        assert_eq!(
+            run_rows(&format!("SELECT array_agg(x ORDER BY y) FROM {rows}")).1,
+            ints([3, 1, 2])
+        );
+        assert_eq!(
+            run_rows(&format!(
+                "SELECT array_agg(x ORDER BY y NULLS FIRST) FROM {rows}"
+            ))
+            .1,
+            ints([2, 3, 1])
+        );
+    }
+
+    /// The clause is legal on every aggregate, not only the order-sensitive
+    /// ones, and an empty group is still NULL rather than an empty array.
+    #[test]
+    fn aggregate_order_by_on_other_aggregates_and_empty_groups() {
+        let (_c, rows) = run_rows(
+            "SELECT string_agg(s, ',' ORDER BY k DESC) \
+             FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) t(s, k)",
+        );
+        assert_eq!(rows, vec![vec![Value::Text("c,b,a".to_string())]]);
+        let (_c, rows) = run_rows("SELECT sum(x ORDER BY x) FROM (VALUES (1), (2)) t(x)");
+        assert_eq!(rows, vec![vec![Value::Int8(3)]]);
+        let (_c, rows) =
+            run_rows("SELECT array_agg(x ORDER BY y) FROM (VALUES (1, 3)) t(x, y) WHERE false");
+        assert_eq!(rows, vec![vec![Value::Null]]);
+    }
+
+    /// `DISTINCT` with an explicit `ORDER BY` dedups on the sorted keys rather
+    /// than through `array_agg`'s finalize sort, so the ORDER BY — including a
+    /// descending one, whose NULLs then come first — decides the output order.
+    #[test]
+    fn array_agg_distinct_honours_an_explicit_order_by() {
+        let (_c, rows) = run_rows(
+            "SELECT array_agg(DISTINCT x ORDER BY x DESC) \
+             FROM (VALUES (3), (1), (NULL), (2), (1)) t(x)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Value::Array {
+                elem: PgType::Int4,
+                elems: vec![Value::Null, Value::Int4(3), Value::Int4(2), Value::Int4(1)],
             }]]
         );
     }

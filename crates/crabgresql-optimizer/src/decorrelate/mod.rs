@@ -816,7 +816,7 @@ fn for_each_source_expr(node: &mut LogicalPlan, f: &mut dyn FnMut(&mut BoundExpr
                 f(expr);
             }
             for aggregate in aggregates {
-                for arg in &mut aggregate.args {
+                for arg in aggregate.exprs_mut() {
                     f(arg);
                 }
             }

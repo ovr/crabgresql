@@ -1,7 +1,10 @@
-use crabgresql_binder::{BoundAggregate, BoundExpr};
+use std::cmp::Ordering;
+
+use crabgresql_binder::{BoundAggregate, BoundExpr, SortKey};
 use crabgresql_storage_api::Tuple;
 use crabgresql_types::Value;
 
+use crate::node::sort::compare_rows;
 use crate::{ExecContext, ExecError, ExecNode, agg, eval, keyindex};
 
 /// Grouped aggregation. On the first pull it buffers every child row, groups
@@ -10,10 +13,24 @@ use crate::{ExecContext, ExecError, ExecNode, agg, eval, keyindex};
 /// aggregate — and emits one row per group laid out `[group keys…, aggregates…]`.
 /// An empty group-key list is the implicit single group: exactly one output row
 /// even over no input (`SELECT count(*)` → 0).
+///
+/// An aggregate carrying its own `ORDER BY` (`array_agg(x ORDER BY y)`) cannot
+/// accumulate as the rows arrive — its order is only known once the group is
+/// complete — so its inputs are buffered per group and folded in at finalize.
+/// Everything else keeps the streaming path.
 pub struct Aggregate {
     child: Box<dyn ExecNode>,
     group_exprs: Vec<BoundExpr>,
     aggregates: Vec<BoundAggregate>,
+    /// The sort keys of each ordered aggregate, addressing its own buffered key
+    /// tuple by position, and empty for an aggregate with no `ORDER BY`. Built
+    /// once so the per-group sort reuses [`compare_rows`] — the comparison
+    /// behind every other `ORDER BY` in the engine.
+    order_keys: Vec<Vec<SortKey>>,
+    /// Whether any aggregate at all is `DISTINCT` / ordered, decided once so a
+    /// group that needs neither allocates for neither.
+    any_distinct: bool,
+    any_ordered: bool,
     ctx: ExecContext,
     /// Output rows, built lazily on the first `next()`.
     output: Option<std::vec::IntoIter<Tuple>>,
@@ -31,6 +48,11 @@ struct AggGroup {
     /// allocate a vector of `None` per group. Readers index it rather than
     /// zipping it, so the short and full-length forms behave alike.
     distinct_values: Vec<Option<agg::DistinctValues>>,
+    /// One buffer per aggregate, holding `(sort keys, arguments)` for the rows
+    /// of this group. Only an *ordered* aggregate ever pushes; the rest keep
+    /// their empty slot. Empty altogether when no aggregate is ordered, and
+    /// indexed rather than zipped for the reason `distinct_values` is.
+    buffered: Vec<Vec<(Tuple, Vec<Value>)>>,
 }
 
 impl Aggregate {
@@ -40,10 +62,23 @@ impl Aggregate {
         aggregates: Vec<BoundAggregate>,
         ctx: ExecContext,
     ) -> Self {
+        let order_keys: Vec<Vec<SortKey>> = aggregates
+            .iter()
+            .map(|agg| {
+                agg.order_by
+                    .iter()
+                    .enumerate()
+                    .map(|(column, key)| key.sort_key(column))
+                    .collect()
+            })
+            .collect();
         Self {
+            any_distinct: aggregates.iter().any(agg::wants_distinct_set),
+            any_ordered: order_keys.iter().any(|keys| !keys.is_empty()),
             child,
             group_exprs,
             aggregates,
+            order_keys,
             ctx,
             output: None,
         }
@@ -52,11 +87,11 @@ impl Aggregate {
     /// A fresh group for `key`, with one accumulator per aggregate. Both the
     /// implicit single group and every keyed group come through here, so the
     /// two cannot disagree on what a new group holds.
-    fn new_group(&self, key: Vec<Value>, any_distinct: bool) -> AggGroup {
+    fn new_group(&self, key: Vec<Value>) -> AggGroup {
         AggGroup {
             key,
             accumulators: self.aggregates.iter().map(agg::Accumulator::new).collect(),
-            distinct_values: if any_distinct {
+            distinct_values: if self.any_distinct {
                 self.aggregates
                     .iter()
                     .map(|agg| {
@@ -66,13 +101,45 @@ impl Aggregate {
             } else {
                 Vec::new()
             },
+            buffered: if self.any_ordered {
+                vec![Vec::new(); self.aggregates.len()]
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// Fold each ordered aggregate's buffer into its accumulator, in the order
+    /// its own `ORDER BY` asks for.
+    ///
+    /// `DISTINCT` is applied here rather than through a hashed seen-set: the
+    /// buffer is already sorted on the keys, and PostgreSQL only accepts
+    /// `DISTINCT` together with an `ORDER BY` whose expressions *are* the
+    /// arguments (the binder enforces that), so dropping adjacent duplicates
+    /// eliminates exactly the values PostgreSQL's own sort-based dedup does —
+    /// NULLs included, which a `DistinctValues` cannot even encode.
+    fn drain_buffers(&self, group: &mut AggGroup) -> Result<(), ExecError> {
+        for (i, keys) in self.order_keys.iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let rows = &mut group.buffered[i];
+            // Stable, so rows equal on every key keep arrival order — the same
+            // tiebreak `Sort` gives a query's own ORDER BY.
+            rows.sort_by(|a, b| compare_rows(&a.0, &b.0, keys));
+            if self.aggregates[i].distinct {
+                rows.dedup_by(|a, b| compare_rows(&a.0, &b.0, keys) == Ordering::Equal);
+            }
+            for (_, args) in rows.iter() {
+                agg::feed(&mut group.accumulators[i], &self.aggregates[i], args, None)?;
+            }
+        }
+        Ok(())
     }
 
     /// Drain the child, accumulate per group, and materialize the output rows.
     fn build(&mut self) -> Result<std::vec::IntoIter<Tuple>, ExecError> {
         let key_tys: Vec<_> = self.group_exprs.iter().map(BoundExpr::ty).collect();
-        let any_distinct = self.aggregates.iter().any(agg::wants_distinct_set);
         let mut groups: Vec<AggGroup> = Vec::new();
         // Each group's key → its index in `groups`, so a row finds its group in
         // ~O(1). Groups stay in first-seen order (accumulation follows scan
@@ -81,7 +148,7 @@ impl Aggregate {
         // The implicit single group needs one seeded group so an empty input
         // still produces a row.
         if self.group_exprs.is_empty() {
-            groups.push(self.new_group(Vec::new(), any_distinct));
+            groups.push(self.new_group(Vec::new()));
         }
         while let Some(row) = self.child.next()? {
             let idx = if self.group_exprs.is_empty() {
@@ -98,7 +165,7 @@ impl Aggregate {
                 }) {
                     keyindex::Slot::Existing(i) => i,
                     keyindex::Slot::Vacant => {
-                        groups.push(self.new_group(key, any_distinct));
+                        groups.push(self.new_group(key));
                         next
                     }
                 }
@@ -106,18 +173,19 @@ impl Aggregate {
             let AggGroup {
                 accumulators,
                 distinct_values,
+                buffered,
                 ..
             } = &mut groups[idx];
             // `distinct_values` is indexed rather than zipped: it is empty when
             // no aggregate is DISTINCT, and a third `zip` would then yield
             // nothing at all — feeding no aggregate and counting no row.
+            // `buffered` is indexed for the same reason.
             for (i, (agg, acc)) in self
                 .aggregates
                 .iter()
                 .zip(accumulators.iter_mut())
                 .enumerate()
             {
-                let seen = distinct_values.get_mut(i).and_then(Option::as_mut);
                 // Evaluated into a small stack buffer, sized to the largest
                 // aggregate arity (2, for `string_agg`), so the common
                 // single-argument aggregates (sum/avg/min/max/count(expr))
@@ -127,7 +195,29 @@ impl Aggregate {
                 for (slot, arg) in buf.iter_mut().zip(agg.args.iter()) {
                     *slot = eval(arg, &row, &self.ctx)?;
                 }
+                if !agg.order_by.is_empty() {
+                    let keys = agg
+                        .order_by
+                        .iter()
+                        .map(|key| eval(&key.expr, &row, &self.ctx))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // Moved out of the stack buffer rather than cloned: a text
+                    // or numeric argument would otherwise be deep-copied once
+                    // per row and the original dropped on the next line.
+                    let args = buf[..agg.args.len()]
+                        .iter_mut()
+                        .map(|slot| std::mem::replace(slot, Value::Null))
+                        .collect();
+                    buffered[i].push((keys, args));
+                    continue;
+                }
+                let seen = distinct_values.get_mut(i).and_then(Option::as_mut);
                 agg::feed(acc, agg, &buf[..agg.args.len()], seen)?;
+            }
+        }
+        if self.any_ordered {
+            for group in &mut groups {
+                self.drain_buffers(group)?;
             }
         }
         let mut out = Vec::with_capacity(groups.len());

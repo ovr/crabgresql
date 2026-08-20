@@ -170,17 +170,18 @@ fn push(plan: &mut PhysicalPlan, demand: Demand) {
             ..
         } => {
             // The parent's demand is deliberately ignored. Only WHERE, the
-            // grouping keys and the aggregate arguments read the *source* row —
-            // `projections`, `having`, `sort` and `distinct` all index the
-            // post-grouping row — and none of the three may be dropped just
-            // because its output column is unread: a group key determines the
-            // row count, and the executor accumulates every aggregate.
+            // grouping keys and each aggregate's own expressions (arguments and
+            // ORDER BY keys alike) read the *source* row — `projections`,
+            // `having`, `sort` and `distinct` all index the post-grouping row —
+            // and none of the three may be dropped just because its output
+            // column is unread: a group key determines the row count, and the
+            // executor accumulates every aggregate.
             let demand = add_exprs(Some(BTreeSet::new()), predicate.as_ref());
             let demand = add_exprs(demand, group_exprs.iter());
             let demand = aggregates
                 .iter()
                 .fold(demand, |demand, agg: &BoundAggregate| {
-                    add_exprs(demand, agg.args.iter())
+                    add_exprs(demand, agg.exprs())
                 });
             match input {
                 PhysicalAggInput::Scan { table, projection } => {
