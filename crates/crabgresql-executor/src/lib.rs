@@ -239,6 +239,28 @@ pub trait CatalogOps: Send + Sync {
     /// connection rather than an OS process — every session here is served from
     /// the same one — which is what `WHERE pid = pg_backend_pid()` needs of it.
     fn backend_pid(&self) -> i32;
+
+    /// What the relation `oid` occupies on disk, or `None` if there is no such
+    /// relation. Backs the four `pg_*_size` functions, which each sum a
+    /// different subset of [`RelationSize`]'s parts — which is why this reports
+    /// the parts rather than one total.
+    ///
+    /// `None` and an all-zero answer are different: the first is an OID naming
+    /// nothing (NULL), the second a relation with no storage behind it (0), as
+    /// PostgreSQL answers for a view.
+    fn relation_size(&self, oid: u32) -> Option<RelationSize>;
+}
+
+/// A relation's physical size in **bytes**, split into the parts the size
+/// functions add up differently. See [`CatalogOps::relation_size`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelationSize {
+    /// The relation's own storage.
+    pub main: u64,
+    /// Its out-of-line ("TOAST") storage, or zero when it has none.
+    pub toast: u64,
+    /// Every index on it, summed.
+    pub indexes: u64,
 }
 
 /// One installable extension version, as [`CatalogOps::available_extensions`]

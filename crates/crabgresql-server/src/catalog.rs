@@ -11,7 +11,9 @@ use crabgresql_catalog::{
     CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
     CatalogUserType, CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
-use crabgresql_executor::{CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, SerialSequence};
+use crabgresql_executor::{
+    CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, RelationSize, SerialSequence,
+};
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
 };
@@ -831,6 +833,19 @@ impl CatalogOps for SessionCatalogOps {
 
     fn my_temp_schema(&self) -> Option<u32> {
         self.system.namespace_oid(&self.temp_schema)
+    }
+
+    /// The catalog measures in pages; the size functions answer in bytes, so the
+    /// one multiplication lives here. `u64` throughout: a page count is a `u32`
+    /// and `8192 *` it does not fit one.
+    fn relation_size(&self, oid: u32) -> Option<RelationSize> {
+        let pages = self.system.relation_pages(oid)?;
+        let bytes = |pages: u32| u64::from(pages) * crabgresql_storage_api::PAGE_BYTES;
+        Some(RelationSize {
+            main: bytes(pages.main),
+            toast: bytes(pages.toast),
+            indexes: bytes(pages.indexes),
+        })
     }
 }
 

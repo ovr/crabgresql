@@ -1,0 +1,131 @@
+--
+-- Relation size: pg_relation_size, pg_table_size, pg_indexes_size,
+-- pg_total_relation_size and pg_size_pretty.
+--
+-- Every query here answers identically on PostgreSQL, so this file's expected
+-- output was generated with psql -q -a against PostgreSQL 18.4 and holds for
+-- both servers. What makes it portable is that no absolute byte count is
+-- printed: a size depends on the page layout, so the queries report predicates
+-- over it (is it positive, is it a whole number of pages) rather than the
+-- number itself. The cases with one right answer everywhere — a view, a missing
+-- OID, an unrecognized fork — are printed as they come.
+--
+CREATE TABLE relsize (a int PRIMARY KEY, b text);
+INSERT INTO relsize SELECT g, repeat('x', 100) FROM generate_series(1, 2000) g;
+CREATE VIEW relsize_v AS SELECT 1 AS one;
+CREATE SEQUENCE relsize_s;
+
+-- A relation that holds rows occupies whole pages of them.
+SELECT pg_relation_size('relsize') > 0 AS positive,
+       pg_relation_size('relsize') % 8192 = 0 AS whole_pages,
+       pg_relation_size('relsize') = pg_relation_size('relsize', 'main') AS main_is_default;
+
+-- The three other forks are counted separately from the main one, so they can
+-- only add to it.
+SELECT pg_relation_size('relsize', 'fsm') >= 0 AS fsm,
+       pg_relation_size('relsize', 'vm') >= 0 AS vm,
+       pg_relation_size('relsize', 'init') >= 0 AS init;
+
+-- Each function adds one more part: the table alone, plus its out-of-line
+-- storage, plus its indexes.
+SELECT pg_table_size('relsize') >= pg_relation_size('relsize') AS table_covers_relation,
+       pg_indexes_size('relsize') > 0 AS indexes_positive,
+       pg_total_relation_size('relsize')
+         = pg_table_size('relsize') + pg_indexes_size('relsize') AS total_is_the_sum;
+
+-- An index is a relation of its own: it has a size, and no indexes on it.
+SELECT pg_relation_size('relsize_pkey') > 0 AS index_positive,
+       pg_relation_size('relsize_pkey') = pg_indexes_size('relsize') AS the_only_index,
+       pg_indexes_size('relsize_pkey') AS index_has_no_indexes,
+       pg_table_size('relsize_pkey') = pg_relation_size('relsize_pkey') AS index_has_no_toast;
+
+-- A view has no storage of its own; a sequence is one page from creation.
+SELECT pg_relation_size('relsize_v') AS view,
+       pg_total_relation_size('relsize_v') AS view_total,
+       pg_relation_size('relsize_s') AS sequence;
+
+-- The size is measured now, not read out of the catalog: pg_class.relpages
+-- holds the last ANALYZE and goes stale as the relation grows, while
+-- pg_relation_size follows the relation.
+CREATE TABLE relsize_grow (a int);
+INSERT INTO relsize_grow SELECT g FROM generate_series(1, 100) g;
+ANALYZE relsize_grow;
+SELECT pg_relation_size('relsize_grow')
+         = (SELECT relpages FROM pg_class WHERE oid = 'relsize_grow'::regclass) * 8192
+         AS agrees_at_analyze;
+INSERT INTO relsize_grow SELECT g FROM generate_series(1, 50000) g;
+SELECT pg_relation_size('relsize_grow')
+         > (SELECT relpages FROM pg_class WHERE oid = 'relsize_grow'::regclass) * 8192
+         AS grew_since_analyze;
+
+-- An OID no relation has is NULL rather than zero — the two are different
+-- answers, and only one of them means "there is nothing to measure".
+SELECT pg_relation_size(999999) AS missing,
+       pg_table_size(999999) AS missing_table,
+       pg_indexes_size(999999) AS missing_indexes,
+       pg_total_relation_size(999999) AS missing_total;
+
+-- The relation is looked up before the fork name is read, so an OID naming
+-- nothing is NULL whatever the second argument says — including a fork name
+-- that raises for a relation that exists.
+SELECT pg_relation_size(999999, 'bogus') AS missing_bogus_fork,
+       pg_relation_size(999999, 'fsm') AS missing_fsm;
+
+-- Both arguments are strict.
+SELECT pg_relation_size(NULL::regclass) AS null_relation,
+       pg_relation_size('relsize', NULL) AS null_fork;
+
+-- The relation may be written as an OID as well as a name, which is how a query
+-- over pg_class asks.
+SELECT pg_relation_size(c.oid) = pg_relation_size('relsize') AS by_oid
+  FROM pg_class c WHERE c.relname = 'relsize';
+
+-- Fork names are matched exactly, and an unrecognized one raises.
+SELECT pg_relation_size('relsize', 'bogus');
+SELECT pg_relation_size('relsize', 'MAIN');
+-- A name that reaches no relation fails in the cast to regclass, before any
+-- size is asked for.
+SELECT pg_relation_size('relsize_nope');
+
+-- pg_size_pretty moves to the next unit only once the count reaches ten of the
+-- current one, and rounds half away from zero. The rounding decides the unit
+-- and what is printed, but is never carried into the next division: 11009536 is
+-- 10.4995 MB, which rounding on the way (to 10752 kB) would turn into 11 MB,
+-- while 10485248 is 10239.5 kB, whose *rounded* figure reaches the limit and so
+-- takes one more step.
+SELECT v, pg_size_pretty(v::bigint) AS pretty
+  FROM (VALUES (0), (1), (1023), (10239), (10240), (10751), (10752), (-10752),
+               (1048576), (1572864), (1073741824), (1099511627776),
+               (11009536), (-11009536), (10485247), (10485248),
+               (9223372036854775807), (-9223372036854775808)) t(v)
+ ORDER BY v;
+
+-- The numeric form keeps whatever fraction survives: a value small enough that
+-- no division happened prints as it came in — including one that would have
+-- rounded up to the limit — and NaN and the infinities go straight to the last
+-- unit.
+SELECT pg_size_pretty(1536.4::numeric) AS undivided,
+       pg_size_pretty(10239.5::numeric) AS undivided_at_the_limit,
+       pg_size_pretty(1024.00::numeric) AS trailing_zeros,
+       pg_size_pretty(10240.00::numeric) AS divided,
+       pg_size_pretty(1234567.891::numeric) AS rounded,
+       pg_size_pretty((-10752.6)::numeric) AS negative,
+       pg_size_pretty('NaN'::numeric) AS nan,
+       pg_size_pretty('-Infinity'::numeric) AS neg_inf;
+-- The same two thresholds the bigint form is checked at, and both sides of each.
+SELECT pg_size_pretty(11009536::numeric) AS no_carried_rounding,
+       pg_size_pretty(10485248.0::numeric) AS rounds_up_to_the_limit,
+       pg_size_pretty(10485247.9::numeric) AS stays_below,
+       pg_size_pretty(10240.5::numeric) AS just_over,
+       pg_size_pretty(10752.5::numeric) AS half_away;
+SELECT pg_size_pretty(NULL::bigint) AS strict;
+
+-- Neither overload is preferred, so an integer argument is ambiguous — as is an
+-- unadorned literal.
+SELECT pg_size_pretty(1024);
+SELECT pg_size_pretty('10240');
+
+DROP VIEW relsize_v;
+DROP SEQUENCE relsize_s;
+DROP TABLE relsize_grow;
+DROP TABLE relsize;

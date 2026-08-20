@@ -16952,3 +16952,78 @@ async fn a_view_depends_on_what_its_subqueries_read() -> anyhow::Result<()> {
     assert_eq!(db.detail(), Some("view dv depends on table d2"));
     Ok(())
 }
+
+/// The parts of a relation's size the smoke suite cannot pin down, because they
+/// depend on storage crabgresql lays out differently from PostgreSQL: the TOAST
+/// relation, an index of its own, and the `pg_catalog` relations that have no
+/// file behind them at all.
+#[tokio::test]
+async fn relation_size_covers_toast_indexes_and_catalog_relations() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE sz (a int, b text);
+             INSERT INTO sz SELECT g, repeat('x', 100) FROM generate_series(1, 2000) g",
+        )
+        .await?;
+    let size = |sql: &'static str| {
+        let client = &client;
+        async move { anyhow::Ok(client.query_one(sql, &[]).await?.get::<_, i64>(0)) }
+    };
+
+    // Every size is a whole number of pages, and the table has no TOAST
+    // relation and no index yet, so all three functions agree.
+    let main = size("SELECT pg_relation_size('sz')").await?;
+    assert!(main > 0 && main % 8192 == 0, "main was {main}");
+    assert_eq!(size("SELECT pg_table_size('sz')").await?, main);
+    assert_eq!(size("SELECT pg_indexes_size('sz')").await?, 0);
+    assert_eq!(size("SELECT pg_total_relation_size('sz')").await?, main);
+
+    // An index is measured on its own and shows up in the table's total.
+    client.batch_execute("CREATE INDEX sz_a ON sz (a)").await?;
+    let index = size("SELECT pg_relation_size('sz_a')").await?;
+    assert!(index > 0 && index % 8192 == 0, "index was {index}");
+    assert_eq!(size("SELECT pg_indexes_size('sz')").await?, index);
+    assert_eq!(
+        size("SELECT pg_total_relation_size('sz')").await?,
+        main + index
+    );
+    // ... but an index has no indexes of its own, which is what keeps
+    // `pg_total_relation_size` from counting it twice.
+    assert_eq!(size("SELECT pg_indexes_size('sz_a')").await?, 0);
+    assert_eq!(size("SELECT pg_table_size('sz_a')").await?, index);
+
+    // A value too wide for a page goes out of line, and only `pg_table_size`
+    // and up count that storage.
+    client
+        .batch_execute("CREATE TABLE szt (a text); INSERT INTO szt SELECT repeat('y', 200000)")
+        .await?;
+    let toasted_main = size("SELECT pg_relation_size('szt')").await?;
+    let toasted_table = size("SELECT pg_table_size('szt')").await?;
+    assert!(
+        toasted_table > toasted_main,
+        "{toasted_table} should exceed {toasted_main}"
+    );
+    // The TOAST relation answers for itself under its own OID, and that is the
+    // difference between the two figures above.
+    let toast =
+        size("SELECT pg_relation_size(reltoastrelid) FROM pg_class WHERE oid = 'szt'::regclass")
+            .await?;
+    assert_eq!(toasted_main + toast, toasted_table);
+
+    // A `pg_catalog` relation is real but has no file: zero, not the NULL an
+    // OID naming nothing gets.
+    assert_eq!(size("SELECT pg_relation_size('pg_class')").await?, 0);
+    let missing: Option<i64> = client
+        .query_one("SELECT pg_relation_size(999999)", &[])
+        .await?
+        .get(0);
+    assert_eq!(missing, None);
+
+    // A temp relation is this session's, and is sized like any other.
+    client
+        .batch_execute("CREATE TEMP TABLE szm (a int); INSERT INTO szm VALUES (1)")
+        .await?;
+    assert_eq!(size("SELECT pg_relation_size('szm')").await?, 8192);
+    Ok(())
+}

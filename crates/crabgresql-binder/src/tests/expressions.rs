@@ -603,3 +603,94 @@ fn index_property_functions_take_regclass_or_oid() -> anyhow::Result<()> {
     assert_eq!(e.code, "42883");
     Ok(())
 }
+
+/// The size functions take their relation the same way, in both arities, and
+/// `pg_relation_size`'s optional second argument does not disturb it.
+#[test]
+fn size_functions_take_regclass_or_oid() -> anyhow::Result<()> {
+    let regclass = PgType::Reg(crabgresql_types::RegKind::Class);
+    for (sql, func, want) in [
+        (
+            "SELECT pg_relation_size('t')",
+            crate::ScalarFn::PgRelationSize,
+            regclass,
+        ),
+        (
+            "SELECT pg_relation_size(16384::oid)",
+            crate::ScalarFn::PgRelationSize,
+            PgType::Oid,
+        ),
+        (
+            "SELECT pg_relation_size('t', 'main')",
+            crate::ScalarFn::PgRelationSize,
+            regclass,
+        ),
+        (
+            "SELECT pg_relation_size(16384::oid, 'main')",
+            crate::ScalarFn::PgRelationSize,
+            PgType::Oid,
+        ),
+        (
+            "SELECT pg_table_size('t')",
+            crate::ScalarFn::PgTableSize,
+            regclass,
+        ),
+        (
+            "SELECT pg_indexes_size(16384::oid)",
+            crate::ScalarFn::PgIndexesSize,
+            PgType::Oid,
+        ),
+        (
+            "SELECT pg_total_relation_size('t')",
+            crate::ScalarFn::PgTotalRelationSize,
+            regclass,
+        ),
+    ] {
+        let ValuesPlan { rows, .. } = bound_values(sql)?;
+        let BoundExpr::FuncCall {
+            func: bound,
+            ret,
+            args,
+        } = &rows[0][0]
+        else {
+            bail!("expected a function call for `{sql}`");
+        };
+        assert_eq!(*bound, func, "for `{sql}`");
+        assert_eq!(*ret, PgType::Int8, "for `{sql}`");
+        assert_eq!(args[0].ty(), want, "for `{sql}`");
+    }
+    // A wrong arity is 42883, not a mis-resolved overload.
+    let e = bind_err("SELECT pg_table_size('t', 'main')")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}
+
+/// `pg_size_pretty` is the opposite case: two ordinary signatures over numbers,
+/// neither of which an integer or an untyped literal can choose between — which
+/// is exactly the `42725` PostgreSQL raises there.
+#[test]
+fn size_pretty_is_ambiguous_for_an_integer() -> anyhow::Result<()> {
+    for (sql, want) in [
+        ("SELECT pg_size_pretty(1024::bigint)", PgType::Int8),
+        ("SELECT pg_size_pretty(1024::numeric)", PgType::Numeric),
+    ] {
+        let ValuesPlan { rows, .. } = bound_values(sql)?;
+        let BoundExpr::FuncCall { func, ret, args } = &rows[0][0] else {
+            bail!("expected a function call for `{sql}`");
+        };
+        assert_eq!(*func, crate::ScalarFn::PgSizePretty, "for `{sql}`");
+        assert_eq!(*ret, PgType::Text, "for `{sql}`");
+        assert_eq!(args[0].ty(), want, "for `{sql}`");
+    }
+    for sql in [
+        "SELECT pg_size_pretty(1024)",
+        "SELECT pg_size_pretty('10240')",
+    ] {
+        let e = bind_err(sql)?;
+        assert_eq!(e.code, "42725", "for `{sql}`");
+    }
+    // float8 reaches neither overload.
+    let e = bind_err("SELECT pg_size_pretty(1.5::float8)")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}

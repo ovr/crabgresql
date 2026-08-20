@@ -99,6 +99,10 @@ struct CatalogIndex {
     /// The index's own physical file, or `0` when it has none — an index the
     /// planner may use but that is backed by no B-tree file at all.
     relfilenode: u32,
+    /// This index's own physical size, or `None` for one the engine holds as
+    /// metadata only. Only [`RelStats::relpages`] is meaningful — an index entry
+    /// is not a row, so no tuple count is carried.
+    stats: Option<RelStats>,
 }
 
 /// One row of `pg_rewrite`: the `_RETURN` rule a view's body is stored as. The
@@ -185,6 +189,20 @@ struct CatalogToast {
     persistence: RelPersistence,
     stats: RelStats,
     relfilenode: u32,
+}
+
+/// What a relation occupies on disk, in 8 KB pages, split the way the four
+/// `pg_*_size` functions add it up. See [`SystemCatalog::relation_pages`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelationPages {
+    /// The relation's own storage — PostgreSQL's main fork. The other forks
+    /// (`fsm`, `vm`, `init`) have no counterpart here and are not carried.
+    pub main: u32,
+    /// Its out-of-line storage, or zero when it has none.
+    pub toast: u32,
+    /// Every index on it, summed. Zero for a relation that is itself an index:
+    /// PostgreSQL reports `pg_indexes_size` of an index as zero.
+    pub indexes: u32,
 }
 
 /// What [`SystemCatalog::serial_sequence`] found. The three non-answers are
@@ -853,7 +871,18 @@ impl SystemCatalog {
                 let table_oid = FIRST_REL_OID + position as u32;
                 for index in relation.indexes {
                     let relfilenode = relation.filenodes.index(&index.name);
-                    pending.push((table_oid, relation.schema.clone(), index, relfilenode));
+                    let stats = relation
+                        .index_stats
+                        .iter()
+                        .find(|(name, _)| *name == index.name)
+                        .map(|(_, stats)| stats.clone());
+                    pending.push((
+                        table_oid,
+                        relation.schema.clone(),
+                        index,
+                        relfilenode,
+                        stats,
+                    ));
                 }
             }
             pending.sort_by(|a, b| a.2.name.cmp(&b.2.name));
@@ -861,12 +890,15 @@ impl SystemCatalog {
                 .into_iter()
                 .enumerate()
                 .map(
-                    |(position, (table_oid, table_schema, metadata, relfilenode))| CatalogIndex {
-                        oid: first_index_oid + position as u32,
-                        table_oid,
-                        table_schema,
-                        metadata,
-                        relfilenode,
+                    |(position, (table_oid, table_schema, metadata, relfilenode, stats))| {
+                        CatalogIndex {
+                            oid: first_index_oid + position as u32,
+                            table_oid,
+                            table_schema,
+                            metadata,
+                            relfilenode,
+                            stats,
+                        }
                     },
                 )
                 .collect()
@@ -1343,6 +1375,87 @@ impl SystemCatalog {
             .toast_oids()
             .get(offset - relations.len() - indexes.len())?;
         (toast.oid == oid).then_some((TOAST_NAMESPACE, toast.name.as_str()))
+    }
+
+    /// The physical size, in 8 KB pages, of everything the relation `oid`
+    /// identifies owns — its own storage, its TOAST relation and its indexes,
+    /// kept apart because the four size functions add them up differently
+    /// (`pg_relation_size` is `main` alone, `pg_table_size` adds `toast`,
+    /// `pg_total_relation_size` adds `indexes` on top).
+    ///
+    /// `None` means "no such relation", which those functions report as NULL.
+    /// It is distinct from a relation with nothing to measure, which answers
+    /// zeros — as PostgreSQL does for a view, a partitioned parent, and (here
+    /// only) a `pg_catalog` relation, which exists but has no file behind it.
+    ///
+    /// A **live** count where the engine can give one: the page count comes from
+    /// [`RelStats::curpages`], not the `relpages` frozen at the last `ANALYZE`
+    /// that `pg_class` must report. `pg_relation_size` is a physical question,
+    /// and PostgreSQL answers it by measuring the file rather than reading the
+    /// catalog.
+    ///
+    /// A sequence is one page from creation, matching both PostgreSQL's 8192 and
+    /// the `relpages = 1` this catalog already publishes for it.
+    ///
+    /// Indexed positionally, exactly as [`SystemCatalog::relation_ref`] is, and
+    /// for the same reason.
+    pub fn relation_pages(&self, oid: u32) -> Option<RelationPages> {
+        // A `pg_catalog` relation is real but has no storage: its rows are
+        // built per statement. Zero, not `None` — the relation exists.
+        if builtin_relation_name(oid).is_some() {
+            return Some(RelationPages::default());
+        }
+        let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
+        let relations = self.relation_oids();
+        if let Some((stored, _)) = relations.get(offset) {
+            if *stored != oid {
+                return None;
+            }
+            let kind = self.relation_kinds()[offset];
+            // A sequence's single page is its fixed shape, not a measurement:
+            // nothing here stores one in a heap file to measure.
+            if matches!(kind, RelKind::Sequence) {
+                return Some(RelationPages {
+                    main: 1,
+                    ..RelationPages::default()
+                });
+            }
+            let stats = &self.relation_stats()[offset];
+            return Some(RelationPages {
+                main: stats.curpages.unwrap_or(stats.relpages),
+                toast: self
+                    .toast_oids()
+                    .iter()
+                    .find(|toast| toast.table_oid == oid)
+                    .map_or(0, |toast| toast.stats.relpages),
+                indexes: self
+                    .index_oids()
+                    .iter()
+                    .filter(|index| index.table_oid == oid)
+                    .map(|index| index.stats.as_ref().map_or(0, |stats| stats.relpages))
+                    .sum(),
+            });
+        }
+        let indexes = self.index_oids();
+        if let Some(index) = indexes.get(offset - relations.len()) {
+            if index.oid != oid {
+                return None;
+            }
+            // An index's own indexes are itself, which is why PostgreSQL reports
+            // `pg_indexes_size(<index>) = 0` while `pg_relation_size` of the
+            // same OID is its whole size.
+            return Some(RelationPages {
+                main: index.stats.as_ref().map_or(0, |stats| stats.relpages),
+                ..RelationPages::default()
+            });
+        }
+        let toast = self
+            .toast_oids()
+            .get(offset - relations.len() - indexes.len())?;
+        (toast.oid == oid).then(|| RelationPages {
+            main: toast.stats.relpages,
+            ..RelationPages::default()
+        })
     }
 
     /// The OID of `namespace.name` in this snapshot, or `None` if it holds no

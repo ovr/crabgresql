@@ -2607,11 +2607,22 @@ impl TableEngine for PgEngine {
                 // The chunk store is the one number the catalog cannot answer for
                 // a temporary relation; see `TableAm::toast_relfilenode`.
                 filenodes.toast = t.toast_relfilenode();
+                let indexes = t.indexes();
+                // Each index's own size, for `pg_relation_size(<index>)`. An
+                // index this table holds as metadata only reports `None` and is
+                // simply left out of the map, which reads back as "unknown".
+                let index_stats = indexes
+                    .iter()
+                    .filter_map(|index| {
+                        Some((index.name.clone(), t.index_statistics(&index.name)?))
+                    })
+                    .collect();
                 RelationMetadata {
-                    indexes: t.indexes(),
+                    indexes,
                     stats: t.statistics(),
                     toast: t.toast_statistics(),
                     filenodes,
+                    index_stats,
                     schema,
                 }
             })
