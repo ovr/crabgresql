@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787271530191,
+  "lastUpdate": 1787271532437,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -47200,6 +47200,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 26066.464456,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1f812ac8ebce3b317b308c99fd176b4e1cf2335e",
+          "message": "feat(catalog): Support the domain columns of pg_type (#265)",
+          "timestamp": "2026-08-20T23:03:29Z",
+          "tree_id": "e6c7b32cf03e21a108afa4108ad8e7a593cc0790",
+          "url": "https://github.com/ovr/crabgresql/commit/1f812ac8ebce3b317b308c99fd176b4e1cf2335e"
+        },
+        "date": 1787271532305,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1258.499148,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18674.472708,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
