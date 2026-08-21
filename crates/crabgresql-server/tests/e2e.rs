@@ -3174,10 +3174,13 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
         22,
         "indoption is int2vector"
     );
+    // `c_pkey`, `c_u_key`, `c_n_nn`, `null_equal_a_key`, and the not-null
+    // constraint PRIMARY KEY gives `c.id` — probed against 18.4, which names it
+    // `c_id_not_null` and counts the same five over these four tables.
     let constraint_messages = client
         .simple_query("SELECT count(*) FROM pg_constraint")
         .await?;
-    assert_eq!(rows(&constraint_messages)[0].get(0), Some("4"));
+    assert_eq!(rows(&constraint_messages)[0].get(0), Some("5"));
     let default_messages = client
         .simple_query("SELECT count(*) FROM pg_attrdef")
         .await?;

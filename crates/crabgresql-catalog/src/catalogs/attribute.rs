@@ -24,6 +24,7 @@ pub(crate) fn pg_attribute_schema() -> TableSchema {
             col("attlen", PgType::Int2),
             col("attnum", PgType::Int2),
             col("atttypmod", PgType::Int4),
+            col("attndims", PgType::Int2),
             col("attbyval", PgType::Bool),
             col("attalign", CHARLIKE),
             col("attstorage", CHARLIKE),
@@ -32,12 +33,23 @@ pub(crate) fn pg_attribute_schema() -> TableSchema {
             col("attidentity", CHARLIKE),
             col("attgenerated", CHARLIKE),
             col("attisdropped", PgType::Bool),
+            // TODO: `Column` carries no inheritance provenance — unlike
+            // `CheckConstraint`, which already has `islocal`/`inhcount` — so
+            // every row claims the column was declared on the relation. A
+            // client reading `not attislocal` (DataGrip's column introspection
+            // does) shows an inherited column as declared here.
+            col("attislocal", PgType::Bool),
+            col("attinhcount", PgType::Int2),
             col("attcollation", PgType::Oid),
             // aclitem[]; represented as text and always NULL (default ACL) here.
             // NULL is the whole truth rather than a placeholder: there is no
             // `GRANT` in this build, so no column ever carries an ACL. Same
             // treatment as `pg_namespace.nspacl`.
             col("attacl", PgType::Text),
+            // text[]; only a foreign table's column ever carries one, and there
+            // are no foreign tables here, so every row is NULL — as it is
+            // upstream for every column of an ordinary relation.
+            col("attfdwoptions", PgType::Array(crabgresql_types::oid::TEXT)),
         ],
     )
 }
@@ -56,6 +68,17 @@ fn attlayout_of(ty: PgType) -> (Value, Value, Value) {
         ),
         None => (Value::Bool(true), chr('i'), chr('p')),
     }
+}
+
+/// `attndims`: how many array dimensions the column was *declared* with.
+/// PostgreSQL records the declaration and never enforces it — a value of any
+/// dimensionality fits any array column. This build's arrays are one-dimensional
+/// throughout.
+fn attndims_of(ty: PgType) -> Value {
+    Value::Int2(match ty {
+        PgType::Array(_) => 1,
+        _ => 0,
+    })
 }
 
 /// `attcollation`: the column's explicit `COLLATE`, else the type's own
@@ -85,6 +108,7 @@ fn system_attribute_rows(oid: u32) -> Vec<Vec<Value>> {
                 Value::Int2(ty.typlen()),
                 Value::Int2(col.attnum()),
                 Value::Int4(-1),
+                attndims_of(*ty),
                 byval,
                 align,
                 storage,
@@ -96,7 +120,10 @@ fn system_attribute_rows(oid: u32) -> Vec<Vec<Value>> {
                 chr('\0'),
                 chr('\0'),
                 Value::Bool(false),
+                Value::Bool(true),
+                Value::Int2(0),
                 Value::Oid(0),
+                Value::Null,
                 Value::Null,
             ]
         })
@@ -126,6 +153,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Int2(c.ty.typlen()),
                 Value::Int2((i + 1) as i16),
                 Value::Int4(c.atttypmod()),
+                attndims_of(c.ty),
                 byval,
                 align,
                 storage,
@@ -142,7 +170,10 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                     None => chr('\0'),
                 },
                 Value::Bool(false),
+                Value::Bool(true),
+                Value::Int2(0),
                 Value::Oid(attcollation_of(c)),
+                Value::Null,
                 Value::Null,
             ]);
         }
@@ -158,6 +189,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Int2(column.ty.typlen()),
                 Value::Int2((position + 1) as i16),
                 Value::Int4(column.atttypmod()),
+                attndims_of(column.ty),
                 byval,
                 align,
                 storage,
@@ -166,7 +198,10 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('\0'),
                 chr('\0'),
                 Value::Bool(false),
+                Value::Bool(true),
+                Value::Int2(0),
                 Value::Oid(attcollation_of(column)),
+                Value::Null,
                 Value::Null,
             ]);
         }
@@ -184,6 +219,7 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Int2(ty.typlen()),
                 Value::Int2((i + 1) as i16),
                 Value::Int4(-1),
+                attndims_of(*ty),
                 byval,
                 align,
                 storage,
@@ -193,7 +229,10 @@ pub(crate) fn pg_attribute_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('\0'),
                 chr('\0'),
                 Value::Bool(false),
+                Value::Bool(true),
+                Value::Int2(0),
                 Value::Oid(0),
+                Value::Null,
                 Value::Null,
             ]);
         }

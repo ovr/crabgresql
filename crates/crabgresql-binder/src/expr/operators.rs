@@ -310,6 +310,66 @@ pub(super) fn bind_binary(
     })
 }
 
+/// `(a, b) = (c, d)` and its `<>` twin.
+///
+/// PostgreSQL compares two rows field by field, and for these two operators
+/// that is exactly a conjunction (resp. disjunction) of the per-field
+/// comparisons — NULL semantics included. Probed against 18.4: `(1,NULL) =
+/// (1,2)` is NULL and `(1,NULL) = (2,2)` is false, which `true AND NULL` and
+/// `false AND NULL` reproduce; `<>` mirrors both through OR.
+///
+/// The ordering operators are deliberately absent: `<` on rows is
+/// lexicographic, which no AND/OR chain expresses, so they keep falling through
+/// to the unsupported-expression path rather than binding to something subtly
+/// wrong.
+fn bind_row_comparison(
+    lhs: &[ast::Expr],
+    op: &ast::BinaryOperator,
+    rhs: &[ast::Expr],
+    op_span: Span,
+    scope: &Scope,
+) -> Result<Binding, BindError> {
+    let combine = match op {
+        ast::BinaryOperator::Eq => BinOp::And,
+        ast::BinaryOperator::NotEq => BinOp::Or,
+        _ => {
+            return Err(BindError::feature_not_supported(format!(
+                "comparison of row constructors with {} is not supported yet",
+                op
+            )));
+        }
+    };
+    if lhs.len() != rhs.len() {
+        return Err(BindError::new(
+            sqlstate::SYNTAX_ERROR,
+            "unequal number of entries in row expressions",
+        ));
+    }
+    let mut combined: Option<BoundExpr> = None;
+    for (l, r) in lhs.iter().zip(rhs) {
+        let field = to_bool_operand(
+            bind_binary(l, op, r, op_span, scope)?,
+            combine.sql_symbol(),
+            op_span,
+        )?;
+        combined = Some(match combined {
+            None => field,
+            Some(acc) => BoundExpr::Binary {
+                op: combine,
+                arg_ty: PgType::Bool,
+                collation: DEFAULT_COLLATION_OID,
+                left: Box::new(acc),
+                right: Box::new(field),
+            },
+        });
+    }
+    match combined {
+        Some(expr) => Ok(Binding::Typed(expr)),
+        // Unreachable through SQL — the parser has no production for `()`.
+        None => Err(BindError::syntax("row constructor has no entries")),
+    }
+}
+
 fn bind_binary_inner(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
@@ -371,6 +431,11 @@ fn bind_binary_inner(
             _ => return Err(custom_op_undefined(left, op, right, scope)),
         };
         return bind_binary(left, &native, right, op_span, scope);
+    }
+    // After the `OPERATOR(...)` rewrite above, so the spelled-out form of a
+    // row comparison reaches this too.
+    if let (ast::Expr::Tuple(lhs), ast::Expr::Tuple(rhs)) = (left, right) {
+        return bind_row_comparison(lhs, op, rhs, op_span, scope);
     }
     // `||` is not a `BinOp`; PG's `textcat`/`anytextcat` lower to a text concat,
     // and `bitcat` to a bit-string concat when either side is a bit string.

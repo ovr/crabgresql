@@ -1070,14 +1070,6 @@ impl SystemCatalog {
             let mut out = Vec::new();
             for (table_oid, schema) in self.relation_oids() {
                 for (position, column) in schema.columns.iter().enumerate() {
-                    // Only a column with an explicit NOT NULL declaration
-                    // carries a constraint name and becomes a row here; a
-                    // PRIMARY KEY sets `Column::nullable` to false without
-                    // recording one.
-                    // TODO: emit the `<table>_<column>_not_null` rows
-                    // PostgreSQL creates for every PRIMARY KEY column
-                    // (upstream `constraints` regression test: "Primary keys
-                    // cause not-null constraints to be created").
                     let Some(name) = &column.not_null_constraint else {
                         continue;
                     };

@@ -63,10 +63,10 @@ SELECT c.relname AS index, con.conname AS constraint, d.deptype
 -- column it reads: `a` because the constraint belongs to the column, `n`
 -- because its expression names it.
 --
--- PostgreSQL also lists a `dep_t_id_not_null` row per table: it creates a
--- not-null constraint for every PRIMARY KEY column, which this build does not
--- (see the TODO in `SystemCatalog::constraint_oids`). The gap is in
--- pg_constraint, not here — every constraint that exists has its edges.
+-- `dep_t_id_not_null` appears once per table, dep_child included: the not-null
+-- constraint PRIMARY KEY gives the column is inherited along with the column.
+-- Unlike a CHECK it contributes one row, not two — it constrains the column
+-- without an expression that names it.
 SELECT con.conname, con.contype, ref.relname, d.refobjsubid, d.deptype
   FROM pg_depend d
   JOIN pg_constraint con ON con.oid = d.objid

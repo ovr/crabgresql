@@ -1,0 +1,56 @@
+--
+-- Column introspection the way a JDBC client performs it: the two queries that
+-- decide whether a column is auto-generated, so a data editor inserting a row
+-- knows to leave a `serial` column out instead of sending an explicit NULL.
+--
+-- Nothing here prints an OID: relation OIDs are assigned per snapshot in this
+-- build (and per cluster in PostgreSQL), so every query resolves the relation
+-- by name. Generated with psql -q -a against PostgreSQL 18.4, then re-run here.
+--
+CREATE TABLE ci_t (id bigserial PRIMARY KEY, name text, tags text[]);
+-- pgJDBC's field metadata: nullability (which reads the domain column
+-- `typnotnull`) and "is autoincrement" (the `nextval(...)` test) in one row.
+SELECT a.attname,
+       a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS mandatory,
+       a.attidentity != '' OR pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE '%nextval(%' AS auto_increment
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON (c.relnamespace = n.oid)
+  JOIN pg_catalog.pg_attribute a ON (c.oid = a.attrelid)
+  JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid)
+  LEFT JOIN pg_catalog.pg_attrdef d ON (d.adrelid = a.attrelid AND d.adnum = a.attnum)
+ WHERE c.oid = 'ci_t'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+-- DataGrip's own column introspection: reads attndims/attislocal/attfdwoptions,
+-- and joins pg_attrdef by comparing two row constructors.
+SELECT C.attname, C.atttypmod, C.attndims,
+       pg_catalog.format_type(C.atttypid, C.atttypmod) AS type_spec,
+       C.attnotnull AS mandatory,
+       pg_catalog.pg_get_expr(D.adbin, C.attrelid) AS column_default_expression,
+       NOT C.attislocal AS column_is_inherited,
+       C.attfdwoptions AS options,
+       C.attisdropped, C.attidentity, C.attgenerated
+  FROM pg_catalog.pg_attribute C
+  LEFT JOIN pg_catalog.pg_attrdef D ON (C.attrelid, C.attnum) = (D.adrelid, D.adnum)
+ WHERE C.attrelid = 'ci_t'::regclass AND C.attnum > 0
+ ORDER BY C.attnum;
+-- The row-constructor comparison that join relies on. `=` is a conjunction of
+-- the field comparisons and `<>` a disjunction, NULL results included.
+SELECT (1, 2) = (1, 2) AS eq,
+       (1, NULL) = (1, 2) AS eq_unknown,
+       (1, NULL) = (2, 2) AS eq_false,
+       (1, 2) <> (1, 3) AS ne,
+       (1, NULL) <> (1, 2) AS ne_unknown,
+       (1, NULL) <> (2, 2) AS ne_true;
+SELECT (1, 2) = (1, 2, 3);
+-- A serial column and a PRIMARY KEY each record a named not-null constraint.
+SELECT conname, contype FROM pg_constraint WHERE conrelid = 'ci_t'::regclass ORDER BY conname;
+-- The domain columns pg_type publishes for a base type.
+SELECT typnotnull, typbasetype, typtypmod, typndims, typdefaultbin, typdefault
+  FROM pg_type WHERE typname = 'int8';
+-- An explicit NULL into the serial column is still rejected: the default is not
+-- a fallback for a value the client actually sent.
+INSERT INTO ci_t (id, name) VALUES (NULL, 'ovr');
+-- Leaving the column out takes the sequence.
+INSERT INTO ci_t (name) VALUES ('ovr');
+SELECT id, name FROM ci_t ORDER BY id;
+DROP TABLE ci_t;

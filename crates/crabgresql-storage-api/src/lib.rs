@@ -273,8 +273,9 @@ pub struct Column {
     /// which republishes the whole schema rather than mutating this in place
     /// (see [`TableAm::schema`]).
     pub nullable: bool,
-    /// The name of an explicit NOT NULL constraint. PRIMARY KEY-implied
-    /// non-nullability has no separate entry here.
+    /// The name of the column's not-null constraint, which PostgreSQL records
+    /// whether the clause was written out, implied by PRIMARY KEY, or implied
+    /// by `serial`. `None` only for a column that accepts NULL.
     pub not_null_constraint: Option<String>,
     /// Canonical SQL text of the column default. The binder reparses and binds
     /// it once per DML statement, then the executor evaluates it per row.
