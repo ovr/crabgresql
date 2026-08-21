@@ -42,6 +42,58 @@ SELECT 'rc_nosuchoperator'::regoper;
 -- equality is by OID, and the round trip through oid and text preserves it
 SELECT '||/'::regoper = 597::regoper AS same_operator,
        '||/'::regoper::oid AS as_oid, '||/'::regoper::text AS as_text;
+-- regoperator names an operator by name *and* operand types, which is exactly
+-- what tells the same-named operators above apart: `+` alone is ambiguous,
+-- `+(integer,integer)` is one operator
+SELECT '+(int4,int4)'::regoperator AS by_name, 551::regoperator AS by_oid;
+-- input reads the operands with the type-name grammar, so every spelling of a
+-- type works and a typmod is accepted and dropped
+SELECT '+(integer,integer)'::regoperator AS sql_spelling,
+       'pg_catalog.+(int4,int4)'::regoperator AS qualified_in,
+       '=(numeric(10,2),numeric)'::regoperator AS with_typmod;
+-- a prefix operator has no left operand, which both halves spell NONE
+SELECT '-(NONE,int8)'::regoperator AS by_name, 484::regoperator AS by_oid,
+       '||/(none,float8)'::regoperator AS folded;
+-- quoted, NONE is an ordinary type name instead
+SELECT '=("NONE",int4)'::regoperator;
+-- like regoper it spells the invalid OID `0` rather than `-`
+SELECT 0::regoperator AS zero, 999999::regoperator AS unknown_oid;
+-- equality is by OID, and the round trip through oid and text preserves it
+SELECT '+(int4,int4)'::regoperator = 551::regoperator AS same_operator,
+       '+(int4,int4)'::regoperator::oid AS as_oid,
+       '+(int4,int4)'::regoperator::text AS as_text;
+-- the operand types are dropped on the way to regoper, which then has to
+-- qualify the name it is left with
+SELECT '+(int4,int4)'::regoperator::regoper AS as_regoper;
+-- the argument is a signature, not a name: without a parenthesized operand list
+-- there is nothing to look up
+SELECT '+'::regoperator;
+SELECT '+(int4,int4'::regoperator;
+SELECT '+(int4,int4) x'::regoperator;
+SELECT '=(int4,)'::regoperator;
+SELECT '+(int4,int4))'::regoperator;
+SELECT '=(,int4)'::regoperator;
+-- the name still has to be a name, and is still qualified by the same rules
+SELECT '(int4,int4)'::regoperator;
+SELECT 'a.b.c.+(int4,int4)'::regoperator;
+SELECT 'rc_nosuchdb.pg_catalog.+(int4,int4)'::regoperator;
+SELECT (current_database() || '.pg_catalog.+(int4,int4)')::regoperator AS db_qualified;
+-- an operator takes two operands, and PostgreSQL counts none as too many
+SELECT '+(int4)'::regoperator;
+SELECT '+()'::regoperator;
+SELECT '+(int4,int4,int4)'::regoperator;
+-- the operand types are resolved before they are counted, and a type that does
+-- not exist is reported under its parsed spelling
+SELECT '=(rc_nosuchtype,int4)'::regoperator;
+SELECT 'a.b.c.d.+(RcNoSuchType,int4)'::regoperator;
+-- a signature naming no operator echoes the argument exactly as written
+SELECT '@#$(int4,int4)'::regoperator;
+SELECT '=(none,int4)'::regoperator;
+SELECT '"PG_CATALOG".+(int4,int4)'::regoperator;
+-- the input function fails softly for pg_input_is_valid, hint and all
+SELECT pg_input_is_valid('+(int4,int4)', 'regoperator') AS valid,
+       pg_input_is_valid('+(int4)', 'regoperator') AS one_operand;
+SELECT message, hint, sql_error_code FROM pg_input_error_info('+(int4)', 'regoperator');
 --
 -- reg* NAME PARSING
 -- a built-in whose SQL spelling is several words is one *type name*, not
@@ -155,3 +207,7 @@ DROP SCHEMA rcs;
 -- always something regtype can read back
 SELECT '_record'::regtype AS typname_spelling, 'record[]'::regtype AS rendered_spelling;
 SELECT 2287::regtype::text::regtype AS roundtrip;
+-- an array of a reg* type is named for its element too, under every spelling
+SELECT 2209::regtype AS by_oid, '_regoperator'::regtype AS typname_spelling,
+       'regoperator[]'::regtype AS rendered_spelling;
+SELECT 2210::regtype AS regclass_array, 1008::regtype AS regproc_array;

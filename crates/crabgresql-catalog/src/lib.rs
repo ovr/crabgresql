@@ -543,13 +543,9 @@ pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
         .map(|row| row.proname)
 }
 
-/// The name of the built-in operator `oid`, the inverse of
-/// [`builtin_oper_oids`].
-pub fn builtin_oper_name(oid: u32) -> Option<&'static str> {
-    PG_OPERATOR_ROWS
-        .iter()
-        .find(|row| row.oid == oid)
-        .map(|row| row.oprname)
+/// The built-in operator `oid` names, the inverse of [`builtin_oper_oids`].
+pub fn builtin_oper_row(oid: u32) -> Option<&'static PgOperatorRow> {
+    PG_OPERATOR_ROWS.iter().find(|row| row.oid == oid)
 }
 
 /// The OIDs of every built-in operator named `name`, in `pg_operator` order.
@@ -561,6 +557,16 @@ pub fn builtin_oper_oids(name: &str) -> Vec<u32> {
         .filter(|row| row.oprname == name)
         .map(|row| row.oid)
         .collect()
+}
+
+/// Singular where [`builtin_oper_oids`] is plural: the operand types are what
+/// tell same-named operators apart, so name plus operands names at most one. A
+/// prefix operator is found under the 0 `oprleft` stores its absent operand as.
+pub fn builtin_oper_oid(name: &str, left: u32, right: u32) -> Option<u32> {
+    PG_OPERATOR_ROWS
+        .iter()
+        .find(|row| row.oprname == name && row.oprleft == left && row.oprright == right)
+        .map(|row| row.oid)
 }
 
 /// Read-only engine serving `pg_catalog` relations. Constructed per statement so
@@ -1303,12 +1309,20 @@ impl SystemCatalog {
         matched.next().is_none().then_some(first)
     }
 
-    /// Backs `regoper` output. Every operator this build publishes is a
-    /// built-in, so the namespace is always `pg_catalog` — `CREATE OPERATOR` is
-    /// not implemented, and when it is this reads the user rows the same way
-    /// [`SystemCatalog::proc_name`] reads `CREATE FUNCTION`'s.
-    pub fn oper_name(&self, oid: u32) -> Option<(String, String)> {
-        builtin_oper_name(oid).map(|name| ("pg_catalog".to_string(), name.to_string()))
+    /// Backs `regoper` and `regoperator` output: `(namespace, name, oprleft,
+    /// oprright)`, with `oprleft` 0 for a prefix operator. Every operator this
+    /// build publishes is a built-in, so the namespace is always `pg_catalog` —
+    /// `CREATE OPERATOR` is not implemented, and when it is this reads the user
+    /// rows the same way [`SystemCatalog::proc_name`] reads `CREATE FUNCTION`'s.
+    pub fn oper_signature(&self, oid: u32) -> Option<(String, String, u32, u32)> {
+        builtin_oper_row(oid).map(|row| {
+            (
+                "pg_catalog".to_string(),
+                row.oprname.to_string(),
+                row.oprleft,
+                row.oprright,
+            )
+        })
     }
 
     /// Built-ins all live in `pg_catalog`, so any other qualifier names
@@ -1319,6 +1333,21 @@ impl SystemCatalog {
             return Vec::new();
         }
         builtin_oper_oids(name)
+    }
+
+    /// The same qualifier gate as [`SystemCatalog::oper_oids`], for the lookup
+    /// `regoperator` makes.
+    pub fn oper_oid(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        left: u32,
+        right: u32,
+    ) -> Option<u32> {
+        if matches!(namespace, Some(ns) if ns != "pg_catalog") {
+            return None;
+        }
+        builtin_oper_oid(name, left, right)
     }
 
     fn routine_by_oid(&self, oid: u32) -> Option<CatalogRoutine> {
