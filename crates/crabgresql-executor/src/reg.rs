@@ -47,14 +47,12 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
                 _ => format!("{}.{}", quote_ident(&operator.namespace), operator.name),
             })
         }
-        // `regoperator` carries the operand types, and those are what make the
-        // name unambiguous — so unlike `regoper` it qualifies by *visibility*
-        // (PG's `OperatorIsVisible`), not by how many operators share the name.
-        // Every operator this build publishes is a `pg_catalog` built-in and
-        // `pg_catalog` is always on the search path, so the name is always bare.
-        // Probed against PG 18.4 with a `CREATE OPERATOR rcx.###`: outside the
-        // search path it prints `rcx.###(integer,integer)`, inside it prints
-        // `###(integer,integer)`.
+        // The operand types are what make the name unambiguous, so unlike
+        // `regoper` this qualifies by *visibility* (PG's `OperatorIsVisible`)
+        // rather than by how many operators share the name — probed with a
+        // `CREATE OPERATOR rcx.###`, which prints qualified only while `rcx` is
+        // off the search path. Every operator this build publishes is a
+        // `pg_catalog` built-in, so the name is always bare.
         //
         // TODO: qualify by visibility once `CREATE OPERATOR` exists and an
         // operator can live off the search path.
@@ -106,11 +104,10 @@ fn type_name(oid: u32, ops: &dyn CatalogOps) -> Option<String> {
 /// which the catalog stores as 0 and PG prints as `NONE` — the same spelling its
 /// input function reads back.
 ///
-/// The `???` is `format_type_be`'s own rendering of a type OID it cannot find
-/// (probed: `format_type(999999, null)` is `???` where `999999::regtype` is the
-/// digits). Unreachable through a catalog row, since an operator's operand types
-/// exist by construction; spelled out so it cannot silently print digits and
-/// look like a resolvable name.
+/// The `???` is `format_type_be`'s rendering of a type OID it cannot find, and
+/// differs from `regtype`'s (`999999::regtype` is the digits). Unreachable
+/// through a catalog row, since an operator's operand types exist by
+/// construction.
 fn operand_name(oid: u32, ops: &dyn CatalogOps) -> String {
     match oid {
         0 => "NONE".to_string(),
@@ -177,8 +174,8 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
 /// Not the splitter's grammar, and the splitter cannot stand in for it:
 /// `character varying` is one type name rather than two identifiers, and
 /// `varchar(10)` and `int4[]` are names a bare catalog lookup never sees.
-/// Quoting is significant for the same reason — bare `char` is the `char(1)`
-/// keyword (`bpchar`) while `"char"` is the one-byte type.
+/// Quoting matters here too, for the reason [`builtin_type_oid_from_syntax`]
+/// gives.
 ///
 /// The numeric spelling is *not* accepted here: `'23'` is a type named `23`,
 /// which does not exist. Only [`from_text`] reads digits as an OID, and it does
@@ -204,11 +201,10 @@ fn resolve_type_name(s: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
 /// `raw` is the argument exactly as written, which the "does not exist" error
 /// echoes; `trimmed` is what parses.
 ///
-/// The order of the steps is observable and was probed against PG 18.4:
+/// The order the steps run in is observable, and was probed against PG 18.4:
 /// `'a.b.c.d.+(nosuchtype,int4)'` reports the *type*, `'a.b.c.d.+(int4)'`
 /// reports the missing argument, and only `'a.b.c.d.+(int4,int4)'` gets as far
-/// as complaining about the dotted name. So: parse the signature, resolve the
-/// operand types, count them, qualify the name, then look the operator up.
+/// as complaining about the dotted name.
 fn operator_from_signature(
     raw: &str,
     trimmed: &str,
@@ -264,10 +260,6 @@ fn operand_oid(arg: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
 /// Every error below is one PG raises before it looks anything up, and each was
 /// probed against PG 18.4 (SQLSTATEs included: the parenthesis and type-name
 /// complaints are `22P02`, a name that does not split is `42602`).
-///
-/// An empty argument list is *zero* operands rather than one empty one, which is
-/// why `'+()'::regoperator` reports "too many arguments" rather than a type
-/// error.
 fn split_name_and_arg_types(s: &str) -> Result<(Vec<String>, Vec<&str>), ExecError> {
     let Some(open) = find_unquoted(s, '(') else {
         return Err(ExecError::new(
@@ -332,9 +324,10 @@ fn split_arg_types(inner: &str) -> Result<Vec<&str>, ExecError> {
     Ok(args)
 }
 
-/// The byte offset of the first `needle` outside a quoted section, applying the
-/// quoting rule [`take_ident`] applies: a `""` inside quotes is a literal quote,
-/// so it neither opens nor closes one.
+/// The byte offset of the first `needle` outside a quoted section. Toggling on
+/// every `"` is what handles the doubled `""` [`take_ident`] reads as one
+/// literal quote: it closes the section and reopens it, leaving `needle` inside
+/// it either way.
 fn find_unquoted(s: &str, needle: char) -> Option<usize> {
     let mut in_quote = false;
     for (i, c) in s.char_indices() {
@@ -720,7 +713,6 @@ mod tests {
     #[test]
     fn a_signature_splits_into_a_name_and_its_operands() {
         assert_eq!(sig("+(int4,int4)"), "+(int4,int4)");
-        // Whitespace anywhere, and the name's own quoting rules.
         assert_eq!(sig(" + ( int4 , int4 ) "), "+(int4,int4)");
         assert_eq!(sig("\"+\"(int4,int4)"), "+(int4,int4)");
         assert_eq!(sig("PG_CATALOG.+(int4,int4)"), "pg_catalog|+(int4,int4)");
@@ -753,8 +745,7 @@ mod tests {
         // The name is what has to be a name; the operands are type syntax.
         assert_eq!(err("(int4,int4)"), "42602 invalid name syntax");
         assert_eq!(err("+(int4,int4"), "22P02 expected a right parenthesis");
-        // The closing parenthesis is the last non-space character, so trailing
-        // text reads as a missing one rather than as junk.
+        // Trailing text reads as a *missing* parenthesis rather than as junk.
         assert_eq!(err("+(int4,int4) x"), "22P02 expected a right parenthesis");
         assert_eq!(err("=(int4,)"), "22P02 expected a type name");
         assert_eq!(err("+(int4,int4))"), "22P02 improper type name");
@@ -767,10 +758,10 @@ mod tests {
     }
 
     /// An operand written between two commas is *empty*, not absent: the
-    /// splitter hands it on and the type parser is what rejects it
-    /// (`invalid type name ""`, a different error from the missing operand
-    /// above). What the operand spellings then mean — `NONE`, a quoted
-    /// `"NONE"`, a user type — needs a catalog, so `regcast` covers it.
+    /// splitter hands it on, and the type parser is what rejects it with a
+    /// different error than the trailing comma above. What the operand
+    /// spellings mean — `NONE`, a quoted `"NONE"`, a user type — needs a
+    /// catalog, so `regcast` covers that.
     #[test]
     fn an_empty_operand_reaches_the_type_parser() {
         let (_, args) = split_name_and_arg_types("=(,int4)").expect("parses");

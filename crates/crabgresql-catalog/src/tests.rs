@@ -1424,12 +1424,9 @@ fn operator_lookups_report_how_many_share_a_name() {
 fn an_operator_is_unique_once_its_operands_are_given() {
     use crabgresql_types::oid::{INT4, INT8};
     assert_eq!(builtin_oper_oid("+", INT4, INT4), Some(551));
-    // The same name with other operands is a different operator, and with
-    // operands no operator has, none at all.
     assert_ne!(builtin_oper_oid("+", INT8, INT8), Some(551));
     assert_eq!(builtin_oper_oid("+", INT4, 0), None);
     assert_eq!(builtin_oper_oid("nosuchoperator", INT4, INT4), None);
-    // A prefix operator is found under the 0 its missing operand is stored as.
     assert_eq!(builtin_oper_oid("-", 0, INT8), Some(484));
     assert_eq!(
         builtin_oper_row(484).map(|row| (row.oprname, row.oprleft, row.oprright)),

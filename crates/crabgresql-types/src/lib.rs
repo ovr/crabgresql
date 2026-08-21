@@ -1774,14 +1774,13 @@ mod tests {
         }
     }
 
-    /// An array's *display* name is its element's plus `[]` — every arm of
-    /// `array_display_name` obeys that, `"char"[]` and `time without time
-    /// zone[]` included, and PostgreSQL 18.4 agrees for every pair this build
-    /// models. Swept rather than spelled out one type at a time because the
-    /// failure mode is an omission: a modelled element with no arm of its own
-    /// falls to the generic `array`, which reads like a type name and is not
-    /// one. That is how the six `reg*` arrays printed `array` until this test
-    /// existed.
+    /// An array's *display* name is its element's plus `[]` — `"char"[]` and
+    /// `time without time zone[]` included, and PostgreSQL 18.4 agrees for every
+    /// pair this build models. Swept rather than spelled out one type at a time
+    /// because the failure mode is an omission: an element with no arm of its
+    /// own in `array_display_name` falls to the generic `array`, which reads
+    /// like a type name and is not one. That is how the six `reg*` arrays
+    /// printed `array` until this test existed.
     #[test]
     fn an_array_is_named_for_its_element() {
         for (elem, _) in array::pairs() {

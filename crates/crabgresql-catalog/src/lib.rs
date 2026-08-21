@@ -559,11 +559,9 @@ pub fn builtin_oper_oids(name: &str) -> Vec<u32> {
         .collect()
 }
 
-/// The OID of the built-in operator with exactly this signature, or `None` if
-/// there is none. Singular where [`builtin_oper_oids`] is plural: the operand
-/// types are what tell same-named operators apart, so name plus operands names
-/// at most one. A prefix operator writes its absent left operand as 0, the same
-/// spelling `oprleft` carries.
+/// Singular where [`builtin_oper_oids`] is plural: the operand types are what
+/// tell same-named operators apart, so name plus operands names at most one. A
+/// prefix operator is found under the 0 `oprleft` stores its absent operand as.
 pub fn builtin_oper_oid(name: &str, left: u32, right: u32) -> Option<u32> {
     PG_OPERATOR_ROWS
         .iter()
@@ -1311,12 +1309,11 @@ impl SystemCatalog {
         matched.next().is_none().then_some(first)
     }
 
-    /// Backs `regoper` and `regoperator` output: the operator's
-    /// `(namespace, name, oprleft, oprright)`, where `oprleft` is 0 for a prefix
-    /// operator. Every operator this build publishes is a built-in, so the
-    /// namespace is always `pg_catalog` — `CREATE OPERATOR` is not implemented,
-    /// and when it is this reads the user rows the same way
-    /// [`SystemCatalog::proc_name`] reads `CREATE FUNCTION`'s.
+    /// Backs `regoper` and `regoperator` output: `(namespace, name, oprleft,
+    /// oprright)`, with `oprleft` 0 for a prefix operator. Every operator this
+    /// build publishes is a built-in, so the namespace is always `pg_catalog` —
+    /// `CREATE OPERATOR` is not implemented, and when it is this reads the user
+    /// rows the same way [`SystemCatalog::proc_name`] reads `CREATE FUNCTION`'s.
     pub fn oper_signature(&self, oid: u32) -> Option<(String, String, u32, u32)> {
         builtin_oper_row(oid).map(|row| {
             (
@@ -1339,8 +1336,7 @@ impl SystemCatalog {
     }
 
     /// The same qualifier gate as [`SystemCatalog::oper_oids`], for the lookup
-    /// `regoperator` makes: name plus operand types, which names at most one
-    /// operator.
+    /// `regoperator` makes.
     pub fn oper_oid(
         &self,
         namespace: Option<&str>,

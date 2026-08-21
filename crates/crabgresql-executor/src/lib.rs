@@ -158,12 +158,10 @@ pub trait CatalogOps: Send + Sync {
     /// is an error is the executor's to decide, so an implementation never
     /// learns the SQL surface.
     fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32>;
-    /// The OID of the operator `namespace.name` names with exactly these
-    /// operand types, or `None` if there is none. Singular where
-    /// [`CatalogOps::oper_oids`] is plural, and that is the whole difference
-    /// between the two operator kinds: the operands make the name unique, so
-    /// `regoperator` input has the one-or-nothing shape `regproc` has and needs
-    /// no ambiguity rule. Backs `regoperator` input.
+    /// Singular where [`CatalogOps::oper_oids`] is plural, and that is the whole
+    /// difference between the two operator kinds: the operands make the name
+    /// unique, so `regoperator` input has the one-or-nothing shape `regproc` has
+    /// and needs no ambiguity rule. Backs `regoperator` input.
     fn oper_oid(&self, namespace: Option<&str>, name: &str, left: u32, right: u32) -> Option<u32>;
     /// The comments on `objoid`, as `obj_description`/`col_description` read
     /// them out of `pg_description`. `catalog` is the `pg_catalog` relation the
