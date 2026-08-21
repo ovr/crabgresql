@@ -4571,9 +4571,13 @@ fn execute_create_table(
             }
         }
         // A serial column is NOT NULL; apply it after the option loop so an
-        // explicit (redundant) NOT NULL is tolerated rather than double-counted.
-        if serial_base.is_some() {
+        // explicit (redundant) NOT NULL is tolerated rather than double-counted
+        // — that redundant clause has already named the constraint, so only an
+        // otherwise-nullable column takes a generated name here.
+        if serial_base.is_some() && column.nullable {
             column.nullable = false;
+            column.not_null_constraint =
+                Some(named_not_null(&mut constraint_names, &name, &column_name));
         }
         columns.push(column);
     }
@@ -4756,10 +4760,21 @@ fn execute_create_table(
             constraint: Some(p.constraint),
         });
     }
+    // Every PRIMARY KEY column is NOT NULL, and upstream records that as a
+    // named `pg_constraint` row of its own alongside the `_pkey` one — probed
+    // against 18.4: `CREATE TABLE t3 (id int PRIMARY KEY, …)` yields both
+    // `t3_pkey` and `t3_id_not_null`. A column that already carries a name
+    // (declared NOT NULL, or a serial) keeps it rather than gaining a second.
     for index in &indexes {
         if index.constraint == Some(IndexConstraint::PrimaryKey) {
             for key in &index.keys {
-                schema.columns[key.column].nullable = false;
+                let column = &mut schema.columns[key.column];
+                column.nullable = false;
+                if column.not_null_constraint.is_none() {
+                    let column_name = column.name.clone();
+                    column.not_null_constraint =
+                        Some(named_not_null(&mut constraint_names, &name, &column_name));
+                }
             }
         }
     }
@@ -6415,6 +6430,19 @@ fn fresh_index_name(
         }
     }
     unreachable!()
+}
+
+/// Name the not-null constraint a column gains implicitly — from `serial` or
+/// from PRIMARY KEY — the way PostgreSQL does, and reserve the name so a later
+/// constraint on the same table generates around it.
+///
+/// The explicit `NOT NULL` clause builds its name inline instead: it also has to
+/// honour a `CONSTRAINT n` label and to reject a duplicate, neither of which
+/// applies to a name generated here.
+fn named_not_null(taken: &mut HashSet<String>, table: &str, column: &str) -> String {
+    let name = fresh_local_name(|c| taken.contains(c), &format!("{table}_{column}_not_null"));
+    taken.insert(name.clone());
+    name
 }
 
 fn fresh_local_name(taken: impl Fn(&str) -> bool, base: &str) -> String {
