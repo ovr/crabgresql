@@ -339,7 +339,6 @@ fn bind_row_comparison(
             )));
         }
     };
-    // PG reports the mismatch from the operator, with the caret on it.
     if lhs.len() != rhs.len() {
         return Err(BindError::new(
             sqlstate::SYNTAX_ERROR,
@@ -348,9 +347,8 @@ fn bind_row_comparison(
     }
     let mut combined: Option<BoundExpr> = None;
     for (l, r) in lhs.iter().zip(rhs) {
-        // Each field pair binds through the ordinary operator path, so a field
-        // whose types have no equality operator raises the same 42883 it would
-        // outside a row.
+        // Through the ordinary operator path, so a field pair whose types have
+        // no equality operator raises the 42883 it would outside a row.
         let field = to_bool_operand(
             bind_binary(l, op, r, op_span, scope)?,
             combine.sql_symbol(),
@@ -437,8 +435,8 @@ fn bind_binary_inner(
         };
         return bind_binary(left, &native, right, op_span, scope);
     }
-    // `(a, b) = (c, d)` — a row-constructor comparison. Placed after the
-    // `OPERATOR(...)` rewrite above so the spelled-out form reaches it too.
+    // After the `OPERATOR(...)` rewrite above, so the spelled-out form of a
+    // row comparison reaches this too.
     if let (ast::Expr::Tuple(lhs), ast::Expr::Tuple(rhs)) = (left, right) {
         return bind_row_comparison(lhs, op, rhs, op_span, scope);
     }

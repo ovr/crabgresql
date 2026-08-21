@@ -4570,10 +4570,10 @@ fn execute_create_table(
                 }
             }
         }
-        // A serial column is NOT NULL; apply it after the option loop so an
-        // explicit (redundant) NOT NULL is tolerated rather than double-counted
-        // — that redundant clause has already named the constraint, so only an
-        // otherwise-nullable column takes a generated name here.
+        // A serial column is NOT NULL; applied after the option loop so an
+        // explicit (redundant) NOT NULL is tolerated rather than double-counted.
+        // That redundant clause has already named the constraint — and may have
+        // labelled it `CONSTRAINT n` — so its name wins over a generated one.
         if serial_base.is_some() && column.nullable {
             column.nullable = false;
             column.not_null_constraint =
@@ -4760,11 +4760,11 @@ fn execute_create_table(
             constraint: Some(p.constraint),
         });
     }
-    // Every PRIMARY KEY column is NOT NULL, and upstream records that as a
-    // named `pg_constraint` row of its own alongside the `_pkey` one — probed
-    // against 18.4: `CREATE TABLE t3 (id int PRIMARY KEY, …)` yields both
-    // `t3_pkey` and `t3_id_not_null`. A column that already carries a name
-    // (declared NOT NULL, or a serial) keeps it rather than gaining a second.
+    // Upstream records a PK column's non-nullability as a `pg_constraint` row
+    // of its own alongside the `_pkey` one — probed against 18.4, where
+    // `CREATE TABLE t3 (id int PRIMARY KEY, …)` yields both `t3_pkey` and
+    // `t3_id_not_null`, and where a column that already carries a name gets no
+    // second one.
     for index in &indexes {
         if index.constraint == Some(IndexConstraint::PrimaryKey) {
             for key in &index.keys {

@@ -1070,10 +1070,9 @@ impl SystemCatalog {
             let mut out = Vec::new();
             for (table_oid, schema) in self.relation_oids() {
                 for (position, column) in schema.columns.iter().enumerate() {
-                    // A column becomes a row here once it carries a constraint
-                    // name — from an explicit NOT NULL, from PRIMARY KEY, or
-                    // from `serial`, all three of which PostgreSQL names.
-                    // A column left nullable carries none.
+                    // PostgreSQL names the constraint whether NOT NULL was
+                    // written out, implied by PRIMARY KEY, or implied by
+                    // `serial`, so all three become rows here.
                     let Some(name) = &column.not_null_constraint else {
                         continue;
                     };
