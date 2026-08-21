@@ -7,16 +7,14 @@ use crate::SystemCatalog;
 use crate::cols::*;
 
 /// `pg_catalog.pg_stat_ssl` — one row per backend, keyed by `pid`, so it joins
-/// to `pg_stat_activity` on that column. It shows the same set of backends,
-/// which here is the session reading it; see
+/// to `pg_stat_activity` on that column; see
 /// [`crate::source::CatalogSource::backends`] for why that is one row.
 ///
-/// **`ssl` is always false.** Nothing in this build speaks TLS: the server
-/// refuses the `SSLRequest` packet and every connection is cleartext, so the
+/// **`ssl` is always false.** The server answers `SSLRequest` with `N`, so the
 /// seven columns PostgreSQL fills from the handshake have nothing to report.
-/// PostgreSQL leaves all of them NULL for a non-TLS backend as well, so a
-/// monitoring client that asks "is this connection encrypted" reads `f` from
-/// both servers rather than failing on an unknown relation.
+/// PostgreSQL leaves them NULL for a non-TLS backend as well, so a monitoring
+/// client asking whether its connection is encrypted reads `f` from both
+/// servers rather than failing on an unknown relation.
 pub(crate) fn pg_stat_ssl_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_stat_ssl",

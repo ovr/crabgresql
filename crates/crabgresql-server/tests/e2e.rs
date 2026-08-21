@@ -16278,8 +16278,8 @@ async fn pg_stat_activity_reports_the_reading_session() -> anyhow::Result<()> {
 }
 
 /// `pg_stat_ssl` describes the reading session's connection: cleartext, so
-/// `ssl` is false and the handshake columns are NULL. It keys on `pid`, so it
-/// joins to `pg_stat_activity` the way a monitoring query writes it.
+/// `ssl` is false and the handshake columns are NULL. The join is how a
+/// monitoring query reaches it, and only `pid` carries it.
 #[tokio::test]
 async fn pg_stat_ssl_reports_a_cleartext_connection() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -16312,8 +16312,8 @@ async fn pg_stat_ssl_reports_a_cleartext_connection() -> anyhow::Result<()> {
 }
 
 /// `pg_stat_gssapi` describes the reading session's connection: no GSSAPI, so
-/// every flag is false and `principal` is NULL. It keys on `pid` like
-/// `pg_stat_ssl`, so the two join to `pg_stat_activity` together.
+/// every flag is false and `principal` is NULL. Being false rather than NULL is
+/// the part worth pinning — it is what PostgreSQL answers.
 #[tokio::test]
 async fn pg_stat_gssapi_reports_a_connection_without_gssapi() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
