@@ -16311,6 +16311,38 @@ async fn pg_stat_ssl_reports_a_cleartext_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_stat_gssapi` describes the reading session's connection: no GSSAPI, so
+/// every flag is false and `principal` is NULL. It keys on `pid` like
+/// `pg_stat_ssl`, so the two join to `pg_stat_activity` together.
+#[tokio::test]
+async fn pg_stat_gssapi_reports_a_connection_without_gssapi() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let row = client
+        .query_one(
+            "SELECT pid = pg_backend_pid() AS is_me, gss_authenticated, principal, \
+             encrypted, credentials_delegated \
+             FROM pg_stat_gssapi",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>("is_me"), "the row is this backend");
+    assert!(!row.get::<_, bool>("gss_authenticated"));
+    assert_eq!(row.get::<_, Option<&str>>("principal"), None);
+    assert!(!row.get::<_, bool>("encrypted"));
+    assert!(!row.get::<_, bool>("credentials_delegated"));
+
+    let joined: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity a \
+             JOIN pg_stat_ssl s USING (pid) JOIN pg_stat_gssapi g USING (pid)",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(joined, 1);
+    Ok(())
+}
+
 /// The block-I/O views report zeros but still list every relation PostgreSQL
 /// would list, so a monitoring query binds and runs.
 #[tokio::test]

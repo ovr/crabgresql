@@ -52,6 +52,7 @@ pub(crate) mod sequence;
 pub(crate) mod settings;
 pub(crate) mod stat_activity;
 pub(crate) mod stat_database;
+pub(crate) mod stat_gssapi;
 pub(crate) mod stat_indexes;
 pub(crate) mod stat_io;
 pub(crate) mod stat_ssl;
