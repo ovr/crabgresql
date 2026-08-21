@@ -54,6 +54,7 @@ pub(crate) mod stat_activity;
 pub(crate) mod stat_database;
 pub(crate) mod stat_indexes;
 pub(crate) mod stat_io;
+pub(crate) mod stat_ssl;
 pub(crate) mod stat_tables;
 pub(crate) mod statio;
 pub(crate) mod statistic;

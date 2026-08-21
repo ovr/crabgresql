@@ -23,7 +23,8 @@ use crate::catalogs::{
     database, depend, description, extension, foreign, index, inherits, language, locks,
     misc_empty, namespace, opclass, operator, policy, prepared, proc, progress, publication,
     relviews, replication, rewrite, sequence, settings, stat_activity, stat_database, stat_indexes,
-    stat_io, stat_tables, statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
+    stat_io, stat_ssl, stat_tables, statio, statistic, statistic_ext, textsearch, timezone,
+    trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -733,6 +734,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         replication::pg_stat_replication_slots_schema,
         no_rows,
+    ),
+    rel(
+        "pg_stat_ssl",
+        12253,
+        PgCatalog,
+        stat_ssl::pg_stat_ssl_schema,
+        stat_ssl::pg_stat_ssl_rows,
     ),
     rel(
         "pg_stat_subscription",

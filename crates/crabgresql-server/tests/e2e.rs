@@ -16277,6 +16277,40 @@ async fn pg_stat_activity_reports_the_reading_session() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_stat_ssl` describes the reading session's connection: cleartext, so
+/// `ssl` is false and the handshake columns are NULL. It keys on `pid`, so it
+/// joins to `pg_stat_activity` the way a monitoring query writes it.
+#[tokio::test]
+async fn pg_stat_ssl_reports_a_cleartext_connection() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    let row = client
+        .query_one(
+            "SELECT pid = pg_backend_pid() AS is_me, ssl, version, cipher, bits, \
+             client_dn, client_serial::text AS serial, issuer_dn \
+             FROM pg_stat_ssl",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>("is_me"), "the row is this backend");
+    assert!(!row.get::<_, bool>("ssl"), "nothing here speaks TLS");
+    assert_eq!(row.get::<_, Option<&str>>("version"), None);
+    assert_eq!(row.get::<_, Option<&str>>("cipher"), None);
+    assert_eq!(row.get::<_, Option<i32>>("bits"), None);
+    assert_eq!(row.get::<_, Option<&str>>("client_dn"), None);
+    assert_eq!(row.get::<_, Option<&str>>("serial"), None);
+    assert_eq!(row.get::<_, Option<&str>>("issuer_dn"), None);
+
+    let joined: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity a JOIN pg_stat_ssl s USING (pid)",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(joined, 1);
+    Ok(())
+}
+
 /// The block-I/O views report zeros but still list every relation PostgreSQL
 /// would list, so a monitoring query binds and runs.
 #[tokio::test]
