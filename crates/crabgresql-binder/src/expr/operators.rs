@@ -347,8 +347,6 @@ fn bind_row_comparison(
     }
     let mut combined: Option<BoundExpr> = None;
     for (l, r) in lhs.iter().zip(rhs) {
-        // Through the ordinary operator path, so a field pair whose types have
-        // no equality operator raises the 42883 it would outside a row.
         let field = to_bool_operand(
             bind_binary(l, op, r, op_span, scope)?,
             combine.sql_symbol(),
@@ -367,8 +365,7 @@ fn bind_row_comparison(
     }
     match combined {
         Some(expr) => Ok(Binding::Typed(expr)),
-        // The parser has no production for `()`, so this is unreachable through
-        // SQL; refusing beats inventing a truth value for an empty row.
+        // Unreachable through SQL — the parser has no production for `()`.
         None => Err(BindError::syntax("row constructor has no entries")),
     }
 }

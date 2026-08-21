@@ -6433,8 +6433,8 @@ fn fresh_index_name(
 }
 
 /// Name the not-null constraint a column gains implicitly — from `serial` or
-/// from PRIMARY KEY — the way PostgreSQL does, and reserve the name so a later
-/// constraint on the same table generates around it.
+/// from PRIMARY KEY — and reserve the name so a later constraint on the same
+/// table generates around it.
 ///
 /// The explicit `NOT NULL` clause builds its name inline instead: it also has to
 /// honour a `CONSTRAINT n` label and to reject a duplicate, neither of which
