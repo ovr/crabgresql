@@ -2512,19 +2512,214 @@ fn decode_escape(s: &str) -> Vec<u8> {
 
 // --- quoting / format ------------------------------------------------------
 
-/// `quote_ident`: double-quote the identifier if it is not a bare lowercase
-/// identifier.
+/// `quote_ident`: double-quote the identifier unless it reads back as itself
+/// bare — PostgreSQL's `quote_identifier`, which every path that writes an
+/// identifier goes through (the SQL function of this name, `pg_get_viewdef`,
+/// `\d`, and the `reg*` output functions).
+///
+/// Two reasons to quote, and missing either emits text that no longer names
+/// what it came from: a shape outside `[a-z_][a-z0-9_]*`, and a **keyword**,
+/// which is why `1 AS numeric` deparses as `1 AS "numeric"`.
 pub fn quote_ident(s: &str) -> String {
     let bare = !s.is_empty()
         && s.chars()
             .enumerate()
-            .all(|(i, c)| c == '_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()));
+            .all(|(i, c)| c == '_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()))
+        && !is_quotable_keyword(s);
     if bare {
         s.to_string()
     } else {
         format!("\"{}\"", s.replace('"', "\"\""))
     }
 }
+
+/// Whether `s` is a keyword [`quote_ident`] has to quote. Only `s` in lower
+/// case can match, which is all this is ever asked about: anything with an
+/// upper-case letter is quoted for its shape before it gets here.
+fn is_quotable_keyword(s: &str) -> bool {
+    QUOTED_KEYWORDS.binary_search(&s).is_ok()
+}
+
+/// The keywords PostgreSQL quotes as identifiers: every category except
+/// `UNRESERVED_KEYWORD`, which is the test `quote_identifier` makes
+/// (`ScanKeywordCategories[kwnum] != UNRESERVED_KEYWORD`). So `numeric` and
+/// `between` are quoted while `name`, `value` and `type` — unreserved, and the
+/// spellings ordinary columns actually use — are not.
+///
+/// Taken verbatim from a running PostgreSQL 18.4 rather than transcribed, which
+/// is also how to refresh it:
+///
+/// ```sql
+/// SELECT word FROM pg_get_keywords() WHERE catcode <> 'U' ORDER BY word;
+/// ```
+///
+/// Sorted, because [`is_quotable_keyword`] binary-searches it.
+static QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
 
 /// `quote_literal`: single-quote the string, doubling embedded quotes; use an
 /// `E'...'` string and double backslashes when the input contains a backslash.
@@ -3911,6 +4106,28 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A keyword has to be quoted to read back as an identifier, and which
+    /// words those are is a category question, not a "does the parser know it"
+    /// one. Every expectation here is `quote_ident()` on PostgreSQL 18.4.
+    #[test]
+    fn keywords_are_quoted_and_unreserved_words_are_not() {
+        for kw in ["numeric", "between", "select", "char", "time", "left"] {
+            assert_eq!(quote_ident(kw), format!("\"{kw}\""), "{kw} is a keyword");
+        }
+        // Unreserved keywords stay bare — they are the spellings ordinary
+        // columns use, and PG leaves them alone.
+        for word in ["name", "value", "type", "day", "abs", "rc_t"] {
+            assert_eq!(quote_ident(word), word, "{word} is not quoted upstream");
+        }
+    }
+
+    /// [`is_quotable_keyword`] binary-searches the list, so an unsorted entry
+    /// would silently stop being found.
+    #[test]
+    fn the_keyword_list_is_sorted() {
+        assert!(QUOTED_KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

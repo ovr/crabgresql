@@ -543,6 +543,29 @@ pub fn builtin_proc_name(oid: u32) -> Option<&'static str> {
         .map(|row| row.proname)
 }
 
+/// The signature of the built-in function `oid`: its name together with its
+/// argument-type OIDs, which is what `regprocedure` renders. Where
+/// [`builtin_proc_name`] answers `abs`, this answers `("abs", [1700])`.
+pub fn builtin_proc_signature(oid: u32) -> Option<(&'static str, &'static [u32])> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.oid == oid)
+        .map(|row| (row.proname, row.proargtypes))
+}
+
+/// The OID of the built-in function whose whole signature is `name(args)`, the
+/// inverse of [`builtin_proc_signature`].
+///
+/// Unlike [`builtin_proc_oid`], an overloaded name is not a problem here: the
+/// argument types pick one row out of the overload set, which is the reason
+/// `regprocedure` exists at all.
+pub fn builtin_proc_oid_by_args(name: &str, args: &[u32]) -> Option<u32> {
+    PG_PROC_ROWS
+        .iter()
+        .find(|row| row.proname == name && row.proargtypes == args)
+        .map(|row| row.oid)
+}
+
 /// The built-in operator `oid` names, the inverse of [`builtin_oper_oids`].
 pub fn builtin_oper_row(oid: u32) -> Option<&'static PgOperatorRow> {
     PG_OPERATOR_ROWS.iter().find(|row| row.oid == oid)
@@ -1323,6 +1346,43 @@ impl SystemCatalog {
                 row.oprright,
             )
         })
+    }
+
+    /// The `(namespace, name, argument types)` of the function `oid`
+    /// identifies. Backs `regprocedure` output, which names a function by its
+    /// whole signature; built-in rows first, then this session's
+    /// `CREATE FUNCTION` routines, exactly as [`SystemCatalog::proc_name`].
+    pub fn proc_signature(&self, oid: u32) -> Option<(String, String, Vec<u32>)> {
+        if let Some((name, args)) = builtin_proc_signature(oid) {
+            return Some(("pg_catalog".to_string(), name.to_string(), args.to_vec()));
+        }
+        self.routine_by_oid(oid)
+            .map(|r| (r.namespace.clone(), r.name.clone(), r.arg_types.clone()))
+    }
+
+    /// The OID of the function `namespace.name(args)` names. Where
+    /// [`SystemCatalog::proc_oid`] refuses an overloaded name, this resolves
+    /// one: the argument types single out a row, so a match is never ambiguous.
+    pub fn proc_oid_by_signature(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        args: &[u32],
+    ) -> Option<u32> {
+        // Built-ins all live in `pg_catalog`, so any other qualifier names a
+        // user routine instead.
+        let in_catalog = !matches!(namespace, Some(ns) if ns != "pg_catalog");
+        if let Some(oid) = builtin_proc_oid_by_args(name, args).filter(|_| in_catalog) {
+            return Some(oid);
+        }
+        self.routines()
+            .iter()
+            .find(|r| {
+                r.name == name
+                    && r.arg_types == args
+                    && namespace.is_none_or(|ns| ns == r.namespace)
+            })
+            .map(|r| r.oid)
     }
 
     /// Built-ins all live in `pg_catalog`, so any other qualifier names

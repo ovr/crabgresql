@@ -1416,7 +1416,11 @@ fn eval_format_type(args: &[Value], ctx: &ExecContext) -> Value {
 /// `typmod` applied. Resolves the oid, then defers the per-type spelling to
 /// [`PgType::format_type`] (which the binder shares, so a deparsed constant's
 /// type label and `\d`'s Type column cannot drift apart).
-fn format_type_text(oid: u32, typmod: Option<i32>, catalog: Option<&dyn CatalogOps>) -> String {
+pub(crate) fn format_type_text(
+    oid: u32,
+    typmod: Option<i32>,
+    catalog: Option<&dyn CatalogOps>,
+) -> String {
     if oid == 0 {
         return "-".to_string();
     }
@@ -1789,6 +1793,17 @@ mod format_type_tests {
                 None
             }
             fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
+                None
+            }
+            fn proc_signature(&self, _oid: u32) -> Option<(String, String, Vec<u32>)> {
+                None
+            }
+            fn proc_oid_by_signature(
+                &self,
+                _namespace: Option<&str>,
+                _name: &str,
+                _args: &[u32],
+            ) -> Option<u32> {
                 None
             }
             fn oper_signature(&self, _oid: u32) -> Option<crate::CatalogOperator> {

@@ -32,8 +32,26 @@ fn render(kind: RegKind, oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         // an unqualified name would not reach; built-ins live in `pg_catalog`
         // and every `CREATE FUNCTION` routine lands in `public`.
         // TODO: schema-qualify a regproc name the session's search path does
-        // not reach.
-        RegKind::Proc => ops.proc_name(oid),
+        // not reach. `regprocout` asks `FunctionIsVisible`, which an overloaded
+        // built-in fails even from `pg_catalog`: PG prints oid 1740 as
+        // `pg_catalog."numeric"` where this prints `"numeric"`.
+        RegKind::Proc => ops.proc_name(oid).map(|name| quote_ident(&name)),
+        // `regprocedure` names the same function by its whole signature, so an
+        // overloaded name still reads back as the one function it came from.
+        // The argument types print in their SQL spelling and with no space
+        // after the comma — `format_procedure` runs `format_type_be` over each,
+        // which is what `format_type_text` is.
+        //
+        // TODO: schema-qualify an unreachable name, as for `regproc` above.
+        RegKind::Procedure => {
+            let (_namespace, name, args) = ops.proc_signature(oid)?;
+            let args = args
+                .iter()
+                .map(|arg| crate::eval::format_type_text(*arg, None, Some(ops)))
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(format!("{}({args})", quote_ident(&name)))
+        }
         // An operator prints bare only when its bare name would read *back* as
         // this same operator — the round trip `regoperin` would make. `=` names
         // some ninety operators, so most of them print schema-qualified even
@@ -119,20 +137,36 @@ fn operand_name(oid: u32, ops: &dyn CatalogOps) -> String {
 /// do. All digits is an OID written directly; anything else is an object name,
 /// optionally schema-qualified and optionally quoted.
 pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, ExecError> {
-    let trimmed = s.trim();
+    // The two shortcuts every `reg*` input function takes before it parses
+    // anything, and both read the argument **as written**: PG compares the raw
+    // string, so `'  1259  '::regclass` is a relation named `1259` rather than
+    // an OID, and `'-'` is `InvalidOid` only when it stands alone.
+    //
+    // Neither operator kind takes the dash: `-` is a legal operator name, so
+    // `regoper` looks it up like any other name and `regoperator` wants a
+    // signature (`'-'::regoperator` is `expected a left parenthesis`).
+    if s == "-" && !matches!(kind, RegKind::Oper | RegKind::Operator) {
+        return Ok(from_oid(kind, 0, ops));
+    }
     // PG accepts the numeric spelling for every reg* type and does not check
     // that the OID exists — `999999::regclass` and `'999999'::regclass` both
     // render as the digits.
-    if !trimmed.is_empty()
-        && trimmed.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(oid) = trimmed.parse::<u32>()
+    if !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(oid) = s.parse::<u32>()
     {
         return Ok(from_oid(kind, oid, ops));
     }
+    let trimmed = s.trim();
     // `regtypein` reads its whole argument as a type name, which is not the
     // splitter's grammar — see [`resolve_type_name`].
     if kind == RegKind::Type {
         return Ok(from_oid(kind, resolve_type_name(trimmed, ops)?, ops));
+    }
+    // `regprocedurein` reads a *signature* too, `abs(numeric)`, and shares the
+    // signature grammar with `regoperatorin` below.
+    if kind == RegKind::Procedure {
+        return procedure_from_signature(s, trimmed, ops);
     }
     // `regoperatorin` reads a *signature*, `+(integer,integer)`, so the whole
     // argument is not a name either: the splitter only ever sees the part ahead
@@ -155,8 +189,8 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
         };
     }
     let oid = match kind {
-        RegKind::Oper | RegKind::Operator | RegKind::Type => {
-            unreachable!("returned above: neither an operator nor a type is looked up by name here")
+        RegKind::Oper | RegKind::Operator | RegKind::Procedure | RegKind::Type => {
+            unreachable!("returned above: none of these is looked up by a bare name here")
         }
         RegKind::Proc => ops.proc_oid(namespace.as_deref(), &name),
         RegKind::Class => ops.rel_oid(namespace.as_deref(), &name),
@@ -181,20 +215,95 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
 /// which does not exist. Only [`from_text`] reads digits as an OID, and it does
 /// so before calling this.
 ///
-/// TODO: a spelling the grammar rejects reports `invalid name syntax` here,
-/// where PG reports the grammar's own error (`unterminated quoted identifier at
-/// or near …`, `syntax error at end of input`). Matching those means surfacing
-/// the type parser's errors.
+/// A spelling the grammar cannot read at all is the grammar's own error —
+/// `syntax error at or near "int4"` for `'int4 int4'` — reported under the
+/// `invalid type name "<spec>"` context PG adds while parsing a type out of a
+/// string. A name it reads but nothing answers to is the ordinary
+/// `type "x" does not exist`, and a qualified one whose schema is missing
+/// reports *that* first: `'ng_catalog.int4'::regtype` is a missing schema.
+///
+/// TODO: a spelling *this* grammar accepts and PG's does not still resolves as
+/// a name — a bare reserved word (`'select'`) reports `type "select" does not
+/// exist` where PG reports a syntax error. See
+/// [`crabgresql_parser::parse_data_type`], which documents why a keyword list
+/// cannot close it.
 fn resolve_type_name(s: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
+    if let Err(e) = crabgresql_parser::parse_data_type(s) {
+        return Err(ExecError::new(e.sqlstate, e.message)
+            .push_context(format!("invalid type name \"{s}\"")));
+    }
     if let Some(oid) = builtin_type_oid_from_syntax(s) {
         return Ok(oid);
     }
     let parts = split_qualified_name(s).ok_or_else(invalid_name_syntax)?;
     let (namespace, name) = qualify(RegKind::Type, &parts, || ops.current_database())?;
+    if let Some(namespace) = &namespace
+        && ops.namespace_oid(namespace).is_none()
+    {
+        return Err(ExecError::new(
+            sqlstate::INVALID_SCHEMA_NAME,
+            format!("schema \"{namespace}\" does not exist"),
+        ));
+    }
     builtin_type_oid(namespace.as_deref(), &name)
         .or_else(|| pseudo_type_oid(namespace.as_deref(), &name))
         .or_else(|| ops.user_type_oid(namespace.as_deref(), &name))
         .ok_or_else(|| not_found(RegKind::Type, s, &parts))
+}
+
+/// How many arguments a signature may carry — PostgreSQL's `FUNC_MAX_ARGS`,
+/// which is a compile-time constant upstream and 100 in every stock build.
+const MAX_ARGS: usize = 100;
+
+/// `regprocedurein`: resolve `name(argtype,…)` to the one function that has
+/// that signature, which is what makes an overloaded name resolvable where
+/// `regproc` refuses it. `raw` is the argument exactly as written, which the
+/// "does not exist" error echoes; `trimmed` is what parses.
+///
+/// The steps run in the order PG's `parseNameAndArgTypes` and `LookupFuncName`
+/// run them, which is observable: `'a.b.c.d(nosuchtype)'` reports the *type*
+/// and only `'a.b.c.d(int4)'` gets as far as the four-part name, and a bad type
+/// beats a too-long argument list. All probed against PG 18.4.
+fn procedure_from_signature(
+    raw: &str,
+    trimmed: &str,
+    ops: &dyn CatalogOps,
+) -> Result<Reg, ExecError> {
+    let (parts, args) = split_name_and_arg_types(trimmed)?;
+    let arg_types = args
+        .iter()
+        .map(|arg| signature_arg_oid(arg, ops))
+        .collect::<Result<Vec<_>, _>>()?;
+    if arg_types.len() > MAX_ARGS {
+        // A limit, not a malformation, so PG codes it 54023 where every other
+        // complaint about this list is 22P02. `regoperator`'s version of this
+        // message carries a HINT and this one does not (probed through
+        // `pg_input_error_info`).
+        return Err(ExecError::new(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "too many arguments",
+        ));
+    }
+    let (namespace, name) = qualify(RegKind::Procedure, &parts, || ops.current_database())?;
+    let oid = ops
+        .proc_oid_by_signature(namespace.as_deref(), &name, &arg_types)
+        .ok_or_else(|| not_found(RegKind::Procedure, raw, &parts))?;
+    Ok(from_oid(RegKind::Procedure, oid, ops))
+}
+
+/// One argument of a signature. Unlike [`operand_oid`] there is no `NONE`:
+/// every argument of a function is a type, and `'int4pl(none,int4)'` is a
+/// syntax error upstream rather than an absent argument.
+fn signature_arg_oid(arg: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
+    if arg.is_empty() {
+        // The type parser's own error for the empty string, which is what an
+        // argument list like `(,int4)` hands it.
+        return Err(ExecError::new(
+            sqlstate::SYNTAX_ERROR,
+            "invalid type name \"\"",
+        ));
+    }
+    resolve_type_name(arg, ops)
 }
 
 /// `regoperatorin`: resolve `name(lefttype,righttype)` to the operator it names.
@@ -243,15 +352,7 @@ fn operand_oid(arg: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
     if arg.eq_ignore_ascii_case("none") {
         return Ok(0);
     }
-    if arg.is_empty() {
-        // The type parser's own error for the empty string, which is what an
-        // argument list like `(,int4)` hands it.
-        return Err(ExecError::new(
-            sqlstate::SYNTAX_ERROR,
-            "invalid type name \"\"",
-        ));
-    }
-    resolve_type_name(arg, ops)
+    signature_arg_oid(arg, ops)
 }
 
 /// Split `name(type,type)` into the name's dot-separated parts and the operand
@@ -280,30 +381,47 @@ fn split_name_and_arg_types(s: &str) -> Result<(Vec<String>, Vec<&str>), ExecErr
     Ok((parts, split_arg_types(inner)?))
 }
 
-/// The operand list between the parentheses, cut at the commas that are outside
-/// quotes and at parenthesis depth zero — a typmod carries commas of its own, so
-/// `'=(numeric(10,2),numeric)'` is two operands, not three.
+/// The argument list between the parentheses, cut at the commas that are
+/// outside quotes and outside any bracketing — a typmod and an array bound both
+/// carry commas of their own, so `'=(numeric(10,2),numeric)'` is two operands
+/// and `'int4pl(int4[1,2])'` is one argument (probed: PG's `CONTEXT` names the
+/// whole `int4[1,2]`, and then the type grammar rejects it).
+///
+/// Bracketing is a **matched stack**, and an unmatched closer or a leftover
+/// opener is `improper type name` — the one complaint about this list that does
+/// not come from the type grammar, and the reason a bare `'numeric)'::regtype`
+/// reports a syntax error while `'int4pl(numeric))'` does not.
 fn split_arg_types(inner: &str) -> Result<Vec<&str>, ExecError> {
     let improper = || ExecError::new(sqlstate::INVALID_TEXT_REPRESENTATION, "improper type name");
     let mut args = Vec::new();
     let mut start = 0;
-    let mut depth = 0usize;
+    let mut open = Vec::new();
     let mut in_quote = false;
     for (i, c) in inner.char_indices() {
         match c {
             '"' => in_quote = !in_quote,
-            '(' if !in_quote => depth += 1,
-            // A `)` at depth zero closed a parenthesis that was never opened:
-            // the extra one in `'+(int4,int4))'`.
-            ')' if !in_quote => depth = depth.checked_sub(1).ok_or_else(improper)?,
-            ',' if !in_quote && depth == 0 => {
+            _ if in_quote => {}
+            '(' | '[' => open.push(c),
+            // A closer with nothing (or the wrong opener) under it: the extra
+            // parenthesis in `'+(int4,int4))'`, or the `]` in `'int4pl(int4])'`.
+            ')' => {
+                if open.pop() != Some('(') {
+                    return Err(improper());
+                }
+            }
+            ']' => {
+                if open.pop() != Some('[') {
+                    return Err(improper());
+                }
+            }
+            ',' if open.is_empty() => {
                 args.push(inner[start..i].trim());
                 start = i + 1;
             }
             _ => {}
         }
     }
-    if in_quote || depth != 0 {
+    if in_quote || !open.is_empty() {
         return Err(improper());
     }
     let last = inner[start..].trim();
@@ -384,14 +502,16 @@ fn pseudo_type_oid(namespace: Option<&str>, name: &str) -> Option<u32> {
 /// `'PUB.NoSuch'::regclass` reports `relation "pub.nosuch"`.
 fn not_found(kind: RegKind, raw: &str, parts: &[String]) -> ExecError {
     let state = match kind {
-        RegKind::Proc | RegKind::Oper | RegKind::Operator => sqlstate::UNDEFINED_FUNCTION,
+        RegKind::Proc | RegKind::Procedure | RegKind::Oper | RegKind::Operator => {
+            sqlstate::UNDEFINED_FUNCTION
+        }
         RegKind::Class => sqlstate::UNDEFINED_TABLE,
         RegKind::Type => sqlstate::UNDEFINED_OBJECT,
         RegKind::Namespace => sqlstate::INVALID_SCHEMA_NAME,
     };
     let message = match kind {
         RegKind::Oper | RegKind::Operator => format!("operator does not exist: {raw}"),
-        RegKind::Proc => format!("function \"{raw}\" does not exist"),
+        RegKind::Proc | RegKind::Procedure => format!("function \"{raw}\" does not exist"),
         _ => format!(
             "{} \"{}\" does not exist",
             kind.object_noun(),
@@ -755,6 +875,24 @@ mod tests {
         // the closing one.
         assert_eq!(err("=(numeric(10,int4)"), "22P02 improper type name");
         assert_eq!(err("=(numeric(10,2,int4)"), "22P02 improper type name");
+    }
+
+    /// Square brackets bracket the list the same way parentheses do, and must
+    /// match by kind: an array bound hides its comma (`'int4pl(int4[1,2])'` is
+    /// one argument, which the type grammar then rejects — PG's `CONTEXT` names
+    /// the whole spelling), while a stray or mismatched bracket is `improper
+    /// type name` before anything parses.
+    #[test]
+    fn brackets_bracket_the_argument_list_and_must_match() {
+        assert_eq!(sig("int4pl(int4[1,2])"), "int4pl(int4[1,2])");
+        assert_eq!(sig("int4pl(int4[],int4)"), "int4pl(int4[],int4)");
+        let err = |s: &str| {
+            let e = signature(s).expect_err("the brackets do not match");
+            format!("{} {}", e.code, e.message)
+        };
+        assert_eq!(err("int4pl(int4])"), "22P02 improper type name");
+        assert_eq!(err("int4pl(int4[)"), "22P02 improper type name");
+        assert_eq!(err("int4pl([int4)"), "22P02 improper type name");
     }
 
     /// An operand written between two commas is *empty*, not absent: the

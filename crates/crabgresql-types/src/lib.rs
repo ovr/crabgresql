@@ -132,6 +132,9 @@ pub mod oid {
     pub const UNKNOWN: u32 = 705;
     /// `regproc`: an OID that renders as a function name. See [`crate::Reg`].
     pub const REGPROC: u32 = 24;
+    /// `regprocedure`: an OID that renders as a function *signature*. See
+    /// [`crate::Reg`].
+    pub const REGPROCEDURE: u32 = 2202;
     /// `regoper`: an OID that renders as an operator name. See [`crate::Reg`].
     pub const REGOPER: u32 = 2203;
     /// `regoperator`: an OID that renders as an operator name *with* its operand
@@ -197,6 +200,7 @@ pub mod oid {
     pub const BIT_ARRAY: u32 = 1561;
     pub const VARBIT_ARRAY: u32 = 1563;
     pub const REGPROC_ARRAY: u32 = 1008;
+    pub const REGPROCEDURE_ARRAY: u32 = 2207;
     pub const REGOPER_ARRAY: u32 = 2208;
     pub const REGOPERATOR_ARRAY: u32 = 2209;
     pub const REGCLASS_ARRAY: u32 = 2210;
@@ -425,13 +429,17 @@ pub enum PgType {
 /// `'pg_class'::regclass` and `1259::regclass` are the same value.
 ///
 /// TODO: model PG's remaining `reg*` types (`regconfig`, `regrole`,
-/// `regprocedure`, …); each needs a lookup that resolves its own kind of object
-/// by name, which only these six have.
+/// `regcollation`, …); each needs a lookup that resolves its own kind of object
+/// by name, which only these seven have.
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
     /// `regproc`: names a function by its bare name. Distinct from
-    /// `regprocedure`, which carries the argument types too.
+    /// [`RegKind::Procedure`], which carries the argument types too.
     Proc,
+    /// `regprocedure`: names a function by its whole signature
+    /// (`abs(numeric)`), which is what makes an overloaded name resolvable —
+    /// `regproc` can only take a name no other function shares.
+    Procedure,
     /// `regoper`: names an operator by its bare name. Distinct from
     /// [`RegKind::Operator`], which carries the operand types too.
     Oper,
@@ -451,6 +459,7 @@ impl RegKind {
     pub fn oid(self) -> u32 {
         match self {
             RegKind::Proc => oid::REGPROC,
+            RegKind::Procedure => oid::REGPROCEDURE,
             RegKind::Oper => oid::REGOPER,
             RegKind::Operator => oid::REGOPERATOR,
             RegKind::Class => oid::REGCLASS,
@@ -463,6 +472,7 @@ impl RegKind {
     pub fn typname(self) -> &'static str {
         match self {
             RegKind::Proc => "regproc",
+            RegKind::Procedure => "regprocedure",
             RegKind::Oper => "regoper",
             RegKind::Operator => "regoperator",
             RegKind::Class => "regclass",
@@ -476,7 +486,7 @@ impl RegKind {
     /// `type "x" does not exist` for `regtype`.
     pub fn object_noun(self) -> &'static str {
         match self {
-            RegKind::Proc => "function",
+            RegKind::Proc | RegKind::Procedure => "function",
             RegKind::Oper | RegKind::Operator => "operator",
             RegKind::Class => "relation",
             RegKind::Type => "type",
@@ -734,6 +744,7 @@ impl PgType {
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
             oid::REGPROC => PgType::Reg(RegKind::Proc),
+            oid::REGPROCEDURE => PgType::Reg(RegKind::Procedure),
             oid::REGOPER => PgType::Reg(RegKind::Oper),
             oid::REGOPERATOR => PgType::Reg(RegKind::Operator),
             oid::REGCLASS => PgType::Reg(RegKind::Class),
@@ -827,6 +838,7 @@ impl PgType {
             "tsvector" => PgType::Tsvector,
             "tsquery" => PgType::Tsquery,
             "regproc" => PgType::Reg(RegKind::Proc),
+            "regprocedure" => PgType::Reg(RegKind::Procedure),
             "regoper" => PgType::Reg(RegKind::Oper),
             "regoperator" => PgType::Reg(RegKind::Operator),
             "regclass" => PgType::Reg(RegKind::Class),
@@ -1287,6 +1299,7 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Vector(VectorKind::Oid)) => "oidvector[]",
         Some(PgType::Vector(VectorKind::Int2)) => "int2vector[]",
         Some(PgType::Reg(RegKind::Proc)) => "regproc[]",
+        Some(PgType::Reg(RegKind::Procedure)) => "regprocedure[]",
         Some(PgType::Reg(RegKind::Oper)) => "regoper[]",
         Some(PgType::Reg(RegKind::Operator)) => "regoperator[]",
         Some(PgType::Reg(RegKind::Class)) => "regclass[]",
@@ -1348,6 +1361,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Vector(VectorKind::Oid)) => "_oidvector",
         Some(PgType::Vector(VectorKind::Int2)) => "_int2vector",
         Some(PgType::Reg(RegKind::Proc)) => "_regproc",
+        Some(PgType::Reg(RegKind::Procedure)) => "_regprocedure",
         Some(PgType::Reg(RegKind::Oper)) => "_regoper",
         Some(PgType::Reg(RegKind::Operator)) => "_regoperator",
         Some(PgType::Reg(RegKind::Class)) => "_regclass",
@@ -1722,6 +1736,7 @@ mod tests {
         assert_eq!(Reg::unresolved(RegKind::Oper, 0).name, "0");
         assert_eq!(Reg::unresolved(RegKind::Operator, 0).name, "0");
         assert_eq!(Reg::unresolved(RegKind::Proc, 0).name, "-");
+        assert_eq!(Reg::unresolved(RegKind::Procedure, 0).name, "-");
         assert_eq!(Reg::unresolved(RegKind::Class, 0).name, "-");
         // Only OID 0 is special.
         assert_eq!(Reg::unresolved(RegKind::Oper, 999_999).name, "999999");

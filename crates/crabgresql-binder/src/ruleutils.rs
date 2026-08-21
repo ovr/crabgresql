@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_parser::{ast, keywords};
+use crabgresql_parser::ast;
 use crabgresql_storage_api::TypeCatalog;
 use crabgresql_types::{FmtCtx, Numeric, PgType, Value, cast, interval, text, timestamptz};
 
@@ -763,46 +763,22 @@ fn object_name(name: &ast::ObjectName) -> String {
 /// quotes whenever dropping them would change what it means.
 ///
 /// "Would change what it means" covers two cases, and missing either emits SQL
-/// that no longer parses: a shape outside `[a-z_][a-z0-9_]*`, which
-/// [`text::quote_ident`] already decides, and a name spelled like a keyword —
-/// `SELECT 1 AS "select"` must not come back as `SELECT 1 AS select`.
+/// that no longer parses: a shape outside `[a-z_][a-z0-9_]*`, and a name
+/// spelled like a keyword — `SELECT 1 AS "select"` must not come back as
+/// `SELECT 1 AS select`. [`text::quote_ident`] decides both, being PG's
+/// `quote_identifier`; an *unquoted* name is folded first, since that is the
+/// spelling the catalog holds and the one that has to read back.
 fn ident(id: &ast::Ident) -> String {
-    if id.quote_style.is_none() {
-        return id.value.to_ascii_lowercase();
+    match id.quote_style {
+        None => quote_name(&id.value.to_ascii_lowercase()),
+        Some(_) => quote_name(&id.value),
     }
-    if is_reserved(&id.value) {
-        return format!("\"{}\"", id.value.replace('"', "\"\""));
-    }
-    text::quote_ident(&id.value)
 }
 
 /// Render a bare name (a synthesised alias or an expanded wildcard column) with
 /// the quoting it needs to read back as itself.
 fn quote_name(name: &str) -> String {
-    if is_reserved(name) {
-        return format!("\"{}\"", name.replace('"', "\"\""));
-    }
     text::quote_ident(name)
-}
-
-/// Whether `name` is a keyword that must be quoted to be used as an identifier.
-///
-/// Not *every* keyword: PG quotes only those whose category is not
-/// `UNRESERVED_KEYWORD`, so ordinary aliases like `type`, `value`, `name` and
-/// `day` stay bare while `select` does not. The parser's two reserved lists are
-/// the same distinction from the other side — the words it refuses to read as a
-/// bare alias.
-fn is_reserved(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    let Some(kw) = keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
-        .ok()
-        .map(|i| keywords::ALL_KEYWORDS_INDEX[i])
-    else {
-        return false;
-    };
-    keywords::RESERVED_FOR_COLUMN_ALIAS.contains(&kw)
-        || keywords::RESERVED_FOR_TABLE_ALIAS.contains(&kw)
 }
 
 #[cfg(test)]
@@ -841,6 +817,21 @@ mod tests {
                     \x20   a AS plain\n\
                     \x20  FROM t\n\
                     \x20 ORDER BY a DESC;";
+        assert_eq!(view_definition(sql, true, &[]).as_deref(), Some(want));
+    }
+
+    /// Quoting follows the keyword's *category*, not whether it was written
+    /// quoted: `numeric` and `between` are keywords PG quotes even though they
+    /// read fine as bare aliases, while `value` and `name` are unreserved and
+    /// stay bare. Pinned against PostgreSQL 18.4's `pg_get_viewdef`.
+    #[test]
+    fn quotes_a_keyword_alias_that_was_written_bare() {
+        let sql = "SELECT 1 AS numeric, 2 AS value, 3 AS between, 4 AS name FROM t";
+        let want = " SELECT 1 AS \"numeric\",\n\
+                    \x20   2 AS value,\n\
+                    \x20   3 AS \"between\",\n\
+                    \x20   4 AS name\n\
+                    \x20  FROM t;";
         assert_eq!(view_definition(sql, true, &[]).as_deref(), Some(want));
     }
 
