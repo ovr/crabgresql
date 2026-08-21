@@ -1791,11 +1791,20 @@ mod format_type_tests {
             fn proc_oid(&self, _namespace: Option<&str>, _name: &str) -> Option<u32> {
                 None
             }
-            fn oper_name(&self, _oid: u32) -> Option<(String, String)> {
+            fn oper_signature(&self, _oid: u32) -> Option<crate::CatalogOperator> {
                 None
             }
             fn oper_oids(&self, _namespace: Option<&str>, _name: &str) -> Vec<u32> {
                 Vec::new()
+            }
+            fn oper_oid(
+                &self,
+                _namespace: Option<&str>,
+                _name: &str,
+                _left: u32,
+                _right: u32,
+            ) -> Option<u32> {
+                None
             }
             fn object_description(
                 &self,

@@ -12,7 +12,8 @@ use crabgresql_catalog::{
     CatalogUserType, CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
 use crabgresql_executor::{
-    CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, RelationSize, SerialSequence,
+    CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, RelationSize,
+    SerialSequence,
 };
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
@@ -688,12 +689,23 @@ impl CatalogOps for SessionCatalogOps {
         self.system.proc_oid(namespace, name)
     }
 
-    fn oper_name(&self, oid: u32) -> Option<(String, String)> {
-        self.system.oper_name(oid)
+    fn oper_signature(&self, oid: u32) -> Option<CatalogOperator> {
+        self.system
+            .oper_signature(oid)
+            .map(|(namespace, name, left, right)| CatalogOperator {
+                namespace,
+                name,
+                left,
+                right,
+            })
     }
 
     fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32> {
         self.system.oper_oids(namespace, name)
+    }
+
+    fn oper_oid(&self, namespace: Option<&str>, name: &str, left: u32, right: u32) -> Option<u32> {
+        self.system.oper_oid(namespace, name, left, right)
     }
 
     /// The comments `pg_description` publishes. The session's own catalog has

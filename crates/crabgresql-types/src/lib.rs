@@ -134,6 +134,9 @@ pub mod oid {
     pub const REGPROC: u32 = 24;
     /// `regoper`: an OID that renders as an operator name. See [`crate::Reg`].
     pub const REGOPER: u32 = 2203;
+    /// `regoperator`: an OID that renders as an operator name *with* its operand
+    /// types, `+(integer,integer)`. See [`crate::Reg`].
+    pub const REGOPERATOR: u32 = 2204;
     /// `regclass`: an OID that renders as a relation name. See [`crate::Reg`].
     pub const REGCLASS: u32 = 2205;
     /// `regtype`: an OID that renders as a type name. See [`crate::Reg`].
@@ -195,6 +198,7 @@ pub mod oid {
     pub const VARBIT_ARRAY: u32 = 1563;
     pub const REGPROC_ARRAY: u32 = 1008;
     pub const REGOPER_ARRAY: u32 = 2208;
+    pub const REGOPERATOR_ARRAY: u32 = 2209;
     pub const REGCLASS_ARRAY: u32 = 2210;
     pub const REGTYPE_ARRAY: u32 = 2211;
     pub const REGNAMESPACE_ARRAY: u32 = 4090;
@@ -421,16 +425,20 @@ pub enum PgType {
 /// `'pg_class'::regclass` and `1259::regclass` are the same value.
 ///
 /// TODO: model PG's remaining `reg*` types (`regconfig`, `regrole`,
-/// `regprocedure`, `regoperator`, …); each needs a lookup that resolves its own
-/// kind of object by name, which only these five have.
+/// `regprocedure`, …); each needs a lookup that resolves its own kind of object
+/// by name, which only these six have.
 #[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegKind {
     /// `regproc`: names a function by its bare name. Distinct from
     /// `regprocedure`, which carries the argument types too.
     Proc,
     /// `regoper`: names an operator by its bare name. Distinct from
-    /// `regoperator`, which carries the operand types too.
+    /// [`RegKind::Operator`], which carries the operand types too.
     Oper,
+    /// `regoperator`: names an operator by name *and* operand types,
+    /// `+(integer,integer)`. The operand types are what make it unambiguous
+    /// where the bare name of [`RegKind::Oper`] is not.
+    Operator,
     /// `regclass`: names a relation (table, view, sequence, index).
     Class,
     /// `regtype`: names a type.
@@ -444,6 +452,7 @@ impl RegKind {
         match self {
             RegKind::Proc => oid::REGPROC,
             RegKind::Oper => oid::REGOPER,
+            RegKind::Operator => oid::REGOPERATOR,
             RegKind::Class => oid::REGCLASS,
             RegKind::Type => oid::REGTYPE,
             RegKind::Namespace => oid::REGNAMESPACE,
@@ -455,6 +464,7 @@ impl RegKind {
         match self {
             RegKind::Proc => "regproc",
             RegKind::Oper => "regoper",
+            RegKind::Operator => "regoperator",
             RegKind::Class => "regclass",
             RegKind::Type => "regtype",
             RegKind::Namespace => "regnamespace",
@@ -467,7 +477,7 @@ impl RegKind {
     pub fn object_noun(self) -> &'static str {
         match self {
             RegKind::Proc => "function",
-            RegKind::Oper => "operator",
+            RegKind::Oper | RegKind::Operator => "operator",
             RegKind::Class => "relation",
             RegKind::Type => "type",
             RegKind::Namespace => "schema",
@@ -494,8 +504,8 @@ pub struct Reg {
     pub kind: RegKind,
     pub oid: u32,
     /// The rendered name: `pg_class`, a schema-qualified `rs.t`, a quoted
-    /// `"Mixed Case"`, `-` for OID 0 (`0` for `regoper`), or the bare digits
-    /// when the OID resolves to nothing (all probed against PG 18.4).
+    /// `"Mixed Case"`, `-` for OID 0 (`0` for the two operator kinds), or the
+    /// bare digits when the OID resolves to nothing (all probed against PG 18.4).
     pub name: String,
 }
 
@@ -503,12 +513,13 @@ impl Reg {
     /// The rendering PG gives an OID that names nothing: `-` for `0`
     /// (`InvalidOid`), the bare digits otherwise.
     ///
-    /// `regoper` is the odd one out — `regoperout` spells `InvalidOid` as `0`,
-    /// not `-`, because `-` is itself a legal operator name and would read back
-    /// as one. Probed: `SELECT 0::regproc, 0::regoper` gives `-` and `0`.
+    /// The operator kinds are the odd ones out — `regoperout` and
+    /// `regoperatorout` spell `InvalidOid` as `0`, not `-`, because `-` is
+    /// itself a legal operator name and would read back as one. Probed:
+    /// `SELECT 0::regproc, 0::regoper, 0::regoperator` gives `-`, `0` and `0`.
     pub fn unresolved(kind: RegKind, oid: u32) -> Self {
         let name = match (oid, kind) {
-            (0, RegKind::Oper) => "0".to_string(),
+            (0, RegKind::Oper | RegKind::Operator) => "0".to_string(),
             (0, _) => "-".to_string(),
             _ => oid.to_string(),
         };
@@ -724,6 +735,7 @@ impl PgType {
             oid::JSONPATH => PgType::Jsonpath,
             oid::REGPROC => PgType::Reg(RegKind::Proc),
             oid::REGOPER => PgType::Reg(RegKind::Oper),
+            oid::REGOPERATOR => PgType::Reg(RegKind::Operator),
             oid::REGCLASS => PgType::Reg(RegKind::Class),
             oid::REGTYPE => PgType::Reg(RegKind::Type),
             oid::REGNAMESPACE => PgType::Reg(RegKind::Namespace),
@@ -816,6 +828,7 @@ impl PgType {
             "tsquery" => PgType::Tsquery,
             "regproc" => PgType::Reg(RegKind::Proc),
             "regoper" => PgType::Reg(RegKind::Oper),
+            "regoperator" => PgType::Reg(RegKind::Operator),
             "regclass" => PgType::Reg(RegKind::Class),
             "regtype" => PgType::Reg(RegKind::Type),
             "regnamespace" => PgType::Reg(RegKind::Namespace),
@@ -1330,6 +1343,7 @@ fn array_typname(elem: u32) -> &'static str {
         Some(PgType::Vector(VectorKind::Int2)) => "_int2vector",
         Some(PgType::Reg(RegKind::Proc)) => "_regproc",
         Some(PgType::Reg(RegKind::Oper)) => "_regoper",
+        Some(PgType::Reg(RegKind::Operator)) => "_regoperator",
         Some(PgType::Reg(RegKind::Class)) => "_regclass",
         Some(PgType::Reg(RegKind::Type)) => "_regtype",
         Some(PgType::Reg(RegKind::Namespace)) => "_regnamespace",
@@ -1696,14 +1710,16 @@ mod tests {
     use super::*;
     use deepsize::DeepSizeOf;
 
-    /// The `regoper` exception documented on [`Reg::unresolved`].
+    /// The operator-kind exception documented on [`Reg::unresolved`].
     #[test]
-    fn regoper_spells_the_invalid_oid_as_zero() {
+    fn the_operator_kinds_spell_the_invalid_oid_as_zero() {
         assert_eq!(Reg::unresolved(RegKind::Oper, 0).name, "0");
+        assert_eq!(Reg::unresolved(RegKind::Operator, 0).name, "0");
         assert_eq!(Reg::unresolved(RegKind::Proc, 0).name, "-");
         assert_eq!(Reg::unresolved(RegKind::Class, 0).name, "-");
         // Only OID 0 is special.
         assert_eq!(Reg::unresolved(RegKind::Oper, 999_999).name, "999999");
+        assert_eq!(Reg::unresolved(RegKind::Operator, 999_999).name, "999999");
     }
 
     /// PostgreSQL's own name for an array type is its element's with an `_`

@@ -143,10 +143,11 @@ pub trait CatalogOps: Send + Sync {
     /// such function. `Some` only when the name is unambiguous, as `regprocin`
     /// requires. Backs `regproc` input.
     fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
-    /// The `(namespace, name)` of the operator `oid` identifies, or `None` if
-    /// there is no such operator. Backs `regoper` output, which needs the
-    /// namespace to qualify a name several operators share.
-    fn oper_name(&self, oid: u32) -> Option<(String, String)>;
+    /// The operator `oid` identifies, or `None` if there is no such operator.
+    /// Backs both operator kinds of `reg*` output: `regoper` needs the namespace
+    /// to qualify a name several operators share, `regoperator` prints the
+    /// operand types as well.
+    fn oper_signature(&self, oid: u32) -> Option<CatalogOperator>;
     /// The OIDs of every operator `namespace.name` names. `None` for
     /// `namespace` searches the unqualified path.
     ///
@@ -157,6 +158,13 @@ pub trait CatalogOps: Send + Sync {
     /// is an error is the executor's to decide, so an implementation never
     /// learns the SQL surface.
     fn oper_oids(&self, namespace: Option<&str>, name: &str) -> Vec<u32>;
+    /// The OID of the operator `namespace.name` names with exactly these
+    /// operand types, or `None` if there is none. Singular where
+    /// [`CatalogOps::oper_oids`] is plural, and that is the whole difference
+    /// between the two operator kinds: the operands make the name unique, so
+    /// `regoperator` input has the one-or-nothing shape `regproc` has and needs
+    /// no ambiguity rule. Backs `regoperator` input.
+    fn oper_oid(&self, namespace: Option<&str>, name: &str, left: u32, right: u32) -> Option<u32>;
     /// The comments on `objoid`, as `obj_description`/`col_description` read
     /// them out of `pg_description`. `catalog` is the `pg_catalog` relation the
     /// object lives in; `None` is the deprecated one-argument
@@ -295,6 +303,21 @@ pub enum SerialSequence {
     Unowned,
     NoColumn { relation: String },
     NoRelation,
+}
+
+/// An operator as the catalog holds it, for the two `reg*` kinds that name one.
+/// Where an operator *lives* is the catalog's to say and how it *prints* is the
+/// executor's, so this carries the raw columns and no rendering — the same split
+/// [`ConstraintDef`] makes.
+#[derive(Clone, Debug)]
+pub struct CatalogOperator {
+    pub namespace: String,
+    /// `pg_operator.oprname`: punctuation, not an identifier — `+`, `||/`, `~~`.
+    pub name: String,
+    /// `oprleft`, which is **0** for a prefix operator: it has no left operand,
+    /// and `regoperator` prints that absence as `NONE`.
+    pub left: u32,
+    pub right: u32,
 }
 
 /// What `pg_get_constraintdef` needs to reproduce a constraint's DDL. Rendering

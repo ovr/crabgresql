@@ -195,6 +195,10 @@ fn pg_type_rows_agree_with_pgtype_for_modeled_types() {
         ("macaddr", PgType::Macaddr),
         ("macaddr8", PgType::Macaddr8),
         ("regoper", PgType::Reg(crabgresql_types::RegKind::Oper)),
+        (
+            "regoperator",
+            PgType::Reg(crabgresql_types::RegKind::Operator),
+        ),
         ("regclass", PgType::Reg(crabgresql_types::RegKind::Class)),
         ("regtype", PgType::Reg(crabgresql_types::RegKind::Type)),
         (
@@ -1385,24 +1389,57 @@ fn pg_operator_describes_upstreams_operators() -> anyhow::Result<()> {
 #[test]
 fn operator_lookups_report_how_many_share_a_name() {
     assert_eq!(builtin_oper_oids("||/"), vec![597]);
-    assert_eq!(builtin_oper_name(597), Some("||/"));
+    assert_eq!(builtin_oper_row(597).map(|row| row.oprname), Some("||/"));
     assert!(
         builtin_oper_oids("+").len() > 1,
         "`+` names one operator per operand pair"
     );
     assert!(builtin_oper_oids("+").contains(&551), "int4pl is `+`");
     assert_eq!(builtin_oper_oids("nosuchoperator"), Vec::<u32>::new());
-    assert_eq!(builtin_oper_name(0), None);
-    assert_eq!(builtin_oper_name(999_999), None);
+    assert!(builtin_oper_row(0).is_none());
+    assert!(builtin_oper_row(999_999).is_none());
 
     // Built-ins live in `pg_catalog`, so any other qualifier names nothing.
     let cat = SystemCatalog::new();
     assert_eq!(cat.oper_oids(Some("pg_catalog"), "||/"), vec![597]);
     assert_eq!(cat.oper_oids(Some("public"), "||/"), Vec::<u32>::new());
     assert_eq!(
-        cat.oper_name(597),
-        Some(("pg_catalog".to_string(), "||/".to_string()))
+        cat.oper_signature(597),
+        Some((
+            "pg_catalog".to_string(),
+            "||/".to_string(),
+            0,
+            crabgresql_types::oid::FLOAT8
+        ))
     );
+}
+
+/// What the *operand types* buy `regoperator`: the name `+` that
+/// [`operator_lookups_report_how_many_share_a_name`] cannot resolve becomes one
+/// operator once they are given. Probed against PostgreSQL 18.4:
+/// `'+(int4,int4)'::regoperator` is 551 and `484::regoperator` is
+/// `-(NONE,bigint)` — a prefix operator, whose absent left operand the catalog
+/// stores as 0.
+#[test]
+fn an_operator_is_unique_once_its_operands_are_given() {
+    use crabgresql_types::oid::{INT4, INT8};
+    assert_eq!(builtin_oper_oid("+", INT4, INT4), Some(551));
+    // The same name with other operands is a different operator, and with
+    // operands no operator has, none at all.
+    assert_ne!(builtin_oper_oid("+", INT8, INT8), Some(551));
+    assert_eq!(builtin_oper_oid("+", INT4, 0), None);
+    assert_eq!(builtin_oper_oid("nosuchoperator", INT4, INT4), None);
+    // A prefix operator is found under the 0 its missing operand is stored as.
+    assert_eq!(builtin_oper_oid("-", 0, INT8), Some(484));
+    assert_eq!(
+        builtin_oper_row(484).map(|row| (row.oprname, row.oprleft, row.oprright)),
+        Some(("-", 0, INT8))
+    );
+
+    let cat = SystemCatalog::new();
+    assert_eq!(cat.oper_oid(Some("pg_catalog"), "+", INT4, INT4), Some(551));
+    assert_eq!(cat.oper_oid(None, "+", INT4, INT4), Some(551));
+    assert_eq!(cat.oper_oid(Some("public"), "+", INT4, INT4), None);
 }
 
 /// `pg_amop` and `pg_amproc` finish the operator-class stack: every reference

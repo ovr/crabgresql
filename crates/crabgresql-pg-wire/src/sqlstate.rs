@@ -30,6 +30,9 @@ pub const UNDEFINED_OBJECT: &str = "42704";
 /// A configuration parameter exists but cannot be assigned.
 pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
 pub const UNDEFINED_FUNCTION: &str = "42883";
+/// `54023` — more arguments than the construct accepts. A class-54 *limit*,
+/// not a syntax error: the string parsed, it just named too many.
+pub const TOO_MANY_ARGUMENTS: &str = "54023";
 pub const AMBIGUOUS_FUNCTION: &str = "42725";
 pub const WRONG_OBJECT_TYPE: &str = "42809";
 pub const DUPLICATE_COLUMN: &str = "42701";
@@ -80,7 +83,9 @@ pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
 pub const INVALID_CURSOR_NAME: &str = "34000";
 /// `42P03` — `DECLARE` names a cursor that is already open in this session.
 pub const DUPLICATE_CURSOR: &str = "42P03";
-/// `42P02` — a `$n` placeholder with no such parameter (e.g. in a simple query).
+/// `42P02` — a `$n` placeholder with no such parameter (e.g. in a simple
+/// query), and the code `regoperator` input reports a signature naming only one
+/// operand with.
 pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// `42P18` — a parameter's type could not be determined / is inconsistent.
 pub const INDETERMINATE_DATATYPE: &str = "42P18";
