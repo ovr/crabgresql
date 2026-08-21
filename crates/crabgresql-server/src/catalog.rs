@@ -689,6 +689,19 @@ impl CatalogOps for SessionCatalogOps {
         self.system.proc_oid(namespace, name)
     }
 
+    fn proc_signature(&self, oid: u32) -> Option<(String, String, Vec<u32>)> {
+        self.system.proc_signature(oid)
+    }
+
+    fn proc_oid_by_signature(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        args: &[u32],
+    ) -> Option<u32> {
+        self.system.proc_oid_by_signature(namespace, name, args)
+    }
+
     fn oper_signature(&self, oid: u32) -> Option<CatalogOperator> {
         self.system
             .oper_signature(oid)

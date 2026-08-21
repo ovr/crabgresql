@@ -94,6 +94,81 @@ SELECT '"PG_CATALOG".+(int4,int4)'::regoperator;
 SELECT pg_input_is_valid('+(int4,int4)', 'regoperator') AS valid,
        pg_input_is_valid('+(int4)', 'regoperator') AS one_operand;
 SELECT message, hint, sql_error_code FROM pg_input_error_info('+(int4)', 'regoperator');
+-- regprocedure names a function by its whole signature, which is what makes an
+-- overloaded name resolvable — regproc can only take a name no other function
+-- carries. Function OIDs are upstream's own, so they are printable here.
+SELECT 'int4pl(int4,int4)'::regprocedure AS by_name, 177::regprocedure AS by_oid;
+-- output prints the argument types in their SQL spelling, with no space after
+-- the comma, so either spelling reads back as the same value
+SELECT 'int4pl(integer, integer)'::regprocedure AS sql_spelling,
+       'int4pl(int4,int4)'::regprocedure = 'int4pl(integer,integer)'::regprocedure AS eq;
+-- space is insignificant everywhere, and an unquoted name folds to lower case
+SELECT '  INT4PL ( INT4 , INT4 ) '::regprocedure AS spacey,
+       'pg_catalog.int4pl(int4,int4)'::regprocedure AS qualified;
+-- a pseudo-type is a legal argument type, and prints as itself
+SELECT 'int4in(cstring)'::regprocedure AS pseudo_arg;
+-- a function named after a keyword prints quoted, since that is what reads back
+-- as the same name
+SELECT 1740::regprocedure AS keyword_name;
+-- OID 0 renders as a dash (regoper's `0` is the exception, not the rule), and
+-- `-` reads back as OID 0 for every reg* type but regoper
+SELECT 0::regprocedure AS zero, 999999::regprocedure AS unknown_oid,
+       '-'::regprocedure AS dash, '-'::regproc AS dash_proc;
+-- the round trip through oid and text preserves the value
+SELECT 'int4pl(int4,int4)'::regprocedure::oid AS as_oid,
+       'int4pl(int4,int4)'::regprocedure::text AS as_text;
+-- a signature no function has is a miss, and the error echoes the argument
+-- exactly as written
+SELECT 'int4pl(int4,int4,int4)'::regprocedure;
+SELECT 'rc_nosuchfunction(int4)'::regprocedure;
+-- a bare name is regproc's spelling, not this one
+SELECT 'int4pl'::regprocedure;
+SELECT 'int4pl(int4'::regprocedure;
+-- the argument list has its own grammar, and each way of getting it wrong
+-- reports differently. Bracketing that does not match is settled before the
+-- type grammar sees anything, which is why it alone says `improper type name`
+SELECT 'int4pl(int4))'::regprocedure;
+SELECT 'int4pl(int4])'::regprocedure;
+SELECT 'int4pl(int4[)'::regprocedure;
+SELECT 'int4pl(int4,)'::regprocedure;
+SELECT 'int4pl(,int4)'::regprocedure;
+SELECT '(int4)'::regprocedure;
+-- ... while a spelling the type grammar rejects reports the token it stopped on
+SELECT 'int4pl(int4 int4)'::regprocedure;
+SELECT 'int4pl(4)'::regprocedure;
+SELECT 'int4pl(.int4)'::regprocedure;
+SELECT 'int4pl(int4.)'::regprocedure;
+SELECT 'int4pl(int4[1,2])'::regprocedure;
+-- an argument list longer than PG's FUNC_MAX_ARGS is a limit, not a syntax
+-- error, and is the one complaint here that is not 22P02
+SELECT ('int4pl(' || repeat('int,', 100) || 'int)')::regprocedure;
+-- an argument type is resolved before the function is looked up, so a type that
+-- does not exist is reported as such — and a missing schema before that
+SELECT 'int4pl(rc_nosuchtype)'::regprocedure;
+SELECT 'int4pl(rc_nosuchschema.t)'::regprocedure;
+-- and an argument type's own name is qualified by the same rules as any other
+SELECT 'int4pl(a.b.c.d)'::regprocedure;
+SELECT 'int4pl(a.b.c)'::regprocedure;
+-- the argument types are read before the *function* name is deconstructed, so a
+-- four-part name is reported only once the types resolve
+SELECT 'a.b.c.d(rc_nosuchtype)'::regprocedure;
+SELECT 'a.b.c.d(int4)'::regprocedure;
+SELECT 'a.b.c(int4)'::regprocedure;
+-- ... but the name's own *syntax* is checked before either
+SELECT 'a b(rc_nosuchtype)'::regprocedure;
+-- a session's own functions resolve the same way, including a zero-argument one
+-- and a name that has to be quoted to read back
+CREATE FUNCTION rc_f(a int, b text) RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE FUNCTION rc_z() RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE FUNCTION "rc Mixed"(a int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+SELECT 'rc_f(int4,text)'::regprocedure AS user_fn,
+       'public.rc_f(int,text)'::regprocedure AS qualified_user_fn;
+SELECT 'rc_z()'::regprocedure AS zero_args, '"rc Mixed"(int)'::regprocedure AS quoted;
+SELECT 'rc_f(int4,text)'::regprocedure::oid::regprocedure AS roundtrip;
+SELECT 'rc_f(int4)'::regprocedure;
+DROP FUNCTION rc_f(int, text);
+DROP FUNCTION rc_z();
+DROP FUNCTION "rc Mixed"(int);
 --
 -- reg* NAME PARSING
 -- a built-in whose SQL spelling is several words is one *type name*, not

@@ -2,6 +2,7 @@
 //! column types (`"char"`, `regproc`) and the constructors for their values.
 
 use crabgresql_storage_api::Column;
+use crabgresql_types::text::quote_ident;
 use crabgresql_types::{PgType, Reg, RegKind, Value, VectorKind};
 
 use crate::ProcRef;
@@ -83,11 +84,21 @@ pub(crate) fn str_char(s: &str) -> Value {
 }
 
 /// A `regproc` datum from a codegen-resolved reference.
+///
+/// The name is quoted the way `regprocout` quotes it, which matters for the
+/// handful of built-ins named after a keyword (`numeric`, `char`, `time`, …):
+/// `pg_cast.castfunc` reads out of this and a `::regproc` cast reads out of
+/// `reg.rs`, and the two must not spell one function differently.
 pub(crate) fn regproc(r: ProcRef) -> Value {
+    // OID 0 is codegen's "no function", and its `-` is a rendering rather than
+    // a name — quoting it would print `"-"`.
+    if r.oid == 0 {
+        return Value::Reg(Reg::unresolved(RegKind::Proc, 0));
+    }
     Value::Reg(Reg {
         kind: RegKind::Proc,
         oid: r.oid,
-        name: r.name.to_string(),
+        name: quote_ident(r.name),
     })
 }
 
@@ -103,7 +114,7 @@ pub(crate) fn regproc_by_name(name: &str) -> Value {
         Some(oid) => Value::Reg(Reg {
             kind: RegKind::Proc,
             oid,
-            name: name.to_string(),
+            name: quote_ident(name),
         }),
         None => Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
     }

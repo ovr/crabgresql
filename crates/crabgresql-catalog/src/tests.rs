@@ -194,6 +194,10 @@ fn pg_type_rows_agree_with_pgtype_for_modeled_types() {
         ("varbit", PgType::Varbit),
         ("macaddr", PgType::Macaddr),
         ("macaddr8", PgType::Macaddr8),
+        (
+            "regprocedure",
+            PgType::Reg(crabgresql_types::RegKind::Procedure),
+        ),
         ("regoper", PgType::Reg(crabgresql_types::RegKind::Oper)),
         (
             "regoperator",
@@ -1437,6 +1441,47 @@ fn an_operator_is_unique_once_its_operands_are_given() {
     assert_eq!(cat.oper_oid(Some("pg_catalog"), "+", INT4, INT4), Some(551));
     assert_eq!(cat.oper_oid(None, "+", INT4, INT4), Some(551));
     assert_eq!(cat.oper_oid(Some("public"), "+", INT4, INT4), None);
+}
+
+/// `regprocedure` names a function by its whole signature, which is what makes
+/// an overloaded name resolvable at all: `int4pl` and `int8pl` share the `+`
+/// operator's job under different argument types, and `regproc` can only take a
+/// name no other function carries.
+#[test]
+fn function_lookups_resolve_a_whole_signature() {
+    let int4 = crabgresql_types::oid::INT4;
+    let oid = builtin_proc_oid_by_args("int4pl", &[int4, int4])
+        .expect("int4pl is `+`'s oprcode, so pg_proc publishes it");
+    assert_eq!(
+        builtin_proc_signature(oid),
+        Some(("int4pl", &[int4, int4][..]))
+    );
+    // The name alone is not the key: a signature no function has is a miss,
+    // not a different overload.
+    assert_eq!(builtin_proc_oid_by_args("int4pl", &[int4]), None);
+    assert_eq!(builtin_proc_oid_by_args("nosuchfunc", &[]), None);
+    assert_eq!(builtin_proc_signature(0), None);
+
+    // Built-ins live in `pg_catalog`, so any other qualifier names nothing —
+    // and the namespace comes back with the signature, as `regprocedure`
+    // output needs it.
+    let cat = SystemCatalog::new();
+    assert_eq!(
+        cat.proc_oid_by_signature(Some("pg_catalog"), "int4pl", &[int4, int4]),
+        Some(oid)
+    );
+    assert_eq!(
+        cat.proc_oid_by_signature(Some("public"), "int4pl", &[int4, int4]),
+        None
+    );
+    assert_eq!(
+        cat.proc_signature(oid),
+        Some((
+            "pg_catalog".to_string(),
+            "int4pl".to_string(),
+            vec![int4, int4]
+        ))
+    );
 }
 
 /// `pg_amop` and `pg_amproc` finish the operator-class stack: every reference

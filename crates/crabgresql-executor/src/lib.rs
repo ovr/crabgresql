@@ -143,6 +143,23 @@ pub trait CatalogOps: Send + Sync {
     /// such function. `Some` only when the name is unambiguous, as `regprocin`
     /// requires. Backs `regproc` input.
     fn proc_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32>;
+    /// The `(namespace, name, argument types)` of the function `oid`
+    /// identifies, or `None` if there is no such function. Backs
+    /// `regprocedure` output, which renders the whole signature.
+    fn proc_signature(&self, oid: u32) -> Option<(String, String, Vec<u32>)>;
+    /// The OID of the function `namespace.name(args)` names, or `None` if there
+    /// is no such function.
+    ///
+    /// Separate from [`CatalogOps::proc_oid`] rather than a wider version of
+    /// it, because the two disagree about what an overload set means: a bare
+    /// name carried by several functions is unresolvable, while a signature
+    /// picks exactly one of them out.
+    fn proc_oid_by_signature(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        args: &[u32],
+    ) -> Option<u32>;
     /// The operator `oid` identifies, or `None` if there is no such operator.
     /// Backs both operator kinds of `reg*` output: `regoper` needs the namespace
     /// to qualify a name several operators share, `regoperator` prints the

@@ -139,21 +139,109 @@ pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
 /// accept `int; DROP TABLE t`.
 ///
 /// Used for type names that reach us outside a statement — a PL/pgSQL
-/// declaration's type, which is lifted out of a routine body as text.
+/// declaration's type, which is lifted out of a routine body as text, and
+/// `regtype`/`regprocedure` input.
+///
+/// A failure is reported the way PostgreSQL reports it: `syntax error at or
+/// near "<token>"`, pointing at the token the type grammar stopped on, rather
+/// than in the fork's own `Expected: …, found: …` wording. PostgreSQL parses
+/// exactly this string in its `RAW_PARSE_TYPE_NAME` mode, so the token it
+/// stops on is the same one — verified against 18.4 for `int4 int4`, `4`,
+/// `'x'`, `"int4" "int4"`, `numeric(10,2) x`, `.int4`, `-1` and `int4[1,2]`.
 pub fn parse_data_type(sql: &str) -> Result<ast::DataType, ParseError> {
     let mut parser = Parser::new(&PostgreSqlDialect {})
         .try_with_sql(sql)
         .map_err(ParseError::from)?;
-    let data_type = parser.parse_data_type().map_err(ParseError::from)?;
-    parser
-        .expect_token(&tokenizer::Token::EOF)
-        .map_err(ParseError::from)?;
-    Ok(data_type)
+    let parsed = parser
+        .parse_data_type()
+        .and_then(|ty| parser.expect_token(&tokenizer::Token::EOF).map(|_| ty));
+    match parsed {
+        Ok(data_type) => Ok(data_type),
+        // A diagnostic the fork already shaped like PostgreSQL's stays as it
+        // is; only the generic parser errors need rewording.
+        Err(e @ ParserError::PgDiagnostic(_)) => Err(ParseError::from(e)),
+        Err(e) => Err(type_name_syntax_error(sql, &e)),
+    }
+}
+
+/// PostgreSQL's `syntax error` for a type name, naming the token the parse
+/// stopped on.
+///
+/// The token is read back out of the fork's own message rather than off the
+/// parser, because where the parser is left standing depends on which check
+/// failed — `parse_data_type` consumes the token it rejects while
+/// `expect_token` does not — and `found:` names it either way.
+fn type_name_syntax_error(sql: &str, e: &ParserError) -> ParseError {
+    let text = e.to_string();
+    let found = text
+        .rsplit_once("found: ")
+        .map(|(_, rest)| rest.split(" at Line:").next().unwrap_or(rest).trim());
+    // Two ways to run out of input, and PostgreSQL words both the same way: no
+    // token at all, and a trailing `.` that promises another name part —
+    // `'int4.'` is `syntax error at end of input` where `'.int4'` is `syntax
+    // error at or near "."`.
+    let at_end = match found {
+        None | Some("EOF") => true,
+        Some(".") => sql.trim_end().ends_with('.'),
+        Some(_) => false,
+    };
+    let message = match found {
+        Some(token) if !at_end => format!("syntax error at or near \"{token}\""),
+        _ => "syntax error at end of input".to_string(),
+    };
+    ParseError {
+        message,
+        sqlstate: SYNTAX_ERROR,
+        hint: None,
+        location: None,
+    }
 }
 
 #[cfg(test)]
 mod wrapper_tests {
     use super::*;
+
+    /// A malformed type name reports the token PostgreSQL reports, in
+    /// PostgreSQL's wording. Every pair here is `SELECT '<spec>'::regprocedure`
+    /// on 18.4, whose argument types go through this same grammar.
+    ///
+    /// TODO: a spelling *this* parser accepts and PostgreSQL's does not still
+    /// gets no error at all — a bare reserved word (`select`, `from`) reads as
+    /// a type name here, so a caller reports `type "select" does not exist`
+    /// where PG reports a syntax error. Categories do not decide it: PG accepts
+    /// `left` and `binary` as type names (`type "left" does not exist`) and
+    /// rejects `setof` and `none`, so closing this means following its
+    /// `Typename` grammar rather than a keyword list.
+    #[test]
+    fn a_malformed_type_name_reports_postgresqls_token() {
+        let err = |s: &str| parse_data_type(s).expect_err("malformed").message;
+        assert_eq!(err("int4 int4"), "syntax error at or near \"int4\"");
+        assert_eq!(err("4"), "syntax error at or near \"4\"");
+        assert_eq!(err("'x'"), "syntax error at or near \"'x'\"");
+        assert_eq!(err("numeric(10,2) x"), "syntax error at or near \"x\"");
+        assert_eq!(err(".int4"), "syntax error at or near \".\"");
+        assert_eq!(err("-1"), "syntax error at or near \"-\"");
+        assert_eq!(err("int4[1,2]"), "syntax error at or near \",\"");
+        // A quoted token keeps its quotes, as PG echoes it.
+        assert_eq!(
+            err("\"int4\" \"int4\""),
+            "syntax error at or near \"\"int4\"\""
+        );
+        // Running out of input, spelled the same way for a trailing dot as for
+        // an unfinished modifier.
+        assert_eq!(err("int4."), "syntax error at end of input");
+        assert_eq!(err("int4("), "syntax error at end of input");
+        // Everything the grammar does accept is untouched.
+        for ok in [
+            "numeric",
+            "int4[]",
+            "varchar(10)",
+            "pg_catalog.int4",
+            "\"char\"",
+        ] {
+            assert!(parse_data_type(ok).is_ok(), "{ok} is a type name");
+        }
+    }
 
     #[test]
     fn parses_select_one() -> anyhow::Result<()> {
