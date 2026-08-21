@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787313225194,
+  "lastUpdate": 1787313226963,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -47848,6 +47848,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18674.472708,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3a877512f2b23ba41f27d53348b2d4a2924312a7",
+          "message": "feat: Support the regoperator type (#267)",
+          "timestamp": "2026-08-21T13:05:10+02:00",
+          "tree_id": "afe2bdfbd4fa1d6451029f5ea4361f03640f1313",
+          "url": "https://github.com/ovr/crabgresql/commit/3a877512f2b23ba41f27d53348b2d4a2924312a7"
+        },
+        "date": 1787313226819,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1264.15015,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 21152.208544,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
