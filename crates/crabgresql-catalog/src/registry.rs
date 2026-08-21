@@ -22,8 +22,9 @@ use crate::catalogs::{
     acl, aggregate, am, amop, attribute, auth, class, collation, constraint, conversion, cursors,
     database, depend, description, extension, foreign, index, inherits, language, locks,
     misc_empty, namespace, opclass, operator, policy, prepared, proc, progress, publication,
-    relviews, replication, rewrite, sequence, settings, stat_activity, stat_database, stat_indexes,
-    stat_io, stat_tables, statio, statistic, statistic_ext, textsearch, timezone, trigger, types,
+    relviews, replication, rewrite, sequence, settings, stat_activity, stat_database, stat_gssapi,
+    stat_indexes, stat_io, stat_ssl, stat_tables, statio, statistic, statistic_ext, textsearch,
+    timezone, trigger, types,
 };
 use crate::cols::no_rows;
 use crate::views::information_schema;
@@ -672,6 +673,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         stat_database::pg_stat_database_conflicts_rows,
     ),
     rel(
+        "pg_stat_gssapi",
+        12257,
+        PgCatalog,
+        stat_gssapi::pg_stat_gssapi_schema,
+        stat_gssapi::pg_stat_gssapi_rows,
+    ),
+    rel(
         "pg_stat_io",
         12301,
         PgCatalog,
@@ -733,6 +741,13 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
         PgCatalog,
         replication::pg_stat_replication_slots_schema,
         no_rows,
+    ),
+    rel(
+        "pg_stat_ssl",
+        12253,
+        PgCatalog,
+        stat_ssl::pg_stat_ssl_schema,
+        stat_ssl::pg_stat_ssl_rows,
     ),
     rel(
         "pg_stat_subscription",
