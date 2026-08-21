@@ -500,3 +500,17 @@ SELECT 2287::regtype::text::regtype AS roundtrip;
  record[]
 (1 row)
 
+-- an array of a reg* type is named for its element too, under every spelling
+SELECT 2209::regtype AS by_oid, '_regoperator'::regtype AS typname_spelling,
+       'regoperator[]'::regtype AS rendered_spelling;
+    by_oid     | typname_spelling | rendered_spelling 
+---------------+------------------+-------------------
+ regoperator[] | regoperator[]    | regoperator[]
+(1 row)
+
+SELECT 2210::regtype AS regclass_array, 1008::regtype AS regproc_array;
+ regclass_array | regproc_array 
+----------------+---------------
+ regclass[]     | regproc[]
+(1 row)
+

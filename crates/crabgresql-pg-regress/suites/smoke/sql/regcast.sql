@@ -207,3 +207,7 @@ DROP SCHEMA rcs;
 -- always something regtype can read back
 SELECT '_record'::regtype AS typname_spelling, 'record[]'::regtype AS rendered_spelling;
 SELECT 2287::regtype::text::regtype AS roundtrip;
+-- an array of a reg* type is named for its element too, under every spelling
+SELECT 2209::regtype AS by_oid, '_regoperator'::regtype AS typname_spelling,
+       'regoperator[]'::regtype AS rendered_spelling;
+SELECT 2210::regtype AS regclass_array, 1008::regtype AS regproc_array;

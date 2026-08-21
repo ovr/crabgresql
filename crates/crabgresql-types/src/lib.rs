@@ -1286,6 +1286,12 @@ fn array_display_name(elem: u32) -> &'static str {
         Some(PgType::Tsquery) => "tsquery[]",
         Some(PgType::Vector(VectorKind::Oid)) => "oidvector[]",
         Some(PgType::Vector(VectorKind::Int2)) => "int2vector[]",
+        Some(PgType::Reg(RegKind::Proc)) => "regproc[]",
+        Some(PgType::Reg(RegKind::Oper)) => "regoper[]",
+        Some(PgType::Reg(RegKind::Operator)) => "regoperator[]",
+        Some(PgType::Reg(RegKind::Class)) => "regclass[]",
+        Some(PgType::Reg(RegKind::Type)) => "regtype[]",
+        Some(PgType::Reg(RegKind::Namespace)) => "regnamespace[]",
         _ => "array",
     }
 }
@@ -1764,6 +1770,27 @@ mod tests {
                 PgType::from_name(name),
                 Some(ty),
                 "{name} does not resolve back to its PgType"
+            );
+        }
+    }
+
+    /// An array's *display* name is its element's plus `[]` — every arm of
+    /// `array_display_name` obeys that, `"char"[]` and `time without time
+    /// zone[]` included, and PostgreSQL 18.4 agrees for every pair this build
+    /// models. Swept rather than spelled out one type at a time because the
+    /// failure mode is an omission: a modelled element with no arm of its own
+    /// falls to the generic `array`, which reads like a type name and is not
+    /// one. That is how the six `reg*` arrays printed `array` until this test
+    /// existed.
+    #[test]
+    fn an_array_is_named_for_its_element() {
+        for (elem, _) in array::pairs() {
+            let element = PgType::from_oid(elem).expect("a modelled element type");
+            assert_eq!(
+                PgType::Array(elem).name(),
+                format!("{}[]", element.name()),
+                "{} has no array display name of its own",
+                element.name()
             );
         }
     }
