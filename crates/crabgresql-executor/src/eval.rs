@@ -1176,8 +1176,8 @@ fn eval_deparse_fn(
         // Two things about a default belong to the *reader* rather than the
         // writer — the `pretty` parenthesisation and the session's time zone —
         // so `pg_get_expr` re-renders for them; see `ruleutils::stored_expr`.
-        // Anything that is not one expression is echoed. A NULL node yields
-        // NULL, as in PG.
+        // Anything that is not one expression is echoed, and a NULL in any
+        // argument yields NULL (see [`strict_null`]).
         ScalarFn::PgGetExpr => Some(Ok(eval_pg_get_expr(args, ctx))),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
         ScalarFn::PgGetRuledef => Some(eval_pg_get_ruledef(args, ctx)),
@@ -1193,6 +1193,21 @@ fn eval_deparse_fn(
     }
 }
 
+/// Whether a call must answer NULL without running: PostgreSQL declares every
+/// `pg_get_*` deparse function STRICT (`pg_proc.proisstrict`, checked on 18.4
+/// for all of `pg_get_expr`, `viewdef`, `ruledef`, `triggerdef`,
+/// `constraintdef`, `indexdef`, `serial_sequence` and the `function_*` trio).
+///
+/// Said here rather than inherited, because this whole family is dispatched from
+/// [`eval_deparse_fn`] ahead of the STRICT short-circuit in `eval_scalar`. That
+/// detour exists for `format_type` alone — the one function in the group that is
+/// *not* strict, and must name a type when only its modifier is NULL — and
+/// without this every other member would silently read a NULL flag as `false`
+/// and return a definition where PostgreSQL returns nothing.
+fn strict_null(args: &[Value]) -> bool {
+    args.iter().any(|arg| matches!(arg, Value::Null))
+}
+
 /// `pg_get_serial_sequence(relation, column)`: the sequence that column owns,
 /// schema-qualified and quoted the way PostgreSQL prints it
 /// (`dp2."MixT_id_seq"`).
@@ -1206,10 +1221,9 @@ fn eval_deparse_fn(
 /// `"ColX"` and `'colx'` raises `42703`, as observed on PostgreSQL 18.4. A
 /// column that owns no sequence is NULL, not an error.
 ///
-/// Strict, stated here rather than inherited for the reason
-/// [`eval_pg_get_indexdef`] gives.
+/// Strict, for the reason [`strict_null`] gives.
 fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
-    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+    if strict_null(args) {
         return Ok(Value::Null);
     }
     let (Value::Text(relation), Value::Text(column)) = (&args[0], &args[1]) else {
@@ -1239,7 +1253,8 @@ fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Valu
 /// `pg_get_constraintdef(oid[, pretty])`: the constraint's DDL text.
 ///
 /// An OID no constraint answers to yields **NULL** — verified against
-/// PostgreSQL 18.4, which does not raise for it here.
+/// PostgreSQL 18.4, which does not raise for it here. So does a NULL `pretty`,
+/// for the reason [`strict_null`] gives.
 ///
 /// A check constraint is doubly parenthesised in the non-pretty form:
 /// `CHECK ((x > 3))`, the outer pair from the `CHECK` syntax and the inner from
@@ -1258,6 +1273,9 @@ fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Valu
 /// what `pg_constraint.conbin` stores and what `information_schema` reads —
 /// already agrees exactly.
 fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if strict_null(args) {
+        return Ok(Value::Null);
+    }
     let Value::Oid(oid) = &args[0] else {
         return Ok(Value::Null);
     };
@@ -1302,13 +1320,11 @@ fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value,
 /// `pg_indexes.indexdef`; `pretty` changes only line breaking, which neither
 /// form produces.
 ///
-/// Strict in every argument (`pg_proc.proisstrict` is true for both overloads on
-/// 18.4), which has to be said here rather than inherited: this is dispatched
-/// from [`eval`] alongside `format_type`, not from the STRICT `eval_scalar` path
-/// that short-circuits a NULL for its callers. Without it a NULL `column` would
-/// read as `0` and return the whole statement where PostgreSQL returns NULL.
+/// Strict in every argument, for the reason [`strict_null`] gives — without it a
+/// NULL `column` would read as `0` and return the whole statement where
+/// PostgreSQL returns NULL.
 fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
-    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+    if strict_null(args) {
         return Ok(Value::Null);
     }
     let Value::Oid(oid) = &args[0] else {
@@ -1348,10 +1364,17 @@ fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, Exec
 }
 
 /// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
-/// (see [`eval_deparse_fn`]). The third argument is PG's `pretty` flag, which
-/// defaults to false — `information_schema` leaves it off and gets the fully
-/// parenthesised form, psql passes it and gets `\d`'s.
+/// (see [`eval_deparse_fn`]). The third argument is PG's `pretty` flag, which an
+/// absent argument leaves false — `information_schema` omits it and gets the
+/// fully parenthesised form, psql passes it and gets `\d`'s.
+///
+/// Strict, for the reason [`strict_null`] gives: an *absent* flag is false, a
+/// NULL one makes the whole call NULL, and so does a NULL relation OID — the
+/// argument this deparse ignores but PostgreSQL still refuses to run without.
 fn eval_pg_get_expr(args: &[Value], ctx: &ExecContext) -> Value {
+    if strict_null(args) {
+        return Value::Null;
+    }
     let Value::Text(sql) = &args[0] else {
         return args[0].clone();
     };
@@ -1367,11 +1390,17 @@ fn eval_pg_get_expr(args: &[Value], ctx: &ExecContext) -> Value {
 /// since there is no name to report missing; a relation that is not a view is
 /// NULL (verified on 18.4 for a table and for `pg_class`, in both spellings); a
 /// view is its `SELECT`, re-rendered by [`crabgresql_binder::ruleutils`].
+///
+/// Strict, for the reason [`strict_null`] gives — `pg_get_viewdef(v, NULL)` is
+/// NULL, not the non-pretty definition.
 fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if strict_null(args) {
+        return Ok(Value::Null);
+    }
     // PG's `pretty` is `PRETTYFLAG_PAREN`: it drops the parentheses that only
-    // restate precedence. Absent or NULL means false, as in PG. An `int4` second
-    // argument is PG's wrap column, which implies pretty; the width is not
-    // honored, since nothing here wraps a select list.
+    // restate precedence. An *absent* second argument means false. An `int4` one
+    // is PG's wrap column, which implies pretty; the width is not honored, since
+    // nothing here wraps a select list.
     let pretty = matches!(args.get(1), Some(Value::Bool(true) | Value::Int4(_)));
     let Some(catalog) = ctx.catalog.as_deref() else {
         return Err(ExecError::new(
@@ -1440,8 +1469,12 @@ fn view_body(
 /// schema-qualifies the relation unconditionally (`public.pv`, even with
 /// `public` in the search path), and with it only when the bare name would not
 /// find it. Verified on 18.4 both ways round — a view in the search path and one
-/// outside it.
+/// outside it. A NULL flag is not "not pretty" but NULL, for the reason
+/// [`strict_null`] gives.
 fn eval_pg_get_ruledef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if strict_null(args) {
+        return Ok(Value::Null);
+    }
     let Value::Oid(oid) = &args[0] else {
         return Ok(Value::Null);
     };
@@ -1479,7 +1512,8 @@ fn eval_pg_get_ruledef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecE
 /// Not a stub standing in for a lookup: `pg_trigger` is empty in every database
 /// this build serves (there is no `CREATE TRIGGER`), and NULL is what PostgreSQL
 /// answers for an OID carrying no trigger — verified on 18.4. The day triggers
-/// exist, this grows the lookup and keeps the same miss.
+/// exist, this grows the lookup and keeps the same miss, which is also why
+/// [`strict_null`]'s answer and this one already coincide.
 fn eval_pg_get_triggerdef(_args: &[Value]) -> Value {
     Value::Null
 }
@@ -1558,9 +1592,13 @@ pub(crate) fn format_type_text(
 /// the expression back — so the two lists are the same string today, and the day
 /// they differ this grows the branch rather than a second renderer.
 ///
-/// A `CREATE FUNCTION` argument of a user-defined type prints as `???`: the
-/// catalog records `0` for it (`crabgresql-server`'s `catalog_routine`), the
-/// same limit `regprocedure` already has.
+/// A **procedure** spells its input arguments `IN a integer` where a function
+/// leaves the mode off — verified on 18.4, which prints `IN a integer, IN b text`
+/// for a procedure and `a integer, b text` for the same argument list on a
+/// function.
+///
+/// An argument whose type OID resolves to nothing prints as `-`, which is what
+/// [`format_type_text`] answers for OID `0`.
 fn eval_pg_get_function_arguments(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let Some((info, catalog)) = proc_info_of(args, ctx, "pg_get_function_arguments")? else {
         return Ok(Value::Null);
@@ -1575,6 +1613,7 @@ fn eval_pg_get_function_arguments(args: &[Value], ctx: &ExecContext) -> Result<V
             'o' => "OUT ",
             'b' => "INOUT ",
             'v' => "VARIADIC ",
+            _ if info.kind == 'p' => "IN ",
             _ => "",
         };
         let name = match info.arg_names.get(position) {
@@ -1594,10 +1633,19 @@ fn eval_pg_get_function_arguments(args: &[Value], ctx: &ExecContext) -> Result<V
 /// declares `RETURNS TABLE` (arguments in mode `t`), `SETOF <type>` when it
 /// returns a set, and the bare type otherwise. Several OUT parameters need no
 /// case of their own: `prorettype` is already `record` there.
+///
+/// A **procedure** has no result at all and answers NULL, which is decided by
+/// `prokind` rather than by the return type: `CREATE PROCEDURE` stores
+/// `prorettype = text` as a placeholder here (`PgType` has no `void`; see the
+/// TODO in `crabgresql-server`'s `execute_create_procedure`), so reading the
+/// type would print `text` where 18.4 prints nothing.
 fn eval_pg_get_function_result(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let Some((info, catalog)) = proc_info_of(args, ctx, "pg_get_function_result")? else {
         return Ok(Value::Null);
     };
+    if info.kind == 'p' {
+        return Ok(Value::Null);
+    }
     let columns: Vec<String> = info
         .arg_types
         .iter()

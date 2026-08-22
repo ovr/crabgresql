@@ -2153,11 +2153,11 @@ pub struct RoutineSig {
 /// renders it: a `pg_proc` row seen through *type OIDs*, where [`RoutineSig`]
 /// sees resolved [`PgType`]s. The two do not merge — this one describes
 /// built-in rows as well, whose types are OIDs the binder never resolves, and
-/// it must survive an OID no type answers to (which prints as `???`).
+/// it must survive an OID no type answers to (which prints as `-`).
 ///
-/// The three optional `pg_proc` columns arrive **expanded**: PostgreSQL leaves
+/// The two optional `pg_proc` columns arrive **expanded**: PostgreSQL leaves
 /// `proallargtypes` NULL when every argument is IN and `proargmodes` NULL when
-/// every mode is `i`, and the producer undoes both so that `arg_types`,
+/// every mode is `i`, and [`StoredProc`] undoes both so that `arg_types`,
 /// `arg_modes` and (when non-empty) `arg_names` are positionally aligned.
 /// `arg_names` stays empty for an unnamed argument list, since there the
 /// absence is what gets printed.
@@ -2173,37 +2173,49 @@ pub struct ProcInfo {
     pub ret_type: u32,
     /// `proretset`: the function returns a set.
     pub retset: bool,
+    /// `prokind`: `f` function, `p` procedure, `a` aggregate, `w` window. A
+    /// procedure is not a function with a return type — PostgreSQL reports no
+    /// result for one at all — so the renderers need this as well as the types.
+    pub kind: char,
 }
 
-impl ProcInfo {
-    /// Build one from the `pg_proc` columns as *stored*, expanding the two that
-    /// PostgreSQL leaves NULL for the all-IN case. `all_types` empty means
-    /// `proallargtypes` is NULL, so the input types are every type; `modes`
-    /// empty means `proargmodes` is NULL, so every mode is `i`.
-    pub fn from_stored(
-        types: Vec<u32>,
-        all_types: Vec<u32>,
-        modes: Vec<char>,
-        names: Vec<String>,
-        ret_type: u32,
-        retset: bool,
-    ) -> Self {
-        let arg_types = if all_types.is_empty() {
-            types
+/// The `pg_proc` columns a [`ProcInfo`] is built from, spelled as PostgreSQL
+/// spells them. Named rather than positional: seven fields of `Vec<u32>`,
+/// `Vec<char>` and `u32` are trivially swappable at a call site, and the two
+/// producers (generated built-in rows, session routines) fill them from sources
+/// that look nothing alike.
+pub struct StoredProc {
+    pub proargtypes: Vec<u32>,
+    /// Empty means NULL — every argument is IN, so `proargtypes` is the list.
+    pub proallargtypes: Vec<u32>,
+    /// Empty means NULL — every mode is `i`.
+    pub proargmodes: Vec<char>,
+    /// Empty means NULL — no argument is named.
+    pub proargnames: Vec<String>,
+    pub prorettype: u32,
+    pub proretset: bool,
+    pub prokind: char,
+}
+
+impl From<StoredProc> for ProcInfo {
+    fn from(stored: StoredProc) -> Self {
+        let arg_types = if stored.proallargtypes.is_empty() {
+            stored.proargtypes
         } else {
-            all_types
+            stored.proallargtypes
         };
-        let arg_modes = if modes.is_empty() {
+        let arg_modes = if stored.proargmodes.is_empty() {
             vec!['i'; arg_types.len()]
         } else {
-            modes
+            stored.proargmodes
         };
         Self {
             arg_types,
             arg_modes,
-            arg_names: names,
-            ret_type,
-            retset,
+            arg_names: stored.proargnames,
+            ret_type: stored.prorettype,
+            retset: stored.proretset,
+            kind: stored.prokind,
         }
     }
 }

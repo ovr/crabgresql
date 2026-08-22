@@ -17180,6 +17180,50 @@ async fn pg_get_viewdef_resolves_by_oid_as_well_as_by_name() -> anyhow::Result<(
     Ok(())
 }
 
+/// Every `pg_get_*` deparse function is STRICT, so a NULL flag makes the whole
+/// call NULL rather than selecting the non-pretty form. `pg_proc.proisstrict` is
+/// true for all of them on 18.4 — `format_type` is the one exception in the
+/// family, and it is not one of these.
+#[tokio::test]
+async fn the_deparse_functions_are_strict_in_every_argument() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t (a int CHECK (a > 0), b text DEFAULT 'x');
+             CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1",
+        )
+        .await?;
+    for sql in [
+        // A NULL `pretty`, in every spelling that takes one.
+        "SELECT pg_get_viewdef('v', NULL::boolean)",
+        "SELECT pg_get_viewdef('v'::regclass, NULL::boolean)",
+        // The wrap-column overload: a NULL width is NULL, not "pretty".
+        "SELECT pg_get_viewdef('v'::regclass, NULL::int)",
+        "SELECT pg_get_ruledef((SELECT oid FROM pg_rewrite), NULL::boolean)",
+        "SELECT pg_get_triggerdef(999999, NULL::boolean)",
+        "SELECT pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE contype = 'c'), \
+                                     NULL::boolean)",
+        "SELECT pg_get_indexdef(999999, 1, NULL::boolean)",
+        // `pg_get_expr` ignores its relation argument, but PostgreSQL still
+        // refuses to run without it.
+        "SELECT pg_get_expr(adbin, NULL::oid) FROM pg_attrdef",
+        "SELECT pg_get_expr(adbin, adrelid, NULL::boolean) FROM pg_attrdef",
+    ] {
+        let got: Option<String> = client.query_one(sql, &[]).await?.get(0);
+        assert_eq!(got, None, "{sql}");
+    }
+    // The flag being *absent* is still false, which is the case the strictness
+    // rule must not swallow.
+    let row = client
+        .query_one(
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 't'::regclass",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, Option<&str>>(0), Some("'x'::text"));
+    Ok(())
+}
+
 /// `pg_get_ruledef` prints the `_RETURN` rule every view carries, wrapping the
 /// same body `pg_get_viewdef` renders. `pg_get_triggerdef` answers NULL for
 /// every OID, which is what PostgreSQL answers while no trigger exists.
@@ -17309,6 +17353,114 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
         .await?
         .get(0);
     assert_eq!(missing, None);
+    Ok(())
+}
+
+/// A **procedure** is not a function with a result: PostgreSQL reports no
+/// `RETURNS` clause for one at all, and spells its input arguments `IN a integer`
+/// where a function leaves the mode off. Both verified on 18.4.
+///
+/// The result matters more than it looks: `CREATE PROCEDURE` stores
+/// `prorettype = text` as a placeholder here, so anything reading the type rather
+/// than `prokind` would answer `text`.
+#[tokio::test]
+async fn a_procedure_has_no_result_and_spells_its_in_arguments() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE PROCEDURE p1(a int, b text) LANGUAGE plpgsql AS $$ BEGIN END $$;
+             CREATE FUNCTION fn1(a int, b text) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$",
+        )
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_arguments(oid), \
+                    pg_get_function_identity_arguments(oid), \
+                    pg_get_function_result(oid), prokind::text \
+             FROM pg_proc WHERE proname = 'p1'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "IN a integer, IN b text");
+    assert_eq!(row.get::<_, &str>(1), "IN a integer, IN b text");
+    assert_eq!(row.get::<_, Option<&str>>(2), None);
+    assert_eq!(row.get::<_, &str>(3), "p");
+    // The same argument list on a function keeps the modes implicit.
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_arguments(oid), pg_get_function_result(oid) \
+             FROM pg_proc WHERE proname = 'fn1'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "a integer, b text");
+    assert_eq!(row.get::<_, Option<&str>>(1), Some("integer"));
+    Ok(())
+}
+
+/// A routine declared over a `CREATE TYPE` type records that type's OID in
+/// `pg_proc.proargtypes`, so the deparse names it. The same goes for `cstring`,
+/// the pseudo-type every type's I/O functions are declared over.
+///
+/// `proargtypes` is more than the printed name: it is what `regprocedure`
+/// resolves a written signature against, so a hole there makes
+/// `'xbase_out(xbase)'::regprocedure` unresolvable.
+#[tokio::test]
+async fn a_routine_over_a_user_type_records_its_oid() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TYPE mood AS ENUM ('sad', 'happy');
+             CREATE FUNCTION likes(m mood) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$",
+        )
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_arguments(oid), (proargtypes)[0] = 'mood'::regtype::oid \
+             FROM pg_proc WHERE proname = 'likes'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "m mood");
+    assert!(row.get::<_, bool>(1), "the argument records the type's OID");
+
+    // `cstring` reaches the same renderer through the pseudo-type table. The
+    // type is completed before reading, because a *shell* type is not published
+    // in `pg_type` here at all — a wider gap than this deparse, and the reason
+    // the I/O functions are read after `CREATE TYPE` rather than between the
+    // two halves of the dance.
+    client
+        .batch_execute(
+            "CREATE TYPE xbase;
+             CREATE FUNCTION xbase_in(cstring) RETURNS xbase AS 'int8in' LANGUAGE internal;
+             CREATE FUNCTION xbase_out(xbase) RETURNS cstring AS 'int8out' LANGUAGE internal;
+             CREATE TYPE xbase (input = xbase_in, output = xbase_out, like = int8)",
+        )
+        .await?;
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_arguments(oid), pg_get_function_result(oid) \
+             FROM pg_proc WHERE proname = 'xbase_in'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "cstring");
+    assert_eq!(row.get::<_, Option<&str>>(1), Some("xbase"));
+    // And the inverse, which is the signature `regprocedure` has to parse back.
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_arguments(oid), pg_get_function_result(oid), \
+                    oid = 'xbase_out(xbase)'::regprocedure::oid \
+             FROM pg_proc WHERE proname = 'xbase_out'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "xbase");
+    assert_eq!(row.get::<_, Option<&str>>(1), Some("cstring"));
+    assert!(
+        row.get::<_, bool>(2),
+        "a written signature over a user type resolves now that its OID is recorded"
+    );
     Ok(())
 }
 

@@ -43,7 +43,7 @@ pub(crate) fn pg_rewrite_schema() -> TableSchema {
 /// a view [`crate::CatalogRelation::definition`] could not render.
 pub(crate) fn pg_rewrite_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     cat.rewrite_oids()
-        .into_iter()
+        .iter()
         .map(|rule| {
             vec![
                 Value::Oid(rule.oid),
@@ -53,8 +53,8 @@ pub(crate) fn pg_rewrite_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 chr('O'),
                 Value::Bool(true),
                 Value::Text("<>".to_string()),
-                match rule.definition {
-                    Some(sql) => Value::Text(sql),
+                match &rule.definition {
+                    Some(sql) => Value::Text(sql.clone()),
                     None => Value::Null,
                 },
             ]

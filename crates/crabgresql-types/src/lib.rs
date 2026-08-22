@@ -130,6 +130,10 @@ pub mod oid {
     /// no [`crate::PgType`] of its own — the binder models it as
     /// `Binding::Unknown` — but `pg_typeof` and `705::regtype` have to name it.
     pub const UNKNOWN: u32 = 705;
+    /// `cstring`: the pseudo-type a C input/output function is declared over.
+    /// Like `unknown` it has no [`crate::PgType`], but `pg_proc.proargtypes`
+    /// records it for every `CREATE TYPE` support function.
+    pub const CSTRING: u32 = 2275;
     /// `regproc`: an OID that renders as a function name. See [`crate::Reg`].
     pub const REGPROC: u32 = 24;
     /// `regprocedure`: an OID that renders as a function *signature*. See
@@ -233,7 +237,7 @@ const PSEUDO_TYPES: &[(u32, &str, &str)] = &[
     (325, "index_am_handler", "index_am_handler"),
     (oid::UNKNOWN, "unknown", "unknown"),
     (2249, "record", "record"),
-    (2275, "cstring", "cstring"),
+    (oid::CSTRING, "cstring", "cstring"),
     (2276, "any", "\"any\""),
     (2277, "anyarray", "anyarray"),
     (2278, "void", "void"),

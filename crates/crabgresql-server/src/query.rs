@@ -5,7 +5,7 @@
 //! module, which drives the engine and the GUC table directly.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
@@ -392,13 +392,26 @@ fn leaf_name(name: &ast::ObjectName) -> Option<String> {
 
 /// A catalog routine as `pg_proc` reports it.
 ///
-/// A type that does not resolve is reported as OID 0 rather than dropping the
-/// row: `pg_proc` should show every routine that exists, and PostgreSQL also
-/// prints 0 for a type it cannot name.
-pub(crate) fn catalog_routine(info: &FuncInfo) -> crabgresql_catalog::CatalogRoutine {
+/// `user_types` maps a `CREATE TYPE` name to its OID, so that a routine
+/// declared over one records the type rather than a hole. It matters beyond
+/// `pg_proc` itself: `proargtypes` is what `regprocedure` renders and what
+/// `SystemCatalog::proc_oid_by_signature` matches a written signature against,
+/// so a zero there makes `'xbase_out(xbase)'::regprocedure` unresolvable and
+/// `pg_get_function_arguments` print `-`.
+///
+/// A type that still does not resolve — a name dropped between the two catalog
+/// reads — is reported as OID 0 rather than dropping the row: `pg_proc` should
+/// show every routine that exists, and PostgreSQL also prints 0 for a type it
+/// cannot name.
+pub(crate) fn catalog_routine(
+    info: &FuncInfo,
+    user_types: &HashMap<String, u32>,
+) -> crabgresql_catalog::CatalogRoutine {
     let oid_of = |r: &TypeRef| match r {
         TypeRef::Builtin(t) => t.oid(),
-        TypeRef::User(_) | TypeRef::Cstring => 0,
+        TypeRef::User(name) => user_types.get(name).copied().unwrap_or(0),
+        // A pseudo-type, which `format_type` names from the shared table.
+        TypeRef::Cstring => crabgresql_types::oid::CSTRING,
     };
     // PostgreSQL leaves proallargtypes/proargmodes NULL unless some argument is
     // OUT or INOUT, and proargnames NULL unless some argument is named.
