@@ -18,8 +18,8 @@ use super::coerce::{
 use super::datatype::{custom_type_name, map_data_type};
 use super::literal::{bind_at_local, bind_at_time_zone, bind_extract, bind_interval, bind_value};
 use super::operators::{
-    bind_binary, bind_binary_op, bind_bool_test, bind_compound, bind_is_null, bind_like,
-    bind_similar_to, bind_unary, binding_typed_ty, is_geo_ty, is_text_family, resolve_operand,
+    bind_binary, bind_binary_bound, bind_binary_op, bind_bool_test, bind_compound, bind_is_null,
+    bind_like, bind_similar_to, bind_unary, binding_typed_ty, is_text_family, resolve_operand,
 };
 use super::scope::{Binding, Scope, normalize_ident};
 
@@ -441,10 +441,14 @@ fn bind_in_subquery(
     negated: bool,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let op = if negated { BinOp::NotEq } else { BinOp::Eq };
+    let op = if negated {
+        ast::BinaryOperator::NotEq
+    } else {
+        ast::BinaryOperator::Eq
+    };
     // `IN` has no operator token of its own to point a cursor at, so the
     // comparison resolves with an empty span.
-    bind_quantified_subquery(expr, op, query, negated, Span::empty(), scope)
+    bind_quantified_subquery(expr, &op, query, negated, Span::empty(), scope)
 }
 
 /// `left op ANY(…)` / `left op SOME(…)` / `left op ALL(…)` (`all` selects `ALL`).
@@ -454,8 +458,9 @@ fn bind_in_subquery(
 /// array parameter binds here too, but a Bind message can only supply its value
 /// in text format).
 /// In both cases a NULL `Const` "hole" of the element type stands in for a
-/// candidate and `bind_binary_op` resolves the operator/coercions exactly as a
-/// written `left op v` would (the same trick as [`bind_in_subquery`]).
+/// candidate and `bind_binary_bound` resolves the operator/coercions exactly as
+/// a written `left op v` would (the same trick as [`bind_in_subquery`]) — so
+/// like PG this takes any operator that yields boolean, not just a comparison.
 ///
 /// TODO: decode array values in binary-format Bind parameters, which
 /// `types::wire::decode_binary` refuses with `0A000`.
@@ -467,19 +472,6 @@ fn bind_quantified(
     op_span: Span,
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let Some(op) = binop_from_comparison(compare_op) else {
-        // The parser also accepts the LIKE/regex operator spellings after
-        // ANY/ALL. Those lower to `ScalarFn` calls, not a `Binary` comparison
-        // template, so the quantified path has no hole to substitute into.
-        // TODO: build a quantified template for the LIKE/regex operator
-        // spellings after ANY/ALL.
-        return Err(BindError::feature_not_supported(format!(
-            "{compare_op} {} (…) is not supported yet",
-            if all { "ALL" } else { "ANY" }
-        ))
-        .at(op_span));
-    };
-
     // The parser emits `Expr::Subquery` for the `ANY(SELECT …)` form (possibly
     // wrapped in redundant parentheses); anything else is an array expression.
     let mut rhs = right;
@@ -488,25 +480,37 @@ fn bind_quantified(
     }
     match rhs {
         ast::Expr::Subquery(query) => {
-            bind_quantified_subquery(left, op, query, all, op_span, scope)
+            bind_quantified_subquery(left, compare_op, query, all, op_span, scope)
         }
-        _ => bind_quantified_array(left, op, right, all, op_span, scope),
+        _ => bind_quantified_array(left, compare_op, right, all, op_span, scope),
     }
 }
 
-/// The comparison subset of the `ast::BinaryOperator` → [`BinOp`] mapping (the
-/// only operators a quantified comparison accepts). Shared with `bind_binary` so
-/// a new comparison spelling can never bind for `a < b` but not `a < ANY(…)`.
-pub(super) fn binop_from_comparison(op: &ast::BinaryOperator) -> Option<BinOp> {
-    Some(match op {
-        ast::BinaryOperator::Eq => BinOp::Eq,
-        ast::BinaryOperator::NotEq => BinOp::NotEq,
-        ast::BinaryOperator::Lt => BinOp::Lt,
-        ast::BinaryOperator::LtEq => BinOp::LtEq,
-        ast::BinaryOperator::Gt => BinOp::Gt,
-        ast::BinaryOperator::GtEq => BinOp::GtEq,
-        _ => return None,
-    })
+/// Which of PG's two "the operator must yield boolean" errors a quantified form
+/// raises: the array form blames the operator (42809), the subquery form names
+/// the type it got instead (42804).
+#[derive(Clone, Copy)]
+enum QuantifiedForm {
+    Array,
+    Subquery,
+}
+
+impl QuantifiedForm {
+    fn non_boolean(self, got: PgType) -> BindError {
+        match self {
+            Self::Array => BindError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "op ANY/ALL (array) requires operator to yield boolean",
+            ),
+            Self::Subquery => BindError::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!(
+                    "row comparison operator must yield type boolean, not type {}",
+                    got.name()
+                ),
+            ),
+        }
+    }
 }
 
 /// The subquery form of [`bind_quantified`]: the one-column subquery supplies
@@ -514,7 +518,7 @@ pub(super) fn binop_from_comparison(op: &ast::BinaryOperator) -> Option<BinOp> {
 /// [`bind_in_subquery`]. A subquery with more than one column errors.
 fn bind_quantified_subquery(
     left: &ast::Expr,
-    op: BinOp,
+    compare_op: &ast::BinaryOperator,
     query: &ast::Query,
     all: bool,
     op_span: Span,
@@ -529,7 +533,15 @@ fn bind_quantified_subquery(
     };
     let elem_ty = col.ty;
     let needle = bind_expr(left, scope)?;
-    let cmp = bind_hole_template(op, needle, elem_ty, col.collation, op_span, scope)?;
+    let cmp = bind_hole_template(
+        compare_op,
+        needle,
+        elem_ty,
+        col.collation,
+        QuantifiedForm::Subquery,
+        op_span,
+        scope,
+    )?;
     Ok(Binding::Typed(BoundExpr::QuantifiedSubquery {
         subplan: Subplan::new(plan),
         all,
@@ -544,9 +556,18 @@ fn bind_quantified_subquery(
 /// [`bind_in_list`]'s unknown-literal policy. A right side that is not an array
 /// (or whose element type has no `PgType`) is PG's `op ANY/ALL (array) requires
 /// array on right side` error.
+///
+/// `oidvector`/`int2vector` are accepted here too — PG takes `attnum =
+/// ANY(indkey)` — even though [`PgType::array_element`] answers `None` for them
+/// so that `ARRAY[v]` builds an `oidvector[]` instead of flattening. Their
+/// element type is [`crabgresql_types::VectorKind::element`].
+///
+/// The right side is settled before the operator, as in PG: `33 * any (44)` is
+/// `requires array on right side` while `33 * any ('{1,2,3}')` is `requires
+/// operator to yield boolean`.
 fn bind_quantified_array(
     left: &ast::Expr,
-    op: BinOp,
+    compare_op: &ast::BinaryOperator,
     right: &ast::Expr,
     all: bool,
     op_span: Span,
@@ -554,26 +575,44 @@ fn bind_quantified_array(
 ) -> Result<Binding, BindError> {
     let needle = bind_expr(left, scope)?;
     let array = bind_expr(right, scope)?;
-    let elem_ty = match binding_typed_ty(&array) {
-        Some(ty) => ty.array_element().ok_or_else(|| {
-            BindError::new(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "op ANY/ALL (array) requires array on right side",
-            )
-            .at(op_span)
-        })?,
+    // A vector stays the vector type it is: there is no `oidvector`→`oid[]`
+    // cast, and none is needed — the executor iterates a `Value::Vector`
+    // alongside a `Value::Array`.
+    let (elem_ty, array_ty) = match binding_typed_ty(&array) {
+        Some(PgType::Vector(kind)) => (kind.element(), PgType::Vector(kind)),
+        Some(ty) => {
+            let elem = ty.array_element().ok_or_else(|| {
+                BindError::new(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "op ANY/ALL (array) requires array on right side",
+                )
+                .at(op_span)
+            })?;
+            (elem, PgType::Array(elem.oid()))
+        }
         // Untyped literal / bind parameter: element type follows the needle.
-        None => binding_typed_ty(&needle).unwrap_or(PgType::Text),
+        None => {
+            let elem = binding_typed_ty(&needle).unwrap_or(PgType::Text);
+            (elem, PgType::Array(elem.oid()))
+        }
     };
-    // Coerce the right side to `elem_ty[]` (identity for an already-typed array;
-    // parses `'{…}'` / types a `$n` param via `resolve_unknown`'s array arm).
-    let array_expr = resolve_operand(&array, PgType::Array(elem_ty.oid()))?;
+    // Identity for an already-typed array or vector; this is what parses `'{…}'`
+    // and types a `$n` param, via `resolve_unknown`'s array arm.
+    let array_expr = resolve_operand(&array, array_ty)?;
     // `PgType::Array` is never itself collatable here (only the element is), so
     // the hole falls back to the element type's default collation — unlike the
     // subquery form, which does know its one column's collation.
     // TODO: track an array value's element collation so `op ANY (array)`
     // compares under it instead of the element type's default.
-    let cmp = bind_hole_template(op, needle, elem_ty, None, op_span, scope)?;
+    let cmp = bind_hole_template(
+        compare_op,
+        needle,
+        elem_ty,
+        None,
+        QuantifiedForm::Array,
+        op_span,
+        scope,
+    )?;
     Ok(Binding::Typed(BoundExpr::QuantifiedArray {
         array: Box::new(array_expr),
         all,
@@ -583,31 +622,23 @@ fn bind_quantified_array(
 
 /// Build a quantified comparison's `needle op <hole>` template, where `<hole>`
 /// is a NULL `Const` of the candidate type. Binding it through
-/// [`bind_binary_op`] resolves the operator, operand promotion and every
+/// [`bind_binary_bound`] resolves the operator, operand promotion and every
 /// coercion exactly as a written `needle op candidate` would — and raises PG's
 /// `operator does not exist` (pointed at `op_span`) when there is none. The
 /// executor substitutes each candidate into that hole.
+///
+/// The operator is then judged by the type it resolved to, never by its
+/// spelling: `<<` is a shift on integers but containment on `inet`, and only the
+/// resolved operator knows which. A non-boolean is [`QuantifiedForm`]'s error.
 fn bind_hole_template(
-    op: BinOp,
+    op: &ast::BinaryOperator,
     needle: Binding,
     elem_ty: PgType,
     collation: Option<u32>,
+    form: QuantifiedForm,
     op_span: Span,
     scope: &Scope,
 ) -> Result<BoundExpr, BindError> {
-    // Geometric comparisons exist in PG but lower to `ScalarFn::Geo` calls here,
-    // not to a `Binary` with a substitutable RHS hole. `bind_binary_op` would
-    // report "operator does not exist", which is untrue — the operator exists,
-    // the quantified form just has no template shape for it.
-    // TODO: build a quantified template for geometric comparisons, rejected
-    // here with `0A000`.
-    if is_geo_ty(Some(elem_ty)) || is_geo_ty(binding_typed_ty(&needle)) {
-        return Err(BindError::feature_not_supported(format!(
-            "{} ANY/ALL (…) on geometric types is not supported yet",
-            op.sql_symbol()
-        ))
-        .at(op_span));
-    }
     let placeholder = BoundExpr::Const {
         value: Value::Null,
         ty: elem_ty,
@@ -623,25 +654,61 @@ fn bind_hole_template(
         },
         _ => placeholder,
     });
-    let cmp = bind_binary_op(
+    let cmp = bind_binary_bound(
         op,
         needle,
         hole,
         op_span,
         (Span::empty(), Span::empty()),
-        scope.catalog().as_ref(),
+        scope,
     )?;
-    match cmp {
-        Binding::Typed(cmp @ BoundExpr::Binary { .. }) => Ok(cmp),
-        // Any other comparison that lowers to a `ScalarFn` likewise has no hole
-        // to substitute into; fail here rather than leaving the executor to trip
-        // over a template shape it cannot destructure.
-        _ => Err(BindError::feature_not_supported(format!(
-            "{} ANY/ALL (…) on type {} is not supported yet",
-            op.sql_symbol(),
+    // A lowering that did not leave the hole where `substitute_hole` looks for
+    // it would compare every candidate against NULL — a wrong answer with no
+    // error — so refuse it here instead.
+    // TODO: build a quantified template for a lowering that does not end in the
+    // candidate, rejected here with `0A000`.
+    let unsupported = || {
+        BindError::feature_not_supported(format!(
+            "{op} ANY/ALL (…) on type {} is not supported yet",
             elem_ty.name()
         ))
-        .at(op_span)),
+        .at(op_span)
+    };
+    let Binding::Typed(cmp) = cmp else {
+        return Err(unsupported());
+    };
+    let ty = cmp.ty();
+    if ty != PgType::Bool {
+        return Err(form.non_boolean(ty).at(op_span));
+    }
+    if !template_has_hole(&cmp) {
+        return Err(unsupported());
+    }
+    Ok(cmp)
+}
+
+/// Whether the candidate side of a template still ends in the NULL `Const`
+/// placeholder, by the same descent `substitute_hole` uses. The type is not
+/// checked: operand promotion (`float8 = ANY(SELECT numeric)`) rebuilds the
+/// placeholder at the resolved comparison type, not at `elem_ty`.
+fn template_has_hole(cmp: &BoundExpr) -> bool {
+    let mut node = match cmp {
+        BoundExpr::Binary { right, .. } => right.as_ref(),
+        _ => cmp,
+    };
+    loop {
+        node = match node {
+            BoundExpr::Const { value, .. } => return matches!(value, Value::Null),
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::Collate { expr, .. } => expr,
+            BoundExpr::FuncCall { args, .. } => match args.last() {
+                Some(last) => last,
+                None => return false,
+            },
+            _ => return false,
+        };
     }
 }
 

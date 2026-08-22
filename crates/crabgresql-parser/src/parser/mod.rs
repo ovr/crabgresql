@@ -3771,27 +3771,19 @@ impl<'a> Parser<'a> {
                     right
                 };
 
-                if !matches!(
+                // PostgreSQL's grammar is `a_expr qual_Op ANY (…)`: any symbolic
+                // operator parses here and the binder judges it. The
+                // keyword-spelled ones are not `qual_Op`, so PG rejects them as
+                // a syntax error (`select true and any(array[true])`).
+                if matches!(
                     op,
-                    BinaryOperator::Gt
-                        | BinaryOperator::Lt
-                        | BinaryOperator::GtEq
-                        | BinaryOperator::LtEq
-                        | BinaryOperator::Eq
-                        | BinaryOperator::NotEq
-                        | BinaryOperator::PGRegexMatch
-                        | BinaryOperator::PGRegexIMatch
-                        | BinaryOperator::PGRegexNotMatch
-                        | BinaryOperator::PGRegexNotIMatch
-                        | BinaryOperator::PGLikeMatch
-                        | BinaryOperator::PGILikeMatch
-                        | BinaryOperator::PGNotLikeMatch
-                        | BinaryOperator::PGNotILikeMatch
+                    BinaryOperator::And
+                        | BinaryOperator::Or
+                        | BinaryOperator::Xor
+                        | BinaryOperator::Overlaps
                 ) {
                     return parser_err!(
-                        format!(
-                        "Expected one of [=, >, <, =>, =<, !=, ~, ~*, !~, !~*, ~~, ~~*, !~~, !~~*] as comparison operator, found: {op}"
-                    ),
+                        format!("Expected an operator before ANY/ALL, found: {op}"),
                         span.start
                     );
                 };

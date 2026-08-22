@@ -1729,19 +1729,6 @@ fn eval_quantified(
     row: &[Value],
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    let BoundExpr::Binary {
-        op,
-        arg_ty,
-        collation,
-        left,
-        right,
-    } = cmp
-    else {
-        return Err(ExecError::new(
-            crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
-            "ANY/ALL comparison template was not a binary comparison",
-        ));
-    };
     // Without the binder's NULL `Const` placeholder there is nothing to
     // substitute a candidate into, and every comparison would silently be
     // `needle op NULL` — i.e. a wrong answer with no error. Fail loudly instead.
@@ -1751,6 +1738,16 @@ fn eval_quantified(
             "ANY/ALL comparison template has no candidate placeholder",
         ));
     }
+    let BoundExpr::Binary {
+        op,
+        arg_ty,
+        collation,
+        left,
+        right,
+    } = cmp
+    else {
+        return eval_quantified_call(cmp, values, all, row, ctx);
+    };
     // The one and only evaluation of the needle. Borrowed when it is a column
     // or a literal, since every comparison below only reads it.
     let needle_slot;
@@ -1804,6 +1801,102 @@ fn eval_quantified(
     }
 }
 
+/// [`eval_quantified`] for the operator spellings that lower to a call rather
+/// than a `Binary` — `~~`, `~`, `@>`, `<<` on `inet`, `~=` on geometry. There is
+/// no `apply_comparison` to hand two values to, so the filled template is built
+/// and evaluated per candidate; that cost is why `Binary` keeps its own path.
+fn eval_quantified_call(
+    cmp: &BoundExpr,
+    values: &[Value],
+    all: bool,
+    row: &[Value],
+    ctx: &ExecContext,
+) -> Result<Value, ExecError> {
+    let template = fold_off_hole_path(cmp, row, ctx)?;
+    let mut saw_null = false;
+    for value in values {
+        // Every candidate is coerced even once the result can only be NULL,
+        // since a coercion failure is observable.
+        let filled = substitute_hole(&template, value.clone(), ctx)?;
+        match eval::eval(&filled, row, ctx)? {
+            Value::Null => saw_null = true,
+            Value::Bool(b) if b != all => return Ok(Value::Bool(!all)),
+            _ => {}
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Bool(all))
+    }
+}
+
+/// Replace every subtree that is not on the hole's path by the constant it
+/// evaluates to — the needle above all, which is what keeps it from being
+/// re-evaluated per candidate. Descends exactly as [`substitute_hole`] does, so
+/// the two can never disagree about which node the hole is.
+fn fold_off_hole_path(
+    expr: &BoundExpr,
+    row: &[Value],
+    ctx: &ExecContext,
+) -> Result<BoundExpr, ExecError> {
+    let fold = |e: &BoundExpr| -> Result<BoundExpr, ExecError> {
+        Ok(BoundExpr::Const {
+            value: eval::eval(e, row, ctx)?,
+            ty: e.ty(),
+        })
+    };
+    match expr {
+        BoundExpr::Const { .. } => Ok(expr.clone()),
+        BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(fold_off_hole_path(expr, row, ctx)?),
+        }),
+        BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
+            expr: Box::new(fold_off_hole_path(expr, row, ctx)?),
+            ty: *ty,
+        }),
+        BoundExpr::Reinterpret {
+            expr,
+            reported,
+            rep,
+        } => Ok(BoundExpr::Reinterpret {
+            expr: Box::new(fold_off_hole_path(expr, row, ctx)?),
+            reported: *reported,
+            rep: *rep,
+        }),
+        BoundExpr::Collate {
+            expr,
+            collation,
+            explicit,
+        } => Ok(BoundExpr::Collate {
+            expr: Box::new(fold_off_hole_path(expr, row, ctx)?),
+            collation: *collation,
+            explicit: *explicit,
+        }),
+        BoundExpr::FuncCall { func, ret, args } => {
+            let last = args.len().saturating_sub(1);
+            let args = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if i == last {
+                        fold_off_hole_path(a, row, ctx)
+                    } else {
+                        fold(a)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::FuncCall {
+                func: *func,
+                ret: *ret,
+                args,
+            })
+        }
+        other => fold(other),
+    }
+}
+
 /// Fold an all-constant `ARRAY[…]` constructor into the `Value::Array` it always
 /// produces, so a quantified comparison over a literal array borrows one
 /// constant instead of rebuilding the array per row. `None` when any element is
@@ -1828,9 +1921,8 @@ fn fold_const_array(expr: &BoundExpr) -> Option<BoundExpr> {
     })
 }
 
-/// The declared type of a comparison template's `<hole>` — the NULL `Const` the
-/// binder planted on the RHS, reached through the same coercion wrappers
-/// [`substitute_hole`] descends. Used to label the constant array a folded
+/// The declared type of a template's `<hole>`, reached by the same last-argument
+/// descent [`substitute_hole`] uses. Used to label the constant array a folded
 /// `op ANY/ALL (SELECT …)` becomes; `None` if the template has no hole.
 fn hole_ty(cmp: &BoundExpr) -> Option<PgType> {
     fn find(expr: &BoundExpr) -> Option<PgType> {
@@ -1840,26 +1932,29 @@ fn hole_ty(cmp: &BoundExpr) -> Option<PgType> {
                 ty,
             } => Some(*ty),
             BoundExpr::Const { .. } => None,
-            BoundExpr::Coerce { expr, .. }
+            BoundExpr::Unary { expr, .. }
+            | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Reinterpret { expr, .. }
             | BoundExpr::Collate { expr, .. } => find(expr),
-            BoundExpr::FuncCall { args, .. } => args.iter().find_map(find),
+            BoundExpr::FuncCall { args, .. } => find(args.last()?),
             _ => None,
         }
     }
     match cmp {
         BoundExpr::Binary { right, .. } => find(right),
-        _ => None,
+        other => find(other),
     }
 }
 
-/// Substitute a candidate value into the comparison template's `<hole>` — the
-/// unique NULL `Const` the binder placed on the RHS — and coerce it to that
-/// hole's declared type. The hole may sit under a `Coerce`, a `Reinterpret`, or
-/// a coercion `FuncCall` (e.g. `bpchar → text` lowers to `FuncCall{BpcharToText}`
-/// rather than a `Coerce`), so descend through all of them; only the NULL
-/// placeholder is replaced, leaving any constant function arguments (typmods)
-/// intact.
+/// Substitute a candidate value into the template's `<hole>` and coerce it to
+/// that hole's declared type.
+///
+/// The hole is the operator's right operand, so it is the *last* argument of
+/// whatever the binder lowered the operator to, under whichever coercion
+/// wrappers that left (a `bpchar → text` cast is a `FuncCall`, not a `Coerce`)
+/// and under the `NOT` of a negated `!~~`. Descending only the last argument is
+/// what keeps a NULL *needle* — `NULL ~~ ANY(…)`, also a NULL `Const` — from
+/// being mistaken for the hole.
 fn substitute_hole(
     expr: &BoundExpr,
     value: Value,
@@ -1876,6 +1971,10 @@ fn substitute_hole(
         }),
         // Any other constant (e.g. a coercion function's typmod argument) stays.
         BoundExpr::Const { .. } => Ok(expr.clone()),
+        BoundExpr::Unary { op, expr } => Ok(BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(substitute_hole(expr, value, ctx)?),
+        }),
         BoundExpr::Coerce { expr, ty } => Ok(BoundExpr::Coerce {
             expr: Box::new(substitute_hole(expr, value, ctx)?),
             ty: *ty,
@@ -1899,10 +1998,10 @@ fn substitute_hole(
             explicit: *explicit,
         }),
         BoundExpr::FuncCall { func, ret, args } => {
-            let args = args
-                .iter()
-                .map(|a| substitute_hole(a, value.clone(), ctx))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut args = args.clone();
+            if let Some(last) = args.last_mut() {
+                *last = substitute_hole(last, value, ctx)?;
+            }
             Ok(BoundExpr::FuncCall {
                 func: *func,
                 ret: *ret,

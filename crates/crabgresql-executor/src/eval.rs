@@ -399,8 +399,10 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         // the one a folded `op ANY/ALL (SELECT …)` becomes — is borrowed rather
         // than cloned, so a large candidate set costs nothing per row.
         BoundExpr::QuantifiedArray { array, all, cmp } => match array.as_ref() {
+            // A vector stands in for an array on the right side; see the
+            // binder's `bind_quantified_array`.
             BoundExpr::Const {
-                value: Value::Array { elems, .. },
+                value: Value::Array { elems, .. } | Value::Vector { elems, .. },
                 ..
             } => crate::eval_quantified(cmp, elems, *all, row, ctx),
             BoundExpr::Const {
@@ -408,7 +410,9 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             } => Ok(Value::Null),
             _ => match eval(array, row, ctx)? {
                 Value::Null => Ok(Value::Null),
-                Value::Array { elems, .. } => crate::eval_quantified(cmp, &elems, *all, row, ctx),
+                Value::Array { elems, .. } | Value::Vector { elems, .. } => {
+                    crate::eval_quantified(cmp, &elems, *all, row, ctx)
+                }
                 other => Err(ExecError::new(
                     sqlstate::INTERNAL_ERROR,
                     format!("ANY/ALL right operand is not an array: {other:?}"),
