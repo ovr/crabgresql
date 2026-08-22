@@ -17194,10 +17194,8 @@ async fn the_deparse_functions_are_strict_in_every_argument() -> anyhow::Result<
         )
         .await?;
     for sql in [
-        // A NULL `pretty`, in every spelling that takes one.
         "SELECT pg_get_viewdef('v', NULL::boolean)",
         "SELECT pg_get_viewdef('v'::regclass, NULL::boolean)",
-        // The wrap-column overload: a NULL width is NULL, not "pretty".
         "SELECT pg_get_viewdef('v'::regclass, NULL::int)",
         "SELECT pg_get_ruledef((SELECT oid FROM pg_rewrite), NULL::boolean)",
         "SELECT pg_get_triggerdef(999999, NULL::boolean)",
@@ -17259,8 +17257,7 @@ async fn pg_get_ruledef_prints_a_views_return_rule() -> anyhow::Result<()> {
             "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO v DO INSTEAD  SELECT a,\n    b\n   FROM t\n  WHERE a > 1;"
         )
     );
-    // The rule's name is `_RETURN` and its `ev_class` is the view, so the row
-    // and the definition agree about what they describe.
+    // The row and the definition agree about what they describe.
     let row = client
         .query_one(
             "SELECT rulename, ev_class::regclass::text FROM pg_rewrite",
@@ -17320,8 +17317,6 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
             "integer".to_string()
         )
     );
-    // An OUT parameter is printed with its mode and is part of the argument
-    // list, identity list included.
     assert_eq!(
         of("f2").await?,
         (
@@ -17336,8 +17331,7 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
         of("f3").await?,
         (String::new(), String::new(), "integer".to_string())
     );
-    // A built-in row: `VARIADIC` and a named argument, straight out of
-    // `pg_proc.dat`.
+    // A built-in row, straight out of `pg_proc.dat`.
     assert_eq!(
         of("json_extract_path").await?.0,
         "from_json json, VARIADIC path_elems text[]"
@@ -17425,10 +17419,8 @@ async fn a_routine_over_a_user_type_records_its_oid() -> anyhow::Result<()> {
     assert!(row.get::<_, bool>(1), "the argument records the type's OID");
 
     // `cstring` reaches the same renderer through the pseudo-type table. The
-    // type is completed before reading, because a *shell* type is not published
-    // in `pg_type` here at all — a wider gap than this deparse, and the reason
-    // the I/O functions are read after `CREATE TYPE` rather than between the
-    // two halves of the dance.
+    // type is completed before reading it back, because a *shell* type is not
+    // published in `pg_type` here at all — a wider gap than this deparse.
     client
         .batch_execute(
             "CREATE TYPE xbase;

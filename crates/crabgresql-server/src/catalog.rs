@@ -423,9 +423,7 @@ impl CatalogSource for SessionCatalogSource {
     }
 
     /// Read together with the user types, because a routine's argument list may
-    /// name one and `pg_proc` records types by OID. The same list feeds
-    /// [`Self::user_types`]; both are cheap reads of the DDL catalog, and this
-    /// one runs once per snapshot that opens `pg_proc`.
+    /// name one and `pg_proc` records types by OID.
     fn routines(&self) -> Vec<CatalogRoutine> {
         let user_types: HashMap<String, u32> = self
             .global_catalog

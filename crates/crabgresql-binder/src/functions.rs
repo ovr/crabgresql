@@ -3031,19 +3031,12 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TEXT,
             },
         ],
-        // Five signatures, as PostgreSQL declares five functions. The `oid` ones
-        // are what a client's generated query writes (`pg_get_viewdef(c.oid)`
-        // over `pg_class`); the `text` ones are what a hand-typed query writes.
-        // They coexist in the table rather than behind an ordered resolver — the
-        // way `pg_relation_size`'s two spellings do — because a bare
+        // Five signatures, as PostgreSQL declares five functions. They coexist in
+        // the table rather than behind an ordered resolver — the way
+        // `pg_relation_size`'s two spellings do — because a bare
         // `pg_get_viewdef('v')` is not ambiguous between them: the string
         // category rule in `narrow_by_unknown_category` sends an unknown literal
         // to `text`, which is exactly how PostgreSQL resolves the same call.
-        //
-        // The `int4` second argument is PostgreSQL's wrap column. It selects the
-        // pretty form (verified on 18.4: `pg_get_viewdef(v, 40)` drops the
-        // precedence parentheses); the width itself is not honored, since
-        // nothing here wraps a select list.
         "pg_get_viewdef" => &[
             Signature {
                 func: ScalarFn::PgGetViewdef,

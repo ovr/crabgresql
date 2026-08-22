@@ -1297,17 +1297,11 @@ impl SystemCatalog {
     /// resolved against the same numbering [`SystemCatalog::rewrite_oids`] hands
     /// out. Backs `pg_get_ruledef`, which resolves *by* the rule's OID.
     ///
-    /// The relation OID alone, and no rule name: every row of `pg_rewrite` here
-    /// is a view's `_RETURN` rule (there is no `CREATE RULE`), so the name is a
-    /// constant the caller already knows. A `None` is an OID no rule answers to,
-    /// which PostgreSQL reports as NULL rather than an error.
+    /// A `None` is an OID no rule answers to, which PostgreSQL reports as NULL
+    /// rather than an error.
     ///
-    /// Indexed rather than scanned, exactly as [`Self::constraint_def`] is and
-    /// for the reason stated there: the block is one dense run, so the offset
-    /// from its base *is* the position, and `pg_get_ruledef` runs once per row
-    /// of `pg_rewrite`. The stored OID is compared afterwards, so a future
-    /// non-positional assignment degrades to not-found rather than to the wrong
-    /// rule.
+    /// Indexed rather than scanned, for the reason [`Self::constraint_def`]
+    /// gives — including why the stored OID is compared afterwards.
     pub fn rewrite_relation(&self, oid: u32) -> Option<u32> {
         let rules = self.rewrite_oids();
         let base = rules.first()?.oid;

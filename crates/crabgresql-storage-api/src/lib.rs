@@ -2171,7 +2171,6 @@ pub struct ProcInfo {
     /// The declared argument names, or empty when no argument is named.
     pub arg_names: Vec<String>,
     pub ret_type: u32,
-    /// `proretset`: the function returns a set.
     pub retset: bool,
     /// `prokind`: `f` function, `p` procedure, `a` aggregate, `w` window. A
     /// procedure is not a function with a return type — PostgreSQL reports no
@@ -2180,10 +2179,8 @@ pub struct ProcInfo {
 }
 
 /// The `pg_proc` columns a [`ProcInfo`] is built from, spelled as PostgreSQL
-/// spells them. Named rather than positional: seven fields of `Vec<u32>`,
-/// `Vec<char>` and `u32` are trivially swappable at a call site, and the two
-/// producers (generated built-in rows, session routines) fill them from sources
-/// that look nothing alike.
+/// spells them. Named rather than positional because seven fields of `Vec<u32>`,
+/// `Vec<char>` and `u32` are trivially swappable at a call site.
 pub struct StoredProc {
     pub proargtypes: Vec<u32>,
     /// Empty means NULL — every argument is IN, so `proargtypes` is the list.
