@@ -17325,6 +17325,19 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
             "text".to_string()
         )
     );
+    // The identity list keeps the names and the OUT mode — on 18.4 it parts
+    // company with the argument list on `DEFAULT` and on nothing else. The
+    // types-only, input-only spelling of a signature is `regprocedure`, which is
+    // a different function and answers differently for the same row.
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_identity_arguments(oid), oid::regprocedure::text \
+             FROM pg_proc WHERE proname = 'f2'",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "x integer, OUT y text");
+    assert_eq!(row.get::<_, &str>(1), "f2(integer)");
     // No arguments is the *empty string*, which PostgreSQL distinguishes from
     // the NULL a missing function gets.
     assert_eq!(
