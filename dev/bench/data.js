@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787432040008,
+  "lastUpdate": 1787432041778,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -51088,6 +51088,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18615.751098,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "16f7f55822224109543b7acfae5793a23fb1d080",
+          "message": "feat(catalog): Add the missing pg_class and pg_proc columns (#273)",
+          "timestamp": "2026-08-22T22:02:45+02:00",
+          "tree_id": "e9e7a8d7cbbf283f269ed497b6645394fd8b5f8f",
+          "url": "https://github.com/ovr/crabgresql/commit/16f7f55822224109543b7acfae5793a23fb1d080"
+        },
+        "date": 1787432041637,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 442.68837,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 46233.517756,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
