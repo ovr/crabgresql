@@ -102,9 +102,10 @@ WHERE c.oid = '{oid}';"
     if !flags.footerless() {
         return Ok(None);
     }
-    // Inheritance is the one footer-worthy relationship no `pg_class` flag
-    // reports (PostgreSQL's `relhassubclass` is not in crabgresql's `pg_class`),
-    // so ask `pg_inherits` directly, from both sides.
+    // Inheritance earns a footer from *either* end — psql prints "Child tables"
+    // on a parent and "Inherits" on a child — and `relhassubclass` only reports
+    // the parent end, so folding this into the flags query above would leave a
+    // child's footer unnoticed. Ask `pg_inherits` directly, from both sides.
     let inherits = format!(
         "SELECT count(*) FROM pg_catalog.pg_inherits \
          WHERE inhrelid = '{oid}' OR inhparent = '{oid}';"
