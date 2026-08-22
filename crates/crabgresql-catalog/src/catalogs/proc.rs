@@ -41,8 +41,12 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
             col("proallargtypes", PgType::Array(crabgresql_types::oid::OID)),
             col("proargmodes", PgType::Array(crabgresql_types::oid::TEXT)),
             col("proargnames", PgType::Array(crabgresql_types::oid::TEXT)),
+            col("proargdefaults", NODE_TREE),
+            col("protrftypes", PgType::Array(crabgresql_types::oid::OID)),
             col("prosrc", PgType::Text),
             col("probin", PgType::Text),
+            col("prosqlbody", NODE_TREE),
+            col("proconfig", PgType::Array(crabgresql_types::oid::TEXT)),
             col("proacl", ACLITEM_ARRAY),
         ],
     )
@@ -59,6 +63,20 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
 /// PostgreSQL stores. `pronargdefaults` is 0 for every one: codegen refuses an
 /// entry carrying an argument default, because nothing here can render the
 /// expression back.
+///
+/// The four columns that are NULL for every row here and in [`user_rows`] are
+/// NULL because there is nothing to record, not as a placeholder:
+///
+/// * `proargdefaults` — no routine declares an argument default, which is the
+///   same fact `pronargdefaults = 0` states. Upstream's `opr_sanity` checks
+///   exactly that the two agree ("pronargdefaults should be 0 iff
+///   proargdefaults is null").
+/// * `protrftypes` — there are no transforms to name.
+/// * `prosqlbody` — PostgreSQL fills this only for a function written in the
+///   standard `BEGIN ATOMIC` form; every SQL routine here carries its body in
+///   `prosrc`, which is the same thing PostgreSQL does for a quoted body.
+/// * `proconfig` — `CREATE FUNCTION` parses no `SET` clause, so no routine has
+///   a per-call GUC setting.
 pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
     // crabgresql's own table-AM handlers, so `pg_am.amhandler` resolves for
     // every method this build ships rather than only the upstream ones. They
@@ -89,7 +107,11 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
             Value::Null,
             Value::Null,
             Value::Null,
+            Value::Null,
+            Value::Null,
             Value::Text((*name).to_string()),
+            Value::Null,
+            Value::Null,
             Value::Null,
             Value::Null,
         ]
@@ -126,8 +148,12 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                 Value::Null,
                 Value::Null,
                 Value::Null,
+                Value::Null,
+                Value::Null,
                 Value::Text(proc.name.to_string()),
                 Value::Text("$libdir/dict_snowball".to_string()),
+                Value::Null,
+                Value::Null,
                 Value::Null,
             ]
         });
@@ -175,8 +201,12 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
                         .map(|n| Value::Text((*n).to_string()))
                         .collect(),
                 ),
+                Value::Null,
+                Value::Null,
                 Value::Text(r.prosrc.to_string()),
                 text_or_null(r.probin),
+                Value::Null,
+                Value::Null,
                 Value::Null,
             ]
         })
@@ -258,7 +288,11 @@ fn user_rows(
                     PgType::Text,
                     r.arg_names.iter().map(|n| Value::Text(n.clone())).collect(),
                 ),
+                Value::Null,
+                Value::Null,
                 Value::Text(r.src.clone()),
+                Value::Null,
+                Value::Null,
                 Value::Null,
                 Value::Null,
             ]

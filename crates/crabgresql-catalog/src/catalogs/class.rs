@@ -17,10 +17,31 @@ use crate::{RelKind, TOAST_NAMESPACE};
 /// emitted with their true constant so a client's `\d` predicates evaluate as on
 /// PG (e.g. `relchecks = 0` gates the CHECK-constraint listing *off*).
 ///
-/// TODO: the storage and inheritance columns (`relallfrozen`, `relisshared`,
-/// `relhassubclass`, `relispopulated`, `relrewrite`, `relfrozenxid`,
-/// `relminmxid`, `reloptions`) are absent, so a query naming one fails with
-/// "column does not exist" rather than reading a value.
+/// The storage and inheritance columns carry the value this server's state
+/// implies rather than a stub:
+///
+/// * `relallfrozen` — `0`, alongside `relallvisible`: no visibility map is kept,
+///   and `0` is what PostgreSQL reports for a never-vacuumed relation.
+/// * `relisshared` — `false` for every row here. This builder publishes user
+///   relations, their indexes and their TOAST relations, and none of those is
+///   shared across databases in PostgreSQL either.
+/// * `relispopulated` — `true`: only a `WITH NO DATA` materialized view is ever
+///   false there, and there are no materialized views.
+/// * `relrewrite` — `0`: nothing here runs an `ALTER TABLE` rewrite, so no
+///   relation is the transient new heap of one in progress.
+/// * `reloptions` — NULL: no storage parameter is kept for any relation, and
+///   NULL is exactly what PostgreSQL reports for one created without `WITH
+///   (…)`.
+///
+/// The two that are derived rather than constant have their rule with the
+/// function that applies it: [`parent_names`] for `relhassubclass`,
+/// [`frozen_xids`] for `relfrozenxid`/`relminmxid`.
+///
+/// TODO: `reloptions` is NULL even for a table created `WITH (fillfactor = 30)`
+/// — the plain `CREATE TABLE` path accepts the clause and drops it (only the
+/// `... AS` path refuses it), so the option is neither honored nor recorded.
+/// Reporting what was asked for needs the parameters carried into the relation
+/// metadata first.
 ///
 /// `relpages`/`reltuples` hold the **last `ANALYZE` snapshot**, not a live
 /// measurement — matching PostgreSQL, where a relation that has never been
@@ -48,19 +69,27 @@ pub(crate) fn pg_class_schema() -> TableSchema {
             col("relpages", PgType::Int4),
             col("reltuples", PgType::Float4),
             col("relallvisible", PgType::Int4),
+            col("relallfrozen", PgType::Int4),
             col("reltoastrelid", PgType::Oid),
             col("relhasindex", PgType::Bool),
+            col("relisshared", PgType::Bool),
             col("relpersistence", CHARLIKE),
             col("relkind", CHARLIKE),
             col("relnatts", PgType::Int2),
             col("relchecks", PgType::Int2),
             col("relhasrules", PgType::Bool),
             col("relhastriggers", PgType::Bool),
+            col("relhassubclass", PgType::Bool),
             col("relrowsecurity", PgType::Bool),
             col("relforcerowsecurity", PgType::Bool),
+            col("relispopulated", PgType::Bool),
             col("relreplident", CHARLIKE),
             col("relispartition", PgType::Bool),
+            col("relrewrite", PgType::Oid),
+            col("relfrozenxid", PgType::Xid),
+            col("relminmxid", PgType::Xid),
             col("relacl", ACLITEM_ARRAY),
+            col("reloptions", PgType::Array(crabgresql_types::oid::TEXT)),
             // pg_node_tree in PG; crabgresql stores the already-deparsed
             // `FOR VALUES …` text (see `pg_get_expr`, which just echoes it).
             col("relpartbound", PgType::Text),
@@ -127,6 +156,55 @@ fn deparse_partbound(part: &PartitionOf, bytea_output: ByteaOutput) -> String {
     )
 }
 
+/// The `(namespace, name)` of every relation some other relation calls its
+/// parent — what `relhassubclass` reports on.
+///
+/// Both kinds of parent count, as they do in PostgreSQL — a client reads the
+/// flag to decide whether to look for children at all, and a partitioned parent
+/// has them just as an inheritance one does. The two sources are exactly the
+/// pair [`pg_inherits_rows`](crate::catalogs::inherits) walks, so a relation
+/// flagged here always has a `pg_inherits` row pointing at it.
+///
+/// Keyed by name rather than OID because that is how a child records its
+/// parent; `pg_inherits` resolves the same pair through the same relation list.
+fn parent_names(relations: &[(u32, TableSchema)]) -> std::collections::HashSet<(String, String)> {
+    let mut parents = std::collections::HashSet::new();
+    for (_, schema) in relations {
+        if let Some(part) = &schema.partition_of {
+            parents.insert((part.parent_namespace.clone(), part.parent_name.clone()));
+        }
+        for inherit in &schema.inherits {
+            parents.insert((inherit.namespace.clone(), inherit.name.clone()));
+        }
+    }
+    parents
+}
+
+/// The `(relfrozenxid, relminmxid)` pair for a relation of the given `relkind`.
+///
+/// PostgreSQL splits these on whether the relation holds unfrozen tuples: a
+/// table (`r`) and a TOAST relation (`t`) carry a real freeze horizon, and
+/// everything else carries `0` — verified against PostgreSQL 18.4, where only
+/// those two relkinds report a non-zero value.
+///
+/// A **sequence** is on the zero side even though it is heap-backed in
+/// PostgreSQL: its single tuple is written frozen at creation, so there is
+/// never anything to freeze later and `relfrozenxid` stays
+/// `InvalidTransactionId`. The same answer follows here from a stronger fact —
+/// a sequence's counter lives in the relation catalog rather than in a
+/// one-page relation at all (see [`pg_class_rows`] on `relfilenode`).
+///
+/// The non-zero value is `1` (`BootstrapTransactionId`/`FirstMultiXactId`),
+/// below every XID this build hands out, because nothing here advances a
+/// per-relation freeze horizon; the same reasoning fixes
+/// `pg_database.datfrozenxid` at 1.
+fn frozen_xids(relkind: char) -> (Value, Value) {
+    match relkind {
+        'r' | 't' => (Value::Xid(1), Value::Xid(1)),
+        _ => (Value::Xid(0), Value::Xid(0)),
+    }
+}
+
 /// The `(relpages, reltuples)` pair `pg_class` reports for a relation.
 ///
 /// PostgreSQL only writes these during `VACUUM`/`ANALYZE`, so a relation that
@@ -190,6 +268,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let filenodes = cat.relation_filenodes();
     let (indexes, toasts, namespace_oids) =
         (cat.index_oids(), cat.toast_oids(), cat.namespace_oids());
+    let parents = parent_names(relations);
     // Resolve a relation's namespace OID, defaulting to `public` (2200) for any
     // namespace not in the map (should not happen for a live relation).
     let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
@@ -234,6 +313,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 RelKind::Table | RelKind::Sequence => filenodes.rel,
                 RelKind::PartitionedTable | RelKind::View => 0,
             };
+            let (relfrozenxid, relminmxid) = frozen_xids(relkind);
             vec![
                 Value::Oid(*oid),
                 Value::Text(schema.name.clone()),
@@ -248,7 +328,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Oid(0),
                 relpages,
                 reltuples,
-                // relallvisible: no visibility map is kept.
+                // relallvisible / relallfrozen: no visibility map is kept.
+                Value::Int4(0),
                 Value::Int4(0),
                 // reltoastrelid: the relation's TOAST relation, or 0 when it has
                 // none. Zero is legitimate PostgreSQL state — it is what PG
@@ -262,6 +343,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         .map_or(0, |t| t.oid),
                 ),
                 Value::Bool(indexes.iter().any(|index| index.table_oid == *oid)),
+                // relisshared.
+                Value::Bool(false),
                 chr(schema.persistence.as_char()),
                 chr(relkind),
                 Value::Int2(schema.columns.len() as i16),
@@ -270,12 +353,22 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Int2(schema.checks.len() as i16),
                 // relhasrules: only a view carries the `_RETURN` rule.
                 Value::Bool(matches!(kind, RelKind::View)),
-                // relhastriggers / relrowsecurity / relforcerowsecurity.
+                // relhastriggers.
+                Value::Bool(false),
+                Value::Bool(parents.contains(&(schema.namespace.clone(), schema.name.clone()))),
+                // relrowsecurity / relforcerowsecurity.
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(false),
+                // relispopulated.
+                Value::Bool(true),
                 chr(relreplident),
                 Value::Bool(schema.partition_of.is_some()),
+                // relrewrite.
+                Value::Oid(0),
+                relfrozenxid,
+                relminmxid,
+                // relacl / reloptions.
+                Value::Null,
                 Value::Null,
                 relpartbound,
             ]
@@ -305,7 +398,9 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Int4(0),
             Value::Float4(-1.0),
             Value::Int4(0),
+            Value::Int4(0),
             Value::Oid(0),
+            Value::Bool(false),
             Value::Bool(false),
             chr('p'),
             chr('i'),
@@ -315,9 +410,17 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
             // An index has no replica identity of its own.
             chr('n'),
             Value::Bool(false),
+            Value::Oid(0),
+            // See `frozen_xids`: an index carries no freeze horizon.
+            Value::Xid(0),
+            Value::Xid(0),
+            // relacl / reloptions / relpartbound.
+            Value::Null,
             Value::Null,
             Value::Null,
         ]
@@ -342,12 +445,14 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             // read as one. The never-analyzed sentinel is the honest answer.
             Value::Float4(-1.0),
             Value::Int4(0),
+            Value::Int4(0),
             // A TOAST relation has no TOAST relation of its own.
             Value::Oid(0),
             // relhasindex: PostgreSQL indexes its TOAST relation on
             // `(chunk_id, chunk_seq)`; ours chains chunks by ctid instead, so
             // there is no `pg_toast_<oid>_index`, and claiming one would be the
             // dangling reference this block exists to avoid.
+            Value::Bool(false),
             Value::Bool(false),
             chr(toast.persistence.as_char()),
             chr('t'),
@@ -357,8 +462,16 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
             chr('n'),
             Value::Bool(false),
+            Value::Oid(0),
+            // See `frozen_xids`: a TOAST relation holds unfrozen tuples.
+            Value::Xid(1),
+            Value::Xid(1),
+            // relacl / reloptions / relpartbound.
+            Value::Null,
             Value::Null,
             Value::Null,
         ]
