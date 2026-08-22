@@ -764,12 +764,7 @@ pub enum ScalarFn {
     /// `relpartbound`), so this echoes its first argument.
     PgGetExpr,
     /// `pg_get_viewdef(text|oid[, bool|int4]) -> text`: the view's `SELECT`,
-    /// re-rendered in PostgreSQL's canonical shape by [`crate::ruleutils`]. The
-    /// two spellings of the relation are two functions in PostgreSQL, and are
-    /// two signatures here for the same reason: a name is resolved through the
-    /// search path and a missing one is `42P01`, while a missing OID is NULL.
-    /// The `int4` second argument is PostgreSQL's wrap column, which implies
-    /// `pretty`.
+    /// re-rendered in PostgreSQL's canonical shape by [`crate::ruleutils`].
     PgGetViewdef,
     /// `pg_get_ruledef(oid[, bool]) -> text`: a rewrite rule's `CREATE RULE`
     /// statement. Every rule here is a view's `_RETURN`, so the body is the
@@ -777,9 +772,7 @@ pub enum ScalarFn {
     /// An OID no rule answers to is NULL, not an error.
     PgGetRuledef,
     /// `pg_get_triggerdef(oid[, bool]) -> text`: a trigger's `CREATE TRIGGER`
-    /// statement. There is no `CREATE TRIGGER` here, so no OID ever answers and
-    /// the result is always NULL — which is what PostgreSQL returns for an OID
-    /// carrying no trigger.
+    /// statement, always NULL while `pg_trigger` is empty.
     PgGetTriggerdef,
     /// `pg_get_function_arguments(oid) -> text`: a function's argument list as
     /// `CREATE FUNCTION` would take it (`a integer, OUT b text`).
@@ -788,8 +781,7 @@ pub enum ScalarFn {
     /// argument defaults left off — what `DROP FUNCTION` needs.
     PgGetFunctionIdentityArguments,
     /// `pg_get_function_result(oid) -> text`: a function's `RETURNS` clause,
-    /// `SETOF`/`TABLE(...)` included. NULL for an OID no function answers to,
-    /// like the two above.
+    /// `SETOF`/`TABLE(...)` included.
     PgGetFunctionResult,
     /// `pg_get_indexdef(oid[, int4, bool]) -> text`: an index's `CREATE INDEX`
     /// DDL, rendered by [`crabgresql_storage_api::index_definition`]. The

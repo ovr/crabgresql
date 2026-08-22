@@ -1575,10 +1575,9 @@ pub(crate) fn format_type_text(
 /// The identity form differs only in omitting `DEFAULT <expr>`, and nothing in
 /// this build carries an argument default — `CREATE FUNCTION` takes no
 /// `DEFAULT`, and `crabgresql-bki` refuses a `pg_proc.dat` entry declaring
-/// `proargdefaults` — so one renderer serves both until that changes. It keeps
-/// the names and the OUT/INOUT modes: the types-only spelling of a signature is
-/// `regprocedure`, not this (18.4 prints `x integer, OUT y text, INOUT z
-/// numeric` for both lists and `g2(integer,numeric)` for the `regprocedure`).
+/// `proargdefaults` — so one renderer serves both until that changes. Names and
+/// OUT/INOUT modes stay in both: the types-only spelling of a signature is
+/// `regprocedure`, not this.
 ///
 /// A **procedure** spells its input arguments `IN a integer` where a function
 /// leaves the mode off; verified on 18.4 with the same argument list on both.

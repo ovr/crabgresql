@@ -2157,14 +2157,12 @@ pub struct RoutineSig {
 ///
 /// The two optional `pg_proc` columns arrive **expanded**: PostgreSQL leaves
 /// `proallargtypes` NULL when every argument is IN and `proargmodes` NULL when
-/// every mode is `i`, and [`StoredProc`] undoes both so that `arg_types`,
-/// `arg_modes` and (when non-empty) `arg_names` are positionally aligned.
-/// `arg_names` stays empty for an unnamed argument list, since there the
-/// absence is what gets printed.
+/// every mode is `i`, and [`StoredProc`] undoes both so that the three lists are
+/// positionally aligned. `arg_names` stays empty for an unnamed argument list,
+/// since there the absence is what gets printed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcInfo {
-    /// Every argument, OUT ones included — `proallargtypes` when it is set,
-    /// `proargtypes` otherwise.
+    /// Every argument, OUT ones included.
     pub arg_types: Vec<u32>,
     /// One of `i`/`o`/`b`/`v`/`t` per entry of `arg_types`.
     pub arg_modes: Vec<char>,
@@ -2173,21 +2171,21 @@ pub struct ProcInfo {
     pub ret_type: u32,
     pub retset: bool,
     /// `prokind`: `f` function, `p` procedure, `a` aggregate, `w` window. A
-    /// procedure is not a function with a return type — PostgreSQL reports no
-    /// result for one at all — so the renderers need this as well as the types.
+    /// procedure is not a function with a return type, so the renderers need
+    /// this as well as the types.
     pub kind: char,
 }
 
 /// The `pg_proc` columns a [`ProcInfo`] is built from, spelled as PostgreSQL
 /// spells them. Named rather than positional because seven fields of `Vec<u32>`,
 /// `Vec<char>` and `u32` are trivially swappable at a call site.
+///
+/// An empty vector is how the three nullable columns spell NULL: no OUT
+/// argument, no mode other than `i`, no argument name.
 pub struct StoredProc {
     pub proargtypes: Vec<u32>,
-    /// Empty means NULL — every argument is IN, so `proargtypes` is the list.
     pub proallargtypes: Vec<u32>,
-    /// Empty means NULL — every mode is `i`.
     pub proargmodes: Vec<char>,
-    /// Empty means NULL — no argument is named.
     pub proargnames: Vec<String>,
     pub prorettype: u32,
     pub proretset: bool,

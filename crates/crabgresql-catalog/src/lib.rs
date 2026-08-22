@@ -1297,9 +1297,6 @@ impl SystemCatalog {
     /// resolved against the same numbering [`SystemCatalog::rewrite_oids`] hands
     /// out. Backs `pg_get_ruledef`, which resolves *by* the rule's OID.
     ///
-    /// A `None` is an OID no rule answers to, which PostgreSQL reports as NULL
-    /// rather than an error.
-    ///
     /// Indexed rather than scanned, for the reason [`Self::constraint_def`]
     /// gives — including why the stored OID is compared afterwards.
     pub fn rewrite_relation(&self, oid: u32) -> Option<u32> {

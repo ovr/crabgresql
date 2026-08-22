@@ -17146,8 +17146,7 @@ async fn pg_get_viewdef_resolves_by_oid_as_well_as_by_name() -> anyhow::Result<(
             .as_deref(),
         Some(body)
     );
-    // `pretty` drops the parentheses that only restate precedence; an integer
-    // second argument is PG's wrap column, which implies pretty.
+    // An integer second argument is PG's wrap column, which implies pretty.
     let pretty = " SELECT a,\n    b\n   FROM t\n  WHERE a > 1;";
     assert_eq!(
         one("SELECT pg_get_viewdef('v'::regclass, true)")
@@ -17180,10 +17179,8 @@ async fn pg_get_viewdef_resolves_by_oid_as_well_as_by_name() -> anyhow::Result<(
     Ok(())
 }
 
-/// Every `pg_get_*` deparse function is STRICT, so a NULL flag makes the whole
-/// call NULL rather than selecting the non-pretty form. `pg_proc.proisstrict` is
-/// true for all of them on 18.4 — `format_type` is the one exception in the
-/// family, and it is not one of these.
+/// Every `pg_get_*` deparse function is STRICT on 18.4, so a NULL flag makes the
+/// whole call NULL rather than selecting the non-pretty form.
 #[tokio::test]
 async fn the_deparse_functions_are_strict_in_every_argument() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -17257,7 +17254,6 @@ async fn pg_get_ruledef_prints_a_views_return_rule() -> anyhow::Result<()> {
             "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO v DO INSTEAD  SELECT a,\n    b\n   FROM t\n  WHERE a > 1;"
         )
     );
-    // The row and the definition agree about what they describe.
     let row = client
         .query_one(
             "SELECT rulename, ev_class::regclass::text FROM pg_rewrite",
@@ -17269,7 +17265,6 @@ async fn pg_get_ruledef_prints_a_views_return_rule() -> anyhow::Result<()> {
 
     assert_eq!(one("SELECT pg_get_ruledef(999999)").await?, None);
     assert_eq!(one("SELECT pg_get_ruledef(NULL::oid)").await?, None);
-    // `pg_trigger` is empty and so is every answer over it.
     assert_eq!(one("SELECT pg_get_triggerdef(999999)").await?, None);
     assert_eq!(one("SELECT pg_get_triggerdef(999999, true)").await?, None);
     assert_eq!(
@@ -17325,10 +17320,9 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
             "text".to_string()
         )
     );
-    // The identity list keeps the names and the OUT mode — on 18.4 it parts
-    // company with the argument list on `DEFAULT` and on nothing else. The
-    // types-only, input-only spelling of a signature is `regprocedure`, which is
-    // a different function and answers differently for the same row.
+    // Both strings are 18.4's. The identity list keeps names and OUT modes and
+    // parts company with the argument list on `DEFAULT` alone; the types-only
+    // spelling of a signature is `regprocedure`, a different function.
     let row = client
         .query_one(
             "SELECT pg_get_function_identity_arguments(oid), oid::regprocedure::text \
@@ -17367,9 +17361,8 @@ async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
 /// `RETURNS` clause for one at all, and spells its input arguments `IN a integer`
 /// where a function leaves the mode off. Both verified on 18.4.
 ///
-/// The result matters more than it looks: `CREATE PROCEDURE` stores
-/// `prorettype = text` as a placeholder here, so anything reading the type rather
-/// than `prokind` would answer `text`.
+/// The result is the case worth pinning: `prorettype` holds a placeholder for a
+/// procedure, so anything reading the type instead of `prokind` answers `text`.
 #[tokio::test]
 async fn a_procedure_has_no_result_and_spells_its_in_arguments() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -17409,9 +17402,8 @@ async fn a_procedure_has_no_result_and_spells_its_in_arguments() -> anyhow::Resu
 /// `pg_proc.proargtypes`, so the deparse names it. The same goes for `cstring`,
 /// the pseudo-type every type's I/O functions are declared over.
 ///
-/// `proargtypes` is more than the printed name: it is what `regprocedure`
-/// resolves a written signature against, so a hole there makes
-/// `'xbase_out(xbase)'::regprocedure` unresolvable.
+/// The OID is more than the printed name: `regprocedure` resolves a written
+/// signature against it.
 #[tokio::test]
 async fn a_routine_over_a_user_type_records_its_oid() -> anyhow::Result<()> {
     let client = connect(spawn_server().await).await;
@@ -17431,9 +17423,8 @@ async fn a_routine_over_a_user_type_records_its_oid() -> anyhow::Result<()> {
     assert_eq!(row.get::<_, &str>(0), "m mood");
     assert!(row.get::<_, bool>(1), "the argument records the type's OID");
 
-    // `cstring` reaches the same renderer through the pseudo-type table. The
-    // type is completed before reading it back, because a *shell* type is not
-    // published in `pg_type` here at all — a wider gap than this deparse.
+    // The type is completed before reading it back, because a *shell* type is
+    // not published in `pg_type` here at all — a wider gap than this deparse.
     client
         .batch_execute(
             "CREATE TYPE xbase;

@@ -216,9 +216,8 @@ pub trait CatalogOps: Send + Sync {
     /// — or `None` if no rule has that OID. Backs `pg_get_ruledef`.
     ///
     /// The OID alone, with no rule name and no body: every rule here is a view's
-    /// `_RETURN` rule, so the name is a constant, and the body is the view's,
-    /// read back through [`CatalogOps::view_sql`] like `pg_get_viewdef`'s. One
-    /// source for the two, so the rule and the view cannot print different SQL.
+    /// `_RETURN` rule, so the name is a constant and the body is the view's,
+    /// read back through [`CatalogOps::view_sql`].
     fn rule_relation(&self, oid: u32) -> Option<u32>;
 
     /// The argument and result shape of the function `oid`, or `None` if there
