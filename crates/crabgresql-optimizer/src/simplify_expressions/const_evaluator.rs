@@ -142,12 +142,14 @@ fn fold_children(
 }
 
 /// The `cmp` of an `ANY`/`ALL` is a **template**, not an expression: it is
-/// `needle op <hole>`, where the hole is a NULL `Const` (possibly under the
-/// coercions the binder resolved) that the executor substitutes each candidate
-/// into. Its shape is load-bearing, so only the needle is folded here —
-/// folding the comparison itself would collapse the whole template to
-/// `Const(NULL)`, and folding the hole's coercion chain would change what every
-/// candidate is cast to.
+/// `needle op <hole>`, and the executor substitutes each candidate into that
+/// hole. Its shape is load-bearing, so only the needle is folded here — folding
+/// the comparison itself would collapse the whole template to `Const(NULL)`, and
+/// folding the hole's coercion chain would change what every candidate is cast
+/// to.
+///
+/// TODO: fold the needle of a call-shaped template (`~~`, `~`, `@>`, …), which
+/// needs the same off-the-hole-path walk the executor does.
 fn fold_template(
     cmp: &mut BoundExpr,
     fmt: &FmtCtx,
@@ -155,7 +157,6 @@ fn fold_template(
 ) -> bool {
     match cmp {
         BoundExpr::Binary { left, .. } => fold(left, fmt, on_subplan),
-        // Not a template the executor can drive; it reports that itself.
         _ => false,
     }
 }

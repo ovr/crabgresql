@@ -1652,6 +1652,135 @@ async fn any_all_quantified_comparisons_match_pg() -> anyhow::Result<()> {
         Some(&tokio_postgres::error::ErrorPosition::Original(10))
     );
 
+    // With an array on the right the operator does get resolved, and is then
+    // rejected for its result type.
+    let err = client
+        .simple_query("SELECT 33 * ANY('{1,2,3}')")
+        .await
+        .expect_err("ANY with a non-boolean operator must be rejected");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(
+        db.message(),
+        "op ANY/ALL (array) requires operator to yield boolean"
+    );
+    assert_eq!(
+        db.position(),
+        Some(&tokio_postgres::error::ErrorPosition::Original(11))
+    );
+
+    // The subquery form is PG's *other* error for the same operator.
+    let err = client
+        .simple_query("SELECT 33 * ANY (SELECT 1)")
+        .await
+        .expect_err("ANY(SELECT …) with a non-boolean operator must be rejected");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::DATATYPE_MISMATCH);
+    assert_eq!(
+        db.message(),
+        "row comparison operator must yield type boolean, not type integer"
+    );
+    assert_eq!(
+        db.position(),
+        Some(&tokio_postgres::error::ErrorPosition::Original(11))
+    );
+
+    // `<<` is a shift on integers but containment on `inet` (which passes,
+    // below), so only the resolved operator can decide it.
+    let err = client
+        .simple_query("SELECT 1 << ANY (ARRAY[1,2])")
+        .await
+        .expect_err("integer shift under ANY must be rejected");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(
+        db.message(),
+        "op ANY/ALL (array) requires operator to yield boolean"
+    );
+
+    // An operator that names nothing is 42883 against the *element* type — and
+    // only after the right side is settled, so the same spelling over a
+    // non-array blames the right side without ever resolving the operator.
+    let err = client
+        .simple_query("SELECT 1 OPERATOR(pg_catalog.###) ANY (ARRAY[1,2])")
+        .await
+        .expect_err("an operator symbol that names no operator must be rejected");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_FUNCTION);
+    assert_eq!(
+        db.message(),
+        "operator does not exist: integer pg_catalog.### integer"
+    );
+    assert_eq!(
+        db.position(),
+        Some(&tokio_postgres::error::ErrorPosition::Original(10))
+    );
+    let err = client
+        .simple_query("SELECT 1 OPERATOR(pg_catalog.###) ANY (44)")
+        .await
+        .expect_err("a non-array right side is judged before the operator");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::WRONG_OBJECT_TYPE);
+    assert_eq!(
+        db.message(),
+        "op ANY/ALL (array) requires array on right side"
+    );
+
+    // --- PG takes any operator that yields boolean after ANY/ALL, not just a
+    // comparison; these all lower to a call rather than a `Binary`. ---
+    let msgs = client
+        .simple_query(
+            "SELECT 'ab' ~~ ANY (ARRAY['a%','b%']) AS like_any, \
+             'ab' ~ ANY (ARRAY['^a','^z']) AS rx_any, \
+             'AB' ~~* ALL (ARRAY['a%','%b']) AS ilike_all, \
+             'ab' !~~ ALL (ARRAY['z%']) AS notlike_all, \
+             'ab' ~~ ANY (SELECT 'a%') AS like_sub, \
+             'a' OPERATOR(pg_catalog.~~) ANY (ARRAY['a']) AS qualified, \
+             inet '10.0.0.1' << ANY (ARRAY[inet '10.0.0.0/8']) AS net, \
+             point '(1,1)' ~= ANY (ARRAY[point '(1,1)']) AS geo",
+        )
+        .await?;
+    let row = rows(&msgs)[0];
+    for i in 0..8 {
+        assert_eq!(row.get(i), Some("t"), "column {i}");
+    }
+
+    // Kleene logic on that path too: an earlier NULL candidate must not mask a
+    // later decisive one.
+    let msgs = client
+        .simple_query(
+            "SELECT 'ab' ~~ ANY (ARRAY[NULL,'a%']) AS hit, \
+             'ab' ~~ ANY (ARRAY[NULL,'z%']) AS miss, \
+             NULL::text ~~ ANY (ARRAY['a%']) AS null_needle, \
+             'ab' ~~ ANY (ARRAY[]::text[]) AS empty_any, \
+             'ab' ~~ ALL (ARRAY[]::text[]) AS empty_all",
+        )
+        .await?;
+    let row = rows(&msgs)[0];
+    assert_eq!(row.get("hit"), Some("t"));
+    assert_eq!(row.get("miss"), None);
+    assert_eq!(row.get("null_needle"), None);
+    assert_eq!(row.get("empty_any"), Some("f"));
+    assert_eq!(row.get("empty_all"), Some("t"));
+
+    // Nothing matches, so all five candidates are tried — and the sequence still
+    // advances once, as on the `Binary` path above.
+    client.simple_query("CREATE SEQUENCE sq3").await?;
+    let msgs = client
+        .simple_query("SELECT nextval('sq3')::text ~~ ANY (ARRAY['%a','%b','%c','%d','%e']) AS r")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("r"), Some("f"));
+    let msgs = client.simple_query("SELECT currval('sq3') AS v").await?;
+    assert_eq!(rows(&msgs)[0].get("v"), Some("1"), "needle evaluated once");
+
+    // `int2vector`/`oidvector` stand in for an array on the right side, which is
+    // what makes the catalog idiom `attnum = ANY(indkey)` work.
+    let msgs = client
+        .simple_query("SELECT 2 = ANY('1 2'::int2vector) AS a, 9 = ANY('1 2'::int2vector) AS b")
+        .await?;
+    assert_eq!(rows(&msgs)[0].get("a"), Some("t"));
+    assert_eq!(rows(&msgs)[0].get("b"), Some("f"));
+
     Ok(())
 }
 
