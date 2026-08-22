@@ -1885,6 +1885,112 @@ fn pg_class_reports_describe_columns_and_partition_bounds() -> anyhow::Result<()
     Ok(())
 }
 
+/// `pg_class.relhassubclass` is true for exactly the relations some other one
+/// names as its parent — through `PARTITION OF` *or* through `INHERITS (...)`.
+///
+/// Walking only one of the two edges would leave half the hierarchies looking
+/// childless while `pg_inherits` still published their edges, and a client
+/// reads this flag to decide whether to look for children at all.
+#[test]
+fn pg_class_relhassubclass_marks_both_kinds_of_parent() -> anyhow::Result<()> {
+    use crabgresql_storage_api::{
+        Column, InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
+        PartitionStrategy, TableSchema,
+    };
+    use crabgresql_types::PgType;
+
+    let plain = |name: &str| TableSchema::new(name, vec![Column::new("a", PgType::Int4)]);
+
+    let mut part = plain("part");
+    part.partition_scheme = Some(PartitionScheme {
+        strategy: PartitionStrategy::Range,
+        key_columns: vec![0],
+    });
+    let mut leaf = plain("part_1");
+    leaf.partition_of = Some(PartitionOf {
+        parent_namespace: "public".to_string(),
+        parent_name: "part".to_string(),
+        key_columns: vec![0],
+        bound: PartitionBound {
+            from: vec![PartitionBoundDatum::Value(Value::Int4(0))],
+            to: vec![PartitionBoundDatum::Value(Value::Int4(10))],
+        },
+    });
+    let mut child = plain("child");
+    child.inherits = vec![InheritParent {
+        namespace: "public".to_string(),
+        name: "base".to_string(),
+    }];
+
+    let cat = SystemCatalog::with_catalog_relations("db", "owner", {
+        vec![
+            CatalogRelation::permanent(plain("lonely")),
+            CatalogRelation::permanent(plain("base")),
+            CatalogRelation::permanent(child),
+            CatalogRelation::permanent(part),
+            CatalogRelation::permanent(leaf),
+        ]
+    });
+
+    let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+    let relname = required(schema.column_index("relname"), "relname is missing")?;
+    let flag = required(
+        schema.column_index("relhassubclass"),
+        "relhassubclass is missing",
+    )?;
+    let parents: Vec<String> = rows
+        .iter()
+        .filter(|r| r[flag] == Value::Bool(true))
+        .filter_map(|r| match &r[relname] {
+            Value::Text(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parents, vec!["base".to_string(), "part".to_string()]);
+    Ok(())
+}
+
+/// `pg_class.relfrozenxid`/`relminmxid` are non-zero for exactly the relations
+/// that hold unfrozen tuples — a table and a TOAST relation.
+///
+/// A **sequence** is the case worth naming: it is heap-backed in PostgreSQL,
+/// yet reports `0` because its one tuple is written frozen (verified on
+/// PostgreSQL 18.4, where only `relkind` `r` and `t` report non-zero). Grouping
+/// it with the tables — which "does it have storage" invites — is what this
+/// test exists to catch.
+#[test]
+fn pg_class_freeze_horizons_are_nonzero_exactly_for_relations_with_tuples() -> anyhow::Result<()> {
+    let cat = wide_fixture();
+    let (schema, rows) = required(cat.build_pg_catalog("pg_class"), "pg_class is missing")?;
+    let relkind = required(schema.column_index("relkind"), "relkind is missing")?;
+    let frozen = required(
+        schema.column_index("relfrozenxid"),
+        "relfrozenxid is missing",
+    )?;
+    let minmxid = required(schema.column_index("relminmxid"), "relminmxid is missing")?;
+
+    let mut kinds: Vec<u8> = Vec::new();
+    for row in &rows {
+        let Value::Char(kind) = row[relkind] else {
+            anyhow::bail!("relkind is not a \"char\"");
+        };
+        let holds_unfrozen_tuples = matches!(kind, b'r' | b't');
+        let expected = Value::Xid(if holds_unfrozen_tuples { 1 } else { 0 });
+        assert_eq!(row[frozen], expected, "relfrozenxid for relkind {kind}");
+        assert_eq!(row[minmxid], expected, "relminmxid for relkind {kind}");
+        kinds.push(kind);
+    }
+    // Without these the loop above proves nothing: it passes trivially on a
+    // fixture that happens to hold only one side of the split.
+    assert!(kinds.contains(&b'r') && kinds.contains(&b't'), "{kinds:?}");
+    assert!(
+        kinds.contains(&b'S'),
+        "no sequence in the fixture: {kinds:?}"
+    );
+    assert!(kinds.contains(&b'p') && kinds.contains(&b'i'), "{kinds:?}");
+    Ok(())
+}
+
 /// `pg_class.relfilenode` reports the storage engine's real file number, and
 /// reports `0` for exactly the relations PostgreSQL gives no storage.
 ///

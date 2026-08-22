@@ -140,6 +140,60 @@ SELECT count(*) AS with_acl FROM pg_proc WHERE proacl IS NOT NULL;
         0
 (1 row)
 
+-- the storage columns answer rather than erroring: no storage parameter is
+-- kept, and no visibility map is built
+SELECT relname, relallfrozen, relisshared, relispopulated, relrewrite,
+       relfrozenxid, relminmxid, reloptions
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
+    relname    | relallfrozen | relisshared | relispopulated | relrewrite | relfrozenxid | relminmxid | reloptions 
+---------------+--------------+-------------+----------------+------------+--------------+------------+------------
+ pgcat_reflect |            0 | f           | t              |          0 |            1 |          1 | 
+(1 row)
+
+-- only a relation holding unfrozen tuples carries a freeze horizon, so the
+-- partitioned parent reports 0 and so does the sequence, whose one tuple
+-- PostgreSQL writes frozen
+CREATE TABLE pgcat_parent (k int) PARTITION BY RANGE (k);
+CREATE TABLE pgcat_leaf PARTITION OF pgcat_parent FOR VALUES FROM (0) TO (10);
+CREATE SEQUENCE pgcat_seq;
+SELECT relname, relkind, relhassubclass, relispartition, relfrozenxid
+  FROM pg_class
+ WHERE relname IN ('pgcat_parent', 'pgcat_leaf', 'pgcat_seq')
+ ORDER BY relname;
+   relname    | relkind | relhassubclass | relispartition | relfrozenxid 
+--------------+---------+----------------+----------------+--------------
+ pgcat_leaf   | r       | f              | t              |            1
+ pgcat_parent | p       | t              | f              |            0
+ pgcat_seq    | S       | f              | f              |            0
+(3 rows)
+
+-- dropped again: the whole suite shares one database, and a live partition
+-- here would show up in every later test that lists pg_inherits
+DROP TABLE pgcat_parent;
+DROP SEQUENCE pgcat_seq;
+-- no routine declares an argument default, which is what pronargdefaults = 0
+-- says too
+SELECT count(*) AS with_defaults FROM pg_proc WHERE proargdefaults IS NOT NULL;
+ with_defaults 
+---------------
+             0
+(1 row)
+
+SELECT count(*) AS with_config FROM pg_proc WHERE proconfig IS NOT NULL;
+ with_config 
+-------------
+           0
+(1 row)
+
+SELECT proname, pronargdefaults, proargdefaults, protrftypes, prosqlbody
+  FROM pg_proc
+ WHERE proname = 'int4pl';
+ proname | pronargdefaults | proargdefaults | protrftypes | prosqlbody 
+---------+-----------------+----------------+-------------+------------
+ int4pl  |               0 |                |             | 
+(1 row)
+
 -- a schema-qualified write reaches the permanent relation (INSERT accepts the
 -- public. qualifier symmetrically with SELECT/UPDATE)
 CREATE TABLE pgcat_pub (v int);

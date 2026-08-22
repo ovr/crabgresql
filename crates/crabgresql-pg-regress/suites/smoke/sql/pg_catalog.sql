@@ -56,6 +56,33 @@ SELECT castsource, casttarget, castcontext
 SELECT count(*) AS with_acl FROM pg_class WHERE relacl IS NOT NULL;
 SELECT count(*) AS with_acl FROM pg_type WHERE typacl IS NOT NULL;
 SELECT count(*) AS with_acl FROM pg_proc WHERE proacl IS NOT NULL;
+-- the storage columns answer rather than erroring: no storage parameter is
+-- kept, and no visibility map is built
+SELECT relname, relallfrozen, relisshared, relispopulated, relrewrite,
+       relfrozenxid, relminmxid, reloptions
+  FROM pg_class
+ WHERE relname = 'pgcat_reflect';
+-- only a relation holding unfrozen tuples carries a freeze horizon, so the
+-- partitioned parent reports 0 and so does the sequence, whose one tuple
+-- PostgreSQL writes frozen
+CREATE TABLE pgcat_parent (k int) PARTITION BY RANGE (k);
+CREATE TABLE pgcat_leaf PARTITION OF pgcat_parent FOR VALUES FROM (0) TO (10);
+CREATE SEQUENCE pgcat_seq;
+SELECT relname, relkind, relhassubclass, relispartition, relfrozenxid
+  FROM pg_class
+ WHERE relname IN ('pgcat_parent', 'pgcat_leaf', 'pgcat_seq')
+ ORDER BY relname;
+-- dropped again: the whole suite shares one database, and a live partition
+-- here would show up in every later test that lists pg_inherits
+DROP TABLE pgcat_parent;
+DROP SEQUENCE pgcat_seq;
+-- no routine declares an argument default, which is what pronargdefaults = 0
+-- says too
+SELECT count(*) AS with_defaults FROM pg_proc WHERE proargdefaults IS NOT NULL;
+SELECT count(*) AS with_config FROM pg_proc WHERE proconfig IS NOT NULL;
+SELECT proname, pronargdefaults, proargdefaults, protrftypes, prosqlbody
+  FROM pg_proc
+ WHERE proname = 'int4pl';
 -- a schema-qualified write reaches the permanent relation (INSERT accepts the
 -- public. qualifier symmetrically with SELECT/UPDATE)
 CREATE TABLE pgcat_pub (v int);
