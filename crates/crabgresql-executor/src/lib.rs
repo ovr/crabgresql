@@ -49,8 +49,8 @@ use crabgresql_planner::{
 };
 use crabgresql_storage_api::pgstat::WriteKind;
 use crabgresql_storage_api::{
-    ColumnProjection, IndexMetadata, PartitionBoundDatum, StorageError, TableAm, TableSchema, Tid,
-    Tuple, TypeCatalog,
+    ColumnProjection, IndexMetadata, PartitionBoundDatum, ProcInfo, StorageError, TableAm,
+    TableSchema, Tid, Tuple, TypeCatalog,
 };
 use crabgresql_txn::{TupleHeader, TxnContext};
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
@@ -211,6 +211,19 @@ pub trait CatalogOps: Send + Sync {
     /// Backs `pg_get_constraintdef`, which resolves *by OID* and so needs the
     /// reverse of the numbering `pg_constraint`'s rows are built from.
     fn constraint_def(&self, oid: u32) -> Option<ConstraintDef>;
+
+    /// The relation the rewrite rule `oid` is attached to — `pg_rewrite.ev_class`
+    /// — or `None` if no rule has that OID. Backs `pg_get_ruledef`.
+    ///
+    /// The OID alone, with no rule name and no body: every rule here is a view's
+    /// `_RETURN` rule, so the name is a constant and the body is the view's,
+    /// read back through [`CatalogOps::view_sql`].
+    fn rule_relation(&self, oid: u32) -> Option<u32>;
+
+    /// The argument and result shape of the function `oid`, or `None` if there
+    /// is no such function. Backs the `pg_get_function_*` trio, which renders
+    /// what [`CatalogOps::proc_signature`] only identifies by.
+    fn proc_info(&self, oid: u32) -> Option<ProcInfo>;
 
     /// Every installable extension version, for the `pg_available_extensions()`
     /// and `pg_available_extension_versions()` functions. The same rows the views

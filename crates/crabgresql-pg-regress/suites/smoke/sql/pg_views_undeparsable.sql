@@ -27,8 +27,8 @@ SELECT definition FROM pg_views WHERE viewname = 'uv_plain';
 SELECT ev_class::regclass AS view, ev_action IS NULL AS action_missing
   FROM pg_rewrite WHERE ev_class IN ('uv_plain'::regclass, 'uv_union'::regclass)
  ORDER BY 1;
--- pg_get_viewdef raises rather than returning the empty string, which is its
--- answer for a relation that is not a view at all — the two must not collide.
+-- pg_get_viewdef raises rather than returning NULL, which is its answer for a
+-- relation that is not a view at all — the two must not collide.
 SELECT pg_get_viewdef('uv_union');
 DROP VIEW uv_union;
 DROP VIEW uv_plain;

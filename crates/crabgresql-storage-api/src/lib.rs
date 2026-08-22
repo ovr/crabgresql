@@ -2149,6 +2149,72 @@ pub struct RoutineSig {
     pub imp: RoutineImpl,
 }
 
+/// One function's argument and result shape, as the `pg_get_function_*` trio
+/// renders it: a `pg_proc` row seen through *type OIDs*, where [`RoutineSig`]
+/// sees resolved [`PgType`]s. The two do not merge — this one describes
+/// built-in rows as well, whose types are OIDs the binder never resolves, and
+/// it must survive an OID no type answers to (which prints as `-`).
+///
+/// The two optional `pg_proc` columns arrive **expanded**: PostgreSQL leaves
+/// `proallargtypes` NULL when every argument is IN and `proargmodes` NULL when
+/// every mode is `i`, and [`StoredProc`] undoes both so that the three lists are
+/// positionally aligned. `arg_names` stays empty for an unnamed argument list,
+/// since there the absence is what gets printed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcInfo {
+    /// Every argument, OUT ones included.
+    pub arg_types: Vec<u32>,
+    /// One of `i`/`o`/`b`/`v`/`t` per entry of `arg_types`.
+    pub arg_modes: Vec<char>,
+    /// The declared argument names, or empty when no argument is named.
+    pub arg_names: Vec<String>,
+    pub ret_type: u32,
+    pub retset: bool,
+    /// `prokind`: `f` function, `p` procedure, `a` aggregate, `w` window. A
+    /// procedure is not a function with a return type, so the renderers need
+    /// this as well as the types.
+    pub kind: char,
+}
+
+/// The `pg_proc` columns a [`ProcInfo`] is built from, spelled as PostgreSQL
+/// spells them. Named rather than positional because seven fields of `Vec<u32>`,
+/// `Vec<char>` and `u32` are trivially swappable at a call site.
+///
+/// An empty vector is how the three nullable columns spell NULL: no OUT
+/// argument, no mode other than `i`, no argument name.
+pub struct StoredProc {
+    pub proargtypes: Vec<u32>,
+    pub proallargtypes: Vec<u32>,
+    pub proargmodes: Vec<char>,
+    pub proargnames: Vec<String>,
+    pub prorettype: u32,
+    pub proretset: bool,
+    pub prokind: char,
+}
+
+impl From<StoredProc> for ProcInfo {
+    fn from(stored: StoredProc) -> Self {
+        let arg_types = if stored.proallargtypes.is_empty() {
+            stored.proargtypes
+        } else {
+            stored.proallargtypes
+        };
+        let arg_modes = if stored.proargmodes.is_empty() {
+            vec!['i'; arg_types.len()]
+        } else {
+            stored.proargmodes
+        };
+        Self {
+            arg_types,
+            arg_modes,
+            arg_names: stored.proargnames,
+            ret_type: stored.prorettype,
+            retset: stored.proretset,
+            kind: stored.prokind,
+        }
+    }
+}
+
 /// A registered `CREATE CAST (source AS target)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserCast {

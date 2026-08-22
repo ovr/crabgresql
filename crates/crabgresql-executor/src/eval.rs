@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundExpr, MinMaxKind, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
+use crabgresql_storage_api::ProcInfo;
 use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
 use crabgresql_types::{Interval, PgType, Value, arith, cast};
@@ -1175,15 +1176,35 @@ fn eval_deparse_fn(
         // Two things about a default belong to the *reader* rather than the
         // writer — the `pretty` parenthesisation and the session's time zone —
         // so `pg_get_expr` re-renders for them; see `ruleutils::stored_expr`.
-        // Anything that is not one expression is echoed. A NULL node yields
-        // NULL, as in PG.
+        // Anything that is not one expression is echoed.
         ScalarFn::PgGetExpr => Some(Ok(eval_pg_get_expr(args, ctx))),
         ScalarFn::PgGetViewdef => Some(eval_pg_get_viewdef(args, ctx)),
+        ScalarFn::PgGetRuledef => Some(eval_pg_get_ruledef(args, ctx)),
+        ScalarFn::PgGetTriggerdef => Some(Ok(eval_pg_get_triggerdef(args))),
         ScalarFn::PgGetConstraintdef => Some(eval_pg_get_constraintdef(args, ctx)),
         ScalarFn::PgGetIndexdef => Some(eval_pg_get_indexdef(args, ctx)),
         ScalarFn::PgGetSerialSequence => Some(eval_pg_get_serial_sequence(args, ctx)),
+        ScalarFn::PgGetFunctionArguments | ScalarFn::PgGetFunctionIdentityArguments => {
+            Some(eval_pg_get_function_arguments(args, ctx))
+        }
+        ScalarFn::PgGetFunctionResult => Some(eval_pg_get_function_result(args, ctx)),
         _ => None,
     }
+}
+
+/// Whether a call must answer NULL without running. PostgreSQL declares every
+/// `pg_get_*` deparse function STRICT (`proisstrict`, checked on 18.4 for all of
+/// `expr`, `viewdef`, `ruledef`, `triggerdef`, `constraintdef`, `indexdef`,
+/// `serial_sequence` and the `function_*` trio), so each of them calls this.
+///
+/// Spelled out rather than inherited because the family is dispatched from
+/// [`eval_deparse_fn`] ahead of the STRICT short-circuit in `eval_scalar`. That
+/// detour exists for `format_type` alone — the one member that is genuinely not
+/// strict, and must name a type when only its modifier is NULL — and without
+/// this the others would read a NULL flag as `false` and return a definition
+/// where PostgreSQL returns nothing.
+fn strict_null(args: &[Value]) -> bool {
+    args.iter().any(|arg| matches!(arg, Value::Null))
 }
 
 /// `pg_get_serial_sequence(relation, column)`: the sequence that column owns,
@@ -1198,11 +1219,8 @@ fn eval_deparse_fn(
 /// The **column** argument is matched literally: `'ColX'` finds a column named
 /// `"ColX"` and `'colx'` raises `42703`, as observed on PostgreSQL 18.4. A
 /// column that owns no sequence is NULL, not an error.
-///
-/// Strict, stated here rather than inherited for the reason
-/// [`eval_pg_get_indexdef`] gives.
 fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
-    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+    if strict_null(args) {
         return Ok(Value::Null);
     }
     let (Value::Text(relation), Value::Text(column)) = (&args[0], &args[1]) else {
@@ -1251,6 +1269,9 @@ fn eval_pg_get_serial_sequence(args: &[Value], ctx: &ExecContext) -> Result<Valu
 /// what `pg_constraint.conbin` stores and what `information_schema` reads —
 /// already agrees exactly.
 fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if strict_null(args) {
+        return Ok(Value::Null);
+    }
     let Value::Oid(oid) = &args[0] else {
         return Ok(Value::Null);
     };
@@ -1295,13 +1316,10 @@ fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value,
 /// `pg_indexes.indexdef`; `pretty` changes only line breaking, which neither
 /// form produces.
 ///
-/// Strict in every argument (`pg_proc.proisstrict` is true for both overloads on
-/// 18.4), which has to be said here rather than inherited: this is dispatched
-/// from [`eval`] alongside `format_type`, not from the STRICT `eval_scalar` path
-/// that short-circuits a NULL for its callers. Without it a NULL `column` would
-/// read as `0` and return the whole statement where PostgreSQL returns NULL.
+/// Strict in every argument: without that a NULL `column` would read as `0` and
+/// return the whole statement where PostgreSQL returns NULL.
 fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
-    if args.iter().any(|arg| matches!(arg, Value::Null)) {
+    if strict_null(args) {
         return Ok(Value::Null);
     }
     let Value::Oid(oid) = &args[0] else {
@@ -1341,10 +1359,16 @@ fn eval_pg_get_indexdef(args: &[Value], ctx: &ExecContext) -> Result<Value, Exec
 }
 
 /// The stored deparse of a `pg_node_tree` column, re-rendered for this reader
-/// (see [`eval_deparse_fn`]). The third argument is PG's `pretty` flag, which
-/// defaults to false — `information_schema` leaves it off and gets the fully
-/// parenthesised form, psql passes it and gets `\d`'s.
+/// (see [`eval_deparse_fn`]). The third argument is PG's `pretty` flag, which an
+/// absent argument leaves false — `information_schema` omits it and gets the
+/// fully parenthesised form, psql passes it and gets `\d`'s.
+///
+/// Strict down to the relation OID — the argument this deparse ignores but
+/// PostgreSQL still refuses to run without.
 fn eval_pg_get_expr(args: &[Value], ctx: &ExecContext) -> Value {
+    if strict_null(args) {
+        return Value::Null;
+    }
     let Value::Text(sql) = &args[0] else {
         return args[0].clone();
     };
@@ -1355,43 +1379,131 @@ fn eval_pg_get_expr(args: &[Value], ctx: &ExecContext) -> Value {
     }
 }
 
-/// `pg_get_viewdef(name[, pretty])`. Three outcomes, all PostgreSQL's: a name no
-/// relation answers to is `42P01`; a relation that is not a view is the empty
-/// string; a view is its `SELECT`, re-rendered by [`crabgresql_binder::ruleutils`].
+/// `pg_get_viewdef(name|oid[, pretty|wrap])`. Four outcomes, all PostgreSQL's: a
+/// *name* no relation answers to is `42P01`; an *OID* none answers to is NULL,
+/// since there is no name to report missing; a relation that is not a view is
+/// NULL (verified on 18.4 for a table and for `pg_class`, in both spellings); a
+/// view is its `SELECT`, re-rendered by [`crabgresql_binder::ruleutils`].
 fn eval_pg_get_viewdef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
-    let Value::Text(name) = &args[0] else {
+    if strict_null(args) {
         return Ok(Value::Null);
-    };
+    }
     // PG's `pretty` is `PRETTYFLAG_PAREN`: it drops the parentheses that only
-    // restate precedence. Absent or NULL means false, as in PG.
-    let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+    // restate precedence. An *absent* second argument means false. An `int4` one
+    // is PG's wrap column, which implies pretty; the width is not honored, since
+    // nothing here wraps a select list.
+    let pretty = matches!(args.get(1), Some(Value::Bool(true) | Value::Int4(_)));
     let Some(catalog) = ctx.catalog.as_deref() else {
         return Err(ExecError::new(
             sqlstate::INTERNAL_ERROR,
             "pg_get_viewdef evaluated without a catalog context",
         ));
     };
-    // Resolved through the one relation-name resolver, so this and
-    // `pg_get_serial_sequence` report a missing schema and a missing relation
-    // in the same words.
-    let (_, namespace, relation) = crate::reg::resolve_relation(name, catalog)?;
-    let (namespace, relation) = (namespace.as_deref(), relation.as_str());
-    let Some((sql, columns)) = catalog.view_sql(namespace, relation) else {
-        // The relation exists but is not a view — PG answers with the empty
-        // string rather than an error.
-        return Ok(Value::Text(String::new()));
+    let (label, namespace, relation) = match &args[0] {
+        // Resolved through the one relation-name resolver, so this and
+        // `pg_get_serial_sequence` report a missing schema and a missing
+        // relation in the same words.
+        Value::Text(name) => {
+            let (_, namespace, relation) = crate::reg::resolve_relation(name, catalog)?;
+            (name.clone(), namespace, relation)
+        }
+        Value::Oid(oid) => match catalog.rel_name(*oid) {
+            Some((namespace, relation)) => (relation.clone(), Some(namespace), relation),
+            None => return Ok(Value::Null),
+        },
+        _ => return Ok(Value::Null),
     };
-    // A view whose body the deparser cannot render must *not* also answer with
-    // the empty string: that is the "not a view" answer, and returning it here
-    // would let a dump silently drop the view body. Say so instead.
-    crabgresql_binder::ruleutils::view_definition(&sql, pretty, &columns)
-        .map(Value::Text)
-        .ok_or_else(|| {
-            ExecError::new(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                format!("pg_get_viewdef cannot deparse the definition of view \"{name}\""),
-            )
-        })
+    let Some((sql, columns)) = catalog.view_sql(namespace.as_deref(), &relation) else {
+        return Ok(Value::Null);
+    };
+    view_body(&sql, pretty, &columns, &label, "pg_get_viewdef").map(Value::Text)
+}
+
+/// A view's re-rendered body, shared by `pg_get_viewdef` and `pg_get_ruledef` so
+/// the rule and the view cannot print different SQL for the same view.
+///
+/// A body the deparser cannot render must *not* come back as NULL: NULL is the
+/// "not a view" answer, and returning it here would let a dump silently drop the
+/// view body. Say so instead.
+fn view_body(
+    sql: &str,
+    pretty: bool,
+    columns: &[String],
+    label: &str,
+    caller: &str,
+) -> Result<String, ExecError> {
+    crabgresql_binder::ruleutils::view_definition(sql, pretty, columns).ok_or_else(|| {
+        ExecError::new(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            format!("{caller} cannot deparse the definition of view \"{label}\""),
+        )
+    })
+}
+
+/// `pg_get_ruledef(oid[, pretty])`: the rule's `CREATE RULE` statement, or NULL
+/// for an OID no rule answers to — PostgreSQL does not raise there.
+///
+/// Every rule in this build is a view's `_RETURN`, so the statement is a fixed
+/// frame around [`eval_pg_get_viewdef`]'s body. The frame is PostgreSQL 18.4's,
+/// down to the two spaces after `DO INSTEAD` (the body itself begins with one):
+///
+/// ```text
+/// CREATE RULE "_RETURN" AS
+///     ON SELECT TO probe.v DO INSTEAD  SELECT a,
+///     b
+///    FROM probe.t
+///   WHERE (a > 1);
+/// ```
+///
+/// `pretty` reaches the header as well as the body: without it PostgreSQL
+/// schema-qualifies the relation unconditionally (`public.pv`, even with
+/// `public` in the search path), and with it only when the bare name would not
+/// find it. Verified on 18.4 both ways round — a view in the search path and one
+/// outside it.
+fn eval_pg_get_ruledef(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    if strict_null(args) {
+        return Ok(Value::Null);
+    }
+    let Value::Oid(oid) = &args[0] else {
+        return Ok(Value::Null);
+    };
+    let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            "pg_get_ruledef evaluated without a catalog context",
+        ));
+    };
+    let Some(relation_oid) = catalog.rule_relation(*oid) else {
+        return Ok(Value::Null);
+    };
+    let Some((namespace, relation)) = catalog.rel_name(relation_oid) else {
+        return Ok(Value::Null);
+    };
+    let Some((sql, columns)) = catalog.view_sql(Some(&namespace), &relation) else {
+        return Ok(Value::Null);
+    };
+    let body = view_body(&sql, pretty, &columns, &relation, "pg_get_ruledef")?;
+    let quoted = quote_ident(&relation);
+    let visible = pretty && catalog.table_is_visible(relation_oid) == Some(true);
+    let target = if visible {
+        quoted
+    } else {
+        format!("{}.{}", quote_ident(&namespace), quoted)
+    };
+    Ok(Value::Text(format!(
+        "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO {target} DO INSTEAD {body}"
+    )))
+}
+
+/// `pg_get_triggerdef(oid[, pretty])`: always NULL.
+///
+/// Not a stub standing in for a lookup: `pg_trigger` is empty in every database
+/// this build serves (there is no `CREATE TRIGGER`), and NULL is what PostgreSQL
+/// answers for an OID carrying no trigger — verified on 18.4. The day triggers
+/// exist, this grows the lookup and keeps the same miss.
+fn eval_pg_get_triggerdef(_args: &[Value]) -> Value {
+    Value::Null
 }
 
 /// `format_type(oid, typmod)`. A NULL oid yields NULL; oid `0` is `-`; an oid
@@ -1450,6 +1562,116 @@ pub(crate) fn format_type_text(
     }
     ty.format_type(typmod)
         .unwrap_or_else(|| ty.name().to_string())
+}
+
+/// `pg_get_function_arguments(oid)` and its identity twin: the argument list
+/// `CREATE FUNCTION` would take, `a integer, OUT b text, VARIADIC c integer[]`.
+/// NULL for an OID no function answers to; the empty string for a function with
+/// no arguments (PostgreSQL distinguishes the two).
+///
+/// The `t` mode is skipped: a `RETURNS TABLE` column is not an argument, and
+/// PostgreSQL prints it in [`eval_pg_get_function_result`] instead.
+///
+/// The identity form differs only in omitting `DEFAULT <expr>`, and nothing in
+/// this build carries an argument default — `CREATE FUNCTION` takes no
+/// `DEFAULT`, and `crabgresql-bki` refuses a `pg_proc.dat` entry declaring
+/// `proargdefaults` — so one renderer serves both until that changes. Names and
+/// OUT/INOUT modes stay in both: the types-only spelling of a signature is
+/// `regprocedure`, not this.
+///
+/// A **procedure** spells its input arguments `IN a integer` where a function
+/// leaves the mode off; verified on 18.4 with the same argument list on both.
+///
+/// An argument whose type OID resolves to nothing prints as `-`.
+fn eval_pg_get_function_arguments(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Some((info, catalog)) = proc_info_of(args, ctx, "pg_get_function_arguments")? else {
+        return Ok(Value::Null);
+    };
+    let mut out = Vec::new();
+    for (position, ty) in info.arg_types.iter().enumerate() {
+        let mode = info.arg_modes.get(position).copied().unwrap_or('i');
+        if mode == 't' {
+            continue;
+        }
+        let prefix = match mode {
+            'o' => "OUT ",
+            'b' => "INOUT ",
+            'v' => "VARIADIC ",
+            _ if info.kind == 'p' => "IN ",
+            _ => "",
+        };
+        let name = match info.arg_names.get(position) {
+            Some(name) if !name.is_empty() => format!("{} ", quote_ident(name)),
+            _ => String::new(),
+        };
+        out.push(format!(
+            "{prefix}{name}{}",
+            format_type_text(*ty, Some(-1), Some(catalog))
+        ));
+    }
+    Ok(Value::Text(out.join(", ")))
+}
+
+/// `pg_get_function_result(oid)`: the `RETURNS` clause. Three shapes, as
+/// PostgreSQL prints them — `TABLE(x integer, y text)` when the function
+/// declares `RETURNS TABLE` (arguments in mode `t`), `SETOF <type>` when it
+/// returns a set, and the bare type otherwise. Several OUT parameters need no
+/// case of their own: `prorettype` is already `record` there.
+///
+/// A **procedure** has no result at all and answers NULL, which is decided by
+/// `prokind` rather than by the return type: `CREATE PROCEDURE` stores
+/// `prorettype = text` as a placeholder here (`PgType` has no `void`; see the
+/// TODO in `crabgresql-server`'s `execute_create_procedure`), so reading the
+/// type would print `text` where 18.4 prints nothing.
+fn eval_pg_get_function_result(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Some((info, catalog)) = proc_info_of(args, ctx, "pg_get_function_result")? else {
+        return Ok(Value::Null);
+    };
+    if info.kind == 'p' {
+        return Ok(Value::Null);
+    }
+    let columns: Vec<String> = info
+        .arg_types
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| info.arg_modes.get(*position) == Some(&'t'))
+        .map(|(position, ty)| {
+            let name = match info.arg_names.get(position) {
+                Some(name) if !name.is_empty() => format!("{} ", quote_ident(name)),
+                _ => String::new(),
+            };
+            format!("{name}{}", format_type_text(*ty, Some(-1), Some(catalog)))
+        })
+        .collect();
+    if !columns.is_empty() {
+        return Ok(Value::Text(format!("TABLE({})", columns.join(", "))));
+    }
+    let ret = format_type_text(info.ret_type, Some(-1), Some(catalog));
+    Ok(Value::Text(if info.retset {
+        format!("SETOF {ret}")
+    } else {
+        ret
+    }))
+}
+
+/// The catalog lookup the `pg_get_function_*` trio shares. A NULL argument and
+/// an OID no function answers to collapse into the same miss, since both print
+/// as NULL.
+fn proc_info_of<'a>(
+    args: &[Value],
+    ctx: &'a ExecContext,
+    caller: &str,
+) -> Result<Option<(ProcInfo, &'a dyn CatalogOps)>, ExecError> {
+    let Value::Oid(oid) = &args[0] else {
+        return Ok(None);
+    };
+    let Some(catalog) = ctx.catalog.as_deref() else {
+        return Err(ExecError::new(
+            sqlstate::INTERNAL_ERROR,
+            format!("{caller} evaluated without a catalog context"),
+        ));
+    };
+    Ok(catalog.proc_info(*oid).map(|info| (info, catalog)))
 }
 
 /// Split a `nextval`/`currval`/`setval` text argument into `(namespace, name)`:
@@ -1853,6 +2075,12 @@ mod format_type_tests {
                 None
             }
             fn constraint_def(&self, _oid: u32) -> Option<crate::ConstraintDef> {
+                None
+            }
+            fn rule_relation(&self, _oid: u32) -> Option<u32> {
+                None
+            }
+            fn proc_info(&self, _oid: u32) -> Option<crabgresql_storage_api::ProcInfo> {
                 None
             }
             fn index_def(&self, _oid: u32) -> Option<crate::IndexDef> {

@@ -62,8 +62,8 @@ use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
-    IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationFilenodes, StorageError,
-    TableAm, TableEngine, TableSchema,
+    IndexConstraint, IndexMetadata, ProcInfo, RelPersistence, RelStats, RelationFilenodes,
+    StorageError, StoredProc, TableAm, TableEngine, TableSchema,
 };
 use crabgresql_txn::Xid;
 #[cfg(test)]
@@ -608,6 +608,7 @@ pub struct SystemCatalog {
     index_oids: OnceLock<Vec<CatalogIndex>>,
     toast_oids: OnceLock<Vec<CatalogToast>>,
     constraint_oids: OnceLock<Vec<CatalogConstraint>>,
+    rewrite_oids: OnceLock<Vec<CatalogRewrite>>,
     attrdef_oids: OnceLock<Vec<CatalogAttrDef>>,
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
@@ -676,6 +677,7 @@ impl SystemCatalog {
             index_oids: OnceLock::new(),
             toast_oids: OnceLock::new(),
             constraint_oids: OnceLock::new(),
+            rewrite_oids: OnceLock::new(),
             attrdef_oids: OnceLock::new(),
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
@@ -1022,33 +1024,36 @@ impl SystemCatalog {
     /// the reason [`SystemCatalog::toast_oids`] gives: appending never moves an
     /// OID that already existed.
     ///
-    /// Not memoized, unlike the blocks above: only `pg_rewrite` reads it, and
-    /// nothing looks a rule up by OID.
-    pub(crate) fn rewrite_oids(&self) -> Vec<CatalogRewrite> {
-        let first = FIRST_REL_OID
-            + self.relation_oids().len() as u32
-            + self.index_oids().len() as u32
-            + self.toast_oids().len() as u32
-            + self.constraint_oids().len() as u32;
-        let mut relations = self.live_relations().to_vec();
-        // The same sort `relation_oids` uses, so `position` is the view's own
-        // `pg_class` OID rather than a number that happens to look like one.
-        relations.sort_by(|a, b| {
-            a.namespace
-                .cmp(&b.namespace)
-                .then_with(|| a.schema.name.cmp(&b.schema.name))
-        });
-        relations
-            .into_iter()
-            .enumerate()
-            .filter(|(_, relation)| relation.kind == RelKind::View)
-            .enumerate()
-            .map(|(slot, (position, relation))| CatalogRewrite {
-                oid: first + slot as u32,
-                view_oid: FIRST_REL_OID + position as u32,
-                definition: relation.definition,
-            })
-            .collect()
+    /// Memoized like the blocks above, and for a reason they share: building it
+    /// clones and sorts every live relation, and `pg_get_ruledef` looks a rule up
+    /// *by OID* once per row of `pg_rewrite`.
+    pub(crate) fn rewrite_oids(&self) -> &[CatalogRewrite] {
+        self.rewrite_oids.get_or_init(|| {
+            let first = FIRST_REL_OID
+                + self.relation_oids().len() as u32
+                + self.index_oids().len() as u32
+                + self.toast_oids().len() as u32
+                + self.constraint_oids().len() as u32;
+            let mut relations = self.live_relations().to_vec();
+            // The same sort `relation_oids` uses, so `position` is the view's own
+            // `pg_class` OID rather than a number that happens to look like one.
+            relations.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            relations
+                .into_iter()
+                .enumerate()
+                .filter(|(_, relation)| relation.kind == RelKind::View)
+                .enumerate()
+                .map(|(slot, (position, relation))| CatalogRewrite {
+                    oid: first + slot as u32,
+                    view_oid: FIRST_REL_OID + position as u32,
+                    definition: relation.definition,
+                })
+                .collect()
+        })
     }
 
     /// The constraints of this snapshot, assigned OIDs from a **fourth block**
@@ -1286,6 +1291,57 @@ impl SystemCatalog {
             columns,
             constraint.expr.clone(),
         ))
+    }
+
+    /// The view the rewrite rule `oid` is attached to — `pg_rewrite.ev_class`,
+    /// resolved against the same numbering [`SystemCatalog::rewrite_oids`] hands
+    /// out. Backs `pg_get_ruledef`, which resolves *by* the rule's OID.
+    ///
+    /// Indexed rather than scanned, for the reason [`Self::constraint_def`]
+    /// gives — including why the stored OID is compared afterwards.
+    pub fn rewrite_relation(&self, oid: u32) -> Option<u32> {
+        let rules = self.rewrite_oids();
+        let base = rules.first()?.oid;
+        let rule = rules.get(oid.checked_sub(base)? as usize)?;
+        (rule.oid == oid).then_some(rule.view_oid)
+    }
+
+    /// Everything the `pg_get_function_*` trio renders about the function `oid`:
+    /// built-in rows first, then this session's `CREATE FUNCTION` routines,
+    /// exactly as [`SystemCatalog::proc_name`]. See [`ProcInfo`] for the two
+    /// columns [`StoredProc`] expands on the way out.
+    pub fn proc_info(&self, oid: u32) -> Option<ProcInfo> {
+        if let Some(row) = PG_PROC_ROWS.iter().find(|row| row.oid == oid) {
+            return Some(
+                StoredProc {
+                    proargtypes: row.proargtypes.to_vec(),
+                    proallargtypes: row.proallargtypes.to_vec(),
+                    proargmodes: row
+                        .proargmodes
+                        .iter()
+                        .filter_map(|mode| mode.chars().next())
+                        .collect(),
+                    proargnames: row.proargnames.iter().map(|n| (*n).to_string()).collect(),
+                    prorettype: row.prorettype,
+                    proretset: row.proretset,
+                    prokind: row.prokind.chars().next().unwrap_or('f'),
+                }
+                .into(),
+            );
+        }
+        let routine = self.routine_by_oid(oid)?;
+        Some(
+            StoredProc {
+                proargtypes: routine.arg_types,
+                proallargtypes: routine.all_arg_types,
+                proargmodes: routine.arg_modes,
+                proargnames: routine.arg_names,
+                prorettype: routine.ret_type,
+                proretset: routine.retset,
+                prokind: routine.kind,
+            }
+            .into(),
+        )
     }
 
     /// The name of the role `oid` identifies, or `None` if no role has that OID.
