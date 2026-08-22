@@ -17112,6 +17112,206 @@ async fn pg_get_serial_sequence_resolves_a_name_not_an_oid() -> anyhow::Result<(
     Ok(())
 }
 
+/// `pg_get_viewdef` resolves a view by OID as well as by name — the spelling a
+/// client's generated query uses. The two disagree about a miss on purpose: a
+/// name that resolves to nothing is `42P01`, an OID that does is NULL, and a
+/// relation that is not a view is NULL either way.
+///
+/// Every string here is PostgreSQL 18.4's, taken from the same statements.
+#[tokio::test]
+async fn pg_get_viewdef_resolves_by_oid_as_well_as_by_name() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t (a int, b text);
+             CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1",
+        )
+        .await?;
+    let one = async |sql: &str| -> anyhow::Result<Option<String>> {
+        Ok(client.query_one(sql, &[]).await?.get(0))
+    };
+
+    let body = " SELECT a,\n    b\n   FROM t\n  WHERE (a > 1);";
+    // Both spellings render the same body, and the `text` one keeps winning an
+    // unadorned literal — the overload set now holds `oid` signatures too, and
+    // PG's string-category rule is what keeps `pg_get_viewdef('v')` from being
+    // `42725`.
+    assert_eq!(
+        one("SELECT pg_get_viewdef('v')").await?.as_deref(),
+        Some(body)
+    );
+    assert_eq!(
+        one("SELECT pg_get_viewdef('v'::regclass)")
+            .await?
+            .as_deref(),
+        Some(body)
+    );
+    // `pretty` drops the parentheses that only restate precedence; an integer
+    // second argument is PG's wrap column, which implies pretty.
+    let pretty = " SELECT a,\n    b\n   FROM t\n  WHERE a > 1;";
+    assert_eq!(
+        one("SELECT pg_get_viewdef('v'::regclass, true)")
+            .await?
+            .as_deref(),
+        Some(pretty)
+    );
+    assert_eq!(
+        one("SELECT pg_get_viewdef('v'::regclass, 40)")
+            .await?
+            .as_deref(),
+        Some(pretty)
+    );
+
+    // A relation that is not a view is NULL, not the empty string, in both
+    // spellings — verified on 18.4 for a table and for `pg_class` itself.
+    assert_eq!(one("SELECT pg_get_viewdef('t')").await?, None);
+    assert_eq!(one("SELECT pg_get_viewdef('t'::regclass)").await?, None);
+    // An OID naming nothing has no name to report missing, so it is NULL where
+    // the name form raises 42P01 (pinned by
+    // `pg_get_serial_sequence_resolves_a_name_not_an_oid`).
+    for sql in [
+        "SELECT pg_get_viewdef(999999)",
+        "SELECT pg_get_viewdef(0)",
+        "SELECT pg_get_viewdef(NULL::oid)",
+        "SELECT pg_get_viewdef(999999, true)",
+    ] {
+        assert_eq!(one(sql).await?, None, "{sql}");
+    }
+    Ok(())
+}
+
+/// `pg_get_ruledef` prints the `_RETURN` rule every view carries, wrapping the
+/// same body `pg_get_viewdef` renders. `pg_get_triggerdef` answers NULL for
+/// every OID, which is what PostgreSQL answers while no trigger exists.
+#[tokio::test]
+async fn pg_get_ruledef_prints_a_views_return_rule() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE t (a int, b text);
+             CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1",
+        )
+        .await?;
+    let one = async |sql: &str| -> anyhow::Result<Option<String>> {
+        Ok(client.query_one(sql, &[]).await?.get(0))
+    };
+
+    // Two spaces after `DO INSTEAD`: the body itself begins with one. Without
+    // `pretty` the relation is schema-qualified even though `public` is in the
+    // search path, and with it the bare name is used — both verified on 18.4.
+    assert_eq!(
+        one("SELECT pg_get_ruledef(oid) FROM pg_rewrite")
+            .await?
+            .as_deref(),
+        Some(
+            "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO public.v DO INSTEAD  SELECT a,\n    b\n   FROM t\n  WHERE (a > 1);"
+        )
+    );
+    assert_eq!(
+        one("SELECT pg_get_ruledef(oid, true) FROM pg_rewrite")
+            .await?
+            .as_deref(),
+        Some(
+            "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO v DO INSTEAD  SELECT a,\n    b\n   FROM t\n  WHERE a > 1;"
+        )
+    );
+    // The rule's name is `_RETURN` and its `ev_class` is the view, so the row
+    // and the definition agree about what they describe.
+    let row = client
+        .query_one(
+            "SELECT rulename, ev_class::regclass::text FROM pg_rewrite",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, String>(0), "_RETURN");
+    assert_eq!(row.get::<_, String>(1), "v");
+
+    assert_eq!(one("SELECT pg_get_ruledef(999999)").await?, None);
+    assert_eq!(one("SELECT pg_get_ruledef(NULL::oid)").await?, None);
+    // `pg_trigger` is empty and so is every answer over it.
+    assert_eq!(one("SELECT pg_get_triggerdef(999999)").await?, None);
+    assert_eq!(one("SELECT pg_get_triggerdef(999999, true)").await?, None);
+    assert_eq!(
+        client
+            .query("SELECT pg_get_triggerdef(oid) FROM pg_trigger", &[])
+            .await?
+            .len(),
+        0
+    );
+    Ok(())
+}
+
+/// The `pg_get_function_*` trio renders a `pg_proc` row back into the clauses
+/// `CREATE FUNCTION` took: the argument list, the identity list `DROP FUNCTION`
+/// needs, and the `RETURNS` clause. Built-in rows answer as well as this
+/// session's own routines.
+#[tokio::test]
+async fn pg_get_function_arguments_renders_a_signature() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION f1(a int, b text) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+             CREATE FUNCTION f2(x int, OUT y text) RETURNS text LANGUAGE SQL AS $$ SELECT 'a' $$;
+             CREATE FUNCTION f3() RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$",
+        )
+        .await?;
+    let of = async |name: &str| -> anyhow::Result<(String, String, String)> {
+        let row = client
+            .query_one(
+                "SELECT pg_get_function_arguments(oid), \
+                        pg_get_function_identity_arguments(oid), \
+                        pg_get_function_result(oid) \
+                 FROM pg_proc WHERE proname = $1",
+                &[&name],
+            )
+            .await?;
+        Ok((row.get(0), row.get(1), row.get(2)))
+    };
+
+    assert_eq!(
+        of("f1").await?,
+        (
+            "a integer, b text".to_string(),
+            "a integer, b text".to_string(),
+            "integer".to_string()
+        )
+    );
+    // An OUT parameter is printed with its mode and is part of the argument
+    // list, identity list included.
+    assert_eq!(
+        of("f2").await?,
+        (
+            "x integer, OUT y text".to_string(),
+            "x integer, OUT y text".to_string(),
+            "text".to_string()
+        )
+    );
+    // No arguments is the *empty string*, which PostgreSQL distinguishes from
+    // the NULL a missing function gets.
+    assert_eq!(
+        of("f3").await?,
+        (String::new(), String::new(), "integer".to_string())
+    );
+    // A built-in row: `VARIADIC` and a named argument, straight out of
+    // `pg_proc.dat`.
+    assert_eq!(
+        of("json_extract_path").await?.0,
+        "from_json json, VARIADIC path_elems text[]"
+    );
+
+    let missing: Option<String> = client
+        .query_one(
+            "SELECT pg_get_function_arguments(999999) \
+             WHERE pg_get_function_result(999999) IS NULL \
+               AND pg_get_function_identity_arguments(NULL::oid) IS NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(missing, None);
+    Ok(())
+}
+
 /// A relation a view reads only from an expression subquery is a dependency:
 /// `pg_depend` records the edge, and `DROP` refuses to strand the view.
 #[tokio::test]

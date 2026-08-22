@@ -62,8 +62,8 @@ use std::sync::{Arc, OnceLock};
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
-    IndexConstraint, IndexMetadata, RelPersistence, RelStats, RelationFilenodes, StorageError,
-    TableAm, TableEngine, TableSchema,
+    IndexConstraint, IndexMetadata, ProcInfo, RelPersistence, RelStats, RelationFilenodes,
+    StorageError, TableAm, TableEngine, TableSchema,
 };
 use crabgresql_txn::Xid;
 #[cfg(test)]
@@ -1285,6 +1285,55 @@ impl SystemCatalog {
             constraint.contype.to_string(),
             columns,
             constraint.expr.clone(),
+        ))
+    }
+
+    /// The view the rewrite rule `oid` is attached to — `pg_rewrite.ev_class`,
+    /// resolved against the same numbering [`SystemCatalog::rewrite_oids`] hands
+    /// out. Backs `pg_get_ruledef`, which resolves *by* the rule's OID.
+    ///
+    /// The relation OID alone, and no rule name: every row of `pg_rewrite` here
+    /// is a view's `_RETURN` rule (there is no `CREATE RULE`), so the name is a
+    /// constant the caller already knows. A `None` is an OID no rule answers to,
+    /// which PostgreSQL reports as NULL rather than an error.
+    ///
+    /// Scanned rather than indexed, unlike [`Self::constraint_def`]: the block
+    /// is dense in the *view* subsequence rather than in the relation list it is
+    /// built from, so an offset is not a position. Views are few and
+    /// `pg_get_ruledef` runs once per one of them.
+    pub fn rewrite_relation(&self, oid: u32) -> Option<u32> {
+        self.rewrite_oids()
+            .into_iter()
+            .find(|rule| rule.oid == oid)
+            .map(|rule| rule.view_oid)
+    }
+
+    /// Everything the `pg_get_function_*` trio renders about the function `oid`:
+    /// built-in rows first, then this session's `CREATE FUNCTION` routines,
+    /// exactly as [`SystemCatalog::proc_name`]. See [`ProcInfo`] for the two
+    /// columns [`ProcInfo::from_stored`] expands on the way out.
+    pub fn proc_info(&self, oid: u32) -> Option<ProcInfo> {
+        if let Some(row) = PG_PROC_ROWS.iter().find(|row| row.oid == oid) {
+            return Some(ProcInfo::from_stored(
+                row.proargtypes.to_vec(),
+                row.proallargtypes.to_vec(),
+                row.proargmodes
+                    .iter()
+                    .filter_map(|mode| mode.chars().next())
+                    .collect(),
+                row.proargnames.iter().map(|n| (*n).to_string()).collect(),
+                row.prorettype,
+                row.proretset,
+            ));
+        }
+        let routine = self.routine_by_oid(oid)?;
+        Some(ProcInfo::from_stored(
+            routine.arg_types,
+            routine.all_arg_types,
+            routine.arg_modes,
+            routine.arg_names,
+            routine.ret_type,
+            routine.retset,
         ))
     }
 

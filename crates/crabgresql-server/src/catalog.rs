@@ -19,7 +19,7 @@ use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
 };
 use crabgresql_storage_api::{
-    CheckConstraint, ColumnProjection, IndexMetadata, RelationMetadata, SequenceAdvance,
+    CheckConstraint, ColumnProjection, IndexMetadata, ProcInfo, RelationMetadata, SequenceAdvance,
     SequenceDefinition, StorageError, TableAm, TableEngine, TableSchema, TypeCatalog,
     ViewDefinition,
 };
@@ -775,6 +775,14 @@ impl CatalogOps for SessionCatalogOps {
             columns,
             expr,
         })
+    }
+
+    fn rule_relation(&self, oid: u32) -> Option<u32> {
+        self.system.rewrite_relation(oid)
+    }
+
+    fn proc_info(&self, oid: u32) -> Option<ProcInfo> {
+        self.system.proc_info(oid)
     }
 
     fn available_extensions(&self) -> Vec<ExtensionVersion> {

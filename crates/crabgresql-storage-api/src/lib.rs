@@ -2149,6 +2149,65 @@ pub struct RoutineSig {
     pub imp: RoutineImpl,
 }
 
+/// One function's argument and result shape, as the `pg_get_function_*` trio
+/// renders it: a `pg_proc` row seen through *type OIDs*, where [`RoutineSig`]
+/// sees resolved [`PgType`]s. The two do not merge — this one describes
+/// built-in rows as well, whose types are OIDs the binder never resolves, and
+/// it must survive an OID no type answers to (which prints as `???`).
+///
+/// The three optional `pg_proc` columns arrive **expanded**: PostgreSQL leaves
+/// `proallargtypes` NULL when every argument is IN and `proargmodes` NULL when
+/// every mode is `i`, and the producer undoes both so that `arg_types`,
+/// `arg_modes` and (when non-empty) `arg_names` are positionally aligned.
+/// `arg_names` stays empty for an unnamed argument list, since there the
+/// absence is what gets printed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcInfo {
+    /// Every argument, OUT ones included — `proallargtypes` when it is set,
+    /// `proargtypes` otherwise.
+    pub arg_types: Vec<u32>,
+    /// One of `i`/`o`/`b`/`v`/`t` per entry of `arg_types`.
+    pub arg_modes: Vec<char>,
+    /// The declared argument names, or empty when no argument is named.
+    pub arg_names: Vec<String>,
+    pub ret_type: u32,
+    /// `proretset`: the function returns a set.
+    pub retset: bool,
+}
+
+impl ProcInfo {
+    /// Build one from the `pg_proc` columns as *stored*, expanding the two that
+    /// PostgreSQL leaves NULL for the all-IN case. `all_types` empty means
+    /// `proallargtypes` is NULL, so the input types are every type; `modes`
+    /// empty means `proargmodes` is NULL, so every mode is `i`.
+    pub fn from_stored(
+        types: Vec<u32>,
+        all_types: Vec<u32>,
+        modes: Vec<char>,
+        names: Vec<String>,
+        ret_type: u32,
+        retset: bool,
+    ) -> Self {
+        let arg_types = if all_types.is_empty() {
+            types
+        } else {
+            all_types
+        };
+        let arg_modes = if modes.is_empty() {
+            vec!['i'; arg_types.len()]
+        } else {
+            modes
+        };
+        Self {
+            arg_types,
+            arg_modes,
+            arg_names: names,
+            ret_type,
+            retset,
+        }
+    }
+}
+
 /// A registered `CREATE CAST (source AS target)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserCast {

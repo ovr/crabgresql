@@ -763,9 +763,34 @@ pub enum ScalarFn {
     /// to SQL. crabgresql already stores canonical SQL text (column defaults,
     /// `relpartbound`), so this echoes its first argument.
     PgGetExpr,
-    /// `pg_get_viewdef(text[, bool]) -> text`: the view's `SELECT`, re-rendered
-    /// in PostgreSQL's canonical shape by [`crate::ruleutils`].
+    /// `pg_get_viewdef(text|oid[, bool|int4]) -> text`: the view's `SELECT`,
+    /// re-rendered in PostgreSQL's canonical shape by [`crate::ruleutils`]. The
+    /// two spellings of the relation are two functions in PostgreSQL, and are
+    /// two signatures here for the same reason: a name is resolved through the
+    /// search path and a missing one is `42P01`, while a missing OID is NULL.
+    /// The `int4` second argument is PostgreSQL's wrap column, which implies
+    /// `pretty`.
     PgGetViewdef,
+    /// `pg_get_ruledef(oid[, bool]) -> text`: a rewrite rule's `CREATE RULE`
+    /// statement. Every rule here is a view's `_RETURN`, so the body is the
+    /// view's own definition and the flag is [`PgGetViewdef`](Self::PgGetViewdef)'s.
+    /// An OID no rule answers to is NULL, not an error.
+    PgGetRuledef,
+    /// `pg_get_triggerdef(oid[, bool]) -> text`: a trigger's `CREATE TRIGGER`
+    /// statement. There is no `CREATE TRIGGER` here, so no OID ever answers and
+    /// the result is always NULL — which is what PostgreSQL returns for an OID
+    /// carrying no trigger.
+    PgGetTriggerdef,
+    /// `pg_get_function_arguments(oid) -> text`: a function's argument list as
+    /// `CREATE FUNCTION` would take it (`a integer, OUT b text`).
+    PgGetFunctionArguments,
+    /// `pg_get_function_identity_arguments(oid) -> text`: the same list with the
+    /// argument defaults left off — what `DROP FUNCTION` needs.
+    PgGetFunctionIdentityArguments,
+    /// `pg_get_function_result(oid) -> text`: a function's `RETURNS` clause,
+    /// `SETOF`/`TABLE(...)` included. NULL for an OID no function answers to,
+    /// like the two above.
+    PgGetFunctionResult,
     /// `pg_get_indexdef(oid[, int4, bool]) -> text`: an index's `CREATE INDEX`
     /// DDL, rendered by [`crabgresql_storage_api::index_definition`]. The
     /// three-argument form is PostgreSQL's per-column one: a non-zero column
@@ -3006,8 +3031,19 @@ fn lookup(name: &str) -> &'static [Signature] {
                 ret: TEXT,
             },
         ],
-        // The `pretty` flag is accepted and ignored: PostgreSQL's non-pretty
-        // form differs only in line breaking, and nothing here asks for it.
+        // Five signatures, as PostgreSQL declares five functions. The `oid` ones
+        // are what a client's generated query writes (`pg_get_viewdef(c.oid)`
+        // over `pg_class`); the `text` ones are what a hand-typed query writes.
+        // They coexist in the table rather than behind an ordered resolver — the
+        // way `pg_relation_size`'s two spellings do — because a bare
+        // `pg_get_viewdef('v')` is not ambiguous between them: the string
+        // category rule in `narrow_by_unknown_category` sends an unknown literal
+        // to `text`, which is exactly how PostgreSQL resolves the same call.
+        //
+        // The `int4` second argument is PostgreSQL's wrap column. It selects the
+        // pretty form (verified on 18.4: `pg_get_viewdef(v, 40)` drops the
+        // precedence parentheses); the width itself is not honored, since
+        // nothing here wraps a select list.
         "pg_get_viewdef" => &[
             Signature {
                 func: ScalarFn::PgGetViewdef,
@@ -3019,7 +3055,61 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: &[TEXT, BOOL],
                 ret: TEXT,
             },
+            Signature {
+                func: ScalarFn::PgGetViewdef,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetViewdef,
+                args: &[OID, BOOL],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetViewdef,
+                args: &[OID, I4],
+                ret: TEXT,
+            },
         ],
+        "pg_get_ruledef" => &[
+            Signature {
+                func: ScalarFn::PgGetRuledef,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetRuledef,
+                args: &[OID, BOOL],
+                ret: TEXT,
+            },
+        ],
+        "pg_get_triggerdef" => &[
+            Signature {
+                func: ScalarFn::PgGetTriggerdef,
+                args: &[OID],
+                ret: TEXT,
+            },
+            Signature {
+                func: ScalarFn::PgGetTriggerdef,
+                args: &[OID, BOOL],
+                ret: TEXT,
+            },
+        ],
+        "pg_get_function_arguments" => &[Signature {
+            func: ScalarFn::PgGetFunctionArguments,
+            args: &[OID],
+            ret: TEXT,
+        }],
+        "pg_get_function_identity_arguments" => &[Signature {
+            func: ScalarFn::PgGetFunctionIdentityArguments,
+            args: &[OID],
+            ret: TEXT,
+        }],
+        "pg_get_function_result" => &[Signature {
+            func: ScalarFn::PgGetFunctionResult,
+            args: &[OID],
+            ret: TEXT,
+        }],
         "pg_get_indexdef" => &[
             Signature {
                 func: ScalarFn::PgGetIndexdef,
