@@ -11,7 +11,7 @@ use crabgresql_types::{PgType, Value};
 use crate::BindError;
 
 use super::bind::bind_expr;
-use super::bound::{BoundAggregate, BoundExpr, BoundWindowSpec, WindowKind, WindowSortKey};
+use super::bound::{BoundAggregate, BoundExpr, BoundWindowSpec, ExprSortKey, WindowKind};
 use super::coerce::{coerce_expr, implicit_castable, resolve_unknown_ctx, type_label};
 use super::operators::is_text_family;
 use super::params::param_ctx_capped;
@@ -331,15 +331,23 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
         BoundExpr::Aggregate {
             func,
             distinct,
-            args: agg_args,
+            agg_args,
+            order_by,
             input_ty,
             ret,
         } => BoundExpr::Aggregate {
             func,
             distinct,
-            args: agg_args
+            agg_args: agg_args
                 .into_iter()
                 .map(|a| inline_params(a, args))
+                .collect(),
+            order_by: order_by
+                .into_iter()
+                .map(|key| ExprSortKey {
+                    expr: inline_params(key.expr, args),
+                    ..key
+                })
                 .collect(),
             input_ty,
             ret,
@@ -372,7 +380,7 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
                 order_by: spec
                     .order_by
                     .into_iter()
-                    .map(|key| WindowSortKey {
+                    .map(|key| ExprSortKey {
                         expr: inline_params(key.expr, args),
                         ..key
                     })

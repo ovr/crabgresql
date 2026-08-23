@@ -335,7 +335,10 @@ impl Accumulator {
             AggFn::ArrayAgg => AggState::ArrayAgg {
                 elem: agg.input_ty,
                 collation: agg.collation,
-                distinct: agg.distinct,
+                // An aggregate with its own ORDER BY arrives already sorted and
+                // already deduplicated (see the node's `drain_buffers`), and the
+                // finalize sort below would undo the order it asked for.
+                distinct: agg.distinct && agg.order_by.is_empty(),
                 elems: None,
             },
         };
@@ -570,10 +573,11 @@ fn compare_element(ty: PgType, a: &Value, b: &Value, collation: u32) -> Ordering
 
 /// Whether this aggregate wants a [`DistinctValues`] set built for it.
 /// `array_agg` opts out because it dedups by sorting at finalize instead (see
-/// [`Accumulator::finalize`]). Asked by the aggregate node, so the rule lives
-/// next to the accumulator it is a statement about.
+/// [`Accumulator::finalize`]), and an aggregate with its own `ORDER BY` because
+/// it dedups from its sorted buffer. Asked by the aggregate node, so the rule
+/// lives next to the accumulator it is a statement about.
 pub fn wants_distinct_set(agg: &BoundAggregate) -> bool {
-    agg.distinct && agg.func != AggFn::ArrayAgg
+    agg.distinct && agg.func != AggFn::ArrayAgg && agg.order_by.is_empty()
 }
 
 /// Fold one input row into `acc`, applying the rules every aggregate shares:
@@ -916,6 +920,7 @@ mod tests {
             func,
             distinct: false,
             args: Vec::new(),
+            order_by: Vec::new(),
             input_ty,
             ret: PgType::Numeric,
             collation: 0,

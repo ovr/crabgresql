@@ -215,6 +215,11 @@ fn window_misuse_reports_pg_text_and_sqlstate() -> anyhow::Result<()> {
             "DISTINCT is not implemented for window functions",
         ),
         (
+            "SELECT sum(big ORDER BY id) OVER () FROM t",
+            "0A000",
+            "aggregate ORDER BY is not implemented for window functions",
+        ),
+        (
             "SELECT rank() OVER w FROM t",
             "42704",
             "window \"w\" does not exist",

@@ -89,13 +89,7 @@ impl WindowAgg {
             });
         }
         for (offset, key) in spec.order_by.iter().enumerate() {
-            keys.push(SortKey {
-                column: output_width + spec.partition_by.len() + offset,
-                ty: key.ty,
-                collation: key.collation,
-                asc: key.asc,
-                nulls_first: key.nulls_first,
-            });
+            keys.push(key.sort_key(output_width + spec.partition_by.len() + offset));
         }
         for row in &mut rows {
             for expr in spec

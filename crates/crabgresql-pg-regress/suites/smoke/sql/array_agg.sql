@@ -42,6 +42,19 @@ SELECT grp, array_agg(txt) FROM aa GROUP BY grp ORDER BY grp;
 SELECT grp, array_agg(val) FROM aa GROUP BY grp HAVING count(val) > 1 ORDER BY grp;
 -- ORDER BY the aggregate: arrays compare element-wise, shorter is less on a tie
 SELECT grp, array_agg(val) FROM aa GROUP BY grp ORDER BY 2;
+-- the aggregate's own ORDER BY decides the element order, NULLs placed by the key
+SELECT array_agg(val ORDER BY val) FROM aa;
+SELECT array_agg(val ORDER BY val DESC) FROM aa;
+SELECT array_agg(val ORDER BY val NULLS FIRST) FROM aa;
+-- ordered by a column the result never shows, and by more than one key
+SELECT array_agg(txt ORDER BY val, id DESC) FROM aa;
+-- per group, and next to another aggregate over the same group
+SELECT grp, array_agg(val ORDER BY val DESC) FROM aa GROUP BY grp ORDER BY grp;
+SELECT count(val), sum(val), array_agg(val ORDER BY val) FROM aa;
+-- DISTINCT with an ORDER BY over the argument: PostgreSQL sorts by the key
+SELECT array_agg(DISTINCT val ORDER BY val DESC) FROM aa;
+-- ... but the expressions must be the arguments, since the dedup *is* that sort
+SELECT array_agg(DISTINCT val ORDER BY id) FROM aa;
 -- DISTINCT: PostgreSQL sorts the result and puts NULLs last
 SELECT array_agg(DISTINCT val) FROM aa;
 SELECT array_agg(DISTINCT txt) FROM aa;
@@ -73,7 +86,4 @@ SELECT ARRAY['ok'::mood];
 -- representation for
 -- (PostgreSQL answers {{10},{NULL},{5},{5},{7}} here.)
 SELECT array_agg(ARRAY[val]) FROM aa;
--- per-aggregate ORDER BY is not implemented
--- (PostgreSQL answers {5,5,7,10,NULL} here.)
-SELECT array_agg(val ORDER BY val) FROM aa;
 -- End array_agg tests.

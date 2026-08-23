@@ -17,7 +17,7 @@ use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
-    ArgFail, Binding, BoundExpr, BoundWindowSpec, MinMaxKind, Scope, WindowKind, WindowSortKey,
+    ArgFail, Binding, BoundExpr, BoundWindowSpec, ExprSortKey, MinMaxKind, Scope, WindowKind,
     bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
 };
 use crate::{BindError, BoundAggregate, OutputColumn};
@@ -4161,7 +4161,8 @@ fn bind_window_call(
         let Binding::Typed(BoundExpr::Aggregate {
             func,
             distinct,
-            args,
+            agg_args,
+            order_by,
             input_ty,
             ret,
         }) = bind_aggregate(agg, name, &func.args, scope)?
@@ -4178,13 +4179,21 @@ fn bind_window_call(
                 "DISTINCT is not implemented for window functions",
             ));
         }
+        // Nor this, and for the same reason: an aggregate's own ORDER BY would
+        // have to re-sort each frame, which the streaming accumulators cannot.
+        if !order_by.is_empty() {
+            return Err(BindError::feature_not_supported(
+                "aggregate ORDER BY is not implemented for window functions",
+            ));
+        }
         WindowKind::Aggregate(BoundAggregate {
             func,
             distinct: false,
-            collation: args.first().map_or(DEFAULT_COLLATION_OID, |a| {
+            collation: agg_args.first().map_or(DEFAULT_COLLATION_OID, |a| {
                 crate::collation::expr_collation(a).collation
             }),
-            args,
+            args: agg_args,
+            order_by,
             input_ty,
             ret,
         })
@@ -4357,14 +4366,7 @@ pub(crate) fn bind_window_spec(
         .iter()
         .map(|item| {
             let expr = bind_window_key(&item.expr, "ORDER BY", scope)?;
-            let asc = item.options.asc.unwrap_or(true);
-            Ok(WindowSortKey {
-                ty: expr.ty(),
-                collation: crate::collation::expr_collation(&expr).collation,
-                expr,
-                asc,
-                nulls_first: item.options.nulls_first.unwrap_or(!asc),
-            })
+            Ok(ExprSortKey::new(expr, &item.options))
         })
         .collect::<Result<Vec<_>, BindError>>()?;
     Ok(BoundWindowSpec {
@@ -4412,7 +4414,8 @@ fn bind_window_key(expr: &ast::Expr, clause: &str, scope: &Scope) -> Result<Boun
 /// [`BoundExpr::Aggregate`] marker. The binder's extraction pass later moves it
 /// into a [`crate::LogicalPlan::Aggregate`] node and replaces the marker with a
 /// `ColumnRef`. `FILTER`/`OVER`/`WITHIN GROUP` were already rejected by the
-/// caller; per-aggregate `ORDER BY` is rejected here.
+/// caller; the per-aggregate `ORDER BY` is bound here, into the marker's
+/// `order_by`.
 fn bind_aggregate(
     agg: AggFn,
     name: &str,
@@ -4440,11 +4443,18 @@ fn bind_aggregate(
         list.duplicate_treatment,
         Some(ast::DuplicateTreatment::Distinct)
     );
-    if !list.clauses.is_empty() {
-        return Err(BindError::feature_not_supported(
-            "aggregate ORDER BY / WITHIN GROUP is not supported yet",
-        ));
-    }
+    // The only argument-list clause an aggregate call may carry is its own
+    // `ORDER BY`; anything else (a `LIMIT`, a `SEPARATOR`) is a dialect the
+    // parser accepts and PG's grammar does not.
+    let order_by = match list.clauses.as_slice() {
+        [] => Vec::new(),
+        [ast::FunctionArgumentClause::OrderBy(exprs)] => bind_aggregate_order_by(exprs, scope)?,
+        _ => {
+            return Err(BindError::feature_not_supported(
+                "this function argument form is not supported yet",
+            ));
+        }
+    };
 
     let has_wildcard = list.args.iter().any(|a| {
         matches!(
@@ -4472,7 +4482,8 @@ fn bind_aggregate(
         return Ok(Binding::Typed(BoundExpr::Aggregate {
             func: AggFn::Count,
             distinct,
-            args: Vec::new(),
+            agg_args: Vec::new(),
+            order_by,
             input_ty: PgType::Int8,
             ret: PgType::Int8,
         }));
@@ -4524,6 +4535,15 @@ fn bind_aggregate(
         .into_iter()
         .map(crate::expr::scalar_from_binding)
         .collect::<Result<Vec<_>, _>>()?;
+    // DISTINCT eliminates duplicates by sorting on the *arguments*, so PG only
+    // accepts the spellings where that sort and this one coincide. Checked
+    // against the arguments as bound, before the coercions below rewrite them.
+    if distinct && order_by.iter().any(|key| !bound.contains(&key.expr)) {
+        return Err(BindError::new(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+        ));
+    }
     let undefined_arity = || {
         let types = bound
             .iter()
@@ -4553,7 +4573,8 @@ fn bind_aggregate(
         return Ok(Binding::Typed(BoundExpr::Aggregate {
             func: AggFn::StringAgg,
             distinct: false,
-            args: vec![value, delim],
+            agg_args: vec![value, delim],
+            order_by,
             input_ty: PgType::Text,
             ret: agg_return_type(agg, PgType::Text, scope)?,
         }));
@@ -4608,10 +4629,43 @@ fn bind_aggregate(
     Ok(Binding::Typed(BoundExpr::Aggregate {
         func: agg,
         distinct,
-        args: vec![arg],
+        agg_args: vec![arg],
+        order_by,
         input_ty,
         ret,
     }))
+}
+
+/// Bind an aggregate's own `ORDER BY` (`array_agg(x ORDER BY y DESC)`).
+///
+/// The keys are evaluated against the same source row as the arguments, so they
+/// bind exactly as a window spec's do (see [`bind_window_spec`]) — including the
+/// orderable-type check, without which a key would reach `compare_values` and
+/// panic. A nested aggregate or window call in a key is caught later, by the
+/// extraction pass that already asks the same of the arguments.
+fn bind_aggregate_order_by(
+    exprs: &[ast::OrderByExpr],
+    scope: &Scope,
+) -> Result<Vec<ExprSortKey>, BindError> {
+    exprs
+        .iter()
+        .map(|item| {
+            let expr = crate::expr::bind_scalar(&item.expr, scope)?;
+            if !crate::expr::is_orderable(expr.ty(), scope.catalog().as_ref()) {
+                return Err(BindError::new(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    format!(
+                        "could not identify an ordering operator for type {}",
+                        crate::expr::type_label(expr.ty(), scope.catalog().as_ref())
+                    ),
+                )
+                .with_detail(Some(
+                    "Use an explicit ordering operator or modify the query.".to_string(),
+                )));
+            }
+            Ok(ExprSortKey::new(expr, &item.options))
+        })
+        .collect()
 }
 
 /// Bind `CURRENT_DATE`, `CURRENT_TIME(p)`, `CURRENT_TIMESTAMP(p)`,

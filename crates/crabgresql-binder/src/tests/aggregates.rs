@@ -320,3 +320,47 @@ fn wildcard_non_count_aggregate_is_undefined() -> anyhow::Result<()> {
     assert_eq!(e.message, "function sum() does not exist");
     Ok(())
 }
+
+#[test]
+fn aggregate_order_by_becomes_sort_keys_on_the_aggregate() -> anyhow::Result<()> {
+    let (_g, aggregates, _p, _h) =
+        agg_of("SELECT array_agg(id ORDER BY name DESC NULLS LAST) FROM t")?;
+    assert_eq!(aggregates.len(), 1);
+    let key = &aggregates[0].order_by[0];
+    assert!(matches!(key.expr, BoundExpr::ColumnRef { .. }));
+    assert!(!key.asc);
+    assert!(!key.nulls_first);
+    Ok(())
+}
+
+/// PostgreSQL sorts a DISTINCT aggregate's input to dedup it, so a second
+/// ordering is only accepted where the two coincide.
+#[test]
+fn distinct_aggregate_order_by_must_name_an_argument() -> anyhow::Result<()> {
+    let e = bind_err("SELECT array_agg(DISTINCT id ORDER BY name) FROM t")?;
+    assert_eq!(e.code, sqlstate::INVALID_COLUMN_REFERENCE);
+    assert_eq!(
+        e.message,
+        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+    );
+    assert_eq!(
+        agg_of("SELECT array_agg(DISTINCT id ORDER BY id) FROM t")?
+            .1
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn aggregate_order_by_rejects_a_nested_aggregate_or_window() -> anyhow::Result<()> {
+    assert_eq!(
+        bind_err("SELECT array_agg(id ORDER BY sum(id)) FROM t")?.message,
+        "aggregate function calls cannot be nested"
+    );
+    assert_eq!(
+        bind_err("SELECT array_agg(id ORDER BY rank() OVER ()) FROM t")?.message,
+        "aggregate function calls cannot contain window function calls"
+    );
+    Ok(())
+}

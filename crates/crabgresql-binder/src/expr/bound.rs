@@ -5,9 +5,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crabgresql_parser::ast;
 use crabgresql_types::{PgType, Value};
 
 use crate::functions::{AggFn, ScalarFn, TableFn, WindowFn};
+use crate::logical_plan::SortKey;
 
 /// Identity of one subplan *template*, handed out by [`Subplan::new`] and never
 /// reused.
@@ -286,7 +288,15 @@ pub enum BoundExpr {
         /// The per-row argument expressions. Empty for `COUNT(*)` (count every
         /// row); one entry for a unary aggregate; two for `string_agg(value,
         /// delimiter)`. The first argument is the value whose NULL skips the row.
-        args: Vec<BoundExpr>,
+        ///
+        /// Deliberately *not* named `args`: the name is what keeps this variant
+        /// out of the `FuncCall { args, .. } | …` or-patterns below, which would
+        /// silently skip `order_by`. Traversals go through
+        /// [`BoundExpr::agg_exprs`].
+        agg_args: Vec<BoundExpr>,
+        /// The aggregate's own `ORDER BY`, evaluated against the same row as
+        /// `agg_args`. See [`BoundAggregate::order_by`], which this becomes.
+        order_by: Vec<ExprSortKey>,
         /// The (first) argument's pre-aggregation type — drives accumulator
         /// dispatch. Unused for `COUNT(*)`.
         input_ty: PgType,
@@ -376,12 +386,35 @@ pub struct BoundAggregate {
     /// see [`AggFn::skips_null_input`]); `string_agg` carries the delimiter as a
     /// second argument.
     pub args: Vec<BoundExpr>,
+    /// The aggregate's own `ORDER BY` (`array_agg(x ORDER BY y)`), evaluated
+    /// against the same source row as `args`. Empty for the ordinary form, in
+    /// which case the executor accumulates in arrival order; non-empty makes it
+    /// buffer the group and sort before accumulating.
+    pub order_by: Vec<ExprSortKey>,
     pub input_ty: PgType,
     pub ret: PgType,
     /// The collation `min`/`max` should compare `args[0]` under — the
     /// database default for a non-collatable `input_ty` or an argument with
     /// no collation of its own. Every other aggregate ignores this.
     pub collation: u32,
+}
+
+impl BoundAggregate {
+    /// Every expression this aggregate evaluates against the source row,
+    /// arguments first. A caller that rebases column indexes or resolves
+    /// subqueries must reach the `ORDER BY` keys too, not only `args`.
+    pub fn exprs(&self) -> impl Iterator<Item = &BoundExpr> {
+        self.args
+            .iter()
+            .chain(self.order_by.iter().map(|key| &key.expr))
+    }
+
+    /// [`Self::exprs`], mutably.
+    pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut BoundExpr> {
+        self.args
+            .iter_mut()
+            .chain(self.order_by.iter_mut().map(|key| &mut key.expr))
+    }
 }
 
 /// What a window call actually computes, once its `OVER` clause is stripped off.
@@ -473,16 +506,15 @@ pub struct BoundWindowSpec {
     pub partition_by: Vec<BoundExpr>,
     /// The window's own `ORDER BY`. Rows equal on these keys are *peers*, which
     /// is what `rank`/`dense_rank` and the default frame are defined in terms of.
-    pub order_by: Vec<WindowSortKey>,
+    pub order_by: Vec<ExprSortKey>,
 }
 
-/// One `ORDER BY` key of a window spec.
+/// One `ORDER BY` key of a window spec or of an aggregate's own `ORDER BY`.
 ///
 /// [`crate::SortKey`] cannot be reused: its `column` indexes an already-projected
-/// tuple, whereas these are expressions evaluated against the window node's
-/// input row.
+/// tuple, whereas these are expressions evaluated against the node's input row.
 #[derive(Clone, Debug, PartialEq)]
-pub struct WindowSortKey {
+pub struct ExprSortKey {
     pub expr: BoundExpr,
     /// `expr.ty()`, carried so the executor never re-derives it.
     pub ty: PgType,
@@ -490,6 +522,35 @@ pub struct WindowSortKey {
     pub collation: u32,
     pub asc: bool,
     pub nulls_first: bool,
+}
+
+impl ExprSortKey {
+    /// The key a bound expression and PostgreSQL's `ASC`/`DESC`/`NULLS` options
+    /// make, with PG's defaults applied: ascending, and NULLs at the end that
+    /// direction puts them (`LAST` for `ASC`, `FIRST` for `DESC`).
+    pub fn new(expr: BoundExpr, options: &ast::OrderByOptions) -> Self {
+        let asc = options.asc.unwrap_or(true);
+        Self {
+            ty: expr.ty(),
+            collation: crate::collation::expr_collation(&expr).collation,
+            expr,
+            asc,
+            nulls_first: options.nulls_first.unwrap_or(!asc),
+        }
+    }
+
+    /// The same key addressing a materialized tuple by position, for a node that
+    /// has evaluated it into `column` — what lets both aggregate and window
+    /// sorts run through the executor's one `compare_rows`.
+    pub fn sort_key(&self, column: usize) -> SortKey {
+        SortKey {
+            column,
+            ty: self.ty,
+            collation: self.collation,
+            asc: self.asc,
+            nulls_first: self.nulls_first,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,9 +693,11 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_srf),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_srf),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_srf)
                     || spec.exprs().any(BoundExpr::contains_srf)
@@ -686,9 +749,11 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(any),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).any(any),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(any) || spec.exprs().any(any)
             }
@@ -808,9 +873,11 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_window),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_window),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
             BoundExpr::Subscript { base, index, .. } => {
                 base.contains_window() || index.contains_window()
@@ -976,7 +1043,9 @@ impl BoundExpr {
                     .any(|(c, r)| c.contains_volatile_fn() || r.contains_volatile_fn())
                     || else_.as_ref().is_some_and(|e| e.contains_volatile_fn())
             }
-            BoundExpr::Aggregate { args, .. } => args.iter().any(|a| a.contains_volatile_fn()),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_volatile_fn),
             // A subquery's own body runs as a separate plan; only the outer needle
             // of an IN-subquery propagates to the enclosing expression.
             BoundExpr::QuantifiedSubquery { cmp, .. } => cmp.contains_volatile_fn(),
@@ -1020,9 +1089,11 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_subquery),
             BoundExpr::WindowFunc { kind, spec, .. } => {
                 kind.args().iter().any(BoundExpr::contains_subquery)
                     || spec.exprs().any(BoundExpr::contains_subquery)
@@ -1081,11 +1152,14 @@ impl BoundExpr {
                     .sum::<usize>()
                     + else_.as_ref().map_or(0, |e| e.count_param_refs(index))
             }
-            BoundExpr::Aggregate { args, .. }
-            | BoundExpr::Coalesce { args, .. }
-            | BoundExpr::MinMax { args, .. } => {
+            BoundExpr::Coalesce { args, .. } | BoundExpr::MinMax { args, .. } => {
                 args.iter().map(|a| a.count_param_refs(index)).sum()
             }
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by)
+                .map(|a| a.count_param_refs(index))
+                .sum(),
             BoundExpr::WindowFunc { kind, spec, .. } => kind
                 .args()
                 .iter()
@@ -1153,10 +1227,13 @@ impl BoundExpr {
                         fold(e, acc);
                     }
                 }
-                BoundExpr::Aggregate { args, .. }
-                | BoundExpr::Coalesce { args, .. }
-                | BoundExpr::MinMax { args, .. } => {
+                BoundExpr::Coalesce { args, .. } | BoundExpr::MinMax { args, .. } => {
                     args.iter().for_each(|a| fold(a, acc));
+                }
+                BoundExpr::Aggregate {
+                    agg_args, order_by, ..
+                } => {
+                    BoundExpr::agg_exprs(agg_args, order_by).for_each(|a| fold(a, acc));
                 }
                 // The arguments and the OVER clause both read this row, so both
                 // widen the hull. A marker that survives to a caller of this is
@@ -1232,9 +1309,11 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => Self::collect_all(args, out),
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => Self::agg_exprs(agg_args, order_by).all(|a| a.collect_column_refs(out)),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
             BoundExpr::Subscript { base, index, .. } => {
                 base.collect_column_refs(out) && index.collect_column_refs(out)
@@ -1279,6 +1358,26 @@ impl BoundExpr {
         exprs.iter().all(|expr| expr.collect_column_refs(out))
     }
 
+    /// Every expression an [`BoundExpr::Aggregate`] marker evaluates against the
+    /// row it sits in — its arguments, then its own `ORDER BY` keys. The
+    /// marker's counterpart of [`BoundWindowSpec::exprs`]; see the `agg_args`
+    /// field for why every traversal has to come through here.
+    pub fn agg_exprs<'a>(
+        args: &'a [BoundExpr],
+        order_by: &'a [ExprSortKey],
+    ) -> impl Iterator<Item = &'a BoundExpr> {
+        args.iter().chain(order_by.iter().map(|key| &key.expr))
+    }
+
+    /// [`Self::agg_exprs`], mutably.
+    pub fn agg_exprs_mut<'a>(
+        args: &'a mut [BoundExpr],
+        order_by: &'a mut [ExprSortKey],
+    ) -> impl Iterator<Item = &'a mut BoundExpr> {
+        args.iter_mut()
+            .chain(order_by.iter_mut().map(|key| &mut key.expr))
+    }
+
     /// Add `delta` to every `ColumnRef` index, relocating this expression from
     /// one row layout to another. `delta` is signed: combining a comma group's
     /// merged-column view with the groups laid out before it shifts *up* by the
@@ -1318,10 +1417,14 @@ impl BoundExpr {
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
-            | BoundExpr::Aggregate { args, .. }
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => {
                 args.iter_mut().for_each(|a| a.shift_column_refs(delta));
+            }
+            BoundExpr::Aggregate {
+                agg_args, order_by, ..
+            } => {
+                Self::agg_exprs_mut(agg_args, order_by).for_each(|a| a.shift_column_refs(delta));
             }
             // Mirrors `column_ref_bounds`: the arguments and the OVER clause
             // both index this row, so both move with it.
