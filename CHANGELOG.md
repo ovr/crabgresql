@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the entries are
 generated from [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.0.3] - 2026-08-23
+
+### Features
+- Support the per-aggregate ORDER BY ([#266](https://github.com/ovr/crabgresql-new/pull/266))
+- Support pg_get_partkeydef
+- **catalog**: Add the missing pg_class and pg_proc columns ([#273](https://github.com/ovr/crabgresql-new/pull/273))
+- Support pg_get_viewdef(oid), pg_get_ruledef and pg_get_function_* ([#272](https://github.com/ovr/crabgresql-new/pull/272))
+- Accept any boolean-yielding operator after ANY/ALL ([#271](https://github.com/ovr/crabgresql-new/pull/271))
+- **catalog**: Support the pg_stat_ssl and pg_stat_gssapi ([#270](https://github.com/ovr/crabgresql-new/pull/270))
+- **catalog**: Add the missing pg_attribute columns and not-null constraints ([#268](https://github.com/ovr/crabgresql-new/pull/268))
+- Support the regprocedure type ([#269](https://github.com/ovr/crabgresql-new/pull/269))
+- Support the regoperator type ([#267](https://github.com/ovr/crabgresql-new/pull/267))
+- **catalog**: Support the domain columns of pg_type ([#265](https://github.com/ovr/crabgresql-new/pull/265))
+- Support pg_relation_size and the other relation-size functions ([#264](https://github.com/ovr/crabgresql-new/pull/264))
+- Support pg_class.relfilenode ([#263](https://github.com/ovr/crabgresql-new/pull/263))
+- **catalog**: Support pg_depend ([#262](https://github.com/ovr/crabgresql-new/pull/262))
+- Support the regoper type ([#256](https://github.com/ovr/crabgresql-new/pull/256))
+- Resolve outer-query columns in table-function arguments ([#261](https://github.com/ovr/crabgresql-new/pull/261))
+- **binder**: Support GREATEST and LEAST ([#257](https://github.com/ovr/crabgresql-new/pull/257))
+- Support radian trigonometric, pi/degrees/radians, gcd/lcm ([#251](https://github.com/ovr/crabgresql-new/pull/251))
+- Support pg_available_extension_versions, pg_tablespace_location and the index AM property functions ([#259](https://github.com/ovr/crabgresql-new/pull/259))
+- Support SHOW transaction isolation level (transaction_isolation) ([#260](https://github.com/ovr/crabgresql-new/pull/260))
+- Support system columns: ctid, xmin, cmin, xmax, cmax ([#253](https://github.com/ovr/crabgresql-new/pull/253))
+- **catalog**: Add ACL columns (as NULL instead of omitting them) ([#255](https://github.com/ovr/crabgresql-new/pull/255))
+- Support pg_is_in_recovery and the transaction-id functions ([#254](https://github.com/ovr/crabgresql-new/pull/254))
+- Support generate_subscripts ([#252](https://github.com/ovr/crabgresql-new/pull/252))
+- **executor**: Support array_agg ([#250](https://github.com/ovr/crabgresql-new/pull/250))
+- **catalog**: Support more tables in pg_catalog from the vendored .dat ([#249](https://github.com/ovr/crabgresql-new/pull/249))
+- **catalog**: serve the cumulative statistics views, with live counters ([#248](https://github.com/ovr/crabgresql-new/pull/248))
+- **catalog**: serve pg_locks, the locks a session holds ([#246](https://github.com/ovr/crabgresql-new/pull/246))
+- **catalog**: Support more tables in pg_catalog (31 empty-by-reality relations) ([#247](https://github.com/ovr/crabgresql-new/pull/247))
+- **binder**: bind ARRAY(SELECT …), the subquery array constructor ([#243](https://github.com/ovr/crabgresql-new/pull/243))
+- Support WITH ORDINALITY for set-returning functions in FROM ([#244](https://github.com/ovr/crabgresql-new/pull/244))
+- **catalog**: pg_description's bootstrap rows, and the functions that read them ([#245](https://github.com/ovr/crabgresql-new/pull/245))
+- **catalog**: serve pg_opclass/pg_opfamily, real OIDs in pg_index.indclass ([#242](https://github.com/ovr/crabgresql-new/pull/242))
+- **catalog**: serve 27 more pg_catalog relations, pg_get_indexdef ([#239](https://github.com/ovr/crabgresql-new/pull/239))
+- **execute**: Support JoinKind::Semi and JoinKind::Anti ([#238](https://github.com/ovr/crabgresql-new/pull/238))
+- **wal**: retire spent segments at checkpoint, and close what that opened ([#237](https://github.com/ovr/crabgresql-new/pull/237))
+- **wal**: Use 32 MiB segment files ([#236](https://github.com/ovr/crabgresql-new/pull/236))
+- **wal**: add trace logging for append/flush/replay
+- **parquet-engine**: Store numeric as a Decimal32/64/128/256, sized by its precision ([#228](https://github.com/ovr/crabgresql-new/pull/228))
+- **engine**: serve range and prefix index scans from the B-tree ([#222](https://github.com/ovr/crabgresql-new/pull/222))
+- **optimizer**: fold constant expressions on the logical plan ([#223](https://github.com/ovr/crabgresql-new/pull/223))
+
+### Performance
+- **optimizer**: decorrelate correlated subqueries into semi/anti/left joins ([#241](https://github.com/ovr/crabgresql-new/pull/241))
+- **copy**: copy a text COPY line into the arena once, address fields by span ([#235](https://github.com/ovr/crabgresql-new/pull/235))
+- **heap**: place an insert batch page by page, one WAL record per page ([#234](https://github.com/ovr/crabgresql-new/pull/234))
+- **executor**: Fast not null validation ([#233](https://github.com/ovr/crabgresql-new/pull/233))
+- **copy**: apply the text typmod to the arena slice, and drop the row template clone ([#232](https://github.com/ovr/crabgresql-new/pull/232))
+- **types**: fast paths for the input functions ([#231](https://github.com/ovr/crabgresql-new/pull/231))
+- **copy**: decode fields into a span arena instead of a String per field ([#230](https://github.com/ovr/crabgresql-new/pull/230))
+
 ## [0.0.2] - 2026-08-12
 
 ### Features

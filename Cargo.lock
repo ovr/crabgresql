@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-bench"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-binder"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-parser",
@@ -478,11 +478,11 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-bki"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "crabgresql-buffer-engine"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-storage-api",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-catalog"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-bki",
@@ -507,11 +507,11 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-config"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "crabgresql-executor"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "arrow-arith",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-optimizer"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "crabgresql-binder",
  "crabgresql-storage-api",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-parquet-engine"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-parser"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-pg-engine"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-buffer-engine",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-pg-regress"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-pg-wire"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-planner"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "crabgresql-binder",
  "crabgresql-optimizer",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-plpgsql"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-binder",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-server"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-server-process"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-config",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-storage-api"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-txn"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-types"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "crabgresql-wal"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crabgresql-txn",
