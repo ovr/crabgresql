@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787484589232,
+  "lastUpdate": 1787484590912,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -52384,6 +52384,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 30039.696392,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "15ba0b6be924fc04bd394cfcf77df7fc79bd0769",
+          "message": "feat: Support the per-aggregate ORDER BY (#266)\n\n`array_agg(x ORDER BY y)` — which DataGrip's schema-introspection query uses to\nlist a relation's ancestors in `inhseqno` order — was rejected at bind time.",
+          "timestamp": "2026-08-23T12:53:55+02:00",
+          "tree_id": "5e18fcbd5a685e5c1e62a438cb55f6234d076c64",
+          "url": "https://github.com/ovr/crabgresql/commit/15ba0b6be924fc04bd394cfcf77df7fc79bd0769"
+        },
+        "date": 1787484590770,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1066.624874,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 37755.080935,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
