@@ -123,7 +123,7 @@ pub(crate) enum KeyEncoding {
 /// Enums are `Generic` even though an enum's equality *is* a raw-field compare,
 /// because the promise is about values, not types: nothing in a
 /// `PgType::User(oid)` says the value under it is the `Value::Enum` its equality
-/// expects.
+/// expects — a domain is a `PgType::User` too, and holds a base value.
 pub(crate) fn key_encoding(ty: PgType) -> KeyEncoding {
     match ty {
         PgType::Bool
@@ -782,18 +782,29 @@ pub fn hash_key<V: Borrow<Value>>(tys: &[PgType], values: &[V]) -> u64 {
                     }
                 }
             }
-            PgType::User(type_oid) => {
-                if let Value::Enum {
+            PgType::User(type_oid) => match v {
+                Value::Enum {
                     type_oid: value_oid,
                     ordinal,
                     ..
-                } = v
-                    && value_oid == type_oid
-                {
+                } if value_oid == type_oid => {
                     type_oid.hash(&mut h);
                     ordinal.hash(&mut h);
                 }
-            }
+                // A **domain** is also a `PgType::User`, and the value under it
+                // is a plain base value — so the type says nothing and the
+                // value says everything. Re-dispatching on the value's own type
+                // is what keeps a `UNIQUE` or `GROUP BY` over a domain column
+                // out of the single shared bucket the arm below would give it;
+                // it agrees with `keys_equal`, which compares the same values.
+                other => {
+                    if let Some(base) = other.pg_type()
+                        && !matches!(base, PgType::User(_))
+                    {
+                        hash_key(&[base], std::slice::from_ref(other)).hash(&mut h);
+                    }
+                }
+            },
             // timetz/interval/inet/cidr/bit/varbit (and anything else): equality
             // is not a raw-field compare, so contribute nothing and rely on
             // `keys_equal`. See `PgType::hashes_distinctly`, which the join

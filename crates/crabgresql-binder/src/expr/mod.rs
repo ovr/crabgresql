@@ -14,6 +14,7 @@ mod bind;
 mod bound;
 mod coerce;
 mod datatype;
+mod domain;
 mod function_body;
 mod literal;
 mod operators;
@@ -28,13 +29,14 @@ pub use assign::{
 pub(crate) use bind::scalar_from_binding;
 pub use bind::{bind_expr, bind_scalar};
 pub use bound::{
-    BinOp, BoundAggregate, BoundExpr, BoundWindowFunc, BoundWindowSpec, ExprSortKey, MinMaxKind,
-    Subplan, SubplanId, UnaryOp, WindowKind,
+    BinOp, BoundAggregate, BoundDomain, BoundExpr, BoundWindowFunc, BoundWindowSpec, ExprSortKey,
+    MinMaxKind, Subplan, SubplanId, UnaryOp, WindowKind,
 };
 pub use datatype::{
     builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod, datetime_precision,
     declared_typmod, interval_typmod, length_typmod, map_data_type, resolve_data_type,
 };
+pub(crate) use domain::{domain_of, undomain_binding};
 pub use function_body::{bind_sql_function_body, inline_params};
 pub use literal::literal_int;
 pub use operators::bool_test_clause;

@@ -1874,7 +1874,8 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => is_row_constant(expr),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => is_row_constant(expr),
         BoundExpr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
         BoundExpr::ArrayCtor { elems, .. } => elems.iter().all(is_row_constant),
         BoundExpr::Subscript { base, index, .. } => is_row_constant(base) && is_row_constant(index),

@@ -64,6 +64,7 @@ pub fn view_definition(sql: &str, pretty: bool, columns: &[String]) -> Option<St
         calls: None,
         zone: None,
         unqualify: None,
+        domain_value: false,
     };
 
     let mut out = String::from(" SELECT ");
@@ -137,6 +138,15 @@ struct Cx<'a> {
     /// `None` everywhere else. A view's `t.c` really does select among several
     /// relations and must keep its qualifier.
     unqualify: Option<&'a str>,
+    /// Whether this walk is deparsing a **domain** constraint, whose single
+    /// operand is spelled `VALUE`.
+    ///
+    /// PostgreSQL renders that one in capitals — `CHECK ((VALUE > 0))` — and it
+    /// is not an ordinary column reference at all but a placeholder for the
+    /// value under test, so the usual lowercasing would be wrong twice over: it
+    /// would not read back as PostgreSQL's text, and it would suggest a column
+    /// that does not exist.
+    domain_value: bool,
 }
 
 /// Canonicalize an expression on its way *into* the catalog — a column default
@@ -153,7 +163,7 @@ struct Cx<'a> {
 /// the catalog; psql asks for the pretty one and [`stored_expr`] derives it by
 /// re-parsing.
 pub fn deparse_stored_expr(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
-    deparse_into_catalog(sql, None, catalog)
+    deparse_into_catalog(sql, None, catalog, false)
 }
 
 /// [`deparse_stored_expr`] for a CHECK predicate, which additionally drops the
@@ -168,13 +178,20 @@ pub fn deparse_check_expr(
     relation: &str,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Option<String> {
-    deparse_into_catalog(sql, Some(relation), catalog)
+    deparse_into_catalog(sql, Some(relation), catalog, false)
+}
+
+/// [`deparse_check_expr`] for a **domain**'s predicate: there is no relation to
+/// unqualify, and the operand is the `VALUE` placeholder.
+pub fn deparse_domain_check_expr(sql: &str, catalog: &Arc<dyn TypeCatalog>) -> Option<String> {
+    deparse_into_catalog(sql, None, catalog, true)
 }
 
 fn deparse_into_catalog(
     sql: &str,
     unqualify: Option<&str>,
     catalog: &Arc<dyn TypeCatalog>,
+    domain_value: bool,
 ) -> Option<String> {
     let e = parse_expression(sql)?;
     let resolve = |f: &ast::Function| call_arg_types(f, catalog);
@@ -183,6 +200,7 @@ fn deparse_into_catalog(
         calls: Some(&resolve),
         zone: None,
         unqualify,
+        domain_value,
     };
     Some(top_expr(&e, cx))
 }
@@ -208,12 +226,19 @@ fn deparse_into_catalog(
 /// already carries its cast: a re-render re-reads `'x'::text` as a cast node
 /// rather than as the bare string it would have to guess a type for.
 pub fn stored_expr(sql: &str, pretty: bool, fmt: &FmtCtx) -> Option<String> {
+    stored_expr_of(sql, pretty, fmt, false)
+}
+
+/// [`stored_expr`] with the choice of whose predicate this is: a domain's, whose
+/// `VALUE` placeholder renders in capitals, or a relation's.
+pub fn stored_expr_of(sql: &str, pretty: bool, fmt: &FmtCtx, domain_value: bool) -> Option<String> {
     let e = parse_expression(sql)?;
     let cx = Cx {
         pretty,
         calls: None,
         zone: Some(fmt),
         unqualify: None,
+        domain_value,
     };
     Some(top_expr(&e, cx))
 }
@@ -480,7 +505,10 @@ fn precedence(e: &ast::Expr) -> u8 {
 fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
     let prec = precedence(e);
     let body = match e {
-        ast::Expr::Identifier(id) => ident(id),
+        ast::Expr::Identifier(id) => match cx.domain_value && is_value_placeholder(id) {
+            true => "VALUE".to_string(),
+            false => ident(id),
+        },
         // `relation.column` inside a CHECK loses its qualifier: see
         // [`Cx::unqualify`]. Guarded on the qualifier actually naming this
         // relation — a mismatched one is not ours to rewrite, and binding has
@@ -776,6 +804,12 @@ fn object_name(name: &ast::ObjectName) -> String {
 /// `SELECT 1 AS select`. [`text::quote_ident`] decides both, being PG's
 /// `quote_identifier`; an *unquoted* name is folded first, since that is the
 /// spelling the catalog holds and the one that has to read back.
+/// Whether an identifier is the unquoted `VALUE` of a domain constraint.
+/// Quoted `"value"` is an ordinary (and, in a domain, unresolvable) name.
+fn is_value_placeholder(id: &ast::Ident) -> bool {
+    id.quote_style.is_none() && id.value.eq_ignore_ascii_case("value")
+}
+
 fn ident(id: &ast::Ident) -> String {
     match id.quote_style {
         None => quote_name(&id.value.to_ascii_lowercase()),

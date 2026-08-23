@@ -63,7 +63,8 @@ pub(super) fn for_each_node_mut(expr: &mut BoundExpr, f: &mut dyn FnMut(&mut Bou
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => for_each_node_mut(expr, f),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => for_each_node_mut(expr, f),
         BoundExpr::Binary { left, right, .. } => {
             for_each_node_mut(left, f);
             for_each_node_mut(right, f);

@@ -406,6 +406,7 @@ fn pg_type_carries_the_domain_columns_where_postgres_does() {
         oid: 20000,
         name: "mood".to_string(),
         enum_labels: Some(vec!["ok".to_string()]),
+        domain: None,
     }]);
     let int4 = catalogs::types::pg_type_builtin_rows()
         .into_iter()
@@ -631,6 +632,7 @@ fn every_regproc_reference_resolves_to_an_emitted_row() -> anyhow::Result<()> {
             oid: 20000,
             name: "mood".to_string(),
             enum_labels: Some(vec!["ok".to_string()]),
+            domain: None,
         }])
         .into_iter()
         .next(),
@@ -2630,6 +2632,7 @@ fn wide_fixture() -> SystemCatalog {
             oid: 16_500,
             name: "mood".to_string(),
             enum_labels: Some(vec!["sad".to_string(), "ok".to_string()]),
+            domain: None,
         }])
         .routines(vec![CatalogRoutine {
             oid: 16_600,
@@ -3374,8 +3377,8 @@ fn the_bootstrap_descriptions_cover_five_catalogs_and_the_extension() -> anyhow:
             // wrote a `descr` for. It grew with `pg_amproc`, `pg_operator` and
             // `pg_aggregate`: a support function, an `oprcode` or a transition
             // function is a `pg_proc` row like any other, and its description
-            // comes along.
-            ("pg_proc", 1309),
+            // comes along, as `domain_in`/`domain_recv` did with domains.
+            ("pg_proc", 1311),
             // The `simple` configuration and dictionary and the default parser
             // come from the `.dat`; the other 29 of each are snowball's, whose
             // comments `initdb` writes with `COMMENT ON`.
@@ -3718,6 +3721,7 @@ fn depend_fixture() -> SystemCatalog {
             oid: MOOD_OID,
             name: "mood".to_string(),
             enum_labels: Some(vec!["sad".to_string(), "ok".to_string()]),
+            domain: None,
         }])
         .view_dependencies(vec![CatalogViewDependency {
             namespace: "public".to_string(),

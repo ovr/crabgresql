@@ -89,7 +89,8 @@ fn fold_children(
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => changed |= fold(expr, fmt, on_subplan),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => changed |= fold(expr, fmt, on_subplan),
         BoundExpr::Binary { left, right, .. } => {
             changed |= fold(left, fmt, on_subplan);
             changed |= fold(right, fmt, on_subplan);
@@ -178,6 +179,10 @@ fn foldable(expr: &BoundExpr) -> bool {
             | BoundExpr::BoolTest { .. }
             | BoundExpr::Coerce { .. }
             | BoundExpr::Reinterpret { .. }
+            // `CoerceToDomain` is deliberately absent: it *raises* rather than
+            // producing a value, and folding it would move a domain violation
+            // from the branch that evaluates the value to plan time, where a
+            // `CASE` arm that is never taken would start failing.
             | BoundExpr::ArrayCtor { .. }
             | BoundExpr::Case { .. }
             | BoundExpr::Coalesce { .. }
@@ -232,6 +237,8 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
         BoundExpr::Reinterpret { expr, rep, .. } => {
             cast::reinterpret_value(eval_const(expr, fmt)?, *rep).ok()
         }
+        // Never folded — see `foldable`.
+        BoundExpr::CoerceToDomain { .. } => None,
         BoundExpr::ArrayCtor { elem, elems, .. } => {
             let values = elems
                 .iter()

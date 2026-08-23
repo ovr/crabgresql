@@ -381,14 +381,23 @@ impl Column {
     /// whatever a data directory already holds, and building a catalog row must
     /// never panic the session that reads `pg_attribute`.
     pub fn atttypmod(&self) -> i32 {
-        const VARHDRSZ: i32 = 4;
-        match self.ty {
-            _ if self.typmod < 0 => -1,
-            PgType::Varchar | PgType::Bpchar | PgType::Numeric => {
-                self.typmod.saturating_add(VARHDRSZ)
-            }
-            _ => self.typmod,
-        }
+        pg_typmod(self.ty, self.typmod)
+    }
+}
+
+/// A declared modifier in PostgreSQL's `atttypmod`/`typtypmod` encoding.
+///
+/// The three varlena types store the modifier with the 4-byte length header
+/// added, which is why `varchar(3)` reads back as 7. Everything internal here
+/// keeps the *declared* number instead, so the conversion belongs at the
+/// catalog boundary — [`Column::atttypmod`] for a column, and a domain's
+/// `pg_type.typtypmod`, which carries the same encoding.
+pub fn pg_typmod(ty: PgType, typmod: i32) -> i32 {
+    const VARHDRSZ: i32 = 4;
+    match ty {
+        _ if typmod < 0 => -1,
+        PgType::Varchar | PgType::Bpchar | PgType::Numeric => typmod.saturating_add(VARHDRSZ),
+        _ => typmod,
     }
 }
 
@@ -2103,6 +2112,48 @@ pub struct EnumInfo {
     pub labels: Vec<String>,
 }
 
+/// A `CREATE DOMAIN`, as everything downstream of the DDL needs it.
+///
+/// A domain is a distinct type whose values are physically its base type's, so
+/// a `Value` under a domain column is a plain `Value::Int4`/`Value::Text`/…; the
+/// domain is what the *declared* type says (`pg_typeof`, `RowDescription`,
+/// `pg_attribute.atttypid` all name it) and what decides which constraints run
+/// when a value is coerced into it. Observed from PostgreSQL 18.4:
+/// `pg_typeof(a)` on a domain column is the domain, `pg_typeof(a + 1)` the base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainInfo {
+    pub oid: u32,
+    pub name: String,
+    /// The immediate base — itself possibly another domain, which PostgreSQL
+    /// allows and records as a `typbasetype` chain.
+    pub base: PgType,
+    /// The domain's own type modifier (`CREATE DOMAIN v AS varchar(3)` stores 7
+    /// here). A *column* of the domain carries `atttypmod = -1`, so this is the
+    /// only place the modifier lives.
+    pub typmod: i32,
+    pub collation: Option<u32>,
+    pub not_null: bool,
+    /// Canonical SQL text of `DEFAULT`, for the same reason
+    /// [`Column::default`] is text: this crate has neither parser nor binder.
+    pub default: Option<String>,
+    /// The domain's `CHECK` constraints in creation order, each as
+    /// `(constraint name, canonical SQL of the predicate over `VALUE`)`.
+    pub checks: Vec<DomainCheck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainCheck {
+    pub name: String,
+    /// The predicate as canonical SQL, referring to the value under test as
+    /// `VALUE` — the spelling PostgreSQL both accepts and renders.
+    pub expr: String,
+    /// `false` for a constraint added `NOT VALID` and not yet validated.
+    /// Enforcement does not depend on this: PostgreSQL applies an unvalidated
+    /// domain constraint to every *new* value, it just never scanned the old
+    /// ones.
+    pub validated: bool,
+}
+
 /// How a registered routine is implemented, from the binder's point of view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoutineImpl {
@@ -2276,6 +2327,36 @@ pub trait TypeCatalog: Send + Sync {
     /// test for a `PgType::User(oid)`.
     fn enum_info(&self, _oid: u32) -> Option<EnumInfo> {
         None
+    }
+
+    /// The `CREATE DOMAIN` with this OID, or `None` if the OID is not a domain.
+    /// `Some(..)` is the binder's "is this a domain?" test for a
+    /// `PgType::User(oid)`, exactly as [`TypeCatalog::enum_info`] is for enums.
+    fn domain_info(&self, _oid: u32) -> Option<DomainInfo> {
+        None
+    }
+
+    /// The type a domain's values really are: the end of the `typbasetype`
+    /// chain, or `ty` itself when it is not a domain.
+    ///
+    /// This is PostgreSQL's `getBaseType`, and it is what operator and function
+    /// resolution runs on — `a + 1` over a `posint` column is `integer + integer`
+    /// and yields `integer`. Distinct from [`TypeCatalog::backing_rep`], which
+    /// answers a different question (the `LIKE` representation a `CREATE TYPE`
+    /// borrowed, for `WITHOUT FUNCTION` casts).
+    fn base_type(&self, ty: PgType) -> PgType {
+        let mut ty = ty;
+        // A chain is bounded by the number of domains, and DDL refuses to build
+        // a cycle; the counter is belt-and-braces against a corrupt catalog
+        // hanging a query.
+        for _ in 0..64 {
+            let PgType::User(oid) = ty else { return ty };
+            match self.domain_info(oid) {
+                Some(info) => ty = info.base,
+                None => return ty,
+            }
+        }
+        ty
     }
 
     /// Every user-defined routine registered under `name` (case-insensitive),

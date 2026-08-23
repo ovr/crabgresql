@@ -24,9 +24,9 @@ use crate::expr::{
     LateralBarrier, NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion,
     VisibleColumn, VisibleLookup, WindowKind, apply_column_typmod, barrier_levels, bind_binary_op,
     bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
-    enum_value, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
-    param_ctx_view_body, parse_unknown, reject_agg_or_window, reject_window, text_column_value,
-    to_bool_operand, unify_value_column, view_expansion,
+    domain_of, enum_value, lookup_visible, merge_types, normalize_ident, output_name,
+    param_ctx_none, param_ctx_view_body, parse_unknown, reject_agg_or_window, reject_window,
+    text_column_value, to_bool_operand, unify_value_column, view_expansion,
 };
 use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
@@ -613,7 +613,9 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         }
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Collate { expr, .. } => subst_expr(expr, params),
-        BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Reinterpret { expr, .. } | BoundExpr::CoerceToDomain { expr, .. } => {
+            subst_expr(expr, params)
+        }
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
@@ -961,7 +963,8 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => subst_outer_expr(expr, outer, depth),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => subst_outer_expr(expr, outer, depth),
         BoundExpr::Binary { left, right, .. } => {
             subst_outer_expr(left, outer, depth);
             subst_outer_expr(right, outer, depth);
@@ -1398,7 +1401,8 @@ pub(crate) fn for_each_subexpr(
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => for_each_subexpr(expr, depth, f),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => for_each_subexpr(expr, depth, f),
         BoundExpr::Binary { left, right, .. } => {
             for_each_subexpr(left, depth, f);
             for_each_subexpr(right, depth, f);
@@ -2031,16 +2035,26 @@ fn unify_set_columns(
             let ty = cols[i].ty;
             common = Some(match common {
                 None => ty,
-                Some(prev) => merge_types(prev, ty).ok_or_else(|| {
-                    BindError::new(
-                        sqlstate::DATATYPE_MISMATCH,
-                        format!(
-                            "UNION types {} and {} cannot be matched",
-                            crate::expr::type_label(prev, catalog.as_ref()),
-                            crate::expr::type_label(ty, catalog.as_ref()),
-                        ),
-                    )
-                })?,
+                Some(prev) => merge_types(prev, ty)
+                    .or_else(|| {
+                        // A domain survives a set operation only when every arm
+                        // is the same domain (which `merge_types` already
+                        // settled above, equal types merging to themselves).
+                        // Otherwise it resolves on its base: 18.4 answers
+                        // `integer` for `posint UNION integer`.
+                        let (p, t) = (catalog.base_type(prev), catalog.base_type(ty));
+                        ((p, t) != (prev, ty)).then(|| merge_types(p, t)).flatten()
+                    })
+                    .ok_or_else(|| {
+                        BindError::new(
+                            sqlstate::DATATYPE_MISMATCH,
+                            format!(
+                                "UNION types {} and {} cannot be matched",
+                                crate::expr::type_label(prev, catalog.as_ref()),
+                                crate::expr::type_label(ty, catalog.as_ref()),
+                            ),
+                        )
+                    })?,
             });
             let next = to_derived(&cols[i]);
             derived = Some(match derived {
@@ -3945,7 +3959,7 @@ fn build_merged_join(
             Binding::Typed(right_expr.clone()),
             crabgresql_parser::Span::empty(),
             (Span::empty(), Span::empty()),
-            catalog.as_ref(),
+            catalog,
         )?;
         let Binding::Typed(eq_expr) = eq else {
             unreachable!("equality of typed operands is always typed");
@@ -4135,7 +4149,7 @@ fn bind_values_query(
     let mut columns = Vec::with_capacity(width);
     let mut column_cells: Vec<Vec<BoundExpr>> = Vec::with_capacity(width);
     for (i, bindings) in columns_of_bindings.into_iter().enumerate() {
-        let (ty, cells) = unify_value_column(bindings, "VALUES")?;
+        let (ty, cells) = unify_value_column(bindings, "VALUES", catalog)?;
         columns.push(OutputColumn::new(format!("column{}", i + 1), ty));
         column_cells.push(cells);
     }
@@ -5433,6 +5447,10 @@ fn rewrite_over_window(
             reported,
             rep,
         }),
+        BoundExpr::CoerceToDomain { expr, domain } => Ok(BoundExpr::CoerceToDomain {
+            expr: Box::new(rewrite_over_window(*expr, input_width, groups)?),
+            domain,
+        }),
         BoundExpr::FuncCall { func, ret, args } => Ok(BoundExpr::FuncCall {
             func,
             ret,
@@ -5838,6 +5856,15 @@ fn rewrite_over_aggregate(
             reported,
             rep,
         }),
+        BoundExpr::CoerceToDomain { expr, domain } => Ok(BoundExpr::CoerceToDomain {
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            domain,
+        }),
         BoundExpr::FuncCall { func, ret, args } => {
             let args = args
                 .into_iter()
@@ -6070,13 +6097,24 @@ fn default_for_column(
     column: &Column,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<BoundExpr, BindError> {
-    let Some(sql) = &column.default else {
-        return Ok(BoundExpr::Const {
-            value: Value::Null,
-            ty: column.ty,
-        });
+    let sql = match &column.default {
+        Some(sql) => sql.clone(),
+        // A column of a domain with no default of its own takes the *domain's*
+        // default. It is resolved here rather than copied down at CREATE TABLE
+        // because PostgreSQL resolves it per statement: `ALTER DOMAIN … SET
+        // DEFAULT` changes what later inserts into an existing table get, and
+        // `information_schema.columns.column_default` stays NULL throughout.
+        None => match domain_of(column.ty, catalog.as_ref()).and_then(|d| d.default) {
+            Some(sql) => sql,
+            None => {
+                return Ok(BoundExpr::Const {
+                    value: Value::Null,
+                    ty: column.ty,
+                });
+            }
+        },
     };
-    let expr = crate::parse_stored_expr(sql, "default expression")?;
+    let expr = crate::parse_stored_expr(&sql, "default expression")?;
     bind_column_default(&expr, column, catalog)
 }
 

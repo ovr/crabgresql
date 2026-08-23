@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
-    EnumInfo, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig, TypeCatalog, UserCast,
-    UserType,
+    DomainCheck, DomainInfo, EnumInfo, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig,
+    TypeCatalog, UserCast, UserType,
 };
 use crabgresql_types::PgType;
 
@@ -142,8 +142,129 @@ struct TypeEntry {
     /// The labels of a `CREATE TYPE ... AS ENUM`, in definition (= sort) order.
     /// `None` for shell and base types; `Some(..)` marks the type as an enum.
     enum_labels: Option<Vec<String>>,
+    /// The base type and constraints of a `CREATE DOMAIN`. `Some(..)` marks the
+    /// type as a domain (`pg_type.typtype = 'd'`), and is mutually exclusive
+    /// with [`TypeEntry::enum_labels`].
+    domain: Option<DomainEntry>,
     /// Objects that depend on this type, in creation order — the cascade set.
     dependents: Vec<DepId>,
+}
+
+/// The domain-specific half of a [`TypeEntry`].
+///
+/// Carries no `pg_constraint` OIDs: each of these constraints becomes a row
+/// there, but the numbering lives in `SystemCatalog::constraint_oids` with
+/// every other constraint's, so that `pg_get_constraintdef` resolves them all
+/// against one authority.
+struct DomainEntry {
+    base: PgType,
+    typmod: i32,
+    collation: Option<u32>,
+    not_null: bool,
+    default: Option<String>,
+    checks: Vec<DomainCheckEntry>,
+}
+
+struct DomainCheckEntry {
+    name: String,
+    expr: String,
+    validated: bool,
+}
+
+/// A `CREATE DOMAIN` as the DDL layer hands it over: everything already
+/// resolved and deparsed, with constraint names still optional.
+pub struct DomainSpec {
+    pub base: PgType,
+    /// The base type's `pg_type.typlen`, which a domain copies.
+    pub typlen: i32,
+    pub typmod: i32,
+    pub collation: Option<u32>,
+    pub not_null: bool,
+    pub default: Option<String>,
+    pub checks: Vec<DomainCheckSpec>,
+}
+
+/// One `CHECK` of a [`DomainSpec`]; `name` is `None` when the clause was
+/// written without `CONSTRAINT <name>`.
+pub struct DomainCheckSpec {
+    pub name: Option<String>,
+    pub expr: String,
+}
+
+/// The `pg_constraint` name PostgreSQL gives a domain's `NOT NULL`.
+pub fn not_null_constraint_name(domain: &str) -> String {
+    format!("{domain}_not_null")
+}
+
+/// The next auto-generated `CHECK` name for `domain`: `<domain>_check`, then
+/// `<domain>_check1`, `<domain>_check2`, … Skips names already in use, which is
+/// what lets an explicit `CONSTRAINT d_check` coexist with an unnamed one.
+fn next_check_name(domain: &str, entry: &DomainEntry) -> String {
+    let taken = |candidate: &str| entry.checks.iter().any(|c| c.name == candidate);
+    let base = format!("{domain}_check");
+    if !taken(&base) {
+        return base;
+    }
+    (1..)
+        .map(|n| format!("{base}{n}"))
+        .find(|candidate| !taken(candidate))
+        .expect("an unused suffix exists")
+}
+
+fn domain_info(name: &str, oid: u32, entry: &DomainEntry) -> DomainInfo {
+    DomainInfo {
+        oid,
+        name: name.to_string(),
+        base: entry.base,
+        typmod: entry.typmod,
+        collation: entry.collation,
+        not_null: entry.not_null,
+        default: entry.default.clone(),
+        checks: entry
+            .checks
+            .iter()
+            .map(|c| DomainCheck {
+                name: c.name.clone(),
+                expr: c.expr.clone(),
+                validated: c.validated,
+            })
+            .collect(),
+    }
+}
+
+/// The domain stored under `name`, or PostgreSQL's error for a name that is not
+/// a domain. A non-domain type reports `42809`, the way `ALTER DOMAIN` on an
+/// enum does; a missing one reports `42704 type "x" does not exist`.
+fn domain<'a>(cat: &'a CatalogInner, name: &str) -> Result<&'a DomainEntry, PgError> {
+    match cat.types.get(name) {
+        Some(entry) => entry.domain.as_ref().ok_or_else(|| {
+            PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a domain"),
+            )
+        }),
+        None => Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{name}\" does not exist"),
+        )),
+    }
+}
+
+/// [`domain`], mutably. Written twice rather than shared through a macro
+/// because the borrow checker cannot hand out one function for both.
+fn domain_mut<'a>(cat: &'a mut CatalogInner, name: &str) -> Result<&'a mut DomainEntry, PgError> {
+    match cat.types.get_mut(name) {
+        Some(entry) => entry.domain.as_mut().ok_or_else(|| {
+            PgError::new(
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a domain"),
+            )
+        }),
+        None => Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{name}\" does not exist"),
+        )),
+    }
 }
 
 /// How a registered routine is implemented: a `LANGUAGE internal` builtin named
@@ -762,6 +883,7 @@ impl GlobalCatalog {
                 typlen: -1,
                 backing: None,
                 enum_labels: None,
+                domain: None,
                 dependents: Vec::new(),
             },
         );
@@ -803,6 +925,7 @@ impl GlobalCatalog {
                         typlen,
                         backing,
                         enum_labels: None,
+                        domain: None,
                         dependents: Vec::new(),
                     },
                 );
@@ -851,6 +974,7 @@ impl GlobalCatalog {
                 typlen: 4,
                 backing: None,
                 enum_labels: Some(labels),
+                domain: None,
                 dependents: Vec::new(),
             },
         );
@@ -973,6 +1097,234 @@ impl GlobalCatalog {
         }
         labels[from_pos] = to.to_string();
         Ok(Vec::new())
+    }
+
+    /// `CREATE DOMAIN name AS base [COLLATE c] [DEFAULT e] [constraints]`.
+    ///
+    /// The constraint list arrives with each entry's name optional; unnamed ones
+    /// are numbered here because only the catalog knows which names are already
+    /// taken. PostgreSQL 18.4 numbers them `<domain>_check`, `<domain>_check1`,
+    /// `<domain>_check2`, … — the *second* one is the first to carry a digit.
+    pub fn create_domain(
+        &self,
+        name: &str,
+        spec: DomainSpec,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        if cat.types.contains_key(name) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("type \"{name}\" already exists"),
+            ));
+        }
+        let oid = cat.alloc_oid();
+        let mut entry = DomainEntry {
+            base: spec.base,
+            typmod: spec.typmod,
+            collation: spec.collation,
+            not_null: spec.not_null,
+            default: spec.default,
+            checks: Vec::new(),
+        };
+        for check in spec.checks {
+            let conname = match check.name {
+                Some(given) => {
+                    if entry.checks.iter().any(|c| c.name == given) {
+                        return Err(PgError::new(
+                            sqlstate::DUPLICATE_OBJECT,
+                            format!("constraint \"{given}\" for domain \"{name}\" already exists"),
+                        ));
+                    }
+                    given
+                }
+                None => next_check_name(name, &entry),
+            };
+            entry.checks.push(DomainCheckEntry {
+                name: conname,
+                expr: check.expr,
+                validated: true,
+            });
+        }
+        cat.types.insert(
+            name.to_string(),
+            TypeEntry {
+                oid,
+                defined: true,
+                // A domain is physically its base type, so it borrows the base's
+                // width — `pg_type.typlen` on 18.4 reads 4 for a domain over
+                // `int` and -1 for one over `text`.
+                typlen: spec.typlen,
+                backing: None,
+                enum_labels: None,
+                domain: Some(entry),
+                dependents: Vec::new(),
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    /// `ALTER DOMAIN name {SET DEFAULT e | DROP DEFAULT}`; `default` is the
+    /// canonical SQL of the new default, or `None` to drop it.
+    pub fn set_domain_default(
+        &self,
+        name: &str,
+        default: Option<String>,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        domain_mut(&mut cat, name)?.default = default;
+        Ok(Vec::new())
+    }
+
+    /// `ALTER DOMAIN name {SET | DROP} NOT NULL`. Whether existing data still
+    /// satisfies the domain is the caller's business — this catalog cannot see
+    /// table contents.
+    pub fn set_domain_not_null(
+        &self,
+        name: &str,
+        not_null: bool,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        domain_mut(&mut cat, name)?.not_null = not_null;
+        Ok(Vec::new())
+    }
+
+    /// `ALTER DOMAIN name ADD [CONSTRAINT c] CHECK (...) [NOT VALID]`.
+    pub fn add_domain_check(
+        &self,
+        name: &str,
+        conname: Option<String>,
+        expr: String,
+        validated: bool,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let entry = domain(&cat, name)?;
+        let conname = match conname {
+            Some(given) => {
+                if entry.checks.iter().any(|c| c.name == given) {
+                    return Err(PgError::new(
+                        sqlstate::DUPLICATE_OBJECT,
+                        format!("constraint \"{given}\" for domain \"{name}\" already exists"),
+                    ));
+                }
+                given
+            }
+            None => next_check_name(name, entry),
+        };
+        domain_mut(&mut cat, name)?.checks.push(DomainCheckEntry {
+            name: conname,
+            expr,
+            validated,
+        });
+        Ok(Vec::new())
+    }
+
+    /// `ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] c`. A `NOT NULL`
+    /// constraint is named `<domain>_not_null` and is dropped through this same
+    /// form, as in PG.
+    pub fn drop_domain_constraint(
+        &self,
+        name: &str,
+        conname: &str,
+        if_exists: bool,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let not_null_name = not_null_constraint_name(name);
+        let entry = domain_mut(&mut cat, name)?;
+        if entry.not_null && conname == not_null_name {
+            entry.not_null = false;
+            return Ok(Vec::new());
+        }
+        let before = entry.checks.len();
+        entry.checks.retain(|c| c.name != conname);
+        if entry.checks.len() == before {
+            let message = format!("constraint \"{conname}\" of domain \"{name}\" does not exist");
+            if if_exists {
+                return Ok(vec![CatalogNotice::new(format!("{message}, skipping"))]);
+            }
+            return Err(PgError::new(sqlstate::UNDEFINED_OBJECT, message));
+        }
+        Ok(Vec::new())
+    }
+
+    /// `ALTER DOMAIN name VALIDATE CONSTRAINT c`. The caller has already
+    /// re-scanned the stored data; this only clears the `NOT VALID` mark.
+    pub fn validate_domain_constraint(
+        &self,
+        name: &str,
+        conname: &str,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let entry = domain_mut(&mut cat, name)?;
+        match entry.checks.iter_mut().find(|c| c.name == conname) {
+            Some(check) => {
+                check.validated = true;
+                Ok(Vec::new())
+            }
+            None => Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("constraint \"{conname}\" of domain \"{name}\" does not exist"),
+            )),
+        }
+    }
+
+    /// `ALTER DOMAIN name RENAME CONSTRAINT from TO to`.
+    pub fn rename_domain_constraint(
+        &self,
+        name: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<CatalogNotice>, PgError> {
+        let mut cat = self
+            .inner
+            .write()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let entry = domain_mut(&mut cat, name)?;
+        if entry.checks.iter().any(|c| c.name == to) {
+            return Err(PgError::new(
+                sqlstate::DUPLICATE_OBJECT,
+                format!("constraint \"{to}\" for domain \"{name}\" already exists"),
+            ));
+        }
+        match entry.checks.iter_mut().find(|c| c.name == from) {
+            Some(check) => {
+                check.name = to.to_string();
+                Ok(Vec::new())
+            }
+            None => Err(PgError::new(
+                sqlstate::UNDEFINED_OBJECT,
+                format!("constraint \"{from}\" of domain \"{name}\" does not exist"),
+            )),
+        }
+    }
+
+    /// The domain registered under `name`, or `None` when the name is free or
+    /// names a non-domain type. The DDL layer needs this to bind a new
+    /// constraint against the right base type before storing it.
+    pub fn domain_by_name(&self, name: &str) -> Option<DomainInfo> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let entry = cat.types.get(name)?;
+        Some(domain_info(name, entry.oid, entry.domain.as_ref()?))
     }
 
     /// `CREATE FUNCTION` / `CREATE PROCEDURE`, for `LANGUAGE internal AS
@@ -1404,6 +1756,15 @@ impl TypeCatalog for GlobalCatalog {
         })
     }
 
+    fn domain_info(&self, oid: u32) -> Option<DomainInfo> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let (name, entry) = cat.types.iter().find(|(_, e)| e.oid == oid)?;
+        Some(domain_info(name, oid, entry.domain.as_ref()?))
+    }
+
     fn routines(&self, name: &str) -> Vec<RoutineSig> {
         let cat = self
             .inner
@@ -1465,14 +1826,17 @@ impl TypeCatalog for GlobalCatalog {
     }
 }
 
-/// A user-defined type as surfaced to the system-catalog (`pg_type`/`pg_enum`)
-/// introspection layer: its OID, name, and — when it is an enum — its labels in
-/// definition order.
+/// A user-defined type as surfaced to the system-catalog
+/// (`pg_type`/`pg_enum`/`pg_constraint`) introspection layer: its OID, name,
+/// and whichever of the enum labels or the domain definition applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserTypeInfo {
     pub oid: u32,
     pub name: String,
     pub enum_labels: Option<Vec<String>>,
+    /// `Some(..)` for a `CREATE DOMAIN`; mutually exclusive with
+    /// [`UserTypeInfo::enum_labels`].
+    pub domain: Option<DomainInfo>,
 }
 
 impl GlobalCatalog {
@@ -1491,6 +1855,7 @@ impl GlobalCatalog {
                 oid: e.oid,
                 name: name.clone(),
                 enum_labels: e.enum_labels.clone(),
+                domain: e.domain.as_ref().map(|d| domain_info(name, e.oid, d)),
             })
             .collect();
         types.sort_by_key(|t| t.oid);

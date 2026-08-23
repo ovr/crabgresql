@@ -78,6 +78,10 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // `oid`/`int2`, both orderable, so there is no element check here.
             | PgType::Vector(_)
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
+        // A domain orders exactly as its base does: the value under it *is* a
+        // base value, and `compare_values` dispatches on the value.
+        || matches!(ty, PgType::User(oid) if catalog.domain_info(oid).is_some())
+            && is_orderable(catalog.base_type(ty), catalog)
 }
 
 /// Types with a default *equality* operator — a superset of the orderable ones,
@@ -99,6 +103,7 @@ pub(crate) fn has_equality(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
     if let PgType::Array(elem) = ty {
         return PgType::from_oid(elem).is_some_and(|e| has_equality(e, catalog));
     }
+    let ty = catalog.base_type(ty);
     matches!(ty, PgType::Xid | PgType::Cid) || is_orderable(ty, catalog)
 }
 
@@ -759,48 +764,84 @@ pub(super) fn apply_length_to_column(
     expr: BoundExpr,
     column: &Column,
 ) -> Result<BoundExpr, BindError> {
+    apply_length(expr, column.ty, column.typmod)
+}
+
+/// [`apply_length_to_column`] over a bare `(type, typmod)` pair, which is how a
+/// domain carries its modifier: `CREATE DOMAIN v AS varchar(3)` stores the 3 on
+/// the *type*, and a column of that domain has `atttypmod = -1`.
+pub(super) fn apply_length(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+) -> Result<BoundExpr, BindError> {
+    apply_length_in(expr, ty, typmod, false)
+}
+
+/// [`apply_length`] in **explicit-cast** context, where an over-long
+/// varchar/char truncates instead of raising. The distinction is observable on
+/// a domain, which is the only place one `(type, typmod)` pair is reached from
+/// both contexts: `'abcd'::v3` yields `abc` while inserting `'abcd'` into a `v3`
+/// column raises `value too long for type character varying(3)`.
+pub(super) fn apply_length_cast(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+) -> Result<BoundExpr, BindError> {
+    apply_length_in(expr, ty, typmod, true)
+}
+
+fn apply_length_in(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+    explicit: bool,
+) -> Result<BoundExpr, BindError> {
     // `numeric` and the datetime types round rather than truncating, and share
     // their whole implementation with the cast path.
-    if column.typmod >= 0 {
-        match column.ty {
+    if typmod >= 0 {
+        match ty {
             PgType::Numeric => {
-                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                let (precision, scale) = Numeric::unpack_typmod(typmod);
                 return apply_numeric_typmod(expr, precision, scale);
             }
             PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
-                return apply_datetime_precision(expr, column.typmod);
+                return apply_datetime_precision(expr, typmod);
             }
-            PgType::Interval => return apply_interval_typmod(expr, column.typmod),
+            PgType::Interval => return apply_interval_typmod(expr, typmod),
             _ => {}
         }
     }
-    let func = match column.ty {
-        PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
-        PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,
-        PgType::Bit if column.typmod >= 0 => ScalarFn::BitTypmod,
-        PgType::Varbit if column.typmod >= 0 => ScalarFn::VarbitTypmod,
+    let func = match ty {
+        PgType::Varchar if typmod >= 0 => ScalarFn::VarcharTypmod,
+        PgType::Bpchar if typmod >= 0 => ScalarFn::BpcharTypmod,
+        PgType::Bit if typmod >= 0 => ScalarFn::BitTypmod,
+        PgType::Varbit if typmod >= 0 => ScalarFn::VarbitTypmod,
         PgType::Name => ScalarFn::NameInput,
         _ => return Ok(expr),
     };
-    // Fold a constant now (assignment semantics: error on non-blank overflow).
+    // Fold a constant now, under whichever of the two rules applies.
     if let BoundExpr::Const {
         value: Value::Text(s),
         ..
     } = &expr
     {
-        let folded = match func {
-            ScalarFn::VarcharTypmod => {
-                crabgresql_types::text::varchar_input(s, column.typmod, false)
+        let folded = match (func, explicit) {
+            (ScalarFn::VarcharTypmod, true) => crabgresql_types::text::truncate_chars(s, typmod),
+            (ScalarFn::VarcharTypmod, false) => {
+                crabgresql_types::text::varchar_input(s, typmod, false)
                     .map_err(|e| BindError::new(e.sqlstate, e.message))?
             }
-            ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, column.typmod, false)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
-            ScalarFn::NameInput => crabgresql_types::text::name_input(s),
+            (ScalarFn::BpcharTypmod, _) => {
+                crabgresql_types::text::bpchar_input(s, typmod, explicit)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message))?
+            }
+            (ScalarFn::NameInput, _) => crabgresql_types::text::name_input(s),
             _ => unreachable!(),
         };
         return Ok(BoundExpr::Const {
             value: Value::Text(folded),
-            ty: column.ty,
+            ty,
         });
     }
     if let BoundExpr::Const {
@@ -808,34 +849,29 @@ pub(super) fn apply_length_to_column(
         ..
     } = &expr
     {
-        let (len, data) = crabgresql_types::bit::coerce(
-            *len,
-            data,
-            column.typmod,
-            column.ty == PgType::Varbit,
-            false,
-        )
-        .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        let (len, data) =
+            crabgresql_types::bit::coerce(*len, data, typmod, ty == PgType::Varbit, explicit)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?;
         return Ok(BoundExpr::Const {
             value: Value::Bit { len, data },
-            ty: column.ty,
+            ty,
         });
     }
     let mut args = vec![expr];
     if func != ScalarFn::NameInput {
         args.push(BoundExpr::Const {
-            value: Value::Int4(column.typmod),
+            value: Value::Int4(typmod),
             ty: PgType::Int4,
         });
-        // Third arg 0 = assignment (error on overflow), not a truncating cast.
+        // Third arg: 0 = assignment (error on overflow), 1 = truncating cast.
         args.push(BoundExpr::Const {
-            value: Value::Int4(0),
+            value: Value::Int4(explicit as i32),
             ty: PgType::Int4,
         });
     }
     Ok(BoundExpr::FuncCall {
         func,
-        ret: column.ty,
+        ret: ty,
         args,
     })
 }

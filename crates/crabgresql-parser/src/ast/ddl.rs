@@ -36,11 +36,6 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::value::escape_single_quote_string;
 use crate::ast::{
-    display_comma_separated, display_separated,
-    table_constraints::{
-        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
-        UniqueConstraint,
-    },
     AttachedToken, CommentDef, ConditionalStatements, CreateFunctionBody, CreateFunctionUsing,
     CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr, FileFormat,
     FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
@@ -50,7 +45,12 @@ use crate::ast::{
     OrderByExpr, ProjectionSelect, Query, RefreshModeKind, ResetConfig, RowAccessPolicy,
     SequenceOptions, Spanned, SqlOption, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod,
-    TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
+    TriggerReferencing, Value, ValueWithSpan, WrappedCollection, display_comma_separated,
+    display_separated,
+    table_constraints::{
+        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
+        UniqueConstraint,
+    },
 };
 use crate::display_utils::{DisplayCommaSeparated, Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
@@ -1158,6 +1158,99 @@ impl fmt::Display for AlterTypeOperation {
     }
 }
 
+/// An `ALTER DOMAIN` statement (`Statement::AlterDomain`)
+/// See <https://www.postgresql.org/docs/current/sql-alterdomain.html>
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct AlterDomain {
+    /// Name of the domain being altered (may be schema-qualified).
+    pub name: ObjectName,
+    /// The specific alteration operation to perform.
+    pub operation: AlterDomainOperation,
+}
+
+/// An [AlterDomain] operation
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum AlterDomainOperation {
+    /// `SET DEFAULT <expr>`
+    SetDefault(Expr),
+    /// `DROP DEFAULT`
+    DropDefault,
+    /// `SET NOT NULL`
+    SetNotNull,
+    /// `DROP NOT NULL`
+    DropNotNull,
+    /// `ADD [CONSTRAINT <name>] { CHECK (...) | NOT NULL } [NOT VALID]`
+    AddConstraint {
+        /// The constraint being added.
+        constraint: DomainConstraint,
+        /// `NOT VALID`: existing data is not re-scanned.
+        not_valid: bool,
+    },
+    /// `DROP CONSTRAINT [IF EXISTS] <name> [RESTRICT | CASCADE]`
+    DropConstraint {
+        /// Name of the constraint to drop.
+        name: Ident,
+        /// `IF EXISTS`: a missing constraint is a NOTICE, not an error.
+        if_exists: bool,
+        /// `CASCADE` rather than the default `RESTRICT`.
+        cascade: bool,
+    },
+    /// `VALIDATE CONSTRAINT <name>`
+    ValidateConstraint(Ident),
+    /// `RENAME CONSTRAINT <from> TO <to>`
+    RenameConstraint {
+        /// Existing constraint name.
+        from: Ident,
+        /// New constraint name.
+        to: Ident,
+    },
+    /// `RENAME TO <name>`
+    Rename(Ident),
+}
+
+impl fmt::Display for AlterDomainOperation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::SetDefault(expr) => write!(f, "SET DEFAULT {expr}"),
+            Self::DropDefault => f.write_str("DROP DEFAULT"),
+            Self::SetNotNull => f.write_str("SET NOT NULL"),
+            Self::DropNotNull => f.write_str("DROP NOT NULL"),
+            Self::AddConstraint {
+                constraint,
+                not_valid,
+            } => {
+                write!(f, "ADD {constraint}")?;
+                if *not_valid {
+                    f.write_str(" NOT VALID")?;
+                }
+                Ok(())
+            }
+            Self::DropConstraint {
+                name,
+                if_exists,
+                cascade,
+            } => {
+                f.write_str("DROP CONSTRAINT ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{name}")?;
+                if *cascade {
+                    f.write_str(" CASCADE")?;
+                }
+                Ok(())
+            }
+            Self::ValidateConstraint(name) => write!(f, "VALIDATE CONSTRAINT {name}"),
+            Self::RenameConstraint { from, to } => write!(f, "RENAME CONSTRAINT {from} TO {to}"),
+            Self::Rename(name) => write!(f, "RENAME TO {name}"),
+        }
+    }
+}
+
 /// `ALTER OPERATOR` statement
 /// See <https://www.postgresql.org/docs/current/sql-alteroperator.html>
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -2243,11 +2336,7 @@ impl ConstraintCharacteristics {
     fn enforced_text(&self) -> Option<&'static str> {
         self.enforced.map(
             |enforced| {
-                if enforced {
-                    "ENFORCED"
-                } else {
-                    "NOT ENFORCED"
-                }
+                if enforced { "ENFORCED" } else { "NOT ENFORCED" }
             },
         )
     }
@@ -3107,16 +3196,15 @@ impl fmt::Display for CreateTable {
             external = if self.external { "EXTERNAL " } else { "" },
             unlogged = if self.unlogged { "UNLOGGED " } else { "" },
             snapshot = if self.snapshot { "SNAPSHOT " } else { "" },
-            global = self.global
-                .map(|global| {
-                    if global {
-                        "GLOBAL "
-                    } else {
-                        "LOCAL "
-                    }
-                })
+            global = self
+                .global
+                .map(|global| { if global { "GLOBAL " } else { "LOCAL " } })
                 .unwrap_or(""),
-            if_not_exists = if self.if_not_exists { "IF NOT EXISTS " } else { "" },
+            if_not_exists = if self.if_not_exists {
+                "IF NOT EXISTS "
+            } else {
+                ""
+            },
             temporary = if self.temporary { "TEMPORARY " } else { "" },
             transient = if self.transient { "TRANSIENT " } else { "" },
             volatile = if self.volatile { "VOLATILE " } else { "" },
@@ -3546,7 +3634,47 @@ pub struct CreateDomain {
     /// The default value of the domain.
     pub default: Option<Expr>,
     /// The constraints of the domain.
-    pub constraints: Vec<TableConstraint>,
+    pub constraints: Vec<DomainConstraint>,
+}
+
+/// One `domain_constraint` of a `CREATE DOMAIN` / `ALTER DOMAIN ... ADD`:
+/// `[ CONSTRAINT name ] { NOT NULL | NULL | CHECK (expression) }`.
+///
+/// Separate from [`TableConstraint`] because the two grammars barely overlap —
+/// a domain takes no column list, no key and no reference, and it *does* take a
+/// bare `NOT NULL`, which the table grammar spells as a column option.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum DomainConstraint {
+    /// `[ CONSTRAINT name ] NOT NULL`
+    NotNull {
+        /// The explicit constraint name, when one was written.
+        name: Option<Ident>,
+    },
+    /// `[ CONSTRAINT name ] NULL` — accepted and ignored, as in PostgreSQL.
+    Null {
+        /// The explicit constraint name, when one was written.
+        name: Option<Ident>,
+    },
+    /// `[ CONSTRAINT name ] CHECK (expression)`
+    Check {
+        /// The explicit constraint name, when one was written.
+        name: Option<Ident>,
+        /// The boolean expression over `VALUE` the constraint enforces.
+        expr: Expr,
+    },
+}
+
+impl fmt::Display for DomainConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let (name, tail) = match self {
+            Self::NotNull { name } => (name, "NOT NULL".to_string()),
+            Self::Null { name } => (name, "NULL".to_string()),
+            Self::Check { name, expr } => (name, format!("CHECK ({expr})")),
+        };
+        write!(f, "{}{tail}", display_constraint_name(name))
+    }
 }
 
 impl fmt::Display for CreateDomain {

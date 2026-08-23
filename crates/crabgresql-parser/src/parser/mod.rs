@@ -6454,7 +6454,7 @@ impl<'a> Parser<'a> {
             None
         };
         let mut constraints = Vec::new();
-        while let Some(constraint) = self.parse_optional_table_constraint()? {
+        while let Some(constraint) = self.parse_optional_domain_constraint()? {
             constraints.push(constraint);
         }
 
@@ -6465,6 +6465,39 @@ impl<'a> Parser<'a> {
             default,
             constraints,
         })
+    }
+
+    /// Parse one `[ CONSTRAINT name ] { NOT NULL | NULL | CHECK (expr) }`, or
+    /// `None` when the next token starts none of them.
+    ///
+    /// A domain's constraint grammar is its own — no column list, no key, no
+    /// reference, and a bare `NOT NULL` the table grammar only accepts as a
+    /// column option — so it does not reuse `parse_optional_table_constraint`.
+    fn parse_optional_domain_constraint(
+        &mut self,
+    ) -> Result<Option<DomainConstraint>, ParserError> {
+        let name = match self.parse_keyword(Keyword::CONSTRAINT) {
+            true => Some(self.parse_identifier()?),
+            false => None,
+        };
+        if self.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
+            return Ok(Some(DomainConstraint::NotNull { name }));
+        }
+        if self.parse_keyword(Keyword::NULL) {
+            return Ok(Some(DomainConstraint::Null { name }));
+        }
+        if self.parse_keyword(Keyword::CHECK) {
+            self.expect_token(&Token::LParen)?;
+            let expr = self.parse_expr()?;
+            self.expect_token(&Token::RParen)?;
+            return Ok(Some(DomainConstraint::Check { name, expr }));
+        }
+        // `CONSTRAINT <name>` with nothing after it is a syntax error, not the
+        // end of the list — the name has already been consumed.
+        match name {
+            Some(_) => self.expected_ref("NOT NULL, NULL or CHECK", self.peek_token_ref()),
+            None => Ok(None),
+        }
     }
 
     /// ```sql
@@ -6969,11 +7002,11 @@ impl<'a> Parser<'a> {
     /// ```
     fn parse_drop_domain(&mut self) -> Result<DropDomain, ParserError> {
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
-        let name = self.parse_object_name(false)?;
+        let names = self.parse_comma_separated(|p| p.parse_object_name(false))?;
         let drop_behavior = self.parse_optional_drop_behavior();
         Ok(DropDomain {
             if_exists,
-            name,
+            names,
             drop_behavior,
         })
     }
@@ -10197,6 +10230,7 @@ impl<'a> Parser<'a> {
         let object_type = self.expect_one_of_keywords(&[
             Keyword::VIEW,
             Keyword::TYPE,
+            Keyword::DOMAIN,
             Keyword::COLLATION,
             Keyword::TABLE,
             Keyword::INDEX,
@@ -10216,6 +10250,7 @@ impl<'a> Parser<'a> {
             }
             Keyword::VIEW => self.parse_alter_view(),
             Keyword::TYPE => self.parse_alter_type(),
+            Keyword::DOMAIN => self.parse_alter_domain(),
             Keyword::COLLATION => self.parse_alter_collation().map(Into::into),
             Keyword::TABLE => self.parse_alter_table(false),
             Keyword::ICEBERG => {
@@ -10590,6 +10625,62 @@ impl<'a> Parser<'a> {
                 self.peek_token_ref(),
             )
         }
+    }
+
+    /// Parse a [Statement::AlterDomain].
+    ///
+    /// [PostgreSQL Documentation](https://www.postgresql.org/docs/current/sql-alterdomain.html)
+    pub fn parse_alter_domain(&mut self) -> Result<Statement, ParserError> {
+        let name = self.parse_object_name(false)?;
+        // `SET NOT NULL` and `SET DEFAULT` share a prefix, as do the two
+        // `RENAME` forms, so each pair is disambiguated by its second keyword
+        // before the shorter spelling is tried.
+        let operation = if self.parse_keywords(&[Keyword::SET, Keyword::NOT, Keyword::NULL]) {
+            AlterDomainOperation::SetNotNull
+        } else if self.parse_keywords(&[Keyword::DROP, Keyword::NOT, Keyword::NULL]) {
+            AlterDomainOperation::DropNotNull
+        } else if self.parse_keywords(&[Keyword::SET, Keyword::DEFAULT]) {
+            AlterDomainOperation::SetDefault(self.parse_expr()?)
+        } else if self.parse_keywords(&[Keyword::DROP, Keyword::DEFAULT]) {
+            AlterDomainOperation::DropDefault
+        } else if self.parse_keywords(&[Keyword::DROP, Keyword::CONSTRAINT]) {
+            let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+            let constraint_name = self.parse_identifier()?;
+            let cascade = matches!(
+                self.parse_one_of_keywords(&[Keyword::CASCADE, Keyword::RESTRICT]),
+                Some(Keyword::CASCADE)
+            );
+            AlterDomainOperation::DropConstraint {
+                name: constraint_name,
+                if_exists,
+                cascade,
+            }
+        } else if self.parse_keywords(&[Keyword::VALIDATE, Keyword::CONSTRAINT]) {
+            AlterDomainOperation::ValidateConstraint(self.parse_identifier()?)
+        } else if self.parse_keywords(&[Keyword::RENAME, Keyword::CONSTRAINT]) {
+            let from = self.parse_identifier()?;
+            self.expect_keyword(Keyword::TO)?;
+            AlterDomainOperation::RenameConstraint {
+                from,
+                to: self.parse_identifier()?,
+            }
+        } else if self.parse_keywords(&[Keyword::RENAME, Keyword::TO]) {
+            AlterDomainOperation::Rename(self.parse_identifier()?)
+        } else if self.parse_keyword(Keyword::ADD) {
+            let Some(constraint) = self.parse_optional_domain_constraint()? else {
+                return self.expected_ref("a constraint after ADD", self.peek_token_ref());
+            };
+            AlterDomainOperation::AddConstraint {
+                constraint,
+                not_valid: self.parse_keywords(&[Keyword::NOT, Keyword::VALID]),
+            }
+        } else {
+            return self.expected_ref(
+                "{SET | DROP} {DEFAULT | NOT NULL}, ADD, {DROP | VALIDATE | RENAME} CONSTRAINT or RENAME TO",
+                self.peek_token_ref(),
+            );
+        };
+        Ok(Statement::AlterDomain(AlterDomain { name, operation }))
     }
 
     /// Parse a [Statement::AlterCollation].

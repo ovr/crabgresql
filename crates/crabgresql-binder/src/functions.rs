@@ -19,7 +19,7 @@ use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
     ArgFail, Binding, BoundExpr, BoundWindowSpec, ExprSortKey, MinMaxKind, Scope, WindowKind,
-    bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
+    bind_expr, bind_sql_function_body, coerce_for_arg, inline_params, undomain_binding,
 };
 use crate::{BindError, BoundAggregate, OutputColumn};
 
@@ -3953,7 +3953,7 @@ fn bind_special_form(
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
     match form {
-        SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings),
+        SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings, scope),
         SpecialForm::NullIf => crate::expr::bind_nullif(bindings, scope),
         SpecialForm::MinMax(kind) => crate::expr::bind_min_max(kind, bindings, scope),
     }
@@ -4170,13 +4170,7 @@ fn bind_pg_typeof(binding: Binding, scope: &Scope) -> Result<Binding, BindError>
         // argument.
         Binding::Unknown { lit, span, param } => (
             crabgresql_types::oid::UNKNOWN,
-            crate::expr::resolve_unknown_ctx(
-                scope.catalog().as_ref(),
-                lit,
-                span,
-                param,
-                PgType::Text,
-            )?,
+            crate::expr::resolve_unknown_ctx(scope.catalog(), lit, span, param, PgType::Text)?,
         ),
     };
     finish_func_call(
@@ -4575,6 +4569,9 @@ fn bind_aggregate(
     let bindings = arg_exprs
         .iter()
         .map(|e| crate::expr::bind_expr(e, scope))
+        // An aggregate over a domain is the aggregate over its base, as for
+        // any other call: `sum(posint_column)` is `sum(integer)`.
+        .map(|b| b.map(|b| undomain_binding(b, scope.catalog().as_ref())))
         .collect::<Result<Vec<_>, _>>()?;
     if agg == AggFn::ArrayAgg
         && bindings
@@ -4912,6 +4909,13 @@ pub(crate) fn resolve_call_variadic(
     catalog: &Arc<dyn TypeCatalog>,
     variadic_call: bool,
 ) -> Result<Binding, BindError> {
+    // A function call over a domain resolves on the base type, as an operator
+    // does — `length(v3col)` is `length(varchar)`. Both the built-in overload
+    // table below and the user-routine fallback see the stripped arguments.
+    let bindings: Vec<Binding> = bindings
+        .into_iter()
+        .map(|b| undomain_binding(b, catalog.as_ref()))
+        .collect();
     let sigs = lookup(name);
     if sigs.is_empty() {
         // No built-in of this name: a user-defined `LANGUAGE SQL` function may

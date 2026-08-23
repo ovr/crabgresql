@@ -8,7 +8,7 @@ use crate::cols::*;
 use crate::oids::*;
 use crabgresql_types::{Reg, RegKind};
 
-use crate::{CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
+use crate::{CatalogDomain, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
 
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
 /// query.
@@ -117,14 +117,14 @@ pub(crate) fn pg_type_builtin_rows() -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// The `pg_type` rows for user-defined enum types, appended after
+/// The `pg_type` rows for user-defined enums and domains, appended after
 /// [`pg_type_builtin_rows`]. Column order matches [`pg_type_schema`].
 ///
-/// TODO: reflect non-enum `CREATE TYPE` shapes into `pg_type` — only types
-/// carrying enum labels are emitted (`typtype = 'e'`), so any other user type
-/// is invisible to a client reading the catalog.
+/// TODO: reflect a `CREATE TYPE ... (INPUT = …)` base type into `pg_type`. Only
+/// enums (`typtype = 'e'`) and domains (`typtype = 'd'`) are emitted, so any
+/// other user type is invisible to a client reading the catalog.
 pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value>> {
-    user_types
+    let mut rows: Vec<Vec<Value>> = user_types
         .iter()
         .filter(|t| t.enum_labels.is_some())
         .map(|t| {
@@ -176,7 +176,96 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
                 Value::Null,
             ]
         })
-        .collect()
+        .collect();
+    rows.extend(
+        user_types
+            .iter()
+            .filter_map(|t| Some((t, t.domain.as_ref()?)))
+            .map(|(t, d)| pg_type_domain_row(t, d)),
+    );
+    rows
+}
+
+/// One `pg_type` row for a `CREATE DOMAIN`.
+///
+/// A domain borrows most of its row from the base type it is over — width,
+/// pass-by-value, alignment, storage, category, and the output/send functions —
+/// because its values *are* base values. What it does not borrow is the input
+/// side: PostgreSQL 18.4 shows `typinput = domain_in` and
+/// `typreceive = domain_recv` on every domain row, since reading a value in is
+/// where the constraints run.
+fn pg_type_domain_row(t: &CatalogUserType, d: &CatalogDomain) -> Vec<Value> {
+    let base = PG_TYPE_ROWS.iter().find(|r| r.oid == d.resolved_basetype);
+    // A base this build has no `pg_type.dat` row for cannot contribute its
+    // physical columns; the variable-length defaults are the safe answer, and
+    // no such base can currently exist (the base is always a built-in).
+    let (typlen, typbyval, typcategory, typalign, typstorage) = match base {
+        Some(r) => (
+            r.typlen,
+            r.typbyval,
+            r.typcategory,
+            r.typalign,
+            r.typstorage,
+        ),
+        None => (-1, false, "S", "i", "x"),
+    };
+    vec![
+        Value::Oid(t.oid),
+        Value::Text(t.name.clone()),
+        Value::Oid(PUBLIC_NAMESPACE_OID),
+        Value::Oid(BOOTSTRAP_ROLE_OID),
+        Value::Int2(typlen),
+        Value::Bool(typbyval),
+        chr('d'),
+        str_char(typcategory),
+        Value::Bool(false),
+        Value::Bool(true),
+        chr(','),
+        // typrelid / typsubscript / typelem / typarray: a domain is not a
+        // composite, and this build creates no array type for one.
+        Value::Oid(0),
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        Value::Oid(0),
+        Value::Oid(0),
+        regproc_by_name("domain_in"),
+        base.map_or_else(
+            || Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+            |r| regproc(r.typoutput),
+        ),
+        regproc_by_name("domain_recv"),
+        base.map_or_else(
+            || Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+            |r| regproc(r.typsend),
+        ),
+        // typmodin / typmodout / typanalyze: a domain's modifier is fixed at
+        // creation, so it needs no modifier I/O of its own.
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        str_char(typalign),
+        str_char(typstorage),
+        Value::Bool(d.not_null),
+        Value::Oid(d.basetype),
+        Value::Int4(crabgresql_storage_api::pg_typmod(
+            PgType::from_oid(d.resolved_basetype).unwrap_or(PgType::Text),
+            d.typmod,
+        )),
+        // typndims: nonzero only on a domain over an array, which this build
+        // has no way to declare.
+        Value::Int4(0),
+        // A domain over a collatable base carries the base's collation unless
+        // one was named — 18.4 shows `typcollation = 100` (the default
+        // collation) on a domain over `text`, not 0.
+        Value::Oid(match d.collation {
+            0 => base.map_or(0, |r| r.typcollation),
+            explicit => explicit,
+        }),
+        // typdefaultbin mirrors typdefault here: both hold the same stored SQL,
+        // which is what `information_schema.domains.domain_default` reads.
+        d.default.clone().map_or(Value::Null, Value::Text),
+        d.default.clone().map_or(Value::Null, Value::Text),
+        Value::Null,
+    ]
 }
 
 /// `pg_catalog.pg_enum` — one row per (enum type, label). `enumsortorder` is the

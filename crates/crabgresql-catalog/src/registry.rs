@@ -659,6 +659,14 @@ pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
         definitions::information_schema::COLUMNS,
     ),
     view(
+        "domains",
+        0,
+        InformationSchema,
+        information_schema::domains_schema,
+        information_schema::domains_rows,
+        definitions::information_schema::DOMAINS,
+    ),
+    view(
         "schemata",
         0,
         InformationSchema,

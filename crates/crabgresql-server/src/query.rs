@@ -38,8 +38,9 @@ use crate::catalog::{SessionCatalog, SessionCatalogOps, SessionCatalogSource, St
 use crate::error::PgError;
 use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyze};
 use crate::global_catalog::{
-    ArgMode, CatalogNotice, FuncBody, FuncDropSpec, FuncInfo, GlobalCatalog, RoutineArg,
-    RoutineDefinition, RoutineKind, TypeRef, Volatility, definition_fingerprint,
+    ArgMode, CatalogNotice, DomainCheckSpec, DomainSpec, FuncBody, FuncDropSpec, FuncInfo,
+    GlobalCatalog, RoutineArg, RoutineDefinition, RoutineKind, TypeRef, Volatility,
+    definition_fingerprint,
 };
 use crate::guc;
 use crate::routines::{RoutineDispatch, SessionNotices};
@@ -672,7 +673,12 @@ pub fn analyze_statement(
     // RETURNING clause) reports its columns; a data-modifying plan without
     // RETURNING makes `output_columns_of` return an error we fold to `None`
     // (NoData).
-    let result_columns = output_columns_of(&logical).ok();
+    // De-domained for the same reason the simple-query path is — see
+    // `undomain_columns`. `Describe` answers from here, so a prepared statement
+    // would otherwise advertise a domain OID the simple-query form does not.
+    let result_columns = output_columns_of(&logical)
+        .ok()
+        .map(|columns| undomain_columns(columns, &type_catalog));
     Ok(Analyzed {
         param_types,
         result_columns,
@@ -986,6 +992,24 @@ fn execute_statement_inner(
             } => return execute_create_type(global_catalog, name, representation),
             ast::Statement::AlterType(alter) => {
                 return execute_alter_type(global_catalog, alter);
+            }
+            ast::Statement::CreateDomain(create) => {
+                return execute_create_domain(global_catalog, &type_catalog, create);
+            }
+            ast::Statement::AlterDomain(alter) => {
+                return execute_alter_domain(
+                    &catalog,
+                    engine,
+                    &type_catalog,
+                    &catalog_ops,
+                    global_catalog,
+                    txnmgr,
+                    session,
+                    alter,
+                );
+            }
+            ast::Statement::DropDomain(drop) => {
+                return execute_drop_domain(global_catalog, engine, drop);
             }
             ast::Statement::CreateFunction(create) => {
                 return execute_create_function(global_catalog, &type_catalog, create);
@@ -1405,7 +1429,7 @@ fn execute_statement_inner(
     let notices = session.notices.drain();
     let result = match exec {
         Execution::Rows { columns, node } => QueryResult::Rows {
-            columns,
+            columns: undomain_columns(columns, &type_catalog),
             node,
             tag: RowTag::Select,
             notices,
@@ -1415,7 +1439,7 @@ fn execute_statement_inner(
             node,
             verb,
         } => QueryResult::Rows {
-            columns,
+            columns: undomain_columns(columns, &type_catalog),
             node,
             tag: verb.into(),
             notices,
@@ -1425,6 +1449,28 @@ fn execute_statement_inner(
         Execution::Deleted(n) => command_with(format!("DELETE {n}"), notices),
     };
     Ok(result)
+}
+
+/// Report a domain-typed result column as its **base** type on the wire.
+///
+/// PostgreSQL does the same, and it is easy to get backwards: `pg_typeof` on a
+/// domain value answers with the domain, but the `RowDescription` for that same
+/// column carries the base type's OID — probed on 18.4, where
+/// `SELECT 1::posint` describes column `a` as OID 23 and `'ab'::vv` over
+/// `varchar(3)` as OID 1043. Clients depend on it: psql decides
+/// a column's alignment from the OID it is told, and would left-align a `posint`
+/// it had never heard of.
+fn undomain_columns(
+    columns: Vec<OutputColumn>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Vec<OutputColumn> {
+    columns
+        .into_iter()
+        .map(|mut column| {
+            column.ty = type_catalog.base_type(column.ty);
+            column
+        })
+        .collect()
 }
 
 /// The routine dispatcher and command counter one statement executes with.
@@ -1951,6 +1997,9 @@ fn read_only_prohibited_ddl(stmt: &ast::Statement) -> Option<&'static str> {
         ast::Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         ast::Statement::CreateIndex(_) => "CREATE INDEX",
         ast::Statement::CreateType { .. } => "CREATE TYPE",
+        ast::Statement::CreateDomain(_) => "CREATE DOMAIN",
+        ast::Statement::AlterDomain(_) => "ALTER DOMAIN",
+        ast::Statement::DropDomain(_) => "DROP DOMAIN",
         ast::Statement::AlterTable(_) => "ALTER TABLE",
         ast::Statement::AlterType(_) => "ALTER TYPE",
         ast::Statement::CreateFunction(_) => "CREATE FUNCTION",
@@ -6577,6 +6626,10 @@ pub(crate) fn resolve_column_type(
             )),
             Some(name) => match type_catalog.resolve_type(&name) {
                 Some(ut) if type_catalog.enum_info(ut.oid).is_some() => Ok(PgType::User(ut.oid)),
+                // A domain column reports the *domain* as its type, as PG's
+                // `pg_attribute.atttypid` does; the modifier stays on the type,
+                // so `atttypmod` is -1 and nothing is copied down here.
+                Some(ut) if type_catalog.domain_info(ut.oid).is_some() => Ok(PgType::User(ut.oid)),
                 Some(_) => Err(PgError::feature_not_supported(format!(
                     "type \"{name}\" is not supported yet"
                 ))),
@@ -6765,6 +6818,446 @@ fn execute_create_type(
         tag: "CREATE TYPE".into(),
         notices: to_notices(notices),
     })
+}
+
+/// `CREATE DOMAIN name AS base [COLLATE c] [DEFAULT e] [NOT NULL | CHECK (…)]…`.
+///
+/// The domain's own `DEFAULT` and `CHECK` are stored as canonical SQL, like a
+/// column's, so that the catalog stays free of the binder's IR and
+/// `pg_get_constraintdef` can echo them. The predicates bind against a
+/// one-column shape whose only column is the base type, which is how `VALUE`
+/// resolves; see `crabgresql_binder::expr::domain`.
+fn execute_create_domain(
+    catalog: &GlobalCatalog,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    create: &ast::CreateDomain,
+) -> Result<QueryResult, PgError> {
+    let name = single_object_name(&create.name, "domain")?;
+    let base = resolve_domain_base(type_catalog, &create.data_type)?;
+    let resolved = type_catalog.base_type(base);
+    let typmod = crabgresql_binder::declared_typmod(resolved, &create.data_type)?.unwrap_or(-1);
+    let collation = match &create.collation {
+        Some(c) => Some(crabgresql_binder::resolve_collation(
+            &ast::ObjectName::from(vec![c.clone()]),
+        )?),
+        None => None,
+    };
+
+    let shape = domain_value_shape(&name, resolved, typmod);
+    let default = match &create.default {
+        Some(expr) => Some(deparse_domain_default(
+            expr,
+            &shape.columns[0],
+            type_catalog,
+        )?),
+        None => None,
+    };
+
+    let mut not_null = false;
+    let mut checks = Vec::new();
+    for constraint in &create.constraints {
+        match constraint {
+            ast::DomainConstraint::Check {
+                name: conname,
+                expr,
+            } => checks.push(DomainCheckSpec {
+                name: conname.as_ref().map(normalize_ident),
+                expr: deparse_domain_check(expr, &shape, type_catalog)?,
+            }),
+            ast::DomainConstraint::NotNull { .. } => not_null = true,
+            // An explicit `NULL` is the default and carries no constraint row,
+            // as in PostgreSQL.
+            ast::DomainConstraint::Null { .. } => {}
+        }
+    }
+
+    let notices = catalog.create_domain(
+        &name,
+        DomainSpec {
+            base,
+            typlen: resolved.typlen() as i32,
+            typmod,
+            collation,
+            not_null,
+            default,
+            checks,
+        },
+    )?;
+    Ok(QueryResult::Command {
+        tag: "CREATE DOMAIN".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// The one-column shape a domain's `DEFAULT` and `CHECK` bind against.
+fn domain_value_shape(domain: &str, base: PgType, typmod: i32) -> TableSchema {
+    TableSchema::new(
+        domain.to_string(),
+        vec![Column::with_typmod("value", base, typmod)],
+    )
+}
+
+/// Resolve the type named after `AS`, reporting a name that resolves to nothing
+/// — or to a shell — as PostgreSQL's `type "x" does not exist`.
+fn resolve_domain_base(
+    type_catalog: &Arc<dyn TypeCatalog>,
+    data_type: &ast::DataType,
+) -> Result<PgType, PgError> {
+    let written = data_type.to_string();
+    let base = crabgresql_binder::resolve_data_type(type_catalog, data_type).map_err(|_| {
+        PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{written}\" does not exist"),
+        )
+    })?;
+    if type_catalog.is_shell_type(&written) {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{written}\" is only a shell"),
+        ));
+    }
+    Ok(base)
+}
+
+/// The same bind-then-deparse a column `DEFAULT` goes through.
+fn deparse_domain_default(
+    expr: &ast::Expr,
+    column: &Column,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<String, PgError> {
+    crabgresql_binder::bind_column_default(expr, column, type_catalog)?;
+    let source = expr.to_string();
+    Ok(
+        match crabgresql_binder::deparse_literal_default(expr, column, type_catalog)? {
+            crabgresql_binder::ColumnDefault::Deparsed(text) => text,
+            // A domain's `DEFAULT NULL` is still recorded — unlike a column's,
+            // where NULL *is* the absence of a default.
+            crabgresql_binder::ColumnDefault::Omit => "NULL".to_string(),
+            crabgresql_binder::ColumnDefault::Source => {
+                crabgresql_binder::ruleutils::deparse_stored_expr(&source, type_catalog)
+                    .unwrap_or(source)
+            }
+        },
+    )
+}
+
+fn deparse_domain_check(
+    expr: &ast::Expr,
+    shape: &TableSchema,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<String, PgError> {
+    crabgresql_binder::bind_check_constraint(expr, shape, type_catalog)?;
+    let source = expr.to_string();
+    Ok(
+        crabgresql_binder::ruleutils::deparse_domain_check_expr(&source, type_catalog)
+            .unwrap_or(source),
+    )
+}
+
+/// `ALTER DOMAIN`. The catalog mutation and its error text live on
+/// [`GlobalCatalog`]; what happens here is the part that needs the *data*: a new
+/// `NOT NULL` or a validated `CHECK` must hold for every value already stored in
+/// a column of the domain, and PostgreSQL re-scans those columns before it
+/// accepts the change.
+#[allow(clippy::too_many_arguments)]
+fn execute_alter_domain(
+    engine: &Arc<dyn TableEngine>,
+    raw_engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    catalog_ops: &Arc<dyn CatalogOps>,
+    catalog: &Arc<GlobalCatalog>,
+    txnmgr: &Arc<TransactionManager>,
+    session: &mut Session,
+    alter: &ast::AlterDomain,
+) -> Result<QueryResult, PgError> {
+    let name = single_object_name(&alter.name, "domain")?;
+    let info = catalog.domain_by_name(&name).ok_or_else(|| {
+        PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("type \"{name}\" does not exist"),
+        )
+    })?;
+    let base = type_catalog.base_type(info.base);
+    let shape = domain_value_shape(&name, base, info.typmod);
+
+    // A re-scan needs the same fully-wired runtime a statement gets — a domain
+    // predicate may call anything a table `CHECK` may. Built up front rather
+    // than per branch so the borrow of `session` ends before the catalog
+    // mutation below; `build_txn(.., false)` allocates no XID, as on the
+    // `ALTER TABLE` validation path.
+    let txn = build_txn(txnmgr, session, false);
+    let (routines, command_counter) = statement_runtime(engine, type_catalog, catalog, session);
+    let ctx = ExecContext {
+        txn: Some(txn.clone()),
+        ..session.exec_context_for_statement(
+            raw_engine,
+            catalog_ops,
+            type_catalog,
+            Arc::clone(&routines),
+            Arc::clone(&command_counter),
+            read_only_active(session),
+        )
+    };
+    let ctx = &ctx;
+    let txn = &txn;
+
+    let notices = match &alter.operation {
+        ast::AlterDomainOperation::SetDefault(expr) => {
+            let text = deparse_domain_default(expr, &shape.columns[0], type_catalog)?;
+            catalog.set_domain_default(&name, Some(text))?
+        }
+        ast::AlterDomainOperation::DropDefault => catalog.set_domain_default(&name, None)?,
+        ast::AlterDomainOperation::SetNotNull => {
+            validate_domain_over_stored_values(
+                engine,
+                type_catalog,
+                txn,
+                ctx,
+                &info,
+                None,
+                /* not_null */ true,
+            )?;
+            catalog.set_domain_not_null(&name, true)?
+        }
+        ast::AlterDomainOperation::DropNotNull => catalog.set_domain_not_null(&name, false)?,
+        ast::AlterDomainOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } => match constraint {
+            ast::DomainConstraint::Check {
+                name: conname,
+                expr,
+            } => {
+                let text = deparse_domain_check(expr, &shape, type_catalog)?;
+                if !not_valid {
+                    validate_domain_over_stored_values(
+                        engine,
+                        type_catalog,
+                        txn,
+                        ctx,
+                        &info,
+                        Some(&text),
+                        false,
+                    )?;
+                }
+                catalog.add_domain_check(
+                    &name,
+                    conname.as_ref().map(normalize_ident),
+                    text,
+                    !not_valid,
+                )?
+            }
+            ast::DomainConstraint::NotNull { .. } => {
+                validate_domain_over_stored_values(
+                    engine,
+                    type_catalog,
+                    txn,
+                    ctx,
+                    &info,
+                    None,
+                    true,
+                )?;
+                catalog.set_domain_not_null(&name, true)?
+            }
+            ast::DomainConstraint::Null { .. } => Vec::new(),
+        },
+        ast::AlterDomainOperation::DropConstraint {
+            name: conname,
+            if_exists,
+            cascade: _,
+        } => catalog.drop_domain_constraint(&name, &normalize_ident(conname), *if_exists)?,
+        ast::AlterDomainOperation::ValidateConstraint(conname) => {
+            let conname = normalize_ident(conname);
+            let text = info
+                .checks
+                .iter()
+                .find(|c| c.name == conname)
+                .map(|c| c.expr.clone())
+                .ok_or_else(|| {
+                    PgError::new(
+                        sqlstate::UNDEFINED_OBJECT,
+                        format!("constraint \"{conname}\" of domain \"{name}\" does not exist"),
+                    )
+                })?;
+            validate_domain_over_stored_values(
+                engine,
+                type_catalog,
+                txn,
+                ctx,
+                &info,
+                Some(&text),
+                false,
+            )?;
+            catalog.validate_domain_constraint(&name, &conname)?
+        }
+        ast::AlterDomainOperation::RenameConstraint { from, to } => {
+            catalog.rename_domain_constraint(&name, &normalize_ident(from), &normalize_ident(to))?
+        }
+        ast::AlterDomainOperation::Rename(new_name) => {
+            catalog.rename_type(&name, &normalize_ident(new_name))?
+        }
+    };
+    Ok(QueryResult::Command {
+        tag: "ALTER DOMAIN".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// Re-scan every column of `info`'s domain and reject the change if some stored
+/// value would not satisfy it.
+///
+/// PostgreSQL names the *column and table* rather than the value, and carries no
+/// DETAIL. Both texts and both SQLSTATEs were probed against 18.4:
+/// `23502 column "x" of table "tt" contains null values` for a new `NOT NULL`,
+/// and `23514 column "x" of table "tt" contains values that violate the new
+/// constraint` for a new `CHECK` — the latter also being what
+/// `VALIDATE CONSTRAINT` reports.
+fn validate_domain_over_stored_values(
+    engine: &Arc<dyn TableEngine>,
+    type_catalog: &Arc<dyn TypeCatalog>,
+    txn: &TxnContext,
+    ctx: &crabgresql_executor::ExecContext,
+    info: &crabgresql_storage_api::DomainInfo,
+    check: Option<&str>,
+    not_null: bool,
+) -> Result<(), PgError> {
+    let base = type_catalog.base_type(info.base);
+    let shape = domain_value_shape(&info.name, base, info.typmod);
+    let predicate = match check {
+        Some(text) => {
+            let parsed = crabgresql_binder::parse_stored_expr(text, "domain constraint")?;
+            Some(crabgresql_binder::bind_check_constraint(&parsed, &shape, type_catalog)?.0)
+        }
+        None => None,
+    };
+    for relation in engine.relations() {
+        for (index, column) in relation.columns.iter().enumerate() {
+            if column.ty != PgType::User(info.oid) {
+                continue;
+            }
+            let table = engine.resolve(Some(&relation.namespace), &relation.name)?;
+            let projection =
+                crabgresql_storage_api::ColumnProjection::of(std::iter::once(index), &relation);
+            for row in table.scan(txn, &projection) {
+                let (_, tuple) = row?;
+                let value = tuple.get(index).cloned().unwrap_or(Value::Null);
+                if matches!(value, Value::Null) {
+                    if not_null {
+                        return Err(PgError::new(
+                            "23502",
+                            format!(
+                                "column \"{}\" of table \"{}\" contains null values",
+                                column.name, relation.name
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+                let Some(predicate) = &predicate else {
+                    continue;
+                };
+                if matches!(
+                    crabgresql_executor::eval::eval(predicate, &[value], ctx)?,
+                    Value::Bool(false)
+                ) {
+                    return Err(PgError::new(
+                        "23514",
+                        format!(
+                            "column \"{}\" of table \"{}\" contains values that violate the new constraint",
+                            column.name, relation.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE | RESTRICT]`.
+///
+/// A table column of the domain is a dependency the global catalog cannot see —
+/// columns live in the engine — so it is discovered by scanning the relations
+/// here. Under RESTRICT that is PostgreSQL's dependency error, verbatim:
+/// `cannot drop type posint because other objects depend on it` with
+/// `DETAIL: column a of table t depends on type posint`.
+fn execute_drop_domain(
+    catalog: &GlobalCatalog,
+    engine: &Arc<dyn TableEngine>,
+    drop: &ast::DropDomain,
+) -> Result<QueryResult, PgError> {
+    let names = drop
+        .names
+        .iter()
+        .map(|name| single_object_name(name, "domain"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cascade = matches!(drop.drop_behavior, Some(ast::DropBehavior::Cascade));
+    for name in &names {
+        let Some(info) = catalog.domain_by_name(name) else {
+            continue;
+        };
+        let dependents = domain_dependents(catalog, engine, info.oid);
+        if dependents.is_empty() {
+            continue;
+        }
+        if !cascade {
+            let detail: Vec<String> = dependents
+                .iter()
+                .map(|dep| format!("{dep} depends on type {name}"))
+                .collect();
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop type {name} because other objects depend on it"),
+            )
+            .with_detail(detail.join("\n"))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        // PostgreSQL's CASCADE drops the dependent column; `ALTER TABLE ...
+        // DROP COLUMN` does not exist in this engine yet, so the alternative to
+        // refusing would be leaving a column typed on a type that is gone.
+        return Err(PgError::feature_not_supported(format!(
+            "DROP DOMAIN ... CASCADE cannot drop the dependent {}",
+            dependents[0]
+        )));
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let notices = catalog.drop_types(&refs, cascade, drop.if_exists)?;
+    Ok(QueryResult::Command {
+        tag: "DROP DOMAIN".into(),
+        notices: to_notices(notices),
+    })
+}
+
+/// Everything that depends on the domain `oid`, described the way PostgreSQL
+/// names it in a dependency message: `column a of table t`, `type dd`.
+///
+/// Two kinds of dependent the global catalog's own `dependents` list cannot
+/// hold: a table column (columns live in the engine) and another domain over
+/// this one (recorded as a `PgType`, not as a `DepId`). Columns come first,
+/// which is the order PostgreSQL lists them in.
+fn domain_dependents(
+    catalog: &GlobalCatalog,
+    engine: &Arc<dyn TableEngine>,
+    oid: u32,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for relation in engine.relations() {
+        for column in &relation.columns {
+            if column.ty == PgType::User(oid) {
+                out.push(format!("column {} of table {}", column.name, relation.name));
+            }
+        }
+    }
+    for user_type in catalog.user_types() {
+        if user_type
+            .domain
+            .as_ref()
+            .is_some_and(|d| d.base == PgType::User(oid))
+        {
+            out.push(format!("type {}", user_type.name));
+        }
+    }
+    out
 }
 
 /// Reject an enum-only `ALTER TYPE` operation targeting a builtin type. Builtins

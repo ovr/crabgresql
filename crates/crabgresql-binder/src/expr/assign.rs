@@ -20,6 +20,7 @@ use super::coerce::{
     coerce_expr, implicit_castable, resolve_unknown_ctx, to_bool_operand, type_label,
 };
 use super::datatype::apply_length_to_column;
+use super::domain::{domain_of, wrap_domain};
 use super::operators::{is_bit_family, is_text_family};
 use super::params::param_ctx_none;
 use super::scope::{Binding, Scope, reject_agg_or_window};
@@ -76,9 +77,19 @@ fn coerce_assign(
     scope: &Scope,
     mismatch: impl FnOnce(String, String) -> BindError,
 ) -> Result<BoundExpr, BindError> {
+    // A source that is already this very domain skips the wrap: the value is
+    // in, and PostgreSQL does not re-check it (`UPDATE t SET a = a` never
+    // re-validates).
+    if !matches!(&binding, Binding::Typed(e) if e.ty() == target)
+        && let Some(info) = domain_of(target, scope.catalog().as_ref())
+    {
+        let base = scope.catalog().base_type(target);
+        let inner = coerce_assign(binding, base, scope, mismatch)?;
+        return wrap_domain(inner, &info, scope.catalog(), false);
+    }
     let bound = match binding {
         Binding::Unknown { lit, span, param } => {
-            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
+            resolve_unknown_ctx(scope.catalog(), lit, span, param, target)?
         }
         Binding::Typed(e) => {
             let ty = e.ty();
@@ -487,7 +498,7 @@ pub fn deparse_literal_default(
         // unfolded and falls out below as `Source` — the DDL path renders those
         // two itself.
         Binding::Unknown { lit, span, param } => {
-            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, column.ty)?
+            resolve_unknown_ctx(scope.catalog(), lit, span, param, column.ty)?
         }
         Binding::Typed(e) => e,
     };

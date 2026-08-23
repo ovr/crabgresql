@@ -157,7 +157,7 @@ fn coerce_function_return(
 ) -> Result<BoundExpr, BindError> {
     let expr = match binding {
         Binding::Unknown { lit, span, param } => {
-            return resolve_unknown_ctx(catalog.as_ref(), lit, span, param, return_type);
+            return resolve_unknown_ctx(catalog, lit, span, param, return_type);
         }
         Binding::Typed(e) => e,
     };
@@ -271,6 +271,10 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             expr: Box::new(inline_params(*expr, args)),
             reported,
             rep,
+        },
+        BoundExpr::CoerceToDomain { expr, domain } => BoundExpr::CoerceToDomain {
+            expr: Box::new(inline_params(*expr, args)),
+            domain,
         },
         BoundExpr::FuncCall {
             func,

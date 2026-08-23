@@ -551,6 +551,12 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             reported: *reported,
             rep: *rep,
         },
+        // Only the operand: a domain's predicates live in their own one-column
+        // world, where `VALUE` is index 0 and no outer level exists.
+        BoundExpr::CoerceToDomain { expr, domain } => BoundExpr::CoerceToDomain {
+            expr: Box::new(outerize_columns(expr, level)),
+            domain: domain.clone(),
+        },
         BoundExpr::FuncCall { func, ret, args } => BoundExpr::FuncCall {
             func: *func,
             ret: *ret,

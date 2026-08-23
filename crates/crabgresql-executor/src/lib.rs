@@ -367,6 +367,10 @@ pub struct ConstraintDef {
     pub columns: Vec<String>,
     /// The stored predicate of a check constraint; `None` for the rest.
     pub expr: Option<String>,
+    /// Whether this constrains a **domain** rather than a relation. It changes
+    /// two things in the rendering: a `NOT NULL` names no column, and a check's
+    /// operand is the `VALUE` placeholder rather than a column.
+    pub is_domain: bool,
 }
 
 /// What `pg_get_indexdef` needs to reproduce an index's DDL: the index and the
@@ -1359,7 +1363,8 @@ fn resolve_expr(
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => resolve_expr(expr, ctx, txn)?,
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => resolve_expr(expr, ctx, txn)?,
         BoundExpr::Binary { left, right, .. } => {
             resolve_expr(left, ctx, txn)?;
             resolve_expr(right, ctx, txn)?;
