@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787493933167,
+  "lastUpdate": 1787493934822,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -53032,6 +53032,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 37755.080935,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "distinct": true,
+          "id": "28be9e891f2b28ff48db1f7861716e542de3fe12",
+          "message": "chore: Ignore local pgdata directory\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-08-23T15:31:32+02:00",
+          "tree_id": "cbf3305b4903248d33d323e0845787de24aa7eea",
+          "url": "https://github.com/ovr/crabgresql/commit/28be9e891f2b28ff48db1f7861716e542de3fe12"
+        },
+        "date": 1787493934722,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1182.939137,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 26086.212169,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
