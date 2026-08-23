@@ -534,58 +534,57 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
                 predicate: None,
             }
         }
-        // Neither hash keys nor sunk leaf filters apply to a row source that is
-        // rebuilt per left row.
         JoinExpr::Join {
             left,
             right,
             kind,
             predicate,
-        } if matches!(*right, JoinExpr::Input { lateral: true, .. }) => {
-            let JoinExpr::Input { input, width, .. } = *right else {
-                unreachable!("matched by the guard");
-            };
-            // Planning the body with its outer references still standing is
-            // sound: an `OuterColumnRef` is not a column of this body's own row,
-            // so it contributes nothing to the column demand, and every pass
-            // already walks past one.
-            let right_shape = match &input {
-                JoinInput::Subplan(body) => Some(Box::new(plan((**body).clone(), costs))),
-                JoinInput::Scan { .. } | JoinInput::TableFunction { .. } => None,
-            };
-            PhysicalJoinExpr::Lateral {
-                left: Box::new(plan_join_expr(*left, costs)),
-                right: input,
-                right_shape,
-                right_width: width,
-                kind,
-                predicate,
+        } => match *right {
+            // Neither hash keys nor sunk leaf filters apply to a row source that
+            // is rebuilt per left row.
+            JoinExpr::Input {
+                input,
+                width,
+                lateral: true,
+            } => {
+                // Planning the body with its outer references still standing is
+                // sound: an `OuterColumnRef` is not a column of this body's own
+                // row, so it contributes nothing to the column demand, and every
+                // pass already walks past one.
+                let right_shape = match &input {
+                    JoinInput::Subplan(body) => Some(Box::new(plan((**body).clone(), costs))),
+                    JoinInput::Scan { .. } | JoinInput::TableFunction { .. } => None,
+                };
+                PhysicalJoinExpr::Lateral {
+                    left: Box::new(plan_join_expr(*left, costs)),
+                    right: input,
+                    right_shape,
+                    right_width: width,
+                    kind,
+                    predicate,
+                }
             }
-        }
-        JoinExpr::Join {
-            left,
-            right,
-            kind,
-            predicate,
-        } => {
-            let left_width = left.width();
-            let (hash_keys, predicate) = extract_hash_keys(predicate, left_width);
-            debug_assert!(
-                kind != JoinKind::Cross || (predicate.is_none() && hash_keys.is_empty()),
-                "a cross join carries no condition; pushdown flips the kind to Inner \
-                 when it attaches one"
-            );
-            let mut left = Box::new(plan_join_expr(*left, costs));
-            let mut right = Box::new(plan_join_expr(*right, costs));
-            let predicate = sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
-            PhysicalJoinExpr::Join {
-                left,
-                right,
-                kind,
-                predicate,
-                hash_keys,
+            right => {
+                let left_width = left.width();
+                let (hash_keys, predicate) = extract_hash_keys(predicate, left_width);
+                debug_assert!(
+                    kind != JoinKind::Cross || (predicate.is_none() && hash_keys.is_empty()),
+                    "a cross join carries no condition; pushdown flips the kind to Inner \
+                     when it attaches one"
+                );
+                let mut left = Box::new(plan_join_expr(*left, costs));
+                let mut right = Box::new(plan_join_expr(right, costs));
+                let predicate =
+                    sink_leaf_filters(predicate, &mut left, &mut right, kind, left_width);
+                PhysicalJoinExpr::Join {
+                    left,
+                    right,
+                    kind,
+                    predicate,
+                    hash_keys,
+                }
             }
-        }
+        },
     }
 }
 
@@ -2525,6 +2524,25 @@ fn join_node_label(kind: JoinKind, hashed: bool) -> String {
     format!("{algorithm} {kind} Join")
 }
 
+/// A join node's own `ON` condition and the plan-level `WHERE` residual, as the
+/// two property lines PG prints under the node.
+fn push_join_filters(
+    lines: &mut Vec<String>,
+    predicate: Option<&BoundExpr>,
+    filter: Option<&BoundExpr>,
+    names: &[Option<String>],
+) {
+    if let Some(predicate) = predicate {
+        lines.push(format!(
+            "  Join Filter: ({})",
+            explain_expr(predicate, names)
+        ));
+    }
+    if let Some(filter) = filter {
+        lines.push(format!("  Filter: ({})", explain_expr(filter, names)));
+    }
+}
+
 /// Render a join tree. `filter` is the plan-level `WHERE` residual that pushdown
 /// could not relocate; it belongs to the root node's row, so only the root call
 /// passes it.
@@ -2575,15 +2593,7 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
                     .join(") AND (");
                 lines.push(format!("  Hash Cond: ({cond})"));
             }
-            if let Some(predicate) = predicate {
-                lines.push(format!(
-                    "  Join Filter: ({})",
-                    explain_expr(predicate, &names)
-                ));
-            }
-            if let Some(filter) = filter {
-                lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
-            }
+            push_join_filters(&mut lines, predicate.as_ref(), filter, &names);
             push_child(&mut lines, explain_join(left, None));
             // The right input is the build side, so a hash join shows it under a
             // Hash node the way PG does.
@@ -2606,15 +2616,7 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
             ..
         } => {
             let mut lines = vec![join_node_label(*kind, false)];
-            if let Some(predicate) = predicate {
-                lines.push(format!(
-                    "  Join Filter: ({})",
-                    explain_expr(predicate, &names)
-                ));
-            }
-            if let Some(filter) = filter {
-                lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
-            }
+            push_join_filters(&mut lines, predicate.as_ref(), filter, &names);
             push_child(&mut lines, explain_join(left, None));
             // `right_shape`, the copy planned once for exactly this: the plan
             // a row is actually produced by is built per left row and cannot be

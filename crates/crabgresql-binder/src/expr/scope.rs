@@ -219,28 +219,40 @@ impl LateralBarrier {
     }
 }
 
+/// Lay `items` out as scope relations, each column's index its position in the
+/// concatenated row.
+fn scope_rels(items: impl IntoIterator<Item = ScopeItem>) -> Vec<ScopeRel> {
+    let mut offset = 0;
+    items
+        .into_iter()
+        .map(|item| {
+            let rel = ScopeRel {
+                qualifier: item.qualifier,
+                columns: item.columns,
+                offset,
+                system_base: item.system_base,
+                declined_system: item.declined_system,
+            };
+            offset += rel.columns.len();
+            rel
+        })
+        .collect()
+}
+
 /// The outer-level chain a FROM item binds against when the items to its left
 /// are visible but off limits: a barrier level naming them, then the real
 /// enclosing queries unchanged (the barrier consumes no level number).
+///
+/// The offsets `scope_rels` assigns are never read here — every match through a
+/// barrier is an error, not an expression.
 pub(crate) fn barrier_levels(
-    items: &[ScopeItem],
+    items: impl IntoIterator<Item = ScopeItem>,
     barrier: LateralBarrier,
     outer: &[OuterLevel],
 ) -> Vec<OuterLevel> {
     let mut levels = Vec::with_capacity(outer.len() + 1);
     levels.push(OuterLevel {
-        rels: items
-            .iter()
-            .map(|item| ScopeRel {
-                qualifier: item.qualifier.clone(),
-                columns: item.columns.clone(),
-                // Never turned into an expression, so the layout is irrelevant:
-                // every match through a barrier is an error.
-                offset: 0,
-                system_base: item.system_base,
-                declined_system: item.declined_system.clone(),
-            })
-            .collect(),
+        rels: scope_rels(items),
         visible: None,
         barrier: Some(barrier),
     });
@@ -765,39 +777,19 @@ impl Scope {
     /// A multi-relation scope for a cross join. Each item becomes a relation;
     /// offsets are assigned left-to-right so a column's index is its position in
     /// the concatenated row.
-    pub fn relations(
-        items: Vec<ScopeItem>,
-        catalog: &Arc<dyn TypeCatalog>,
-        params: &ParamCtx,
-    ) -> Scope {
-        Self::relations_with_visible(items, None, catalog, params)
-    }
-
-    /// Like [`Scope::relations`], but with an explicit merged-column view for a
-    /// FROM clause that contains a `USING`/`NATURAL` join. The `rels` are still
-    /// built from `items` (so qualified `q.c` resolves each side's own column);
-    /// `visible`, when `Some`, drives unqualified resolution and `*` expansion.
+    ///
+    /// `visible`, when `Some`, is the merged-column view of a FROM clause
+    /// containing a `USING`/`NATURAL` join: the `rels` are still built from
+    /// `items` (so qualified `q.c` resolves each side's own column), but
+    /// unqualified resolution and `*` expansion follow the merged view.
     pub fn relations_with_visible(
         items: Vec<ScopeItem>,
         visible: Option<Vec<VisibleColumn>>,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
     ) -> Scope {
-        let mut offset = 0;
-        let mut rels = Vec::with_capacity(items.len());
-        for item in items {
-            let width = item.columns.len();
-            rels.push(ScopeRel {
-                qualifier: item.qualifier,
-                columns: item.columns,
-                offset,
-                system_base: item.system_base,
-                declined_system: item.declined_system,
-            });
-            offset += width;
-        }
         Scope {
-            rels,
+            rels: scope_rels(items),
             visible,
             catalog: catalog.clone(),
             params: params.clone(),

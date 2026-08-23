@@ -371,24 +371,7 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
                 add_exprs(add_exprs(demand, Some(&key.left)), Some(&key.right))
             });
 
-            // Split at the boundary: left indices pass through unchanged, right
-            // indices rebase into the right subtree's own base-0 space. This is
-            // a partition of the concatenated row, not a clamp — every index
-            // lands on exactly one side.
-            let split = left.width();
-            let (left_demand, right_demand) = match demand {
-                None => (ALL, ALL),
-                Some(demand) => (
-                    Some(demand.iter().copied().filter(|i| *i < split).collect()),
-                    Some(
-                        demand
-                            .iter()
-                            .filter(|i| **i >= split)
-                            .map(|i| i - split)
-                            .collect(),
-                    ),
-                ),
-            };
+            let (left_demand, right_demand) = split_demand(demand, left.width());
             prune_join(left, left_demand);
             prune_join(right, right_demand);
         }
@@ -407,14 +390,31 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
                 Some(slots) => add_indices(demand, slots),
                 None => ALL,
             };
-            let split = left.width();
-            let left_demand = match demand {
-                None => ALL,
-                Some(demand) => Some(demand.iter().copied().filter(|i| *i < split).collect()),
-            };
-            prune_join(left, left_demand);
+            prune_join(left, split_demand(demand, left.width()).0);
         }
     }
+}
+
+/// Partition a join node's demand at the boundary between its inputs: left
+/// indices pass through unchanged, right indices rebase into the right
+/// subtree's own base-0 space.
+///
+/// A partition of the concatenated row, not a clamp — every index lands on
+/// exactly one side.
+fn split_demand(demand: Demand, split: usize) -> (Demand, Demand) {
+    let Some(demand) = demand else {
+        return (ALL, ALL);
+    };
+    (
+        Some(demand.iter().copied().filter(|i| *i < split).collect()),
+        Some(
+            demand
+                .iter()
+                .filter(|i| **i >= split)
+                .map(|i| i - split)
+                .collect(),
+        ),
+    )
 }
 
 /// Fold explicit row indices into `demand`.
