@@ -48,7 +48,7 @@ pub use catalogs::depend::nextval_target;
 pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::{AvailableExtension, available_extensions};
 pub use oids::PLPGSQL_LANG_OID;
-pub use registry::{builtin_relation_name, builtin_relation_oid};
+pub use registry::{builtin_relation_name, builtin_relation_oid, builtin_view_definition};
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
     CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,

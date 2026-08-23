@@ -2306,25 +2306,135 @@ fn oversized_typmod_saturates_instead_of_panicking() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The registry is sorted by `(namespace, name)` with unique names, which is
-/// what `registry::lookup`'s binary search assumes. Out of order it would not
-/// error — it would silently fail to find a relation that is right there.
+/// Each registry table is sorted by `(namespace, name)`, which is what
+/// `registry::lookup`'s binary search assumes. Out of order it would not error —
+/// it would silently fail to find a relation that is right there.
+///
+/// Names are unique across *both* tables, not within each: the two are one
+/// namespace to every caller, and a name in both would make which definition
+/// answers depend on the search order inside `lookup`.
 #[test]
 fn the_registry_is_sorted_and_its_names_are_unique() {
-    let keys: Vec<_> = registry::CATALOG_RELATIONS
-        .iter()
+    for (label, keys) in [
+        (
+            "CATALOG_RELATIONS",
+            registry::CATALOG_RELATIONS
+                .iter()
+                .map(|def| (def.namespace, def.name))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "CATALOG_VIEWS",
+            registry::CATALOG_VIEWS
+                .iter()
+                .map(|def| (def.rel.namespace, def.rel.name))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(keys, sorted, "{label} must be sorted and unique");
+    }
+
+    let mut names: Vec<_> = registry::all()
         .map(|def| (def.namespace, def.name))
         .collect();
-    let mut sorted = keys.clone();
-    sorted.sort();
-    sorted.dedup();
-    assert_eq!(keys, sorted, "CATALOG_RELATIONS must be sorted and unique");
+    let total = names.len();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), total, "a name is served by both tables");
 
     // ...and the search really does find every entry, in both directions.
-    for def in registry::CATALOG_RELATIONS {
+    for def in registry::all() {
         assert!(registry::lookup(def.namespace, def.name).is_some());
     }
     assert!(registry::lookup(CatalogNamespace::PgCatalog, "no_such_catalog").is_none());
+}
+
+/// A view carries its definition and a base table does not — the whole point of
+/// the split.
+#[test]
+fn only_views_have_a_definition() {
+    let pg_views = required(
+        builtin_view_definition("pg_views"),
+        "pg_views is served as a view and must carry its definition",
+    )
+    .expect("a served view without a definition");
+    assert!(
+        pg_views.contains("c.relkind = 'v'"),
+        "pg_views must be defined over relkind = 'v': {pg_views}"
+    );
+
+    assert_eq!(builtin_view_definition("pg_class"), None);
+    assert_eq!(builtin_view_definition("no_such_catalog"), None);
+}
+
+/// What keeps the definition text from being decoration. Nothing runs it — the
+/// rows come from Rust — so a definition pasted under the wrong name, or a row
+/// builder that quietly serves fewer columns than PostgreSQL's view does, has
+/// nothing else to fail against.
+#[test]
+fn every_view_definition_parses_and_names_our_columns() {
+    use crabgresql_parser::ast::{Expr, SelectItem, SetExpr, Statement};
+    use crabgresql_parser::dialect::PostgreSqlDialect;
+    use crabgresql_parser::parser::Parser;
+
+    /// The name a select item publishes. PostgreSQL's own deparse aliases every
+    /// item whose name would not otherwise come out right, so a `None` here is
+    /// a definition transcribed wrong rather than a shape to handle.
+    fn output_name(item: &SelectItem) -> Option<String> {
+        match item {
+            SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(ident.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                parts.last().map(|ident| ident.value.clone())
+            }
+            _ => None,
+        }
+    }
+
+    for def in registry::CATALOG_VIEWS {
+        let name = def.rel.name;
+        if name == "pg_publication_tables" {
+            // `VARIADIC` in a call's argument list is a gap in the grammar, not
+            // in the transcription. Skipped by name rather than by a silent
+            // parse-failure branch, so the day the grammar grows it this fails
+            // and the skip goes away.
+            continue;
+        }
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, def.definition)
+            .unwrap_or_else(|e| panic!("{name}: its definition does not parse: {e}"));
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("{name}: a definition must be one query");
+        };
+        // Every one of PostgreSQL's own definitions is a plain SELECT or a
+        // UNION of them; the left-most arm names the columns either way.
+        let mut body = query.body.as_ref();
+        while let SetExpr::SetOperation { left, .. } = body {
+            body = left.as_ref();
+        }
+        let SetExpr::Select(select) = body else {
+            panic!("{name}: a definition must select");
+        };
+        let selected: Vec<_> = select
+            .projection
+            .iter()
+            .map(|item| {
+                output_name(item)
+                    .unwrap_or_else(|| panic!("{name}: cannot name select item {item}"))
+            })
+            .collect();
+        let published: Vec<_> = (def.rel.schema)()
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        assert_eq!(
+            published, selected,
+            "{name}: the row builder publishes columns the definition does not select"
+        );
+    }
 }
 
 /// Every `pg_catalog` relation has a distinct, non-zero OID that round-trips,
@@ -2337,7 +2447,7 @@ fn the_registry_is_sorted_and_its_names_are_unique() {
 /// replace, with nothing to notice it by.
 #[test]
 fn xmin_columns_exist_and_are_oids() {
-    for def in registry::CATALOG_RELATIONS {
+    for def in registry::all() {
         let Some(name) = def.xmin_column else {
             continue;
         };
@@ -2362,7 +2472,7 @@ fn xmin_columns_exist_and_are_oids() {
 #[test]
 fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
     let mut seen = std::collections::HashSet::new();
-    for def in registry::CATALOG_RELATIONS {
+    for def in registry::all() {
         if def.namespace != CatalogNamespace::PgCatalog {
             // The information_schema entries have no OID to check; the TODO on
             // `CatalogRelDef::oid` says why, and this pins the sentinel so it
@@ -2404,7 +2514,7 @@ fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
 /// `pg_user`'s name, and every column would still line up.
 #[test]
 fn each_entry_serves_the_relation_it_names() {
-    for def in registry::CATALOG_RELATIONS {
+    for def in registry::all() {
         let schema = (def.schema)();
         assert_eq!(schema.name, def.name);
         let namespace = match def.namespace {
@@ -2578,7 +2688,7 @@ fn wide_fixture() -> SystemCatalog {
 #[test]
 fn every_relation_builds_rows_as_wide_as_its_schema() {
     let cat = wide_fixture();
-    for def in registry::CATALOG_RELATIONS {
+    for def in registry::all() {
         let schema = (def.schema)();
         let rows = (def.rows)(&cat);
         for (i, row) in rows.iter().enumerate() {
