@@ -17076,6 +17076,54 @@ async fn a_view_over_pg_depend_is_readable() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A view's `pg_depend` column edges reach the relations its `LATERAL` items
+/// read.
+///
+/// The lateral side of a join is the one part of a plan that is *not* planned
+/// with the statement — it is built per left row — so the pass that reads each
+/// scan's settled projection sees nothing there unless the planner keeps a copy
+/// for it. Missing that, a view whose lateral body is the only reader of a
+/// relation records no column edge on it at all, and a client reading these rows
+/// concludes a column has no dependent when it has one.
+///
+/// Probed against PostgreSQL 18.4: `y` and `z` are recorded, `w` is not.
+#[tokio::test]
+async fn a_views_lateral_body_records_its_column_dependencies() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE lt (x int);
+             CREATE TABLE lu (y int, z int, w int);
+             CREATE VIEW lv AS
+               SELECT lt.x, s.z FROM lt, LATERAL (SELECT lu.y AS z FROM lu WHERE lu.z = lt.x) s",
+        )
+        .await?;
+    let edges: Vec<(String, i32)> = client
+        .query(
+            "SELECT t.relname, d.refobjsubid FROM pg_depend d
+               JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+               JOIN pg_class v ON v.oid = r.ev_class
+               JOIN pg_class t ON t.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+              WHERE v.relname = 'lv' AND t.relname IN ('lt', 'lu')
+              ORDER BY 1, 2",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![
+            ("lt".to_string(), 1),
+            ("lu".to_string(), 1),
+            ("lu".to_string(), 2)
+        ],
+        "the lateral body reads lu.y and lu.z, and not lu.w"
+    );
+    Ok(())
+}
+
 /// `pg_get_serial_sequence` answers from the same `OWNED BY` link `pg_depend`'s
 /// auto edge is built from: a `serial` column owns its sequence, a hand-written
 /// `DEFAULT nextval(...)` does not, and the two error cases are PostgreSQL's.

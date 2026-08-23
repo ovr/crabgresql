@@ -4304,6 +4304,9 @@ fn build_join_expr(
         PhysicalJoinExpr::Lateral {
             left,
             right,
+            // Deliberately dropped: `right_shape` is the inspection copy, and
+            // the rows come from `right` substituted per left row.
+            right_shape: _,
             right_width,
             kind,
             predicate,

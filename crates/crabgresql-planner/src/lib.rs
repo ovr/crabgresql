@@ -433,6 +433,18 @@ pub enum PhysicalJoinExpr {
     Lateral {
         left: Box<PhysicalJoinExpr>,
         right: JoinInput,
+        /// The same item planned once, with its `OuterColumnRef`s left standing.
+        ///
+        /// **Never executed**, and not the plan any row is produced by: the
+        /// executor builds that from `right` per left row. This copy exists for
+        /// the passes that *inspect* a plan and have no row to substitute —
+        /// [`scan_projections`], which feeds `pg_depend`'s per-column view
+        /// dependencies, and `EXPLAIN`. Without it a relation read only inside a
+        /// lateral item is invisible to both.
+        ///
+        /// `None` for a table function, which scans no relation and has no
+        /// subtree to show.
+        right_shape: Option<Box<PhysicalPlan>>,
         right_width: usize,
         /// `Cross`, `Inner` or `Left` — PostgreSQL refuses a lateral reference
         /// across a `RIGHT`/`FULL` join, and the binder does too.
@@ -533,9 +545,20 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
             let JoinExpr::Input { input, width, .. } = *right else {
                 unreachable!("matched by the guard");
             };
+            // Planned once here, per statement rather than per left row, so the
+            // passes that only *look* at the tree can see through the lateral
+            // item. Planning it with its outer references still standing is
+            // sound: an `OuterColumnRef` is not a column of this body's own row,
+            // so it contributes nothing to the column demand and every pass
+            // already walks past one.
+            let right_shape = match &input {
+                JoinInput::Subplan(body) => Some(Box::new(plan((**body).clone(), costs))),
+                JoinInput::Scan { .. } | JoinInput::TableFunction { .. } => None,
+            };
             PhysicalJoinExpr::Lateral {
                 left: Box::new(plan_join_expr(*left, costs)),
                 right: input,
+                right_shape,
                 right_width: width,
                 kind,
                 predicate,
@@ -880,9 +903,18 @@ fn collect_join_scans(
             collect_join_scans(left, out);
             collect_join_scans(right, out);
         }
-        // The lateral side is still logical and is planned afresh per left row,
-        // so it has no scan with a settled projection to report here.
-        PhysicalJoinExpr::Lateral { left, .. } => collect_join_scans(left, out),
+        // Through `right_shape`, not `right`: the executed plan is built per left
+        // row and does not exist yet, but a relation read only inside a lateral
+        // item is still read by the statement — leaving it out under-reports
+        // `pg_depend`, which is the one direction this must not err in.
+        PhysicalJoinExpr::Lateral {
+            left, right_shape, ..
+        } => {
+            collect_join_scans(left, out);
+            if let Some(shape) = right_shape {
+                collect_scans(shape, out);
+            }
+        }
     }
 }
 
@@ -2572,7 +2604,7 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
         }
         PhysicalJoinExpr::Lateral {
             left,
-            right,
+            right_shape,
             kind,
             predicate,
             ..
@@ -2588,18 +2620,16 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
                 lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
             }
             push_child(&mut lines, explain_join(left, None));
-            // One line, not a rendered subtree: the lateral side has no plan
-            // yet — it is built from the logical body once per left row, so
-            // there is nothing here that could be shown without inventing it.
+            // `right_shape`, the copy planned once for exactly this: the plan a
+            // row is actually produced by is built per left row and cannot be
+            // shown, but the two differ only in the constants substituted into
+            // them. A table function has no shape and renders as its own node.
             push_child(
                 &mut lines,
-                vec![
-                    match right {
-                        JoinInput::TableFunction { .. } => "Function Scan",
-                        _ => "Subquery Scan",
-                    }
-                    .to_string(),
-                ],
+                match right_shape {
+                    Some(shape) => explain(shape),
+                    None => vec!["Function Scan".to_string()],
+                },
             );
             lines
         }
@@ -3192,6 +3222,40 @@ mod tests {
         assert!(
             reads_id,
             "column 0 (`id`) is read by the lateral body, got {projection:?}"
+        );
+    }
+
+    #[test]
+    fn a_relation_read_only_inside_a_lateral_item_is_still_reported() {
+        // `scan_projections` feeds `pg_depend`'s per-column view dependencies,
+        // and the lateral side is the one part of the plan that is not planned
+        // with the statement — so without `right_shape` this relation, and every
+        // column edge on it, would be invisible.
+        let plan = plan_sql("SELECT s.z FROM t a, LATERAL (SELECT b.big AS z FROM t b) s");
+        let scanned: Vec<String> = scan_projections(&plan)
+            .iter()
+            .map(|(schema, _)| schema.name.clone())
+            .collect();
+        assert_eq!(
+            scanned,
+            vec!["t".to_string(), "t".to_string()],
+            "both the left scan and the one inside the lateral body"
+        );
+
+        // And EXPLAIN shows the lateral side as the subtree it is, rather than a
+        // one-line placeholder.
+        let PhysicalPlan::Join { source, .. } = &plan else {
+            panic!("expected Join");
+        };
+        let rendered = explain_join(source, None);
+        assert_eq!(rendered[0], "Nested Loop");
+        assert!(
+            rendered
+                .iter()
+                .filter(|l| l.contains("Seq Scan on t"))
+                .count()
+                == 2,
+            "the lateral body's scan is rendered too, got {rendered:?}"
         );
     }
 
