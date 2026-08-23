@@ -1340,9 +1340,8 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
 
 fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match join {
-        // A `LATERAL` leaf is a correlation level — its references name the row
-        // to its left, which the lateral join node itself supplies — so it is
-        // visited one deeper, exactly as `subst_outer_join` substitutes it.
+        // Depth moves exactly as it does in `subst_outer_join`; see there for
+        // why a `LATERAL` leaf is a level of its own.
         JoinExpr::Input { input, lateral, .. } => {
             let depth = depth + usize::from(*lateral);
             match input {
@@ -2796,19 +2795,16 @@ struct Preceding<'a> {
 }
 
 impl<'a> Preceding<'a> {
-    /// Nothing precedes this item.
     fn none() -> Self {
         Self::default()
     }
 
-    /// Whether any FROM item precedes this one at all. Nothing to reference
-    /// means nothing to probe for and no level to push.
+    /// Whether any FROM item precedes this one — reachable or not.
     fn is_empty(&self) -> bool {
         self.reachable.is_empty() && self.out_of_reach.is_empty()
     }
 
-    /// Every preceding item, reachable or not — what a barrier names, and what
-    /// the sibling probe asks about.
+    /// Every preceding item, reachable or not — what a barrier names.
     fn all(&self) -> Vec<ScopeItem> {
         let mut all = self.reachable.to_vec();
         all.extend(self.out_of_reach.iter().cloned());
@@ -3704,15 +3700,14 @@ fn bind_table_with_joins(
     demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
     // Whether the preceding comma groups are in the row this group's *leading*
-    // item is fed, which decides whether a `LATERAL` reference to one of them is
-    // an ordinary lateral reference or out of reach.
+    // item is fed.
     //
-    // With no joins, the group *is* that item, and [`bind_from_clause`] makes it
-    // the right child of the cross join with the preceding groups — their
-    // columns are exactly its left row. With a chain, the item becomes the
-    // bottom-left leaf of that chain and the cross join is spliced in *above*
-    // it, so there is no left row under it at all. Marking it lateral there
-    // would produce a leaf whose `level: 1` references no join node can fill.
+    // With no joins, the group *is* that item, and `bind_from_clause` makes it
+    // the right child of the cross join with those groups — their columns are
+    // exactly its left row. With a chain, the item becomes the chain's
+    // bottom-left leaf and the cross join is spliced in *above* it, so there is
+    // no left row under it at all: marking it lateral would leave `level: 1`
+    // references no join node can fill.
     let leads_a_chain = !table.joins.is_empty();
     let mut bound = bind_from_item(
         engine,

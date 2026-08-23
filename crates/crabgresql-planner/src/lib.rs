@@ -534,8 +534,8 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
                 predicate: None,
             }
         }
-        // The right side is lateral: it stays logical, and neither hash keys nor
-        // sunk leaf filters apply to a row source that is rebuilt per left row.
+        // Neither hash keys nor sunk leaf filters apply to a row source that is
+        // rebuilt per left row.
         JoinExpr::Join {
             left,
             right,
@@ -545,11 +545,9 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
             let JoinExpr::Input { input, width, .. } = *right else {
                 unreachable!("matched by the guard");
             };
-            // Planned once here, per statement rather than per left row, so the
-            // passes that only *look* at the tree can see through the lateral
-            // item. Planning it with its outer references still standing is
+            // Planning the body with its outer references still standing is
             // sound: an `OuterColumnRef` is not a column of this body's own row,
-            // so it contributes nothing to the column demand and every pass
+            // so it contributes nothing to the column demand, and every pass
             // already walks past one.
             let right_shape = match &input {
                 JoinInput::Subplan(body) => Some(Box::new(plan((**body).clone(), costs))),
@@ -2480,8 +2478,6 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
             },
             _ => vec![None; *width],
         },
-        // A lateral item's columns have no schema name to show, the same as
-        // any other subquery or table-function leaf.
         PhysicalJoinExpr::Lateral {
             left, right_width, ..
         } => {
@@ -2620,10 +2616,9 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
                 lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
             }
             push_child(&mut lines, explain_join(left, None));
-            // `right_shape`, the copy planned once for exactly this: the plan a
-            // row is actually produced by is built per left row and cannot be
-            // shown, but the two differ only in the constants substituted into
-            // them. A table function has no shape and renders as its own node.
+            // `right_shape`, the copy planned once for exactly this: the plan
+            // a row is actually produced by is built per left row and cannot be
+            // shown, but the two differ only in the constants substituted in.
             push_child(
                 &mut lines,
                 match right_shape {
@@ -3191,7 +3186,6 @@ mod tests {
         assert_eq!(*right_width, 1);
         assert!(matches!(right, JoinInput::Subplan(_)));
         assert!(!source.uses_hash_join());
-        // And EXPLAIN calls it what it is.
         assert_eq!(explain_join(&source, None)[0], "Nested Loop");
     }
 

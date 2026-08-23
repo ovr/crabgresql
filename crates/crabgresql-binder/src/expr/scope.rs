@@ -213,7 +213,7 @@ impl LateralBarrier {
     }
 
     /// Whether writing `LATERAL` would actually reach the item — the one thing
-    /// the HINT claims, and false on the right of a `RIGHT`/`FULL` join.
+    /// the HINT claims.
     fn lateral_would_help(self) -> bool {
         self == LateralBarrier::NeedsLateral
     }
@@ -1028,10 +1028,8 @@ impl Scope {
         };
         let mut level_no = 0;
         for level in self.outer.iter() {
-            // A barrier level is not an enclosing query: its items sit beside
-            // this one in the same FROM clause, so a match is the mistake it
-            // names rather than a correlated reference, and it leaves the level
-            // numbering of the real ancestors alone.
+            // A barrier level is not an enclosing query, so it leaves the
+            // level numbering of the real ancestors alone.
             if let Some(barrier) = level.barrier {
                 if let Some(rel) = level
                     .rels
@@ -1111,8 +1109,7 @@ impl Scope {
         }
         let mut level_no = 0;
         for level in self.outer.iter() {
-            // See `resolve_outer`: a barrier level raises rather than binding,
-            // and the qualifier alone decides — PG reports it for `t.nosuch`
+            // The qualifier alone decides — PG reports this for `t.nosuch`
             // too, without ever asking whether `t` has such a column.
             if let Some(barrier) = level.barrier {
                 if level.rels.iter().any(|r| r.qualifier == qualifier) {

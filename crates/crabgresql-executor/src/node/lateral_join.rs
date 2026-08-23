@@ -33,8 +33,7 @@ pub struct LateralJoin {
     kind: JoinKind,
     predicate: Option<BoundExpr>,
     ctx: ExecContext,
-    /// The left row being expanded, and the source built for it. `None` means
-    /// the next `next()` pulls a new left row.
+    /// The left row being expanded, and the source built for it.
     current: Option<(Tuple, Box<dyn ExecNode>)>,
     /// Whether any right row of the current left row passed the predicate —
     /// what a `LEFT JOIN LATERAL` null-extends on.
@@ -56,7 +55,7 @@ impl LateralJoin {
         // The binder refuses a lateral reference across a RIGHT/FULL join (as
         // PostgreSQL does), and no rewrite produces a lateral semi/anti join, so
         // the preserved-right machinery the other join nodes carry has no case
-        // here — and saying so is better than silently emitting a wrong shape.
+        // here.
         if !matches!(kind, JoinKind::Cross | JoinKind::Inner | JoinKind::Left) {
             return Err(ExecError::new(
                 crabgresql_pg_wire::sqlstate::INTERNAL_ERROR,
@@ -79,8 +78,7 @@ impl LateralJoin {
         })
     }
 
-    /// Build the right side for one left row: fill its outer references from
-    /// the row, then turn the result into an ordinary row source.
+    /// Build the right side for one left row.
     fn source_for(&self, left: &[Value]) -> Result<Box<dyn ExecNode>, ExecError> {
         let txn = self.ctx.txn.clone().ok_or_else(|| {
             ExecError::new(
@@ -143,8 +141,6 @@ impl ExecNode for LateralJoin {
 
             let Some(right_row) = right.next()? else {
                 let (left, _) = self.current.take().expect("matched above");
-                // A left row the lateral side produced nothing for (or nothing
-                // that passed the condition) survives only under LEFT JOIN.
                 if !self.matched && self.kind == JoinKind::Left {
                     let mut row = left;
                     row.extend(std::iter::repeat_n(Value::Null, self.right_width));
@@ -153,8 +149,8 @@ impl ExecNode for LateralJoin {
                 continue;
             };
 
-            // Tested in the reused probe buffer rather than a freshly built row,
-            // exactly as the two non-lateral join nodes do — see `fill_probe`.
+            // Tested in the reused probe buffer, as the two non-lateral join
+            // nodes do — see `fill_probe`.
             fill_probe(
                 &mut self.probe,
                 &self.touched,
