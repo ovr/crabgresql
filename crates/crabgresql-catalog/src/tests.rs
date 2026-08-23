@@ -2394,17 +2394,17 @@ fn every_view_definition_parses_and_names_our_columns() {
         }
     }
 
+    // Definitions this build cannot read, checked against the expected set
+    // below rather than skipped where they occur: a silent `continue` would
+    // outlive the gap that justifies it.
+    let mut unparsed = Vec::new();
+
     for def in registry::CATALOG_VIEWS {
         let name = def.rel.name;
-        if name == "pg_publication_tables" {
-            // `VARIADIC` in a call's argument list is a gap in the grammar, not
-            // in the transcription. Skipped by name rather than by a silent
-            // parse-failure branch, so the day the grammar grows it this fails
-            // and the skip goes away.
+        let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, def.definition) else {
+            unparsed.push(name);
             continue;
-        }
-        let statements = Parser::parse_sql(&PostgreSqlDialect {}, def.definition)
-            .unwrap_or_else(|e| panic!("{name}: its definition does not parse: {e}"));
+        };
         let [Statement::Query(query)] = statements.as_slice() else {
             panic!("{name}: a definition must be one query");
         };
@@ -2435,6 +2435,17 @@ fn every_view_definition_parses_and_names_our_columns() {
             "{name}: the row builder publishes columns the definition does not select"
         );
     }
+
+    // `pg_publication_tables` calls `pg_get_publication_tables(VARIADIC ...)`,
+    // and `VARIADIC` in a call's argument list is a gap in the grammar, not in
+    // the transcription — so its columns go unchecked until the grammar grows
+    // it. Empty here means that day came: drop the expectation and the view
+    // joins the check.
+    assert_eq!(
+        unparsed,
+        ["pg_publication_tables"],
+        "the set of definitions this build cannot parse moved"
+    );
 }
 
 /// Every `pg_catalog` relation has a distinct, non-zero OID that round-trips,
