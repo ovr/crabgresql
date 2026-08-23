@@ -77,6 +77,9 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
     let leaf = JoinExpr::Input {
         input: JoinInput::Subplan(Box::new(plan)),
         width,
+        // The arm is the subquery's own body with its correlation lifted into
+        // the join condition, so it reads no row but the one this node feeds it.
+        lateral: false,
     };
     let join = |left: JoinExpr| JoinExpr::Join {
         left: Box::new(left),
@@ -107,6 +110,7 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
                 source: join(JoinExpr::Input {
                     input: JoinInput::Scan { table, system },
                     width,
+                    lateral: false,
                 }),
                 columns,
                 projections,
@@ -133,6 +137,7 @@ pub(super) fn attach_arm(node: &mut LogicalPlan, arm: Arm) -> bool {
                             system: None,
                         },
                         width,
+                        lateral: false,
                     }
                 }
                 AggInput::Join(source) => source,
@@ -165,5 +170,6 @@ fn placeholder_join() -> JoinExpr {
     JoinExpr::Input {
         input: JoinInput::Subplan(Box::new(placeholder())),
         width: 0,
+        lateral: false,
     }
 }

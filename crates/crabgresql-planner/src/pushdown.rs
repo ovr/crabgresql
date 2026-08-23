@@ -416,6 +416,7 @@ mod tests {
                 ordinality: false,
             },
             width: 1,
+            lateral: false,
         }
     }
 

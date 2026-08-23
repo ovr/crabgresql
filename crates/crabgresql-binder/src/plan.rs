@@ -4,6 +4,7 @@
 //! silently dropping a clause would return wrong results instead of an honest
 //! error.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -20,12 +21,12 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 use crate::copy_rows::RowBatch;
 use crate::expr::{
     BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, ExprSortKey,
-    NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion, VisibleColumn,
-    VisibleLookup, WindowKind, apply_column_typmod, bind_binary_op, bind_column_default, bind_expr,
-    bind_projection, bind_scalar, coerce_expr, coerce_to_column, enum_value, lookup_visible,
-    merge_types, normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
-    reject_agg_or_window, reject_window, text_column_value, to_bool_operand, unify_value_column,
-    view_expansion,
+    LateralBarrier, NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion,
+    VisibleColumn, VisibleLookup, WindowKind, apply_column_typmod, barrier_levels, bind_binary_op,
+    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
+    enum_value, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
+    param_ctx_view_body, parse_unknown, reject_agg_or_window, reject_window, text_column_value,
+    to_bool_operand, unify_value_column, view_expansion,
 };
 use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
@@ -691,6 +692,15 @@ pub fn substitute_outer(plan: &mut LogicalPlan, outer: &[Value]) {
     subst_outer_plan(plan, outer, 1);
 }
 
+/// [`substitute_outer`] for loose expressions rather than a plan — a lateral
+/// table function's arguments, which the lateral join node fills from the left
+/// row before building the row source for it.
+pub fn substitute_outer_exprs(exprs: &mut [BoundExpr], outer: &[Value]) {
+    for expr in exprs {
+        subst_outer_expr(expr, outer, 1);
+    }
+}
+
 fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
     match plan {
         LogicalPlan::Values(ValuesPlan {
@@ -897,24 +907,24 @@ fn subst_outer_plan(plan: &mut LogicalPlan, outer: &[Value], depth: usize) {
 
 fn subst_outer_join(join: &mut JoinExpr, outer: &[Value], depth: usize) {
     match join {
-        JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan { .. } => {}
-            // Same depth. A FROM subquery binds with an empty outer scope, so
-            // no `OuterColumnRef` inside it can *escape* it — see the
-            // `debug_assert!` in `bind_from_item`'s Derived arm. (It may well
-            // hold references of its own, correlating one of its nested
-            // subqueries to its own relations; those sit below a marker, so
-            // they are visited at a deeper `depth` than their `level` and left
-            // alone.)
-            // TODO: LATERAL — it binds a FROM subquery against the enclosing
-            // scope, so it needs the `depth + 1` back here.
-            JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth),
-            JoinInput::TableFunction { args, .. } => {
-                for e in args.iter_mut() {
-                    subst_outer_expr(e, outer, depth);
+        // A plain FROM item stays at this depth: its body binds against the
+        // enclosing queries, so an `OuterColumnRef` that escapes it is filled
+        // from the same row this substitution carries. A `LATERAL` one is a
+        // correlation level of its own — its `level: 1` references name the row
+        // to its *left*, which only the lateral join node above can supply — so
+        // it is entered one deeper, leaving those references for that node.
+        JoinExpr::Input { input, lateral, .. } => {
+            let depth = depth + usize::from(*lateral);
+            match input {
+                JoinInput::Scan { .. } => {}
+                JoinInput::Subplan(plan) => subst_outer_plan(plan, outer, depth),
+                JoinInput::TableFunction { args, .. } => {
+                    for e in args.iter_mut() {
+                        subst_outer_expr(e, outer, depth);
+                    }
                 }
             }
-        },
+        }
         JoinExpr::Join {
             left,
             right,
@@ -1055,6 +1065,58 @@ fn plan_has_outer_refs_at(plan: &LogicalPlan, depth: usize) -> bool {
     let mut found = false;
     for_each_plan_expr(plan, depth, &mut |e, depth| {
         if expr_has_outer_ref(e, depth) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Settle the correlation level a `LATERAL` bind pushed for the FROM items to
+/// this one's left: report whether the body landed on it, and undo the push if
+/// it did not.
+///
+/// Undoing it matters twice over. A reference that survives names a genuinely
+/// enclosing query, and with the level gone it has to move one closer or the
+/// boundary above will never fill it; and a leaf marked lateral for nothing
+/// would pay for a per-left-row re-execution it has no use for. Substituting
+/// from an empty row is exactly that renumbering — `level > depth` is
+/// decremented, `level < depth` left alone — and `level == depth` cannot occur,
+/// which is what the walk above has just established.
+fn settle_lateral_level(plan: &mut LogicalPlan) -> bool {
+    let mut found = false;
+    for_each_plan_expr(plan, 1, &mut |e, depth| {
+        found = found || expr_refs_immediate_outer(e, depth);
+    });
+    if !found {
+        subst_outer_plan(plan, &[], 1);
+    }
+    found
+}
+
+/// [`settle_lateral_level`] for a table function's arguments, which sit directly
+/// at the item's own depth rather than inside a plan.
+fn settle_lateral_level_exprs(exprs: &mut [BoundExpr]) -> bool {
+    if exprs.iter().any(|e| expr_refs_immediate_outer(e, 1)) {
+        return true;
+    }
+    for expr in exprs {
+        subst_outer_expr(expr, &[], 1);
+    }
+    false
+}
+
+/// Whether `expr` reads the row of the query level *immediately* enclosing it.
+///
+/// [`plan_has_outer_refs`] answers the wider "does anything escape", which is
+/// the right question for deciding whether a subquery can be folded once. This
+/// narrower one — `level == depth` rather than `>=` — is what tells a `LATERAL`
+/// item that landed on the pushed level from one that only reached past it.
+fn expr_refs_immediate_outer(expr: &BoundExpr, depth: usize) -> bool {
+    let mut found = false;
+    for_each_subexpr(expr, depth, &mut |expr, depth| {
+        if let BoundExpr::OuterColumnRef { level, .. } = expr
+            && *level == depth
+        {
             found = true;
         }
     });
@@ -1269,11 +1331,16 @@ fn for_each_plan_expr(plan: &LogicalPlan, depth: usize, f: &mut impl FnMut(&Boun
 
 fn for_each_join_expr(join: &JoinExpr, depth: usize, f: &mut impl FnMut(&BoundExpr, usize)) {
     match join {
-        JoinExpr::Input { input, .. } => match input {
-            JoinInput::Scan { .. } => {}
-            JoinInput::Subplan(plan) => for_each_plan_expr(plan, depth, &mut *f),
-            JoinInput::TableFunction { args, .. } => args.iter().for_each(|e| f(e, depth)),
-        },
+        // Depth moves exactly as it does in `subst_outer_join`; see there for
+        // why a `LATERAL` leaf is a level of its own.
+        JoinExpr::Input { input, lateral, .. } => {
+            let depth = depth + usize::from(*lateral);
+            match input {
+                JoinInput::Scan { .. } => {}
+                JoinInput::Subplan(plan) => for_each_plan_expr(plan, depth, &mut *f),
+                JoinInput::TableFunction { args, .. } => args.iter().for_each(|e| f(e, depth)),
+            }
+        }
         JoinExpr::Join {
             left,
             right,
@@ -1407,9 +1474,18 @@ fn plan_for_each_subexpr(plan: &LogicalPlan, depth: usize, f: &mut dyn FnMut(&Bo
 /// agreeing on these slots must produce the same answer, since the plan run for
 /// them is the same plan.
 pub fn plan_outer_ref_slots(plan: &LogicalPlan) -> Option<Vec<(usize, PgType)>> {
+    outer_ref_slots(|f| plan_for_each_subexpr(plan, 1, f))
+}
+
+/// The shared body of [`plan_outer_ref_slots`] and [`lateral_input_slots`]:
+/// drive `walk` and keep the slots it reports *at* its own depth, unless it also
+/// reads one further out.
+fn outer_ref_slots(
+    walk: impl FnOnce(&mut dyn FnMut(&BoundExpr, usize)),
+) -> Option<Vec<(usize, PgType)>> {
     let mut slots = std::collections::BTreeMap::new();
     let mut escapes_further = false;
-    plan_for_each_subexpr(plan, 1, &mut |expr, depth| {
+    walk(&mut |expr, depth| {
         if let BoundExpr::OuterColumnRef { level, index, ty } = expr {
             if *level == depth {
                 slots.insert(*index, *ty);
@@ -1419,6 +1495,27 @@ pub fn plan_outer_ref_slots(plan: &LogicalPlan) -> Option<Vec<(usize, PgType)>> 
         }
     });
     (!escapes_further).then(|| slots.into_iter().collect())
+}
+
+/// The left-row slots a `LATERAL` FROM item reads, ascending — the columns the
+/// join node below it must still be producing for the item to be fillable.
+///
+/// `None` means "cannot be pinned down": the item also reads a row further out,
+/// so the set this walk can see is not the whole of what it depends on. The
+/// column-projection pass reads that as "keep every left column", the same
+/// fail-safe it applies to an expression it cannot bound.
+pub fn lateral_input_slots(input: &JoinInput) -> Option<Vec<usize>> {
+    let slots = match input {
+        // Never lateral — a base relation reads no row but its own.
+        JoinInput::Scan { .. } => Vec::new(),
+        JoinInput::Subplan(plan) => plan_outer_ref_slots(plan)?,
+        JoinInput::TableFunction { args, .. } => outer_ref_slots(|f| {
+            for arg in args {
+                for_each_subexpr(arg, 1, &mut *f);
+            }
+        })?,
+    };
+    Some(slots.into_iter().map(|(index, _)| index).collect())
 }
 
 /// Whether `plan` calls a volatile function (or a routine, which PostgreSQL
@@ -2564,8 +2661,17 @@ fn bind_table_query(
         source,
         relations,
         visible,
-    } = bind_from_item(engine, catalog, params, &relation, ctes, &[], &[], &demand)?
-        .into_bound_from();
+    } = bind_from_item(
+        engine,
+        catalog,
+        params,
+        &relation,
+        ctes,
+        &Preceding::none(),
+        &[],
+        &demand,
+    )?
+    .into_bound_from();
     let scope = Scope::relations_with_visible(relations, visible, catalog, params);
     let mut columns = Vec::new();
     let mut projections = Vec::new();
@@ -2645,6 +2751,122 @@ struct BoundFromItem {
     system_base: Option<usize>,
     /// See [`ScopeItem::declined_system`].
     declined_system: Option<DeclinedSystem>,
+    /// See [`JoinExpr::Input::lateral`]: this item actually references the FROM
+    /// items to its left, so the row source has to be rebuilt per left row.
+    lateral: bool,
+}
+
+/// What the FROM items *before* this one offer it, which is the whole of what
+/// `LATERAL` means.
+///
+/// `reachable` are the ones whose columns end up in the row the join node above
+/// this item feeds it, laid out base-0 in exactly that row's order — the only
+/// ones a lateral reference can be filled from, and the level pushed under a
+/// lateral bind. `out_of_reach` precede this item too but sit in another
+/// comma-separated group, which [`bind_from_clause`] cross-joins *above* the
+/// chain, so they never reach that row.
+///
+/// A leftmost FROM item gets [`Preceding::none`]: nothing precedes it, so
+/// `LATERAL` on it is legal and inert.
+#[derive(Default)]
+struct Preceding<'a> {
+    reachable: &'a [ScopeItem],
+    visible: Option<&'a [VisibleColumn]>,
+    out_of_reach: &'a [ScopeItem],
+    /// Set when this item is the right side of a `RIGHT`/`FULL` join, where the
+    /// left row is not guaranteed to exist — so it may not reference
+    /// `reachable` at all, whether or not `LATERAL` is written. Turns the
+    /// lateral level into a barrier that raises PG's error.
+    right_of_outer_join: bool,
+}
+
+impl<'a> Preceding<'a> {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether any FROM item precedes this one — reachable or not.
+    fn is_empty(&self) -> bool {
+        self.reachable.is_empty() && self.out_of_reach.is_empty()
+    }
+
+    /// Every preceding item, reachable or not — what a barrier names.
+    fn items(&self) -> impl Iterator<Item = ScopeItem> + '_ {
+        self.reachable.iter().chain(self.out_of_reach).cloned()
+    }
+
+    /// Whether [`Self::lateral_levels`] puts a correlation level in front of
+    /// the enclosing queries for this item.
+    ///
+    /// The one question the caller has to ask after binding: if a level was
+    /// pushed, a reference at level 1 names the left row and the leaf is
+    /// lateral; if none was, level 1 still means the enclosing query and the
+    /// leaf must be left alone.
+    fn pushes_a_level(&self) -> bool {
+        !self.reachable.is_empty() && !self.right_of_outer_join
+    }
+
+    /// The outer-level chain a `LATERAL` body (or a table function's arguments)
+    /// binds against: the reachable items as level 1, then the enclosing
+    /// queries. An out-of-reach item is a barrier sitting *between* the two, so
+    /// it shadows a like-named enclosing relation instead of silently binding
+    /// to it — and consumes no level number.
+    ///
+    /// With nothing reachable, no level is pushed at all: a leftmost `LATERAL`
+    /// item's references belong to the enclosing query and must stay at level 1.
+    fn lateral_levels<'s>(
+        &self,
+        outer_scope: &'s [OuterLevel],
+        catalog: &Arc<dyn TypeCatalog>,
+        params: &ParamCtx,
+    ) -> Cow<'s, [OuterLevel]> {
+        if self.right_of_outer_join {
+            return Cow::Owned(barrier_levels(
+                self.items(),
+                LateralBarrier::WrongJoinType,
+                outer_scope,
+            ));
+        }
+        let tail = match self.out_of_reach.is_empty() {
+            true => Cow::Borrowed(outer_scope),
+            false => Cow::Owned(barrier_levels(
+                self.out_of_reach.iter().cloned(),
+                LateralBarrier::OtherGroup,
+                outer_scope,
+            )),
+        };
+        if self.reachable.is_empty() {
+            return tail;
+        }
+        Cow::Owned(
+            Scope::relations_with_visible(
+                self.reachable.to_vec(),
+                self.visible.map(<[VisibleColumn]>::to_vec),
+                catalog,
+                params,
+            )
+            .with_outer(tail.into_owned())
+            .as_outer_levels(),
+        )
+    }
+
+    /// The outer-level chain a *non*-lateral subquery in FROM binds against:
+    /// the enclosing queries, behind a barrier naming every preceding item so a
+    /// reference to one reports what PostgreSQL reports rather than "missing
+    /// FROM-clause entry".
+    fn barred_levels<'s>(&self, outer_scope: &'s [OuterLevel]) -> Cow<'s, [OuterLevel]> {
+        if self.is_empty() {
+            return Cow::Borrowed(outer_scope);
+        }
+        // On the right of a RIGHT/FULL join the items are out of reach whatever
+        // is written, so the hint that `LATERAL` would reach them is dropped —
+        // as PostgreSQL drops it.
+        let barrier = match self.right_of_outer_join {
+            true => LateralBarrier::NeverReachable,
+            false => LateralBarrier::NeedsLateral,
+        };
+        Cow::Owned(barrier_levels(self.items(), barrier, outer_scope))
+    }
 }
 
 /// A bound FROM clause (or one comma-delimited `TableWithJoins` group): its
@@ -2667,6 +2889,7 @@ impl BoundFromItem {
             source: JoinExpr::Input {
                 input: self.input,
                 width,
+                lateral: self.lateral,
             },
             relations: vec![ScopeItem {
                 qualifier: self.qualifier,
@@ -2815,11 +3038,10 @@ fn view_output_columns(
 
 /// Resolve one FROM item to a [`BoundFromItem`], producing a bare row source
 /// (no projection pipeline) so several can be combined into a join tree.
-/// `siblings` are the FROM items already bound to this item's left, used only to
-/// tell an implicitly-lateral table-function argument from a genuinely unknown
-/// column (see [`bind_table_fn_args`]); it is empty for the leftmost item.
-/// `outer_scope` carries the enclosing queries' relations, which a table
-/// function's arguments — and only they, among FROM items — may reference.
+/// `preceding` describes the FROM items already bound to this one's left — what
+/// a `LATERAL` item (and an implicitly-lateral table function) may reference,
+/// and what a plain subquery is refused with. `outer_scope` carries the
+/// enclosing queries' relations.
 #[allow(clippy::too_many_arguments)]
 fn bind_from_item(
     engine: &Arc<dyn TableEngine>,
@@ -2827,7 +3049,7 @@ fn bind_from_item(
     params: &ParamCtx,
     relation: &ast::TableFactor,
     ctes: &CteEnv,
-    siblings: &[ScopeItem],
+    preceding: &Preceding,
     outer_scope: &[OuterLevel],
     demand: &SystemDemand,
 ) -> Result<BoundFromItem, BindError> {
@@ -2852,7 +3074,7 @@ fn bind_from_item(
                 *with_ordinality,
                 catalog,
                 params,
-                siblings,
+                preceding,
                 outer_scope,
             )
         }
@@ -2883,15 +3105,15 @@ fn bind_from_item(
                     "unnest with multiple arrays is not supported yet",
                 ));
             }
-            let (func, args) = bind_table_fn_args(
+            let (func, args, lateral) = bind_table_fn_args(
                 "unnest",
                 array_exprs,
                 catalog,
                 params,
-                siblings,
+                preceding,
                 outer_scope,
             )?;
-            bound_table_fn_item(func, args, "unnest", alias, *with_ordinality)
+            bound_table_fn_item(func, args, "unnest", alias, *with_ordinality, lateral)
         }
         // `LATERAL f(…)` gets its own factor, and binds exactly like the `f(…)`
         // above: a function FROM item is implicitly LATERAL in PostgreSQL, so the
@@ -2909,7 +3131,7 @@ fn bind_from_item(
             *with_ordinality,
             catalog,
             params,
-            siblings,
+            preceding,
             outer_scope,
         ),
         // A bare name may resolve to a CTE (which shadows a real table).
@@ -2935,6 +3157,7 @@ fn bind_from_item(
                     input: JoinInput::Subplan(Box::new(cte.plan.clone())),
                     system_base: None,
                     declined_system: None,
+                    lateral: false,
                 });
             }
             // Read resolution honors the search path: temp → pg_catalog →
@@ -3020,6 +3243,7 @@ fn bind_from_item(
                         input,
                         system_base,
                         declined_system,
+                        lateral: false,
                     })
                 }
                 Err(e) => {
@@ -3051,6 +3275,7 @@ fn bind_from_item(
                             // exposes no system columns on one either.
                             system_base: None,
                             declined_system: None,
+                            lateral: false,
                         });
                     }
                     Err(not_found_as_written(e, cte_schema.as_deref(), &tname))
@@ -3063,15 +3288,6 @@ fn bind_from_item(
             alias,
             ..
         } => {
-            // Everything below binds the body with an empty outer scope, which
-            // is exactly what LATERAL is not. Left to fall through, `LATERAL
-            // (SELECT o.x …)` would fail with a misleading `42703 column "o.x"
-            // does not exist`; say what is actually missing instead.
-            if *lateral {
-                return Err(BindError::feature_not_supported(
-                    "LATERAL is not supported yet",
-                ));
-            }
             let Some(alias) = alias else {
                 return Err(BindError::new(
                     sqlstate::SYNTAX_ERROR,
@@ -3079,25 +3295,20 @@ fn bind_from_item(
                 ));
             };
             let qualifier = normalize_ident(&alias.name);
-            // A (non-LATERAL) subquery in FROM cannot see the enclosing query's
-            // columns, so it binds with no outer scope.
-            let inner = bind_query_scoped(engine, catalog, params, subquery, ctes, &[])?;
-            // That empty scope is load-bearing: `subst_outer_join` descends into
-            // this subplan at the *same* depth, which is only sound because no
-            // `OuterColumnRef` can *escape* it — an escaping one needs a
-            // non-empty `Scope::outer` at this bind. (References that stay
-            // inside, correlating a nested subquery of the body to the body's
-            // own relations, are both legal and common; `plan_has_outer_refs`
-            // is depth-aware precisely so they do not read as escaping.)
-            // Implementing LATERAL means binding this against the enclosing scope,
-            // and then the `depth + 1` has to come back — this assert is what will
-            // say so.
-            debug_assert!(
-                !plan_has_outer_refs(&inner),
-                "no outer reference can escape a FROM subquery bound with an empty outer \
-                 scope; supporting LATERAL means restoring the `depth + 1` in \
-                 `subst_outer_join`"
-            );
+            // The one difference LATERAL makes: whether the FROM items to this
+            // one's left are a scope the body may resolve against, or a barrier
+            // that names them only to refuse. Either way the enclosing queries
+            // follow — a plain FROM subquery is correlated to them just as an
+            // expression subquery is, and stays at the same correlation depth.
+            let levels = match lateral {
+                true => preceding.lateral_levels(outer_scope, catalog, params),
+                false => preceding.barred_levels(outer_scope),
+            };
+            let mut inner = bind_query_scoped(engine, catalog, params, subquery, ctes, &levels)?;
+            // Whether the body used the level `lateral_levels` pushed decides
+            // both the flag and the depth arithmetic above the leaf.
+            let is_lateral =
+                *lateral && preceding.pushes_a_level() && settle_lateral_level(&mut inner);
             let mut columns = output_columns_of(&inner)?;
             apply_alias_columns(&mut columns, &alias.columns, &table_subject(&qualifier))?;
             Ok(BoundFromItem {
@@ -3106,6 +3317,7 @@ fn bind_from_item(
                 input: JoinInput::Subplan(Box::new(inner)),
                 system_base: None,
                 declined_system: None,
+                lateral: is_lateral,
             })
         }
         other => Err(BindError::feature_not_supported(format!(
@@ -3409,6 +3621,7 @@ fn bind_from_clause(
             outer_scope,
             windows,
             &relations,
+            visible.as_deref(),
             demand,
         )?;
         for rel in &group_relations {
@@ -3470,15 +3683,39 @@ fn bind_table_with_joins(
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
     siblings: &[ScopeItem],
+    // The merged `USING`/`NATURAL` view accumulated over `siblings`, so a
+    // `LATERAL` leading item resolves such a join column the way PostgreSQL
+    // does — once, rather than ambiguously across both physical sides.
+    siblings_visible: Option<&[VisibleColumn]>,
     demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
+    // Whether the preceding comma groups are in the row this group's *leading*
+    // item is fed.
+    //
+    // With no joins, the group *is* that item, and `bind_from_clause` makes it
+    // the right child of the cross join with those groups — their columns are
+    // exactly its left row. With a chain, the item becomes the chain's
+    // bottom-left leaf and the cross join is spliced in *above* it, so there is
+    // no left row under it at all: marking it lateral would leave `level: 1`
+    // references no join node can fill.
+    let leading = match table.joins.is_empty() {
+        true => Preceding {
+            reachable: siblings,
+            visible: siblings_visible,
+            ..Preceding::none()
+        },
+        false => Preceding {
+            out_of_reach: siblings,
+            ..Preceding::none()
+        },
+    };
     let mut bound = bind_from_item(
         engine,
         catalog,
         params,
         &table.relation,
         ctes,
-        siblings,
+        &leading,
         outer_scope,
         demand,
     )?
@@ -3495,15 +3732,6 @@ fn bind_table_with_joins(
     // group's combined row (base 0). Materialized only once a USING/NATURAL join
     // needs it; an all-`ON`/`CROSS` chain leaves it `None` and allocates nothing.
     let mut visible: Option<Vec<VisibleColumn>> = None;
-    // Everything already joined to this item's left — what an implicitly-lateral
-    // table-function argument could legally reference. Grown in place as the
-    // chain is bound, so an N-way join does not re-clone the accumulated columns
-    // N times.
-    let mut left_relations: Vec<ScopeItem> = Vec::new();
-    if !table.joins.is_empty() {
-        left_relations.extend(siblings.iter().cloned());
-        left_relations.extend(bound.relations.iter().cloned());
-    }
 
     for join in &table.joins {
         if join.global {
@@ -3511,23 +3739,36 @@ fn bind_table_with_joins(
                 "GLOBAL JOIN is not supported yet",
             ));
         }
+        // Bound before the right factor, because the join kind decides whether
+        // that factor may reference the left side at all: PostgreSQL refuses a
+        // `LATERAL` reference across a RIGHT or FULL join, where the left row
+        // it would read is not guaranteed to exist.
+        let binding = join_kind_and_constraint(&join.join_operator)?;
         let right = bind_from_item(
             engine,
             catalog,
             params,
             &join.relation,
             ctes,
-            &left_relations,
+            &Preceding {
+                // The accumulated left side of *this* chain, in the layout of
+                // the row this join node is fed. Items from earlier comma
+                // groups precede it too, but the tree cross-joins those above
+                // the chain, so they never reach that row.
+                reachable: &bound.relations,
+                visible: visible.as_deref(),
+                out_of_reach: siblings,
+                right_of_outer_join: matches!(binding.kind(), JoinKind::Right | JoinKind::Full),
+            },
             outer_scope,
             demand,
         )?
         .into_bound_from();
-        left_relations.extend(right.relations.iter().cloned());
         let right_qualifier = &right.relations[0].qualifier;
         ensure_unique_qualifier(&mut seen, right_qualifier)?;
         let right_width = right.source.width();
 
-        let (kind, predicate) = match join_kind_and_constraint(&join.join_operator)? {
+        let (kind, predicate) = match binding {
             JoinBinding::Cross => {
                 if let Some(v) = &mut visible {
                     v.extend(default_visible(&right.relations, left_width, catalog)?);
@@ -3785,6 +4026,20 @@ enum JoinBinding<'a> {
     On(JoinKind, &'a ast::Expr),
     Using(JoinKind, Vec<String>),
     Natural(JoinKind),
+}
+
+impl JoinBinding<'_> {
+    /// The join semantics this binding produces, before any condition is bound
+    /// — which is when the right factor needs it, to decide whether a `LATERAL`
+    /// reference into the left side is allowed at all.
+    fn kind(&self) -> JoinKind {
+        match self {
+            JoinBinding::Cross => JoinKind::Cross,
+            JoinBinding::On(kind, _) | JoinBinding::Using(kind, _) | JoinBinding::Natural(kind) => {
+                *kind
+            }
+        }
+    }
 }
 
 /// A `USING (...)` column name: a bare identifier, normalized like any column
@@ -4080,7 +4335,7 @@ fn bind_function_from_item(
     with_ordinality: bool,
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
-    siblings: &[ScopeItem],
+    preceding: &Preceding,
     outer_scope: &[OuterLevel],
 ) -> Result<BoundFromItem, BindError> {
     // A *function* name, not a relation name: qualifiers are resolved by the
@@ -4088,59 +4343,40 @@ fn bind_function_from_item(
     let fname = crate::functions::function_name(name)
         .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
     let arg_exprs = positional_arg_exprs(args)?;
-    let (func, bound_args) =
-        bind_table_fn_args(&fname, &arg_exprs, catalog, params, siblings, outer_scope)?;
-    bound_table_fn_item(func, bound_args, &fname, alias, with_ordinality)
+    let (func, bound_args, lateral) =
+        bind_table_fn_args(&fname, &arg_exprs, catalog, params, preceding, outer_scope)?;
+    bound_table_fn_item(func, bound_args, &fname, alias, with_ordinality, lateral)
 }
 
-/// Bind a table function's arguments for a FROM item.
+/// Bind a table function's arguments for a FROM item, reporting whether they
+/// turned out to be lateral.
 ///
-/// Two scopes can answer them, and PostgreSQL consults them in this order:
+/// A function FROM item is *implicitly* LATERAL in PostgreSQL — `FROM t,
+/// unnest(t.arr)` needs no keyword — so its arguments bind against the same
+/// chain a written `LATERAL` gets: the reachable preceding items as level 1,
+/// then the enclosing queries. That ordering is the rule, not an optimization:
+/// `SELECT (SELECT … FROM unnest(t.arr)) FROM t` is an ordinary correlated
+/// reference, but a `t` in this very FROM clause shadows the outer one.
 ///
-/// 1. The FROM items already bound to this one's left. A function FROM item is
-///    implicitly LATERAL there, so `FROM t, unnest(t.arr)` resolves `t` — and
-///    that is the one thing this build cannot do. It is reported as the missing
-///    feature it is rather than resolved somewhere else: binding such a name
-///    outward instead would silently answer a *different* query.
-/// 2. The enclosing queries. `SELECT (SELECT … FROM unnest(t.arr)) FROM t` is an
-///    ordinary correlated reference, legal in PostgreSQL without LATERAL, and it
-///    binds to an [`BoundExpr::OuterColumnRef`] filled per outer row by
-///    [`substitute_outer`].
-///
-/// The sibling probe leads with "does this argument need more than constants?"
-/// because a constant binds in *every* scope, siblings included — asking the
-/// siblings alone would report `FROM t, generate_series(1, 5)` as a lateral
-/// reference.
-///
-/// The probe asks whether the *arguments* resolve against the siblings, not
-/// whether the whole call does, so the two gaps stay distinct: `unnest(t.arr)`
-/// resolves completely and the only thing missing is LATERAL itself, while
-/// `unnest(t.name)` on a text column reports the `42883` PostgreSQL reports. A
-/// name that resolves in neither scope keeps its own 42703/42P01, also matching
-/// PostgreSQL.
+/// The arguments themselves have no local scope — they are evaluated per left
+/// row, not per row of the function's own output — so the scope they bind in is
+/// [`Scope::empty`] over that chain.
 fn bind_table_fn_args(
     name: &str,
     arg_exprs: &[ast::Expr],
     catalog: &Arc<dyn TypeCatalog>,
     params: &ParamCtx,
-    siblings: &[ScopeItem],
+    preceding: &Preceding,
     outer_scope: &[OuterLevel],
-) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
-    if !siblings.is_empty() {
-        let bare = Scope::empty(catalog, params);
-        let lateral = Scope::relations(siblings.to_vec(), catalog, params);
-        let needs_a_sibling = arg_exprs
-            .iter()
-            .any(|e| bind_expr(e, &bare).is_err() && bind_expr(e, &lateral).is_ok());
-        if needs_a_sibling {
-            return Err(match bind_table_fn_call(name, arg_exprs, &lateral) {
-                Ok(_) => BindError::feature_not_supported("LATERAL is not supported yet"),
-                Err(call_error) => call_error,
-            });
-        }
-    }
-    let scope = Scope::empty(catalog, params).with_outer(outer_scope.to_vec());
-    bind_table_fn_call(name, arg_exprs, &scope)
+) -> Result<(TableFn, Vec<BoundExpr>, bool), BindError> {
+    let levels = preceding.lateral_levels(outer_scope, catalog, params);
+    let scope = Scope::empty(catalog, params).with_outer(levels.into_owned());
+    let (func, mut args) = bind_table_fn_call(name, arg_exprs, &scope)?;
+    // Same settlement as the `Derived` arm: whether an argument landed on the
+    // level `lateral_levels` pushed decides both the flag and the depth
+    // arithmetic above this leaf.
+    let lateral = preceding.pushes_a_level() && settle_lateral_level_exprs(&mut args);
+    Ok((func, args, lateral))
 }
 
 /// Assemble the FROM item for an already-resolved table function. `default_name`
@@ -4161,6 +4397,7 @@ fn bound_table_fn_item(
     default_name: &str,
     alias: &Option<ast::TableAlias>,
     ordinality: bool,
+    lateral: bool,
 ) -> Result<BoundFromItem, BindError> {
     let qualifier = relation_qualifier(alias, default_name);
     let mut columns = func.columns();
@@ -4190,6 +4427,7 @@ fn bound_table_fn_item(
         },
         system_base: None,
         declined_system: None,
+        lateral,
     })
 }
 

@@ -115,10 +115,149 @@ impl ScopeRel {
 /// an unqualified reference to a `USING`/`NATURAL` join column of an outer query
 /// resolves to the single merged column (as in PG) rather than being reported
 /// ambiguous. Level 1 is the immediate parent; deeper ancestors follow.
+///
+/// A level carrying a [`LateralBarrier`] is not an enclosing query at all — see
+/// that type — and so does not consume a level number.
 #[derive(Clone)]
 pub(crate) struct OuterLevel {
     rels: Vec<ScopeRel>,
     visible: Option<Vec<VisibleColumn>>,
+    barrier: Option<LateralBarrier>,
+}
+
+/// A pseudo outer level holding FROM items that sit *beside* the one being
+/// bound rather than above it: they precede it in the same FROM clause, so a
+/// reference to one is neither a local column nor a correlated reference to an
+/// enclosing query — it is the specific mistake PostgreSQL names.
+///
+/// Resolution consults these before the real enclosing queries, which is what
+/// makes a same-level FROM item shadow a like-named outer one, and raises
+/// instead of binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateralBarrier {
+    /// A plain subquery in FROM: legal to write, but only `LATERAL` lets it see
+    /// its siblings.
+    NeedsLateral,
+    /// The same, on the right of a `RIGHT`/`FULL` join — where writing `LATERAL`
+    /// would not help either, so PostgreSQL states the fact and offers no hint.
+    NeverReachable,
+    /// A `LATERAL` item on the right of a `RIGHT`/`FULL` join, where the left
+    /// row it would reference may not exist at all.
+    WrongJoinType,
+    /// A `LATERAL` item *anywhere in an explicit join chain* — leading it or
+    /// inside it — referencing a FROM item from an earlier comma-separated
+    /// group. PostgreSQL answers these queries; we do not, because the join tree
+    /// cross-joins the groups *above* the chain, so that item's columns are not
+    /// in the row any node of the chain is fed.
+    ///
+    /// A barrier rather than a silent fall-through to the enclosing queries,
+    /// which would bind a like-named outer relation and answer a different
+    /// question — and rather than binding it anyway, which would leave a leaf
+    /// holding `level: 1` references no join node above it can substitute.
+    OtherGroup,
+}
+
+impl LateralBarrier {
+    /// The `42P01` a qualified reference (`t.c`) through this barrier raises.
+    /// The qualifier alone decides — PostgreSQL reports this even when the
+    /// relation has no column by that name.
+    fn refuse_relation(self, qualifier: &str) -> BindError {
+        let err = BindError::new(
+            sqlstate::UNDEFINED_TABLE,
+            format!("invalid reference to FROM-clause entry for table \"{qualifier}\""),
+        );
+        match self {
+            LateralBarrier::NeedsLateral | LateralBarrier::NeverReachable => {
+                let err = err.with_detail(Some(format!(
+                    "There is an entry for table \"{qualifier}\", but it cannot be referenced \
+                     from this part of the query."
+                )));
+                err.with_hint(self.lateral_would_help().then(|| {
+                    "To reference that table, you must mark this subquery with LATERAL.".to_string()
+                }))
+            }
+            LateralBarrier::WrongJoinType => err.with_detail(Some(
+                "The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+                    .to_string(),
+            )),
+            LateralBarrier::OtherGroup => BindError::feature_not_supported(format!(
+                "LATERAL reference to \"{qualifier}\" from another comma-separated FROM item \
+                 is not supported yet"
+            )),
+        }
+    }
+
+    /// The error an *unqualified* column name found behind this barrier raises.
+    /// A plain FROM subquery gets a column-shaped wording; a `LATERAL` item
+    /// across the wrong join type is blamed on the relation either way.
+    fn refuse_column(self, column: &str, qualifier: &str) -> BindError {
+        match self {
+            LateralBarrier::NeedsLateral | LateralBarrier::NeverReachable => {
+                let err = BindError::new(
+                    sqlstate::UNDEFINED_COLUMN,
+                    format!("column \"{column}\" does not exist"),
+                )
+                .with_detail(Some(format!(
+                    "There is a column named \"{column}\" in table \"{qualifier}\", but it \
+                     cannot be referenced from this part of the query."
+                )));
+                err.with_hint(self.lateral_would_help().then(|| {
+                    "To reference that column, you must mark this subquery with LATERAL."
+                        .to_string()
+                }))
+            }
+            LateralBarrier::WrongJoinType | LateralBarrier::OtherGroup => {
+                self.refuse_relation(qualifier)
+            }
+        }
+    }
+
+    /// Whether writing `LATERAL` would actually reach the item — the one thing
+    /// the HINT claims.
+    fn lateral_would_help(self) -> bool {
+        self == LateralBarrier::NeedsLateral
+    }
+}
+
+/// Lay `items` out as scope relations, each column's index its position in the
+/// concatenated row.
+fn scope_rels(items: impl IntoIterator<Item = ScopeItem>) -> Vec<ScopeRel> {
+    let mut offset = 0;
+    items
+        .into_iter()
+        .map(|item| {
+            let rel = ScopeRel {
+                qualifier: item.qualifier,
+                columns: item.columns,
+                offset,
+                system_base: item.system_base,
+                declined_system: item.declined_system,
+            };
+            offset += rel.columns.len();
+            rel
+        })
+        .collect()
+}
+
+/// The outer-level chain a FROM item binds against when the items to its left
+/// are visible but off limits: a barrier level naming them, then the real
+/// enclosing queries unchanged (the barrier consumes no level number).
+///
+/// The offsets `scope_rels` assigns are never read here — every match through a
+/// barrier is an error, not an expression.
+pub(crate) fn barrier_levels(
+    items: impl IntoIterator<Item = ScopeItem>,
+    barrier: LateralBarrier,
+    outer: &[OuterLevel],
+) -> Vec<OuterLevel> {
+    let mut levels = Vec::with_capacity(outer.len() + 1);
+    levels.push(OuterLevel {
+        rels: scope_rels(items),
+        visible: None,
+        barrier: Some(barrier),
+    });
+    levels.extend(outer.iter().cloned());
+    levels
 }
 
 /// One column of a merged join namespace (`JOIN … USING` / `NATURAL JOIN`): the
@@ -638,39 +777,19 @@ impl Scope {
     /// A multi-relation scope for a cross join. Each item becomes a relation;
     /// offsets are assigned left-to-right so a column's index is its position in
     /// the concatenated row.
-    pub fn relations(
-        items: Vec<ScopeItem>,
-        catalog: &Arc<dyn TypeCatalog>,
-        params: &ParamCtx,
-    ) -> Scope {
-        Self::relations_with_visible(items, None, catalog, params)
-    }
-
-    /// Like [`Scope::relations`], but with an explicit merged-column view for a
-    /// FROM clause that contains a `USING`/`NATURAL` join. The `rels` are still
-    /// built from `items` (so qualified `q.c` resolves each side's own column);
-    /// `visible`, when `Some`, drives unqualified resolution and `*` expansion.
+    ///
+    /// `visible`, when `Some`, is the merged-column view of a FROM clause
+    /// containing a `USING`/`NATURAL` join: the `rels` are still built from
+    /// `items` (so qualified `q.c` resolves each side's own column), but
+    /// unqualified resolution and `*` expansion follow the merged view.
     pub fn relations_with_visible(
         items: Vec<ScopeItem>,
         visible: Option<Vec<VisibleColumn>>,
         catalog: &Arc<dyn TypeCatalog>,
         params: &ParamCtx,
     ) -> Scope {
-        let mut offset = 0;
-        let mut rels = Vec::with_capacity(items.len());
-        for item in items {
-            let width = item.columns.len();
-            rels.push(ScopeRel {
-                qualifier: item.qualifier,
-                columns: item.columns,
-                offset,
-                system_base: item.system_base,
-                declined_system: item.declined_system,
-            });
-            offset += width;
-        }
         Scope {
-            rels,
+            rels: scope_rels(items),
             visible,
             catalog: catalog.clone(),
             params: params.clone(),
@@ -804,6 +923,7 @@ impl Scope {
         levels.push(OuterLevel {
             rels: self.rels.clone(),
             visible: self.visible.clone(),
+            barrier: None,
         });
         levels.extend(self.outer.iter().cloned());
         levels
@@ -898,8 +1018,21 @@ impl Scope {
                 format!("column reference \"{name}\" is ambiguous"),
             )
         };
-        for (depth, level) in self.outer.iter().enumerate() {
-            let level_no = depth + 1;
+        let mut level_no = 0;
+        for level in self.outer.iter() {
+            // A barrier level is not an enclosing query, so it leaves the
+            // level numbering of the real ancestors alone.
+            if let Some(barrier) = level.barrier {
+                if let Some(rel) = level
+                    .rels
+                    .iter()
+                    .find(|rel| rel.columns.iter().any(|c| c.name == name))
+                {
+                    return Err(barrier.refuse_column(name, &rel.qualifier));
+                }
+                continue;
+            }
+            level_no += 1;
             // A `USING`/`NATURAL` join in the outer query merges its join column
             // into one `visible` entry; resolve against it first so a correlated
             // unqualified reference to that column is not seen as ambiguous across
@@ -966,11 +1099,21 @@ impl Scope {
             let local = column_in_rel(rel, qualifier, column)?;
             return self.column_expr(rel, local);
         }
-        for (depth, level) in self.outer.iter().enumerate() {
+        let mut level_no = 0;
+        for level in self.outer.iter() {
+            // The qualifier alone decides — PG reports this for `t.nosuch`
+            // too, without ever asking whether `t` has such a column.
+            if let Some(barrier) = level.barrier {
+                if level.rels.iter().any(|r| r.qualifier == qualifier) {
+                    return Err(barrier.refuse_relation(qualifier));
+                }
+                continue;
+            }
+            level_no += 1;
             if let Some(rel) = level.rels.iter().find(|r| r.qualifier == qualifier) {
                 let local = column_in_rel(rel, qualifier, column)?;
                 let expr = self.column_expr(rel, local)?;
-                return Ok(outerize_columns(&expr, depth + 1));
+                return Ok(outerize_columns(&expr, level_no));
             }
         }
         Err(BindError::new(
@@ -1038,7 +1181,12 @@ impl Scope {
     /// The same, for a correlated reference `level` query levels up (1 = the
     /// immediate parent).
     pub fn outer_column_typmod(&self, level: usize, index: usize) -> i32 {
-        match self.outer.get(level.wrapping_sub(1)) {
+        match self
+            .outer
+            .iter()
+            .filter(|l| l.barrier.is_none())
+            .nth(level.wrapping_sub(1))
+        {
             Some(outer) => typmod_at(&outer.rels, index),
             None => -1,
         }

@@ -163,6 +163,14 @@ fn reorder_join(node: &mut PhysicalJoinExpr) {
             reorder_join(left);
             reorder_join(right);
         }
+        // The lateral side is still logical — it is planned per left row, and
+        // this pass runs on physical plans, so it is reached again there.
+        PhysicalJoinExpr::Lateral {
+            left, predicate, ..
+        } => {
+            reorder(predicate);
+            reorder_join(left);
+        }
     }
 }
 

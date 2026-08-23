@@ -14166,16 +14166,17 @@ async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() ->
     }
 
     // `arr` is a column of the sibling `u` *and* of the enclosing `t`. PG binds
-    // the sibling (counting `u`'s two elements); that is the LATERAL this build
-    // does not have, so answering from `t` instead would be a wrong answer
-    // dressed as a right one.
-    let err = client
-        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) FROM t")
-        .await
-        .expect_err("a sibling reference is the LATERAL gap");
-    let err = err.as_db_error().expect("a database error");
-    assert_eq!(err.code(), &SqlState::FEATURE_NOT_SUPPORTED);
-    assert_eq!(err.message(), "LATERAL is not supported yet");
+    // the sibling, counting `u`'s two elements for every row of `t` — answering
+    // from `t` instead would be a wrong answer dressed as a right one.
+    let counted = client
+        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) AS n FROM t ORDER BY id")
+        .await?;
+    let counted = rows(&counted);
+    assert_eq!(
+        counted.iter().map(|r| r.get("n")).collect::<Vec<_>>(),
+        [Some("2"), Some("2")],
+        "the sibling `u` wins over the enclosing `t`"
+    );
 
     // Neither scope has it: the LATERAL branch must not swallow the honest 42703.
     let err = client
@@ -14186,6 +14187,100 @@ async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() ->
         err.as_db_error().map(|e| e.code()),
         Some(&SqlState::UNDEFINED_COLUMN)
     );
+    Ok(())
+}
+
+/// A `LATERAL` FROM item over the wire: the right side is rebuilt per left row,
+/// so what it produces has to change with the row — and a `LEFT JOIN LATERAL`
+/// has to keep the left row when it produces nothing at all.
+///
+/// Every expectation was probed against PostgreSQL 18.4.
+#[tokio::test]
+async fn lateral_items_are_evaluated_per_left_row() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE lat (x int, arr int[]); \
+             INSERT INTO lat VALUES (1, '{10,20}'), (2, '{30}'), (3, NULL)",
+        )
+        .await?;
+
+    // A subquery body reading the left row, one row out per left row.
+    let out = client
+        .simple_query(
+            "SELECT lat.x, s.z FROM lat, LATERAL (SELECT lat.x * 10 AS z) s ORDER BY lat.x",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("z")).collect::<Vec<_>>(),
+        [Some("10"), Some("20"), Some("30")]
+    );
+
+    // A table function is implicitly lateral, and its output length varies.
+    let out = client
+        .simple_query("SELECT lat.x, g FROM lat, generate_series(1, lat.x) g ORDER BY 1, 2")
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("g")).collect::<Vec<_>>(),
+        [
+            Some("1"),
+            Some("1"),
+            Some("2"),
+            Some("1"),
+            Some("2"),
+            Some("3")
+        ]
+    );
+
+    // An inner join drops a left row the lateral side answered nothing for; a
+    // LEFT JOIN LATERAL null-extends it instead.
+    let out = client
+        .simple_query(
+            "SELECT lat.x FROM lat JOIN LATERAL (SELECT 1 WHERE lat.x > 1) s(z) ON true \
+             ORDER BY 1",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("x")).collect::<Vec<_>>(),
+        [Some("2"), Some("3")]
+    );
+    let out = client
+        .simple_query(
+            "SELECT lat.x, s.z FROM lat LEFT JOIN LATERAL (SELECT 1 WHERE lat.x > 1) s(z) \
+             ON true ORDER BY 1",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("z")).collect::<Vec<_>>(),
+        [None, Some("1"), Some("1")]
+    );
+
+    // A bind parameter inside a lateral body survives the per-row rebuild.
+    let scaled: i64 = client
+        .query_one(
+            "SELECT sum(s.z)::bigint FROM lat, LATERAL (SELECT lat.x * $1::int AS z) s",
+            &[&3i32],
+        )
+        .await?
+        .get(0);
+    assert_eq!(scaled, 18, "3 * (1 + 2 + 3)");
+
+    // A lateral item leading an explicit join chain reaches back into an earlier
+    // comma group, which this build cannot answer. It has to come back as an
+    // error on the *connection* — binding it as lateral produced a leaf whose
+    // references nothing could substitute, and the planner's assertion on that
+    // took the whole session down.
+    let err = client
+        .simple_query("SELECT * FROM lat, LATERAL (SELECT lat.x AS z) s CROSS JOIN lat u")
+        .await
+        .expect_err("a lateral reference across comma groups is refused");
+    assert_eq!(
+        err.as_db_error().map(|e| e.code()),
+        Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+    );
+    // The session survived it.
+    let alive: i32 = client.query_one("SELECT 1", &[]).await?.get(0);
+    assert_eq!(alive, 1);
     Ok(())
 }
 
@@ -16978,6 +17073,54 @@ async fn a_view_over_pg_depend_is_readable() -> anyhow::Result<()> {
         .map(|row| row.get(0))
         .collect();
     assert_eq!(columns, vec![1], "dv2 reads only dt.id");
+    Ok(())
+}
+
+/// A view's `pg_depend` column edges reach the relations its `LATERAL` items
+/// read.
+///
+/// The lateral side of a join is the one part of a plan that is *not* planned
+/// with the statement — it is built per left row — so the pass that reads each
+/// scan's settled projection sees nothing there unless the planner keeps a copy
+/// for it. Missing that, a view whose lateral body is the only reader of a
+/// relation records no column edge on it at all, and a client reading these rows
+/// concludes a column has no dependent when it has one.
+///
+/// Probed against PostgreSQL 18.4: `y` and `z` are recorded, `w` is not.
+#[tokio::test]
+async fn a_views_lateral_body_records_its_column_dependencies() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE lt (x int);
+             CREATE TABLE lu (y int, z int, w int);
+             CREATE VIEW lv AS
+               SELECT lt.x, s.z FROM lt, LATERAL (SELECT lu.y AS z FROM lu WHERE lu.z = lt.x) s",
+        )
+        .await?;
+    let edges: Vec<(String, i32)> = client
+        .query(
+            "SELECT t.relname, d.refobjsubid FROM pg_depend d
+               JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+               JOIN pg_class v ON v.oid = r.ev_class
+               JOIN pg_class t ON t.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+              WHERE v.relname = 'lv' AND t.relname IN ('lt', 'lu')
+              ORDER BY 1, 2",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        edges,
+        vec![
+            ("lt".to_string(), 1),
+            ("lu".to_string(), 1),
+            ("lu".to_string(), 2)
+        ],
+        "the lateral body reads lu.y and lu.z, and not lu.w"
+    );
     Ok(())
 }
 

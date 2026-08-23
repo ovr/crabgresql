@@ -371,28 +371,57 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
                 add_exprs(add_exprs(demand, Some(&key.left)), Some(&key.right))
             });
 
-            // Split at the boundary: left indices pass through unchanged, right
-            // indices rebase into the right subtree's own base-0 space. This is
-            // a partition of the concatenated row, not a clamp — every index
-            // lands on exactly one side.
-            let split = left.width();
-            let (left_demand, right_demand) = match demand {
-                None => (ALL, ALL),
-                Some(demand) => (
-                    Some(demand.iter().copied().filter(|i| *i < split).collect()),
-                    Some(
-                        demand
-                            .iter()
-                            .filter(|i| **i >= split)
-                            .map(|i| i - split)
-                            .collect(),
-                    ),
-                ),
-            };
+            let (left_demand, right_demand) = split_demand(demand, left.width());
             prune_join(left, left_demand);
             prune_join(right, right_demand);
         }
+        PhysicalJoinExpr::Lateral {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            let demand = add_exprs(demand, predicate.as_ref());
+            // The lateral side reads the left row through slots no expression
+            // in *this* node mentions, so they have to be added by hand — a
+            // pruned-away left column would come back NULL and change the
+            // answer rather than merely the width.
+            let demand = match crabgresql_binder::lateral_input_slots(right) {
+                Some(slots) => add_indices(demand, slots),
+                None => ALL,
+            };
+            prune_join(left, split_demand(demand, left.width()).0);
+        }
     }
+}
+
+/// Partition a join node's demand at the boundary between its inputs: left
+/// indices pass through unchanged, right indices rebase into the right
+/// subtree's own base-0 space.
+///
+/// A partition of the concatenated row, not a clamp — every index lands on
+/// exactly one side.
+fn split_demand(demand: Demand, split: usize) -> (Demand, Demand) {
+    let Some(demand) = demand else {
+        return (ALL, ALL);
+    };
+    (
+        Some(demand.iter().copied().filter(|i| *i < split).collect()),
+        Some(
+            demand
+                .iter()
+                .filter(|i| **i >= split)
+                .map(|i| i - split)
+                .collect(),
+        ),
+    )
+}
+
+/// Fold explicit row indices into `demand`.
+fn add_indices(demand: Demand, indices: impl IntoIterator<Item = usize>) -> Demand {
+    let mut demand = demand?;
+    demand.extend(indices);
+    Some(demand)
 }
 
 /// Fold more expressions into `demand`, collapsing to [`ALL`] as soon as any of

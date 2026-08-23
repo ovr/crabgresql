@@ -77,17 +77,228 @@ fn an_outer_reference_in_a_table_fn_argument_escapes() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A FROM subquery is bound with an empty outer scope, so a parsed LATERAL
-/// cannot mean what it says. Report the missing feature rather than the
-/// `42703` that falls out of binding it as a plain derived table.
-///
-/// TODO: bind a LATERAL FROM item against the scope of the FROM items to its
-/// left, so the correlation resolves instead of being rejected.
+/// A `LATERAL` item resolves the FROM items to its left, and the leaf that
+/// carries it says so — that flag is what every correlation-depth walk keys on.
 #[test]
-fn lateral_is_reported_as_unsupported() -> anyhow::Result<()> {
-    let error = bind_err("SELECT * FROM t, LATERAL (SELECT t.id) x")?;
-    assert_eq!(error.code, "0A000");
-    assert_eq!(error.message, "LATERAL is not supported yet");
+fn lateral_marks_the_leaf_and_binds_the_sibling_at_level_one() -> anyhow::Result<()> {
+    let plan = bound("SELECT * FROM t, LATERAL (SELECT t.id) x")?;
+    let LogicalPlan::Join(JoinPlan { source, .. }) = &plan else {
+        bail!("expected a Join plan");
+    };
+    let JoinExpr::Join { right, .. } = source else {
+        bail!("expected a binary join at the root");
+    };
+    let JoinExpr::Input {
+        input: JoinInput::Subplan(body),
+        lateral,
+        ..
+    } = right.as_ref()
+    else {
+        bail!("expected a subplan leaf on the right");
+    };
+    assert!(lateral, "the body references `t`, so the leaf is lateral");
+    assert!(
+        plan_has_outer_refs(body),
+        "`t.id` is an outer reference from the body's point of view"
+    );
+    // And the reference is *not* one the enclosing statement fills: the lateral
+    // join node above it does, one level in.
+    assert!(!plan_has_outer_refs(&plan));
+    Ok(())
+}
+
+/// `LATERAL` on a leftmost FROM item is legal and inert — there is nothing to
+/// its left. The leaf must not be marked, or the executor would rebuild it per
+/// row of a left input that does not exist.
+#[test]
+fn a_leftmost_lateral_item_is_not_marked() -> anyhow::Result<()> {
+    let plan = bound("SELECT * FROM LATERAL (SELECT 1) x")?;
+    assert!(!plan_has_outer_refs(&plan));
+    Ok(())
+}
+
+/// A `LATERAL` item that references only an *enclosing* query keeps its
+/// references at level 1: the level pushed for the (unused) siblings is dropped
+/// again, so the enclosing boundary still fills them.
+#[test]
+fn an_unused_lateral_level_is_dropped_again() -> anyhow::Result<()> {
+    let subplan =
+        first_subplan("SELECT id, (SELECT x.c FROM t u, LATERAL (SELECT t.id AS c) x) FROM t")?;
+    let LogicalPlan::Join(JoinPlan { source, .. }) = &subplan else {
+        bail!("expected a Join plan");
+    };
+    let JoinExpr::Join { right, .. } = source else {
+        bail!("expected a binary join at the root");
+    };
+    let JoinExpr::Input { lateral, .. } = right.as_ref() else {
+        bail!("expected a leaf on the right");
+    };
+    assert!(
+        !lateral,
+        "`t` is the enclosing query, not the sibling `u`, so nothing is lateral"
+    );
+    assert!(
+        plan_has_outer_refs(&subplan),
+        "the reference escapes to the enclosing query, at level 1"
+    );
+    Ok(())
+}
+
+/// A plain subquery in FROM may not see its siblings, and PostgreSQL says so
+/// precisely — naming the entry and the keyword that would reach it — rather
+/// than reporting a missing FROM-clause entry.
+#[test]
+fn a_non_lateral_from_subquery_is_refused_by_name() -> anyhow::Result<()> {
+    let error = bind_err("SELECT * FROM t, (SELECT t.id) x")?;
+    assert_eq!(error.code, sqlstate::UNDEFINED_TABLE);
+    assert_eq!(
+        error.message,
+        "invalid reference to FROM-clause entry for table \"t\""
+    );
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "There is an entry for table \"t\", but it cannot be referenced from this part of \
+             the query."
+        )
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("To reference that table, you must mark this subquery with LATERAL.")
+    );
+
+    // The unqualified form blames the column instead, again as PG does.
+    let error = bind_err("SELECT * FROM t, (SELECT id) x")?;
+    assert_eq!(error.code, sqlstate::UNDEFINED_COLUMN);
+    assert_eq!(error.message, "column \"id\" does not exist");
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "There is a column named \"id\" in table \"t\", but it cannot be referenced from \
+             this part of the query."
+        )
+    );
+    Ok(())
+}
+
+/// A plain FROM subquery *is* correlated to the enclosing queries, though —
+/// only its siblings are off limits. This is the case the barrier must let
+/// through, and it stays at the same correlation depth as the item itself.
+#[test]
+fn a_non_lateral_from_subquery_may_reference_an_enclosing_query() -> anyhow::Result<()> {
+    let subplan = first_subplan("SELECT id, (SELECT x.c FROM t u, (SELECT t.id AS c) x) FROM t")?;
+    assert!(plan_has_outer_refs(&subplan));
+    Ok(())
+}
+
+/// A `LATERAL` reference across a RIGHT or FULL join is refused: the left row it
+/// would read is not guaranteed to exist. PG's own wording, DETAIL included.
+#[test]
+fn lateral_across_a_right_or_full_join_is_refused() -> anyhow::Result<()> {
+    for sql in [
+        "SELECT * FROM t RIGHT JOIN LATERAL (SELECT t.id) x ON true",
+        "SELECT * FROM t FULL JOIN LATERAL (SELECT t.id) x ON true",
+    ] {
+        let error = bind_err(sql)?;
+        assert_eq!(error.code, sqlstate::UNDEFINED_TABLE, "for `{sql}`");
+        assert_eq!(
+            error.message, "invalid reference to FROM-clause entry for table \"t\"",
+            "for `{sql}`"
+        );
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("The combining JOIN type must be INNER or LEFT for a LATERAL reference."),
+            "for `{sql}`"
+        );
+    }
+
+    // A function FROM item is implicitly lateral, so it is refused the same way
+    // without the keyword ever being written.
+    let error = bind_err("SELECT * FROM t RIGHT JOIN generate_series(1, t.id) g ON true")?;
+    assert_eq!(
+        error.detail.as_deref(),
+        Some("The combining JOIN type must be INNER or LEFT for a LATERAL reference.")
+    );
+
+    // A *plain* subquery there is out of reach too, but `LATERAL` would not
+    // reach it either — so PG states the fact and offers no hint.
+    let error = bind_err("SELECT * FROM t RIGHT JOIN (SELECT t.id) x ON true")?;
+    assert_eq!(
+        error.detail.as_deref(),
+        Some(
+            "There is an entry for table \"t\", but it cannot be referenced from this part of \
+             the query."
+        )
+    );
+    assert_eq!(
+        error.hint, None,
+        "LATERAL would not help across a RIGHT JOIN"
+    );
+    Ok(())
+}
+
+/// A `LATERAL` body across a RIGHT join may still reference an *enclosing*
+/// query — only the left row is off limits. No level is pushed there, so its
+/// level-1 reference has to stay one the enclosing boundary fills; treating it
+/// as lateral would read it out of a left row that never existed.
+#[test]
+fn a_refused_lateral_still_reaches_the_enclosing_query() -> anyhow::Result<()> {
+    let subplan = first_subplan(
+        "SELECT (SELECT x.c FROM t u RIGHT JOIN LATERAL (SELECT o.id AS c) x ON true) FROM t o",
+    )?;
+    let LogicalPlan::Join(JoinPlan { source, .. }) = &subplan else {
+        bail!("expected a Join plan");
+    };
+    let JoinExpr::Join { right, .. } = source else {
+        bail!("expected a binary join at the root");
+    };
+    let JoinExpr::Input { lateral, .. } = right.as_ref() else {
+        bail!("expected a leaf on the right");
+    };
+    assert!(!lateral, "no level was pushed, so nothing became lateral");
+    assert!(
+        plan_has_outer_refs(&subplan),
+        "`o.id` still escapes to the enclosing query"
+    );
+    Ok(())
+}
+
+/// The shapes PostgreSQL answers and this build does not: a lateral item
+/// *anywhere in a join chain* reaching back into an earlier comma group, whose
+/// columns no node of that chain is fed. Refused by name rather than resolved
+/// outward, which would silently answer a different query.
+///
+/// The chain-*leading* cases matter twice over. Binding them as lateral leaves a
+/// leaf that is the bottom-left of the chain, with the cross join to the earlier
+/// groups spliced in above it — so its `level: 1` references have no join node
+/// to fill them, and the plan either trips the planner's `debug_assert` or
+/// reaches execution with an unsubstituted reference.
+#[test]
+fn lateral_into_another_comma_group_is_an_honest_gap() -> anyhow::Result<()> {
+    for sql in [
+        // Inside the chain.
+        "SELECT * FROM t, t u JOIN LATERAL (SELECT t.id) x ON true",
+        // Leading the chain, as a subquery and as an implicitly-lateral table
+        // function, over each of the join shapes that put a factor to its right.
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x CROSS JOIN t u",
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x JOIN t u ON true",
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x RIGHT JOIN t u ON true",
+        "SELECT * FROM t, generate_series(1, t.id) g JOIN t u ON true",
+    ] {
+        let error = bind_err(sql)?;
+        assert_eq!(error.code, "0A000", "for `{sql}`");
+        assert_eq!(
+            error.message,
+            "LATERAL reference to \"t\" from another comma-separated FROM item is not \
+             supported yet",
+            "for `{sql}`"
+        );
+    }
+
+    // The same item without a chain after it is answered as usual — the gap is
+    // the *position*, not the reference.
+    let plan = bound("SELECT * FROM t, LATERAL (SELECT t.id AS z) x")?;
+    assert!(!plan_has_outer_refs(&plan));
     Ok(())
 }
 

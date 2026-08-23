@@ -92,6 +92,22 @@ pub enum JoinExpr {
     Input {
         input: JoinInput,
         width: usize,
+        /// A `LATERAL` FROM item: this leaf's expressions (a subplan's body, a
+        /// table function's arguments) hold [`BoundExpr::OuterColumnRef`]s at
+        /// `level: 1` addressing the row of everything joined to its *left*,
+        /// rather than an enclosing query's row.
+        ///
+        /// That makes the leaf a correlation level of its own — the same kind
+        /// of boundary an expression subquery marker is — so every walk that
+        /// tracks correlation depth increments it on the way in
+        /// (`subst_outer_join`, `for_each_plan_expr`), and the executor fills
+        /// the references once per left row instead of once per statement.
+        ///
+        /// `false` for the overwhelming majority of leaves, including a
+        /// `LATERAL` item that turned out to reference nothing: the flag
+        /// records that references are actually *present*, not that the
+        /// keyword was written.
+        lateral: bool,
     },
     Join {
         left: Box<JoinExpr>,
