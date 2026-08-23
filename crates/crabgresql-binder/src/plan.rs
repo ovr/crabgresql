@@ -3703,10 +3703,17 @@ fn bind_table_with_joins(
     siblings_visible: Option<&[VisibleColumn]>,
     demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
-    // The group's leading item sits directly on top of the cross join with the
-    // preceding comma groups, so their columns *are* the row it is fed: they are
-    // reachable, and a `LATERAL` reference to one is an ordinary lateral
-    // reference.
+    // Whether the preceding comma groups are in the row this group's *leading*
+    // item is fed, which decides whether a `LATERAL` reference to one of them is
+    // an ordinary lateral reference or out of reach.
+    //
+    // With no joins, the group *is* that item, and [`bind_from_clause`] makes it
+    // the right child of the cross join with the preceding groups — their
+    // columns are exactly its left row. With a chain, the item becomes the
+    // bottom-left leaf of that chain and the cross join is spliced in *above*
+    // it, so there is no left row under it at all. Marking it lateral there
+    // would produce a leaf whose `level: 1` references no join node can fill.
+    let leads_a_chain = !table.joins.is_empty();
     let mut bound = bind_from_item(
         engine,
         catalog,
@@ -3714,8 +3721,13 @@ fn bind_table_with_joins(
         &table.relation,
         ctes,
         &Preceding {
-            reachable: siblings,
-            visible: siblings_visible,
+            reachable: if leads_a_chain { &[] } else { siblings },
+            visible: if leads_a_chain {
+                None
+            } else {
+                siblings_visible
+            },
+            out_of_reach: if leads_a_chain { siblings } else { &[] },
             ..Preceding::none()
         },
         outer_scope,

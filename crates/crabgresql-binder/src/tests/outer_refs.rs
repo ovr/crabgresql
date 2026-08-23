@@ -263,18 +263,42 @@ fn a_refused_lateral_still_reaches_the_enclosing_query() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The one shape PostgreSQL answers and this build does not: a lateral item
-/// inside a join chain reaching back into an earlier comma group, whose columns
-/// the chain's join node is never fed. Refused by name rather than resolved
+/// The shapes PostgreSQL answers and this build does not: a lateral item
+/// *anywhere in a join chain* reaching back into an earlier comma group, whose
+/// columns no node of that chain is fed. Refused by name rather than resolved
 /// outward, which would silently answer a different query.
+///
+/// The chain-*leading* cases matter twice over. Binding them as lateral leaves a
+/// leaf that is the bottom-left of the chain, with the cross join to the earlier
+/// groups spliced in above it — so its `level: 1` references have no join node
+/// to fill them, and the plan either trips the planner's `debug_assert` or
+/// reaches execution with an unsubstituted reference.
 #[test]
 fn lateral_into_another_comma_group_is_an_honest_gap() -> anyhow::Result<()> {
-    let error = bind_err("SELECT * FROM t, t u JOIN LATERAL (SELECT t.id) x ON true")?;
-    assert_eq!(error.code, "0A000");
-    assert_eq!(
-        error.message,
-        "LATERAL reference to \"t\" from another comma-separated FROM item is not supported yet"
-    );
+    for sql in [
+        // Inside the chain.
+        "SELECT * FROM t, t u JOIN LATERAL (SELECT t.id) x ON true",
+        // Leading the chain, as a subquery and as an implicitly-lateral table
+        // function, over each of the join shapes that put a factor to its right.
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x CROSS JOIN t u",
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x JOIN t u ON true",
+        "SELECT * FROM t, LATERAL (SELECT t.id AS z) x RIGHT JOIN t u ON true",
+        "SELECT * FROM t, generate_series(1, t.id) g JOIN t u ON true",
+    ] {
+        let error = bind_err(sql)?;
+        assert_eq!(error.code, "0A000", "for `{sql}`");
+        assert_eq!(
+            error.message,
+            "LATERAL reference to \"t\" from another comma-separated FROM item is not \
+             supported yet",
+            "for `{sql}`"
+        );
+    }
+
+    // The same item without a chain after it is answered as usual — the gap is
+    // the *position*, not the reference.
+    let plan = bound("SELECT * FROM t, LATERAL (SELECT t.id AS z) x")?;
+    assert!(!plan_has_outer_refs(&plan));
     Ok(())
 }
 

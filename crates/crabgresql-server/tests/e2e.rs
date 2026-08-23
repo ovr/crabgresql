@@ -14264,6 +14264,23 @@ async fn lateral_items_are_evaluated_per_left_row() -> anyhow::Result<()> {
         .await?
         .get(0);
     assert_eq!(scaled, 18, "3 * (1 + 2 + 3)");
+
+    // A lateral item leading an explicit join chain reaches back into an earlier
+    // comma group, which this build cannot answer. It has to come back as an
+    // error on the *connection* — binding it as lateral produced a leaf whose
+    // references nothing could substitute, and the planner's assertion on that
+    // took the whole session down.
+    let err = client
+        .simple_query("SELECT * FROM lat, LATERAL (SELECT lat.x AS z) s CROSS JOIN lat u")
+        .await
+        .expect_err("a lateral reference across comma groups is refused");
+    assert_eq!(
+        err.as_db_error().map(|e| e.code()),
+        Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+    );
+    // The session survived it.
+    let alive: i32 = client.query_one("SELECT 1", &[]).await?.get(0);
+    assert_eq!(alive, 1);
     Ok(())
 }
 

@@ -505,10 +505,16 @@ fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinEx
             width,
             lateral,
         } => {
+            // A lateral leaf is always the right child of the join that feeds it
+            // its left row. The binder guarantees it by construction rather than
+            // by care: `Preceding::pushes_a_level` is the one gate that sets the
+            // flag, and it is handed an empty `reachable` at every position
+            // where the leaf would land somewhere else — so this assert
+            // documents the invariant, it is not what enforces it.
             debug_assert!(
                 !lateral,
-                "a lateral leaf is always the right child of the join that feeds it its \
-                 left row — the binder only marks one when something precedes it"
+                "a lateral leaf reached the planner outside the right child of a join, \
+                 so nothing can substitute its level-1 references"
             );
             PhysicalJoinExpr::Input {
                 input: plan_join_input(input, costs),

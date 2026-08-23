@@ -144,13 +144,16 @@ pub(crate) enum LateralBarrier {
     /// A `LATERAL` item on the right of a `RIGHT`/`FULL` join, where the left
     /// row it would reference may not exist at all.
     WrongJoinType,
-    /// A `LATERAL` item inside an explicit join chain, referencing a FROM item
-    /// from an earlier comma-separated group. PostgreSQL answers this query; we
-    /// do not — the join tree cross-joins the groups *above* the chain, so that
-    /// item's columns are not in the row the chain's join node is fed. A
-    /// barrier rather than a silent fall-through to the enclosing queries,
+    /// A `LATERAL` item *anywhere in an explicit join chain* — leading it or
+    /// inside it — referencing a FROM item from an earlier comma-separated
+    /// group. PostgreSQL answers these queries; we do not, because the join tree
+    /// cross-joins the groups *above* the chain, so that item's columns are not
+    /// in the row any node of the chain is fed.
+    ///
+    /// A barrier rather than a silent fall-through to the enclosing queries,
     /// which would bind a like-named outer relation and answer a different
-    /// question.
+    /// question — and rather than binding it anyway, which would leave a leaf
+    /// holding `level: 1` references no join node above it can substitute.
     OtherGroup,
 }
 
