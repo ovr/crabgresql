@@ -154,13 +154,10 @@ fn unnest_in_from_binds_element_column() -> anyhow::Result<()> {
 }
 
 #[test]
-fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::Result<()> {
-    // A function FROM item is implicitly LATERAL in PG, so all of these are
-    // legal there. Bound in an empty scope they would fail with a misleading
-    // 42P01/42703 blaming a FROM clause that plainly lists `t`; say what is
-    // actually missing instead, exactly as the derived-table arm does.
-    // TODO: bind a function FROM item as implicitly LATERAL, so its arguments
-    // can reference the columns of FROM items to its left.
+fn a_table_fn_argument_is_implicitly_lateral() -> anyhow::Result<()> {
+    // A function FROM item is implicitly LATERAL in PG — the keyword is
+    // optional and decides nothing — so each of these resolves the sibling and
+    // marks the leaf.
     for sql in [
         "SELECT * FROM t, generate_series(1, t.id) g",
         "SELECT * FROM t, generate_series(1, id) g",
@@ -168,14 +165,51 @@ fn lateral_table_fn_argument_reports_lateral_not_a_missing_column() -> anyhow::R
         "SELECT * FROM t JOIN generate_series(1, t.id) g ON true",
         "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
         // `id` is visible in the sibling `u` and in the enclosing query alike.
-        // PG takes the sibling, so resolving it outward instead would answer a
-        // different question — a wrong answer where this is a stated gap.
+        // PG takes the sibling, so this must bind to the sibling's row.
         "SELECT id, (SELECT count(*) FROM t u, generate_series(1, id)) FROM t",
     ] {
-        let e = bind_err(sql)?;
-        assert_eq!(e.code, "0A000", "for `{sql}`");
-        assert_eq!(e.message, "LATERAL is not supported yet", "for `{sql}`");
+        let plan = bound(sql).with_context(|| format!("binding `{sql}`"))?;
+        assert!(
+            !plan_has_outer_refs(&plan),
+            "the argument names a sibling, which the lateral join fills, not the \
+             enclosing statement — for `{sql}`"
+        );
     }
+    Ok(())
+}
+
+/// The argument's reference lands at level 1 of the *lateral* level, and the
+/// leaf that carries it is marked so the executor rebuilds it per left row.
+#[test]
+fn an_implicitly_lateral_table_fn_marks_its_leaf() -> anyhow::Result<()> {
+    let plan = bound("SELECT * FROM t, generate_series(1, t.id) g")?;
+    let LogicalPlan::Join(JoinPlan { source, .. }) = &plan else {
+        bail!("expected a Join plan");
+    };
+    let JoinExpr::Join { right, .. } = source else {
+        bail!("expected a binary join at the root");
+    };
+    let JoinExpr::Input {
+        input: JoinInput::TableFunction { args, .. },
+        lateral,
+        ..
+    } = right.as_ref()
+    else {
+        bail!("expected a table-function leaf on the right");
+    };
+    assert!(lateral);
+    assert!(
+        matches!(
+            &args[1],
+            BoundExpr::OuterColumnRef {
+                level: 1,
+                index: 0,
+                ..
+            }
+        ),
+        "the upper bound reads slot 0 of the left row, got {:?}",
+        args[1]
+    );
     Ok(())
 }
 

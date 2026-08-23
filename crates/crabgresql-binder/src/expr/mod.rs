@@ -62,6 +62,7 @@ pub(crate) use operators::{
 pub(crate) use params::{ViewExpansion, param_ctx_view_body, view_expansion};
 pub(crate) use scope::column_value;
 pub(crate) use scope::{
-    NamedWindows, OuterLevel, ScopeItem, VisibleColumn, VisibleLookup, common_typmod,
-    lookup_visible, normalize_ident, projection_typmod, reject_window,
+    LateralBarrier, NamedWindows, OuterLevel, ScopeItem, VisibleColumn, VisibleLookup,
+    barrier_levels, common_typmod, lookup_visible, normalize_ident, projection_typmod,
+    reject_window,
 };

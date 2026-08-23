@@ -62,8 +62,9 @@ pub use eval::{
 };
 use generated::GeneratedSet;
 pub use node::{
-    Aggregate, Append, Concat, Distinct, Filter, HashJoin, IndexScan, Limit, MaterializedRows,
-    NestedLoopJoin, ProjectSet, Projection, SeqScan, Sort, TableFunctionSource, Values, WindowAgg,
+    Aggregate, Append, Concat, Distinct, Filter, HashJoin, IndexScan, LateralJoin, Limit,
+    MaterializedRows, NestedLoopJoin, ProjectSet, Projection, SeqScan, Sort, TableFunctionSource,
+    Values, WindowAgg,
 };
 use node::{index_probe_rows, index_probe_system_rows};
 use tally::count_write;
@@ -1327,6 +1328,15 @@ fn resolve_join(
                 resolve_expr(&mut key.left, ctx, txn)?;
                 resolve_expr(&mut key.right, ctx, txn)?;
             }
+        }
+        PhysicalJoinExpr::Lateral {
+            left, predicate, ..
+        } => {
+            resolve_join(left, ctx, txn)?;
+            resolve_opt(predicate, ctx, txn)?;
+            // The lateral side is deliberately skipped: its markers may read the
+            // left row, which does not exist yet. `LateralJoin` resolves them
+            // once per left row, after substitution.
         }
     }
     Ok(())
@@ -4290,6 +4300,24 @@ fn build_join_expr(
                     ctx.clone(),
                 )?))
             }
+        }
+        PhysicalJoinExpr::Lateral {
+            left,
+            right,
+            right_width,
+            kind,
+            predicate,
+        } => {
+            let left_width = left.width();
+            Ok(Box::new(LateralJoin::new(
+                build_join_expr(*left, ctx, txn)?,
+                right,
+                left_width,
+                right_width,
+                kind,
+                predicate,
+                ctx.clone(),
+            )?))
         }
     }
 }

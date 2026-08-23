@@ -392,7 +392,36 @@ fn prune_join(node: &mut PhysicalJoinExpr, demand: Demand) {
             prune_join(left, left_demand);
             prune_join(right, right_demand);
         }
+        PhysicalJoinExpr::Lateral {
+            left,
+            right,
+            predicate,
+            ..
+        } => {
+            let demand = add_exprs(demand, predicate.as_ref());
+            // The lateral side reads the left row through slots no expression
+            // in *this* node mentions, so they have to be added by hand — a
+            // pruned-away left column would come back NULL and change the
+            // answer rather than merely the width.
+            let demand = match crabgresql_binder::lateral_input_slots(right) {
+                Some(slots) => add_indices(demand, slots),
+                None => ALL,
+            };
+            let split = left.width();
+            let left_demand = match demand {
+                None => ALL,
+                Some(demand) => Some(demand.iter().copied().filter(|i| *i < split).collect()),
+            };
+            prune_join(left, left_demand);
+        }
     }
+}
+
+/// Fold explicit row indices into `demand`.
+fn add_indices(demand: Demand, indices: impl IntoIterator<Item = usize>) -> Demand {
+    let mut demand = demand?;
+    demand.extend(indices);
+    Some(demand)
 }
 
 /// Fold more expressions into `demand`, collapsing to [`ALL`] as soon as any of

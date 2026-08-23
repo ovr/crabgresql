@@ -14166,16 +14166,17 @@ async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() ->
     }
 
     // `arr` is a column of the sibling `u` *and* of the enclosing `t`. PG binds
-    // the sibling (counting `u`'s two elements); that is the LATERAL this build
-    // does not have, so answering from `t` instead would be a wrong answer
-    // dressed as a right one.
-    let err = client
-        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) FROM t")
-        .await
-        .expect_err("a sibling reference is the LATERAL gap");
-    let err = err.as_db_error().expect("a database error");
-    assert_eq!(err.code(), &SqlState::FEATURE_NOT_SUPPORTED);
-    assert_eq!(err.message(), "LATERAL is not supported yet");
+    // the sibling, counting `u`'s two elements for every row of `t` — answering
+    // from `t` instead would be a wrong answer dressed as a right one.
+    let counted = client
+        .simple_query("SELECT id, (SELECT count(*) FROM u, unnest(arr)) AS n FROM t ORDER BY id")
+        .await?;
+    let counted = rows(&counted);
+    assert_eq!(
+        counted.iter().map(|r| r.get("n")).collect::<Vec<_>>(),
+        [Some("2"), Some("2")],
+        "the sibling `u` wins over the enclosing `t`"
+    );
 
     // Neither scope has it: the LATERAL branch must not swallow the honest 42703.
     let err = client
@@ -14186,6 +14187,83 @@ async fn table_function_arguments_resolve_the_enclosing_query_not_a_sibling() ->
         err.as_db_error().map(|e| e.code()),
         Some(&SqlState::UNDEFINED_COLUMN)
     );
+    Ok(())
+}
+
+/// A `LATERAL` FROM item over the wire: the right side is rebuilt per left row,
+/// so what it produces has to change with the row — and a `LEFT JOIN LATERAL`
+/// has to keep the left row when it produces nothing at all.
+///
+/// Every expectation was probed against PostgreSQL 18.4.
+#[tokio::test]
+async fn lateral_items_are_evaluated_per_left_row() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE lat (x int, arr int[]); \
+             INSERT INTO lat VALUES (1, '{10,20}'), (2, '{30}'), (3, NULL)",
+        )
+        .await?;
+
+    // A subquery body reading the left row, one row out per left row.
+    let out = client
+        .simple_query(
+            "SELECT lat.x, s.z FROM lat, LATERAL (SELECT lat.x * 10 AS z) s ORDER BY lat.x",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("z")).collect::<Vec<_>>(),
+        [Some("10"), Some("20"), Some("30")]
+    );
+
+    // A table function is implicitly lateral, and its output length varies.
+    let out = client
+        .simple_query("SELECT lat.x, g FROM lat, generate_series(1, lat.x) g ORDER BY 1, 2")
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("g")).collect::<Vec<_>>(),
+        [
+            Some("1"),
+            Some("1"),
+            Some("2"),
+            Some("1"),
+            Some("2"),
+            Some("3")
+        ]
+    );
+
+    // An inner join drops a left row the lateral side answered nothing for; a
+    // LEFT JOIN LATERAL null-extends it instead.
+    let out = client
+        .simple_query(
+            "SELECT lat.x FROM lat JOIN LATERAL (SELECT 1 WHERE lat.x > 1) s(z) ON true \
+             ORDER BY 1",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("x")).collect::<Vec<_>>(),
+        [Some("2"), Some("3")]
+    );
+    let out = client
+        .simple_query(
+            "SELECT lat.x, s.z FROM lat LEFT JOIN LATERAL (SELECT 1 WHERE lat.x > 1) s(z) \
+             ON true ORDER BY 1",
+        )
+        .await?;
+    assert_eq!(
+        rows(&out).iter().map(|r| r.get("z")).collect::<Vec<_>>(),
+        [None, Some("1"), Some("1")]
+    );
+
+    // A bind parameter inside a lateral body survives the per-row rebuild.
+    let scaled: i64 = client
+        .query_one(
+            "SELECT sum(s.z)::bigint FROM lat, LATERAL (SELECT lat.x * $1::int AS z) s",
+            &[&3i32],
+        )
+        .await?
+        .get(0);
+    assert_eq!(scaled, 18, "3 * (1 + 2 + 3)");
     Ok(())
 }
 

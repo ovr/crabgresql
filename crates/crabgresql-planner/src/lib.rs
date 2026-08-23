@@ -421,6 +421,24 @@ pub enum PhysicalJoinExpr {
         predicate: Option<BoundExpr>,
         hash_keys: Vec<HashKey>,
     },
+    /// A join whose right side is a `LATERAL` FROM item: it reads the left row,
+    /// so it produces *different rows for every one of them*.
+    ///
+    /// That is why `right` is still a [`JoinInput`] and not a planned node —
+    /// its expressions hold `OuterColumnRef { level: 1 }` slots that only exist
+    /// once a left row does, so the executor fills them and plans it per row.
+    /// Keeping the shape distinct also puts the two consequences beyond reach
+    /// of a missed condition: there is nowhere to hang hash keys, and nothing
+    /// materializes the right side once.
+    Lateral {
+        left: Box<PhysicalJoinExpr>,
+        right: JoinInput,
+        right_width: usize,
+        /// `Cross`, `Inner` or `Left` — PostgreSQL refuses a lateral reference
+        /// across a `RIGHT`/`FULL` join, and the binder does too.
+        kind: JoinKind,
+        predicate: Option<BoundExpr>,
+    },
 }
 
 impl PhysicalJoinExpr {
@@ -432,6 +450,9 @@ impl PhysicalJoinExpr {
                 left, right, kind, ..
             } if kind.emits_pairs() => left.width() + right.width(),
             PhysicalJoinExpr::Join { left, .. } => left.width(),
+            PhysicalJoinExpr::Lateral {
+                left, right_width, ..
+            } => left.width() + right_width,
         }
     }
 
@@ -479,11 +500,41 @@ fn plan_join_input(input: JoinInput, costs: cost::CostSettings) -> PhysicalJoinI
 
 fn plan_join_expr(source: JoinExpr, costs: cost::CostSettings) -> PhysicalJoinExpr {
     match source {
-        JoinExpr::Input { input, width } => PhysicalJoinExpr::Input {
-            input: plan_join_input(input, costs),
+        JoinExpr::Input {
+            input,
             width,
-            predicate: None,
-        },
+            lateral,
+        } => {
+            debug_assert!(
+                !lateral,
+                "a lateral leaf is always the right child of the join that feeds it its \
+                 left row — the binder only marks one when something precedes it"
+            );
+            PhysicalJoinExpr::Input {
+                input: plan_join_input(input, costs),
+                width,
+                predicate: None,
+            }
+        }
+        // The right side is lateral: it stays logical, and neither hash keys nor
+        // sunk leaf filters apply to a row source that is rebuilt per left row.
+        JoinExpr::Join {
+            left,
+            right,
+            kind,
+            predicate,
+        } if matches!(*right, JoinExpr::Input { lateral: true, .. }) => {
+            let JoinExpr::Input { input, width, .. } = *right else {
+                unreachable!("matched by the guard");
+            };
+            PhysicalJoinExpr::Lateral {
+                left: Box::new(plan_join_expr(*left, costs)),
+                right: input,
+                right_width: width,
+                kind,
+                predicate,
+            }
+        }
         JoinExpr::Join {
             left,
             right,
@@ -823,6 +874,9 @@ fn collect_join_scans(
             collect_join_scans(left, out);
             collect_join_scans(right, out);
         }
+        // The lateral side is still logical and is planned afresh per left row,
+        // so it has no scan with a settled projection to report here.
+        PhysicalJoinExpr::Lateral { left, .. } => collect_join_scans(left, out),
     }
 }
 
@@ -2388,6 +2442,15 @@ fn join_column_names(join: &PhysicalJoinExpr) -> Vec<Option<String>> {
             },
             _ => vec![None; *width],
         },
+        // A lateral item's columns have no schema name to show, the same as
+        // any other subquery or table-function leaf.
+        PhysicalJoinExpr::Lateral {
+            left, right_width, ..
+        } => {
+            let mut names = emitted_column_names(left);
+            names.extend(std::iter::repeat_n(None, *right_width));
+            names
+        }
         PhysicalJoinExpr::Join { left, right, .. } => {
             let mut names = emitted_column_names(left);
             names.extend(emitted_column_names(right));
@@ -2498,6 +2561,39 @@ fn explain_join(join: &PhysicalJoinExpr, filter: Option<&BoundExpr>) -> Vec<Stri
                 } else {
                     right
                 },
+            );
+            lines
+        }
+        PhysicalJoinExpr::Lateral {
+            left,
+            right,
+            kind,
+            predicate,
+            ..
+        } => {
+            let mut lines = vec![join_node_label(*kind, false)];
+            if let Some(predicate) = predicate {
+                lines.push(format!(
+                    "  Join Filter: ({})",
+                    explain_expr(predicate, &names)
+                ));
+            }
+            if let Some(filter) = filter {
+                lines.push(format!("  Filter: ({})", explain_expr(filter, &names)));
+            }
+            push_child(&mut lines, explain_join(left, None));
+            // One line, not a rendered subtree: the lateral side has no plan
+            // yet — it is built from the logical body once per left row, so
+            // there is nothing here that could be shown without inventing it.
+            push_child(
+                &mut lines,
+                vec![
+                    match right {
+                        JoinInput::TableFunction { .. } => "Function Scan",
+                        _ => "Subquery Scan",
+                    }
+                    .to_string(),
+                ],
             );
             lines
         }
@@ -3038,6 +3134,59 @@ mod tests {
         };
         assert_eq!(hash_keys.len(), 1);
         assert_eq!(hash_keys[0].ty, PgType::Money);
+    }
+
+    #[test]
+    fn a_lateral_right_side_stays_logical_and_is_never_hashed() {
+        // Even with an equality across the join — the shape that would otherwise
+        // become a hash key — the right side has to stay a per-left-row build:
+        // there is no one rowset to hash.
+        let PhysicalPlan::Join { source, .. } =
+            plan_sql("SELECT * FROM t, LATERAL (SELECT t.id AS z) s WHERE t.id = s.z")
+        else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Lateral {
+            right, right_width, ..
+        } = &source
+        else {
+            panic!("expected a Lateral join node, not a hashable Join");
+        };
+        assert_eq!(*right_width, 1);
+        assert!(matches!(right, JoinInput::Subplan(_)));
+        assert!(!source.uses_hash_join());
+        // And EXPLAIN calls it what it is.
+        assert_eq!(explain_join(&source, None)[0], "Nested Loop");
+    }
+
+    #[test]
+    fn a_lateral_join_keeps_the_left_columns_its_right_side_reads() {
+        // `name` is the only column the target list asks for, but the lateral
+        // body reads `id`. Pruning the scan to `name` alone would feed the
+        // lateral side a NULL and change the answer.
+        let PhysicalPlan::Join { source, .. } =
+            plan_sql("SELECT s.z FROM t, LATERAL (SELECT t.id AS z) s")
+        else {
+            panic!("expected Join");
+        };
+        let PhysicalJoinExpr::Lateral { left, .. } = &source else {
+            panic!("expected a Lateral join node");
+        };
+        let PhysicalJoinExpr::Input {
+            input: PhysicalJoinInput::Scan { projection, .. },
+            ..
+        } = left.as_ref()
+        else {
+            panic!("expected a scan on the left");
+        };
+        let reads_id = match projection {
+            ColumnProjection::All => true,
+            ColumnProjection::Some(cols) => cols.contains(&0),
+        };
+        assert!(
+            reads_id,
+            "column 0 (`id`) is read by the lateral body, got {projection:?}"
+        );
     }
 
     /// The root join node of a `PhysicalPlan::Join`, plus whatever predicate was

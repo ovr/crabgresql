@@ -1,0 +1,250 @@
+--
+-- LATERAL
+-- A FROM item that reads the rows to its left: explicit LATERAL subqueries,
+-- implicitly-lateral table functions, LEFT JOIN LATERAL's null extension, and
+-- the errors PG raises for a reference that is not allowed to be lateral.
+--
+CREATE TABLE lat (x integer, arr integer[]);
+INSERT INTO lat VALUES (1, '{10,20}'), (2, '{30}'), (3, NULL);
+-- the comma form: the subquery sees the row to its left
+SELECT * FROM lat, LATERAL (SELECT lat.x * 10 AS z) s ORDER BY 1;
+ x |   arr   | z  
+---+---------+----
+ 1 | {10,20} | 10
+ 2 | {30}    | 20
+ 3 |         | 30
+(3 rows)
+
+-- CROSS JOIN LATERAL is the same thing
+SELECT lat.x, s.z FROM lat CROSS JOIN LATERAL (SELECT lat.x + 100 AS z) s ORDER BY 1;
+ x |  z  
+---+-----
+ 1 | 101
+ 2 | 102
+ 3 | 103
+(3 rows)
+
+-- an inner join drops a left row the lateral side produced nothing for
+SELECT lat.x, s.z FROM lat JOIN LATERAL (SELECT lat.x * 10 AS z WHERE lat.x > 1) s ON true
+  ORDER BY 1;
+ x | z  
+---+----
+ 2 | 20
+ 3 | 30
+(2 rows)
+
+-- LEFT JOIN LATERAL null-extends it instead
+SELECT lat.x, s.z FROM lat LEFT JOIN LATERAL (SELECT lat.x * 10 AS z WHERE lat.x > 1) s ON true
+  ORDER BY 1;
+ x | z  
+---+----
+ 1 |   
+ 2 | 20
+ 3 | 30
+(3 rows)
+
+-- the ON condition still applies to the pair
+SELECT lat.x, s.e FROM lat LEFT JOIN LATERAL (SELECT unnest(lat.arr) AS e) s ON s.e > 15
+  ORDER BY 1;
+ x | e  
+---+----
+ 1 | 20
+ 2 | 30
+ 3 |   
+(3 rows)
+
+-- a lateral item producing several rows multiplies the left row
+SELECT lat.x, s.e FROM lat, LATERAL (SELECT unnest(lat.arr) AS e) s ORDER BY 1, 2;
+ x | e  
+---+----
+ 1 | 10
+ 1 | 20
+ 2 | 30
+(3 rows)
+
+-- LATERAL over VALUES
+SELECT * FROM lat, LATERAL (VALUES (lat.x)) v(a) ORDER BY 1;
+ x |   arr   | a 
+---+---------+---
+ 1 | {10,20} | 1
+ 2 | {30}    | 2
+ 3 |         | 3
+(3 rows)
+
+-- a table function in FROM is implicitly lateral — no keyword needed
+SELECT lat.x, u FROM lat, unnest(lat.arr) u ORDER BY 1, 2;
+ x | u  
+---+----
+ 1 | 10
+ 1 | 20
+ 2 | 30
+(3 rows)
+
+SELECT lat.x, g FROM lat, generate_series(1, lat.x) g ORDER BY 1, 2;
+ x | g 
+---+---
+ 1 | 1
+ 2 | 1
+ 2 | 2
+ 3 | 1
+ 3 | 2
+ 3 | 3
+(6 rows)
+
+-- ... and the keyword changes nothing
+SELECT lat.x, g FROM lat CROSS JOIN LATERAL generate_series(1, lat.x) g ORDER BY 1, 2;
+ x | g 
+---+---
+ 1 | 1
+ 2 | 1
+ 2 | 2
+ 3 | 1
+ 3 | 2
+ 3 | 3
+(6 rows)
+
+-- WITH ORDINALITY on a lateral table function
+SELECT lat.x, u.v, u.n FROM lat, unnest(lat.arr) WITH ORDINALITY AS u(v, n) ORDER BY 1, 3;
+ x | v  | n 
+---+----+---
+ 1 | 10 | 1
+ 1 | 20 | 2
+ 2 | 30 | 1
+(3 rows)
+
+-- a lateral item may reference several relations to its left
+SELECT * FROM lat a JOIN lat b ON a.x = b.x, LATERAL (SELECT a.x + b.x AS s) l ORDER BY 1;
+ x |   arr   | x |   arr   | s 
+---+---------+---+---------+---
+ 1 | {10,20} | 1 | {10,20} | 2
+ 2 | {30}    | 2 | {30}    | 4
+ 3 |         | 3 |         | 6
+(3 rows)
+
+-- a USING/NATURAL join's merged column resolves once inside a lateral item,
+-- rather than ambiguously across the two physical sides
+CREATE TABLE la (k integer, v integer);
+INSERT INTO la VALUES (1, 10), (2, 20);
+CREATE TABLE lb (k integer, w integer);
+INSERT INTO lb VALUES (1, 100), (2, 200);
+SELECT * FROM la JOIN lb USING (k), LATERAL (SELECT k * 1000 AS z) s ORDER BY 1;
+ k | v  |  w  |  z   
+---+----+-----+------
+ 1 | 10 | 100 | 1000
+ 2 | 20 | 200 | 2000
+(2 rows)
+
+SELECT * FROM la NATURAL JOIN lb, LATERAL (SELECT k + 1 AS z) s ORDER BY 1;
+ k | v  |  w  | z 
+---+----+-----+---
+ 1 | 10 | 100 | 2
+ 2 | 20 | 200 | 3
+(2 rows)
+
+SELECT * FROM la JOIN lb USING (k) CROSS JOIN LATERAL (SELECT k * 7 AS z) s ORDER BY 1;
+ k | v  |  w  | z  
+---+----+-----+----
+ 1 | 10 | 100 |  7
+ 2 | 20 | 200 | 14
+(2 rows)
+
+DROP TABLE la;
+DROP TABLE lb;
+-- LATERAL inside LATERAL
+SELECT * FROM lat, LATERAL (SELECT * FROM LATERAL (SELECT lat.x + 1 AS y) a) b ORDER BY 1;
+ x |   arr   | y 
+---+---------+---
+ 1 | {10,20} | 2
+ 2 | {30}    | 3
+ 3 |         | 4
+(3 rows)
+
+-- a lateral item inside a correlated subquery reaches both levels
+SELECT i.x, (SELECT count(*) FROM lat o, LATERAL (SELECT o.x + i.x AS s) l WHERE l.s > 3)
+  FROM lat i ORDER BY 1;
+ x | count 
+---+-------
+ 1 |     1
+ 2 |     2
+ 3 |     3
+(3 rows)
+
+-- an aggregate over a lateral join
+SELECT sum(g) FROM lat, generate_series(1, lat.x) g;
+ sum 
+-----
+  10
+(1 row)
+
+-- the WHERE of the enclosing query filters the joined row
+SELECT lat.x, g FROM lat, generate_series(1, lat.x) g WHERE g = 2 ORDER BY 1;
+ x | g 
+---+---
+ 2 | 2
+ 3 | 2
+(2 rows)
+
+-- a leftmost LATERAL is legal and references nothing
+SELECT * FROM LATERAL (SELECT 1) s;
+ ?column? 
+----------
+        1
+(1 row)
+
+-- LATERAL on the left of a join, referenced by the right one
+SELECT * FROM lat, LATERAL (SELECT lat.x AS a) p, LATERAL (SELECT p.a * 2 AS b) q ORDER BY 1;
+ x |   arr   | a | b 
+---+---------+---+---
+ 1 | {10,20} | 1 | 2
+ 2 | {30}    | 2 | 4
+ 3 |         | 3 | 6
+(3 rows)
+
+-- without LATERAL a FROM subquery may not see its siblings
+SELECT * FROM lat, (SELECT lat.x) s;
+ERROR:  invalid reference to FROM-clause entry for table "lat"
+DETAIL:  There is an entry for table "lat", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
+SELECT * FROM lat, (SELECT x) s;
+ERROR:  column "x" does not exist
+DETAIL:  There is a column named "x" in table "lat", but it cannot be referenced from this part of the query.
+HINT:  To reference that column, you must mark this subquery with LATERAL.
+-- a lateral reference across RIGHT/FULL JOIN is refused
+SELECT * FROM lat RIGHT JOIN LATERAL (SELECT lat.x) s ON true;
+ERROR:  invalid reference to FROM-clause entry for table "lat"
+DETAIL:  The combining JOIN type must be INNER or LEFT for a LATERAL reference.
+SELECT * FROM lat FULL JOIN LATERAL (SELECT lat.x) s ON true;
+ERROR:  invalid reference to FROM-clause entry for table "lat"
+DETAIL:  The combining JOIN type must be INNER or LEFT for a LATERAL reference.
+-- a table function there is implicitly lateral, so it is refused the same way
+SELECT * FROM lat RIGHT JOIN generate_series(1, lat.x) g ON true;
+ERROR:  invalid reference to FROM-clause entry for table "lat"
+DETAIL:  The combining JOIN type must be INNER or LEFT for a LATERAL reference.
+-- without the keyword the entry is equally out of reach, but LATERAL would not
+-- reach it either, so no hint is offered
+SELECT * FROM lat RIGHT JOIN (SELECT lat.x) s ON true;
+ERROR:  invalid reference to FROM-clause entry for table "lat"
+DETAIL:  There is an entry for table "lat", but it cannot be referenced from this part of the query.
+SELECT * FROM lat RIGHT JOIN (SELECT x) s ON true;
+ERROR:  column "x" does not exist
+DETAIL:  There is a column named "x" in table "lat", but it cannot be referenced from this part of the query.
+-- a FROM subquery is still correlated to the *enclosing* query without LATERAL
+SELECT i.x, (SELECT s.c FROM lat u, (SELECT i.x AS c) s LIMIT 1) FROM lat i ORDER BY 1;
+ x | c 
+---+---
+ 1 | 1
+ 2 | 2
+ 3 | 3
+(3 rows)
+
+-- and so is a LATERAL one across a RIGHT join: only the left row is off limits
+SELECT i.x, (SELECT s.c FROM lat u RIGHT JOIN LATERAL (SELECT i.x AS c) s ON true LIMIT 1)
+  FROM lat i ORDER BY 1;
+ x | c 
+---+---
+ 1 | 1
+ 2 | 2
+ 3 | 3
+(3 rows)
+
+DROP TABLE lat;
