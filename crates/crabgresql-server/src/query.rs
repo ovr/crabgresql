@@ -413,9 +413,10 @@ pub(crate) fn catalog_routine(
         // A pseudo-type, which `format_type` names from the shared table.
         TypeRef::Cstring => crabgresql_types::oid::CSTRING,
     };
-    // PostgreSQL leaves proallargtypes/proargmodes NULL unless some argument is
-    // OUT or INOUT, and proargnames NULL unless some argument is named.
-    let has_output = info.all_args.iter().any(|a| !a.mode.is_input());
+    // PostgreSQL leaves proallargtypes/proargmodes NULL unless some argument's
+    // mode is other than plain IN — which VARIADIC is, as much as OUT/INOUT are
+    // — and proargnames NULL unless some argument is named.
+    let has_modes = info.all_args.iter().any(|a| a.mode != ArgMode::In);
     let named = info.all_args.iter().any(|a| a.name.is_some());
     crabgresql_catalog::CatalogRoutine {
         oid: info.oid,
@@ -424,16 +425,28 @@ pub(crate) fn catalog_routine(
         kind: info.kind.prokind(),
         lang: info.lang_oid,
         arg_types: info.args.iter().map(oid_of).collect(),
-        all_arg_types: if has_output {
+        all_arg_types: if has_modes {
             info.all_args.iter().map(|a| oid_of(&a.ty)).collect()
         } else {
             Vec::new()
         },
-        arg_modes: if has_output {
+        arg_modes: if has_modes {
             info.all_args.iter().map(|a| a.mode.proargmode()).collect()
         } else {
             Vec::new()
         },
+        // `provariadic` is the *element* type, where the signature carries the
+        // array; a declared type that is not an array never reaches here
+        // (`routine_args` rejects it with 42P13).
+        variadic_elem: info
+            .all_args
+            .iter()
+            .find(|a| a.mode.is_variadic())
+            .and_then(|a| match &a.ty {
+                TypeRef::Builtin(PgType::Array(elem)) => Some(*elem),
+                _ => None,
+            })
+            .unwrap_or(0),
         arg_names: if named {
             info.all_args
                 .iter()
@@ -7000,38 +7013,60 @@ fn execute_create_function(
 /// Resolve a parsed routine's parameter list. `OUT` parameters are kept — they
 /// are excluded from the routine's *identity* by the catalog, not here, because
 /// `pg_proc.proallargtypes`/`proargmodes` still need to report them.
+///
+/// A `VARIADIC` parameter must be an array and must be the last *input*
+/// parameter; both violations are PostgreSQL's `42P13`, with the caret on the
+/// `VARIADIC` keyword in the first case and on the parameter that follows it in
+/// the second.
 fn routine_args(
     catalog: &GlobalCatalog,
     args: &[ast::OperateFunctionArg],
 ) -> Result<Vec<RoutineArg>, PgError> {
-    args.iter()
-        .map(|arg| {
-            let mode = match arg.mode {
-                None | Some(ast::ArgMode::In) => ArgMode::In,
-                Some(ast::ArgMode::Out) => ArgMode::Out,
-                Some(ast::ArgMode::InOut) => ArgMode::InOut,
-                Some(ast::ArgMode::Variadic) => {
-                    return Err(PgError::feature_not_supported(
-                        "VARIADIC parameters are not supported yet",
-                    ));
-                }
-            };
-            if arg.default_expr.is_some() {
-                return Err(PgError::feature_not_supported(
-                    "parameter defaults are not supported yet",
-                ));
+    let mut out: Vec<RoutineArg> = Vec::with_capacity(args.len());
+    let mut variadic_seen = false;
+    for arg in args {
+        let mode = match arg.mode {
+            None | Some(ast::ArgMode::In) => ArgMode::In,
+            Some(ast::ArgMode::Out) => ArgMode::Out,
+            Some(ast::ArgMode::InOut) => ArgMode::InOut,
+            Some(ast::ArgMode::Variadic) => ArgMode::Variadic,
+        };
+        // An OUT parameter after the variadic one is fine — only *inputs* have
+        // to stop there, since only they are what a call's arguments fill.
+        if variadic_seen && mode.is_input() {
+            return Err(PgError::new(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "VARIADIC parameter must be the last input parameter",
+            )
+            .at(arg.arg_span));
+        }
+        if arg.default_expr.is_some() {
+            return Err(PgError::feature_not_supported(
+                "parameter defaults are not supported yet",
+            ));
+        }
+        let ty = resolve_type_ref(catalog, &arg.data_type)?;
+        if mode.is_variadic() {
+            if !matches!(ty, TypeRef::Builtin(PgType::Array(_))) {
+                return Err(PgError::new(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "VARIADIC parameter must be an array",
+                )
+                .at(arg.arg_span));
             }
-            // An empty span (line 0) means the arg was built without source
-            // location; only parsed, bare arguments carry a caret position.
-            let start = arg.data_type_span.start;
-            Ok(RoutineArg {
-                ty: resolve_type_ref(catalog, &arg.data_type)?,
-                mode,
-                name: arg.name.as_ref().map(normalize_ident),
-                position: (start.line != 0).then_some((start.line, start.column)),
-            })
-        })
-        .collect()
+            variadic_seen = true;
+        }
+        // An empty span (line 0) means the arg was built without source
+        // location; only parsed, bare arguments carry a caret position.
+        let start = arg.data_type_span.start;
+        out.push(RoutineArg {
+            ty,
+            mode,
+            name: arg.name.as_ref().map(normalize_ident),
+            position: (start.line != 0).then_some((start.line, start.column)),
+        });
+    }
+    Ok(out)
 }
 
 /// `IMMUTABLE | STABLE | VOLATILE`, defaulting to PG's `VOLATILE`.

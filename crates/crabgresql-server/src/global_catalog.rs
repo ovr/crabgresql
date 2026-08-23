@@ -243,6 +243,7 @@ pub enum ArgMode {
     In,
     Out,
     InOut,
+    Variadic,
 }
 
 impl ArgMode {
@@ -252,13 +253,22 @@ impl ArgMode {
             ArgMode::In => 'i',
             ArgMode::Out => 'o',
             ArgMode::InOut => 'b',
+            ArgMode::Variadic => 'v',
         }
     }
 
     /// Whether an argument in this mode is passed in by the caller, and so is
     /// part of the routine's identity for overload resolution and DROP.
+    ///
+    /// A `VARIADIC` parameter is an input like any other: its declared type —
+    /// the *array* — is what the routine's signature carries, which is why
+    /// `DROP FUNCTION f(int, int[])` names a `f(a int, VARIADIC b int[])`.
     pub fn is_input(self) -> bool {
         !matches!(self, ArgMode::Out)
+    }
+
+    pub fn is_variadic(self) -> bool {
+        matches!(self, ArgMode::Variadic)
     }
 }
 
@@ -1438,6 +1448,16 @@ impl TypeCatalog for GlobalCatalog {
                         RoutineKind::Procedure => ApiRoutineKind::Procedure,
                     },
                     strict: f.strict,
+                    // The binder coerces a spread call's trailing arguments to
+                    // the element type, which the declared array type hides.
+                    variadic_elem: f
+                        .all_args
+                        .iter()
+                        .find(|a| a.mode.is_variadic())
+                        .and_then(|a| match cat.pg_type_of(&a.ty) {
+                            Some(PgType::Array(elem)) => PgType::from_oid(elem),
+                            _ => None,
+                        }),
                     imp,
                 })
             })

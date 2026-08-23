@@ -2642,6 +2642,7 @@ fn wide_fixture() -> SystemCatalog {
             arg_types: vec![PgType::Int4.oid()],
             all_arg_types: Vec::new(),
             arg_modes: Vec::new(),
+            variadic_elem: 0,
             arg_names: vec!["a".to_string()],
             ret_type: PgType::Int4.oid(),
             retset: false,

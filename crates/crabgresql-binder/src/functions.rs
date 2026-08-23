@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crabgresql_parser::ast;
+use crabgresql_parser::ast::Spanned;
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{RoutineImpl, RoutineKind, RoutineSig, TypeCatalog};
 use crabgresql_types::collation::DEFAULT_COLLATION_OID;
@@ -505,6 +506,20 @@ pub enum ScalarFn {
     ConcatWs,
     /// `format(text, ...) -> text` (variadic, non-strict).
     Format,
+    /// The `f(… , VARIADIC arr)` spellings of the three above: the **last**
+    /// argument is an array whose elements stand in for the trailing arguments,
+    /// expanded at run time because only then is its length known.
+    ///
+    /// They are separate variants rather than a flag because the NULL rules
+    /// differ from the spread-out call: `concat(VARIADIC NULL::int[])` is NULL
+    /// where `concat(NULL)` is the empty string, and
+    /// `format('%s', VARIADIC NULL::text[])` is "too few arguments" where
+    /// `format('%s', NULL)` is the empty string.
+    ConcatVariadic,
+    /// `concat_ws(sep, VARIADIC arr)`.
+    ConcatWsVariadic,
+    /// `format(picture, VARIADIC arr)`.
+    FormatVariadic,
     /// `text LIKE text -> bool` (case-sensitive).
     Like,
     /// `text ILIKE text -> bool` (case-insensitive).
@@ -3896,6 +3911,10 @@ fn bind_special_form(
                 | ast::FunctionArg::ExprNamed { operator, .. } => {
                     return syntax_error(&operator.to_string());
                 }
+                // `VARIADIC` belongs to PG's *function* argument list, not to
+                // the bare expression list these forms take, so its cursor
+                // stops on the keyword itself.
+                ast::FunctionArg::Variadic(_) => return syntax_error("variadic"),
                 // PG's grammar has no bare wildcard in an expression list either,
                 // and its cursor stops at the star — including for the Snowflake
                 // `* EXCLUDE(…)` this parser accepts.
@@ -4019,7 +4038,8 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return bind_aggregate(agg, &name, &func.args, scope);
     }
     let arg_exprs = positional_args(&func.args)?;
-    let bindings = arg_exprs
+    let variadic = variadic_arg_index(&func.args);
+    let mut bindings = arg_exprs
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
@@ -4027,17 +4047,49 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
     // `concat`/`concat_ws`/`format` are variadic and non-strict; they don't fit
     // the fixed-arity overload table, so every argument is coerced to text and a
     // single variadic `FuncCall` is built directly.
-    if let Some(func) = match name.as_str() {
-        "concat" => Some(ScalarFn::Concat),
-        "concat_ws" => Some(ScalarFn::ConcatWs),
-        "format" => Some(ScalarFn::Format),
+    //
+    // `spread_at` is where the callee's `VARIADIC "any"` parameter sits; below
+    // it the parameter is an ordinary one, which is why a `VARIADIC` argument
+    // landing on `concat_ws`'s separator is `function concat_ws(text[]) does
+    // not exist` rather than a spread.
+    if let Some((plain, spread_fn, spread_at, min_args)) = match name.as_str() {
+        "concat" => Some((ScalarFn::Concat, ScalarFn::ConcatVariadic, 0, 1)),
+        "concat_ws" => Some((ScalarFn::ConcatWs, ScalarFn::ConcatWsVariadic, 1, 2)),
+        // `format(text)` is a second `pg_proc` entry, not the variadic one, so
+        // one argument is enough.
+        "format" => Some((ScalarFn::Format, ScalarFn::FormatVariadic, 1, 1)),
         _ => None,
     } {
+        // `concat()` and `concat_ws(',')` are 42883 on 18.4, not the empty
+        // string: the variadic parameter needs at least one argument. Spelled
+        // with the keyword the array *is* that whole parameter, so it also has
+        // to land exactly on it — `concat_ws(',', 'a', VARIADIC arr)` has one
+        // argument too many for `concat_ws(text, VARIADIC "any")`.
+        if bindings.len() < min_args || variadic.is_some_and(|i| i != spread_at) {
+            return Err(undefined_function(&name, &bindings));
+        }
+        if let Some(i) = variadic {
+            if !matches!(&bindings[i], Binding::Typed(e) if matches!(e.ty(), PgType::Array(_))) {
+                return Err(variadic_not_array(arg_exprs[i].span()));
+            }
+            // The array keeps its own type where the other operands are coerced
+            // to text: `VARIADIC "any"` renders each *element* with that
+            // element's output function.
+            let mut args = bindings
+                .drain(..i)
+                .map(crate::expr::to_concat_operand)
+                .collect::<Result<Vec<_>, _>>()?;
+            let Binding::Typed(array) = bindings.remove(0) else {
+                unreachable!("checked above");
+            };
+            args.push(array);
+            return finish_func_call(spread_fn, PgType::Text, args);
+        }
         let args = bindings
             .into_iter()
             .map(crate::expr::to_concat_operand)
             .collect::<Result<Vec<_>, _>>()?;
-        return finish_func_call(func, PgType::Text, args);
+        return finish_func_call(plain, PgType::Text, args);
     }
 
     // Polymorphic array functions can't live in the fixed-signature overload
@@ -4075,7 +4127,7 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return bind_pg_typeof(binding, scope);
     }
 
-    resolve_call(&name, bindings, scope.catalog())
+    resolve_call_variadic(&name, bindings, scope.catalog(), variadic.is_some())
 }
 
 /// Bind `pg_typeof(any) -> regtype`, which reports its argument's type.
@@ -4845,11 +4897,32 @@ pub(crate) fn resolve_call(
     bindings: Vec<Binding>,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<Binding, BindError> {
+    resolve_call_variadic(name, bindings, catalog, false)
+}
+
+/// `variadic_call` is whether the call's last argument was written
+/// `VARIADIC expr`. It changes only which shape a user routine's variadic
+/// parameter presents (see [`routine_params`]); a built-in signature has no
+/// variadic parameter to reshape, so the keyword just leaves the argument's own
+/// array type to resolve against — which is exactly PostgreSQL's behavior for
+/// `cardinality(VARIADIC a)` and `length(VARIADIC a)`'s 42883 alike.
+pub(crate) fn resolve_call_variadic(
+    name: &str,
+    bindings: Vec<Binding>,
+    catalog: &Arc<dyn TypeCatalog>,
+    variadic_call: bool,
+) -> Result<Binding, BindError> {
     let sigs = lookup(name);
     if sigs.is_empty() {
         // No built-in of this name: a user-defined `LANGUAGE SQL` function may
         // still match. Only when that also fails is the call undefined.
-        return resolve_user_routine_call(name, bindings, catalog.routines(name), catalog);
+        return resolve_user_routine_call(
+            name,
+            bindings,
+            catalog.routines(name),
+            catalog,
+            variadic_call,
+        );
     }
     // First try an all-exact-type match. Then, among the signatures whose args
     // all coerce, pick the one keeping the most arguments at their exact type —
@@ -4894,10 +4967,9 @@ pub(crate) fn resolve_call(
             // and no ambiguity.
             let survivors = narrowed.iter().filter(|sig| reachable(sig.args)).count();
             // A routine PG would have weighed suppresses the error.
-            let user_candidate = catalog
-                .routines(name)
-                .iter()
-                .any(|r| r.arg_types.len() == bindings.len() && reachable(&r.arg_types));
+            let user_candidate = catalog.routines(name).iter().any(|r| {
+                routine_params(r, bindings.len(), variadic_call).is_some_and(|p| reachable(&p))
+            });
             if survivors > 1 && !user_candidate {
                 return Err(ambiguous_function(name, &bindings));
             }
@@ -4944,11 +5016,13 @@ pub(crate) fn resolve_call(
             // exist". Same-arity user routines are still candidates by type, so
             // they have to be ruled out first; other arities never were.
             if let Some(e) = literal_fail
-                && !routines.iter().any(|r| r.arg_types.len() == bindings.len())
+                && !routines
+                    .iter()
+                    .any(|r| routine_params(r, bindings.len(), variadic_call).is_some())
             {
                 return Err(e);
             }
-            resolve_user_routine_call(name, bindings, routines, catalog)
+            resolve_user_routine_call(name, bindings, routines, catalog, variadic_call)
         }
     }
 }
@@ -5008,8 +5082,9 @@ fn resolve_user_routine_call(
     bindings: Vec<Binding>,
     sigs: Vec<RoutineSig>,
     catalog: &Arc<dyn TypeCatalog>,
+    variadic_call: bool,
 ) -> Result<Binding, BindError> {
-    let Some((sig, args)) = choose_routine_overload(name, &bindings, &sigs)? else {
+    let Some((sig, args)) = choose_routine_overload(name, &bindings, &sigs, variadic_call)? else {
         return Err(undefined_function(name, &bindings));
     };
 
@@ -5073,6 +5148,52 @@ fn resolve_user_routine_call(
     Ok(Binding::Typed(inline_params(body, &args)))
 }
 
+/// The parameter list a routine presents to a call of `nargs` arguments, or
+/// `None` when it cannot take that many.
+///
+/// A `VARIADIC` routine has *two* shapes, and the call picks which one applies.
+/// Written `f(1, 2, 3)`, the trailing parameter stands for however many
+/// arguments are left, so `f(a int, VARIADIC b int[])` presents `int, int, int`.
+/// Written `f(1, VARIADIC arr)`, the array *is* that parameter and the declared
+/// list is used as it stands. PostgreSQL admits only the shape the call chose:
+/// `f(ARRAY[1,2])` against `f(VARIADIC int[])` is `42883`, verified on 18.4.
+///
+/// The spread shape needs at least one argument for the variadic parameter —
+/// `f()` against `f(VARIADIC int[])` is `42883` too, not an empty array.
+fn routine_params(sig: &RoutineSig, nargs: usize, variadic_call: bool) -> Option<Vec<PgType>> {
+    let declared = &sig.arg_types;
+    match sig.variadic_elem {
+        Some(elem) if !variadic_call => {
+            if nargs < declared.len() {
+                return None;
+            }
+            let mut params = declared[..declared.len() - 1].to_vec();
+            params.resize(nargs, elem);
+            Some(params)
+        }
+        _ => (declared.len() == nargs).then(|| declared.clone()),
+    }
+}
+
+/// A spread call's trailing arguments folded back into the array its variadic
+/// parameter actually receives; a no-op for every other call shape.
+fn pack_variadic_tail(
+    sig: &RoutineSig,
+    variadic_call: bool,
+    mut args: Vec<BoundExpr>,
+) -> Vec<BoundExpr> {
+    let Some(elem) = sig.variadic_elem.filter(|_| !variadic_call) else {
+        return args;
+    };
+    let tail = args.split_off(sig.arg_types.len() - 1);
+    args.push(BoundExpr::ArrayCtor {
+        elem,
+        ty: PgType::Array(elem.oid()),
+        elems: tail,
+    });
+    args
+}
+
 /// Pick the winning user-routine overload for a call, mirroring the built-in
 /// resolver's preference: an all-exact-type match wins outright; otherwise the
 /// argument-coercible candidate keeping the most arguments at their exact type
@@ -5082,14 +5203,16 @@ fn choose_routine_overload<'a>(
     name: &str,
     bindings: &[Binding],
     sigs: &'a [RoutineSig],
+    variadic_call: bool,
 ) -> Result<Option<(&'a RoutineSig, Vec<BoundExpr>)>, BindError> {
+    let params = |sig: &RoutineSig| routine_params(sig, bindings.len(), variadic_call);
     // Two overloads can never share the same argument types (`create_function`
     // rejects that), so at most one all-exact match exists.
     for sig in sigs {
-        if sig.arg_types.len() == bindings.len()
-            && let Ok(args) = try_coerce_args(bindings, &sig.arg_types, true)
+        if let Some(p) = params(sig)
+            && let Ok(args) = try_coerce_args(bindings, &p, true)
         {
-            return Ok(Some((sig, args)));
+            return Ok(Some((sig, pack_variadic_tail(sig, variadic_call, args))));
         }
     }
     // No exact match: rank the coercible candidates by how many arguments are
@@ -5098,16 +5221,13 @@ fn choose_routine_overload<'a>(
     let mut tied = false;
     // As for built-ins: the rejected literal of a lone arity-matching overload
     // is the error PG reports, since the overload was already chosen by then.
-    let arity_matches = sigs
-        .iter()
-        .filter(|s| s.arg_types.len() == bindings.len())
-        .count();
+    let arity_matches = sigs.iter().filter(|s| params(s).is_some()).count();
     let mut literal_fail: Option<BindError> = None;
     for sig in sigs {
-        if sig.arg_types.len() != bindings.len() {
+        let Some(p) = params(sig) else {
             continue;
-        }
-        let args = match try_coerce_args(bindings, &sig.arg_types, false) {
+        };
+        let args = match try_coerce_args(bindings, &p, false) {
             Ok(args) => args,
             Err(ArgFail::LiteralInput(e)) if arity_matches == 1 => {
                 literal_fail = Some(e);
@@ -5117,9 +5237,10 @@ fn choose_routine_overload<'a>(
         };
         let score = bindings
             .iter()
-            .zip(&sig.arg_types)
+            .zip(&p)
             .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
             .count();
+        let args = pack_variadic_tail(sig, variadic_call, args);
         match &best {
             None => best = Some((score, sig, args)),
             Some((b, _, _)) if score > *b => {
@@ -5313,6 +5434,17 @@ fn typed_mismatch(bindings: &[Binding], params: &[PgType], exact_only: bool) -> 
         matches!(binding, Binding::Typed(_))
             && coerce_for_arg(binding.clone(), target, exact_only).is_err()
     })
+}
+
+/// PG's `42804` for `concat(VARIADIC 10)`: a `VARIADIC "any"` parameter spreads
+/// an array's elements, so the argument has to *be* an array. The caret sits on
+/// the argument, not on the `VARIADIC` keyword.
+fn variadic_not_array(span: crabgresql_parser::Span) -> BindError {
+    BindError::new(
+        sqlstate::DATATYPE_MISMATCH,
+        "VARIADIC argument must be an array",
+    )
+    .at_if_unset(span)
 }
 
 fn undefined_function(name: &str, bindings: &[Binding]) -> BindError {
@@ -5565,11 +5697,17 @@ fn positional_args(args: &ast::FunctionArguments) -> Result<Vec<ast::Expr>, Bind
 
 /// Extract plain positional argument expressions, rejecting named/wildcard
 /// forms. Shared by scalar calls and table-function (FROM-position) calls.
+///
+/// A `VARIADIC expr` argument yields `expr` with no trace left behind, which is
+/// all most callees need (see [`resolve_call_variadic`]). The two that need
+/// more — a user routine's variadic parameter and a `VARIADIC "any"` built-in —
+/// ask separately, via [`variadic_arg_index`].
 pub(crate) fn positional_arg_exprs(args: &[ast::FunctionArg]) -> Result<Vec<ast::Expr>, BindError> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
         match arg {
-            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => out.push(e.clone()),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+            | ast::FunctionArg::Variadic(ast::FunctionArgExpr::Expr(e)) => out.push(e.clone()),
             _ => {
                 return Err(BindError::feature_not_supported(
                     "named or wildcard function arguments are not supported yet",
@@ -5578,4 +5716,15 @@ pub(crate) fn positional_arg_exprs(args: &[ast::FunctionArg]) -> Result<Vec<ast:
         }
     }
     Ok(out)
+}
+
+/// Where the call wrote `VARIADIC`, if it did. The parser has already enforced
+/// that it is the last argument.
+fn variadic_arg_index(args: &ast::FunctionArguments) -> Option<usize> {
+    let ast::FunctionArguments::List(list) = args else {
+        return None;
+    };
+    list.args
+        .iter()
+        .position(|a| matches!(a, ast::FunctionArg::Variadic(_)))
 }

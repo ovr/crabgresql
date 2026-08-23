@@ -2146,6 +2146,11 @@ pub struct RoutineSig {
     pub kind: RoutineKind,
     /// `STRICT`: a NULL argument yields NULL without entering the body.
     pub strict: bool,
+    /// The *element* type of a trailing `VARIADIC` parameter, or `None` when
+    /// the routine declares none. The array type itself stays in `arg_types`
+    /// (the routine's identity is the array), so this is the extra fact a
+    /// caller needs to spread `f(1, 2, 3)` over `f(a int, VARIADIC b int[])`.
+    pub variadic_elem: Option<PgType>,
     pub imp: RoutineImpl,
 }
 

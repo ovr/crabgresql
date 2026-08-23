@@ -5571,6 +5571,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_arg(&mut self) -> Result<OperateFunctionArg, ParserError> {
+        // Taken before the mode keyword: the caret of `VARIADIC parameter must
+        // be an array` sits on `VARIADIC` itself, not on the name or type.
+        let arg_start = self.peek_token().span.start;
         let mode = if self.parse_keyword(Keyword::IN) {
             Some(ArgMode::In)
         } else if self.parse_keyword(Keyword::OUT) {
@@ -5634,6 +5637,7 @@ impl<'a> Parser<'a> {
             name,
             data_type,
             data_type_span: Span::new(type_start, type_start),
+            arg_span: Span::new(arg_start, arg_start),
             default_expr,
         })
     }
@@ -5698,6 +5702,7 @@ impl<'a> Parser<'a> {
             name,
             data_type,
             data_type_span: Span::empty(),
+            arg_span: Span::empty(),
             default_expr: None,
         })
     }
@@ -16119,6 +16124,10 @@ impl<'a> Parser<'a> {
 
     /// Parse a single function argument, handling named and unnamed variants.
     pub fn parse_function_args(&mut self) -> Result<FunctionArg, ParserError> {
+        // The "last argument only" rule lives in `parse_call_arg_list`.
+        if self.parse_keyword(Keyword::VARIADIC) {
+            return Ok(FunctionArg::Variadic(self.parse_wildcard_expr()?.into()));
+        }
         let arg = if self.dialect.supports_named_fn_args_with_expr_name() {
             self.maybe_parse(|p| {
                 let name = p.parse_expr()?;
@@ -16201,10 +16210,34 @@ impl<'a> Parser<'a> {
         if self.consume_token(&Token::RParen) {
             Ok(vec![])
         } else {
-            let args = self.parse_comma_separated(Parser::parse_function_args)?;
+            let args = self.parse_call_arg_list()?;
             self.expect_token(&Token::RParen)?;
             Ok(args)
         }
+    }
+
+    /// A call's comma-separated argument list, enforcing that `VARIADIC` marks
+    /// the **last** argument.
+    ///
+    /// PostgreSQL's grammar admits `VARIADIC` only in the final position of an
+    /// argument list, so `concat(VARIADIC a, b)` is rejected as
+    /// `syntax error at or near ","` with the caret on the comma — not as a
+    /// later type or resolution failure. Reporting it here is what keeps the
+    /// caret on the comma; anything downstream has already lost that token.
+    fn parse_call_arg_list(&mut self) -> Result<Vec<FunctionArg>, ParserError> {
+        let mut args = Vec::new();
+        loop {
+            let arg = self.parse_function_args()?;
+            let variadic = matches!(arg, FunctionArg::Variadic(_));
+            args.push(arg);
+            if variadic && self.peek_token_ref().token == Token::Comma {
+                return Err(self.pg_syntax_error(","));
+            }
+            if self.is_parse_comma_separated_end() {
+                break;
+            }
+        }
+        Ok(args)
     }
 
     fn parse_table_function_args(&mut self) -> Result<TableFunctionArgs, ParserError> {
@@ -16219,7 +16252,12 @@ impl<'a> Parser<'a> {
             if let Some(settings) = self.parse_settings()? {
                 break Some(settings);
             }
-            args.push(self.parse_function_args()?);
+            let arg = self.parse_function_args()?;
+            let variadic = matches!(arg, FunctionArg::Variadic(_));
+            args.push(arg);
+            if variadic && self.peek_token_ref().token == Token::Comma {
+                return Err(self.pg_syntax_error(","));
+            }
             if self.is_parse_comma_separated_end() {
                 break None;
             }
@@ -16260,7 +16298,7 @@ impl<'a> Parser<'a> {
         }
 
         let duplicate_treatment = self.parse_duplicate_treatment()?;
-        let args = self.parse_comma_separated(Parser::parse_function_args)?;
+        let args = self.parse_call_arg_list()?;
 
         if self.dialect.supports_window_function_null_treatment_arg() {
             if let Some(null_treatment) = self.parse_null_treatment()? {
@@ -17964,6 +18002,25 @@ mod tests {
             "SELECT SUBSTR('a' SIMILAR 'b' ESCAPE '#')"
         )
         .is_err());
+    }
+
+    /// Both halves of the rule, so a guard that rejected every `VARIADIC` would
+    /// not pass: the accepted positions parse, and a misplaced one is the
+    /// comma's `syntax error` rather than some later failure.
+    #[test]
+    fn parse_variadic_call_argument_must_be_last() {
+        let dialects = all_dialects();
+        dialects.verified_stmt("SELECT concat(VARIADIC ARRAY[1, 2])");
+        dialects.verified_stmt("SELECT concat_ws(',', VARIADIC a)");
+        dialects.verified_stmt("SELECT f(a, b, VARIADIC c)");
+        for sql in [
+            "SELECT concat(VARIADIC ARRAY[1], 2)",
+            "SELECT f(VARIADIC a, VARIADIC b)",
+        ] {
+            let error = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+                .expect_err("VARIADIC must be the last argument");
+            assert_eq!(format!("{error}"), "syntax error at or near \",\"", "{sql}");
+        }
     }
 
     /// Without the guard a qualifier is silently absorbed: `parse_prefix` builds

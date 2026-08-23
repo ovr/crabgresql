@@ -229,9 +229,8 @@ pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {
 /// `procost`/`prorows`/`proparallel` report what the routine declared —
 /// `CREATE FUNCTION` parses no `COST`/`ROWS` clause at all and drops the
 /// `PARALLEL` it does parse, so one created `PARALLEL SAFE` reports `u`.
-/// TODO: fill `provariadic`/`pronargdefaults` once `VARIADIC` parameters and
-/// argument defaults are accepted; `CREATE FUNCTION` rejects both, so 0 is
-/// exact until then.
+/// TODO: fill `pronargdefaults` once argument defaults are accepted;
+/// `CREATE FUNCTION` rejects them, so 0 is exact until then.
 pub(crate) fn pg_proc_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let mut rows = pg_proc_builtin_rows();
     rows.extend(user_rows(cat.routines(), cat.namespace_oids()));
@@ -259,7 +258,9 @@ fn user_rows(
                     100.0
                 }),
                 Value::Float4(if r.retset { 1000.0 } else { 0.0 }),
-                Value::Oid(0),
+                // provariadic: the element type of a VARIADIC parameter, 0 for
+                // a routine that declares none.
+                Value::Oid(r.variadic_elem),
                 // prosupport: a user routine has no planner support function.
                 Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
                 chr(r.kind),

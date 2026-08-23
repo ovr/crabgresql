@@ -64,6 +64,9 @@ pub const RESERVED_NAME: &str = "42939";
 /// that renames, drops, or retypes an existing view column).
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+/// `42P13` — a routine definition is invalid, e.g. a `VARIADIC` parameter that
+/// is not an array or is not the last input parameter.
+pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
 /// `54000` — an implementation limit was reached, e.g. a row too big to store
 /// on one page.
 pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";

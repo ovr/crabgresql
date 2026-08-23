@@ -1,0 +1,231 @@
+--
+-- VARIADIC parameters and VARIADIC arguments
+-- A routine's trailing parameter may stand for any number of arguments, and a
+-- call may hand that parameter a whole array instead by writing VARIADIC. The
+-- two shapes are exclusive: the spread form does not accept an array, and the
+-- VARIADIC form does not spread. Output generated with PostgreSQL (psql -a -q).
+-- (The resolution failures — too few arguments, a wrongly-typed array, VARIADIC
+-- in a COALESCE-style expression list — are covered by the server e2e tests
+-- instead: PG prints a `LINE`/caret excerpt and the "No function matches" HINT
+-- on a 42883 that no error this engine raises carries yet.)
+--
+--
+-- Declaring one
+--
+CREATE FUNCTION vsum(a int, VARIADIC rest int[]) RETURNS int LANGUAGE SQL IMMUTABLE
+  AS $$ SELECT a + coalesce(cardinality(rest), 0) $$;
+-- The spread form: every trailing argument becomes one array element.
+SELECT vsum(1, 2, 3, 4);
+ vsum 
+------
+    4
+(1 row)
+
+SELECT vsum(1, 2);
+ vsum 
+------
+    2
+(1 row)
+
+-- Trailing arguments coerce to the element type by the ordinary implicit rules.
+SELECT vsum(1, 2::smallint, 3);
+ vsum 
+------
+    3
+(1 row)
+
+--
+-- Calling one with VARIADIC
+--
+SELECT vsum(1, VARIADIC ARRAY[2, 3]);
+ vsum 
+------
+    3
+(1 row)
+
+SELECT vsum(1, VARIADIC '{2,3}');
+ vsum 
+------
+    3
+(1 row)
+
+-- A NULL array reaches the body as a NULL argument, not as no arguments.
+SELECT vsum(1, VARIADIC NULL::int[]);
+ vsum 
+------
+    1
+(1 row)
+
+SELECT vsum(1, VARIADIC ARRAY[]::int[]);
+ vsum 
+------
+    1
+(1 row)
+
+--
+-- The declaration's own rules
+--
+CREATE FUNCTION vbad(VARIADIC a int) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+ERROR:  VARIADIC parameter must be an array
+LINE 1: CREATE FUNCTION vbad(VARIADIC a int) RETURNS int LANGUAGE SQ...
+                             ^
+CREATE FUNCTION vbad(VARIADIC a int[], b int) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+ERROR:  VARIADIC parameter must be the last input parameter
+LINE 1: CREATE FUNCTION vbad(VARIADIC a int[], b int) RETURNS int LA...
+                                               ^
+CREATE FUNCTION vbad(VARIADIC a int[], VARIADIC b int[]) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+ERROR:  VARIADIC parameter must be the last input parameter
+LINE 1: CREATE FUNCTION vbad(VARIADIC a int[], VARIADIC b int[]) RET...
+                                               ^
+-- An OUT parameter may still follow: only *inputs* have to stop at the
+-- variadic one.
+CREATE FUNCTION vout(VARIADIC a int[], OUT b int) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+SELECT pg_get_function_arguments(oid) FROM pg_proc WHERE proname = 'vout';
+      pg_get_function_arguments      
+-------------------------------------
+ VARIADIC a integer[], OUT b integer
+(1 row)
+
+--
+-- The catalog
+--
+SELECT provariadic, pronargs, proargmodes, proallargtypes, proargnames
+  FROM pg_proc WHERE proname = 'vsum';
+ provariadic | pronargs | proargmodes | proallargtypes | proargnames 
+-------------+----------+-------------+----------------+-------------
+          23 |        2 | {i,v}       | {23,1007}      | {a,rest}
+(1 row)
+
+SELECT proargtypes FROM pg_proc WHERE proname = 'vsum';
+ proargtypes 
+-------------
+ 23 1007
+(1 row)
+
+SELECT pg_get_function_arguments(oid), pg_get_function_identity_arguments(oid)
+  FROM pg_proc WHERE proname = 'vsum';
+     pg_get_function_arguments      | pg_get_function_identity_arguments 
+------------------------------------+------------------------------------
+ a integer, VARIADIC rest integer[] | a integer, VARIADIC rest integer[]
+(1 row)
+
+-- The routine's identity is its declared types, the array among them: VARIADIC
+-- is not part of it, and DROP accepts the signature written either way.
+SELECT oid::regprocedure FROM pg_proc WHERE proname = 'vsum';
+           oid           
+-------------------------
+ vsum(integer,integer[])
+(1 row)
+
+--
+-- A PL/pgSQL body receives the array
+--
+CREATE FUNCTION vjoin(VARIADIC parts text[]) RETURNS text LANGUAGE plpgsql IMMUTABLE
+  AS $$ BEGIN RETURN array_to_string(parts, '-'); END $$;
+SELECT vjoin('a', 'b', 'c');
+ vjoin 
+-------
+ a-b-c
+(1 row)
+
+SELECT vjoin(VARIADIC ARRAY['x', 'y']);
+ vjoin 
+-------
+ x-y
+(1 row)
+
+--
+-- The built-in VARIADIC "any" functions
+--
+SELECT concat(VARIADIC ARRAY['a', 'b', 'c']);
+ concat 
+--------
+ abc
+(1 row)
+
+SELECT concat(VARIADIC ARRAY[1, 2, 3]);
+ concat 
+--------
+ 123
+(1 row)
+
+SELECT concat(VARIADIC '{}'::int[]) = '';
+ ?column? 
+----------
+ t
+(1 row)
+
+-- A NULL array is NULL, where a NULL argument would have been skipped.
+SELECT concat(VARIADIC NULL::int[]) IS NULL, concat(NULL) = '';
+ ?column? | ?column? 
+----------+----------
+ t        | t
+(1 row)
+
+SELECT concat_ws(',', VARIADIC ARRAY[1, 2, 3]);
+ concat_ws 
+-----------
+ 1,2,3
+(1 row)
+
+SELECT concat_ws(',', VARIADIC ARRAY[NULL, 'a', NULL, 'b']::text[]);
+ concat_ws 
+-----------
+ a,b
+(1 row)
+
+SELECT concat_ws(',', VARIADIC NULL::text[]) IS NULL;
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT format('%s|%s', VARIADIC ARRAY['a', 'b']);
+ format 
+--------
+ a|b
+(1 row)
+
+-- Extra elements past the picture's placeholders are ignored.
+SELECT format('%s|%s', VARIADIC ARRAY['a', 'b', 'c']);
+ format 
+--------
+ a|b
+(1 row)
+
+-- A NULL array is no arguments at all here, which is too few for the picture.
+SELECT format('%s', VARIADIC NULL::text[]);
+ERROR:  too few arguments for format()
+-- The argument has to be an array: this is the one call shape that says so.
+SELECT concat(VARIADIC 10);
+ERROR:  VARIADIC argument must be an array
+LINE 1: SELECT concat(VARIADIC 10);
+                               ^
+SELECT concat_ws(',', VARIADIC 10);
+ERROR:  VARIADIC argument must be an array
+LINE 1: SELECT concat_ws(',', VARIADIC 10);
+                                       ^
+--
+-- VARIADIC on a callee that has no variadic parameter is just its array type
+--
+SELECT cardinality(VARIADIC ARRAY[1, 2]);
+ cardinality 
+-------------
+           2
+(1 row)
+
+SELECT count(VARIADIC ARRAY[1, 2]);
+ count 
+-------
+     1
+(1 row)
+
+--
+-- Grammar: VARIADIC marks the last argument, and nothing may follow it
+--
+SELECT concat(VARIADIC ARRAY[1], 2);
+ERROR:  syntax error at or near ","
+LINE 1: SELECT concat(VARIADIC ARRAY[1], 2);
+                                       ^
+DROP FUNCTION vjoin(text[]);
+DROP FUNCTION vsum(int, VARIADIC int[]);

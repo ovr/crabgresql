@@ -87,6 +87,21 @@ fn bit_count(len: usize) -> Result<i32, ExecError> {
 /// (`concat`, `format`, `… ::text`) and every `timestamptz` operation depend on
 /// `extra_float_digits` and the session `TimeZone`. Functions needing a real
 /// handle (sequences, the catalog) are dispatched ahead of this in `eval.rs`.
+/// The elements a `VARIADIC arr` argument stands in for, or `None` when the
+/// array itself is NULL — which is not the same as an empty array, and not the
+/// same as one NULL element.
+///
+/// PostgreSQL spreads a multi-dimensional array in storage order
+/// (`concat(VARIADIC '{{1,2},{3,4}}'::int[])` is `1234`); `Value::Array` is
+/// one-dimensional here, so its element list already is that order.
+fn variadic_elements(arg: &Value) -> Option<&[Value]> {
+    match arg {
+        Value::Array { elems, .. } => Some(elems),
+        Value::Null => None,
+        other => unreachable!("the binder rejects a non-array VARIADIC argument, got {other:?}"),
+    }
+}
+
 pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value, ExecError> {
     // Non-strict string functions run even when arguments are NULL, so they are
     // handled before the STRICT NULL short-circuit below.
@@ -118,6 +133,44 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             };
             let fmt_args: Vec<text::FormatArg> =
                 args[1..].iter().map(|a| a.encode_text_with(fmt)).collect();
+            return text::format(&picture, &fmt_args)
+                .map(Value::Text)
+                .map_err(text_err);
+        }
+        ScalarFn::ConcatVariadic => {
+            let Some(elems) = variadic_elements(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            let mut out = String::new();
+            for a in elems {
+                if let Some(s) = a.encode_text_with(fmt) {
+                    out.push_str(&s);
+                }
+            }
+            return Ok(Value::Text(out));
+        }
+        ScalarFn::ConcatWsVariadic => {
+            let Some(sep) = args[0].encode_text_with(fmt) else {
+                return Ok(Value::Null);
+            };
+            let Some(elems) = variadic_elements(&args[1]) else {
+                return Ok(Value::Null);
+            };
+            let parts: Vec<String> = elems
+                .iter()
+                .filter_map(|a| a.encode_text_with(fmt))
+                .collect();
+            return Ok(Value::Text(parts.join(&sep)));
+        }
+        ScalarFn::FormatVariadic => {
+            let Some(picture) = args[0].encode_text_with(fmt) else {
+                return Ok(Value::Null);
+            };
+            let fmt_args: Vec<text::FormatArg> = variadic_elements(&args[1])
+                .unwrap_or(&[])
+                .iter()
+                .map(|a| a.encode_text_with(fmt))
+                .collect();
             return text::format(&picture, &fmt_args)
                 .map(Value::Text)
                 .map_err(text_err);
