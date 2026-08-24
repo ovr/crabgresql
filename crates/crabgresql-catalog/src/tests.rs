@@ -2394,9 +2394,8 @@ fn every_view_definition_parses_and_names_our_columns() {
         }
     }
 
-    // Definitions this build cannot read, checked against the expected set
-    // below rather than skipped where they occur: a silent `continue` would
-    // outlive the gap that justifies it.
+    // Checked against an expected set below rather than skipped where they
+    // occur: a silent `continue` would outlive the gap that justifies it.
     let mut unparsed = Vec::new();
 
     for def in registry::CATALOG_VIEWS {
@@ -2436,11 +2435,10 @@ fn every_view_definition_parses_and_names_our_columns() {
         );
     }
 
-    // `pg_publication_tables` calls `pg_get_publication_tables(VARIADIC ...)`,
-    // and `VARIADIC` in a call's argument list is a gap in the grammar, not in
-    // the transcription — so its columns go unchecked until the grammar grows
-    // it. Empty here means that day came: drop the expectation and the view
-    // joins the check.
+    // `VARIADIC` in a call's argument list is a gap in the grammar, not in the
+    // transcription, so `pg_publication_tables` goes column-unchecked until the
+    // grammar grows it. Empty here means that day came: drop the expectation
+    // and the view joins the check.
     assert_eq!(
         unparsed,
         ["pg_publication_tables"],

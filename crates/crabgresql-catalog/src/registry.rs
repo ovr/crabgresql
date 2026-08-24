@@ -133,8 +133,6 @@ const fn rel_deferred(
     }
 }
 
-/// A served relation PostgreSQL defines as a view.
-///
 /// The relation part is *embedded* rather than repeated, so a view is deferred
 /// or reports a per-relation `xmin` by exactly the same fields a table does —
 /// `pg_locks` is a view here and needs [`CatalogRelDef::deferred`].
@@ -640,8 +638,7 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
 
 /// Every relation this build serves that PostgreSQL defines as a *view*, in the
 /// same `(namespace, name)` order — 63 of `pg_catalog`'s 80, plus the three
-/// `information_schema` entries. [`CATALOG_RELATIONS`] holds the base tables;
-/// the split is what gives a view somewhere to carry its definition text.
+/// `information_schema` entries.
 ///
 /// The `pg_catalog` OIDs sit in the 12000 band because `initdb` creates these
 /// relations rather than bootstrapping them; they are deterministic for a given
