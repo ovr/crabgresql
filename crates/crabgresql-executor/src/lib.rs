@@ -326,9 +326,12 @@ pub struct ObjectAcl {
     /// Whether the object is a sequence — the one relation-kind check any of
     /// these functions makes. False for anything that is not a relation.
     pub is_sequence: bool,
-    /// A system object: a `pg_catalog` relation, the `pg_catalog` schema, a
-    /// built-in type or a built-in function.
-    pub system: bool,
+    /// Whether PUBLIC holds the one privilege upstream leaves it on an object of
+    /// this class — SELECT on a relation, USAGE on a schema, a type or a
+    /// function. Not the same as "is a system object": `initdb` closes some
+    /// system catalogs (`pg_authid`, `pg_statistic`, …) and opens the `public`
+    /// schema, which is not one.
+    pub granted_to_public: bool,
 }
 
 /// What one role may do with another, as [`CatalogOps::role_membership`] answers

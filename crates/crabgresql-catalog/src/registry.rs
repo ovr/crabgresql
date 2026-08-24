@@ -1244,6 +1244,40 @@ pub fn builtin_relation_name(oid: u32) -> Option<&'static str> {
         .map(|def| def.name)
 }
 
+/// The `pg_catalog` relations `initdb` keeps *closed* to PUBLIC — everything a
+/// stock cluster answers `has_table_privilege(<some role>, …, 'SELECT')` with
+/// `false` for. The rest of the catalog is world-readable, which is why
+/// [`public_reads`] takes this list as the exception rather than the rule.
+///
+/// PostgreSQL 18.4 closes sixteen relations; the eight here are the ones this
+/// build serves, probed with
+/// `SELECT relname FROM pg_class WHERE relnamespace = 11 AND relkind IN ('r','v')
+/// AND NOT has_table_privilege('pg_signal_backend', oid, 'SELECT')`. They are
+/// closed because they hold password verifiers (`pg_authid`, `pg_shadow`),
+/// planner statistics that would leak table contents (`pg_statistic`,
+/// `pg_statistic_ext_data`), connection strings (`pg_subscription`,
+/// `pg_user_mapping`), replication state, or large-object data.
+///
+/// Sorted, and every name must be one this build serves — both are asserted by
+/// `restricted_catalogs_are_sorted_and_served`, so a typo cannot quietly open a
+/// catalog by naming a relation that does not exist.
+pub(crate) static RESTRICTED_CATALOGS: &[&str] = &[
+    "pg_authid",
+    "pg_largeobject",
+    "pg_replication_origin_status",
+    "pg_shadow",
+    "pg_statistic",
+    "pg_statistic_ext_data",
+    "pg_subscription",
+    "pg_user_mapping",
+];
+
+/// Whether PUBLIC may `SELECT` from the `pg_catalog` relation `name` — true for
+/// every one this build serves but [`RESTRICTED_CATALOGS`].
+pub(crate) fn public_reads(name: &str) -> bool {
+    RESTRICTED_CATALOGS.binary_search(&name).is_err()
+}
+
 /// The SQL that defines the `pg_catalog` view `name`, as PostgreSQL 18.4 prints
 /// it. The rows of that view are built by Rust rather than by this SQL; see
 /// [`crate::views::definitions`] for what the text is for.

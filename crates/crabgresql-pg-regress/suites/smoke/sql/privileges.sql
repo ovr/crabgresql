@@ -48,6 +48,19 @@ SELECT has_type_privilege('priv_plain', 'int4', 'USAGE WITH GRANT OPTION') AS ty
 SELECT has_table_privilege('priv_plain', 'pg_class', 'SELECT') AS cat_select,
        has_table_privilege('priv_plain', 'pg_class', 'INSERT') AS cat_insert,
        has_schema_privilege('priv_plain', 'pg_catalog', 'USAGE') AS cat_usage;
+-- ... but not every catalog: the ones holding password verifiers, planner
+-- statistics or connection strings are closed to PUBLIC.
+SELECT has_table_privilege('priv_plain', 'pg_authid', 'SELECT') AS authid,
+       has_table_privilege('priv_plain', 'pg_shadow', 'SELECT') AS shadow,
+       has_table_privilege('priv_plain', 'pg_statistic', 'SELECT') AS stats,
+       has_table_privilege('priv_plain', 'pg_subscription', 'SELECT') AS sub,
+       has_table_privilege('priv_plain', 'pg_type', 'SELECT') AS typ;
+-- The public schema carries a USAGE grant to PUBLIC and nothing more: CREATE
+-- there stayed with the owner in PostgreSQL 15.
+SELECT has_schema_privilege('priv_plain', 'public', 'USAGE') AS usage,
+       has_schema_privilege('priv_plain', 'public', 'CREATE') AS create_,
+       has_schema_privilege('priv_plain', 'public',
+                            'USAGE WITH GRANT OPTION') AS grantable;
 -- A list is held when *any* of its privileges is.
 SELECT has_table_privilege('priv_plain', 'pg_class',
                            'INSERT, UPDATE, SELECT') AS any_of,
@@ -79,6 +92,26 @@ SELECT pg_has_role('priv_plain', 'priv_group', 'MEMBER') AS plain_of_group,
 GRANT priv_member TO priv_plain;
 SELECT pg_has_role('priv_plain', 'priv_group', 'USAGE') AS transitive;
 REVOKE priv_member FROM priv_plain;
+-- The admin option travels differently from the rest: it is held by anyone who
+-- can reach a role that was granted it, and the reaching is plain membership —
+-- neither the INHERIT option of the step nor an admin option on the step
+-- itself matters.
+CREATE ROLE priv_admin;
+CREATE ROLE priv_indirect;
+CREATE ROLE priv_indirect_noinherit NOINHERIT;
+GRANT priv_group TO priv_admin WITH ADMIN OPTION;
+GRANT priv_admin TO priv_indirect;
+GRANT priv_admin TO priv_indirect_noinherit;
+SELECT pg_has_role('priv_admin', 'priv_group',
+                   'USAGE WITH ADMIN OPTION') AS direct,
+       pg_has_role('priv_indirect', 'priv_group',
+                   'USAGE WITH ADMIN OPTION') AS through_a_member,
+       pg_has_role('priv_indirect_noinherit', 'priv_group',
+                   'MEMBER WITH ADMIN OPTION') AS through_noinherit,
+       pg_has_role('priv_indirect', 'priv_admin',
+                   'USAGE WITH ADMIN OPTION') AS on_the_step_itself,
+       pg_has_role('priv_member', 'priv_group',
+                   'USAGE WITH ADMIN OPTION') AS unrelated_member;
 --
 -- How each family reads a name.
 --
@@ -124,6 +157,9 @@ SELECT has_type_privilege('priv_nosuch', 'USAGE');
 SELECT pg_has_role('priv_nosuch', 'USAGE');
 SELECT has_table_privilege('priv_nosuch', 'priv_t', 'SELECT');
 SELECT has_column_privilege('priv_t', 'nosuch', 'SELECT');
+-- A qualified name whose *schema* is missing reports the schema, not the
+-- relation: the relation is never looked for.
+SELECT has_table_privilege('priv_nosuch.priv_t', 'SELECT');
 -- An unrecognized privilege is 22023, and each class recognizes its own set.
 SELECT has_table_privilege('priv_t', 'BOGUS');
 SELECT has_table_privilege('priv_t', 'USAGE');
@@ -147,4 +183,7 @@ DROP SCHEMA priv_sch;
 DROP ROLE priv_plain;
 DROP ROLE priv_member;
 DROP ROLE priv_noinherit;
+DROP ROLE priv_indirect;
+DROP ROLE priv_indirect_noinherit;
+DROP ROLE priv_admin;
 DROP ROLE priv_group;

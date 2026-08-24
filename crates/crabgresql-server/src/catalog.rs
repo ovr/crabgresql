@@ -740,7 +740,7 @@ impl CatalogOps for SessionCatalogOps {
         Some(ObjectAcl {
             owner: acl.owner,
             is_sequence: acl.is_sequence,
-            system: acl.system,
+            granted_to_public: acl.granted_to_public,
         })
     }
 

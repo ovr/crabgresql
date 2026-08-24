@@ -15,14 +15,18 @@
 //! 1. a superuser holds every privilege on everything;
 //! 2. so does the owner, and so does any role that inherits the owner's
 //!    privileges — including the grant option, which is the owner's to give;
-//! 3. otherwise only what upstream's default ACL leaves to PUBLIC: `USAGE` on a
-//!    type, `EXECUTE` on a function, and — because `initdb` grants them
-//!    explicitly — `SELECT` on a system catalog and `USAGE` on `pg_catalog`.
-//!    PUBLIC never holds a grant option.
+//! 3. otherwise only what upstream leaves to PUBLIC: `USAGE` on a type,
+//!    `EXECUTE` on a function, and the grants `initdb` writes out — `SELECT` on
+//!    a system catalog (but not on the eight it deliberately closes) and `USAGE`
+//!    on the `pg_catalog` and `public` schemas. PUBLIC never holds a grant
+//!    option, and never holds `CREATE` on `public`: since PostgreSQL 15 that
+//!    one stayed with the owner.
 //!
-//! A user table, a user schema and a sequence therefore answer `false` for
-//! anyone but the owner and the superusers, which is what PostgreSQL answers
-//! for the same objects.
+//! Which objects PUBLIC reaches is the catalog's to report — `ObjectAcl`'s
+//! `granted_to_public` — because the answer is a property of the object, not of
+//! the question. A user table, a `CREATE SCHEMA` namespace and a sequence carry
+//! no such grant, so they answer `false` for anyone but the owner and the
+//! superusers, which is what PostgreSQL answers for the same objects.
 //!
 //! # Resolving the arguments
 //!
@@ -252,12 +256,18 @@ fn holds_object(
         // Nothing below is granted `WITH GRANT OPTION` by a default ACL.
         return false;
     }
+    // What is left is PUBLIC's, and which privilege that is depends on the
+    // class; whether *this* object carries the grant at all is the catalog's
+    // answer (`granted_to_public`), which is how a closed system catalog and an
+    // open one part company.
     match class {
-        AclClass::Type => privilege.name == "USAGE",
-        AclClass::Function => privilege.name == "EXECUTE",
-        AclClass::Schema => acl.system && privilege.name == "USAGE",
+        AclClass::Type => acl.granted_to_public && privilege.name == "USAGE",
+        AclClass::Function => acl.granted_to_public && privilege.name == "EXECUTE",
+        // USAGE only: `CREATE` on `public` belongs to the owner, and has since
+        // PostgreSQL 15.
+        AclClass::Schema => acl.granted_to_public && privilege.name == "USAGE",
         AclClass::Relation | AclClass::Column | AclClass::AnyColumn | AclClass::Sequence => {
-            acl.system && privilege.name == "SELECT"
+            acl.granted_to_public && privilege.name == "SELECT"
         }
         // A foreign server and a foreign-data wrapper grant nothing to PUBLIC,
         // and neither exists in this build to be asked about.

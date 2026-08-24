@@ -246,10 +246,15 @@ pub struct ObjectAcl {
     /// `has_sequence_privilege` makes and no other family does. Always false for
     /// an object that is not a relation.
     pub is_sequence: bool,
-    /// Whether this is a system object, which upstream ships with an explicit
-    /// grant to PUBLIC: SELECT on a system catalog, USAGE on `pg_catalog`, on
-    /// every type and on every built-in function.
-    pub system: bool,
+    /// Whether PUBLIC holds the one privilege upstream leaves it on an object of
+    /// this class: SELECT on a relation, USAGE on a schema, a type or a
+    /// function. Which privilege that is depends on the class, so the flag says
+    /// only *whether* — the executor's `acl` module says which.
+    ///
+    /// It is not the same as "is a system object": `initdb` closes eight of the
+    /// system catalogs this build serves ([`registry::RESTRICTED_CATALOGS`])
+    /// and opens the `public` schema, which is not one.
+    pub granted_to_public: bool,
 }
 
 /// What one role may do with another, as [`SystemCatalog::role_membership`]
@@ -1564,35 +1569,52 @@ impl SystemCatalog {
         }
         RoleMembership {
             superuser: false,
-            inherits: self.reaches(member, role, |edge| edge.inherit_option),
-            member: self.reaches(member, role, |_| true),
+            inherits: self.reaches(
+                member,
+                role,
+                |edge| edge.inherit_option,
+                |edge| edge.inherit_option,
+            ),
+            member: self.reaches(member, role, |_| true, |_| true),
             // `SET` needs the *whole* chain to be settable for the same reason
             // `USAGE` needs it to inherit: reaching a role through one it may
             // not become is not reaching it.
-            set: self.reaches(member, role, |edge| edge.set_option),
-            admin: self
-                .role_members()
-                .iter()
-                .any(|m| m.member == member && m.role == role && m.admin_option),
+            set: self.reaches(member, role, |edge| edge.set_option, |edge| edge.set_option),
+            // The admin option is the one answer whose chain and whose last edge
+            // are asked different questions. PostgreSQL's `is_admin_of_role`
+            // walks *plain* membership — the option a grant carries says nothing
+            // about who may reach it — and then looks for an `ADMIN OPTION`
+            // grant of `role` to any role reached. So a member of a role that
+            // holds the option holds it too, without holding it directly.
+            admin: self.reaches(member, role, |_| true, |edge| edge.admin_option),
         }
     }
 
-    /// Whether `member` reaches `role` over the membership edges `keep` admits.
+    /// Whether `member` reaches `role` over the membership edges `keep` admits,
+    /// arriving on an edge `hit` accepts. The two predicates are separate
+    /// because they differ for the admin option; for the rest they agree, which
+    /// is what makes an inheriting chain need every edge to inherit.
+    ///
     /// Breadth-first with a seen set, so a cycle (which the server refuses to
     /// store) could not loop this.
-    fn reaches(&self, member: u32, role: u32, keep: impl Fn(&CatalogRoleMember) -> bool) -> bool {
+    fn reaches(
+        &self,
+        member: u32,
+        role: u32,
+        keep: impl Fn(&CatalogRoleMember) -> bool,
+        hit: impl Fn(&CatalogRoleMember) -> bool,
+    ) -> bool {
         let mut seen = std::collections::HashSet::from([member]);
         let mut queue = vec![member];
         while let Some(current) = queue.pop() {
-            for edge in self
-                .role_members()
-                .iter()
-                .filter(|m| m.member == current && keep(m))
-            {
-                if edge.role == role {
+            for edge in self.role_members().iter().filter(|m| m.member == current) {
+                if edge.role == role && hit(edge) {
                     return true;
                 }
-                if seen.insert(edge.role) {
+                // The traversal filter applies to a step *through* a role, so it
+                // is asked after the arrival above: an edge may be unusable as a
+                // step and still be the grant the question is about.
+                if keep(edge) && seen.insert(edge.role) {
                     queue.push(edge.role);
                 }
             }
@@ -1602,7 +1624,7 @@ impl SystemCatalog {
 
     /// The relation `oid` identifies, as a privilege check needs it: who owns
     /// it, whether it is a sequence (the one relation kind
-    /// `has_sequence_privilege` accepts), and whether it is a system catalog.
+    /// `has_sequence_privilege` accepts), and whether PUBLIC may read it.
     /// `None` for an OID no relation answers to, which those functions report as
     /// NULL.
     ///
@@ -1610,13 +1632,13 @@ impl SystemCatalog {
     /// [`SystemCatalog::serial_sequence`] covers them: a live user relation
     /// (positionally numbered) and a served `pg_catalog` one (fixed OID).
     pub fn relation_acl(&self, oid: u32) -> Option<ObjectAcl> {
-        if registry::builtin_relation_name(oid).is_some() {
-            // A system catalog: PostgreSQL's `initdb` grants SELECT on it to
-            // PUBLIC, which is what `system` carries to the caller.
+        if let Some(name) = registry::builtin_relation_name(oid) {
+            // A system catalog. `initdb` grants SELECT on most of them to
+            // PUBLIC and closes the rest — see `registry::RESTRICTED_CATALOGS`.
             return Some(ObjectAcl {
                 owner: oids::BOOTSTRAP_ROLE_OID,
                 is_sequence: false,
-                system: true,
+                granted_to_public: registry::public_reads(name),
             });
         }
         let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
@@ -1628,7 +1650,7 @@ impl SystemCatalog {
             return Some(ObjectAcl {
                 owner: oids::BOOTSTRAP_ROLE_OID,
                 is_sequence: matches!(self.relation_kinds()[offset], RelKind::Sequence),
-                system: false,
+                granted_to_public: false,
             });
         }
         // An index or a TOAST relation: neither is a sequence, and both are
@@ -1641,19 +1663,22 @@ impl SystemCatalog {
             return Some(ObjectAcl {
                 owner: oids::BOOTSTRAP_ROLE_OID,
                 is_sequence: false,
-                system: false,
+                granted_to_public: false,
             });
         }
         let toast = self.toast_oids().get(index - indexes.len())?;
         (toast.oid == oid).then_some(ObjectAcl {
             owner: oids::BOOTSTRAP_ROLE_OID,
             is_sequence: false,
-            system: false,
+            granted_to_public: false,
         })
     }
 
-    /// The schema `oid` identifies. `system` is `pg_catalog`, whose USAGE
-    /// PostgreSQL grants to PUBLIC.
+    /// The schema `oid` identifies. Two of them carry a USAGE grant to PUBLIC
+    /// from `initdb`: `pg_catalog`, and `public` — which since PostgreSQL 15 is
+    /// owned by the database owner and opened to PUBLIC for USAGE *only*, so
+    /// CREATE there still belongs to the owner alone. `pg_toast` and every
+    /// `CREATE SCHEMA` namespace carry no grant at all.
     ///
     /// `information_schema` cannot turn up here: it has no `pg_namespace` row in
     /// this build (see `catalogs::namespace`), so it has no OID to ask about.
@@ -1661,7 +1686,7 @@ impl SystemCatalog {
         self.namespace_name(oid).map(|name| ObjectAcl {
             owner: oids::BOOTSTRAP_ROLE_OID,
             is_sequence: false,
-            system: name == "pg_catalog",
+            granted_to_public: name == "pg_catalog" || name == "public",
         })
     }
 
@@ -1673,7 +1698,7 @@ impl SystemCatalog {
         exists.then_some(ObjectAcl {
             owner: oids::BOOTSTRAP_ROLE_OID,
             is_sequence: false,
-            system: true,
+            granted_to_public: true,
         })
     }
 
@@ -1683,7 +1708,7 @@ impl SystemCatalog {
         self.proc_name(oid).map(|_| ObjectAcl {
             owner: oids::BOOTSTRAP_ROLE_OID,
             is_sequence: false,
-            system: true,
+            granted_to_public: true,
         })
     }
 

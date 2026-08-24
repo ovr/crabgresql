@@ -624,6 +624,8 @@ pub struct StaticSource {
     settings: Vec<CatalogSetting>,
     locks: Vec<CatalogLock>,
     view_dependencies: Vec<CatalogViewDependency>,
+    roles: Vec<CatalogRole>,
+    role_members: Vec<CatalogRoleMember>,
 }
 
 impl Default for StaticSource {
@@ -642,6 +644,8 @@ impl Default for StaticSource {
             settings: Vec::new(),
             locks: Vec::new(),
             view_dependencies: Vec::new(),
+            roles: Vec::new(),
+            role_members: Vec::new(),
         }
     }
 }
@@ -703,6 +707,19 @@ impl StaticSource {
         self.view_dependencies = deps;
         self
     }
+
+    /// The cluster's roles and the memberships between them. Empty by default,
+    /// where the trait's own default answers with the bootstrap superuser alone
+    /// — a source that names roles must name all of them, including that one.
+    pub fn roles(mut self, roles: Vec<CatalogRole>) -> Self {
+        self.roles = roles;
+        self
+    }
+
+    pub fn role_members(mut self, members: Vec<CatalogRoleMember>) -> Self {
+        self.role_members = members;
+        self
+    }
 }
 
 impl CatalogSource for StaticSource {
@@ -748,6 +765,17 @@ impl CatalogSource for StaticSource {
 
     fn view_dependencies(&self) -> Vec<CatalogViewDependency> {
         self.view_dependencies.clone()
+    }
+
+    fn roles(&self) -> Vec<CatalogRole> {
+        match self.roles.is_empty() {
+            true => vec![CatalogRole::bootstrap(&self.owner)],
+            false => self.roles.clone(),
+        }
+    }
+
+    fn role_members(&self) -> Vec<CatalogRoleMember> {
+        self.role_members.clone()
     }
 }
 

@@ -214,10 +214,30 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
 pub fn relation_oid_from_name(s: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
     let parts = split_qualified_name(s.trim()).ok_or_else(invalid_name_syntax)?;
     let (namespace, name) = qualify(RegKind::Class, &parts, || ops.current_database())?;
+    // A named schema is resolved first and its absence reported as its own
+    // error, which is what `RangeVarGetRelid` does through
+    // `LookupExplicitNamespace`: `'nosuch.t'` is a missing *schema* (3F000), not
+    // a missing relation. `regclassin` reports the relation instead, so this is
+    // one more place the two part company. The same check, for the same reason,
+    // is in [`resolve_type_name`].
+    //
+    // `information_schema` lands here too, and correctly so: this build serves
+    // three of its views but publishes no `pg_namespace` row for the schema (see
+    // `registry`'s OID TODO and `catalogs::namespace`), so every privilege
+    // question about it now reports the one fact behind all of them rather than
+    // a missing relation.
+    if let Some(namespace) = &namespace
+        && ops.namespace_oid(namespace).is_none()
+    {
+        return Err(ExecError::new(
+            sqlstate::INVALID_SCHEMA_NAME,
+            format!("schema \"{namespace}\" does not exist"),
+        ));
+    }
     ops.rel_oid(namespace.as_deref(), &name)
-        // A served `information_schema` relation resolves to OID 0 (it has no
-        // `pg_class` row to number it), which is no more a relation to ask a
-        // privilege question about than a name nothing answers to.
+        // Belt and braces: 0 is `InvalidOid` and never an object to ask about.
+        // Nothing served reaches here with one — the `information_schema` views
+        // that carry no OID are turned away by the schema check above.
         .filter(|oid| *oid != 0)
         .ok_or_else(|| not_found(RegKind::Class, s, &parts))
 }
