@@ -5160,7 +5160,7 @@ fn resolve_user_routine_call(
 ///
 /// The spread shape needs at least one argument for the variadic parameter —
 /// `f()` against `f(VARIADIC int[])` is `42883` too, not an empty array.
-fn routine_params(sig: &RoutineSig, nargs: usize, variadic_call: bool) -> Option<Vec<PgType>> {
+pub fn routine_params(sig: &RoutineSig, nargs: usize, variadic_call: bool) -> Option<Vec<PgType>> {
     let declared = &sig.arg_types;
     match sig.variadic_elem {
         Some(elem) if !variadic_call => {
@@ -5205,13 +5205,32 @@ fn choose_routine_overload<'a>(
     sigs: &'a [RoutineSig],
     variadic_call: bool,
 ) -> Result<Option<(&'a RoutineSig, Vec<BoundExpr>)>, BindError> {
-    let params = |sig: &RoutineSig| routine_params(sig, bindings.len(), variadic_call);
+    let spread = |sig: &RoutineSig| sig.variadic_elem.is_some() && !variadic_call;
+    let mut candidates: Vec<(&RoutineSig, Vec<PgType>)> = sigs
+        .iter()
+        .filter_map(|sig| routine_params(sig, bindings.len(), variadic_call).map(|p| (sig, p)))
+        .collect();
+    // A spread candidate presenting some other candidate's declared parameter
+    // list is not a candidate at all: `m(VARIADIC int[])` and `m(int)` both
+    // present `int` to `m(1)`, and PostgreSQL calls the second whichever order
+    // they were created in. The test is on the *lists*, not on variadic-ness —
+    // where they differ both stay and the ordinary rules decide, which is how
+    // `n(VARIADIC int[])` beats `n(numeric)` for `n(1)`. Two spread candidates
+    // collapsing onto each other keep competing, and so are `42725`. All four
+    // verified on 18.4.
+    let fixed: Vec<Vec<PgType>> = candidates
+        .iter()
+        .filter(|(sig, _)| !spread(sig))
+        .map(|(_, params)| params.clone())
+        .collect();
+    candidates.retain(|(sig, params)| !spread(sig) || !fixed.contains(params));
+
     // Two overloads can never share the same argument types (`create_function`
-    // rejects that), so at most one all-exact match exists.
-    for sig in sigs {
-        if let Some(p) = params(sig)
-            && let Ok(args) = try_coerce_args(bindings, &p, true)
-        {
+    // rejects that), and the dedup above closed the one other way two
+    // candidates could present the same list, so at most one all-exact match
+    // exists.
+    for (sig, params) in &candidates {
+        if let Ok(args) = try_coerce_args(bindings, params, true) {
             return Ok(Some((sig, pack_variadic_tail(sig, variadic_call, args))));
         }
     }
@@ -5219,17 +5238,13 @@ fn choose_routine_overload<'a>(
     // already at their exact type, as the built-in resolver does.
     let mut best: Option<(usize, &RoutineSig, Vec<BoundExpr>)> = None;
     let mut tied = false;
-    // As for built-ins: the rejected literal of a lone arity-matching overload
-    // is the error PG reports, since the overload was already chosen by then.
-    let arity_matches = sigs.iter().filter(|s| params(s).is_some()).count();
     let mut literal_fail: Option<BindError> = None;
-    for sig in sigs {
-        let Some(p) = params(sig) else {
-            continue;
-        };
-        let args = match try_coerce_args(bindings, &p, false) {
+    for (sig, params) in &candidates {
+        let args = match try_coerce_args(bindings, params, false) {
             Ok(args) => args,
-            Err(ArgFail::LiteralInput(e)) if arity_matches == 1 => {
+            // As for built-ins: the rejected literal of a lone candidate is the
+            // error PG reports, since the overload was already chosen by then.
+            Err(ArgFail::LiteralInput(e)) if candidates.len() == 1 => {
                 literal_fail = Some(e);
                 continue;
             }
@@ -5237,7 +5252,7 @@ fn choose_routine_overload<'a>(
         };
         let score = bindings
             .iter()
-            .zip(&p)
+            .zip(params)
             .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
             .count();
         let args = pack_variadic_tail(sig, variadic_call, args);

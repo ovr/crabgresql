@@ -10370,6 +10370,23 @@ async fn variadic_resolution_failures_match_pg() -> anyhow::Result<()> {
         assert_eq!(dberr.message(), "syntax error at or near \"variadic\"");
     }
 
+    // A variadic *function* is reachable from CALL's resolution in both shapes,
+    // so naming one is 42809 "is not a procedure" — the same answer PG gives —
+    // rather than the 42883 an arity-only match would have produced.
+    for (sql, types) in [
+        ("CALL vsum(1, 2, 3)", "integer, integer, integer"),
+        ("CALL vsum(1, VARIADIC ARRAY[2])", "integer, integer[]"),
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("a function is not callable with CALL");
+        let dberr = err.as_db_error().expect("database error");
+        assert_eq!(dberr.code(), &SqlState::WRONG_OBJECT_TYPE, "{sql}");
+        assert_eq!(dberr.message(), format!("vsum({types}) is not a procedure"));
+        assert_eq!(dberr.hint(), Some("To call a function, use SELECT."));
+    }
+
     Ok(())
 }
 

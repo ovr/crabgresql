@@ -227,5 +227,99 @@ SELECT concat(VARIADIC ARRAY[1], 2);
 ERROR:  syntax error at or near ","
 LINE 1: SELECT concat(VARIADIC ARRAY[1], 2);
                                        ^
+--
+-- A spread candidate against a plain overload of the same arity
+--
+-- Where the two present the same parameter list, the plain one wins — whichever
+-- order they were created in, and whether or not the argument needs a cast.
+CREATE FUNCTION m(VARIADIC x int[]) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'variadic' $$;
+CREATE FUNCTION m(x int) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'plain' $$;
+SELECT m(1);
+   m   
+-------
+ plain
+(1 row)
+
+CREATE FUNCTION k(x numeric) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'plain' $$;
+CREATE FUNCTION k(VARIADIC x numeric[]) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'variadic' $$;
+SELECT k(1);
+   k   
+-------
+ plain
+(1 row)
+
+-- Where the lists differ the ordinary rules decide, and the spread's exact int
+-- beats the plain overload's implicit widening.
+CREATE FUNCTION n(x numeric) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'plain' $$;
+CREATE FUNCTION n(VARIADIC x int[]) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'variadic' $$;
+SELECT n(1);
+    n     
+----------
+ variadic
+(1 row)
+
+-- Two spread candidates collapsing onto one list keep competing.
+CREATE FUNCTION q(VARIADIC x int[]) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'one' $$;
+CREATE FUNCTION q(a int, VARIADIC x int[]) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT 'two' $$;
+SELECT q(1);
+  q  
+-----
+ one
+(1 row)
+
+--
+-- CALL takes both shapes too
+--
+CREATE TABLE plog (t text);
+CREATE PROCEDURE pq(VARIADIC a int[]) LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO plog VALUES (coalesce(array_to_string(a, '-'), '<null>'));
+END $$;
+CALL pq(1, 2, 3);
+CALL pq(VARIADIC ARRAY[4, 5]);
+CALL pq(VARIADIC NULL::int[]);
+CALL pq(6);
+CREATE PROCEDURE pw(x text, VARIADIC a int[]) LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO plog VALUES (x || array_to_string(a, '-'));
+END $$;
+CALL pw('x:', 7, 8);
+CALL pw('y:', VARIADIC ARRAY[9]);
+SELECT t FROM plog;
+   t    
+--------
+ 1-2-3
+ 4-5
+ <null>
+ 6
+ x:7-8
+ y:9
+(6 rows)
+
+--
+-- Deparse keeps the keyword, and the argument under it renders like any other
+--
+CREATE TABLE vt (a text);
+CREATE VIEW vv AS SELECT concat(VARIADIC CAST(a AS text[])) FROM vt;
+SELECT pg_get_viewdef('vv'::regclass, true);
+                pg_get_viewdef                
+----------------------------------------------
+  SELECT concat(VARIADIC a::text[]) AS concat+
+    FROM vt;
+(1 row)
+
+DROP VIEW vv;
+DROP TABLE vt;
+DROP PROCEDURE pw(text, int[]);
+DROP PROCEDURE pq(int[]);
+DROP TABLE plog;
+DROP FUNCTION q(int[]);
+DROP FUNCTION q(int, int[]);
+DROP FUNCTION n(numeric);
+DROP FUNCTION n(int[]);
+DROP FUNCTION k(numeric);
+DROP FUNCTION k(numeric[]);
+DROP FUNCTION m(int);
+DROP FUNCTION m(int[]);
 DROP FUNCTION vjoin(text[]);
 DROP FUNCTION vsum(int, VARIADIC int[]);
