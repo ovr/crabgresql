@@ -940,6 +940,7 @@ fn eval_catalog_fn(
             | ScalarFn::PgMyTempSchema
             | ScalarFn::PgIsOtherTempSchema
             | ScalarFn::PgBackendPid
+            | ScalarFn::HasPrivilege(_)
     ) {
         return None;
     }
@@ -979,6 +980,12 @@ fn eval_catalog_fn(
         )));
     };
     match func {
+        // The privilege questions read their own arguments: each family spells
+        // the role, the object and the column differently, which is what the
+        // `PrivCall` carries and why they never reach the `oid_of` below.
+        ScalarFn::HasPrivilege(call) => {
+            return Some(crate::acl::eval_has_privilege(call, args, ops));
+        }
         ScalarFn::CurrentDatabase => return Some(Ok(Value::Text(ops.current_database()))),
         ScalarFn::CurrentUser => return Some(Ok(Value::Text(ops.current_user()))),
         ScalarFn::SessionUser => return Some(Ok(Value::Text(ops.session_user()))),
@@ -2109,6 +2116,24 @@ mod format_type_tests {
         impl CatalogOps for OneEnum {
             fn role_name(&self, _oid: u32) -> Option<String> {
                 None
+            }
+            fn role_oid(&self, _name: &str) -> Option<u32> {
+                None
+            }
+            fn current_user_oid(&self) -> u32 {
+                0
+            }
+            fn role_membership(&self, _member: u32, _role: u32) -> crate::RoleMembership {
+                crate::RoleMembership::default()
+            }
+            fn object_acl(&self, _class: crate::AclClass, _oid: u32) -> Option<crate::ObjectAcl> {
+                None
+            }
+            fn attribute_number(&self, _oid: u32, _column: &str) -> Option<i16> {
+                None
+            }
+            fn has_attribute(&self, _oid: u32, _attnum: i16) -> bool {
+                false
             }
             fn table_is_visible(&self, _oid: u32) -> Option<bool> {
                 None

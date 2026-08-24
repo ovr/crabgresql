@@ -9,6 +9,7 @@
 //! yields a row count, and — with `RETURNING` — a row stream projected over the
 //! affected tuples the function already owns.
 
+pub mod acl;
 mod agg;
 mod checks;
 pub mod eval;
@@ -38,6 +39,9 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 pub use crabgresql_binder::OutputColumn;
+// Re-exported for the server's `CatalogOps` implementation, which has to name
+// the class a privilege question is about but need not depend on the binder.
+pub use crabgresql_binder::AclClass;
 use crabgresql_binder::{
     BoundExpr, DistinctKey, LogicalPlan, RelationIdent, Returning, SortKey, SysCol, SystemEmit,
     needs_header, projects_after_write,
@@ -126,6 +130,25 @@ pub trait GucOps: Send + Sync {
 pub trait CatalogOps: Send + Sync {
     /// The name of the role `oid` identifies, or `None` if no role has that OID.
     fn role_name(&self, oid: u32) -> Option<String>;
+    /// The inverse, matched exactly rather than as an identifier — see
+    /// [`crate::acl`] for why the privilege functions need it that way.
+    fn role_oid(&self, name: &str) -> Option<u32>;
+    /// The OID of `current_user`: the role a privilege question is asked on
+    /// behalf of when the call names none.
+    fn current_user_oid(&self) -> u32;
+    /// What `member` may do with `role`, for `pg_has_role` and for every
+    /// ownership test the object families make.
+    fn role_membership(&self, member: u32, role: u32) -> RoleMembership;
+    /// Who owns the object `oid` of class `class`, or `None` if there is no such
+    /// object — which the privilege functions report as NULL. See [`ObjectAcl`].
+    fn object_acl(&self, class: AclClass, oid: u32) -> Option<ObjectAcl>;
+    /// The `attnum` of a named column of relation `oid`, behind
+    /// `has_column_privilege(rel, 'col', ...)`.
+    fn attribute_number(&self, oid: u32, column: &str) -> Option<i16>;
+    /// Whether relation `oid` has an attribute numbered `attnum` — a user
+    /// column or a system one. Behind the `int2` spelling of the same call,
+    /// which answers NULL for a number no column carries.
+    fn has_attribute(&self, oid: u32, attnum: i16) -> bool;
     /// Whether the relation `oid` identifies is reachable by an unqualified
     /// name, or `None` if there is no such relation.
     fn table_is_visible(&self, oid: u32) -> Option<bool>;
@@ -291,6 +314,37 @@ pub trait CatalogOps: Send + Sync {
     /// nothing (NULL), the second a relation with no storage behind it (0), as
     /// PostgreSQL answers for a view.
     fn relation_size(&self, oid: u32) -> Option<RelationSize>;
+}
+
+/// What a privilege question needs to know about one object: who owns it, and
+/// whether it is one of the objects PostgreSQL's `initdb` opens to PUBLIC. The
+/// *decision* those two facts feed is [`crate::acl`]'s, so an implementation
+/// never learns which privilege an owner holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectAcl {
+    pub owner: u32,
+    /// Whether the object is a sequence — the one relation-kind check any of
+    /// these functions makes. False for anything that is not a relation.
+    pub is_sequence: bool,
+    /// A system object: a `pg_catalog` relation, the `pg_catalog` schema, a
+    /// built-in type or a built-in function.
+    pub system: bool,
+}
+
+/// What one role may do with another, as [`CatalogOps::role_membership`] answers
+/// it — the three privileges `pg_has_role` distinguishes, plus the admin option
+/// over the grant and whether the asking role is a superuser.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoleMembership {
+    pub superuser: bool,
+    /// `USAGE`: the role's privileges arrive without a `SET ROLE`.
+    pub inherits: bool,
+    /// `MEMBER`: membership at all, inheriting or not.
+    pub member: bool,
+    /// `SET`: `SET ROLE` to it is allowed.
+    pub set: bool,
+    /// `WITH ADMIN OPTION` / `WITH GRANT OPTION` on the membership.
+    pub admin: bool,
 }
 
 /// A relation's physical size in **bytes**, split into the parts the size

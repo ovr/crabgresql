@@ -229,6 +229,47 @@ pub struct RelationPages {
     pub indexes: u32,
 }
 
+/// What a privilege question needs to know about an object: who owns it, and
+/// whether it is one of the objects PostgreSQL's `initdb` opens to PUBLIC.
+///
+/// The *decision* is not here — which privileges an owner or PUBLIC holds is
+/// PostgreSQL-observable behavior and lives in the executor, so this reports
+/// only the facts. See [`SystemCatalog::relation_acl`] and its siblings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectAcl {
+    /// Always the bootstrap superuser: nothing here can `ALTER ... OWNER TO`,
+    /// and every catalog row says so (see [`oids::BOOTSTRAP_ROLE_OID`]). Carried
+    /// as a field rather than assumed by the caller so that an owner column,
+    /// when one exists, changes only this crate.
+    pub owner: u32,
+    /// Whether the object is a sequence — the kind check
+    /// `has_sequence_privilege` makes and no other family does. Always false for
+    /// an object that is not a relation.
+    pub is_sequence: bool,
+    /// Whether this is a system object, which upstream ships with an explicit
+    /// grant to PUBLIC: SELECT on a system catalog, USAGE on `pg_catalog`, on
+    /// every type and on every built-in function.
+    pub system: bool,
+}
+
+/// What one role may do with another, as [`SystemCatalog::role_membership`]
+/// answers it. The three membership fields are the three privileges
+/// `pg_has_role` distinguishes; see that method for why they differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoleMembership {
+    /// Whether the asking role is a superuser, which holds every privilege on
+    /// everything without a grant.
+    pub superuser: bool,
+    /// `USAGE`: the role's privileges arrive without a `SET ROLE`.
+    pub inherits: bool,
+    /// `MEMBER`: membership at all, inheriting or not.
+    pub member: bool,
+    /// `SET`: `SET ROLE` to it is allowed.
+    pub set: bool,
+    /// `WITH ADMIN OPTION` / `WITH GRANT OPTION` on the membership.
+    pub admin: bool,
+}
+
 /// What [`SystemCatalog::serial_sequence`] found. The three non-answers are
 /// distinct because PostgreSQL renders each differently: a missing relation and
 /// a missing column are errors with different SQLSTATEs, and a column that owns
@@ -1465,6 +1506,226 @@ impl SystemCatalog {
             .iter()
             .find(|r| r.oid == oid)
             .map(|r| r.name.as_str())
+    }
+
+    /// The inverse: the OID of the role named `name`, or `None` if the cluster
+    /// has no such role. Matched **exactly** — the privilege functions read
+    /// their role argument as a stored name rather than as an identifier, so
+    /// `pg_has_role('R','USAGE')` misses where `'r'` hits.
+    pub fn role_oid(&self, name: &str) -> Option<u32> {
+        self.roles().iter().find(|r| r.name == name).map(|r| r.oid)
+    }
+
+    /// The OID of [`SystemCatalog::current_user`] — the role every privilege
+    /// question is asked on behalf of when the call names none. Resolved through
+    /// the role list rather than assumed, for the reason
+    /// [`SystemCatalog::session_user_oid`] gives.
+    pub fn current_user_oid(&self) -> u32 {
+        let name = self.current_user();
+        self.role_oid(name).unwrap_or(oids::BOOTSTRAP_ROLE_OID)
+    }
+
+    /// What `member` may do with `role`, as the three spellings of
+    /// `pg_has_role` and every object-privilege check need it.
+    ///
+    /// The three membership answers are distinct and PostgreSQL keeps them
+    /// apart: `MEMBER` is membership at all, `USAGE` is membership whose
+    /// privileges arrive without a `SET ROLE` (the grant's `INHERIT` option),
+    /// and `SET` is being allowed to `SET ROLE` to it. A superuser holds all of
+    /// them over every role, and every role holds all but `ADMIN OPTION` over
+    /// itself.
+    ///
+    /// The walk is transitive over the membership edges, mirroring
+    /// `RoleStore::is_member_of` in the server's role catalog — with one
+    /// difference the options force: a chain confers `USAGE` only while every
+    /// edge on it inherits, so the inheriting closure is walked separately from
+    /// the plain one.
+    pub fn role_membership(&self, member: u32, role: u32) -> RoleMembership {
+        let superuser = self.roles().iter().any(|r| r.oid == member && r.superuser);
+        if superuser {
+            return RoleMembership {
+                superuser: true,
+                inherits: true,
+                member: true,
+                set: true,
+                admin: true,
+            };
+        }
+        if member == role {
+            // Not `admin`: a role holds no admin option over itself, which is
+            // what makes `pg_has_role(r, r, 'MEMBER WITH ADMIN OPTION')` false.
+            return RoleMembership {
+                superuser: false,
+                inherits: true,
+                member: true,
+                set: true,
+                admin: false,
+            };
+        }
+        RoleMembership {
+            superuser: false,
+            inherits: self.reaches(member, role, |edge| edge.inherit_option),
+            member: self.reaches(member, role, |_| true),
+            // `SET` needs the *whole* chain to be settable for the same reason
+            // `USAGE` needs it to inherit: reaching a role through one it may
+            // not become is not reaching it.
+            set: self.reaches(member, role, |edge| edge.set_option),
+            admin: self
+                .role_members()
+                .iter()
+                .any(|m| m.member == member && m.role == role && m.admin_option),
+        }
+    }
+
+    /// Whether `member` reaches `role` over the membership edges `keep` admits.
+    /// Breadth-first with a seen set, so a cycle (which the server refuses to
+    /// store) could not loop this.
+    fn reaches(&self, member: u32, role: u32, keep: impl Fn(&CatalogRoleMember) -> bool) -> bool {
+        let mut seen = std::collections::HashSet::from([member]);
+        let mut queue = vec![member];
+        while let Some(current) = queue.pop() {
+            for edge in self
+                .role_members()
+                .iter()
+                .filter(|m| m.member == current && keep(m))
+            {
+                if edge.role == role {
+                    return true;
+                }
+                if seen.insert(edge.role) {
+                    queue.push(edge.role);
+                }
+            }
+        }
+        false
+    }
+
+    /// The relation `oid` identifies, as a privilege check needs it: who owns
+    /// it, whether it is a sequence (the one relation kind
+    /// `has_sequence_privilege` accepts), and whether it is a system catalog.
+    /// `None` for an OID no relation answers to, which those functions report as
+    /// NULL.
+    ///
+    /// Both kinds of relation are covered, exactly as
+    /// [`SystemCatalog::serial_sequence`] covers them: a live user relation
+    /// (positionally numbered) and a served `pg_catalog` one (fixed OID).
+    pub fn relation_acl(&self, oid: u32) -> Option<ObjectAcl> {
+        if registry::builtin_relation_name(oid).is_some() {
+            // A system catalog: PostgreSQL's `initdb` grants SELECT on it to
+            // PUBLIC, which is what `system` carries to the caller.
+            return Some(ObjectAcl {
+                owner: oids::BOOTSTRAP_ROLE_OID,
+                is_sequence: false,
+                system: true,
+            });
+        }
+        let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
+        let relations = self.relation_oids();
+        if let Some((stored, _)) = relations.get(offset) {
+            if *stored != oid {
+                return None;
+            }
+            return Some(ObjectAcl {
+                owner: oids::BOOTSTRAP_ROLE_OID,
+                is_sequence: matches!(self.relation_kinds()[offset], RelKind::Sequence),
+                system: false,
+            });
+        }
+        // An index or a TOAST relation: neither is a sequence, and both are
+        // ordinary objects of the bootstrap superuser.
+        let indexes = self.index_oids();
+        let index = offset - relations.len();
+        if let Some(entry) = indexes.get(index)
+            && entry.oid == oid
+        {
+            return Some(ObjectAcl {
+                owner: oids::BOOTSTRAP_ROLE_OID,
+                is_sequence: false,
+                system: false,
+            });
+        }
+        let toast = self.toast_oids().get(index - indexes.len())?;
+        (toast.oid == oid).then_some(ObjectAcl {
+            owner: oids::BOOTSTRAP_ROLE_OID,
+            is_sequence: false,
+            system: false,
+        })
+    }
+
+    /// The schema `oid` identifies. `system` is `pg_catalog`, whose USAGE
+    /// PostgreSQL grants to PUBLIC.
+    ///
+    /// `information_schema` cannot turn up here: it has no `pg_namespace` row in
+    /// this build (see `catalogs::namespace`), so it has no OID to ask about.
+    pub fn namespace_acl(&self, oid: u32) -> Option<ObjectAcl> {
+        self.namespace_name(oid).map(|name| ObjectAcl {
+            owner: oids::BOOTSTRAP_ROLE_OID,
+            is_sequence: false,
+            system: name == "pg_catalog",
+        })
+    }
+
+    /// The type `oid` identifies — built-in, pseudo, or a `CREATE TYPE` one.
+    pub fn type_acl(&self, oid: u32) -> Option<ObjectAcl> {
+        let exists = crabgresql_types::PgType::from_oid(oid).is_some()
+            || crabgresql_types::pseudo_type_name(oid).is_some()
+            || self.user_type_ref(oid).is_some();
+        exists.then_some(ObjectAcl {
+            owner: oids::BOOTSTRAP_ROLE_OID,
+            is_sequence: false,
+            system: true,
+        })
+    }
+
+    /// The function `oid` identifies — a built-in `pg_proc` row or a
+    /// `CREATE FUNCTION` routine.
+    pub fn proc_acl(&self, oid: u32) -> Option<ObjectAcl> {
+        self.proc_name(oid).map(|_| ObjectAcl {
+            owner: oids::BOOTSTRAP_ROLE_OID,
+            is_sequence: false,
+            system: true,
+        })
+    }
+
+    /// The `attnum` of the column `column` of relation `oid`, or `None` if the
+    /// relation has no such column. Matched exactly, as PostgreSQL matches it
+    /// here: `has_column_privilege(rel,'RELNAME','SELECT')` is an error, not a
+    /// case-folded hit.
+    pub fn attribute_number(&self, oid: u32, column: &str) -> Option<i16> {
+        let position = match self.relation_oids().iter().find(|(rel, _)| *rel == oid) {
+            Some((_, schema)) => schema.column_index(column),
+            None => (self.catalog_relation_schema(oid)?).column_index(column),
+        }?;
+        i16::try_from(position + 1).ok()
+    }
+
+    /// Whether relation `oid` has an attribute numbered `attnum`: a user column
+    /// (1-based) or one of the system attributes (negative), which is what
+    /// `has_column_privilege(rel, -1::smallint, 'SELECT')` asks about. Anything
+    /// else — 0, or past the last column — is `false`, reported as NULL.
+    pub fn has_attribute(&self, oid: u32, attnum: i16) -> bool {
+        if attnum < 0 {
+            return crabgresql_storage_api::SysCol::ALL
+                .iter()
+                .any(|col| col.attnum() == attnum);
+        }
+        let columns = match self.relation_oids().iter().find(|(rel, _)| *rel == oid) {
+            Some((_, schema)) => schema.columns.len(),
+            None => match self.catalog_relation_schema(oid) {
+                Some(schema) => schema.columns.len(),
+                None => return false,
+            },
+        };
+        attnum >= 1 && (attnum as usize) <= columns
+    }
+
+    /// The shape of a served `pg_catalog` relation, for the two attribute
+    /// lookups above — the same fallback [`SystemCatalog::serial_sequence`]
+    /// makes for an OID that is not a live user relation.
+    fn catalog_relation_schema(&self, oid: u32) -> Option<TableSchema> {
+        let name = registry::builtin_relation_name(oid)?;
+        let def = registry::lookup(CatalogNamespace::PgCatalog, name)?;
+        Some((def.schema)())
     }
 
     /// The name of the function `oid` identifies, or `None` if this snapshot
