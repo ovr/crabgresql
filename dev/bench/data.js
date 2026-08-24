@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787604753135,
+  "lastUpdate": 1787604755080,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -53696,6 +53696,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q22",
             "value": 0.817,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a",
+          "message": "feat: Initial support for user management (#278)\n\nRoles are a cluster object here as in PostgreSQL: they live in their own\nfile under the data directory, independent of the per-database relation\ncatalog, and are shared by every connection for the life of the server.\n\n- CREATE/ALTER/DROP ROLE, and the USER/GROUP spellings of each\n- role membership: GRANT <role> TO <role> [WITH ADMIN OPTION], REVOKE\n  [ADMIN OPTION FOR], GRANTED BY, and IN ROLE/ROLE/ADMIN on CREATE\n- SET ROLE / SET SESSION AUTHORIZATION as the GUCs PostgreSQL makes them,\n  so SET LOCAL rolls back with its transaction and SHOW role answers\n- per-role settings (ALTER ROLE ... SET), applied at login\n- pg_authid and the five relations over it (pg_roles, pg_user, pg_shadow,\n  pg_group, pg_auth_members) built from the one live role list\n\nA password is stored as a SCRAM-SHA-256 verifier, but nothing\nauthenticates against it yet and no privilege on an object is checked:\nGRANT ... ON <object> is refused with 0A000 rather than silently\naccepted, and a name the catalog has no role for still connects as a\ntrusted superuser (PostgreSQL's FATAL 28000 arrives with authentication).\n\nBehaviour is pinned against PostgreSQL 18.4: a new `roles` smoke suite\nwhose expected output was generated from psql, plus e2e coverage of what\ndepends on the login role's name or on the wire.\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-24T22:03:15+02:00",
+          "tree_id": "b2676f1f0af36d3bebcf7ef0530d1201523f95f4",
+          "url": "https://github.com/ovr/crabgresql/commit/f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a"
+        },
+        "date": 1787604754914,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.309,
+            "unit": "s",
+            "extra": "dataset load — parquet, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.176,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.012,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.035,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 0.345,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.049,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.025,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.065,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.048,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.074,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.033,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.008,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.023,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.017,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.022,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.039,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.007,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.034,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.18,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 0.023,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 0.732,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 0.292,
+            "unit": "s",
+            "extra": "best of the timed runs — parquet, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.519,
             "unit": "s",
             "extra": "best of the timed runs — parquet, 86805 rows"
           }
