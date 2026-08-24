@@ -17,7 +17,4 @@ crabgresql-bki.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-# Parses the view definitions in `views::definitions` against the schemas the
-# row builders publish. The parser depends on nothing of this crate, so this
-# adds no cycle.
 crabgresql-parser.workspace = true
