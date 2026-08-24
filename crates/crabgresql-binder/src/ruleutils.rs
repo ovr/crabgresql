@@ -578,8 +578,7 @@ fn function(f: &ast::Function, cx: Cx) -> String {
             .enumerate()
             .map(|(i, a): (usize, &ast::FunctionArg)| {
                 // `VARIADIC` is part of the call PG prints back, and the
-                // argument under it deparses like any other — the keyword only
-                // says which parameter it fills.
+                // argument under it deparses like any other.
                 let (variadic, arg) = match a {
                     ast::FunctionArg::Unnamed(arg) => ("", arg),
                     ast::FunctionArg::Variadic(arg) => ("VARIADIC ", arg),

@@ -2436,10 +2436,8 @@ fn every_view_definition_parses_and_names_our_columns() {
     }
 
     // Every definition parses, so every one of them had its columns checked
-    // above — `pg_publication_tables` was the last holdout, and the `VARIADIC`
-    // its definition calls with is grammar now. The list stays so that a
-    // transcription reaching for something this build cannot parse fails here
-    // rather than quietly skipping its column check.
+    // above. The list stays so that a transcription reaching for grammar this
+    // build lacks fails here rather than quietly skipping that check.
     assert!(
         unparsed.is_empty(),
         "definitions this build cannot parse: {unparsed:?}"

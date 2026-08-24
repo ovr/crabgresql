@@ -5210,14 +5210,12 @@ fn choose_routine_overload<'a>(
         .iter()
         .filter_map(|sig| routine_params(sig, bindings.len(), variadic_call).map(|p| (sig, p)))
         .collect();
-    // A spread candidate presenting some other candidate's declared parameter
-    // list is not a candidate at all: `m(VARIADIC int[])` and `m(int)` both
-    // present `int` to `m(1)`, and PostgreSQL calls the second whichever order
-    // they were created in. The test is on the *lists*, not on variadic-ness —
-    // where they differ both stay and the ordinary rules decide, which is how
-    // `n(VARIADIC int[])` beats `n(numeric)` for `n(1)`. Two spread candidates
-    // collapsing onto each other keep competing, and so are `42725`. All four
-    // verified on 18.4.
+    // `m(VARIADIC int[])` and `m(int)` both present `int` to `m(1)`, and
+    // PostgreSQL calls the second whichever order they were created in. The
+    // test is on the *lists*, not on variadic-ness: where they differ both stay
+    // and the ordinary rules decide, which is how `n(VARIADIC int[])` beats
+    // `n(numeric)` for `n(1)`. Two spread candidates collapsing onto each other
+    // keep competing, and so are `42725`. All four verified on 18.4.
     let fixed: Vec<Vec<PgType>> = candidates
         .iter()
         .filter(|(sig, _)| !spread(sig))

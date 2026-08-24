@@ -7258,8 +7258,7 @@ fn execute_call(
     let params = param_ctx_none();
     let scope = crabgresql_binder::Scope::empty(&type_catalog, &params);
     let mut args = Vec::with_capacity(list.args.len());
-    // `CALL p(VARIADIC arr)` hands the variadic parameter the array itself; the
-    // parser has already checked that the keyword marks the last argument.
+    // The parser has already checked that the keyword marks the last argument.
     let mut variadic_call = false;
     for arg in &list.args {
         let expr = match arg {
@@ -7348,8 +7347,8 @@ fn resolve_procedure(
 ) -> Result<RoutineSig, PgError> {
     let sigs = type_catalog.routines(name);
     let arg_types: Vec<PgType> = args.iter().map(|a| a.ty()).collect();
-    // A variadic procedure presents two shapes and the call picks one, exactly
-    // as for a function — see `crabgresql_binder::routine_params`.
+    // A variadic procedure has the two shapes a function does — see
+    // `crabgresql_binder::routine_params`.
     let params = |sig: &RoutineSig| routine_params(sig, args.len(), variadic_call);
     let matches_arity = |sig: &RoutineSig| params(sig).is_some();
 
