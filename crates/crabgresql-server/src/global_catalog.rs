@@ -122,6 +122,24 @@ impl CatalogNotice {
     }
 }
 
+/// PostgreSQL's refusal to drop a type something still depends on.
+///
+/// One constructor because two paths raise it: this catalog, for the dependents
+/// it tracks itself, and `DROP DOMAIN`, which adds the ones only the engine can
+/// see (a table column). All three lines are wire-visible text.
+pub fn dependents_still_exist(name: &str, dependents: &[String]) -> PgError {
+    let lines: Vec<String> = dependents
+        .iter()
+        .map(|dep| format!("{dep} depends on type {name}"))
+        .collect();
+    PgError::new(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        format!("cannot drop type {name} because other objects depend on it"),
+    )
+    .with_detail(lines.join("\n"))
+    .with_hint("Use DROP ... CASCADE to drop the dependent objects too.")
+}
+
 /// Identifies a non-type dependent of a type, for `DROP TYPE ... CASCADE`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DepId {
@@ -191,24 +209,38 @@ pub struct DomainCheckSpec {
     pub expr: String,
 }
 
-/// The `pg_constraint` name PostgreSQL gives a domain's `NOT NULL`.
-pub fn not_null_constraint_name(domain: &str) -> String {
-    format!("{domain}_not_null")
-}
-
-/// The next auto-generated `CHECK` name for `domain`: `<domain>_check`, then
-/// `<domain>_check1`, `<domain>_check2`, … Skips names already in use, which is
-/// what lets an explicit `CONSTRAINT d_check` coexist with an unnamed one.
-fn next_check_name(domain: &str, entry: &DomainEntry) -> String {
+/// Append one `CHECK` to `entry`, naming it if the clause did not.
+///
+/// An unnamed one is `<domain>_check`, then `<domain>_check1`, `<domain>_check2`,
+/// … skipping names already in use — which is what lets an explicit
+/// `CONSTRAINT d_check` coexist with an unnamed one. Shared by `CREATE DOMAIN`
+/// and `ALTER DOMAIN ... ADD`, so the rule and its `42710` have one home.
+fn push_domain_check(
+    entry: &mut DomainEntry,
+    domain: &str,
+    name: Option<String>,
+    expr: String,
+    validated: bool,
+) -> Result<(), PgError> {
     let taken = |candidate: &str| entry.checks.iter().any(|c| c.name == candidate);
-    let base = format!("{domain}_check");
-    if !taken(&base) {
-        return base;
-    }
-    (1..)
-        .map(|n| format!("{base}{n}"))
-        .find(|candidate| !taken(candidate))
-        .expect("an unused suffix exists")
+    let name = match name {
+        Some(given) => {
+            if taken(&given) {
+                return Err(PgError::new(
+                    sqlstate::DUPLICATE_OBJECT,
+                    format!("constraint \"{given}\" for domain \"{domain}\" already exists"),
+                ));
+            }
+            given
+        }
+        None => crate::query::fresh_local_name(taken, &format!("{domain}_check")),
+    };
+    entry.checks.push(DomainCheckEntry {
+        name,
+        expr,
+        validated,
+    });
+    Ok(())
 }
 
 fn domain_info(name: &str, oid: u32, entry: &DomainEntry) -> DomainInfo {
@@ -233,25 +265,8 @@ fn domain_info(name: &str, oid: u32, entry: &DomainEntry) -> DomainInfo {
 }
 
 /// The domain stored under `name`, or PostgreSQL's error for a name that is not
-/// a domain. A non-domain type reports `42809`, the way `ALTER DOMAIN` on an
-/// enum does; a missing one reports `42704 type "x" does not exist`.
-fn domain<'a>(cat: &'a CatalogInner, name: &str) -> Result<&'a DomainEntry, PgError> {
-    match cat.types.get(name) {
-        Some(entry) => entry.domain.as_ref().ok_or_else(|| {
-            PgError::new(
-                sqlstate::WRONG_OBJECT_TYPE,
-                format!("\"{name}\" is not a domain"),
-            )
-        }),
-        None => Err(PgError::new(
-            sqlstate::UNDEFINED_OBJECT,
-            format!("type \"{name}\" does not exist"),
-        )),
-    }
-}
-
-/// [`domain`], mutably. Written twice rather than shared through a macro
-/// because the borrow checker cannot hand out one function for both.
+/// one. A non-domain type reports `42809`, the way `ALTER DOMAIN` on an enum
+/// does; a missing one reports `42704 type "x" does not exist`.
 fn domain_mut<'a>(cat: &'a mut CatalogInner, name: &str) -> Result<&'a mut DomainEntry, PgError> {
     match cat.types.get_mut(name) {
         Some(entry) => entry.domain.as_mut().ok_or_else(|| {
@@ -1130,23 +1145,7 @@ impl GlobalCatalog {
             checks: Vec::new(),
         };
         for check in spec.checks {
-            let conname = match check.name {
-                Some(given) => {
-                    if entry.checks.iter().any(|c| c.name == given) {
-                        return Err(PgError::new(
-                            sqlstate::DUPLICATE_OBJECT,
-                            format!("constraint \"{given}\" for domain \"{name}\" already exists"),
-                        ));
-                    }
-                    given
-                }
-                None => next_check_name(name, &entry),
-            };
-            entry.checks.push(DomainCheckEntry {
-                name: conname,
-                expr: check.expr,
-                validated: true,
-            });
+            push_domain_check(&mut entry, name, check.name, check.expr, true)?;
         }
         cat.types.insert(
             name.to_string(),
@@ -1209,24 +1208,7 @@ impl GlobalCatalog {
             .inner
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let entry = domain(&cat, name)?;
-        let conname = match conname {
-            Some(given) => {
-                if entry.checks.iter().any(|c| c.name == given) {
-                    return Err(PgError::new(
-                        sqlstate::DUPLICATE_OBJECT,
-                        format!("constraint \"{given}\" for domain \"{name}\" already exists"),
-                    ));
-                }
-                given
-            }
-            None => next_check_name(name, entry),
-        };
-        domain_mut(&mut cat, name)?.checks.push(DomainCheckEntry {
-            name: conname,
-            expr,
-            validated,
-        });
+        push_domain_check(domain_mut(&mut cat, name)?, name, conname, expr, validated)?;
         Ok(Vec::new())
     }
 
@@ -1243,7 +1225,7 @@ impl GlobalCatalog {
             .inner
             .write()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let not_null_name = not_null_constraint_name(name);
+        let not_null_name = crabgresql_catalog::not_null_constraint_name(name);
         let entry = domain_mut(&mut cat, name)?;
         if entry.not_null && conname == not_null_name {
             entry.not_null = false;
@@ -1787,6 +1769,15 @@ impl TypeCatalog for GlobalCatalog {
         Some(domain_info(name, oid, entry.domain.as_ref()?))
     }
 
+    fn domain_base(&self, oid: u32) -> Option<(PgType, i32)> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let domain = cat.types.values().find(|e| e.oid == oid)?.domain.as_ref()?;
+        Some((domain.base, domain.typmod))
+    }
+
     fn routines(&self, name: &str) -> Vec<RoutineSig> {
         let cat = self
             .inner
@@ -1904,17 +1895,12 @@ impl CatalogInner {
             ));
         };
         if !entry.dependents.is_empty() && !cascade {
-            let lines: Vec<String> = entry
+            let described: Vec<String> = entry
                 .dependents
                 .iter()
-                .map(|dep| format!("{} depends on type {name}", self.describe_dep(*dep)))
+                .map(|dep| self.describe_dep(*dep))
                 .collect();
-            return Err(PgError::new(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                format!("cannot drop type {name} because other objects depend on it"),
-            )
-            .with_detail(lines.join("\n"))
-            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+            return Err(dependents_still_exist(name, &described));
         }
         Ok(())
     }

@@ -2695,15 +2695,10 @@ fn insert_direct(
         }
     }
     for tuple in &tuples {
-        validate_constraints(
-            &schema,
-            tuple,
-            &mut visible,
-            domains,
-            &notnull,
-            &checks,
-            ctx,
-        )?;
+        // Ahead of the relation's own constraints: a domain constraint belongs
+        // to the *coercion*, which in PostgreSQL happens before the row exists.
+        domains.validate(tuple, ctx)?;
+        validate_constraints(&schema, tuple, &mut visible, &notnull, &checks, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -2841,16 +2836,17 @@ fn insert_routed(
         }
         let checks = leaf_checks[leaf].as_ref().expect("just seeded");
         let notnull = leaf_notnull[leaf].get_or_insert_with(|| NotNullSet::for_schema(leaf_schema));
+        // As in `insert_direct`: the domain is entered before the row exists.
+        domains.validate(tuple, ctx)?;
         match visible[leaf].as_mut() {
             Some(seen) => {
-                validate_constraints(leaf_schema, tuple, seen, domains, notnull, checks, ctx)?;
+                validate_constraints(leaf_schema, tuple, seen, notnull, checks, ctx)?;
                 seen.record(tuple, None);
             }
             None => validate_constraints(
                 leaf_schema,
                 tuple,
                 &mut UniqueKeySet::none(),
-                domains,
                 notnull,
                 checks,
                 ctx,
@@ -3200,7 +3196,6 @@ fn update_inherited(
                     &shapes[i].0,
                     &new,
                     &mut simulated[i],
-                    &DomainSet::none(),
                     &notnull[i],
                     &checks[i],
                     ctx,
@@ -3214,7 +3209,6 @@ fn update_inherited(
                     &shapes[i].0,
                     &new,
                     &mut UniqueKeySet::none(),
-                    &DomainSet::none(),
                     &notnull[i],
                     &checks[i],
                     ctx,
@@ -3380,15 +3374,9 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) = validate_constraints(
-                &schema,
-                &new,
-                &mut simulated,
-                &DomainSet::none(),
-                &notnull,
-                &checks,
-                ctx,
-            ) {
+            if let Err(error) =
+                validate_constraints(&schema, &new, &mut simulated, &notnull, &checks, ctx)
+            {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
@@ -3398,7 +3386,6 @@ fn update_direct(
                 &schema,
                 &new,
                 &mut UniqueKeySet::none(),
-                &DomainSet::none(),
                 &notnull,
                 &checks,
                 ctx,
@@ -3639,7 +3626,6 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
-                        &DomainSet::none(),
                         &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
@@ -3653,7 +3639,6 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
-                        &DomainSet::none(),
                         &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
@@ -3668,7 +3653,6 @@ fn update_routed(
                     &leaf_shapes[dst].0,
                     &new,
                     &mut UniqueKeySet::none(),
-                    &DomainSet::none(),
                     &leaf_notnull[dst],
                     &leaf_checks[dst],
                     ctx,
@@ -3797,15 +3781,10 @@ fn validate_constraints(
     schema: &TableSchema,
     tuple: &Tuple,
     existing: &mut UniqueKeySet,
-    domains: &DomainSet,
     notnull: &NotNullSet,
     checks: &CheckSet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
-    // Ahead of the relation's own not-null: a domain constraint belongs to the
-    // *coercion*, which in PostgreSQL happens before the row exists. See
-    // `DomainSet`, and note this set is empty unless the source was a load.
-    domains.validate(tuple, ctx)?;
     notnull.validate(schema, tuple, ctx)?;
 
     // Order matches PostgreSQL's observable behavior, probed against 18.4 on

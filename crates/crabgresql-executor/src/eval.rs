@@ -476,20 +476,8 @@ pub(crate) fn check_domain(
 
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
-///
-/// A domain target resolves to its base first. `cast::cast_value` has no
-/// catalog, so a `PgType::User` reaches it as an opaque type it knows no cast
-/// to — and the value under a domain is *already* its base's, so there is
-/// nothing to convert. Reached wherever a plan's declared column type survives
-/// into a runtime coercion, `scalar_subquery_value` being the one that made a
-/// `SELECT (SELECT domain_col FROM t)` fail with `cannot cast type integer to
-/// user-defined`.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
-    let ty = match (ty, &ctx.types) {
-        (PgType::User(_), Some(types)) => types.base_type(ty),
-        _ => ty,
-    };
-    cast::cast_value(value, ty, &ctx.fmt)
+    cast::cast_value(value, runtime_target(ty, ctx), &ctx.fmt)
         .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
@@ -502,8 +490,26 @@ pub fn coerce_value_assign(
     ty: PgType,
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    cast::cast_value_assign(value, ty, &ctx.fmt)
+    cast::cast_value_assign(value, runtime_target(ty, ctx), &ctx.fmt)
         .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
+}
+
+/// The type a runtime coercion actually converts to: a domain resolves to its
+/// base first.
+///
+/// `crabgresql_types::cast` has no catalog, so a `PgType::User` reaches it as an
+/// opaque type it knows no cast to — while the value under a domain is
+/// *already* its base's, so there is nothing to convert. A plan's declared
+/// column type can be a domain anywhere the executor coerces to it, which is
+/// why this sits between both entry points and the cast machinery rather than
+/// at the site that first hit it: `scalar_subquery_value`, where
+/// `SELECT (SELECT domain_col FROM t)` failed with `cannot cast type integer to
+/// user-defined`.
+fn runtime_target(ty: PgType, ctx: &ExecContext) -> PgType {
+    match (ty, &ctx.types) {
+        (PgType::User(_), Some(types)) => types.base_type(ty),
+        _ => ty,
+    }
 }
 
 /// Dispatch the non-strict array constructor functions (`array_cat`,

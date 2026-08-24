@@ -478,9 +478,8 @@ fn bind_binary_bound_inner(
     // `posint` column answers `integer`. Every binary operator funnels through
     // here (the AST entry point and the quantified `ANY`/`ALL` path both), so
     // this is the one place the strip has to happen for operators.
-    let catalog = scope.catalog().clone();
-    let lb = undomain_binding(lb, catalog.as_ref());
-    let rb = undomain_binding(rb, catalog.as_ref());
+    let lb = undomain_binding(lb, scope.catalog().as_ref());
+    let rb = undomain_binding(rb, scope.catalog().as_ref());
     // TODO: raise 3F000 `schema "x" does not exist` when the qualifier names no
     // schema, as PG does; the schema catalog is not reachable from the binder
     // scope, so that case collapses into the 42883 below.
@@ -751,7 +750,7 @@ pub(crate) fn bind_binary_op(
 
     // Admit only operators the executor actually implements for `arg_ty`, so a
     // bind never produces a node the evaluator can't handle. PG resolves against
-    // a concrete operator types; this whitelist is our stand-in. `%` exists
+    // a concrete operator catalog; this whitelist is our stand-in. `%` exists
     // for the integer types and `numeric` (PG has `numeric_mod`), but not float.
     let supported = if op.is_arithmetic() {
         let numeric_arith = matches!(
@@ -774,7 +773,7 @@ pub(crate) fn bind_binary_op(
         // have a hash opclass but no btree one. Every other comparison stays on
         // `is_orderable`, so `'1'::xid < '2'::xid` still has no operator.
         //
-        // `cid` is narrower still: PostgreSQL 18.4's operator types gives it
+        // `cid` is narrower still: PostgreSQL 18.4's operator catalog gives it
         // `=` and nothing else, not even `<>`. Probed, not assumed — `pg_operator`
         // lists one row for `(cid, cid)` against two for `(xid, xid)`.
         has_equality(arg_ty, types) && !(arg_ty == PgType::Cid && op == BinOp::NotEq)

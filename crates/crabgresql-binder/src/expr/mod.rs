@@ -37,6 +37,7 @@ pub use datatype::{
     datetime_precision, declared_typmod, interval_typmod, length_typmod, map_data_type,
     resolve_data_type, text_value,
 };
+pub use domain::value_shape;
 pub(crate) use domain::{bind_domain, domain_collation, domain_of, undomain_binding, wrap_domain};
 pub use function_body::{bind_sql_function_body, inline_params};
 pub use literal::literal_int;

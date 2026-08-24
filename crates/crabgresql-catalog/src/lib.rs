@@ -176,6 +176,15 @@ pub struct CatalogConstraint {
     pub inhcount: i16,
 }
 
+/// The `pg_constraint` name PostgreSQL gives a domain's `NOT NULL`.
+///
+/// One definition because two things read it: the row this catalog publishes,
+/// and `ALTER DOMAIN ... DROP CONSTRAINT`, which matches the written name
+/// against it. If they drifted, the published constraint would be undroppable.
+pub fn not_null_constraint_name(domain: &str) -> String {
+    format!("{domain}_not_null")
+}
+
 /// What [`SystemCatalog::constraint_def`] hands back: enough of a
 /// `pg_constraint` row to render its DDL, without exposing the row itself.
 pub struct ConstraintDefRow {
@@ -1159,7 +1168,7 @@ impl SystemCatalog {
                 if domain.not_null {
                     out.push(CatalogConstraint {
                         oid: first + out.len() as u32,
-                        name: format!("{}_not_null", user_type.name),
+                        name: not_null_constraint_name(&user_type.name),
                         contype: "n",
                         namespace: "public".to_string(),
                         table_oid: 0,

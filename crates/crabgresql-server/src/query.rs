@@ -40,7 +40,7 @@ use crate::explain::{ExplainOptions, explain_columns, explain_result, run_analyz
 use crate::global_catalog::{
     ArgMode, CatalogNotice, DomainCheckSpec, DomainSpec, FuncBody, FuncDropSpec, FuncInfo,
     GlobalCatalog, RoutineArg, RoutineDefinition, RoutineKind, TypeRef, Volatility,
-    definition_fingerprint,
+    definition_fingerprint, dependents_still_exist,
 };
 use crate::guc;
 use crate::routines::{RoutineDispatch, SessionNotices};
@@ -6521,7 +6521,7 @@ fn named_not_null(taken: &mut HashSet<String>, table: &str, column: &str) -> Str
     name
 }
 
-fn fresh_local_name(taken: impl Fn(&str) -> bool, base: &str) -> String {
+pub(crate) fn fresh_local_name(taken: impl Fn(&str) -> bool, base: &str) -> String {
     if !taken(base) {
         return base.to_string();
     }
@@ -6850,7 +6850,7 @@ fn execute_create_domain(
         },
     };
 
-    let shape = domain_value_shape(&name, resolved, typmod);
+    let shape = crabgresql_binder::value_shape(&name, resolved, typmod);
     let default = match &create.default {
         Some(expr) => Some(deparse_domain_default(
             expr,
@@ -6894,14 +6894,6 @@ fn execute_create_domain(
         tag: "CREATE DOMAIN".into(),
         notices: to_notices(notices),
     })
-}
-
-/// The one-column shape a domain's `DEFAULT` and `CHECK` bind against.
-fn domain_value_shape(domain: &str, base: PgType, typmod: i32) -> TableSchema {
-    TableSchema::new(
-        domain.to_string(),
-        vec![Column::with_typmod("value", base, typmod)],
-    )
 }
 
 /// Resolve the type named after `AS`, reporting a name that resolves to nothing
@@ -6985,7 +6977,7 @@ fn execute_alter_domain(
         )
     })?;
     let base = type_catalog.base_type(info.base);
-    let shape = domain_value_shape(&name, base, info.typmod);
+    let shape = crabgresql_binder::value_shape(&name, base, info.typmod);
 
     // A re-scan needs the same fully-wired runtime a statement gets — a domain
     // predicate may call anything a table `CHECK` may. Built up front rather
@@ -7129,7 +7121,7 @@ fn validate_domain_over_stored_values(
     not_null: bool,
 ) -> Result<(), PgError> {
     let base = type_catalog.base_type(info.base);
-    let shape = domain_value_shape(&info.name, base, info.typmod);
+    let shape = crabgresql_binder::value_shape(&info.name, base, info.typmod);
     let predicate = match check {
         Some(text) => {
             let parsed = crabgresql_binder::parse_stored_expr(text, "domain constraint")?;
@@ -7208,16 +7200,7 @@ fn execute_drop_domain(
             continue;
         }
         if !cascade {
-            let detail: Vec<String> = dependents
-                .iter()
-                .map(|dep| format!("{dep} depends on type {name}"))
-                .collect();
-            return Err(PgError::new(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                format!("cannot drop type {name} because other objects depend on it"),
-            )
-            .with_detail(detail.join("\n"))
-            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+            return Err(dependents_still_exist(name, &dependents));
         }
         // PostgreSQL's CASCADE drops the dependent column; `ALTER TABLE ...
         // DROP COLUMN` does not exist in this engine yet, so the alternative to

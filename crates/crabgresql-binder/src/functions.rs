@@ -5315,10 +5315,14 @@ fn coerce_routine_args(
     let args = try_coerce_args(bindings, base, exact_only)?;
     args.into_iter()
         .zip(declared)
-        .map(|(arg, declared)| match domain_of(*declared, catalog.as_ref()) {
-            Some(info) => wrap_domain(arg, &info, catalog, false).map_err(ArgFail::LiteralInput),
-            None => Ok(arg),
-        })
+        .map(
+            |(arg, declared)| match domain_of(*declared, catalog.as_ref()) {
+                Some(info) => {
+                    wrap_domain(arg, &info, catalog, false).map_err(ArgFail::LiteralInput)
+                }
+                None => Ok(arg),
+            },
+        )
         .collect()
 }
 

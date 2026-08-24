@@ -79,9 +79,10 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             | PgType::Vector(_)
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
         // A domain orders exactly as its base does: the value under it *is* a
-        // base value, and `compare_values` dispatches on the value.
-        || matches!(ty, PgType::User(oid) if catalog.domain_info(oid).is_some())
-            && is_orderable(catalog.base_type(ty), catalog)
+        // base value, and `compare_values` dispatches on the value. `base_type`
+        // answering something else is itself the "this is a domain" test, so
+        // there is no second lookup to ask it.
+        || (catalog.base_type(ty) != ty && is_orderable(catalog.base_type(ty), catalog))
 }
 
 /// Types with a default *equality* operator — a superset of the orderable ones,

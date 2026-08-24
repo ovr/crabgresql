@@ -80,15 +80,21 @@ struct ResolvedDomain {
     /// The end of the `typbasetype` chain — the shape a value really has, and
     /// what a *column* of the domain reports.
     base: PgType,
-    /// The immediate base, `None` when it is itself a domain. `information_
-    /// schema.domains` reports that one: over `dd AS posint`, 18.4 shows
+    /// The immediate base, which `information_schema.domains` reports rather
+    /// than the end of the chain: over `dd AS posint`, 18.4 shows
     /// `data_type = USER-DEFINED`, `udt_schema = public`, `udt_name = posint`.
-    immediate: Option<PgType>,
-    /// The immediate base's name when it is a domain, for `udt_name`.
-    immediate_name: Option<String>,
+    immediate: Immediate,
     typmod: i32,
     default: Option<String>,
     collation: u32,
+}
+
+/// A domain's immediate base: a built-in, or another domain named by name.
+/// One value rather than two `Option`s, so "exactly one of them is set" is not
+/// an invariant every reader has to re-derive.
+enum Immediate {
+    Builtin(PgType),
+    Domain(String),
 }
 
 fn resolved_domains(cat: &SystemCatalog) -> Vec<ResolvedDomain> {
@@ -101,18 +107,6 @@ fn resolved_domains(cat: &SystemCatalog) -> Vec<ResolvedDomain> {
         .collect()
 }
 
-fn domain_of_column(
-    cat: &SystemCatalog,
-    column: &crabgresql_storage_api::Column,
-) -> Option<ResolvedDomain> {
-    let PgType::User(oid) = column.ty else {
-        return None;
-    };
-    let t = cat.user_types().iter().find(|t| t.oid == oid)?;
-    let d = t.domain.as_ref()?;
-    resolved_domain(cat, t, d)
-}
-
 fn resolved_domain(
     cat: &SystemCatalog,
     t: &crate::CatalogUserType,
@@ -121,16 +115,18 @@ fn resolved_domain(
     // A base this build cannot name is skipped rather than reported as
     // something else; the only way that happens is a domain over a domain,
     // whose immediate base is a user OID no `PgType` answers to.
-    let immediate_name = cat
+    let immediate = match cat
         .user_types()
         .iter()
         .find(|u| u.oid == d.basetype && u.domain.is_some())
-        .map(|u| u.name.clone());
+    {
+        Some(u) => Immediate::Domain(u.name.clone()),
+        None => Immediate::Builtin(PgType::from_oid(d.basetype)?),
+    };
     Some(ResolvedDomain {
         name: t.name.clone(),
         base: PgType::from_oid(d.resolved_basetype)?,
-        immediate: PgType::from_oid(d.basetype).filter(|_| immediate_name.is_none()),
-        immediate_name,
+        immediate,
         typmod: d.typmod,
         default: d.default.clone(),
         collation: d.collation,
@@ -185,8 +181,8 @@ pub(crate) fn domains_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             // `data_type` is `USER-DEFINED`, and PostgreSQL leaves every length
             // and precision column NULL beside it.
             let attrs = match d.immediate {
-                Some(base) => type_attributes(base, d.typmod),
-                None => type_attributes(PgType::User(0), -1),
+                Immediate::Builtin(base) => type_attributes(base, d.typmod),
+                Immediate::Domain(_) => type_attributes(PgType::User(0), -1),
             };
             // As in `columns`, PostgreSQL's view excludes `pg_catalog.default`,
             // so a domain left on the database collation reports NULL.
@@ -208,9 +204,9 @@ pub(crate) fn domains_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Text(d.name),
                 // `USER-DEFINED` is what PostgreSQL reports when the base is
                 // itself a domain — the standard has no name for one.
-                Value::Text(match d.immediate {
-                    Some(base) => base.name().to_string(),
-                    None => "USER-DEFINED".to_string(),
+                Value::Text(match &d.immediate {
+                    Immediate::Builtin(base) => base.name().to_string(),
+                    Immediate::Domain(_) => "USER-DEFINED".to_string(),
                 }),
                 attrs.character_length,
                 attrs.character_octets,
@@ -232,14 +228,13 @@ pub(crate) fn domains_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Null,
                 d.default.map_or(Value::Null, Value::Text),
                 Value::Text(database.to_string()),
-                match &d.immediate_name {
-                    Some(_) => Value::Text("public".to_string()),
-                    None => Value::Text("pg_catalog".to_string()),
+                match &d.immediate {
+                    Immediate::Domain(_) => Value::Text("public".to_string()),
+                    Immediate::Builtin(_) => Value::Text("pg_catalog".to_string()),
                 },
-                match (&d.immediate_name, d.immediate) {
-                    (Some(name), _) => Value::Text(name.clone()),
-                    (None, Some(base)) => Value::Text(base.typname().to_string()),
-                    (None, None) => Value::Null,
+                match &d.immediate {
+                    Immediate::Domain(name) => Value::Text(name.clone()),
+                    Immediate::Builtin(base) => Value::Text(base.typname().to_string()),
                 },
                 // scope_{catalog,schema,name} / maximum_cardinality: reference
                 // and array-domain columns, neither of which exists here.
@@ -432,6 +427,14 @@ pub(crate) fn columns_schema() -> TableSchema {
 
 pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (database, relations) = (cat.database(), cat.live_relations());
+    // Once for the view, not twice per user-typed column: resolving one domain
+    // scans the type list, and this view is read over a whole database.
+    let domains: std::collections::HashMap<u32, ResolvedDomain> = cat
+        .user_types()
+        .iter()
+        .filter_map(|t| Some((t.oid, resolved_domain(cat, t, t.domain.as_ref()?)?)))
+        .collect();
+    let domains = &domains;
     relations
         .iter()
         // Sequences are not tables; omit their columns from information_schema.
@@ -448,7 +451,10 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                     // the domain's own modifier applied, and the domain is
                     // named only through the `domain_*` triple. Probed on 18.4
                     // over `CREATE DOMAIN dcol AS varchar(5)`.
-                    let domain = domain_of_column(cat, column);
+                    let domain = match column.ty {
+                        PgType::User(oid) => domains.get(&oid),
+                        _ => None,
+                    };
                     let (ty, typmod) = match &domain {
                         Some(d) => (d.base, d.typmod),
                         None => (column.ty, column.typmod),
@@ -461,12 +467,14 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         ),
                         None => (Value::Null, Value::Null, Value::Null),
                     };
-                    let attrs = type_attributes(ty, typmod);
-                    let (character_length, character_octets) =
-                        (attrs.character_length, attrs.character_octets);
-                    let (precision, radix) = (attrs.numeric_precision, attrs.numeric_radix);
-                    let (datetime_precision, interval_type) =
-                        (attrs.datetime_precision, attrs.interval_type);
+                    let TypeAttributes {
+                        character_length,
+                        character_octets,
+                        numeric_precision: precision,
+                        numeric_radix: radix,
+                        datetime_precision,
+                        interval_type,
+                    } = type_attributes(ty, typmod);
                     // PG's view joins pg_collation but excludes
                     // `pg_catalog.default`, so a column left on the database
                     // collation reports NULL here rather than "default".

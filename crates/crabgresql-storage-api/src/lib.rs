@@ -2348,19 +2348,15 @@ pub trait TypeCatalog: Send + Sync {
         self.base_type_and_typmod(ty).0
     }
 
-    /// The type modifier a domain's values carry, or `-1` for a type with none.
+    /// The type a domain's values really are and the modifier they carry, or
+    /// `(ty, -1)` for a type that is not a domain.
     ///
-    /// It comes from wherever in the `typbasetype` chain it was declared, which
-    /// is not necessarily the type `ty` names: `CREATE DOMAIN v3b AS v3` over
-    /// `v3 AS varchar(3)` leaves `v3b` with `typtypmod = -1`, yet `'abcd'::v3b`
-    /// is `abc` on 18.4. At most one level can carry one — the grammar takes no
-    /// modifier after a domain name — so the chain has a single answer.
-    fn base_typmod(&self, ty: PgType) -> i32 {
-        self.base_type_and_typmod(ty).1
-    }
-
-    /// One walk answering both, since every caller that wants the type wants
-    /// the modifier that goes with it.
+    /// The modifier comes from wherever in the `typbasetype` chain it was
+    /// declared, which is not necessarily the type `ty` names: `CREATE DOMAIN
+    /// v3b AS v3` over `v3 AS varchar(3)` leaves `v3b` with `typtypmod = -1`,
+    /// yet `'abcd'::v3b` is `abc` on 18.4. At most one level can carry one —
+    /// the grammar takes no modifier after a domain name — so the chain has a
+    /// single answer.
     fn base_type_and_typmod(&self, ty: PgType) -> (PgType, i32) {
         let mut ty = ty;
         let mut typmod = -1;
@@ -2371,17 +2367,29 @@ pub trait TypeCatalog: Send + Sync {
             let PgType::User(oid) = ty else {
                 return (ty, typmod);
             };
-            match self.domain_info(oid) {
-                Some(info) => {
-                    ty = info.base;
-                    if info.typmod >= 0 {
-                        typmod = info.typmod;
+            match self.domain_base(oid) {
+                Some((base, m)) => {
+                    ty = base;
+                    if m >= 0 {
+                        typmod = m;
                     }
                 }
                 None => return (ty, typmod),
             }
         }
         (ty, typmod)
+    }
+
+    /// One link of the `typbasetype` chain: the immediate base and modifier of
+    /// the domain with this OID, or `None` if the OID is not a domain.
+    ///
+    /// Split from [`TypeCatalog::domain_info`] because walking a chain — or
+    /// merely asking whether an OID *is* a domain, which `is_orderable` does per
+    /// sort key — has no use for the constraints, and cloning a `DomainInfo`
+    /// deep-copies the domain's name, its default and every check's SQL.
+    fn domain_base(&self, oid: u32) -> Option<(PgType, i32)> {
+        let info = self.domain_info(oid)?;
+        Some((info.base, info.typmod))
     }
 
     /// Every user-defined routine registered under `name` (case-insensitive),

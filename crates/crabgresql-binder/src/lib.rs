@@ -30,7 +30,7 @@ pub use expr::{
     deparse_literal_default, inline_params, interval_typmod, length_typmod, literal_int,
     map_data_type, param_ctx_capped, param_ctx_extended, param_ctx_none, param_types,
     parse_stored_expr, reject_agg_or_window, require_all_resolved, resolve_data_type,
-    subquery_in_execute_param,
+    subquery_in_execute_param, value_shape,
 };
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,

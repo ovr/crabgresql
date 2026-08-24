@@ -96,7 +96,7 @@ pub(crate) fn wrap_domain(
     explicit: bool,
 ) -> Result<BoundExpr, BindError> {
     // The modifier comes from the chain, not from `info`: a domain over a
-    // domain declares none of its own — see `TypeCatalog::base_typmod`.
+    // domain declares none of its own — see `TypeCatalog::base_type_and_typmod`.
     let (base, typmod) = catalog.base_type_and_typmod(PgType::User(info.oid));
     let expr = match explicit {
         true => apply_length_cast(expr, base, typmod)?,
@@ -127,7 +127,8 @@ pub(crate) fn bind_domain(
     info: &DomainInfo,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<BoundDomain, BindError> {
-    let schema = value_shape(info, catalog);
+    let (base, typmod) = catalog.base_type_and_typmod(PgType::User(info.oid));
+    let schema = value_shape(&info.name, base, typmod);
     // Innermost first, which is the order the constraints run in.
     let mut chain = vec![info.clone()];
     while let Some(next) = domain_of(chain[0].base, catalog.as_ref()) {
@@ -168,9 +169,14 @@ pub(crate) fn bind_domain(
 /// spelled `value` because that is what `VALUE` normalizes to, and the relation
 /// is named after the domain so that a predicate written `d.VALUE` — which
 /// PostgreSQL rejects — is at least diagnosed against the right object.
-pub(crate) fn value_shape(info: &DomainInfo, catalog: &Arc<dyn TypeCatalog>) -> TableSchema {
+///
+/// Takes the parts rather than a [`DomainInfo`] because `CREATE DOMAIN` binds
+/// its predicates before there is one to take, and the two must agree: a
+/// predicate validated at DDL time against a different shape than the one it is
+/// later evaluated under is a validation that proves nothing.
+pub fn value_shape(domain: &str, base: PgType, typmod: i32) -> TableSchema {
     TableSchema::new(
-        info.name.clone(),
-        vec![Column::new("value", catalog.base_type(info.base))],
+        domain.to_string(),
+        vec![Column::with_typmod("value", base, typmod)],
     )
 }
