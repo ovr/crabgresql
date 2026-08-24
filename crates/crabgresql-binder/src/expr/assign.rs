@@ -20,7 +20,7 @@ use super::coerce::{
     coerce_expr, implicit_castable, resolve_unknown_ctx, to_bool_operand, type_label,
 };
 use super::datatype::apply_length_to_column;
-use super::domain::{domain_of, wrap_domain};
+use super::domain::{domain_of, undomain_binding, wrap_domain};
 use super::operators::{is_bit_family, is_text_family};
 use super::params::param_ctx_none;
 use super::scope::{Binding, Scope, reject_agg_or_window};
@@ -77,6 +77,15 @@ fn coerce_assign(
     scope: &Scope,
     mismatch: impl FnOnce(String, String) -> BindError,
 ) -> Result<BoundExpr, BindError> {
+    // A domain on the *source* side is just its base value, so it assigns
+    // wherever the base does: `INSERT INTO int_tbl(x) SELECT posint_col` is
+    // accepted by PostgreSQL and would otherwise reach the 42804 below, which
+    // knows no coercion out of a `PgType::User`. Skipped when the target is
+    // that very domain, so the wrap below still sees the two types as equal.
+    let binding = match &binding {
+        Binding::Typed(e) if e.ty() == target => binding,
+        _ => undomain_binding(binding, scope.catalog().as_ref()),
+    };
     // A source that is already this very domain skips the wrap: the value is
     // in, and PostgreSQL does not re-check it (`UPDATE t SET a = a` never
     // re-validates).

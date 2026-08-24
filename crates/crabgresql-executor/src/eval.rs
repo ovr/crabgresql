@@ -437,21 +437,21 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
 /// `23514 value for domain p2 violates check constraint "p2_check"`. Neither
 /// carries a DETAIL — a domain has no row to print.
 ///
-/// A NULL skips the checks entirely, the way it does for a table `CHECK`: a
-/// predicate evaluating to NULL passes, and PostgreSQL does not even run them.
+/// A NULL does **not** skip the checks. `CHECK (VALUE > 0)` admits one only
+/// because the predicate itself evaluates to NULL there, while
+/// `CHECK (VALUE IS NOT NULL)` — the spelling PostgreSQL's own documentation
+/// suggests — returns `false` and rejects it. Probed on 18.4: the first passes
+/// and the second raises 23514, which no "skip on NULL" rule reproduces.
 pub(crate) fn check_domain(
     value: &Value,
     domain: &BoundDomain,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
-    if matches!(value, Value::Null) {
-        if domain.not_null {
-            return Err(ExecError::new(
-                "23502",
-                format!("domain {} does not allow null values", domain.name),
-            ));
-        }
-        return Ok(());
+    if domain.not_null && matches!(value, Value::Null) {
+        return Err(ExecError::new(
+            "23502",
+            format!("domain {} does not allow null values", domain.name),
+        ));
     }
     if domain.checks.is_empty() {
         return Ok(());
@@ -476,7 +476,19 @@ pub(crate) fn check_domain(
 
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
+///
+/// A domain target resolves to its base first. `cast::cast_value` has no
+/// catalog, so a `PgType::User` reaches it as an opaque type it knows no cast
+/// to — and the value under a domain is *already* its base's, so there is
+/// nothing to convert. Reached wherever a plan's declared column type survives
+/// into a runtime coercion, `scalar_subquery_value` being the one that made a
+/// `SELECT (SELECT domain_col FROM t)` fail with `cannot cast type integer to
+/// user-defined`.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
+    let ty = match (ty, &ctx.types) {
+        (PgType::User(_), Some(types)) => types.base_type(ty),
+        _ => ty,
+    };
     cast::cast_value(value, ty, &ctx.fmt)
         .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }

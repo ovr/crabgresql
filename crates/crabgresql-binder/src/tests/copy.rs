@@ -107,7 +107,7 @@ fn copy_parses_fields_straight_into_values() -> anyhow::Result<()> {
 }
 
 /// Every `parse_unknown` arm must return exactly the `Value` variant its
-/// `PgType` pairs with, because `apply_column_typmod` destructures on that
+/// `PgType` pairs with, because `apply_typmod_value` destructures on that
 /// pairing and raises an internal error when it does not hold.
 ///
 /// There is no second path to absorb a mismatch any more, so the invariant
@@ -186,14 +186,13 @@ fn every_column_type_parses_into_the_shape_its_typmod_expects() -> anyhow::Resul
 
     let fmt = FmtCtx::utc_default();
     for (ty, typmod, literal) in cases {
-        let column = Column::with_typmod("c", ty, typmod);
         let value = match crate::expr::parse_unknown(literal, ty, &fmt) {
             Ok(value) => value,
             Err(e) => bail!("{ty:?} typmod {typmod} rejected {literal:?}: {e}"),
         };
-        if let Err(e) = apply_column_typmod(value, &column) {
+        if let Err(e) = apply_typmod_value(value, ty, typmod) {
             bail!(
-                "{ty:?} typmod {typmod}: parse_unknown and apply_column_typmod \
+                "{ty:?} typmod {typmod}: parse_unknown and apply_typmod_value \
                  disagree on the value shape for {literal:?}: {e}"
             );
         }
@@ -247,10 +246,9 @@ fn copy_defers_a_default_that_does_not_fold() -> anyhow::Result<()> {
 /// one — an ASCII string satisfies both.
 #[test]
 fn copy_truncates_a_name_column_despite_its_absent_typmod() -> anyhow::Result<()> {
-    let column = Column::new("n", PgType::Name);
-    assert_eq!(column.typmod, -1);
     let stored = |s: String| -> anyhow::Result<String> {
-        match apply_column_typmod(Value::Text(s), &column) {
+        // A `name` column's typmod is always -1, and the clip happens anyway.
+        match apply_typmod_value(Value::Text(s), PgType::Name, -1) {
             Ok(Value::Text(stored)) => Ok(stored),
             other => bail!("a name column must accept text, got {other:?}"),
         }
@@ -264,7 +262,7 @@ fn copy_truncates_a_name_column_despite_its_absent_typmod() -> anyhow::Result<()
 
 /// The text family reaches its length rules straight from the decoded field,
 /// without a `String` in between — so those rules are asserted through a real
-/// load rather than only through `apply_column_typmod`: blank padding, the
+/// load rather than only through `apply_typmod_value`: blank padding, the
 /// silent truncation of a blank overflow, the `22001` for anything else, and
 /// `name`'s byte clip.
 #[test]
@@ -461,10 +459,9 @@ fn a_constant_default_reaches_every_row_of_the_batch() -> anyhow::Result<()> {
 /// not five blanks.
 #[test]
 fn copy_leaves_a_null_untouched_by_a_typmod() -> anyhow::Result<()> {
-    // `Column::typmod` is the bare declared length; it is `atttypmod()` that
-    // adds the varlena header PostgreSQL's catalog reports.
-    let column = Column::with_typmod("c", PgType::Bpchar, 5);
-    match apply_column_typmod(Value::Null, &column) {
+    // The modifier here is the bare declared length; it is `Column::atttypmod`
+    // that adds the varlena header PostgreSQL's catalog reports.
+    match apply_typmod_value(Value::Null, PgType::Bpchar, 5) {
         Ok(Value::Null) => {}
         other => bail!("a NULL must pass through a char(5) typmod: {other:?}"),
     }

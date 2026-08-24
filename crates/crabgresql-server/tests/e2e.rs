@@ -11119,6 +11119,64 @@ async fn correlated_reference_inside_a_union_arm_resolves() -> anyhow::Result<()
     Ok(())
 }
 
+/// A load enforces a domain the same as any other write, even though it builds
+/// its tuples without an expression tree to hang a coercion on.
+///
+/// The value is parsed through the *base* type — `PgType::User` has no input
+/// function, so parsing as the declared type is what used to fail the whole
+/// load with `invalid input syntax for type user-defined` — and the domain's
+/// own modifier and constraints are applied afterwards.
+#[tokio::test]
+async fn copy_parses_a_domain_column_as_its_base_and_still_checks_it() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query("CREATE DOMAIN posint AS int CHECK (VALUE > 0)")
+        .await?;
+    client
+        .simple_query("CREATE DOMAIN vv AS varchar(3)")
+        .await?;
+    client
+        .simple_query("CREATE TABLE loaded (a posint, b vv)")
+        .await?;
+
+    let sink = client.copy_in("COPY loaded (a, b) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    // A NULL passes a domain whose only constraint is a `CHECK`, as it does on
+    // the expression path.
+    sink.send(Bytes::from_static(b"5\tab\n\\N\txy\n")).await?;
+    assert_eq!(sink.finish().await?, 2);
+
+    let loaded = client
+        .simple_query("SELECT a, b FROM loaded ORDER BY a NULLS LAST")
+        .await?;
+    let rows = rows(&loaded);
+    assert_eq!(rows[0].get("a"), Some("5"));
+    assert_eq!(rows[0].get("b"), Some("ab"));
+    assert_eq!(rows[1].get("a"), None);
+
+    let sink = client.copy_in("COPY loaded (a, b) FROM STDIN").await?;
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(
+        b"-1	ab
+",
+    ))
+    .await?;
+    let violation = sink
+        .finish()
+        .await
+        .expect_err("a negative value must not enter posint");
+    let db = violation.as_db_error().expect("a server error");
+    assert_eq!(db.code().code(), "23514");
+    assert_eq!(
+        db.message(),
+        "value for domain posint violates check constraint \"posint_check\""
+    );
+    Ok(())
+}
+
 /// A domain-typed result column is advertised on the wire as its **base** type,
 /// not as the domain — which is the opposite of what `pg_typeof` answers for
 /// the same value, and the pair is easy to get backwards.

@@ -22,7 +22,7 @@ use crate::BindError;
 use super::assign::{bind_check_constraint, parse_stored_expr};
 use super::bound::{BoundDomain, BoundExpr};
 use super::datatype::{apply_length, apply_length_cast};
-use super::scope::Binding;
+use super::scope::{Binding, with_column_collation};
 
 /// The domain `ty` names, or `None` when it is a builtin, an enum, or any other
 /// user type.
@@ -41,16 +41,29 @@ pub(crate) fn domain_of(ty: PgType, catalog: &dyn TypeCatalog) -> Option<DomainI
 /// value under a domain already *is* a base value, so `coerce_value` sees a type
 /// it already has. What changes is [`BoundExpr::ty`], and with it every
 /// overload the resolver considers.
+/// The domain's collation travels with it. A domain is where a collation can be
+/// declared — `CREATE DOMAIN ci AS text COLLATE "C"` — and stripping the type
+/// without it would order the values byte-wise, the wrong answer for every ICU
+/// collation.
 pub(crate) fn undomain(expr: BoundExpr, catalog: &dyn TypeCatalog) -> BoundExpr {
     let ty = expr.ty();
-    let base = catalog.base_type(ty);
-    if base == ty {
+    let Some(info) = domain_of(ty, catalog) else {
         return expr;
-    }
-    BoundExpr::Coerce {
+    };
+    let base = catalog.base_type(ty);
+    let stripped = BoundExpr::Coerce {
         expr: Box::new(expr),
         ty: base,
-    }
+    };
+    with_column_collation(stripped, domain_collation(&info, base))
+}
+
+/// The collation a domain's values carry, or `None` when it is the one the base
+/// type would have taken anyway — an implicit wrapper for that adds a node and
+/// says nothing.
+pub(crate) fn domain_collation(info: &DomainInfo, base: PgType) -> Option<u32> {
+    info.collation
+        .filter(|oid| *oid != crabgresql_types::collation::type_collation(base))
 }
 
 /// [`undomain`] over a [`Binding`]. An unknown literal has no type to strip, so
@@ -65,7 +78,7 @@ pub(crate) fn undomain_binding(binding: Binding, catalog: &dyn TypeCatalog) -> B
 /// Wrap `expr` — already coerced to the type at the end of the domain's
 /// `typbasetype` chain — in the node that enforces the domain.
 ///
-/// The domain's own type modifier is applied here rather than by the caller: a
+/// The domain's type modifier is applied here rather than by the caller: a
 /// `CREATE DOMAIN v AS varchar(3)` records the 3 on the type, so a column of `v`
 /// carries `atttypmod = -1` and this is the only place that knows the length.
 /// It runs *before* the constraints, as PostgreSQL does — `'abcd'` cast to a
@@ -82,10 +95,12 @@ pub(crate) fn wrap_domain(
     catalog: &Arc<dyn TypeCatalog>,
     explicit: bool,
 ) -> Result<BoundExpr, BindError> {
-    let base = catalog.base_type(info.base);
+    // The modifier comes from the chain, not from `info`: a domain over a
+    // domain declares none of its own — see `TypeCatalog::base_typmod`.
+    let (base, typmod) = catalog.base_type_and_typmod(PgType::User(info.oid));
     let expr = match explicit {
-        true => apply_length_cast(expr, base, info.typmod)?,
-        false => apply_length(expr, base, info.typmod)?,
+        true => apply_length_cast(expr, base, typmod)?,
+        false => apply_length(expr, base, typmod)?,
     };
     Ok(BoundExpr::CoerceToDomain {
         expr: Box::new(expr),

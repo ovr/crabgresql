@@ -2345,18 +2345,43 @@ pub trait TypeCatalog: Send + Sync {
     /// answers a different question (the `LIKE` representation a `CREATE TYPE`
     /// borrowed, for `WITHOUT FUNCTION` casts).
     fn base_type(&self, ty: PgType) -> PgType {
+        self.base_type_and_typmod(ty).0
+    }
+
+    /// The type modifier a domain's values carry, or `-1` for a type with none.
+    ///
+    /// It comes from wherever in the `typbasetype` chain it was declared, which
+    /// is not necessarily the type `ty` names: `CREATE DOMAIN v3b AS v3` over
+    /// `v3 AS varchar(3)` leaves `v3b` with `typtypmod = -1`, yet `'abcd'::v3b`
+    /// is `abc` on 18.4. At most one level can carry one — the grammar takes no
+    /// modifier after a domain name — so the chain has a single answer.
+    fn base_typmod(&self, ty: PgType) -> i32 {
+        self.base_type_and_typmod(ty).1
+    }
+
+    /// One walk answering both, since every caller that wants the type wants
+    /// the modifier that goes with it.
+    fn base_type_and_typmod(&self, ty: PgType) -> (PgType, i32) {
         let mut ty = ty;
+        let mut typmod = -1;
         // A chain is bounded by the number of domains, and DDL refuses to build
         // a cycle; the counter is belt-and-braces against a corrupt catalog
         // hanging a query.
         for _ in 0..64 {
-            let PgType::User(oid) = ty else { return ty };
+            let PgType::User(oid) = ty else {
+                return (ty, typmod);
+            };
             match self.domain_info(oid) {
-                Some(info) => ty = info.base,
-                None => return ty,
+                Some(info) => {
+                    ty = info.base;
+                    if info.typmod >= 0 {
+                        typmod = info.typmod;
+                    }
+                }
+                None => return (ty, typmod),
             }
         }
-        ty
+        (ty, typmod)
     }
 
     /// Every user-defined routine registered under `name` (case-insensitive),

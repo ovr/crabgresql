@@ -16,7 +16,7 @@ pub(super) use crabgresql_types::collation::DEFAULT_COLLATION_OID;
 pub(super) use crabgresql_types::{FmtCtx, PgType, Value};
 
 pub(super) use crate::expr::{
-    BinOp, BoundExpr, ParamCtx, apply_column_typmod, param_ctx_extended, param_types,
+    BinOp, BoundExpr, ParamCtx, apply_typmod_value, param_ctx_extended, param_types,
 };
 pub(super) use crate::logical_plan::*;
 pub(super) use crate::plan::*;

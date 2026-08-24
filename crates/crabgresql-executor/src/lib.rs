@@ -55,7 +55,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{TupleHeader, TxnContext};
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
 
-use checks::{CheckSet, NotNullSet};
+use checks::{CheckSet, DomainSet, NotNullSet};
 use eval::eval;
 pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
@@ -2536,19 +2536,22 @@ fn execute_insert(
     // to completion first is what makes `INSERT INTO t SELECT ... FROM t` read
     // only pre-insert rows (no Halloween problem), and lets validation/routing
     // see a stable set so the statement stays all-or-nothing.
-    let (tuples, notnull_verified) = collect_insert_tuples(source, ctx, txn)?;
+    let (tuples, notnull_verified, domains) = collect_insert_tuples(source, ctx, txn)?;
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
         // its key and write there. `notnull_verified` indexes the parent's shape,
         // so it says nothing about the leaf a row is checked against — ignored
         // here, and empty by construction for the one source that builds it.
-        Some(leaves) => insert_routed(table, tuples, returning, &leaves, freeze, system, ctx, txn),
+        Some(leaves) => insert_routed(
+            table, tuples, returning, &leaves, &domains, freeze, system, ctx, txn,
+        ),
         // Ordinary table: rows go straight to `table`.
         None => insert_direct(
             table,
             tuples,
             returning,
             &notnull_verified,
+            &domains,
             freeze,
             system,
             ctx,
@@ -2588,9 +2591,11 @@ fn collect_insert_tuples(
     source: PhysicalInsertSource,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<(Vec<Tuple>, Vec<u32>), ExecError> {
+) -> Result<(Vec<Tuple>, Vec<u32>, DomainSet), ExecError> {
     let mut tuples: Vec<Tuple> = Vec::new();
     let mut verified: Vec<u32> = Vec::new();
+    // Only a load owes any: see `DomainSet`.
+    let mut owed = DomainSet::none();
     match source {
         PhysicalInsertSource::Values(rows) => {
             for row in rows {
@@ -2619,8 +2624,10 @@ fn collect_insert_tuples(
             rows,
             defaults,
             notnull_verified,
+            domains,
         } => {
             tuples = rows;
+            owed = DomainSet::new(domains);
             // Safe against the defaults filled below: a builder only vouches for
             // the columns it filled itself, never one it left to the executor.
             verified = notnull_verified;
@@ -2648,7 +2655,7 @@ fn collect_insert_tuples(
             }
         }
     }
-    Ok((tuples, verified))
+    Ok((tuples, verified, owed))
 }
 
 /// Constraint-check and write every tuple to a single table (the non-partitioned
@@ -2660,6 +2667,7 @@ fn insert_direct(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     notnull_verified: &[u32],
+    domains: &DomainSet,
     freeze: bool,
     system: &[SysCol],
     ctx: &ExecContext,
@@ -2687,7 +2695,15 @@ fn insert_direct(
         }
     }
     for tuple in &tuples {
-        validate_constraints(&schema, tuple, &mut visible, &notnull, &checks, ctx)?;
+        validate_constraints(
+            &schema,
+            tuple,
+            &mut visible,
+            domains,
+            &notnull,
+            &checks,
+            ctx,
+        )?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
         visible.record(tuple, None);
@@ -2771,6 +2787,7 @@ fn insert_routed(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     leaves: &[Arc<dyn TableAm>],
+    domains: &DomainSet,
     freeze: bool,
     system: &[SysCol],
     ctx: &ExecContext,
@@ -2826,13 +2843,14 @@ fn insert_routed(
         let notnull = leaf_notnull[leaf].get_or_insert_with(|| NotNullSet::for_schema(leaf_schema));
         match visible[leaf].as_mut() {
             Some(seen) => {
-                validate_constraints(leaf_schema, tuple, seen, notnull, checks, ctx)?;
+                validate_constraints(leaf_schema, tuple, seen, domains, notnull, checks, ctx)?;
                 seen.record(tuple, None);
             }
             None => validate_constraints(
                 leaf_schema,
                 tuple,
                 &mut UniqueKeySet::none(),
+                domains,
                 notnull,
                 checks,
                 ctx,
@@ -3182,6 +3200,7 @@ fn update_inherited(
                     &shapes[i].0,
                     &new,
                     &mut simulated[i],
+                    &DomainSet::none(),
                     &notnull[i],
                     &checks[i],
                     ctx,
@@ -3195,6 +3214,7 @@ fn update_inherited(
                     &shapes[i].0,
                     &new,
                     &mut UniqueKeySet::none(),
+                    &DomainSet::none(),
                     &notnull[i],
                     &checks[i],
                     ctx,
@@ -3360,9 +3380,15 @@ fn update_direct(
             if !simulated.forget(&old, tid) {
                 continue;
             }
-            if let Err(error) =
-                validate_constraints(&schema, &new, &mut simulated, &notnull, &checks, ctx)
-            {
+            if let Err(error) = validate_constraints(
+                &schema,
+                &new,
+                &mut simulated,
+                &DomainSet::none(),
+                &notnull,
+                &checks,
+                ctx,
+            ) {
                 simulated.record(&old, Some(tid));
                 return Err(error);
             }
@@ -3372,6 +3398,7 @@ fn update_direct(
                 &schema,
                 &new,
                 &mut UniqueKeySet::none(),
+                &DomainSet::none(),
                 &notnull,
                 &checks,
                 ctx,
@@ -3612,6 +3639,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
+                        &DomainSet::none(),
                         &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
@@ -3625,6 +3653,7 @@ fn update_routed(
                         &leaf_shapes[dst].0,
                         &new,
                         &mut simulated[dst],
+                        &DomainSet::none(),
                         &leaf_notnull[dst],
                         &leaf_checks[dst],
                         ctx,
@@ -3639,6 +3668,7 @@ fn update_routed(
                     &leaf_shapes[dst].0,
                     &new,
                     &mut UniqueKeySet::none(),
+                    &DomainSet::none(),
                     &leaf_notnull[dst],
                     &leaf_checks[dst],
                     ctx,
@@ -3767,10 +3797,15 @@ fn validate_constraints(
     schema: &TableSchema,
     tuple: &Tuple,
     existing: &mut UniqueKeySet,
+    domains: &DomainSet,
     notnull: &NotNullSet,
     checks: &CheckSet,
     ctx: &ExecContext,
 ) -> Result<(), ExecError> {
+    // Ahead of the relation's own not-null: a domain constraint belongs to the
+    // *coercion*, which in PostgreSQL happens before the row exists. See
+    // `DomainSet`, and note this set is empty unless the source was a load.
+    domains.validate(tuple, ctx)?;
     notnull.validate(schema, tuple, ctx)?;
 
     // Order matches PostgreSQL's observable behavior, probed against 18.4 on

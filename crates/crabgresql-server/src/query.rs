@@ -6836,11 +6836,18 @@ fn execute_create_domain(
     let base = resolve_domain_base(type_catalog, &create.data_type)?;
     let resolved = type_catalog.base_type(base);
     let typmod = crabgresql_binder::declared_typmod(resolved, &create.data_type)?.unwrap_or(-1);
+    // The *effective* collation, not just a written one: a domain over a
+    // collatable base inherits that base's, which is what 18.4 reports —
+    // `CREATE DOMAIN dtext AS text` has `typcollation = "default"`, not 0.
+    // Recording it here keeps every reader from re-deriving it.
     let collation = match &create.collation {
         Some(c) => Some(crabgresql_binder::resolve_collation(
             &ast::ObjectName::from(vec![c.clone()]),
         )?),
-        None => None,
+        None => match crabgresql_types::collation::type_collation(resolved) {
+            0 => None,
+            inherited => Some(inherited),
+        },
     };
 
     let shape = domain_value_shape(&name, resolved, typmod);
@@ -7141,18 +7148,18 @@ fn validate_domain_over_stored_values(
             for row in table.scan(txn, &projection) {
                 let (_, tuple) = row?;
                 let value = tuple.get(index).cloned().unwrap_or(Value::Null);
-                if matches!(value, Value::Null) {
-                    if not_null {
-                        return Err(PgError::new(
-                            "23502",
-                            format!(
-                                "column \"{}\" of table \"{}\" contains null values",
-                                column.name, relation.name
-                            ),
-                        ));
-                    }
-                    continue;
+                if not_null && matches!(value, Value::Null) {
+                    return Err(PgError::new(
+                        "23502",
+                        format!(
+                            "column \"{}\" of table \"{}\" contains null values",
+                            column.name, relation.name
+                        ),
+                    ));
                 }
+                // A NULL still runs the predicate — see `check_domain`, which
+                // this scan has to agree with or `ADD CONSTRAINT` would accept
+                // rows the next write rejects.
                 let Some(predicate) = &predicate else {
                     continue;
                 };
@@ -7248,7 +7255,11 @@ fn domain_dependents(
             }
         }
     }
+    let mut name = None;
     for user_type in catalog.user_types() {
+        if user_type.oid == oid {
+            name = Some(user_type.name.clone());
+        }
         if user_type
             .domain
             .as_ref()
@@ -7256,6 +7267,11 @@ fn domain_dependents(
         {
             out.push(format!("type {}", user_type.name));
         }
+    }
+    // Then the catalog's own — a function or a cast over this domain. One
+    // DETAIL block lists all three kinds, as PostgreSQL's does.
+    if let Some(name) = name {
+        out.extend(catalog.type_dependents(&name));
     }
     out
 }

@@ -1315,6 +1315,28 @@ impl GlobalCatalog {
         }
     }
 
+    /// How this catalog's own dependents on `name` — functions and casts — are
+    /// described in a dependency message, in creation order.
+    ///
+    /// `DROP DOMAIN` needs them alongside the dependents only the engine can
+    /// see (a table column) so that one DETAIL block lists both, as PostgreSQL's
+    /// does. `validate_drop_type` reports the same set, but only once nothing
+    /// else has already refused the drop.
+    pub fn type_dependents(&self, name: &str) -> Vec<String> {
+        let cat = self
+            .inner
+            .read()
+            .unwrap_or_else(|_| panic!("rwlock poisoned"));
+        let Some(entry) = cat.types.get(name) else {
+            return Vec::new();
+        };
+        entry
+            .dependents
+            .iter()
+            .map(|dep| cat.describe_dep(*dep))
+            .collect()
+    }
+
     /// The domain registered under `name`, or `None` when the name is free or
     /// names a non-domain type. The DDL layer needs this to bind a new
     /// constraint against the right base type before storing it.

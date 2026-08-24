@@ -99,6 +99,81 @@ SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT x FROM u) s LIMIT 1;
 SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT 9) s LIMIT 1;
 DROP TABLE u;
 --
+-- A domain on the *source* side of an assignment is just its base value.
+--
+CREATE TABLE plain (x int);
+INSERT INTO plain(x) SELECT a FROM t;
+SELECT * FROM plain;
+UPDATE plain SET x = (SELECT a FROM t);
+DROP TABLE plain;
+--
+-- A CHECK is evaluated for NULL too — only a `false` violates. That is what
+-- makes `CHECK (VALUE IS NOT NULL)`, the spelling the PostgreSQL manual
+-- suggests, actually reject a NULL while `CHECK (VALUE > 0)` admits one.
+--
+CREATE DOMAIN notnullish AS int CHECK (VALUE IS NOT NULL);
+SELECT NULL::notnullish;
+SELECT 1::notnullish;
+--
+-- A domain over a domain inherits the modifier its chain declares, even though
+-- its own typtypmod is -1.
+--
+CREATE DOMAIN v3b AS v3;
+SELECT 'abcd'::v3b;
+SELECT typtypmod FROM pg_type WHERE typname = 'v3b';
+--
+-- COPY parses through the base type and still enforces the domain.
+--
+-- One documented divergence in the expected output: PostgreSQL follows a failed
+-- COPY with a `CONTEXT: COPY loaded, line 1, column a: "-1"` line. This build
+-- carries no error context on any COPY error, so those lines are absent — a gap
+-- in COPY diagnostics generally, not in the domain check that raised them.
+--
+CREATE TABLE loaded (a posint, b v3, c int);
+COPY loaded (a, b, c) FROM stdin;
+5	ab	1
+\.
+COPY loaded (a, b, c) FROM stdin;
+-1	ab	2
+\.
+COPY loaded (a, b, c) FROM stdin;
+7	abcd	3
+\.
+COPY loaded (a, b, c) FROM stdin;
+\N	xy	4
+\.
+SELECT * FROM loaded ORDER BY c;
+DROP TABLE loaded;
+--
+-- A domain constraint runs before the relation's own NOT NULL: it belongs to
+-- the coercion, which happens before the row exists.
+--
+CREATE TABLE ordering (a posint NOT NULL, b int NOT NULL);
+INSERT INTO ordering VALUES (-1, NULL);
+DROP TABLE ordering;
+--
+-- A domain as a function's parameter and as its return type.
+--
+CREATE FUNCTION takes(p posint) RETURNS int AS 'SELECT p::int * 2' LANGUAGE SQL;
+SELECT takes(5);
+SELECT takes(-1);
+CREATE FUNCTION returns_dom(p int) RETURNS posint AS 'SELECT p' LANGUAGE SQL;
+SELECT returns_dom(5);
+SELECT returns_dom(-1);
+--
+-- A domain is where a collation can be declared, and it drives the ordering.
+-- `y` pins `C` explicitly so the comparison is against a known order rather
+-- than against whatever collation the database was created with.
+--
+CREATE DOMAIN ci AS text COLLATE "en-x-icu";
+CREATE DOMAIN dtext AS text;
+CREATE TABLE collated (x ci, y text COLLATE "C", z dtext);
+INSERT INTO collated VALUES ('B', 'B', 'B'), ('a', 'a', 'a'), ('A', 'A', 'A'), ('b', 'b', 'b');
+SELECT x FROM collated ORDER BY x;
+SELECT y FROM collated ORDER BY y;
+SELECT z FROM collated ORDER BY z COLLATE "en-x-icu";
+DROP TABLE collated;
+--
 -- Catalog reflection.
 --
 SELECT typname, typtype, typlen, typbyval, typcategory, typinput, typoutput, typalign, typstorage, typnotnull, typbasetype::regtype, typtypmod, typcollation, typdefault
@@ -135,4 +210,8 @@ DROP TABLE t;
 DROP TABLE tz;
 DROP DOMAIN dd;
 DROP DOMAIN posint;
-DROP DOMAIN nn, v3, dz, ord;
+DROP DOMAIN nn, dz, ord, notnullish, ci, dtext;
+DROP FUNCTION takes(posint);
+DROP FUNCTION returns_dom(int);
+DROP DOMAIN v3b;
+DROP DOMAIN v3;

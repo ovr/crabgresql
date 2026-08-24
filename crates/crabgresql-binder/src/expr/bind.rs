@@ -223,7 +223,11 @@ fn bind_collate(
     let oid = crate::collation::resolve_collation(collation)?;
     let bound = match bind_expr(expr, scope)? {
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
-        Binding::Typed(e) => e,
+        // An explicit `COLLATE` is a use of the value like any other, so a
+        // domain resolves on its base here too — otherwise the gate below would
+        // refuse `ORDER BY textdomain_col COLLATE "en-x-icu"`, which PostgreSQL
+        // accepts.
+        Binding::Typed(e) => super::domain::undomain(e, scope.catalog().as_ref()),
     };
     let ty = bound.ty();
     if !ty.is_collatable() {

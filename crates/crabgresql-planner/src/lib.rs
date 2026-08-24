@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crabgresql_binder::{
-    AggInput, AggregatePlan, AppendPlan, BinOp, BoundAggregate, BoundExpr, BoundWindowFunc,
-    BoundWindowSpec, DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr, JoinInput,
-    JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, OutputColumn, QueryPlan,
+    AggInput, AggregatePlan, AppendPlan, BinOp, BoundAggregate, BoundDomain, BoundExpr,
+    BoundWindowFunc, BoundWindowSpec, DeletePlan, DistinctKey, InsertPlan, InsertSource, JoinExpr,
+    JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation, OutputColumn, QueryPlan,
     RelationIdent, Returning, SetOpPlan, SortKey, SubqueryPlan, SysCol, SystemEmit, TableFn,
     TableFunctionPlan, UpdatePlan, ValuesPlan, WindowPlan,
 };
@@ -354,6 +354,9 @@ pub enum PhysicalInsertSource {
         rows: Vec<Tuple>,
         defaults: Vec<(usize, BoundExpr)>,
         notnull_verified: Vec<u32>,
+        /// The domain constraints the source could not enforce itself — see
+        /// [`InsertSource::Tuples`].
+        domains: Vec<(usize, Arc<BoundDomain>)>,
     },
     /// Rows pulled from `input`, each mapped through `projections` (full-width,
     /// schema order) evaluated against the source tuple.
@@ -1139,10 +1142,12 @@ fn lower(logical: LogicalPlan, costs: cost::CostSettings) -> PhysicalPlan {
                     rows,
                     defaults,
                     notnull_verified,
+                    domains,
                 } => PhysicalInsertSource::Tuples {
                     rows,
                     defaults,
                     notnull_verified,
+                    domains,
                 },
                 InsertSource::Query { input, projections } => PhysicalInsertSource::Query {
                     input: Box::new(lower(*input, costs)),

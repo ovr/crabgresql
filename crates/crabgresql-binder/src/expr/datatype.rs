@@ -887,30 +887,30 @@ fn apply_length_in(
 /// `false` to the input functions is assignment context: an over-long
 /// `varchar(n)`/`char(n)` whose excess is not blank errors rather than
 /// truncating.
-pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindError> {
+pub fn apply_typmod_value(value: Value, ty: PgType, typmod: i32) -> Result<Value, BindError> {
     // A NULL takes no length. On the expression path this falls out of the fold
     // guards and reaches the runtime call, which returns NULL; here it is said
     // once, up front.
     if matches!(value, Value::Null) {
         return Ok(value);
     }
-    // `parse_unknown` produced this value *for* `column.ty`, so a shape that
+    // `parse_unknown` produced this value *for* `ty`, so a shape that
     // does not match the type is a bug in this file rather than bad input.
     let mismatch = || {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
-            format!("copy value does not match column type {}", column.ty.name()),
+            format!("copy value does not match column type {}", ty.name()),
         )
     };
     // `numeric` and the datetime types round rather than truncating; each arm
     // returns, so the length pass below only sees the types it handles.
-    if column.typmod >= 0 {
-        match column.ty {
+    if typmod >= 0 {
+        match ty {
             PgType::Numeric => {
                 let Value::Numeric(n) = value else {
                     return Err(mismatch());
                 };
-                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                let (precision, scale) = Numeric::unpack_typmod(typmod);
                 return n
                     .apply_typmod(precision, scale)
                     .map(Value::Numeric)
@@ -920,14 +920,14 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
                 let Value::Time(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::Time(time::apply_typmod(usec, column.typmod)));
+                return Ok(Value::Time(time::apply_typmod(usec, typmod)));
             }
             PgType::TimeTz => {
                 let Value::TimeTz(t) = value else {
                     return Err(mismatch());
                 };
                 return Ok(Value::TimeTz(crabgresql_types::TimeTz {
-                    usec: time::apply_typmod(t.usec, column.typmod),
+                    usec: time::apply_typmod(t.usec, typmod),
                     zone: t.zone,
                 }));
             }
@@ -935,25 +935,19 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
                 let Value::Timestamp(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::Timestamp(timestamp::apply_typmod(
-                    usec,
-                    column.typmod,
-                )));
+                return Ok(Value::Timestamp(timestamp::apply_typmod(usec, typmod)));
             }
             PgType::TimestampTz => {
                 let Value::TimestampTz(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::TimestampTz(timestamp::apply_typmod(
-                    usec,
-                    column.typmod,
-                )));
+                return Ok(Value::TimestampTz(timestamp::apply_typmod(usec, typmod)));
             }
             PgType::Interval => {
                 let Value::Interval(iv) = value else {
                     return Err(mismatch());
                 };
-                return crabgresql_types::interval::apply_typmod(iv, column.typmod)
+                return crabgresql_types::interval::apply_typmod(iv, typmod)
                     .map(Value::Interval)
                     .map_err(|e| BindError::new(e.sqlstate, e.message));
             }
@@ -962,36 +956,30 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
     }
     // `name` truncates whatever its typmod says, and a `name` column's is always
     // -1 — hence the unconditional arm, exactly as in `apply_length_to_column`.
-    match column.ty {
+    match ty {
         // The text family's length rules read the *text*, not the `Value`, so
-        // they live in `text_column_value` — where COPY reaches them without
+        // they live in `text_value` — where COPY reaches them without
         // building a `String` first. A length-free `text`/`varchar` matches
         // neither arm and falls through untouched, keeping its allocation.
-        PgType::Varchar | PgType::Bpchar if column.typmod >= 0 => {
+        PgType::Varchar | PgType::Bpchar if typmod >= 0 => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            text_column_value(&s, column)
+            text_value(&s, ty, typmod)
         }
         PgType::Name => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            text_column_value(&s, column)
+            text_value(&s, ty, typmod)
         }
-        PgType::Bit | PgType::Varbit if column.typmod >= 0 => {
+        PgType::Bit | PgType::Varbit if typmod >= 0 => {
             let Value::Bit { len, data } = value else {
                 return Err(mismatch());
             };
-            crabgresql_types::bit::coerce(
-                len,
-                &data,
-                column.typmod,
-                column.ty == PgType::Varbit,
-                false,
-            )
-            .map(|(len, data)| Value::Bit { len, data })
-            .map_err(|e| BindError::new(e.sqlstate, e.message))
+            crabgresql_types::bit::coerce(len, &data, typmod, ty == PgType::Varbit, false)
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
         }
         _ => Ok(value),
     }
@@ -1002,27 +990,23 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
 /// was allocated only to be read once and dropped.
 ///
 /// This is COPY's route into the text family. The expression path reaches the
-/// same rules through [`apply_column_typmod`], which unwraps its `Value::Text`
+/// same rules through [`apply_typmod_value`], which unwraps its `Value::Text`
 /// and lands here, so `varchar(n)`'s `22001`, `char(n)`'s blank padding and
 /// `name`'s byte clip have one implementation rather than two.
 ///
 /// `false` to the input functions is assignment context, as in
-/// [`apply_column_typmod`]: an over-long value whose excess is not blank errors
+/// [`apply_typmod_value`]: an over-long value whose excess is not blank errors
 /// rather than truncating.
-pub fn text_column_value(s: &str, column: &Column) -> Result<Value, BindError> {
-    match column.ty {
-        PgType::Varchar if column.typmod >= 0 => {
-            crabgresql_types::text::varchar_input(s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
-        }
-        PgType::Bpchar if column.typmod >= 0 => {
-            crabgresql_types::text::bpchar_input(s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
-        }
+pub fn text_value(s: &str, ty: PgType, typmod: i32) -> Result<Value, BindError> {
+    match ty {
+        PgType::Varchar if typmod >= 0 => crabgresql_types::text::varchar_input(s, typmod, false)
+            .map(Value::Text)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Bpchar if typmod >= 0 => crabgresql_types::text::bpchar_input(s, typmod, false)
+            .map(Value::Text)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // `name` clips at 63 bytes whatever its typmod says (a `name` column's
-        // is always -1), matching the arm above in `apply_column_typmod`.
+        // is always -1), matching the arm above in `apply_typmod_value`.
         PgType::Name => Ok(Value::Text(crabgresql_types::text::name_input(s))),
         // `text`, and a `varchar`/`char` with no declared length: no rule to
         // apply, so the field text is the value.
