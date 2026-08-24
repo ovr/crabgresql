@@ -2435,14 +2435,14 @@ fn every_view_definition_parses_and_names_our_columns() {
         );
     }
 
-    // `VARIADIC` in a call's argument list is a gap in the grammar, not in the
-    // transcription, so `pg_publication_tables` goes column-unchecked until the
-    // grammar grows it. Empty here means that day came: drop the expectation
-    // and the view joins the check.
-    assert_eq!(
-        unparsed,
-        ["pg_publication_tables"],
-        "the set of definitions this build cannot parse moved"
+    // Every definition parses, so every one of them had its columns checked
+    // above — `pg_publication_tables` was the last holdout, and the `VARIADIC`
+    // its definition calls with is grammar now. The list stays so that a
+    // transcription reaching for something this build cannot parse fails here
+    // rather than quietly skipping its column check.
+    assert!(
+        unparsed.is_empty(),
+        "definitions this build cannot parse: {unparsed:?}"
     );
 }
 
