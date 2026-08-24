@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787604755080,
+  "lastUpdate": 1787604757256,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -56920,6 +56920,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19910.177715,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a",
+          "message": "feat: Initial support for user management (#278)\n\nRoles are a cluster object here as in PostgreSQL: they live in their own\nfile under the data directory, independent of the per-database relation\ncatalog, and are shared by every connection for the life of the server.\n\n- CREATE/ALTER/DROP ROLE, and the USER/GROUP spellings of each\n- role membership: GRANT <role> TO <role> [WITH ADMIN OPTION], REVOKE\n  [ADMIN OPTION FOR], GRANTED BY, and IN ROLE/ROLE/ADMIN on CREATE\n- SET ROLE / SET SESSION AUTHORIZATION as the GUCs PostgreSQL makes them,\n  so SET LOCAL rolls back with its transaction and SHOW role answers\n- per-role settings (ALTER ROLE ... SET), applied at login\n- pg_authid and the five relations over it (pg_roles, pg_user, pg_shadow,\n  pg_group, pg_auth_members) built from the one live role list\n\nA password is stored as a SCRAM-SHA-256 verifier, but nothing\nauthenticates against it yet and no privilege on an object is checked:\nGRANT ... ON <object> is refused with 0A000 rather than silently\naccepted, and a name the catalog has no role for still connects as a\ntrusted superuser (PostgreSQL's FATAL 28000 arrives with authentication).\n\nBehaviour is pinned against PostgreSQL 18.4: a new `roles` smoke suite\nwhose expected output was generated from psql, plus e2e coverage of what\ndepends on the login role's name or on the wire.\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-24T22:03:15+02:00",
+          "tree_id": "b2676f1f0af36d3bebcf7ef0530d1201523f95f4",
+          "url": "https://github.com/ovr/crabgresql/commit/f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a"
+        },
+        "date": 1787604757115,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1267.363711,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20141.268751,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
