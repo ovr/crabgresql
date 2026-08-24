@@ -17,6 +17,7 @@ use crabgresql_plpgsql::RoutineCache;
 use crate::error::PgError;
 use crate::guc;
 use crate::query::RowTag;
+use crate::roles::{Role, RoleCatalog};
 use crate::routines::SessionNotices;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{Format, TransactionStatus, sqlstate};
@@ -416,7 +417,28 @@ pub struct Session {
     /// are still the current connection identity reported by information-schema
     /// metadata.
     pub database: String,
+    /// The login role: `session_user`, and what `RESET ROLE` goes back to.
+    /// `SET SESSION AUTHORIZATION` is the one statement that changes it.
     pub user: String,
+    /// The OID [`Session::user`] had when it was installed. Read through
+    /// [`Session::user_oid`] rather than directly — a trust session's OID is
+    /// synthetic and can be superseded, which is what that accessor handles.
+    pub user_oid_at_login: u32,
+    /// The role the connection authenticated as, which nothing changes:
+    /// `RESET SESSION AUTHORIZATION` restores [`Session::user`] to it, and every
+    /// `SET ROLE` permission check asks whether *it* may make the switch — not
+    /// whoever `SET SESSION AUTHORIZATION` most recently installed.
+    pub auth_user: String,
+    /// See [`Session::user_oid_at_login`]; read through [`Session::auth_user_oid`].
+    pub auth_user_oid_at_login: u32,
+    /// The role the session is currently acting as — `current_user` — and the
+    /// `role` GUC `SET ROLE` assigns. `None` is PostgreSQL's `role = none`: no
+    /// switch is in effect, so `current_user` is the login role.
+    ///
+    /// Kept as a name *and* an OID because both are asked for: the name by
+    /// `current_user`, the OID by every membership question.
+    pub current_role: Option<(String, u32)>,
+    pub roles: Arc<RoleCatalog>,
     /// This connection's backend id — the integer handed to the client in
     /// `BackendKeyData`, and what `pg_backend_pid()` and `pg_locks.pid` report.
     /// It identifies a connection, not an OS process: every session here runs in
@@ -780,11 +802,13 @@ impl SequenceOps for SessionSequences {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_identity(
         txnmgr: Arc<TransactionManager>,
         engine: Arc<dyn TableEngine>,
+        roles: Arc<RoleCatalog>,
         database: impl Into<String>,
-        user: impl Into<String>,
+        user: Role,
         backend_id: i32,
         temp_schema: impl Into<String>,
         temp_namespace_oid: u32,
@@ -792,7 +816,12 @@ impl Session {
         let lock_owner = txnmgr.new_lock_owner();
         Self {
             database: database.into(),
-            user: user.into(),
+            auth_user: user.name.clone(),
+            auth_user_oid_at_login: user.oid,
+            user: user.name,
+            user_oid_at_login: user.oid,
+            current_role: None,
+            roles,
             backend_id,
             backend_start: crabgresql_types::tz::now_micros(),
             application_name: String::new(),
@@ -836,6 +865,59 @@ impl Session {
             notices: Arc::new(SessionNotices::default()),
             routine_cache: Arc::new(RoutineCache::new()),
         }
+    }
+
+    /// `current_user`: the role a `SET ROLE` switched to, or the login role
+    /// when none is in effect.
+    pub fn current_user(&self) -> &str {
+        match &self.current_role {
+            Some((name, _)) => name,
+            None => &self.user,
+        }
+    }
+
+    /// The OID of [`Session::current_user`]. Every privilege question is asked
+    /// of this, not of the login role.
+    pub fn current_user_oid(&self) -> u32 {
+        match &self.current_role {
+            Some((_, oid)) => *oid,
+            None => self.user_oid(),
+        }
+    }
+
+    /// The login role's OID — `session_user`'s.
+    pub fn user_oid(&self) -> u32 {
+        self.resolved_oid(&self.user, self.user_oid_at_login)
+    }
+
+    /// The authenticated role's OID; see [`Session::auth_user`].
+    pub fn auth_user_oid(&self) -> u32 {
+        self.resolved_oid(&self.auth_user, self.auth_user_oid_at_login)
+    }
+
+    /// The OID `name` has *now*, for an identity installed at login.
+    ///
+    /// A trust session — one that named a role the catalog does not have — holds
+    /// a synthetic OID that no `pg_authid` row keeps once a real role of that
+    /// name is created. Re-resolving by name is what makes the session follow
+    /// that role instead of pointing at an OID nothing resolves; every other
+    /// identity is looked up by an OID it already owns and answers here
+    /// unchanged.
+    fn resolved_oid(&self, name: &str, at_login: u32) -> u32 {
+        if at_login != crate::roles::TRUST_SESSION_ROLE_OID {
+            return at_login;
+        }
+        self.roles.lookup(name).map_or(at_login, |role| role.oid)
+    }
+
+    /// Whether the session currently acts as a superuser, which is what
+    /// `SHOW is_superuser` reports.
+    ///
+    /// A login role the catalog does not have is one too: authentication does
+    /// not exist yet, so such a session is exactly the trusted one every
+    /// connection used to get. See [`crate::roles::RoleCatalog::login`].
+    pub fn is_superuser(&self) -> bool {
+        self.roles.is_superuser(self.current_user_oid())
     }
 
     /// Capture a parameter's block-entry state so the transaction can put it

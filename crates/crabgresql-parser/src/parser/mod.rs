@@ -5069,6 +5069,15 @@ impl<'a> Parser<'a> {
             self.parse_create_database()
         } else if self.parse_keyword(Keyword::ROLE) {
             self.parse_create_role().map(Into::into)
+        } else if self.parse_keyword(Keyword::USER) {
+            // `CREATE USER` is `CREATE ROLE … LOGIN`: the only difference from
+            // `CREATE ROLE` is the default, which an explicit NOLOGIN overrides.
+            let mut role = self.parse_create_role()?;
+            role.login.get_or_insert(true);
+            Ok(role.into())
+        } else if self.parse_keyword(Keyword::GROUP) {
+            // `CREATE GROUP` is a plain `CREATE ROLE`, kept for pre-8.1 spelling.
+            self.parse_create_role().map(Into::into)
         } else if self.parse_keyword(Keyword::SEQUENCE) {
             self.parse_create_sequence(temporary)
         } else if self.parse_keyword(Keyword::COLLATION) {
@@ -6891,6 +6900,8 @@ impl<'a> Parser<'a> {
             ObjectType::Type
         } else if self.parse_keyword(Keyword::USER) {
             ObjectType::User
+        } else if self.parse_keyword(Keyword::GROUP) {
+            ObjectType::Role
         } else if self.parse_keyword(Keyword::FUNCTION) {
             return self.parse_drop_function().map(Into::into);
         } else if self.parse_keyword(Keyword::POLICY) {
@@ -10237,6 +10248,10 @@ impl<'a> Parser<'a> {
             Keyword::FUNCTION,
             Keyword::AGGREGATE,
             Keyword::ROLE,
+            // PostgreSQL's spellings of the same statement: `ALTER USER` and
+            // `ALTER GROUP` both operate on `pg_authid`.
+            Keyword::USER,
+            Keyword::GROUP,
             Keyword::POLICY,
             Keyword::ICEBERG,
             Keyword::SCHEMA,
@@ -10286,11 +10301,11 @@ impl<'a> Parser<'a> {
                     self.parse_alter_operator().map(Into::into)
                 }
             }
-            Keyword::ROLE => self.parse_alter_role(),
+            Keyword::ROLE | Keyword::USER | Keyword::GROUP => self.parse_alter_role(),
             Keyword::POLICY => self.parse_alter_policy().map(Into::into),
             // unreachable because expect_one_of_keywords used above
             unexpected_keyword => Err(ParserError::ParserError(
-                format!("Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, AGGREGATE, ROLE, POLICY, ICEBERG, SCHEMA, OPERATOR}}, got {unexpected_keyword:?}"),
+                format!("Internal parser error: expected any of {{VIEW, TYPE, COLLATION, TABLE, INDEX, FUNCTION, AGGREGATE, ROLE, USER, GROUP, POLICY, ICEBERG, SCHEMA, OPERATOR}}, got {unexpected_keyword:?}"),
             )),
         }
     }
@@ -14143,7 +14158,13 @@ impl<'a> Parser<'a> {
                 session: false,
             }
             .into());
-        } else if self.parse_keyword(Keyword::AUTHORIZATION) {
+        // `SET SESSION AUTHORIZATION` spells the scope and the parameter with
+        // the same word, so the scope modifier eats the first `SESSION` and this
+        // sees only `AUTHORIZATION`. `SET LOCAL SESSION AUTHORIZATION` — the
+        // other scope PostgreSQL accepts — leaves both words for it instead.
+        } else if self.parse_keyword(Keyword::AUTHORIZATION)
+            || self.parse_keywords(&[Keyword::SESSION, Keyword::AUTHORIZATION])
+        {
             let scope = match scope {
                 Some(s) => s,
                 None => {
@@ -15214,6 +15235,10 @@ impl<'a> Parser<'a> {
 
         let with_grant_option =
             self.parse_keywords(&[Keyword::WITH, Keyword::GRANT, Keyword::OPTION]);
+        // PostgreSQL's role-membership counterpart of WITH GRANT OPTION: it lets
+        // the member grant the role onward.
+        let with_admin_option =
+            self.parse_keywords(&[Keyword::WITH, Keyword::ADMIN, Keyword::OPTION]);
 
         let current_grants =
             if self.parse_keywords(&[Keyword::COPY, Keyword::CURRENT, Keyword::GRANTS]) {
@@ -15241,6 +15266,7 @@ impl<'a> Parser<'a> {
             objects,
             grantees,
             with_grant_option,
+            with_admin_option,
             as_grantor,
             granted_by,
             current_grants,
@@ -15645,6 +15671,14 @@ impl<'a> Parser<'a> {
             Ok(Action::Ownership)
         } else if self.parse_keyword(Keyword::DROP) {
             Ok(Action::Drop)
+        } else if let Some(role) = self.maybe_parse(|p| p.parse_object_name(false))? {
+            // PostgreSQL accepts a bare identifier in privilege position: it
+            // is how `GRANT <role> TO <role>` is spelled, the role-membership
+            // form having no keyword of its own. Which reading applies is
+            // decided *after* parsing, by whether an `ON <objects>` clause
+            // followed — 18.4 parses `GRANT bogus ON TABLE t TO r` and only
+            // then complains that `bogus` is an unrecognized privilege type.
+            Ok(Action::Role { role })
         } else {
             self.expected_ref("a privilege keyword", self.peek_token_ref())?
         }
@@ -15808,6 +15842,11 @@ impl<'a> Parser<'a> {
 
     /// Parse a REVOKE statement
     pub fn parse_revoke(&mut self) -> Result<Revoke, ParserError> {
+        // `REVOKE ADMIN OPTION FOR <role> FROM <role>`: drops the option and
+        // keeps the membership, PostgreSQL's counterpart of
+        // `REVOKE GRANT OPTION FOR`.
+        let admin_option_for =
+            self.parse_keywords(&[Keyword::ADMIN, Keyword::OPTION, Keyword::FOR]);
         let (privileges, objects) = self.parse_grant_deny_revoke_privileges_objects()?;
 
         self.expect_keyword_is(Keyword::FROM)?;
@@ -15825,6 +15864,7 @@ impl<'a> Parser<'a> {
             privileges,
             objects,
             grantees,
+            admin_option_for,
             granted_by,
             cascade,
         })
@@ -18020,6 +18060,15 @@ impl<'a> Parser<'a> {
     fn parse_reset(&mut self) -> Result<ResetStatement, ParserError> {
         if self.parse_keyword(Keyword::ALL) {
             return Ok(ResetStatement { reset: Reset::ALL });
+        }
+        // `RESET SESSION AUTHORIZATION` names one parameter in two words, so it
+        // cannot come out of `parse_object_name`.
+        if self.parse_keywords(&[Keyword::SESSION, Keyword::AUTHORIZATION]) {
+            return Ok(ResetStatement {
+                reset: Reset::ConfigurationParameter(ObjectName::from(vec![Ident::new(
+                    "session_authorization",
+                )])),
+            });
         }
 
         let obj = self.parse_object_name(false)?;

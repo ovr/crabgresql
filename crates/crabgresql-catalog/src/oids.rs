@@ -45,13 +45,14 @@ pub(crate) const BTREE_AM_OID: u32 = 403;
 pub(crate) const HASH_AM_OID: u32 = 405;
 
 /// OID reported as the owner of every relation, type, and schema. PostgreSQL
-/// assigns 10 to the bootstrap superuser. `pg_get_userbyid` resolves it back to
-/// the session user, so the two must agree — hence the shared constant.
+/// assigns 10 to the bootstrap superuser, and so does the role catalog's
+/// bootstrap entry — `pg_get_userbyid` resolves it back to that role, so the two
+/// must agree, hence the shared constant.
 ///
-/// TODO: one owner stands for the whole cluster. Nothing creates a second role,
-/// so every `relowner`/`typowner`/`nspowner` reports this OID whoever connects;
-/// per-object ownership needs `CREATE ROLE` and an owner stored per object.
-pub(crate) const BOOTSTRAP_ROLE_OID: u32 = 10;
+/// TODO: one owner stands for the whole cluster. `CREATE ROLE` now makes more
+/// than one role exist, but nothing stores an owner *per object*, so every
+/// `relowner`/`typowner`/`nspowner` still reports this OID.
+pub const BOOTSTRAP_ROLE_OID: u32 = 10;
 
 /// `pg_namespace.oid` of `public`, PostgreSQL's fixed value. Where a user type
 /// lives, and so what its `typnamespace` reports — the schema an unqualified

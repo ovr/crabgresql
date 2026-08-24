@@ -384,6 +384,9 @@ pub struct Grant {
     pub grantees: Vec<Grantee>,
     /// Whether `WITH GRANT OPTION` is present.
     pub with_grant_option: bool,
+    /// Whether `WITH ADMIN OPTION` is present — the role-membership form's
+    /// counterpart of `WITH GRANT OPTION`.
+    pub with_admin_option: bool,
     /// Optional `AS GRANTOR` identifier.
     pub as_grantor: Option<Ident>,
     /// Optional `GRANTED BY` identifier.
@@ -408,6 +411,9 @@ impl fmt::Display for Grant {
         }
         if self.with_grant_option {
             write!(f, " WITH GRANT OPTION")?;
+        }
+        if self.with_admin_option {
+            write!(f, " WITH ADMIN OPTION")?;
         }
         if let Some(ref as_grantor) = self.as_grantor {
             write!(f, " AS {as_grantor}")?;
@@ -436,6 +442,9 @@ pub struct Revoke {
     pub objects: Option<GrantObjects>,
     /// Grantees affected by the revoke.
     pub grantees: Vec<Grantee>,
+    /// Whether `ADMIN OPTION FOR` was given: the membership stays and only the
+    /// admin option is dropped.
+    pub admin_option_for: bool,
     /// Optional `GRANTED BY` identifier.
     ///
     /// [BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/dcl-statements)
@@ -446,7 +455,11 @@ pub struct Revoke {
 
 impl fmt::Display for Revoke {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "REVOKE {privileges}", privileges = self.privileges)?;
+        write!(f, "REVOKE ")?;
+        if self.admin_option_for {
+            write!(f, "ADMIN OPTION FOR ")?;
+        }
+        write!(f, "{privileges}", privileges = self.privileges)?;
         if let Some(ref objects) = self.objects {
             write!(f, " ON {objects}")?;
         }

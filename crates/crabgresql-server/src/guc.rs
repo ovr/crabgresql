@@ -65,6 +65,12 @@ pub enum SavedValue {
     ByteaOutput(ByteaOutput),
     DefaultIsolation(IsolationLevel),
     DefaultReadOnly(bool),
+    /// The `role` GUC: the switched-to role, or `None` for `role = none`.
+    Role(Option<(String, u32)>),
+    /// The login role's name and OID, plus the `role` value that went with it —
+    /// see the `session_authorization` definition for why the two travel
+    /// together. Boxed to keep the enum's other variants small.
+    SessionAuthorization(String, u32, Box<Option<(String, u32)>>),
 }
 
 /// How a parameter responds to `SET` and `RESET`.
@@ -196,6 +202,13 @@ impl GucDef {
     /// needs to ask rather than letting the setter answer.
     pub fn is_read_only(&self) -> bool {
         matches!(self.kind, GucKind::ReadOnly)
+    }
+
+    /// Whether `RESET ALL` leaves this parameter alone. PostgreSQL flags the
+    /// two identity parameters `GUC_NO_RESET_ALL`, so `SET ROLE r; RESET ALL`
+    /// really does leave `current_user` at `r` — verified against 18.4.
+    pub fn skipped_by_reset_all(&self) -> bool {
+        matches!(self.key, "role" | "session_authorization")
     }
 }
 
@@ -465,7 +478,7 @@ pub static GUCS: &[GucDef] = &[
         max_val: None,
         enumvals: None,
         boot_val: "off",
-        show: |_| "on".to_string(),
+        show: |s| if s.is_superuser() { "on" } else { "off" }.to_string(),
         kind: GucKind::ReadOnly,
     },
     GucDef {
@@ -489,6 +502,36 @@ pub static GUCS: &[GucDef] = &[
             restore: |s, v| {
                 if let SavedValue::Costs(costs) = v {
                     s.costs = costs;
+                }
+            },
+        },
+    },
+    GucDef {
+        key: "role",
+        name: "role",
+        description: "Sets the current role.",
+        extra_desc: None,
+        report: false,
+        // PostgreSQL flags this `GUC_NO_SHOW_ALL` like `is_superuser`:
+        // `SHOW role` answers, but 18.4 has no `pg_settings` row for it.
+        show_all: false,
+        category: STATEMENT,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "none",
+        show: |s| match &s.current_role {
+            Some((name, _)) => name.clone(),
+            None => "none".to_string(),
+        },
+        kind: GucKind::Settable {
+            set: set_role,
+            capture: |s| SavedValue::Role(s.current_role.clone()),
+            restore: |s, v| {
+                if let SavedValue::Role(role) = v {
+                    s.current_role = role;
                 }
             },
         },
@@ -571,6 +614,47 @@ pub static GUCS: &[GucDef] = &[
         boot_val: crabgresql_types::version::SERVER_VERSION_NUM,
         show: |_| crabgresql_types::version::SERVER_VERSION_NUM.to_string(),
         kind: GucKind::ReadOnly,
+    },
+    GucDef {
+        key: "session_authorization",
+        name: "session_authorization",
+        description: "Sets the session user identifier.",
+        extra_desc: None,
+        // GUC_REPORT in PostgreSQL, unlike `role` beside it: 18.4 sends a
+        // `session_authorization` ParameterStatus in the startup burst and again
+        // whenever the identity changes (verified on the wire), so a client can
+        // keep track of who it is acting as.
+        report: true,
+        // `GUC_NO_SHOW_ALL`, like `role` above.
+        show_all: false,
+        category: STATEMENT,
+        context: "user",
+        vartype: "string",
+        min_val: None,
+        max_val: None,
+        enumvals: None,
+        boot_val: "",
+        show: |s| s.user.clone(),
+        kind: GucKind::Settable {
+            set: set_session_authorization,
+            // Assigning this also clears `role`, so both are captured here —
+            // restoring the login role alone would leave a `SET ROLE` that ran
+            // before it still in effect.
+            capture: |s| {
+                SavedValue::SessionAuthorization(
+                    s.user.clone(),
+                    s.user_oid_at_login,
+                    Box::new(s.current_role.clone()),
+                )
+            },
+            restore: |s, v| {
+                if let SavedValue::SessionAuthorization(user, oid, role) = v {
+                    s.user = user;
+                    s.user_oid_at_login = oid;
+                    s.current_role = *role;
+                }
+            },
+        },
     },
     GucDef {
         key: "standard_conforming_strings",
@@ -875,6 +959,79 @@ fn set_timezone(session: &mut Session, value: GucValue) -> Result<(), PgError> {
 /// `SET application_name`. Never fails: PostgreSQL accepts any string and
 /// rewrites the parts it will not report verbatim. See
 /// [`clean_application_name`] for the rule.
+/// `SET ROLE x` / `SET ROLE NONE` / `RESET ROLE`, and the `SET role = x`
+/// spelling of the same thing.
+///
+/// The membership check is asked of the *session* role — the one
+/// `session_user` reports — rather than of `current_user`: a `SET ROLE` cannot
+/// use the role it switched to as a stepping stone to a third one. A
+/// `SET SESSION AUTHORIZATION` does move the check, because it moves the session
+/// role itself: 18.4 refuses `SET SESSION AUTHORIZATION b; SET ROLE c` for a
+/// non-superuser `b` that is not a member of `c`, even when the role that
+/// logged in could have made the switch.
+fn set_role(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let name = match value {
+        GucValue::Default => None,
+        GucValue::OffsetSecondsEast(secs) => Some(secs.to_string()),
+        GucValue::Str(s) if s.eq_ignore_ascii_case("none") => None,
+        GucValue::Str(s) => Some(s),
+    };
+    let Some(name) = name else {
+        session.current_role = None;
+        return Ok(());
+    };
+    let Some(role) = session.roles.lookup(&name) else {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("role \"{name}\" does not exist"),
+        ));
+    };
+    if !session.roles.can_set_role(session.user_oid(), role.oid) {
+        return Err(PgError::new(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            format!("permission denied to set role \"{name}\""),
+        ));
+    }
+    session.current_role = Some((role.name, role.oid));
+    Ok(())
+}
+
+/// `SET SESSION AUTHORIZATION x` / `… DEFAULT` / `RESET SESSION AUTHORIZATION`.
+///
+/// Only a superuser may name another role, and the switch also clears `role` —
+/// PostgreSQL treats it as establishing a new session identity rather than as a
+/// second layer over the current one.
+fn set_session_authorization(session: &mut Session, value: GucValue) -> Result<(), PgError> {
+    let name = match value {
+        GucValue::Default => None,
+        GucValue::OffsetSecondsEast(secs) => Some(secs.to_string()),
+        GucValue::Str(s) if s.is_empty() => None,
+        GucValue::Str(s) => Some(s),
+    };
+    let Some(name) = name else {
+        session.user = session.auth_user.clone();
+        session.user_oid_at_login = session.auth_user_oid_at_login;
+        session.current_role = None;
+        return Ok(());
+    };
+    let Some(role) = session.roles.lookup(&name) else {
+        return Err(PgError::new(
+            sqlstate::UNDEFINED_OBJECT,
+            format!("role \"{name}\" does not exist"),
+        ));
+    };
+    if !session.roles.is_superuser(session.auth_user_oid()) {
+        return Err(PgError::new(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to set session authorization",
+        ));
+    }
+    session.user = role.name;
+    session.user_oid_at_login = role.oid;
+    session.current_role = None;
+    Ok(())
+}
+
 fn set_application_name(session: &mut Session, value: GucValue) -> Result<(), PgError> {
     let name = match value {
         GucValue::Default => String::new(),

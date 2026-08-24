@@ -4,13 +4,13 @@
 //! both on the search path.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crabgresql_catalog::{
     CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
-    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogSetting, CatalogSource, CatalogUserType, CatalogViewDependency, SerialSequenceLookup,
-    SystemCatalog, ViewDepRelation,
+    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRole, CatalogRoleMember,
+    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType,
+    CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
 use crabgresql_executor::{
     CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, PartitionKeyDef,
@@ -29,6 +29,7 @@ use crabgresql_types::ByteaOutput;
 
 use crate::global_catalog::GlobalCatalog;
 use crate::query::{catalog_routine, partition_session_relations};
+use crate::roles::{RoleCatalog, RoleSnapshot};
 use crate::session::Session;
 
 /// The relations one statement resolved, and the write it is going to perform.
@@ -121,7 +122,19 @@ pub struct SessionCatalogSource {
     /// Backs `user_types` and `routines`.
     global_catalog: Arc<GlobalCatalog>,
     database: String,
+    /// The name every catalog row reports as its owner: the bootstrap
+    /// superuser, whichever role this session runs as.
     owner: String,
+    /// This session's identity: the login role, and the role a `SET ROLE`
+    /// switched to. Snapshotted here because the source outlives the `&Session`
+    /// it is built from.
+    session_user: String,
+    current_user: String,
+    /// The cluster's roles, read lazily and exactly once per snapshot: a
+    /// `SELECT 1` must not pay to clone the role list, and `pg_authid` and
+    /// `pg_auth_members` must not read two different ones.
+    role_catalog: Arc<RoleCatalog>,
+    roles: OnceLock<RoleSnapshot>,
     temp_schema: String,
     temp_namespace_oid: u32,
     /// Eager, unlike the engine-backed lists: this source outlives the
@@ -231,7 +244,11 @@ impl SessionCatalogSource {
             engine,
             global_catalog,
             database: session.database.clone(),
-            owner: session.user.clone(),
+            owner: session.roles.owner_name(),
+            session_user: session.user.clone(),
+            current_user: session.current_user().to_string(),
+            role_catalog: Arc::clone(&session.roles),
+            roles: OnceLock::new(),
             temp_schema: session.temp_schema.clone(),
             temp_namespace_oid: session.temp_namespace_oid,
             cursors,
@@ -246,6 +263,15 @@ impl SessionCatalogSource {
             backend: session.backend(),
             nested: false,
         }
+    }
+
+    /// The cluster's roles as this snapshot sees them, read once and shared by
+    /// `roles()` and `role_members()` so the two cannot disagree.
+    fn role_snapshot(&self) -> &RoleSnapshot {
+        self.roles.get_or_init(|| {
+            self.role_catalog
+                .snapshot_with_session_role(&self.session_user)
+        })
     }
 }
 
@@ -409,6 +435,52 @@ impl CatalogSource for SessionCatalogSource {
 
     fn owner(&self) -> &str {
         &self.owner
+    }
+
+    fn session_user(&self) -> &str {
+        &self.session_user
+    }
+
+    fn current_user(&self) -> &str {
+        &self.current_user
+    }
+
+    fn roles(&self) -> Vec<CatalogRole> {
+        self.role_snapshot()
+            .roles
+            .iter()
+            .map(|r| CatalogRole {
+                oid: r.oid,
+                name: r.name.clone(),
+                superuser: r.superuser,
+                inherit: r.inherit,
+                createrole: r.createrole,
+                createdb: r.createdb,
+                canlogin: r.canlogin,
+                replication: r.replication,
+                bypassrls: r.bypassrls,
+                connlimit: r.connlimit,
+                password: r.password.clone(),
+                valid_until: r.valid_until,
+                config: r.config.clone(),
+            })
+            .collect()
+    }
+
+    fn role_members(&self) -> Vec<CatalogRoleMember> {
+        self.role_snapshot()
+            .members
+            .iter()
+            .map(|m| CatalogRoleMember {
+                oid: m.oid,
+                role: m.role,
+                member: m.member,
+                grantor: m.grantor,
+                admin_option: m.admin_option,
+                inherit_option: m.inherit_option,
+                set_option: m.set_option,
+            })
+            .collect()
     }
 
     fn user_types(&self) -> Vec<CatalogUserType> {
@@ -860,16 +932,13 @@ impl CatalogOps for SessionCatalogOps {
     }
 
     fn current_user(&self) -> String {
-        self.system.owner().to_string()
+        self.system.current_user().to_string()
     }
 
-    /// The same string as [`CatalogOps::current_user`]: `SET ROLE` is accepted
-    /// and ignored, so nothing can make the two differ.
-    ///
-    /// TODO: track `SET ROLE` in `current_user`, so it can differ from the
-    /// authenticated role this method reports.
+    /// The role the connection logged in as, which a `SET ROLE` does *not*
+    /// change — that is the whole difference from [`CatalogOps::current_user`].
     fn session_user(&self) -> String {
-        self.system.owner().to_string()
+        self.system.session_user().to_string()
     }
 
     /// Mirrors the resolution order `table_is_visible` and `rel_oid` above

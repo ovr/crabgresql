@@ -41,6 +41,10 @@ pub const COPY_ALLOW_PATHS: &str = "CRABGRESQL_COPY_ALLOW_PATHS";
 /// `tracing` filter directives. Read by `tracing_subscriber`'s `EnvFilter`
 /// rather than by this crate, so the name is here only to be documented.
 pub const LOG_FILTER: &str = "RUST_LOG";
+/// Name of the superuser a *fresh* data directory is bootstrapped with, the way
+/// `initdb --username` names PostgreSQL's. Read only when the data directory has
+/// no role catalog yet; afterwards the stored roles are authoritative.
+pub const SUPERUSER: &str = "CRABGRESQL_SUPERUSER";
 
 /// One above PostgreSQL's 5432, so a local PostgreSQL can keep running.
 pub const DEFAULT_PORT: u16 = 5433;

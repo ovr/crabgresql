@@ -668,6 +668,8 @@ dependencies = [
  "crabgresql-wal",
  "futures-util",
  "memchr",
+ "rand",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-postgres",

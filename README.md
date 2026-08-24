@@ -38,6 +38,15 @@ What exists today:
   (including `JOIN USING`/`NATURAL JOIN`, foreign keys, checks, and advanced
   index forms) errors with `0A000`
   instead of being silently ignored.
+- **Roles** (`crabgresql-server::roles`): `CREATE`/`ALTER`/`DROP ROLE` (and the
+  `USER`/`GROUP` spellings), role membership through `GRANT <role> TO <role>`,
+  `SET ROLE` / `SET SESSION AUTHORIZATION`, and per-role settings
+  (`ALTER ROLE … SET`) applied at login. Roles are a cluster object: they live
+  in their own file under the data directory and are reflected into `pg_authid`
+  and the five relations over it. A password is stored as a SCRAM-SHA-256
+  verifier, but nothing authenticates against it yet and no privilege on an
+  object is checked — `GRANT … ON <object>` is refused with `0A000` rather than
+  silently accepted.
 - **Expressions** (`crabgresql-executor::eval`): comparisons, `AND`/`OR`/`NOT`
   with SQL three-valued NULL logic, `IS [NOT] NULL`, int4/int8 arithmetic
   with PG overflow (`22003`) and division-by-zero (`22012`) behavior.
@@ -72,6 +81,7 @@ not parse falls back to its default rather than failing startup.
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
 | `CRABGRESQL_LISTEN_ADDRESS` | `127.0.0.1` | | address to accept connections on (also `--listen-address`). Loopback by default: authentication is trust and there is no TLS, so anything reachable on this port is a superuser |
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
+| `CRABGRESQL_SUPERUSER` | `postgres` | | name of the bootstrap superuser created when the data directory has no role catalog yet, as `initdb --username` names PostgreSQL's (also `--superuser`). Ignored afterwards: the stored roles are authoritative. Connections are still trusted whoever they claim to be — nothing authenticates yet |
 | `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |
 | `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `32MB` | `1MB`–`2GB` | per-relation buffered bytes that make one write buffer flush-eligible |

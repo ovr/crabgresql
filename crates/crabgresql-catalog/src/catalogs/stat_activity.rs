@@ -4,7 +4,7 @@ use crabgresql_storage_api::TableSchema;
 use crabgresql_types::{PgType, Value};
 
 use crate::cols::*;
-use crate::oids::{BOOTSTRAP_ROLE_OID, DATABASE_OID};
+use crate::oids::DATABASE_OID;
 use crate::{SystemCatalog, source::CatalogBackend};
 
 /// `pg_catalog.pg_stat_activity` — one row per backend.
@@ -65,8 +65,10 @@ fn backend_row(cat: &SystemCatalog, backend: &CatalogBackend) -> Vec<Value> {
         Value::Text(cat.database().to_string()),
         Value::Int4(backend.pid),
         Value::Null, // leader_pid
-        Value::Oid(BOOTSTRAP_ROLE_OID),
-        Value::Text(cat.owner().to_string()),
+        // `usesysid`/`usename` are the backend's *login* role, not the object
+        // owner every other catalog row carries.
+        Value::Oid(cat.session_user_oid()),
+        Value::Text(cat.session_user().to_string()),
         Value::Text(backend.application_name.clone()),
         Value::Null, // client_addr
         Value::Null, // client_hostname

@@ -31,6 +31,10 @@ crabgresql-types.workspace = true
 crabgresql-wal.workspace = true
 clap.workspace = true
 memchr.workspace = true
+# A stored password is a SCRAM verifier: PBKDF2-HMAC-SHA-256 over `sha2`, with
+# `rand` for the salt (the same pair `crabgresql-executor` already digests with).
+rand.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
