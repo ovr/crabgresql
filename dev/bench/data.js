@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787570437403,
+  "lastUpdate": 1787570439396,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -55624,6 +55624,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18236.021723,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d51a2ab8e16ecc9369d632e5ff427e64507e83c0",
+          "message": "feat: Support VARIADIC (#276)",
+          "timestamp": "2026-08-24T10:38:49Z",
+          "tree_id": "4794466dfc4a467685c5fb4b739555483919d75d",
+          "url": "https://github.com/ovr/crabgresql/commit/d51a2ab8e16ecc9369d632e5ff427e64507e83c0"
+        },
+        "date": 1787570439264,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1226.416654,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18467.00226,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
