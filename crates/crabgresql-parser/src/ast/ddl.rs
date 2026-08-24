@@ -36,6 +36,11 @@ use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::value::escape_single_quote_string;
 use crate::ast::{
+    display_comma_separated, display_separated,
+    table_constraints::{
+        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
+        UniqueConstraint,
+    },
     AttachedToken, CommentDef, ConditionalStatements, CreateFunctionBody, CreateFunctionUsing,
     CreateTableLikeKind, CreateTableOptions, CreateViewParams, DataType, Expr, FileFormat,
     FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionDesc,
@@ -45,12 +50,7 @@ use crate::ast::{
     OrderByExpr, ProjectionSelect, Query, RefreshModeKind, ResetConfig, RowAccessPolicy,
     SequenceOptions, Spanned, SqlOption, StorageLifecyclePolicy, StorageSerializationPolicy,
     TableVersion, Tag, TriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod,
-    TriggerReferencing, Value, ValueWithSpan, WrappedCollection, display_comma_separated,
-    display_separated,
-    table_constraints::{
-        CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, TableConstraint,
-        UniqueConstraint,
-    },
+    TriggerReferencing, Value, ValueWithSpan, WrappedCollection,
 };
 use crate::display_utils::{DisplayCommaSeparated, Indent, NewLine, SpaceOrNewline};
 use crate::keywords::Keyword;
@@ -2336,7 +2336,11 @@ impl ConstraintCharacteristics {
     fn enforced_text(&self) -> Option<&'static str> {
         self.enforced.map(
             |enforced| {
-                if enforced { "ENFORCED" } else { "NOT ENFORCED" }
+                if enforced {
+                    "ENFORCED"
+                } else {
+                    "NOT ENFORCED"
+                }
             },
         )
     }
