@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787563871837,
+  "lastUpdate": 1787563874061,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -54976,6 +54976,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 19160.723146,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4f5d7d29cba450efdcad46c223f244dc8c56b30b",
+          "message": "refactor(catalog): Split into CATALOG_RELATIONS and CATALOG_VIEWS (#275)",
+          "timestamp": "2026-08-24T08:56:37Z",
+          "tree_id": "c38eeb1a3b4e21479245e34f5ed814080b4b8306",
+          "url": "https://github.com/ovr/crabgresql/commit/4f5d7d29cba450efdcad46c223f244dc8c56b30b"
+        },
+        "date": 1787563873928,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1242.097873,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18236.021723,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
