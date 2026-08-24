@@ -295,11 +295,15 @@ pub struct CatalogRoutine {
     /// stands for a type that does not resolve, as PostgreSQL reports for one
     /// it cannot name.
     pub arg_types: Vec<u32>,
-    /// Every argument including OUT/INOUT, or empty when they are all IN —
-    /// PostgreSQL leaves `proallargtypes` NULL in that case.
+    /// Every argument including OUT/INOUT/VARIADIC, or empty when they are all
+    /// IN — PostgreSQL leaves `proallargtypes` NULL in that case.
     pub all_arg_types: Vec<u32>,
-    /// One of `i`/`o`/`b` per entry of `all_arg_types`, or empty.
+    /// One of `i`/`o`/`b`/`v` per entry of `all_arg_types`, or empty.
     pub arg_modes: Vec<char>,
+    /// `pg_proc.provariadic`: the *element* type of a `VARIADIC` parameter, or
+    /// 0 when the routine declares none. The array type itself is the one in
+    /// `arg_types`/`all_arg_types`.
+    pub variadic_elem: u32,
     /// Argument names, or empty when no argument is named.
     pub arg_names: Vec<String>,
     pub ret_type: u32,

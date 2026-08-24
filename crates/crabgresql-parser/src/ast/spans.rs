@@ -2018,7 +2018,10 @@ impl Spanned for FunctionArg {
                 arg,
                 operator: _,
             } => name.span.union(&arg.span()),
-            FunctionArg::Unnamed(arg) => arg.span(),
+            // The span is the argument expression's, not the `VARIADIC`
+            // keyword's: PostgreSQL points its "VARIADIC argument must be an
+            // array" caret at the expression.
+            FunctionArg::Unnamed(arg) | FunctionArg::Variadic(arg) => arg.span(),
             FunctionArg::ExprNamed {
                 name,
                 arg,

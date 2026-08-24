@@ -33,6 +33,7 @@ pub use expr::{
 };
 pub use functions::{
     AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
+    routine_params,
 };
 pub use logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,

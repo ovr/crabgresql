@@ -576,15 +576,23 @@ fn function(f: &ast::Function, cx: Cx) -> String {
             .args
             .iter()
             .enumerate()
-            .map(|(i, a): (usize, &ast::FunctionArg)| match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    match (arg_type(i), literal_of(e)) {
-                        (_, Some(v)) if bare_args => value_body(v),
-                        (Some(ty), Some(v)) => typed_value(v, ty),
-                        _ => top_expr(e, cx),
-                    }
-                }
-                other => other.to_string(),
+            .map(|(i, a): (usize, &ast::FunctionArg)| {
+                // `VARIADIC` is part of the call PG prints back, and the
+                // argument under it deparses like any other.
+                let (variadic, arg) = match a {
+                    ast::FunctionArg::Unnamed(arg) => ("", arg),
+                    ast::FunctionArg::Variadic(arg) => ("VARIADIC ", arg),
+                    other => return other.to_string(),
+                };
+                let ast::FunctionArgExpr::Expr(e) = arg else {
+                    return a.to_string();
+                };
+                let body = match (arg_type(i), literal_of(e)) {
+                    (_, Some(v)) if bare_args => value_body(v),
+                    (Some(ty), Some(v)) => typed_value(v, ty),
+                    _ => top_expr(e, cx),
+                };
+                format!("{variadic}{body}")
             })
             .collect::<Vec<_>>()
             .join(", "),

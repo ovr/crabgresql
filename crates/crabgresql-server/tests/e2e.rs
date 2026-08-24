@@ -10263,6 +10263,133 @@ async fn create_function_language_sql_reports_errors_like_pg() -> anyhow::Result
     Ok(())
 }
 
+/// The resolution failures a `VARIADIC` parameter or argument can produce.
+///
+/// They live here rather than in the smoke suite because PostgreSQL prints a
+/// `LINE`/caret excerpt and the "No function matches …" HINT on a 42883, and no
+/// error this engine raises carries either yet — so the psql-rendered output
+/// would not match. The message and SQLSTATE are what this pins.
+#[tokio::test]
+async fn variadic_resolution_failures_match_pg() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .simple_query(
+            "CREATE FUNCTION vsum(a int, VARIADIC rest int[]) RETURNS int LANGUAGE SQL IMMUTABLE \
+             AS $$ SELECT a + coalesce(cardinality(rest), 0) $$",
+        )
+        .await?;
+
+    // Every one of these is 42883, and the reported argument list is the one the
+    // call actually wrote — the array type included, since with the keyword the
+    // array *is* the parameter rather than one of the spread elements.
+    for (sql, types, why) in [
+        (
+            "SELECT vsum(1)",
+            "integer",
+            "at least one argument must reach the variadic parameter",
+        ),
+        (
+            "SELECT vsum(1, 2.0)",
+            "integer, numeric",
+            "a spread argument coerces to the element type by the implicit rules only",
+        ),
+        (
+            "SELECT vsum(1, VARIADIC 2)",
+            "integer, integer",
+            "a VARIADIC argument that is not an array matches no signature",
+        ),
+        (
+            "SELECT vsum(1, VARIADIC ARRAY['x'])",
+            "integer, text[]",
+            "a VARIADIC array of the wrong element type matches no signature",
+        ),
+        (
+            "SELECT vsum(1, ARRAY[2, 3])",
+            "integer, integer[]",
+            "without the keyword the array is one spread element, not the parameter",
+        ),
+        (
+            "SELECT concat_ws(VARIADIC ARRAY['a', 'b'])",
+            "text[]",
+            "the array must land on the variadic parameter, not on the separator",
+        ),
+        (
+            "SELECT concat_ws(',', 'a', VARIADIC ARRAY['b'])",
+            "unknown, unknown, text[]",
+            "the keyword form takes exactly as many arguments as the signature has",
+        ),
+        (
+            "SELECT concat()",
+            "",
+            "concat needs at least one argument for its variadic parameter",
+        ),
+        (
+            "SELECT concat_ws(',')",
+            "unknown",
+            "concat_ws needs at least one argument past the separator",
+        ),
+        (
+            "SELECT length(VARIADIC ARRAY['a'])",
+            "text[]",
+            "a callee with no variadic parameter sees the array's own type",
+        ),
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("the call matches no signature");
+        let dberr = err.as_db_error().expect("database error");
+        assert_eq!(dberr.code(), &SqlState::UNDEFINED_FUNCTION, "{sql}: {why}");
+        let name = sql
+            .trim_start_matches("SELECT ")
+            .split('(')
+            .next()
+            .expect("every probe is a call");
+        assert_eq!(
+            dberr.message(),
+            format!("function {name}({types}) does not exist"),
+            "{sql}: {why}"
+        );
+    }
+
+    // `VARIADIC` belongs to a function argument list; COALESCE and its siblings
+    // take a bare expression list, where PG's parser stops on the keyword.
+    for sql in [
+        "SELECT coalesce(variadic array[1])",
+        "SELECT greatest(variadic array[1])",
+        "SELECT nullif(variadic array[1])",
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("VARIADIC is not part of a bare expression list");
+        let dberr = err.as_db_error().expect("database error");
+        assert_eq!(dberr.code(), &SqlState::SYNTAX_ERROR, "{sql}");
+        assert_eq!(dberr.message(), "syntax error at or near \"variadic\"");
+    }
+
+    // A variadic *function* is reachable from CALL's resolution in both shapes,
+    // so naming one is 42809 "is not a procedure" — the same answer PG gives —
+    // rather than the 42883 an arity-only match would have produced.
+    for (sql, types) in [
+        ("CALL vsum(1, 2, 3)", "integer, integer, integer"),
+        ("CALL vsum(1, VARIADIC ARRAY[2])", "integer, integer[]"),
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .expect_err("a function is not callable with CALL");
+        let dberr = err.as_db_error().expect("database error");
+        assert_eq!(dberr.code(), &SqlState::WRONG_OBJECT_TYPE, "{sql}");
+        assert_eq!(dberr.message(), format!("vsum({types}) is not a procedure"));
+        assert_eq!(dberr.hint(), Some("To call a function, use SELECT."));
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_function_language_sql_resolution_and_volatility_match_pg() -> anyhow::Result<()> {
     use tokio_postgres::error::SqlState;

@@ -6716,6 +6716,11 @@ pub enum FunctionArg {
     },
     /// An unnamed argument (positional), given by expression or wildcard.
     Unnamed(FunctionArgExpr),
+    /// `VARIADIC expr` — the trailing argument is an array to spread over the
+    /// callee's variadic parameter rather than one element of it. PostgreSQL's
+    /// grammar allows this only on the *last* argument, which the parser
+    /// enforces, so nothing downstream has to check the position.
+    Variadic(FunctionArgExpr),
 }
 
 impl fmt::Display for FunctionArg {
@@ -6732,6 +6737,7 @@ impl fmt::Display for FunctionArg {
                 operator,
             } => write!(f, "{name} {operator} {arg}"),
             FunctionArg::Unnamed(unnamed_arg) => write!(f, "{unnamed_arg}"),
+            FunctionArg::Variadic(arg) => write!(f, "VARIADIC {arg}"),
         }
     }
 }
@@ -8679,6 +8685,11 @@ pub struct OperateFunctionArg {
     /// points a "argument type … is only a shell" NOTICE caret). Empty when the
     /// argument was built programmatically rather than parsed.
     pub data_type_span: Span,
+    /// Source span whose start is the argument's *first* token — the mode
+    /// keyword when one is written, the name or type otherwise. That is where
+    /// PostgreSQL points the caret of the two `VARIADIC parameter …` errors.
+    /// Empty when the argument was built programmatically rather than parsed.
+    pub arg_span: Span,
     /// Optional default expression for the argument.
     pub default_expr: Option<Expr>,
 }
@@ -8691,6 +8702,7 @@ impl OperateFunctionArg {
             name: None,
             data_type,
             data_type_span: Span::empty(),
+            arg_span: Span::empty(),
             default_expr: None,
         }
     }
@@ -8702,6 +8714,7 @@ impl OperateFunctionArg {
             name: Some(name.into()),
             data_type,
             data_type_span: Span::empty(),
+            arg_span: Span::empty(),
             default_expr: None,
         }
     }

@@ -2435,14 +2435,12 @@ fn every_view_definition_parses_and_names_our_columns() {
         );
     }
 
-    // `VARIADIC` in a call's argument list is a gap in the grammar, not in the
-    // transcription, so `pg_publication_tables` goes column-unchecked until the
-    // grammar grows it. Empty here means that day came: drop the expectation
-    // and the view joins the check.
-    assert_eq!(
-        unparsed,
-        ["pg_publication_tables"],
-        "the set of definitions this build cannot parse moved"
+    // Every definition parses, so every one of them had its columns checked
+    // above. The list stays so that a transcription reaching for grammar this
+    // build lacks fails here rather than quietly skipping that check.
+    assert!(
+        unparsed.is_empty(),
+        "definitions this build cannot parse: {unparsed:?}"
     );
 }
 
@@ -2642,6 +2640,7 @@ fn wide_fixture() -> SystemCatalog {
             arg_types: vec![PgType::Int4.oid()],
             all_arg_types: Vec::new(),
             arg_modes: Vec::new(),
+            variadic_elem: 0,
             arg_names: vec!["a".to_string()],
             ret_type: PgType::Int4.oid(),
             retset: false,
