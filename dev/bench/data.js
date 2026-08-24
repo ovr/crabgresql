@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787604751117,
+  "lastUpdate": 1787604753135,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -39438,6 +39438,168 @@ window.BENCHMARK_DATA = {
           {
             "name": "Q22",
             "value": 0.018,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a",
+          "message": "feat: Initial support for user management (#278)\n\nRoles are a cluster object here as in PostgreSQL: they live in their own\nfile under the data directory, independent of the per-database relation\ncatalog, and are shared by every connection for the life of the server.\n\n- CREATE/ALTER/DROP ROLE, and the USER/GROUP spellings of each\n- role membership: GRANT <role> TO <role> [WITH ADMIN OPTION], REVOKE\n  [ADMIN OPTION FOR], GRANTED BY, and IN ROLE/ROLE/ADMIN on CREATE\n- SET ROLE / SET SESSION AUTHORIZATION as the GUCs PostgreSQL makes them,\n  so SET LOCAL rolls back with its transaction and SHOW role answers\n- per-role settings (ALTER ROLE ... SET), applied at login\n- pg_authid and the five relations over it (pg_roles, pg_user, pg_shadow,\n  pg_group, pg_auth_members) built from the one live role list\n\nA password is stored as a SCRAM-SHA-256 verifier, but nothing\nauthenticates against it yet and no privilege on an object is checked:\nGRANT ... ON <object> is refused with 0A000 rather than silently\naccepted, and a name the catalog has no role for still connects as a\ntrusted superuser (PostgreSQL's FATAL 28000 arrives with authentication).\n\nBehaviour is pinned against PostgreSQL 18.4: a new `roles` smoke suite\nwhose expected output was generated from psql, plus e2e coverage of what\ndepends on the login role's name or on the wire.\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-24T22:03:15+02:00",
+          "tree_id": "b2676f1f0af36d3bebcf7ef0530d1201523f95f4",
+          "url": "https://github.com/ovr/crabgresql/commit/f3ad504dbd4a2a053c4117dfa8fa0cd1d789041a"
+        },
+        "date": 1787604752996,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 0.384,
+            "unit": "s",
+            "extra": "dataset load — heap, 86805 rows"
+          },
+          {
+            "name": "Q1",
+            "value": 0.197,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q2",
+            "value": 0.014,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q3",
+            "value": 0.058,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q4",
+            "value": 0.045,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q5",
+            "value": 0.074,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q6",
+            "value": 0.054,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q7",
+            "value": 0.106,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q8",
+            "value": 0.074,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q9",
+            "value": 0.104,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q10",
+            "value": 0.057,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q11",
+            "value": 0.011,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q12",
+            "value": 0.039,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q13",
+            "value": 0.018,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q14",
+            "value": 0.044,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q15",
+            "value": 0.085,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q16",
+            "value": 0.007,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q17",
+            "value": 0.076,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q18",
+            "value": 0.244,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q19",
+            "value": 0.049,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q20",
+            "value": 0.054,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q21",
+            "value": 0.164,
+            "unit": "s",
+            "extra": "best of the timed runs — heap, 86805 rows"
+          },
+          {
+            "name": "Q22",
+            "value": 0.016,
             "unit": "s",
             "extra": "best of the timed runs — heap, 86805 rows"
           }
