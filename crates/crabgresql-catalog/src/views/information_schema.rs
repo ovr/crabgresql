@@ -8,6 +8,246 @@ use crate::SystemCatalog;
 use crate::catalogs::attribute::attcollation_of;
 use crate::cols::*;
 
+/// The type-shape columns `information_schema.columns` and
+/// `information_schema.domains` both report. Factored out because a domain and
+/// a column of that domain answer them identically — the domain's modifier
+/// applied to the domain's base type.
+struct TypeAttributes {
+    character_length: Value,
+    character_octets: Value,
+    numeric_precision: Value,
+    numeric_radix: Value,
+    datetime_precision: Value,
+    interval_type: Value,
+}
+
+fn type_attributes(ty: PgType, typmod: i32) -> TypeAttributes {
+    let (character_length, character_octets) = match ty {
+        PgType::Varchar | PgType::Bpchar if typmod >= 0 => {
+            (Value::Int4(typmod), Value::Int4(typmod * 4))
+        }
+        PgType::Bit | PgType::Varbit if typmod >= 0 => (Value::Int4(typmod), Value::Null),
+        _ => (Value::Null, Value::Null),
+    };
+    let (numeric_precision, numeric_radix) = match ty {
+        PgType::Int2 => (Value::Int4(16), Value::Int4(2)),
+        PgType::Int4 => (Value::Int4(32), Value::Int4(2)),
+        PgType::Int8 => (Value::Int4(64), Value::Int4(2)),
+        PgType::Float4 => (Value::Int4(24), Value::Int4(2)),
+        PgType::Float8 => (Value::Int4(53), Value::Int4(2)),
+        _ => (Value::Null, Value::Null),
+    };
+    // `datetime_precision` is the declared fractional-second precision,
+    // defaulting to the 6 every datetime type keeps. `interval_type` names the
+    // fields the modifier admits, uppercased and with the precision appended
+    // (`DAY TO SECOND(4)`); a full-range `interval(3)` reports NULL there and
+    // carries its precision only in `datetime_precision`.
+    let (datetime_precision, interval_type) = match ty {
+        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
+            let p = if typmod >= 0 { typmod } else { 6 };
+            (Value::Int4(p), Value::Null)
+        }
+        PgType::Interval => {
+            let (range, precision) = crabgresql_types::interval::unpack_typmod(typmod);
+            let spelling = crabgresql_types::interval::range_name(range).map(|fields| {
+                let mut s = fields.to_ascii_uppercase();
+                if let Some(p) = precision {
+                    s.push_str(&format!("({p})"));
+                }
+                Value::Text(s)
+            });
+            (
+                Value::Int4(precision.map_or(6, i32::from)),
+                spelling.unwrap_or(Value::Null),
+            )
+        }
+        _ => (Value::Null, Value::Null),
+    };
+    TypeAttributes {
+        character_length,
+        character_octets,
+        numeric_precision,
+        numeric_radix,
+        datetime_precision,
+        interval_type,
+    }
+}
+
+/// A domain reduced to what the two views need: its name, the built-in it is
+/// ultimately over, and its modifier.
+struct ResolvedDomain {
+    name: String,
+    /// The end of the `typbasetype` chain — the shape a value really has, and
+    /// what a *column* of the domain reports.
+    base: PgType,
+    /// The immediate base, which `information_schema.domains` reports rather
+    /// than the end of the chain: over `dd AS posint`, 18.4 shows
+    /// `data_type = USER-DEFINED`, `udt_schema = public`, `udt_name = posint`.
+    immediate: Immediate,
+    typmod: i32,
+    default: Option<String>,
+    collation: u32,
+}
+
+/// A domain's immediate base: a built-in, or another domain named by name.
+/// One value rather than two `Option`s, so "exactly one of them is set" is not
+/// an invariant every reader has to re-derive.
+enum Immediate {
+    Builtin(PgType),
+    Domain(String),
+}
+
+fn resolved_domains(cat: &SystemCatalog) -> Vec<ResolvedDomain> {
+    cat.user_types()
+        .iter()
+        .filter_map(|t| {
+            let d = t.domain.as_ref()?;
+            resolved_domain(cat, t, d)
+        })
+        .collect()
+}
+
+fn resolved_domain(
+    cat: &SystemCatalog,
+    t: &crate::CatalogUserType,
+    d: &crate::CatalogDomain,
+) -> Option<ResolvedDomain> {
+    // A base this build cannot name is skipped rather than reported as
+    // something else; the only way that happens is a domain over a domain,
+    // whose immediate base is a user OID no `PgType` answers to.
+    let immediate = match cat
+        .user_types()
+        .iter()
+        .find(|u| u.oid == d.basetype && u.domain.is_some())
+    {
+        Some(u) => Immediate::Domain(u.name.clone()),
+        None => Immediate::Builtin(PgType::from_oid(d.basetype)?),
+    };
+    Some(ResolvedDomain {
+        name: t.name.clone(),
+        base: PgType::from_oid(d.resolved_basetype)?,
+        immediate,
+        typmod: d.typmod,
+        default: d.default.clone(),
+        collation: d.collation,
+    })
+}
+
+/// `information_schema.domains` — one row per `CREATE DOMAIN`.
+pub(crate) fn domains_schema() -> TableSchema {
+    let text = PgType::Text;
+    let cardinal = PgType::Int4;
+    TableSchema::in_namespace(
+        "domains",
+        "information_schema",
+        vec![
+            col("domain_catalog", text),
+            col("domain_schema", text),
+            col("domain_name", text),
+            col("data_type", text),
+            col("character_maximum_length", cardinal),
+            col("character_octet_length", cardinal),
+            col("character_set_catalog", text),
+            col("character_set_schema", text),
+            col("character_set_name", text),
+            col("collation_catalog", text),
+            col("collation_schema", text),
+            col("collation_name", text),
+            col("numeric_precision", cardinal),
+            col("numeric_precision_radix", cardinal),
+            col("numeric_scale", cardinal),
+            col("datetime_precision", cardinal),
+            col("interval_type", text),
+            col("interval_precision", cardinal),
+            col("domain_default", text),
+            col("udt_catalog", text),
+            col("udt_schema", text),
+            col("udt_name", text),
+            col("scope_catalog", text),
+            col("scope_schema", text),
+            col("scope_name", text),
+            col("maximum_cardinality", cardinal),
+            col("dtd_identifier", text),
+        ],
+    )
+}
+
+pub(crate) fn domains_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
+    let database = cat.database();
+    resolved_domains(cat)
+        .into_iter()
+        .map(|d| {
+            // A domain over another domain reports no shape at all: its
+            // `data_type` is `USER-DEFINED`, and PostgreSQL leaves every length
+            // and precision column NULL beside it.
+            let attrs = match d.immediate {
+                Immediate::Builtin(base) => type_attributes(base, d.typmod),
+                Immediate::Domain(_) => type_attributes(PgType::User(0), -1),
+            };
+            // As in `columns`, PostgreSQL's view excludes `pg_catalog.default`,
+            // so a domain left on the database collation reports NULL.
+            let collation = crabgresql_types::collation::lookup_by_oid(d.collation)
+                .filter(|c| c.name != "default");
+            let (collation_catalog, collation_schema, collation_name) = match collation {
+                Some(c) => (
+                    Value::Text(database.to_string()),
+                    Value::Text("pg_catalog".to_string()),
+                    Value::Text(c.name.to_string()),
+                ),
+                None => (Value::Null, Value::Null, Value::Null),
+            };
+            vec![
+                Value::Text(database.to_string()),
+                // Every `CREATE DOMAIN` lands in `public`, as every user type
+                // does here.
+                Value::Text("public".to_string()),
+                Value::Text(d.name),
+                // `USER-DEFINED` is what PostgreSQL reports when the base is
+                // itself a domain — the standard has no name for one.
+                Value::Text(match &d.immediate {
+                    Immediate::Builtin(base) => base.name().to_string(),
+                    Immediate::Domain(_) => "USER-DEFINED".to_string(),
+                }),
+                attrs.character_length,
+                attrs.character_octets,
+                // character_set_{catalog,schema,name}
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                collation_catalog,
+                collation_schema,
+                collation_name,
+                attrs.numeric_precision,
+                attrs.numeric_radix,
+                // numeric_scale
+                Value::Null,
+                attrs.datetime_precision,
+                attrs.interval_type,
+                // interval_precision, as in `columns`: always NULL, the value
+                // travels in `datetime_precision`.
+                Value::Null,
+                d.default.map_or(Value::Null, Value::Text),
+                Value::Text(database.to_string()),
+                match &d.immediate {
+                    Immediate::Domain(_) => Value::Text("public".to_string()),
+                    Immediate::Builtin(_) => Value::Text("pg_catalog".to_string()),
+                },
+                match &d.immediate {
+                    Immediate::Domain(name) => Value::Text(name.clone()),
+                    Immediate::Builtin(base) => Value::Text(base.typname().to_string()),
+                },
+                // scope_{catalog,schema,name} / maximum_cardinality: reference
+                // and array-domain columns, neither of which exists here.
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("1".to_string()),
+            ]
+        })
+        .collect()
+}
+
 /// `information_schema.schemata`.
 ///
 /// TODO: the SQL standard types these columns as domains (`sql_identifier`,
@@ -187,6 +427,14 @@ pub(crate) fn columns_schema() -> TableSchema {
 
 pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (database, relations) = (cat.database(), cat.live_relations());
+    // Once for the view, not twice per user-typed column: resolving one domain
+    // scans the type list, and this view is read over a whole database.
+    let domains: std::collections::HashMap<u32, ResolvedDomain> = cat
+        .user_types()
+        .iter()
+        .filter_map(|t| Some((t.oid, resolved_domain(cat, t, t.domain.as_ref()?)?)))
+        .collect();
+    let domains = &domains;
     relations
         .iter()
         // Sequences are not tables; omit their columns from information_schema.
@@ -198,53 +446,35 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 .iter()
                 .enumerate()
                 .map(move |(index, column)| {
-                    let (character_length, character_octets) = match column.ty {
-                        PgType::Varchar | PgType::Bpchar if column.typmod >= 0 => {
-                            (Value::Int4(column.typmod), Value::Int4(column.typmod * 4))
-                        }
-                        PgType::Bit | PgType::Varbit if column.typmod >= 0 => {
-                            (Value::Int4(column.typmod), Value::Null)
-                        }
-                        _ => (Value::Null, Value::Null),
+                    // A domain column reports the *base* type's shape — its
+                    // `data_type`, length and `udt_name` are the base's, with
+                    // the domain's own modifier applied, and the domain is
+                    // named only through the `domain_*` triple. Probed on 18.4
+                    // over `CREATE DOMAIN dcol AS varchar(5)`.
+                    let domain = match column.ty {
+                        PgType::User(oid) => domains.get(&oid),
+                        _ => None,
                     };
-                    let (precision, radix) = match column.ty {
-                        PgType::Int2 => (Value::Int4(16), Value::Int4(2)),
-                        PgType::Int4 => (Value::Int4(32), Value::Int4(2)),
-                        PgType::Int8 => (Value::Int4(64), Value::Int4(2)),
-                        PgType::Float4 => (Value::Int4(24), Value::Int4(2)),
-                        PgType::Float8 => (Value::Int4(53), Value::Int4(2)),
-                        _ => (Value::Null, Value::Null),
+                    let (ty, typmod) = match &domain {
+                        Some(d) => (d.base, d.typmod),
+                        None => (column.ty, column.typmod),
                     };
-                    // `datetime_precision` is the declared fractional-second
-                    // precision, defaulting to the 6 every datetime type keeps.
-                    // `interval_type` names the fields the modifier admits,
-                    // uppercased and with the precision appended
-                    // (`DAY TO SECOND(4)`); a full-range `interval(3)` reports
-                    // NULL there and carries its precision only in
-                    // `datetime_precision`.
-                    let (datetime_precision, interval_type) = match column.ty {
-                        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
-                            let p = if column.typmod >= 0 { column.typmod } else { 6 };
-                            (Value::Int4(p), Value::Null)
-                        }
-                        PgType::Interval => {
-                            let (range, precision) =
-                                crabgresql_types::interval::unpack_typmod(column.typmod);
-                            let spelling =
-                                crabgresql_types::interval::range_name(range).map(|fields| {
-                                    let mut s = fields.to_ascii_uppercase();
-                                    if let Some(p) = precision {
-                                        s.push_str(&format!("({p})"));
-                                    }
-                                    Value::Text(s)
-                                });
-                            (
-                                Value::Int4(precision.map_or(6, i32::from)),
-                                spelling.unwrap_or(Value::Null),
-                            )
-                        }
-                        _ => (Value::Null, Value::Null),
+                    let (domain_catalog, domain_schema, domain_name) = match &domain {
+                        Some(d) => (
+                            Value::Text(database.to_string()),
+                            Value::Text("public".to_string()),
+                            Value::Text(d.name.clone()),
+                        ),
+                        None => (Value::Null, Value::Null, Value::Null),
                     };
+                    let TypeAttributes {
+                        character_length,
+                        character_octets,
+                        numeric_precision: precision,
+                        numeric_radix: radix,
+                        datetime_precision,
+                        interval_type,
+                    } = type_attributes(ty, typmod);
                     // PG's view joins pg_collation but excludes
                     // `pg_catalog.default`, so a column left on the database
                     // collation reports NULL here rather than "default".
@@ -271,7 +501,7 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                             .map(|default| Value::Text(default.clone()))
                             .unwrap_or(Value::Null),
                         Value::Text(if column.nullable { "YES" } else { "NO" }.to_string()),
-                        Value::Text(column.ty.name().to_string()),
+                        Value::Text(ty.name().to_string()),
                         character_length,
                         character_octets,
                         precision,
@@ -291,13 +521,12 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         collation_catalog,
                         collation_schema,
                         collation_name,
-                        // domain_{catalog,schema,name}
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
+                        domain_catalog,
+                        domain_schema,
+                        domain_name,
                         Value::Text(database.to_string()),
                         Value::Text("pg_catalog".to_string()),
-                        Value::Text(column.ty.typname().to_string()),
+                        Value::Text(ty.typname().to_string()),
                         Value::Null,
                         Value::Null,
                         Value::Null,

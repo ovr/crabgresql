@@ -223,7 +223,11 @@ fn bind_collate(
     let oid = crate::collation::resolve_collation(collation)?;
     let bound = match bind_expr(expr, scope)? {
         Binding::Unknown { lit, span, param } => resolve_unknown(lit, span, param, PgType::Text)?,
-        Binding::Typed(e) => e,
+        // An explicit `COLLATE` is a use of the value like any other, so a
+        // domain resolves on its base here too — otherwise the gate below would
+        // refuse `ORDER BY textdomain_col COLLATE "en-x-icu"`, which PostgreSQL
+        // accepts.
+        Binding::Typed(e) => super::domain::undomain(e, scope.catalog().as_ref()),
     };
     let ty = bound.ty();
     if !ty.is_collatable() {
@@ -259,7 +263,7 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    let (elem, exprs) = unify_value_column(bindings, "ARRAY")?;
+    let (elem, exprs) = unify_value_column(bindings, "ARRAY", scope.catalog())?;
     // Reject an element type this build has no array type for — a user enum, or
     // an array, which is what makes a multi-dimensional constructor land here.
     // `type_label`, not `PgType::name`, which renders a runtime-created type as
@@ -922,7 +926,7 @@ fn bind_case(
                     value,
                     Span::empty(),
                     (Span::empty(), Span::empty()),
-                    scope.catalog().as_ref(),
+                    scope.catalog(),
                 )? {
                     Binding::Typed(e) => e,
                     // `=` always resolves to a typed boolean expression.
@@ -944,7 +948,7 @@ fn bind_case(
     let mut result_bindings = Vec::with_capacity(then_bindings.len() + 1);
     result_bindings.extend(else_binding);
     result_bindings.extend(then_bindings);
-    let (ty, mut results) = unify_value_column(result_bindings, "CASE")?;
+    let (ty, mut results) = unify_value_column(result_bindings, "CASE", scope.catalog())?;
 
     let else_ = if has_else {
         Some(Box::new(results.remove(0)))
@@ -980,7 +984,7 @@ fn bind_case(
 /// The result is a [`BoundExpr::Coalesce`] rather than the equivalent `CASE WHEN a
 /// IS NOT NULL THEN a …`, because that shape would place — and evaluate — every
 /// argument twice. Laziness lives in the executor: `coalesce(1, 1/0)` is `1`.
-pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError> {
+pub(crate) fn bind_coalesce(bindings: Vec<Binding>, scope: &Scope) -> Result<Binding, BindError> {
     // `COALESCE()` is a syntax error in PG's grammar (`expr_list` is not
     // optional). This parser accepts an empty argument list for any call, so the
     // refusal has to happen here; the message is PG's, without its cursor.
@@ -990,7 +994,7 @@ pub(crate) fn bind_coalesce(bindings: Vec<Binding>) -> Result<Binding, BindError
             "syntax error at or near \")\"",
         ));
     }
-    let (ty, args) = unify_value_column(bindings, "COALESCE")?;
+    let (ty, args) = unify_value_column(bindings, "COALESCE", scope.catalog())?;
     if ty.is_collatable() {
         crate::collation::check_explicit_conflict(
             args.iter().map(crate::collation::expr_collation),
@@ -1016,7 +1020,7 @@ pub(crate) fn bind_min_max(
             "syntax error at or near \")\"",
         ));
     }
-    let (ty, args) = unify_value_column(bindings, kind.keyword())?;
+    let (ty, args) = unify_value_column(bindings, kind.keyword(), scope.catalog())?;
     if ty.is_collatable() {
         crate::collation::check_explicit_conflict(
             args.iter().map(crate::collation::expr_collation),
@@ -1081,7 +1085,7 @@ pub(crate) fn bind_nullif(bindings: Vec<Binding>, scope: &Scope) -> Result<Bindi
         right,
         Span::empty(),
         (Span::empty(), Span::empty()),
-        scope.catalog().as_ref(),
+        scope.catalog(),
     )?;
     let eq = match eq {
         Binding::Typed(e) => e,
@@ -1233,7 +1237,7 @@ fn bind_in_list(
             right,
             Span::empty(),
             (Span::empty(), Span::empty()),
-            scope.catalog().as_ref(),
+            scope.catalog(),
         )?;
         acc = Some(match acc {
             None => comparison,
@@ -1243,7 +1247,7 @@ fn bind_in_list(
                 comparison,
                 Span::empty(),
                 (Span::empty(), Span::empty()),
-                scope.catalog().as_ref(),
+                scope.catalog(),
             )?,
         });
     }
@@ -1288,7 +1292,7 @@ fn bind_between(
         low,
         Span::empty(),
         (Span::empty(), Span::empty()),
-        catalog.as_ref(),
+        catalog,
     )?;
     let high = bind_expr(high, scope)?;
     let hi = bind_binary_op(
@@ -1297,7 +1301,7 @@ fn bind_between(
         high,
         Span::empty(),
         (Span::empty(), Span::empty()),
-        catalog.as_ref(),
+        catalog,
     )?;
     bind_binary_op(
         chain,
@@ -1305,7 +1309,7 @@ fn bind_between(
         hi,
         Span::empty(),
         (Span::empty(), Span::empty()),
-        catalog.as_ref(),
+        catalog,
     )
 }
 

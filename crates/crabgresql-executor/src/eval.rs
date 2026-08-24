@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 
-use crabgresql_binder::{BinOp, BoundExpr, MinMaxKind, ScalarFn, UnaryOp};
+use crabgresql_binder::{BinOp, BoundDomain, BoundExpr, MinMaxKind, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::ProcInfo;
 use crabgresql_txn::{TxnContext, XactStatus};
@@ -148,6 +148,11 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
         BoundExpr::Reinterpret { expr, rep, .. } => {
             cast::reinterpret_value(eval(expr, row, ctx)?, *rep)
                 .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
+        }
+        BoundExpr::CoerceToDomain { expr, domain } => {
+            let value = eval(expr, row, ctx)?;
+            check_domain(&value, domain, ctx)?;
+            Ok(value)
         }
         BoundExpr::FuncCall { func, ret, args } => {
             // `LIKE` is the one scalar hot enough for the generic path's cost
@@ -423,10 +428,56 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
     }
 }
 
+/// Enforce a domain's constraints on a value entering it.
+///
+/// The two error texts and their SQLSTATEs were probed against PostgreSQL 18.4:
+/// `SELECT NULL::n2` over `CREATE DOMAIN n2 AS int NOT NULL` is
+/// `23502 domain n2 does not allow null values`, and `SELECT (-1)::p2` over
+/// `CHECK (VALUE > 0)` is
+/// `23514 value for domain p2 violates check constraint "p2_check"`. Neither
+/// carries a DETAIL — a domain has no row to print.
+///
+/// A NULL does **not** skip the checks. `CHECK (VALUE > 0)` admits one only
+/// because the predicate itself evaluates to NULL there, while
+/// `CHECK (VALUE IS NOT NULL)` — the spelling PostgreSQL's own documentation
+/// suggests — returns `false` and rejects it. Probed on 18.4: the first passes
+/// and the second raises 23514, which no "skip on NULL" rule reproduces.
+pub(crate) fn check_domain(
+    value: &Value,
+    domain: &BoundDomain,
+    ctx: &ExecContext,
+) -> Result<(), ExecError> {
+    if domain.not_null && matches!(value, Value::Null) {
+        return Err(ExecError::new(
+            "23502",
+            format!("domain {} does not allow null values", domain.name),
+        ));
+    }
+    if domain.checks.is_empty() {
+        return Ok(());
+    }
+    let row = std::slice::from_ref(value);
+    for (name, predicate) in &domain.checks {
+        // As for a table check, only an outright `false` violates: a NULL
+        // predicate passes.
+        if !matches!(eval(predicate, row, ctx)?, Value::Bool(false)) {
+            continue;
+        }
+        return Err(ExecError::new(
+            "23514",
+            format!(
+                "value for domain {} violates check constraint \"{name}\"",
+                domain.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Runtime side of a bind-time `Coerce` node, via the shared cast machinery.
 /// NULL passes through any cast.
 pub fn coerce_value(value: Value, ty: PgType, ctx: &ExecContext) -> Result<Value, ExecError> {
-    cast::cast_value(value, ty, &ctx.fmt)
+    cast::cast_value(value, runtime_target(ty, ctx), &ctx.fmt)
         .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
 }
 
@@ -439,8 +490,26 @@ pub fn coerce_value_assign(
     ty: PgType,
     ctx: &ExecContext,
 ) -> Result<Value, ExecError> {
-    cast::cast_value_assign(value, ty, &ctx.fmt)
+    cast::cast_value_assign(value, runtime_target(ty, ctx), &ctx.fmt)
         .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
+}
+
+/// The type a runtime coercion actually converts to: a domain resolves to its
+/// base first.
+///
+/// `crabgresql_types::cast` has no catalog, so a `PgType::User` reaches it as an
+/// opaque type it knows no cast to — while the value under a domain is
+/// *already* its base's, so there is nothing to convert. A plan's declared
+/// column type can be a domain anywhere the executor coerces to it, which is
+/// why this sits between both entry points and the cast machinery rather than
+/// at the site that first hit it: `scalar_subquery_value`, where
+/// `SELECT (SELECT domain_col FROM t)` failed with `cannot cast type integer to
+/// user-defined`.
+fn runtime_target(ty: PgType, ctx: &ExecContext) -> PgType {
+    match (ty, &ctx.types) {
+        (PgType::User(_), Some(types)) => types.base_type(ty),
+        _ => ty,
+    }
 }
 
 /// Dispatch the non-strict array constructor functions (`array_cat`,
@@ -1292,12 +1361,16 @@ fn eval_pg_get_constraintdef(args: &[Value], ctx: &ExecContext) -> Result<Value,
             let expr = def.expr.as_deref().unwrap_or_default();
             // Re-rendered rather than echoed, so the reader's `pretty` flag and
             // session time zone apply — the same round trip `pg_get_expr` makes.
-            let rendered = crabgresql_binder::ruleutils::stored_expr(expr, pretty, &ctx.fmt)
-                .unwrap_or_else(|| expr.to_string());
+            let rendered =
+                crabgresql_binder::ruleutils::stored_expr_of(expr, pretty, &ctx.fmt, def.is_domain)
+                    .unwrap_or_else(|| expr.to_string());
             format!("CHECK ({rendered})")
         }
         "p" => format!("PRIMARY KEY ({})", columns()),
         "u" => format!("UNIQUE ({})", columns()),
+        // A domain's NOT NULL names no column — there is none — and PostgreSQL
+        // prints the bare keyword for it (probed on 18.4).
+        "n" if def.is_domain => "NOT NULL".to_string(),
         "n" => format!("NOT NULL {}", columns()),
         // A contype this build does not render is better reported as absent
         // than as a definition that omits half of itself.

@@ -3,6 +3,8 @@
 //! search, …) gets its own resolver, and the unary/binary entry points try them
 //! in turn before reporting `42883`.
 
+use std::sync::Arc;
+
 use crabgresql_parser::ast::Spanned;
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
@@ -20,6 +22,7 @@ use super::coerce::{
     resolve_unknown, resolve_unknown_ctx, to_bool_operand, type_label,
 };
 use super::datatype::{has_equality, is_orderable};
+use super::domain::undomain_binding;
 use super::literal::parse_number;
 use super::scope::{Binding, Scope, normalize_ident};
 
@@ -470,6 +473,13 @@ fn bind_binary_bound_inner(
     operand_spans: (Span, Span),
     scope: &Scope,
 ) -> Result<Binding, BindError> {
+    // An operator over a domain is the operator over its base — PostgreSQL's
+    // `getBaseType` at the point of use, which is why `pg_typeof(a + 1)` on a
+    // `posint` column answers `integer`. Every binary operator funnels through
+    // here (the AST entry point and the quantified `ANY`/`ALL` path both), so
+    // this is the one place the strip has to happen for operators.
+    let lb = undomain_binding(lb, scope.catalog().as_ref());
+    let rb = undomain_binding(rb, scope.catalog().as_ref());
     // TODO: raise 3F000 `schema "x" does not exist` when the qualifier names no
     // schema, as PG does; the schema catalog is not reachable from the binder
     // scope, so that case collapses into the 42883 below.
@@ -617,7 +627,7 @@ fn bind_binary_bound_inner(
             )));
         }
     };
-    bind_binary_op(op, lb, rb, op_span, operand_spans, scope.catalog().as_ref())
+    bind_binary_op(op, lb, rb, op_span, operand_spans, scope.catalog())
 }
 
 /// Resolve a binary operator over two already-bound operands. Split out from
@@ -632,8 +642,16 @@ pub(crate) fn bind_binary_op(
     rb: Binding,
     op_span: Span,
     operand_spans: (Span, Span),
-    catalog: &dyn TypeCatalog,
+    catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<Binding, BindError> {
+    // The second domain-stripping chokepoint, and the one that catches the
+    // desugared comparisons — `CASE`, `BETWEEN`, `IN`, the chained forms — which
+    // build a `BinOp` directly instead of coming through the AST path.
+    let lb = undomain_binding(lb, catalog.as_ref());
+    let rb = undomain_binding(rb, catalog.as_ref());
+    // `resolve_unknown_ctx` needs the `Arc` (it may have to bind a domain's
+    // constraints); everything else below only reads the trait.
+    let types = catalog.as_ref();
     if op.is_logic() {
         // `AND`/`OR` are also built by desugaring (BETWEEN, chained
         // comparisons); those callers pass empty spans and so print no cursor,
@@ -687,11 +705,11 @@ pub(crate) fn bind_binary_op(
     // side is parsed as that type — PG reports `operator does not exist:
     // boolean + unknown`, never a coercion failure, when no operator applies.
     let (left, right, arg_ty) = match (lb, rb) {
-        (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op, catalog)?,
+        (Binding::Typed(l), Binding::Typed(r)) => unify_types(l, r, op, types)?,
         (Binding::Typed(l), Binding::Unknown { lit, span, param }) => {
             let ty = l.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
-                return Err(no_operator(&type_label(ty, catalog), op, "unknown"));
+                return Err(no_operator(&type_label(ty, types), op, "unknown"));
             }
             let r = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
             (l, r, ty)
@@ -699,7 +717,7 @@ pub(crate) fn bind_binary_op(
         (Binding::Unknown { lit, span, param }, Binding::Typed(r)) => {
             let ty = r.ty();
             if op.is_arithmetic() && !ty.is_numeric() {
-                return Err(no_operator("unknown", op, &type_label(ty, catalog)));
+                return Err(no_operator("unknown", op, &type_label(ty, types)));
             }
             let l = resolve_unknown_ctx(catalog, lit, span, param, ty)?;
             (l, r, ty)
@@ -758,12 +776,12 @@ pub(crate) fn bind_binary_op(
         // `cid` is narrower still: PostgreSQL 18.4's operator catalog gives it
         // `=` and nothing else, not even `<>`. Probed, not assumed — `pg_operator`
         // lists one row for `(cid, cid)` against two for `(xid, xid)`.
-        has_equality(arg_ty, catalog) && !(arg_ty == PgType::Cid && op == BinOp::NotEq)
+        has_equality(arg_ty, types) && !(arg_ty == PgType::Cid && op == BinOp::NotEq)
     } else {
-        is_orderable(arg_ty, catalog)
+        is_orderable(arg_ty, types)
     };
     if !supported {
-        let name = type_label(arg_ty, catalog);
+        let name = type_label(arg_ty, types);
         return Err(no_operator(&name, op, &name));
     }
 

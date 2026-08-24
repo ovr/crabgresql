@@ -13,6 +13,7 @@ use crate::BindError;
 use super::bind::bind_expr;
 use super::bound::{BoundAggregate, BoundExpr, BoundWindowSpec, ExprSortKey, WindowKind};
 use super::coerce::{coerce_expr, implicit_castable, resolve_unknown_ctx, type_label};
+use super::domain::{domain_of, wrap_domain};
 use super::operators::is_text_family;
 use super::params::param_ctx_capped;
 use super::scope::{Binding, Scope};
@@ -157,10 +158,22 @@ fn coerce_function_return(
 ) -> Result<BoundExpr, BindError> {
     let expr = match binding {
         Binding::Unknown { lit, span, param } => {
-            return resolve_unknown_ctx(catalog.as_ref(), lit, span, param, return_type);
+            return resolve_unknown_ctx(catalog, lit, span, param, return_type);
         }
         Binding::Typed(e) => e,
     };
+    // A domain return is the base return, then entry into the domain — the
+    // same two steps a column assignment takes, and PostgreSQL enforces it:
+    // `CREATE FUNCTION rdom(int) RETURNS dpos AS 'SELECT $1'` raises 23514 for
+    // a negative argument (probed on 18.4).
+    if let Some(info) = domain_of(return_type, catalog.as_ref()) {
+        let base = coerce_function_return(
+            Binding::Typed(expr),
+            catalog.base_type(return_type),
+            catalog,
+        )?;
+        return wrap_domain(base, &info, catalog, false);
+    }
     let ty = expr.ty();
     if ty == return_type {
         Ok(expr)
@@ -271,6 +284,10 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             expr: Box::new(inline_params(*expr, args)),
             reported,
             rep,
+        },
+        BoundExpr::CoerceToDomain { expr, domain } => BoundExpr::CoerceToDomain {
+            expr: Box::new(inline_params(*expr, args)),
+            domain,
         },
         BoundExpr::FuncCall {
             func,

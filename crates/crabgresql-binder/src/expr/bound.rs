@@ -89,6 +89,31 @@ impl PartialEq for Subplan {
     }
 }
 
+/// A domain's identity and constraints, bound and ready to run — the payload of
+/// a [`BoundExpr::CoerceToDomain`].
+///
+/// Each predicate is bound against a one-column shape whose single column is the
+/// domain's base type, so `VALUE` inside it is `ColumnRef { index: 0 }` and the
+/// evaluator feeds it a one-element tuple holding the value under test. That is
+/// the same trick a table `CHECK` uses, minus the table.
+///
+/// Shared behind an `Arc` because one domain reaches every row of a bulk load
+/// and the predicates are immutable once bound.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundDomain {
+    /// `pg_type` OID, which is also what [`BoundExpr::ty`] reports.
+    pub oid: u32,
+    pub name: Arc<str>,
+    pub not_null: bool,
+    /// `(constraint name, predicate)` sorted **by name**, which is the order
+    /// PostgreSQL reports violations in — exactly as for a table's checks.
+    /// Probed on 18.4: a domain declared `CONSTRAINT bbb CHECK (VALUE > 100)
+    /// CONSTRAINT aaa CHECK (VALUE > 200)` blames `aaa` for the value 0, and
+    /// one declared `mmm` then extended with `nnn` blames `mmm` — neither
+    /// declaration order nor its reverse explains both.
+    pub checks: Vec<(Arc<str>, BoundExpr)>,
+}
+
 /// Typed expression IR. Every node knows its result type; the evaluator
 /// dispatches on the recorded types and never re-infers them.
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +209,20 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         reported: PgType,
         rep: PgType,
+    },
+    /// Coercion into a `CREATE DOMAIN` type: the operand has already been cast
+    /// to the domain's base, and this node runs the domain's constraints over
+    /// the result. The value it passes on is unchanged; only [`BoundExpr::ty`]
+    /// differs, reporting the domain.
+    ///
+    /// It exists as a node rather than as a check the writing statement performs
+    /// because PostgreSQL enforces a domain wherever a value *enters* it, not
+    /// only where one is stored: `SELECT (-1)::posint` raises 23514 with no
+    /// table in sight. One node covers a whole `typbasetype` chain — see
+    /// [`BoundDomain`], which flattens it.
+    CoerceToDomain {
+        expr: Box<BoundExpr>,
+        domain: Arc<BoundDomain>,
     },
     /// A scalar function call; `ret` is the result type.
     FuncCall {
@@ -660,6 +699,9 @@ impl BoundExpr {
             BoundExpr::IsNull { .. } | BoundExpr::BoolTest { .. } => PgType::Bool,
             BoundExpr::Coerce { ty, .. } => *ty,
             BoundExpr::Reinterpret { reported, .. } => *reported,
+            // The domain, not the base the value is physically in — this is what
+            // makes `pg_typeof('1'::posint)` answer `posint`.
+            BoundExpr::CoerceToDomain { domain, .. } => PgType::User(domain.oid),
             BoundExpr::FuncCall { ret, .. } | BoundExpr::Routine { ret, .. } => *ret,
             BoundExpr::ArrayCtor { ty, .. } => *ty,
             BoundExpr::Subscript { ty, .. } => *ty,
@@ -689,7 +731,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.contains_srf(),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.contains_srf(),
             BoundExpr::Binary { left, right, .. } => left.contains_srf() || right.contains_srf(),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
@@ -744,7 +787,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => any(expr),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => any(expr),
             BoundExpr::Binary { left, right, .. } => any(left) || any(right),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
@@ -803,7 +847,9 @@ impl BoundExpr {
             }
             BoundExpr::Coerce { expr, .. } => expr.contains_aggregate(),
             BoundExpr::Collate { expr, .. } => expr.contains_aggregate(),
-            BoundExpr::Reinterpret { expr, .. } => expr.contains_aggregate(),
+            BoundExpr::Reinterpret { expr, .. } | BoundExpr::CoerceToDomain { expr, .. } => {
+                expr.contains_aggregate()
+            }
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }
             | BoundExpr::Srf { args, .. }
@@ -866,7 +912,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.contains_window(),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.contains_window(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_window() || right.contains_window()
             }
@@ -925,7 +972,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.first_agg_or_window(),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.first_agg_or_window(),
             BoundExpr::Binary { left, right, .. } => left
                 .first_agg_or_window()
                 .or_else(|| right.first_agg_or_window()),
@@ -1033,7 +1081,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.contains_volatile_fn(),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.contains_volatile_fn(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_volatile_fn() || right.contains_volatile_fn()
             }
@@ -1082,7 +1131,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.contains_subquery(),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.contains_subquery(),
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_subquery() || right.contains_subquery()
             }
@@ -1132,7 +1182,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.count_param_refs(index),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.count_param_refs(index),
             BoundExpr::Binary { left, right, .. } => {
                 left.count_param_refs(index) + right.count_param_refs(index)
             }
@@ -1203,7 +1254,8 @@ impl BoundExpr {
                 | BoundExpr::BoolTest { expr, .. }
                 | BoundExpr::Coerce { expr, .. }
                 | BoundExpr::Collate { expr, .. }
-                | BoundExpr::Reinterpret { expr, .. } => fold(expr, acc),
+                | BoundExpr::Reinterpret { expr, .. }
+                | BoundExpr::CoerceToDomain { expr, .. } => fold(expr, acc),
                 BoundExpr::Binary { left, right, .. } => {
                     fold(left, acc);
                     fold(right, acc);
@@ -1300,7 +1352,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.collect_column_refs(out),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.collect_column_refs(out),
             BoundExpr::Binary { left, right, .. } => {
                 left.collect_column_refs(out) && right.collect_column_refs(out)
             }
@@ -1408,7 +1461,8 @@ impl BoundExpr {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => expr.shift_column_refs(delta),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => expr.shift_column_refs(delta),
             BoundExpr::Binary { left, right, .. } => {
                 left.shift_column_refs(delta);
                 right.shift_column_refs(delta);

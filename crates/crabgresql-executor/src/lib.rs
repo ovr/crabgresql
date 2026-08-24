@@ -55,7 +55,7 @@ use crabgresql_storage_api::{
 use crabgresql_txn::{TupleHeader, TxnContext};
 use crabgresql_types::{FmtCtx, PgType, Value, cast};
 
-use checks::{CheckSet, NotNullSet};
+use checks::{CheckSet, DomainSet, NotNullSet};
 use eval::eval;
 pub use eval::{
     coerce_value, coerce_value_assign, compare_values, compare_values_collated, is_orderable,
@@ -367,6 +367,10 @@ pub struct ConstraintDef {
     pub columns: Vec<String>,
     /// The stored predicate of a check constraint; `None` for the rest.
     pub expr: Option<String>,
+    /// Whether this constrains a **domain** rather than a relation. It changes
+    /// two things in the rendering: a `NOT NULL` names no column, and a check's
+    /// operand is the `VALUE` placeholder rather than a column.
+    pub is_domain: bool,
 }
 
 /// What `pg_get_indexdef` needs to reproduce an index's DDL: the index and the
@@ -1359,7 +1363,8 @@ fn resolve_expr(
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => resolve_expr(expr, ctx, txn)?,
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => resolve_expr(expr, ctx, txn)?,
         BoundExpr::Binary { left, right, .. } => {
             resolve_expr(left, ctx, txn)?;
             resolve_expr(right, ctx, txn)?;
@@ -2531,19 +2536,22 @@ fn execute_insert(
     // to completion first is what makes `INSERT INTO t SELECT ... FROM t` read
     // only pre-insert rows (no Halloween problem), and lets validation/routing
     // see a stable set so the statement stays all-or-nothing.
-    let (tuples, notnull_verified) = collect_insert_tuples(source, ctx, txn)?;
+    let (tuples, notnull_verified, domains) = collect_insert_tuples(source, ctx, txn)?;
     match routing {
         // Partitioned parent: route each row to the leaf whose RANGE bound admits
         // its key and write there. `notnull_verified` indexes the parent's shape,
         // so it says nothing about the leaf a row is checked against — ignored
         // here, and empty by construction for the one source that builds it.
-        Some(leaves) => insert_routed(table, tuples, returning, &leaves, freeze, system, ctx, txn),
+        Some(leaves) => insert_routed(
+            table, tuples, returning, &leaves, &domains, freeze, system, ctx, txn,
+        ),
         // Ordinary table: rows go straight to `table`.
         None => insert_direct(
             table,
             tuples,
             returning,
             &notnull_verified,
+            &domains,
             freeze,
             system,
             ctx,
@@ -2583,9 +2591,11 @@ fn collect_insert_tuples(
     source: PhysicalInsertSource,
     ctx: &ExecContext,
     txn: &TxnContext,
-) -> Result<(Vec<Tuple>, Vec<u32>), ExecError> {
+) -> Result<(Vec<Tuple>, Vec<u32>, DomainSet), ExecError> {
     let mut tuples: Vec<Tuple> = Vec::new();
     let mut verified: Vec<u32> = Vec::new();
+    // Only a load owes any: see `DomainSet`.
+    let mut owed = DomainSet::none();
     match source {
         PhysicalInsertSource::Values(rows) => {
             for row in rows {
@@ -2614,8 +2624,10 @@ fn collect_insert_tuples(
             rows,
             defaults,
             notnull_verified,
+            domains,
         } => {
             tuples = rows;
+            owed = DomainSet::new(domains);
             // Safe against the defaults filled below: a builder only vouches for
             // the columns it filled itself, never one it left to the executor.
             verified = notnull_verified;
@@ -2643,7 +2655,7 @@ fn collect_insert_tuples(
             }
         }
     }
-    Ok((tuples, verified))
+    Ok((tuples, verified, owed))
 }
 
 /// Constraint-check and write every tuple to a single table (the non-partitioned
@@ -2655,6 +2667,7 @@ fn insert_direct(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     notnull_verified: &[u32],
+    domains: &DomainSet,
     freeze: bool,
     system: &[SysCol],
     ctx: &ExecContext,
@@ -2682,6 +2695,9 @@ fn insert_direct(
         }
     }
     for tuple in &tuples {
+        // Ahead of the relation's own constraints: a domain constraint belongs
+        // to the *coercion*, which in PostgreSQL happens before the row exists.
+        domains.validate(tuple, ctx)?;
         validate_constraints(&schema, tuple, &mut visible, &notnull, &checks, ctx)?;
         // The rows of this statement are not written until every one of them has
         // been checked, so the set is what carries a duplicate within one INSERT.
@@ -2766,6 +2782,7 @@ fn insert_routed(
     tuples: Vec<Tuple>,
     returning: Option<Returning>,
     leaves: &[Arc<dyn TableAm>],
+    domains: &DomainSet,
     freeze: bool,
     system: &[SysCol],
     ctx: &ExecContext,
@@ -2819,6 +2836,8 @@ fn insert_routed(
         }
         let checks = leaf_checks[leaf].as_ref().expect("just seeded");
         let notnull = leaf_notnull[leaf].get_or_insert_with(|| NotNullSet::for_schema(leaf_schema));
+        // As in `insert_direct`: the domain is entered before the row exists.
+        domains.validate(tuple, ctx)?;
         match visible[leaf].as_mut() {
             Some(seen) => {
                 validate_constraints(leaf_schema, tuple, seen, notnull, checks, ctx)?;

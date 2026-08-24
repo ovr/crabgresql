@@ -20,13 +20,14 @@ use crabgresql_types::{FmtCtx, PgType, Value};
 
 use crate::copy_rows::RowBatch;
 use crate::expr::{
-    BinOp, Binding, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem, ExprSortKey,
-    LateralBarrier, NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem, ViewExpansion,
-    VisibleColumn, VisibleLookup, WindowKind, apply_column_typmod, barrier_levels, bind_binary_op,
-    bind_column_default, bind_expr, bind_projection, bind_scalar, coerce_expr, coerce_to_column,
-    enum_value, lookup_visible, merge_types, normalize_ident, output_name, param_ctx_none,
-    param_ctx_view_body, parse_unknown, reject_agg_or_window, reject_window, text_column_value,
-    to_bool_operand, unify_value_column, view_expansion,
+    BinOp, Binding, BoundDomain, BoundExpr, BoundWindowFunc, BoundWindowSpec, DeclinedSystem,
+    ExprSortKey, LateralBarrier, NamedWindows, OuterLevel, ParamCtx, Scope, ScopeItem,
+    ViewExpansion, VisibleColumn, VisibleLookup, WindowKind, apply_typmod_value, barrier_levels,
+    bind_binary_op, bind_column_default, bind_domain, bind_expr, bind_projection, bind_scalar,
+    coerce_expr, coerce_to_column, domain_of, enum_value, lookup_visible, merge_types,
+    normalize_ident, output_name, param_ctx_none, param_ctx_view_body, parse_unknown,
+    reject_agg_or_window, reject_window, text_value, to_bool_operand, unify_value_column,
+    view_expansion,
 };
 use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
 use crate::logical_plan::{
@@ -613,7 +614,9 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         }
         BoundExpr::Coerce { expr, .. } => subst_expr(expr, params),
         BoundExpr::Collate { expr, .. } => subst_expr(expr, params),
-        BoundExpr::Reinterpret { expr, .. } => subst_expr(expr, params),
+        BoundExpr::Reinterpret { expr, .. } | BoundExpr::CoerceToDomain { expr, .. } => {
+            subst_expr(expr, params)
+        }
         BoundExpr::FuncCall { args, .. }
         | BoundExpr::Routine { args, .. }
         | BoundExpr::Srf { args, .. }
@@ -961,7 +964,8 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => subst_outer_expr(expr, outer, depth),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => subst_outer_expr(expr, outer, depth),
         BoundExpr::Binary { left, right, .. } => {
             subst_outer_expr(left, outer, depth);
             subst_outer_expr(right, outer, depth);
@@ -1398,7 +1402,8 @@ pub(crate) fn for_each_subexpr(
         | BoundExpr::BoolTest { expr, .. }
         | BoundExpr::Coerce { expr, .. }
         | BoundExpr::Collate { expr, .. }
-        | BoundExpr::Reinterpret { expr, .. } => for_each_subexpr(expr, depth, f),
+        | BoundExpr::Reinterpret { expr, .. }
+        | BoundExpr::CoerceToDomain { expr, .. } => for_each_subexpr(expr, depth, f),
         BoundExpr::Binary { left, right, .. } => {
             for_each_subexpr(left, depth, f);
             for_each_subexpr(right, depth, f);
@@ -2031,16 +2036,26 @@ fn unify_set_columns(
             let ty = cols[i].ty;
             common = Some(match common {
                 None => ty,
-                Some(prev) => merge_types(prev, ty).ok_or_else(|| {
-                    BindError::new(
-                        sqlstate::DATATYPE_MISMATCH,
-                        format!(
-                            "UNION types {} and {} cannot be matched",
-                            crate::expr::type_label(prev, catalog.as_ref()),
-                            crate::expr::type_label(ty, catalog.as_ref()),
-                        ),
-                    )
-                })?,
+                Some(prev) => merge_types(prev, ty)
+                    .or_else(|| {
+                        // A domain survives a set operation only when every arm
+                        // is the same domain (which `merge_types` already
+                        // settled above, equal types merging to themselves).
+                        // Otherwise it resolves on its base: 18.4 answers
+                        // `integer` for `posint UNION integer`.
+                        let (p, t) = (catalog.base_type(prev), catalog.base_type(ty));
+                        ((p, t) != (prev, ty)).then(|| merge_types(p, t)).flatten()
+                    })
+                    .ok_or_else(|| {
+                        BindError::new(
+                            sqlstate::DATATYPE_MISMATCH,
+                            format!(
+                                "UNION types {} and {} cannot be matched",
+                                crate::expr::type_label(prev, catalog.as_ref()),
+                                crate::expr::type_label(ty, catalog.as_ref()),
+                            ),
+                        )
+                    })?,
             });
             let next = to_derived(&cols[i]);
             derived = Some(match derived {
@@ -3945,7 +3960,7 @@ fn build_merged_join(
             Binding::Typed(right_expr.clone()),
             crabgresql_parser::Span::empty(),
             (Span::empty(), Span::empty()),
-            catalog.as_ref(),
+            catalog,
         )?;
         let Binding::Typed(eq_expr) = eq else {
             unreachable!("equality of typed operands is always typed");
@@ -4135,7 +4150,7 @@ fn bind_values_query(
     let mut columns = Vec::with_capacity(width);
     let mut column_cells: Vec<Vec<BoundExpr>> = Vec::with_capacity(width);
     for (i, bindings) in columns_of_bindings.into_iter().enumerate() {
-        let (ty, cells) = unify_value_column(bindings, "VALUES")?;
+        let (ty, cells) = unify_value_column(bindings, "VALUES", catalog)?;
         columns.push(OutputColumn::new(format!("column{}", i + 1), ty));
         column_cells.push(cells);
     }
@@ -4569,6 +4584,20 @@ fn bind_order_by(
         let collation = projections.get(column).map_or(DEFAULT_COLLATION_OID, |e| {
             crate::collation::expr_collation(e).collation
         });
+        // A domain sorts as its base does, under the collation the domain
+        // carries — the key is internal, so this does not touch the type the
+        // projection reports.
+        let (ty, collation) = match domain_of(ty, scope.catalog().as_ref()) {
+            Some(info) => {
+                let base = scope.catalog().base_type(ty);
+                (
+                    base,
+                    crate::expr::domain_collation(&info, base)
+                        .unwrap_or_else(|| crabgresql_types::collation::type_collation(base)),
+                )
+            }
+            None => (ty, collation),
+        };
         keys.push(SortKey {
             column,
             ty,
@@ -5433,6 +5462,10 @@ fn rewrite_over_window(
             reported,
             rep,
         }),
+        BoundExpr::CoerceToDomain { expr, domain } => Ok(BoundExpr::CoerceToDomain {
+            expr: Box::new(rewrite_over_window(*expr, input_width, groups)?),
+            domain,
+        }),
         BoundExpr::FuncCall { func, ret, args } => Ok(BoundExpr::FuncCall {
             func,
             ret,
@@ -5838,6 +5871,15 @@ fn rewrite_over_aggregate(
             reported,
             rep,
         }),
+        BoundExpr::CoerceToDomain { expr, domain } => Ok(BoundExpr::CoerceToDomain {
+            expr: Box::new(rewrite_over_aggregate(
+                *expr,
+                group_exprs,
+                aggregates,
+                scope,
+            )?),
+            domain,
+        }),
         BoundExpr::FuncCall { func, ret, args } => {
             let args = args
                 .into_iter()
@@ -6070,13 +6112,24 @@ fn default_for_column(
     column: &Column,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<BoundExpr, BindError> {
-    let Some(sql) = &column.default else {
-        return Ok(BoundExpr::Const {
-            value: Value::Null,
-            ty: column.ty,
-        });
+    let sql = match &column.default {
+        Some(sql) => sql.clone(),
+        // A column of a domain with no default of its own takes the *domain's*
+        // default. It is resolved here rather than copied down at CREATE TABLE
+        // because PostgreSQL resolves it per statement: `ALTER DOMAIN … SET
+        // DEFAULT` changes what later inserts into an existing table get, and
+        // `information_schema.columns.column_default` stays NULL throughout.
+        None => match domain_of(column.ty, catalog.as_ref()).and_then(|d| d.default) {
+            Some(sql) => sql,
+            None => {
+                return Ok(BoundExpr::Const {
+                    value: Value::Null,
+                    ty: column.ty,
+                });
+            }
+        },
     };
-    let expr = crate::parse_stored_expr(sql, "default expression")?;
+    let expr = crate::parse_stored_expr(&sql, "default expression")?;
     bind_column_default(&expr, column, catalog)
 }
 
@@ -6532,6 +6585,33 @@ impl CopyFromPlan {
             })
             .collect();
 
+        // The shape a field is parsed into, which for a domain column is not
+        // the shape it declares: the value is the base type's, with the
+        // modifier from the `typbasetype` chain. Resolved per batch for the
+        // same reason `enums` is — each entry costs a catalog read lock.
+        let storage: Vec<(PgType, i32)> = self
+            .target_indices
+            .iter()
+            .map(|&idx| {
+                let column = &self.schema.columns[idx];
+                match matches!(column.ty, PgType::User(_)) {
+                    true => catalog.base_type_and_typmod(column.ty),
+                    false => (column.ty, column.typmod),
+                }
+            })
+            .collect();
+
+        // A domain column's constraints: COPY parses values without an
+        // expression tree, so there is no `CoerceToDomain` to carry them and
+        // the executor enforces them from here instead. Bound once per batch,
+        // never per cell.
+        let mut domains: Vec<(usize, Arc<BoundDomain>)> = Vec::new();
+        for &idx in &self.target_indices {
+            if let Some(info) = domain_of(self.schema.columns[idx].ty, catalog.as_ref()) {
+                domains.push((idx, Arc::new(bind_domain(&info, catalog)?)));
+            }
+        }
+
         // A reordered column list parses into this first, so the fields are read
         // in wire order while the tuple is still assembled in schema order.
         // Allocated once for the batch — and not at all for the ordered case,
@@ -6549,10 +6629,13 @@ impl CopyFromPlan {
             self.check_arity(fields.len())?;
             if !self.rows.ordered {
                 scattered.clear();
-                for ((field, &idx), enum_info) in
-                    fields.iter().zip(&self.target_indices).zip(&enums)
+                for (((field, &idx), enum_info), &shape) in fields
+                    .iter()
+                    .zip(&self.target_indices)
+                    .zip(&enums)
+                    .zip(&storage)
                 {
-                    scattered.push(self.field_value(field, idx, enum_info.as_ref(), fmt)?);
+                    scattered.push(self.field_value(field, idx, enum_info.as_ref(), shape, fmt)?);
                 }
             }
             let mut tuple = Vec::with_capacity(self.rows.slots.len());
@@ -6566,6 +6649,7 @@ impl CopyFromPlan {
                                 fields.get(*k),
                                 self.target_indices[*k],
                                 enums[*k].as_ref(),
+                                storage[*k],
                                 fmt,
                             )?,
                             // Already parsed above, in wire order; move it out
@@ -6602,6 +6686,7 @@ impl CopyFromPlan {
                 rows: tuples,
                 defaults: self.rows.defaults.clone(),
                 notnull_verified,
+                domains,
             },
             returning: None,
             // A partitioned parent routes each decoded row to a leaf, reusing the
@@ -6617,13 +6702,15 @@ impl CopyFromPlan {
 
     /// One decoded field as its column's [`Value`]: `None` is the NULL marker,
     /// anything else parses through the column's input function and then its
-    /// length rule. `enum_info` is the column's labels when it is an enum,
-    /// resolved once per batch by the caller.
+    /// length rule. `enum_info` is the column's labels when it is an enum and
+    /// `shape` the `(type, typmod)` it parses into, both resolved once per batch
+    /// by the caller.
     fn field_value(
         &self,
         field: Option<&str>,
         idx: usize,
         enum_info: Option<&EnumInfo>,
+        shape: (PgType, i32),
         fmt: &FmtCtx,
     ) -> Result<Value, BindError> {
         // The NULL marker: a genuine SQL NULL, not the column default, and it
@@ -6631,26 +6718,26 @@ impl CopyFromPlan {
         let Some(text) = field else {
             return Ok(Value::Null);
         };
-        let column = &self.schema.columns[idx];
+        let (ty, typmod) = shape;
         if let Some(info) = enum_info {
-            let PgType::User(oid) = column.ty else {
+            let PgType::User(oid) = self.schema.columns[idx].ty else {
                 unreachable!("only a user type resolves an enum")
             };
-            return apply_column_typmod(enum_value(oid, info, text)?, column);
+            return apply_typmod_value(enum_value(oid, info, text)?, ty, typmod);
         }
-        match column.ty {
+        match ty {
             // The text family goes straight from the batch's arena to the
             // finished value: parsing it into a `String` first, only for the
             // length rule to read that `String` and build another, is the one
             // allocation a load can drop outright.
             PgType::Text | PgType::Varchar | PgType::Bpchar | PgType::Name => {
-                text_column_value(text, column)
+                text_value(text, ty, typmod)
             }
             // Anything else, including a user type that is not an enum: the
             // input dispatch handles it, naming the type `user-defined` the way
             // the expression path does. Reachable, because dropping a type a
             // column still uses is allowed here.
-            _ => apply_column_typmod(parse_unknown(text, column.ty, fmt)?, column),
+            _ => apply_typmod_value(parse_unknown(text, ty, fmt)?, ty, typmod),
         }
     }
 

@@ -323,7 +323,8 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
             | BoundExpr::BoolTest { expr, .. }
             | BoundExpr::Coerce { expr, .. }
             | BoundExpr::Collate { expr, .. }
-            | BoundExpr::Reinterpret { expr, .. } => opaque(expr),
+            | BoundExpr::Reinterpret { expr, .. }
+            | BoundExpr::CoerceToDomain { expr, .. } => opaque(expr),
             BoundExpr::Binary { left, right, .. } => opaque(left) || opaque(right),
             BoundExpr::FuncCall { args, .. }
             | BoundExpr::Routine { args, .. }

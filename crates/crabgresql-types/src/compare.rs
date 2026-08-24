@@ -160,7 +160,10 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             (_, Value::Null) => Ordering::Greater,
             _ => match (l.pg_type(), r.pg_type()) {
                 (Some(a), Some(b)) if a == b && !matches!(a, PgType::User(_)) => {
-                    compare_values(a, l, r)
+                    // `collation`, not the default: a domain value reaches here
+                    // as its base, and losing the collation would order a text
+                    // domain byte-wise.
+                    compare_values_collated(a, l, r, collation)
                 }
                 (Some(a), Some(b)) => a.oid().cmp(&b.oid()),
                 _ => Ordering::Equal,

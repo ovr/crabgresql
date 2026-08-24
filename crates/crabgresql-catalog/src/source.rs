@@ -266,7 +266,8 @@ pub struct ViewDepRelation {
     pub columns: Option<Vec<String>>,
 }
 
-/// A user-defined type reflected into `pg_type` (and, for enums, `pg_enum`).
+/// A user-defined type reflected into `pg_type` (and, for enums, `pg_enum`; for
+/// domains, `pg_constraint`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogUserType {
     pub oid: u32,
@@ -274,10 +275,43 @@ pub struct CatalogUserType {
     /// The enum labels in definition (= sort) order, or `None` for a non-enum
     /// user type.
     ///
-    /// TODO: reflect non-enum `CREATE TYPE` shapes into `pg_type` — only rows
-    /// with labels here are emitted (`typtype = 'e'`), so any other user type
-    /// is invisible to a client reading the catalog.
+    /// TODO: reflect a `CREATE TYPE ... (INPUT = …)` base type into `pg_type`.
+    /// A row is emitted only for an enum (`typtype = 'e'`) or a domain
+    /// (`typtype = 'd'`), so any other user type is invisible to a client
+    /// reading the catalog.
     pub enum_labels: Option<Vec<String>>,
+    /// The definition of a `CREATE DOMAIN`, or `None` for any other user type.
+    /// Mutually exclusive with [`CatalogUserType::enum_labels`].
+    pub domain: Option<CatalogDomain>,
+}
+
+/// The `pg_type` columns a domain fills in beyond a plain type's, plus the
+/// constraints that become its `pg_constraint` rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogDomain {
+    /// `typbasetype` — the *immediate* base, which may be another domain.
+    pub basetype: u32,
+    /// The end of the `typbasetype` chain. Not a `pg_type` column: it is where
+    /// the physical columns a domain copies (`typlen`, `typbyval`, `typalign`,
+    /// `typstorage`, `typcategory`, the output/send functions) are read from.
+    pub resolved_basetype: u32,
+    pub typmod: i32,
+    /// `typcollation`, or `0` for a non-collatable base.
+    pub collation: u32,
+    pub not_null: bool,
+    /// `typdefault`, as the canonical SQL PostgreSQL stores.
+    pub default: Option<String>,
+    /// The domain's `CHECK` constraints in declaration order.
+    pub checks: Vec<CatalogDomainCheck>,
+}
+
+/// One `CHECK` of a [`CatalogDomain`], as `pg_constraint` publishes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogDomainCheck {
+    pub name: String,
+    /// The predicate over `VALUE` as stored SQL — `pg_constraint.conbin`.
+    pub expr: String,
+    pub validated: bool,
 }
 
 /// A user-defined routine reflected into `pg_proc`. Built by whoever owns the

@@ -1,0 +1,469 @@
+--
+-- CREATE DOMAIN / ALTER DOMAIN / DROP DOMAIN
+-- A domain is a distinct type over a base type: values are physically the
+-- base's, but the domain is what pg_typeof and pg_attribute name, and its
+-- constraints run wherever a value enters it — an explicit cast included.
+-- Expected output generated from PostgreSQL 18.4 with `psql -q -a`.
+--
+CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+SELECT 1::posint;
+ posint 
+--------
+      1
+(1 row)
+
+SELECT (-1)::posint;
+ERROR:  value for domain posint violates check constraint "posint_check"
+-- A NULL passes a CHECK, as it does for a table constraint.
+SELECT NULL::posint;
+ posint 
+--------
+       
+(1 row)
+
+-- The declared type is the domain, not the base.
+SELECT pg_typeof(1::posint);
+ pg_typeof 
+-----------
+ posint
+(1 row)
+
+-- NOT NULL is a constraint of its own, with its own SQLSTATE.
+CREATE DOMAIN nn AS int NOT NULL;
+SELECT NULL::nn;
+ERROR:  domain nn does not allow null values
+SELECT 1::nn;
+ nn 
+----
+  1
+(1 row)
+
+-- A domain carries the type modifier; a column of it has atttypmod -1.
+CREATE DOMAIN v3 AS varchar(3);
+SELECT 'ab'::v3;
+ v3 
+----
+ ab
+(1 row)
+
+SELECT 'abcd'::v3;
+ v3  
+-----
+ abc
+(1 row)
+
+--
+-- As a column type.
+--
+CREATE TABLE t (a posint, b v3);
+INSERT INTO t VALUES (1, 'ab');
+INSERT INTO t VALUES (-1, 'ab');
+ERROR:  value for domain posint violates check constraint "posint_check"
+INSERT INTO t VALUES (1, 'abcd');
+ERROR:  value too long for type character varying(3)
+UPDATE t SET a = -5;
+ERROR:  value for domain posint violates check constraint "posint_check"
+-- The column reports the domain; anything computed from it reports the base.
+SELECT a, b, a + 1, pg_typeof(a), pg_typeof(a + 1) FROM t;
+ a | b  | ?column? | pg_typeof | pg_typeof 
+---+----+----------+-----------+-----------
+ 1 | ab |        2 | posint    | integer
+(1 row)
+
+SELECT atttypid::regtype, atttypmod FROM pg_attribute WHERE attrelid = 't'::regclass AND attnum > 0 ORDER BY attnum;
+ atttypid | atttypmod 
+----------+-----------
+ posint   |        -1
+ v3       |        -1
+(2 rows)
+
+--
+-- A domain over a domain: the inner (base) constraints run first.
+--
+CREATE DOMAIN dd AS posint CHECK (VALUE > 10);
+SELECT 50::dd;
+ dd 
+----
+ 50
+(1 row)
+
+SELECT 5::dd;
+ERROR:  value for domain dd violates check constraint "dd_check"
+SELECT (-5)::dd;
+ERROR:  value for domain dd violates check constraint "posint_check"
+SELECT typbasetype::regtype FROM pg_type WHERE typname = 'dd';
+ typbasetype 
+-------------
+ posint
+(1 row)
+
+--
+-- Two violated constraints resolve by name, not by declaration order.
+--
+CREATE DOMAIN ord AS int CONSTRAINT bbb CHECK (VALUE > 100) CONSTRAINT aaa CHECK (VALUE > 200);
+SELECT 0::ord;
+ERROR:  value for domain ord violates check constraint "aaa"
+--
+-- A domain default fills a column that has none of its own, and is resolved
+-- per statement rather than copied into the table.
+--
+CREATE DOMAIN dz AS int DEFAULT 7;
+CREATE TABLE tz (x dz, y int);
+INSERT INTO tz(y) VALUES (1);
+ALTER DOMAIN dz SET DEFAULT 9;
+INSERT INTO tz(y) VALUES (2);
+SELECT * FROM tz ORDER BY y;
+ x | y 
+---+---
+ 7 | 1
+ 9 | 2
+(2 rows)
+
+SELECT column_default FROM information_schema.columns WHERE table_name = 'tz' AND column_name = 'x';
+ column_default 
+----------------
+ 
+(1 row)
+
+--
+-- ALTER DOMAIN re-scans the columns already typed on the domain.
+--
+CREATE DOMAIN d AS int;
+CREATE TABLE tt (x d);
+INSERT INTO tt VALUES (1), (NULL), (-3);
+ALTER DOMAIN d SET NOT NULL;
+ERROR:  column "x" of table "tt" contains null values
+ALTER DOMAIN d ADD CONSTRAINT c1 CHECK (VALUE > 0);
+ERROR:  column "x" of table "tt" contains values that violate the new constraint
+-- NOT VALID skips the scan; VALIDATE runs it.
+ALTER DOMAIN d ADD CONSTRAINT c1 CHECK (VALUE > 0) NOT VALID;
+ALTER DOMAIN d VALIDATE CONSTRAINT c1;
+ERROR:  column "x" of table "tt" contains values that violate the new constraint
+DELETE FROM tt WHERE x IS NULL OR x < 0;
+ALTER DOMAIN d SET NOT NULL;
+ALTER DOMAIN d VALIDATE CONSTRAINT c1;
+ALTER DOMAIN d ADD CHECK (VALUE < 100);
+INSERT INTO tt VALUES (0);
+ERROR:  value for domain d violates check constraint "c1"
+INSERT INTO tt VALUES (500);
+ERROR:  value for domain d violates check constraint "d_check"
+ALTER DOMAIN d DROP CONSTRAINT c1;
+ALTER DOMAIN d DROP CONSTRAINT c1;
+ERROR:  constraint "c1" of domain "d" does not exist
+ALTER DOMAIN d DROP CONSTRAINT IF EXISTS c1;
+NOTICE:  constraint "c1" of domain "d" does not exist, skipping
+ALTER DOMAIN d RENAME CONSTRAINT d_check TO zz;
+ALTER DOMAIN d DROP NOT NULL;
+ALTER DOMAIN d SET DEFAULT 3;
+ALTER DOMAIN d DROP DEFAULT;
+ALTER DOMAIN nosuch SET NOT NULL;
+ERROR:  type "nosuch" does not exist
+--
+-- Operators, functions and the type-unifying constructs all resolve on the
+-- base — except where every branch is the *same* domain, which keeps it.
+--
+CREATE TABLE u (x posint);
+INSERT INTO u VALUES (1), (2), (3);
+SELECT max(x), min(x), sum(x), count(x) FROM u;
+ max | min | sum | count 
+-----+-----+-----+-------
+   3 |   1 |   6 |     3
+(1 row)
+
+SELECT abs(x), x * 2 FROM u ORDER BY 1;
+ abs | ?column? 
+-----+----------
+   1 |        2
+   2 |        4
+   3 |        6
+(3 rows)
+
+SELECT array_agg(x ORDER BY x) FROM u;
+ array_agg 
+-----------
+ {1,2,3}
+(1 row)
+
+SELECT x, count(*) FROM u GROUP BY x ORDER BY x;
+ x | count 
+---+-------
+ 1 |     1
+ 2 |     1
+ 3 |     1
+(3 rows)
+
+SELECT DISTINCT x FROM u ORDER BY x;
+ x 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT pg_typeof(CASE WHEN true THEN x ELSE x END) FROM u LIMIT 1;
+ pg_typeof 
+-----------
+ posint
+(1 row)
+
+SELECT pg_typeof(CASE WHEN true THEN x ELSE 0 END) FROM u LIMIT 1;
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+SELECT pg_typeof(coalesce(x, x)), pg_typeof(greatest(x, x)) FROM u LIMIT 1;
+ pg_typeof | pg_typeof 
+-----------+-----------
+ posint    | posint
+(1 row)
+
+SELECT pg_typeof(coalesce(x, 0)), pg_typeof(greatest(x, 0)) FROM u LIMIT 1;
+ pg_typeof | pg_typeof 
+-----------+-----------
+ integer   | integer
+(1 row)
+
+SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT x FROM u) s LIMIT 1;
+ pg_typeof 
+-----------
+ posint
+(1 row)
+
+SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT 9) s LIMIT 1;
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+DROP TABLE u;
+--
+-- A domain on the *source* side of an assignment is just its base value.
+--
+CREATE TABLE plain (x int);
+INSERT INTO plain(x) SELECT a FROM t;
+SELECT * FROM plain;
+ x 
+---
+ 1
+(1 row)
+
+UPDATE plain SET x = (SELECT a FROM t);
+DROP TABLE plain;
+--
+-- A CHECK is evaluated for NULL too — only a `false` violates. That is what
+-- makes `CHECK (VALUE IS NOT NULL)`, the spelling the PostgreSQL manual
+-- suggests, actually reject a NULL while `CHECK (VALUE > 0)` admits one.
+--
+CREATE DOMAIN notnullish AS int CHECK (VALUE IS NOT NULL);
+SELECT NULL::notnullish;
+ERROR:  value for domain notnullish violates check constraint "notnullish_check"
+SELECT 1::notnullish;
+ notnullish 
+------------
+          1
+(1 row)
+
+--
+-- A domain over a domain inherits the modifier its chain declares, even though
+-- its own typtypmod is -1.
+--
+CREATE DOMAIN v3b AS v3;
+SELECT 'abcd'::v3b;
+ v3b 
+-----
+ abc
+(1 row)
+
+SELECT typtypmod FROM pg_type WHERE typname = 'v3b';
+ typtypmod 
+-----------
+        -1
+(1 row)
+
+--
+-- COPY parses through the base type and still enforces the domain.
+--
+-- One documented divergence in the expected output: PostgreSQL follows a failed
+-- COPY with a `CONTEXT: COPY loaded, line 1, column a: "-1"` line. This build
+-- carries no error context on any COPY error, so those lines are absent — a gap
+-- in COPY diagnostics generally, not in the domain check that raised them.
+--
+CREATE TABLE loaded (a posint, b v3, c int);
+COPY loaded (a, b, c) FROM stdin;
+COPY loaded (a, b, c) FROM stdin;
+ERROR:  value for domain posint violates check constraint "posint_check"
+COPY loaded (a, b, c) FROM stdin;
+ERROR:  value too long for type character varying(3)
+COPY loaded (a, b, c) FROM stdin;
+SELECT * FROM loaded ORDER BY c;
+ a | b  | c 
+---+----+---
+ 5 | ab | 1
+   | xy | 4
+(2 rows)
+
+DROP TABLE loaded;
+--
+-- A domain constraint runs before the relation's own NOT NULL: it belongs to
+-- the coercion, which happens before the row exists.
+--
+CREATE TABLE ordering (a posint NOT NULL, b int NOT NULL);
+INSERT INTO ordering VALUES (-1, NULL);
+ERROR:  value for domain posint violates check constraint "posint_check"
+DROP TABLE ordering;
+--
+-- A domain as a function's parameter and as its return type.
+--
+CREATE FUNCTION takes(p posint) RETURNS int AS 'SELECT p::int * 2' LANGUAGE SQL;
+SELECT takes(5);
+ takes 
+-------
+    10
+(1 row)
+
+SELECT takes(-1);
+ERROR:  value for domain posint violates check constraint "posint_check"
+CREATE FUNCTION returns_dom(p int) RETURNS posint AS 'SELECT p' LANGUAGE SQL;
+SELECT returns_dom(5);
+ returns_dom 
+-------------
+           5
+(1 row)
+
+SELECT returns_dom(-1);
+ERROR:  value for domain posint violates check constraint "posint_check"
+--
+-- A domain is where a collation can be declared, and it drives the ordering.
+-- `y` pins `C` explicitly so the comparison is against a known order rather
+-- than against whatever collation the database was created with.
+--
+CREATE DOMAIN ci AS text COLLATE "en-x-icu";
+CREATE DOMAIN dtext AS text;
+CREATE TABLE collated (x ci, y text COLLATE "C", z dtext);
+INSERT INTO collated VALUES ('B', 'B', 'B'), ('a', 'a', 'a'), ('A', 'A', 'A'), ('b', 'b', 'b');
+SELECT x FROM collated ORDER BY x;
+ x 
+---
+ a
+ A
+ b
+ B
+(4 rows)
+
+SELECT y FROM collated ORDER BY y;
+ y 
+---
+ A
+ B
+ a
+ b
+(4 rows)
+
+SELECT z FROM collated ORDER BY z COLLATE "en-x-icu";
+ z 
+---
+ a
+ A
+ b
+ B
+(4 rows)
+
+DROP TABLE collated;
+--
+-- Catalog reflection.
+--
+SELECT typname, typtype, typlen, typbyval, typcategory, typinput, typoutput, typalign, typstorage, typnotnull, typbasetype::regtype, typtypmod, typcollation, typdefault
+  FROM pg_type WHERE typname IN ('posint', 'nn', 'v3', 'dz') ORDER BY typname;
+ typname | typtype | typlen | typbyval | typcategory | typinput  | typoutput  | typalign | typstorage | typnotnull |    typbasetype    | typtypmod | typcollation | typdefault 
+---------+---------+--------+----------+-------------+-----------+------------+----------+------------+------------+-------------------+-----------+--------------+------------
+ dz      | d       |      4 | t        | N           | domain_in | int4out    | i        | p          | f          | integer           |        -1 |            0 | 9
+ nn      | d       |      4 | t        | N           | domain_in | int4out    | i        | p          | t          | integer           |        -1 |            0 | 
+ posint  | d       |      4 | t        | N           | domain_in | int4out    | i        | p          | f          | integer           |        -1 |            0 | 
+ v3      | d       |     -1 | f        | S           | domain_in | varcharout | i        | x          | f          | character varying |         7 |          100 | 
+(4 rows)
+
+-- Likewise scoped: upstream's information_schema domains carry constraints of
+-- their own.
+--
+-- One documented divergence in the expected output below: PostgreSQL renders
+-- `dd_check` as `CHECK (((VALUE)::integer > 10))`, decorating VALUE with the
+-- coercion out of the base *domain* `posint`. It stores a node tree and can see
+-- that coercion; this build stores the predicate as SQL text, where there is no
+-- cast to render. The predicate itself is the same one, and both agree on every
+-- value.
+SELECT conname, contype, contypid::regtype, conrelid, conkey, convalidated, pg_get_constraintdef(oid)
+  FROM pg_constraint c WHERE contypid <> 0
+   AND (SELECT typnamespace FROM pg_type WHERE oid = c.contypid) = 'public'::regnamespace
+ ORDER BY conname;
+     conname      | contype |  contypid  | conrelid | conkey | convalidated |    pg_get_constraintdef     
+------------------+---------+------------+----------+--------+--------------+-----------------------------
+ aaa              | c       | ord        |        0 |        | t            | CHECK ((VALUE > 200))
+ bbb              | c       | ord        |        0 |        | t            | CHECK ((VALUE > 100))
+ dd_check         | c       | dd         |        0 |        | t            | CHECK ((VALUE > 10))
+ nn_not_null      | n       | nn         |        0 |        | t            | NOT NULL
+ notnullish_check | c       | notnullish |        0 |        | t            | CHECK ((VALUE IS NOT NULL))
+ posint_check     | c       | posint     |        0 |        | t            | CHECK ((VALUE > 0))
+ zz               | c       | d          |        0 |        | t            | CHECK ((VALUE < 100))
+(7 rows)
+
+-- Scoped to `public`: PostgreSQL's own information_schema is itself built on
+-- domains (sql_identifier, cardinal_number, …), which this build has none of.
+SELECT domain_name, data_type, character_maximum_length, numeric_precision, domain_default, udt_schema, udt_name, dtd_identifier
+  FROM information_schema.domains WHERE domain_schema = 'public' ORDER BY domain_name;
+ domain_name |     data_type     | character_maximum_length | numeric_precision | domain_default | udt_schema | udt_name | dtd_identifier 
+-------------+-------------------+--------------------------+-------------------+----------------+------------+----------+----------------
+ ci          | text              |                          |                   |                | pg_catalog | text     | 1
+ d           | integer           |                          |                32 |                | pg_catalog | int4     | 1
+ dd          | USER-DEFINED      |                          |                   |                | public     | posint   | 1
+ dtext       | text              |                          |                   |                | pg_catalog | text     | 1
+ dz          | integer           |                          |                32 | 9              | pg_catalog | int4     | 1
+ nn          | integer           |                          |                32 |                | pg_catalog | int4     | 1
+ notnullish  | integer           |                          |                32 |                | pg_catalog | int4     | 1
+ ord         | integer           |                          |                32 |                | pg_catalog | int4     | 1
+ posint      | integer           |                          |                32 |                | pg_catalog | int4     | 1
+ v3          | character varying |                        3 |                   |                | pg_catalog | varchar  | 1
+ v3b         | USER-DEFINED      |                          |                   |                | public     | v3       | 1
+(11 rows)
+
+SELECT column_name, data_type, character_maximum_length, domain_schema, domain_name, udt_name
+  FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
+ column_name |     data_type     | character_maximum_length | domain_schema | domain_name | udt_name 
+-------------+-------------------+--------------------------+---------------+-------------+----------
+ a           | integer           |                          | public        | posint      | int4
+ b           | character varying |                        3 | public        | v3          | varchar
+(2 rows)
+
+--
+-- DROP.
+--
+DROP DOMAIN d;
+ERROR:  cannot drop type d because other objects depend on it
+DETAIL:  column x of table tt depends on type d
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE tt;
+DROP DOMAIN d;
+DROP DOMAIN d;
+ERROR:  type "d" does not exist
+DROP DOMAIN IF EXISTS d;
+NOTICE:  type "d" does not exist, skipping
+DROP DOMAIN posint;
+ERROR:  cannot drop type posint because other objects depend on it
+DETAIL:  column a of table t depends on type posint
+type dd depends on type posint
+function takes(posint) depends on type posint
+function returns_dom(integer) depends on type posint
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE t;
+DROP TABLE tz;
+DROP DOMAIN dd;
+DROP DOMAIN posint;
+ERROR:  cannot drop type posint because other objects depend on it
+DETAIL:  function takes(posint) depends on type posint
+function returns_dom(integer) depends on type posint
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP DOMAIN nn, dz, ord, notnullish, ci, dtext;
+DROP FUNCTION takes(posint);
+DROP FUNCTION returns_dom(int);
+DROP DOMAIN v3b;
+DROP DOMAIN v3;

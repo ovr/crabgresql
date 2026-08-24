@@ -50,9 +50,10 @@ pub use catalogs::extension::{AvailableExtension, available_extensions};
 pub use oids::PLPGSQL_LANG_OID;
 pub use registry::{builtin_relation_name, builtin_relation_oid, builtin_view_definition};
 pub use source::{
-    CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
-    CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
-    CatalogUserType, CatalogViewDependency, RelKind, StaticSource, ViewDepRelation,
+    CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
+    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
+    CatalogSetting, CatalogSource, CatalogUserType, CatalogViewDependency, RelKind, StaticSource,
+    ViewDepRelation,
 };
 
 #[cfg(test)]
@@ -154,7 +155,11 @@ pub struct CatalogConstraint {
     /// The namespace of the table it constrains — resolved to `connamespace` by
     /// whoever renders the row.
     pub namespace: String,
+    /// `conrelid`: the table it constrains, or `0` for a domain constraint.
     pub table_oid: u32,
+    /// `contypid`: the domain it constrains, or `0` for a table constraint.
+    /// Exactly one of this and [`CatalogConstraint::table_oid`] is non-zero.
+    pub type_oid: u32,
     /// The backing index for `p`/`u`, `0` for a constraint with no index.
     pub index_oid: u32,
     /// Constrained column positions, zero-based; rendered as `conkey`'s
@@ -169,6 +174,25 @@ pub struct CatalogConstraint {
     pub validated: bool,
     pub islocal: bool,
     pub inhcount: i16,
+}
+
+/// The `pg_constraint` name PostgreSQL gives a domain's `NOT NULL`.
+///
+/// One definition because two things read it: the row this catalog publishes,
+/// and `ALTER DOMAIN ... DROP CONSTRAINT`, which matches the written name
+/// against it. If they drifted, the published constraint would be undroppable.
+pub fn not_null_constraint_name(domain: &str) -> String {
+    format!("{domain}_not_null")
+}
+
+/// What [`SystemCatalog::constraint_def`] hands back: enough of a
+/// `pg_constraint` row to render its DDL, without exposing the row itself.
+pub struct ConstraintDefRow {
+    pub contype: String,
+    pub columns: Vec<String>,
+    pub expr: Option<String>,
+    /// A domain constraint rather than a relation's.
+    pub is_domain: bool,
 }
 
 /// A table's out-of-line ("TOAST") relation, as `pg_class` publishes it.
@@ -1084,6 +1108,7 @@ impl SystemCatalog {
                         contype: "n",
                         namespace: schema.namespace.clone(),
                         table_oid: *table_oid,
+                        type_oid: 0,
                         index_oid: 0,
                         columns: vec![position],
                         expr: None,
@@ -1099,6 +1124,7 @@ impl SystemCatalog {
                         contype: "c",
                         namespace: schema.namespace.clone(),
                         table_oid: *table_oid,
+                        type_oid: 0,
                         // A check is not index-backed.
                         index_oid: 0,
                         columns: check.columns.clone(),
@@ -1123,6 +1149,7 @@ impl SystemCatalog {
                     },
                     namespace: index.table_schema.namespace.clone(),
                     table_oid: index.table_oid,
+                    type_oid: 0,
                     index_oid: index.oid,
                     columns: index.metadata.keys.iter().map(|key| key.column).collect(),
                     expr: None,
@@ -1130,6 +1157,46 @@ impl SystemCatalog {
                     islocal: true,
                     inhcount: 0,
                 });
+            }
+            // Domain constraints last, so adding one cannot renumber a table's.
+            // `conrelid` is 0 and `conkey` empty on every one of them, as on
+            // PostgreSQL 18.4, where a domain constraint constrains a *type*.
+            for user_type in self.user_types() {
+                let Some(domain) = &user_type.domain else {
+                    continue;
+                };
+                if domain.not_null {
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: not_null_constraint_name(&user_type.name),
+                        contype: "n",
+                        namespace: "public".to_string(),
+                        table_oid: 0,
+                        type_oid: user_type.oid,
+                        index_oid: 0,
+                        columns: Vec::new(),
+                        expr: None,
+                        validated: true,
+                        islocal: true,
+                        inhcount: 0,
+                    });
+                }
+                for check in &domain.checks {
+                    out.push(CatalogConstraint {
+                        oid: first + out.len() as u32,
+                        name: check.name.clone(),
+                        contype: "c",
+                        namespace: "public".to_string(),
+                        table_oid: 0,
+                        type_oid: user_type.oid,
+                        index_oid: 0,
+                        columns: Vec::new(),
+                        expr: Some(check.expr.clone()),
+                        validated: check.validated,
+                        islocal: true,
+                        inhcount: 0,
+                    });
+                }
             }
             out
         })
@@ -1292,30 +1359,38 @@ impl SystemCatalog {
     /// list whose elements are whole `TableSchema`s. The stored OID is still
     /// compared afterwards, so a future non-positional assignment degrades to
     /// not-found rather than to the wrong constraint (as in [`Self::relation_ref`]).
-    pub fn constraint_def(&self, oid: u32) -> Option<(String, Vec<String>, Option<String>)> {
+    pub fn constraint_def(&self, oid: u32) -> Option<ConstraintDefRow> {
         let constraints = self.constraint_oids();
         let base = constraints.first()?.oid;
         let constraint = constraints.get(oid.checked_sub(base)? as usize)?;
         if constraint.oid != oid {
             return None;
         }
-        let relations = self.relation_oids();
-        let (stored, schema) =
-            relations.get(constraint.table_oid.checked_sub(FIRST_REL_OID)? as usize)?;
-        if *stored != constraint.table_oid {
-            return None;
-        }
-        let columns = constraint
-            .columns
-            .iter()
-            .filter_map(|position| schema.columns.get(*position))
-            .map(|column| column.name.clone())
-            .collect();
-        Some((
-            constraint.contype.to_string(),
+        // A domain constraint has no relation and no columns — `conrelid` is 0
+        // and `conkey` NULL — so the relation lookup below would fail it.
+        let columns = match constraint.table_oid {
+            0 => Vec::new(),
+            table_oid => {
+                let relations = self.relation_oids();
+                let (stored, schema) =
+                    relations.get(table_oid.checked_sub(FIRST_REL_OID)? as usize)?;
+                if *stored != table_oid {
+                    return None;
+                }
+                constraint
+                    .columns
+                    .iter()
+                    .filter_map(|position| schema.columns.get(*position))
+                    .map(|column| column.name.clone())
+                    .collect()
+            }
+        };
+        Some(ConstraintDefRow {
+            contype: constraint.contype.to_string(),
             columns,
-            constraint.expr.clone(),
-        ))
+            expr: constraint.expr.clone(),
+            is_domain: constraint.type_oid != 0,
+        })
     }
 
     /// The view the rewrite rule `oid` is attached to — `pg_rewrite.ev_class`,

@@ -7,9 +7,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crabgresql_catalog::{
-    CatalogBackend, CatalogCursor, CatalogLock, CatalogLockTarget, CatalogPreparedStatement,
-    CatalogRelation, CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource,
-    CatalogUserType, CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
+    CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
+    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
+    CatalogSetting, CatalogSource, CatalogUserType, CatalogViewDependency, SerialSequenceLookup,
+    SystemCatalog, ViewDepRelation,
 };
 use crabgresql_executor::{
     CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, PartitionKeyDef,
@@ -414,10 +415,30 @@ impl CatalogSource for SessionCatalogSource {
         self.global_catalog
             .user_types()
             .into_iter()
-            .map(|t| CatalogUserType {
-                oid: t.oid,
-                name: t.name,
-                enum_labels: t.enum_labels,
+            .map(|t| {
+                let domain = t.domain.map(|d| CatalogDomain {
+                    basetype: d.base.oid(),
+                    resolved_basetype: self.global_catalog.base_type(d.base).oid(),
+                    typmod: d.typmod,
+                    collation: d.collation.unwrap_or(0),
+                    not_null: d.not_null,
+                    default: d.default,
+                    checks: d
+                        .checks
+                        .into_iter()
+                        .map(|c| CatalogDomainCheck {
+                            name: c.name,
+                            expr: c.expr,
+                            validated: c.validated,
+                        })
+                        .collect(),
+                });
+                CatalogUserType {
+                    oid: t.oid,
+                    name: t.name,
+                    enum_labels: t.enum_labels,
+                    domain,
+                }
             })
             .collect()
     }
@@ -777,11 +798,12 @@ impl CatalogOps for SessionCatalogOps {
     }
 
     fn constraint_def(&self, oid: u32) -> Option<ConstraintDef> {
-        let (contype, columns, expr) = self.system.constraint_def(oid)?;
+        let row = self.system.constraint_def(oid)?;
         Some(ConstraintDef {
-            contype,
-            columns,
-            expr,
+            contype: row.contype,
+            columns: row.columns,
+            expr: row.expr,
+            is_domain: row.is_domain,
         })
     }
 

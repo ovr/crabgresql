@@ -2,6 +2,8 @@
 //! common type two operands unify to, and the rules that turn an `unknown`
 //! literal into a typed value.
 
+use std::sync::Arc;
+
 use crabgresql_parser::{Span, ast};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{EnumInfo, TypeCatalog, UserCast};
@@ -17,6 +19,7 @@ use crate::functions::ScalarFn;
 use super::bind::bind_expr;
 use super::bound::BoundExpr;
 use super::datatype::{apply_length_typmod_if_any, apply_numeric_typmod_if_any, resolve_data_type};
+use super::domain::{domain_of, undomain, undomain_binding, wrap_domain};
 use super::operators::is_text_family;
 use super::params::ParamCtx;
 use super::scope::{Binding, Scope};
@@ -68,7 +71,7 @@ pub(super) fn bind_cast(
     }
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
-            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, target)?
+            resolve_unknown_cast(scope.catalog(), lit, span, param, target)?
         }
         Binding::Typed(e) => coerce_cast(e, target, scope)?,
     };
@@ -88,7 +91,7 @@ pub(super) fn bind_cast(
 fn bind_reg_cast(inner: &ast::Expr, kind: RegKind, scope: &Scope) -> Result<BoundExpr, BindError> {
     let expr = match bind_expr(inner, scope)? {
         Binding::Unknown { lit, span, param } => {
-            resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, param, PgType::Text)?
+            resolve_unknown_ctx(scope.catalog(), lit, span, param, PgType::Text)?
         }
         Binding::Typed(e) => e,
     };
@@ -140,6 +143,19 @@ fn coerce_user_cast(
         return Ok(expr);
     }
     let catalog = scope.catalog();
+
+    // Both domain directions are settled before the `CREATE CAST` registry is
+    // consulted: no `pg_cast` row stands between a domain and its base in
+    // PostgreSQL either, the coercion is implicit in the type's definition.
+    if let Some(info) = domain_of(target, catalog.as_ref()) {
+        // Straight to the end of the `typbasetype` chain, because one node
+        // covers the whole of it — see `bind_domain`.
+        let inner = coerce_cast(expr, catalog.base_type(target), scope)?;
+        return wrap_domain(inner, &info, catalog, true);
+    }
+    if domain_of(source, catalog.as_ref()).is_some() {
+        return coerce_cast(undomain(expr, catalog.as_ref()), target, scope);
+    }
 
     // Enum → text renders the label (PG's `enum_out`); the other text-family
     // targets do not have this cast, so they must use an explicitly registered
@@ -217,7 +233,7 @@ pub(super) fn bind_typed_string(
             )));
         }
     };
-    let expr = resolve_unknown_ctx(scope.catalog().as_ref(), lit, span, None, target)?;
+    let expr = resolve_unknown_cast(scope.catalog(), lit, span, None, target)?;
     let expr = apply_numeric_typmod_if_any(expr, target, &ts.data_type)?;
     Ok(Binding::Typed(apply_length_typmod_if_any(
         expr,
@@ -451,7 +467,25 @@ fn common_type_castable(from: PgType, to: PgType) -> bool {
 pub(crate) fn unify_value_column(
     bindings: Vec<Binding>,
     label: &str,
+    catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(PgType, Vec<BoundExpr>), BindError> {
+    // A domain survives only when every typed branch is the *same* domain;
+    // as soon as one branch differs, the set resolves on the base. Probed on
+    // 18.4: `CASE WHEN … THEN a ELSE a END` over a `posint` column is `posint`,
+    // while `… THEN a ELSE 0 END` is `integer`.
+    let mut typed = bindings.iter().filter_map(|b| match b {
+        Binding::Typed(e) => Some(e.ty()),
+        _ => None,
+    });
+    let first = typed.next();
+    let uniform = typed.all(|ty| Some(ty) == first);
+    let bindings: Vec<Binding> = match uniform {
+        true => bindings,
+        false => bindings
+            .into_iter()
+            .map(|b| undomain_binding(b, catalog.as_ref()))
+            .collect(),
+    };
     let mut common: Option<PgType> = None;
     for binding in &bindings {
         if let Binding::Typed(e) = binding {
@@ -1040,12 +1074,48 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
 /// (an unknown label is PG's `invalid input value for enum` error). Every other
 /// target defers to the catalog-free [`resolve_unknown`].
 pub(crate) fn resolve_unknown_ctx(
-    catalog: &dyn TypeCatalog,
+    catalog: &Arc<dyn TypeCatalog>,
     lit: Option<String>,
     span: Span,
     param: Option<(usize, ParamCtx)>,
     ty: PgType,
 ) -> Result<BoundExpr, BindError> {
+    resolve_unknown_in(catalog, lit, span, param, ty, false)
+}
+
+/// [`resolve_unknown_ctx`] in explicit-cast context. The two differ only for a
+/// domain target, whose type modifier truncates on a cast and raises on an
+/// assignment — see [`super::domain::wrap_domain`].
+pub(crate) fn resolve_unknown_cast(
+    catalog: &Arc<dyn TypeCatalog>,
+    lit: Option<String>,
+    span: Span,
+    param: Option<(usize, ParamCtx)>,
+    ty: PgType,
+) -> Result<BoundExpr, BindError> {
+    resolve_unknown_in(catalog, lit, span, param, ty, true)
+}
+
+fn resolve_unknown_in(
+    catalog: &Arc<dyn TypeCatalog>,
+    lit: Option<String>,
+    span: Span,
+    param: Option<(usize, ParamCtx)>,
+    ty: PgType,
+    explicit: bool,
+) -> Result<BoundExpr, BindError> {
+    // A value entering a domain takes the base type and is then checked, which
+    // is also the path `'abcd'::v3` takes into a `varchar(3)` domain: the
+    // modifier lives on the type, so only the domain wrapper can apply it.
+    //
+    // Ahead of the parameter shortcut below, because a `$1::posint` is exactly
+    // the case where the check cannot fold at bind time and *has* to survive as
+    // a node.
+    if let Some(info) = domain_of(ty, catalog.as_ref()) {
+        let base = catalog.base_type(ty);
+        let inner = resolve_unknown_in(catalog, lit, span, param, base, explicit)?;
+        return wrap_domain(inner, &info, catalog, explicit);
+    }
     if param.is_some() {
         return resolve_unknown(lit, span, param, ty);
     }

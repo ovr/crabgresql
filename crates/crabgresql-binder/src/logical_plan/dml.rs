@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crabgresql_storage_api::{TableAm, Tuple};
 
 use crate::OutputColumn;
-use crate::expr::BoundExpr;
+use crate::expr::{BoundDomain, BoundExpr};
 
 use super::{LogicalPlan, MappedRelation, SysCol};
 
@@ -139,6 +139,14 @@ pub enum InsertSource {
         /// `rows`. The executor subtracts them from the live schema's not-null
         /// list; empty — every builder but COPY — just checks them all.
         notnull_verified: Vec<u32>,
+        /// The domain constraints owed on the columns that carry one, paired
+        /// with the column each guards.
+        ///
+        /// Every other source coerces through a `BoundExpr::CoerceToDomain`,
+        /// which enforces the domain as the value is computed; a load has no
+        /// expression to hang that on, so it hands the executor the bound
+        /// constraints instead. Empty for a relation with no domain column.
+        domains: Vec<(usize, Arc<BoundDomain>)>,
     },
     /// `INSERT ... SELECT` / `INSERT ... TABLE t`: rows are pulled from `input`
     /// at execution time. `projections` is full-width in schema order — non-target

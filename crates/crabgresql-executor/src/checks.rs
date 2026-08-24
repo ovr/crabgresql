@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crabgresql_binder::BoundExpr;
+use crabgresql_binder::{BoundDomain, BoundExpr};
 use crabgresql_storage_api::{TableSchema, Tuple, TypeCatalog};
 use crabgresql_types::Value;
 
@@ -94,6 +94,44 @@ fn violation(schema: &TableSchema, tuple: &Tuple, index: usize, ctx: &ExecContex
         "Failing row contains ({}).",
         display_tuple(schema, tuple, ctx)
     )))
+}
+
+/// The domain constraints a tuple source could not enforce itself, paired with
+/// the column each guards.
+///
+/// Only COPY builds one: every other source coerces each value through a
+/// `BoundExpr::CoerceToDomain`, which fires while the value is computed —
+/// *before* the row exists, which is where PostgreSQL puts it. Probed on 18.4:
+/// `INSERT INTO t(a dpos NOT NULL, b int NOT NULL) VALUES (-1, NULL)` reports
+/// the domain, not `b`'s not-null. Running this set ahead of [`NotNullSet`]
+/// reproduces that order for the load path too.
+pub(crate) struct DomainSet {
+    columns: Vec<(usize, Arc<BoundDomain>)>,
+}
+
+impl DomainSet {
+    pub(crate) fn new(columns: Vec<(usize, Arc<BoundDomain>)>) -> Self {
+        DomainSet { columns }
+    }
+
+    /// A set that checks nothing — every source but COPY, and any relation with
+    /// no domain column.
+    pub(crate) fn none() -> Self {
+        DomainSet {
+            columns: Vec::new(),
+        }
+    }
+
+    pub(crate) fn validate(&self, tuple: &Tuple, ctx: &ExecContext) -> Result<(), ExecError> {
+        for (index, domain) in &self.columns {
+            // `get`, as in `NotNullSet::validate`: a tuple narrower than the
+            // shape is not this function's to diagnose.
+            if let Some(value) = tuple.get(*index) {
+                eval::check_domain(value, domain, ctx)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A relation's `CHECK` constraints, bound and ordered the way violations are

@@ -83,9 +83,9 @@ pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Bool(true),
                 Value::Bool(c.validated),
                 Value::Oid(c.table_oid),
-                // contypid. TODO: publish domain constraints; `CREATE DOMAIN`
-                // is not implemented, so no constraint here belongs to a type.
-                Value::Oid(0),
+                // contypid: the domain a domain constraint belongs to, 0 for a
+                // table constraint. Exactly one of the two is ever non-zero.
+                Value::Oid(c.type_oid),
                 Value::Oid(c.index_oid),
                 // conparentid. TODO: copy a partitioned parent's `CHECK`
                 // constraints into its leaves, each pointing back at the

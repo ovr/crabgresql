@@ -69,6 +69,11 @@ const HANDWRITTEN_CATALOG_PROCS: &[&str] = &[
     "enum_out",
     "enum_recv",
     "enum_send",
+    // A domain's `pg_type` row is built at run time from the base type's, but
+    // its input side is always PostgreSQL's own: `typinput = domain_in`,
+    // `typreceive = domain_recv` on every domain row (probed on 18.4).
+    "domain_in",
+    "domain_recv",
 ];
 
 /// Read the vendored `.dat` files in `catalog_dir` and write the generated row

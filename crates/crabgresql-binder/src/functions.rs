@@ -19,7 +19,8 @@ use crabgresql_types::{PgType, RegKind};
 
 use crate::expr::{
     ArgFail, Binding, BoundExpr, BoundWindowSpec, ExprSortKey, MinMaxKind, Scope, WindowKind,
-    bind_expr, bind_sql_function_body, coerce_for_arg, inline_params,
+    bind_expr, bind_sql_function_body, coerce_for_arg, domain_of, inline_params, undomain_binding,
+    wrap_domain,
 };
 use crate::{BindError, BoundAggregate, OutputColumn};
 
@@ -3953,7 +3954,7 @@ fn bind_special_form(
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
     match form {
-        SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings),
+        SpecialForm::Coalesce => crate::expr::bind_coalesce(bindings, scope),
         SpecialForm::NullIf => crate::expr::bind_nullif(bindings, scope),
         SpecialForm::MinMax(kind) => crate::expr::bind_min_max(kind, bindings, scope),
     }
@@ -4170,13 +4171,7 @@ fn bind_pg_typeof(binding: Binding, scope: &Scope) -> Result<Binding, BindError>
         // argument.
         Binding::Unknown { lit, span, param } => (
             crabgresql_types::oid::UNKNOWN,
-            crate::expr::resolve_unknown_ctx(
-                scope.catalog().as_ref(),
-                lit,
-                span,
-                param,
-                PgType::Text,
-            )?,
+            crate::expr::resolve_unknown_ctx(scope.catalog(), lit, span, param, PgType::Text)?,
         ),
     };
     finish_func_call(
@@ -4575,6 +4570,9 @@ fn bind_aggregate(
     let bindings = arg_exprs
         .iter()
         .map(|e| crate::expr::bind_expr(e, scope))
+        // An aggregate over a domain is the aggregate over its base, as for
+        // any other call: `sum(posint_column)` is `sum(integer)`.
+        .map(|b| b.map(|b| undomain_binding(b, scope.catalog().as_ref())))
         .collect::<Result<Vec<_>, _>>()?;
     if agg == AggFn::ArrayAgg
         && bindings
@@ -4912,6 +4910,13 @@ pub(crate) fn resolve_call_variadic(
     catalog: &Arc<dyn TypeCatalog>,
     variadic_call: bool,
 ) -> Result<Binding, BindError> {
+    // A function call over a domain resolves on the base type, as an operator
+    // does — `length(v3col)` is `length(varchar)`. Both the built-in overload
+    // table below and the user-routine fallback see the stripped arguments.
+    let bindings: Vec<Binding> = bindings
+        .into_iter()
+        .map(|b| undomain_binding(b, catalog.as_ref()))
+        .collect();
     let sigs = lookup(name);
     if sigs.is_empty() {
         // No built-in of this name: a user-defined `LANGUAGE SQL` function may
@@ -5084,7 +5089,9 @@ fn resolve_user_routine_call(
     catalog: &Arc<dyn TypeCatalog>,
     variadic_call: bool,
 ) -> Result<Binding, BindError> {
-    let Some((sig, args)) = choose_routine_overload(name, &bindings, &sigs, variadic_call)? else {
+    let Some((sig, args)) =
+        choose_routine_overload(name, &bindings, &sigs, variadic_call, catalog)?
+    else {
         return Err(undefined_function(name, &bindings));
     };
 
@@ -5204,11 +5211,22 @@ fn choose_routine_overload<'a>(
     bindings: &[Binding],
     sigs: &'a [RoutineSig],
     variadic_call: bool,
+    catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<Option<(&'a RoutineSig, Vec<BoundExpr>)>, BindError> {
     let spread = |sig: &RoutineSig| sig.variadic_elem.is_some() && !variadic_call;
-    let mut candidates: Vec<(&RoutineSig, Vec<PgType>)> = sigs
+    // Each candidate carries its parameter list twice: as declared, which is
+    // what an argument finally enters, and resolved on the base, which is what
+    // it is matched and scored against. A parameter declared on a domain
+    // accepts whatever its base accepts, and the arguments arrived
+    // base-stripped (see `resolve_call_variadic`), so matching them against a
+    // declared `PgType::User(oid)` would find no overload at all.
+    let mut candidates: Vec<(&RoutineSig, Vec<PgType>, Vec<PgType>)> = sigs
         .iter()
-        .filter_map(|sig| routine_params(sig, bindings.len(), variadic_call).map(|p| (sig, p)))
+        .filter_map(|sig| {
+            let declared = routine_params(sig, bindings.len(), variadic_call)?;
+            let base = declared.iter().map(|t| catalog.base_type(*t)).collect();
+            Some((sig, declared, base))
+        })
         .collect();
     // `m(VARIADIC int[])` and `m(int)` both present `int` to `m(1)`, and
     // PostgreSQL calls the second whichever order they were created in. The
@@ -5218,17 +5236,17 @@ fn choose_routine_overload<'a>(
     // keep competing, and so are `42725`. All four verified on 18.4.
     let fixed: Vec<Vec<PgType>> = candidates
         .iter()
-        .filter(|(sig, _)| !spread(sig))
-        .map(|(_, params)| params.clone())
+        .filter(|(sig, _, _)| !spread(sig))
+        .map(|(_, _, base)| base.clone())
         .collect();
-    candidates.retain(|(sig, params)| !spread(sig) || !fixed.contains(params));
+    candidates.retain(|(sig, _, base)| !spread(sig) || !fixed.contains(base));
 
     // Two overloads can never share the same argument types (`create_function`
     // rejects that), and the dedup above closed the one other way two
     // candidates could present the same list, so at most one all-exact match
     // exists.
-    for (sig, params) in &candidates {
-        if let Ok(args) = try_coerce_args(bindings, params, true) {
+    for (sig, declared, base) in &candidates {
+        if let Ok(args) = coerce_routine_args(bindings, declared, base, true, catalog) {
             return Ok(Some((sig, pack_variadic_tail(sig, variadic_call, args))));
         }
     }
@@ -5237,8 +5255,8 @@ fn choose_routine_overload<'a>(
     let mut best: Option<(usize, &RoutineSig, Vec<BoundExpr>)> = None;
     let mut tied = false;
     let mut literal_fail: Option<BindError> = None;
-    for (sig, params) in &candidates {
-        let args = match try_coerce_args(bindings, params, false) {
+    for (sig, declared, base) in &candidates {
+        let args = match coerce_routine_args(bindings, declared, base, false, catalog) {
             Ok(args) => args,
             // As for built-ins: the rejected literal of a lone candidate is the
             // error PG reports, since the overload was already chosen by then.
@@ -5250,7 +5268,7 @@ fn choose_routine_overload<'a>(
         };
         let score = bindings
             .iter()
-            .zip(params)
+            .zip(base)
             .filter(|(b, target)| matches!(b, Binding::Typed(e) if e.ty() == **target))
             .count();
         let args = pack_variadic_tail(sig, variadic_call, args);
@@ -5273,6 +5291,39 @@ fn choose_routine_overload<'a>(
         return Err(e);
     }
     Ok(best.map(|(_, sig, args)| (sig, args)))
+}
+
+/// Coerce a call's arguments to one candidate's parameter list.
+///
+/// `base` is what each argument is matched and coerced against — a domain
+/// parameter accepts whatever its base does — and `declared` is what the
+/// coerced argument then enters, so a domain parameter's constraints run on the
+/// call. PostgreSQL enforces them there: `f(-1)` on `f(p posint)` raises 23514
+/// (probed on 18.4).
+///
+/// A domain violation folded at bind time reports as [`ArgFail::LiteralInput`],
+/// the way a rejected literal already travels: it surfaces only when the
+/// candidate was the sole one, and is otherwise just a candidate that did not
+/// fit.
+fn coerce_routine_args(
+    bindings: &[Binding],
+    declared: &[PgType],
+    base: &[PgType],
+    exact_only: bool,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<BoundExpr>, ArgFail> {
+    let args = try_coerce_args(bindings, base, exact_only)?;
+    args.into_iter()
+        .zip(declared)
+        .map(
+            |(arg, declared)| match domain_of(*declared, catalog.as_ref()) {
+                Some(info) => {
+                    wrap_domain(arg, &info, catalog, false).map_err(ArgFail::LiteralInput)
+                }
+                None => Ok(arg),
+            },
+        )
+        .collect()
 }
 
 /// Bind a `CEIL(x)` / `FLOOR(x)` expression (sqlparser parses these as dedicated

@@ -78,6 +78,11 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // `oid`/`int2`, both orderable, so there is no element check here.
             | PgType::Vector(_)
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
+        // A domain orders exactly as its base does: the value under it *is* a
+        // base value, and `compare_values` dispatches on the value. `base_type`
+        // answering something else is itself the "this is a domain" test, so
+        // there is no second lookup to ask it.
+        || (catalog.base_type(ty) != ty && is_orderable(catalog.base_type(ty), catalog))
 }
 
 /// Types with a default *equality* operator — a superset of the orderable ones,
@@ -99,6 +104,7 @@ pub(crate) fn has_equality(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
     if let PgType::Array(elem) = ty {
         return PgType::from_oid(elem).is_some_and(|e| has_equality(e, catalog));
     }
+    let ty = catalog.base_type(ty);
     matches!(ty, PgType::Xid | PgType::Cid) || is_orderable(ty, catalog)
 }
 
@@ -759,48 +765,84 @@ pub(super) fn apply_length_to_column(
     expr: BoundExpr,
     column: &Column,
 ) -> Result<BoundExpr, BindError> {
+    apply_length(expr, column.ty, column.typmod)
+}
+
+/// [`apply_length_to_column`] over a bare `(type, typmod)` pair, which is how a
+/// domain carries its modifier: `CREATE DOMAIN v AS varchar(3)` stores the 3 on
+/// the *type*, and a column of that domain has `atttypmod = -1`.
+pub(super) fn apply_length(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+) -> Result<BoundExpr, BindError> {
+    apply_length_in(expr, ty, typmod, false)
+}
+
+/// [`apply_length`] in **explicit-cast** context, where an over-long
+/// varchar/char truncates instead of raising. The distinction is observable on
+/// a domain, which is the only place one `(type, typmod)` pair is reached from
+/// both contexts: `'abcd'::v3` yields `abc` while inserting `'abcd'` into a `v3`
+/// column raises `value too long for type character varying(3)`.
+pub(super) fn apply_length_cast(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+) -> Result<BoundExpr, BindError> {
+    apply_length_in(expr, ty, typmod, true)
+}
+
+fn apply_length_in(
+    expr: BoundExpr,
+    ty: PgType,
+    typmod: i32,
+    explicit: bool,
+) -> Result<BoundExpr, BindError> {
     // `numeric` and the datetime types round rather than truncating, and share
     // their whole implementation with the cast path.
-    if column.typmod >= 0 {
-        match column.ty {
+    if typmod >= 0 {
+        match ty {
             PgType::Numeric => {
-                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                let (precision, scale) = Numeric::unpack_typmod(typmod);
                 return apply_numeric_typmod(expr, precision, scale);
             }
             PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
-                return apply_datetime_precision(expr, column.typmod);
+                return apply_datetime_precision(expr, typmod);
             }
-            PgType::Interval => return apply_interval_typmod(expr, column.typmod),
+            PgType::Interval => return apply_interval_typmod(expr, typmod),
             _ => {}
         }
     }
-    let func = match column.ty {
-        PgType::Varchar if column.typmod >= 0 => ScalarFn::VarcharTypmod,
-        PgType::Bpchar if column.typmod >= 0 => ScalarFn::BpcharTypmod,
-        PgType::Bit if column.typmod >= 0 => ScalarFn::BitTypmod,
-        PgType::Varbit if column.typmod >= 0 => ScalarFn::VarbitTypmod,
+    let func = match ty {
+        PgType::Varchar if typmod >= 0 => ScalarFn::VarcharTypmod,
+        PgType::Bpchar if typmod >= 0 => ScalarFn::BpcharTypmod,
+        PgType::Bit if typmod >= 0 => ScalarFn::BitTypmod,
+        PgType::Varbit if typmod >= 0 => ScalarFn::VarbitTypmod,
         PgType::Name => ScalarFn::NameInput,
         _ => return Ok(expr),
     };
-    // Fold a constant now (assignment semantics: error on non-blank overflow).
+    // Fold a constant now, under whichever of the two rules applies.
     if let BoundExpr::Const {
         value: Value::Text(s),
         ..
     } = &expr
     {
-        let folded = match func {
-            ScalarFn::VarcharTypmod => {
-                crabgresql_types::text::varchar_input(s, column.typmod, false)
+        let folded = match (func, explicit) {
+            (ScalarFn::VarcharTypmod, true) => crabgresql_types::text::truncate_chars(s, typmod),
+            (ScalarFn::VarcharTypmod, false) => {
+                crabgresql_types::text::varchar_input(s, typmod, false)
                     .map_err(|e| BindError::new(e.sqlstate, e.message))?
             }
-            ScalarFn::BpcharTypmod => crabgresql_types::text::bpchar_input(s, column.typmod, false)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))?,
-            ScalarFn::NameInput => crabgresql_types::text::name_input(s),
+            (ScalarFn::BpcharTypmod, _) => {
+                crabgresql_types::text::bpchar_input(s, typmod, explicit)
+                    .map_err(|e| BindError::new(e.sqlstate, e.message))?
+            }
+            (ScalarFn::NameInput, _) => crabgresql_types::text::name_input(s),
             _ => unreachable!(),
         };
         return Ok(BoundExpr::Const {
             value: Value::Text(folded),
-            ty: column.ty,
+            ty,
         });
     }
     if let BoundExpr::Const {
@@ -808,34 +850,29 @@ pub(super) fn apply_length_to_column(
         ..
     } = &expr
     {
-        let (len, data) = crabgresql_types::bit::coerce(
-            *len,
-            data,
-            column.typmod,
-            column.ty == PgType::Varbit,
-            false,
-        )
-        .map_err(|e| BindError::new(e.sqlstate, e.message))?;
+        let (len, data) =
+            crabgresql_types::bit::coerce(*len, data, typmod, ty == PgType::Varbit, explicit)
+                .map_err(|e| BindError::new(e.sqlstate, e.message))?;
         return Ok(BoundExpr::Const {
             value: Value::Bit { len, data },
-            ty: column.ty,
+            ty,
         });
     }
     let mut args = vec![expr];
     if func != ScalarFn::NameInput {
         args.push(BoundExpr::Const {
-            value: Value::Int4(column.typmod),
+            value: Value::Int4(typmod),
             ty: PgType::Int4,
         });
-        // Third arg 0 = assignment (error on overflow), not a truncating cast.
+        // Third arg: 0 = assignment (error on overflow), 1 = truncating cast.
         args.push(BoundExpr::Const {
-            value: Value::Int4(0),
+            value: Value::Int4(explicit as i32),
             ty: PgType::Int4,
         });
     }
     Ok(BoundExpr::FuncCall {
         func,
-        ret: column.ty,
+        ret: ty,
         args,
     })
 }
@@ -851,30 +888,30 @@ pub(super) fn apply_length_to_column(
 /// `false` to the input functions is assignment context: an over-long
 /// `varchar(n)`/`char(n)` whose excess is not blank errors rather than
 /// truncating.
-pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindError> {
+pub fn apply_typmod_value(value: Value, ty: PgType, typmod: i32) -> Result<Value, BindError> {
     // A NULL takes no length. On the expression path this falls out of the fold
     // guards and reaches the runtime call, which returns NULL; here it is said
     // once, up front.
     if matches!(value, Value::Null) {
         return Ok(value);
     }
-    // `parse_unknown` produced this value *for* `column.ty`, so a shape that
+    // `parse_unknown` produced this value *for* `ty`, so a shape that
     // does not match the type is a bug in this file rather than bad input.
     let mismatch = || {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
-            format!("copy value does not match column type {}", column.ty.name()),
+            format!("copy value does not match column type {}", ty.name()),
         )
     };
     // `numeric` and the datetime types round rather than truncating; each arm
     // returns, so the length pass below only sees the types it handles.
-    if column.typmod >= 0 {
-        match column.ty {
+    if typmod >= 0 {
+        match ty {
             PgType::Numeric => {
                 let Value::Numeric(n) = value else {
                     return Err(mismatch());
                 };
-                let (precision, scale) = Numeric::unpack_typmod(column.typmod);
+                let (precision, scale) = Numeric::unpack_typmod(typmod);
                 return n
                     .apply_typmod(precision, scale)
                     .map(Value::Numeric)
@@ -884,14 +921,14 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
                 let Value::Time(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::Time(time::apply_typmod(usec, column.typmod)));
+                return Ok(Value::Time(time::apply_typmod(usec, typmod)));
             }
             PgType::TimeTz => {
                 let Value::TimeTz(t) = value else {
                     return Err(mismatch());
                 };
                 return Ok(Value::TimeTz(crabgresql_types::TimeTz {
-                    usec: time::apply_typmod(t.usec, column.typmod),
+                    usec: time::apply_typmod(t.usec, typmod),
                     zone: t.zone,
                 }));
             }
@@ -899,25 +936,19 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
                 let Value::Timestamp(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::Timestamp(timestamp::apply_typmod(
-                    usec,
-                    column.typmod,
-                )));
+                return Ok(Value::Timestamp(timestamp::apply_typmod(usec, typmod)));
             }
             PgType::TimestampTz => {
                 let Value::TimestampTz(usec) = value else {
                     return Err(mismatch());
                 };
-                return Ok(Value::TimestampTz(timestamp::apply_typmod(
-                    usec,
-                    column.typmod,
-                )));
+                return Ok(Value::TimestampTz(timestamp::apply_typmod(usec, typmod)));
             }
             PgType::Interval => {
                 let Value::Interval(iv) = value else {
                     return Err(mismatch());
                 };
-                return crabgresql_types::interval::apply_typmod(iv, column.typmod)
+                return crabgresql_types::interval::apply_typmod(iv, typmod)
                     .map(Value::Interval)
                     .map_err(|e| BindError::new(e.sqlstate, e.message));
             }
@@ -926,36 +957,30 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
     }
     // `name` truncates whatever its typmod says, and a `name` column's is always
     // -1 — hence the unconditional arm, exactly as in `apply_length_to_column`.
-    match column.ty {
+    match ty {
         // The text family's length rules read the *text*, not the `Value`, so
-        // they live in `text_column_value` — where COPY reaches them without
+        // they live in `text_value` — where COPY reaches them without
         // building a `String` first. A length-free `text`/`varchar` matches
         // neither arm and falls through untouched, keeping its allocation.
-        PgType::Varchar | PgType::Bpchar if column.typmod >= 0 => {
+        PgType::Varchar | PgType::Bpchar if typmod >= 0 => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            text_column_value(&s, column)
+            text_value(&s, ty, typmod)
         }
         PgType::Name => {
             let Value::Text(s) = value else {
                 return Err(mismatch());
             };
-            text_column_value(&s, column)
+            text_value(&s, ty, typmod)
         }
-        PgType::Bit | PgType::Varbit if column.typmod >= 0 => {
+        PgType::Bit | PgType::Varbit if typmod >= 0 => {
             let Value::Bit { len, data } = value else {
                 return Err(mismatch());
             };
-            crabgresql_types::bit::coerce(
-                len,
-                &data,
-                column.typmod,
-                column.ty == PgType::Varbit,
-                false,
-            )
-            .map(|(len, data)| Value::Bit { len, data })
-            .map_err(|e| BindError::new(e.sqlstate, e.message))
+            crabgresql_types::bit::coerce(len, &data, typmod, ty == PgType::Varbit, false)
+                .map(|(len, data)| Value::Bit { len, data })
+                .map_err(|e| BindError::new(e.sqlstate, e.message))
         }
         _ => Ok(value),
     }
@@ -966,27 +991,23 @@ pub fn apply_column_typmod(value: Value, column: &Column) -> Result<Value, BindE
 /// was allocated only to be read once and dropped.
 ///
 /// This is COPY's route into the text family. The expression path reaches the
-/// same rules through [`apply_column_typmod`], which unwraps its `Value::Text`
+/// same rules through [`apply_typmod_value`], which unwraps its `Value::Text`
 /// and lands here, so `varchar(n)`'s `22001`, `char(n)`'s blank padding and
 /// `name`'s byte clip have one implementation rather than two.
 ///
 /// `false` to the input functions is assignment context, as in
-/// [`apply_column_typmod`]: an over-long value whose excess is not blank errors
+/// [`apply_typmod_value`]: an over-long value whose excess is not blank errors
 /// rather than truncating.
-pub fn text_column_value(s: &str, column: &Column) -> Result<Value, BindError> {
-    match column.ty {
-        PgType::Varchar if column.typmod >= 0 => {
-            crabgresql_types::text::varchar_input(s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
-        }
-        PgType::Bpchar if column.typmod >= 0 => {
-            crabgresql_types::text::bpchar_input(s, column.typmod, false)
-                .map(Value::Text)
-                .map_err(|e| BindError::new(e.sqlstate, e.message))
-        }
+pub fn text_value(s: &str, ty: PgType, typmod: i32) -> Result<Value, BindError> {
+    match ty {
+        PgType::Varchar if typmod >= 0 => crabgresql_types::text::varchar_input(s, typmod, false)
+            .map(Value::Text)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
+        PgType::Bpchar if typmod >= 0 => crabgresql_types::text::bpchar_input(s, typmod, false)
+            .map(Value::Text)
+            .map_err(|e| BindError::new(e.sqlstate, e.message)),
         // `name` clips at 63 bytes whatever its typmod says (a `name` column's
-        // is always -1), matching the arm above in `apply_column_typmod`.
+        // is always -1), matching the arm above in `apply_typmod_value`.
         PgType::Name => Ok(Value::Text(crabgresql_types::text::name_input(s))),
         // `text`, and a `varchar`/`char` with no declared length: no rule to
         // apply, so the field text is the value.
