@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787602783229,
+  "lastUpdate": 1787602785607,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -56272,6 +56272,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18467.00226,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e81128651e4faca9ad8b75b9725e093832e630da",
+          "message": "feat: Support domains (#277)\n\n`CREATE DOMAIN`, `ALTER DOMAIN` and `DROP DOMAIN`, with `NOT NULL`, `DEFAULT` and `CHECK`",
+          "timestamp": "2026-08-24T21:37:25+02:00",
+          "tree_id": "b45db07440c95afe903c90b44477225bca19a1a2",
+          "url": "https://github.com/ovr/crabgresql/commit/e81128651e4faca9ad8b75b9725e093832e630da"
+        },
+        "date": 1787602785490,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1200.848744,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 19910.177715,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
