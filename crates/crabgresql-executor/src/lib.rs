@@ -260,10 +260,9 @@ pub trait CatalogOps: Send + Sync {
     /// and `current_catalog`.
     fn current_database(&self) -> String;
 
-    /// The role this connection authenticated as. crabgresql has no `SET ROLE`,
-    /// so `current_user` and `session_user` are always the same string; the
-    /// split lives here so a future `SET ROLE` changes one method rather than
-    /// the SQL surface.
+    /// The role the session is currently acting as (`current_user`), and the
+    /// one it logged in as (`session_user`). They differ exactly when a
+    /// `SET ROLE` is in effect.
     fn current_user(&self) -> String;
     fn session_user(&self) -> String;
 

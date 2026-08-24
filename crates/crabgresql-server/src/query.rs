@@ -73,7 +73,7 @@ pub struct Notice {
 
 impl Notice {
     /// A `WARNING`-severity message (no DETAIL), as used by transaction control.
-    fn warning(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn warning(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             severity: NoticeSeverity::Warning,
             code: Cow::Borrowed(code),
@@ -213,7 +213,7 @@ impl From<DmlVerb> for RowTag {
 
 impl QueryResult {
     /// A command result with no accompanying warnings.
-    fn command(tag: impl Into<String>) -> Self {
+    pub(crate) fn command(tag: impl Into<String>) -> Self {
         QueryResult::Command {
             tag: tag.into(),
             notices: Vec::new(),
@@ -1069,6 +1069,26 @@ fn execute_statement_inner(
                 if_exists,
                 ..
             } => return execute_drop_type(global_catalog, names, *cascade, *if_exists),
+            ast::Statement::CreateRole(create) => {
+                return crate::role_stmt::execute_create_role(session, create);
+            }
+            ast::Statement::AlterRole { name, operation } => {
+                return crate::role_stmt::execute_alter_role(session, name, operation);
+            }
+            // `DROP USER`/`DROP GROUP` reach here too: PostgreSQL treats all
+            // three spellings as one statement over `pg_authid`.
+            ast::Statement::Drop {
+                object_type: ast::ObjectType::Role | ast::ObjectType::User,
+                names,
+                if_exists,
+                ..
+            } => return crate::role_stmt::execute_drop_role(session, names, *if_exists),
+            ast::Statement::Grant(grant) => {
+                return crate::role_stmt::execute_grant(session, grant);
+            }
+            ast::Statement::Revoke(revoke) => {
+                return crate::role_stmt::execute_revoke(session, revoke);
+            }
             ast::Statement::DropCast {
                 if_exists,
                 source,
@@ -3623,7 +3643,20 @@ fn apply_set(set: &ast::Set, session: &mut Session) -> Result<QueryResult, PgErr
             let scope = local.then_some(ast::ContextModifier::Local);
             ("timezone".to_string(), timezone_value(value)?, scope)
         }
-        // SET ROLE / SET NAMES / SESSION AUTHORIZATION: accepted and ignored.
+        ast::Set::SetRole {
+            context_modifier,
+            role_name,
+        } => {
+            return crate::role_stmt::execute_set_role(
+                session,
+                *context_modifier,
+                role_name.as_ref(),
+            );
+        }
+        ast::Set::SetSessionAuthorization(kind) => {
+            return crate::role_stmt::execute_set_session_authorization(session, kind);
+        }
+        // SET NAMES and the dialect-specific spellings: accepted and ignored.
         _ => return Ok(QueryResult::command("SET")),
     };
 
@@ -3937,7 +3970,7 @@ fn apply_reset(reset: &ast::ResetStatement, session: &mut Session) -> Result<Que
                 // here rather than inside the setter also keeps a read-only
                 // parameter out of the save stack, where it could neither change
                 // nor ever be a `session`.
-                if def.is_read_only() || def.is_transaction_scoped() {
+                if def.is_read_only() || def.is_transaction_scoped() || def.skipped_by_reset_all() {
                     continue;
                 }
                 session.assign_guc(def, guc::GucValue::Default, false)?;
@@ -6645,7 +6678,7 @@ pub(crate) fn resolve_column_type(
 }
 
 /// Wrap catalog-produced notices as NOTICE-severity messages for the wire.
-fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
+pub(crate) fn to_notices(notices: Vec<CatalogNotice>) -> Vec<Notice> {
     notices
         .into_iter()
         .map(|n| Notice {

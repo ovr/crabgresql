@@ -26,8 +26,14 @@ async fn spawn_pg(dir: &Path) -> (u16, JoinHandle<std::io::Result<()>>) {
     };
     // Nothing here loads a server-side COPY file; the data dir is enough.
     let copy_files = crabgresql_server::CopyFileAccess::confined_to(dir);
+    // Read back from `dir` on every start, like the relation catalog beside it:
+    // that is what lets a restart test see the roles the previous run created.
+    let roles = std::sync::Arc::new(
+        crabgresql_server::RoleCatalog::open(dir, crabgresql_server::DEFAULT_SUPERUSER)
+            .expect("open the durable role catalog"),
+    );
     let handle = tokio::spawn(crabgresql_server::serve_with(
-        listener, engine, txnmgr, copy_files,
+        listener, engine, txnmgr, copy_files, roles,
     ));
     (port, handle)
 }
@@ -1222,5 +1228,87 @@ async fn inheritance_hierarchy_survives_restart() -> anyhow::Result<()> {
         shutdown(client, handle).await;
     }
 
+    Ok(())
+}
+
+/// Roles, their attributes and their memberships survive a full restart: they
+/// live in their own file under the data directory, written whole on every DDL
+/// statement, so a server that comes up over the same directory reads back the
+/// role set the previous one left.
+#[tokio::test]
+async fn roles_and_memberships_survive_restart() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let (alice_oid, verifier) = {
+        let (port, handle) = spawn_pg(dir.path()).await;
+        let client = connect(port).await;
+        client
+            .simple_query("CREATE ROLE alice LOGIN PASSWORD 'secret' CONNECTION LIMIT 3")
+            .await?;
+        client.simple_query("CREATE ROLE devs").await?;
+        client.simple_query("GRANT devs TO alice").await?;
+        client
+            .simple_query("ALTER ROLE alice SET extra_float_digits = 3")
+            .await?;
+        let stored = client
+            .simple_query("SELECT oid, rolpassword FROM pg_authid WHERE rolname = 'alice'")
+            .await?;
+        let stored = rows(&stored);
+        let row = (
+            stored[0].get(0).expect("alice's oid").to_string(),
+            stored[0].get(1).expect("alice's verifier").to_string(),
+        );
+        shutdown(client, handle).await;
+        row
+    };
+
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let back = client
+        .simple_query(
+            "SELECT oid, rolcanlogin, rolconnlimit, rolpassword \
+             FROM pg_authid WHERE rolname = 'alice'",
+        )
+        .await?;
+    let back = rows(&back);
+    assert_eq!(back[0].get(0), Some(alice_oid.as_str()));
+    assert_eq!(back[0].get(1), Some("t"));
+    assert_eq!(back[0].get(2), Some("3"));
+    // The verifier is stored, not re-hashed: a restart that re-derived it would
+    // produce a different salt and lock the role out once SASL exists.
+    assert_eq!(back[0].get(3), Some(verifier.as_str()));
+    let config = client
+        .simple_query(
+            "SELECT array_to_string(rolconfig, ',') FROM pg_roles WHERE rolname = 'alice'",
+        )
+        .await?;
+    assert_eq!(rows(&config)[0].get(0), Some("extra_float_digits=3"));
+
+    let membership = client
+        .simple_query(
+            "SELECT r.rolname, m.rolname FROM pg_auth_members a \
+             JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON m.oid = a.member",
+        )
+        .await?;
+    let membership = rows(&membership);
+    assert_eq!(membership.len(), 1);
+    assert_eq!(
+        (membership[0].get(0), membership[0].get(1)),
+        (Some("devs"), Some("alice"))
+    );
+
+    // A drop is persisted the same way a create is.
+    client.simple_query("DROP ROLE devs").await?;
+    shutdown(client, handle).await;
+    let (port, handle) = spawn_pg(dir.path()).await;
+    let client = connect(port).await;
+    let names = client
+        .simple_query("SELECT rolname FROM pg_roles ORDER BY rolname")
+        .await?;
+    assert_eq!(
+        rows(&names).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("alice"), Some("postgres")]
+    );
+    shutdown(client, handle).await;
     Ok(())
 }

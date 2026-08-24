@@ -103,7 +103,7 @@ pub struct CatalogNotice {
 }
 
 impl CatalogNotice {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             detail: None,

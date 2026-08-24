@@ -103,6 +103,15 @@ pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 /// `55000` — the object is not in a state the operation requires, e.g. `currval`
 /// / `lastval` before any `nextval` has run in the session.
 pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+/// `55006` — the object is in use by the operation itself, e.g. `DROP ROLE` on
+/// the role the dropping session is running as.
+pub const OBJECT_IN_USE: &str = "55006";
+/// `0LP01` — a `GRANT`/`REVOKE` of role membership the role graph forbids, e.g.
+/// one that would make the membership circular.
+pub const INVALID_GRANT_OPERATION: &str = "0LP01";
+/// `01000` — class 01, the SQLSTATE a plain `WARNING` carries when nothing more
+/// specific applies (e.g. `REVOKE` of a membership that was never granted).
+pub const WARNING: &str = "01000";
 /// `22004` — a NULL where the operation forbids one, e.g. a NULL element in
 /// `ts_filter`'s weight array.
 pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";

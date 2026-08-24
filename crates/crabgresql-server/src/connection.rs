@@ -23,6 +23,7 @@ use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
     executed_columns, fetch_columns, prepare_copy_from, run_copy_insert,
 };
+use crate::roles::RoleCatalog;
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
@@ -60,6 +61,7 @@ pub async fn handle_connection(
     catalog: Arc<GlobalCatalog>,
     txnmgr: Arc<TransactionManager>,
     stats: Arc<PgStatCounters>,
+    roles: Arc<RoleCatalog>,
 ) -> Result<(), ProtocolError> {
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
@@ -96,17 +98,34 @@ pub async fn handle_connection(
     // matching how the regression runner gives each test its own session. Built
     // before the ParameterStatus burst below, which reports its values.
     let backend_id = NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed);
-    let user = params
+    let name = params
         .get("user")
         .cloned()
-        .unwrap_or_else(|| "postgres".to_string());
+        .unwrap_or_else(|| crate::DEFAULT_SUPERUSER.to_string());
     let database = params
         .get("database")
         .cloned()
-        .unwrap_or_else(|| user.clone());
+        .unwrap_or_else(|| name.clone());
+    // PostgreSQL would refuse a role it does not have with a FATAL 28000. Until
+    // startup authenticates, such a name gets a synthetic superuser instead —
+    // logged, because a connection that names an unknown role is either a typo
+    // or a client that would be rejected by a real server.
+    let user = match roles.login(&name) {
+        Ok(role) => role,
+        Err(role) => {
+            tracing::warn!(
+                user = %name,
+                "no such role; accepting the connection as a trusted superuser \
+                 because authentication is not implemented yet"
+            );
+            role
+        }
+    };
+    let role_config = user.config.clone();
     let mut session = Session::with_identity(
         txnmgr.clone(),
         engine.clone(),
+        Arc::clone(&roles),
         database,
         user,
         backend_id,
@@ -114,6 +133,21 @@ pub async fn handle_connection(
         crate::session::TEMP_NAMESPACE_OID_BASE + backend_id as u32,
     )
     .sharing_stats(Arc::clone(&stats));
+    // `ALTER ROLE … SET`: the login role's per-role settings, applied before the
+    // first statement and before the ParameterStatus burst reports them. A
+    // stored setting this build does not have is skipped rather than fatal —
+    // PostgreSQL also lets a session start with one it cannot apply.
+    for entry in &role_config {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let Some(def) = guc::lookup(key) else {
+            continue;
+        };
+        if let Err(e) = session.assign_guc(def, guc::GucValue::Str(value.to_string()), false) {
+            tracing::warn!(setting = %key, error = %e, "ignoring a per-role setting");
+        }
+    }
     // Through the same cleaning `SET application_name` goes through, which PG
     // also applies to the connection parameter.
     if let Some(name) = params.get("application_name") {

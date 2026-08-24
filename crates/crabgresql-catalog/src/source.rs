@@ -350,6 +350,67 @@ pub struct CatalogRoutine {
     pub src: String,
 }
 
+/// One role, as `pg_authid` shows it. The five relations derived from that one
+/// (`pg_roles`, `pg_user`, `pg_shadow`, `pg_group`, and — with
+/// [`CatalogRoleMember`] — `pg_auth_members`) are all built from this list, so
+/// they cannot drift apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogRole {
+    pub oid: u32,
+    pub name: String,
+    pub superuser: bool,
+    pub inherit: bool,
+    pub createrole: bool,
+    pub createdb: bool,
+    pub canlogin: bool,
+    pub replication: bool,
+    pub bypassrls: bool,
+    /// `-1` is PostgreSQL's "no per-role connection limit".
+    pub connlimit: i32,
+    /// The stored password verifier. `pg_authid` and `pg_shadow` show it;
+    /// `pg_roles`/`pg_user` mask it whether or not it is there, so a client
+    /// cannot tell a role with no password from one whose hash it may not read.
+    pub password: Option<String>,
+    /// `rolvaliduntil` as `timestamptz` micros.
+    pub valid_until: Option<i64>,
+    /// `rolconfig`: the `ALTER ROLE … SET` entries, spelled `name=value`.
+    pub config: Vec<String>,
+}
+
+impl CatalogRole {
+    /// The bootstrap superuser: what `initdb` creates, and what a deployment
+    /// with no role catalog of its own reports as its one role.
+    pub fn bootstrap(name: &str) -> Self {
+        Self {
+            oid: crate::oids::BOOTSTRAP_ROLE_OID,
+            name: name.to_string(),
+            superuser: true,
+            inherit: true,
+            createrole: true,
+            createdb: true,
+            canlogin: true,
+            replication: true,
+            bypassrls: true,
+            connlimit: -1,
+            password: None,
+            valid_until: None,
+            config: Vec::new(),
+        }
+    }
+}
+
+/// One `pg_auth_members` row: `member` is a member of `role`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogRoleMember {
+    pub oid: u32,
+    pub role: u32,
+    pub member: u32,
+    pub grantor: u32,
+    pub admin_option: bool,
+    pub inherit_option: bool,
+    pub set_option: bool,
+}
+
 /// The live server state one [`crate::SystemCatalog`] snapshot reflects.
 ///
 /// Every method that enumerates state is called **at most once** per snapshot,
@@ -375,9 +436,23 @@ pub trait CatalogSource: Send + Sync {
     /// The database this snapshot's session is connected to.
     fn database(&self) -> &str;
 
-    /// The session user. Every catalog row reports it as its owner, and it is
-    /// the one name [`crate::SystemCatalog::role_name`] resolves.
+    /// The name of the role every catalog row reports as its owner — the
+    /// bootstrap superuser, which [`crate::SystemCatalog::role_name`] resolves
+    /// [`crate::BOOTSTRAP_ROLE_OID`] to.
     fn owner(&self) -> &str;
+
+    /// The session's login role: `session_user`, and what `pg_stat_activity`
+    /// reports for this backend. Defaults to [`CatalogSource::owner`], which is
+    /// the truth for a deployment whose only role is the bootstrap one.
+    fn session_user(&self) -> &str {
+        self.owner()
+    }
+
+    /// The role the session currently acts as: `current_user`. Differs from
+    /// [`CatalogSource::session_user`] only after a `SET ROLE`.
+    fn current_user(&self) -> &str {
+        self.session_user()
+    }
 
     /// The user-defined types to reflect into `pg_type`/`pg_enum`.
     fn user_types(&self) -> Vec<CatalogUserType> {
@@ -401,6 +476,23 @@ pub trait CatalogSource: Send + Sync {
     /// The user-created schemas (`CREATE SCHEMA`) as `(name, oid)`, to reflect
     /// into `pg_namespace` and `information_schema.schemata`.
     fn schemas(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
+    /// The cluster's roles, to reflect into `pg_authid` and the five relations
+    /// derived from it.
+    ///
+    /// The default is the one role a deployment without a role catalog has: the
+    /// session's own [`CatalogSource::owner`], a login superuser. It is a
+    /// truthful answer rather than an empty one — every catalog row reports that
+    /// role as its owner, so `pg_authid` may not be empty while `pg_class` is
+    /// not.
+    fn roles(&self) -> Vec<CatalogRole> {
+        vec![CatalogRole::bootstrap(self.owner())]
+    }
+
+    /// Role membership, to reflect into `pg_auth_members` and `pg_group.grolist`.
+    fn role_members(&self) -> Vec<CatalogRoleMember> {
         Vec::new()
     }
 

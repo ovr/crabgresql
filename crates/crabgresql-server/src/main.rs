@@ -29,6 +29,16 @@ struct Cli {
     #[arg(long = "data-dir", short = 'D', env = config::DATA_DIR, default_value = config::DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 
+    /// Name of the bootstrap superuser created when the data directory has no
+    /// role catalog yet, as `initdb --username` names PostgreSQL's. Ignored on
+    /// an existing data directory, whose stored roles are authoritative.
+    #[arg(
+        long = "superuser",
+        env = config::SUPERUSER,
+        default_value = crabgresql_server::DEFAULT_SUPERUSER
+    )]
+    superuser: String,
+
     /// Extra directory a server-side `COPY … FROM '<file>'` may read. Repeatable,
     /// or colon-separated in the environment. The data directory is always
     /// allowed and is where a relative path resolves; by default nothing else
@@ -65,6 +75,13 @@ async fn main() -> std::io::Result<()> {
     );
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(&cli.data_dir)?;
 
+    // Roles are a cluster object: one catalog for the whole data directory,
+    // rather than one per database as the relation catalog is.
+    let roles = std::sync::Arc::new(crabgresql_server::RoleCatalog::open(
+        &cli.data_dir,
+        &cli.superuser,
+    )?);
+
     let copy_files = cli.copy_allow_path.iter().fold(
         crabgresql_server::CopyFileAccess::confined_to(&cli.data_dir),
         |access, root| access.allowing(root),
@@ -100,7 +117,7 @@ async fn main() -> std::io::Result<()> {
     );
 
     tokio::select! {
-        result = crabgresql_server::serve_with(listener, engine, txnmgr, copy_files) => result,
+        result = crabgresql_server::serve_with(listener, engine, txnmgr, copy_files, roles) => result,
         () = shutdown_signal() => {
             tracing::info!("received shutdown signal; flushing for a clean shutdown");
             engine_for_shutdown.shutdown();

@@ -12,8 +12,8 @@
 -- the connection identity, and its keyword aliases
 SELECT current_database(), current_catalog;
 SELECT current_user, current_role, user, session_user;
--- ...all one value: crabgresql has no SET ROLE, so the three role spellings
--- cannot diverge
+-- ...all one value: no SET ROLE has run in this session, so the three role
+-- spellings cannot diverge
 SELECT current_user = session_user AS same_role,
        current_database() = current_catalog AS same_db;
 -- current_schema is the rare one PostgreSQL spells both ways

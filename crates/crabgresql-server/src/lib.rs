@@ -14,6 +14,8 @@ mod global_catalog;
 mod guc;
 mod prepare;
 mod query;
+mod role_stmt;
+mod roles;
 mod routines;
 mod session;
 
@@ -29,6 +31,7 @@ use tokio::net::TcpListener;
 
 pub use crate::copy_access::CopyFileAccess;
 use crate::global_catalog::GlobalCatalog;
+pub use crate::roles::RoleCatalog;
 
 /// Open the durable heap engine over a data directory and run crash recovery:
 /// replay the WAL from the redo point the last checkpoint published, rebuild the
@@ -66,9 +69,18 @@ pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::
         engine,
         Arc::new(TransactionManager::new()),
         CopyFileAccess::deny_all(),
+        // Roles live as long as the process here, for the same reason the COPY
+        // policy denies everything: there is no data directory to anchor them
+        // on.
+        Arc::new(RoleCatalog::in_memory(DEFAULT_SUPERUSER)),
     )
     .await
 }
+
+/// The role a data directory is bootstrapped with when the server is not told
+/// otherwise — PostgreSQL's own convention, and the name both test harnesses
+/// connect as.
+pub const DEFAULT_SUPERUSER: &str = "postgres";
 
 /// Accept connections forever, one tokio task per session, using the supplied
 /// [`TransactionManager`]. The durable path passes a manager built by
@@ -77,14 +89,16 @@ pub async fn serve(listener: TcpListener, engine: Arc<dyn TableEngine>) -> std::
 /// allocator + commit log) are shared across every connection for the life of
 /// the server, matching PG's persistent catalog.
 ///
-/// `copy_files` is passed explicitly rather than defaulted: it decides which
-/// files a client can make the server read, and a silent default is exactly the
-/// kind of security setting that rots unnoticed.
+/// `copy_files` and `roles` are passed explicitly rather than defaulted: they
+/// decide which files a client can make the server read and who it may act as,
+/// and a silent default is exactly the kind of security setting that rots
+/// unnoticed.
 pub async fn serve_with(
     listener: TcpListener,
     engine: Arc<dyn TableEngine>,
     txnmgr: Arc<TransactionManager>,
     copy_files: CopyFileAccess,
+    roles: Arc<RoleCatalog>,
 ) -> std::io::Result<()> {
     let catalog = Arc::new(GlobalCatalog::with_copy_files(copy_files));
     // Nothing durably records when a definition last changed, so the catalog's
@@ -104,10 +118,11 @@ pub async fn serve_with(
         let catalog = catalog.clone();
         let txnmgr = txnmgr.clone();
         let stats = stats.clone();
+        let roles = roles.clone();
         tokio::spawn(async move {
             tracing::debug!(%peer, "connection opened");
             if let Err(e) =
-                connection::handle_connection(socket, engine, catalog, txnmgr, stats).await
+                connection::handle_connection(socket, engine, catalog, txnmgr, stats, roles).await
             {
                 tracing::warn!(%peer, error = %e, "connection failed");
             }

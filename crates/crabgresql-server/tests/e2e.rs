@@ -79,9 +79,15 @@ async fn spawn_server_reading(copy_roots: &[&std::path::Path]) -> u16 {
         crabgresql_server::CopyFileAccess::confined_to(dir.path()),
         |access, root| access.allowing(root),
     );
+    // Roles persist next to the engine's own catalog, so a test can restart a
+    // server over the same directory and still see them.
+    let roles = std::sync::Arc::new(
+        crabgresql_server::RoleCatalog::open(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)
+            .expect("open the test role catalog"),
+    );
     std::mem::forget(dir);
     tokio::spawn(crabgresql_server::serve_with(
-        listener, engine, txnmgr, copy_files,
+        listener, engine, txnmgr, copy_files, roles,
     ));
     port
 }
@@ -18086,5 +18092,711 @@ async fn relation_size_covers_toast_indexes_and_catalog_relations() -> anyhow::R
         .batch_execute("CREATE TEMP TABLE szm (a int); INSERT INTO szm VALUES (1)")
         .await?;
     assert_eq!(size("SELECT pg_relation_size('szm')").await?, 8192);
+    Ok(())
+}
+
+/// `CREATE ROLE` and the five relations derived from `pg_authid`: a role shows
+/// up in all of them at once, on the side its attributes put it.
+#[tokio::test]
+async fn roles_reflect_into_every_authid_relation() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice LOGIN PASSWORD 'secret'; CREATE ROLE devs")
+        .await?;
+    client.batch_execute("GRANT devs TO alice").await?;
+
+    let listed = client
+        .simple_query("SELECT rolname, rolcanlogin, rolsuper FROM pg_roles ORDER BY rolname")
+        .await?;
+    let listed = rows(&listed);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("alice"), Some("t")),
+            (Some("devs"), Some("f")),
+            (Some("postgres"), Some("t")),
+        ]
+    );
+
+    // `pg_user` is the login roles, `pg_group` the rest — with its members.
+    let users = client
+        .simple_query("SELECT usename FROM pg_user ORDER BY usename")
+        .await?;
+    assert_eq!(
+        rows(&users).iter().map(|r| r.get(0)).collect::<Vec<_>>(),
+        vec![Some("alice"), Some("postgres")]
+    );
+    let groups = client
+        .simple_query(
+            "SELECT groname, grolist = ARRAY[(SELECT oid FROM pg_roles WHERE rolname = 'alice')] \
+             FROM pg_group",
+        )
+        .await?;
+    assert_eq!(rows(&groups)[0].get(0), Some("devs"));
+    assert_eq!(rows(&groups)[0].get(1), Some("t"));
+
+    // The membership is one `pg_auth_members` row, granted by the role that ran
+    // the statement.
+    let members = client
+        .simple_query(
+            "SELECT r.rolname, m.rolname, a.admin_option \
+             FROM pg_auth_members a \
+             JOIN pg_roles r ON r.oid = a.roleid \
+             JOIN pg_roles m ON m.oid = a.member",
+        )
+        .await?;
+    let members = rows(&members);
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].get(0), Some("devs"));
+    assert_eq!(members[0].get(1), Some("alice"));
+    assert_eq!(members[0].get(2), Some("f"));
+    Ok(())
+}
+
+/// The stored password is a SCRAM verifier, and only `pg_authid`/`pg_shadow`
+/// show it: the two masking relations print the same `********` for a role with
+/// a password and for one without, as PostgreSQL does.
+#[tokio::test]
+async fn password_is_a_scram_verifier_and_masked_where_pg_masks_it() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice LOGIN PASSWORD 'secret'; CREATE ROLE nopass LOGIN")
+        .await?;
+
+    let stored = client
+        .simple_query(
+            "SELECT rolpassword LIKE 'SCRAM-SHA-256$4096:%' FROM pg_authid WHERE rolname = 'alice'",
+        )
+        .await?;
+    assert_eq!(rows(&stored)[0].get(0), Some("t"));
+
+    let masked = client
+        .simple_query("SELECT rolname, rolpassword FROM pg_roles WHERE rolcanlogin ORDER BY 1")
+        .await?;
+    for row in rows(&masked) {
+        assert_eq!(row.get(1), Some("********"), "role {:?}", row.get(0));
+    }
+    // `pg_shadow` is the unmasked view of the same column, so a role with no
+    // password reads NULL there rather than the mask.
+    let shadow = client
+        .simple_query("SELECT passwd IS NULL FROM pg_shadow WHERE usename = 'nopass'")
+        .await?;
+    assert_eq!(rows(&shadow)[0].get(0), Some("t"));
+
+    // An already-hashed password is stored as it arrived rather than hashed
+    // twice, which is what lets a dump be restored.
+    let verifier: String = client
+        .query_one(
+            "SELECT rolpassword FROM pg_authid WHERE rolname = 'alice'",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .batch_execute(&format!("CREATE ROLE copied LOGIN PASSWORD '{verifier}'"))
+        .await?;
+    let copied: String = client
+        .query_one(
+            "SELECT rolpassword FROM pg_authid WHERE rolname = 'copied'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(copied, verifier);
+    Ok(())
+}
+
+/// The errors a role statement raises, each with the SQLSTATE PostgreSQL raises
+/// it under.
+#[tokio::test]
+async fn role_statements_report_pg_errors() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice; CREATE ROLE devs")
+        .await?;
+
+    let code = async |sql: &str| -> SqlState {
+        client
+            .simple_query(sql)
+            .await
+            .expect_err("statement should have failed")
+            .as_db_error()
+            .expect("database error")
+            .code()
+            .clone()
+    };
+
+    assert_eq!(code("CREATE ROLE alice").await, SqlState::DUPLICATE_OBJECT);
+    assert_eq!(code("DROP ROLE nope").await, SqlState::UNDEFINED_OBJECT);
+    assert_eq!(
+        code("ALTER ROLE nope WITH LOGIN").await,
+        SqlState::UNDEFINED_OBJECT
+    );
+    assert_eq!(
+        code("ALTER ROLE alice RENAME TO devs").await,
+        SqlState::DUPLICATE_OBJECT
+    );
+    // The session cannot drop the role it is running as.
+    assert_eq!(code("DROP ROLE postgres").await, SqlState::OBJECT_IN_USE);
+    // PostgreSQL's grammar has no `IF NOT EXISTS` here.
+    assert_eq!(
+        code("CREATE ROLE IF NOT EXISTS dave").await,
+        SqlState::SYNTAX_ERROR
+    );
+    // Privileges on objects are not modelled, and are refused rather than
+    // silently accepted.
+    assert_eq!(
+        code("GRANT SELECT ON pg_class TO alice").await,
+        SqlState::FEATURE_NOT_SUPPORTED
+    );
+
+    // A membership grant that would close a cycle in the role graph.
+    client.batch_execute("GRANT devs TO alice").await?;
+    let err = client
+        .simple_query("GRANT alice TO devs")
+        .await
+        .expect_err("a circular membership must be rejected");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code().code(), "0LP01");
+    assert_eq!(err.message(), "role \"alice\" is a member of role \"devs\"");
+
+    // `DROP ROLE IF EXISTS` on a missing role is a NOTICE, not an error.
+    client.batch_execute("DROP ROLE IF EXISTS nope").await?;
+    Ok(())
+}
+
+/// `SET ROLE` moves `current_user` and leaves `session_user` alone;
+/// `SET SESSION AUTHORIZATION` moves both. Membership decides who may switch,
+/// and `SET LOCAL ROLE` unwinds with its transaction.
+#[tokio::test]
+async fn set_role_and_session_authorization_track_the_session_identity() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice LOGIN; CREATE ROLE devs; CREATE ROLE others")
+        .await?;
+    client.batch_execute("GRANT devs TO alice").await?;
+
+    let identity = async || -> anyhow::Result<(String, String, String)> {
+        let row = client
+            .query_one(
+                "SELECT current_user, session_user, current_setting('role')",
+                &[],
+            )
+            .await?;
+        Ok((row.get(0), row.get(1), row.get(2)))
+    };
+    assert_eq!(
+        identity().await?,
+        ("postgres".into(), "postgres".into(), "none".into()),
+        "a fresh session has no role in effect"
+    );
+
+    client.batch_execute("SET ROLE devs").await?;
+    assert_eq!(
+        identity().await?,
+        ("devs".into(), "postgres".into(), "devs".into())
+    );
+    client.batch_execute("RESET ROLE").await?;
+    assert_eq!(identity().await?.0, "postgres");
+
+    // `SET LOCAL` is undone by the rollback that ends its block.
+    client.batch_execute("BEGIN; SET LOCAL ROLE devs").await?;
+    assert_eq!(identity().await?.0, "devs");
+    client.batch_execute("ROLLBACK").await?;
+    assert_eq!(identity().await?.0, "postgres");
+
+    // `RESET ALL` leaves the identity parameters alone — PostgreSQL flags both
+    // `GUC_NO_RESET_ALL`.
+    client.batch_execute("SET ROLE devs; RESET ALL").await?;
+    assert_eq!(identity().await?.0, "devs");
+    client.batch_execute("RESET ROLE").await?;
+
+    // A superuser may become anyone; the role it becomes may not go on to a
+    // third role it is not a member of.
+    client
+        .batch_execute("SET SESSION AUTHORIZATION alice")
+        .await?;
+    assert_eq!(
+        identity().await?,
+        ("alice".into(), "alice".into(), "none".into())
+    );
+    client.batch_execute("SET ROLE devs").await?;
+    assert_eq!(identity().await?.0, "devs");
+    client.batch_execute("RESET ROLE").await?;
+    let err = client
+        .simple_query("SET ROLE others")
+        .await
+        .expect_err("alice is not a member of others");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code(), &SqlState::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(err.message(), "permission denied to set role \"others\"");
+
+    // The authenticated role is what `RESET SESSION AUTHORIZATION` goes back to.
+    client.batch_execute("RESET SESSION AUTHORIZATION").await?;
+    assert_eq!(identity().await?.0, "postgres");
+
+    let err = client
+        .simple_query("SET ROLE nope")
+        .await
+        .expect_err("switching to a role that does not exist must fail");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_OBJECT
+    );
+    Ok(())
+}
+
+/// `CREATE USER`/`CREATE GROUP` and their `ALTER`/`DROP` spellings are the same
+/// statement over `pg_authid`; only `USER` differs, by implying `LOGIN`.
+#[tokio::test]
+async fn user_and_group_are_spellings_of_role() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE USER carol; CREATE GROUP admins")
+        .await?;
+    let logins = client
+        .simple_query(
+            "SELECT rolname, rolcanlogin FROM pg_authid \
+             WHERE rolname IN ('carol', 'admins') ORDER BY rolname",
+        )
+        .await?;
+    assert_eq!(
+        rows(&logins)
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect::<Vec<_>>(),
+        vec![(Some("admins"), Some("f")), (Some("carol"), Some("t"))]
+    );
+
+    client
+        .batch_execute("ALTER USER carol WITH CREATEDB")
+        .await?;
+    client
+        .batch_execute("ALTER GROUP admins RENAME TO staff")
+        .await?;
+    let after = client
+        .simple_query("SELECT rolcreatedb FROM pg_authid WHERE rolname = 'carol'")
+        .await?;
+    assert_eq!(rows(&after)[0].get(0), Some("t"));
+
+    client
+        .batch_execute("DROP USER carol; DROP GROUP staff")
+        .await?;
+    let left = client
+        .simple_query("SELECT count(*) FROM pg_roles WHERE rolname <> 'postgres'")
+        .await?;
+    assert_eq!(rows(&left)[0].get(0), Some("0"));
+    Ok(())
+}
+
+/// `ALTER ROLE … SET` fills `rolconfig` under the parameter's canonical name,
+/// and the entries are applied to a session that logs in as that role.
+#[tokio::test]
+async fn per_role_settings_are_stored_and_applied_at_login() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client.batch_execute("CREATE ROLE alice LOGIN").await?;
+    client
+        .batch_execute("ALTER ROLE alice SET timezone = 'UTC'")
+        .await?;
+    client
+        .batch_execute("ALTER ROLE alice SET extra_float_digits = 3")
+        .await?;
+
+    // Stored as PostgreSQL stores them: `TimeZone`, not the `timezone` the
+    // statement spelled.
+    let config = client
+        .simple_query(
+            "SELECT array_to_string(rolconfig, ',') FROM pg_roles WHERE rolname = 'alice'",
+        )
+        .await?;
+    assert_eq!(
+        rows(&config)[0].get(0),
+        Some("TimeZone=UTC,extra_float_digits=3")
+    );
+
+    let alice = connect_as(port, "alice", "postgres").await;
+    let applied = alice.simple_query("SHOW extra_float_digits").await?;
+    assert_eq!(rows(&applied)[0].get(0), Some("3"));
+
+    // `RESET` drops one entry by name; `RESET ALL` drops them all.
+    client
+        .batch_execute("ALTER ROLE alice RESET timezone")
+        .await?;
+    let config = client
+        .simple_query(
+            "SELECT array_to_string(rolconfig, ',') FROM pg_roles WHERE rolname = 'alice'",
+        )
+        .await?;
+    assert_eq!(rows(&config)[0].get(0), Some("extra_float_digits=3"));
+    client.batch_execute("ALTER ROLE alice RESET ALL").await?;
+    let config = client
+        .simple_query("SELECT rolconfig IS NULL FROM pg_roles WHERE rolname = 'alice'")
+        .await?;
+    assert_eq!(rows(&config)[0].get(0), Some("t"));
+    Ok(())
+}
+
+/// Dropping a role takes its memberships with it, so `pg_auth_members` can
+/// never name an OID `pg_authid` no longer has.
+#[tokio::test]
+async fn dropping_a_role_removes_its_memberships() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice; CREATE ROLE devs; GRANT devs TO alice")
+        .await?;
+    client.batch_execute("DROP ROLE devs").await?;
+    let left = client
+        .simple_query("SELECT count(*) FROM pg_auth_members")
+        .await?;
+    assert_eq!(rows(&left)[0].get(0), Some("0"));
+    Ok(())
+}
+
+/// `pg_get_userbyid` resolves the owner OID every catalog row carries, which is
+/// the bootstrap superuser rather than whoever is connected.
+#[tokio::test]
+async fn object_owners_resolve_to_the_bootstrap_role() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE owned (i int); CREATE ROLE alice LOGIN")
+        .await?;
+    client
+        .batch_execute("SET SESSION AUTHORIZATION alice")
+        .await?;
+    let owner = client
+        .simple_query("SELECT tableowner FROM pg_tables WHERE tablename = 'owned'")
+        .await?;
+    assert_eq!(
+        rows(&owner)[0].get(0),
+        Some("postgres"),
+        "the owner does not follow the session's identity"
+    );
+    let by_id = client.simple_query("SELECT pg_get_userbyid(10)").await?;
+    assert_eq!(rows(&by_id)[0].get(0), Some("postgres"));
+    Ok(())
+}
+
+/// `SET LOCAL` outside a transaction block warns and changes nothing — the
+/// identity parameters are no exception, and a `SET LOCAL ROLE` that took effect
+/// at session scope would leave `current_user` moved for good.
+#[tokio::test]
+async fn set_local_role_outside_a_block_warns_and_changes_nothing() {
+    let mut socket = raw_session(spawn_server().await).await;
+    simple_query_raw(&mut socket, "CREATE ROLE devs").await;
+
+    for sql in [
+        "SET LOCAL ROLE devs",
+        "SET LOCAL SESSION AUTHORIZATION devs",
+    ] {
+        let msgs = simple_query_raw(&mut socket, sql).await;
+        let notice = msgs
+            .iter()
+            .find(|(tag, _)| *tag == b'N')
+            .expect("a warning is expected");
+        let notice = fields(notice);
+        assert_eq!(notice.severity(), "WARNING");
+        assert_eq!(notice.code(), "25P01");
+        assert_eq!(
+            notice.message(),
+            "SET LOCAL can only be used in transaction blocks"
+        );
+        assert_eq!(command_tags(&msgs), ["SET"], "{sql}");
+    }
+
+    let msgs = simple_query_raw(&mut socket, "SELECT current_user, session_user").await;
+    let row = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'D')
+        .expect("a data row is expected");
+    assert!(
+        String::from_utf8_lossy(&row.1).contains("postgres"),
+        "the identity must be untouched"
+    );
+}
+
+/// `session_authorization` is GUC_REPORT in PostgreSQL: it rides in the startup
+/// burst and every identity change is echoed, together with `is_superuser`,
+/// whose value follows the role in effect. `role` is not reported.
+#[tokio::test]
+async fn session_authorization_changes_emit_parameter_status() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE ROLE alice LOGIN; CREATE ROLE devs; GRANT devs TO alice")
+        .await?;
+
+    let mut socket = raw_session(port).await;
+
+    /// Run one simple query, returning the `ParameterStatus` pairs it emitted.
+    async fn query(
+        socket: &mut tokio::net::TcpStream,
+        sql: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let query = frontend_batch(&[FrontendMessage::Query(sql.to_string())]);
+        socket.write_all(&query).await?;
+        Ok(read_until_ready(socket)
+            .await
+            .into_iter()
+            .filter(|(tag, _)| *tag == b'S')
+            .map(|(_, body)| {
+                let mut parts = body.split(|b| *b == 0);
+                let name = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                let value = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+                (name, value)
+            })
+            .collect())
+    }
+
+    let mut reported = query(&mut socket, "SET SESSION AUTHORIZATION alice").await?;
+    reported.sort();
+    assert_eq!(
+        reported,
+        vec![
+            ("is_superuser".to_string(), "off".to_string()),
+            ("session_authorization".to_string(), "alice".to_string()),
+        ]
+    );
+    // A `SET ROLE` moves `current_user` only, so it reports the superuser flag
+    // and not the session identity.
+    assert_eq!(
+        query(&mut socket, "SET ROLE devs").await?,
+        Vec::<(String, String)>::new(),
+        "alice is not a superuser, so the flag does not move"
+    );
+    let mut reported = query(&mut socket, "RESET SESSION AUTHORIZATION").await?;
+    reported.sort();
+    assert_eq!(
+        reported,
+        vec![
+            ("is_superuser".to_string(), "on".to_string()),
+            ("session_authorization".to_string(), "postgres".to_string()),
+        ]
+    );
+    assert_eq!(
+        query(&mut socket, "SET ROLE devs").await?,
+        vec![("is_superuser".to_string(), "off".to_string())]
+    );
+    Ok(())
+}
+
+/// A `REVOKE` reaches only the grant the revoking role made: one made by
+/// somebody else stays, and PostgreSQL says so in a WARNING rather than failing
+/// or silently doing nothing.
+#[tokio::test]
+async fn revoke_only_touches_the_revokers_own_grant() {
+    let mut socket = raw_session(spawn_server().await).await;
+    for sql in [
+        "CREATE ROLE alice",
+        "CREATE ROLE devs",
+        "CREATE ROLE admin",
+        "GRANT devs TO admin WITH ADMIN OPTION",
+    ] {
+        simple_query_raw(&mut socket, sql).await;
+    }
+
+    // Never granted at all.
+    let msgs = simple_query_raw(&mut socket, "REVOKE devs FROM alice").await;
+    let notice = fields(
+        msgs.iter()
+            .find(|(tag, _)| *tag == b'N')
+            .expect("a warning is expected"),
+    );
+    assert_eq!(notice.severity(), "WARNING");
+    assert_eq!(notice.code(), "01000");
+    assert_eq!(
+        notice.message(),
+        "role \"alice\" has not been granted membership in role \"devs\" by role \"postgres\""
+    );
+    assert_eq!(command_tags(&msgs), ["REVOKE"]);
+
+    // Granted by somebody else: the same WARNING, and the membership survives.
+    simple_query_raw(&mut socket, "GRANT devs TO alice GRANTED BY admin").await;
+    let msgs = simple_query_raw(&mut socket, "REVOKE devs FROM alice").await;
+    assert!(
+        msgs.iter().any(|(tag, _)| *tag == b'N'),
+        "revoking another role's grant must warn"
+    );
+    let msgs = simple_query_raw(&mut socket, "SELECT count(*) FROM pg_auth_members").await;
+    let row = msgs
+        .iter()
+        .find(|(tag, _)| *tag == b'D')
+        .expect("a data row is expected");
+    assert!(String::from_utf8_lossy(&row.1).contains('2'));
+
+    // Naming that grantor revokes it.
+    let msgs = simple_query_raw(&mut socket, "REVOKE devs FROM alice GRANTED BY admin").await;
+    assert!(
+        !msgs.iter().any(|(tag, _)| *tag == b'N'),
+        "revoking the grant that exists must not warn"
+    );
+}
+
+/// `GRANTED BY` records another role as the grantor, under PostgreSQL's two
+/// permission rules: the caller must be able to act as that role, and that role
+/// must be entitled to hand out the one being granted.
+#[tokio::test]
+async fn granted_by_records_the_named_grantor() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE ROLE alice; CREATE ROLE devs; CREATE ROLE admin")
+        .await?;
+    client
+        .batch_execute("GRANT devs TO admin WITH ADMIN OPTION")
+        .await?;
+
+    // The named role must exist…
+    let err = client
+        .simple_query("GRANT devs TO alice GRANTED BY nosuch")
+        .await
+        .expect_err("an unknown grantor must be rejected");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_OBJECT
+    );
+    // …and hold ADMIN OPTION on what it is granting.
+    let err = client
+        .simple_query("GRANT devs TO alice GRANTED BY alice")
+        .await
+        .expect_err("a grantor without the admin option must be rejected");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code(), &SqlState::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(
+        err.message(),
+        "permission denied to grant privileges as role \"alice\""
+    );
+    assert_eq!(
+        err.detail(),
+        Some("The grantor must have the ADMIN option on role \"devs\".")
+    );
+
+    client
+        .batch_execute("GRANT devs TO alice GRANTED BY admin")
+        .await?;
+    let grantor = client
+        .simple_query(
+            "SELECT g.rolname FROM pg_auth_members a \
+             JOIN pg_authid g ON g.oid = a.grantor \
+             JOIN pg_authid m ON m.oid = a.member WHERE m.rolname = 'alice'",
+        )
+        .await?;
+    assert_eq!(rows(&grantor)[0].get(0), Some("admin"));
+
+    // A non-superuser may not grant as a role it has no privileges of.
+    client.batch_execute("SET ROLE alice").await?;
+    let err = client
+        .simple_query("GRANT devs TO alice GRANTED BY admin")
+        .await
+        .expect_err("alice may not act as admin");
+    assert_eq!(
+        err.as_db_error().expect("database error").detail(),
+        Some("Only roles with privileges of role \"admin\" may grant privileges as this role.")
+    );
+
+    // Snowflake's `AS <grantor>` is refused rather than ignored.
+    client.batch_execute("RESET ROLE").await?;
+    let err = client
+        .simple_query("GRANT devs TO alice AS admin")
+        .await
+        .expect_err("AS <grantor> is not modelled");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::FEATURE_NOT_SUPPORTED
+    );
+    Ok(())
+}
+
+/// The bootstrap superuser cannot be dropped: every catalog row reports it as
+/// its owner, so `pg_get_userbyid(relowner)` would stop resolving. Its own
+/// session is told it is the current user; another session gets PostgreSQL's
+/// "required by the database system".
+#[tokio::test]
+async fn the_bootstrap_role_cannot_be_dropped() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let client = connect(port).await;
+    client
+        .batch_execute("CREATE ROLE other LOGIN SUPERUSER")
+        .await?;
+
+    let err = client
+        .simple_query("DROP ROLE postgres")
+        .await
+        .expect_err("the session's own role must not be droppable");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code().code(), "55006");
+    assert_eq!(err.message(), "current user cannot be dropped");
+
+    let elsewhere = connect_as(port, "other", "postgres").await;
+    let err = elsewhere
+        .simple_query("DROP ROLE postgres")
+        .await
+        .expect_err("the bootstrap role must not be droppable from anywhere");
+    let err = err.as_db_error().expect("database error");
+    assert_eq!(err.code(), &SqlState::DEPENDENT_OBJECTS_STILL_EXIST);
+    assert_eq!(
+        err.message(),
+        "cannot drop role postgres because it is required by the database system"
+    );
+    Ok(())
+}
+
+/// A session that logged in as a name the catalog has no role for is trusted
+/// with a synthetic OID, and that OID must never reach the catalog: it grants as
+/// the bootstrap role, and it follows a real role of the same name as soon as
+/// one is created.
+#[tokio::test]
+async fn a_trust_session_never_leaves_its_synthetic_oid_behind() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let ghost = connect_as(port, "ghost", "postgres").await;
+    ghost
+        .batch_execute("CREATE ROLE alice; CREATE ROLE devs; GRANT devs TO alice")
+        .await?;
+
+    let dangling = ghost
+        .simple_query(
+            "SELECT count(*) FROM pg_auth_members a \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_authid r WHERE r.oid = a.grantor)",
+        )
+        .await?;
+    assert_eq!(rows(&dangling)[0].get(0), Some("0"));
+    let grantor = ghost
+        .simple_query(
+            "SELECT g.rolname FROM pg_auth_members a JOIN pg_authid g ON g.oid = a.grantor",
+        )
+        .await?;
+    assert_eq!(rows(&grantor)[0].get(0), Some("postgres"));
+
+    // The session is a trusted superuser only for as long as its name names no
+    // role: creating one makes the session that role, flags and all.
+    let superuser = ghost.simple_query("SHOW is_superuser").await?;
+    assert_eq!(rows(&superuser)[0].get(0), Some("on"));
+    let other = connect(port).await;
+    other.batch_execute("CREATE ROLE ghost LOGIN").await?;
+    let superuser = ghost.simple_query("SHOW is_superuser").await?;
+    assert_eq!(
+        rows(&superuser)[0].get(0),
+        Some("off"),
+        "the open session must follow the role its name now points at"
+    );
+    // …and that role is now the one it may not drop.
+    let err = ghost
+        .simple_query("DROP ROLE ghost")
+        .await
+        .expect_err("the session's own role must not be droppable");
+    assert_eq!(
+        err.as_db_error().expect("database error").message(),
+        "current user cannot be dropped"
+    );
     Ok(())
 }

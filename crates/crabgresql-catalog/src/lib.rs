@@ -47,13 +47,13 @@ pub(crate) mod views;
 pub use catalogs::depend::nextval_target;
 pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::{AvailableExtension, available_extensions};
-pub use oids::PLPGSQL_LANG_OID;
+pub use oids::{BOOTSTRAP_ROLE_OID, PLPGSQL_LANG_OID};
 pub use registry::{builtin_relation_name, builtin_relation_oid, builtin_view_definition};
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
-    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRoutine, CatalogSequence,
-    CatalogSetting, CatalogSource, CatalogUserType, CatalogViewDependency, RelKind, StaticSource,
-    ViewDepRelation,
+    CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRole, CatalogRoleMember,
+    CatalogRoutine, CatalogSequence, CatalogSetting, CatalogSource, CatalogUserType,
+    CatalogViewDependency, RelKind, StaticSource, ViewDepRelation,
 };
 
 #[cfg(test)]
@@ -637,6 +637,8 @@ pub struct SystemCatalog {
     user_types: OnceLock<Vec<CatalogUserType>>,
     routines: OnceLock<Vec<CatalogRoutine>>,
     user_schemas: OnceLock<Vec<(String, u32)>>,
+    roles: OnceLock<Vec<CatalogRole>>,
+    role_members: OnceLock<Vec<CatalogRoleMember>>,
     cursors: OnceLock<Vec<CatalogCursor>>,
     prepared_statements: OnceLock<Vec<CatalogPreparedStatement>>,
     settings: OnceLock<Vec<CatalogSetting>>,
@@ -706,6 +708,8 @@ impl SystemCatalog {
             user_types: OnceLock::new(),
             routines: OnceLock::new(),
             user_schemas: OnceLock::new(),
+            roles: OnceLock::new(),
+            role_members: OnceLock::new(),
             cursors: OnceLock::new(),
             prepared_statements: OnceLock::new(),
             settings: OnceLock::new(),
@@ -738,6 +742,14 @@ impl SystemCatalog {
 
     pub(crate) fn user_schemas(&self) -> &[(String, u32)] {
         self.user_schemas.get_or_init(|| self.source.schemas())
+    }
+
+    pub(crate) fn roles(&self) -> &[CatalogRole] {
+        self.roles.get_or_init(|| self.source.roles())
+    }
+
+    pub(crate) fn role_members(&self) -> &[CatalogRoleMember] {
+        self.role_members.get_or_init(|| self.source.role_members())
     }
 
     fn cursors(&self) -> &[CatalogCursor] {
@@ -1445,11 +1457,14 @@ impl SystemCatalog {
     }
 
     /// The name of the role `oid` identifies, or `None` if no role has that OID.
-    /// Every catalog row reports [`oids::BOOTSTRAP_ROLE_OID`] as its owner
-    /// (crabgresql has no role catalog), so exactly one OID resolves — to this
-    /// snapshot's session user. Backs `pg_get_userbyid`.
+    /// Backs `pg_get_userbyid`, and so resolves the owner OID every catalog row
+    /// carries — [`oids::BOOTSTRAP_ROLE_OID`], the role catalog's bootstrap
+    /// superuser.
     pub fn role_name(&self, oid: u32) -> Option<&str> {
-        (oid == oids::BOOTSTRAP_ROLE_OID).then_some(self.source.owner())
+        self.roles()
+            .iter()
+            .find(|r| r.oid == oid)
+            .map(|r| r.name.as_str())
     }
 
     /// The name of the function `oid` identifies, or `None` if this snapshot
@@ -1568,10 +1583,33 @@ impl SystemCatalog {
         self.source.database()
     }
 
-    /// The session user. Backs `current_user`/`session_user`, and is the name
-    /// every catalog row's owner OID resolves to.
+    /// The name every catalog row's owner OID resolves to: the bootstrap
+    /// superuser.
     pub fn owner(&self) -> &str {
         self.source.owner()
+    }
+
+    /// The session's login role — `session_user`, and `pg_stat_activity`'s
+    /// `usename`.
+    pub fn session_user(&self) -> &str {
+        self.source.session_user()
+    }
+
+    /// The role the session currently acts as — `current_user`.
+    pub fn current_user(&self) -> &str {
+        self.source.current_user()
+    }
+
+    /// The OID of [`SystemCatalog::session_user`], for `pg_stat_activity`'s
+    /// `usesysid`. A login role the role catalog does not have still gets a row
+    /// there — the server synthesizes one — so this resolves through the same
+    /// role list rather than assuming the bootstrap OID.
+    pub fn session_user_oid(&self) -> u32 {
+        let name = self.session_user();
+        self.roles()
+            .iter()
+            .find(|r| r.name == name)
+            .map_or(oids::BOOTSTRAP_ROLE_OID, |r| r.oid)
     }
 
     /// The `(namespace, name)` of the relation `oid` identifies — a
