@@ -17,3 +17,4 @@ crabgresql-bki.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+crabgresql-parser.workspace = true
