@@ -22,11 +22,10 @@ struct TypeAttributes {
     interval_type: Value,
 }
 
-/// Every column above answered out of [`crabgresql_types::info_schema`], which
-/// is also what the `information_schema._pg_*` functions call. PostgreSQL
-/// defines these two views *in terms of* those functions, so sharing the one
-/// implementation is what keeps a view column and a direct call from drifting
-/// apart.
+/// PostgreSQL defines these two views *in terms of* the
+/// `information_schema._pg_*` functions, so both go through the one
+/// implementation those functions use — that is what keeps a view column and a
+/// direct call from drifting apart.
 ///
 /// `typmod` arrives **declared** — a `varchar(10)` column stores 10 — while the
 /// shared answers are stated over PostgreSQL's `atttypmod` encoding, where the

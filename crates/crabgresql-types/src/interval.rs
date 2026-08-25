@@ -505,9 +505,7 @@ pub fn pack_typmod(range: u16, precision: Option<u8>) -> i32 {
 }
 
 /// The precision a modifier *declares*, exactly as written and with no clamp —
-/// what `format_type` and `information_schema` print. `None` when none was
-/// written, either because the whole modifier is absent or because its low half
-/// is the [`NO_PRECISION`] sentinel a range-only modifier carries.
+/// what `format_type` and `information_schema` print.
 ///
 /// Distinct from the precision [`unpack_typmod`] returns, which is clamped to
 /// the digits a value can actually hold. That clamp is right for truncating a

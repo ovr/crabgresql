@@ -42,12 +42,9 @@ const VARHDRSZ: i32 = 4;
 /// only, so the encoding is never in question.
 const MAX_BYTES_PER_CHAR: i32 = 4;
 
-/// What an unbounded character column reports as its octet length: 2^30, the
-/// largest value that fits the standard's `cardinal_number` here.
+/// The largest value the standard's `cardinal_number` carries here.
 const UNBOUNDED_OCTET_LENGTH: i32 = 1 << 30;
 
-/// The fractional-second precision every datetime type keeps when none was
-/// declared.
 const DEFAULT_DATETIME_PRECISION: i32 = 6;
 
 /// The declared modifier behind a varlena one: `typmod` with the length header
@@ -110,8 +107,7 @@ pub fn char_octet_length(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithEr
 /// *bits* for the binary types (an `integer` reports 32), in decimal digits for
 /// `numeric`, which is the one type whose answer comes from the modifier.
 ///
-/// `Err` where PostgreSQL raises `22003`, for the same reason as
-/// [`char_max_length`]: stripping the header overflows near `i32::MIN`.
+/// `Err` where PostgreSQL raises `22003` — see [`strip_header`].
 pub fn numeric_precision(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithError> {
     Ok(match ty {
         PgType::Int2 => Some(16),
@@ -165,9 +161,6 @@ pub fn datetime_precision(ty: PgType, typmod: i32) -> Option<i32> {
                 typmod
             })
         }
-        // An interval's modifier packs the field range above its precision, and
-        // the all-ones low half is how "none was declared" is spelled inside a
-        // modifier that still names a range.
         PgType::Interval => {
             Some(crate::interval::declared_precision(typmod).unwrap_or(DEFAULT_DATETIME_PRECISION))
         }
@@ -181,11 +174,8 @@ pub fn datetime_precision(ty: PgType, typmod: i32) -> Option<i32> {
 /// `interval` and an `interval(2)` name no fields, and carry their precision
 /// through [`datetime_precision`] alone.
 ///
-/// PostgreSQL renders this through `format_type`; here the modifier is read
-/// directly, by the same two rules `format_type` applies — the range through
-/// [`crate::interval::range_name`], the precision through
-/// [`crate::interval::declared_precision`], which is *not* the clamped one
-/// [`crate::interval::unpack_typmod`] returns.
+/// PostgreSQL renders this through `format_type`; here the modifier is decoded
+/// by the same two rules that arm applies, so the two cannot drift apart.
 ///
 /// One divergence, on an input no catalog holds: PostgreSQL's `format_type`
 /// raises `XX000 invalid INTERVAL typmod` for a range mask it cannot name
@@ -239,7 +229,6 @@ mod tests {
         assert_eq!(octets(PgType::Varchar, -1), Some(1_073_741_824));
         assert_eq!(max_len(PgType::Text, -1), None);
         assert_eq!(octets(PgType::Text, -1), Some(1_073_741_824));
-        // `text` takes no modifier, so any other value leaves both NULL.
         assert_eq!(octets(PgType::Text, 0), None);
     }
 
@@ -319,7 +308,6 @@ mod tests {
         for ty in [PgType::Int2, PgType::Int4, PgType::Int8] {
             assert_eq!(scale(ty, -1), Some(0), "{ty:?}");
         }
-        // A binary float has a precision but no decimal scale.
         assert_eq!(scale(PgType::Float4, -1), None);
         assert_eq!(scale(PgType::Float8, -1), None);
     }
@@ -333,7 +321,6 @@ mod tests {
         assert_eq!(scale(PgType::Numeric, 196_612), Some(0));
         assert_eq!(precision(PgType::Numeric, -1), None);
         assert_eq!(scale(PgType::Numeric, -1), None);
-        // The radix is known even when the precision is not.
         assert_eq!(numeric_precision_radix(PgType::Numeric, -1), Some(10));
     }
 
@@ -356,12 +343,9 @@ mod tests {
         ] {
             assert_eq!(datetime_precision(ty, -1), Some(6), "{ty:?}");
             assert_eq!(datetime_precision(ty, 3), Some(3), "{ty:?}");
-            // Unlike the length family, every negative value is undeclared
-            // here — and a positive one is passed through unclamped.
             assert_eq!(datetime_precision(ty, -5), Some(6), "{ty:?}");
             assert_eq!(datetime_precision(ty, 196_612), Some(196_612), "{ty:?}");
         }
-        // A date has no fractional seconds at all, and says so with a 0.
         assert_eq!(datetime_precision(PgType::Date, -1), Some(0));
         assert_eq!(datetime_precision(PgType::Date, 3), Some(0));
         assert_eq!(datetime_precision(PgType::Int4, -1), None);

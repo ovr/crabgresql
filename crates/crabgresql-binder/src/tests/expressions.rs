@@ -780,8 +780,7 @@ fn privilege_functions_resolve_by_argument_spelling() -> anyhow::Result<()> {
 }
 
 /// The seven `information_schema._pg_*` helpers share one signature, so what
-/// this pins is the mapping from name to question and the return type — six
-/// report an `int4` and only `_pg_interval_type` a `text`. The
+/// this pins is the mapping from name to question and to return type. The
 /// `information_schema.` qualifier is dropped like any other, so both spellings
 /// reach the same signature.
 #[test]

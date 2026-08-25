@@ -727,11 +727,8 @@ pub enum ScalarFn {
     /// asked about and how each argument was spelled, which is exactly what
     /// [`PrivCall`] carries. The executor evaluates them in `acl`.
     HasPrivilege(PrivCall),
-    /// One of the seven `information_schema._pg_*` type-shape helpers, all of
-    /// which take `(typid oid, typmod int4)` and differ only in which question
-    /// they ask — which is what [`InfoSchemaTypeAttr`] carries. The executor
-    /// answers them out of `crabgresql_types::info_schema`, the same module the
-    /// `information_schema.columns` row builder reads.
+    /// One of the seven `information_schema._pg_*` type-shape helpers, which
+    /// differ only in the question they ask — see [`InfoSchemaTypeAttr`].
     InfoSchemaTypeAttr(InfoSchemaTypeAttr),
     /// `pg_relation_size(regclass[, text]) -> int8`: the relation's own storage
     /// in bytes. The second argument names a fork (`main`, `fsm`, `vm`, `init`)
@@ -2171,9 +2168,6 @@ fn lookup(name: &str) -> &'static [Signature] {
             }
         };
     }
-    // The seven `information_schema._pg_*` helpers: one overload each, over the
-    // `(typid, typmod)` pair every catalog row carries. Only the return type
-    // varies.
     macro_rules! info_attr_sig {
         ($attr:expr, $ret:expr) => {
             &[Signature {
@@ -3251,11 +3245,8 @@ fn lookup(name: &str) -> &'static [Signature] {
             priv_col_sig!(None, ArgForm::Oid, ArgForm::Name, &[OID, TEXT, TEXT]),
             priv_col_sig!(None, ArgForm::Oid, ArgForm::Attnum, &[OID, I2, TEXT]),
         ],
-        // The `information_schema` type-shape helpers. PostgreSQL's own
-        // `information_schema.columns` and `.domains` are defined over these
-        // seven, and so are this build's row builders for the two views — see
-        // `crabgresql_types::info_schema`, which holds the single answer both
-        // paths read.
+        // The `information_schema` type-shape helpers, answered out of
+        // `crabgresql_types::info_schema`.
         "_pg_char_max_length" => info_attr_sig!(InfoSchemaTypeAttr::CharMaxLength, I4),
         "_pg_char_octet_length" => info_attr_sig!(InfoSchemaTypeAttr::CharOctetLength, I4),
         "_pg_numeric_precision" => info_attr_sig!(InfoSchemaTypeAttr::NumericPrecision, I4),

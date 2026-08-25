@@ -1101,12 +1101,7 @@ impl PgType {
             PgType::Timestamp if m >= 0 => format!("timestamp({m}) without time zone"),
             PgType::TimestampTz if m >= 0 => format!("timestamp({m}) with time zone"),
             // `interval` is the one type whose modifier is two things at once:
-            // the fields it admits, spelled out, then the precision. The
-            // precision is read raw rather than through
-            // `interval::unpack_typmod`, which clamps it to the six digits a
-            // value can hold: PostgreSQL does not clamp here, and prints
-            // `format_type(1186, 268435527)` as `interval second(71)` — the same
-            // way the `time`/`timestamp` arms above print their `({m})`.
+            // the fields it admits, spelled out, then the precision.
             PgType::Interval if m >= 0 => {
                 let (range, _) = interval::unpack_typmod(m);
                 let mut s = name.to_string();
