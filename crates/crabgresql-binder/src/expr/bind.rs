@@ -291,6 +291,12 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
 /// Bind an `a[i]` subscript: a single integer index on an array, whose result
 /// type is the array's element type.
 ///
+/// The base may be qualified (`t.a[1]`). The parser only folds a dotted path
+/// into a `CompoundIdentifier` when *every* link is an identifier, so a
+/// trailing subscript leaves the whole path here as `root` plus a chain of
+/// `Dot`s — those dots are the column reference, not field access, and resolve
+/// through [`bind_compound`].
+///
 /// TODO: support array slices (`a[1:3]`) and chained/multi-dimensional
 /// subscripts, both rejected here with `0A000`.
 fn bind_subscript(
@@ -298,21 +304,43 @@ fn bind_subscript(
     access_chain: &[ast::AccessExpr],
     scope: &Scope,
 ) -> Result<Binding, BindError> {
-    let index_expr = match access_chain {
-        [ast::AccessExpr::Subscript(ast::Subscript::Index { index })] => index,
-        [ast::AccessExpr::Subscript(ast::Subscript::Slice { .. })] => {
+    let unsupported = || {
+        BindError::feature_not_supported(
+            "multi-dimensional or field subscripting is not supported yet",
+        )
+    };
+    // Anything but "a path, then exactly one subscript at the end" is a feature
+    // this build does not have: a second subscript needs multi-dimensional
+    // arrays, a dot *after* a subscript needs composite types.
+    let Some((ast::AccessExpr::Subscript(subscript), path)) = access_chain.split_last() else {
+        return Err(unsupported());
+    };
+    let index_expr = match subscript {
+        ast::Subscript::Index { index } => index,
+        ast::Subscript::Slice { .. } => {
             return Err(BindError::feature_not_supported(
                 "array slice access is not supported yet",
             ));
         }
-        // Chained/multi-dimensional subscripts and dotted field access.
-        _ => {
-            return Err(BindError::feature_not_supported(
-                "multi-dimensional or field subscripting is not supported yet",
-            ));
-        }
     };
-    let base = bind_scalar(root, scope)?;
+    let base = if path.is_empty() {
+        bind_scalar(root, scope)?
+    } else {
+        // A dotted path only names a column when it is identifiers all the way
+        // down; `f(x).c[1]` is field access on a composite result instead.
+        let mut parts = Vec::with_capacity(path.len() + 1);
+        let ast::Expr::Identifier(root_ident) = root else {
+            return Err(unsupported());
+        };
+        parts.push(root_ident.clone());
+        for link in path {
+            let ast::AccessExpr::Dot(ast::Expr::Identifier(ident)) = link else {
+                return Err(unsupported());
+            };
+            parts.push(ident.clone());
+        }
+        bind_compound(&parts, scope)?
+    };
     let elem = match base.ty() {
         PgType::Array(elem_oid) => PgType::from_oid(elem_oid).ok_or_else(|| {
             BindError::feature_not_supported("subscripting this array type is not supported yet")
@@ -1381,8 +1409,17 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         // An `ARRAY[...]` constructor is named "array" in PG.
         ast::Expr::Array(_) => "array".into(),
         // `a[i]` subscript keeps the base's name, like a bare column through a
-        // cast (`a[1]` → "a"); a non-name base falls through to `?column?`.
-        ast::Expr::CompoundFieldAccess { root, .. } => output_name(root),
+        // cast (`a[1]` → "a"); a non-name base falls through to `?column?`. A
+        // qualified base is named after its *last* path element, not the
+        // qualifier (`t.a[1]` → "a").
+        ast::Expr::CompoundFieldAccess { root, access_chain } => access_chain
+            .iter()
+            .rev()
+            .find_map(|link| match link {
+                ast::AccessExpr::Dot(expr) => Some(output_name(expr)),
+                ast::AccessExpr::Subscript(_) => None,
+            })
+            .unwrap_or_else(|| output_name(root)),
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
         // CEIL/FLOOR special syntax is named after the function.

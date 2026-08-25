@@ -28,6 +28,11 @@ INSERT INTO arr VALUES (2, '{4,5}', '{z}');
 INSERT INTO arr VALUES (3, ARRAY[1, NULL, 3], NULL);
 SELECT id, a, t, a[1] AS a1 FROM arr ORDER BY id;
 
+-- a subscript on a qualified column, by table name and by alias; the unaliased
+-- one is named after the column, not the qualifier
+SELECT arr.a[1], x.t[2] FROM arr AS x, arr WHERE arr.id = x.id AND arr.a[2] = 2;
+SELECT id FROM arr WHERE arr.a[1] = 1 ORDER BY arr.a[3];
+
 -- element-wise ordering (shorter array is less on a common prefix)
 SELECT a FROM (VALUES
     (ARRAY[1, 2, 3]),
